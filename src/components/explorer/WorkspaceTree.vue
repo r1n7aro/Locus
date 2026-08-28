@@ -18,7 +18,7 @@ export interface WorkspaceTreeRow {
   selected?: boolean;
   focused?: boolean;
   editing?: boolean;
-  draggable?: boolean;
+  dragEnabled?: boolean;
   disabled?: boolean;
   domId?: string;
   title?: string;
@@ -43,10 +43,8 @@ withDefaults(defineProps<{
 
 const emit = defineEmits<{
   (e: "activate", item: WorkspaceTreeItem, event: MouseEvent): void;
-  (e: "toggle", item: WorkspaceTreeItem): void;
   (e: "contextmenu", item: WorkspaceTreeItem, event: MouseEvent): void;
-  (e: "dragstart", item: WorkspaceTreeItem, event: DragEvent): void;
-  (e: "dragend", item: WorkspaceTreeItem, event: DragEvent): void;
+  (e: "dragPointerDown", item: WorkspaceTreeItem, event: PointerEvent): void;
   (e: "dragover", item: WorkspaceTreeItem, event: DragEvent): void;
   (e: "dragleave", item: WorkspaceTreeItem, event: DragEvent): void;
   (e: "drop", item: WorkspaceTreeItem, event: DragEvent): void;
@@ -61,11 +59,6 @@ function defaultIcon(row: WorkspaceTreeRow) {
   if (row.kind === "package") return Package;
   if (row.kind === "folder") return row.expanded ? FolderOpen : Folder;
   return File;
-}
-
-function toggleBranch(item: WorkspaceTreeItem, event: MouseEvent) {
-  if (event.detail >= 2) return;
-  emit("toggle", item);
 }
 
 function scrollToIndex(index: number, options?: { align?: "auto" | "center" }) {
@@ -98,15 +91,13 @@ defineExpose({ scrollToIndex });
             editing: item.treeRow.editing,
             ...item.treeRow.classes,
           }"
-          :draggable="item.treeRow.draggable && !item.treeRow.editing"
+          :style="{ '--workspace-tree-row-indent': rowIndent(item.treeRow, baseIndent, indentSize) }"
           :data-tree-key="item.treeRow.key"
           role="treeitem"
           :aria-level="item.treeRow.depth + 1"
           :aria-expanded="item.treeRow.expandable ? item.treeRow.expanded : undefined"
           :aria-selected="item.treeRow.selected"
           @contextmenu="emit('contextmenu', item, $event)"
-          @dragstart="emit('dragstart', item, $event)"
-          @dragend="emit('dragend', item, $event)"
           @dragover="emit('dragover', item, $event)"
           @dragleave="emit('dragleave', item, $event)"
           @drop="emit('drop', item, $event)"
@@ -115,30 +106,19 @@ defineExpose({ scrollToIndex });
             :is="item.treeRow.editing ? 'div' : 'button'"
             :type="item.treeRow.editing ? undefined : 'button'"
             class="workspace-tree-row"
-            :class="{ disabled: item.treeRow.disabled }"
+            :class="{
+              disabled: item.treeRow.disabled,
+              'drag-enabled': item.treeRow.dragEnabled && !item.treeRow.editing,
+            }"
             :style="{
               paddingLeft: rowIndent(item.treeRow, baseIndent, indentSize),
             }"
             :title="item.treeRow.title"
             :disabled="item.treeRow.editing ? undefined : item.treeRow.disabled"
             tabindex="-1"
+            @pointerdown="item.treeRow.dragEnabled && !item.treeRow.editing && emit('dragPointerDown', item, $event)"
             @click="!item.treeRow.editing && emit('activate', item, $event)"
           >
-            <button
-              v-if="item.treeRow.expandable"
-              type="button"
-              class="workspace-tree-branch"
-              :class="{ open: item.treeRow.expanded }"
-              tabindex="-1"
-              :aria-label="item.treeRow.expanded ? 'Collapse' : 'Expand'"
-              @click.stop="toggleBranch(item, $event)"
-            >
-              <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true">
-                <path d="M4 2.5 7.5 6 4 9.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            </button>
-            <span v-else class="workspace-tree-branch-spacer" aria-hidden="true"></span>
-
             <span class="workspace-tree-icon" :class="`kind-${item.treeRow.kind}`" aria-hidden="true">
               <slot name="icon" :item="item" :row="item.treeRow" :index="index">
                 <LucideIcon :icon="defaultIcon(item.treeRow)" :size="13" :stroke-width="2" />
@@ -206,7 +186,7 @@ defineExpose({ scrollToIndex });
   padding: 2px 8px 2px 10px;
   border: none;
   background: transparent;
-  color: var(--text-color);
+  color: color-mix(in srgb, var(--text-color) 78%, var(--text-secondary) 22%);
   font: inherit;
   text-align: left;
   cursor: pointer;
@@ -218,13 +198,16 @@ defineExpose({ scrollToIndex });
   opacity: 0.56;
 }
 
+.workspace-tree-row.drag-enabled {
+  cursor: grab;
+  touch-action: none;
+}
+
 .workspace-tree-row:focus-visible {
   outline: 2px solid var(--accent-color);
   outline-offset: -2px;
 }
 
-.workspace-tree-branch,
-.workspace-tree-branch-spacer,
 .workspace-tree-icon {
   display: inline-flex;
   align-items: center;
@@ -235,29 +218,6 @@ defineExpose({ scrollToIndex });
   flex-shrink: 0;
 }
 
-.workspace-tree-branch {
-  padding: 0;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-
-.workspace-tree-branch:hover {
-  background: color-mix(in srgb, var(--hover-bg) 85%, transparent);
-  color: var(--text-color);
-}
-
-.workspace-tree-branch svg {
-  opacity: 0.72;
-  transition: transform 0.15s ease;
-}
-
-.workspace-tree-branch.open svg {
-  transform: rotate(90deg);
-}
-
 .workspace-tree-name,
 .workspace-tree-editor {
   flex: 1;
@@ -265,7 +225,7 @@ defineExpose({ scrollToIndex });
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--font-mono-identifier);
+  font-family: var(--font-ui);
   font-size: 12px;
   line-height: 1.4;
 }

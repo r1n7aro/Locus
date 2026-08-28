@@ -23,6 +23,8 @@ import {
   openUnityReferenceImportProgressWindow,
 } from "../services/unityReferenceImportWindow";
 
+const workspaceRef = { checkoutId: "checkout-feature", expectedGeneration: 7 };
+
 describe("unityReferenceImportWindow", () => {
   beforeEach(() => {
     subWindowMocks.invokeMock.mockReset();
@@ -72,7 +74,7 @@ describe("unityReferenceImportWindow", () => {
     const existingWindow = { emit: vi.fn() };
     subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
-    await openUnityReferenceImportProgressWindow();
+    await openUnityReferenceImportProgressWindow(workspaceRef);
 
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({ focusExisting: true }),
@@ -89,7 +91,7 @@ describe("unityReferenceImportWindow", () => {
     const existingWindow = { emit: vi.fn() };
     subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
-    await openUnityReferenceImportProgressWindow({
+    await openUnityReferenceImportProgressWindow(workspaceRef, {
       targetPath: "reference-folder",
       running: true,
       locale: "zh-CN",
@@ -112,11 +114,11 @@ describe("unityReferenceImportWindow", () => {
       pooled: true,
     });
 
-    await openUnityReferenceImportProgressWindow({ targetPath: "reference-folder" });
+    await openUnityReferenceImportProgressWindow(workspaceRef, { targetPath: "reference-folder" });
 
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({
-        kind: "unity-reference-import-progress",
+        kind: expect.stringMatching(/^unity-reference-import-progress-/),
         title: "Locus Unity Docs",
         width: 720,
         height: 560,

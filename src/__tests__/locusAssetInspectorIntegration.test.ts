@@ -24,7 +24,7 @@ describe("Locus asset inspector integration", () => {
     expect(chat).toContain("doAssetRefOpenInLocusInspectorWindow");
     expect(chat).toContain('target.kind === "sceneObject"');
     expect(chat).toContain('kind: "sceneObject"');
-    expect(chat).toContain("openUnitySceneObjectInspector(target.scenePath, target.objectPath)");
+    expect(chat).toContain("openUnitySceneObjectInspector(projectStore.requireWorkspaceRef(), target.scenePath, target.objectPath)");
     expect(chat).toContain(".unity-object-identity[data-unity-ref-kind]");
     expect(chat).toContain('t("common.openInLocusInspector")');
     expect(chat).toContain('t("common.openInLocusInspectorWindow")');
@@ -41,7 +41,7 @@ describe("Locus asset inspector integration", () => {
     expect(service).toContain('LOCUS_ASSET_INSPECTOR_TAB_ID_PREFIX = "locus-inspector:"');
     expect(service).toContain("buildLocusAssetInspectorTabId");
     expect(service).toContain("parseLocusAssetInspectorTabId");
-    expect(service).toContain("viewOpenInspectorTab({ tabId: buildLocusAssetInspectorTabId(nextPayload) })");
+    expect(service).toContain("viewOpenInspectorTab(workspaceRef, { tabId: buildLocusAssetInspectorTabId(nextPayload) })");
     expect(service).toContain("scenePath");
     expect(service).toContain("objectPath");
 
@@ -104,7 +104,7 @@ describe("Locus asset inspector integration", () => {
     expect(runtime).toContain("pub async fn open_inspector_tab_window");
     expect(runtime).toContain("fn detach_inspector_tab_window");
     expect(runtime).toContain("fn encode_view_host_tab_id");
-    expect(runtime).toContain("reusable_view_host_window_label(app_handle, &id)");
+    expect(runtime).toContain("reusable_view_host_window_label_scoped(");
   });
 
   it("hosts an embedded floating inspector panel in the main window", () => {
@@ -121,8 +121,8 @@ describe("Locus asset inspector integration", () => {
     expect(composable).toContain("export async function openLocusAssetInspector(");
     expect(composable).toContain("canFitEmbeddedLocusAssetInspectorPanel");
     expect(composable).toContain('|| (mode === "auto" && canFitEmbeddedLocusAssetInspectorPanel())');
-    expect(composable).toContain("if (preferEmbedded && openLocusAssetInspectorPanel(payload))");
-    expect(composable).toContain("return openLocusAssetInspectorWindow(payload);");
+    expect(composable).toContain("if (preferEmbedded && openLocusAssetInspectorPanel(payload, workspaceRef))");
+    expect(composable).toContain("return openLocusAssetInspectorWindow(workspaceRef, payload);");
     expect(composable).toContain("normalizeLocusAssetInspectorPayload");
     expect(composable).toContain("isValidLocusAssetInspectorPayload");
 

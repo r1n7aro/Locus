@@ -2055,6 +2055,7 @@ pub(crate) fn build_workspace_scene_target_inspector(
     );
     let mut env = SemanticBuildEnv {
         app_handle: None,
+        event_scope: None,
         cwd,
         profiler: &mut profiler,
         batch_reader: None,
@@ -2846,10 +2847,17 @@ pub(crate) fn build_scene_semantic_session(
     ctx: &DiffBuildContext,
     cwd: &str,
     app_handle: &tauri::AppHandle,
+    event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     profiler: &mut DiffProfiler,
 ) -> Option<crate::diff::service::SemanticSession> {
     // Emit ParseYaml phase BEFORE parsing so UI shows progress during the work
-    emit_diff_progress(app_handle, profiler, DiffPhase::ParseYaml, None);
+    emit_diff_progress(
+        app_handle,
+        event_scope,
+        profiler,
+        DiffPhase::ParseYaml,
+        None,
+    );
     let (old_docs, new_docs) = rayon::join(
         || parse_yaml_docs(old_content.as_bytes()),
         || parse_yaml_docs(new_content.as_bytes()),
@@ -2910,13 +2918,20 @@ pub(crate) fn build_scene_semantic_session(
     };
     let mut env = SemanticBuildEnv {
         app_handle: Some(app_handle.clone()),
+        event_scope: Some(event_scope.clone()),
         cwd,
         profiler,
         batch_reader,
         script_cache: ScriptInfoCache::default(),
     };
     // Emit BuildSemantic BEFORE the actual build so UI shows progress during the work
-    emit_diff_progress(app_handle, env.profiler, DiffPhase::BuildSemantic, None);
+    emit_diff_progress(
+        app_handle,
+        event_scope,
+        env.profiler,
+        DiffPhase::BuildSemantic,
+        None,
+    );
 
     // Pre-warm scene script cache so labels can use readonly lookup
     {
@@ -3330,6 +3345,7 @@ mod tests {
     fn test_env<'a>(profiler: &'a mut DiffProfiler) -> SemanticBuildEnv<'a> {
         SemanticBuildEnv {
             app_handle: None,
+            event_scope: None,
             cwd: ".",
             profiler,
             batch_reader: None,

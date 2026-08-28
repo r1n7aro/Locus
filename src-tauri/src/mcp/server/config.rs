@@ -55,8 +55,25 @@ impl Default for McpServerSettings {
 }
 
 impl McpServerSettings {
+    /// Process-level listener URL. Workspace tools require a scoped URL from
+    /// `scoped_endpoint_url`; the base URL is retained for settings and
+    /// integration discovery.
     pub fn endpoint_url(&self) -> String {
         format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+
+    pub fn scoped_endpoint_url(
+        &self,
+        checkout_id: &str,
+        workspace_generation: Option<u64>,
+    ) -> String {
+        let checkout_id: String =
+            url::form_urlencoded::byte_serialize(checkout_id.as_bytes()).collect();
+        let mut url = format!("{}?checkoutId={checkout_id}", self.endpoint_url());
+        if let Some(generation) = workspace_generation {
+            url.push_str(&format!("&workspaceGeneration={generation}"));
+        }
+        url
     }
 
     pub fn tool_enabled(&self, name: &str) -> bool {
@@ -124,6 +141,10 @@ mod tests {
         assert!(!settings.enabled);
         assert_eq!(settings.port, DEFAULT_PORT);
         assert_eq!(settings.endpoint_url(), "http://127.0.0.1:27121/mcp");
+        assert_eq!(
+            settings.scoped_endpoint_url("checkout A", Some(7)),
+            "http://127.0.0.1:27121/mcp?checkoutId=checkout+A&workspaceGeneration=7"
+        );
         assert!(settings.tool_enabled("unity_execute"));
 
         let settings = McpServerSettings {

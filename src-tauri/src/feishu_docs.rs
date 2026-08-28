@@ -4362,6 +4362,7 @@ pub async fn start_feishu_reference_import(
     request: FeishuReferenceImportRequest,
     knowledge_index_state: Arc<KnowledgeIndexState>,
     state: Arc<tokio::sync::Mutex<FeishuReferenceImportRuntime>>,
+    workspace_lease: crate::workspace_service::WorkspaceLease,
 ) -> Result<FeishuReferenceImportStatus, String> {
     let target_path = normalize_optional_text(request.target_path.clone());
     if let Some(target_path) = target_path.as_deref() {
@@ -4468,6 +4469,7 @@ pub async fn start_feishu_reference_import(
     let config_for_task = config.clone();
     let target_path_for_task = target_path.clone();
     tauri::async_runtime::spawn(async move {
+        let _workspace_lease = workspace_lease;
         let outcome = run_feishu_reference_import(
             app_handle.clone(),
             working_dir_for_task.clone(),

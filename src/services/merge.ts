@@ -1,5 +1,10 @@
 import { ipcInvoke } from "./ipc";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+  type WorkspaceRef,
+} from "./project";
 import type {
   MergeSessionRequest,
   MergeSessionPayload,
@@ -19,10 +24,30 @@ export interface MergeProgressEvent {
   phaseDurations?: Record<string, number>;
 }
 
-export function listenMergeProgress(
+function cloneWorkspaceRef(workspaceRef: WorkspaceRef): WorkspaceRef {
+  return {
+    checkoutId: workspaceRef.checkoutId,
+    expectedGeneration: workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+export async function listenMergeProgress(
   cb: (evt: MergeProgressEvent) => void,
+  workspaceRef: WorkspaceRef,
 ): Promise<UnlistenFn> {
-  return listen<MergeProgressEvent>("merge-progress", (e) => cb(e.payload));
+  const scopedRef = cloneWorkspaceRef(workspaceRef);
+  return listen<RoutedWorkspaceEvent<MergeProgressEvent>>(
+    WORKSPACE_EVENT_NAME,
+    ({ payload }) => {
+      if (payload.eventName !== "merge-progress") return;
+      if (payload.checkoutId !== scopedRef.checkoutId) return;
+      if (
+        scopedRef.expectedGeneration != null
+        && payload.workspaceGeneration !== scopedRef.expectedGeneration
+      ) return;
+      cb(payload.payload);
+    },
+  );
 }
 
 /**
@@ -31,8 +56,13 @@ export function listenMergeProgress(
  */
 export function mergeSemanticSession(
   request: MergeSessionRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<MergeSessionPayload> {
-  return ipcInvoke<MergeSessionPayload>("git_merge_semantic_session", { request });
+  const scopedRef = cloneWorkspaceRef(workspaceRef);
+  return ipcInvoke<MergeSessionPayload>("git_merge_semantic_session", {
+    request,
+    workspaceRef: scopedRef,
+  });
 }
 
 /**
@@ -40,9 +70,11 @@ export function mergeSemanticSession(
  */
 export function mergeSemanticTarget(
   request: MergeTargetRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<MergeTargetInspector> {
   return ipcInvoke<MergeTargetInspector>("git_merge_semantic_target", {
     request,
+    workspaceRef: cloneWorkspaceRef(workspaceRef),
   });
 }
 
@@ -51,8 +83,12 @@ export function mergeSemanticTarget(
  */
 export function mergeSemanticApply(
   request: MergeApplyRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<void> {
-  return ipcInvoke("git_merge_semantic_apply", { request });
+  return ipcInvoke("git_merge_semantic_apply", {
+    request,
+    workspaceRef: cloneWorkspaceRef(workspaceRef),
+  });
 }
 
 /**
@@ -60,6 +96,10 @@ export function mergeSemanticApply(
  */
 export function mergeSemanticValidate(
   request: MergeApplyRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<void> {
-  return ipcInvoke("git_merge_semantic_validate", { request });
+  return ipcInvoke("git_merge_semantic_validate", {
+    request,
+    workspaceRef: cloneWorkspaceRef(workspaceRef),
+  });
 }

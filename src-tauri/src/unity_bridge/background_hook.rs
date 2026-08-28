@@ -1,8 +1,28 @@
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
 use super::unix_now_ms;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkspaceStatusKey {
+    checkout_id: String,
+    workspace_generation: u64,
+    service_instance_id: Option<String>,
+    service_generation: Option<u64>,
+}
+
+impl From<&crate::workspace_service::event::WorkspaceEventScope> for WorkspaceStatusKey {
+    fn from(scope: &crate::workspace_service::event::WorkspaceEventScope) -> Self {
+        Self {
+            checkout_id: scope.checkout_id.to_string(),
+            workspace_generation: scope.workspace_generation,
+            service_instance_id: scope.service_instance_id.as_ref().map(ToString::to_string),
+            service_generation: scope.service_generation,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -88,7 +108,8 @@ struct ProcessPatch {
 struct HookRuntime {
     enabled: bool,
     patches: Vec<ProcessPatch>,
-    last_status: UnityBackgroundHookStatus,
+    project_scopes: HashMap<String, WorkspaceStatusKey>,
+    workspace_statuses: HashMap<WorkspaceStatusKey, UnityBackgroundHookStatus>,
 }
 
 fn runtime() -> &'static Mutex<HookRuntime> {
@@ -97,9 +118,112 @@ fn runtime() -> &'static Mutex<HookRuntime> {
         Mutex::new(HookRuntime {
             enabled: true,
             patches: Vec::new(),
-            last_status: UnityBackgroundHookStatus::inactive(true),
+            project_scopes: HashMap::new(),
+            workspace_statuses: HashMap::new(),
         })
     })
+}
+
+fn project_key(project_path: &str) -> String {
+    super::project_runtime_key(project_path)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn base_status(enabled: bool) -> UnityBackgroundHookStatus {
+    if enabled {
+        UnityBackgroundHookStatus::inactive(true)
+    } else {
+        UnityBackgroundHookStatus::disabled()
+    }
+}
+
+pub fn bind_workspace_scope(
+    project_path: &str,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    let Ok(mut rt) = runtime().lock() else {
+        return;
+    };
+    let key = WorkspaceStatusKey::from(scope);
+    if let Some(previous) = rt
+        .project_scopes
+        .insert(project_key(project_path), key.clone())
+    {
+        if previous != key {
+            rt.workspace_statuses.remove(&previous);
+        }
+    }
+    let enabled = rt.enabled;
+    rt.workspace_statuses
+        .entry(key)
+        .or_insert_with(|| base_status(enabled));
+}
+
+pub fn unbind_workspace_scope(
+    project_path: &str,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    let Ok(mut rt) = runtime().lock() else {
+        return;
+    };
+    let expected = WorkspaceStatusKey::from(scope);
+    let project = project_key(project_path);
+    if rt.project_scopes.get(&project) == Some(&expected) {
+        rt.project_scopes.remove(&project);
+        rt.workspace_statuses.remove(&expected);
+    }
+}
+
+pub fn status_for_scope(
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) -> UnityBackgroundHookStatus {
+    runtime()
+        .lock()
+        .map(|rt| {
+            rt.workspace_statuses
+                .get(&WorkspaceStatusKey::from(scope))
+                .cloned()
+                .unwrap_or_else(|| base_status(rt.enabled))
+        })
+        .unwrap_or_else(|_| failed_runtime_status())
+}
+
+pub fn status_for_project(project_path: &str) -> UnityBackgroundHookStatus {
+    runtime()
+        .lock()
+        .map(|rt| {
+            rt.project_scopes
+                .get(&project_key(project_path))
+                .and_then(|key| rt.workspace_statuses.get(key))
+                .cloned()
+                .unwrap_or_else(|| base_status(rt.enabled))
+        })
+        .unwrap_or_else(|_| failed_runtime_status())
+}
+
+pub fn record_status_for_project(project_path: &str, status: UnityBackgroundHookStatus) {
+    let Ok(mut rt) = runtime().lock() else {
+        return;
+    };
+    if let Some(key) = rt.project_scopes.get(&project_key(project_path)).cloned() {
+        rt.workspace_statuses.insert(key, status);
+    }
+}
+
+fn failed_runtime_status() -> UnityBackgroundHookStatus {
+    UnityBackgroundHookStatus {
+        enabled: false,
+        supported: cfg!(target_os = "windows"),
+        state: UnityBackgroundHookState::Failed,
+        patched: false,
+        process_id: None,
+        editor_process_path: None,
+        symbol_count: 0,
+        error: Some("Unity background hook runtime is unavailable".to_string()),
+        updated_at_ms: unix_now_ms(),
+    }
 }
 
 pub fn initialize(enabled: bool) {
@@ -107,32 +231,14 @@ pub fn initialize(enabled: bool) {
         .lock()
         .expect("unity background hook runtime poisoned");
     rt.enabled = enabled;
-    rt.last_status = if enabled {
-        UnityBackgroundHookStatus::inactive(true)
-    } else {
-        UnityBackgroundHookStatus::disabled()
-    };
+    let status = base_status(enabled);
+    for current in rt.workspace_statuses.values_mut() {
+        *current = status.clone();
+    }
 }
 
 pub fn enabled() -> bool {
     runtime().lock().map(|rt| rt.enabled).unwrap_or(false)
-}
-
-pub fn status() -> UnityBackgroundHookStatus {
-    runtime()
-        .lock()
-        .map(|rt| rt.last_status.clone())
-        .unwrap_or_else(|_| UnityBackgroundHookStatus {
-            enabled: false,
-            supported: cfg!(target_os = "windows"),
-            state: UnityBackgroundHookState::Failed,
-            patched: false,
-            process_id: None,
-            editor_process_path: None,
-            symbol_count: 0,
-            error: Some("Unity background hook runtime is unavailable".to_string()),
-            updated_at_ms: unix_now_ms(),
-        })
 }
 
 pub fn set_enabled(value: bool) -> Result<UnityBackgroundHookStatus, String> {
@@ -142,12 +248,16 @@ pub fn set_enabled(value: bool) -> Result<UnityBackgroundHookStatus, String> {
     rt.enabled = value;
     if !value {
         let restore_result = restore_all_locked(&mut rt);
-        rt.last_status = UnityBackgroundHookStatus::disabled();
+        for status in rt.workspace_statuses.values_mut() {
+            *status = UnityBackgroundHookStatus::disabled();
+        }
         restore_result?;
-        return Ok(rt.last_status.clone());
+        return Ok(UnityBackgroundHookStatus::disabled());
     }
-    rt.last_status = UnityBackgroundHookStatus::inactive(true);
-    Ok(rt.last_status.clone())
+    for status in rt.workspace_statuses.values_mut() {
+        *status = UnityBackgroundHookStatus::inactive(true);
+    }
+    Ok(UnityBackgroundHookStatus::inactive(true))
 }
 
 pub fn restore_runtime_patches() -> Result<(), String> {
@@ -155,15 +265,15 @@ pub fn restore_runtime_patches() -> Result<(), String> {
         .lock()
         .map_err(|e| format!("unity background hook runtime lock poisoned: {e}"))?;
     let restore_result = restore_all_locked(&mut rt);
-    rt.last_status = if rt.enabled {
-        UnityBackgroundHookStatus::inactive(true)
-    } else {
-        UnityBackgroundHookStatus::disabled()
-    };
+    let status = base_status(rt.enabled);
+    for current in rt.workspace_statuses.values_mut() {
+        *current = status.clone();
+    }
     restore_result
 }
 
-pub fn sync_for_process(
+pub fn sync_for_project(
+    project_path: &str,
     process_id: u32,
     editor_process_path: &str,
 ) -> Result<UnityBackgroundHookStatus, String> {
@@ -172,45 +282,57 @@ pub fn sync_for_process(
         .map_err(|e| format!("unity background hook runtime lock poisoned: {e}"))?;
 
     if !rt.enabled {
-        rt.last_status = UnityBackgroundHookStatus::disabled();
-        return Ok(rt.last_status.clone());
+        let status = UnityBackgroundHookStatus::disabled();
+        record_status_locked(&mut rt, project_path, status.clone());
+        return Ok(status);
     }
 
     let editor_process_path = editor_process_path.trim();
     if editor_process_path.is_empty() {
-        rt.last_status = failed_status(
+        let status = failed_status(
             true,
             Some(process_id),
             None,
             "Unity process path is unavailable".to_string(),
         );
-        return Ok(rt.last_status.clone());
+        record_status_locked(&mut rt, project_path, status.clone());
+        return Ok(status);
     }
 
     if let Some(existing) = rt.patches.iter().find(|patch| {
         patch.process_id == process_id && patch.editor_process_path == editor_process_path
     }) {
-        rt.last_status = patched_status(existing);
-        return Ok(rt.last_status.clone());
+        let status = patched_status(existing);
+        record_status_locked(&mut rt, project_path, status.clone());
+        return Ok(status);
     }
 
-    match patch_process(process_id, editor_process_path) {
+    let status = match patch_process(process_id, editor_process_path) {
         Ok(process_patch) => {
             let status = patched_status(&process_patch);
             rt.patches.push(process_patch);
-            rt.last_status = status;
+            status
         }
-        Err(error) => {
-            rt.last_status = failed_status(
-                true,
-                Some(process_id),
-                Some(editor_process_path.to_string()),
-                error,
-            );
-        }
-    }
+        Err(error) => failed_status(
+            true,
+            Some(process_id),
+            Some(editor_process_path.to_string()),
+            error,
+        ),
+    };
+    record_status_locked(&mut rt, project_path, status.clone());
 
-    Ok(rt.last_status.clone())
+    Ok(status)
+}
+
+fn record_status_locked(
+    rt: &mut HookRuntime,
+    project_path: &str,
+    status: UnityBackgroundHookStatus,
+) {
+    if let Some(key) = rt.project_scopes.get(&project_key(project_path)).cloned() {
+        rt.workspace_statuses.insert(key, status);
+    }
 }
 
 fn patched_status(process_patch: &ProcessPatch) -> UnityBackgroundHookStatus {
@@ -787,4 +909,60 @@ pub(in crate::unity_bridge) fn engine_module_bounds(
     _process_id: u32,
 ) -> Result<(u64, u64, String), String> {
     Err("engine module lookup is only supported on Windows".to_string())
+}
+
+#[cfg(test)]
+mod workspace_scope_tests {
+    use super::*;
+    use crate::workspace_service::event::WorkspaceEventScope;
+    use crate::workspace_service::{CheckoutId, ProjectId, ServiceInstanceId};
+
+    fn scope(
+        checkout: &str,
+        workspace_generation: u64,
+        service_generation: u64,
+    ) -> WorkspaceEventScope {
+        let checkout_id = CheckoutId::new(checkout).expect("checkout id");
+        WorkspaceEventScope {
+            project_id: ProjectId::new("project-background-hook-test").expect("project id"),
+            checkout_id: checkout_id.clone(),
+            workspace_generation,
+            service_instance_id: Some(ServiceInstanceId::for_service(&checkout_id, "unity")),
+            service_generation: Some(service_generation),
+        }
+    }
+
+    fn observed(process_id: u32, path: &str) -> UnityBackgroundHookStatus {
+        UnityBackgroundHookStatus {
+            enabled: true,
+            supported: cfg!(target_os = "windows"),
+            state: UnityBackgroundHookState::Failed,
+            patched: false,
+            process_id: Some(process_id),
+            editor_process_path: Some(path.to_string()),
+            symbol_count: 0,
+            error: Some("test observation".to_string()),
+            updated_at_ms: unix_now_ms(),
+        }
+    }
+
+    #[test]
+    fn checkout_statuses_do_not_overwrite_each_other_or_leak_across_generations() {
+        let root_a = r"F:\scope-tests\background-hook-a";
+        let root_b = r"F:\scope-tests\background-hook-b";
+        let scope_a = scope("checkout-background-hook-a", 21, 201);
+        let scope_b = scope("checkout-background-hook-b", 22, 202);
+        bind_workspace_scope(root_a, &scope_a);
+        bind_workspace_scope(root_b, &scope_b);
+        record_status_for_project(root_a, observed(2101, "Unity-A.exe"));
+        record_status_for_project(root_b, observed(2202, "Unity-B.exe"));
+
+        assert_eq!(status_for_scope(&scope_a).process_id, Some(2101));
+        assert_eq!(status_for_scope(&scope_b).process_id, Some(2202));
+
+        let replacement = scope("checkout-background-hook-a", 23, 203);
+        bind_workspace_scope(root_a, &replacement);
+        assert_eq!(status_for_scope(&scope_a).process_id, None);
+        assert_eq!(status_for_scope(&replacement).process_id, None);
+    }
 }

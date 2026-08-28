@@ -6,10 +6,15 @@ function read(path: string): string {
 }
 
 describe("structured session context export", () => {
-  it("uses schema v35 with explicit context, cache, repair, and session execution migrations", () => {
+  it("uses schema v36 with explicit workspace routing and prior context migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 35;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 36;");
+    expect(store).toContain('36,\n                "persist project contexts, shared sessions, and scoped runs"');
+    expect(store).toContain("default_checkout_id TEXT REFERENCES workspace_checkouts(checkout_id)");
+    expect(store).toContain("git_branch_ref TEXT");
+    expect(store).toContain("git_head_oid TEXT");
+    expect(store).toContain("CREATE TABLE IF NOT EXISTS project_explorer_nodes");
     expect(store).toContain('Self::migrate(conn, 26, "persist session context attempts"');
     expect(store).toContain('27,\n                "persist structured conversation checkpoints"');
     expect(store).toContain("migrate_conversation_checkpoints");
@@ -46,7 +51,10 @@ describe("structured session context export", () => {
     const lib = read("src-tauri/src/lib.rs");
 
     expect(exporter).toContain('const EXPORT_FORMAT: &str = "locus.context_review";');
-    expect(exporter).toContain("const EXPORT_FORMAT_VERSION: u32 = 5;");
+    expect(exporter).toContain("const EXPORT_FORMAT_VERSION: u32 = 7;");
+    expect(exporter).toContain('"defaultCheckoutId"');
+    expect(exporter).toContain('"branchRef"');
+    expect(exporter).toContain('"headOid"');
     expect(exporter).toContain("cache_invalidations: Value");
     expect(exporter).toContain("serde_yaml::to_string");
     expect(exporter).toContain("content_hash");

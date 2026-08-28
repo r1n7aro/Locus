@@ -5,7 +5,8 @@ import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useProjectStore } from "../stores/project";
 import { useUiStore } from "../stores/ui";
-import { diffSingleFile, createRequestToken, invalidateDiffCacheForFiles, isTokenStale } from "../services/diff";
+import { computeRequestKey, diffSingleFile, createRequestToken, invalidateDiffCacheForFiles, isTokenStale } from "../services/diff";
+import type { WorkspaceRef } from "../services/project";
 import { normalizeAppError } from "../services/errors";
 import { undoRevertFile, UNDO_FILE_DIRTY_ERROR_CODE } from "../services/undo";
 import { findUndoRestoreUserMessage } from "../services/chatUndo";
@@ -34,6 +35,7 @@ const emit = defineEmits<{ close: [] }>();
 const props = defineProps<{
   embedded?: boolean;
   showClose?: boolean;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const chatStore = useChatStore();
@@ -281,7 +283,7 @@ function onItemMouseEnter(ev: MouseEvent, item: DisplayItem) {
   hoverTimer = setTimeout(async () => {
     const token = createRequestToken();
     try {
-      const payload = await diffSingleFile(buildRequest(item, "preview"));
+      const payload = await diffSingleFile(buildRequest(item, "preview"), props.workspaceRef);
       if (seq !== hoverSeq || isTokenStale(token)) return;
       previewPayload.value = payload;
       hoverAnchor.value = el;
@@ -316,7 +318,10 @@ async function onItemClick(item: DisplayItem) {
   const request = buildRequest(item, "full");
   if (displaySettings.chatDiffReviewTarget === "window") {
     try {
-      const opened = await openChatDiffReviewWindow({ request });
+      const opened = await openChatDiffReviewWindow({
+        request,
+        workspaceRef: props.workspaceRef,
+      });
       if (opened) {
         changesStore.closeInlineDiff();
         return;
@@ -331,9 +336,12 @@ async function onItemClick(item: DisplayItem) {
     }
   }
   const seq = ++clickSeq;
-  changesStore.setInlineDiffLoading(true);
+  changesStore.setInlineDiffLoading(
+    true,
+    computeRequestKey(request, props.workspaceRef),
+  );
   try {
-    const payload = await diffSingleFile(request);
+    const payload = await diffSingleFile(request, props.workspaceRef);
     if (seq !== clickSeq) return; // stale — newer click or session switch
     changesStore.openInlineDiff(payload, item.assistantMessageId);
   } catch (e) {
@@ -458,7 +466,7 @@ function cancelUndo() {
 
 function onSelectInUnity(ev: MouseEvent, path: string) {
   ev.stopPropagation();
-  selectUnityAsset(path);
+  selectUnityAsset(projectStore.requireWorkspaceRef(), path);
 }
 
 function onOpenInEditor(ev: MouseEvent, path: string) {

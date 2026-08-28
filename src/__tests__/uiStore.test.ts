@@ -164,7 +164,6 @@ describe("ui store window resize sync", () => {
     await store.init();
 
     expect(store.activeTab).toBe("chat");
-    expect(store.knowledgeMounted).toBe(false);
   });
 
   it("does not derive layout offsets from unstable WebView screen coordinates", async () => {
@@ -234,7 +233,6 @@ describe("ui store window resize sync", () => {
     expect(tauriWindowMocks.getCurrentWindow).not.toHaveBeenCalled();
     expect(store.isMaximized).toBe(false);
     expect(store.activeTab).toBe("chat");
-    expect(store.knowledgeMounted).toBe(false);
   });
 
   it("logs localStorage write failures when completing onboarding", () => {

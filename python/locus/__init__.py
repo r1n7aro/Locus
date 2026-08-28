@@ -29,7 +29,15 @@ from ._models import (
     ToolCallImage,
     ToolCallResult,
     ToolInfo,
+    UnityEditorEnsureResult,
+    UnityEditorLaunchInfo,
+    UnityEditorRestartResult,
+    UnityEditorStatus,
+    UnityDialogChoice,
+    UnityDialogChoiceResult,
+    UnityModalDialog,
     WorkspaceInfo,
+    WorkspaceRef,
 )
 from ._tools import Tool, tool
 
@@ -53,19 +61,33 @@ __all__ = [
     "ToolCallResult",
     "ToolInfo",
     "Tool",
+    "UnityEditorEnsureResult",
+    "UnityEditorLaunchInfo",
+    "UnityEditorRestartResult",
+    "UnityEditorStatus",
+    "UnityDialogChoice",
+    "UnityDialogChoiceResult",
+    "UnityModalDialog",
     "WorkspaceInfo",
+    "WorkspaceRef",
     "call_tool",
     "define_agent",
     "get_agent",
     "get_model",
     "get_session",
     "get_tool",
+    "get_unity_editor_status",
+    "get_unity_dialog",
     "get_workspace",
     "list_agents",
     "list_models",
     "list_sessions",
     "list_tools",
     "prompt",
+    "choose_unity_dialog",
+    "ensure_unity_editor",
+    "restart_unity_editor",
+    "wait_unity_execution",
     "tool",
 ]
 
@@ -104,12 +126,84 @@ async def call_tool(
     arguments: dict[str, Any] | None = None,
     *,
     timeout: float | None = None,
+    workspace_ref: WorkspaceRef | None = None,
 ) -> ToolCallResult:
-    return await _client().call_tool(tool, arguments, timeout=timeout)
+    return await _client().call_tool(
+        tool,
+        arguments,
+        timeout=timeout,
+        workspace_ref=workspace_ref,
+    )
 
 
 async def get_workspace() -> WorkspaceInfo:
     return await _client().get_workspace()
+
+
+async def get_unity_editor_status(*, project: str) -> UnityEditorStatus:
+    return await _client().get_unity_editor_status(project=project)
+
+
+async def ensure_unity_editor(
+    *,
+    project: str,
+    mode: str = "interactive",
+    wait_until: str = "ready",
+    timeout: float = 300.0,
+) -> UnityEditorEnsureResult:
+    return await _client().ensure_unity_editor(
+        project=project,
+        mode=mode,
+        wait_until=wait_until,
+        timeout=timeout,
+    )
+
+
+async def restart_unity_editor(
+    *,
+    project: str,
+    mode: str = "interactive",
+    wait_until: str = "ready",
+    timeout: float = 300.0,
+    force: bool = False,
+) -> UnityEditorRestartResult:
+    return await _client().restart_unity_editor(
+        project=project,
+        mode=mode,
+        wait_until=wait_until,
+        timeout=timeout,
+        force=force,
+    )
+
+
+async def get_unity_dialog(*, project: str) -> UnityModalDialog | None:
+    return await _client().get_unity_dialog(project=project)
+
+
+async def choose_unity_dialog(
+    *,
+    project: str,
+    dialog_id: str,
+    choice_id: str,
+) -> UnityDialogChoiceResult:
+    return await _client().choose_unity_dialog(
+        project=project,
+        dialog_id=dialog_id,
+        choice_id=choice_id,
+    )
+
+
+async def wait_unity_execution(
+    *,
+    project: str,
+    execution_id: str,
+    timeout: float | None = None,
+) -> str:
+    return await _client().wait_unity_execution(
+        project=project,
+        execution_id=execution_id,
+        timeout=timeout,
+    )
 
 
 async def list_sessions(

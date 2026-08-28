@@ -41,9 +41,11 @@ import { normalizeAppError } from "../services/errors";
 import { t } from "../i18n";
 import { acquireSelectionLock } from "./useSelectionLock";
 import { useNotificationStore } from "../stores/notification";
+import type { WorkspaceRef } from "../services/project";
 
 interface CollabProps {
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
   isActive: boolean;
   selectedModelId: string;
   selectedAgentId: string;
@@ -52,6 +54,13 @@ interface CollabProps {
 
 interface CollabStateOptions {
   onGitTerminalOutput?: (command: string, output: string, isError?: boolean) => void;
+}
+
+interface CollabWorkspaceSnapshot {
+  workingDir: string;
+  workspaceRef: WorkspaceRef;
+  checkoutId: string;
+  expectedGeneration: number | null;
 }
 
 function quoteGitPath(path: string) {
@@ -282,8 +291,30 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     return gitRefreshToken;
   }
 
-  function isCurrentGitRefresh(token: number, workingDir: string) {
-    return token === gitRefreshToken && workingDir === props.workingDir;
+  function captureWorkspaceSnapshot(): CollabWorkspaceSnapshot {
+    if (!props.workspaceRef) {
+      throw new Error("Workspace checkout is required for Collab operations.");
+    }
+    const workspaceRef = {
+      checkoutId: props.workspaceRef.checkoutId,
+      expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+    };
+    return {
+      workingDir: props.workingDir,
+      workspaceRef,
+      checkoutId: workspaceRef.checkoutId,
+      expectedGeneration: workspaceRef.expectedGeneration ?? null,
+    };
+  }
+
+  function isCurrentWorkspaceSnapshot(snapshot: CollabWorkspaceSnapshot) {
+    return snapshot.workingDir === props.workingDir
+      && snapshot.checkoutId === (props.workspaceRef?.checkoutId ?? null)
+      && snapshot.expectedGeneration === (props.workspaceRef?.expectedGeneration ?? null);
+  }
+
+  function isCurrentGitRefresh(token: number, snapshot: CollabWorkspaceSnapshot) {
+    return token === gitRefreshToken && isCurrentWorkspaceSnapshot(snapshot);
   }
 
   function clearScheduledGitRefresh() {
@@ -317,10 +348,10 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     }
   }
 
-  async function loadHistorySnapshot(token: number, workingDir: string) {
-    if (!workingDir) return;
+  async function loadHistorySnapshot(token: number, workspace: CollabWorkspaceSnapshot) {
+    if (!workspace.workingDir) return;
     if (gitProbeState.value && !gitProbeState.value.available) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       isRepo.value = false;
       commits.value = [];
       graphRefs.value = [];
@@ -334,13 +365,13 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
       hasMoreCommits.value = false;
       return;
     }
-    if (isCurrentGitRefresh(token, workingDir) && !logLoadedOnce) {
+    if (isCurrentGitRefresh(token, workspace) && !logLoadedOnce) {
       loading.value = true;
     }
     const t0 = perfNow();
     try {
-      const result = await gitHistorySnapshot(0, PAGE_SIZE);
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const result = await gitHistorySnapshot(0, PAGE_SIZE, workspace.workspaceRef);
+      if (!isCurrentGitRefresh(token, workspace)) return;
       isRepo.value = result.isRepo;
       commits.value = dedupeCommitsByHash(result.commits);
       graphRefs.value = result.refs;
@@ -350,7 +381,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
       snapshotWorkspace.value = result.workspace.changeCount;
       hasMoreCommits.value = result.hasMore;
     } catch (e) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       console.error("git_history_snapshot failed:", e);
       isRepo.value = false;
       commits.value = [];
@@ -358,7 +389,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
       stashes.value = [];
       hasMoreCommits.value = false;
     } finally {
-      if (isCurrentGitRefresh(token, workingDir)) {
+      if (isCurrentGitRefresh(token, workspace)) {
         logLoadedOnce = true;
         loading.value = false;
         perfLog("gitHistorySnapshot", t0);
@@ -369,25 +400,31 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   async function loadMoreCommits() {
     if (loadingMore.value || !hasMoreCommits.value) return;
     const token = gitRefreshToken;
-    const workingDir = props.workingDir;
-    if (!workingDir) return;
+    const workspace = captureWorkspaceSnapshot();
+    if (!workspace.workingDir) return;
     loadingMore.value = true;
     try {
-      const result = await gitHistorySnapshot(commits.value.length, PAGE_SIZE);
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const result = await gitHistorySnapshot(
+        commits.value.length,
+        PAGE_SIZE,
+        workspace.workspaceRef,
+      );
+      if (!isCurrentGitRefresh(token, workspace)) return;
       commits.value = mergeCommitsByHash(commits.value, result.commits);
       hasMoreCommits.value = result.hasMore;
     } catch (e) {
-      console.error("git_history_snapshot loadMore failed:", e);
+      if (isCurrentGitRefresh(token, workspace)) {
+        console.error("git_history_snapshot loadMore failed:", e);
+      }
     } finally {
-      loadingMore.value = false;
+      if (isCurrentWorkspaceSnapshot(workspace)) loadingMore.value = false;
     }
   }
 
-  async function loadGitStatus(token: number, workingDir: string) {
-    if (!workingDir) return;
+  async function loadGitStatus(token: number, workspace: CollabWorkspaceSnapshot) {
+    if (!workspace.workingDir) return;
     if (gitProbeState.value && !gitProbeState.value.available) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       applyGitStatusResult({
         unstaged: [],
         staged: [],
@@ -399,16 +436,16 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     }
     // Only show loading indicator on first load; skip for background refreshes
     // to avoid flickering the file list with "Loading..." text.
-    if (isCurrentGitRefresh(token, workingDir) && !statusLoadedOnce) {
+    if (isCurrentGitRefresh(token, workspace) && !statusLoadedOnce) {
       filesLoading.value = true;
     }
     const t0 = perfNow();
     try {
-      const result = await gitStatus();
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const result = await gitStatus(workspace.workspaceRef);
+      if (!isCurrentGitRefresh(token, workspace)) return;
       applyGitStatusResult(result);
     } catch (e) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       console.error("git_status failed:", e);
       applyGitStatusResult({
         unstaged: [],
@@ -418,7 +455,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
         operation: null,
       });
     } finally {
-      if (isCurrentGitRefresh(token, workingDir)) {
+      if (isCurrentGitRefresh(token, workspace)) {
         statusLoadedOnce = true;
         filesLoading.value = false;
         perfLog("gitStatus", t0);
@@ -426,96 +463,114 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     }
   }
 
+  let commitFilesRequestToken = 0;
+
   async function loadCommitFiles(hash: string) {
+    const workspace = captureWorkspaceSnapshot();
+    const requestToken = ++commitFilesRequestToken;
     filesLoading.value = true;
     commitBody.value = "";
     const t0 = perfNow();
     try {
       const [files, body] = await Promise.all([
-        gitCommitFiles(hash),
-        gitCommitBody(hash),
+        gitCommitFiles(hash, workspace.workspaceRef),
+        gitCommitBody(hash, workspace.workspaceRef),
       ]);
+      if (
+        requestToken !== commitFilesRequestToken
+        || !isCurrentWorkspaceSnapshot(workspace)
+        || selectedCommitHash.value !== hash
+      ) return;
       commitFiles.value = files;
       commitBody.value = body;
     } catch (e) {
+      if (
+        requestToken !== commitFilesRequestToken
+        || !isCurrentWorkspaceSnapshot(workspace)
+      ) return;
       console.error("git_commit_files failed:", e);
       commitFiles.value = [];
       commitBody.value = "";
     } finally {
-      filesLoading.value = false;
-      perfLog("gitCommitFiles", t0);
+      if (
+        requestToken === commitFilesRequestToken
+        && isCurrentWorkspaceSnapshot(workspace)
+      ) {
+        filesLoading.value = false;
+        perfLog("gitCommitFiles", t0);
+      }
     }
   }
 
-  async function loadBranches(token: number, workingDir: string) {
-    if (!workingDir) return;
+  async function loadBranches(token: number, workspace: CollabWorkspaceSnapshot) {
+    if (!workspace.workingDir) return;
     if (gitProbeState.value && !gitProbeState.value.available) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       localBranches.value = [];
       remoteBranches.value = [];
       return;
     }
     const t0 = perfNow();
     try {
-      const result = await gitBranches();
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const result = await gitBranches(workspace.workspaceRef);
+      if (!isCurrentGitRefresh(token, workspace)) return;
       localBranches.value = result.local;
       remoteBranches.value = result.remotes;
       for (const [name] of result.remotes) {
         expandedRemoteNames.value.add(name);
       }
     } catch (e) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       console.error("git_branches failed:", e);
     } finally {
-      if (isCurrentGitRefresh(token, workingDir)) {
+      if (isCurrentGitRefresh(token, workspace)) {
         perfLog("gitBranches", t0);
       }
     }
   }
 
-  async function loadSubmodules(token: number, workingDir: string) {
-    if (!workingDir) return;
+  async function loadSubmodules(token: number, workspace: CollabWorkspaceSnapshot) {
+    if (!workspace.workingDir) return;
     if (gitProbeState.value && !gitProbeState.value.available) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       submodules.value = [];
       return;
     }
     const t0 = perfNow();
     try {
-      const result = await gitSubmodules();
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const result = await gitSubmodules(workspace.workspaceRef);
+      if (!isCurrentGitRefresh(token, workspace)) return;
       submodules.value = result;
     } catch (e) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       console.error("git_submodules failed:", e);
     } finally {
-      if (isCurrentGitRefresh(token, workingDir)) {
+      if (isCurrentGitRefresh(token, workspace)) {
         perfLog("gitSubmodules", t0);
       }
     }
   }
 
-  async function loadSidebarData(token: number, workingDir: string) {
+  async function loadSidebarData(token: number, workspace: CollabWorkspaceSnapshot) {
     const t0 = perfNow();
     await Promise.all([
-      loadBranches(token, workingDir),
-      loadSubmodules(token, workingDir),
+      loadBranches(token, workspace),
+      loadSubmodules(token, workspace),
     ]);
-    if (isCurrentGitRefresh(token, workingDir)) {
+    if (isCurrentGitRefresh(token, workspace)) {
       perfLog("sidebar [branches + submodules]", t0);
     }
   }
 
-  async function loadGitUserConfig(token: number, workingDir: string) {
-    if (!workingDir) {
-      if (isCurrentGitRefresh(token, workingDir)) {
+  async function loadGitUserConfig(token: number, workspace: CollabWorkspaceSnapshot) {
+    if (!workspace.workingDir) {
+      if (isCurrentGitRefresh(token, workspace)) {
         currentGitAuthor.value = "";
       }
       return;
     }
     if (gitProbeState.value && !gitProbeState.value.available) {
-      if (isCurrentGitRefresh(token, workingDir)) {
+      if (isCurrentGitRefresh(token, workspace)) {
         currentGitAuthor.value = "";
       }
       return;
@@ -523,16 +578,16 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
 
     const t0 = perfNow();
     try {
-      const cfg = await gitCheckUserConfig();
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const cfg = await gitCheckUserConfig(workspace.workspaceRef);
+      if (!isCurrentGitRefresh(token, workspace)) return;
       const name = cfg.name.trim();
       const email = cfg.email.trim();
       currentGitAuthor.value = name || email;
     } catch {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       currentGitAuthor.value = "";
     } finally {
-      if (isCurrentGitRefresh(token, workingDir)) {
+      if (isCurrentGitRefresh(token, workspace)) {
         perfLog("gitCheckUserConfig", t0);
       }
     }
@@ -570,38 +625,38 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     currentGitAuthor.value = "";
   }
 
-  async function loadGitAvailability(token: number, workingDir: string) {
-    if (!workingDir) {
-      if (isCurrentGitRefresh(token, workingDir)) {
+  async function loadGitAvailability(token: number, workspace: CollabWorkspaceSnapshot) {
+    if (!workspace.workingDir) {
+      if (isCurrentGitRefresh(token, workspace)) {
         gitProbeState.value = null;
       }
       return;
     }
     const t0 = perfNow();
     try {
-      const probe = await gitProbe();
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const probe = await gitProbe(workspace.workspaceRef);
+      if (!isCurrentGitRefresh(token, workspace)) return;
       gitProbeState.value = probe;
     } catch {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       gitProbeState.value = {
         available: false,
         inPath: false,
         isRepo: false,
       };
     }
-    if (isCurrentGitRefresh(token, workingDir)) {
+    if (isCurrentGitRefresh(token, workspace)) {
       perfLog("gitProbe", t0);
     }
   }
 
   async function refreshGitData() {
-    const workingDir = props.workingDir;
+    const workspace = captureWorkspaceSnapshot();
     const token = nextGitRefreshToken();
     const t0 = perfNow();
     // Don't set loading=true on background refreshes; loadGitLog handles its own first-load state.
-    await loadGitAvailability(token, workingDir);
-    if (!isCurrentGitRefresh(token, workingDir)) return;
+    await loadGitAvailability(token, workspace);
+    if (!isCurrentGitRefresh(token, workspace)) return;
     if (!gitProbeState.value?.available) {
       resetGitData();
       loading.value = false;
@@ -611,25 +666,30 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     }
     const t1 = perfNow();
     await Promise.all([
-      loadHistorySnapshot(token, workingDir),
-      loadGitStatus(token, workingDir),
-      loadSidebarData(token, workingDir),
-      loadGitUserConfig(token, workingDir),
+      loadHistorySnapshot(token, workspace),
+      loadGitStatus(token, workspace),
+      loadSidebarData(token, workspace),
+      loadGitUserConfig(token, workspace),
     ]);
-    if (!isCurrentGitRefresh(token, workingDir)) return;
+    if (!isCurrentGitRefresh(token, workspace)) return;
     perfLog("parallel [gitHistorySnapshot + gitStatus + sidebar + userConfig]", t1);
     perfLog("refreshGitData (total)", t0);
   }
 
   // ── Git init flow ───────────────────────────────────────────────
+  let initRequestToken = 0;
+
   async function initGitUnity() {
+    const workspace = captureWorkspaceSnapshot();
+    const requestToken = ++initRequestToken;
     initError.value = null;
     if (!gitAvailable.value) {
       initError.value = gitHelpText.value || t("collab.gitInitFailed");
       return;
     }
     try {
-      const cfg = await gitCheckUserConfig();
+      const cfg = await gitCheckUserConfig(workspace.workspaceRef);
+      if (requestToken !== initRequestToken || !isCurrentWorkspaceSnapshot(workspace)) return;
       currentGitAuthor.value = cfg.name.trim() || cfg.email.trim();
       if (!cfg.name || !cfg.email) {
         gitConfigName.value = cfg.name;
@@ -637,24 +697,31 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
         showGitConfigModal.value = true;
         return;
       }
-      await doInitGitUnity();
+      await doInitGitUnity(workspace, requestToken);
     } catch (e) {
+      if (requestToken !== initRequestToken || !isCurrentWorkspaceSnapshot(workspace)) return;
       initError.value = normalizeAppError(e).message || t("collab.gitInitFailed");
     }
   }
 
   async function saveGitConfigAndInit() {
+    const workspace = captureWorkspaceSnapshot();
+    const requestToken = ++initRequestToken;
     gitConfigSaving.value = true;
     gitConfigError.value = "";
     try {
       await gitSetUserConfig(gitConfigName.value, gitConfigEmail.value);
+      if (requestToken !== initRequestToken || !isCurrentWorkspaceSnapshot(workspace)) return;
       currentGitAuthor.value = gitConfigName.value.trim() || gitConfigEmail.value.trim();
       showGitConfigModal.value = false;
-      await doInitGitUnity();
+      await doInitGitUnity(workspace, requestToken);
     } catch (e) {
+      if (requestToken !== initRequestToken || !isCurrentWorkspaceSnapshot(workspace)) return;
       gitConfigError.value = normalizeAppError(e).message;
     } finally {
-      gitConfigSaving.value = false;
+      if (requestToken === initRequestToken && isCurrentWorkspaceSnapshot(workspace)) {
+        gitConfigSaving.value = false;
+      }
     }
   }
 
@@ -662,17 +729,24 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     showGitConfigModal.value = false;
   }
 
-  async function doInitGitUnity() {
+  async function doInitGitUnity(
+    workspace: CollabWorkspaceSnapshot,
+    requestToken: number,
+  ) {
     initLoading.value = true;
     initError.value = null;
     try {
-      await gitInitUnity();
+      await gitInitUnity(workspace.workspaceRef);
+      if (requestToken !== initRequestToken || !isCurrentWorkspaceSnapshot(workspace)) return;
       clearScheduledGitRefresh();
       await refreshGitData();
     } catch (e) {
+      if (requestToken !== initRequestToken || !isCurrentWorkspaceSnapshot(workspace)) return;
       initError.value = normalizeAppError(e).message || t("collab.gitInitFailed");
     } finally {
-      initLoading.value = false;
+      if (requestToken === initRequestToken && isCurrentWorkspaceSnapshot(workspace)) {
+        initLoading.value = false;
+      }
     }
   }
 
@@ -751,18 +825,17 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     options.onGitTerminalOutput?.(command, output, isError);
   }
 
-  async function reconcileGitStatusAfterMutation() {
-    const workingDir = props.workingDir;
-    if (!workingDir) return;
+  async function reconcileGitStatusAfterMutation(workspace: CollabWorkspaceSnapshot) {
+    if (!workspace.workingDir || !isCurrentWorkspaceSnapshot(workspace)) return;
     const token = nextGitRefreshToken();
     const t0 = perfNow();
     try {
-      const result = await gitStatus();
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      const result = await gitStatus(workspace.workspaceRef);
+      if (!isCurrentGitRefresh(token, workspace)) return;
       applyGitStatusResult(result);
       perfLog("gitStatus (mutation reconcile)", t0);
     } catch (e) {
-      if (!isCurrentGitRefresh(token, workingDir)) return;
+      if (!isCurrentGitRefresh(token, workspace)) return;
       pushGitTerminalOutput(
         "git status --porcelain=v2 -z -uall",
         normalizeAppError(e).message,
@@ -775,24 +848,28 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   async function runStageMutation(
     paths: string[],
     target: Ref<Set<string>>,
-    action: () => Promise<void>,
+    action: (workspaceRef: WorkspaceRef) => Promise<void>,
     errorLabel: string,
     commandLabel: string,
   ) {
+    const workspace = captureWorkspaceSnapshot();
     const uniquePaths = [...new Set(paths)];
     if (uniquePaths.length === 0 || stageOperationBusy.value) return;
     addPendingPaths(target, uniquePaths);
     clearScheduledGitRefresh();
     try {
-      await action();
+      await action(workspace.workspaceRef);
     } catch (e) {
+      if (!isCurrentWorkspaceSnapshot(workspace)) return;
       const err = normalizeAppError(e);
       pushGitTerminalOutput(commandLabel, err.message || errorLabel, true);
     } finally {
       try {
-        await reconcileGitStatusAfterMutation();
+        await reconcileGitStatusAfterMutation(workspace);
       } finally {
-        removePendingPaths(target, uniquePaths);
+        if (isCurrentWorkspaceSnapshot(workspace)) {
+          removePendingPaths(target, uniquePaths);
+        }
       }
     }
   }
@@ -815,7 +892,9 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     await runStageMutation(
       expanded,
       pendingStagePaths,
-      () => pathspecs.length === 1 ? gitStage(pathspecs[0]) : gitStagePaths(pathspecs),
+      (workspaceRef) => pathspecs.length === 1
+        ? gitStage(pathspecs[0], workspaceRef)
+        : gitStagePaths(pathspecs, workspaceRef),
       expanded.length === 1 ? "stage failed:" : "stage files failed:",
       summarizeGitCommand("git add --", pathspecs),
     );
@@ -831,19 +910,23 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     await runStageMutation(
       expanded,
       pendingUnstagePaths,
-      () => pathspecs.length === 1 ? gitUnstage(pathspecs[0]) : gitUnstagePaths(pathspecs),
+      (workspaceRef) => pathspecs.length === 1
+        ? gitUnstage(pathspecs[0], workspaceRef)
+        : gitUnstagePaths(pathspecs, workspaceRef),
       expanded.length === 1 ? "unstage failed:" : "unstage files failed:",
       summarizeGitCommand("git restore --staged --", pathspecs),
     );
   }
 
   async function stageAll() {
+    const workspace = captureWorkspaceSnapshot();
     const paths = unstagedFiles.value.map(file => file.path);
     if ((paths.length === 0 && blockedFiles.value.length === 0) || stageOperationBusy.value) return;
     addPendingPaths(pendingStagePaths, paths);
     clearScheduledGitRefresh();
     try {
-      const result = await gitStageAll();
+      const result = await gitStageAll(workspace.workspaceRef);
+      if (!isCurrentWorkspaceSnapshot(workspace)) return;
       const output = buildStageAllOutput(result);
       if (output) {
         pushGitTerminalOutput(STAGE_ALL_COMMAND, output, false);
@@ -861,13 +944,16 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
         );
       }
     } catch (e) {
+      if (!isCurrentWorkspaceSnapshot(workspace)) return;
       const err = normalizeAppError(e);
       pushGitTerminalOutput(STAGE_ALL_COMMAND, err.message || "stage all failed:", true);
     } finally {
       try {
-        await reconcileGitStatusAfterMutation();
+        await reconcileGitStatusAfterMutation(workspace);
       } finally {
-        removePendingPaths(pendingStagePaths, paths);
+        if (isCurrentWorkspaceSnapshot(workspace)) {
+          removePendingPaths(pendingStagePaths, paths);
+        }
       }
     }
   }
@@ -876,7 +962,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     await runStageMutation(
       stagedFiles.value.map(file => file.path),
       pendingUnstagePaths,
-      () => gitUnstageAll(),
+      (workspaceRef) => gitUnstageAll(workspaceRef),
       "unstage all failed:",
       "git reset HEAD",
     );
@@ -1108,9 +1194,18 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   });
 
   watch(
-    () => props.workingDir,
+    () => [
+      props.workingDir,
+      props.workspaceRef?.checkoutId ?? null,
+      props.workspaceRef?.expectedGeneration ?? null,
+    ] as const,
     () => {
       clearScheduledGitRefresh();
+      nextGitRefreshToken();
+      commitFilesRequestToken += 1;
+      initRequestToken += 1;
+      initLoading.value = false;
+      gitConfigSaving.value = false;
       resetGitData();
       void refreshGitData();
     },
@@ -1135,12 +1230,18 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
         document.addEventListener("visibilitychange", handleVisibilityChange);
       }
 
-      // If background warmup already fetched git data, use it
-      const cachedProbe = getWarmup<GitProbeResult>("collab:probe");
+      // Startup warmup entries carry the checkout identity in their key, so a
+      // pane can only consume data fetched for the same runtime generation.
+      const warmupScopeKey = props.workspaceRef
+        ? `${props.workspaceRef.checkoutId}@${props.workspaceRef.expectedGeneration ?? "current"}`
+        : "";
+      const cachedProbe = warmupScopeKey
+        ? getWarmup<GitProbeResult>(`collab:probe:${warmupScopeKey}`)
+        : undefined;
       if (cachedProbe !== undefined) {
         gitProbeState.value = cachedProbe;
         if (cachedProbe.available) {
-          const snapshot = getWarmup<GitHistorySnapshot>("collab:snapshot");
+          const snapshot = getWarmup<GitHistorySnapshot>(`collab:snapshot:${warmupScopeKey}`);
           // If probe is cached but log data is not yet available (warmup still
           // in progress), fall through to a full refresh so we don't display
           // stale "not a repo" state due to isRepo's false default.
@@ -1148,9 +1249,9 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
             await refreshGitData();
             return;
           }
-          const status = getWarmup<GitStatusResult>("collab:status");
-          const br = getWarmup<GitBranchesResult>("collab:branches");
-          const sm = getWarmup<GitSubmoduleInfo[]>("collab:submodules");
+          const status = getWarmup<GitStatusResult>(`collab:status:${warmupScopeKey}`);
+          const br = getWarmup<GitBranchesResult>(`collab:branches:${warmupScopeKey}`);
+          const sm = getWarmup<GitSubmoduleInfo[]>(`collab:submodules:${warmupScopeKey}`);
           isRepo.value = snapshot.isRepo;
           commits.value = dedupeCommitsByHash(snapshot.commits);
           graphRefs.value = snapshot.refs;

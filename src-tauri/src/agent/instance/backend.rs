@@ -8,8 +8,6 @@ use crate::session::models::ToolCallInfo;
 pub type RawContextStore = Arc<tokio::sync::Mutex<HashMap<String, Vec<RawRound>>>>;
 type SessionUnityStateStore = tokio::sync::Mutex<HashMap<String, (String, Option<String>)>>;
 
-pub(super) const MAX_TOOL_ITERATIONS: usize = 200;
-
 pub use crate::commands::CodexTransportMode;
 
 pub(super) fn session_unity_state() -> &'static SessionUnityStateStore {
@@ -418,6 +416,83 @@ mod tests {
     }
 
     #[test]
+    fn mock_tool_plan_can_call_checkout_scoped_python() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "python" }
+        })];
+        let messages = vec![message(
+            "user-python",
+            MessageRole::User,
+            "[[mock:python-tool]] inspect Unity",
+        )];
+
+        let plan = build_mock_response_plan(MockModelProfile::Tool, &messages, &tools);
+
+        assert_eq!(plan.tool_calls.len(), 1);
+        assert_eq!(plan.tool_calls[0].name, "python");
+        assert!(plan.tool_calls[0]
+            .arguments
+            .contains("get_unity_editor_status"));
+        assert!(plan.tool_calls[0].arguments.contains("readonly"));
+    }
+
+    #[test]
+    fn mock_tool_plan_can_reproduce_agent_unity_execute() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "unity_execute" }
+        })];
+        let messages = vec![message(
+            "user-unity-execute",
+            MessageRole::User,
+            super::MOCK_AGENT_UNITY_EXECUTE_SCENARIO,
+        )];
+
+        let plan = build_mock_response_plan(MockModelProfile::Tool, &messages, &tools);
+
+        assert_eq!(plan.tool_calls.len(), 1);
+        assert_eq!(plan.tool_calls[0].name, "unity_execute");
+        let arguments: serde_json::Value =
+            serde_json::from_str(&plan.tool_calls[0].arguments).expect("unity_execute arguments");
+        assert_eq!(arguments["readonly"], true);
+        assert_eq!(arguments["request_editor_status"], "editing");
+        assert!(arguments["code"]
+            .as_str()
+            .is_some_and(|code| code.contains("GetActiveScene")));
+    }
+
+    #[test]
+    fn mock_tool_plan_can_reproduce_agent_unity_yaml_read() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "unity_yaml_read" }
+        })];
+        let messages = vec![message(
+            "user-unity-yaml-read",
+            MessageRole::User,
+            super::MOCK_AGENT_UNITY_YAML_READ_SCENARIO,
+        )];
+
+        let plan = build_mock_response_plan(MockModelProfile::Tool, &messages, &tools);
+
+        assert_eq!(plan.tool_calls.len(), 1);
+        assert_eq!(plan.tool_calls[0].name, "unity_yaml_read");
+        let arguments: serde_json::Value =
+            serde_json::from_str(&plan.tool_calls[0].arguments).expect("unity_yaml_read arguments");
+        assert_eq!(arguments["depth"], 1);
+        assert_eq!(arguments["max_array_items"], 2);
+        assert_eq!(
+            arguments["path"],
+            "Assets/Scenes/Examples/AudioExample.unity"
+        );
+        assert_eq!(
+            arguments["hierarchy_fields"],
+            serde_json::json!(["components", "active"])
+        );
+    }
+
+    #[test]
     fn mock_tool_plan_can_reproduce_an_orphaned_stream_start() {
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -655,6 +730,11 @@ struct MockResponsePlan {
 }
 
 const MOCK_ORPHAN_TOOL_START_SCENARIO: &str = "[[mock:orphan-tool-start]]";
+pub(crate) const MOCK_WORKSPACE_SWITCH_HOLD_SCENARIO: &str = "[[mock:workspace-switch-hold]]";
+pub(crate) const MOCK_PYTHON_TOOL_SCENARIO: &str = "[[mock:python-tool]]";
+pub(crate) const MOCK_AGENT_UNITY_EXECUTE_SCENARIO: &str = "[[mock:agent-unity-execute]]";
+pub(crate) const MOCK_AGENT_UNITY_YAML_READ_SCENARIO: &str = "[[mock:agent-unity-yaml-read]]";
+const MOCK_WORKSPACE_SWITCH_HOLD_DELAY_MS: u64 = 8_000;
 
 fn api_tool_name(tool: &serde_json::Value) -> Option<&str> {
     tool.get("function")
@@ -748,7 +828,84 @@ fn build_mock_response_plan(
             error: None,
         },
         MockModelProfile::Tool => {
-            let tool_call = if tool_is_exposed(api_tools, "todowrite") {
+            let tool_call = if user_text.contains(MOCK_AGENT_UNITY_YAML_READ_SCENARIO)
+                && tool_is_exposed(api_tools, "unity_yaml_read")
+            {
+                Some(ToolCallInfo {
+                    id: format!(
+                        "mock-unity-yaml-read-{}",
+                        latest_user
+                            .map(|message| message.id.as_str())
+                            .unwrap_or("turn")
+                    ),
+                    name: "unity_yaml_read".to_string(),
+                    arguments: serde_json::json!({
+                        "depth": 1,
+                        "hierarchy_fields": ["components", "active"],
+                        "max_array_items": 2,
+                        "path": "Assets/Scenes/Examples/AudioExample.unity"
+                    })
+                    .to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                })
+            } else if user_text.contains(MOCK_AGENT_UNITY_EXECUTE_SCENARIO)
+                && tool_is_exposed(api_tools, "unity_execute")
+            {
+                Some(ToolCallInfo {
+                    id: format!(
+                        "mock-unity-execute-{}",
+                        latest_user
+                            .map(|message| message.id.as_str())
+                            .unwrap_or("turn")
+                    ),
+                    name: "unity_execute".to_string(),
+                    arguments: serde_json::json!({
+                        "async": "sync",
+                        "code": "var scene = UnityEditor.SceneManagement.EditorSceneManager.GetActiveScene(); print(scene.path); print(scene.name);",
+                        "enable_non_public_access": true,
+                        "readonly": true,
+                        "request_editor_status": "editing"
+                    })
+                    .to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                })
+            } else if user_text.contains(MOCK_PYTHON_TOOL_SCENARIO)
+                && tool_is_exposed(api_tools, "python")
+            {
+                Some(ToolCallInfo {
+                    id: format!(
+                        "mock-python-{}",
+                        latest_user
+                            .map(|message| message.id.as_str())
+                            .unwrap_or("turn")
+                    ),
+                    name: "python".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "run",
+                        "code": "status = await locus.get_unity_editor_status(project=project)\nprint(f'LOCUS_PYTHON_TOOL_OK:{status.process_state}:{status.ready}')",
+                        "description": "Probe the injected Locus SDK and Unity lifecycle state",
+                        "readonly": true,
+                        "timeout": 30_000
+                    })
+                    .to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                })
+            } else if tool_is_exposed(api_tools, "todowrite") {
                 Some(ToolCallInfo {
                     id: format!(
                         "mock-tool-{}",
@@ -853,8 +1010,20 @@ pub(super) async fn stream_mock_response(
     const THINKING_DELAY_MS: u64 = 90;
     const TEXT_CHUNK_DELAY_MS: u64 = 45;
 
+    let hold_for_workspace_switch = latest_user_message(messages).is_some_and(|(_, message)| {
+        message
+            .content
+            .contains(MOCK_WORKSPACE_SWITCH_HOLD_SCENARIO)
+    });
     let plan = build_mock_response_plan(profile, messages, api_tools);
-    tokio::time::sleep(std::time::Duration::from_millis(INITIAL_DELAY_MS)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(
+        if hold_for_workspace_switch {
+            MOCK_WORKSPACE_SWITCH_HOLD_DELAY_MS
+        } else {
+            INITIAL_DELAY_MS
+        },
+    ))
+    .await;
     if let Some(error) = plan.error.as_ref() {
         return Err(error.clone());
     }

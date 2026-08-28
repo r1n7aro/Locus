@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { t } from "../../i18n";
 import type { Locale } from "../../i18n";
 import BaseDropdown from "../ui/BaseDropdown.vue";
@@ -50,6 +50,7 @@ import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { normalizeAppError } from "../../services/errors";
 import { toggleTauriDevtools } from "../../services/tauriRuntime";
 import { useNotificationStore } from "../../stores/notification";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 
 defineProps<{
   locale: string;
@@ -64,6 +65,7 @@ const emit = defineEmits<{
 }>();
 
 const notificationStore = useNotificationStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const initialDebugMode = getCachedDebugMode();
 const debugEnabled = ref(initialDebugMode ?? false);
 const debugReady = ref(initialDebugMode !== null);
@@ -92,6 +94,7 @@ const unityBackgroundHookEnabled = ref(true);
 const unityBackgroundHookReady = ref(false);
 const unityBackgroundHookBusy = ref(false);
 const unityBackgroundHookStatus = ref<UnityBackgroundHookStatus | null>(null);
+let unityBackgroundHookLoadVersion = 0;
 const storageInfo = ref<AppStorageInfo | null>(null);
 const storageBusy = ref(false);
 const storageInfoLoadFailed = ref(false);
@@ -473,39 +476,51 @@ async function onSubagentConcurrentChange(event: Event) {
 }
 
 async function refreshUnityBackgroundHook() {
+  const version = ++unityBackgroundHookLoadVersion;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
   try {
     const [enabled, status] = await Promise.all([
       getUnityBackgroundHookEnabled(),
-      getUnityBackgroundHookStatus(),
+      workspaceRef ? getUnityBackgroundHookStatus(workspaceRef) : Promise.resolve(null),
     ]);
+    if (version !== unityBackgroundHookLoadVersion) return;
     unityBackgroundHookEnabled.value = enabled;
     unityBackgroundHookStatus.value = status;
   } catch (e) {
+    if (version !== unityBackgroundHookLoadVersion) return;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "loadUnityBackgroundHook",
     });
   } finally {
-    unityBackgroundHookReady.value = true;
+    if (version === unityBackgroundHookLoadVersion) unityBackgroundHookReady.value = true;
   }
 }
 
 async function toggleUnityBackgroundHook() {
   if (!unityBackgroundHookReady.value || unityBackgroundHookBusy.value) return;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
+  const version = ++unityBackgroundHookLoadVersion;
   unityBackgroundHookBusy.value = true;
   const next = !unityBackgroundHookEnabled.value;
   unityBackgroundHookEnabled.value = next;
   try {
-    const status = await setUnityBackgroundHookEnabled(next);
-    unityBackgroundHookStatus.value = status;
-    if (status.state === "failed" && status.error) {
+    const status = await setUnityBackgroundHookEnabled(next, workspaceRef);
+    if (version === unityBackgroundHookLoadVersion) unityBackgroundHookStatus.value = status;
+    if (
+      version === unityBackgroundHookLoadVersion
+      && status.state === "failed"
+      && status.error
+    ) {
       notificationStore.addNotice("error", status.error, {
         operation: "unity-background-hook",
         replaceOperation: true,
       });
     }
   } catch (e) {
+    if (version !== unityBackgroundHookLoadVersion) return;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
@@ -517,6 +532,17 @@ async function toggleUnityBackgroundHook() {
     unityBackgroundHookBusy.value = false;
   }
 }
+
+watch(
+  () => {
+    const scope = workspaceContextStore.focusedWorkspaceRef;
+    return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
+  },
+  () => {
+    unityBackgroundHookStatus.value = null;
+    void refreshUnityBackgroundHook();
+  },
+);
 
 async function refreshCloseBehavior() {
   try {

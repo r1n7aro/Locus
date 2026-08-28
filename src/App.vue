@@ -2,10 +2,9 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
-import { AppWindow, FolderCog, FolderOpen, ListX } from "lucide";
+import { AppWindow } from "lucide";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
 import { normalizeAppError } from "./services/errors";
@@ -14,6 +13,7 @@ import { useAuthStore } from "./stores/auth";
 import { useAgentStore } from "./stores/agent";
 import { useModelStore } from "./stores/model";
 import { useProjectStore } from "./stores/project";
+import { useWorkspaceContextStore } from "./stores/workspaceContext";
 import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
 import { useAppUpdateStore } from "./stores/appUpdate";
@@ -27,8 +27,11 @@ import BaseButton from "./components/ui/BaseButton.vue";
 import BaseContextMenu from "./components/ui/BaseContextMenu.vue";
 import LucideIcon from "./components/icons/LucideIcon.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
+import DevelopmentWorkbench from "./components/workbench/DevelopmentWorkbench.vue";
+import InternalDragOverlay from "./components/ui/InternalDragOverlay.vue";
 
 import { provideDiffOverlay } from "./composables/useDiffOverlay";
+import { provideInternalDragController } from "./composables/useInternalDrag";
 import { initTheme } from "./composables/useTheme";
 import { initFonts, useDisplaySettings } from "./composables/useDisplaySettings";
 import { isKnowledgeDownloadWindowLocation } from "./services/knowledgeDownloadWindow";
@@ -47,17 +50,15 @@ import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWin
 import {
   isExtraWorkdirsWindowLocation,
   listenExtraWorkdirsUpdated,
-  openExtraWorkdirsWindow,
 } from "./services/extraWorkdirsWindow";
 import { prepareSubWindowPool } from "./services/subWindow";
 import {
-  isWorkspacePageId,
+  isAppWorkspacePageId,
+  isCheckoutWorkspacePageId,
   isWorkspacePageWindowLocation,
   openWorkspacePageWindow,
   WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
-  type WorkspacePageId,
 } from "./services/workspacePageWindow";
-import type { ExtraWorkdirStatus } from "./services/extraWorkdirs";
 import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
 import {
   canStartWindowDragFromTarget,
@@ -66,6 +67,7 @@ import {
   startCurrentWindowDragging,
 } from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
+import { reloadPluginInspectorDrawers } from "./services/inspectorDrawerExtensions";
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
 const isUnityEmbedWindow = !isUnityEmbedTestWindow && window.location.pathname === "/unity-embed";
 const unityEmbedParams = new URLSearchParams(window.location.search);
@@ -129,6 +131,7 @@ const authStore = useAuthStore();
 const agentStore = useAgentStore();
 const modelStore = useModelStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const appUpdateStore = useAppUpdateStore();
@@ -138,6 +141,7 @@ const unityEmbedBootstrapError = ref<string | null>(null);
 const KNOWLEDGE_RUNTIME_LOADING_OPERATION = "knowledgeEmbeddingRuntimeLoading";
 const KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT = 16;
 let knowledgeRuntimeStatusTimer: ReturnType<typeof setTimeout> | null = null;
+let knowledgeRuntimeStatusRequestSeq = 0;
 let knowledgeRuntimeStartupPollsRemaining = 0;
 let appCloseRequestUnlisten: UnlistenFn | null = null;
 let extraWorkdirsUpdatedUnlisten: UnlistenFn | null = null;
@@ -145,13 +149,39 @@ let workspacePageResetOnboardingUnlisten: UnlistenFn | null = null;
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
+const internalDragController = provideInternalDragController();
+onUnmounted(() => internalDragController.dispose());
 // The floating Locus inspector panel lives in the main window only; standalone
 // windows fall back to the dedicated inspector window.
 const locusAssetInspectorPanel = useLocusAssetInspectorPanel();
 setLocusAssetInspectorPanelHostAvailable(!isStandaloneWindow);
-const { bootstrapCritical, bootstrapDeferred, preloadTabsInBackground, registerListeners, cleanup, applyWorkingDir, refreshAfterSettings, onOnboardingCompleted } = useAppBootstrap({
+const {
+  bootstrapCritical,
+  bootstrapDeferred,
+  preloadTabsInBackground,
+  registerListeners,
+  cleanup,
+  refreshAfterSettings,
+  onOnboardingCompleted: completeOnboarding,
+} = useAppBootstrap({
   handleExternalScriptOpen: !isUnityEmbedWindow && !isStandaloneWindow,
 });
+
+async function handleOnboardingCompleted() {
+  await completeOnboarding();
+  await workspaceContextStore.initialize(getCurrentTauriWindowLabel() || "main", "main");
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (workspaceRef) {
+    await Promise.all([
+      chatStore.refreshSessions(),
+      agentStore.loadWorkspaceAgents(workspaceRef),
+      projectStore.checkUnityConnection(),
+      projectStore.checkUnityPlugin(),
+      projectStore.loadAssetDbStatus(),
+    ]);
+    void reloadPluginInspectorDrawers();
+  }
+}
 const {
   handleUnityAssetDrag: handleMainUnityAssetDrag,
   handleUnityAssetDrop: handleMainUnityAssetDrop,
@@ -207,22 +237,6 @@ function createLazyViewState(
   };
 }
 
-const chatView = createLazyViewState(
-  () => import("./components/ChatWorkspaceView.vue"),
-  "loadChatWorkspaceView",
-);
-const collabView = createLazyViewState(
-  () => import("./components/CollabView.vue"),
-  "loadCollabView",
-);
-const knowledgeView = createLazyViewState(
-  () => import("./components/KnowledgeView.vue"),
-  "loadKnowledgeView",
-);
-const assetView = createLazyViewState(
-  () => import("./components/AssetView.vue"),
-  "loadAssetView",
-);
 const viewPackageView = createLazyViewState(
   () => import("./components/ViewPackageView.vue"),
   "loadViewPackageView",
@@ -239,22 +253,6 @@ const settingsView = createLazyViewState(
   () => import("./components/SettingsView.vue"),
   "loadSettingsView",
 );
-
-const chatViewComponent = chatView.component;
-const chatViewLoading = chatView.loading;
-const chatViewError = chatView.error;
-
-const collabViewComponent = collabView.component;
-const collabViewLoading = collabView.loading;
-const collabViewError = collabView.error;
-
-const knowledgeViewComponent = knowledgeView.component;
-const knowledgeViewLoading = knowledgeView.loading;
-const knowledgeViewError = knowledgeView.error;
-
-const assetViewComponent = assetView.component;
-const assetViewLoading = assetView.loading;
-const assetViewError = assetView.error;
 
 const viewPackageViewComponent = viewPackageView.component;
 const viewPackageViewLoading = viewPackageView.loading;
@@ -273,18 +271,16 @@ const settingsViewLoading = settingsView.loading;
 const settingsViewError = settingsView.error;
 
 type AppTab = typeof uiStore.activeTab;
+type ProcessTab = Extract<AppTab, "chat" | "views" | "plugins" | "agent" | "settings">;
 
 interface TopTabItem {
-  id: AppTab;
+  id: ProcessTab;
   labelKey: string;
   visible: boolean;
 }
 
 const topTabs = computed<TopTabItem[]>(() => [
-  { id: "chat", labelKey: "app.tab.dev", visible: true },
-  { id: "knowledge", labelKey: "app.tab.knowledge", visible: displaySettings.showKnowledgeTab },
-  { id: "collab", labelKey: "app.tab.collab", visible: displaySettings.showCollabTab },
-  { id: "asset", labelKey: "app.tab.asset", visible: displaySettings.showAssetTab },
+  { id: "chat", labelKey: "app.tab.development", visible: true },
   { id: "views", labelKey: "app.tab.views", visible: displaySettings.showViewsTab },
   { id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab },
   { id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab },
@@ -294,22 +290,37 @@ const topTabs = computed<TopTabItem[]>(() => [
 const visibleTopTabs = computed(() => topTabs.value.filter((tab) => tab.visible));
 const topTabContextMenu = ref<{ x: number; y: number; tab: TopTabItem } | null>(null);
 
-function isTopTabVisible(tab: AppTab) {
-  return visibleTopTabs.value.some((item) => item.id === tab);
+function isTopTabActive(tab: TopTabItem) {
+  return uiStore.activeTab === tab.id;
 }
 
-function canOpenTopTabInWindow(tab: AppTab): tab is WorkspacePageId {
-  return isWorkspacePageId(tab);
+function canOpenTopTabInWindow(tab: TopTabItem) {
+  return tab.id !== "chat" && (
+    isAppWorkspacePageId(tab.id)
+    || (workspaceContextStore.focusedRuntime !== null && isCheckoutWorkspacePageId(tab.id))
+  );
 }
 
 async function openTopTabInWindow(tab: TopTabItem) {
   topTabContextMenu.value = null;
-  if (!canOpenTopTabInWindow(tab.id)) return;
+  if (!canOpenTopTabInWindow(tab)) return;
   try {
-    await openWorkspacePageWindow({
-      page: tab.id,
-      title: t(tab.labelKey),
-    });
+    const runtime = workspaceContextStore.focusedRuntime;
+    if (runtime && isCheckoutWorkspacePageId(tab.id)) {
+      await openWorkspacePageWindow({
+        scope: "checkout",
+        page: tab.id,
+        title: `${shortDir(runtime.root)} · ${t(tab.labelKey)}`,
+        checkoutId: runtime.checkoutId,
+        workspaceGeneration: runtime.workspaceGeneration,
+      });
+    } else if (isAppWorkspacePageId(tab.id)) {
+      await openWorkspacePageWindow({
+        scope: "app",
+        page: tab.id,
+        title: t(tab.labelKey),
+      });
+    }
   } catch (cause) {
     const error = normalizeAppError(cause);
     notificationStore.addNotice("error", error.message, {
@@ -321,7 +332,7 @@ async function openTopTabInWindow(tab: TopTabItem) {
 }
 
 function onTopTabClick(event: MouseEvent, tab: TopTabItem) {
-  if (event.ctrlKey && canOpenTopTabInWindow(tab.id)) {
+  if (event.ctrlKey && canOpenTopTabInWindow(tab)) {
     void openTopTabInWindow(tab);
     return;
   }
@@ -329,36 +340,20 @@ function onTopTabClick(event: MouseEvent, tab: TopTabItem) {
 }
 
 function openTopTabContextMenu(event: MouseEvent, tab: TopTabItem) {
-  if (!canOpenTopTabInWindow(tab.id)) return;
+  if (!canOpenTopTabInWindow(tab)) return;
   event.preventDefault();
   event.stopPropagation();
   topTabContextMenu.value = { x: event.clientX, y: event.clientY, tab };
 }
 
 watch(() => uiStore.activeTab, (tab) => {
-  if (tab !== "chat") return;
-  void chatView.ensureLoaded();
+  if (tab === "views") void viewPackageView.ensureLoaded();
 }, { immediate: true });
 
 // 离开设置页时做一次兜底刷新（顶栏切 Tab 不走 setTab 之外的逻辑，原 closeSettings 的副作用迁移到这里）。
 watch(() => uiStore.activeTab, (tab, prev) => {
   if (prev === "settings" && tab !== "settings") void refreshAfterSettings();
 });
-
-watch(() => uiStore.collabMounted, (mounted) => {
-  if (!mounted) return;
-  void collabView.ensureLoaded();
-}, { immediate: true });
-
-watch(() => uiStore.knowledgeMounted, (mounted) => {
-  if (!mounted) return;
-  void knowledgeView.ensureLoaded();
-}, { immediate: true });
-
-watch(() => uiStore.assetMounted, (mounted) => {
-  if (!mounted) return;
-  void assetView.ensureLoaded();
-}, { immediate: true });
 
 watch(() => uiStore.viewMounted, (mounted) => {
   if (!mounted) return;
@@ -381,43 +376,16 @@ watch(() => uiStore.settingsMounted, (mounted) => {
 }, { immediate: true });
 
 watch([() => uiStore.activeTab, visibleTopTabs], () => {
-  if (isTopTabVisible(uiStore.activeTab)) return;
+  if (visibleTopTabs.value.some((tab) => tab.id === uiStore.activeTab)) return;
   uiStore.setTab("chat");
 }, { immediate: true });
 
-// -- Workspace dropdown (local UI) --
-type RecentDirContextMenu = {
-  x: number;
-  y: number;
-  dir: string;
-};
-
-const showDirDropdown = ref(false);
-const dirDropdownRef = ref<HTMLElement | null>(null);
-const recentDirContextMenu = ref<RecentDirContextMenu | null>(null);
-const pendingWorkspaceSwitchPath = ref<string | null>(null);
-const workspaceSwitchRunningTaskCount = ref(0);
-const switchingWorkspacePath = ref<string | null>(null);
-const workspaceSwitchBusy = ref(false);
 const appCloseConfirmOpen = ref(false);
 const appCloseBusy = ref(false);
 const appCloseRunningTaskCount = ref(0);
 const runningSessionCount = computed(() => chatStore.streamingSessionIds.size);
-const workspaceSwitchTargetName = computed(() =>
-  pendingWorkspaceSwitchPath.value ? shortDir(pendingWorkspaceSwitchPath.value) : "",
-);
-const workspaceButtonTitle = computed(() => {
-  if (switchingWorkspacePath.value) {
-    return t(
-      "app.dir.switchingTitle",
-      shortDir(switchingWorkspacePath.value),
-      switchingWorkspacePath.value,
-    );
-  }
-  return projectStore.workingDir || t("app.dir.notSetTitle");
-});
-const workspaceButtonLabel = computed(() =>
-  switchingWorkspacePath.value ? t("app.dir.switching") : shortDir(projectStore.workingDir),
+const focusedWorkspaceRoot = computed(
+  () => workspaceContextStore.focusedRoot || projectStore.workingDir,
 );
 const showAppUpdateModal = computed(() =>
   Boolean(
@@ -467,42 +435,6 @@ function shortDir(dir: string): string {
   return parts.length > 0 ? parts[parts.length - 1] : dir;
 }
 
-function parentPath(dir: string): string {
-  const parts = dir.replace(/\\/g, "/").split("/").filter(Boolean);
-  if (parts.length <= 1) return "";
-  return parts.slice(0, -1).join("/");
-}
-
-function toggleDirDropdown() {
-  if (workspaceSwitchBusy.value) return;
-  showDirDropdown.value = !showDirDropdown.value;
-  if (showDirDropdown.value) {
-    void projectStore.loadExtraWorkdirs();
-  } else {
-    recentDirContextMenu.value = null;
-  }
-}
-
-function extraWorkdirsFor(dir: string): ExtraWorkdirStatus[] {
-  return projectStore.extraWorkdirs[dir] ?? [];
-}
-
-function extraWorkdirTooltip(extra: ExtraWorkdirStatus): string {
-  return [extra.path, extra.readOnly ? t("extraWorkdirs.readOnly") : "", extra.comment]
-    .filter(Boolean)
-    .join(" — ");
-}
-
-function closeRecentDirContextMenu() {
-  recentDirContextMenu.value = null;
-}
-
-function closeWorkspaceSwitchDialog() {
-  if (workspaceSwitchBusy.value) return;
-  pendingWorkspaceSwitchPath.value = null;
-  workspaceSwitchRunningTaskCount.value = 0;
-}
-
 function closeAppCloseDialog() {
   if (appCloseBusy.value) return;
   appCloseConfirmOpen.value = false;
@@ -529,65 +461,6 @@ function reportAppCloseError(error: unknown) {
   });
 }
 
-function notifyCancelledWorkspaceSessions(count: number) {
-  if (count <= 0) return;
-  notificationStore.addNotice("info", t("app.dir.runningCancelledNotice", String(count)), {
-    operation: "workspaceSwitchCancelled",
-    replaceOperation: true,
-  });
-}
-
-async function performWorkingDirChange(dir: string, cancelledSessionCount = 0) {
-  try {
-    await applyWorkingDir(dir);
-    notifyCancelledWorkspaceSessions(cancelledSessionCount);
-    return true;
-  } catch (error) {
-    reportWorkingDirSwitchError(error);
-    return false;
-  }
-}
-
-async function requestWorkingDirChange(dir: string) {
-  if (!dir || dir === projectStore.workingDir || workspaceSwitchBusy.value) return;
-  const runningTaskCount = await getRunningTaskCount().catch(() => runningSessionCount.value);
-  if (runningTaskCount > 0) {
-    pendingWorkspaceSwitchPath.value = dir;
-    workspaceSwitchRunningTaskCount.value = runningTaskCount;
-    return;
-  }
-  workspaceSwitchBusy.value = true;
-  switchingWorkspacePath.value = dir;
-  try {
-    await performWorkingDirChange(dir);
-  } finally {
-    switchingWorkspacePath.value = null;
-    workspaceSwitchBusy.value = false;
-  }
-}
-
-async function confirmWorkspaceSwitch() {
-  const target = pendingWorkspaceSwitchPath.value;
-  if (!target || workspaceSwitchBusy.value) return;
-  workspaceSwitchBusy.value = true;
-  switchingWorkspacePath.value = target;
-  try {
-    const sessionIds = Array.from(chatStore.streamingSessionIds);
-    const runningTaskCount = workspaceSwitchRunningTaskCount.value;
-    await chatStore.cancelSessions(sessionIds);
-    const switched = await performWorkingDirChange(target, runningTaskCount);
-    if (switched) {
-      pendingWorkspaceSwitchPath.value = null;
-      workspaceSwitchRunningTaskCount.value = 0;
-    }
-  } catch (error) {
-    reportWorkingDirSwitchError(error);
-  } finally {
-    switchingWorkspacePath.value = null;
-    workspaceSwitchBusy.value = false;
-  }
-}
-
 async function confirmAppClose() {
   if (appCloseBusy.value) return;
   appCloseBusy.value = true;
@@ -610,107 +483,7 @@ async function handleAppCloseRequest() {
   await confirmAppClose();
 }
 
-async function selectRecentDir(dir: string) {
-  if (workspaceSwitchBusy.value) return;
-  closeRecentDirContextMenu();
-  showDirDropdown.value = false;
-  await requestWorkingDirChange(dir);
-}
-
-async function browseFromDropdown() {
-  if (workspaceSwitchBusy.value) return;
-  closeRecentDirContextMenu();
-  showDirDropdown.value = false;
-  try {
-    const selected = await open({ directory: true, multiple: false, defaultPath: projectStore.workingDir || undefined });
-    if (selected && typeof selected === "string") {
-      await requestWorkingDirChange(selected);
-    }
-  } catch (e) {
-    const err = normalizeAppError(e);
-    console.error("browse_working_dir failed:", e);
-    notificationStore.addNotice("error", err.message, {
-      operation: "browseWorkingDir",
-      skipConsoleLog: true,
-    });
-  }
-}
-
-function openRecentDirContextMenu(event: MouseEvent, dir: string) {
-  if (workspaceSwitchBusy.value) return;
-  event.preventDefault();
-  event.stopPropagation();
-  recentDirContextMenu.value = {
-    x: event.clientX,
-    y: event.clientY,
-    dir,
-  };
-}
-
-async function openContextRecentDirInFileExplorer() {
-  const dir = recentDirContextMenu.value?.dir;
-  if (!dir) return;
-  closeRecentDirContextMenu();
-  try {
-    await projectStore.openDirInFileExplorer(dir);
-  } catch (error) {
-    const err = normalizeAppError(error);
-    notificationStore.addNotice("error", err.message, {
-      code: err.code,
-      operation: "openRecentDirInFileExplorer",
-      replaceOperation: true,
-      skipConsoleLog: true,
-    });
-  }
-}
-
-async function removeContextRecentDir() {
-  const dir = recentDirContextMenu.value?.dir;
-  if (!dir) return;
-  closeRecentDirContextMenu();
-  try {
-    await projectStore.removeRecentDir(dir);
-  } catch (error) {
-    const err = normalizeAppError(error);
-    notificationStore.addNotice("error", err.message, {
-      code: err.code,
-      operation: "removeRecentDir",
-      replaceOperation: true,
-      skipConsoleLog: true,
-    });
-  }
-}
-
-async function configureContextRecentDirExtraWorkdirs() {
-  const dir = recentDirContextMenu.value?.dir;
-  if (!dir) return;
-  closeRecentDirContextMenu();
-  try {
-    await openExtraWorkdirsWindow({ workspacePath: dir });
-  } catch (error) {
-    const err = normalizeAppError(error);
-    notificationStore.addNotice("error", err.message, {
-      code: err.code,
-      operation: "openExtraWorkdirsWindow",
-      replaceOperation: true,
-      skipConsoleLog: true,
-    });
-  }
-}
-
-function handleDirClickOutside(e: MouseEvent) {
-  const target = e.target as Node;
-  const targetElement = target instanceof Element ? target : target.parentElement;
-  if (targetElement?.closest(".recent-dir-ctx-menu")) return;
-  if (dirDropdownRef.value && !dirDropdownRef.value.contains(target)) {
-    showDirDropdown.value = false;
-    closeRecentDirContextMenu();
-  }
-}
-
 function onResetOnboarding() {
-  showDirDropdown.value = false;
-  closeRecentDirContextMenu();
   projectStore.resetWorkspaceState();
   chatStore.resetWorkspaceScope();
   uiStore.resetOnboarding();
@@ -758,14 +531,22 @@ function scheduleKnowledgeRuntimeStatusPoll(delay = 700) {
 }
 
 async function refreshKnowledgeRuntimeLoadingStatus() {
-  if (isStandaloneWindow || !projectStore.workingDir.trim()) {
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  const requestSeq = ++knowledgeRuntimeStatusRequestSeq;
+  if (isStandaloneWindow || !workspaceRef) {
     notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
     clearKnowledgeRuntimeStatusTimer();
     return;
   }
 
   try {
-    const status = await knowledgeGetEmbeddingStatus();
+    const status = await knowledgeGetEmbeddingStatus(workspaceRef);
+    const currentRef = workspaceContextStore.focusedWorkspaceRef;
+    if (
+      requestSeq !== knowledgeRuntimeStatusRequestSeq
+      || currentRef?.checkoutId !== workspaceRef.checkoutId
+      || currentRef.expectedGeneration !== workspaceRef.expectedGeneration
+    ) return;
     if (status.activating) {
       notificationStore.addNotice("info", t("knowledge.retrieval.runtimeStarting"), {
         operation: KNOWLEDGE_RUNTIME_LOADING_OPERATION,
@@ -784,6 +565,7 @@ async function refreshKnowledgeRuntimeLoadingStatus() {
       scheduleKnowledgeRuntimeStatusPoll();
     }
   } catch {
+    if (requestSeq !== knowledgeRuntimeStatusRequestSeq) return;
     notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
     clearKnowledgeRuntimeStatusTimer();
   }
@@ -791,6 +573,7 @@ async function refreshKnowledgeRuntimeLoadingStatus() {
 
 function startKnowledgeRuntimeStartupPolling() {
   if (isStandaloneWindow) return;
+  knowledgeRuntimeStatusRequestSeq += 1;
   knowledgeRuntimeStartupPollsRemaining = KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT;
   scheduleKnowledgeRuntimeStatusPoll(120);
 }
@@ -871,7 +654,6 @@ onMounted(async () => {
     markStartupPhase("standalone_window_ready");
     return;
   }
-  document.addEventListener("click", handleDirClickOutside, true);
   await registerAppCloseRequestListener();
   await registerExtraWorkdirsUpdatedListener();
   workspacePageResetOnboardingUnlisten = await listen(
@@ -882,17 +664,32 @@ onMounted(async () => {
   markStartupPhase("main_bootstrap_critical_start");
   await bootstrapCritical();
   markStartupPhase("main_bootstrap_critical_done");
+  try {
+    await workspaceContextStore.initialize(getCurrentTauriWindowLabel() || "main", "main");
+    if (!workspaceContextStore.focusedWorkspaceRef && projectStore.workingDir) {
+      await workspaceContextStore.openAndFocus(projectStore.workingDir);
+    }
+    if (workspaceContextStore.focusedWorkspaceRef) {
+      await Promise.all([
+        chatStore.refreshSessions(),
+        agentStore.loadWorkspaceAgents(workspaceContextStore.focusedWorkspaceRef),
+        projectStore.checkUnityConnection(),
+        projectStore.checkUnityPlugin(),
+        projectStore.loadAssetDbStatus(),
+      ]);
+      void reloadPluginInspectorDrawers();
+    }
+  } catch (error) {
+    reportWorkingDirSwitchError(error);
+  }
   markStartupPhase("main_register_listeners_start");
   await registerListeners();
   markStartupPhase("main_register_listeners_done");
-  // Sessions page is now interactive — kick off background work. Passing the
-  // lazy-view loaders lets the preloader fill each view's component ref, so
-  // the first visit to these tabs mounts instantly (no loading-placeholder flash).
+  // Development is already interactive. Preload the remaining process-level pages.
   preloadTabsInBackground([
     settingsView.ensureLoaded,
-    collabView.ensureLoaded,
-    knowledgeView.ensureLoaded,
-    assetView.ensureLoaded,
+    viewPackageView.ensureLoaded,
+    pluginView.ensureLoaded,
     agentView.ensureLoaded,
   ]);
   markStartupPhase("main_preload_tabs_scheduled");
@@ -917,7 +714,6 @@ onUnmounted(() => {
     return;
   }
   if (isStandaloneWindow) return;
-  document.removeEventListener("click", handleDirClickOutside, true);
   appCloseRequestUnlisten?.();
   appCloseRequestUnlisten = null;
   extraWorkdirsUpdatedUnlisten?.();
@@ -929,7 +725,7 @@ onUnmounted(() => {
   cleanup();
 });
 
-watch(() => projectStore.workingDir, () => {
+watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
   startKnowledgeRuntimeStartupPolling();
 });
 </script>
@@ -963,7 +759,7 @@ watch(() => projectStore.workingDir, () => {
   <div v-else-if="!authStore.authChecked" class="app-startup-state">
     <span>{{ t("common.loading") }}</span>
   </div>
-  <OnboardingView v-else-if="authStore.authChecked && uiStore.showOnboarding" @completed="onOnboardingCompleted" />
+  <OnboardingView v-else-if="authStore.authChecked && uiStore.showOnboarding" @completed="handleOnboardingCompleted" />
   <div
     class="app-layout"
     :class="{ 'is-window-resizing': uiStore.isWindowResizing }"
@@ -982,7 +778,7 @@ watch(() => projectStore.workingDir, () => {
           v-for="tab in visibleTopTabs"
           :key="tab.id"
           class="tab-item"
-          :class="{ active: uiStore.activeTab === tab.id }"
+          :class="{ active: isTopTabActive(tab) }"
           @click="onTopTabClick($event, tab)"
           @contextmenu="openTopTabContextMenu($event, tab)"
         >{{ t(tab.labelKey) }}</button>
@@ -1011,81 +807,6 @@ watch(() => projectStore.workingDir, () => {
           <span class="tab-plugin-action">{{ pluginToastAction }}</span>
         </button>
         <div class="tab-spacer"></div>
-        <div class="workspace-selector" ref="dirDropdownRef">
-          <button
-            class="workspace-btn"
-            :class="{ 'is-switching': workspaceSwitchBusy }"
-            :title="workspaceButtonTitle"
-            :disabled="workspaceSwitchBusy"
-            :aria-busy="workspaceSwitchBusy"
-            @click="toggleDirDropdown"
-          >
-            <svg class="ws-icon" viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-              <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
-            </svg>
-            <span class="ws-name">{{ workspaceButtonLabel }}</span>
-            <span v-if="workspaceSwitchBusy" class="workspace-switch-spinner" aria-hidden="true"></span>
-            <svg v-else class="ws-chevron" :class="{ open: showDirDropdown }" viewBox="0 0 16 16" fill="currentColor" width="10" height="10">
-              <path d="M4.427 5.427a.75.75 0 0 1 1.06-.013L8 7.867l2.513-2.453a.75.75 0 1 1 1.047 1.073l-3 2.927a.75.75 0 0 1-1.047 0l-3-2.927a.75.75 0 0 1-.013-1.06z"/>
-            </svg>
-          </button>
-          <Transition name="dropdown">
-            <div v-if="showDirDropdown" class="dir-dropdown">
-              <div class="dropdown-label">{{ t("app.dir.recentDirs") }}</div>
-              <template v-for="dir in projectStore.recentDirs" :key="dir">
-                <div
-                  class="dir-item"
-                  :class="{
-                    active: dir === projectStore.workingDir,
-                    'context-selected': recentDirContextMenu?.dir === dir,
-                  }"
-                  @click="selectRecentDir(dir)"
-                  @contextmenu.prevent.stop="openRecentDirContextMenu($event, dir)"
-                  :title="dir"
-                >
-                  <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-                    <path d="M1 3.5A1.5 1.5 0 0 1 2.5 2h3.879a1.5 1.5 0 0 1 1.06.44l1.122 1.12A1.5 1.5 0 0 0 9.62 4H13.5A1.5 1.5 0 0 1 15 5.5v7a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12.5v-9z"/>
-                  </svg>
-                  <div class="dir-item-text">
-                    <span class="dir-item-name">{{ shortDir(dir) }}</span>
-                    <span class="dir-item-path">{{ parentPath(dir) }}</span>
-                  </div>
-                  <span v-if="dir === projectStore.workingDir" class="dir-check">&#10003;</span>
-                </div>
-                <div
-                  v-if="extraWorkdirsFor(dir).length > 0"
-                  class="dir-item-extras"
-                  @contextmenu.prevent.stop="openRecentDirContextMenu($event, dir)"
-                >
-                  <div
-                    v-for="extra in extraWorkdirsFor(dir)"
-                    :key="extra.path"
-                    class="dir-extra-row"
-                    :class="{ missing: !extra.exists }"
-                    :title="extraWorkdirTooltip(extra)"
-                    @click.stop
-                  >
-                    <svg class="dir-extra-icon" viewBox="0 0 16 16" fill="currentColor" width="10" height="10">
-                      <path d="M7.775 3.275a.75.75 0 0 0 1.06 1.06l1.25-1.25a2 2 0 1 1 2.83 2.83l-2.5 2.5a2 2 0 0 1-2.83 0 .75.75 0 0 0-1.06 1.06 3.5 3.5 0 0 0 4.95 0l2.5-2.5a3.5 3.5 0 0 0-4.95-4.95l-1.25 1.25zm-4.69 9.64a2 2 0 0 1 0-2.83l2.5-2.5a2 2 0 0 1 2.83 0 .75.75 0 0 0 1.06-1.06 3.5 3.5 0 0 0-4.95 0l-2.5 2.5a3.5 3.5 0 0 0 4.95 4.95l1.25-1.25a.75.75 0 0 0-1.06-1.06l-1.25 1.25a2 2 0 0 1-2.83 0z"/>
-                    </svg>
-                    <span class="dir-extra-name">{{ shortDir(extra.path) }}</span>
-                    <span v-if="extra.comment" class="dir-extra-comment">{{ extra.comment }}</span>
-                    <span v-if="extra.readOnly" class="dir-extra-readonly">{{ t("extraWorkdirs.readOnly") }}</span>
-                    <span v-if="!extra.exists" class="dir-extra-missing">{{ t("extraWorkdirs.missingBadge") }}</span>
-                  </div>
-                </div>
-              </template>
-              <div v-if="projectStore.recentDirs.length === 0" class="dropdown-empty">{{ t("app.dir.noRecords") }}</div>
-              <div class="dropdown-divider"></div>
-              <div class="dir-item browse" @click="browseFromDropdown">
-                <svg class="dir-item-icon" viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
-                  <path d="M8 2a.75.75 0 0 1 .75.75v4.5h4.5a.75.75 0 0 1 0 1.5h-4.5v4.5a.75.75 0 0 1-1.5 0v-4.5h-4.5a.75.75 0 0 1 0-1.5h4.5v-4.5A.75.75 0 0 1 8 2z"/>
-                </svg>
-                <span class="dir-item-name">{{ t("app.dir.browseOther") }}</span>
-              </div>
-            </div>
-          </Transition>
-        </div>
         <div class="window-controls">
           <button
             class="win-ctrl-btn"
@@ -1110,76 +831,15 @@ watch(() => projectStore.workingDir, () => {
         </div>
       </div>
       <TopBannerHost />
-
       <div class="tab-content">
-        <component
-          :is="chatViewComponent"
-          v-if="chatViewComponent"
-          v-show="uiStore.activeTab === 'chat'"
-          :active="uiStore.activeTab === 'chat'"
-          layout-mode="auto"
-        />
-        <div
-          v-else-if="uiStore.activeTab === 'chat'"
-          class="tab-loading-state"
-          :class="{ 'is-loading': chatViewLoading, 'is-error': !!chatViewError }"
-        >
-          {{ chatViewError || t("common.loading") }}
-        </div>
-        <component
-          :is="collabViewComponent"
-          v-if="uiStore.collabMounted && collabViewComponent"
-          v-show="uiStore.activeTab === 'collab'"
-          :working-dir="projectStore.workingDir"
-          :is-active="uiStore.activeTab === 'collab'"
-          :selected-model-id="modelStore.selectedModelId"
-          :selected-agent-id="agentStore.selectedAgentId"
-          :models="modelStore.availableModels"
-          @select-model="(id: string) => modelStore.selectModel(id)"
-        />
-        <div
-          v-else-if="uiStore.collabMounted && uiStore.activeTab === 'collab'"
-          class="tab-loading-state"
-          :class="{ 'is-loading': collabViewLoading, 'is-error': !!collabViewError }"
-        >
-          {{ collabViewError || t("common.loading") }}
-        </div>
-
-        <component
-          :is="knowledgeViewComponent"
-          v-if="uiStore.knowledgeMounted && knowledgeViewComponent"
-          v-show="uiStore.activeTab === 'knowledge'"
-          :working-dir="projectStore.workingDir"
-          :selected-model-id="modelStore.selectedModelId"
-          :model-defaults="modelStore.modelDefaults"
-        />
-        <div
-          v-else-if="uiStore.knowledgeMounted && uiStore.activeTab === 'knowledge'"
-          class="tab-loading-state"
-          :class="{ 'is-loading': knowledgeViewLoading, 'is-error': !!knowledgeViewError }"
-        >
-          {{ knowledgeViewError || t("common.loading") }}
-        </div>
-
-        <component
-          :is="assetViewComponent"
-          v-if="uiStore.assetMounted && assetViewComponent"
-          v-show="uiStore.activeTab === 'asset'"
-          :working-dir="projectStore.workingDir"
-        />
-        <div
-          v-else-if="uiStore.assetMounted && uiStore.activeTab === 'asset'"
-          class="tab-loading-state"
-          :class="{ 'is-loading': assetViewLoading, 'is-error': !!assetViewError }"
-        >
-          {{ assetViewError || t("common.loading") }}
-        </div>
+        <DevelopmentWorkbench v-show="uiStore.activeTab === 'chat'" />
 
         <component
           :is="viewPackageViewComponent"
           v-if="uiStore.viewMounted && viewPackageViewComponent"
           v-show="uiStore.activeTab === 'views'"
-          :working-dir="projectStore.workingDir"
+          :working-dir="focusedWorkspaceRoot"
+          :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
         />
         <div
           v-else-if="uiStore.viewMounted && uiStore.activeTab === 'views'"
@@ -1193,7 +853,7 @@ watch(() => projectStore.workingDir, () => {
           :is="pluginViewComponent"
           v-if="showPluginEntry && uiStore.pluginsMounted && pluginViewComponent"
           v-show="uiStore.activeTab === 'plugins'"
-          :working-dir="projectStore.workingDir"
+          working-dir=""
         />
         <div
           v-else-if="showPluginEntry && uiStore.pluginsMounted && uiStore.activeTab === 'plugins'"
@@ -1207,7 +867,8 @@ watch(() => projectStore.workingDir, () => {
           :is="agentViewComponent"
           v-if="uiStore.agentMounted && agentViewComponent"
           v-show="uiStore.activeTab === 'agent'"
-          :working-dir="projectStore.workingDir"
+          :working-dir="focusedWorkspaceRoot"
+          :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
           :agent-list="[...agentStore.agents, ...agentStore.subagents]"
         />
         <div
@@ -1223,8 +884,8 @@ watch(() => projectStore.workingDir, () => {
           v-if="uiStore.settingsMounted && settingsViewComponent"
           v-show="uiStore.activeTab === 'settings'"
           :all-models="modelStore.availableModels"
-          :agents="agentStore.agents"
-          :subagents="agentStore.subagents"
+          :agents="agentStore.appAgents"
+          :subagents="agentStore.appSubagents"
           @auth-changed="handleSettingsAuthChanged"
           @model-defaults-changed="modelStore.applyModelDefaults"
           @codex-transport-changed="modelStore.applyCodexModelConfig"
@@ -1265,90 +926,6 @@ watch(() => projectStore.workingDir, () => {
       {{ t("app.tab.openInWindow") }}
     </button>
   </BaseContextMenu>
-  <BaseContextMenu
-    v-if="recentDirContextMenu"
-    class="recent-dir-ctx-menu"
-    :x="recentDirContextMenu.x"
-    :y="recentDirContextMenu.y"
-    :min-width="180"
-    :z-index="260"
-    @close="closeRecentDirContextMenu"
-  >
-    <button
-      type="button"
-      class="recent-dir-ctx-item"
-      @click="openContextRecentDirInFileExplorer"
-    >
-      <LucideIcon :icon="FolderOpen" :size="13" />
-      {{ t("common.openInFileExplorer") }}
-    </button>
-    <button
-      type="button"
-      class="recent-dir-ctx-item"
-      @click="configureContextRecentDirExtraWorkdirs"
-    >
-      <LucideIcon :icon="FolderCog" :size="13" />
-      {{ t("app.dir.configureExtraWorkdirs") }}
-    </button>
-    <button
-      type="button"
-      class="recent-dir-ctx-item"
-      @click="removeContextRecentDir"
-    >
-      <LucideIcon :icon="ListX" :size="13" />
-      {{ t("app.dir.removeRecent") }}
-    </button>
-  </BaseContextMenu>
-  <Transition name="workspace-switch-modal">
-    <div
-      v-if="pendingWorkspaceSwitchPath"
-      class="workspace-switch-overlay"
-      @click.self="closeWorkspaceSwitchDialog"
-    >
-      <div
-        class="workspace-switch-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="workspace-switch-title"
-      >
-        <div class="workspace-switch-header">
-          <span id="workspace-switch-title" class="workspace-switch-title">
-            {{ t("app.dir.runningConfirmTitle") }}
-          </span>
-          <button
-            class="workspace-switch-close"
-            :disabled="workspaceSwitchBusy"
-            @click="closeWorkspaceSwitchDialog"
-          >
-            <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-              <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06z"/>
-            </svg>
-          </button>
-        </div>
-        <div class="workspace-switch-body">
-          <p class="workspace-switch-message">
-            {{ t("app.dir.runningConfirmMessage", String(workspaceSwitchRunningTaskCount), workspaceSwitchTargetName) }}
-          </p>
-          <div class="workspace-switch-path">{{ pendingWorkspaceSwitchPath }}</div>
-          <p class="workspace-switch-warning">
-            {{ t("app.dir.runningConfirmWarning") }}
-          </p>
-        </div>
-        <div class="workspace-switch-footer">
-          <BaseButton :disabled="workspaceSwitchBusy" @click="closeWorkspaceSwitchDialog">
-            {{ t("common.cancel") }}
-          </BaseButton>
-          <BaseButton
-            variant="primary"
-            :disabled="workspaceSwitchBusy"
-            @click="confirmWorkspaceSwitch"
-          >
-            {{ t("app.dir.runningConfirmAction") }}
-          </BaseButton>
-        </div>
-      </div>
-    </div>
-  </Transition>
   <Transition name="workspace-switch-modal">
     <div
       v-if="appCloseConfirmOpen"
@@ -1400,4 +977,5 @@ watch(() => projectStore.workingDir, () => {
   </Transition>
   <FileDiffOverlay v-if="diffOverlay.visible.value" />
   <LocusAssetInspectorPanel v-if="!isStandaloneWindow && locusAssetInspectorPanel.state.open" />
+  <InternalDragOverlay />
 </template>

@@ -9,6 +9,10 @@ mod view_capture;
 
 pub use backend::resolve_openrouter_model;
 pub use backend::{LlmBackend, MockModelProfile, RawContextStore, RawRound};
+pub(crate) use backend::{
+    MOCK_AGENT_UNITY_EXECUTE_SCENARIO, MOCK_AGENT_UNITY_YAML_READ_SCENARIO,
+    MOCK_WORKSPACE_SWITCH_HOLD_SCENARIO,
+};
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -26,7 +30,7 @@ use tauri::{AppHandle, Manager};
 use crate::agent::definition::{AgentDef, AgentDefRegistry};
 use crate::agent::workspace_execution_lock::{
     normalize_workspace_path_key, process_workspace_execution_lock, WorkspaceExecutionGuard,
-    WorkspaceExecutionLockOwner, WorkspaceExecutionLockRequest,
+    WorkspaceExecutionLockAcquireError, WorkspaceExecutionLockOwner, WorkspaceExecutionLockRequest,
 };
 use crate::commands::{
     BasicToolConfirmDisplay, KnowledgeToolConfirmDirectoryMode, KnowledgeToolConfirmOperation,
@@ -43,10 +47,11 @@ use crate::session::store::{SessionPromptPrefixCache, SessionStore};
 use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState};
 
 const KNOWLEDGE_QUERY_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
+const UNITY_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 use backend::{
     is_prompt_too_long_error, is_retryable_llm_error, model_context_limit, normalize_tool_args,
-    session_unity_state, stream_mock_response, LlmCallResult, MAX_TOOL_ITERATIONS,
+    session_unity_state, stream_mock_response, LlmCallResult,
 };
 use prompt_context::{
     detect_input_system, detect_render_pipeline, parse_physics_config, parse_tag_manager,
@@ -261,6 +266,7 @@ pub struct AgentInstance {
     working_dir: String,
     raw_store: RawContextStore,
     workspace_id: Option<String>,
+    execution_context: Option<Arc<crate::workspace_service::AgentExecutionContext>>,
     parent_tool_call: Option<ParentToolCall>,
     /// Nesting depth in the `subagent` tree: 0 for a top-level agent,
     /// parent depth + 1 for each spawned subagent. Checked against the
@@ -3825,7 +3831,8 @@ impl AgentInstance {
                     require_workspace_bound("file_path")
                 }
             }
-            "unity_set_play_mode"
+            "python"
+            | "unity_set_play_mode"
             | "unity_execute"
             | "unity_run_states"
             | "unity_capture_viewport"
@@ -4008,6 +4015,7 @@ impl AgentInstance {
             working_dir,
             raw_store,
             workspace_id,
+            execution_context: None,
             parent_tool_call: None,
             subagent_depth: 0,
             subagent_active: Arc::new(AtomicU32::new(0)),
@@ -4037,6 +4045,15 @@ impl AgentInstance {
 
     pub fn partial_assistant_state(&self) -> Arc<AssistantStreamState> {
         self.partial_assistant.clone()
+    }
+
+    pub fn set_execution_context(
+        &mut self,
+        execution_context: Arc<crate::workspace_service::AgentExecutionContext>,
+    ) {
+        self.working_dir = execution_context.root().to_string_lossy().to_string();
+        self.workspace_id = Some(execution_context.project_id.to_string());
+        self.execution_context = Some(execution_context);
     }
 
     pub fn set_codex_fast_mode(&mut self, enabled: bool) {
@@ -4270,6 +4287,7 @@ impl AgentInstance {
 
         ToolExecutionContext {
             app_handle: Some(app_handle.clone()),
+            execution: self.execution_context.clone(),
             working_dir: if self.has_selected_working_dir() {
                 Some(self.working_dir.clone())
             } else {
@@ -4288,45 +4306,12 @@ impl AgentInstance {
         }
     }
 
-    async fn resolve_effective_tool_names(&self) -> Vec<String> {
-        let mut tools: Vec<String> = self
-            .def
-            .tools
-            .iter()
-            .filter(|tool_name| match tool_name.as_str() {
-                "knowledge_query" | "create_skill_package" | "skill_list" => {
-                    self.has_selected_working_dir()
-                        && self.knowledge_access_mode.allows_tool(tool_name.as_str())
-                }
-                // Semantic C# tools ride on the optional Roslyn language
-                // server; keep them out of the agent context entirely while
-                // the feature toggle (or the tool's own switch) is off.
-                "code_find_references"
-                | "code_goto_definition"
-                | "code_symbol_search"
-                | "code_diagnostics"
-                | "code_hover" => {
-                    crate::csharp_lsp::is_enabled()
-                        && crate::code_tools::tool_enabled(tool_name.as_str())
-                }
-                // Asset-side code analysis tools work without the language
-                // server but honor their per-tool switches.
-                "unity_code_usages" => crate::code_tools::tool_enabled(tool_name.as_str()),
-                // Hot reload rides on the hot-reload feature plus the sidecar
-                // compiler; keep it out of the agent context entirely when
-                // either is off (calling it would only error and redirect to
-                // unity_recompile).
-                "unity_hot_reload" => {
-                    crate::unity_hotreload::is_enabled() && crate::csharp_compile::is_enabled()
-                }
-                "unity_test_list" | "unity_test_run" => {
-                    self.has_selected_working_dir()
-                        && crate::workspace::unity_test_tools_available(&self.working_dir)
-                }
-                _ => true,
-            })
-            .cloned()
-            .collect();
+    /// Every tool declared by the agent plus runtime-registered skill, task,
+    /// and MCP tools. This inventory deliberately skips workspace capability
+    /// filtering so inspection UIs can explain unavailable tools instead of
+    /// silently hiding them.
+    async fn resolve_configured_tool_names(&self) -> Vec<String> {
+        let mut tools = self.def.tools.clone();
         for tool_name in self.tool_registry.skill_tool_names() {
             push_unique_tool_name(&mut tools, &tool_name);
         }
@@ -4344,6 +4329,111 @@ impl AgentInstance {
             push_unique_tool_name(&mut tools, &tool_name);
         }
         tools
+    }
+
+    /// Returns the stable reason code that prevents a configured tool from
+    /// participating in the current workspace runtime. Per-agent enabled
+    /// overrides and model capabilities are handled separately.
+    fn tool_environment_unavailable_reason(&self, name: &str) -> Option<&'static str> {
+        if let Some(owner) = crate::workspace_service::service::owner_service_for_tool(name) {
+            match self.execution_context.as_ref() {
+                Some(execution) => {
+                    if !execution
+                        .workspace
+                        .services()
+                        .detected_kinds()
+                        .contains(&owner)
+                    {
+                        return Some(match owner {
+                            crate::workspace_service::ServiceKind::Unity => {
+                                "requires_unity_workspace"
+                            }
+                        });
+                    }
+                    if execution.binding(owner).is_none() {
+                        return Some(match owner {
+                            crate::workspace_service::ServiceKind::Unity => {
+                                "unity_service_unavailable"
+                            }
+                        });
+                    }
+                }
+                None if !self.has_selected_working_dir() => {
+                    return Some(match owner {
+                        crate::workspace_service::ServiceKind::Unity => "requires_unity_workspace",
+                    });
+                }
+                // Legacy execution paths with an explicit working directory
+                // predate checkout-scoped bindings. Preserve their runtime
+                // behavior while scoped previews and sessions use the branch
+                // above.
+                None => {}
+            }
+        }
+
+        match name {
+            "knowledge_query" | "create_skill_package" | "skill_list" => {
+                if !self.has_selected_working_dir() {
+                    Some("requires_workspace")
+                } else if !self.knowledge_access_mode.allows_tool(name) {
+                    Some("knowledge_access_disabled")
+                } else {
+                    None
+                }
+            }
+            "code_find_references"
+            | "code_goto_definition"
+            | "code_symbol_search"
+            | "code_diagnostics"
+            | "code_hover" => {
+                if !crate::csharp_lsp::is_enabled() {
+                    Some("code_analysis_disabled")
+                } else if !crate::code_tools::tool_enabled(name) {
+                    Some("code_tool_disabled")
+                } else {
+                    None
+                }
+            }
+            "unity_code_usages" if !crate::code_tools::tool_enabled(name) => {
+                Some("code_tool_disabled")
+            }
+            "unity_hot_reload" if !crate::unity_hotreload::is_enabled() => {
+                Some("hot_reload_disabled")
+            }
+            "unity_hot_reload" if !crate::csharp_compile::is_enabled() => {
+                Some("compile_server_disabled")
+            }
+            "unity_test_list" | "unity_test_run" => {
+                if !self.has_selected_working_dir() {
+                    Some("requires_workspace")
+                } else if !crate::workspace::unity_test_tools_available(&self.working_dir) {
+                    Some("unity_test_framework_unavailable")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn tool_runtime_unavailable_reason(&self, name: &str) -> Option<&'static str> {
+        self.tool_environment_unavailable_reason(name)
+            .or_else(|| (!self.tool_supported_by_model(name)).then_some("model_vision_unsupported"))
+            .or_else(|| {
+                (self.subagent_tool_suppressed && name == "subagent")
+                    .then_some("subagent_depth_limit")
+            })
+    }
+
+    async fn resolve_effective_tool_names(&self) -> Vec<String> {
+        self.resolve_configured_tool_names()
+            .await
+            .into_iter()
+            .filter(|tool_name| {
+                self.tool_environment_unavailable_reason(tool_name)
+                    .is_none()
+            })
+            .collect()
     }
 
     fn disables_tool_load_configuration(&self) -> bool {
@@ -4382,6 +4472,21 @@ impl AgentInstance {
 
     fn is_knowledge_mutation_tool_name(name: &str) -> bool {
         matches!(name, "create_skill_package")
+    }
+
+    fn knowledge_tool_requires_checkout_runtime(name: &str) -> bool {
+        matches!(
+            name,
+            "knowledge_list"
+                | "knowledge_query"
+                | "knowledge_read"
+                | "knowledge_create"
+                | "knowledge_edit"
+                | "knowledge_move"
+                | "knowledge_delete"
+                | "create_skill_package"
+                | "skill_list"
+        )
     }
 
     fn tool_direct_load_overrides(&self) -> HashMap<String, bool> {
@@ -4557,19 +4662,20 @@ impl AgentInstance {
     /// per-agent override. Disabled tools must still surface in inspection
     /// UIs, so this set deliberately skips the enabled filter.
     async fn configured_tool_set(&self) -> HashSet<String> {
-        self.resolve_effective_tool_names()
+        self.resolve_configured_tool_names()
             .await
             .into_iter()
-            .filter_map(|name| self.canonical_tool_name(&name))
+            .map(|name| self.canonical_tool_name(&name).unwrap_or(name))
             .collect()
     }
 
     async fn allowed_tool_set(&self) -> HashSet<String> {
         let enabled_overrides = self.tool_enabled_overrides();
         let mut allowed: HashSet<String> = self
-            .configured_tool_set()
+            .resolve_effective_tool_names()
             .await
             .into_iter()
+            .filter_map(|name| self.canonical_tool_name(&name))
             .filter(|name| {
                 self.is_tool_enabled(name, &enabled_overrides) && self.tool_supported_by_model(name)
             })
@@ -4597,7 +4703,7 @@ impl AgentInstance {
             }
             if self.default_tool_load_mode(&canonical) == ToolLoadMode::Skill
                 && self.knowledge_access_mode.allows_tool(&canonical)
-                && self.tool_supported_by_model(&canonical)
+                && self.tool_runtime_unavailable_reason(&canonical).is_none()
             {
                 allowed.insert(canonical);
             }
@@ -5163,10 +5269,21 @@ impl AgentInstance {
             .filter(|name| {
                 !codex_native_tool_search || !matches!(name.as_str(), "tool_load" | "tool_call")
             })
-            .filter(|name| self.tool_supported_by_model(name))
-            .filter_map(|name| self.resolve_api_tool(name))
-            .map(|tool| self.contextualize_api_tool(tool))
-            .filter_map(|tool| {
+            .filter_map(|configured_name| {
+                let (tool, definition_available) = match self.resolve_api_tool(configured_name) {
+                    Some(tool) => (self.contextualize_api_tool(tool), true),
+                    None => (
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": configured_name,
+                                "description": "",
+                                "parameters": { "type": "object", "properties": {} },
+                            }
+                        }),
+                        false,
+                    ),
+                };
                 let (name, description) = extract_api_tool_name_and_description(&tool)?;
                 let direct_loaded = direct_tool_names.contains(&name);
                 let default_direct_load = self.default_direct_load_for_tool(&name);
@@ -5194,9 +5311,17 @@ impl AgentInstance {
                     "mcp"
                 } else if is_built_in_tool {
                     "builtIn"
-                } else {
+                } else if definition_available {
                     "skill"
+                } else {
+                    "unknown"
                 };
+                let unavailable_reason = if definition_available {
+                    self.tool_runtime_unavailable_reason(&name)
+                } else {
+                    Some("tool_definition_unavailable")
+                };
+                let runtime_available = unavailable_reason.is_none();
                 let load_reason = if Self::is_meta_tool(&name) {
                     "meta_tool"
                 } else if direct_load_override == Some(true) {
@@ -5236,6 +5361,8 @@ impl AgentInstance {
                         "canConfigureDirectLoad": can_configure_direct_load,
                         "enabled": enabled,
                         "canToggleEnabled": can_toggle_enabled,
+                        "runtimeAvailable": runtime_available,
+                        "unavailableReason": unavailable_reason,
                         "nativeLazy": native_lazy,
                         "toolSource": tool_source,
                         "descriptionOverridden": description_overridden,
@@ -5249,11 +5376,8 @@ impl AgentInstance {
     }
 
     pub async fn list_injected_prompt_items(&self) -> Vec<InjectedPromptItem> {
-        if !self.has_selected_working_dir() {
-            return Vec::new();
-        }
-
         let mut items = Vec::new();
+        let has_working_dir = self.has_selected_working_dir();
         let env_template = self.def.env_template.as_str();
         let injection_config = crate::commands::load_agent_injection_config_layers(
             self.app_agent_dir.as_ref(),
@@ -5270,22 +5394,25 @@ impl AgentInstance {
             meta: Some(injection_item_meta(&injection_config, "env", None)),
         });
 
-        if let Some(content) = crate::extra_workdirs::build_env_prompt_block(&self.working_dir) {
-            items.push(InjectedPromptItem {
-                id: "extra_workdirs".to_string(),
-                title: "Additional Working Directories".to_string(),
-                kind: "context".to_string(),
-                content,
-                source: "workspace".to_string(),
-                meta: Some(injection_item_meta(
-                    &injection_config,
-                    "extra_workdirs",
-                    None,
-                )),
-            });
+        if has_working_dir {
+            if let Some(content) = crate::extra_workdirs::build_env_prompt_block(&self.working_dir)
+            {
+                items.push(InjectedPromptItem {
+                    id: "extra_workdirs".to_string(),
+                    title: "Additional Working Directories".to_string(),
+                    kind: "context".to_string(),
+                    content,
+                    source: "workspace".to_string(),
+                    meta: Some(injection_item_meta(
+                        &injection_config,
+                        "extra_workdirs",
+                        None,
+                    )),
+                });
+            }
         }
 
-        if self.knowledge_access_mode.allows_context() {
+        if has_working_dir && self.knowledge_access_mode.allows_context() {
             if let Ok(rule_entries) =
                 build_l3_rule_entries(&self.working_dir, self.app_knowledge_dir.as_ref().as_ref())
             {
@@ -6388,6 +6515,23 @@ impl AgentInstance {
             env = env.replace("<physics_config>", &physics_config);
         } else {
             remove_block(&mut env, "unity");
+        }
+
+        if let Some(execution) = self.execution_context.as_ref() {
+            for binding in execution.service_bindings.values() {
+                if let Ok(resolved) = binding.resolve() {
+                    for fragment in resolved
+                        .service
+                        .context_provider()
+                        .prompt_fragments(execution)
+                    {
+                        if !fragment.content.trim().is_empty() {
+                            env.push_str("\n\n");
+                            env.push_str(fragment.content.trim());
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(powershell_runtime) = crate::tool::builtins::powershell_runtime_env_prompt() {
@@ -8131,10 +8275,13 @@ impl AgentInstance {
             .get(child_def_id)
             .ok_or_else(|| format!("AgentDef '{}' not found", child_def_id))?;
 
-        let child_session_id = store.create_session(
+        let child_session_id = store.create_session_scoped(
             &format!("sub:{}", child_def_id),
             Some(&self.session_id),
             self.workspace_id.as_deref(),
+            self.execution_context
+                .as_ref()
+                .map(|execution| execution.checkout_id.as_str()),
             "chat",
             Some(child_def_id),
         )?;
@@ -8160,6 +8307,7 @@ impl AgentInstance {
             self.cancel_waiter(),
         );
         child.subagent_depth = self.subagent_depth + 1;
+        child.execution_context = self.execution_context.clone();
         child.subagent_active = self.subagent_active.clone();
         child.session_undo_enabled = self.session_undo_enabled;
         child.async_tasks_enabled = self.async_tasks_enabled;
@@ -10232,7 +10380,11 @@ impl AgentInstance {
     {
         Box::pin(async move {
             let run_id = self.new_run_id();
-            store.try_start_run(&self.session_id, &run_id)?;
+            let run_scope = self
+                .execution_context
+                .as_ref()
+                .map(|execution| execution.persisted_run_scope());
+            store.try_start_run_scoped(&self.session_id, &run_id, run_scope.as_ref())?;
             self.run_with_run_id(
                 app_handle,
                 store,
@@ -10723,12 +10875,6 @@ impl AgentInstance {
 
         'agent_loop: loop {
             iteration += 1;
-            if iteration > MAX_TOOL_ITERATIONS {
-                return Err(format!(
-                    "Agent loop exceeded max iterations ({})",
-                    MAX_TOOL_ITERATIONS
-                ));
-            }
 
             if self.is_cancel_requested() {
                 self.clear_pending_knowledge_proposal(app_handle).await;
@@ -12104,15 +12250,23 @@ impl AgentInstance {
                                 .map(|(tc, _)| effective_name(tc).to_string())
                                 .collect(),
                         };
-                        match process_workspace_execution_lock(&self.working_dir)
-                            .acquire_with_diagnostics(
-                                lock_request,
-                                owner,
-                                self.cancel_waiter(),
-                                app_handle,
-                            )
-                            .await
-                        {
+                        let acquisition = match self.execution_context.as_ref() {
+                            Some(execution) => {
+                                process_workspace_execution_lock(&self.working_dir)
+                                    .acquire_with_diagnostics(
+                                        lock_request,
+                                        owner,
+                                        self.cancel_waiter(),
+                                        crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                                            execution.workspace.as_ref(),
+                                        ),
+                                        app_handle,
+                                    )
+                                    .await
+                            }
+                            None => Err(WorkspaceExecutionLockAcquireError::MissingWorkspaceScope),
+                        };
+                        match acquisition {
                             Ok(guard) => Some(guard),
                             Err(_) => {
                                 self.clear_pending_knowledge_proposal(app_handle).await;
@@ -12784,7 +12938,14 @@ impl AgentInstance {
                                     .await
                                 {
                                     if Self::changed_files_touch_view_tree(&entry.changed_files) {
-                                        crate::view::emit_view_tree_changed(app_handle);
+                                        if let Some(execution) = self.execution_context.as_ref() {
+                                            crate::view::emit_view_tree_changed_for_scope(
+                                                app_handle,
+                                                &crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                                                    execution.workspace.as_ref(),
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
                                 eprintln!(
@@ -13172,6 +13333,9 @@ impl AgentInstance {
         if name == "bash" {
             return Self::bash_is_readonly(args);
         }
+        if name == "python" {
+            return crate::tool::builtins::python_is_readonly(args);
+        }
         if name == "unity_execute" {
             return Self::unity_execute_is_readonly(args);
         }
@@ -13258,6 +13422,9 @@ impl AgentInstance {
         if target_name == "bash" {
             return self.bash_needs_primary_workspace_tracking(&target_args);
         }
+        if target_name == "python" {
+            return !crate::tool::builtins::python_is_readonly(&target_args);
+        }
         if target_name == "unity_execute" {
             return !Self::unity_execute_is_readonly(&target_args);
         }
@@ -13324,6 +13491,11 @@ impl AgentInstance {
                 && self.bash_needs_primary_workspace_tracking(&target_args))
             .then_some(WorkspaceExecutionLockRequest::Exclusive);
         }
+        if target_name == "python" {
+            return (self.session_undo_enabled
+                && !crate::tool::builtins::python_is_readonly(&target_args))
+            .then_some(WorkspaceExecutionLockRequest::Exclusive);
+        }
         if target_name == "unity_execute" {
             return (!Self::unity_execute_is_readonly(&target_args))
                 .then_some(WorkspaceExecutionLockRequest::Exclusive);
@@ -13383,6 +13555,9 @@ impl AgentInstance {
             // workspace mutations remain mutually exclusive with the group.
             "bash" => (self.session_undo_enabled
                 && self.bash_needs_primary_workspace_tracking(&target_args))
+            .then(|| WorkspaceExecutionLockRequest::ParallelOpaque(parallel_group_id.to_string())),
+            "python" => (self.session_undo_enabled
+                && !crate::tool::builtins::python_is_readonly(&target_args))
             .then(|| WorkspaceExecutionLockRequest::ParallelOpaque(parallel_group_id.to_string())),
             _ => self.workspace_execution_request_for_tool(&target_name, &target_args),
         }
@@ -14591,10 +14766,14 @@ impl AgentInstance {
         }
     }
 
-    async fn await_tool_result<F>(&self, future: F) -> ExecutedToolResult
-    where
-        F: std::future::Future<Output = ToolResult> + Send,
-    {
+    // Keep cancellation type-erased at this boundary. A generic `F` here makes
+    // `tokio::select!` embed every concrete tool future in the dispatch state
+    // machine; the Unity YAML read branch alone previously expanded this
+    // wrapper to 44,792 bytes in debug builds.
+    async fn await_tool_result(
+        &self,
+        future: std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + '_>>,
+    ) -> ExecutedToolResult {
         if self.is_cancel_requested() {
             return Self::interrupted_tool_result();
         }
@@ -14606,10 +14785,12 @@ impl AgentInstance {
         }
     }
 
-    async fn await_executed_tool_result<F>(&self, future: F) -> ExecutedToolResult
-    where
-        F: std::future::Future<Output = ExecutedToolResult> + Send,
-    {
+    async fn await_executed_tool_result(
+        &self,
+        future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = ExecutedToolResult> + Send + '_>,
+        >,
+    ) -> ExecutedToolResult {
         if self.is_cancel_requested() {
             return Self::interrupted_tool_result();
         }
@@ -14642,6 +14823,7 @@ impl AgentInstance {
             cancel_rx,
         );
         instance.parent_tool_call = self.parent_tool_call.clone();
+        instance.execution_context = self.execution_context.clone();
         instance.subagent_depth = self.subagent_depth;
         instance.subagent_active = self.subagent_active.clone();
         instance.subagent_tool_suppressed = self.subagent_tool_suppressed;
@@ -14731,6 +14913,11 @@ impl AgentInstance {
             &args,
             &assistant_message_id,
         );
+        let workspace_event_scope = self.execution_context.as_ref().map(|execution| {
+            crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                execution.workspace.as_ref(),
+            )
+        });
         let executor = self.clone_for_background_task(started.cancel_rx.clone());
 
         let initial_manager = manager.clone();
@@ -14783,10 +14970,21 @@ impl AgentInstance {
             };
             let mut cancel_rx = started.cancel_rx.clone();
             let workspace_guard = if let Some(request) = workspace_request {
-                match process_workspace_execution_lock(&working_dir)
-                    .acquire_with_diagnostics(request, owner, cancel_rx.clone(), &app_handle)
-                    .await
-                {
+                let acquisition = match workspace_event_scope {
+                    Some(scope) => {
+                        process_workspace_execution_lock(&working_dir)
+                            .acquire_with_diagnostics(
+                                request,
+                                owner,
+                                cancel_rx.clone(),
+                                scope,
+                                &app_handle,
+                            )
+                            .await
+                    }
+                    None => Err(WorkspaceExecutionLockAcquireError::MissingWorkspaceScope),
+                };
+                match acquisition {
                     Ok(guard) => Some(guard),
                     Err(_) => {
                         if let Some(snapshot) =
@@ -15123,6 +15321,58 @@ impl AgentInstance {
             });
         }
 
+        if Self::knowledge_tool_requires_checkout_runtime(&tc.name)
+            && self.execution_context.is_none()
+        {
+            return ExecutedToolResult::from_tool_result(ToolResult {
+                output: format!(
+                    "Tool '{}' requires a checkout-scoped AgentExecutionContext.",
+                    tc.name
+                ),
+                is_error: true,
+            });
+        }
+
+        let _service_binding = if let Some(owner) =
+            crate::workspace_service::service::owner_service_for_tool(&tc.name)
+        {
+            let Some(execution) = self.execution_context.as_ref() else {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!(
+                        "Tool '{}' requires a checkout-scoped {:?} service binding",
+                        tc.name, owner
+                    ),
+                    is_error: true,
+                });
+            };
+            let resolved =
+                if crate::workspace_service::service::service_ready_required_for_tool(&tc.name) {
+                    execution
+                        .resolve_service_ready(owner, UNITY_SERVICE_READY_TIMEOUT)
+                        .await
+                } else {
+                    execution.resolve_service(owner)
+                };
+            match resolved {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    let diagnostic = error
+                        .diagnostic_json()
+                        .map(|json| format!(" diagnostic={json}"))
+                        .unwrap_or_default();
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: format!(
+                            "Tool '{}' service binding error: {}{}",
+                            tc.name, error, diagnostic
+                        ),
+                        is_error: true,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
         if tc.name == "tool_load" {
             let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
             return ExecutedToolResult::from_tool_result(match self.cached_lazy_tool_renderer() {
@@ -15359,6 +15609,27 @@ impl AgentInstance {
             }
         }
 
+        // Keep the Unity execution future out of the generic tool-dispatch
+        // state machine. In debug builds the agent loop already owns a large
+        // poll frame; nesting the monolithic dispatcher, Unity bridge and a
+        // synchronous progress emit exhausted Tokio's 2 MiB worker stack.
+        // Boxing here also prevents the Unity future from inflating this
+        // preflight future's state and poll frame.
+        if tc.name == "unity_execute" {
+            return Box::pin(self.execute_unity_execute(app_handle, &tc.id, args, run_id)).await;
+        }
+
+        Box::pin(self.execute_single_tool_dispatch(app_handle, store, tc, args, run_id)).await
+    }
+
+    async fn execute_single_tool_dispatch(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        tc: &ToolCallInfo,
+        args: &serde_json::Value,
+        run_id: &str,
+    ) -> ExecutedToolResult {
         if tc.name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
             && crate::mcp::manager::resolve_wire_tool(&tc.name).is_some()
         {
@@ -15401,15 +15672,17 @@ impl AgentInstance {
                 }),
             }
         } else if tc.name == "read" {
-            self.await_executed_tool_result(self.execute_read(app_handle, args, &tc.id, run_id))
-                .await
+            self.await_executed_tool_result(Box::pin(
+                self.execute_read(app_handle, args, &tc.id, run_id),
+            ))
+            .await
         } else if tc.name == "subagent" {
-            self.await_executed_tool_result(
+            self.await_executed_tool_result(Box::pin(
                 self.execute_subagent(app_handle, store, args, &tc.id, run_id),
-            )
+            ))
             .await
         } else if tc.name == "ask_user_question" {
-            self.await_tool_result(self.execute_ask(app_handle, &tc.id, args, run_id))
+            self.await_tool_result(Box::pin(self.execute_ask(app_handle, &tc.id, args, run_id)))
                 .await
         } else if tc.name == "todowrite" {
             ExecutedToolResult::from_tool_result(self.execute_todowrite(store, args, run_id))
@@ -15418,68 +15691,129 @@ impl AgentInstance {
         } else if tc.name == "knowledge_list" {
             ExecutedToolResult::from_tool_result(self.execute_knowledge_list(args))
         } else if tc.name == "knowledge_query" {
-            self.await_tool_result(self.execute_knowledge_query(app_handle, &tc.id, args, run_id))
-                .await
+            self.await_tool_result(Box::pin(
+                self.execute_knowledge_query(app_handle, &tc.id, args, run_id),
+            ))
+            .await
         } else if tc.name == "knowledge_read" {
             self.execute_knowledge_read(app_handle, &tc.id, args, run_id)
                 .await
         } else if tc.name == "knowledge_create" {
-            self.await_tool_result(self.execute_knowledge_create(app_handle, args))
+            self.await_tool_result(Box::pin(self.execute_knowledge_create(app_handle, args)))
                 .await
         } else if tc.name == "knowledge_edit" {
-            self.await_tool_result(self.execute_knowledge_edit(app_handle, args))
+            self.await_tool_result(Box::pin(self.execute_knowledge_edit(app_handle, args)))
                 .await
         } else if tc.name == "knowledge_move" {
-            self.await_tool_result(self.execute_knowledge_move(app_handle, args))
+            self.await_tool_result(Box::pin(self.execute_knowledge_move(app_handle, args)))
                 .await
         } else if tc.name == "knowledge_delete" {
-            self.await_tool_result(self.execute_knowledge_delete(app_handle, args))
+            self.await_tool_result(Box::pin(self.execute_knowledge_delete(app_handle, args)))
                 .await
         } else if tc.name == "create_skill_package" {
-            self.await_tool_result(self.execute_create_skill_package(app_handle, args))
-                .await
+            self.await_tool_result(Box::pin(
+                self.execute_create_skill_package(app_handle, args),
+            ))
+            .await
         } else if tc.name == "skill_list" {
             ExecutedToolResult::from_tool_result(self.execute_skill_list(args))
         } else if tc.name == "unity_set_play_mode" {
-            self.await_tool_result(
+            self.await_tool_result(Box::pin(
                 self.execute_unity_set_play_mode(app_handle, &tc.id, args, run_id),
-            )
+            ))
             .await
-        } else if tc.name == "unity_execute" {
-            self.execute_unity_execute(app_handle, &tc.id, args, run_id)
-                .await
         } else if tc.name == "unity_recompile" {
-            self.await_tool_result(self.execute_unity_recompile(app_handle, &tc.id, args, run_id))
-                .await
+            self.await_tool_result(Box::pin(
+                self.execute_unity_recompile(app_handle, &tc.id, args, run_id),
+            ))
+            .await
         } else if tc.name == "unity_run_states" {
-            self.await_tool_result(self.execute_unity_run_states(app_handle, &tc.id, args, run_id))
-                .await
+            self.await_tool_result(Box::pin(
+                self.execute_unity_run_states(app_handle, &tc.id, args, run_id),
+            ))
+            .await
         } else if tc.name == "unity_capture_viewport" {
-            self.await_executed_tool_result(Self::execute_unity_capture_viewport(
+            self.await_executed_tool_result(Box::pin(Self::execute_unity_capture_viewport(
                 &self.working_dir,
                 args,
-            ))
+            )))
             .await
         } else if tc.name == "view_capture" {
-            self.await_executed_tool_result(self.execute_view_capture(app_handle, args))
+            self.await_executed_tool_result(Box::pin(self.execute_view_capture(app_handle, args)))
                 .await
         } else if tc.name == "unity_ref_search" {
-            ExecutedToolResult::from_tool_result(Self::execute_unity_ref_search(app_handle, args))
+            let Some(execution) = self.execution_context.as_ref() else {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output:
+                        "Tool 'unity_ref_search' requires a checkout-scoped AgentExecutionContext."
+                            .to_string(),
+                    is_error: true,
+                });
+            };
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            ExecutedToolResult::from_tool_result(Self::execute_unity_ref_search(
+                args,
+                execution.workspace.core().asset_db(),
+            ))
         } else if tc.name == "unity_asset_search" {
-            ExecutedToolResult::from_tool_result(Self::execute_unity_asset_search(app_handle, args))
+            let Some(execution) = self.execution_context.as_ref() else {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output:
+                        "Tool 'unity_asset_search' requires a checkout-scoped AgentExecutionContext."
+                            .to_string(),
+                    is_error: true,
+                });
+            };
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            ExecutedToolResult::from_tool_result(Self::execute_unity_asset_search(
+                args,
+                execution.workspace.core().asset_db(),
+            ))
         } else if tc.name == "unity_yaml_search" {
-            self.await_tool_result(Self::execute_unity_yaml_search(
+            let Some(execution) = self.execution_context.as_ref() else {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output:
+                        "Tool 'unity_yaml_search' requires a checkout-scoped AgentExecutionContext."
+                            .to_string(),
+                    is_error: true,
+                });
+            };
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            self.await_tool_result(Box::pin(Self::execute_unity_yaml_search(
                 app_handle,
                 &self.working_dir,
+                execution.workspace.core().asset_db(),
                 args,
-            ))
+            )))
             .await
         } else if tc.name == "unity_yaml_read" {
-            self.await_tool_result(Self::execute_unity_yaml_read(
+            let Some(execution) = self.execution_context.as_ref() else {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output:
+                        "Tool 'unity_yaml_read' requires a checkout-scoped AgentExecutionContext."
+                            .to_string(),
+                    is_error: true,
+                });
+            };
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            self.await_tool_result(Box::pin(Self::execute_unity_yaml_read(
                 app_handle,
                 &self.working_dir,
+                execution.workspace.core().asset_db(),
                 args,
-            ))
+            )))
             .await
         } else {
             let bash_git_knowledge_assessment = if tc.name == "bash" {
@@ -15512,11 +15846,11 @@ impl AgentInstance {
                 }));
             }
             let mut result = self
-                .await_tool_result(self.tool_registry.execute_with_context(
+                .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                     &tc.name,
                     args,
                     tool_context,
-                ))
+                )))
                 .await;
 
             if result.outcome == ToolRunOutcome::Done
@@ -16047,10 +16381,34 @@ impl AgentInstance {
 
     fn execute_config_query(&self, app_handle: &AppHandle, args: &serde_json::Value) -> ToolResult {
         let category = args.get("category").and_then(|v| v.as_str());
+        let workspace_scope = match self.execution_context.as_ref() {
+            Some(execution) => {
+                let registry = app_handle
+                    .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+                    .inner()
+                    .clone();
+                match registry.resolve_workspace_ref(
+                    &crate::workspace_service::WorkspaceRef::for_runtime(&execution.workspace),
+                ) {
+                    Ok(scope) => Some(scope),
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!("Failed to resolve config checkout scope: {error}"),
+                            is_error: true,
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
 
         let entries = match category {
-            Some(cat) => crate::config_registry::collect_by_category(app_handle, cat),
-            None => crate::config_registry::collect_all(app_handle),
+            Some(cat) => crate::config_registry::collect_by_category(
+                app_handle,
+                cat,
+                workspace_scope.as_ref(),
+            ),
+            None => crate::config_registry::collect_all(app_handle, workspace_scope.as_ref()),
         };
 
         match entries {
@@ -16290,10 +16648,21 @@ impl AgentInstance {
             parsed_types = Some(vec![prefix_type]);
         }
 
-        let knowledge_index_state = {
-            let state: tauri::State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>> =
-                app_handle.state();
-            state.inner().clone()
+        let Some(execution) = self.execution_context.as_ref() else {
+            return ToolResult {
+                output: "Tool 'knowledge_query' requires a checkout-scoped AgentExecutionContext."
+                    .to_string(),
+                is_error: true,
+            };
+        };
+        let knowledge_index_state = match execution.workspace.knowledge_index(app_handle) {
+            Ok(state) => state,
+            Err(error) => {
+                return ToolResult {
+                    output: format!("Failed to open workspace knowledge index: {error}"),
+                    is_error: true,
+                };
+            }
         };
 
         let progress_handle = app_handle.clone();
@@ -16766,11 +17135,13 @@ impl AgentInstance {
         app_handle: &AppHandle,
         source: &str,
     ) -> Result<(), String> {
-        let knowledge_index_state = {
-            let state: tauri::State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>> =
-                app_handle.state();
-            state.inner().clone()
-        };
+        let execution = self.execution_context.as_ref().ok_or_else(|| {
+            format!(
+                "Knowledge reconciliation '{}' requires a checkout-scoped AgentExecutionContext.",
+                source
+            )
+        })?;
+        let knowledge_index_state = execution.workspace.knowledge_index(app_handle)?;
         crate::commands::reconcile_and_emit_knowledge_changed(
             app_handle,
             &self.working_dir,
@@ -17994,11 +18365,10 @@ impl AgentInstance {
     }
 
     pub(crate) fn execute_unity_ref_search(
-        app_handle: &AppHandle,
         args: &serde_json::Value,
+        asset_db: Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
     ) -> ToolResult {
         use crate::asset_db::types::{guid_to_hex, AssetKind};
-        use crate::asset_db::AssetDbState;
 
         let asset_path = match args.get("asset_path").and_then(|v| v.as_str()) {
             Some(p) => p.to_string(),
@@ -18076,19 +18446,7 @@ impl AgentInstance {
             None => None,
         };
 
-        let ref_graph_state: tauri::State<'_, AssetDbState> = match app_handle.try_state() {
-            Some(s) => s,
-            None => {
-                return ToolResult {
-                    output:
-                        "AssetDbState not available. The reference graph has not been initialized."
-                            .to_string(),
-                    is_error: true,
-                };
-            }
-        };
-
-        let guard = match ref_graph_state.0.lock() {
+        let guard = match asset_db.lock() {
             Ok(g) => g,
             Err(e) => {
                 return ToolResult {
@@ -18407,21 +18765,20 @@ impl AgentInstance {
         }
     }
 
-    fn unity_yaml_project_context<'a>(
-        app_handle: &'a AppHandle,
+    fn unity_yaml_project_context(
         working_dir: &str,
         file_path_arg: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
     ) -> (
-        Option<tauri::State<'a, crate::asset_db::AssetDbState>>,
+        Option<Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>>,
         Option<std::path::PathBuf>,
         std::path::PathBuf,
     ) {
-        let ref_graph_state: Option<tauri::State<'_, crate::asset_db::AssetDbState>> =
-            app_handle.try_state();
+        let ref_graph_state = Some(Arc::clone(asset_db));
 
         let project_root: Option<std::path::PathBuf> = ref_graph_state
             .as_ref()
-            .and_then(|s| s.0.lock().ok())
+            .and_then(|s| s.lock().ok())
             .and_then(|g| g.as_ref().map(|rg| rg.project_root().to_path_buf()))
             .or_else(|| {
                 // AssetDb may not be loaded yet (cold start); fall back to the
@@ -18654,6 +19011,7 @@ impl AgentInstance {
     fn load_yaml_property_tree(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
         use_cache: bool,
     ) -> Result<Arc<crate::unity_serialized_property::property_tree::YamlPropertyTree>, ToolResult>
@@ -18672,7 +19030,7 @@ impl AgentInstance {
             }
         }
         let (ref_graph_state, project_root, _) =
-            Self::unity_yaml_project_context(app_handle, working_dir, &path.asset_path);
+            Self::unity_yaml_project_context(working_dir, &path.asset_path, asset_db);
         let content = Self::read_unity_yaml_content(&path.absolute_asset_path)?;
         if !Self::is_unity_yaml_content(&content) {
             if Self::looks_binary_content(&content) {
@@ -18761,6 +19119,7 @@ impl AgentInstance {
     async fn append_unity_subscene_authoring_hierarchy(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         requested_path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
         snapshot: &crate::view::UnitySerializedPropertySnapshot,
         mut output: String,
@@ -18801,6 +19160,7 @@ impl AgentInstance {
         match Self::read_unity_subscene_authoring_hierarchy(
             app_handle,
             working_dir,
+            asset_db,
             &subscene_path,
             args,
             hierarchy_fields,
@@ -18823,6 +19183,7 @@ impl AgentInstance {
     async fn read_unity_subscene_authoring_hierarchy(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
         args: &serde_json::Value,
         hierarchy_fields: crate::unity_serialized_property::property_tree::HierarchyFieldSelection,
@@ -18860,7 +19221,7 @@ impl AgentInstance {
             }
         }
 
-        let tree = Self::load_yaml_property_tree(app_handle, working_dir, path, true)
+        let tree = Self::load_yaml_property_tree(app_handle, working_dir, asset_db, path, true)
             .map_err(|result| result.output)?;
         let auto_expand_limit = Self::unity_property_tree_auto_expand_char_limit(args);
         let snapshot = tree
@@ -18888,6 +19249,7 @@ impl AgentInstance {
     async fn finish_unity_property_tree_read(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         requested_path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
         snapshot: &crate::view::UnitySerializedPropertySnapshot,
         output: String,
@@ -18898,6 +19260,7 @@ impl AgentInstance {
         let output = Self::append_unity_subscene_authoring_hierarchy(
             app_handle,
             working_dir,
+            asset_db,
             requested_path,
             snapshot,
             output,
@@ -18914,6 +19277,7 @@ impl AgentInstance {
     async fn execute_unity_property_tree_read(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         args: &serde_json::Value,
     ) -> ToolResult {
         let path = match Self::unity_property_tree_path_arg(working_dir, args) {
@@ -18960,6 +19324,7 @@ impl AgentInstance {
                             return Self::finish_unity_property_tree_read(
                                 app_handle,
                                 working_dir,
+                                asset_db,
                                 &path,
                                 &snapshot,
                                 selected,
@@ -18980,6 +19345,7 @@ impl AgentInstance {
                             return Self::finish_unity_property_tree_read(
                                 app_handle,
                                 working_dir,
+                                asset_db,
                                 &path,
                                 &snapshot,
                                 requested_outline.take().unwrap_or(output),
@@ -18995,6 +19361,7 @@ impl AgentInstance {
                             return Self::finish_unity_property_tree_read(
                                 app_handle,
                                 working_dir,
+                                asset_db,
                                 &path,
                                 &snapshot,
                                 requested_outline.take().unwrap_or(output),
@@ -19028,7 +19395,8 @@ impl AgentInstance {
         }
 
         // Disk is a strict fallback after the connected Editor path fails.
-        let disk_tree = Self::load_yaml_property_tree(app_handle, working_dir, &path, true);
+        let disk_tree =
+            Self::load_yaml_property_tree(app_handle, working_dir, asset_db, &path, true);
         let complete_candidate = disk_tree.as_ref().ok().and_then(|tree| {
             tree.read_complete_within_budget_and_array_limit(&path, auto_expand_limit, array_limit)
                 .ok()
@@ -19043,6 +19411,7 @@ impl AgentInstance {
                 return Self::finish_unity_property_tree_read(
                     app_handle,
                     working_dir,
+                    asset_db,
                     &path,
                     &candidate.snapshot,
                     output,
@@ -19067,6 +19436,7 @@ impl AgentInstance {
                     Self::finish_unity_property_tree_read(
                         app_handle,
                         working_dir,
+                        asset_db,
                         &path,
                         &snapshot,
                         output,
@@ -19119,6 +19489,7 @@ impl AgentInstance {
     async fn execute_unity_property_tree_search(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         args: &serde_json::Value,
     ) -> ToolResult {
         let path = match Self::unity_property_tree_path_arg(working_dir, args) {
@@ -19165,8 +19536,12 @@ impl AgentInstance {
                 }
             }
         }
-        let mut result =
-            Self::execute_unity_property_tree_search_from_disk(app_handle, working_dir, args);
+        let mut result = Self::execute_unity_property_tree_search_from_disk(
+            app_handle,
+            working_dir,
+            asset_db,
+            args,
+        );
         if !result.is_error {
             if let Some(reason) = live_fallback_reason.as_deref() {
                 result.output = Self::unity_yaml_source_banner(Some(reason)) + &result.output;
@@ -19178,16 +19553,18 @@ impl AgentInstance {
     fn execute_unity_property_tree_search_from_disk(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         args: &serde_json::Value,
     ) -> ToolResult {
         let path = match Self::unity_property_tree_path_arg(working_dir, args) {
             Ok(path) => path,
             Err(result) => return result,
         };
-        let tree = match Self::load_yaml_property_tree(app_handle, working_dir, &path, false) {
-            Ok(tree) => tree,
-            Err(result) => return result,
-        };
+        let tree =
+            match Self::load_yaml_property_tree(app_handle, working_dir, asset_db, &path, false) {
+                Ok(tree) => tree,
+                Err(result) => return result,
+            };
         let options = Self::unity_property_tree_search_options(args);
         match tree.search(&path, &options) {
             Ok(matches) => ToolResult {
@@ -19490,12 +19867,19 @@ impl AgentInstance {
     pub(crate) async fn execute_unity_yaml_search(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         args: &serde_json::Value,
     ) -> ToolResult {
         use crate::unity_yaml as yaml_parser;
 
         if args.get("path").is_some() {
-            return Self::execute_unity_property_tree_search(app_handle, working_dir, args).await;
+            return Self::execute_unity_property_tree_search(
+                app_handle,
+                working_dir,
+                &asset_db,
+                args,
+            )
+            .await;
         }
 
         let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
@@ -19530,7 +19914,7 @@ impl AgentInstance {
         }
 
         let (ref_graph_state, _project_root, abs_path) =
-            Self::unity_yaml_project_context(app_handle, working_dir, &file_path_arg);
+            Self::unity_yaml_project_context(working_dir, &file_path_arg, &asset_db);
         let mut live_fallback_reason: Option<String> = None;
         if Self::unity_yaml_live_eligible(working_dir, &abs_path) {
             let payload = Self::unity_yaml_search_editor_payload(&file_path_arg, &search_options);
@@ -19575,6 +19959,7 @@ impl AgentInstance {
             return Self::execute_unity_property_tree_search(
                 app_handle,
                 working_dir,
+                &asset_db,
                 &property_args,
             )
             .await;
@@ -19621,12 +20006,19 @@ impl AgentInstance {
     pub(crate) async fn execute_unity_yaml_read(
         app_handle: &AppHandle,
         working_dir: &str,
+        asset_db: Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
         args: &serde_json::Value,
     ) -> ToolResult {
         use crate::unity_yaml as yaml_parser;
 
         if args.get("path").is_some() {
-            return Self::execute_unity_property_tree_read(app_handle, working_dir, args).await;
+            return Self::execute_unity_property_tree_read(
+                app_handle,
+                working_dir,
+                &asset_db,
+                args,
+            )
+            .await;
         }
 
         let file_path_arg = match Self::unity_yaml_file_path_arg(args) {
@@ -19657,15 +20049,20 @@ impl AgentInstance {
         let (window_limit, window_offset) = Self::parse_unity_yaml_read_window(args);
 
         let (ref_graph_state, project_root, abs_path) =
-            Self::unity_yaml_project_context(app_handle, working_dir, &file_path_arg);
+            Self::unity_yaml_project_context(working_dir, &file_path_arg, &asset_db);
         let ext = Self::unity_yaml_file_extension(&abs_path);
         let is_hierarchical = yaml_parser::is_hierarchical_file(&ext);
 
         if !is_hierarchical {
             let mut property_args = args.clone();
             property_args["path"] = serde_json::Value::String(file_path_arg.clone());
-            return Self::execute_unity_property_tree_read(app_handle, working_dir, &property_args)
-                .await;
+            return Self::execute_unity_property_tree_read(
+                app_handle,
+                working_dir,
+                &asset_db,
+                &property_args,
+            )
+            .await;
         }
 
         if is_hierarchical && object_path.is_none() {
@@ -20272,8 +20669,11 @@ impl AgentInstance {
         Some(crate::unity_yaml::SourcePrefabContext { tree, docs })
     }
 
-    fn ensure_ref_graph_initialized(app_handle: &AppHandle, working_dir: &str) {
-        use crate::asset_db::{AssetDb, AssetDbState};
+    fn ensure_ref_graph_initialized(
+        working_dir: &str,
+        ref_graph_state: &Option<Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>>,
+    ) {
+        use crate::asset_db::AssetDb;
 
         let project_root = std::path::Path::new(working_dir);
         if !project_root.join("Assets").is_dir() {
@@ -20312,8 +20712,8 @@ impl AgentInstance {
                     "[unity_yaml_read] auto-scan complete: {} nodes, {} edges, {}ms",
                     stats.nodes_added, stats.edges_added, stats.elapsed_ms
                 );
-                if let Some(ref_graph_state) = app_handle.try_state::<AssetDbState>() {
-                    if let Ok(mut guard) = ref_graph_state.0.lock() {
+                if let Some(ref_graph_state) = ref_graph_state {
+                    if let Ok(mut guard) = ref_graph_state.lock() {
                         *guard = Some(graph);
                     }
                 }
@@ -20325,7 +20725,7 @@ impl AgentInstance {
     }
 
     fn build_asset_object_map_for_refs(
-        ref_graph_state: &Option<tauri::State<'_, crate::asset_db::AssetDbState>>,
+        ref_graph_state: &Option<Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>>,
         refs: &[crate::unity_yaml::RawYamlRef],
     ) -> std::collections::HashMap<(crate::asset_db::types::Guid, i64), String> {
         use std::collections::HashSet;
@@ -20346,7 +20746,7 @@ impl AgentInstance {
 
         ref_graph_state
             .as_ref()
-            .and_then(|state| state.0.lock().ok())
+            .and_then(|state| state.lock().ok())
             .and_then(|guard| {
                 guard
                     .as_ref()
@@ -20370,9 +20770,9 @@ impl AgentInstance {
     }
 
     fn build_guid_map_for_docs(
-        app_handle: &AppHandle,
+        _app_handle: &AppHandle,
         working_dir: &str,
-        ref_graph_state: &Option<tauri::State<'_, crate::asset_db::AssetDbState>>,
+        ref_graph_state: &Option<Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>>,
         docs: &[crate::unity_yaml::YamlDoc],
         lines: &[&str],
     ) -> std::collections::HashMap<crate::asset_db::types::Guid, String> {
@@ -20402,7 +20802,7 @@ impl AgentInstance {
 
         let db_map = ref_graph_state
             .as_ref()
-            .and_then(|rgs| rgs.0.lock().ok())
+            .and_then(|rgs| rgs.lock().ok())
             .and_then(|guard| {
                 guard
                     .as_ref()
@@ -20417,11 +20817,11 @@ impl AgentInstance {
             // the blocking work off the async worker so the executor isn't
             // starved while the scan runs.
             tokio::task::block_in_place(|| {
-                Self::ensure_ref_graph_initialized(app_handle, working_dir)
+                Self::ensure_ref_graph_initialized(working_dir, ref_graph_state)
             });
             ref_graph_state
                 .as_ref()
-                .and_then(|rgs| rgs.0.lock().ok())
+                .and_then(|rgs| rgs.lock().ok())
                 .and_then(|guard| {
                     guard
                         .as_ref()
@@ -20432,11 +20832,9 @@ impl AgentInstance {
     }
 
     pub(crate) fn execute_unity_asset_search(
-        app_handle: &AppHandle,
         args: &serde_json::Value,
+        asset_db: Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
     ) -> ToolResult {
-        use crate::asset_db::AssetDbState;
-
         let q = match args.get("q").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => {
@@ -20482,18 +20880,7 @@ impl AgentInstance {
             })
             .unwrap_or_default();
 
-        let ref_graph_state: tauri::State<'_, AssetDbState> = match app_handle.try_state() {
-            Some(s) => s,
-            None => {
-                return ToolResult {
-                    output: "AssetDbState not available. The asset index has not been initialized."
-                        .to_string(),
-                    is_error: true,
-                };
-            }
-        };
-
-        let guard = match ref_graph_state.0.lock() {
+        let guard = match asset_db.lock() {
             Ok(g) => g,
             Err(e) => {
                 return ToolResult {
@@ -20596,10 +20983,13 @@ impl AgentInstance {
             self.id, agent_def.name, subagent_type, description
         );
 
-        let child_session_id = match store.create_session(
+        let child_session_id = match store.create_session_scoped(
             &format!("sub:{}", description),
             Some(&self.session_id),
             self.workspace_id.as_deref(),
+            self.execution_context
+                .as_ref()
+                .map(|execution| execution.checkout_id.as_str()),
             "chat",
             Some(&agent_def.id),
         ) {
@@ -20636,6 +21026,7 @@ impl AgentInstance {
             run_id.to_string(),
             tool_call_id.to_string(),
         ));
+        child.execution_context = self.execution_context.clone();
         child.subagent_depth = self.subagent_depth + 1;
         child.subagent_active = self.subagent_active.clone();
         child.session_undo_enabled = self.session_undo_enabled;
@@ -20660,8 +21051,12 @@ impl AgentInstance {
         // inject pending input and cancel this subagent without cancelling its
         // parent. The start gate ensures RunStart cannot race ahead of the map.
         let child_run_id = child.new_run_id();
+        let child_run_scope = self
+            .execution_context
+            .as_ref()
+            .map(|execution| execution.persisted_run_scope());
         store
-            .try_start_run(&child_session_id, &child_run_id)
+            .try_start_run_scoped(&child_session_id, &child_run_id, child_run_scope.as_ref())
             .map_err(|error| format!("Failed to start subagent run: {}", error))?;
         let child_partial_assistant = child.partial_assistant.clone();
         let child_app_handle = app_handle.clone();
@@ -22699,6 +23094,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: system_prompt.to_string(),
                 env_template: env_template.to_string(),
                 tools: Vec::new(),
@@ -22880,6 +23276,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: "{{#knowledge}}\n<knowledge_context>\n{{/knowledge}}".to_string(),
                 tools,
@@ -22907,6 +23304,36 @@ PrefabInstance:
             HashMap::new(),
             cancel_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn app_agent_preview_without_workspace_keeps_all_configured_tools() {
+        let instance = test_agent_instance_with_tools_and_mode(
+            String::new(),
+            vec![
+                "read".to_string(),
+                "list".to_string(),
+                "knowledge_query".to_string(),
+            ],
+            KnowledgeAccessMode::Full,
+        );
+
+        let items = instance.list_injected_prompt_items().await;
+
+        assert!(items.iter().any(|item| item.id == "env"));
+        assert!(items.iter().any(|item| item.title == "read"));
+        assert!(items.iter().any(|item| item.title == "list"));
+        assert!(items.iter().any(|item| item.title == "knowledge_query"));
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.title == "knowledge_query")
+                .and_then(|item| item.meta.as_ref())
+                .and_then(|meta| meta.get("unavailableReason"))
+                .and_then(|value| value.as_str()),
+            Some("requires_workspace")
+        );
+        assert!(items.iter().all(|item| item.id != "knowledge_context"));
     }
 
     fn test_custom_backend(supports_vision: bool) -> crate::agent::instance::LlmBackend {
@@ -22971,7 +23398,7 @@ PrefabInstance:
     }
 
     #[tokio::test]
-    async fn vision_required_tools_are_hidden_from_non_vision_models() {
+    async fn vision_required_tools_stay_visible_in_preview_but_out_of_requests() {
         let mut instance = test_agent_instance_with_tools_and_mode(
             String::new(),
             vec![
@@ -22998,15 +23425,23 @@ PrefabInstance:
 
         let preview = instance.available_tool_prompt_items().await;
         assert!(preview.iter().any(|item| item.title == "read"));
-        assert!(!preview.iter().any(|item| item.title == "view_capture"));
-        assert!(!preview
+        assert!(preview.iter().any(|item| item.title == "view_capture"));
+        assert!(preview
             .iter()
             .any(|item| item.title == "unity_capture_viewport"));
+        assert_eq!(
+            tool_meta_bool(&preview, "view_capture", "runtimeAvailable"),
+            Some(false)
+        );
+        assert_eq!(
+            tool_meta_string(&preview, "view_capture", "unavailableReason").as_deref(),
+            Some("model_vision_unsupported")
+        );
 
         instance.backend = test_custom_backend(true);
         let allowed = instance.allowed_tool_set().await;
         assert!(allowed.contains("view_capture"));
-        assert!(allowed.contains("unity_capture_viewport"));
+        assert!(!allowed.contains("unity_capture_viewport"));
     }
 
     #[tokio::test]
@@ -23090,6 +23525,67 @@ PrefabInstance:
             .and_then(|value| value.as_bool())
     }
 
+    fn tool_meta_string(items: &[InjectedPromptItem], name: &str, key: &str) -> Option<String> {
+        items
+            .iter()
+            .find(|item| item.title == name)
+            .and_then(|item| item.meta.as_ref())
+            .and_then(|meta| meta.get(key))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn workspace_preview_lists_unity_tools_with_missing_workspace_reason() {
+        let temp = tempdir().expect("temp dir");
+        let mut instance = test_agent_instance_with_tools_and_mode(
+            temp.path().to_string_lossy().to_string(),
+            vec!["read".to_string(), "unity_execute".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+        let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(temp.path())
+            .expect("workspace identity");
+        let runtime = crate::workspace_service::WorkspaceRuntime::new(identity, Vec::new(), 1);
+        instance.set_execution_context(Arc::new(
+            crate::workspace_service::AgentExecutionContext::new(runtime, HashMap::new()),
+        ));
+
+        let allowed = instance.allowed_tool_set().await;
+        assert!(allowed.contains("read"));
+        assert!(!allowed.contains("unity_execute"));
+
+        let preview = instance.available_tool_prompt_items().await;
+        assert!(preview.iter().any(|item| item.title == "unity_execute"));
+        assert_eq!(
+            tool_meta_bool(&preview, "unity_execute", "runtimeAvailable"),
+            Some(false)
+        );
+        assert_eq!(
+            tool_meta_string(&preview, "unity_execute", "unavailableReason").as_deref(),
+            Some("requires_unity_workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_keeps_configured_tools_when_their_definition_is_missing() {
+        let instance = test_agent_instance_with_tools_and_mode(
+            String::new(),
+            vec!["read".to_string(), "missing_test_tool".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+
+        assert!(!instance
+            .allowed_tool_set()
+            .await
+            .contains("missing_test_tool"));
+        let preview = instance.available_tool_prompt_items().await;
+        assert!(preview.iter().any(|item| item.title == "missing_test_tool"));
+        assert_eq!(
+            tool_meta_string(&preview, "missing_test_tool", "unavailableReason").as_deref(),
+            Some("tool_definition_unavailable")
+        );
+    }
+
     #[tokio::test]
     async fn codex_native_preview_hides_fallback_meta_tools() {
         let temp = tempdir().expect("temp dir");
@@ -23132,6 +23628,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec![
@@ -23203,6 +23700,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec![
@@ -23764,6 +24262,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec![
@@ -23866,6 +24365,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec![
@@ -23953,6 +24453,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec!["edit".to_string(), "web_fetch".to_string()],
@@ -24037,6 +24538,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec![
@@ -24109,6 +24611,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec![
@@ -24179,6 +24682,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec!["read".to_string(), "skill_special".to_string()],
@@ -24373,6 +24877,7 @@ PrefabInstance:
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec![
@@ -24641,6 +25146,7 @@ Create a reusable Skill.
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec!["skill_list".to_string()],
@@ -24753,6 +25259,7 @@ Search, install, audit, and export a plugin.
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec!["read".to_string()],
@@ -27455,6 +27962,7 @@ Search, install, audit, and export a plugin.
                 id: "test".to_string(),
                 name: "Test".to_string(),
                 description: String::new(),
+                project_types: Vec::new(),
                 system_prompt: String::new(),
                 env_template: String::new(),
                 tools: vec!["read".to_string(), "subagent".to_string()],

@@ -4,27 +4,26 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { X } from "lucide";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
-import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
+import { knowledgeGetLexicalRebuildStatus } from "../services/knowledge";
 import {
-  knowledgeCloseLexicalProgressWindow,
-  knowledgeGetLexicalRebuildStatus,
-} from "../services/knowledge";
-import {
-  KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
   KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE,
+  getKnowledgeLexicalProgressWindowWorkspaceRef,
 } from "../services/knowledgeLexicalProgressWindow";
 import type { LexicalRebuildStatus } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 type CloseReason = "success" | "error" | null;
 
 const appWindow = getCurrentWindow();
+const workspaceContextStore = useWorkspaceContextStore();
+const workspaceRef = getKnowledgeLexicalProgressWindowWorkspaceRef();
 const statusSnapshot = ref<LexicalRebuildStatus | null>(null);
 const closeReason = ref<CloseReason>(null);
 const statusError = ref("");
 
 let closeTimer: ReturnType<typeof setTimeout> | null = null;
-let statusUnlisten: RuntimeUnsubscribe | null = null;
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
 function clearCloseTimer() {
   if (!closeTimer) return;
@@ -42,17 +41,12 @@ function formatPercent(value: number): string {
 
 async function destroyWindow() {
   clearCloseTimer();
-  statusUnlisten?.();
-  statusUnlisten = null;
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
   try {
     await appWindow.setClosable(true);
   } catch {
     // ignore unsupported close state changes on teardown
-  }
-  try {
-    await knowledgeCloseLexicalProgressWindow();
-  } catch {
-    // fall back to local window handles when the command is unavailable
   }
   try {
     await appWindow.destroy();
@@ -121,9 +115,13 @@ function applyStatus(nextStatus: LexicalRebuildStatus) {
 }
 
 async function loadInitialStatus() {
+  if (!workspaceRef) return;
   try {
-    const nextStatus = await knowledgeGetLexicalRebuildStatus();
+    const nextStatus = await knowledgeGetLexicalRebuildStatus(workspaceRef);
     applyStatus(nextStatus);
+    if (nextStatus.running) {
+      pollTimer = setTimeout(() => void loadInitialStatus(), 300);
+    }
   } catch (cause) {
     statusError.value = normalizeAppError(cause).message;
   }
@@ -204,14 +202,9 @@ async function initializeWindow() {
     // ignore unsupported close state changes
   }
 
-  try {
-    statusUnlisten = await getLocusRuntime().subscribe<LexicalRebuildStatus>(
-      KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
-      applyStatus,
-    );
-  } catch {
-    // initial status still renders if event subscription is unavailable
-  }
+  if (!workspaceRef) return;
+  await workspaceContextStore.initialize(appWindow.label, "main");
+  await workspaceContextStore.focusCheckout(workspaceRef.checkoutId);
 
   await loadInitialStatus();
 }
@@ -222,7 +215,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   clearCloseTimer();
-  statusUnlisten?.();
+  if (pollTimer) clearTimeout(pollTimer);
 });
 </script>
 

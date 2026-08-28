@@ -11,10 +11,12 @@ import {
   prunePendingConflictResolutionKeys,
 } from "./conflictResolutionState";
 import BaseButton from "../ui/BaseButton.vue";
+import type { WorkspaceRef } from "../../services/project";
 
 const { hideMeta } = useHideMeta();
 
 const props = defineProps<{
+  workspaceRef?: WorkspaceRef | null;
   unmergedFiles: UnmergedFileEntry[];
   stagedFiles: GitFileChange[];
   operation: MergeOperation | null;
@@ -22,6 +24,20 @@ const props = defineProps<{
   hasUnresolvedFiles: boolean;
   selectedConflictPath?: string | null;
 }>();
+
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
+  return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 const emit = defineEmits<{
   (e: "selectConflictFile", file: UnmergedFileEntry): void;
@@ -70,6 +86,19 @@ watch(() => props.unmergedFiles, (files) => {
   );
 }, { immediate: true });
 
+watch(
+  () => [
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  () => {
+    actionLoading.value = false;
+    actionError.value = null;
+    showAbortConfirm.value = false;
+    pendingResolutionKeys.value = new Set();
+  },
+);
+
 function addPendingResolution(file: UnmergedFileEntry): string {
   const key = buildConflictResolutionKey(file);
   const next = new Set(pendingResolutionKeys.value);
@@ -91,25 +120,31 @@ function isFileResolving(file: UnmergedFileEntry): boolean {
 
 async function doAction(action: "continue" | "skip" | "abort") {
   if (!props.operation) return;
+  const workspaceRef = captureWorkspaceRef();
   actionLoading.value = true;
   actionError.value = null;
   try {
-    await gitMergeAction(action, props.operation.kind);
+    await gitMergeAction(action, props.operation.kind, workspaceRef);
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     emit("actionDone");
   } catch (e) {
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     actionError.value = normalizeAppError(e).message;
   } finally {
-    actionLoading.value = false;
+    if (isCurrentWorkspaceRef(workspaceRef)) actionLoading.value = false;
   }
 }
 
 async function resolveFile(file: UnmergedFileEntry, stage: "left" | "right" | "delete") {
+  const workspaceRef = captureWorkspaceRef();
   const resolutionKey = addPendingResolution(file);
   actionError.value = null;
   try {
-    await gitMergeApply(file.path, { takeStage: { stage } });
+    await gitMergeApply(file.path, { takeStage: { stage } }, workspaceRef);
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     emit("fileResolved", file);
   } catch (e) {
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     removePendingResolution(resolutionKey);
     actionError.value = normalizeAppError(e).message;
   }

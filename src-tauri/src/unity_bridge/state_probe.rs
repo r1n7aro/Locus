@@ -246,11 +246,6 @@ impl SemanticPhase {
     pub fn transient(self) -> bool {
         matches!(self, SemanticPhase::Starting | SemanticPhase::Reloading)
     }
-
-    /// Does this state need the user to look at the editor?
-    pub fn needs_user(self) -> bool {
-        matches!(self, SemanticPhase::Unresponsive | SemanticPhase::Crashed)
-    }
 }
 
 /// The fused semantic state handed to the UI / agent / sidecar.
@@ -266,7 +261,6 @@ pub struct SemanticState {
     /// `high` | `medium` | `low`.
     pub confidence: String,
     pub transient: bool,
-    pub needs_user: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     pub checked_at_ms: u64,
@@ -293,7 +287,6 @@ impl SemanticState {
             source: source.to_string(),
             confidence: confidence.to_string(),
             transient: phase.transient(),
-            needs_user: phase.needs_user(),
             detail,
             checked_at_ms: unix_now_ms(),
             process: ObservedProcessState {
@@ -499,7 +492,27 @@ impl UnityStateProbeStatus {
 
 struct ProbeRuntime {
     enabled: bool,
-    last_status: UnityStateProbeStatus,
+    project_scopes: HashMap<String, WorkspaceStatusKey>,
+    workspace_statuses: HashMap<WorkspaceStatusKey, UnityStateProbeStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WorkspaceStatusKey {
+    checkout_id: String,
+    workspace_generation: u64,
+    service_instance_id: Option<String>,
+    service_generation: Option<u64>,
+}
+
+impl From<&crate::workspace_service::event::WorkspaceEventScope> for WorkspaceStatusKey {
+    fn from(scope: &crate::workspace_service::event::WorkspaceEventScope) -> Self {
+        Self {
+            checkout_id: scope.checkout_id.to_string(),
+            workspace_generation: scope.workspace_generation,
+            service_instance_id: scope.service_instance_id.as_ref().map(ToString::to_string),
+            service_generation: scope.service_generation,
+        }
+    }
 }
 
 fn runtime() -> &'static Mutex<ProbeRuntime> {
@@ -507,19 +520,107 @@ fn runtime() -> &'static Mutex<ProbeRuntime> {
     RT.get_or_init(|| {
         Mutex::new(ProbeRuntime {
             enabled: true,
-            last_status: UnityStateProbeStatus::base(true, UnityStateProbeTier::Inactive),
+            project_scopes: HashMap::new(),
+            workspace_statuses: HashMap::new(),
         })
     })
+}
+
+fn base_status(enabled: bool) -> UnityStateProbeStatus {
+    if enabled {
+        UnityStateProbeStatus::base(true, UnityStateProbeTier::Inactive)
+    } else {
+        UnityStateProbeStatus::base(false, UnityStateProbeTier::Disabled)
+    }
+}
+
+pub fn bind_workspace_scope(
+    project_path: &str,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    let Ok(mut rt) = runtime().lock() else {
+        return;
+    };
+    let key = WorkspaceStatusKey::from(scope);
+    if let Some(previous) = rt
+        .project_scopes
+        .insert(project_key(project_path), key.clone())
+    {
+        if previous != key {
+            rt.workspace_statuses.remove(&previous);
+        }
+    }
+    let enabled = rt.enabled;
+    rt.workspace_statuses
+        .entry(key)
+        .or_insert_with(|| base_status(enabled));
+}
+
+pub fn unbind_workspace_scope(
+    project_path: &str,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    let Ok(mut rt) = runtime().lock() else {
+        return;
+    };
+    let expected = WorkspaceStatusKey::from(scope);
+    let project = project_key(project_path);
+    if rt.project_scopes.get(&project) == Some(&expected) {
+        rt.project_scopes.remove(&project);
+        rt.workspace_statuses.remove(&expected);
+    }
+}
+
+pub fn status_for_scope(
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) -> UnityStateProbeStatus {
+    runtime()
+        .lock()
+        .map(|rt| {
+            rt.workspace_statuses
+                .get(&WorkspaceStatusKey::from(scope))
+                .cloned()
+                .unwrap_or_else(|| base_status(rt.enabled))
+        })
+        .unwrap_or_else(|_| UnityStateProbeStatus::base(false, UnityStateProbeTier::Unsupported))
+}
+
+fn status_for_project(project_path: &str) -> UnityStateProbeStatus {
+    runtime()
+        .lock()
+        .map(|rt| {
+            rt.project_scopes
+                .get(&project_key(project_path))
+                .and_then(|key| rt.workspace_statuses.get(key))
+                .cloned()
+                .unwrap_or_else(|| base_status(rt.enabled))
+        })
+        .unwrap_or_else(|_| UnityStateProbeStatus::base(false, UnityStateProbeTier::Unsupported))
+}
+
+fn record_project_status(project_path: &str, update: impl FnOnce(&mut UnityStateProbeStatus)) {
+    let Ok(mut rt) = runtime().lock() else {
+        return;
+    };
+    let Some(key) = rt.project_scopes.get(&project_key(project_path)).cloned() else {
+        return;
+    };
+    let enabled = rt.enabled;
+    let status = rt
+        .workspace_statuses
+        .entry(key)
+        .or_insert_with(|| base_status(enabled));
+    update(status);
+    status.updated_at_ms = unix_now_ms();
 }
 
 pub fn initialize(enabled: bool) {
     let mut rt = runtime().lock().expect("state probe runtime poisoned");
     rt.enabled = enabled;
-    rt.last_status = if enabled {
-        UnityStateProbeStatus::base(true, UnityStateProbeTier::Inactive)
-    } else {
-        UnityStateProbeStatus::base(false, UnityStateProbeTier::Disabled)
-    };
+    let status = base_status(enabled);
+    for current in rt.workspace_statuses.values_mut() {
+        *current = status.clone();
+    }
     if let Ok(mut memory) = state_memory().lock() {
         *memory = StateMemory::default();
     }
@@ -533,32 +634,21 @@ pub fn enabled() -> bool {
 pub fn set_enabled(value: bool) -> UnityStateProbeStatus {
     let mut rt = runtime().lock().expect("state probe runtime poisoned");
     rt.enabled = value;
-    rt.last_status = if value {
+    let status = if value {
         UnityStateProbeStatus::base(true, UnityStateProbeTier::Inactive)
     } else {
         // Drop any cached per-process symbol tables so a re-enable re-resolves.
         imp::clear_cache();
         UnityStateProbeStatus::base(false, UnityStateProbeTier::Disabled)
     };
+    for current in rt.workspace_statuses.values_mut() {
+        *current = status.clone();
+    }
     if let Ok(mut memory) = state_memory().lock() {
         *memory = StateMemory::default();
     }
     reset_observer_runtime();
-    rt.last_status.clone()
-}
-
-pub fn status() -> UnityStateProbeStatus {
-    runtime()
-        .lock()
-        .map(|rt| rt.last_status.clone())
-        .unwrap_or_else(|_| UnityStateProbeStatus::base(false, UnityStateProbeTier::Unsupported))
-}
-
-fn record_status(update: impl FnOnce(&mut UnityStateProbeStatus)) {
-    if let Ok(mut rt) = runtime().lock() {
-        update(&mut rt.last_status);
-        rt.last_status.updated_at_ms = unix_now_ms();
-    }
+    status
 }
 
 #[derive(Default)]
@@ -607,6 +697,19 @@ pub fn start_observer(project_path: &str) {
 
 pub fn stop_all_observers() {
     reset_observer_runtime();
+}
+
+/// Stop only the observer associated with one checkout. Workspace selection
+/// changes keep every other checkout observer alive.
+pub fn stop_observer(project_path: &str) {
+    let key = project_key(project_path);
+    if let Ok(mut runtime) = observer_runtime().lock() {
+        if let Some(mut entry) = runtime.projects.remove(&key) {
+            if let Some(handle) = entry.abort_handle.take() {
+                handle.abort();
+            }
+        }
+    }
 }
 
 fn ensure_observer(project_path: &str) {
@@ -912,6 +1015,7 @@ pub(crate) fn fallback_editor_status_for_project(
 /// stack read to classify the domain-reload sub-phase — higher fidelity, used
 /// on demand (e.g. the self-test).
 pub fn sample_blocking(
+    project_path: &str,
     process_id: u32,
     module_path: &str,
     allow_suspend: bool,
@@ -922,7 +1026,13 @@ pub fn sample_blocking(
     // Process creation time keys the per-PID cache so a restarted editor that
     // reuses the same PID never reads stale symbols / a stale main-thread id.
     let created = super::process::process_created_at_unix_ms(process_id);
-    imp::sample(process_id, module_path, allow_suspend, created)
+    imp::sample(
+        project_path,
+        process_id,
+        module_path,
+        allow_suspend,
+        created,
+    )
 }
 
 // ── Fusion ───────────────────────────────────────────────────────────
@@ -936,6 +1046,7 @@ fn process_state_name(state: &super::UnityEditorProcessState) -> &'static str {
 }
 
 async fn native_hook_observation_for_process(
+    project_path: &str,
     process_id: Option<u32>,
     process_path: Option<String>,
 ) -> NativeHookObservation {
@@ -949,7 +1060,7 @@ async fn native_hook_observation_for_process(
     }
 
     let Some(pid) = process_id else {
-        let status = super::background_hook::status();
+        let status = super::background_hook::status_for_project(project_path);
         return NativeHookObservation {
             state: format!("{:?}", status.state).to_ascii_lowercase(),
             patched: status.patched,
@@ -967,8 +1078,9 @@ async fn native_hook_observation_for_process(
         };
     };
 
+    let hook_project_path = project_path.to_string();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        super::background_hook::sync_for_process(pid, &path)
+        super::background_hook::sync_for_project(&hook_project_path, pid, &path)
     })
     .await
     .map_err(|error| format!("native hook sync task failed: {error}"))
@@ -1560,8 +1672,8 @@ fn fuse(inputs: &FusionInputs) -> SemanticState {
 /// tier (Stack / CpuOnly) is set authoritatively inside `sample`; here we only
 /// record the latest phase and, when no native tier ever engaged, mark the
 /// degraded inference tier.
-pub fn note_fused(state: &SemanticState, process_id: Option<u32>) {
-    record_status(|status| {
+pub fn note_fused(project_path: &str, state: &SemanticState, process_id: Option<u32>) {
+    record_project_status(project_path, |status| {
         status.last_phase = Some(state.phase.clone());
         if process_id.is_some() {
             status.process_id = process_id;
@@ -1595,26 +1707,36 @@ async fn query_process_bounded(project_path: &str) -> super::UnityEditorProcessI
 }
 
 async fn native_sample_with_timeout(
+    project_path: &str,
     process_id: u32,
     module_hint: String,
     allow_suspend: bool,
     timeout: std::time::Duration,
 ) -> Option<NativeSample> {
+    let status_project_path = project_path.to_string();
+    let sample_project_path = status_project_path.clone();
     let task = tauri::async_runtime::spawn_blocking(move || {
-        sample_blocking(process_id, &module_hint, allow_suspend)
+        sample_blocking(
+            &sample_project_path,
+            process_id,
+            &module_hint,
+            allow_suspend,
+        )
     });
     match tokio::time::timeout(timeout, task).await {
         Ok(Ok(Ok(sample))) => sample,
         Ok(Ok(Err(error))) => {
-            record_status(|s| s.error = Some(error));
+            record_project_status(&status_project_path, |s| s.error = Some(error));
             None
         }
         Ok(Err(error)) => {
-            record_status(|s| s.error = Some(format!("native sample task failed: {error}")));
+            record_project_status(&status_project_path, |s| {
+                s.error = Some(format!("native sample task failed: {error}"));
+            });
             None
         }
         Err(_) => {
-            record_status(|s| {
+            record_project_status(&status_project_path, |s| {
                 s.error = Some(format!(
                     "native {} sample timed out after {}ms",
                     if allow_suspend { "stack" } else { "passive" },
@@ -1670,6 +1792,7 @@ async fn observe_project_once_with_native_broker_status(
     let process_id = process.process_id;
     let module_hint = process.executable_path.clone().unwrap_or_default();
     let process_created_at_ms = process_id.and_then(super::process::process_created_at_unix_ms);
+    super::dialog::sync_project_process(project_path, process_id, process_created_at_ms).await;
 
     let mut pipe_connected = false;
     let mut pipe_status = super::UNITY_EDITOR_STATUS_DISCONNECTED.to_string();
@@ -1783,7 +1906,8 @@ async fn observe_project_once_with_native_broker_status(
             // Passive first — never suspends the main thread.
             let hint = module_hint.clone();
             let passive =
-                native_sample_with_timeout(pid, hint, false, PASSIVE_SAMPLE_TIMEOUT).await;
+                native_sample_with_timeout(project_path, pid, hint, false, PASSIVE_SAMPLE_TIMEOUT)
+                    .await;
 
             // On-demand escalation: only suspend for a stack read when a domain
             // reload is actually likely — the pipe is down while the editor is
@@ -1797,7 +1921,7 @@ async fn observe_project_once_with_native_broker_status(
 
             if reload_likely {
                 let hint = module_hint.clone();
-                native_sample_with_timeout(pid, hint, true, STACK_SAMPLE_TIMEOUT)
+                native_sample_with_timeout(project_path, pid, hint, true, STACK_SAMPLE_TIMEOUT)
                     .await
                     .or(passive)
             } else {
@@ -1809,8 +1933,12 @@ async fn observe_project_once_with_native_broker_status(
     } else {
         None
     };
-    let native_hook =
-        native_hook_observation_for_process(process_id, process.executable_path.clone()).await;
+    let native_hook = native_hook_observation_for_process(
+        project_path,
+        process_id,
+        process.executable_path.clone(),
+    )
+    .await;
 
     let inputs = FusionInputs {
         pipe_connected,
@@ -1838,7 +1966,7 @@ async fn observe_project_once_with_native_broker_status(
         observer,
     };
     let state = fuse(&inputs);
-    note_fused(&state, process_id);
+    note_fused(project_path, &state, process_id);
     state
 }
 
@@ -1961,7 +2089,9 @@ mod imp {
     use std::sync::Mutex;
     use std::time::Instant;
 
-    use super::{record_status, NativeSample, ReloadPhase, UnityStateProbeTier, STACK_SCAN_BYTES};
+    use super::{
+        record_project_status, NativeSample, ReloadPhase, UnityStateProbeTier, STACK_SCAN_BYTES,
+    };
 
     type Bool = i32;
     type Dword = u32;
@@ -2507,7 +2637,7 @@ mod imp {
     /// dbghelp work runs WITHOUT the cache lock held. A failure is NOT cached
     /// (it fails fast when there's no PDB, and a transient module read during a
     /// reload should be retried), so the next escalation tries again.
-    pub(super) fn ensure_symbols(pid: u32, module_path_hint: &str) {
+    pub(super) fn ensure_symbols(project_path: &str, pid: u32, module_path_hint: &str) {
         match cache().lock() {
             Ok(cache) => {
                 if cache.symbols.contains_key(&pid) {
@@ -2523,7 +2653,7 @@ mod imp {
                 if let Ok(mut cache) = cache().lock() {
                     cache.symbols.entry(pid).or_insert(Some(syms));
                 }
-                record_status(|s| {
+                record_project_status(project_path, |s| {
                     s.tier = UnityStateProbeTier::Stack;
                     s.process_id = Some(pid);
                     s.total_symbols = total;
@@ -2532,7 +2662,7 @@ mod imp {
                 });
             }
             Err(error) => {
-                record_status(|s| {
+                record_project_status(project_path, |s| {
                     if matches!(
                         s.tier,
                         UnityStateProbeTier::Inactive
@@ -2549,6 +2679,7 @@ mod imp {
     }
 
     pub(super) fn sample(
+        project_path: &str,
         pid: u32,
         module_path_hint: &str,
         allow_suspend: bool,
@@ -2572,7 +2703,7 @@ mod imp {
         // the first (sub-second) build never blocks a concurrent sampler. Only
         // the stack tier needs symbols; the passive tier skips dbghelp.
         if allow_suspend {
-            ensure_symbols(pid, module_path_hint);
+            ensure_symbols(project_path, pid, module_path_hint);
         }
 
         // Main thread, cached in history.
@@ -2694,7 +2825,7 @@ mod imp {
         // Reflect the passive tier in the status surface (without clobbering a
         // higher-fidelity tier a prior stack sample established).
         if !allow_suspend {
-            record_status(|s| {
+            record_project_status(project_path, |s| {
                 s.process_id = Some(pid);
                 if matches!(
                     s.tier,
@@ -2716,6 +2847,61 @@ mod imp {
     }
 }
 
+#[cfg(test)]
+mod workspace_scope_tests {
+    use super::*;
+    use crate::workspace_service::event::WorkspaceEventScope;
+    use crate::workspace_service::{CheckoutId, ProjectId, ServiceInstanceId};
+
+    fn scope(
+        checkout: &str,
+        workspace_generation: u64,
+        service_generation: u64,
+    ) -> WorkspaceEventScope {
+        let checkout_id = CheckoutId::new(checkout).expect("checkout id");
+        WorkspaceEventScope {
+            project_id: ProjectId::new("project-state-probe-test").expect("project id"),
+            checkout_id: checkout_id.clone(),
+            workspace_generation,
+            service_instance_id: Some(ServiceInstanceId::for_service(&checkout_id, "unity")),
+            service_generation: Some(service_generation),
+        }
+    }
+
+    #[test]
+    fn checkout_statuses_do_not_overwrite_each_other_or_leak_across_generations() {
+        let root_a = r"F:\scope-tests\state-probe-a";
+        let root_b = r"F:\scope-tests\state-probe-b";
+        let scope_a = scope("checkout-state-probe-a", 11, 101);
+        let scope_b = scope("checkout-state-probe-b", 12, 102);
+        bind_workspace_scope(root_a, &scope_a);
+        bind_workspace_scope(root_b, &scope_b);
+
+        record_project_status(root_a, |status| {
+            status.enabled = true;
+            status.tier = UnityStateProbeTier::Stack;
+            status.process_id = Some(1101);
+        });
+        record_project_status(root_b, |status| {
+            status.enabled = true;
+            status.tier = UnityStateProbeTier::Passive;
+            status.process_id = Some(1202);
+        });
+
+        let status_a = status_for_scope(&scope_a);
+        let status_b = status_for_scope(&scope_b);
+        assert_eq!(status_a.process_id, Some(1101));
+        assert_eq!(status_a.tier, UnityStateProbeTier::Stack);
+        assert_eq!(status_b.process_id, Some(1202));
+        assert_eq!(status_b.tier, UnityStateProbeTier::Passive);
+
+        let replacement = scope("checkout-state-probe-a", 13, 103);
+        bind_workspace_scope(root_a, &replacement);
+        assert_eq!(status_for_scope(&scope_a).process_id, None);
+        assert_eq!(status_for_scope(&replacement).process_id, None);
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 mod imp {
     use super::NativeSample;
@@ -2723,6 +2909,7 @@ mod imp {
     pub(super) fn clear_cache() {}
 
     pub(super) fn sample(
+        _project_path: &str,
         _pid: u32,
         _module_path: &str,
         _allow_suspend: bool,

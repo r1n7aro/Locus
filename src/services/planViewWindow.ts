@@ -12,7 +12,8 @@ export const PLAN_VIEW_WINDOW_FLAG = "planView";
 export const PLAN_VIEW_WINDOW_TITLE = "Locus Plan Review";
 
 export interface PlanViewWindowPayload {
-  planFilePath: string;
+  sessionId: string;
+  planFilePath?: string;
   /** Present while the plan awaits approval: enables the approve / send-back
    *  actions inside the window (answered via the global answer_question). */
   questionId?: string;
@@ -34,6 +35,7 @@ export function getPlanViewWindowPayload(
 ): PlanViewWindowPayload {
   const params = new URLSearchParams(search);
   return {
+    sessionId: trimOrEmpty(params.get("sessionId")),
     planFilePath: trimOrEmpty(params.get("planFilePath")),
     questionId: trimOrEmpty(params.get("questionId")) || undefined,
   };
@@ -42,8 +44,9 @@ export function getPlanViewWindowPayload(
 export function buildPlanViewWindowQuery(payload: PlanViewWindowPayload): string {
   const params = new URLSearchParams({
     [PLAN_VIEW_WINDOW_FLAG]: "1",
-    planFilePath: payload.planFilePath,
+    sessionId: payload.sessionId,
   });
+  if (payload.planFilePath) params.set("planFilePath", payload.planFilePath);
   if (payload.questionId) {
     params.set("questionId", payload.questionId);
   }
@@ -58,7 +61,7 @@ export async function openPlanViewWindow(
   payload: PlanViewWindowPayload,
 ): Promise<boolean> {
   if (!hasTauriWindowRuntime()) return false;
-  if (!payload.planFilePath.trim()) return false;
+  if (!payload.sessionId.trim()) return false;
 
   const result = await openSubWindow({
     kind: PLAN_VIEW_WINDOW_LABEL,

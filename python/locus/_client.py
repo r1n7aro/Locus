@@ -164,6 +164,7 @@ class Client:
         arguments: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        workspace_ref: "WorkspaceRef | None" = None,
     ) -> "ToolCallResult":
         from ._models import ToolCallResult, ToolInfo
 
@@ -179,6 +180,7 @@ class Client:
                 "name": name,
                 "arguments": arguments or {},
                 "timeoutMs": None if timeout is None else max(1, int(timeout * 1000)),
+                "workspaceRef": None if workspace_ref is None else workspace_ref.to_payload(),
             },
             timeout=effective_timeout + 5.0,
         )
@@ -189,6 +191,163 @@ class Client:
 
         payload = await self.rpc("workspace.get")
         return WorkspaceInfo.from_payload(payload)
+
+    async def get_unity_editor_status(self, *, project: str) -> "UnityEditorStatus":
+        """Return the process, connection, and semantic state for a Unity project."""
+        from ._models import UnityEditorStatus
+
+        project = project.strip()
+        if not project:
+            raise ValueError("project cannot be empty")
+        payload = await self.rpc("unity.editor.status", {"project": project})
+        return UnityEditorStatus.from_payload(payload)
+
+    async def ensure_unity_editor(
+        self,
+        *,
+        project: str,
+        mode: str = "interactive",
+        wait_until: str = "ready",
+        timeout: float = 300.0,
+    ) -> "UnityEditorEnsureResult":
+        """Ensure the project editor is running and wait for the requested state.
+
+        ``mode`` accepts ``interactive`` or ``headless``. ``wait_until``
+        accepts ``process``, ``connected``, or ``ready``. The
+        operation is serialized per checkout, so concurrent workflows reuse a
+        single editor process.
+        """
+        from ._models import UnityEditorEnsureResult
+
+        project = project.strip()
+        mode = mode.strip().lower()
+        wait_until = wait_until.strip().lower()
+        if not project:
+            raise ValueError("project cannot be empty")
+        if mode not in {"interactive", "headless"}:
+            raise ValueError("mode must be 'interactive' or 'headless'")
+        if wait_until not in {"process", "connected", "ready"}:
+            raise ValueError("wait_until must be 'process', 'connected', or 'ready'")
+        if timeout <= 0 or timeout > 1800:
+            raise ValueError("timeout must be greater than 0 and at most 1800 seconds")
+        payload = await self.rpc(
+            "unity.editor.ensure",
+            {
+                "project": project,
+                "mode": mode,
+                "waitUntil": wait_until,
+                "timeoutMs": max(1, int(timeout * 1000)),
+            },
+            timeout=timeout + 10.0,
+        )
+        return UnityEditorEnsureResult.from_payload(payload)
+
+    async def restart_unity_editor(
+        self,
+        *,
+        project: str,
+        mode: str = "interactive",
+        wait_until: str = "ready",
+        timeout: float = 300.0,
+        force: bool = False,
+    ) -> "UnityEditorRestartResult":
+        """Restart the project editor and wait for the requested state.
+
+        With ``force=False``, Locus requests a normal close first and force
+        closes remaining project processes after the close timeout. With
+        ``force=True``, matching project processes are force-closed directly.
+        """
+        from ._models import UnityEditorRestartResult
+
+        project = project.strip()
+        mode = mode.strip().lower()
+        wait_until = wait_until.strip().lower()
+        if not project:
+            raise ValueError("project cannot be empty")
+        if mode not in {"interactive", "headless"}:
+            raise ValueError("mode must be 'interactive' or 'headless'")
+        if wait_until not in {"process", "connected", "ready"}:
+            raise ValueError("wait_until must be 'process', 'connected', or 'ready'")
+        if timeout <= 0 or timeout > 1800:
+            raise ValueError("timeout must be greater than 0 and at most 1800 seconds")
+        payload = await self.rpc(
+            "unity.editor.restart",
+            {
+                "project": project,
+                "mode": mode,
+                "waitUntil": wait_until,
+                "timeoutMs": max(1, int(timeout * 1000)),
+                "force": bool(force),
+            },
+            timeout=timeout + 10.0,
+        )
+        return UnityEditorRestartResult.from_payload(payload)
+
+    async def get_unity_dialog(self, *, project: str) -> "UnityModalDialog | None":
+        """Return the blocking modal dialog for a Unity project, if present.
+
+        This RPC is handled by Locus's native window observer and remains
+        available while the Unity managed main thread is blocked.
+        """
+        from ._models import UnityModalDialog
+
+        project = project.strip()
+        if not project:
+            raise ValueError("project cannot be empty")
+        payload = await self.rpc("unity.dialog.get", {"project": project})
+        return None if payload is None else UnityModalDialog.from_payload(payload)
+
+    async def choose_unity_dialog(
+        self,
+        *,
+        project: str,
+        dialog_id: str,
+        choice_id: str,
+    ) -> "UnityDialogChoiceResult":
+        """Invoke one choice returned by :meth:`get_unity_dialog`."""
+        from ._models import UnityDialogChoiceResult
+
+        project = project.strip()
+        dialog_id = dialog_id.strip()
+        choice_id = choice_id.strip()
+        if not project:
+            raise ValueError("project cannot be empty")
+        if not dialog_id:
+            raise ValueError("dialog_id cannot be empty")
+        if not choice_id:
+            raise ValueError("choice_id cannot be empty")
+        payload = await self.rpc(
+            "unity.dialog.choose",
+            {
+                "project": project,
+                "dialogId": dialog_id,
+                "choiceId": choice_id,
+            },
+        )
+        return UnityDialogChoiceResult.from_payload(payload)
+
+    async def wait_unity_execution(
+        self,
+        *,
+        project: str,
+        execution_id: str,
+        timeout: float | None = None,
+    ) -> str:
+        """Return the original result of a detached Unity execution."""
+        project = project.strip()
+        execution_id = execution_id.strip()
+        if not project:
+            raise ValueError("project cannot be empty")
+        if not execution_id:
+            raise ValueError("execution_id cannot be empty")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        payload = await self.rpc(
+            "unity.execution.wait",
+            {"project": project, "executionId": execution_id},
+            timeout=_DEFAULT_TOOL_TIMEOUT if timeout is None else timeout,
+        )
+        return str(payload)
 
     async def list_sessions(
         self,
@@ -248,6 +407,7 @@ class Client:
         *,
         agent_spec: dict[str, Any] | None = None,
         session_id: str | None = None,
+        workspace_ref: "WorkspaceRef | None" = None,
         title: str | None = None,
         model: str | None = None,
         effort: str | None = None,
@@ -268,6 +428,7 @@ class Client:
                 "agentSpec": agent_spec,
                 "prompt": prompt,
                 "sessionId": session_id,
+                "workspaceRef": None if workspace_ref is None else workspace_ref.to_payload(),
                 "title": title,
                 "model": model,
                 "effort": effort,
@@ -298,6 +459,11 @@ if TYPE_CHECKING:
         SessionSummary,
         ToolCallResult,
         ToolInfo,
+        UnityEditorEnsureResult,
+        UnityEditorStatus,
+        UnityDialogChoiceResult,
+        UnityModalDialog,
+        WorkspaceRef,
         WorkspaceInfo,
     )
     from ._tools import Tool

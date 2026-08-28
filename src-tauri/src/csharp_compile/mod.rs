@@ -14,14 +14,17 @@
 mod client;
 pub mod manager;
 pub mod params;
+pub mod scheduler;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 pub const STATUS_EVENT: &str = "csharp-compile-status";
+const COMPILE_SERVICE_KIND: &str = "csharp_compile";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 // Master gate for direct private/internal access in generated unity_execute /
@@ -66,15 +69,128 @@ pub(crate) fn emit_status_in_background() {
         return;
     };
     tokio::spawn(async move {
-        let _ = app_handle.emit(STATUS_EVENT, status().await);
+        let Some(registry) =
+            app_handle.try_state::<std::sync::Arc<crate::workspace_service::ProjectRegistry>>()
+        else {
+            let _ = app_handle.emit(STATUS_EVENT, status().await);
+            return;
+        };
+        let runtimes = registry.runtimes();
+        if runtimes.is_empty() {
+            let _ = app_handle.emit(STATUS_EVENT, status().await);
+            return;
+        }
+        for runtime in runtimes {
+            let identity = compile_service_identity_for_runtime(&runtime);
+            let payload = status_for_project(&runtime.root().to_string_lossy()).await;
+            let generations = compile_service_generations()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if generations.get(&identity.key).copied() != Some(identity.service_generation) {
+                continue;
+            }
+            registry
+                .event_router()
+                .publish_prevalidated_external_service(
+                    &app_handle,
+                    STATUS_EVENT,
+                    crate::workspace_service::event::WorkspaceEventEnvelope {
+                        project_id: runtime.project_id().clone(),
+                        checkout_id: runtime.checkout_id().clone(),
+                        workspace_generation: runtime.generation(),
+                        service_instance_id: Some(identity.service_instance_id),
+                        service_generation: Some(identity.service_generation),
+                        payload,
+                    },
+                );
+        }
     });
 }
 
+pub(crate) fn notify_active_scope_loss(reason: &str) {
+    let scopes = active_scopes()
+        .lock()
+        .map(|mut scopes| scopes.drain().collect::<HashSet<_>>())
+        .unwrap_or_default();
+    if scopes.is_empty() {
+        return;
+    }
+
+    if let Some((app_handle, registry)) = APP_HANDLE.get().and_then(|app_handle| {
+        app_handle
+            .try_state::<std::sync::Arc<crate::workspace_service::ProjectRegistry>>()
+            .map(|registry| (app_handle, registry))
+    }) {
+        let lost_identities = scopes
+            .iter()
+            .map(|scope| {
+                (
+                    CompileServiceKey {
+                        checkout_id: scope.checkout_id.clone(),
+                        workspace_generation: scope.workspace_generation,
+                    },
+                    scope.service_generation,
+                )
+            })
+            .collect::<HashSet<_>>();
+        for (key, service_generation) in lost_identities {
+            let Some(runtime) = registry.runtime(&key.checkout_id) else {
+                continue;
+            };
+            if runtime.generation() != key.workspace_generation {
+                continue;
+            }
+            let generations = compile_service_generations()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if generations.get(&key).copied() != Some(service_generation) {
+                continue;
+            }
+            registry
+                .event_router()
+                .publish_prevalidated_external_service(
+                    app_handle,
+                    "csharp-compile-scope-lost",
+                    crate::workspace_service::event::WorkspaceEventEnvelope {
+                        project_id: runtime.project_id().clone(),
+                        checkout_id: key.checkout_id.clone(),
+                        workspace_generation: key.workspace_generation,
+                        service_instance_id: Some(
+                            crate::workspace_service::ServiceInstanceId::for_service(
+                                &key.checkout_id,
+                                COMPILE_SERVICE_KIND,
+                            ),
+                        ),
+                        service_generation: Some(service_generation),
+                        payload: json!({ "reason": reason }),
+                    },
+                );
+        }
+    }
+
+    let invalidated = scopes
+        .into_iter()
+        .map(|scope| CompileServiceKey {
+            checkout_id: scope.checkout_id,
+            workspace_generation: scope.workspace_generation,
+        })
+        .collect::<HashSet<_>>();
+    for key in invalidated {
+        advance_compile_service_generation(&key);
+    }
+}
+
 /// Called once from app setup with the persisted flags.
-pub fn initialize(enabled: bool, non_public_access_enabled: bool, app_handle: tauri::AppHandle) {
+pub fn initialize(
+    enabled: bool,
+    non_public_access_enabled: bool,
+    app_handle: tauri::AppHandle,
+    resource_policy: std::sync::Arc<crate::resource_policy::ResourcePolicyStore>,
+) {
     ENABLED.store(enabled, Ordering::Relaxed);
     NON_PUBLIC_ACCESS_ENABLED.store(non_public_access_enabled, Ordering::Relaxed);
     let _ = APP_HANDLE.set(app_handle);
+    scheduler::initialize(resource_policy);
 }
 
 pub fn is_enabled() -> bool {
@@ -185,10 +301,18 @@ pub struct CsharpCompileStatusPayload {
     pub hot_cold_queued: u64,
 }
 
-pub async fn status() -> CsharpCompileStatusPayload {
+async fn status_with_project(project_path: Option<&str>) -> CsharpCompileStatusPayload {
     let running = manager::current_status().await;
-    let hot_reload = crate::unity_hotreload::coordinator::counters().await;
-    let hot_unapplied_changes = crate::unity_hotreload::coordinator::unapplied_change_count().await;
+    let (hot_reload, hot_unapplied_changes) = match project_path {
+        Some(project_path) => tokio::join!(
+            crate::unity_hotreload::coordinator::counters_for_project(project_path),
+            crate::unity_hotreload::coordinator::unapplied_change_count_for_project(project_path),
+        ),
+        None => tokio::join!(
+            crate::unity_hotreload::coordinator::counters(),
+            crate::unity_hotreload::coordinator::unapplied_change_count(),
+        ),
+    };
     CsharpCompileStatusPayload {
         enabled: is_enabled(),
         non_public_access_enabled: non_public_access_enabled(),
@@ -213,6 +337,16 @@ pub async fn status() -> CsharpCompileStatusPayload {
     }
 }
 
+/// Process-level sidecar status with aggregate Hot Reload counters.
+pub async fn status() -> CsharpCompileStatusPayload {
+    status_with_project(None).await
+}
+
+/// Sidecar process status combined with one checkout's Hot Reload data plane.
+pub async fn status_for_project(project_path: &str) -> CsharpCompileStatusPayload {
+    status_with_project(Some(project_path)).await
+}
+
 /// Status refresh used by UI surfaces. When the sidecar is enabled, this also
 /// probes startup after a recorded startup error so stale errors clear as soon
 /// as the published server has been repaired.
@@ -228,6 +362,20 @@ pub async fn refresh_status() -> CsharpCompileStatusPayload {
         }
     }
     status().await
+}
+
+pub async fn refresh_status_for_project(project_path: &str) -> CsharpCompileStatusPayload {
+    if is_enabled()
+        && crate::dotnet_runtime::is_platform_supported()
+        && manager::server_dll_available()
+        && manager::last_error_for_diagnostics().is_some()
+    {
+        let running = manager::current_status().await;
+        if running.is_none() {
+            let _ = manager::ensure_client().await;
+        }
+    }
+    status_for_project(project_path).await
 }
 
 /// Pre-start the sidecar and JIT-warm Roslyn with a tiny self-contained
@@ -274,6 +422,283 @@ pub struct CompileParams {
     /// hot patches follow it. Old Unity plugins omit the field → false.
     #[serde(default)]
     pub allow_unsafe: bool,
+    /// Rust-only routing identity. The Unity wire payload supplies the editor
+    /// session separately; every sidecar request promotes this to top-level
+    /// `scopeId`.
+    #[serde(skip)]
+    pub scope_id: Option<CompileScopeId>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct CompileScopeId {
+    pub checkout_id: crate::workspace_service::CheckoutId,
+    pub workspace_generation: u64,
+    pub service_generation: u64,
+    pub unity_editor_session_id: String,
+}
+
+impl CompileScopeId {
+    fn system() -> Self {
+        Self {
+            checkout_id: crate::workspace_service::CheckoutId::new("checkout-system")
+                .expect("static compile scope checkout id"),
+            workspace_generation: 1,
+            service_generation: 1,
+            unity_editor_session_id: "locus-system".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompileServiceKey {
+    checkout_id: crate::workspace_service::CheckoutId,
+    workspace_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompileServiceEventIdentity {
+    key: CompileServiceKey,
+    service_instance_id: crate::workspace_service::ServiceInstanceId,
+    service_generation: u64,
+}
+
+fn compile_service_generations() -> &'static Mutex<HashMap<CompileServiceKey, u64>> {
+    static GENERATIONS: OnceLock<Mutex<HashMap<CompileServiceKey, u64>>> = OnceLock::new();
+    GENERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_compile_service_generation() -> u64 {
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+    NEXT_GENERATION
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            current.checked_add(1)
+        })
+        .expect("C# compile service generation space exhausted")
+        + 1
+}
+
+fn compile_service_generation(key: &CompileServiceKey) -> u64 {
+    let mut generations = compile_service_generations()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    *generations
+        .entry(key.clone())
+        .or_insert_with(next_compile_service_generation)
+}
+
+fn advance_compile_service_generation(key: &CompileServiceKey) -> u64 {
+    let next = next_compile_service_generation();
+    compile_service_generations()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(key.clone(), next);
+    next
+}
+
+fn advance_compile_service_generations_for_checkout(
+    checkout_id: &crate::workspace_service::CheckoutId,
+) {
+    let keys = compile_service_generations()
+        .lock()
+        .map(|generations| {
+            generations
+                .keys()
+                .filter(|key| &key.checkout_id == checkout_id)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for key in keys {
+        advance_compile_service_generation(&key);
+    }
+}
+
+fn compile_service_identity_for_runtime(
+    runtime: &crate::workspace_service::WorkspaceRuntime,
+) -> CompileServiceEventIdentity {
+    let key = CompileServiceKey {
+        checkout_id: runtime.checkout_id().clone(),
+        workspace_generation: runtime.generation(),
+    };
+    CompileServiceEventIdentity {
+        service_instance_id: crate::workspace_service::ServiceInstanceId::for_service(
+            runtime.checkout_id(),
+            COMPILE_SERVICE_KIND,
+        ),
+        service_generation: compile_service_generation(&key),
+        key,
+    }
+}
+
+pub(crate) fn compile_scope_identity_for_project(
+    project_path: &str,
+) -> Result<(crate::workspace_service::CheckoutId, u64, u64), String> {
+    let app_handle = APP_HANDLE
+        .get()
+        .ok_or_else(|| "C# compile workspace registry is not initialized".to_string())?;
+    let registry = app_handle
+        .try_state::<std::sync::Arc<crate::workspace_service::ProjectRegistry>>()
+        .ok_or_else(|| "C# compile workspace registry is unavailable".to_string())?;
+    let runtime = registry
+        .runtime_for_root(std::path::Path::new(project_path))
+        .ok_or_else(|| format!("C# compile checkout is not registered: {project_path}"))?;
+    let identity = compile_service_identity_for_runtime(&runtime);
+    Ok((
+        runtime.checkout_id().clone(),
+        runtime.generation(),
+        identity.service_generation,
+    ))
+}
+
+pub(crate) fn retire_workspace_generation(
+    checkout_id: &crate::workspace_service::CheckoutId,
+    workspace_generation: u64,
+) {
+    let key = CompileServiceKey {
+        checkout_id: checkout_id.clone(),
+        workspace_generation,
+    };
+    if let Ok(mut active) = active_scopes().lock() {
+        active.retain(|scope| {
+            scope.checkout_id != *checkout_id || scope.workspace_generation != workspace_generation
+        });
+    }
+    if let Ok(mut generations) = compile_service_generations().lock() {
+        generations.remove(&key);
+    }
+}
+
+fn validate_compile_scope(scope: &CompileScopeId) -> Result<CompileScopeId, String> {
+    let key = CompileServiceKey {
+        checkout_id: scope.checkout_id.clone(),
+        workspace_generation: scope.workspace_generation,
+    };
+    let current_generation = compile_service_generation(&key);
+    if current_generation != scope.service_generation {
+        return Err(format!(
+            "stale C# compile service scope for checkout {} workspace generation {}: expected service generation {}, current {}",
+            scope.checkout_id,
+            scope.workspace_generation,
+            scope.service_generation,
+            current_generation
+        ));
+    }
+    Ok(scope.clone())
+}
+
+fn active_scopes() -> &'static Mutex<HashSet<CompileScopeId>> {
+    static ACTIVE_SCOPES: OnceLock<Mutex<HashSet<CompileScopeId>>> = OnceLock::new();
+    ACTIVE_SCOPES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn scoped_request(mut request: Value, scope: Option<&CompileScopeId>) -> Result<Value, String> {
+    let scope = scope.map(validate_compile_scope).transpose()?;
+    if let Some(scope) = scope.as_ref() {
+        if let Ok(mut active) = active_scopes().lock() {
+            active.insert(scope.clone());
+        }
+    }
+    let scope = scope.unwrap_or_else(CompileScopeId::system);
+    if let Some(object) = request.as_object_mut() {
+        object.insert("scopeId".to_string(), json!(scope));
+    }
+    Ok(request)
+}
+
+/// Release every stateful compile-server scope owned by one checkout. Unity
+/// service shutdown calls this only after its service leases reach zero, so
+/// no immutable Agent execution can race a scope teardown.
+pub async fn release_scopes_for_checkout(
+    checkout_id: &crate::workspace_service::CheckoutId,
+) -> Result<usize, String> {
+    let scopes = {
+        let active = active_scopes()
+            .lock()
+            .map_err(|error| format!("compile scope registry lock poisoned: {error}"))?;
+        active
+            .iter()
+            .filter(|scope| &scope.checkout_id == checkout_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if scopes.is_empty() {
+        advance_compile_service_generations_for_checkout(checkout_id);
+        emit_status_in_background();
+        return Ok(0);
+    }
+
+    // A stopped sidecar has already discarded all in-memory scopes. Avoid
+    // starting a fresh process solely to send cleanup messages.
+    let Some(client) = manager::current_client().await else {
+        if let Ok(mut active) = active_scopes().lock() {
+            for scope in &scopes {
+                active.remove(scope);
+            }
+        }
+        advance_compile_service_generations_for_checkout(checkout_id);
+        emit_status_in_background();
+        return Ok(scopes.len());
+    };
+    let mut errors = Vec::new();
+    for scope in &scopes {
+        match client
+            .request_with_timeout_no_kill(
+                "scope/release",
+                json!({ "scopeId": scope }),
+                client::DEFAULT_REQUEST_TIMEOUT,
+            )
+            .await
+        {
+            Ok(_) => {
+                if let Ok(mut active) = active_scopes().lock() {
+                    active.remove(scope);
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    if let Ok(mut active) = active_scopes().lock() {
+        active.retain(|scope| &scope.checkout_id != checkout_id);
+    }
+    advance_compile_service_generations_for_checkout(checkout_id);
+    emit_status_in_background();
+    if errors.is_empty() {
+        Ok(scopes.len())
+    } else {
+        Err(format!(
+            "failed to release {} compile scope(s): {}",
+            errors.len(),
+            errors.join("; ")
+        ))
+    }
+}
+
+pub async fn release_scope(scope: &CompileScopeId) -> Result<bool, String> {
+    let tracked = active_scopes()
+        .lock()
+        .map_err(|error| format!("compile scope registry lock poisoned: {error}"))?
+        .contains(scope);
+    if !tracked {
+        return Ok(false);
+    }
+    let Some(client) = manager::current_client().await else {
+        if let Ok(mut active) = active_scopes().lock() {
+            active.remove(scope);
+        }
+        return Ok(true);
+    };
+    client
+        .request_with_timeout_no_kill(
+            "scope/release",
+            json!({ "scopeId": scope }),
+            client::DEFAULT_REQUEST_TIMEOUT,
+        )
+        .await?;
+    if let Ok(mut active) = active_scopes().lock() {
+        active.remove(scope);
+    }
+    Ok(true)
 }
 
 /// Compiler/runtime policy for direct private/internal IL. Production uses
@@ -372,7 +797,8 @@ pub(crate) async fn compile_snippet_with_access_probe(
     if let Some(mode) = non_public_access_probe_mode {
         request["nonPublicAccessProbeMode"] = json!(mode.as_str());
     }
-    let outcome = request_compile("compile/snippet", request).await;
+    let outcome =
+        request_compile("compile/snippet", request, compile_params.scope_id.as_ref()).await;
     record_outcome(&outcome);
     outcome
 }
@@ -415,7 +841,12 @@ pub(crate) async fn compile_run_states_with_access_probe(
     if let Some(mode) = non_public_access_probe_mode {
         request["nonPublicAccessProbeMode"] = json!(mode.as_str());
     }
-    let outcome = request_compile("compile/runStates", request).await;
+    let outcome = request_compile(
+        "compile/runStates",
+        request,
+        compile_params.scope_id.as_ref(),
+    )
+    .await;
     record_outcome(&outcome);
     outcome
 }
@@ -437,7 +868,12 @@ pub async fn compile_view_script(
         "params": compile_params,
         "returnAssemblyPath": true,
     });
-    let outcome = request_compile("compile/viewScript", request).await;
+    let outcome = request_compile(
+        "compile/viewScript",
+        request,
+        compile_params.scope_id.as_ref(),
+    )
+    .await;
     record_outcome(&outcome);
     outcome
 }
@@ -490,14 +926,15 @@ pub async fn compile_skill_package(
         "diagnosticStyle": "viewScript",
         "emitDebugSymbols": false,
     });
-    let outcome = request_compile("compile/raw", raw_request).await;
+    let outcome =
+        request_compile("compile/raw", raw_request, compile_params.scope_id.as_ref()).await;
     record_outcome(&outcome);
     outcome
 }
 
 /// Compile an arbitrary source set (tests and the warm-up).
 pub async fn compile_raw(request: Value) -> Result<CompileOutcome, String> {
-    request_compile("compile/raw", request).await
+    request_compile("compile/raw", request, None).await
 }
 
 fn build_skill_package_assembly_name(package_id: &str, source_hash: &str) -> String {
@@ -759,7 +1196,11 @@ pub async fn analyze_hot_diff(
 
     let client = manager::ensure_client().await?;
     let value = client
-        .request_with_timeout("analyze/hotDiff", request, client::DEFAULT_REQUEST_TIMEOUT)
+        .request_with_timeout(
+            "analyze/hotDiff",
+            scoped_request(request, compile_params.scope_id.as_ref())?,
+            client::DEFAULT_REQUEST_TIMEOUT,
+        )
         .await?;
     parse_hot_diff_result(value)
 }
@@ -820,7 +1261,11 @@ pub async fn compile_hot_patch(
 
     let client = manager::ensure_client().await?;
     let value = client
-        .request_with_timeout("compile/hotPatch", request, client::COMPILE_REQUEST_TIMEOUT)
+        .request_with_timeout(
+            "compile/hotPatch",
+            scoped_request(request, compile_params.scope_id.as_ref())?,
+            client::COMPILE_REQUEST_TIMEOUT,
+        )
         .await?;
     parse_hot_patch_result(value)
 }
@@ -835,7 +1280,11 @@ pub async fn query_callers(
     });
     let client = manager::ensure_client().await?;
     let value = client
-        .request_with_timeout("caller/query", request, client::DEFAULT_REQUEST_TIMEOUT)
+        .request_with_timeout(
+            "caller/query",
+            scoped_request(request, compile_params.scope_id.as_ref())?,
+            client::DEFAULT_REQUEST_TIMEOUT,
+        )
         .await?;
     let result: CallerQueryResult = serde_json::from_value(value)
         .map_err(|error| format!("malformed caller/query response: {error}"))?;
@@ -851,6 +1300,7 @@ pub async fn query_callers(
 /// loaded it. This keeps the compile server's session image registry aligned
 /// with the running AppDomain.
 pub async fn register_session_image(
+    scope: &CompileScopeId,
     domain_generation: &str,
     assembly_name: &str,
     assembly_b64: &str,
@@ -868,7 +1318,11 @@ pub async fn register_session_image(
 
     let client = manager::ensure_client().await?;
     let value = client
-        .request_with_timeout("image/register", request, client::DEFAULT_REQUEST_TIMEOUT)
+        .request_with_timeout(
+            "image/register",
+            scoped_request(request, Some(scope))?,
+            client::DEFAULT_REQUEST_TIMEOUT,
+        )
         .await?;
     let success = value
         .get("success")
@@ -912,10 +1366,13 @@ pub(crate) async fn compile_access_probe_with_mode(
     let value = client
         .request_with_timeout(
             "compile/accessProbe",
-            json!({
-                "params": compile_params,
-                "nonPublicAccessProbeMode": mode.as_str(),
-            }),
+            scoped_request(
+                json!({
+                    "params": compile_params,
+                    "nonPublicAccessProbeMode": mode.as_str(),
+                }),
+                compile_params.scope_id.as_ref(),
+            )?,
             client::COMPILE_REQUEST_TIMEOUT,
         )
         .await?;
@@ -1142,7 +1599,10 @@ pub async fn index_types(
     let value = client
         .request_with_timeout(
             "index/types",
-            json!({ "params": compile_params }),
+            scoped_request(
+                json!({ "params": compile_params }),
+                compile_params.scope_id.as_ref(),
+            )?,
             client::DEFAULT_REQUEST_TIMEOUT,
         )
         .await?;
@@ -1162,7 +1622,10 @@ pub async fn index_serialized_schema(compile_params: &CompileParams) -> Result<V
     client
         .request_with_timeout_no_kill(
             "index/schema",
-            json!({ "params": compile_params }),
+            scoped_request(
+                json!({ "params": compile_params }),
+                compile_params.scope_id.as_ref(),
+            )?,
             client::SCHEMA_REQUEST_TIMEOUT,
         )
         .await
@@ -1174,10 +1637,18 @@ pub fn initialize_enabled_for_tests(value: bool) {
     ENABLED.store(value, Ordering::Relaxed);
 }
 
-async fn request_compile(method: &str, request: Value) -> Result<CompileOutcome, String> {
+async fn request_compile(
+    method: &str,
+    request: Value,
+    scope: Option<&CompileScopeId>,
+) -> Result<CompileOutcome, String> {
     let client = manager::ensure_client().await?;
     let result = client
-        .request_with_timeout(method, request, client::COMPILE_REQUEST_TIMEOUT)
+        .request_with_timeout(
+            method,
+            scoped_request(request, scope)?,
+            client::COMPILE_REQUEST_TIMEOUT,
+        )
         .await?;
     parse_compile_result(result)
 }
@@ -1243,6 +1714,48 @@ fn parse_compile_result(value: Value) -> Result<CompileOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compile_scope_wire_identity_tracks_workspace_and_service_generations() {
+        let checkout_id =
+            crate::workspace_service::CheckoutId::new("checkout-compile-generation-contract")
+                .expect("checkout id");
+        let key = CompileServiceKey {
+            checkout_id: checkout_id.clone(),
+            workspace_generation: 41,
+        };
+        let first_generation = compile_service_generation(&key);
+        let scope = CompileScopeId {
+            checkout_id: checkout_id.clone(),
+            workspace_generation: 41,
+            service_generation: first_generation,
+            unity_editor_session_id: "editor-a".to_string(),
+        };
+
+        let first = scoped_request(json!({}), Some(&scope)).expect("current scope");
+        assert_eq!(first["scopeId"]["checkoutId"], checkout_id.as_str());
+        assert_eq!(first["scopeId"]["workspaceGeneration"], 41);
+        assert_eq!(first["scopeId"]["serviceGeneration"], first_generation);
+
+        let next_generation = advance_compile_service_generation(&key);
+        let stale = scoped_request(json!({}), Some(&scope)).expect_err("stale scope");
+        assert!(stale.contains("stale C# compile service scope"));
+        let rebound_scope = CompileScopeId {
+            service_generation: next_generation,
+            ..scope.clone()
+        };
+        let rebound = scoped_request(json!({}), Some(&rebound_scope)).expect("rebound scope");
+        assert_eq!(rebound["scopeId"]["workspaceGeneration"], 41);
+        assert_eq!(rebound["scopeId"]["serviceGeneration"], next_generation);
+        assert_ne!(first_generation, next_generation);
+
+        if let Ok(mut active) = active_scopes().lock() {
+            active.retain(|active| active.checkout_id != checkout_id);
+        }
+        if let Ok(mut generations) = compile_service_generations().lock() {
+            generations.remove(&key);
+        }
+    }
 
     #[test]
     fn tool_non_public_access_defaults_on_and_respects_both_gates() {
@@ -1522,6 +2035,7 @@ mod tests {
             reference_paths: vec!["a.dll".to_string()],
             defines: vec!["UNITY_EDITOR".to_string()],
             allow_unsafe: true,
+            scope_id: None,
         };
         let value = serde_json::to_value(&params).expect("serialize");
         assert_eq!(value["domainGeneration"], "gen");
@@ -1544,6 +2058,14 @@ mod tests {
     /// stays green on machines without the sidecar toolchain.
     #[tokio::test]
     async fn compile_raw_bcl_smoke_and_crash_recovery() {
+        let policy_dir = tempfile::tempdir().expect("compile policy dir");
+        let config = std::sync::Arc::new(crate::config::AppConfig::load_from_path(
+            &policy_dir.path().join("config.json"),
+        ));
+        scheduler::initialize(std::sync::Arc::new(
+            crate::resource_policy::ResourcePolicyStore::from_config(config)
+                .expect("compile resource policy"),
+        ));
         if manager::find_server_dll().is_none() {
             eprintln!("skip: compile server dll not built (bun run compile-server:bundle)");
             return;

@@ -29,7 +29,7 @@ describe("AgentView rule context menu", () => {
     const en = read("src/language/en.json");
 
     expect(source).toContain("function canToggleRule(rule: RuleItem | null | undefined): boolean");
-    expect(source).toContain("return !!rule && !rule.pluginId;");
+    expect(source).toContain("return !!props.workspaceRef && !!rule && !rule.readOnly && !rule.pluginId;");
     expect(source).toContain("if (!canToggleRule(rule)) return;");
     expect(source).toContain(':disabled="!canToggleRule(rule)"');
     expect(source).toContain(':disabled="!canToggleRule(selectedRule())"');

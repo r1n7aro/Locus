@@ -27,6 +27,7 @@ import {
 } from "../services/locusAssetInspectorWindow";
 
 describe("locusAssetInspectorWindow", () => {
+  const workspaceRef = { checkoutId: "checkout-a", expectedGeneration: 3 };
   const assetPath = "Assets/Prefabs/Characters/NPCs_BasePrefabs/Gluecose.prefab";
   const scenePath = "Assets/Scenes/WIP/TestingGround.unity";
   const objectPath = "BardHare/DialogueShot/cm[1]";
@@ -98,30 +99,30 @@ describe("locusAssetInspectorWindow", () => {
   });
 
   it("opens inspector tabs through the View host tab system", async () => {
-    const opened = await openLocusAssetInspectorWindow({ assetPath });
+    const opened = await openLocusAssetInspectorWindow(workspaceRef, { assetPath });
 
     expect(opened).toBe(true);
     expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledTimes(1);
-    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith({
+    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith(workspaceRef, {
       tabId: buildLocusAssetInspectorTabId({ assetPath }),
     });
   });
 
   it("opens scene object targets through the View host tab system", async () => {
-    const opened = await openLocusAssetInspectorWindow({
+    const opened = await openLocusAssetInspectorWindow(workspaceRef, {
       kind: "sceneObject",
       scenePath,
       objectPath,
     });
 
     expect(opened).toBe(true);
-    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith({
+    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith(workspaceRef, {
       tabId: buildLocusAssetInspectorTabId({ kind: "sceneObject", scenePath, objectPath }),
     });
   });
 
   it("rejects invalid payloads without touching the backend", async () => {
-    const opened = await openLocusAssetInspectorWindow({ assetPath: "   " });
+    const opened = await openLocusAssetInspectorWindow(workspaceRef, { assetPath: "   " });
 
     expect(opened).toBe(false);
     expect(viewServiceMocks.viewOpenInspectorTabMock).not.toHaveBeenCalled();
@@ -130,7 +131,7 @@ describe("locusAssetInspectorWindow", () => {
   it("does nothing without a Tauri window runtime", async () => {
     tauriRuntimeMocks.hasTauriWindowRuntimeMock.mockReturnValue(false);
 
-    const opened = await openLocusAssetInspectorWindow({ assetPath });
+    const opened = await openLocusAssetInspectorWindow(workspaceRef, { assetPath });
 
     expect(opened).toBe(false);
     expect(viewServiceMocks.viewOpenInspectorTabMock).not.toHaveBeenCalled();

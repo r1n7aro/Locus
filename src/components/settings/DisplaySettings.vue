@@ -8,8 +8,10 @@ import {
   type AssetRefClickAction,
   type DiffReviewTarget,
   type FontSlot,
+  type KnowledgeFolderKind,
   type MemoryFileOpenTarget,
   type PlanApprovalTarget,
+  type WorkspaceDisplayMode,
 } from "../../composables/useDisplaySettings";
 import { normalizeAppError } from "../../services/errors";
 import { ipcInvoke } from "../../services/ipc";
@@ -46,6 +48,26 @@ const themeOptions = computed(() =>
     label: t(opt.labelKey),
   })),
 );
+
+const workspaceDisplayModeOptions = computed(() => [
+  { value: "single", label: t("settings.display.workspaceModeSingle") },
+  { value: "multi", label: t("settings.display.workspaceModeMulti") },
+]);
+
+const knowledgeFolderToggles: { kind: KnowledgeFolderKind; labelKey: string }[] = [
+  { kind: "plan", labelKey: "knowledge.type.plan" },
+  { kind: "memory", labelKey: "knowledge.type.memory" },
+  { kind: "design", labelKey: "knowledge.type.design" },
+  { kind: "skill", labelKey: "knowledge.type.skill" },
+  { kind: "reference", labelKey: "knowledge.type.reference" },
+];
+
+function setKnowledgeFolderVisibility(kind: KnowledgeFolderKind, visible: boolean): void {
+  setDisplay("knowledgeFolderVisibility", {
+    ...display.knowledgeFolderVisibility,
+    [kind]: visible,
+  });
+}
 
 const sessionMessagePageSizeOptions = computed<DropdownOption[]>(() =>
   SESSION_MESSAGE_PAGE_SIZE_OPTIONS.map((value) => ({
@@ -108,9 +130,6 @@ const unityEmbedAssetRefClickActionOptions = computed(() => [
 ]);
 
 const topNavigationToggles = [
-  { key: "showKnowledgeTab", labelKey: "settings.display.showKnowledgeTab" },
-  { key: "showCollabTab", labelKey: "settings.display.showCollabTab" },
-  { key: "showAssetTab", labelKey: "settings.display.showAssetTab" },
   { key: "showViewsTab", labelKey: "settings.display.showViewsTab" },
   { key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" },
   { key: "showAgentTab", labelKey: "settings.display.showAgentTab" },
@@ -271,6 +290,27 @@ async function updateViewWindowsAboveMain(value: boolean) {
       <span>{{ t("settings.display.showWelcomeSubtitle") }}</span>
     </div>
 
+    <div class="choice-row">
+      <span class="choice-label">{{ t("settings.display.workspaceMode") }}</span>
+      <BaseSegmented
+        class="choice-segmented"
+        :model-value="display.workspaceDisplayMode"
+        :options="workspaceDisplayModeOptions"
+        :aria-label="t('settings.display.workspaceMode')"
+        size="sm"
+        @update:model-value="setDisplay('workspaceDisplayMode', $event as WorkspaceDisplayMode)"
+      />
+    </div>
+
+    <div v-for="item in knowledgeFolderToggles" :key="item.kind" class="toggle-row">
+      <BaseSwitch
+        :model-value="display.knowledgeFolderVisibility[item.kind]"
+        :aria-label="t('settings.display.showKnowledgeFolder', t(item.labelKey))"
+        @update:model-value="setKnowledgeFolderVisibility(item.kind, $event)"
+      />
+      <span>{{ t("settings.display.showKnowledgeFolder", t(item.labelKey)) }}</span>
+    </div>
+
     <div class="toggle-row">
       <BaseSwitch
         :model-value="display.showAgentSelector"
@@ -278,6 +318,15 @@ async function updateViewWindowsAboveMain(value: boolean) {
         @update:model-value="setDisplay('showAgentSelector', $event)"
       />
       <span>{{ t("settings.display.showAgentSelector") }}</span>
+    </div>
+
+    <div class="toggle-row">
+      <BaseSwitch
+        :model-value="display.showCollabSidebar"
+        :aria-label="t('settings.display.showCollabSidebar')"
+        @update:model-value="setDisplay('showCollabSidebar', $event)"
+      />
+      <span>{{ t("settings.display.showCollabSidebar") }}</span>
     </div>
 
     <div v-for="item in topNavigationToggles" :key="item.key" class="toggle-row">

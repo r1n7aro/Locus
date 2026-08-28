@@ -9,13 +9,12 @@ function read(relPath: string) {
 }
 
 describe("KnowledgeExplorer tree UX", () => {
-  it("indents leaf rows with a chevron-width spacer so hierarchy stays visible", () => {
+  it("uses depth indentation without a dedicated chevron column", () => {
     const workspaceTree = read("src/components/explorer/WorkspaceTree.vue");
 
-    // Every non-chevron row (documents included) renders the spacer; without
-    // it a child document's name lands on the same x as its parent folder.
-    expect(workspaceTree).toContain('v-else class="workspace-tree-branch-spacer"');
     expect(workspaceTree).toContain("paddingLeft: rowIndent(item.treeRow, baseIndent, indentSize)");
+    expect(workspaceTree).not.toContain("workspace-tree-branch-spacer");
+    expect(workspaceTree).not.toContain("workspace-tree-branch");
   });
 
   it("locks row heights to the virtualizer's row-height", () => {
@@ -50,8 +49,8 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(explorer).toMatch(/if \(row\.node\.kind === "folder"\) \{\s*toggleExpansion\(row\);/);
     expect(explorer).toContain('@click="openSelectedFolderConfig"');
     expect(explorer).toContain('t("knowledge.explorer.folderConfig")');
-    expect(workspaceTree).toContain('@click.stop="toggleBranch(item, $event)"');
-    expect(workspaceTree).toContain("if (event.detail >= 2) return;");
+    expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
+    expect(workspaceTree).not.toContain("toggleBranch");
     // Rapid repeated row clicks keep the expanded state stable.
     expect(explorer).toContain("if (event.detail >= 2) return;");
     expect(explorer).not.toContain("onRowDoubleClick");
@@ -124,7 +123,7 @@ describe("KnowledgeExplorer tree UX", () => {
     const state = read("src/composables/useKnowledgeState.ts");
 
     expect(explorer).toContain("pruneKnowledgeDragNodes(");
-    expect(explorer).toContain('emit("moveNodes", movable, targetDir, row.node.type);');
+    expect(explorer).toContain('emit("moveNodes", movable, decision.intent.targetDir, decision.intent.targetType);');
     expect(explorer).toContain("function scheduleDragExpand(row: FlatRow) {");
     expect(explorer).toContain("DRAG_EXPAND_DELAY_MS");
     expect(view).toContain('@move-nodes="handleMoveNodes"');

@@ -28,6 +28,7 @@ import { parseMcpToolName, toolCallDisplayName } from "../toolCallSummary";
 
 const props = defineProps<{
   toolConfirm: PendingToolConfirm;
+  sessionId?: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -164,8 +165,9 @@ const planPrefersWindow = computed(
 
 function openPlanWindow() {
   const display = planApprovalDisplay.value;
-  if (!display) return;
+  if (!display || !props.sessionId) return;
   void openPlanViewWindow({
+    sessionId: props.sessionId,
     planFilePath: display.planFilePath,
     questionId: props.toolConfirm.questionId,
   });

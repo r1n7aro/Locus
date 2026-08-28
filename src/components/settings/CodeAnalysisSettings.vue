@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { t } from "../../i18n";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
@@ -16,8 +16,10 @@ import { defaultCodeAnalysisToolsConfig } from "../../types";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { normalizeAppError } from "../../services/errors";
 import { useNotificationStore } from "../../stores/notification";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 
 const notificationStore = useNotificationStore();
+const workspaceContextStore = useWorkspaceContextStore();
 
 const lspStatus = ref<CsharpLspStatus | null>(null);
 const lspReady = ref(false);
@@ -29,6 +31,13 @@ const codeToolsReady = ref(false);
 const codeToolsBusy = ref(false);
 
 let unsubscribeStatus: RuntimeUnsubscribe | null = null;
+let statusSubscriptionVersion = 0;
+let disposed = false;
+
+const workspaceScopeKey = computed(() => {
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
+});
 
 const lspEnabled = computed(() => lspStatus.value?.enabled ?? false);
 
@@ -87,8 +96,17 @@ const assetToolItems = computed<CodeToolItem[]>(() => [
 ]);
 
 async function refreshLspStatus() {
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    lspStatus.value = null;
+    lspReady.value = true;
+    return;
+  }
   try {
-    lspStatus.value = await csharpLspGetStatus();
+    const status = await csharpLspGetStatus(scope);
+    if (workspaceScopeKey.value === `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`) {
+      lspStatus.value = status;
+    }
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -103,8 +121,13 @@ async function refreshLspStatus() {
 async function toggleLspEnabled() {
   if (!lspReady.value || lspBusy.value) return;
   lspBusy.value = true;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    lspBusy.value = false;
+    return;
+  }
   try {
-    lspStatus.value = await csharpLspSetEnabled(!lspEnabled.value);
+    lspStatus.value = await csharpLspSetEnabled(!lspEnabled.value, scope);
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -121,8 +144,13 @@ async function toggleLspEnabled() {
 async function restartLsp() {
   if (restartBusy.value || !lspEnabled.value) return;
   restartBusy.value = true;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    restartBusy.value = false;
+    return;
+  }
   try {
-    lspStatus.value = await csharpLspRestart();
+    lspStatus.value = await csharpLspRestart(scope);
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -154,8 +182,13 @@ async function toggleCodeTool(key: CodeToolKey) {
   codeToolsBusy.value = true;
   const next = { ...codeTools.value, [key]: !codeTools.value[key] };
   codeTools.value = next;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    codeToolsBusy.value = false;
+    return;
+  }
   try {
-    codeTools.value = await codeAnalysisToolsSetConfig(next);
+    codeTools.value = await codeAnalysisToolsSetConfig(next, scope);
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -169,17 +202,44 @@ async function toggleCodeTool(key: CodeToolKey) {
   }
 }
 
+async function bindLspStatus() {
+  const version = ++statusSubscriptionVersion;
+  unsubscribeStatus?.();
+  unsubscribeStatus = null;
+  lspStatus.value = null;
+  lspReady.value = false;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope || disposed) {
+    lspReady.value = true;
+    return;
+  }
+  await refreshLspStatus();
+  try {
+    const unsubscribe = await subscribeCsharpLspStatus(scope, (payload) => {
+      if (workspaceScopeKey.value !== `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`) return;
+      lspStatus.value = payload;
+      lspReady.value = true;
+    });
+    if (disposed || version !== statusSubscriptionVersion) unsubscribe();
+    else unsubscribeStatus = unsubscribe;
+  } catch {
+    // The explicit status request remains authoritative.
+  }
+}
+
 onMounted(() => {
-  void refreshLspStatus();
+  disposed = false;
+  void bindLspStatus();
   void refreshCodeTools();
-  void subscribeCsharpLspStatus((payload) => {
-    lspStatus.value = payload;
-  }).then((unsubscribe) => {
-    unsubscribeStatus = unsubscribe;
-  });
+});
+
+watch(workspaceScopeKey, () => {
+  void bindLspStatus();
 });
 
 onUnmounted(() => {
+  disposed = true;
+  statusSubscriptionVersion += 1;
   unsubscribeStatus?.();
   unsubscribeStatus = null;
 });

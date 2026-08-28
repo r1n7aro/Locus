@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildSessionTree } from "../components/chat/sessionTree";
+import {
+  buildSessionTree,
+  sessionTreeStatusForSession,
+} from "../components/chat/sessionTree";
 import type { SessionSummary } from "../types";
 
 function makeSession(overrides: Partial<SessionSummary> & Pick<SessionSummary, "id" | "title" | "sessionType" | "updatedAt">): SessionSummary {
@@ -87,6 +90,18 @@ describe("buildSessionTree", () => {
       expect(tree[0].title).toBe("Event System");
       expect(tree[0].status).toBe("queued");
     }
+  });
+
+  it("lets live streaming state override a stale persisted runtime status", () => {
+    const session = makeSession({
+      id: "streaming-session",
+      title: "Streaming",
+      sessionType: "chat",
+      updatedAt: 12,
+      runtimeStatus: null,
+    });
+
+    expect(sessionTreeStatusForSession(session, new Set([session.id]))).toBe("running");
   });
 
   it("keeps legacy docgen sessions readable", () => {

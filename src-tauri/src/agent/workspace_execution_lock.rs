@@ -6,7 +6,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Manager};
 use tokio::sync::{
     watch, Mutex as AsyncMutex, OnceCell, OwnedMutexGuard, OwnedRwLockReadGuard,
     OwnedRwLockWriteGuard, RwLock,
@@ -107,7 +107,6 @@ pub(crate) struct WorkspaceExecutionLockDiagnostic {
     pub session_id: String,
     pub run_id: String,
     pub iteration: usize,
-    pub workspace: String,
     pub mode: String,
     pub waited_ms: u64,
     pub tools: Vec<String>,
@@ -120,6 +119,7 @@ type WorkspaceExecutionLockDiagnosticReporter =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspaceExecutionLockAcquireError {
     Cancelled,
+    MissingWorkspaceScope,
 }
 
 #[derive(Debug, Clone)]
@@ -402,7 +402,6 @@ impl WorkspaceExecutionLock {
             session_id: owner.session_id.clone(),
             run_id: owner.run_id.clone(),
             iteration: owner.iteration,
-            workspace: owner.workspace.clone(),
             mode: request.label().to_string(),
             waited_ms: duration_millis(waited),
             tools: owner.tools.clone(),
@@ -425,16 +424,26 @@ impl WorkspaceExecutionLock {
         request: WorkspaceExecutionLockRequest,
         owner: WorkspaceExecutionLockOwner,
         cancel_rx: watch::Receiver<bool>,
+        workspace_event_scope: crate::workspace_service::event::WorkspaceEventScope,
         app_handle: &AppHandle,
     ) -> Result<WorkspaceExecutionGuard, WorkspaceExecutionLockAcquireError> {
         let app_handle = app_handle.clone();
+        let event_router = app_handle
+            .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+            .event_router()
+            .clone();
         let reporter: WorkspaceExecutionLockDiagnosticReporter = Arc::new(move |diagnostic| {
-            if let Err(error) =
-                app_handle.emit(WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT, diagnostic)
-            {
+            if matches!(
+                event_router.publish_for_scope(
+                    &app_handle,
+                    &workspace_event_scope,
+                    WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT,
+                    diagnostic,
+                ),
+                crate::workspace_service::event::WorkspaceEventPublishOutcome::DroppedSerialization
+            ) {
                 eprintln!(
-                    "[WorkspaceExecutionLock] failed to emit frontend diagnostic: {}",
-                    error
+                    "[WorkspaceExecutionLock] failed to serialize scoped frontend diagnostic"
                 );
             }
         });

@@ -43,7 +43,8 @@ describe("Unity embedded window setting", () => {
     const en = read("src/language/en.json");
 
     expect(service).toContain('ipcInvoke<boolean>("get_unity_embed_enabled")');
-    expect(service).toContain('ipcInvoke<boolean>("set_unity_embed_enabled", { value })');
+    expect(service).toContain('ipcInvoke<boolean>("set_unity_embed_enabled", {');
+    expect(service).toContain("workspaceRef: requireUnityEmbedWorkspaceRef(workspaceRef)");
     expect(settings).toContain("getUnityEmbedEnabled");
     expect(settings).toContain("setUnityEmbedEnabled");
     expect(settings).toContain("<BaseSwitch");

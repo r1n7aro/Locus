@@ -18,6 +18,7 @@
 //   index/schema      -> SerializedProperty schema built from reference metadata
 
 using System.Globalization;
+using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Locus.CompileServer;
@@ -32,8 +33,12 @@ CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
 var stdin = Console.OpenStandardInput();
 var stdout = Console.OpenStandardOutput();
 var transport = new StdioTransport(stdin, stdout);
-var service = new CompileService();
-var shutdownRequested = false;
+var initializeService = new CompileService();
+var scopes = new ScopedCompileServiceRegistry();
+var inFlight = new List<Task>();
+var inFlightLock = new object();
+var requestCancellations = new ConcurrentDictionary<string, CancellationTokenSource>(
+    StringComparer.Ordinal);
 
 while (true)
 {
@@ -72,94 +77,142 @@ while (true)
     if (method == "exit")
         break;
 
+    if (method == "$/cancelRequest")
+    {
+        JsonNode? cancelledId = @params?["id"];
+        if (cancelledId != null &&
+            requestCancellations.TryGetValue(cancelledId.ToJsonString(), out var source))
+        {
+            try
+            {
+                source.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The request completed between lookup and cancellation.
+            }
+        }
+        continue;
+    }
+
     if (id == null)
         continue; // Unknown notification.
 
-    JsonNode? result = null;
-    JsonObject? error = null;
-    try
+    JsonNode requestId = id.DeepClone();
+    string requestMethod = method;
+    JsonNode? requestParams = @params?.DeepClone();
+    string requestKey = requestId.ToJsonString();
+    var cancellation = new CancellationTokenSource();
+    requestCancellations[requestKey] = cancellation;
+    Task dispatch = Task.Run(async delegate
     {
-        switch (method)
+        JsonNode? result = null;
+        JsonObject? error = null;
+        ScopedCompileServiceRegistry.ScopeState? scope = null;
+        bool scopeGateHeld = false;
+        try
         {
-            case "initialize":
-                result = service.HandleInitialize(@params);
-                break;
-            case "shutdown":
-                shutdownRequested = true;
+            if (requestMethod == "initialize")
+            {
+                result = initializeService.HandleInitialize(requestParams);
+            }
+            else if (requestMethod == "shutdown")
+            {
                 result = null;
-                break;
-            case "compile/raw":
-                result = service.HandleCompileRaw(@params);
-                break;
-            case "image/register":
-                result = service.HandleRegisterImage(@params);
-                break;
-            case "compile/snippet":
-                result = service.HandleCompileSnippet(@params);
-                break;
-            case "compile/runStates":
-                result = service.HandleCompileRunStates(@params);
-                break;
-            case "compile/viewScript":
-                result = service.HandleCompileViewScript(@params);
-                break;
-            case "analyze/hotDiff":
-                result = service.HandleAnalyzeHotDiff(@params);
-                break;
-            case "compile/hotPatch":
-                result = service.HandleCompileHotPatch(@params);
-                break;
-            case "compile/accessProbe":
-                result = service.HandleCompileAccessProbe(@params);
-                break;
-            case "caller/query":
-                result = service.HandleCallerQuery(@params);
-                break;
-            case "index/types":
-                result = service.HandleIndexTypes(@params);
-                break;
-            case "index/schema":
-                result = service.HandleIndexSchema(@params);
-                break;
-            default:
-                error = RpcError(-32601, $"method not found: {method}");
-                break;
+            }
+            else if (requestMethod == "scope/release")
+            {
+                bool released = await scopes
+                    .ReleaseAsync(requestParams, cancellation.Token)
+                    .ConfigureAwait(false);
+                result = new JsonObject { ["released"] = released };
+            }
+            else
+            {
+                scope = scopes.GetOrCreate(requestParams);
+                await scope.RequestGate.WaitAsync(cancellation.Token).ConfigureAwait(false);
+                scopeGateHeld = true;
+                cancellation.Token.ThrowIfCancellationRequested();
+                result = requestMethod switch
+                {
+                    "compile/raw" => scope.Service.HandleCompileRaw(requestParams),
+                    "image/register" => scope.Service.HandleRegisterImage(requestParams),
+                    "compile/snippet" => scope.Service.HandleCompileSnippet(requestParams),
+                    "compile/runStates" => scope.Service.HandleCompileRunStates(requestParams),
+                    "compile/viewScript" => scope.Service.HandleCompileViewScript(requestParams),
+                    "analyze/hotDiff" => scope.Service.HandleAnalyzeHotDiff(requestParams),
+                    "compile/hotPatch" => scope.Service.HandleCompileHotPatch(requestParams),
+                    "compile/accessProbe" => scope.Service.HandleCompileAccessProbe(requestParams),
+                    "caller/query" => scope.Service.HandleCallerQuery(requestParams),
+                    "index/types" => scope.Service.HandleIndexTypes(requestParams),
+                    "index/schema" => scope.Service.HandleIndexSchema(requestParams),
+                    _ => throw new RpcMethodNotFoundException(requestMethod),
+                };
+                cancellation.Token.ThrowIfCancellationRequested();
+            }
         }
-    }
-    catch (RpcInvalidParamsException ex)
-    {
-        error = RpcError(-32602, ex.Message);
-    }
-    catch (Exception ex)
-    {
-        error = RpcError(-32603, $"internal error in {method}: {ex}");
-    }
+        catch (RpcMethodNotFoundException ex)
+        {
+            error = RpcError(-32601, $"method not found: {ex.Method}");
+        }
+        catch (RpcInvalidParamsException ex)
+        {
+            error = RpcError(-32602, ex.Message);
+        }
+        catch (OperationCanceledException)
+        {
+            error = RpcError(-32800, $"request cancelled: {requestMethod}");
+        }
+        catch (Exception ex)
+        {
+            error = RpcError(-32603, $"internal error in {requestMethod}: {ex}");
+        }
+        finally
+        {
+            if (scopeGateHeld)
+                scope!.RequestGate.Release();
+            requestCancellations.TryRemove(requestKey, out _);
+            cancellation.Dispose();
+        }
 
-    var response = new JsonObject
-    {
-        ["jsonrpc"] = "2.0",
-        ["id"] = id.DeepClone(),
-    };
-    if (error != null)
-        response["error"] = error;
-    else
-        response["result"] = result;
+        var response = new JsonObject
+        {
+            ["jsonrpc"] = "2.0",
+            ["id"] = requestId,
+        };
+        if (error != null)
+            response["error"] = error;
+        else
+            response["result"] = result;
 
-    try
+        try
+        {
+            transport.WriteMessage(JsonSerializer.SerializeToUtf8Bytes(response));
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[LocusCompileServer] transport write failed: {ex.Message}");
+        }
+    });
+    lock (inFlightLock)
     {
-        transport.WriteMessage(JsonSerializer.SerializeToUtf8Bytes(response));
+        inFlight.RemoveAll(static task => task.IsCompleted);
+        inFlight.Add(dispatch);
     }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"[LocusCompileServer] transport write failed: {ex.Message}");
-        break;
-    }
-
-    if (shutdownRequested && method == "shutdown")
-        continue; // Keep draining until `exit` so the response flushes first.
 }
+
+Task[] remaining;
+lock (inFlightLock)
+    remaining = inFlight.ToArray();
+await Task.WhenAll(remaining).ConfigureAwait(false);
 
 return 0;
 
 static JsonObject RpcError(int code, string message) =>
     new() { ["code"] = code, ["message"] = message };
+
+sealed class RpcMethodNotFoundException : Exception
+{
+    public string Method { get; }
+    public RpcMethodNotFoundException(string method) => Method = method;
+}

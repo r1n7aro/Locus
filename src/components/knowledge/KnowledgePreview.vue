@@ -15,6 +15,7 @@ import type {
 import { skillSurfaceAllowsCommand } from "../../types";
 import { t } from "../../i18n";
 import { useNotificationStore } from "../../stores/notification";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import { useSkills } from "../../composables/useSkills";
 import {
   deriveSkillSurface,
@@ -30,7 +31,6 @@ import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import MarkdownRenderer from "../MarkdownRenderer.vue";
 import SemanticCodeRenderer from "../ui/SemanticCodeRenderer.vue";
-import KnowledgeChatPane from "./KnowledgeChatPane.vue";
 import {
   getSkillUnityInstallStatus,
   installSkillUnityFiles,
@@ -54,27 +54,26 @@ import {
   getKnowledgeEditMode,
   isKnowledgeEditModeLocked,
 } from "./knowledgeEditMode";
-import { acquireSelectionLock } from "../../composables/useSelectionLock";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import {
   useMarkdownEditorViewMode,
   type MarkdownEditorViewMode,
 } from "../ui/markdownEditorViewMode";
 import { semanticCodeLanguageFromPath } from "../../composables/semanticCodeRendering";
+import {
+  buildKnowledgeDocumentWorkspaceDragPayload,
+  startKnowledgeInternalDrag,
+} from "./knowledgeWorkspaceDrag";
+import { useInternalDragController } from "../../composables/useInternalDrag";
 
 const AUTO_SAVE_DELAY_MS = 700;
-const DEFAULT_SIDE_PANEL_WIDTH = 420;
-const COLLAPSED_SIDE_PANEL_WIDTH = 42;
-const MIN_SIDE_PANEL_WIDTH = 280;
-const MAX_SIDE_PANEL_WIDTH = 720;
-const MIN_MAIN_COLUMN_WIDTH = 320;
-const SIDE_RAIL_COLLAPSED_STORAGE_KEY = "locus:knowledgePreviewSideRailCollapsed";
 const MEMORY_PREVIEW_PATH_PREFIX = "unity-project-understanding";
 const BUILTIN_MEMORY_PREVIEW_PATHS = new Set([
   "project-mistake-note.md",
   "user-preference.md",
 ]);
 const notificationStore = useNotificationStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const { skillItems, loadSkills } = useSkills();
 const { markdownEditorViewMode, setMarkdownEditorViewMode } = useMarkdownEditorViewMode();
 type InjectModeSelection = KnowledgeInjectMode | "inherit_parent";
@@ -85,6 +84,7 @@ const props = defineProps<{
   loading: boolean;
   saveLoading: boolean;
 }>();
+const internalDrag = useInternalDragController();
 
 const emit = defineEmits<{
   (e: "close"): void;
@@ -101,9 +101,6 @@ const fileNameDirty = ref(false);
 const dirtySections = ref<Set<KnowledgeDocumentSection>>(new Set());
 const autoSaveQueued = ref(false);
 const autoSaveInFlight = ref(false);
-const metaCollapsed = ref(loadStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY) ?? false);
-const isSideResizing = ref(false);
-const sidePanelWidth = ref(DEFAULT_SIDE_PANEL_WIDTH);
 const skillCommandDraft = ref("");
 const skillArgumentHintDraft = ref("");
 const skillUnityStatus = ref<SkillUnityInstallStatus | null>(null);
@@ -113,11 +110,6 @@ const summaryRenderedSearchRef = ref<HTMLElement | null>(null);
 const rulesRenderedSearchRef = ref<HTMLElement | null>(null);
 const bodyRenderedSearchRef = ref<HTMLElement | null>(null);
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
-let sideResizing = false;
-let sideResizeStartX = 0;
-let sideResizeStartWidth = DEFAULT_SIDE_PANEL_WIDTH;
-let bodyCursorBeforeResize = "";
-let releaseSelectionLock: (() => void) | null = null;
 let searchMatchScrollFrame = 0;
 let skillUnityStatusRequestId = 0;
 
@@ -164,6 +156,13 @@ const titleMeasureText = computed(() => fileNameDraft.value || " ");
 const typeLabel = computed(() => labelForType(props.document?.type));
 const scopeLabel = computed(() => labelForStoredScope(props.document));
 const injectMode = computed(() => props.document?.effectiveInjectMode ?? "none");
+
+function onDocumentDragPointerDown(event: PointerEvent): void {
+  if (!props.document) return;
+  startKnowledgeInternalDrag(internalDrag, event, {
+    payload: buildKnowledgeDocumentWorkspaceDragPayload(props.document),
+  });
+}
 // Skill documents show the effective auto-channel mode: a surface without the
 // auto side reads as "none" regardless of the stored injectMode.
 const displayInjectMode = computed<KnowledgeInjectMode>(() => (
@@ -319,10 +318,6 @@ const footerLabel = computed(() =>
 const footerWarning = computed(() =>
   hasUnsavedChanges.value && !autoSaveQueued.value && !autoSaveInFlight.value,
 );
-const sidePanelOptions = computed(() => [
-  { value: "meta", label: t("knowledge.side.meta") },
-  { value: "chat", label: t("knowledge.side.chat") },
-]);
 const editorViewOptions = computed(() => [
   { value: "rendered", label: t("knowledge.editor.view.rendered") },
   { value: "native", label: t("knowledge.editor.view.native") },
@@ -402,17 +397,6 @@ const canRemoveSkillUnityFiles = computed(() => {
     && !!skillUnityStatus.value?.hasUnity
     && (state === "installed" || state === "modified" || state === "partial");
 });
-const sideRailStyle = computed(() => {
-  if (metaCollapsed.value) {
-    return {
-      width: `${COLLAPSED_SIDE_PANEL_WIDTH}px`,
-    };
-  }
-  return {
-    width: `clamp(${MIN_SIDE_PANEL_WIDTH}px, ${sidePanelWidth.value}px, calc(100% - ${MIN_MAIN_COLUMN_WIDTH}px))`,
-  };
-});
-const isPreviewResizing = computed(() => isSideResizing.value);
 const activeSearchContext = computed(() => {
   if (!props.document || !props.searchContext) return null;
   const result = props.searchContext.result;
@@ -439,44 +423,6 @@ const searchHighlightRe = computed<RegExp | null>(() => {
   if (!searchQueryTerms.value.length) return null;
   return new RegExp(`(${searchQueryTerms.value.map(escapeRegExp).join("|")})`, "gi");
 });
-
-function loadStoredBoolean(storageKey: string): boolean | null {
-  try {
-    const raw = localStorage.getItem(storageKey);
-    if (raw === "true") return true;
-    if (raw === "false") return false;
-  } catch {
-    // ignore persistence failures
-  }
-  return null;
-}
-
-function persistStoredBoolean(storageKey: string, value: boolean) {
-  try {
-    localStorage.setItem(storageKey, String(value));
-  } catch {
-    // ignore persistence failures
-  }
-}
-
-function toggleSideRail() {
-  const nextValue = !metaCollapsed.value;
-  metaCollapsed.value = nextValue;
-  persistStoredBoolean(SIDE_RAIL_COLLAPSED_STORAGE_KEY, nextValue);
-}
-
-function lockResizeInteraction(cursor: "col-resize") {
-  bodyCursorBeforeResize = document.body.style.cursor;
-  document.body.style.cursor = cursor;
-  releaseSelectionLock?.();
-  releaseSelectionLock = acquireSelectionLock();
-}
-
-function unlockResizeInteraction() {
-  document.body.style.cursor = bodyCursorBeforeResize;
-  releaseSelectionLock?.();
-  releaseSelectionLock = null;
-}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -744,10 +690,7 @@ watch(skillPackageId, () => {
 onUnmounted(() => {
   clearAutoSaveTimer();
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
-  document.removeEventListener("mousemove", onSideResizeMove);
-  document.removeEventListener("mouseup", onSideResizeEnd);
   cancelSearchMatchScroll();
-  unlockResizeInteraction();
 });
 
 function currentDraftValues() {
@@ -994,35 +937,6 @@ function onEditModeChange(value: string) {
   updateMeta(nextPatch);
 }
 
-function onSideResizeStart(event: MouseEvent) {
-  if (metaCollapsed.value) return;
-  event.preventDefault();
-  sideResizing = true;
-  isSideResizing.value = true;
-  sideResizeStartX = event.clientX;
-  sideResizeStartWidth = sidePanelWidth.value;
-  document.addEventListener("mousemove", onSideResizeMove);
-  document.addEventListener("mouseup", onSideResizeEnd);
-  lockResizeInteraction("col-resize");
-}
-
-function onSideResizeMove(event: MouseEvent) {
-  if (!sideResizing) return;
-  const delta = sideResizeStartX - event.clientX;
-  sidePanelWidth.value = Math.min(
-    MAX_SIDE_PANEL_WIDTH,
-    Math.max(MIN_SIDE_PANEL_WIDTH, sideResizeStartWidth + delta),
-  );
-}
-
-function onSideResizeEnd() {
-  sideResizing = false;
-  isSideResizing.value = false;
-  document.removeEventListener("mousemove", onSideResizeMove);
-  document.removeEventListener("mouseup", onSideResizeEnd);
-  unlockResizeInteraction();
-}
-
 function inferSkillName(document: KnowledgeDocument | null): string {
   const path = document?.path?.trim().replace(/\\/g, "/") ?? "";
   if (!path) return "";
@@ -1142,13 +1056,14 @@ async function refreshSkillUnityStatus() {
   // earlier request overwrite the status of the currently shown package.
   const requestId = ++skillUnityStatusRequestId;
   const packageId = skillPackageId.value;
-  if (!packageId) {
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!packageId || !workspaceRef) {
     skillUnityStatus.value = null;
     return;
   }
   skillUnityStatusLoading.value = true;
   try {
-    const status = await getSkillUnityInstallStatus(packageId);
+    const status = await getSkillUnityInstallStatus(packageId, workspaceRef);
     if (requestId === skillUnityStatusRequestId) {
       skillUnityStatus.value = status;
     }
@@ -1165,10 +1080,11 @@ async function refreshSkillUnityStatus() {
 
 async function installSkillUnity() {
   const packageId = skillPackageId.value;
-  if (!packageId || skillUnityActionPending.value) return;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!packageId || !workspaceRef || skillUnityActionPending.value) return;
   skillUnityActionPending.value = true;
   try {
-    skillUnityStatus.value = await installSkillUnityFiles(packageId);
+    skillUnityStatus.value = await installSkillUnityFiles(packageId, workspaceRef);
     notificationStore.addNotice("success", t("knowledge.skill.unityInstallDone"), {
       operation: "skill_unity_install",
       replaceOperation: true,
@@ -1185,10 +1101,11 @@ async function installSkillUnity() {
 
 async function removeSkillUnity() {
   const packageId = skillPackageId.value;
-  if (!packageId || skillUnityActionPending.value) return;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!packageId || !workspaceRef || skillUnityActionPending.value) return;
   skillUnityActionPending.value = true;
   try {
-    skillUnityStatus.value = await removeSkillUnityFiles(packageId);
+    skillUnityStatus.value = await removeSkillUnityFiles(packageId, workspaceRef);
     notificationStore.addNotice("success", t("knowledge.skill.unityRemoveDone"), {
       operation: "skill_unity_remove",
       replaceOperation: true,
@@ -1247,11 +1164,15 @@ function labelForProvider(provider?: string | null): string {
 </script>
 
 <template>
-  <div class="preview-panel" :class="{ 'is-resizing': isPreviewResizing }">
+  <div class="preview-panel">
     <div class="preview-shell">
       <div class="preview-main-column">
         <div class="preview-header">
-          <div class="preview-header-main">
+          <div
+            class="preview-header-main"
+            :class="{ 'drag-enabled': !!document }"
+            @pointerdown="onDocumentDragPointerDown"
+          >
             <span v-if="documentDisplayPath" class="preview-path">{{ documentDisplayPath }}</span>
           </div>
           <div class="preview-header-actions">
@@ -1563,48 +1484,6 @@ function labelForProvider(provider?: string | null): string {
         </div>
       </div>
 
-      <div
-        v-if="document && !metaCollapsed"
-        class="preview-side-resize-handle"
-        @mousedown="onSideResizeStart"
-      ></div>
-
-      <aside
-        v-if="document"
-        class="preview-side-rail"
-        :class="{ 'is-resizing': isSideResizing }"
-        :style="sideRailStyle"
-      >
-        <div class="preview-side-rail-header">
-          <div class="preview-side-tabs" role="tablist">
-            <button
-              type="button"
-              class="preview-side-toggle preview-side-toggle-tab"
-              :title="metaCollapsed ? t('knowledge.side.expand') : t('knowledge.side.collapse')"
-              :aria-expanded="!metaCollapsed"
-              @click="toggleSideRail"
-            >
-              <span class="preview-side-toggle-chevron">{{ metaCollapsed ? "◀" : "▶" }}</span>
-            </button>
-            <button
-              v-show="!metaCollapsed"
-              type="button"
-              class="preview-side-tab"
-              :class="{ active: true }"
-              role="tab"
-              :aria-selected="true"
-            >
-              {{ sidePanelOptions[1]?.label }}
-            </button>
-          </div>
-        </div>
-
-          <div v-if="!metaCollapsed" class="preview-side-rail-body">
-          <div class="preview-side-rail-panel preview-side-rail-panel-chat">
-            <KnowledgeChatPane :document="document" />
-          </div>
-        </div>
-      </aside>
     </div>
   </div>
 </template>
@@ -1639,6 +1518,15 @@ function labelForProvider(provider?: string | null): string {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.preview-header-main.drag-enabled {
+  cursor: grab;
+  touch-action: none;
+}
+
+.preview-header-main.drag-enabled:active {
+  cursor: grabbing;
 }
 
 .preview-header-actions {
@@ -2266,224 +2154,6 @@ function labelForProvider(provider?: string | null): string {
   color: var(--text-secondary);
 }
 
-.preview-side-resize-handle {
-  width: 0;
-  cursor: col-resize;
-  background: transparent;
-  flex-shrink: 0;
-  position: relative;
-  z-index: 4;
-}
-
-.preview-side-resize-handle::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: -3px;
-  width: 6px;
-}
-
-.preview-side-resize-handle::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: -1px;
-  width: 2px;
-  background: transparent;
-  transition: background 0.15s ease;
-}
-
-.preview-side-resize-handle:hover::after {
-  background: color-mix(in srgb, var(--accent-color) 40%, transparent);
-}
-
-.preview-side-rail {
-  flex-shrink: 0;
-  min-width: 0;
-  border-left: 1px solid var(--border-color);
-  background: color-mix(in srgb, var(--sidebar-bg) 86%, var(--panel-bg));
-  display: flex;
-  flex-direction: column;
-  padding: 0;
-  overflow: hidden;
-  transition: width 0.16s ease;
-}
-
-.preview-side-rail:has(.meta-dropdown.open) {
-  position: relative;
-  z-index: 20;
-  overflow: visible;
-}
-
-.preview-side-rail.is-resizing {
-  transition: none;
-}
-
-.preview-side-rail-header {
-  min-height: 38px;
-  display: flex;
-  align-items: stretch;
-  border-bottom: 1px solid var(--border-color);
-  background: color-mix(in srgb, var(--sidebar-bg) 90%, var(--panel-bg));
-  padding: 0;
-}
-
-.preview-side-tabs {
-  width: 100%;
-  min-width: 0;
-  min-height: 38px;
-  display: flex;
-  align-items: stretch;
-}
-
-.preview-side-toggle {
-  width: 30px;
-  flex: 0 0 30px;
-  border: none;
-  background: transparent;
-  color: inherit;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  box-shadow: none;
-  padding: 0;
-  transition: color 0.14s ease;
-}
-
-.preview-side-toggle:hover {
-  color: inherit;
-}
-
-.preview-side-toggle-chevron {
-  font-size: 10px;
-  line-height: 1;
-}
-
-.preview-side-tab {
-  flex: 1 1 0;
-  min-width: 0;
-  border: none;
-  border-right: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
-  background: transparent;
-  color: var(--text-secondary);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 0 12px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  box-shadow: none;
-  transition: background 0.14s ease, color 0.14s ease;
-}
-
-.preview-side-tabs .preview-side-tab:last-of-type {
-  border-right: none;
-}
-
-.preview-side-tab:hover {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.preview-side-tab.active {
-  background: color-mix(in srgb, var(--accent-soft) 44%, var(--sidebar-bg) 56%);
-  color: var(--text-color);
-}
-
-.preview-side-toggle-tab {
-  border-right: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
-  justify-content: center;
-}
-
-.preview-side-rail-body {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  overflow: hidden;
-  width: 100%;
-}
-
-.preview-side-rail-panel {
-  flex: 1;
-  width: 100%;
-  min-height: 0;
-  overflow: auto;
-}
-
-.preview-side-rail:has(.meta-dropdown.open) .preview-side-rail-body,
-.preview-side-rail:has(.meta-dropdown.open) .preview-side-rail-panel {
-  overflow: visible;
-}
-
-.preview-side-rail-panel-meta {
-  display: flex;
-  flex-direction: column;
-}
-
-.preview-side-rail-panel-chat {
-  overflow: hidden;
-}
-
-.meta-stack {
-  flex: 1;
-  min-height: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 12px 14px 14px;
-}
-
-.meta-group {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.meta-group + .meta-group {
-  padding-top: 12px;
-  border-top: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
-}
-
-.meta-group-file {
-  margin-top: auto;
-}
-
-.meta-row {
-  display: grid;
-  grid-template-columns: 60px minmax(0, 1fr);
-  gap: 12px;
-  align-items: center;
-}
-
-.meta-label {
-  font-size: 11px;
-  color: var(--text-secondary);
-  line-height: 1.45;
-}
-
-.meta-value {
-  font-size: 12px;
-  color: var(--text-color);
-  line-height: 1.45;
-  text-align: left;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.meta-value-wrap {
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
-  overflow-wrap: anywhere;
-}
-
 .skill-unity-actions {
   display: flex;
   flex-wrap: wrap;
@@ -2938,7 +2608,7 @@ function labelForProvider(provider?: string | null): string {
 
 .document-page .editor-footnote {
   position: fixed;
-  right: calc(var(--knowledge-chat-offset, 16px) + 16px);
+  right: 16px;
   bottom: 10px;
 }
 

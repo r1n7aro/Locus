@@ -1,8 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{
-    AtomicBool as GlobalAtomicBool, AtomicU64, Ordering as GlobalAtomicOrdering,
-};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -10,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl};
 
 use crate::error::AppError;
-use crate::workspace::Workspace;
+use crate::workspace_service::{
+    ProjectRegistry, ServiceKind, ServiceStatus, WindowContextRegistry, WorkspaceRef,
+    WorkspaceRuntime,
+};
 
-const WINDOW_LABEL: &str = "unity-embed";
 const WINDOW_LABEL_PREFIX: &str = "unity-embed";
 const MAIN_WINDOW_LABEL: &str = "main";
 const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
@@ -34,10 +33,20 @@ const UNITY_EMBED_QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 const ASSET_DRAG_CACHE_TTL: Duration = Duration::from_secs(3);
 const ASSET_DRAG_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(35);
 
-static UNITY_EMBED_QUIESCED: GlobalAtomicBool = GlobalAtomicBool::new(false);
-static UNITY_EMBED_CONTROL_EPOCH: AtomicU64 = AtomicU64::new(0);
+#[derive(Debug, Default)]
+struct UnityEmbedQuiesceState {
+    active: bool,
+    epoch: u64,
+}
+
+fn unity_embed_quiesce_states() -> &'static Mutex<HashMap<String, UnityEmbedQuiesceState>> {
+    static STATES: OnceLock<Mutex<HashMap<String, UnityEmbedQuiesceState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 pub(crate) struct UnityEmbedQuiesceGuard {
+    scope_key: String,
+    epoch: u64,
     active: bool,
 }
 
@@ -47,22 +56,34 @@ impl Drop for UnityEmbedQuiesceGuard {
             return;
         }
 
-        // Advance the epoch before accepting new messages. Messages received
-        // while Unity was closing retain the previous epoch and stay ignored
-        // even if their main-thread dispatch runs after this guard is dropped.
-        UNITY_EMBED_CONTROL_EPOCH.fetch_add(1, GlobalAtomicOrdering::SeqCst);
-        UNITY_EMBED_QUIESCED.store(false, GlobalAtomicOrdering::SeqCst);
+        if let Ok(mut states) = unity_embed_quiesce_states().lock() {
+            if let Some(state) = states.get_mut(&self.scope_key) {
+                if state.active && state.epoch == self.epoch {
+                    // Advance the checkout epoch before accepting new messages.
+                    // Messages received during shutdown retain the older epoch.
+                    state.epoch = state.epoch.wrapping_add(1);
+                    state.active = false;
+                }
+            }
+        }
         self.active = false;
-        eprintln!("[Locus] Unity embed control resumed after editor shutdown");
+        eprintln!(
+            "[Locus] Unity embed control resumed after editor shutdown: scope={}",
+            self.scope_key
+        );
     }
 }
 
-fn unity_embed_is_quiesced() -> bool {
-    UNITY_EMBED_QUIESCED.load(GlobalAtomicOrdering::SeqCst)
-}
-
-fn unity_embed_control_epoch() -> u64 {
-    UNITY_EMBED_CONTROL_EPOCH.load(GlobalAtomicOrdering::SeqCst)
+fn unity_embed_quiesce_snapshot(scope_key: &str) -> (bool, u64) {
+    unity_embed_quiesce_states()
+        .lock()
+        .ok()
+        .and_then(|states| {
+            states
+                .get(scope_key)
+                .map(|state| (state.active, state.epoch))
+        })
+        .unwrap_or((false, 0))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -204,6 +225,8 @@ struct LocusFileDropRef {
 #[serde(rename_all = "camelCase")]
 struct LocusFileDropPayload {
     files: Vec<LocusFileDropRef>,
+    x: f64,
+    y: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -248,7 +271,39 @@ pub struct UnityEmbedStatus {
     pub message: String,
     pub pipe_name: String,
     pub window_label: String,
+    pub checkout_id: String,
+    pub workspace_generation: u64,
     pub control: UnityEmbedControlSnapshot,
+}
+
+/// Immutable checkout binding captured by a control-pipe listener. Unity's
+/// native overlay messages do not carry Locus workspace identity, so the pipe
+/// that accepted the message is the authoritative routing boundary.
+#[derive(Clone)]
+struct UnityEmbedCheckoutBinding {
+    workspace_ref: WorkspaceRef,
+    scope_key: String,
+    pipe_name: String,
+}
+
+impl UnityEmbedCheckoutBinding {
+    fn new(workspace_ref: WorkspaceRef, project_root: &str) -> Self {
+        let scope_key = unity_embed_scope_key(&workspace_ref);
+        let pipe_name = control_pipe_name_for_project_path(project_root);
+        Self {
+            workspace_ref,
+            scope_key,
+            pipe_name,
+        }
+    }
+
+    fn window_label(&self, window_id: &str) -> String {
+        unity_embed_window_label_for_scope(&self.workspace_ref, window_id)
+    }
+
+    fn host_url(&self, window_id: &str, target_kind: &str, target_id: &str) -> String {
+        unity_embed_host_url_for_scope(&self.workspace_ref, window_id, target_kind, target_id)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -405,19 +460,57 @@ fn query_escape(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-pub(crate) fn unity_embed_window_label_for_id(window_id: &str) -> String {
+fn unity_embed_scope_key(workspace_ref: &WorkspaceRef) -> String {
+    let checkout = workspace_ref.checkout_id.as_str();
+    let checkout_hex = checkout
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let generation = workspace_ref.expected_generation.unwrap_or_default();
+    format!("{checkout_hex}-g{generation:x}")
+}
+
+fn unity_embed_window_label_for_scope(workspace_ref: &WorkspaceRef, window_id: &str) -> String {
     let normalized = sanitize_unity_embed_id(window_id);
-    if normalized == DEFAULT_WINDOW_ID {
-        WINDOW_LABEL.to_string()
-    } else {
-        format!("{WINDOW_LABEL_PREFIX}-{normalized}")
+    format!(
+        "{WINDOW_LABEL_PREFIX}-{}-{normalized}",
+        unity_embed_scope_key(workspace_ref)
+    )
+}
+
+fn unity_embed_window_label_for_optional_id(
+    workspace_ref: &WorkspaceRef,
+    window_id: Option<&str>,
+) -> String {
+    unity_embed_window_label_for_scope(workspace_ref, window_id.unwrap_or(DEFAULT_WINDOW_ID))
+}
+
+fn unity_embed_host_url_for_scope(
+    workspace_ref: &WorkspaceRef,
+    window_id: &str,
+    target_kind: &str,
+    target_id: &str,
+) -> String {
+    let window_id = sanitize_unity_embed_id(window_id);
+    let target_kind = normalize_target_kind(target_kind);
+    let mut url = format!(
+        "{EMBED_URL}&windowId={}&target={}&checkoutId={}&workspaceGeneration={}",
+        query_escape(&window_id),
+        query_escape(&target_kind),
+        query_escape(workspace_ref.checkout_id.as_str()),
+        workspace_ref.expected_generation.unwrap_or_default(),
+    );
+    let target_id = target_id.trim();
+    if !target_id.is_empty() {
+        url.push_str("&id=");
+        url.push_str(&query_escape(target_id));
     }
+    url
 }
 
-fn unity_embed_window_label_for_optional_id(window_id: Option<&str>) -> String {
-    unity_embed_window_label_for_id(window_id.unwrap_or(DEFAULT_WINDOW_ID))
-}
-
+/// Base route used by View URL composition. Callers that create an actual
+/// window must append the checkout query (or use the scoped helper above).
 pub(crate) fn unity_embed_host_url(window_id: &str, target_kind: &str, target_id: &str) -> String {
     let window_id = sanitize_unity_embed_id(window_id);
     let target_kind = normalize_target_kind(target_kind);
@@ -438,8 +531,11 @@ fn unity_embed_window_id_for_msg(msg: &UnityEmbedControlMessage) -> String {
     sanitize_unity_embed_id(&msg.window_id)
 }
 
-fn unity_embed_window_label_for_msg(msg: &UnityEmbedControlMessage) -> String {
-    unity_embed_window_label_for_id(&unity_embed_window_id_for_msg(msg))
+fn unity_embed_window_label_for_msg(
+    binding: &UnityEmbedCheckoutBinding,
+    msg: &UnityEmbedControlMessage,
+) -> String {
+    binding.window_label(&unity_embed_window_id_for_msg(msg))
 }
 
 fn unity_embed_window_title(msg: &UnityEmbedControlMessage) -> String {
@@ -451,23 +547,32 @@ fn unity_embed_window_title(msg: &UnityEmbedControlMessage) -> String {
         .to_string()
 }
 
-fn unity_embed_host_url_for_msg(msg: &UnityEmbedControlMessage) -> String {
+fn unity_embed_host_url_for_msg(
+    binding: &UnityEmbedCheckoutBinding,
+    msg: &UnityEmbedControlMessage,
+) -> String {
     let window_id = unity_embed_window_id_for_msg(msg);
     let target_kind = if msg.target_kind.trim().is_empty() {
         DEFAULT_TARGET_KIND
     } else {
         msg.target_kind.as_str()
     };
-    unity_embed_host_url(&window_id, target_kind, &msg.target_id)
+    binding.host_url(&window_id, target_kind, &msg.target_id)
 }
 
 fn is_unity_embed_window_label(label: &str) -> bool {
-    label == WINDOW_LABEL
-        || label
-            .strip_prefix(WINDOW_LABEL_PREFIX)
-            .and_then(|suffix| suffix.strip_prefix('-'))
-            .map(|suffix| !suffix.is_empty())
-            .unwrap_or(false)
+    label
+        .strip_prefix(WINDOW_LABEL_PREFIX)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .map(|suffix| !suffix.is_empty())
+        .unwrap_or(false)
+}
+
+fn is_unity_embed_window_for_scope(label: &str, workspace_ref: &WorkspaceRef) -> bool {
+    label.starts_with(&format!(
+        "{WINDOW_LABEL_PREFIX}-{}-",
+        unity_embed_scope_key(workspace_ref)
+    ))
 }
 
 fn is_locus_view_window_label(label: &str) -> bool {
@@ -485,6 +590,16 @@ fn unity_embed_window_labels(app_handle: &AppHandle) -> Vec<String> {
         .keys()
         .filter(|label| is_unity_embed_window_label(label))
         .cloned()
+        .collect()
+}
+
+fn unity_embed_window_labels_for_scope(
+    app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
+) -> Vec<String> {
+    unity_embed_window_labels(app_handle)
+        .into_iter()
+        .filter(|label| is_unity_embed_window_for_scope(label, workspace_ref))
         .collect()
 }
 
@@ -521,7 +636,40 @@ fn locus_frontend_drop_window_labels(app_handle: &AppHandle) -> Vec<String> {
     labels
 }
 
+fn locus_frontend_drop_window_labels_for_scope(
+    app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
+) -> Vec<String> {
+    let Some(contexts) = app_handle.try_state::<Arc<WindowContextRegistry>>() else {
+        return Vec::new();
+    };
+    contexts
+        .snapshots()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|context| {
+            context.focused_checkout_id == workspace_ref.checkout_id
+                && workspace_ref
+                    .expected_generation
+                    .is_none_or(|generation| generation == context.workspace_generation)
+        })
+        .map(|context| context.window_id)
+        .filter(|label| app_handle.get_webview_window(label).is_some())
+        .collect()
+}
+
+fn window_matches_workspace_ref(
+    app_handle: &AppHandle,
+    label: &str,
+    workspace_ref: &WorkspaceRef,
+) -> bool {
+    locus_frontend_drop_window_labels_for_scope(app_handle, workspace_ref)
+        .iter()
+        .any(|candidate| candidate == label)
+}
+
 fn normalize_open_frontend_window_request(
+    workspace_ref: &WorkspaceRef,
     request: UnityEmbedOpenFrontendWindowRequest,
 ) -> UnityEmbedOpenFrontendWindowResult {
     let target_kind = normalize_target_kind(&request.target_kind);
@@ -551,8 +699,9 @@ fn normalize_open_frontend_window_request(
             }
         })
         .to_string();
-    let window_label = unity_embed_window_label_for_id(&window_id);
-    let host_url = unity_embed_host_url(&window_id, &target_kind, &target_id);
+    let window_label = unity_embed_window_label_for_scope(workspace_ref, &window_id);
+    let host_url =
+        unity_embed_host_url_for_scope(workspace_ref, &window_id, &target_kind, &target_id);
     UnityEmbedOpenFrontendWindowResult {
         window_id,
         window_label,
@@ -563,9 +712,9 @@ fn normalize_open_frontend_window_request(
     }
 }
 
-fn control_state() -> &'static Mutex<UnityEmbedControlState> {
-    static STATE: OnceLock<Mutex<UnityEmbedControlState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(UnityEmbedControlState::default()))
+fn checkout_control_states() -> &'static Mutex<HashMap<String, UnityEmbedControlState>> {
+    static STATE: OnceLock<Mutex<HashMap<String, UnityEmbedControlState>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn applied_states() -> &'static Mutex<HashMap<String, UnityEmbedAppliedState>> {
@@ -578,8 +727,9 @@ fn transient_close_states() -> &'static Mutex<HashMap<String, UnityEmbedTransien
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn record_control_message(msg: &UnityEmbedControlMessage) {
-    if let Ok(mut state) = control_state().lock() {
+fn record_control_message(binding: &UnityEmbedCheckoutBinding, msg: &UnityEmbedControlMessage) {
+    if let Ok(mut states) = checkout_control_states().lock() {
+        let state = states.entry(binding.scope_key.clone()).or_default();
         state.update_count = state.update_count.saturating_add(1);
         state.last_type = msg.kind.clone();
         state.last_rect = format!("{} {} {} {}", msg.x, msg.y, msg.width, msg.height);
@@ -589,17 +739,52 @@ fn record_control_message(msg: &UnityEmbedControlMessage) {
     }
 }
 
-fn record_child_hwnd(hwnd: i64) {
-    if let Ok(mut state) = control_state().lock() {
-        state.last_child_hwnd = hwnd;
+fn record_child_hwnd(scope_key: &str, hwnd: i64) {
+    if let Ok(mut states) = checkout_control_states().lock() {
+        states
+            .entry(scope_key.to_string())
+            .or_default()
+            .last_child_hwnd = hwnd;
     }
 }
 
-fn record_mount_result(mounted: bool, error: Option<String>) {
-    if let Ok(mut state) = control_state().lock() {
+fn record_mount_result(scope_key: &str, mounted: bool, error: Option<String>) {
+    if let Ok(mut states) = checkout_control_states().lock() {
+        let state = states.entry(scope_key.to_string()).or_default();
         state.last_mounted = mounted;
         state.last_error = error.unwrap_or_default();
     }
+}
+
+fn update_control_state_for_window_label(
+    label: &str,
+    update: impl FnOnce(&mut UnityEmbedControlState),
+) {
+    let Ok(mut states) = checkout_control_states().lock() else {
+        return;
+    };
+    let scope_key = states
+        .keys()
+        .find(|scope_key| label.starts_with(&format!("{WINDOW_LABEL_PREFIX}-{scope_key}-")))
+        .cloned();
+    if let Some(scope_key) = scope_key {
+        if let Some(state) = states.get_mut(&scope_key) {
+            update(state);
+        }
+    }
+}
+
+fn record_mount_result_for_window_label(label: &str, mounted: bool, error: Option<String>) {
+    update_control_state_for_window_label(label, |state| {
+        state.last_mounted = mounted;
+        state.last_error = error.unwrap_or_default();
+    });
+}
+
+fn record_child_hwnd_for_window_label(label: &str, hwnd: i64) {
+    update_control_state_for_window_label(label, |state| {
+        state.last_child_hwnd = hwnd;
+    });
 }
 
 fn should_ignore_stale_control_message(label: &str, msg: &UnityEmbedControlMessage) -> bool {
@@ -649,7 +834,6 @@ fn cancel_all_transient_close_destroys(app_handle: &AppHandle) {
     for label in unity_embed_window_labels(app_handle) {
         cancel_transient_close_destroy(&label);
     }
-    cancel_transient_close_destroy(WINDOW_LABEL);
 }
 
 fn is_transient_close_generation_current(label: &str, generation: u64) -> bool {
@@ -748,6 +932,14 @@ fn record_applied_mount_mode(label: &str, mount_mode: UnityEmbedMountMode) {
     }
 }
 
+fn applied_parent_hwnd(label: &str) -> i64 {
+    applied_states()
+        .lock()
+        .ok()
+        .and_then(|states| states.get(label).map(|state| state.parent_hwnd))
+        .unwrap_or_default()
+}
+
 fn record_applied_visibility(label: &str, visible: bool) {
     if let Ok(mut states) = applied_states().lock() {
         let state = states.entry(label.to_string()).or_default();
@@ -793,14 +985,20 @@ fn record_all_embed_windows_destroyed() {
     }
 }
 
-fn record_all_embed_windows_quiesced() {
+fn record_embed_windows_quiesced(scope_key: &str, labels: &[String]) {
+    let labels = labels.iter().collect::<HashSet<_>>();
     if let Ok(mut states) = applied_states().lock() {
-        states.clear();
+        states.retain(|label, _| !labels.contains(label));
     }
     if let Ok(mut revisions) = control_revisions().lock() {
-        revisions.clear();
+        revisions.retain(|label, _| !labels.contains(label));
     }
-    record_mount_result(false, None);
+    if let Ok(mut states) = checkout_control_states().lock() {
+        if let Some(state) = states.get_mut(scope_key) {
+            state.last_mounted = false;
+            state.last_error.clear();
+        }
+    }
 }
 
 fn should_show_window_now(window: &tauri::WebviewWindow, msg: &UnityEmbedControlMessage) -> bool {
@@ -812,24 +1010,26 @@ fn should_show_window_now(window: &tauri::WebviewWindow, msg: &UnityEmbedControl
     msg.visible
 }
 
-fn control_snapshot() -> UnityEmbedControlSnapshot {
+fn control_snapshot_for_scope(workspace_ref: &WorkspaceRef) -> UnityEmbedControlSnapshot {
     let now = Instant::now();
-    if let Ok(state) = control_state().lock() {
-        return UnityEmbedControlSnapshot {
-            update_count: state.update_count,
-            last_type: state.last_type.clone(),
-            last_rect: state.last_rect.clone(),
-            last_parent_hwnd: state.last_parent_hwnd,
-            last_child_hwnd: state.last_child_hwnd,
-            last_visible: state.last_visible,
-            last_mounted: state.last_mounted,
-            last_error: state.last_error.clone(),
-            last_update_ms_ago: state
-                .last_update_at
-                .map(|updated_at| now.duration_since(updated_at).as_millis()),
-        };
+    let scope_key = unity_embed_scope_key(workspace_ref);
+    if let Ok(states) = checkout_control_states().lock() {
+        if let Some(state) = states.get(&scope_key) {
+            return UnityEmbedControlSnapshot {
+                update_count: state.update_count,
+                last_type: state.last_type.clone(),
+                last_rect: state.last_rect.clone(),
+                last_parent_hwnd: state.last_parent_hwnd,
+                last_child_hwnd: state.last_child_hwnd,
+                last_visible: state.last_visible,
+                last_mounted: state.last_mounted,
+                last_error: state.last_error.clone(),
+                last_update_ms_ago: state
+                    .last_update_at
+                    .map(|updated_at| now.duration_since(updated_at).as_millis()),
+            };
+        }
     }
-
     UnityEmbedControlSnapshot::default()
 }
 
@@ -867,11 +1067,48 @@ fn control_pipe_name_for_project_path(project_path: &str) -> String {
     format!("{CONTROL_PIPE_NAME_PREFIX}{suffix}")
 }
 
-async fn current_workspace_path(app_handle: &AppHandle) -> String {
-    match app_handle.try_state::<Arc<Workspace>>() {
-        Some(workspace) => workspace.path.read().await.clone(),
-        None => String::new(),
+fn workspace_path_for_window(app_handle: &AppHandle, label: &str) -> String {
+    let Some(registry) = app_handle.try_state::<Arc<ProjectRegistry>>() else {
+        return String::new();
+    };
+    registry
+        .runtimes()
+        .into_iter()
+        .find(|runtime| is_unity_embed_window_for_scope(label, &WorkspaceRef::for_runtime(runtime)))
+        .map(|runtime| runtime.root().to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+fn workspace_ref_for_window(app_handle: &AppHandle, label: &str) -> Result<WorkspaceRef, String> {
+    let registry = app_handle
+        .try_state::<Arc<ProjectRegistry>>()
+        .ok_or_else(|| "workspace registry is unavailable".to_string())?;
+    let by_embed_label = registry
+        .runtimes()
+        .into_iter()
+        .find(|runtime| is_unity_embed_window_for_scope(label, &WorkspaceRef::for_runtime(runtime)))
+        .map(|runtime| WorkspaceRef::for_runtime(&runtime));
+    if by_embed_label.is_some() {
+        return by_embed_label.ok_or_else(|| "Unity embed window scope is unavailable".to_string());
     }
+    let contexts = app_handle
+        .try_state::<Arc<WindowContextRegistry>>()
+        .ok_or_else(|| "window context registry is unavailable".to_string())?;
+    workspace_ref_for_window_context(&contexts, label)
+}
+
+fn workspace_ref_for_window_context(
+    contexts: &WindowContextRegistry,
+    label: &str,
+) -> Result<WorkspaceRef, String> {
+    let context = contexts
+        .active_pane(label)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("workspace scope is unavailable for window '{label}'"))?;
+    Ok(WorkspaceRef::new(
+        context.focused_checkout_id,
+        Some(context.workspace_generation),
+    ))
 }
 
 pub(crate) fn handle_unity_embed_webview_event(
@@ -890,8 +1127,10 @@ pub(crate) fn handle_unity_embed_webview_event(
         }
     }
 
-    let paths = match event {
-        tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => paths.clone(),
+    let (paths, x, y) = match event {
+        tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) => {
+            (paths.clone(), position.x, position.y)
+        }
         _ => return,
     };
     if paths.is_empty() {
@@ -903,6 +1142,8 @@ pub(crate) fn handle_unity_embed_webview_event(
         webview.app_handle().clone(),
         webview.label().to_string(),
         paths,
+        x,
+        y,
     );
 }
 
@@ -919,8 +1160,10 @@ pub(crate) fn handle_locus_window_event(window: &tauri::Window, event: &tauri::W
         }
     }
 
-    let paths = match event {
-        tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => paths.clone(),
+    let (paths, x, y) = match event {
+        tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) => {
+            (paths.clone(), position.x, position.y)
+        }
         _ => return,
     };
     if paths.is_empty() {
@@ -932,12 +1175,20 @@ pub(crate) fn handle_locus_window_event(window: &tauri::Window, event: &tauri::W
         window.app_handle().clone(),
         window.label().to_string(),
         paths,
+        x,
+        y,
     );
 }
 
-fn handle_locus_drop_paths(app_handle: AppHandle, target_label: String, paths: Vec<PathBuf>) {
+fn handle_locus_drop_paths(
+    app_handle: AppHandle,
+    target_label: String,
+    paths: Vec<PathBuf>,
+    x: f64,
+    y: f64,
+) {
     tauri::async_runtime::spawn(async move {
-        let workspace_path = current_workspace_path(&app_handle).await;
+        let workspace_path = workspace_path_for_window(&app_handle, &target_label);
         let refs = unity_file_drop_asset_refs(&workspace_path, &paths);
         if !refs.is_empty() {
             if let Err(error) = emit_locus_asset_drop_to(&app_handle, &target_label, refs) {
@@ -947,7 +1198,8 @@ fn handle_locus_drop_paths(app_handle: AppHandle, target_label: String, paths: V
 
         let file_refs = locus_file_drop_refs(&workspace_path, &paths);
         if !file_refs.is_empty() {
-            if let Err(error) = emit_locus_file_drop_to(&app_handle, &target_label, file_refs) {
+            if let Err(error) = emit_locus_file_drop_to(&app_handle, &target_label, file_refs, x, y)
+            {
                 eprintln!("[Locus] failed to emit local file drop: {error}");
             }
         }
@@ -955,14 +1207,17 @@ fn handle_locus_drop_paths(app_handle: AppHandle, target_label: String, paths: V
 }
 
 fn commit_cached_unity_asset_drag_drop_to(app_handle: &AppHandle, label: &str) {
-    let refs = current_unity_embed_asset_drag_refs();
+    let Ok(workspace_ref) = workspace_ref_for_window(app_handle, label) else {
+        return;
+    };
+    let refs = current_unity_embed_asset_drag_refs(&workspace_ref);
     if refs.is_empty() {
         return;
     }
     if let Err(error) = emit_locus_asset_drop_to(app_handle, label, refs) {
         eprintln!("[Locus] failed to emit cached Unity asset drop: {error}");
     }
-    clear_unity_embed_asset_drag_after_release(app_handle);
+    clear_unity_embed_asset_drag_after_release(app_handle, &workspace_ref);
 }
 
 fn is_locus_drop_target_label(label: &str) -> bool {
@@ -1007,6 +1262,7 @@ fn emit_locus_asset_drop_to(
 
 fn emit_locus_asset_drop_to_chat_windows(
     app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
     refs: Vec<UnityEmbedAssetRef>,
 ) -> Result<(), String> {
     if refs.is_empty() {
@@ -1014,7 +1270,7 @@ fn emit_locus_asset_drop_to_chat_windows(
     }
 
     let payload = UnityEmbedAssetDropPayload { refs };
-    for label in locus_frontend_drop_window_labels(app_handle) {
+    for label in locus_frontend_drop_window_labels_for_scope(app_handle, workspace_ref) {
         emit_to_existing_window(app_handle, &label, ASSET_DROP_EVENT, payload.clone())?;
     }
     Ok(())
@@ -1022,13 +1278,15 @@ fn emit_locus_asset_drop_to_chat_windows(
 
 fn emit_unity_embed_asset_drop(
     app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
     refs: Vec<UnityEmbedAssetRef>,
 ) -> Result<(), String> {
-    emit_locus_asset_drop_to_chat_windows(app_handle, refs)
+    emit_locus_asset_drop_to_chat_windows(app_handle, workspace_ref, refs)
 }
 
 fn emit_unity_embed_text_drop(
     app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
     text: String,
     entries: Vec<UnityEmbedTextDropEntry>,
     title: Option<String>,
@@ -1040,13 +1298,7 @@ fn emit_unity_embed_text_drop(
         title,
         source,
     };
-    emit_to_existing_window(
-        app_handle,
-        MAIN_WINDOW_LABEL,
-        TEXT_DROP_EVENT,
-        payload.clone(),
-    )?;
-    for label in unity_embed_window_labels(app_handle) {
+    for label in locus_frontend_drop_window_labels_for_scope(app_handle, workspace_ref) {
         emit_to_existing_window(app_handle, &label, TEXT_DROP_EVENT, payload.clone())?;
     }
     Ok(())
@@ -1054,45 +1306,52 @@ fn emit_unity_embed_text_drop(
 
 fn emit_unity_embed_asset_drag_state(
     app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
     refs: Vec<UnityEmbedAssetRef>,
 ) -> Result<(), String> {
     let payload = UnityEmbedAssetDragStatePayload {
         has_refs: !refs.is_empty(),
         refs,
     };
-    for label in locus_frontend_drop_window_labels(app_handle) {
+    for label in locus_frontend_drop_window_labels_for_scope(app_handle, workspace_ref) {
         emit_to_existing_window(app_handle, &label, ASSET_DRAG_STATE_EVENT, payload.clone())?;
     }
     Ok(())
 }
 
-fn asset_drag_cache() -> &'static Mutex<UnityEmbedAssetDragCache> {
-    static CACHE: OnceLock<Mutex<UnityEmbedAssetDragCache>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(UnityEmbedAssetDragCache::default()))
+fn asset_drag_cache() -> &'static Mutex<HashMap<String, UnityEmbedAssetDragCache>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, UnityEmbedAssetDragCache>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn asset_drag_release_monitor_state() -> &'static Mutex<UnityEmbedAssetDragReleaseMonitorState> {
-    static STATE: OnceLock<Mutex<UnityEmbedAssetDragReleaseMonitorState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(UnityEmbedAssetDragReleaseMonitorState::default()))
+fn asset_drag_release_monitor_state(
+) -> &'static Mutex<HashMap<String, UnityEmbedAssetDragReleaseMonitorState>> {
+    static STATE: OnceLock<Mutex<HashMap<String, UnityEmbedAssetDragReleaseMonitorState>>> =
+        OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cache_unity_embed_asset_drag_refs(refs: Vec<UnityEmbedAssetRef>) {
-    let Ok(mut cache) = asset_drag_cache().lock() else {
+fn cache_unity_embed_asset_drag_refs(workspace_ref: &WorkspaceRef, refs: Vec<UnityEmbedAssetRef>) {
+    let Ok(mut caches) = asset_drag_cache().lock() else {
         return;
     };
+    let scope_key = unity_embed_scope_key(workspace_ref);
 
     if refs.is_empty() {
-        cache.refs.clear();
-        cache.updated_at = None;
+        caches.remove(&scope_key);
         return;
     }
 
+    let cache = caches.entry(scope_key).or_default();
     cache.refs = refs;
     cache.updated_at = Some(Instant::now());
 }
 
-fn current_unity_embed_asset_drag_refs() -> Vec<UnityEmbedAssetRef> {
-    let Ok(cache) = asset_drag_cache().lock() else {
+fn current_unity_embed_asset_drag_refs(workspace_ref: &WorkspaceRef) -> Vec<UnityEmbedAssetRef> {
+    let Ok(caches) = asset_drag_cache().lock() else {
+        return Vec::new();
+    };
+    let Some(cache) = caches.get(&unity_embed_scope_key(workspace_ref)) else {
         return Vec::new();
     };
 
@@ -1106,16 +1365,21 @@ fn current_unity_embed_asset_drag_refs() -> Vec<UnityEmbedAssetRef> {
     cache.refs.clone()
 }
 
-fn ensure_unity_embed_asset_drag_release_monitor(app_handle: &AppHandle) {
+fn ensure_unity_embed_asset_drag_release_monitor(
+    app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
+) {
     #[cfg(target_os = "windows")]
     {
-        if current_unity_embed_asset_drag_refs().is_empty() {
+        if current_unity_embed_asset_drag_refs(workspace_ref).is_empty() {
             return;
         }
 
+        let scope_key = unity_embed_scope_key(workspace_ref);
         let should_spawn = asset_drag_release_monitor_state()
             .lock()
-            .map(|mut state| {
+            .map(|mut states| {
+                let state = states.entry(scope_key).or_default();
                 if state.running {
                     false
                 } else {
@@ -1129,19 +1393,24 @@ fn ensure_unity_embed_asset_drag_release_monitor(app_handle: &AppHandle) {
         }
 
         let app_for_monitor = app_handle.clone();
+        let workspace_ref = workspace_ref.clone();
         tauri::async_runtime::spawn(async move {
-            monitor_unity_embed_asset_drag_release(app_for_monitor).await;
+            monitor_unity_embed_asset_drag_release(app_for_monitor, workspace_ref).await;
         });
     }
 
     #[cfg(not(target_os = "windows"))]
     {
         let _ = app_handle;
+        let _ = workspace_ref;
     }
 }
 
 #[cfg(target_os = "windows")]
-async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
+async fn monitor_unity_embed_asset_drag_release(
+    app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+) {
     let mut probe_error_logged = false;
     let mut saw_left_button_down = match windows_impl::unity_asset_drag_release_probe(&app_handle) {
         Ok(probe) => probe.left_button_down,
@@ -1154,7 +1423,7 @@ async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
 
     loop {
         tokio::time::sleep(ASSET_DRAG_RELEASE_POLL_INTERVAL).await;
-        if current_unity_embed_asset_drag_refs().is_empty() {
+        if current_unity_embed_asset_drag_refs(&workspace_ref).is_empty() {
             break;
         }
 
@@ -1180,8 +1449,10 @@ async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
 
         match probe.target {
             windows_impl::UnityAssetDragReleaseTarget::MainWindow => {
-                let refs = current_unity_embed_asset_drag_refs();
-                if !refs.is_empty() {
+                let refs = current_unity_embed_asset_drag_refs(&workspace_ref);
+                if !refs.is_empty()
+                    && window_matches_workspace_ref(&app_handle, MAIN_WINDOW_LABEL, &workspace_ref)
+                {
                     if let Err(error) =
                         emit_locus_asset_drop_to(&app_handle, MAIN_WINDOW_LABEL, refs)
                     {
@@ -1189,19 +1460,21 @@ async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
                             "[Locus] failed to emit Unity asset drop to main window: {error}"
                         );
                     }
-                    clear_unity_embed_asset_drag_after_release(&app_handle);
+                    clear_unity_embed_asset_drag_after_release(&app_handle, &workspace_ref);
                 }
                 break;
             }
             windows_impl::UnityAssetDragReleaseTarget::ViewWindow(label) => {
-                let refs = current_unity_embed_asset_drag_refs();
-                if !refs.is_empty() {
+                let refs = current_unity_embed_asset_drag_refs(&workspace_ref);
+                if !refs.is_empty()
+                    && window_matches_workspace_ref(&app_handle, &label, &workspace_ref)
+                {
                     if let Err(error) = emit_locus_asset_drop_to(&app_handle, &label, refs) {
                         eprintln!(
                             "[Locus] failed to emit Unity asset drop to view window {label}: {error}"
                         );
                     }
-                    clear_unity_embed_asset_drag_after_release(&app_handle);
+                    clear_unity_embed_asset_drag_after_release(&app_handle, &workspace_ref);
                 }
                 break;
             }
@@ -1214,38 +1487,52 @@ async fn monitor_unity_embed_asset_drag_release(app_handle: AppHandle) {
         }
     }
 
-    if let Ok(mut state) = asset_drag_release_monitor_state().lock() {
-        state.running = false;
+    if let Ok(mut states) = asset_drag_release_monitor_state().lock() {
+        states.remove(&unity_embed_scope_key(&workspace_ref));
     }
 }
 
-fn clear_unity_embed_asset_drag_after_release(app_handle: &AppHandle) {
+fn clear_unity_embed_asset_drag_after_release(
+    app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
+) {
     #[cfg(target_os = "windows")]
     windows_impl::stop_reference_drag_preview();
 
-    cache_unity_embed_asset_drag_refs(Vec::new());
-    if let Err(error) = emit_unity_embed_asset_drag_state(app_handle, Vec::new()) {
+    cache_unity_embed_asset_drag_refs(workspace_ref, Vec::new());
+    if let Err(error) = emit_unity_embed_asset_drag_state(app_handle, workspace_ref, Vec::new()) {
         eprintln!("[Locus] failed to clear Unity asset drag state: {error}");
     }
 }
 
 #[tauri::command]
-pub async fn unity_embed_commit_asset_drop(app_handle: AppHandle) -> Result<(), AppError> {
-    let refs = current_unity_embed_asset_drag_refs();
+pub async fn unity_embed_commit_asset_drop(
+    app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<(), AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let workspace_ref = scope.workspace_ref();
+    let refs = current_unity_embed_asset_drag_refs(&workspace_ref);
     if refs.is_empty() {
         return Ok(());
     }
 
-    emit_unity_embed_asset_drop(&app_handle, refs).map_err(AppError::from)?;
-    cache_unity_embed_asset_drag_refs(Vec::new());
+    emit_unity_embed_asset_drop(&app_handle, &workspace_ref, refs).map_err(AppError::from)?;
+    cache_unity_embed_asset_drag_refs(&workspace_ref, Vec::new());
     #[cfg(target_os = "windows")]
     windows_impl::stop_reference_drag_preview();
-    emit_unity_embed_asset_drag_state(&app_handle, Vec::new()).map_err(AppError::from)
+    emit_unity_embed_asset_drag_state(&app_handle, &workspace_ref, Vec::new())
+        .map_err(AppError::from)
 }
 
 #[tauri::command]
 pub async fn unity_embed_start_asset_drag(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     request: UnityEmbedStartAssetDragRequest,
 ) -> Result<String, AppError> {
     let refs = sanitize_locus_outbound_drag_refs(request.refs);
@@ -1253,13 +1540,13 @@ pub async fn unity_embed_start_asset_drag(
         return Ok("no_refs".to_string());
     }
 
-    let cwd = current_workspace_path(&app_handle).await;
-    if cwd.trim().is_empty() {
-        return Err(AppError::new(
-            "unity.drag.workspace_missing",
-            "No Unity workspace is active.",
-        ));
-    }
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_embed_start_asset_drag",
+    )
+    .await?;
+    let cwd = ready.root_text();
 
     let payload = serde_json::json!({ "refs": refs }).to_string();
     // Only show the cursor-following drag preview once Unity acknowledged the
@@ -1272,18 +1559,29 @@ pub async fn unity_embed_start_asset_drag(
 }
 
 #[tauri::command]
-pub async fn unity_embed_cancel_asset_drag(app_handle: AppHandle) -> Result<(), AppError> {
-    cache_unity_embed_asset_drag_refs(Vec::new());
+pub async fn unity_embed_cancel_asset_drag(
+    app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<(), AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let canonical_ref = scope.workspace_ref();
+    cache_unity_embed_asset_drag_refs(&canonical_ref, Vec::new());
     #[cfg(target_os = "windows")]
     windows_impl::stop_reference_drag_preview();
-    if let Err(error) = emit_unity_embed_asset_drag_state(&app_handle, Vec::new()) {
+    if let Err(error) = emit_unity_embed_asset_drag_state(&app_handle, &canonical_ref, Vec::new()) {
         eprintln!("[Locus] failed to clear Unity asset drag state: {error}");
     }
 
-    let cwd = current_workspace_path(&app_handle).await;
-    if cwd.trim().is_empty() {
-        return Ok(());
-    }
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_embed_cancel_asset_drag",
+    )
+    .await?;
+    let cwd = ready.root_text();
 
     if let Err(error) = crate::unity_bridge::cancel_asset_drag(&cwd).await {
         eprintln!("[Locus] failed to cancel Unity asset drag: {error}");
@@ -1294,6 +1592,8 @@ pub async fn unity_embed_cancel_asset_drag(app_handle: AppHandle) -> Result<(), 
 #[tauri::command]
 pub async fn unity_embed_start_native_asset_file_drag(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     request: UnityEmbedNativeAssetFileDragRequest,
 ) -> Result<String, AppError> {
     let refs = sanitize_locus_outbound_drag_refs(request.refs);
@@ -1301,13 +1601,13 @@ pub async fn unity_embed_start_native_asset_file_drag(
         return Ok("no_refs".to_string());
     }
 
-    let cwd = current_workspace_path(&app_handle).await;
-    if cwd.trim().is_empty() {
-        return Err(AppError::new(
-            "unity.drag.workspace_missing",
-            "No Unity workspace is active.",
-        ));
-    }
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_embed_start_native_asset_file_drag",
+    )
+    .await?;
+    let cwd = ready.root_text();
 
     let paths = native_asset_file_drag_paths(&cwd, &refs);
     if paths.is_empty() {
@@ -1315,21 +1615,20 @@ pub async fn unity_embed_start_native_asset_file_drag(
     }
     let preview_label = unity_ref_drag_preview_label(&refs, paths.len());
 
-    dispatch_native_file_drag(app_handle, paths, preview_label, Some(cwd)).await
+    dispatch_native_file_drag(app_handle, paths, preview_label, Some((cwd, workspace_ref))).await
 }
 
 #[tauri::command]
 pub async fn locus_start_native_file_drag(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     request: LocusNativeFileDragRequest,
 ) -> Result<String, AppError> {
-    let cwd = current_workspace_path(&app_handle).await;
-    if cwd.trim().is_empty() {
-        return Err(AppError::new(
-            "file.drag.workspace_missing",
-            "No workspace is active.",
-        ));
-    }
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let cwd = scope.runtime().root().to_string_lossy().to_string();
 
     let paths = native_locus_file_drag_paths(&cwd, &request.files);
     if paths.is_empty() {
@@ -1360,12 +1659,11 @@ async fn dispatch_native_file_drag(
     app_handle: AppHandle,
     paths: Vec<String>,
     preview_label: String,
-    unity_asset_drag_workspace: Option<String>,
+    unity_asset_drag_workspace: Option<(String, WorkspaceRef)>,
 ) -> Result<String, AppError> {
     #[cfg(target_os = "windows")]
     {
         windows_impl::start_reference_drag_preview(preview_label.clone());
-        let clear_unity_asset_drag_after_finish = unity_asset_drag_workspace.is_some();
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         app_handle
@@ -1376,7 +1674,9 @@ async fn dispatch_native_file_drag(
             .map_err(|error| {
                 clear_native_file_drag_preview_and_cache(
                     &app_handle,
-                    clear_unity_asset_drag_after_finish,
+                    unity_asset_drag_workspace
+                        .as_ref()
+                        .map(|(_, workspace_ref)| workspace_ref),
                 );
                 AppError::new(
                     "unity.drag.native_dispatch_failed",
@@ -1389,7 +1689,7 @@ async fn dispatch_native_file_drag(
             Err(_) => {
                 finish_native_file_drag_after_finish(
                     &app_handle,
-                    unity_asset_drag_workspace.as_deref(),
+                    unity_asset_drag_workspace.as_ref(),
                 )
                 .await;
                 return Err(AppError::new(
@@ -1399,7 +1699,7 @@ async fn dispatch_native_file_drag(
             }
         };
 
-        finish_native_file_drag_after_finish(&app_handle, unity_asset_drag_workspace.as_deref())
+        finish_native_file_drag_after_finish(&app_handle, unity_asset_drag_workspace.as_ref())
             .await;
         return result.map_err(|error| {
             AppError::new("unity.drag.native_failed", error).operation("nativeAssetFileDrag")
@@ -1419,14 +1719,14 @@ async fn dispatch_native_file_drag(
 #[cfg(target_os = "windows")]
 fn clear_native_file_drag_preview_and_cache(
     app_handle: &AppHandle,
-    clear_unity_asset_drag_after_finish: bool,
+    workspace_ref: Option<&WorkspaceRef>,
 ) {
     windows_impl::stop_reference_drag_preview();
-    if !clear_unity_asset_drag_after_finish {
+    let Some(workspace_ref) = workspace_ref else {
         return;
-    }
-    cache_unity_embed_asset_drag_refs(Vec::new());
-    if let Err(error) = emit_unity_embed_asset_drag_state(app_handle, Vec::new()) {
+    };
+    cache_unity_embed_asset_drag_refs(workspace_ref, Vec::new());
+    if let Err(error) = emit_unity_embed_asset_drag_state(app_handle, workspace_ref, Vec::new()) {
         eprintln!("[Locus] failed to clear Unity asset drag state: {error}");
     }
 }
@@ -1434,18 +1734,18 @@ fn clear_native_file_drag_preview_and_cache(
 #[cfg(target_os = "windows")]
 async fn finish_native_file_drag_after_finish(
     app_handle: &AppHandle,
-    unity_asset_drag_workspace: Option<&str>,
+    unity_asset_drag_workspace: Option<&(String, WorkspaceRef)>,
 ) {
-    let Some(workspace_path) = unity_asset_drag_workspace else {
-        clear_native_file_drag_preview_and_cache(app_handle, false);
+    let Some((workspace_path, workspace_ref)) = unity_asset_drag_workspace else {
+        clear_native_file_drag_preview_and_cache(app_handle, None);
         return;
     };
 
-    clear_native_file_drag_preview_and_cache(app_handle, true);
+    clear_native_file_drag_preview_and_cache(app_handle, Some(workspace_ref));
     if let Err(error) = crate::unity_bridge::cancel_asset_drag(workspace_path).await {
         eprintln!("[Locus] failed to cancel Unity asset drag after native file drag: {error}");
     }
-    clear_native_file_drag_preview_and_cache(app_handle, true);
+    clear_native_file_drag_preview_and_cache(app_handle, Some(workspace_ref));
 }
 
 fn sanitize_locus_outbound_drag_refs(refs: Vec<UnityEmbedAssetRef>) -> Vec<UnityEmbedAssetRef> {
@@ -1734,6 +2034,8 @@ fn emit_locus_file_drop_to(
     app_handle: &AppHandle,
     label: &str,
     files: Vec<LocusFileDropRef>,
+    x: f64,
+    y: f64,
 ) -> Result<(), String> {
     if files.is_empty() {
         return Ok(());
@@ -1742,7 +2044,7 @@ fn emit_locus_file_drop_to(
         app_handle,
         label,
         FILE_DROP_EVENT,
-        LocusFileDropPayload { files },
+        LocusFileDropPayload { files, x, y },
     )
 }
 
@@ -1892,28 +2194,12 @@ fn unity_drop_type_label(path: &Path) -> Option<String> {
         .filter(|extension| !extension.is_empty())
 }
 
-async fn current_control_pipe_name(app_handle: &AppHandle) -> Option<String> {
-    let current_project_path = current_workspace_path(app_handle).await;
-    if current_project_path.trim().is_empty() {
-        None
-    } else {
-        Some(control_pipe_name_for_project_path(&current_project_path))
-    }
-}
-
-async fn is_current_control_pipe(app_handle: &AppHandle, pipe_name: &str) -> bool {
-    current_control_pipe_name(app_handle)
-        .await
-        .as_deref()
-        .map(|current| current == pipe_name)
-        .unwrap_or(false)
-}
-
 pub(crate) async fn open_unity_embed_frontend_window_for_request(
+    workspace_ref: &WorkspaceRef,
     working_dir: &str,
     request: UnityEmbedOpenFrontendWindowRequest,
 ) -> Result<UnityEmbedOpenFrontendWindowResult, String> {
-    let result = normalize_open_frontend_window_request(request);
+    let result = normalize_open_frontend_window_request(workspace_ref, request);
     let payload = serde_json::to_string(&result)
         .map_err(|error| format!("Failed to serialize Unity frontend window request: {error}"))?;
     crate::unity_bridge::open_frontend_window(working_dir, &payload).await?;
@@ -1922,8 +2208,10 @@ pub(crate) async fn open_unity_embed_frontend_window_for_request(
 
 #[tauri::command]
 pub async fn unity_embed_open_frontend_window(
+    app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
     request: UnityEmbedOpenFrontendWindowRequest,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<UnityEmbedOpenFrontendWindowResult, AppError> {
     if !config.unity_embed_enabled() {
@@ -1931,24 +2219,44 @@ pub async fn unity_embed_open_frontend_window(
             "Unity embedded windows are disabled in settings".to_string(),
         ));
     }
-    let working_dir = workspace.path.read().await.clone();
-    open_unity_embed_frontend_window_for_request(&working_dir, request)
+    let runtime = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?
+        .runtime()
+        .clone();
+    let execution = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_embed_open_frontend_window",
+    )
+    .await?;
+    ensure_unity_embed_control_server(app_handle, runtime);
+    let working_dir = execution.root_text();
+    open_unity_embed_frontend_window_for_request(&workspace_ref, &working_dir, request)
         .await
         .map_err(Into::into)
 }
 
 #[tauri::command]
-pub async fn unity_embed_status(app_handle: AppHandle) -> Result<UnityEmbedStatus, AppError> {
-    let pipe_name = current_control_pipe_name(&app_handle)
-        .await
-        .unwrap_or_default();
+pub async fn unity_embed_status(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<UnityEmbedStatus, AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let runtime = scope.runtime().clone();
+    let canonical_ref = WorkspaceRef::for_runtime(&runtime);
+    let pipe_name = control_pipe_name_for_project_path(&runtime.root().to_string_lossy());
     Ok(UnityEmbedStatus {
         ok: true,
         runtime: "tauri".to_string(),
         message: "pong".to_string(),
         pipe_name,
-        window_label: WINDOW_LABEL.to_string(),
-        control: control_snapshot(),
+        window_label: unity_embed_window_label_for_scope(&canonical_ref, DEFAULT_WINDOW_ID),
+        checkout_id: runtime.checkout_id().to_string(),
+        workspace_generation: runtime.generation(),
+        control: control_snapshot_for_scope(&canonical_ref),
     })
 }
 
@@ -1959,29 +2267,126 @@ pub fn get_unity_embed_enabled(
     Ok(config.unity_embed_enabled())
 }
 
+fn live_unity_embed_runtime_scopes(
+    workspace_registry: &ProjectRegistry,
+) -> Vec<(WorkspaceRef, String)> {
+    let mut scopes = workspace_registry
+        .runtimes()
+        .into_iter()
+        .filter_map(|runtime| {
+            let root = runtime.root().to_string_lossy().to_string();
+            crate::unity_bridge::is_unity_project(&root)
+                .then(|| (WorkspaceRef::for_runtime(&runtime), root))
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| left.0.checkout_id.cmp(&right.0.checkout_id));
+    scopes
+}
+
+fn sync_unity_embed_markers_transactionally(
+    roots: &[String],
+    value: bool,
+    previous: bool,
+) -> Result<(), String> {
+    let mut attempted = Vec::new();
+    for root in roots {
+        attempted.push(root.as_str());
+        if let Err(error) = crate::unity_bridge::sync_unity_embed_enabled_marker(root, value) {
+            let rollback_errors = attempted
+                .iter()
+                .filter_map(|attempted_root| {
+                    crate::unity_bridge::sync_unity_embed_enabled_marker(attempted_root, previous)
+                        .err()
+                        .map(|rollback| format!("{attempted_root}: {rollback}"))
+                })
+                .collect::<Vec<_>>();
+            let rollback_detail = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; rollback failed: {}", rollback_errors.join("; "))
+            };
+            return Err(format!(
+                "failed to update Unity embed marker for {root}: {error}{rollback_detail}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_unity_embed_enabled(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
     value: bool,
     config: State<'_, Arc<crate::config::AppConfig>>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<bool, AppError> {
-    config
-        .set_unity_embed_enabled(value)
-        .map_err(AppError::from)?;
+    let _scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let _settings_mutation = super::system::unity_process_settings_mutation_gate()
+        .lock()
+        .await;
+    let runtime_scopes = live_unity_embed_runtime_scopes(workspace_registry.inner());
+    let roots = runtime_scopes
+        .iter()
+        .map(|(_, root)| root.clone())
+        .collect::<Vec<_>>();
+    let previous = config.unity_embed_enabled();
 
-    let project_path = workspace.path.read().await.clone();
-    if !project_path.trim().is_empty() && crate::unity_bridge::is_unity_project(&project_path) {
-        crate::unity_bridge::sync_unity_embed_enabled_marker(&project_path, value)
-            .map_err(AppError::from)?;
+    if let Err(error) = config.set_unity_embed_enabled(value) {
+        let _ = config.set_unity_embed_enabled(previous);
+        return Err(AppError::from(error));
+    }
+    if let Err(error) = sync_unity_embed_markers_transactionally(&roots, value, previous) {
+        let _ = config.set_unity_embed_enabled(previous);
+        return Err(AppError::from(error));
+    }
+
+    for (runtime_ref, root) in &runtime_scopes {
+        if value {
+            if let Some(runtime) = workspace_registry.runtime(&runtime_ref.checkout_id) {
+                if runtime_ref
+                    .expected_generation
+                    .is_some_and(|generation| generation == runtime.generation())
+                    && runtime
+                        .services()
+                        .state_snapshot(ServiceKind::Unity)
+                        .await
+                        .is_some_and(|snapshot| {
+                            matches!(
+                                snapshot.status,
+                                ServiceStatus::Starting | ServiceStatus::Running
+                            )
+                        })
+                {
+                    ensure_unity_embed_control_server_for_scope(
+                        app_handle.clone(),
+                        runtime_ref.clone(),
+                        root.clone(),
+                    );
+                }
+            }
+        } else {
+            stop_unity_embed_control_server(runtime_ref);
+        }
     }
 
     if !value {
+        let checkout_refs = runtime_scopes
+            .into_iter()
+            .map(|(workspace_ref, _)| workspace_ref)
+            .collect::<Vec<_>>();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
         app_handle
             .run_on_main_thread(move || {
-                destroy_unity_embed_control_window_on_main(&app_for_main);
+                for checkout_ref in &checkout_refs {
+                    destroy_unity_embed_control_windows_for_scope_on_main(
+                        &app_for_main,
+                        checkout_ref,
+                    );
+                }
                 let _ = tx.send(());
             })
             .map_err(|error| format!("Failed to disable Unity embed windows: {error}"))?;
@@ -1995,14 +2400,26 @@ pub async fn set_unity_embed_enabled(
 #[tauri::command]
 pub async fn unity_embed_set_mouse_activation_suppressed(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     window_id: Option<String>,
     suppressed: bool,
 ) -> Result<(), AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let canonical_ref = scope.workspace_ref();
+    let _execution = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_embed_set_mouse_activation_suppressed",
+    )
+    .await?;
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
-        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
+        let label = unity_embed_window_label_for_optional_id(&canonical_ref, window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::set_mouse_activation_suppressed(
@@ -2032,13 +2449,25 @@ pub async fn unity_embed_set_mouse_activation_suppressed(
 #[tauri::command]
 pub async fn unity_embed_activate_for_input(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     window_id: Option<String>,
 ) -> Result<(), AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let canonical_ref = scope.workspace_ref();
+    let _execution = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_embed_activate_for_input",
+    )
+    .await?;
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
-        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
+        let label = unity_embed_window_label_for_optional_id(&canonical_ref, window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::activate_for_input(
@@ -2064,14 +2493,26 @@ pub async fn unity_embed_activate_for_input(
 #[tauri::command]
 pub async fn unity_embed_set_drag_passthrough(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     window_id: Option<String>,
     active: bool,
 ) -> Result<(), AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let canonical_ref = scope.workspace_ref();
+    let _execution = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_embed_set_drag_passthrough",
+    )
+    .await?;
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
-        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
+        let label = unity_embed_window_label_for_optional_id(&canonical_ref, window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::set_drag_passthrough(
@@ -2099,13 +2540,19 @@ pub async fn unity_embed_set_drag_passthrough(
 #[tauri::command]
 pub async fn unity_embed_focus_debug_snapshot(
     app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     window_id: Option<String>,
 ) -> Result<UnityEmbedFocusDebugSnapshot, AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let canonical_ref = scope.workspace_ref();
     #[cfg(target_os = "windows")]
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let app_for_main = app_handle.clone();
-        let label = unity_embed_window_label_for_optional_id(window_id.as_deref());
+        let label = unity_embed_window_label_for_optional_id(&canonical_ref, window_id.as_deref());
         app_handle
             .run_on_main_thread(move || {
                 let result = windows_impl::focus_debug_snapshot(
@@ -2145,6 +2592,43 @@ pub(crate) fn start_unity_embed_control_server(app_handle: AppHandle) {
     }
 }
 
+pub(crate) fn ensure_unity_embed_control_server(
+    app_handle: AppHandle,
+    runtime: Arc<WorkspaceRuntime>,
+) {
+    ensure_unity_embed_control_server_for_scope(
+        app_handle,
+        WorkspaceRef::for_runtime(&runtime),
+        runtime.root().to_string_lossy().to_string(),
+    );
+}
+
+pub(crate) fn ensure_unity_embed_control_server_for_scope(
+    app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    project_root: String,
+) {
+    #[cfg(target_os = "windows")]
+    windows_impl::ensure_checkout_server(app_handle, workspace_ref, project_root);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app_handle;
+        let _ = workspace_ref;
+        let _ = project_root;
+    }
+}
+
+pub(crate) fn stop_unity_embed_control_server(workspace_ref: &WorkspaceRef) {
+    #[cfg(target_os = "windows")]
+    windows_impl::stop_checkout_server(workspace_ref);
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = workspace_ref;
+    }
+}
+
 pub(crate) fn refresh_unity_embed_control_server(app_handle: AppHandle) {
     #[cfg(target_os = "windows")]
     windows_impl::refresh(app_handle);
@@ -2164,37 +2648,47 @@ pub(crate) fn reset_unity_embed_control_window(app_handle: &AppHandle) {
     }
 }
 
-/// Preserve the Unity-embedded WebViews while their cross-process parent HWND
-/// is about to disappear. The barrier runs on the GUI thread, detaches and
-/// hides every embed window, and rejects stale overlay messages until the
-/// returned guard is dropped. A later Unity open/update message remounts the
-/// existing WebView into the new editor window.
+/// Preserve one checkout's Unity-embedded WebViews while that editor process
+/// is about to disappear. Sibling checkout overlays and control pipes remain
+/// active throughout the barrier.
 pub(crate) async fn quiesce_unity_embed_control_windows(
     app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
 ) -> Result<UnityEmbedQuiesceGuard, String> {
-    UNITY_EMBED_QUIESCED
-        .compare_exchange(
-            false,
-            true,
-            GlobalAtomicOrdering::SeqCst,
-            GlobalAtomicOrdering::SeqCst,
-        )
-        .map_err(|_| "Unity embed shutdown is already in progress".to_string())?;
-    let guard = UnityEmbedQuiesceGuard { active: true };
-    let quiesce_epoch = UNITY_EMBED_CONTROL_EPOCH
-        .fetch_add(1, GlobalAtomicOrdering::SeqCst)
-        .wrapping_add(1);
+    let scope_key = unity_embed_scope_key(workspace_ref);
+    let quiesce_epoch = {
+        let mut states = unity_embed_quiesce_states()
+            .lock()
+            .map_err(|error| format!("Unity embed quiesce state lock poisoned: {error}"))?;
+        let state = states.entry(scope_key.clone()).or_default();
+        if state.active {
+            return Err(format!(
+                "Unity embed shutdown is already in progress for checkout {}",
+                workspace_ref.checkout_id
+            ));
+        }
+        state.epoch = state.epoch.wrapping_add(1);
+        state.active = true;
+        state.epoch
+    };
+    let guard = UnityEmbedQuiesceGuard {
+        scope_key: scope_key.clone(),
+        epoch: quiesce_epoch,
+        active: true,
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let app_for_main = app_handle.clone();
+    let workspace_ref_for_main = workspace_ref.clone();
+    let scope_key_for_main = scope_key.clone();
     app_handle
         .run_on_main_thread(move || {
-            let result =
-                if !unity_embed_is_quiesced() || unity_embed_control_epoch() != quiesce_epoch {
-                    Err("Unity embed shutdown barrier was cancelled".to_string())
-                } else {
-                    quiesce_unity_embed_control_windows_on_main(&app_for_main)
-                };
+            let snapshot = unity_embed_quiesce_snapshot(&scope_key_for_main);
+            let result = if snapshot != (true, quiesce_epoch) {
+                Err("Unity embed shutdown barrier was cancelled".to_string())
+            } else {
+                quiesce_unity_embed_control_windows_on_main(&app_for_main, &workspace_ref_for_main)
+            };
             let _ = tx.send(result);
         })
         .map_err(|error| format!("Failed to dispatch Unity embed shutdown barrier: {error}"))?;
@@ -2207,16 +2701,19 @@ pub(crate) async fn quiesce_unity_embed_control_windows(
     Ok(guard)
 }
 
-fn quiesce_unity_embed_control_windows_on_main(app_handle: &AppHandle) -> Result<(), String> {
-    cancel_all_transient_close_destroys(app_handle);
-    let labels = unity_embed_window_labels(app_handle);
+fn quiesce_unity_embed_control_windows_on_main(
+    app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
+) -> Result<(), String> {
+    let scope_key = unity_embed_scope_key(workspace_ref);
+    let labels = unity_embed_window_labels_for_scope(app_handle, workspace_ref);
+    for label in &labels {
+        cancel_transient_close_destroy(label);
+    }
     let window_count = labels.len();
     let mut errors = Vec::new();
 
-    #[cfg(target_os = "windows")]
-    windows_impl::prepare_for_editor_shutdown();
-
-    for label in labels {
+    for label in &labels {
         let Some(window) = app_handle.get_webview_window(&label) else {
             continue;
         };
@@ -2236,11 +2733,12 @@ fn quiesce_unity_embed_control_windows_on_main(app_handle: &AppHandle) -> Result
 
     // Force the first message from the relaunched editor to reapply geometry,
     // parentage, and visibility to the preserved WebView windows.
-    record_all_embed_windows_quiesced();
+    record_embed_windows_quiesced(&scope_key, &labels);
 
     if errors.is_empty() {
         eprintln!(
-            "[Locus] Unity embed windows quiesced before editor shutdown: count={window_count}"
+            "[Locus] Unity embed windows quiesced before editor shutdown: checkout={} count={window_count}",
+            workspace_ref.checkout_id
         );
         Ok(())
     } else {
@@ -2263,6 +2761,22 @@ pub(crate) fn destroy_unity_embed_control_window_on_main(app_handle: &AppHandle)
     record_all_embed_windows_destroyed();
 }
 
+fn destroy_unity_embed_control_windows_for_scope_on_main(
+    app_handle: &AppHandle,
+    workspace_ref: &WorkspaceRef,
+) {
+    let labels = unity_embed_window_labels(app_handle)
+        .into_iter()
+        .filter(|label| is_unity_embed_window_for_scope(label, workspace_ref))
+        .collect::<Vec<_>>();
+    for label in labels {
+        destroy_unity_embed_window_on_main(app_handle, &label);
+    }
+    if let Ok(mut controls) = checkout_control_states().lock() {
+        controls.remove(&unity_embed_scope_key(workspace_ref));
+    }
+}
+
 fn destroy_unity_embed_window_on_main(app_handle: &AppHandle, label: &str) {
     cancel_transient_close_destroy(label);
     if let Some(window) = app_handle.get_webview_window(label) {
@@ -2272,6 +2786,7 @@ fn destroy_unity_embed_window_on_main(app_handle: &AppHandle, label: &str) {
             eprintln!("[Locus] failed to destroy Unity embed window: {close_error}");
         }
     }
+    detach_embed_window_context(app_handle, label);
     record_window_destroyed(label);
 }
 
@@ -2286,19 +2801,21 @@ fn normalized_rect(msg: &UnityEmbedControlMessage) -> (i32, i32, u32, u32) {
 
 fn ensure_embed_window(
     app_handle: &AppHandle,
+    binding: &UnityEmbedCheckoutBinding,
     msg: &UnityEmbedControlMessage,
 ) -> Result<(tauri::WebviewWindow, bool), String> {
-    let label = unity_embed_window_label_for_msg(msg);
+    let label = unity_embed_window_label_for_msg(binding, msg);
     if let Some(window) = app_handle.get_webview_window(&label) {
+        bind_embed_window_context(app_handle, &label, binding)?;
         #[cfg(target_os = "windows")]
         if let Ok(hwnd) = window.hwnd() {
-            record_child_hwnd(hwnd.0 as isize as i64);
+            record_child_hwnd(&binding.scope_key, hwnd.0 as isize as i64);
         }
         return Ok((window, false));
     }
 
     let (x, y, width, height) = normalized_rect(msg);
-    let host_url = unity_embed_host_url_for_msg(msg);
+    let host_url = unity_embed_host_url_for_msg(binding, msg);
     let title = unity_embed_window_title(msg);
     let builder = tauri::WebviewWindowBuilder::new(
         app_handle,
@@ -2319,27 +2836,63 @@ fn ensure_embed_window(
     let window = builder
         .build()
         .map_err(|error| format!("Failed to create Unity embed window: {error}"))?;
+    bind_embed_window_context(app_handle, &label, binding)?;
 
     #[cfg(target_os = "windows")]
     {
         if let Ok(hwnd) = window.hwnd() {
-            record_child_hwnd(hwnd.0 as isize as i64);
+            record_child_hwnd(&binding.scope_key, hwnd.0 as isize as i64);
         }
     }
 
     Ok((window, true))
 }
 
+fn bind_embed_window_context(
+    app_handle: &AppHandle,
+    label: &str,
+    binding: &UnityEmbedCheckoutBinding,
+) -> Result<(), String> {
+    let contexts = app_handle
+        .try_state::<Arc<WindowContextRegistry>>()
+        .ok_or_else(|| "window context registry is unavailable".to_string())?;
+    let registry = app_handle
+        .try_state::<Arc<ProjectRegistry>>()
+        .ok_or_else(|| "workspace registry is unavailable".to_string())?;
+    let runtime = registry
+        .resolve_workspace_ref(&binding.workspace_ref)
+        .map_err(|error| format!("Unity embed checkout binding is stale: {error}"))?
+        .runtime()
+        .clone();
+    let intent_epoch = contexts
+        .next_pane_intent_epoch(label, "main")
+        .map_err(|error| format!("Failed to allocate Unity embed focus intent: {error}"))?;
+    contexts
+        .focus(label, "main", runtime, intent_epoch)
+        .map(|_| ())
+        .map_err(|error| format!("Failed to bind Unity embed window '{label}': {error}"))
+}
+
+fn detach_embed_window_context(app_handle: &AppHandle, label: &str) {
+    if let Some(contexts) = app_handle.try_state::<Arc<WindowContextRegistry>>() {
+        let result = contexts
+            .next_window_intent_epoch(label)
+            .and_then(|intent_epoch| contexts.remove_window(label, intent_epoch));
+        if let Err(error) = result {
+            eprintln!("[Locus] failed to detach Unity embed window context '{label}': {error}");
+        }
+    }
+}
+
 fn apply_control_message_on_main(
     app_handle: &AppHandle,
+    binding: UnityEmbedCheckoutBinding,
     msg: UnityEmbedControlMessage,
     expected_epoch: u64,
     received_while_quiesced: bool,
 ) -> Result<(), String> {
-    if received_while_quiesced
-        || unity_embed_is_quiesced()
-        || unity_embed_control_epoch() != expected_epoch
-    {
+    let current_quiesce = unity_embed_quiesce_snapshot(&binding.scope_key);
+    if received_while_quiesced || current_quiesce.0 || current_quiesce.1 != expected_epoch {
         return Ok(());
     }
 
@@ -2351,7 +2904,7 @@ fn apply_control_message_on_main(
         return Ok(());
     }
 
-    let label = unity_embed_window_label_for_msg(&msg);
+    let label = unity_embed_window_label_for_msg(&binding, &msg);
     // While the managed domain is reloading, the native overlay client keeps
     // the pipe alive and sends this marker. Retain the overlay exactly as-is
     // (no geometry/visibility change, no teardown) so it does not flicker; the
@@ -2364,18 +2917,18 @@ fn apply_control_message_on_main(
         return Ok(());
     }
     if msg.kind != "assetDrop" && msg.kind != "assetDrag" && msg.kind != "consoleText" {
-        record_control_message(&msg);
+        record_control_message(&binding, &msg);
     }
     match msg.kind.as_str() {
         "open" | "update" => {
             cancel_transient_close_destroy(&label);
-            let (window, created) = ensure_embed_window(app_handle, &msg)?;
+            let (window, created) = ensure_embed_window(app_handle, &binding, &msg)?;
 
             let apply_geometry = created || needs_geometry_apply(&label, &msg);
             let desired_visible = should_show_window_now(&window, &msg);
             let apply_visibility = created || needs_visibility_apply(&label, desired_visible);
             if apply_geometry {
-                let mount_mode = apply_window_geometry(&window, &msg)?;
+                let mount_mode = apply_window_geometry(&window, &binding.scope_key, &msg)?;
                 record_applied_geometry(&label, &msg, mount_mode);
             }
 
@@ -2407,10 +2960,10 @@ fn apply_control_message_on_main(
                 return Ok(());
             }
             emit_locus_asset_drop_to(app_handle, &label, refs)?;
-            cache_unity_embed_asset_drag_refs(Vec::new());
+            cache_unity_embed_asset_drag_refs(&binding.workspace_ref, Vec::new());
             #[cfg(target_os = "windows")]
             windows_impl::stop_reference_drag_preview();
-            emit_unity_embed_asset_drag_state(app_handle, Vec::new())
+            emit_unity_embed_asset_drag_state(app_handle, &binding.workspace_ref, Vec::new())
         }
         "assetDrag" => {
             let refs = msg.asset_refs.unwrap_or_default();
@@ -2418,9 +2971,9 @@ fn apply_control_message_on_main(
                 #[cfg(target_os = "windows")]
                 windows_impl::stop_reference_drag_preview();
             }
-            cache_unity_embed_asset_drag_refs(refs.clone());
-            ensure_unity_embed_asset_drag_release_monitor(app_handle);
-            emit_unity_embed_asset_drag_state(app_handle, refs)
+            cache_unity_embed_asset_drag_refs(&binding.workspace_ref, refs.clone());
+            ensure_unity_embed_asset_drag_release_monitor(app_handle, &binding.workspace_ref);
+            emit_unity_embed_asset_drag_state(app_handle, &binding.workspace_ref, refs)
         }
         "consoleText" => {
             let text = msg.text.unwrap_or_default();
@@ -2439,7 +2992,14 @@ fn apply_control_message_on_main(
             if text.trim().is_empty() && entries.is_empty() {
                 return Ok(());
             }
-            emit_unity_embed_text_drop(app_handle, text, entries, title, source)
+            emit_unity_embed_text_drop(
+                app_handle,
+                &binding.workspace_ref,
+                text,
+                entries,
+                title,
+                source,
+            )
         }
         other => Err(format!("Unknown Unity embed control message: {other}")),
     }
@@ -2447,16 +3007,18 @@ fn apply_control_message_on_main(
 
 async fn apply_control_message(
     app_handle: AppHandle,
+    binding: UnityEmbedCheckoutBinding,
     msg: UnityEmbedControlMessage,
 ) -> Result<(), String> {
-    let received_while_quiesced = unity_embed_is_quiesced();
-    let expected_epoch = unity_embed_control_epoch();
+    let (received_while_quiesced, expected_epoch) =
+        unity_embed_quiesce_snapshot(&binding.scope_key);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let app_for_main = app_handle.clone();
     app_handle
         .run_on_main_thread(move || {
             let result = apply_control_message_on_main(
                 &app_for_main,
+                binding,
                 msg,
                 expected_epoch,
                 received_while_quiesced,
@@ -2471,6 +3033,7 @@ async fn apply_control_message(
 
 fn apply_window_geometry(
     window: &tauri::WebviewWindow,
+    scope_key: &str,
     msg: &UnityEmbedControlMessage,
 ) -> Result<UnityEmbedMountMode, String> {
     #[cfg(target_os = "windows")]
@@ -2490,6 +3053,7 @@ fn apply_window_geometry(
                     }
                 };
                 record_mount_result(
+                    scope_key,
                     matches!(
                         mount_mode,
                         UnityEmbedMountMode::Child
@@ -2504,7 +3068,7 @@ fn apply_window_geometry(
                 eprintln!(
                     "[Locus] Unity embed Win32 overlay failed, using Tauri fallback: {error}"
                 );
-                record_mount_result(false, Some(error.clone()));
+                record_mount_result(scope_key, false, Some(error.clone()));
                 windows_impl::disable_popup_sync_for_window(window);
                 apply_overlay_geometry(window, msg)?;
                 return Ok(UnityEmbedMountMode::TauriFallback);
@@ -2512,7 +3076,11 @@ fn apply_window_geometry(
         }
     }
 
-    record_mount_result(false, Some("Unity parent HWND is missing".to_string()));
+    record_mount_result(
+        scope_key,
+        false,
+        Some("Unity parent HWND is missing".to_string()),
+    );
     #[cfg(target_os = "windows")]
     {
         windows_impl::disable_popup_sync_for_window(window);
@@ -3597,10 +4165,9 @@ mod windows_impl {
     static MOUSE_HOOK_ROOT_COUNT: AtomicUsize = AtomicUsize::new(0);
     static MOUSE_WIN_EVENT_HOOK_READY: AtomicBool = AtomicBool::new(false);
 
-    #[derive(Default)]
-    struct ControlServerState {
+    struct CheckoutControlServer {
         pipe_name: String,
-        handle: Option<tauri::async_runtime::JoinHandle<()>>,
+        handle: tauri::async_runtime::JoinHandle<()>,
     }
 
     fn popup_sync_state() -> &'static Mutex<PopupSyncState> {
@@ -3608,9 +4175,9 @@ mod windows_impl {
         STATE.get_or_init(|| Mutex::new(PopupSyncState::default()))
     }
 
-    fn control_server_state() -> &'static Mutex<ControlServerState> {
-        static STATE: OnceLock<Mutex<ControlServerState>> = OnceLock::new();
-        STATE.get_or_init(|| Mutex::new(ControlServerState::default()))
+    fn control_server_state() -> &'static Mutex<HashMap<String, CheckoutControlServer>> {
+        static STATE: OnceLock<Mutex<HashMap<String, CheckoutControlServer>>> = OnceLock::new();
+        STATE.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     fn mouse_activation_state() -> &'static Mutex<MouseActivationState> {
@@ -3778,56 +4345,97 @@ mod windows_impl {
                 mouse_hook_sync_loop(app_for_hook_sync).await;
             });
         }
-
-        refresh(app_handle);
     }
 
     pub(super) fn refresh(app_handle: AppHandle) {
-        tauri::async_runtime::spawn(async move {
-            let next_pipe_name = current_control_pipe_name(&app_handle)
-                .await
-                .unwrap_or_default();
-
-            let mut state = match control_server_state().lock() {
-                Ok(state) => state,
-                Err(error) => {
-                    eprintln!("[Locus] Unity embed control state lock failed: {error}");
-                    return;
+        let Some(registry) = app_handle.try_state::<Arc<ProjectRegistry>>() else {
+            return;
+        };
+        let current = registry
+            .runtimes()
+            .into_iter()
+            .map(|runtime| unity_embed_scope_key(&WorkspaceRef::for_runtime(&runtime)))
+            .collect::<HashSet<_>>();
+        if let Ok(mut servers) = control_server_state().lock() {
+            let stale = servers
+                .keys()
+                .filter(|key| !current.contains(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in stale {
+                if let Some(server) = servers.remove(&key) {
+                    server.handle.abort();
                 }
-            };
+            }
+        }
+    }
 
-            let running_same_pipe = state.pipe_name == next_pipe_name && state.handle.is_some();
-            if running_same_pipe {
+    pub(super) fn ensure_checkout_server(
+        app_handle: AppHandle,
+        workspace_ref: WorkspaceRef,
+        project_root: String,
+    ) {
+        let binding = UnityEmbedCheckoutBinding::new(workspace_ref, &project_root);
+        let server_key = binding.scope_key.clone();
+        let pipe_name = binding.pipe_name.clone();
+        let mut servers = match control_server_state().lock() {
+            Ok(servers) => servers,
+            Err(error) => {
+                eprintln!("[Locus] Unity embed control state lock failed: {error}");
                 return;
             }
-
-            if let Some(handle) = state.handle.take() {
-                handle.abort();
+        };
+        if servers
+            .get(&server_key)
+            .is_some_and(|server| server.pipe_name == pipe_name)
+        {
+            return;
+        }
+        let conflicting_keys = servers
+            .iter()
+            .filter_map(|(key, server)| {
+                (key != &server_key && server.pipe_name == pipe_name).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in conflicting_keys {
+            if let Some(previous) = servers.remove(&key) {
+                previous.handle.abort();
             }
+        }
+        if let Some(previous) = servers.remove(&server_key) {
+            previous.handle.abort();
+        }
 
-            state.pipe_name = next_pipe_name.clone();
-            if next_pipe_name.is_empty() {
-                return;
+        let app_for_server = app_handle.clone();
+        let binding_for_server = binding.clone();
+        let key_for_cleanup = server_key.clone();
+        let pipe_for_log = pipe_name.clone();
+        let handle = tauri::async_runtime::spawn(async move {
+            if let Err(error) = server_loop(app_for_server, binding_for_server).await {
+                eprintln!(
+                    "[Locus] Unity embed control pipe stopped ({}): {error}",
+                    pipe_for_log
+                );
             }
-
-            let app_for_server = app_handle.clone();
-            let pipe_for_server = next_pipe_name.clone();
-            state.handle = Some(tauri::async_runtime::spawn(async move {
-                if let Err(error) =
-                    server_loop(app_for_server.clone(), pipe_for_server.clone()).await
+            if let Ok(mut servers) = control_server_state().lock() {
+                if servers
+                    .get(&key_for_cleanup)
+                    .is_some_and(|server| server.pipe_name == pipe_for_log)
                 {
-                    eprintln!(
-                        "[Locus] Unity embed control pipe stopped ({}): {error}",
-                        pipe_for_server
-                    );
+                    servers.remove(&key_for_cleanup);
                 }
-                if let Ok(mut state) = control_server_state().lock() {
-                    if state.pipe_name == pipe_for_server {
-                        state.handle = None;
-                    }
-                }
-            }));
+            }
         });
+        servers.insert(server_key, CheckoutControlServer { pipe_name, handle });
+    }
+
+    pub(super) fn stop_checkout_server(workspace_ref: &WorkspaceRef) {
+        let server_key = unity_embed_scope_key(workspace_ref);
+        if let Ok(mut servers) = control_server_state().lock() {
+            if let Some(server) = servers.remove(&server_key) {
+                server.handle.abort();
+            }
+        }
     }
 
     pub(super) fn set_mouse_activation_suppressed(
@@ -4161,7 +4769,7 @@ mod windows_impl {
             return;
         }
 
-        let foreground_parent = focus_parent_for_embed_window(hwnd);
+        let foreground_parent = focus_parent_for_embed_window(hwnd, window.label());
         let foreground_target = if is_valid_window(foreground_parent) {
             foreground_parent
         } else {
@@ -4194,7 +4802,7 @@ mod windows_impl {
         detach_input_threads(current_thread, attached_threads);
     }
 
-    unsafe fn focus_parent_for_embed_window(hwnd: HWND) -> HWND {
+    unsafe fn focus_parent_for_embed_window(hwnd: HWND, label: &str) -> HWND {
         if has_child_style(hwnd) {
             if let Ok(parent) = GetParent(hwnd) {
                 if is_valid_window(parent) {
@@ -4203,10 +4811,7 @@ mod windows_impl {
             }
         }
 
-        let parent_hwnd = control_state()
-            .lock()
-            .map(|state| state.last_parent_hwnd)
-            .unwrap_or_default();
+        let parent_hwnd = applied_parent_hwnd(label);
         if parent_hwnd > 0 {
             let parent = HWND(parent_hwnd as isize as *mut std::ffi::c_void);
             if is_valid_window(parent) {
@@ -4400,9 +5005,8 @@ mod windows_impl {
     ) -> UnityEmbedFocusDebugSnapshot {
         let foreground = unsafe { GetForegroundWindow() };
         let overlay = window.and_then(|window| window.hwnd().ok());
-        let parent_hwnd = control_state()
-            .lock()
-            .map(|state| state.last_parent_hwnd)
+        let parent_hwnd = window
+            .map(|window| applied_parent_hwnd(window.label()))
             .unwrap_or_default();
         let parent = if parent_hwnd > 0 {
             HWND(parent_hwnd as isize as *mut std::ffi::c_void)
@@ -4619,7 +5223,11 @@ mod windows_impl {
         ServerOptions::new().max_instances(16).create(pipe_name)
     }
 
-    async fn server_loop(app_handle: AppHandle, pipe_name: String) -> io::Result<()> {
+    async fn server_loop(
+        app_handle: AppHandle,
+        binding: UnityEmbedCheckoutBinding,
+    ) -> io::Result<()> {
+        let pipe_name = binding.pipe_name.clone();
         let mut server = create_server(&pipe_name)?;
         eprintln!("[Locus] Unity embed control pipe listening: {pipe_name}");
 
@@ -4628,10 +5236,11 @@ mod windows_impl {
             let next_server = create_server(&pipe_name)?;
             let connected = std::mem::replace(&mut server, next_server);
             let app_for_client = app_handle.clone();
-            let pipe_for_client = pipe_name.clone();
+            let binding_for_client = binding.clone();
 
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = handle_client(app_for_client, connected, pipe_for_client).await
+                if let Err(error) =
+                    handle_client(app_for_client, connected, binding_for_client).await
                 {
                     eprintln!("[Locus] Unity embed control client error: {error}");
                 }
@@ -4642,7 +5251,7 @@ mod windows_impl {
     async fn handle_client(
         app_handle: AppHandle,
         server: NamedPipeServer,
-        pipe_name: String,
+        binding: UnityEmbedCheckoutBinding,
     ) -> io::Result<()> {
         let mut reader = BufReader::new(server);
         let mut line = String::new();
@@ -4669,11 +5278,9 @@ mod windows_impl {
                 }
             };
 
-            if !is_current_control_pipe(&app_handle, &pipe_name).await {
-                continue;
-            }
-
-            if let Err(error) = apply_control_message(app_handle.clone(), msg).await {
+            if let Err(error) =
+                apply_control_message(app_handle.clone(), binding.clone(), msg).await
+            {
                 eprintln!("[Locus] failed to apply Unity embed control message: {error}");
             }
         }
@@ -4860,7 +5467,7 @@ mod windows_impl {
         }
         remove_popup_sync_entry(snapshot.child_hwnd);
         record_applied_mount_mode(&snapshot.label, UnityEmbedMountMode::Child);
-        record_mount_result(true, None);
+        record_mount_result_for_window_label(&snapshot.label, true, None);
         eprintln!("[Locus] Unity embed popup fallback recovered to child mount");
     }
 
@@ -5262,7 +5869,7 @@ mod windows_impl {
             .hwnd()
             .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
         let child_hwnd = child.0 as isize as i64;
-        record_child_hwnd(child_hwnd);
+        record_child_hwnd_for_window_label(window.label(), child_hwnd);
         set_activation_guard_enabled(Some(window), false)?;
         unsafe {
             sync_overlay_visibility(child, false);
@@ -5272,7 +5879,7 @@ mod windows_impl {
         if unsafe { IsWindow(Some(parent)).as_bool() } {
             let (x, y, width, height) = normalized_rect(msg);
             update_popup_sync(
-                &unity_embed_window_label_for_msg(msg),
+                window.label(),
                 msg.parent_hwnd,
                 child_hwnd,
                 x,
@@ -5296,7 +5903,7 @@ mod windows_impl {
             .hwnd()
             .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
         let child_hwnd = child.0 as isize as i64;
-        record_child_hwnd(child_hwnd);
+        record_child_hwnd_for_window_label(window.label(), child_hwnd);
         let parent = HWND(msg.parent_hwnd as isize as *mut std::ffi::c_void);
         let (x, y, width, height) = normalized_rect(msg);
         let width_i32 = width as i32;
@@ -5452,7 +6059,7 @@ mod windows_impl {
             .hwnd()
             .map_err(|error| format!("Failed to read Tauri window handle: {error}"))?;
         let child_hwnd = child.0 as isize as i64;
-        record_child_hwnd(child_hwnd);
+        record_child_hwnd_for_window_label(window.label(), child_hwnd);
         let parent_hwnd = msg.parent_hwnd;
         let parent = HWND(parent_hwnd as isize as *mut std::ffi::c_void);
         let owner = owner_override.unwrap_or(parent);
@@ -5529,7 +6136,7 @@ mod windows_impl {
         }
 
         update_popup_sync(
-            &unity_embed_window_label_for_msg(msg),
+            window.label(),
             parent_hwnd,
             child_hwnd,
             x,
@@ -5567,10 +6174,89 @@ mod tests {
 
     use super::{
         control_pipe_name_for_project_path, locus_file_drop_refs, native_asset_file_drag_paths,
-        native_locus_file_drag_paths, normalize_pipe_project_path, unity_file_drop_asset_refs,
-        unity_ref_drag_preview_label, unity_relative_drop_path, LocusFileDropRef,
-        UnityEmbedAssetRef,
+        native_locus_file_drag_paths, normalize_pipe_project_path, unity_embed_host_url_for_scope,
+        unity_embed_scope_key, unity_embed_window_label_for_scope, unity_file_drop_asset_refs,
+        unity_ref_drag_preview_label, unity_relative_drop_path, workspace_ref_for_window_context,
+        LocusFileDropRef, UnityEmbedAssetRef,
     };
+    use crate::workspace_service::identity::ProjectIdResolver;
+    use crate::workspace_service::{
+        CheckoutId, WindowContextRegistry, WorkspaceRef, WorkspaceRuntime,
+    };
+    use std::sync::Arc;
+
+    fn checkout_ref(id: &str, generation: u64) -> WorkspaceRef {
+        WorkspaceRef::new(CheckoutId::new(id).expect("checkout id"), Some(generation))
+    }
+
+    #[test]
+    fn checkout_a_and_b_use_distinct_pipe_window_and_host_protocols() {
+        let checkout_a = checkout_ref("checkout-a", 3);
+        let checkout_b = checkout_ref("checkout-b", 7);
+        let pipe_a = control_pipe_name_for_project_path(r"F:\Game\Main");
+        let pipe_b = control_pipe_name_for_project_path(r"F:\Game\Worktrees\Feature");
+        let label_a = unity_embed_window_label_for_scope(&checkout_a, "session-1");
+        let label_b = unity_embed_window_label_for_scope(&checkout_b, "session-1");
+        let url_a = unity_embed_host_url_for_scope(&checkout_a, "session-1", "session", "s1");
+        let url_b = unity_embed_host_url_for_scope(&checkout_b, "session-1", "session", "s1");
+
+        assert_ne!(pipe_a, pipe_b);
+        assert_ne!(label_a, label_b);
+        assert!(url_a.contains("checkoutId=checkout-a"));
+        assert!(url_a.contains("workspaceGeneration=3"));
+        assert!(url_b.contains("checkoutId=checkout-b"));
+        assert!(url_b.contains("workspaceGeneration=7"));
+    }
+
+    #[test]
+    fn control_server_scope_rejects_a_recreated_checkout_generation() {
+        let first = checkout_ref("checkout-recreated", 41);
+        let replacement = checkout_ref("checkout-recreated", 42);
+
+        assert_ne!(
+            unity_embed_scope_key(&first),
+            unity_embed_scope_key(&replacement)
+        );
+    }
+
+    #[test]
+    fn ordinary_window_drop_scope_uses_the_active_pane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root_a = temp.path().join("checkout-a");
+        let root_b = temp.path().join("checkout-b");
+        fs::create_dir_all(&root_a).expect("checkout A root");
+        fs::create_dir_all(&root_b).expect("checkout B root");
+        let runtime_a = WorkspaceRuntime::new(
+            ProjectIdResolver::resolve(&root_a).expect("checkout A identity"),
+            Vec::new(),
+            11,
+        );
+        let runtime_b = WorkspaceRuntime::new(
+            ProjectIdResolver::resolve(&root_b).expect("checkout B identity"),
+            Vec::new(),
+            12,
+        );
+        let contexts = WindowContextRegistry::new();
+        contexts
+            .focus("main", "secondary", Arc::clone(&runtime_a), 1)
+            .expect("secondary pane focus");
+        contexts
+            .focus("main", "main", Arc::clone(&runtime_b), 1)
+            .expect("main pane focus");
+
+        let selected =
+            workspace_ref_for_window_context(&contexts, "main").expect("main window drop scope");
+        assert_eq!(selected.checkout_id, *runtime_b.checkout_id());
+        assert_eq!(selected.expected_generation, Some(12));
+
+        contexts
+            .focus("main", "secondary", Arc::clone(&runtime_a), 2)
+            .expect("activate secondary pane");
+        let selected = workspace_ref_for_window_context(&contexts, "main")
+            .expect("secondary window drop scope");
+        assert_eq!(selected.checkout_id, *runtime_a.checkout_id());
+        assert_eq!(selected.expected_generation, Some(11));
+    }
 
     #[test]
     fn pipe_project_path_normalizes_windows_slashes_and_extended_prefix() {

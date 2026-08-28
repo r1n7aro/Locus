@@ -27,12 +27,14 @@ describe("KnowledgeExplorer row icons", () => {
     expect(workspaceTree).toContain('class="workspace-tree-row-shell"');
   });
 
-  it("uses a spacer instead of a chevron for collapsed branches without child rows", () => {
+  it("uses one stateful folder icon without a dedicated chevron column", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
     const workspaceTree = read("src/components/explorer/WorkspaceTree.vue");
 
     expect(explorer).toContain("entry.row.directChildCount > 0");
-    expect(workspaceTree).toContain('v-else class="workspace-tree-branch-spacer"');
+    expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
+    expect(workspaceTree).not.toContain("workspace-tree-branch-spacer");
+    expect(workspaceTree).not.toContain("workspace-tree-branch");
     expect(workspaceTree).not.toContain("empty: row.directChildCount === 0");
   });
 });

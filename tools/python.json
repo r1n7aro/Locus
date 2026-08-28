@@ -1,0 +1,37 @@
+{
+  "description": "Run Python in the current checkout with the Locus Python SDK ready to use. The selected runtime from Settings > General is used, and `locus`, `project`, and `workspace_ref` are injected into an async body, so top-level `await` works.\n\nCommon SDK calls:\n- Status: `status = await locus.get_unity_editor_status(project=project)`; inspect `status.process_state`, `status.ready`, `status.main_thread_blocked`, `status.blocking_reason`, `status.blocking_dialog`, `status.blocking_dialog_recoverable`, and `status.is_crashed`\n- Start/reconnect: `result = await locus.ensure_unity_editor(project=project, mode=\"interactive\", wait_until=\"ready\")`\n- Headless start: `result = await locus.ensure_unity_editor(project=project, mode=\"headless\", wait_until=\"ready\")`\n- Restart: `result = await locus.restart_unity_editor(project=project, mode=\"interactive\", wait_until=\"ready\")`; inspect `result.forced_process_ids` and `result.status`\n- Tool call: `result = await locus.call_tool(\"unity_get_console_log\", {\"limit\": 50}, workspace_ref=workspace_ref)`\n\nStatus fields report observable state and capabilities; the model chooses whether to resolve a dialog, wait, or restart Unity. Use action=`help` only when a workflow needs more SDK surface. Topics: `agents`, `sessions`, `tools`, `unity`, `callbacks`. This keeps advanced documentation out of the default context. For action=`run`, set readonly=true only when the Python body and every SDK/tool call it makes are observation-only.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "type": "string",
+        "enum": ["run", "help"],
+        "description": "Run Python code, or progressively load one SDK help topic. Default run.",
+        "default": "run"
+      },
+      "code": {
+        "type": "string",
+        "description": "Python statements executed inside an async function. `locus`, `project`, and `workspace_ref` are already defined; top-level await is supported. Required for action=run."
+      },
+      "topic": {
+        "type": "string",
+        "enum": ["overview", "agents", "sessions", "tools", "unity", "callbacks"],
+        "description": "SDK documentation topic returned by action=help. Default overview."
+      },
+      "description": {
+        "type": "string",
+        "description": "Briefly describe the Python workflow."
+      },
+      "readonly": {
+        "type": "boolean",
+        "description": "Whether the Python body and all nested SDK/tool calls only observe state. Required for action=run; help is always read-only."
+      },
+      "timeout": {
+        "type": "integer",
+        "description": "Timeout in milliseconds for sync execution. Default 120000; maximum 1800000. Background async/notify execution has no deadline."
+      }
+    },
+    "required": ["action", "description"],
+    "additionalProperties": false
+  }
+}

@@ -6,16 +6,18 @@ import { t } from "../i18n";
 import BaseButton from "./ui/BaseButton.vue";
 import {
   knowledgeCancelLocalEmbeddingModelDownload,
-  knowledgeCloseDownloadProgressWindow,
   knowledgeGetEmbeddingStatus,
 } from "../services/knowledge";
 import { normalizeAppError } from "../services/errors";
 import {
   getKnowledgeDownloadWindowModelId,
+  getKnowledgeDownloadWindowWorkspaceRef,
   KNOWLEDGE_DOWNLOAD_WINDOW_MODEL_EVENT,
   KNOWLEDGE_DOWNLOAD_WINDOW_TITLE,
 } from "../services/knowledgeDownloadWindow";
 import type { EmbeddingStatus } from "../types";
+import type { WorkspaceRef } from "../services/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 type CloseReason = "success" | "error" | "cancelled" | null;
 type MetaSummary = {
@@ -24,7 +26,9 @@ type MetaSummary = {
 };
 
 const appWindow = getCurrentWindow();
+const workspaceContextStore = useWorkspaceContextStore();
 const requestedModelId = ref(getKnowledgeDownloadWindowModelId());
+const workspaceRef = ref<WorkspaceRef | null>(getKnowledgeDownloadWindowWorkspaceRef());
 const statusSnapshot = ref<EmbeddingStatus | null>(null);
 const closeReason = ref<CloseReason>(null);
 const pollError = ref("");
@@ -167,12 +171,6 @@ async function destroyWindow() {
   closeRequestUnlisten?.();
   closeRequestUnlisten = null;
   try {
-    await knowledgeCloseDownloadProgressWindow();
-    return;
-  } catch {
-    // fall back to local window handles when the command is unavailable
-  }
-  try {
     await appWindow.setClosable(true);
   } catch {
     // ignore unsupported close state changes on teardown
@@ -207,11 +205,12 @@ function detailIncludesRequestedModel(detail: string | null | undefined): boolea
 }
 
 async function cancelDownload() {
+  if (!workspaceRef.value) return;
   if (cancelPending.value || closeReason.value) return;
   cancelPending.value = true;
   pollError.value = "";
   try {
-    await knowledgeCancelLocalEmbeddingModelDownload();
+    await knowledgeCancelLocalEmbeddingModelDownload(workspaceRef.value);
     schedulePoll(140);
   } catch (cause) {
     cancelPending.value = false;
@@ -220,8 +219,9 @@ async function cancelDownload() {
 }
 
 async function refreshStatus() {
+  if (!workspaceRef.value) return;
   try {
-    const nextStatus = await knowledgeGetEmbeddingStatus();
+    const nextStatus = await knowledgeGetEmbeddingStatus(workspaceRef.value);
     statusSnapshot.value = nextStatus;
     pollError.value = "";
 
@@ -398,17 +398,22 @@ async function initializeWindow() {
       if (allowWindowClose) return;
       event.preventDefault();
     });
-    modelEventUnlisten = await appWindow.listen<{ modelId?: string }>(
+    modelEventUnlisten = await appWindow.listen<{ modelId?: string; workspaceRef?: WorkspaceRef }>(
       KNOWLEDGE_DOWNLOAD_WINDOW_MODEL_EVENT,
       (event) => {
         const nextModelId = event.payload?.modelId?.trim() || "";
         if (!nextModelId) return;
+        workspaceRef.value = event.payload?.workspaceRef ?? workspaceRef.value;
         resetDownloadSession(nextModelId);
       },
     );
   } catch {
     // keep polling even if window event hooks are unavailable
   }
+
+  if (!workspaceRef.value) return;
+  await workspaceContextStore.initialize(appWindow.label, "main");
+  await workspaceContextStore.focusCheckout(workspaceRef.value.checkoutId);
 
   schedulePoll(220);
 }

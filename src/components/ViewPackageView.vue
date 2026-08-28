@@ -8,6 +8,11 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
+import {
+  type InternalDropTargetRegistration,
+  useInternalDragController,
+} from "../composables/useInternalDrag";
+import { withInternalTreePreview } from "./explorer/internalTreePreview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Box,
@@ -26,6 +31,11 @@ import {
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+  type WorkspaceRef,
+} from "../services/project";
 import { useNotificationStore } from "../stores/notification";
 import {
   checkViewOpenRequirements,
@@ -73,7 +83,8 @@ interface VisibleViewRow {
 type VisibleViewEntry =
   | { type: "empty-folder"; key: string; depth: number }
   | { type: "row"; key: string; row: VisibleViewRow }
-  | { type: "create"; key: string; draft: ViewCreateFolderDraft };
+  | { type: "create"; key: string; draft: ViewCreateFolderDraft }
+  | { type: "drop-preview"; key: string; depth: number; node: ViewTreeNode };
 
 interface ViewCreateFolderDraft {
   parentRelPath: string;
@@ -101,14 +112,6 @@ interface ViewDeleteConfirmState {
   node: ViewTreeNode;
 }
 
-interface ViewPointerDragState {
-  node: ViewTreeNode;
-  pointerId: number;
-  startX: number;
-  startY: number;
-  active: boolean;
-}
-
 interface ViewDropTarget {
   key: string;
   targetDirRelPath: string;
@@ -119,6 +122,7 @@ interface ViewDropTarget {
 
 const props = defineProps<{
   workingDir: string;
+  workspaceRef: WorkspaceRef | null;
 }>();
 
 const STORAGE_KEY_VIEW_EXPANDED = "locus:viewPackageExpanded";
@@ -143,25 +147,29 @@ const createFolderDraft = ref<ViewCreateFolderDraft | null>(null);
 const createFolderInputRef = ref<HTMLInputElement | null>(null);
 const renameDraft = ref<ViewRenameDraft | null>(null);
 const renameInputRef = ref<HTMLInputElement | null>(null);
+const viewPackageRootRef = ref<HTMLElement | null>(null);
 const draggingNode = ref<ViewTreeNode | null>(null);
 const dragTargetKey = ref("");
 const dragTargetPosition = ref<ViewDropTarget["position"] | "">("");
+const inlineDropTarget = ref<ViewDropTarget | null>(null);
 const viewCompileErrors = ref<Record<string, string>>({});
 const viewCompileCheckedKeys = ref<Record<string, string>>({});
 const viewCompilePendingKeys = ref<Record<string, string>>({});
 const viewCompileValidationPromises = new Map<string, Promise<string>>();
 const viewCompileValidationRuns = new Map<string, number>();
 let nextViewCompileValidationRun = 0;
-let unsubscribeViewReload: RuntimeUnsubscribe | null = null;
-let unsubscribeViewTreeChanged: RuntimeUnsubscribe | null = null;
-let pointerDragState: ViewPointerDragState | null = null;
-let pointerMoveListener: ((event: PointerEvent) => void) | null = null;
-let pointerUpListener: ((event: PointerEvent) => void) | null = null;
-let pointerCancelListener: ((event: PointerEvent) => void) | null = null;
-let suppressNextClick = false;
-let suppressNextClickTimer: number | null = null;
+let nextViewLoadRun = 0;
+let unsubscribeWorkspaceEvents: RuntimeUnsubscribe | null = null;
+const internalDrag = useInternalDragController();
+let unregisterViewTreeDropTarget: (() => void) | null = null;
+const VIEW_TREE_INTERNAL_DRAG_TYPE = "locus/view-tree";
 
-const hasWorkspace = computed(() => !!props.workingDir.trim());
+const hasWorkspace = computed(() => !!props.workingDir.trim() && !!props.workspaceRef);
+
+function requireWorkspaceRef(): WorkspaceRef {
+  if (props.workspaceRef) return props.workspaceRef;
+  throw new Error("View workspace scope is unavailable.");
+}
 const selectedView = computed(() =>
   views.value.find((view) => view.id === selectedViewId.value) ?? null,
 );
@@ -240,6 +248,33 @@ const visibleViewEntries = computed<VisibleViewEntry[]>(() => {
 
   walk(viewTreeNodes.value, 0);
   return entries;
+});
+
+const displayedViewEntries = computed<VisibleViewEntry[]>(() => {
+  const source = draggingNode.value;
+  const target = inlineDropTarget.value;
+  if (!source || !target || internalDrag.previewMode.value === "floating") {
+    return visibleViewEntries.value;
+  }
+  return withInternalTreePreview(
+    visibleViewEntries.value,
+    {
+      sourceKey: source.key,
+      targetKey: target.key === ROOT_ANCHOR_KEY ? null : target.key,
+      position: target.key === ROOT_ANCHOR_KEY ? "root" : target.position,
+      rootDepth: 0,
+    },
+    (entry) => ({
+      nodeKey: entry.type === "row" ? entry.row.node.key : undefined,
+      depth: entry.type === "row" ? entry.row.depth : entry.type === "create" ? entry.draft.depth : entry.depth,
+    }),
+    (depth) => ({
+      type: "drop-preview",
+      key: `view-drop-preview:${source.key}`,
+      depth,
+      node: source,
+    }),
+  );
 });
 
 function loadExpandedState(): Record<string, boolean> {
@@ -520,7 +555,7 @@ function clearViewCompileDiagnostics() {
 
 async function validateViewCompile(view: ViewPackageSummary): Promise<string> {
   try {
-    const detail = await viewRead(view.id);
+    const detail = await viewRead(requireWorkspaceRef(), view.id);
     for (const file of detail.files) {
       if (!isViewCompileFile(file.relPath)) continue;
       if (file.truncated) {
@@ -601,11 +636,20 @@ function selectView(view: ViewPackageSummary) {
 
 async function loadViews() {
   if (!hasWorkspace.value) return;
+  const workspaceRef = requireWorkspaceRef();
+  const run = ++nextViewLoadRun;
   loading.value = true;
   loadError.value = "";
   try {
-    applyTreeSnapshot(await viewTree());
+    const snapshot = await viewTree(workspaceRef);
+    if (
+      run !== nextViewLoadRun
+      || props.workspaceRef?.checkoutId !== workspaceRef.checkoutId
+      || props.workspaceRef?.expectedGeneration !== workspaceRef.expectedGeneration
+    ) return;
+    applyTreeSnapshot(snapshot);
   } catch (error) {
+    if (run !== nextViewLoadRun) return;
     const err = normalizeViewError(error);
     views.value = [];
     folders.value = [];
@@ -618,7 +662,7 @@ async function loadViews() {
       replaceOperation: true,
     });
   } finally {
-    loading.value = false;
+    if (run === nextViewLoadRun) loading.value = false;
   }
 }
 
@@ -641,13 +685,7 @@ function treeIndentPx(depth: number): number {
   return VIEW_TREE_INDENT_BASE_PX + Math.max(0, depth) * VIEW_TREE_INDENT_STEP_PX;
 }
 
-function selectTreeRow(row: VisibleViewRow, event?: MouseEvent) {
-  if (suppressNextClick) {
-    event?.preventDefault();
-    event?.stopPropagation();
-    suppressNextClick = false;
-    return;
-  }
+function selectTreeRow(row: VisibleViewRow) {
   closeContextMenu();
   if (row.node.kind === "folder") {
     toggleRow(row);
@@ -748,7 +786,7 @@ async function submitCreateFolder() {
   const name = draft?.name.trim();
   if (!draft || !name) return;
   try {
-    await viewCreateFolder({ parentRelPath: draft.parentRelPath, name });
+    await viewCreateFolder(requireWorkspaceRef(), { parentRelPath: draft.parentRelPath, name });
     closeCreateFolder();
     await loadViews();
   } catch (error) {
@@ -802,7 +840,7 @@ async function submitRename() {
     return;
   }
   try {
-    applyTreeSnapshot(await viewRenameEntry({ relPath: draft.relPath, name }));
+    applyTreeSnapshot(await viewRenameEntry(requireWorkspaceRef(), { relPath: draft.relPath, name }));
     closeRename();
   } catch (error) {
     const err = normalizeAppError(error);
@@ -835,7 +873,7 @@ async function confirmDeleteEntry() {
   const confirm = deleteConfirm.value;
   if (!confirm) return;
   try {
-    applyTreeSnapshot(await viewDeleteEntry({ relPath: confirm.node.relPath }));
+    applyTreeSnapshot(await viewDeleteEntry(requireWorkspaceRef(), { relPath: confirm.node.relPath }));
   } catch (error) {
     const err = normalizeAppError(error);
     loadError.value = err.message;
@@ -853,6 +891,7 @@ function clearDragState() {
   draggingNode.value = null;
   dragTargetKey.value = "";
   dragTargetPosition.value = "";
+  inlineDropTarget.value = null;
 }
 
 function viewNodeParentRelPath(node: ViewTreeNode): string {
@@ -907,38 +946,6 @@ function viewFolderKeyForRelPath(relPath: string): string {
   return `view-dir:${normalizeViewPath(relPath)}`;
 }
 
-function clearPointerDragListeners() {
-  if (pointerMoveListener) {
-    window.removeEventListener("pointermove", pointerMoveListener);
-    pointerMoveListener = null;
-  }
-  if (pointerUpListener) {
-    window.removeEventListener("pointerup", pointerUpListener);
-    pointerUpListener = null;
-  }
-  if (pointerCancelListener) {
-    window.removeEventListener("pointercancel", pointerCancelListener);
-    pointerCancelListener = null;
-  }
-  document.body.classList.remove("view-tree-pointer-dragging");
-}
-
-function scheduleSuppressNextClick() {
-  suppressNextClick = true;
-  if (suppressNextClickTimer) {
-    window.clearTimeout(suppressNextClickTimer);
-  }
-  suppressNextClickTimer = window.setTimeout(() => {
-    suppressNextClick = false;
-    suppressNextClickTimer = null;
-  }, 240);
-}
-
-function clearPointerDragState() {
-  pointerDragState = null;
-  clearPointerDragListeners();
-}
-
 function shouldIgnorePointerDrag(event: PointerEvent): boolean {
   const target = event.target;
   return (
@@ -949,16 +956,16 @@ function shouldIgnorePointerDrag(event: PointerEvent): boolean {
   );
 }
 
-function resolveDropTargetFromPoint(
-  x: number,
+function resolveDropTarget(
+  target: Element,
   y: number,
   node: ViewTreeNode,
 ): ViewDropTarget | null {
-  const target = document.elementFromPoint(x, y);
-  if (!(target instanceof Element)) return null;
-
   const rowElement = target.closest<HTMLElement>(".view-tree-row-shell");
   if (rowElement) {
+    if (rowElement.dataset.inlineDropPreview === "true" && inlineDropTarget.value) {
+      return inlineDropTarget.value;
+    }
     const row = visibleRowByNodeKey(rowElement.dataset.viewNodeKey ?? "");
     if (!row) return null;
     const rect = rowElement.getBoundingClientRect();
@@ -1001,14 +1008,6 @@ function resolveDropTargetFromPoint(
   return null;
 }
 
-function updatePointerDropTarget(event: PointerEvent) {
-  const state = pointerDragState;
-  if (!state?.active) return;
-  const target = resolveDropTargetFromPoint(event.clientX, event.clientY, state.node);
-  dragTargetKey.value = target?.key ?? "";
-  dragTargetPosition.value = target?.position ?? "";
-}
-
 function onTreePointerDown(row: VisibleViewRow, event: PointerEvent) {
   if (
     event.button !== 0 ||
@@ -1020,99 +1019,48 @@ function onTreePointerDown(row: VisibleViewRow, event: PointerEvent) {
     return;
   }
 
-  clearPointerDragState();
-  pointerDragState = {
-    node: row.node,
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    active: false,
-  };
-
-  pointerMoveListener = onTreePointerMove;
-  pointerUpListener = (upEvent) => {
-    void finishPointerDrag(upEvent);
-  };
-  pointerCancelListener = () => {
-    clearDragState();
-    clearPointerDragState();
-  };
-
-  window.addEventListener("pointermove", pointerMoveListener);
-  window.addEventListener("pointerup", pointerUpListener);
-  window.addEventListener("pointercancel", pointerCancelListener);
+  internalDrag.start(event, {
+    id: `view-tree:${row.node.key}`,
+    payload: { type: VIEW_TREE_INTERNAL_DRAG_TYPE, data: { node: row.node } },
+    preview: {
+      label: row.node.label,
+      kind: row.node.kind === "folder" ? "folder" : "package",
+    },
+    allowedOperations: ["move"],
+    onActivated: () => {
+      draggingNode.value = row.node;
+      dragTargetKey.value = "";
+      dragTargetPosition.value = "";
+      closeContextMenu();
+      closeCreateFolder();
+      closeRename();
+    },
+    onFinished: clearDragState,
+  });
 }
 
-function onTreePointerMove(event: PointerEvent) {
-  const state = pointerDragState;
-  if (!state || event.pointerId !== state.pointerId) return;
-
-  const dx = event.clientX - state.startX;
-  const dy = event.clientY - state.startY;
-  if (!state.active) {
-    if (Math.hypot(dx, dy) < 5) return;
-    state.active = true;
-    draggingNode.value = state.node;
-    dragTargetKey.value = "";
-    closeContextMenu();
-    closeCreateFolder();
-    document.body.classList.add("view-tree-pointer-dragging");
-  }
-
-  event.preventDefault();
-  updatePointerDropTarget(event);
+interface ViewTreeInternalDragData {
+  node: ViewTreeNode;
 }
 
-async function finishPointerDrag(event: PointerEvent) {
-  const state = pointerDragState;
-  if (!state || event.pointerId !== state.pointerId) return;
-
-  const target = state.active
-    ? resolveDropTargetFromPoint(event.clientX, event.clientY, state.node)
-    : null;
-  const shouldSuppressClick = state.active;
-  clearPointerDragState();
-
-  if (shouldSuppressClick) {
-    scheduleSuppressNextClick();
-  }
-
-  if (!target) {
-    clearDragState();
-    return;
-  }
-
-  await moveNodeToTarget(state.node, target);
-}
-
-function onTreeDragStart(row: VisibleViewRow, event: DragEvent) {
-  if (createFolderDraft.value || !canDragNode(row.node)) {
-    event.preventDefault();
-    return;
-  }
-  closeContextMenu();
-  draggingNode.value = row.node;
-  dragTargetKey.value = "";
-  dragTargetPosition.value = "";
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", row.node.relPath);
-  }
-}
-
-function onTreeDragEnd() {
-  clearDragState();
-}
-
-function onTreeFolderDragOver(row: VisibleViewRow, event: DragEvent) {
-  if (!draggingNode.value) return;
-  const target = resolveDropTargetFromPoint(event.clientX, event.clientY, draggingNode.value);
-  if (!target || target.key !== row.node.key) return;
-  event.preventDefault();
-  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  dragTargetKey.value = target.key;
-  dragTargetPosition.value = target.position;
-}
+const viewTreeDropTarget: InternalDropTargetRegistration<ViewTreeInternalDragData, ViewDropTarget> = {
+  id: "view-package-tree",
+  root: () => viewPackageRootRef.value,
+  accepts: (source) => source.payload.type === VIEW_TREE_INTERNAL_DRAG_TYPE,
+  resolve: ({ source, point, hit }) => {
+    const target = resolveDropTarget(hit, point.y, source.payload.data.node);
+    return target ? { key: `${target.key}:${target.position}`, operation: "move", intent: target } : null;
+  },
+  onTargetChange: (decision) => {
+    dragTargetKey.value = decision?.intent.key ?? "";
+    dragTargetPosition.value = decision?.intent.position ?? "";
+    inlineDropTarget.value = decision?.intent ?? null;
+  },
+  drop: async ({ source, decision }) => {
+    await moveNodeToTarget(source.payload.data.node, decision.intent);
+  },
+  previewMode: ({ hit }) => hit.closest(".view-list") ? "floating-with-gap" : "floating",
+};
 
 async function moveNodeToTarget(
   node: ViewTreeNode,
@@ -1132,7 +1080,7 @@ async function moveNodeToTarget(
   }
   try {
     applyTreeSnapshot(
-      await viewMoveEntry({
+      await viewMoveEntry(requireWorkspaceRef(), {
         sourceRelPath: node.relPath,
         targetDirRelPath: target.targetDirRelPath,
         insertBeforeRelPath: target.insertBeforeRelPath,
@@ -1154,70 +1102,6 @@ async function moveNodeToTarget(
   }
 }
 
-async function moveNodeToDir(
-  node: ViewTreeNode,
-  targetDirRelPath: string,
-  targetKey = targetDirRelPath ? viewFolderKeyForRelPath(targetDirRelPath) : ROOT_ANCHOR_KEY,
-) {
-  await moveNodeToTarget(node, {
-    key: targetKey,
-    targetDirRelPath,
-    position: "inside",
-  });
-}
-
-async function moveDraggingNode(targetDirRelPath: string, targetKey?: string) {
-  const node = draggingNode.value;
-  if (!node) {
-    clearDragState();
-    return;
-  }
-  await moveNodeToDir(node, targetDirRelPath, targetKey);
-}
-
-function onTreeFolderDrop(row: VisibleViewRow, event: DragEvent) {
-  if (!draggingNode.value) return;
-  const target = resolveDropTargetFromPoint(event.clientX, event.clientY, draggingNode.value);
-  if (!target || target.key !== row.node.key) {
-    clearDragState();
-    return;
-  }
-  event.preventDefault();
-  event.stopPropagation();
-  void moveNodeToTarget(draggingNode.value, target);
-}
-
-function onTreeRootDragOver(event: DragEvent) {
-  const target = event.target;
-  if (
-    target instanceof Element &&
-    target.closest(".view-tree-row-shell, .view-tree-create-row")
-  ) {
-    return;
-  }
-  if (!canDropNodeInsideDir(draggingNode.value, "")) return;
-  event.preventDefault();
-  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  dragTargetKey.value = ROOT_ANCHOR_KEY;
-  dragTargetPosition.value = "inside";
-}
-
-function onTreeRootDrop(event: DragEvent) {
-  const target = event.target;
-  if (
-    target instanceof Element &&
-    target.closest(".view-tree-row-shell, .view-tree-create-row")
-  ) {
-    return;
-  }
-  if (!canDropNodeInsideDir(draggingNode.value, "")) {
-    clearDragState();
-    return;
-  }
-  event.preventDefault();
-  void moveDraggingNode("", ROOT_ANCHOR_KEY);
-}
-
 async function importViewPackage(targetDirRelPath = "") {
   if (importing.value) return;
   closeContextMenu();
@@ -1233,7 +1117,7 @@ async function importViewPackage(targetDirRelPath = "") {
     });
     if (!selected || typeof selected !== "string") return;
 
-    const result = await viewImportPackage({
+    const result = await viewImportPackage(requireWorkspaceRef(), {
       filePath: selected,
       targetDirRelPath,
     });
@@ -1279,7 +1163,7 @@ async function exportViewPackage(view: ViewPackageSummary | null = selectedView.
     });
     if (!filePath) return;
 
-    const savedPath = await viewExportPackage({
+    const savedPath = await viewExportPackage(requireWorkspaceRef(), {
       viewId: view.id,
       filePath,
     });
@@ -1320,7 +1204,7 @@ async function openViewPackage(view: ViewPackageSummary) {
       });
       return;
     }
-    const requirementError = await checkViewOpenRequirements(view);
+    const requirementError = await checkViewOpenRequirements(requireWorkspaceRef(), view);
     if (requirementError) {
       notificationStore.addNotice("error", requirementError.message, {
         code: requirementError.code,
@@ -1329,7 +1213,7 @@ async function openViewPackage(view: ViewPackageSummary) {
       });
       return;
     }
-    await viewRun(view.id);
+    await viewRun(requireWorkspaceRef(), view.id);
   } catch (runError) {
     const err = normalizeViewError(runError, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
@@ -1355,7 +1239,7 @@ async function openViewPackageInUnity(view: ViewPackageSummary) {
       });
       return;
     }
-    const requirementError = await checkViewOpenRequirements(view);
+    const requirementError = await checkViewOpenRequirements(requireWorkspaceRef(), view);
     if (requirementError) {
       notificationStore.addNotice("error", requirementError.message, {
         code: requirementError.code,
@@ -1364,7 +1248,7 @@ async function openViewPackageInUnity(view: ViewPackageSummary) {
       });
       return;
     }
-    await viewRunInUnity(view.id);
+    await viewRunInUnity(requireWorkspaceRef(), view.id);
   } catch (runError) {
     const err = normalizeViewError(runError, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
@@ -1402,49 +1286,52 @@ async function openContextViewInUnity() {
   await openViewPackageInUnity(view);
 }
 
-watch(() => props.workingDir, () => {
-  selectedViewId.value = "";
-  clearViewCompileDiagnostics();
-  closeContextMenu();
-  closeCreateFolder();
-  closeRename();
-  deleteConfirm.value = null;
-  clearDragState();
-  clearPointerDragState();
-  if (hasWorkspace.value) void loadViews();
-});
+watch(
+  () => `${props.workspaceRef?.checkoutId ?? ""}@${props.workspaceRef?.expectedGeneration ?? ""}`,
+  () => {
+    nextViewLoadRun++;
+    selectedViewId.value = "";
+    clearViewCompileDiagnostics();
+    closeContextMenu();
+    closeCreateFolder();
+    closeRename();
+    deleteConfirm.value = null;
+    clearDragState();
+    if (internalDrag.isDraggingType(VIEW_TREE_INTERNAL_DRAG_TYPE)) internalDrag.cancel();
+    if (hasWorkspace.value) void loadViews();
+  },
+);
 
 onMounted(async () => {
-  unsubscribeViewReload = await getLocusRuntime().subscribe<ViewPackageSummary>(
-    "view-package-reloaded",
-    () => {
-      void loadViews();
-    },
-  );
-  unsubscribeViewTreeChanged = await getLocusRuntime().subscribe(
-    "view-tree-changed",
-    () => {
-      void loadViews();
+  unregisterViewTreeDropTarget = internalDrag.registerTarget(viewTreeDropTarget);
+  unsubscribeWorkspaceEvents = await getLocusRuntime().subscribe<RoutedWorkspaceEvent>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      const workspaceRef = props.workspaceRef;
+      if (!workspaceRef || event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      if (event.eventName === "view-package-reloaded" || event.eventName === "view-tree-changed") {
+        void loadViews();
+      }
     },
   );
   if (hasWorkspace.value) await loadViews();
 });
 
 onUnmounted(() => {
-  unsubscribeViewReload?.();
-  unsubscribeViewReload = null;
-  unsubscribeViewTreeChanged?.();
-  unsubscribeViewTreeChanged = null;
-  clearPointerDragState();
-  if (suppressNextClickTimer) {
-    window.clearTimeout(suppressNextClickTimer);
-    suppressNextClickTimer = null;
-  }
+  unregisterViewTreeDropTarget?.();
+  unregisterViewTreeDropTarget = null;
+  unsubscribeWorkspaceEvents?.();
+  unsubscribeWorkspaceEvents = null;
+  if (internalDrag.isDraggingType(VIEW_TREE_INTERNAL_DRAG_TYPE)) internalDrag.cancel();
 });
 </script>
 
 <template>
-  <div class="view-package-view">
+  <div ref="viewPackageRootRef" class="view-package-view">
     <WorkspaceRequiredState
       v-if="!hasWorkspace"
       :description="t('workspace.required.viewDescription')"
@@ -1471,10 +1358,8 @@ onUnmounted(() => {
             class="view-list"
             :class="{ 'is-root-drop-target': dragTargetKey === ROOT_ANCHOR_KEY }"
             @contextmenu.prevent="onTreeContextMenu"
-            @dragover="onTreeRootDragOver"
-            @drop="onTreeRootDrop"
           >
-            <template v-for="entry in visibleViewEntries" :key="entry.key">
+            <template v-for="entry in displayedViewEntries" :key="entry.key">
               <div
                 v-if="entry.type === 'row'"
                 class="view-tree-row-shell"
@@ -1495,17 +1380,12 @@ onUnmounted(() => {
                     dragTargetKey === entry.row.node.key &&
                     dragTargetPosition === 'after',
                 }"
-                draggable="false"
                 :style="{ '--view-tree-row-indent': `${treeIndentPx(entry.row.depth)}px` }"
                 :data-view-node-key="entry.row.node.key"
                 :data-view-node-kind="entry.row.node.kind"
                 :title="entry.row.node.label"
                 @pointerdown="onTreePointerDown(entry.row, $event)"
                 @contextmenu.prevent.stop="openTreeContextMenu($event, entry.row)"
-                @dragstart="onTreeDragStart(entry.row, $event)"
-                @dragend="onTreeDragEnd"
-                @dragover="onTreeFolderDragOver(entry.row, $event)"
-                @drop="onTreeFolderDrop(entry.row, $event)"
               >
                 <div
                   v-if="isRenamingNode(entry.row.node)"
@@ -1577,7 +1457,7 @@ onUnmounted(() => {
                   type="button"
                   class="view-tree-row"
                   :style="{ paddingLeft: `${treeIndentPx(entry.row.depth)}px` }"
-                  @click="selectTreeRow(entry.row, $event)"
+                  @click="selectTreeRow(entry.row)"
                 >
                   <span
                     v-if="entry.row.node.kind === 'folder'"
@@ -1636,12 +1516,35 @@ onUnmounted(() => {
                     :aria-label="`${t('view.action.open')} ${entry.row.node.label}`"
                     :disabled="running"
                     @pointerdown.stop
-                    @dragstart.prevent.stop
                     @click.stop="openTreeView(entry.row)"
                   >
                     <LucideIcon :icon="PanelTopOpen" :size="12" :stroke-width="2" />
                     <span>{{ t("view.action.open") }}</span>
                   </button>
+                </div>
+              </div>
+
+              <div
+                v-else-if="entry.type === 'drop-preview'"
+                class="view-tree-row-shell is-drop-preview"
+                data-inline-drop-preview="true"
+                aria-hidden="true"
+                :style="{ '--view-tree-row-indent': `${treeIndentPx(entry.depth)}px` }"
+              >
+                <div class="view-tree-row is-drop-preview-row" :style="{ paddingLeft: `${treeIndentPx(entry.depth)}px` }">
+                  <span v-if="entry.depth > 0" class="view-tree-branch-spacer" aria-hidden="true"></span>
+                  <span
+                    class="view-tree-kind-icon"
+                    :class="entry.node.kind === 'folder' ? 'folder' : 'view'"
+                    aria-hidden="true"
+                  >
+                    <LucideIcon
+                      :icon="entry.node.kind === 'folder' ? Folder : resolveLocusViewIcon(entry.node.view?.icon)"
+                      :size="13"
+                      :stroke-width="2"
+                    />
+                  </span>
+                  <span class="view-tree-label">{{ entry.node.label }}</span>
                 </div>
               </div>
 
@@ -1699,7 +1602,7 @@ onUnmounted(() => {
             <div v-else-if="!viewTreeNodes.length && !loading && !createFolderDraft" class="view-empty">
               {{ t("view.list.empty") }}
             </div>
-            <div v-if="loading && !visibleViewEntries.length" class="view-empty">{{ t("common.loading") }}</div>
+            <div v-if="loading && !displayedViewEntries.length" class="view-empty">{{ t("common.loading") }}</div>
           </div>
         </aside>
 
@@ -1965,6 +1868,7 @@ onUnmounted(() => {
 }
 
 .view-tree-row-shell {
+  touch-action: none;
   position: relative;
   display: flex;
   align-items: stretch;
@@ -1998,6 +1902,16 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--active-bg) 62%, transparent);
   box-shadow: inset 0 0 0 1px
     color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
+}
+
+.view-tree-row-shell.is-drop-preview {
+  background: color-mix(in srgb, var(--accent-soft) 12%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent-color) 36%, transparent);
+}
+
+.view-tree-row.is-drop-preview-row {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .view-tree-row-shell.drop-before::before,
@@ -2333,15 +2247,6 @@ onUnmounted(() => {
   min-width: 24px;
   height: 24px;
   padding: 0;
-}
-
-:global(body.view-tree-pointer-dragging) {
-  cursor: grabbing;
-  user-select: none;
-}
-
-:global(body.view-tree-pointer-dragging *) {
-  cursor: grabbing !important;
 }
 
 .view-empty {

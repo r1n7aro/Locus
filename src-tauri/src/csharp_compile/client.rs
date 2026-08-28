@@ -8,26 +8,40 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock, Weak};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Compiles can be slow right after a sidecar cold start (Roslyn JIT +
 /// first-time reference loading over a few hundred DLLs).
 pub const COMPILE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 pub const SCHEMA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const CANCEL_SIGNAL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct PendingRequest {
+    sender: oneshot::Sender<Result<Value, String>>,
+    scope_key: Option<String>,
+    _job_permit: Option<super::scheduler::CompileJobPermit>,
+    timed_out: bool,
+}
+
+struct WriterCommand {
+    frame: Vec<u8>,
+    completion: oneshot::Sender<Result<(), String>>,
+}
 
 /// A running compile-server process plus the JSON-RPC plumbing.
 pub struct CompileClient {
-    stdin: AsyncMutex<tokio::process::ChildStdin>,
+    writer_tx: mpsc::UnboundedSender<WriterCommand>,
     child: Mutex<Option<tokio::process::Child>>,
-    pending: Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>,
+    pending: Mutex<HashMap<i64, PendingRequest>>,
     next_id: AtomicI64,
     exited_rx: watch::Receiver<bool>,
     unusable: AtomicBool,
+    self_weak: OnceLock<Weak<CompileClient>>,
 }
 
 impl CompileClient {
@@ -69,14 +83,22 @@ impl CompileClient {
             .ok_or_else(|| "C# compile server stdout unavailable".to_string())?;
 
         let (exited_tx, exited_rx) = watch::channel(false);
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel();
 
         let client = std::sync::Arc::new(CompileClient {
-            stdin: AsyncMutex::new(stdin),
+            writer_tx,
             child: Mutex::new(Some(child)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(0),
             exited_rx,
             unusable: AtomicBool::new(false),
+            self_weak: OnceLock::new(),
+        });
+        let _ = client.self_weak.set(std::sync::Arc::downgrade(&client));
+
+        let writer_client = std::sync::Arc::downgrade(&client);
+        tokio::spawn(async move {
+            Self::write_loop(stdin, writer_rx, writer_client).await;
         });
 
         let reader_client = std::sync::Arc::clone(&client);
@@ -89,8 +111,64 @@ impl CompileClient {
         Ok(client)
     }
 
+    async fn write_loop(
+        mut stdin: tokio::process::ChildStdin,
+        mut commands: mpsc::UnboundedReceiver<WriterCommand>,
+        client: Weak<CompileClient>,
+    ) {
+        while let Some(command) = commands.recv().await {
+            let result: Result<(), String> = async {
+                stdin
+                    .write_all(&command.frame)
+                    .await
+                    .map_err(|e| format!("C# compile server write failed: {e}"))?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|e| format!("C# compile server flush failed: {e}"))?;
+                Ok(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => {
+                    // Completion is advisory for the writer. A dropped caller
+                    // must not cancel a frame once it has entered this queue.
+                    let _ = command.completion.send(Ok(()));
+                }
+                Err(error) => {
+                    if let Some(client) = client.upgrade() {
+                        client.handle_writer_failure(&error);
+                    }
+                    let _ = command.completion.send(Err(error.clone()));
+                    // A failed Content-Length frame may be partial, so the
+                    // stream cannot safely accept any subsequent frame.
+                    while let Ok(queued) = commands.try_recv() {
+                        let _ = queued.completion.send(Err(error.clone()));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn has_exited(&self) -> bool {
         self.unusable.load(Ordering::Relaxed) || *self.exited_rx.borrow()
+    }
+
+    pub async fn wait_for_process_exit(&self) {
+        if *self.exited_rx.borrow() {
+            return;
+        }
+        let mut exited = self.exited_rx.clone();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+            while !*exited.borrow() {
+                if exited.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
     }
 
     async fn read_loop(&self, stdout: tokio::process::ChildStdout) {
@@ -138,12 +216,13 @@ impl CompileClient {
             // Response to one of our requests.
             (Some(id), None) => {
                 let Some(id) = id.as_i64() else { return };
-                let sender = self
+                let pending_request = self
                     .pending
                     .lock()
                     .ok()
                     .and_then(|mut pending| pending.remove(&id));
-                if let Some(sender) = sender {
+                if let Some(pending_request) = pending_request {
+                    let scoped = pending_request.scope_key.is_some();
                     let outcome = if let Some(error) = message.get("error") {
                         Err(format!(
                             "compile server error {}: {}",
@@ -156,7 +235,17 @@ impl CompileClient {
                     } else {
                         Ok(message.get("result").cloned().unwrap_or(Value::Null))
                     };
-                    let _ = sender.send(outcome);
+                    if !pending_request.timed_out {
+                        if let Some(scope_key) = pending_request.scope_key.as_deref() {
+                            super::scheduler::clear_scope_poisoned(scope_key);
+                        }
+                    }
+                    if pending_request.sender.send(outcome).is_err() && scoped {
+                        // The caller abandoned an already-issued stateful
+                        // request. Its late registry mutations cannot be
+                        // distinguished from successfully consumed output.
+                        self.begin_scoped_timeout_recovery(id, "cancelled caller");
+                    }
                 }
             }
             // The server issues no requests today; answer anything anyway so
@@ -176,26 +265,132 @@ impl CompileClient {
 
     fn fail_all_pending(&self, reason: &str) {
         if let Ok(mut pending) = self.pending.lock() {
-            for (_, sender) in pending.drain() {
-                let _ = sender.send(Err(reason.to_string()));
+            for (_, pending_request) in pending.drain() {
+                if let Some(scope_key) = pending_request.scope_key.as_deref() {
+                    super::scheduler::clear_scope_poisoned(scope_key);
+                }
+                let _ = pending_request.sender.send(Err(reason.to_string()));
             }
         }
+    }
+
+    fn has_pending(&self, id: i64) -> bool {
+        self.pending
+            .lock()
+            .map(|pending| pending.contains_key(&id))
+            .unwrap_or(false)
+    }
+
+    fn mark_pending_timed_out(&self, id: i64) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(request) = pending.get_mut(&id) {
+                request.timed_out = true;
+            }
+        }
+    }
+
+    fn spawn_request_watchdog(
+        &self,
+        id: i64,
+        method: String,
+        timeout: std::time::Duration,
+        scope_key: Option<String>,
+        kill_on_timeout: bool,
+    ) {
+        let Some(client) = self.self_weak.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            if !client.has_pending(id) {
+                return;
+            }
+            if scope_key.is_some() {
+                client.begin_scoped_timeout_recovery(id, &method);
+            } else if kill_on_timeout {
+                client.kill_after_timeout(&method);
+            }
+        });
+    }
+
+    fn begin_scoped_timeout_recovery(&self, id: i64, method: &str) {
+        // One scoped timeout makes the shared process state untrustworthy: a
+        // late Roslyn response may already have committed an image that the
+        // caller never loaded. Drain this client immediately so no other
+        // checkout can successfully rely on registries that are about to be
+        // discarded, then give the C# task a short cooperative-cancel grace.
+        if self.unusable.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.mark_pending_timed_out(id);
+        let reason = format!(
+            "C# compile server scoped request '{method}' timed out; recovering shared sidecar"
+        );
+        eprintln!("[CsharpCompile] {reason}");
+        super::notify_active_scope_loss(&reason);
+        self.fail_all_pending(&reason);
+        super::scheduler::clear_all_poisoned();
+        super::emit_status_in_background();
+
+        let Some(client) = self.self_weak.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                CANCEL_SIGNAL_TIMEOUT,
+                client.notify("$/cancelRequest", json!({ "id": id })),
+            )
+            .await;
+            if crate::unity_hotreload::coordinator::total_active_patches().await > 0 {
+                crate::unity_hotreload::note_sidecar_session_lost();
+            }
+            if let Ok(mut guard) = client.child.lock() {
+                if let Some(child) = guard.as_mut() {
+                    let _ = child.start_kill();
+                }
+            }
+        });
     }
 
     async fn write_message(&self, message: &Value) -> Result<(), String> {
         let body = serde_json::to_vec(message).map_err(|e| e.to_string())?;
         let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
         frame.extend_from_slice(&body);
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(&frame)
-            .await
-            .map_err(|e| format!("C# compile server write failed: {e}"))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| format!("C# compile server flush failed: {e}"))?;
-        Ok(())
+        let (completion, written) = oneshot::channel();
+        if self
+            .writer_tx
+            .send(WriterCommand { frame, completion })
+            .is_err()
+        {
+            let error = "C# compile server writer is unavailable".to_string();
+            self.handle_writer_failure(&error);
+            return Err(error);
+        }
+        match written.await {
+            Ok(result) => result,
+            Err(_) => {
+                let error = "C# compile server writer stopped".to_string();
+                self.handle_writer_failure(&error);
+                Err(error)
+            }
+        }
+    }
+
+    fn handle_writer_failure(&self, error: &str) {
+        if self.unusable.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let reason = format!("{error}; recovering shared sidecar");
+        eprintln!("[CsharpCompile] {reason}");
+        super::notify_active_scope_loss(&reason);
+        self.fail_all_pending(&reason);
+        super::scheduler::clear_all_poisoned();
+        super::emit_status_in_background();
+        if let Ok(mut guard) = self.child.lock() {
+            if let Some(child) = guard.as_mut() {
+                let _ = child.start_kill();
+            }
+        }
     }
 
     pub async fn request_with_timeout(
@@ -228,11 +423,53 @@ impl CompileClient {
         if self.has_exited() {
             return Err("C# compile server is not running".to_string());
         }
+        let scope_key = params.get("scopeId").and_then(|scope| {
+            let checkout_id = scope.get("checkoutId")?.as_str()?.trim();
+            let workspace_generation = scope.get("workspaceGeneration")?.as_u64()?;
+            let service_generation = scope.get("serviceGeneration")?.as_u64()?;
+            let editor_session_id = scope.get("unityEditorSessionId")?.as_str()?.trim();
+            (!checkout_id.is_empty()
+                && workspace_generation > 0
+                && service_generation > 0
+                && !editor_session_id.is_empty())
+            .then(|| {
+                format!(
+                    "{checkout_id}\0{workspace_generation}\0{service_generation}\0{editor_session_id}"
+                )
+            })
+        });
+        let job_permit = match scope_key.as_ref() {
+            Some(scope_key) if method == "scope/release" => {
+                Some(super::scheduler::acquire_control(scope_key.clone()).await?)
+            }
+            Some(scope_key) => Some(super::scheduler::acquire(scope_key.clone()).await?),
+            None => None,
+        };
+        if self.has_exited() {
+            return Err("C# compile server is recovering".to_string());
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(id, tx);
+            pending.insert(
+                id,
+                PendingRequest {
+                    sender: tx,
+                    scope_key: scope_key.clone(),
+                    _job_permit: job_permit,
+                    timed_out: false,
+                },
+            );
         }
+        // Arm before the first await so aborting a caller during a blocked pipe
+        // write cannot strand the pending entry or its compile-job lease.
+        self.spawn_request_watchdog(
+            id,
+            method.to_string(),
+            timeout,
+            scope_key.clone(),
+            kill_on_timeout,
+        );
         let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if let Err(error) = self.write_message(&message).await {
             if let Ok(mut pending) = self.pending.lock() {
@@ -240,14 +477,24 @@ impl CompileClient {
             }
             return Err(error);
         }
-        match tokio::time::timeout(timeout, rx).await {
+        let mut rx = rx;
+        match tokio::time::timeout(timeout, &mut rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("C# compile server dropped the request".to_string()),
             Err(_) => {
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.remove(&id);
+                let is_scoped = scope_key.is_some();
+                if scope_key.is_some() {
+                    // The synchronous Roslyn call may outlive the caller's
+                    // timeout. Keep both the scheduler job lease and response
+                    // registration alive until the server confirms completion;
+                    // meanwhile reject new work for this scope explicitly.
+                    self.begin_scoped_timeout_recovery(id, method);
+                } else {
+                    if let Ok(mut pending) = self.pending.lock() {
+                        pending.remove(&id);
+                    }
                 }
-                if kill_on_timeout {
+                if kill_on_timeout && !is_scoped {
                     self.kill_after_timeout(method);
                 }
                 Err(format!("C# compile server request '{method}' timed out"))
@@ -279,8 +526,10 @@ impl CompileClient {
     fn kill_after_timeout(&self, method: &str) {
         let reason = format!("C# compile server request '{method}' timed out; restarting sidecar");
         eprintln!("[CsharpCompile] {reason}");
+        super::notify_active_scope_loss(&reason);
         self.unusable.store(true, Ordering::Relaxed);
         self.fail_all_pending(&reason);
+        super::scheduler::clear_all_poisoned();
         if let Ok(mut guard) = self.child.lock() {
             if let Some(child) = guard.as_mut() {
                 let _ = child.start_kill();

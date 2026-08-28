@@ -13,6 +13,9 @@ import {
   unityGradientValue,
   type UnitySerializedPropertyTargetSnapshot,
 } from "./unitySerializedValue";
+import { useProjectStore } from "../../stores/project";
+
+const projectStore = useProjectStore();
 
 const props = withDefaults(defineProps<{
   modelValue: unknown;
@@ -90,6 +93,7 @@ function openEditor() {
   if (!canOpenEditor.value || !target) return;
   void openUnityValueEditorWindow({
     kind: "gradient",
+    workspaceRef: projectStore.requireWorkspaceRef(),
     target: target as UnitySerializedPropertyTarget,
     label: props.label || undefined,
   }).catch((error) => {
@@ -106,6 +110,11 @@ function handleFieldKeydown(event: KeyboardEvent) {
 onMounted(() => {
   void listenUnityValueEditorCommitted((event) => {
     if (event.kind !== "gradient" || !props.bindingTarget) return;
+    const workspaceRef = projectStore.requireWorkspaceRef();
+    if (
+      event.workspaceRef.checkoutId !== workspaceRef.checkoutId
+      || event.workspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
+    ) return;
     const ownKey = unityPropertyTargetKey(props.bindingTarget as UnitySerializedPropertyTarget);
     if (unityPropertyTargetKey(event.target) !== ownKey) return;
     localOverride.value = event.value;

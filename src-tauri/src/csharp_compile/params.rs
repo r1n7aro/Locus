@@ -45,6 +45,8 @@ struct GetCompileParamsResponse {
     #[serde(default)]
     fingerprint: String,
     #[serde(default)]
+    session_id: String,
+    #[serde(default)]
     domain_generation: String,
     #[serde(default)]
     lang_version: String,
@@ -62,6 +64,7 @@ struct GetCompileParamsResponse {
 pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
     let key = project_key(project_path);
     let cached = { params_cache().lock().await.get(&key).cloned() };
+    let previous_scope = cached.as_ref().and_then(|params| params.scope_id.clone());
 
     let known_fingerprint = cached
         .as_ref()
@@ -95,7 +98,18 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
         return Err("get_compile_params response missing domain_generation".to_string());
     }
 
-    let params = if response.unchanged {
+    let editor_session_id = if response.session_id.trim().is_empty() {
+        // Compatibility with a plugin that predates editor session IDs in
+        // this response. Domain generation is unique per AppDomain and still
+        // prevents cross-editor state sharing.
+        response.domain_generation.clone()
+    } else {
+        response.session_id.clone()
+    };
+    let (checkout_id, workspace_generation, service_generation) =
+        super::compile_scope_identity_for_project(project_path)?;
+
+    let mut params = if response.unchanged {
         match cached {
             // Same reference params; the domain generation may still have
             // moved (reload without a reference change).
@@ -121,8 +135,29 @@ pub async fn get_params(project_path: &str) -> Result<CompileParams, String> {
             reference_paths: response.reference_paths,
             defines: response.defines,
             allow_unsafe: response.allow_unsafe,
+            scope_id: None,
         }
     };
+    let current_scope = super::CompileScopeId {
+        checkout_id,
+        workspace_generation,
+        service_generation,
+        unity_editor_session_id: editor_session_id,
+    };
+    if previous_scope
+        .as_ref()
+        .is_some_and(|scope| scope != &current_scope)
+    {
+        if let Some(previous_scope) = previous_scope.as_ref() {
+            if let Err(error) = super::release_scope(previous_scope).await {
+                eprintln!(
+                    "[CsharpCompile] failed to release previous editor scope {}: {}",
+                    previous_scope.unity_editor_session_id, error
+                );
+            }
+        }
+    }
+    params.scope_id = Some(current_scope);
 
     eprintln!(
         "[CsharpCompile] compile params {} in {}ms ({} reference paths)",

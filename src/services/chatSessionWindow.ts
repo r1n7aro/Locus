@@ -1,5 +1,6 @@
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import type { WorkspaceRef } from "./project";
 
 export const CHAT_SESSION_WINDOW_EVENT = "chat-session-window:payload";
 export const CHAT_SESSION_WINDOW_FLAG = "chatSessionWindow";
@@ -9,6 +10,7 @@ export interface ChatSessionWindowPayload {
   sessionId: string;
   title?: string;
   newChat?: boolean;
+  workspaceRef?: WorkspaceRef | null;
 }
 
 let newChatWindowSequence = 0;
@@ -53,11 +55,23 @@ export function getChatSessionWindowPayload(
   search = window.location.search,
 ): ChatSessionWindowPayload {
   const params = new URLSearchParams(search);
-  return {
+  const checkoutId = trimOrEmpty(params.get("checkoutId"));
+  const generationRaw = params.get("workspaceGeneration");
+  const expectedGeneration = generationRaw && /^\d+$/.test(generationRaw)
+    ? Number(generationRaw)
+    : null;
+  const payload: ChatSessionWindowPayload = {
     sessionId: trimOrEmpty(params.get("sessionId")),
     title: trimOrEmpty(params.get("title")) || undefined,
     newChat: params.get("newChat") === "1",
   };
+  if (checkoutId && Number.isSafeInteger(expectedGeneration)) {
+    payload.workspaceRef = {
+      checkoutId,
+      expectedGeneration,
+    };
+  }
+  return payload;
 }
 
 export function buildChatSessionWindowQuery(payload: ChatSessionWindowPayload): string {
@@ -70,6 +84,12 @@ export function buildChatSessionWindowQuery(payload: ChatSessionWindowPayload): 
   }
   if (payload.newChat) {
     params.set("newChat", "1");
+    const workspaceRef = payload.workspaceRef;
+    if (!workspaceRef?.checkoutId.trim() || !Number.isSafeInteger(workspaceRef.expectedGeneration)) {
+      throw new Error("A checkout generation is required for a new chat window.");
+    }
+    params.set("checkoutId", workspaceRef.checkoutId.trim());
+    params.set("workspaceGeneration", String(workspaceRef.expectedGeneration));
   }
   return params.toString();
 }
@@ -105,7 +125,10 @@ export async function openChatSessionWindow(
   return true;
 }
 
-export async function openNewChatSessionWindow(title = "New session"): Promise<boolean> {
+export async function openNewChatSessionWindow(
+  workspaceRef: WorkspaceRef,
+  title = "New session",
+): Promise<boolean> {
   if (!hasTauriWindowRuntime()) return false;
 
   const normalizedTitle = trimOrEmpty(title) || "New session";
@@ -113,6 +136,7 @@ export async function openNewChatSessionWindow(title = "New session"): Promise<b
     sessionId: "",
     title: normalizedTitle,
     newChat: true,
+    workspaceRef,
   };
   await openSubWindow({
     kind: newChatSessionWindowKind(),

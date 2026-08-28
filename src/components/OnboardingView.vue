@@ -12,7 +12,12 @@ import { normalizeAppError } from "../services/errors";
 import { useAuthStore } from "../stores/auth";
 import { useModelStore } from "../stores/model";
 import { useUiStore } from "../stores/ui";
-import { setWorkingDir, getWorkingDir } from "../services/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+  type WorkspaceRef,
+} from "../services/project";
 import { checkUnityPlugin, checkUnityPluginInstallPlan, installUnityPlugin } from "../services/unity";
 import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
 import { assetDbScanStart } from "../services/asset";
@@ -29,6 +34,7 @@ const emit = defineEmits<{ completed: [] }>();
 const uiStore = useUiStore();
 const authStore = useAuthStore();
 const modelStore = useModelStore();
+const workspaceContextStore = useWorkspaceContextStore();
 
 const step = ref(0); // 0=welcome, 1=auth, 2=project, 3=plugin, 4=vcs, 5=scan
 const TOTAL_STEPS = 6;
@@ -153,6 +159,14 @@ const projectPath = ref("");
 const projectError = ref("");
 const projectValid = ref(false);
 const projectOpening = ref(false);
+const onboardingWorkspaceRef = ref<WorkspaceRef | null>(null);
+
+function requireOnboardingWorkspaceRef(): WorkspaceRef {
+  if (!onboardingWorkspaceRef.value) {
+    throw new Error("The onboarding workspace is not registered.");
+  }
+  return onboardingWorkspaceRef.value;
+}
 
 async function waitForProjectOpeningPaint() {
   await nextTick();
@@ -176,7 +190,11 @@ async function browseProject() {
       projectOpening.value = true;
       await waitForProjectOpeningPaint();
       try {
-        projectPath.value = await setWorkingDir(selected);
+        const context = await workspaceContextStore.openAndFocus(selected);
+        const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+        if (!context || !workspaceRef) throw new Error("Failed to focus the selected workspace.");
+        projectPath.value = workspaceContextStore.focusedRoot;
+        onboardingWorkspaceRef.value = { ...workspaceRef };
         projectValid.value = true;
       } catch (e) {
         projectError.value = normalizeAppError(e).message;
@@ -196,7 +214,7 @@ let unlistenPlugin: UnlistenFn | null = null;
 async function checkPlugin() {
   pluginError.value = "";
   try {
-    pluginStatus.value = await checkUnityPlugin();
+    pluginStatus.value = await checkUnityPlugin(requireOnboardingWorkspaceRef());
   } catch {
     pluginStatus.value = null;
   }
@@ -207,7 +225,7 @@ async function installPlugin() {
   pluginError.value = "";
   let forceCloseUnity = false;
   try {
-    const plan = await checkUnityPluginInstallPlan();
+    const plan = await checkUnityPluginInstallPlan(requireOnboardingWorkspaceRef());
     if (plan.dllUpdateRequired && plan.unityRunning) {
       const confirmed = await confirm(t("app.plugin.closeUnityConfirmMessage"), {
         title: t("app.plugin.closeUnityConfirmTitle"),
@@ -224,7 +242,7 @@ async function installPlugin() {
 
   pluginInstalling.value = true;
   try {
-    await installUnityPlugin({ forceCloseUnity });
+    await installUnityPlugin(requireOnboardingWorkspaceRef(), { forceCloseUnity });
     pluginStatus.value = { status: "upToDate" };
   } catch (e) {
     pluginError.value = normalizeAppError(e).message;
@@ -292,10 +310,10 @@ async function checkGit() {
   gitError.value = "";
   gitConfigError.value = "";
   try {
-    gitProbeState.value = await gitProbe();
+    gitProbeState.value = await gitProbe(requireOnboardingWorkspaceRef());
     if (gitProbeState.value?.available) {
       try {
-        syncGitConfigForm(await gitCheckUserConfig());
+        syncGitConfigForm(await gitCheckUserConfig(requireOnboardingWorkspaceRef()));
       } catch { /* ignore — non-fatal */ }
     } else {
       resetGitConfigForm();
@@ -369,7 +387,7 @@ async function doInitGit() {
   gitInitLoading.value = true;
   gitError.value = "";
   try {
-    await gitInitUnity();
+    await gitInitUnity(requireOnboardingWorkspaceRef());
     await checkGit();
   } catch (e) {
     gitError.value = normalizeAppError(e).message;
@@ -387,16 +405,25 @@ async function startScan() {
   scanPhase.value = { phase: "dirScan" };
   scanDone.value = false;
   try {
-    unlistenScan = await listen<AssetDbScanEvent>("ref-graph-scan", (e) => {
-      scanPhase.value = e.payload;
-      if (e.payload.phase === "done") {
-        scanStats.value = e.payload.stats;
-        scanDone.value = true;
-      } else if (e.payload.phase === "reconcileDone") {
-        scanPhase.value = null;
-      }
-    });
-    await assetDbScanStart();
+    const workspaceRef = requireOnboardingWorkspaceRef();
+    unlistenScan = await listen<RoutedWorkspaceEvent<AssetDbScanEvent>>(
+      WORKSPACE_EVENT_NAME,
+      (e) => {
+        if (
+          e.payload.eventName !== "ref-graph-scan"
+          || e.payload.checkoutId !== workspaceRef.checkoutId
+          || e.payload.workspaceGeneration !== workspaceRef.expectedGeneration
+        ) return;
+        scanPhase.value = e.payload.payload;
+        if (e.payload.payload.phase === "done") {
+          scanStats.value = e.payload.payload.stats;
+          scanDone.value = true;
+        } else if (e.payload.payload.phase === "reconcileDone") {
+          scanPhase.value = null;
+        }
+      },
+    );
+    await assetDbScanStart(workspaceRef);
   } catch (e) {
     scanPhase.value = { phase: "error", error: normalizeAppError(e) };
   }
@@ -406,9 +433,18 @@ watch(step, async (s) => {
   if (s === 3) {
     await checkPlugin();
     if (!unlistenPlugin) {
-      unlistenPlugin = await listen<PluginStatus>("unity-plugin-status", (e) => {
-        pluginStatus.value = e.payload;
-      });
+      const workspaceRef = requireOnboardingWorkspaceRef();
+      unlistenPlugin = await listen<RoutedWorkspaceEvent<PluginStatus>>(
+        WORKSPACE_EVENT_NAME,
+        (e) => {
+          if (
+            e.payload.eventName !== "unity-plugin-status"
+            || e.payload.checkoutId !== workspaceRef.checkoutId
+            || e.payload.workspaceGeneration !== workspaceRef.expectedGeneration
+          ) return;
+          pluginStatus.value = e.payload.payload;
+        },
+      );
     }
   }
   if (s === 4) await checkGit();
@@ -431,9 +467,11 @@ function scanProgressText(): string {
 
 onMounted(async () => {
   try {
-    const dir = await getWorkingDir();
-    if (dir && dir.trim() !== "") {
-      projectPath.value = dir;
+    await workspaceContextStore.initialize("main", "main");
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (workspaceRef && workspaceContextStore.focusedRoot) {
+      projectPath.value = workspaceContextStore.focusedRoot;
+      onboardingWorkspaceRef.value = { ...workspaceRef };
       projectValid.value = true;
     }
   } catch { /* ignore */ }

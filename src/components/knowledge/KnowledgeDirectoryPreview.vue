@@ -26,8 +26,15 @@ import {
   useMarkdownEditorViewMode,
   type MarkdownEditorViewMode,
 } from "../ui/markdownEditorViewMode";
+import type { WorkspaceRef } from "../../services/project";
+import {
+  buildKnowledgeFolderWorkspaceDragPayload,
+  startKnowledgeInternalDrag,
+} from "./knowledgeWorkspaceDrag";
+import { useInternalDragController } from "../../composables/useInternalDrag";
 
 const props = defineProps<{
+  workspaceRef: WorkspaceRef;
   directory: KnowledgeDirectoryConfigRecord | null;
   loading: boolean;
   saveLoading: boolean;
@@ -38,6 +45,7 @@ const props = defineProps<{
   deleteFeishuImport?: ((path: string) => Promise<void>) | null;
   deleteUnityImport?: ((path: string) => Promise<void>) | null;
 }>();
+const internalDrag = useInternalDragController();
 
 const emit = defineEmits<{
   (e: "close"): void;
@@ -280,6 +288,15 @@ const directoryTitle = computed(() => {
   const segments = path.split("/").filter(Boolean);
   return segments[segments.length - 1] ?? path;
 });
+const directoryWorkspaceDragEnabled = computed(() => !!props.directory?.path.trim());
+
+function onDirectoryDragPointerDown(event: PointerEvent): void {
+  const payload = props.directory
+    ? buildKnowledgeFolderWorkspaceDragPayload(props.directory)
+    : null;
+  if (!payload) return;
+  startKnowledgeInternalDrag(internalDrag, event, { payload });
+}
 const panelTabOptions = computed(() => {
   const options = [
     {
@@ -508,7 +525,11 @@ function effectiveCapabilityLabel(
 <template>
   <div class="directory-preview" @keydown.capture="handleKeydown">
     <div class="directory-preview-header">
-      <div class="directory-preview-header-main">
+      <div
+        class="directory-preview-header-main"
+        :class="{ 'drag-enabled': directoryWorkspaceDragEnabled }"
+        @pointerdown="onDirectoryDragPointerDown"
+      >
         <span class="directory-preview-path">{{ pathLabel }}</span>
       </div>
       <div class="directory-preview-actions">
@@ -553,6 +574,7 @@ function effectiveCapabilityLabel(
             {{ t("knowledge.referenceFolder.external.hint") }}
           </div>
           <ReferenceExternalImportPanel
+            :workspace-ref="workspaceRef"
             mode="directory"
             :directory="directory"
             :fixed-target-path="directory.path"
@@ -818,6 +840,15 @@ function effectiveCapabilityLabel(
   flex: 1;
   display: flex;
   align-items: center;
+}
+
+.directory-preview-header-main.drag-enabled {
+  cursor: grab;
+  touch-action: none;
+}
+
+.directory-preview-header-main.drag-enabled:active {
+  cursor: grabbing;
 }
 
 .directory-preview-path {

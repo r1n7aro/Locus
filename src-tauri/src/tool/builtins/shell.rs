@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::misc::truncate_utf8_middle;
 use super::{make_exec, ToolDef, ToolResult};
@@ -147,7 +147,7 @@ const WINDOWS_SH_GUIDANCE: &str = "\n\nWindows (Git Bash) rules:\n\
 /// Decode child-process output. Native Windows tools (PowerShell 5.1 cmdlets
 /// among others) emit legacy ANSI-codepage bytes (e.g. GBK on zh-CN systems);
 /// lossy UTF-8 alone turns their diagnostics into unreadable U+FFFD soup.
-fn decode_console_bytes(bytes: &[u8]) -> String {
+pub(super) fn decode_console_bytes(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
         Ok(text) => text.to_string(),
         Err(_) => {
@@ -420,9 +420,9 @@ pub(super) fn bash() -> ToolDef {
     }
 }
 
-struct CapturedCommandOutput {
-    status: std::process::ExitStatus,
-    bytes: Vec<u8>,
+pub(super) struct CapturedCommandOutput {
+    pub(super) status: std::process::ExitStatus,
+    pub(super) bytes: Vec<u8>,
 }
 
 async fn forward_captured_pipe<R>(mut pipe: R, sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>)
@@ -448,7 +448,28 @@ async fn run_captured_command(
     output_reporter: Option<crate::async_tasks::TaskOutputReporter>,
     process_owner: ProcessOwner,
 ) -> std::io::Result<CapturedCommandOutput> {
+    run_captured_command_with_input(command, None, output_reporter, process_owner).await
+}
+
+pub(super) async fn run_captured_command_with_input(
+    command: tokio::process::Command,
+    input: Option<Vec<u8>>,
+    output_reporter: Option<crate::async_tasks::TaskOutputReporter>,
+    process_owner: ProcessOwner,
+) -> std::io::Result<CapturedCommandOutput> {
     let mut child = spawn_managed(command, process_owner)?;
+    if let Some(input) = input {
+        let Some(mut stdin) = child.take_stdin() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "child stdin is unavailable",
+            ));
+        };
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
     let stdout = child.take_stdout();
     let stderr = child.take_stderr();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();

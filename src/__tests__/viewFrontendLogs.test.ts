@@ -18,10 +18,10 @@ describe("View frontend logs", () => {
 
     expect(host).toContain("installViewConsoleLogCapture");
     expect(host).toContain("CONSOLE_LOG_LEVELS");
-    expect(host).toContain("viewAppendFrontendLog({ viewId: activeViewId, level, message })");
+    expect(host).toContain("viewAppendFrontendLog(requireViewWorkspaceRef(), { viewId: activeViewId, level, message })");
     expect(host).toContain('window.addEventListener("unhandledrejection"');
-    expect(host).toContain("viewReadFrontendLog({ viewId, limit: 1 })");
-    expect(host).toContain("viewOpenFrontendLog(viewId)");
+    expect(host).toContain("viewReadFrontendLog(requireViewWorkspaceRef(), { viewId, limit: 1 })");
+    expect(host).toContain("viewOpenFrontendLog(requireViewWorkspaceRef(), viewId)");
     expect(host).toContain("view-host-logbar");
     expect(host).toContain("RUNTIME_STATUSBAR_SELECTOR");
     expect(host).toContain("embeddedLogbarSlot");

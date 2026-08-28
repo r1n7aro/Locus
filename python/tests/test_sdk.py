@@ -69,6 +69,134 @@ class _SdkSurfaceClient(locus.Client):
                 "workspaceId": "workspace-1",
                 "unityConnected": True,
             }
+        if method == "unity.editor.status":
+            return {
+                "projectPath": values["project"],
+                "checkoutId": "checkout-1",
+                "workspaceGeneration": 7,
+                "connected": False,
+                "ready": False,
+                "processState": "not_running",
+                "processId": None,
+                "editorPath": None,
+                "launchMode": None,
+                "headless": False,
+                "semanticPhase": "quit",
+                "mainThreadBlocked": False,
+                "mainThread": {"state": "unknown"},
+                "safety": {"canCallUnityApi": False},
+                "serviceStatus": "running",
+                "readiness": {"phase": "degraded", "revision": 2},
+                "connection": {
+                    "connected": False,
+                    "controlChannelState": "disconnected",
+                },
+                "semantic": {
+                    "phase": "quit",
+                    "process": {"state": "not_running"},
+                },
+            }
+        if method == "unity.editor.ensure":
+            status = {
+                "projectPath": values["project"],
+                "checkoutId": "checkout-1",
+                "workspaceGeneration": 7,
+                "connected": True,
+                "ready": True,
+                "processState": "running",
+                "processId": 4242,
+                "editorPath": "E:/Unity/Editor/Unity.exe",
+                "launchMode": values.get("mode", "interactive"),
+                "headless": values.get("mode") == "headless",
+                "semanticPhase": "editing",
+                "mainThreadBlocked": False,
+                "mainThread": {"state": "idle"},
+                "safety": {"canCallUnityApi": True},
+                "serviceStatus": "running",
+                "readiness": {"phase": "ready", "revision": 3},
+                "connection": {
+                    "connected": True,
+                    "controlChannelState": "ready",
+                },
+                "semantic": {
+                    "phase": "editing",
+                    "process": {"state": "running", "pid": 4242},
+                },
+            }
+            return {
+                "launched": True,
+                "waitUntil": values["waitUntil"],
+                "waitedMs": 1250,
+                "launch": {
+                    "editorPath": "E:/Unity/Editor/Unity.exe",
+                    "projectPath": values["project"],
+                    "projectVersion": "2022.3.58f1",
+                    "processId": 4242,
+                    "mode": values.get("mode", "interactive"),
+                },
+                "status": status,
+            }
+        if method == "unity.editor.restart":
+            status = {
+                "projectPath": values["project"],
+                "checkoutId": "checkout-1",
+                "workspaceGeneration": 7,
+                "connected": True,
+                "ready": True,
+                "processState": "running",
+                "processId": 5252,
+                "editorPath": "E:/Unity/Editor/Unity.exe",
+                "launchMode": values.get("mode", "interactive"),
+                "headless": values.get("mode") == "headless",
+                "semanticPhase": "editing",
+                "mainThreadBlocked": False,
+                "mainThread": {"state": "idle"},
+                "safety": {"canCallUnityApi": True},
+                "serviceStatus": "running",
+                "readiness": {"phase": "ready", "revision": 4},
+                "connection": {"connected": True, "controlChannelState": "ready"},
+                "semantic": {
+                    "phase": "editing",
+                    "process": {"state": "running", "pid": 5252},
+                },
+            }
+            return {
+                "closedProcessIds": [4242],
+                "forcedProcessIds": [],
+                "waitUntil": values["waitUntil"],
+                "waitedMs": 2250,
+                "launch": {
+                    "editorPath": "E:/Unity/Editor/Unity.exe",
+                    "projectPath": values["project"],
+                    "projectVersion": "2022.3.58f1",
+                    "processId": 5252,
+                    "mode": values.get("mode", "interactive"),
+                },
+                "status": status,
+            }
+        if method == "unity.dialog.get":
+            return {
+                "code": "unity_modal_dialog_blocked",
+                "dialogId": "dialog-1",
+                "project": values["project"],
+                "title": "Scene changed",
+                "message": "Reload it?",
+                "choices": [
+                    {"id": "choice-0", "label": "Reload"},
+                    {"id": "choice-1", "label": "Keep Changes"},
+                ],
+                "mainThreadBlocked": True,
+                "openedAtMs": 123,
+            }
+        if method == "unity.dialog.choose":
+            return {
+                "dialogId": values["dialogId"],
+                "choiceId": values["choiceId"],
+                "label": "Reload",
+                "invoked": True,
+            }
+        if method == "unity.execution.wait":
+            return "MODAL_PROBE:cancelled"
         if method == "sessions.list":
             return [
                 {
@@ -215,6 +343,23 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.session_id, "session-2")
         self.assertEqual(agent.session_id, "session-2")
 
+    async def test_agent_prompt_forwards_workspace_scope(self) -> None:
+        client = _FakeClient()
+        agent = locus.Agent(
+            name="Scoped",
+            id="scoped",
+            system_prompt="Stay in the selected checkout.",
+            client=client,
+        )
+        workspace_ref = locus.WorkspaceRef(
+            checkout_id="checkout-1",
+            expected_generation=7,
+        )
+
+        await agent.prompt("run", workspace_ref=workspace_ref)
+
+        self.assertEqual(client.calls[0]["workspace_ref"], workspace_ref)
+
     async def test_python_tool_callback_runs_on_originating_event_loop(self) -> None:
         origin_loop = asyncio.get_running_loop()
 
@@ -292,6 +437,168 @@ class SdkCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.session_id, "session-1")
         prompt_call = next(call for call in client.calls if call[0] == "agents.prompt")
         self.assertEqual(prompt_call[1]["sessionId"], "session-1")
+
+    async def test_reads_and_resolves_unity_dialog_without_tool_schema(self) -> None:
+        client = _SdkSurfaceClient()
+
+        dialog = await client.get_unity_dialog(project=r"F:\Project")
+        assert dialog is not None
+        result = await client.choose_unity_dialog(
+            project=dialog.project,
+            dialog_id=dialog.dialog_id,
+            choice_id=dialog.choices[0].id,
+        )
+        output = await client.wait_unity_execution(
+            project=dialog.project,
+            execution_id="exec-1",
+        )
+
+        self.assertEqual(dialog.title, "Scene changed")
+        self.assertTrue(dialog.main_thread_blocked)
+        self.assertEqual(dialog.choices[1].label, "Keep Changes")
+        self.assertTrue(result.invoked)
+        self.assertEqual(output, "MODAL_PROBE:cancelled")
+        self.assertIn(
+            ("unity.dialog.get", {"project": r"F:\Project"}),
+            client.calls,
+        )
+        self.assertIn(
+            (
+                "unity.execution.wait",
+                {"project": r"F:\Project", "executionId": "exec-1"},
+            ),
+            client.calls,
+        )
+        self.assertIn(
+            (
+                "unity.dialog.choose",
+                {
+                    "project": r"F:\Project",
+                    "dialogId": "dialog-1",
+                    "choiceId": "choice-0",
+                },
+            ),
+            client.calls,
+        )
+
+    async def test_queries_and_ensures_unity_editor_lifecycle(self) -> None:
+        client = _SdkSurfaceClient()
+
+        before = await client.get_unity_editor_status(project=r"F:\Project")
+        ensured = await client.ensure_unity_editor(
+            project=r"F:\Project",
+            wait_until="ready",
+            timeout=12.5,
+        )
+
+        self.assertEqual(before.process_state, "not_running")
+        self.assertEqual(before.workspace_ref.checkout_id, "checkout-1")
+        self.assertEqual(before.workspace_ref.expected_generation, 7)
+        self.assertEqual(before.semantic_phase, "quit")
+        self.assertFalse(before.is_running)
+        self.assertTrue(ensured.launched)
+        self.assertTrue(ensured.status.ready)
+        self.assertTrue(ensured.status.is_running)
+        self.assertEqual(ensured.status.readiness_phase, "ready")
+        assert ensured.launch is not None
+        self.assertEqual(ensured.launch.project_version, "2022.3.58f1")
+        self.assertIn(
+            ("unity.editor.status", {"project": r"F:\Project"}),
+            client.calls,
+        )
+        self.assertIn(
+            (
+                "unity.editor.ensure",
+                {
+                    "project": r"F:\Project",
+                    "mode": "interactive",
+                    "waitUntil": "ready",
+                    "timeoutMs": 12500,
+                },
+            ),
+            client.calls,
+        )
+
+    async def test_unity_ensure_validates_wait_target_and_timeout(self) -> None:
+        client = _SdkSurfaceClient()
+
+        with self.assertRaises(ValueError):
+            await client.ensure_unity_editor(project=r"F:\Project", wait_until="running")
+        with self.assertRaises(ValueError):
+            await client.ensure_unity_editor(project=r"F:\Project", timeout=0)
+        with self.assertRaises(ValueError):
+            await client.ensure_unity_editor(project=r"F:\Project", timeout=1801)
+        with self.assertRaises(ValueError):
+            await client.ensure_unity_editor(project=r"F:\Project", mode="background")
+
+    async def test_restarts_unity_editor_and_reports_closed_processes(self) -> None:
+        client = _SdkSurfaceClient()
+
+        restarted = await client.restart_unity_editor(
+            project=r"F:\Project",
+            wait_until="connected",
+            timeout=15,
+        )
+
+        self.assertEqual(restarted.closed_process_ids, (4242,))
+        self.assertEqual(restarted.forced_process_ids, ())
+        self.assertEqual(restarted.launch.process_id, 5252)
+        self.assertTrue(restarted.status.connected)
+        self.assertIn(
+            (
+                "unity.editor.restart",
+                {
+                    "project": r"F:\Project",
+                    "mode": "interactive",
+                    "waitUntil": "connected",
+                    "timeoutMs": 15000,
+                    "force": False,
+                },
+            ),
+            client.calls,
+        )
+
+    async def test_status_exposes_main_thread_blocking_and_dialog(self) -> None:
+        payload = {
+            "projectPath": r"F:\Project",
+            "checkoutId": "checkout-1",
+            "workspaceGeneration": 7,
+            "connected": True,
+            "ready": False,
+            "processState": "running",
+            "processId": 4242,
+            "launchMode": "interactive",
+            "headless": False,
+            "semanticPhase": "editing",
+            "mainThreadBlocked": True,
+            "blockingReason": "modal_dialog",
+            "mainThread": {"state": "blocked"},
+            "safety": {"canCallUnityApi": False, "recommendedAction": "resolve_dialog"},
+            "blockingDialog": {
+                "code": "unity_modal_dialog_blocked",
+                "dialogId": "dialog-1",
+                "project": r"F:\Project",
+                "title": "Scene changed",
+                "message": "Reload it?",
+                "choices": [{"id": "choice-0", "label": "Reload"}],
+                "mainThreadBlocked": True,
+                "openedAtMs": 123,
+            },
+            "blockingDialogRecoverable": True,
+            "connection": {},
+            "semantic": {},
+        }
+
+        status = locus.UnityEditorStatus.from_payload(payload)
+
+        self.assertTrue(status.main_thread_blocked)
+        self.assertFalse(hasattr(status, "needs_user"))
+        self.assertNotIn("needsUser", status.semantic)
+        self.assertFalse(status.can_call_unity_api)
+        self.assertTrue(status.blocking_dialog_recoverable)
+        self.assertEqual(status.blocking_reason, "modal_dialog")
+        assert status.blocking_dialog is not None
+        self.assertEqual(status.blocking_dialog.title, "Scene changed")
 
     async def test_tool_and_run_errors_are_explicit(self) -> None:
         failed_tool = locus.ToolCallResult(name="build", output="compile failed", is_error=True)

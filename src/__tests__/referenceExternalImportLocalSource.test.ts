@@ -38,8 +38,8 @@ describe("Reference external import local source", () => {
     expect(panel).toContain("v-else-if=\"activeSource === 'local'\"");
     expect(panel).toContain("const localWindowModel = computed<ReferenceExternalImportLocalWindowModel>(() => ({");
     expect(panel).toContain("knowledgeImportLocalReferenceDocs({");
-    expect(panel).toContain("knowledgeSyncLocalReferenceDocs(targetPath)");
-    expect(panel).toContain("knowledgeDeleteLocalReferenceDocs(targetPath)");
+    expect(panel).toContain("knowledgeSyncLocalReferenceDocs(targetPath, props.workspaceRef)");
+    expect(panel).toContain("knowledgeDeleteLocalReferenceDocs(targetPath, props.workspaceRef)");
     expect(panel).toContain("aiEditable: localMode.value === \"snapshot\" && localAiEditable.value,");
     expect(panel).toContain('t("knowledge.localReference.syncConfirmEditable")');
     expect(panel).toContain("!!localStatus.value?.running");

@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import type { WorkspaceRef } from "./project";
 import type {
   SessionSummary,
   SessionDetail,
@@ -22,6 +23,7 @@ import type {
 } from "../types";
 
 export interface ChatParams {
+  workspaceRef?: WorkspaceRef | null;
   sessionId?: string | null;
   text: string;
   resume?: boolean | null;
@@ -44,6 +46,7 @@ export interface ChatParams {
 }
 
 export interface CreateSessionParams {
+  workspaceRef: WorkspaceRef;
   title: string;
   parentSessionId?: string | null;
   sessionType?: string | null;
@@ -71,6 +74,10 @@ export interface QueueChatInputParams {
 
 export function chat(params: ChatParams): Promise<ChatLaunchResult> {
   return ipcInvoke<ChatLaunchResult>("chat", { ...params });
+}
+
+export function listProjectSessions(projectId: string): Promise<SessionSummary[]> {
+  return ipcInvoke<SessionSummary[]>("list_project_sessions", { projectId });
 }
 
 export function queueChatInput(params: QueueChatInputParams): Promise<PendingSessionInput> {
@@ -151,16 +158,18 @@ export function listSessions(): Promise<SessionSummary[]> {
   return ipcInvoke<SessionSummary[]>("list_sessions");
 }
 
+export function listCheckoutSessions(workspaceRef: WorkspaceRef): Promise<SessionSummary[]> {
+  return ipcInvoke<SessionSummary[]>("list_checkout_sessions", { workspaceRef });
+}
+
 export function listArchivedSessions(): Promise<SessionSummary[]> {
   return ipcInvoke<SessionSummary[]>("list_archived_sessions");
 }
 
-export function getActiveSessionSelection(): Promise<string | null> {
-  return ipcInvoke<string | null>("get_active_session_selection");
-}
-
-export function saveActiveSessionSelection(sessionId: string | null): Promise<void> {
-  return ipcInvoke("save_active_session_selection", { sessionId });
+export function listArchivedCheckoutSessions(
+  workspaceRef: WorkspaceRef,
+): Promise<SessionSummary[]> {
+  return ipcInvoke<SessionSummary[]>("list_archived_checkout_sessions", { workspaceRef });
 }
 
 export function loadSession(sessionId: string): Promise<SessionDetail> {
@@ -332,6 +341,6 @@ export interface PlanFileContent {
 }
 
 /** Read a plan file for the standalone plan review window (plan/ root only). */
-export function getPlanFileContent(path: string): Promise<PlanFileContent> {
-  return ipcInvoke<PlanFileContent>("get_plan_file_content", { path });
+export function getPlanFileContent(sessionId: string): Promise<PlanFileContent> {
+  return ipcInvoke<PlanFileContent>("get_plan_file_content", { sessionId });
 }

@@ -24,14 +24,14 @@
 //!   - `get_watcher_tuning` / `set_watcher_tuning` — live tunables for the
 //!     incremental ref_graph watcher (debounce + worker count).
 //!
-//! v1 simplifications worth knowing:
+//! Runtime details worth knowing:
 //!   - `WorkspacePreviewCache` is an 8-slot hand-rolled FIFO+LRU; sessions
-//!     are evicted on workspace switch (`set_working_dir`) so a stale session
-//!     can never be paired with a new project's `AssetDb`.
+//!     are namespaced by checkout id and runtime generation.
 //!   - PrefabInstance targets in scene previews render the GameObject header
 //!     only — proper source-prefab cross-resolution is out of scope for v1.
-//!   - `ScanPhaseState` is process-only; the most recent successful scan
-//!     snapshot is persisted per-workspace under `Library/Locus/`.
+//!   - Each `WorkspaceRuntime` owns its scan phase, last-scan snapshot, and
+//!     preview cache. Successful snapshots are also persisted under that
+//!     checkout's `Library/Locus/` directory.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -69,8 +69,82 @@ use crate::diff::types::{
 };
 use crate::error::AppError;
 use crate::unity_yaml::{UnityYamlDocs, UnityYamlFile, YamlDoc};
-use crate::workspace::Workspace;
-use crate::AssetDbWatcherHandle;
+use crate::workspace_service::{
+    ProjectRegistry, ResolvedWorkspaceScope, WorkspaceRef, WorkspaceResolveError,
+};
+
+fn asset_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
+    match error {
+        WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
+            "workspace.registry_unavailable",
+            "The workspace registry is unavailable.",
+        )
+        .detail(detail),
+        WorkspaceResolveError::CheckoutUnavailable { checkout_id } => AppError::new(
+            "workspace.checkout_unavailable",
+            "The requested checkout is unavailable.",
+        )
+        .detail(checkout_id.to_string()),
+        WorkspaceResolveError::StaleGeneration {
+            checkout_id,
+            expected_generation,
+            actual_generation,
+        } => AppError::new(
+            "workspace.generation_stale",
+            "The workspace runtime changed before the request was handled.",
+        )
+        .detail(format!(
+            "checkout={checkout_id}, expected={expected_generation}, actual={actual_generation}"
+        )),
+    }
+}
+
+pub(crate) struct AssetWorkspaceScope {
+    root: PathBuf,
+    scope_key: String,
+    resolved: ResolvedWorkspaceScope,
+}
+
+impl AssetWorkspaceScope {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn root_string(&self) -> String {
+        self.root.to_string_lossy().to_string()
+    }
+
+    pub(crate) fn scope_key(&self) -> &str {
+        &self.scope_key
+    }
+
+    pub(crate) fn asset_db(&self) -> AssetDbState {
+        AssetDbState(self.resolved.runtime().core().asset_db())
+    }
+
+    pub(crate) fn resolved(&self) -> &ResolvedWorkspaceScope {
+        &self.resolved
+    }
+
+    pub(crate) fn into_resolved(self) -> ResolvedWorkspaceScope {
+        self.resolved
+    }
+}
+
+pub(crate) async fn resolve_asset_workspace_scope(
+    workspace_ref: &WorkspaceRef,
+    registry: &ProjectRegistry,
+) -> Result<AssetWorkspaceScope, AppError> {
+    let resolved = registry
+        .resolve_workspace_ref(workspace_ref)
+        .map_err(asset_workspace_resolve_error)?;
+    let runtime = resolved.runtime();
+    Ok(AssetWorkspaceScope {
+        root: runtime.root().to_path_buf(),
+        scope_key: format!("{}:{}", runtime.checkout_id(), runtime.generation()),
+        resolved,
+    })
+}
 
 // ── LastScanInfo: latest successful scan snapshot for the active workspace ──
 
@@ -149,13 +223,12 @@ pub fn delete_persisted_last_scan_info(project_root: &Path) -> Result<(), String
     }
 }
 
-/// Tauri-managed state holding the most recent `LastScanInfo`, if any.
 #[derive(Clone, Default)]
-pub struct LastScanInfoState(pub Arc<Mutex<Option<LastScanInfo>>>);
+pub struct LastScanInfoState(Arc<Mutex<Option<LastScanInfo>>>);
 
 impl LastScanInfoState {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
+        Self::default()
     }
 
     /// Replace the stored value. Silently no-ops on lock poisoning.
@@ -188,11 +261,11 @@ impl LastScanInfoState {
 // scanning or verifying it holds the latest active phase. Completion events are
 // intentionally never stored — completion goes back to None.
 #[derive(Clone, Default)]
-pub struct ScanPhaseState(pub Arc<Mutex<Option<ScanPhase>>>);
+pub struct ScanPhaseState(Arc<Mutex<Option<ScanPhase>>>);
 
 impl ScanPhaseState {
     pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
+        Self::default()
     }
 
     pub fn is_running_phase(phase: &ScanPhase) -> bool {
@@ -503,23 +576,21 @@ fn report_path_to_rel(project_root: &Path, report_path: &Path) -> Result<String,
 
 #[tauri::command]
 pub async fn asset_db_overview(
-    ref_graph_state: State<'_, AssetDbState>,
-    watcher_handle: State<'_, AssetDbWatcherHandle>,
-    last_scan_info: State<'_, LastScanInfoState>,
-    scan_phase: State<'_, ScanPhaseState>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<AssetDbOverview, AppError> {
-    let (watcher_running, watcher_queue_len, watcher_current_file) = watcher_handle
-        .lock()
-        .map(|guard| match &*guard {
-            Some(w) => (true, w.queue_len() as u64, w.current_file()),
-            None => (false, 0u64, None),
-        })
-        .unwrap_or((false, 0, None));
-    let working_dir = workspace.path.read().await.clone();
-
-    let project_root = Path::new(&working_dir);
-    let last = last_scan_info.snapshot();
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let runtime_core = scope.resolved().runtime().core();
+    let (watcher_running, watcher_queue_len, watcher_current_file) = (
+        scope.resolved().runtime().core().watchers_running(),
+        0,
+        None,
+    );
+    let project_root = scope.root();
+    let last = runtime_core
+        .asset_last_scan_info()
+        .snapshot()
+        .or_else(|| read_persisted_last_scan_info(project_root).ok().flatten());
     let last_scan_at = last
         .as_ref()
         .map(|i| i.finished_at_unix_ms)
@@ -527,10 +598,11 @@ pub async fn asset_db_overview(
     let last_scan_duration_ms = last.as_ref().map(|i| i.duration_ms);
     let last_scan_stats = last.as_ref().map(|i| i.stats.clone());
 
-    let phase_snapshot = scan_phase.snapshot();
+    let phase_snapshot = runtime_core.asset_scan_phase().snapshot();
     let phase_derived_status = phase_snapshot.as_ref().map(classify_scan_phase);
 
-    let guard = ref_graph_state
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| AppError::new("ref_graph.lock_failed", format!("Lock error: {}", e)))?;
@@ -617,14 +689,16 @@ pub async fn asset_db_overview(
 
 #[tauri::command]
 pub async fn asset_db_light_status(
-    ref_graph_state: State<'_, AssetDbState>,
-    last_scan_info: State<'_, LastScanInfoState>,
-    scan_phase: State<'_, ScanPhaseState>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<AssetDbLightStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let project_root = Path::new(&working_dir);
-    let last = last_scan_info.snapshot();
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let runtime_core = scope.resolved().runtime().core();
+    let project_root = scope.root();
+    let last = runtime_core
+        .asset_last_scan_info()
+        .snapshot()
+        .or_else(|| read_persisted_last_scan_info(project_root).ok().flatten());
     let last_scan_at = last
         .as_ref()
         .map(|i| i.finished_at_unix_ms)
@@ -632,10 +706,11 @@ pub async fn asset_db_light_status(
     let last_scan_duration_ms = last.as_ref().map(|i| i.duration_ms);
     let last_scan_stats = last.as_ref().map(|i| i.stats.clone());
 
-    let phase_snapshot = scan_phase.snapshot();
+    let phase_snapshot = runtime_core.asset_scan_phase().snapshot();
     let phase_derived_status = phase_snapshot.as_ref().map(classify_scan_phase);
 
-    let guard = ref_graph_state
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| AppError::new("ref_graph.lock_failed", format!("Lock error: {}", e)))?;
@@ -671,17 +746,18 @@ pub async fn asset_db_light_status(
 #[tauri::command]
 pub async fn asset_risk_report(
     kind: AssetRiskKind,
-    ref_graph_state: State<'_, AssetDbState>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    if scope.root().as_os_str().is_empty() {
         return Err(AppError::new(
             "asset.risk.no_workspace",
             "Open a Unity workspace before viewing asset risk details.",
         ));
     }
-    let project_root = Path::new(&working_dir);
+    let project_root = scope.root();
+    let asset_db = scope.asset_db();
 
     match kind {
         AssetRiskKind::DuplicateGuids => {
@@ -701,7 +777,7 @@ pub async fn asset_risk_report(
             })
         }
         AssetRiskKind::BrokenReferences | AssetRiskKind::MissingScripts => {
-            let guard = ref_graph_state.0.lock().map_err(|e| {
+            let guard = asset_db.0.lock().map_err(|e| {
                 AppError::new("ref_graph.lock_failed", format!("Lock error: {}", e))
             })?;
             let graph = guard.as_ref().ok_or_else(|| {
@@ -1114,8 +1190,8 @@ pub async fn search_workspace_assets(
     query: String,
     roots: Vec<String>,
     limit: Option<usize>,
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<AssetSearchResult>, AppError> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -1140,17 +1216,18 @@ pub async fn search_workspace_assets(
         .unwrap_or(SEARCH_RESULT_LIMIT)
         .clamp(1, SEARCH_RESULT_MAX_LIMIT);
 
-    let cwd = workspace.path.read().await.clone();
-    if cwd.is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    if scope.root().as_os_str().is_empty() {
         return Ok(Vec::new());
     }
-    let cwd_path = PathBuf::from(&cwd);
+    let cwd_path = scope.root().to_path_buf();
     if !cwd_path.is_dir() {
         return Err(AppError::new(
             "asset.search.invalid_workspace",
-            format!("Workspace directory not found: {}", cwd),
+            format!("Workspace directory not found: {}", cwd_path.display()),
         ));
     }
+    let asset_db = scope.asset_db();
 
     // ── Phase 1: ref_graph-backed roots (Assets, Packages) ─────────────
     // Push the search down into SQLite. The DB query path uses derived
@@ -1162,7 +1239,7 @@ pub async fn search_workspace_assets(
         .any(|r| matches!(r, AssetSearchRoot::Assets | AssetSearchRoot::Packages));
 
     let index_results: Option<Vec<crate::asset_db::AssetSearchRowDb>> = if want_index_root {
-        let guard = ref_graph_state
+        let guard = asset_db
             .0
             .lock()
             .map_err(|e| AppError::new("ref_graph.lock_failed", format!("Lock error: {}", e)))?;
@@ -1543,7 +1620,7 @@ pub struct WorkspacePreviewSession {
 /// once `CAP` entries are reached. For cap = 8 the data structure cost is
 /// trivial; we deliberately don't pull in the `lru` crate.
 pub struct WorkspacePreviewCache {
-    inner: Mutex<VecDeque<(String, Arc<WorkspacePreviewSession>)>>,
+    inner: Mutex<VecDeque<(String, String, Arc<WorkspacePreviewSession>)>>,
     scene_hierarchies: Mutex<VecDeque<SceneHierarchyCacheEntry>>,
     scene_hierarchy_build_lock: tokio::sync::Mutex<()>,
 }
@@ -1578,26 +1655,24 @@ impl WorkspacePreviewCache {
         }
     }
 
-    /// Insert a fresh session and return its uuid key. Evicts the oldest
-    /// entry if at capacity.
-    pub fn insert(&self, session: Arc<WorkspacePreviewSession>) -> String {
+    pub fn insert_scoped(&self, scope_key: &str, session: Arc<WorkspacePreviewSession>) -> String {
         let key = Uuid::new_v4().to_string();
         if let Ok(mut q) = self.inner.lock() {
             while q.len() >= Self::CAP {
                 q.pop_front();
             }
-            q.push_back((key.clone(), session));
+            q.push_back((scope_key.to_string(), key.clone(), session));
         }
         key
     }
 
-    /// LRU touch + fetch. Moves the matched entry to the back of the queue
-    /// so frequently-used previews stay resident.
-    pub fn get(&self, key: &str) -> Option<Arc<WorkspacePreviewSession>> {
+    pub fn get_scoped(&self, scope_key: &str, key: &str) -> Option<Arc<WorkspacePreviewSession>> {
         let mut q = self.inner.lock().ok()?;
-        let pos = q.iter().position(|(k, _)| k == key)?;
+        let pos = q
+            .iter()
+            .position(|(entry_scope, entry_key, _)| entry_scope == scope_key && entry_key == key)?;
         let entry = q.remove(pos)?;
-        let session = entry.1.clone();
+        let session = entry.2.clone();
         q.push_back(entry);
         Some(session)
     }
@@ -1636,17 +1711,10 @@ impl WorkspacePreviewCache {
         }
     }
 
-    /// Drop every cached session. Called on real workspace switches so a
-    /// stale session from project A can never be paired with project B's
-    /// `AssetDb` / GuidResolver in `preview_workspace_asset_target`.
-    pub fn clear(&self) {
-        if let Ok(mut q) = self.inner.lock() {
-            q.clear();
-        }
-        if let Ok(mut q) = self.scene_hierarchies.lock() {
-            q.clear();
-        }
-    }
+    /// Compatibility hook for callers that used to clear a process-global
+    /// preview projection. Checkout-scoped entries remain owned by their
+    /// runtime namespace and expire through the bounded cache.
+    pub fn clear(&self) {}
 }
 
 impl Default for WorkspacePreviewCache {
@@ -1786,21 +1854,27 @@ pub async fn search_workspace_scene_objects(
     scene_path: String,
     query: String,
     limit: Option<usize>,
-    workspace: State<'_, Arc<Workspace>>,
-    preview_cache: State<'_, WorkspacePreviewCache>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<WorkspaceSceneObjectSearchResult>, AppError> {
     let scene_path = scene_path.trim().replace('\\', "/");
     if !scene_path.to_ascii_lowercase().ends_with(".unity") {
         return Ok(Vec::new());
     }
 
-    let cwd = workspace.path.read().await.clone();
-    if cwd.is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let preview_cache = Arc::clone(scope.resolved().runtime().core().asset_preview_cache());
+    if scope.root().as_os_str().is_empty() {
         return Ok(Vec::new());
     }
-    let workspace_root = PathBuf::from(cwd);
+    let workspace_root = scope.root().to_path_buf();
     let (canonical, rel_path) = resolve_workspace_path(&workspace_root, &scene_path)?;
-    let cache_key = format!("{}\0{}", canonical.display(), rel_path);
+    let cache_key = format!(
+        "{}\0{}\0{}",
+        scope.scope_key(),
+        canonical.display(),
+        rel_path
+    );
     let fingerprint = scene_hierarchy_fingerprint(&canonical)?;
 
     let objects = if let Some(cached) = preview_cache.get_scene_hierarchy(&cache_key, fingerprint) {
@@ -2369,6 +2443,7 @@ fn try_build_yaml_structured_payload(
     rel_path: &str,
     canonical: &Path,
     asset_kind: UnityAssetKind,
+    scope_key: &str,
     preview_cache: &WorkspacePreviewCache,
     ref_graph_state: &AssetDbState,
 ) -> Option<AssetPreviewPayload> {
@@ -2430,7 +2505,7 @@ fn try_build_yaml_structured_payload(
         scene_side: None,
     };
     let _ = asset_kind; // Reserved for future dispatch; AssetInspector is the only YAML layout today.
-    let preview_key = preview_cache.insert(Arc::new(session));
+    let preview_key = preview_cache.insert_scoped(scope_key, Arc::new(session));
 
     Some(AssetPreviewPayload::Structured {
         preview_key,
@@ -2458,6 +2533,7 @@ fn try_build_scene_structured_payload(
     rel_path: &str,
     canonical: &Path,
     _asset_kind: UnityAssetKind,
+    scope_key: &str,
     preview_cache: &WorkspacePreviewCache,
     ref_graph_state: &AssetDbState,
 ) -> Option<AssetPreviewPayload> {
@@ -2542,7 +2618,7 @@ fn try_build_scene_structured_payload(
         script_cache,
         scene_side: Some(scene_side),
     };
-    let preview_key = preview_cache.insert(Arc::new(session));
+    let preview_key = preview_cache.insert_scoped(scope_key, Arc::new(session));
 
     Some(AssetPreviewPayload::Structured {
         preview_key,
@@ -2713,23 +2789,27 @@ enum TargetKind {
 pub async fn preview_workspace_asset_target(
     preview_key: String,
     target_id: String,
-    preview_cache: State<'_, WorkspacePreviewCache>,
-    ref_graph_state: State<'_, AssetDbState>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SemanticTargetInspector, AppError> {
-    let session = preview_cache.get(&preview_key).ok_or_else(|| {
-        AppError::new(
-            "asset.preview.cache_miss",
-            format!(
-                "Preview session not found (likely evicted): {}. Re-open the asset.",
-                preview_key
-            ),
-        )
-        .retryable(true)
-    })?;
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let preview_cache = Arc::clone(scope.resolved().runtime().core().asset_preview_cache());
+    let session = preview_cache
+        .get_scoped(scope.scope_key(), &preview_key)
+        .ok_or_else(|| {
+            AppError::new(
+                "asset.preview.cache_miss",
+                format!(
+                    "Preview session not found (likely evicted): {}. Re-open the asset.",
+                    preview_key
+                ),
+            )
+            .retryable(true)
+        })?;
 
-    let cwd = workspace.path.read().await.clone();
-    let side_ctx = neutral_side_context(&ref_graph_state);
+    let cwd = scope.root_string();
+    let asset_db = scope.asset_db();
+    let side_ctx = neutral_side_context(&asset_db);
     let (kind, file_id) = parse_target_id(&target_id, &session)?;
 
     match kind {
@@ -2748,17 +2828,19 @@ pub async fn preview_workspace_asset_target(
 #[tauri::command]
 pub async fn preview_workspace_asset_thumbnail(
     file_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<AssetThumbnailPreview, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    if cwd.is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    if scope.root().as_os_str().is_empty() {
         return Err(AppError::new(
             "asset.thumbnail.no_workspace",
             "No workspace is currently open",
         ));
     }
 
-    let workspace_root = PathBuf::from(&cwd);
+    let cwd = scope.root_string();
+    let workspace_root = scope.root().to_path_buf();
     let (_canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
     if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
         return Err(AppError::new(
@@ -2861,17 +2943,18 @@ fn decode_preview_frame_data_url(url: &str) -> Result<(String, Vec<u8>), AppErro
 #[tauri::command]
 pub async fn read_workspace_asset_preview_frame_cache(
     file_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Option<AssetPreviewFrame>, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    if cwd.is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    if scope.root().as_os_str().is_empty() {
         return Err(AppError::new(
             "asset.preview_frame_cache.no_workspace",
             "No workspace is currently open",
         ));
     }
 
-    let workspace_root = PathBuf::from(&cwd);
+    let workspace_root = scope.root().to_path_buf();
     let (canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
     if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
         return Ok(None);
@@ -2933,17 +3016,18 @@ pub async fn cache_workspace_asset_preview_frame(
     pan_x: f32,
     pan_y: f32,
     pan_z: f32,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
-    if cwd.is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    if scope.root().as_os_str().is_empty() {
         return Err(AppError::new(
             "asset.preview_frame_cache.no_workspace",
             "No workspace is currently open",
         ));
     }
 
-    let workspace_root = PathBuf::from(&cwd);
+    let workspace_root = scope.root().to_path_buf();
     let (canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
     if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
         return Ok(());
@@ -3011,17 +3095,19 @@ pub async fn render_workspace_asset_preview_frame(
     pan_x: f32,
     pan_y: f32,
     pan_z: f32,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<AssetPreviewFrame, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    if cwd.is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    if scope.root().as_os_str().is_empty() {
         return Err(AppError::new(
             "asset.preview_frame.no_workspace",
             "No workspace is currently open",
         ));
     }
 
-    let workspace_root = PathBuf::from(&cwd);
+    let cwd = scope.root_string();
+    let workspace_root = scope.root().to_path_buf();
     let (_canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
     if !asset_rel_path.to_ascii_lowercase().ends_with(".prefab") {
         return Err(AppError::new(
@@ -3076,20 +3162,21 @@ pub async fn render_workspace_asset_preview_frame(
 pub async fn preview_workspace_asset(
     file_path: String,
     focus_line: Option<u32>,
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
     binary_cache: State<'_, Arc<BinaryCache>>,
-    preview_cache: State<'_, WorkspacePreviewCache>,
 ) -> Result<AssetPreviewPayload, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    if cwd.is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let preview_cache = Arc::clone(scope.resolved().runtime().core().asset_preview_cache());
+    if scope.root().as_os_str().is_empty() {
         return Err(AppError::new(
             "asset.preview.no_workspace",
             "No workspace is currently open",
         ));
     }
-    let workspace_root = PathBuf::from(&cwd);
+    let workspace_root = scope.root().to_path_buf();
     let (canonical, asset_rel_path) = resolve_workspace_path(&workspace_root, &file_path)?;
+    let asset_db = scope.asset_db();
 
     let ext = canonical
         .extension()
@@ -3115,8 +3202,9 @@ pub async fn preview_workspace_asset(
             &asset_rel_path,
             &canonical,
             asset_kind,
+            scope.scope_key(),
             &preview_cache,
-            &ref_graph_state,
+            &asset_db,
         ) {
             return Ok(payload);
         }
@@ -3131,8 +3219,9 @@ pub async fn preview_workspace_asset(
             &asset_rel_path,
             &canonical,
             asset_kind,
+            scope.scope_key(),
             &preview_cache,
-            &ref_graph_state,
+            &asset_db,
         ) {
             return Ok(payload);
         }
@@ -3145,12 +3234,8 @@ pub async fn preview_workspace_asset(
     // Slice 3b: try to render image/psd/model via the existing BinaryCache
     //   + locus-binary URI protocol. On success → `binaryPreview` payload.
     //   On unknown kind / oversized / read error → `binaryInfo` fallback.
-    let payload = build_binary_payload(
-        &asset_rel_path,
-        &canonical,
-        binary_cache.inner(),
-        &ref_graph_state,
-    );
+    let payload =
+        build_binary_payload(&asset_rel_path, &canonical, binary_cache.inner(), &asset_db);
     if let Some(start) = preview_start {
         eprintln!(
             "[perf:preview-workspace-asset:fbx] path={} total={}ms payload={}",
@@ -3166,6 +3251,95 @@ pub async fn preview_workspace_asset(
 mod tests {
     use super::*;
     use std::path::Path as StdPath;
+
+    fn test_registry(config_dir: &StdPath) -> Arc<ProjectRegistry> {
+        let config = Arc::new(crate::config::AppConfig::load_from_path(
+            &config_dir.join("config.json"),
+        ));
+        let policy = Arc::new(
+            crate::resource_policy::ResourcePolicyStore::from_config(config)
+                .expect("resource policy"),
+        );
+        ProjectRegistry::new(policy, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn explicit_checkout_scopes_isolate_same_relative_asset_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root_a = temp.path().join("checkout-a");
+        let root_b = temp.path().join("checkout-b");
+        for root in [&root_a, &root_b] {
+            std::fs::create_dir_all(root.join("Assets")).expect("asset root");
+        }
+        std::fs::write(root_a.join("Assets/Same.txt"), "checkout-a").expect("write a");
+        std::fs::write(root_b.join("Assets/Same.txt"), "checkout-b").expect("write b");
+
+        let registry = test_registry(temp.path());
+        let runtime_a = registry.open_workspace(&root_a).expect("runtime a");
+        let runtime_b = registry.open_workspace(&root_b).expect("runtime b");
+        let scope_a =
+            resolve_asset_workspace_scope(&WorkspaceRef::for_runtime(&runtime_a), &registry)
+                .await
+                .expect("scope a");
+        let scope_b =
+            resolve_asset_workspace_scope(&WorkspaceRef::for_runtime(&runtime_b), &registry)
+                .await
+                .expect("scope b");
+
+        let (path_a, _) =
+            resolve_workspace_path(scope_a.root(), "Assets/Same.txt").expect("resolve a");
+        let (path_b, _) =
+            resolve_workspace_path(scope_b.root(), "Assets/Same.txt").expect("resolve b");
+        assert_eq!(
+            std::fs::read_to_string(path_a).expect("read a"),
+            "checkout-a"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path_b).expect("read b"),
+            "checkout-b"
+        );
+        assert_ne!(scope_a.scope_key(), scope_b.scope_key());
+        assert!(!Arc::ptr_eq(
+            &scope_a.resolved().runtime().core().asset_db(),
+            &scope_b.resolved().runtime().core().asset_db(),
+        ));
+    }
+
+    #[tokio::test]
+    async fn asset_scope_rejects_stale_checkout_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("checkout-a");
+        std::fs::create_dir_all(root.join("Assets")).expect("asset root");
+        let registry = test_registry(temp.path());
+        let runtime = registry.open_workspace(&root).expect("runtime");
+        let stale_ref = WorkspaceRef::new(
+            runtime.checkout_id().clone(),
+            Some(runtime.generation().saturating_add(1)),
+        );
+
+        assert!(resolve_asset_workspace_scope(&stale_ref, &registry)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn preview_sessions_are_namespaced_by_checkout_generation() {
+        let cache = WorkspacePreviewCache::new();
+        let session = Arc::new(WorkspacePreviewSession {
+            rel_path: "Assets/Same.asset".to_string(),
+            yaml: WorkspacePreviewYaml::Flat(UnityYamlDocs::parse(b"")),
+            doc_labels: HashMap::new(),
+            script_cache: ScriptInfoCache::default(),
+            scene_side: None,
+        });
+        let key = cache.insert_scoped("checkout-a:3", session);
+
+        assert!(cache.get_scoped("checkout-a:3", &key).is_some());
+        assert!(cache.get_scoped("checkout-b:9", &key).is_none());
+        assert!(cache.get_scoped("checkout-a:4", &key).is_none());
+        cache.clear();
+        assert!(cache.get_scoped("checkout-a:3", &key).is_some());
+    }
 
     #[cfg(unix)]
     fn create_dir_symlink(source: &StdPath, link: &StdPath) -> std::io::Result<()> {

@@ -11,6 +11,8 @@ import {
   setWatcherTuning,
 } from "../services/asset";
 import { listDirEntriesPage } from "../services/project";
+import { WORKSPACE_EVENT_NAME } from "../services/project";
+import type { RoutedWorkspaceEvent, WorkspaceRef } from "../services/project";
 import { t } from "../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../services/errors";
 import { getWarmup } from "./warmupCache";
@@ -26,6 +28,7 @@ import type {
 
 interface AssetProps {
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
 }
 
 // ── Explorer node ──────────────────────────────────────────
@@ -152,7 +155,13 @@ export function useAssetState(props: AssetProps) {
   // watcher tuning
   const watcherTuning = ref<WatcherTuning | null>(null);
   const watcherTuningSaving = ref(false);
-  const hasWorkspace = computed(() => !!props.workingDir.trim());
+  const hasWorkspace = computed(() => !!props.workingDir.trim() && !!props.workspaceRef);
+
+  function requireAssetWorkspaceRef(): WorkspaceRef {
+    const workspaceRef = props.workspaceRef;
+    if (!workspaceRef) throw new Error("A workspace checkout is required for asset operations.");
+    return workspaceRef;
+  }
 
   function resetWorkspaceState() {
     invalidatePreviewSession();
@@ -302,6 +311,8 @@ export function useAssetState(props: AssetProps) {
     options: { append?: boolean } = {},
   ) {
     if (!hasWorkspace.value) return;
+    const workspaceRef = props.workspaceRef;
+    if (!workspaceRef) return;
     if (folder.loading) return;
     if (!options.append && folder.loaded) return;
     if (options.append && !folder.hasMore) return;
@@ -309,6 +320,7 @@ export function useAssetState(props: AssetProps) {
     try {
       const page = await listDirEntriesPage(
         folder.path,
+        workspaceRef,
         options.append ? folder.nextOffset : 0,
         ASSET_EXPLORER_PAGE_SIZE,
         true,
@@ -324,6 +336,8 @@ export function useAssetState(props: AssetProps) {
 
   async function probeFolderBranchState(folder: AssetFolderNode) {
     if (!hasWorkspace.value) return;
+    const workspaceRef = props.workspaceRef;
+    if (!workspaceRef) return;
     if (folder.loaded) {
       folder.hasChildFoldersKnown = true;
       folder.hasChildFolders = folder.children.some((child) => child.kind === "folder");
@@ -335,6 +349,7 @@ export function useAssetState(props: AssetProps) {
     try {
       const page = await listDirEntriesPage(
         folder.path,
+        workspaceRef,
         0,
         ASSET_EXPLORER_BRANCH_PROBE_PAGE_SIZE,
         true,
@@ -575,7 +590,7 @@ export function useAssetState(props: AssetProps) {
           "Assets",
           "Packages",
           "ProjectSettings",
-        ]);
+        ], undefined, requireAssetWorkspaceRef());
         searchResults.value = results;
         searchTruncated.value = results.length === 200;
         searchHasFallback.value = results.some((r) => r.source === "filesystem");
@@ -710,6 +725,7 @@ export function useAssetState(props: AssetProps) {
       const payload = await previewWorkspaceAsset(
         nextNode.path,
         previewFocusLine.value ?? undefined,
+        requireAssetWorkspaceRef(),
       );
       if (session !== previewSession) return;
       previewPayload.value = payload;
@@ -745,7 +761,11 @@ export function useAssetState(props: AssetProps) {
     }
     targetLoading.value = true;
     try {
-      const inspector = await previewWorkspaceAssetTarget(previewKey, targetId);
+      const inspector = await previewWorkspaceAssetTarget(
+        previewKey,
+        targetId,
+        requireAssetWorkspaceRef(),
+      );
       if (session !== previewSession) return null;
       const payload = previewPayload.value;
       if (!payload || payload.kind !== "structured" || payload.previewKey !== previewKey) {
@@ -794,7 +814,7 @@ export function useAssetState(props: AssetProps) {
     }
     dbLoading.value = true;
     try {
-      dbOverview.value = await assetDbOverview();
+      dbOverview.value = await assetDbOverview(requireAssetWorkspaceRef());
     } catch (e) {
       const err = normalizeAppError(e);
       error.value = err.message;
@@ -832,7 +852,7 @@ export function useAssetState(props: AssetProps) {
   async function triggerRescan() {
     if (!hasWorkspace.value) return;
     try {
-      const result = await assetDbScanStart();
+      const result = await assetDbScanStart(requireAssetWorkspaceRef());
       if ((result.started || result.alreadyRunning) && dbOverview.value) {
         dbOverview.value = {
           ...dbOverview.value,
@@ -847,7 +867,7 @@ export function useAssetState(props: AssetProps) {
   }
 
   // ── Lifecycle ────────────────────────────────────────────
-  let unlisten: UnlistenFn | null = null;
+  let unlistenScoped: UnlistenFn | null = null;
   let watcherPollTimer: ReturnType<typeof setInterval> | null = null;
 
   // Lightweight polling so the watcher card can show queue depth + current
@@ -879,7 +899,10 @@ export function useAssetState(props: AssetProps) {
         preservePreview: true,
         revealInTree: "none",
       });
-      const cachedDbOverview = getWarmup<AssetDbOverview>("asset:dbOverview");
+      const workspaceRef = requireAssetWorkspaceRef();
+      const cachedDbOverview = getWarmup<AssetDbOverview>(
+        `asset:dbOverview:${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`,
+      );
       const cachedWatcherTuning = getWarmup<WatcherTuning>("asset:watcherTuning");
 
       if (cachedDbOverview) {
@@ -898,9 +921,8 @@ export function useAssetState(props: AssetProps) {
       resetWorkspaceState();
     }
     try {
-      unlisten = await listen<AssetDbScanEvent>("ref-graph-scan", async (e) => {
+      const applyScanPhase = async (phase: AssetDbScanEvent) => {
         if (!hasWorkspace.value) return;
-        const phase = e.payload;
         if (!dbOverview.value) {
           await refreshDbOverview();
           return;
@@ -927,7 +949,22 @@ export function useAssetState(props: AssetProps) {
             status: "scanning",
           };
         }
-      });
+      };
+      unlistenScoped = await listen<RoutedWorkspaceEvent<AssetDbScanEvent>>(
+        WORKSPACE_EVENT_NAME,
+        async (event) => {
+          const workspaceRef = props.workspaceRef;
+          if (!workspaceRef) return;
+          const routed = event.payload;
+          if (routed.eventName !== "ref-graph-scan") return;
+          if (routed.checkoutId !== workspaceRef.checkoutId) return;
+          if (
+            workspaceRef.expectedGeneration != null
+            && routed.workspaceGeneration !== workspaceRef.expectedGeneration
+          ) return;
+          await applyScanPhase(routed.payload);
+        },
+      );
     } catch (e) {
       // listen failure shouldn't break the page
       console.warn("[useAssetState] failed to listen ref-graph-scan", e);
@@ -936,8 +973,8 @@ export function useAssetState(props: AssetProps) {
   });
 
   onUnmounted(() => {
-    unlisten?.();
-    unlisten = null;
+    unlistenScoped?.();
+    unlistenScoped = null;
     stopWatcherPoll();
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
     releaseSelectionLock?.();
@@ -946,8 +983,12 @@ export function useAssetState(props: AssetProps) {
 
   // Re-init when workingDir changes (workspace switch).
   watch(
-    () => props.workingDir,
-    (workingDir) => {
+    () => [
+      props.workingDir,
+      props.workspaceRef?.checkoutId ?? "",
+      props.workspaceRef?.expectedGeneration ?? null,
+    ] as const,
+    ([workingDir]) => {
       stopWatcherPoll();
       resetWorkspaceState();
       if (!workingDir.trim()) return;
@@ -957,7 +998,10 @@ export function useAssetState(props: AssetProps) {
         preservePreview: true,
         revealInTree: "none",
       });
-      const cachedDbOverview = getWarmup<AssetDbOverview>("asset:dbOverview");
+      const workspaceRef = requireAssetWorkspaceRef();
+      const cachedDbOverview = getWarmup<AssetDbOverview>(
+        `asset:dbOverview:${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`,
+      );
       const cachedWatcherTuning = getWarmup<WatcherTuning>("asset:watcherTuning");
 
       if (cachedDbOverview) {

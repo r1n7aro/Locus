@@ -8,6 +8,11 @@ import type {
   SemanticTargetInspector,
   SemanticTargetRequest,
 } from "../types";
+import type { WorkspaceRef } from "./project";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+} from "./project";
 
 // ── Diff progress events ──
 
@@ -23,14 +28,41 @@ export interface DiffProgressEvent {
 }
 
 export function listenDiffProgress(
+  getWorkspaceRef: () => WorkspaceRef | null,
   cb: (evt: DiffProgressEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<DiffProgressEvent>("diff-progress", (e) => cb(e.payload));
+  return listen<RoutedWorkspaceEvent<DiffProgressEvent>>(
+    WORKSPACE_EVENT_NAME,
+    ({ payload }) => {
+      if (payload.eventName !== "diff-progress") return;
+      const workspaceRef = getWorkspaceRef();
+      if (!workspaceRef || payload.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && payload.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      cb(payload.payload);
+    },
+  );
 }
 
 // ── Request key computation (for cache + dedup) ──
 
-function computeRequestKey(req: FileDiffRequest): string {
+function diffScopeKey(req: FileDiffRequest, workspaceRef?: WorkspaceRef | null): string {
+  if (workspaceRef?.checkoutId.trim()) {
+    const generation = Number.isSafeInteger(workspaceRef.expectedGeneration)
+      ? String(workspaceRef.expectedGeneration)
+      : "current";
+    return `w=${workspaceRef.checkoutId.trim()}@${generation}`;
+  }
+  if (req.sessionId?.trim()) return `s=${req.sessionId.trim()}`;
+  return "u";
+}
+
+function computeRequestKey(
+  req: FileDiffRequest,
+  workspaceRef?: WorkspaceRef | null,
+): string {
   return [
     req.source,
     req.filePath,
@@ -40,6 +72,7 @@ function computeRequestKey(req: FileDiffRequest): string {
     req.assistantMessageId ?? "",
     req.detail,
     req.fullContext ? "fc" : "",
+    diffScopeKey(req, workspaceRef),
   ].join(":");
 }
 
@@ -57,6 +90,22 @@ export function parseDiffRequestKey(key: string): FileDiffRequest | null {
     detail: detail as FileDiffRequest["detail"],
     fullContext: fc === "fc",
   };
+}
+
+export function parseDiffWorkspaceRefFromKey(key: string): WorkspaceRef | undefined {
+  const scope = key.split(":")[8] ?? "";
+  if (!scope.startsWith("w=")) return undefined;
+  const separator = scope.lastIndexOf("@");
+  if (separator <= 2) return undefined;
+  const checkoutId = scope.slice(2, separator).trim();
+  const generationRaw = scope.slice(separator + 1);
+  if (!checkoutId) return undefined;
+  const expectedGeneration = /^\d+$/.test(generationRaw)
+    ? Number(generationRaw)
+    : undefined;
+  return Number.isSafeInteger(expectedGeneration)
+    ? { checkoutId, expectedGeneration }
+    : { checkoutId };
 }
 
 // ── LRU cache ──
@@ -91,8 +140,9 @@ const inflight = new Map<string, Promise<FileDiffPayload>>();
 
 export async function diffSingleFile(
   request: FileDiffRequest,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<FileDiffPayload> {
-  const key = computeRequestKey(request);
+  const key = computeRequestKey(request, workspaceRef);
 
   // Check cache
   const cached = lruGet(key);
@@ -105,6 +155,7 @@ export async function diffSingleFile(
   console.log("[diff] IPC call start, key=", key);
   const promise = ipcInvoke<FileDiffPayload>("diff_single_file", {
     request,
+    workspaceRef: workspaceRef ?? null,
   }).then((payload) => {
     console.log("[diff] IPC resolved, payload=", !!payload);
     lruSet(key, payload);
@@ -134,8 +185,12 @@ export async function diffStrings(
 
 export async function diffTextForLarge(
   request: FileDiffRequest,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<TextDiff> {
-  return ipcInvoke<TextDiff>("diff_text_for_large", { request });
+  return ipcInvoke<TextDiff>("diff_text_for_large", {
+    request,
+    workspaceRef: workspaceRef ?? null,
+  });
 }
 
 export async function diffSemanticTarget(
@@ -191,8 +246,9 @@ export function invalidateDiffCacheForFiles(paths: readonly string[]) {
 export async function refetchDiffByKey(key: string): Promise<FileDiffPayload | null> {
   const request = parseDiffRequestKey(key);
   if (!request) return null;
+  const workspaceRef = parseDiffWorkspaceRefFromKey(key);
   invalidateDiffCache(key);
-  return diffSingleFile(request);
+  return diffSingleFile(request, workspaceRef);
 }
 
 export { computeRequestKey };

@@ -21,7 +21,7 @@ describe("KnowledgeDownloadProgressWindow", () => {
     expect(source).toContain('class="download-window-footer"');
     expect(source).toContain('@click="void cancelDownload()"');
     expect(serviceSource).toContain(
-      'ipcInvoke<void>("knowledge_cancel_local_embedding_model_download")',
+      'ipcInvoke<void>("knowledge_cancel_local_embedding_model_download", { workspaceRef })',
     );
   });
 

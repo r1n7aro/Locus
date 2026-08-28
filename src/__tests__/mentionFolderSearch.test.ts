@@ -27,7 +27,9 @@ describe("folder mention search", () => {
       "utf8",
     );
 
-    expect(richInput).toContain("const folderSearchPromise = searchWorkspaceEntries(query)");
+    expect(richInput).toContain(
+      "const folderSearchPromise = searchWorkspaceEntries(query, workspaceRef)",
+    );
     expect(richInput).toContain("folderResults = mapWorkspaceFolderMentionResults(results);");
     expect(richInput).toContain("...folderResults,");
   });

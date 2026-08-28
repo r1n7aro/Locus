@@ -2,11 +2,41 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { Plus, Trash2 } from "lucide";
+import {
+  type InternalDropDecision,
+  type InternalDropTargetRegistration,
+  useInternalDragController,
+} from "../composables/useInternalDrag";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { listAgents, listSubagentDefs, getAgentEnvTemplate, getAgentRenderedEnvPrompt, getAgentSystemPrompt, getAgentSystemPromptStats, listAgentInjectedItems, setAgentInjectionEnabled, setAgentToolDirectLoad, setAgentToolEnabled, listRules, readRule, saveRule, deleteRule, setRuleEnabled, setRuleOrder } from "../services/agent";
+import {
+  deleteRule,
+  getAgentEnvTemplate,
+  getAgentRenderedEnvPrompt,
+  getAgentSystemPrompt,
+  getAgentSystemPromptStats,
+  getWorkspaceAgentEnvTemplate,
+  getWorkspaceAgentRenderedEnvPrompt,
+  getWorkspaceAgentSystemPrompt,
+  getWorkspaceAgentSystemPromptStats,
+  listAgentInjectedItems,
+  listAgents,
+  listAppRules,
+  listRules,
+  listSubagentDefs,
+  listWorkspaceAgentInjectedItems,
+  listWorkspaceAgents,
+  listWorkspaceSubagentDefs,
+  readAppRule,
+  readRule,
+  saveRule,
+  setAgentInjectionEnabled,
+  setAgentToolDirectLoad,
+  setAgentToolEnabled,
+  setRuleEnabled,
+  setRuleOrder,
+} from "../services/agent";
 import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
-import { getWarmup } from "../composables/warmupCache";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseCheckbox from "./ui/BaseCheckbox.vue";
@@ -19,10 +49,13 @@ import { acquireSelectionLock } from "../composables/useSelectionLock";
 import { parseAgentToolDefinition } from "./agent/toolSchema";
 import { buildAgentPromptDashboard, type AgentPromptHealthLevel, type AgentPromptPartKey } from "./agent/agentPromptDashboard";
 import { useModelStore } from "../stores/model";
+import type { WorkspaceRef } from "../services/project";
+import { agentProjectTypesLabel } from "../utils/agentProjectTypes";
 
 const props = defineProps<{
   workingDir: string;
   agentList: AgentInfo[];
+  workspaceRef?: WorkspaceRef | null;
 }>();
 const modelStore = useModelStore();
 
@@ -42,6 +75,7 @@ const selected = ref<SelectedKind | null>(null);
 // ── System Prompt ──
 const systemPromptContent = ref("");
 const systemPromptLoading = ref(false);
+let systemPromptRequestId = 0;
 const promptStats = ref<AgentSystemPromptStats | null>(null);
 const promptStatsLoading = ref(false);
 const promptStatsError = ref("");
@@ -50,6 +84,7 @@ let promptStatsRequestId = 0;
 // ── Env Template ──
 const envTemplateContent = ref("");
 const envTemplateLoading = ref(false);
+let envTemplateRequestId = 0;
 const envRenderedContent = ref("");
 const envRenderedLoading = ref(false);
 type EnvPreviewMode = "structure" | "rendered";
@@ -85,7 +120,10 @@ function highlightedEnv(raw: string): string {
 
 // ── Rule ──
 const ruleItems = ref<RuleItem[]>([]);
+const rulePreviewOrder = ref<RuleItem[] | null>(null);
+const displayedRuleItems = computed(() => rulePreviewOrder.value ?? ruleItems.value);
 const ruleLoading = ref(false);
+let ruleRequestId = 0;
 const ruleContent = ref("");
 const ruleContentLoading = ref(false);
 const ruleEditing = ref(false);
@@ -99,10 +137,15 @@ const error = ref("");
 const ruleDragIndex = ref<number | null>(null);
 const ruleDragOverIndex = ref<number | null>(null);
 const ruleContextMenu = ref<{ x: number; y: number; rule: RuleItem | null } | null>(null);
+const agentViewRef = ref<HTMLElement | null>(null);
+const internalDrag = useInternalDragController();
+let unregisterRuleDropTarget: (() => void) | null = null;
+const AGENT_RULE_INTERNAL_DRAG_TYPE = "locus/agent-rule";
 
 // ── Injected ──
 const injectedItems = ref<InjectedPromptItem[]>([]);
 const injectedLoading = ref(false);
+let injectedRequestId = 0;
 const toolLoadSaving = ref(false);
 const toolLoadConfigError = ref("");
 const toolEnabledSavingId = ref<string | null>(null);
@@ -232,7 +275,7 @@ function canEditRule(rule: RuleItem | null | undefined): boolean {
 }
 
 function canToggleRule(rule: RuleItem | null | undefined): boolean {
-  return !!rule && !rule.pluginId;
+  return !!props.workspaceRef && !!rule && !rule.readOnly && !rule.pluginId;
 }
 
 function closeRuleContextMenu() {
@@ -266,7 +309,21 @@ const selectedToolLoadLabel = computed(() => {
   return t("agent.tool.loadMode.direct");
 });
 
+const selectedToolRuntimeAvailable = computed(() => {
+  const item = selectedInjectedItem();
+  return !item || item.kind !== "tools" || toolItemRuntimeAvailable(item);
+});
+
+const selectedToolUnavailableReason = computed(() => {
+  const item = selectedInjectedItem();
+  if (!item || item.kind !== "tools") return "";
+  return toolItemUnavailableReason(item);
+});
+
 const selectedToolLoadSummary = computed(() => {
+  if (!selectedToolRuntimeAvailable.value) {
+    return t("agent.tool.loadSummary.unavailable");
+  }
   const mode = selectedToolLoadMode.value;
   if (mode === "lazy") return t("agent.tool.loadSummary.lazy");
   if (mode === "skill") return t("agent.tool.loadSummary.skill");
@@ -275,7 +332,7 @@ const selectedToolLoadSummary = computed(() => {
 
 const selectedToolCanConfigureDirectLoad = computed(() => {
   const item = selectedInjectedItem();
-  if (!item || item.kind !== "tools") return false;
+  if (!props.workspaceRef || !item || item.kind !== "tools") return false;
   return toolMetaBoolean(item.meta, "canConfigureDirectLoad") === true;
 });
 
@@ -297,8 +354,48 @@ function toolItemEnabled(item: InjectedPromptItem): boolean {
   return toolMetaBoolean(item.meta, "enabled") !== false;
 }
 
+function toolItemRuntimeAvailable(item: InjectedPromptItem): boolean {
+  return toolMetaBoolean(item.meta, "runtimeAvailable") !== false;
+}
+
+function toolUnavailableReasonText(reason: string): string {
+  switch (reason) {
+    case "requires_unity_workspace":
+      return t("agent.tool.unavailableReason.requiresUnityWorkspace");
+    case "unity_service_unavailable":
+      return t("agent.tool.unavailableReason.unityServiceUnavailable");
+    case "requires_workspace":
+      return t("agent.tool.unavailableReason.requiresWorkspace");
+    case "knowledge_access_disabled":
+      return t("agent.tool.unavailableReason.knowledgeAccessDisabled");
+    case "code_analysis_disabled":
+      return t("agent.tool.unavailableReason.codeAnalysisDisabled");
+    case "code_tool_disabled":
+      return t("agent.tool.unavailableReason.codeToolDisabled");
+    case "hot_reload_disabled":
+      return t("agent.tool.unavailableReason.hotReloadDisabled");
+    case "compile_server_disabled":
+      return t("agent.tool.unavailableReason.compileServerDisabled");
+    case "unity_test_framework_unavailable":
+      return t("agent.tool.unavailableReason.unityTestFrameworkUnavailable");
+    case "model_vision_unsupported":
+      return t("agent.tool.unavailableReason.modelVisionUnsupported");
+    case "subagent_depth_limit":
+      return t("agent.tool.unavailableReason.subagentDepthLimit");
+    case "tool_definition_unavailable":
+      return t("agent.tool.unavailableReason.toolDefinitionUnavailable");
+    default:
+      return t("agent.tool.unavailableReason.runtimeUnavailable");
+  }
+}
+
+function toolItemUnavailableReason(item: InjectedPromptItem): string {
+  if (toolItemRuntimeAvailable(item)) return "";
+  return toolUnavailableReasonText(toolMetaString(item.meta, "unavailableReason"));
+}
+
 function canToggleToolEnabled(item: InjectedPromptItem): boolean {
-  return toolMetaBoolean(item.meta, "canToggleEnabled") === true;
+  return !!props.workspaceRef && toolMetaBoolean(item.meta, "canToggleEnabled") === true;
 }
 
 function injectionItemEnabled(item: InjectedPromptItem | null | undefined): boolean {
@@ -306,7 +403,8 @@ function injectionItemEnabled(item: InjectedPromptItem | null | undefined): bool
 }
 
 function canToggleInjectionItem(item: InjectedPromptItem | null | undefined): boolean {
-  return !!item
+  return !!props.workspaceRef
+    && !!item
     && item.kind !== "tools"
     && toolMetaBoolean(item.meta, "canToggleEnabled") === true;
 }
@@ -514,6 +612,10 @@ function sourceBadgeClass(source: string | null | undefined): string {
 }
 
 function resetAgentDetailState() {
+  systemPromptRequestId += 1;
+  envTemplateRequestId += 1;
+  ruleRequestId += 1;
+  injectedRequestId += 1;
   selected.value = null;
   closeRuleContextMenu();
   ruleContent.value = "";
@@ -521,11 +623,16 @@ function resetAgentDetailState() {
   ruleCreating.value = false;
   confirmingDeleteRule.value = null;
   systemPromptContent.value = "";
+  systemPromptLoading.value = false;
   envTemplateContent.value = "";
+  envTemplateLoading.value = false;
   envRenderedContent.value = "";
   envRenderedLoading.value = false;
   envRenderedRequestId += 1;
+  ruleItems.value = [];
+  ruleLoading.value = false;
   injectedItems.value = [];
+  injectedLoading.value = false;
   injectionError.value = "";
   promptStats.value = null;
   promptStatsError.value = "";
@@ -539,11 +646,36 @@ function preferredAgentId(agents: AgentInfo[]): string {
   return def ? def.id : agents[0].id;
 }
 
+function mergeAgentLists(...groups: AgentInfo[][]): AgentInfo[] {
+  const seen = new Set<string>();
+  return groups.flatMap((group) => group.filter((agent) => {
+    if (seen.has(agent.id)) return false;
+    seen.add(agent.id);
+    return true;
+  }));
+}
+
+let agentListRequestId = 0;
+
 async function loadAllAgents() {
+  const requestId = ++agentListRequestId;
   try {
-    const topLevel = await listAgents();
-    const subLevel = await listSubagentDefs();
-    allAgents.value = [...topLevel, ...subLevel];
+    const workspaceRef = props.workspaceRef;
+    let nextAgents: AgentInfo[];
+    if (workspaceRef) {
+      const [topLevel, subLevel] = await Promise.all([
+        listWorkspaceAgents(workspaceRef),
+        listWorkspaceSubagentDefs(workspaceRef),
+      ]);
+      nextAgents = mergeAgentLists(topLevel, subLevel);
+    } else if (props.agentList.length > 0) {
+      nextAgents = mergeAgentLists(props.agentList);
+    } else {
+      const [topLevel, subLevel] = await Promise.all([listAgents(), listSubagentDefs()]);
+      nextAgents = mergeAgentLists(topLevel, subLevel);
+    }
+    if (requestId !== agentListRequestId) return;
+    allAgents.value = nextAgents;
     const selectedStillAvailable = allAgents.value.some(
       (agent) => agent.id === selectedAgentId.value,
     );
@@ -555,6 +687,10 @@ async function loadAllAgents() {
       }
     }
   } catch (e) {
+    if (requestId !== agentListRequestId) return;
+    if (props.agentList.length > 0) {
+      allAgents.value = mergeAgentLists(props.agentList);
+    }
     console.error("loadAllAgents failed:", e);
   }
 }
@@ -567,11 +703,13 @@ async function switchAgent(agentId: string) {
 
 async function loadAgentData() {
   if (!selectedAgentId.value) return;
-  loadSystemPrompt();
-  loadEnvTemplate();
-  loadPromptStats();
-  loadInjectedItems();
-  loadRules();
+  await Promise.all([
+    loadSystemPrompt(),
+    loadEnvTemplate(),
+    loadPromptStats(),
+    loadInjectedItems(),
+    loadRules(),
+  ]);
 }
 
 function selectPrompt() {
@@ -597,13 +735,23 @@ function selectEnv() {
 // ── Env Template ──
 async function loadEnvTemplate() {
   if (!selectedAgentId.value) return;
+  const requestId = ++envTemplateRequestId;
+  const agentId = selectedAgentId.value;
+  const workspaceRef = props.workspaceRef;
   envTemplateLoading.value = true;
   try {
-    envTemplateContent.value = await getAgentEnvTemplate(selectedAgentId.value);
+    const content = workspaceRef
+      ? await getWorkspaceAgentEnvTemplate(workspaceRef, agentId)
+      : await getAgentEnvTemplate(agentId);
+    if (requestId !== envTemplateRequestId) return;
+    envTemplateContent.value = content;
   } catch (e) {
+    if (requestId !== envTemplateRequestId) return;
     envTemplateContent.value = t("common.loadFailed", normalizeAppError(e).message);
   } finally {
-    envTemplateLoading.value = false;
+    if (requestId === envTemplateRequestId) {
+      envTemplateLoading.value = false;
+    }
   }
 }
 
@@ -618,9 +766,17 @@ function setEnvPreviewMode(value: string) {
 async function loadRenderedEnvPrompt() {
   if (!selectedAgentId.value) return;
   const requestId = ++envRenderedRequestId;
+  const agentId = selectedAgentId.value;
+  const workspaceRef = props.workspaceRef;
   envRenderedLoading.value = true;
   try {
-    const content = await getAgentRenderedEnvPrompt(selectedAgentId.value);
+    const content = workspaceRef
+      ? await getWorkspaceAgentRenderedEnvPrompt(
+          workspaceRef,
+          agentId,
+          modelStore.selectedModelId,
+        )
+      : await getAgentRenderedEnvPrompt(agentId);
     if (requestId !== envRenderedRequestId) return;
     envRenderedContent.value = content;
   } catch (e) {
@@ -636,22 +792,40 @@ async function loadRenderedEnvPrompt() {
 // ── System Prompt ──
 async function loadSystemPrompt() {
   if (!selectedAgentId.value) return;
+  const requestId = ++systemPromptRequestId;
+  const agentId = selectedAgentId.value;
+  const workspaceRef = props.workspaceRef;
   systemPromptLoading.value = true;
   try {
-    systemPromptContent.value = await getAgentSystemPrompt(selectedAgentId.value);
+    const content = workspaceRef
+      ? await getWorkspaceAgentSystemPrompt(workspaceRef, agentId)
+      : await getAgentSystemPrompt(agentId);
+    if (requestId !== systemPromptRequestId) return;
+    systemPromptContent.value = content;
   } catch (e) {
+    if (requestId !== systemPromptRequestId) return;
     systemPromptContent.value = t("common.loadFailed", normalizeAppError(e).message);
   } finally {
-    systemPromptLoading.value = false;
+    if (requestId === systemPromptRequestId) {
+      systemPromptLoading.value = false;
+    }
   }
 }
 
 async function loadPromptStats() {
   if (!selectedAgentId.value) return;
   const requestId = ++promptStatsRequestId;
+  const agentId = selectedAgentId.value;
+  const workspaceRef = props.workspaceRef;
   promptStatsLoading.value = true;
   try {
-    const stats = await getAgentSystemPromptStats(selectedAgentId.value);
+    const stats = workspaceRef
+      ? await getWorkspaceAgentSystemPromptStats(
+          workspaceRef,
+          agentId,
+          modelStore.selectedModelId,
+        )
+      : await getAgentSystemPromptStats(agentId);
     if (requestId !== promptStatsRequestId) return;
     promptStats.value = stats;
     promptStatsError.value = "";
@@ -669,26 +843,43 @@ async function loadPromptStats() {
 // ── Rule CRUD ──
 async function loadRules() {
   if (!selectedAgentId.value) return;
+  const requestId = ++ruleRequestId;
+  const agentId = selectedAgentId.value;
+  const workspaceRef = props.workspaceRef;
   ruleLoading.value = true;
   try {
-    ruleItems.value = await listRules(selectedAgentId.value);
+    const items = workspaceRef
+      ? await listRules(workspaceRef, agentId)
+      : await listAppRules(agentId);
+    if (requestId !== ruleRequestId) return;
+    ruleItems.value = items;
   } catch (e) {
+    if (requestId !== ruleRequestId) return;
     console.error("list_rules failed:", e);
     ruleItems.value = [];
   } finally {
-    ruleLoading.value = false;
+    if (requestId === ruleRequestId) {
+      ruleLoading.value = false;
+    }
   }
 }
 
 async function loadInjectedItems() {
   if (!selectedAgentId.value) return;
+  const requestId = ++injectedRequestId;
+  const agentId = selectedAgentId.value;
+  const workspaceRef = props.workspaceRef;
   injectedLoading.value = true;
   try {
-    const items = await listAgentInjectedItems(
-      selectedAgentId.value,
-      null,
-      modelStore.selectedModelId,
-    );
+    const items = workspaceRef
+      ? await listWorkspaceAgentInjectedItems(
+          workspaceRef,
+          agentId,
+          null,
+          modelStore.selectedModelId,
+        )
+      : await listAgentInjectedItems(agentId, null, modelStore.selectedModelId);
+    if (requestId !== injectedRequestId) return;
     injectedItems.value = items;
     if (selected.value?.type === "injected") {
       const selectedId = selected.value.item.id;
@@ -700,10 +891,13 @@ async function loadInjectedItems() {
       }
     }
   } catch (e) {
+    if (requestId !== injectedRequestId) return;
     console.error("list_agent_injected_items failed:", e);
     injectedItems.value = [];
   } finally {
-    injectedLoading.value = false;
+    if (requestId === injectedRequestId) {
+      injectedLoading.value = false;
+    }
   }
 }
 
@@ -722,12 +916,13 @@ async function setSelectedToolDirectLoadState(directLoad: boolean) {
   const item = selectedInjectedItem();
   const tool = selectedToolDefinition.value;
   if (!selectedAgentId.value || !item || item.kind !== "tools" || !tool) return;
+  if (!props.workspaceRef) return;
   if (!selectedToolCanConfigureDirectLoad.value || toolLoadSaving.value) return;
 
   toolLoadSaving.value = true;
   toolLoadConfigError.value = "";
   try {
-    await setAgentToolDirectLoad(selectedAgentId.value, tool.name, directLoad);
+    await setAgentToolDirectLoad(props.workspaceRef, selectedAgentId.value, tool.name, directLoad);
     await loadInjectedItems();
     void loadPromptStats();
   } catch (e) {
@@ -740,6 +935,7 @@ async function setSelectedToolDirectLoadState(directLoad: boolean) {
 
 async function setToolEnabledState(item: InjectedPromptItem, enabled: boolean) {
   if (!selectedAgentId.value || item.kind !== "tools") return;
+  if (!props.workspaceRef) return;
   if (!canToggleToolEnabled(item) || toolEnabledSavingId.value) return;
 
   toolEnabledSavingId.value = item.id;
@@ -748,7 +944,7 @@ async function setToolEnabledState(item: InjectedPromptItem, enabled: boolean) {
   const previous = record?.enabled;
   if (record) record.enabled = enabled;
   try {
-    await setAgentToolEnabled(selectedAgentId.value, item.title, enabled);
+    await setAgentToolEnabled(props.workspaceRef, selectedAgentId.value, item.title, enabled);
     await loadInjectedItems();
     void loadPromptStats();
   } catch (e) {
@@ -768,6 +964,7 @@ async function setSelectedToolEnabledState(enabled: boolean) {
 
 async function setInjectionEnabledState(item: InjectedPromptItem, enabled: boolean) {
   if (!selectedAgentId.value || !canToggleInjectionItem(item) || injectionSavingId.value) return;
+  if (!props.workspaceRef) return;
 
   injectionSavingId.value = item.id;
   injectionError.value = "";
@@ -775,7 +972,7 @@ async function setInjectionEnabledState(item: InjectedPromptItem, enabled: boole
   const previous = record?.enabled;
   if (record) record.enabled = enabled;
   try {
-    await setAgentInjectionEnabled(selectedAgentId.value, item.id, enabled);
+    await setAgentInjectionEnabled(props.workspaceRef, selectedAgentId.value, item.id, enabled);
     envRenderedContent.value = "";
     await loadInjectedItems();
     void loadPromptStats();
@@ -802,7 +999,9 @@ async function selectRuleItem(rule: RuleItem) {
   confirmingDeleteRule.value = null;
   ruleContentLoading.value = true;
   try {
-    ruleContent.value = await readRule(selectedAgentId.value, ruleKey(rule));
+    ruleContent.value = props.workspaceRef
+      ? await readRule(props.workspaceRef, selectedAgentId.value, ruleKey(rule))
+      : await readAppRule(selectedAgentId.value, ruleKey(rule));
   } catch (e) {
     ruleContent.value = t("common.readFailed", normalizeAppError(e).message);
   } finally {
@@ -812,10 +1011,11 @@ async function selectRuleItem(rule: RuleItem) {
 
 async function setRuleEnabledState(rule: RuleItem, enabled: boolean) {
   if (!canToggleRule(rule)) return;
+  if (!props.workspaceRef) return;
   const previous = rule.enabled;
   rule.enabled = enabled;
   try {
-    await setRuleEnabled(selectedAgentId.value, ruleKey(rule), enabled);
+    await setRuleEnabled(props.workspaceRef, selectedAgentId.value, ruleKey(rule), enabled);
     void loadPromptStats();
   } catch (e) {
     console.error("set_rule_enabled failed:", e);
@@ -833,8 +1033,9 @@ function startEditRule() {
 async function saveEditRule() {
   const sr = selectedRule();
   if (!sr || !canEditRule(sr)) return;
+  if (!props.workspaceRef) return;
   try {
-    await saveRule(selectedAgentId.value, sr.fileName, ruleEditContent.value);
+    await saveRule(props.workspaceRef, selectedAgentId.value, sr.fileName, ruleEditContent.value);
     ruleContent.value = ruleEditContent.value;
     ruleEditing.value = false;
     await loadRules();
@@ -852,6 +1053,7 @@ function cancelEditRule() {
 }
 
 function startCreateRule() {
+  if (!props.workspaceRef) return;
   closeRuleContextMenu();
   confirmingDeleteRule.value = null;
   collapsedSections.value.rules = false;
@@ -863,9 +1065,10 @@ function startCreateRule() {
 async function commitCreateRule() {
   const name = ruleNewName.value.trim();
   if (!name) return;
+  if (!props.workspaceRef) return;
   try {
     const content = ruleNewContent.value || `# ${name}\n\n`;
-    const item = await saveRule(selectedAgentId.value, name, content);
+    const item = await saveRule(props.workspaceRef, selectedAgentId.value, name, content);
     ruleCreating.value = false;
     await loadRules();
     await loadPromptStats();
@@ -879,8 +1082,9 @@ async function commitCreateRule() {
 async function removeRule(rule: RuleItem) {
   closeRuleContextMenu();
   if (!canEditRule(rule)) return;
+  if (!props.workspaceRef) return;
   try {
-    await deleteRule(selectedAgentId.value, rule.fileName);
+    await deleteRule(props.workspaceRef, selectedAgentId.value, rule.fileName);
     if (selectedRuleKey() === ruleKey(rule)) {
       selected.value = null;
       ruleContent.value = "";
@@ -894,40 +1098,115 @@ async function removeRule(rule: RuleItem) {
   }
 }
 
-function onRuleDragStart(index: number, e: DragEvent) {
-  closeRuleContextMenu();
-  ruleDragIndex.value = index;
-  if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+interface AgentRuleInternalDragData {
+  sourceKey: string;
+  label: string;
+  originalRules: RuleItem[];
+  previewRules?: RuleItem[];
 }
-function onRuleDragOver(index: number, e: DragEvent) {
-  e.preventDefault();
-  ruleDragOverIndex.value = index;
-}
-function onRuleDragLeave() {
-  ruleDragOverIndex.value = null;
-}
-async function onRuleDrop(index: number) {
-  const from = ruleDragIndex.value;
-  ruleDragOverIndex.value = null;
-  ruleDragIndex.value = null;
-  if (from === null || from === index) return;
-  const arr = [...ruleItems.value];
-  const [moved] = arr.splice(from, 1);
-  arr.splice(index, 0, moved);
-  ruleItems.value = arr;
-  const fileNames = arr.map(r => ruleKey(r));
+
+async function persistRuleOrder(rules: RuleItem[]) {
+  if (!props.workspaceRef) return;
+  ruleItems.value = [...rules];
+  const fileNames = rules.map(r => ruleKey(r));
   try {
-    await setRuleOrder(selectedAgentId.value, fileNames);
+    await setRuleOrder(props.workspaceRef, selectedAgentId.value, fileNames);
     void loadPromptStats();
   } catch (e) {
     console.error("set_rule_order failed:", e);
     await loadRules();
   }
 }
-function onRuleDragEnd() {
-  ruleDragIndex.value = null;
-  ruleDragOverIndex.value = null;
+
+function onRulePointerDown(index: number, rule: RuleItem, event: PointerEvent) {
+  if (!props.workspaceRef || rule.readOnly) return;
+  const originalRules = [...ruleItems.value];
+  internalDrag.start(event, {
+    id: `agent-rule:${ruleKey(rule)}`,
+    payload: {
+      type: AGENT_RULE_INTERNAL_DRAG_TYPE,
+      data: {
+        sourceKey: ruleKey(rule),
+        label: rule.title,
+        originalRules,
+      } satisfies AgentRuleInternalDragData,
+    },
+    preview: { label: rule.title, kind: "item" },
+    allowedOperations: ["move"],
+    onActivated: () => {
+      closeRuleContextMenu();
+      ruleDragIndex.value = index;
+    },
+    onFinished: () => {
+      rulePreviewOrder.value = null;
+      ruleDragIndex.value = null;
+      ruleDragOverIndex.value = null;
+    },
+  });
 }
+
+const ruleDropTarget: InternalDropTargetRegistration<
+  AgentRuleInternalDragData,
+  { targetKey: string; position: "before" | "after" }
+> = {
+  id: "agent-rule-list",
+  root: () => agentViewRef.value,
+  accepts: (source) => source.payload.type === AGENT_RULE_INTERNAL_DRAG_TYPE,
+  resolve: ({ source, point, hit }) => {
+    const row = hit.closest<HTMLElement>(".rule-item[data-rule-index]");
+    if (!row || !agentViewRef.value?.contains(row)) {
+      if (!hit.closest(".rule-drag-zone")) return null;
+      const data = source.payload.data;
+      const remaining = data.originalRules.filter((rule) => ruleKey(rule) !== data.sourceKey);
+      const last = remaining[remaining.length - 1];
+      return last
+        ? {
+            key: `rule:${ruleKey(last)}:after`,
+            operation: "move",
+            intent: { targetKey: ruleKey(last), position: "after" },
+          }
+        : null;
+    }
+    const index = Number(row.dataset.ruleIndex);
+    const targetKey = row.dataset.ruleKey ?? "";
+    const data = source.payload.data;
+    if (!Number.isInteger(index) || !targetKey) return null;
+    if (targetKey === data.sourceKey) {
+      const current = internalDrag.activeTarget.value?.decision;
+      return current?.key.startsWith("rule:")
+        ? current as InternalDropDecision<{ targetKey: string; position: "before" | "after" }>
+        : null;
+    }
+    const bounds = row.getBoundingClientRect();
+    const position = point.y < bounds.top + bounds.height / 2 ? "before" : "after";
+    return { key: `rule:${targetKey}:${position}`, operation: "move", intent: { targetKey, position } };
+  },
+  onTargetChange: (decision) => {
+    const source = internalDrag.source.value;
+    if (source?.payload.type !== AGENT_RULE_INTERNAL_DRAG_TYPE) return;
+    const data = source.payload.data as AgentRuleInternalDragData;
+    if (!decision) {
+      rulePreviewOrder.value = null;
+      ruleDragIndex.value = data.originalRules.findIndex((rule) => ruleKey(rule) === data.sourceKey);
+      return;
+    }
+    const moved = data.originalRules.find((rule) => ruleKey(rule) === data.sourceKey);
+    if (!moved) return;
+    const next = data.originalRules.filter((rule) => ruleKey(rule) !== data.sourceKey);
+    const targetIndex = next.findIndex((rule) => ruleKey(rule) === decision.intent.targetKey);
+    if (targetIndex < 0) return;
+    const insertIndex = targetIndex + (decision.intent.position === "after" ? 1 : 0);
+    next.splice(insertIndex, 0, moved);
+    data.previewRules = next;
+    rulePreviewOrder.value = next;
+    ruleDragIndex.value = insertIndex;
+    ruleDragOverIndex.value = null;
+  },
+  drop: async ({ source }) => {
+    await persistRuleOrder(source.payload.data.previewRules ?? source.payload.data.originalRules);
+  },
+  previewMode: ({ hit }) => hit.closest(".rule-drag-zone") ? "floating-with-gap" : "floating",
+};
 
 function openRuleContextMenu(event: MouseEvent, rule: RuleItem | null = null) {
   event.preventDefault();
@@ -1021,18 +1300,9 @@ function formatDate(ts: number): string {
 }
 
 onMounted(async () => {
+  unregisterRuleDropTarget = internalDrag.registerTarget(ruleDropTarget);
   agentViewUnmounted = false;
-  // Use background warmup cache if available
-  const cachedAgents = getWarmup<AgentInfo[]>("agent:agents");
-  const cachedSubagents = getWarmup<AgentInfo[]>("agent:subagents");
-  if (cachedAgents && cachedSubagents) {
-    allAgents.value = [...cachedAgents, ...cachedSubagents];
-    if (!selectedAgentId.value) {
-      selectedAgentId.value = preferredAgentId(allAgents.value);
-    }
-  } else {
-    await loadAllAgents();
-  }
+  await loadAllAgents();
   if (agentViewUnmounted) return;
   if (selectedAgentId.value) {
     loadAgentData();
@@ -1062,6 +1332,8 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  unregisterRuleDropTarget?.();
+  unregisterRuleDropTarget = null;
   agentViewUnmounted = true;
   closeRuleContextMenu();
   document.removeEventListener("mousemove", onResizeMove);
@@ -1075,24 +1347,43 @@ onUnmounted(() => {
 });
 
 watch(
-  () => props.workingDir,
-  () => {
-    loadAllAgents().then(() => {
-      if (selectedAgentId.value) loadAgentData();
-    });
+  () => [
+    props.workspaceRef?.checkoutId ?? "",
+    props.workspaceRef?.expectedGeneration ?? -1,
+    props.workingDir,
+  ] as const,
+  async () => {
+    resetAgentDetailState();
+    await loadAllAgents();
+    if (selectedAgentId.value) await loadAgentData();
+  },
+);
+
+watch(
+  () => props.workspaceRef ? "" : props.agentList.map((agent) => agent.id).join("\u0000"),
+  async () => {
+    if (props.workspaceRef) return;
+    resetAgentDetailState();
+    await loadAllAgents();
+    if (selectedAgentId.value) await loadAgentData();
   },
 );
 
 watch(
   () => modelStore.selectedModelId,
   () => {
-    if (selectedAgentId.value) void loadInjectedItems();
+    if (!selectedAgentId.value) return;
+    void loadPromptStats();
+    void loadInjectedItems();
+    if (envPreviewMode.value === "rendered") {
+      void loadRenderedEnvPrompt();
+    }
   },
 );
 </script>
 
 <template>
-  <div class="agent-view">
+  <div ref="agentViewRef" class="agent-view">
     <div class="agent-sidebar" :style="{ width: sidebarWidth + 'px' }">
       <div class="sidebar-title">Agent</div>
       <div v-if="allAgents.length === 0" class="sidebar-empty">{{ t("common.loading") }}</div>
@@ -1106,6 +1397,9 @@ watch(
       >
         <div class="agent-tab-head">
           <div class="agent-tab-name">{{ ag.name }}</div>
+          <span v-if="agentProjectTypesLabel(ag)" class="agent-tab-project-types">
+            {{ agentProjectTypesLabel(ag) }}
+          </span>
         </div>
         <div class="agent-tab-desc">{{ ag.description }}</div>
       </button>
@@ -1117,7 +1411,7 @@ watch(
         <div class="dir-toolbar">
           <span class="dir-title">Context</span>
           <div class="dir-actions">
-            <BaseButton class="dir-btn" :aria-label="t('agent.newRule')" @click="startCreateRule" :title="t('agent.newRule')">+</BaseButton>
+            <BaseButton class="dir-btn" :aria-label="t('agent.newRule')" @click="startCreateRule" :disabled="!props.workspaceRef" :title="t('agent.newRule')">+</BaseButton>
             <BaseButton class="dir-btn" :aria-label="t('common.refresh')" @click="refreshAll" :disabled="systemPromptLoading || ruleLoading" :title="t('common.refresh')">
               <span :class="{ spinning: systemPromptLoading || ruleLoading }">&#8635;</span>
             </BaseButton>
@@ -1148,9 +1442,9 @@ watch(
             </button>
             <template v-if="!isSectionCollapsed('rules')">
               <div v-if="(ruleLoading || injectedLoading) && ruleSectionEntryCount === 0" class="dir-empty-inline">{{ t("common.loading") }}</div>
-              <div class="rule-drag-zone" @dragover.prevent>
+              <div class="rule-drag-zone">
                 <button
-                  v-for="(rule, idx) in ruleItems"
+                  v-for="(rule, idx) in displayedRuleItems"
                   :key="ruleKey(rule)"
                   type="button"
                   class="kb-item rule-item"
@@ -1158,19 +1452,20 @@ watch(
                     selected: selected?.type === 'rule' && selectedRuleKey() === ruleKey(rule),
                     'rule-context-target': ruleKey(ruleContextMenu?.rule) === ruleKey(rule) && selectedRuleKey() !== ruleKey(rule),
                     'rule-disabled': !rule.enabled,
-                    'rule-dragging': ruleDragIndex === idx,
+                    'rule-dragging': ruleDragIndex === idx && internalDrag.previewMode.value === 'floating',
+                    'rule-drop-gap': ruleDragIndex === idx && internalDrag.previewMode.value === 'floating-with-gap',
                     'rule-drag-over': ruleDragOverIndex === idx && ruleDragIndex !== idx,
                   }"
-                  draggable="true"
-                  @dragstart="onRuleDragStart(idx, $event)"
-                  @dragover="onRuleDragOver(idx, $event)"
-                  @dragleave="onRuleDragLeave"
-                  @drop.prevent="onRuleDrop(idx)"
-                  @dragend="onRuleDragEnd"
+                  :data-rule-index="idx"
+                  :data-rule-key="ruleKey(rule)"
                   @contextmenu.prevent.stop="openRuleContextMenu($event, rule)"
                   @click.stop="selectRuleItem(rule)"
                 >
-                  <span class="rule-order-num" title="Drag to reorder">{{ idx + 1 }}</span>
+                  <span
+                    class="rule-order-num"
+                    title="Drag to reorder"
+                    @pointerdown.stop="onRulePointerDown(idx, rule, $event)"
+                  >{{ idx + 1 }}</span>
                   <label class="rule-toggle-label" @click.stop>
                     <BaseCheckbox
                       :model-value="rule.enabled"
@@ -1302,6 +1597,7 @@ watch(
                 :class="{
                   selected: selected?.type === 'injected' && selectedInjectedItem()?.id === item.id,
                   'tool-disabled': !toolItemEnabled(item),
+                  'tool-unavailable': !toolItemRuntimeAvailable(item),
                 }"
                 @click="selectInjectedItem(item)"
               >
@@ -1453,6 +1749,11 @@ watch(
             <div class="tool-detail">
               <div class="tool-summary-line">{{ selectedToolLoadSummary }}</div>
               <div class="tool-summary-line">{{ selectedToolFooterMeta }}</div>
+
+              <section v-if="!selectedToolRuntimeAvailable" class="tool-section tool-availability-section">
+                <div class="tool-section-title">{{ t("agent.tool.currentlyUnavailable") }}</div>
+                <div class="tool-availability-reason">{{ selectedToolUnavailableReason }}</div>
+              </section>
 
               <section class="tool-section tool-load-config-section">
                 <div class="tool-section-title">{{ t("agent.tool.loadConfig.title") }}</div>
@@ -1664,8 +1965,10 @@ watch(
                     <span class="dashboard-stat-value">{{ formatCount(promptDashboard.skillToolCount) }}</span>
                   </div>
                   <div class="dashboard-stat-cell">
-                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.disabledTools") }}</span>
-                    <span class="dashboard-stat-value">{{ formatCount(promptDashboard.disabledToolCount) }}</span>
+                    <span class="dashboard-stat-label">{{ t("agent.dashboard.runtime.restrictedTools") }}</span>
+                    <span class="dashboard-stat-value">
+                      {{ formatCount(promptDashboard.unavailableToolCount) }} / {{ formatCount(promptDashboard.disabledToolCount) }}
+                    </span>
                   </div>
                 </div>
                 <div v-if="promptStatsError" class="dashboard-inline-note">{{ promptStatsError }}</div>
@@ -1683,7 +1986,7 @@ watch(
         :z-index="80"
         @close="closeRuleContextMenu"
       >
-          <button type="button" class="agent-rule-ctx-item" @click="startCreateRule">
+          <button type="button" class="agent-rule-ctx-item" :disabled="!props.workspaceRef" @click="startCreateRule">
             <LucideIcon :icon="Plus" :size="13" />
             {{ t("agent.newRule") }}
           </button>
@@ -1780,6 +2083,15 @@ watch(
   align-items: center;
   gap: 6px;
   min-width: 0;
+}
+
+.agent-tab-project-types {
+  margin-left: auto;
+  color: var(--text-tertiary, var(--text-secondary));
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.3;
+  white-space: nowrap;
 }
 
 .agent-tab.active .agent-tab-name {
@@ -2601,6 +2913,11 @@ watch(
   border-top: 2px solid var(--accent-color);
 }
 
+.rule-item.rule-drop-gap {
+  opacity: 0;
+  transition: none;
+}
+
 .rule-item.rule-context-target {
   background: color-mix(in srgb, var(--active-bg) 52%, var(--hover-bg) 48%);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-border) 52%, transparent);
@@ -2615,6 +2932,7 @@ watch(
   color: var(--text-secondary);
   opacity: 0.6;
   cursor: grab;
+  touch-action: none;
 }
 .rule-order-num:hover {
   opacity: 1;
@@ -2699,6 +3017,10 @@ watch(
 
 .tool-item.tool-disabled {
   opacity: 0.6;
+}
+
+.tool-item.tool-unavailable .tool-title {
+  color: var(--text-secondary);
 }
 
 /* Soften the enable checkboxes in the list: dozens of solid accent squares
@@ -2866,6 +3188,17 @@ watch(
 }
 
 .tool-config-disabled-note {
+  color: var(--status-warn-fg);
+}
+
+.tool-availability-section {
+  padding-inline-start: 10px;
+  border-inline-start: 2px solid var(--status-warn-border);
+}
+
+.tool-availability-reason {
+  font-size: 13px;
+  line-height: 1.6;
   color: var(--status-warn-fg);
 }
 

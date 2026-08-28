@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
@@ -26,6 +26,7 @@ import { useChatChangesStore } from "../stores/chatChanges";
 import { useModelStore } from "../stores/model";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import { useUiStore } from "../stores/ui";
 import { useSkills } from "../composables/useSkills";
 import {
@@ -64,8 +65,9 @@ const chatChangesStore = useChatChangesStore();
 const modelStore = useModelStore();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const uiStore = useUiStore();
-const { skillItems } = useSkills();
+const { skillItems, loadSkills } = useSkills();
 const contextReviewFiles = ref(new Map<string, ManagedLocalFileAttachment>());
 
 const workspaceRef = ref<HTMLElement | null>(null);
@@ -563,11 +565,14 @@ async function reviewSessionContext(request?: string | SessionContextExportReque
 
   const source = chatStore.sessions.find((session) => session.id === sid);
   const sourceTitle = source?.title || sid.slice(0, 8);
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
   chatStore.newChat({ persistSelection: props.persistSessionSelection });
 
   let reviewSessionId = "";
   try {
     reviewSessionId = await createSession({
+      workspaceRef,
       title: t("chat.contextReviewTitle", sourceTitle),
       sessionType: "chat",
       agentId: agentStore.selectedAgentId || null,
@@ -624,9 +629,25 @@ async function reviewSessionContext(request?: string | SessionContextExportReque
   }
 }
 
+defineExpose({
+  exportSessionContext,
+  reviewSessionContext,
+});
+
 onMounted(() => {
   nextTick(connectWorkspaceResizeObserver);
 });
+
+watch(
+  () => {
+    const scope = workspaceContextStore.focusedWorkspaceRef;
+    return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
+  },
+  (scopeKey) => {
+    if (scopeKey) void loadSkills();
+  },
+  { immediate: true },
+);
 
 onUnmounted(() => {
   disconnectWorkspaceResizeObserver();
@@ -690,10 +711,11 @@ onUnmounted(() => {
       :unity-launching="projectStore.unityLaunching"
       :unity-launch-state="projectStore.unityLaunchState"
       :unity-connection-status="projectStore.unityConnectionStatus"
+      :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
+      :project-services="projectStore.detectedServices"
       :working-dir="projectStore.workingDir"
       :scan-phase="projectStore.scanPhase"
       :last-scan-stats="projectStore.lastScanStats"
-      :is-unity-project="projectStore.isUnityProject"
       :skills="skillItems"
       :managed-local-files="activeContextReviewFiles"
       :streaming-session-ids="chatStore.streamingSessionIds"
@@ -745,6 +767,7 @@ onUnmounted(() => {
         :layout="isVerticalLayout ? 'bottom' : 'side'"
         :max-side-width="assistantSidebarMaxSideWidth"
         :storage-scope="sessionPanelStorageScope"
+        :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
       />
     </Transition>
   </div>

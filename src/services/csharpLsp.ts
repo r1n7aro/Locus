@@ -6,26 +6,34 @@ import type {
   UnitySemanticState,
 } from "../types";
 import { ipcInvoke } from "./ipc";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+  type WorkspaceRef,
+} from "./project";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 
-export function csharpLspGetStatus(): Promise<CsharpLspStatus> {
-  return ipcInvoke<CsharpLspStatus>("csharp_lsp_get_status", undefined, {
+export function csharpLspGetStatus(workspaceRef: WorkspaceRef): Promise<CsharpLspStatus> {
+  return ipcInvoke<CsharpLspStatus>("csharp_lsp_get_status", { workspaceRef }, {
     operation: "csharpLspGetStatus",
     notify: false,
     throwOnError: true,
   });
 }
 
-export function csharpLspSetEnabled(value: boolean): Promise<CsharpLspStatus> {
+export function csharpLspSetEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<CsharpLspStatus> {
   return ipcInvoke<CsharpLspStatus>(
     "csharp_lsp_set_enabled",
-    { value },
+    { value, workspaceRef },
     { operation: "csharpLspSetEnabled", notify: false, throwOnError: true },
   );
 }
 
-export function csharpLspRestart(): Promise<CsharpLspStatus> {
-  return ipcInvoke<CsharpLspStatus>("csharp_lsp_restart", undefined, {
+export function csharpLspRestart(workspaceRef: WorkspaceRef): Promise<CsharpLspStatus> {
+  return ipcInvoke<CsharpLspStatus>("csharp_lsp_restart", { workspaceRef }, {
     operation: "csharpLspRestart",
     notify: false,
     throwOnError: true,
@@ -42,42 +50,54 @@ export function codeAnalysisToolsGetConfig(): Promise<CodeAnalysisToolsConfig> {
 
 export function codeAnalysisToolsSetConfig(
   value: CodeAnalysisToolsConfig,
+  workspaceRef: WorkspaceRef,
 ): Promise<CodeAnalysisToolsConfig> {
   return ipcInvoke<CodeAnalysisToolsConfig>(
     "code_analysis_tools_set_config",
-    { value },
+    { value, workspaceRef },
     { operation: "codeAnalysisToolsSetConfig", notify: false, throwOnError: true },
   );
 }
 
-export function unitySidecarCompilerGetStatus(): Promise<CsharpCompileStatus> {
-  return ipcInvoke<CsharpCompileStatus>("unity_sidecar_compiler_get_status", undefined, {
+export function unitySidecarCompilerGetStatus(
+  workspaceRef: WorkspaceRef,
+): Promise<CsharpCompileStatus> {
+  return ipcInvoke<CsharpCompileStatus>("unity_sidecar_compiler_get_status", { workspaceRef }, {
     operation: "unitySidecarCompilerGetStatus",
     notify: false,
     throwOnError: true,
   });
 }
 
-export function unitySidecarCompilerSetEnabled(value: boolean): Promise<CsharpCompileStatus> {
+export function unitySidecarCompilerSetEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<CsharpCompileStatus> {
   return ipcInvoke<CsharpCompileStatus>(
     "unity_sidecar_compiler_set_enabled",
-    { value },
+    { value, workspaceRef },
     { operation: "unitySidecarCompilerSetEnabled", notify: false, throwOnError: true },
   );
 }
 
-export function unityNonPublicAccessSetEnabled(value: boolean): Promise<CsharpCompileStatus> {
+export function unityNonPublicAccessSetEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<CsharpCompileStatus> {
   return ipcInvoke<CsharpCompileStatus>(
     "unity_non_public_access_set_enabled",
-    { value },
+    { value, workspaceRef },
     { operation: "unityNonPublicAccessSetEnabled", notify: false, throwOnError: true },
   );
 }
 
-export function unityHotReloadSetEnabled(value: boolean): Promise<CsharpCompileStatus> {
+export function unityHotReloadSetEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<CsharpCompileStatus> {
   return ipcInvoke<CsharpCompileStatus>(
     "unity_hot_reload_set_enabled",
-    { value },
+    { value, workspaceRef },
     { operation: "unityHotReloadSetEnabled", notify: false, throwOnError: true },
   );
 }
@@ -93,8 +113,8 @@ export interface HotReloadPreflight {
 
 /** Enable-time check: the connected editor's Code Optimization, for the
  * Debug-mode gate the hot-reload toggles run before turning the feature on. */
-export function unityHotReloadPreflight(): Promise<HotReloadPreflight> {
-  return ipcInvoke<HotReloadPreflight>("unity_hot_reload_preflight", undefined, {
+export function unityHotReloadPreflight(workspaceRef: WorkspaceRef): Promise<HotReloadPreflight> {
+  return ipcInvoke<HotReloadPreflight>("unity_hot_reload_preflight", { workspaceRef }, {
     operation: "unityHotReloadPreflight",
     notify: false,
     throwOnError: true,
@@ -107,10 +127,12 @@ export interface CodeOptimizationResult {
 
 /** Switch the connected editor's Code Optimization to Debug (the auto-fix the
  * user confirms in the enable-time prompt). Triggers a Unity recompile. */
-export function unityHotReloadSetCodeOptimizationDebug(): Promise<CodeOptimizationResult> {
+export function unityHotReloadSetCodeOptimizationDebug(
+  workspaceRef: WorkspaceRef,
+): Promise<CodeOptimizationResult> {
   return ipcInvoke<CodeOptimizationResult>(
     "unity_hot_reload_set_code_optimization_debug",
-    undefined,
+    { workspaceRef },
     {
       operation: "unityHotReloadSetCodeOptimizationDebug",
       notify: false,
@@ -124,10 +146,11 @@ export function unityHotReloadSetCodeOptimizationDebug(): Promise<CodeOptimizati
  * Unity recompile. */
 export function unityHotReloadSetCodeOptimization(
   level: "debug" | "release",
+  workspaceRef: WorkspaceRef,
 ): Promise<CodeOptimizationResult> {
   return ipcInvoke<CodeOptimizationResult>(
     "unity_hot_reload_set_code_optimization",
-    { level },
+    { level, workspaceRef },
     {
       operation: "unityHotReloadSetCodeOptimization",
       notify: false,
@@ -146,10 +169,11 @@ export interface PlayModeReloadResult {
  * recompile. */
 export function unityHotReloadSetPlayModeReload(
   domainReload: boolean,
+  workspaceRef: WorkspaceRef,
 ): Promise<PlayModeReloadResult> {
   return ipcInvoke<PlayModeReloadResult>(
     "unity_hot_reload_set_play_mode_reload",
-    { domainReload },
+    { domainReload, workspaceRef },
     {
       operation: "unityHotReloadSetPlayModeReload",
       notify: false,
@@ -158,8 +182,8 @@ export function unityHotReloadSetPlayModeReload(
   );
 }
 
-export function unityRecompileRun(): Promise<string> {
-  return ipcInvoke<string>("unity_recompile_run", undefined, {
+export function unityRecompileRun(workspaceRef: WorkspaceRef): Promise<string> {
+  return ipcInvoke<string>("unity_recompile_run", { workspaceRef }, {
     operation: "unityRecompileRun",
     notify: false,
     throwOnError: true,
@@ -174,8 +198,8 @@ export interface HotReloadSelfTestEvent {
   failed: number;
 }
 
-export function unityHotReloadSelfTestRun(): Promise<void> {
-  return ipcInvoke<void>("unity_hot_reload_selftest_run", undefined, {
+export function unityHotReloadSelfTestRun(workspaceRef: WorkspaceRef): Promise<void> {
+  return ipcInvoke<void>("unity_hot_reload_selftest_run", { workspaceRef }, {
     operation: "unityHotReloadSelfTestRun",
     notify: false,
     throwOnError: true,
@@ -183,9 +207,21 @@ export function unityHotReloadSelfTestRun(): Promise<void> {
 }
 
 export function subscribeUnityHotReloadSelfTest(
+  workspaceRef: WorkspaceRef,
   handler: (payload: HotReloadSelfTestEvent) => void,
 ): Promise<RuntimeUnsubscribe> {
-  return getLocusRuntime().subscribe<HotReloadSelfTestEvent>("unity-hotreload-selftest", handler);
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<HotReloadSelfTestEvent>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "unity-hotreload-selftest") return;
+      if (event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
+  );
 }
 
 export type UnityStateProbeTier =
@@ -198,6 +234,10 @@ export type UnityStateProbeTier =
   | "unsupported";
 
 export interface UnityStateProbeStatus {
+  checkoutId: string;
+  workspaceGeneration: number;
+  serviceInstanceId?: string | null;
+  serviceGeneration?: number | null;
   enabled: boolean;
   supported: boolean;
   tier: UnityStateProbeTier;
@@ -209,32 +249,35 @@ export interface UnityStateProbeStatus {
   updatedAtMs: number;
 }
 
-export function unityStateProbeGetStatus(): Promise<UnityStateProbeStatus> {
-  return ipcInvoke<UnityStateProbeStatus>("get_unity_state_probe_status", undefined, {
+export function unityStateProbeGetStatus(workspaceRef: WorkspaceRef): Promise<UnityStateProbeStatus> {
+  return ipcInvoke<UnityStateProbeStatus>("get_unity_state_probe_status", { workspaceRef }, {
     operation: "unityStateProbeGetStatus",
     notify: false,
     throwOnError: true,
   });
 }
 
-export function unityStateProbeSetEnabled(value: boolean): Promise<UnityStateProbeStatus> {
+export function unityStateProbeSetEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<UnityStateProbeStatus> {
   return ipcInvoke<UnityStateProbeStatus>(
     "set_unity_state_probe_enabled",
-    { value },
+    { value, workspaceRef },
     { operation: "unityStateProbeSetEnabled", notify: false, throwOnError: true },
   );
 }
 
-export function unityStateProbeSelfTestRun(): Promise<void> {
-  return ipcInvoke<void>("unity_state_probe_selftest_run", undefined, {
+export function unityStateProbeSelfTestRun(workspaceRef: WorkspaceRef): Promise<void> {
+  return ipcInvoke<void>("unity_state_probe_selftest_run", { workspaceRef }, {
     operation: "unityStateProbeSelfTestRun",
     notify: false,
     throwOnError: true,
   });
 }
 
-export function unitySemanticStateGet(): Promise<UnitySemanticState> {
-  return ipcInvoke<UnitySemanticState>("get_unity_semantic_state", undefined, {
+export function unitySemanticStateGet(workspaceRef: WorkspaceRef): Promise<UnitySemanticState> {
+  return ipcInvoke<UnitySemanticState>("get_unity_semantic_state", { workspaceRef }, {
     operation: "unitySemanticStateGet",
     notify: false,
     throwOnError: true,
@@ -242,9 +285,21 @@ export function unitySemanticStateGet(): Promise<UnitySemanticState> {
 }
 
 export function subscribeUnityStateProbeSelfTest(
+  workspaceRef: WorkspaceRef,
   handler: (payload: HotReloadSelfTestEvent) => void,
 ): Promise<RuntimeUnsubscribe> {
-  return getLocusRuntime().subscribe<HotReloadSelfTestEvent>("unity-state-probe-selftest", handler);
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<HotReloadSelfTestEvent>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "unity-state-probe-selftest") return;
+      if (event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
+  );
 }
 
 export function unityNativeBridgeGetEnabled(): Promise<boolean> {
@@ -255,24 +310,29 @@ export function unityNativeBridgeGetEnabled(): Promise<boolean> {
   });
 }
 
-export function unityNativeBridgeSetEnabled(value: boolean): Promise<boolean> {
+export function unityNativeBridgeSetEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<boolean> {
   return ipcInvoke<boolean>(
     "set_unity_native_bridge_enabled",
-    { value },
+    { value, workspaceRef },
     { operation: "unityNativeBridgeSetEnabled", notify: false, throwOnError: true },
   );
 }
 
-export function unityNativeBrokerGetStatus(): Promise<UnityNativeBrokerStatus | null> {
-  return ipcInvoke<UnityNativeBrokerStatus | null>("get_unity_native_broker_status", undefined, {
+export function unityNativeBrokerGetStatus(
+  workspaceRef: WorkspaceRef,
+): Promise<UnityNativeBrokerStatus | null> {
+  return ipcInvoke<UnityNativeBrokerStatus | null>("get_unity_native_broker_status", { workspaceRef }, {
     operation: "unityNativeBrokerGetStatus",
     notify: false,
     throwOnError: true,
   });
 }
 
-export function unityNativeBridgeSelfTestRun(): Promise<void> {
-  return ipcInvoke<void>("unity_native_bridge_selftest_run", undefined, {
+export function unityNativeBridgeSelfTestRun(workspaceRef: WorkspaceRef): Promise<void> {
+  return ipcInvoke<void>("unity_native_bridge_selftest_run", { workspaceRef }, {
     operation: "unityNativeBridgeSelfTestRun",
     notify: false,
     throwOnError: true,
@@ -280,22 +340,55 @@ export function unityNativeBridgeSelfTestRun(): Promise<void> {
 }
 
 export function subscribeUnityNativeBridgeSelfTest(
+  workspaceRef: WorkspaceRef,
   handler: (payload: HotReloadSelfTestEvent) => void,
 ): Promise<RuntimeUnsubscribe> {
-  return getLocusRuntime().subscribe<HotReloadSelfTestEvent>(
-    "unity-native-bridge-selftest",
-    handler,
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<HotReloadSelfTestEvent>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "unity-native-bridge-selftest") return;
+      if (event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
   );
 }
 
 export function subscribeCsharpLspStatus(
+  workspaceRef: WorkspaceRef,
   handler: (payload: CsharpLspStatus) => void,
 ): Promise<RuntimeUnsubscribe> {
-  return getLocusRuntime().subscribe<CsharpLspStatus>("csharp-lsp-status", handler);
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<CsharpLspStatus>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "csharp-lsp-status") return;
+      if (event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
+  );
 }
 
 export function subscribeUnitySidecarCompilerStatus(
+  workspaceRef: WorkspaceRef,
   handler: (payload: CsharpCompileStatus) => void,
 ): Promise<RuntimeUnsubscribe> {
-  return getLocusRuntime().subscribe<CsharpCompileStatus>("csharp-compile-status", handler);
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<CsharpCompileStatus>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "csharp-compile-status") return;
+      if (event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
+  );
 }

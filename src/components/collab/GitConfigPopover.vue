@@ -8,6 +8,7 @@ import { t } from "../../i18n";
 import { gitConfigEntriesSignature, isSafeGitConfigKey, normalizeGitConfigEntries } from "./gitConfigEditor";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
+import type { WorkspaceRef } from "../../services/project";
 
 interface EditableConfigEntry extends GitConfigEntry {
   id: string;
@@ -15,6 +16,7 @@ interface EditableConfigEntry extends GitConfigEntry {
 
 const props = defineProps<{
   open: boolean;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -37,6 +39,21 @@ const draftEntries = ref<Record<GitConfigScope, EditableConfigEntry[]>>({
   global: [],
 });
 let nextEntryId = 0;
+let configRequestGeneration = 0;
+
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
+  return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 const scopeOptions = computed<SegmentedOption[]>(() => [
   { value: "repo", label: t("git.config.repo") },
@@ -74,11 +91,14 @@ function cloneEntries(entries: GitConfigEntry[]): EditableConfigEntry[] {
 }
 
 async function loadConfig() {
+  const workspaceRef = captureWorkspaceRef();
+  const generation = ++configRequestGeneration;
   loading.value = true;
   error.value = "";
   savedMessage.value = "";
   try {
-    const result = await gitConfigSnapshot();
+    const result = await gitConfigSnapshot(workspaceRef);
+    if (generation !== configRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     snapshot.value = result;
     originalEntries.value = {
       repo: result.repo.entries,
@@ -89,9 +109,12 @@ async function loadConfig() {
       global: cloneEntries(result.global.entries),
     };
   } catch (e) {
+    if (generation !== configRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     error.value = normalizeAppError(e).message;
   } finally {
-    loading.value = false;
+    if (generation === configRequestGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+      loading.value = false;
+    }
   }
 }
 
@@ -111,12 +134,19 @@ function removeEntry(id: string) {
 
 async function saveActiveScope() {
   if (saveDisabled.value) return;
+  const workspaceRef = captureWorkspaceRef();
+  const generation = ++configRequestGeneration;
   saving.value = true;
   error.value = "";
   savedMessage.value = "";
   try {
     const scope = activeScope.value;
-    const result = await gitSaveConfig(scope, normalizeGitConfigEntries(draftEntries.value[scope]));
+    const result = await gitSaveConfig(
+      scope,
+      normalizeGitConfigEntries(draftEntries.value[scope]),
+      workspaceRef,
+    );
+    if (generation !== configRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     if (snapshot.value) {
       snapshot.value = {
         ...snapshot.value,
@@ -128,9 +158,12 @@ async function saveActiveScope() {
     savedMessage.value = t("git.config.saved", t(scope === "repo" ? "git.config.repo" : "git.config.global"));
     emit("saved", scope);
   } catch (e) {
+    if (generation !== configRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     error.value = normalizeAppError(e).message;
   } finally {
-    saving.value = false;
+    if (generation === configRequestGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+      saving.value = false;
+    }
   }
 }
 
@@ -146,8 +179,15 @@ function onWindowKeydown(event: KeyboardEvent) {
 }
 
 watch(
-  () => props.open,
-  async (open) => {
+  () => [
+    props.open,
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  async ([open]) => {
+    configRequestGeneration += 1;
+    loading.value = false;
+    saving.value = false;
     if (!open) {
       window.removeEventListener("keydown", onWindowKeydown);
       return;

@@ -73,7 +73,7 @@ pub fn remove_async_mode(args: &serde_json::Value) -> serde_json::Value {
 pub fn supports_async_mode(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "bash" | "unity_execute" | "unity_test_run" | "subagent"
+        "bash" | "python" | "unity_execute" | "unity_test_run" | "subagent"
     )
 }
 

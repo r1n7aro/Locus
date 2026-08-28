@@ -87,4 +87,24 @@ describe("persistent user Agents", () => {
     expect(knowledgeChat).toContain("agent.isDefault");
     expect(knowledgeChat).not.toContain('agent.id === "knowledge"');
   });
+
+  it("ships project-typed built-ins and a minimal Simple Agent", () => {
+    const unity = JSON.parse(read("agent/dev/config.json"));
+    const simple = JSON.parse(read("agent/simple/config.json"));
+    const definitions = read("src-tauri/src/agent/definition.rs");
+    const sessionCommands = read("src-tauri/src/commands/session.rs");
+    const agentView = read("src/components/AgentView.vue");
+    const selector = read("src/components/ModelEffortSelector.vue");
+
+    expect(unity.project_types).toEqual(["unity"]);
+    expect(simple.project_types).toEqual(["generic"]);
+    expect(simple.tools).toEqual(["read", "write", "edit", "bash", "python", "grep", "list"]);
+    expect(existsSync(resolve(root, "agent/simple/soul.md"))).toBe(true);
+    expect(existsSync(resolve(root, "agent/simple/env.md"))).toBe(false);
+    expect(existsSync(resolve(root, "agent/simple/rule"))).toBe(false);
+    expect(definitions).toContain('["soul.md", "system.md"]');
+    expect(sessionCommands).toContain("preferred_agent_id_for_project_type");
+    expect(agentView).toContain("agentProjectTypesLabel(ag)");
+    expect(selector).toContain("agentProjectTypesLabel(agent)");
+  });
 });

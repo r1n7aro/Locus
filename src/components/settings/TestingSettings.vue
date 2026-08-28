@@ -14,6 +14,7 @@ import {
 } from "../../services/integrationTests";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useNotificationStore } from "../../stores/notification";
+import { useProjectStore } from "../../stores/project";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
@@ -35,6 +36,7 @@ interface SuiteState {
 }
 
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 
 const suiteItems: SuiteItem[] = [
   { id: "connect", labelKey: "settings.testing.suite.connect", descKey: "settings.testing.suite.connectDesc" },
@@ -158,7 +160,7 @@ async function runProbe() {
   probeRunning.value = true;
   probeLines.value = [t("settings.testing.probe.starting")];
   try {
-    const report = await runUnityRecompileProbe();
+    const report = await runUnityRecompileProbe(projectStore.requireWorkspaceRef());
     probeLines.value = report.split("\n");
   } catch (e) {
     const err = normalizeAppError(e);
@@ -194,7 +196,7 @@ async function startRun(suites: UnityIntegrationSuite[]) {
       suiteTimeoutMs: 1_200_000,
       pollMs: 500,
       noProgressTimeoutMs: 60_000,
-    });
+    }, projectStore.requireWorkspaceRef());
     currentRunId.value = started.runId;
   } catch (e) {
     running.value = false;

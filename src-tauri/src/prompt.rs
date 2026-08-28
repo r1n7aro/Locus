@@ -24,6 +24,7 @@ pub mod tools {
     pub const WRITE: &str = include_str!("../../tools/write.json");
     pub const EDIT: &str = include_str!("../../tools/edit.json");
     pub const BASH: &str = include_str!("../../tools/bash.json");
+    pub const PYTHON: &str = include_str!("../../tools/python.json");
     pub const GET_TASK_STATUS: &str = include_str!("../../tools/get_task_status.json");
     pub const CANCEL_TASK: &str = include_str!("../../tools/cancel_task.json");
     pub const GREP: &str = include_str!("../../tools/grep.json");
@@ -92,6 +93,7 @@ pub mod tools {
         ("write", WRITE),
         ("edit", EDIT),
         ("bash", BASH),
+        ("python", PYTHON),
         ("get_task_status", GET_TASK_STATUS),
         ("cancel_task", CANCEL_TASK),
         ("grep", GREP),

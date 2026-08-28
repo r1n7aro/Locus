@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_AGENT_ID: &str = "dev";
 pub const USER_AGENTS_DIR_NAME: &str = "user-agents";
+pub const GENERIC_PROJECT_TYPE: &str = "generic";
+pub const UNITY_PROJECT_TYPE: &str = "unity";
 
 pub fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
@@ -51,6 +53,8 @@ pub struct AgentDef {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub project_types: Vec<String>,
     #[serde(skip)]
     pub system_prompt: String,
     #[serde(skip)]
@@ -328,12 +332,12 @@ impl AgentDefRegistry {
             .map_err(|e| format!("parse config.json error: {}", e))?;
 
         def.id = id.to_string();
+        Self::normalize_project_types(&mut def.project_types);
         Self::normalize_agent_tools(id, &mut def.tools);
 
-        let system_path = dir.join("system.md");
-        if system_path.is_file() {
-            def.system_prompt = fs::read_to_string(&system_path)
-                .map_err(|e| format!("read system.md error: {}", e))?;
+        if let Some(prompt_path) = Self::system_prompt_path(dir) {
+            def.system_prompt = fs::read_to_string(&prompt_path)
+                .map_err(|e| format!("read {:?} error: {}", prompt_path, e))?;
         }
 
         let env_path = dir.join("env.md");
@@ -394,6 +398,22 @@ impl AgentDefRegistry {
             overrides.insert(tool_name, definition);
         }
         Ok(overrides)
+    }
+
+    fn system_prompt_path(agent_dir: &Path) -> Option<PathBuf> {
+        ["soul.md", "system.md"]
+            .into_iter()
+            .map(|name| agent_dir.join(name))
+            .find(|path| path.is_file())
+    }
+
+    fn normalize_project_types(project_types: &mut Vec<String>) {
+        for project_type in project_types.iter_mut() {
+            *project_type = project_type.trim().to_ascii_lowercase();
+        }
+        let mut seen = HashSet::new();
+        project_types
+            .retain(|project_type| !project_type.is_empty() && seen.insert(project_type.clone()));
     }
 
     fn apply_schema_description_overlay(
@@ -476,6 +496,15 @@ impl AgentDefRegistry {
                             base.description = desc.to_string();
                         }
                     }
+                    if let Some(project_types) =
+                        overlay.get("project_types").and_then(|v| v.as_array())
+                    {
+                        base.project_types = project_types
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                        Self::normalize_project_types(&mut base.project_types);
+                    }
                     if let Some(tools) = overlay.get("tools").and_then(|v| v.as_array()) {
                         base.tools = tools
                             .iter()
@@ -520,9 +549,8 @@ impl AgentDefRegistry {
             }
         }
 
-        let system_path = project_dir.join("system.md");
-        if system_path.is_file() {
-            if let Ok(prompt) = fs::read_to_string(&system_path) {
+        if let Some(prompt_path) = Self::system_prompt_path(project_dir) {
+            if let Ok(prompt) = fs::read_to_string(&prompt_path) {
                 base.system_prompt = prompt;
             }
         }
@@ -628,6 +656,25 @@ impl AgentDefRegistry {
 }
 
 impl AgentDef {
+    pub fn project_type_match_score(&self, project_type: &str) -> u8 {
+        let project_type = project_type.trim().to_ascii_lowercase();
+        if self
+            .project_types
+            .iter()
+            .any(|value| value == &project_type)
+        {
+            return 2;
+        }
+        if self.project_types.is_empty() || self.project_types.iter().any(|value| value == "*") {
+            return 1;
+        }
+        0
+    }
+
+    pub fn supports_project_type(&self, project_type: &str) -> bool {
+        self.project_type_match_score(project_type) > 0
+    }
+
     pub fn apply_tool_description_override(
         &self,
         tool_name: &str,
@@ -768,6 +815,27 @@ mod tests {
     #[test]
     fn dev_agent_exposes_unified_knowledge_tools() {
         assert_unified_knowledge_tools("dev");
+    }
+
+    #[test]
+    fn built_in_agents_declare_project_types_and_simple_stays_minimal() {
+        let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let unity = registry.get("dev").expect("Unity Agent should load");
+        let simple = registry.get("simple").expect("Simple Agent should load");
+
+        assert_eq!(unity.project_types, vec!["unity"]);
+        assert_eq!(simple.project_types, vec!["generic"]);
+        assert_eq!(
+            simple.tools,
+            ["read", "write", "edit", "bash", "python", "grep", "list"]
+        );
+        assert!(simple.sub_agents.is_empty());
+        assert!(simple.env_template.is_empty());
+        assert!(simple
+            .system_prompt
+            .contains("general-purpose software development agent"));
+        assert!(simple.supports_project_type("generic"));
+        assert!(!simple.supports_project_type("unity"));
     }
 
     #[test]

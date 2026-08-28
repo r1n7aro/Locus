@@ -269,6 +269,39 @@ pub(crate) fn process_created_at_unix_ms(_process_id: u32) -> Option<u64> {
     None
 }
 
+fn launch_mode_from_args(args: &[String]) -> super::UnityLaunchMode {
+    if args.iter().any(|arg| {
+        arg.eq_ignore_ascii_case("-batchmode") || arg.eq_ignore_ascii_case("-nographics")
+    }) {
+        super::UnityLaunchMode::Headless
+    } else {
+        super::UnityLaunchMode::Interactive
+    }
+}
+
+#[cfg(windows)]
+pub(super) async fn query_unity_editor_launch_mode(
+    process_id: Option<u32>,
+) -> Option<super::UnityLaunchMode> {
+    let process_id = process_id?;
+    tokio::task::spawn_blocking(move || {
+        let command_line = probe_native::read_process_command_line(process_id).ok()?;
+        Some(launch_mode_from_args(&split_windows_command_line(
+            &command_line,
+        )))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(not(windows))]
+pub(super) async fn query_unity_editor_launch_mode(
+    _process_id: Option<u32>,
+) -> Option<super::UnityLaunchMode> {
+    None
+}
+
 pub(super) async fn cached_project_editor_process(
     project_path: &str,
 ) -> Option<UnityEditorProcessInfo> {
@@ -1117,8 +1150,8 @@ fn split_windows_command_line(command_line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_project_identity, project_path_from_args, split_windows_command_line,
-        unity_process_args_are_worker,
+        launch_mode_from_args, normalize_project_identity, project_path_from_args,
+        split_windows_command_line, unity_process_args_are_worker,
     };
 
     #[test]
@@ -1137,6 +1170,23 @@ mod tests {
         );
 
         assert_eq!(project_path_from_args(&args), Some(r#"D:\Projects\Game"#));
+    }
+
+    #[test]
+    fn detects_headless_launch_flags() {
+        let headless = split_windows_command_line(
+            r#"Unity.exe -projectPath D:\Projects\Game -batchmode -nographics"#,
+        );
+        let interactive = split_windows_command_line(r#"Unity.exe -projectPath D:\Projects\Game"#);
+
+        assert_eq!(
+            launch_mode_from_args(&headless),
+            super::super::UnityLaunchMode::Headless
+        );
+        assert_eq!(
+            launch_mode_from_args(&interactive),
+            super::super::UnityLaunchMode::Interactive
+        );
     }
 
     #[test]

@@ -3,6 +3,8 @@ import type { Component } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { ipcInvoke } from "./ipc";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import { WORKSPACE_EVENT_NAME, type RoutedWorkspaceEvent } from "./project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import {
   defineInspectorPropertyDrawers,
   pluginInspectorPropertyDrawerLibrary,
@@ -68,6 +70,7 @@ interface LoadedDrawerPackage {
 
 let loadRun = 0;
 let changeListenerInstalled = false;
+let scopedChangeListenerInstalled = false;
 let loadedPackages: LoadedDrawerPackage[] = [];
 let injectedStyleEl: HTMLStyleElement | null = null;
 
@@ -85,11 +88,27 @@ export function bootstrapPluginInspectorDrawers(): void {
   }).catch(() => {
     changeListenerInstalled = false;
   });
+  if (!scopedChangeListenerInstalled) {
+    scopedChangeListenerInstalled = true;
+    void listen<RoutedWorkspaceEvent>(WORKSPACE_EVENT_NAME, ({ payload }) => {
+      if (payload.eventName !== PLUGINS_CHANGED_EVENT) return;
+      const focusedCheckoutId = useWorkspaceContextStore().focusedWorkspaceRef?.checkoutId;
+      if (focusedCheckoutId !== payload.checkoutId) return;
+      void reloadPluginInspectorDrawers().catch((error) => {
+        console.warn("[inspectorDrawerExtensions] scoped drawer reload failed:", error);
+      });
+    }).catch(() => {
+      scopedChangeListenerInstalled = false;
+    });
+  }
 }
 
 export async function reloadPluginInspectorDrawers(): Promise<void> {
   const run = ++loadRun;
-  const packages = await ipcInvoke<PluginDrawerPackage[]>("plugin_inspector_drawer_packages");
+  const workspaceRef = useWorkspaceContextStore().focusedWorkspaceRef;
+  const packages = await ipcInvoke<PluginDrawerPackage[]>("plugin_inspector_drawer_packages", {
+    workspaceRef: workspaceRef ?? null,
+  });
   if (run !== loadRun) return;
 
   unloadPluginInspectorDrawers();

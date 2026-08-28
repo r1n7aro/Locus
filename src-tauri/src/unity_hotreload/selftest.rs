@@ -108,7 +108,8 @@
 //! Triggered from Settings > Code Analysis; progress streams to the UI via
 //! the `unity-hotreload-selftest` event.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -116,13 +117,34 @@ use tauri::Emitter;
 
 use super::coordinator;
 
-static RUNNING: AtomicBool = AtomicBool::new(false);
+fn running_checkouts() -> &'static Mutex<HashSet<String>> {
+    static RUNNING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    RUNNING.get_or_init(|| Mutex::new(HashSet::new()))
+}
 
-struct SelfTestRunningGuard;
+struct SelfTestRunningGuard {
+    ownership_key: String,
+}
+
+impl SelfTestRunningGuard {
+    fn acquire(ownership_key: String) -> Result<Self, String> {
+        let mut running = running_checkouts()
+            .lock()
+            .map_err(|error| format!("hot-reload self-test ownership is unavailable: {error}"))?;
+        if !running.insert(ownership_key.clone()) {
+            return Err(
+                "the hot-reload self-test is already running for this checkout".to_string(),
+            );
+        }
+        Ok(Self { ownership_key })
+    }
+}
 
 impl Drop for SelfTestRunningGuard {
     fn drop(&mut self) {
-        RUNNING.store(false, Ordering::SeqCst);
+        if let Ok(mut running) = running_checkouts().lock() {
+            running.remove(&self.ownership_key);
+        }
     }
 }
 
@@ -986,6 +1008,7 @@ impl MessageDriverCapabilities {
 struct SelfTest {
     app: tauri::AppHandle,
     project: String,
+    event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
     passed: u32,
     failed: u32,
     /// Per-file texts as the positive phase left them; the negative phase
@@ -1369,16 +1392,23 @@ fn utility_proxy_assertion() -> &'static str {
 
 impl SelfTest {
     fn emit(&self, line: Option<String>, finished: bool) {
-        let _ = self.app.emit(
-            "unity-hotreload-selftest",
-            SelfTestEvent {
-                running: !finished,
-                finished,
-                line,
-                passed: self.passed,
-                failed: self.failed,
-            },
-        );
+        let payload = SelfTestEvent {
+            running: !finished,
+            finished,
+            line,
+            passed: self.passed,
+            failed: self.failed,
+        };
+        if let Some(scope) = self.event_scope.as_ref() {
+            crate::workspace_service::event::emit_for_workspace_scope(
+                &self.app,
+                scope,
+                "unity-hotreload-selftest",
+                payload,
+            );
+        } else {
+            let _ = self.app.emit("unity-hotreload-selftest", payload);
+        }
     }
 
     fn log(&self, line: impl Into<String>) {
@@ -7272,19 +7302,20 @@ fn extract_int(output: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-/// Entry point for the Tauri command. Refuses to run twice concurrently.
-pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), String> {
+async fn run_owned(
+    app: tauri::AppHandle,
+    project_path: String,
+    ownership_key: String,
+    event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+) -> Result<(), String> {
     if project_path.trim().is_empty() {
         return Err("select a Unity project workspace first".to_string());
     }
-    if RUNNING.swap(true, Ordering::SeqCst) {
-        return Err("the hot-reload self-test is already running".to_string());
-    }
-
-    let _running_guard = SelfTestRunningGuard;
+    let _running_guard = SelfTestRunningGuard::acquire(ownership_key)?;
     let mut test = SelfTest {
         app,
         project: project_path,
+        event_scope,
         passed: 0,
         failed: 0,
         negative_ledgers: NegativeLedgers::default(),
@@ -7299,4 +7330,53 @@ pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), Stri
     };
     test.run().await;
     Ok(())
+}
+
+/// Legacy CLI-driver entry. Production IPC uses [`run_scoped`].
+pub async fn run(app: tauri::AppHandle, project_path: String) -> Result<(), String> {
+    let ownership_key = format!(
+        "path:{}",
+        project_path
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&project_path)
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    );
+    run_owned(app, project_path, ownership_key, None).await
+}
+
+/// Checkout-owned self-test entry. Separate checkouts may run independently;
+/// duplicate starts for one checkout are rejected deterministically.
+pub async fn run_scoped(
+    app: tauri::AppHandle,
+    project_path: String,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
+) -> Result<(), String> {
+    let ownership_key = format!("checkout:{}", event_scope.checkout_id);
+    run_owned(app, project_path, ownership_key, Some(event_scope)).await
+}
+
+#[cfg(test)]
+mod checkout_ownership_tests {
+    use super::SelfTestRunningGuard;
+
+    #[test]
+    fn duplicate_checkout_is_rejected_while_distinct_checkouts_run_independently() {
+        let checkout_a =
+            SelfTestRunningGuard::acquire("test-checkout:a-independent-owner".to_string())
+                .expect("checkout A ownership");
+        assert!(
+            SelfTestRunningGuard::acquire("test-checkout:a-independent-owner".to_string()).is_err()
+        );
+
+        let checkout_b =
+            SelfTestRunningGuard::acquire("test-checkout:b-independent-owner".to_string())
+                .expect("checkout B ownership");
+        drop(checkout_b);
+        drop(checkout_a);
+
+        SelfTestRunningGuard::acquire("test-checkout:a-independent-owner".to_string())
+            .expect("checkout A ownership released");
+    }
 }

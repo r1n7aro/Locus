@@ -17,7 +17,10 @@ describe("compile server dev ensure", () => {
     const unityTestLauncher = read("scripts/locus-unity-test.mjs");
     const buildScript = read("scripts/build-locus-compile-server.mjs");
     const csharp = read("locus_compile_server/CompileService.cs");
+    const scopedRegistry = read("locus_compile_server/ScopedCompileServiceRegistry.cs");
     const program = read("locus_compile_server/Program.cs");
+    const client = read("src-tauri/src/csharp_compile/client.rs");
+    const compile = read("src-tauri/src/csharp_compile/mod.rs");
     const manager = read("src-tauri/src/csharp_compile/manager.rs");
 
     expect(pkg).toContain('"compile-server:bundle": "bun run scripts/build-locus-compile-server.mjs"');
@@ -43,8 +46,15 @@ describe("compile server dev ensure", () => {
     expect(buildScript).toContain("directoriesMatch");
     expect(buildScript).toContain("restoreMissingUnchangedFiles");
     expect(buildScript).toContain("replacePublishedDirectory");
-    expect(program).toContain('case "index/schema":');
-    expect(csharp).toContain("public const int ProtocolVersion = 8;");
-    expect(manager).toContain("const EXPECTED_PROTOCOL_VERSION: i64 = 8;");
+    expect(program).toContain('"index/schema" => scope.Service.HandleIndexSchema');
+    expect(program).toContain('requestMethod == "scope/release"');
+    expect(csharp).toContain("public const int ProtocolVersion = 10;");
+    expect(manager).toContain("const EXPECTED_PROTOCOL_VERSION: i64 = 10;");
+    expect(scopedRegistry).toContain('RequiredScopeGeneration(scope, "workspaceGeneration")');
+    expect(scopedRegistry).toContain('RequiredScopeGeneration(scope, "serviceGeneration")');
+    expect(client).toContain('scope.get("workspaceGeneration")?.as_u64()?');
+    expect(client).toContain('scope.get("serviceGeneration")?.as_u64()?');
+    expect(compile).toContain("publish_prevalidated_external_service");
+    expect(compile).toContain("service_generation: Some(identity.service_generation)");
   });
 });

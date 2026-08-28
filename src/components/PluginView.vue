@@ -76,6 +76,7 @@ import {
   type PluginRegistrySummary,
 } from "../services/plugin";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import type { WorkspaceRef } from "../services/project";
 import { useNotificationStore } from "../stores/notification";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
@@ -86,6 +87,7 @@ import MarkdownRenderer from "./MarkdownRenderer.vue";
 
 const props = defineProps<{
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const PLUGIN_REGISTRY_SOURCES_STORAGE_KEY = "locus:plugin-hub:registries";
@@ -189,8 +191,6 @@ const directImportScope = ref<PluginInstallScope>("app");
 const directImportInstalling = ref(false);
 const directImportError = ref("");
 let unlistenPluginsChanged: UnlistenFn | null = null;
-let unlistenKnowledgeChanged: UnlistenFn | null = null;
-let unlistenViewTreeChanged: UnlistenFn | null = null;
 let githubOAuthPollTimer: ReturnType<typeof setTimeout> | null = null;
 let githubOAuthPollInFlight = false;
 
@@ -516,7 +516,7 @@ async function installDirectPlugin() {
     const installed = await pluginInstallFromSource({
       type: directImportMode.value === "local" ? "local" : "auto",
       input,
-    }, directImportScope.value);
+    }, directImportScope.value, props.workspaceRef);
     notificationStore.addNotice(
       "success",
       t("plugin.notice.installed", installed.name || installed.id),
@@ -1368,7 +1368,7 @@ async function refreshAll() {
   loading.value = true;
   loadError.value = "";
   try {
-    installedPlugins.value = await pluginListInstalled();
+    installedPlugins.value = await pluginListInstalled(props.workspaceRef);
     void loadInstalledRegistryEntries();
     if (
       selectedPluginKey.value
@@ -1716,7 +1716,7 @@ async function installRegistryPluginWithScopes(
         downloadSource: detail.downloadSource
           ? { ...detail.downloadSource, repo: detail.downloadSource.repo || detail.repo }
           : {},
-      }, scope);
+      }, scope, props.workspaceRef);
     }
     const installedLabel = [
       installed?.name || detail.name || detail.id,
@@ -1774,7 +1774,12 @@ async function setPluginEnabledState(plugin: InstalledPluginSummary, enabled: bo
   // summary replaces it when the backend answers, or rolls back on failure.
   replaceInstalledPlugin({ ...plugin, enabled });
   try {
-    const updated = await pluginSetEnabled(plugin.id, plugin.scope, enabled);
+    const updated = await pluginSetEnabled(
+      plugin.id,
+      plugin.scope,
+      enabled,
+      props.workspaceRef,
+    );
     replaceInstalledPlugin(updated);
     notificationStore.addNotice(
       "success",
@@ -1821,7 +1826,7 @@ async function uninstallPlugin(plugin: InstalledPluginSummary) {
   }
   uninstallKey.value = key;
   try {
-    await pluginUninstall(plugin.id, plugin.scope);
+    await pluginUninstall(plugin.id, plugin.scope, props.workspaceRef);
     notificationStore.addNotice(
       "success",
       t("plugin.notice.uninstalled", plugin.name || plugin.id),
@@ -1893,12 +1898,6 @@ onMounted(async () => {
     unlistenPluginsChanged = await listen("plugins-changed", () => {
       void refreshAll();
     });
-    unlistenKnowledgeChanged = await listen("knowledge-changed", () => {
-      void refreshAll();
-    });
-    unlistenViewTreeChanged = await listen("view-tree-changed", () => {
-      void refreshAll();
-    });
   } catch (error) {
     console.warn("Failed to listen for plugin view refresh events:", error);
   }
@@ -1907,8 +1906,6 @@ onMounted(async () => {
 onUnmounted(() => {
   stopGithubOAuthPoll();
   unlistenPluginsChanged?.();
-  unlistenKnowledgeChanged?.();
-  unlistenViewTreeChanged?.();
 });
 </script>
 

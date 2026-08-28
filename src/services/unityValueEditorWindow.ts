@@ -2,6 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { UnitySerializedPropertyTarget } from "./unitySerializedProperty";
+import type { WorkspaceRef } from "./project";
 
 export const UNITY_VALUE_EDITOR_WINDOW_LABEL = "locus-value-editor";
 export const UNITY_VALUE_EDITOR_WINDOW_PATH = "/locus-value-editor";
@@ -20,6 +21,7 @@ export type UnityValueEditorKind = "curve" | "gradient";
 
 export interface UnityValueEditorPayload {
   kind: UnityValueEditorKind;
+  workspaceRef: WorkspaceRef;
   /** Full serialized-property target including propertyPath. */
   target: UnitySerializedPropertyTarget;
   label?: string;
@@ -27,6 +29,7 @@ export interface UnityValueEditorPayload {
 
 export interface UnityValueEditorCommittedEvent {
   kind: UnityValueEditorKind;
+  workspaceRef: WorkspaceRef;
   target: UnitySerializedPropertyTarget;
   propertyPath: string;
   value: unknown;
@@ -57,8 +60,14 @@ export function getUnityValueEditorWindowPayload(
     target = null;
   }
   if (!target || typeof target !== "object" || !target.kind) return null;
+  const checkoutId = params.get("checkoutId")?.trim() ?? "";
+  const workspaceGeneration = Number(params.get("workspaceGeneration"));
+  if (!checkoutId || !Number.isSafeInteger(workspaceGeneration) || workspaceGeneration <= 0) {
+    return null;
+  }
   return {
     kind,
+    workspaceRef: { checkoutId, expectedGeneration: workspaceGeneration },
     target,
     label: params.get("label") ?? undefined,
   };
@@ -68,6 +77,8 @@ export function buildUnityValueEditorWindowQuery(payload: UnityValueEditorPayloa
   const params = new URLSearchParams({
     [UNITY_VALUE_EDITOR_WINDOW_FLAG]: "1",
     kind: payload.kind,
+    checkoutId: payload.workspaceRef.checkoutId,
+    workspaceGeneration: String(payload.workspaceRef.expectedGeneration),
     target: JSON.stringify(payload.target),
   });
   if (payload.label) params.set("label", payload.label);
@@ -80,6 +91,8 @@ export function buildUnityValueEditorWindowUrl(payload: UnityValueEditorPayload)
 
 function hasValidEditorPayload(payload: UnityValueEditorPayload): boolean {
   return !!payload.target
+    && !!payload.workspaceRef?.checkoutId?.trim()
+    && Number.isSafeInteger(payload.workspaceRef.expectedGeneration)
     && typeof payload.target.kind === "string"
     && !!payload.target.kind.trim()
     && !!(payload.target.propertyPath ?? "").trim();

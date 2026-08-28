@@ -16,9 +16,7 @@ const WINDOW_DRAG_EXCLUDED_SELECTOR = [
   "textarea",
   "select",
   "[contenteditable='true']",
-  ".workspace-selector",
   ".window-controls",
-  ".dir-dropdown",
   "[data-window-no-drag]",
 ].join(", ");
 

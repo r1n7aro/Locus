@@ -1,5 +1,6 @@
 import { ipcInvoke } from "./ipc";
 import type { PluginRegistrySource } from "./pluginRegistrySources";
+import type { WorkspaceRef } from "./project";
 
 export type PluginInstallScope = "app" | "project";
 
@@ -224,27 +225,35 @@ export interface PluginGithubOAuthPollResult {
   auth?: PluginGithubAuthStatus | null;
 }
 
-export function pluginListInstalled(): Promise<InstalledPluginSummary[]> {
-  return ipcInvoke<InstalledPluginSummary[]>("plugin_list_installed");
+export function pluginListInstalled(
+  workspaceRef?: WorkspaceRef | null,
+): Promise<InstalledPluginSummary[]> {
+  return ipcInvoke<InstalledPluginSummary[]>("plugin_list_installed", {
+    workspaceRef: workspaceRef ?? null,
+  });
 }
 
 export function pluginInstallFromPath(
   sourcePath: string,
   scope: PluginInstallScope,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<InstalledPluginSummary> {
   return ipcInvoke<InstalledPluginSummary>("plugin_install_from_path", {
     sourcePath,
     scope,
+    workspaceRef: workspaceRef ?? null,
   });
 }
 
 export function pluginUninstall(
   pluginId: string,
   scope: PluginInstallScope,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<string> {
   return ipcInvoke<string>("plugin_uninstall", {
     pluginId,
     scope,
+    workspaceRef: workspaceRef ?? null,
   });
 }
 
@@ -252,17 +261,23 @@ export function pluginSetEnabled(
   pluginId: string,
   scope: PluginInstallScope,
   enabled: boolean,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<InstalledPluginSummary> {
   return ipcInvoke<InstalledPluginSummary>("plugin_set_enabled", {
     pluginId,
     scope,
     enabled,
+    workspaceRef: workspaceRef ?? null,
   });
 }
 
-export function pluginExport(request: PluginExportRequest): Promise<PluginExportResult> {
+export function pluginExport(
+  request: PluginExportRequest,
+  workspaceRef?: WorkspaceRef | null,
+): Promise<PluginExportResult> {
   return ipcInvoke<PluginExportResult>("plugin_export", {
     request,
+    workspaceRef: workspaceRef ?? null,
   });
 }
 
@@ -352,20 +367,24 @@ export function pluginRegistryFetchDescription(options: {
 export function pluginInstallFromRegistry(
   request: PluginRegistryInstallRequest,
   scope: PluginInstallScope,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<InstalledPluginSummary> {
   return ipcInvoke<InstalledPluginSummary>("plugin_install_from_registry", {
     request,
     scope,
+    workspaceRef: workspaceRef ?? null,
   });
 }
 
 export function pluginInstallFromSource(
   source: PluginDownloadSource,
   scope: PluginInstallScope,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<InstalledPluginSummary> {
   return ipcInvoke<InstalledPluginSummary>("plugin_install_from_source", {
     source,
     scope,
+    workspaceRef: workspaceRef ?? null,
   });
 }
 

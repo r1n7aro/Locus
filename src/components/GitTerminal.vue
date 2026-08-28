@@ -1,10 +1,8 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
-import { listen } from "@tauri-apps/api/event";
 import { answerQuestion as answerSessionQuestion, cancelChat, chat } from "../services/session";
 import { gitExecute } from "../services/git";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { StreamEvent, ModelOption, PendingQuestion, PendingToolConfirm } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import StreamingMarkdownRenderer from "./chat/StreamingMarkdownRenderer.vue";
@@ -13,14 +11,36 @@ import { normalizeAppError } from "../services/errors";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { useThrottledStreamingText } from "../composables/streamingRenderThrottle";
 import { formatModelDisplayName } from "../utils/modelDisplay";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+  type WorkspaceRef,
+} from "../services/project";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 
 const props = defineProps<{
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
   selectedModelId: string;
   selectedAgentId: string;
   currentBranch: string;
   models: ModelOption[];
 }>();
+
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef: WorkspaceRef | undefined, workingDir = props.workingDir) {
+  return workingDir === props.workingDir
+    && (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 const emit = defineEmits<{
   (e: "commandDone"): void;
@@ -290,6 +310,8 @@ function shouldRefreshOnToolCompletion(toolName: string): boolean {
 }
 
 async function runNative(text: string) {
+  const workspaceRef = captureWorkspaceRef();
+  const workingDir = props.workingDir;
   streamingText.value = "";
   thinking.value = false;
   pendingQuestion.value = null;
@@ -300,7 +322,8 @@ async function runNative(text: string) {
   activeToolExec = null;
   streaming.value = true;
   try {
-    const result = await gitExecute(text);
+    const result = await gitExecute(text, workspaceRef);
+    if (!isCurrentWorkspaceRef(workspaceRef, workingDir)) return;
     const output = (result.stdout + result.stderr).trimEnd();
     if (output) {
       lines.value.push({
@@ -311,15 +334,18 @@ async function runNative(text: string) {
     }
     emit("commandDone");
   } catch (e) {
+    if (!isCurrentWorkspaceRef(workspaceRef, workingDir)) return;
     lines.value.push({
       id: "err_" + Date.now(),
       type: "error",
       content: normalizeAppError(e).message,
     });
   } finally {
-    streaming.value = false;
-    nativeRunning.value = false;
-    scrollToBottom(true);
+    if (isCurrentWorkspaceRef(workspaceRef, workingDir)) {
+      streaming.value = false;
+      nativeRunning.value = false;
+      scrollToBottom(true);
+    }
   }
 }
 
@@ -355,19 +381,24 @@ async function submit() {
   toolConfirmFeedback.value = "";
   pendingSessionId = null;
   activeToolExec = null;
+  const workspaceRef = captureWorkspaceRef();
+  const workingDir = props.workingDir;
 
   try {
     const { sessionId: sid, runId } = await chat({
+      workspaceRef,
       sessionId: sessionId.value,
       text: text,
       agentId: "dev",
       model: props.selectedModelId || null,
       sessionType: "git",
     });
+    if (!isCurrentWorkspaceRef(workspaceRef, workingDir)) return;
     sessionId.value = sid;
     currentRunId.value = runId;
     pendingSessionId = null;
   } catch (e) {
+    if (!isCurrentWorkspaceRef(workspaceRef, workingDir)) return;
     streaming.value = false;
     thinking.value = false;
     nativeRunning.value = false;
@@ -778,13 +809,23 @@ function handleKeydownWrapped(e: KeyboardEvent) {
   handleKeydown(e);
 }
 
-let unlisten: UnlistenFn | null = null;
+let unlisten: RuntimeUnsubscribe | null = null;
 let destroyed = false;
 
 onMounted(async () => {
-  const fn = await listen<StreamEvent>("stream-event", (e) => {
-    handleStreamEvent(e.payload);
-  });
+  const fn = await getLocusRuntime().subscribe<RoutedWorkspaceEvent<StreamEvent>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      const workspaceRef = props.workspaceRef;
+      if (event.eventName !== "stream-event" || !workspaceRef) return;
+      if (event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      handleStreamEvent(event.payload);
+    },
+  );
   if (destroyed) {
     fn();
   } else {
@@ -801,7 +842,11 @@ onUnmounted(() => {
 });
 
 watch(
-  () => props.workingDir,
+  () => [
+    props.workingDir,
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
   () => {
     lines.value = [];
     sessionId.value = null;

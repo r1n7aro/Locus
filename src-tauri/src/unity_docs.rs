@@ -516,6 +516,7 @@ pub async fn start_unity_reference_import(
     requested_locale: Option<String>,
     knowledge_index_state: Arc<KnowledgeIndexState>,
     state: Arc<tokio::sync::Mutex<UnityReferenceImportRuntime>>,
+    workspace_lease: crate::workspace_service::WorkspaceLease,
 ) -> Result<UnityReferenceImportStatus, String> {
     let target_path = normalize_requested_target_path(target_path.as_deref());
     if let Some(existing_path) = existing_unity_binding_path(&working_dir)? {
@@ -578,6 +579,7 @@ pub async fn start_unity_reference_import(
     let working_dir_for_task = working_dir.clone();
     let target_path_for_task = target_path.clone();
     tauri::async_runtime::spawn(async move {
+        let _workspace_lease = workspace_lease;
         match run_unity_reference_import(
             app_handle_for_task,
             working_dir_for_task.clone(),
@@ -585,7 +587,7 @@ pub async fn start_unity_reference_import(
             project_version,
             docs_version,
             selected_locale,
-            knowledge_index_state,
+            knowledge_index_state.clone(),
             state_for_task.clone(),
             cancel_requested,
         )
@@ -960,7 +962,7 @@ async fn run_unity_reference_import(
                 crate::knowledge_index::reconcile_workspace_internal(
                     &working_dir,
                     app_knowledge_dir.0.as_ref().as_ref(),
-                    knowledge_index_state,
+                    knowledge_index_state.clone(),
                     false,
                     true,
                     true,
@@ -983,7 +985,7 @@ async fn run_unity_reference_import(
         crate::knowledge_index::reconcile_workspace_internal(
             &working_dir,
             app_knowledge_dir.0.as_ref().as_ref(),
-            knowledge_index_state,
+            knowledge_index_state.clone(),
             false,
             true,
             true,
@@ -1004,6 +1006,7 @@ async fn run_unity_reference_import(
     reconcile_result.map_err(UnityReferenceImportRunError::Failed)?;
     crate::commands::emit_knowledge_changed(
         &app_handle,
+        &knowledge_index_state,
         &working_dir,
         "knowledge_import_unity_reference_docs",
     );

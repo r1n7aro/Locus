@@ -39,10 +39,10 @@ describe("View Unity requirements", () => {
     expect(host).toContain("view.host.unityConnectionRequired");
 
     expect(page).toContain("selectedViewUnityRequirementText");
-    expect(page).toContain("checkViewOpenRequirements(view)");
+    expect(page).toContain("checkViewOpenRequirements(requireWorkspaceRef(), view)");
     expect(page).toContain("normalizeViewError(runError");
     expect(page).toContain("view.metadata.unityConnection");
-    expect(sessionPanel).toContain("checkViewOpenRequirements(view)");
+    expect(sessionPanel).toContain("checkViewOpenRequirements(workspaceRef, view)");
     expect(sessionPanel).toContain("normalizeViewError(error");
     expect(sessionPanel).toContain("cachedViewOpenRequirementError(view)");
     expect(sessionPanel).toContain("projectStore.unityConnectionStatus");

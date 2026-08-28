@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import type { MergeFileInfo, FileDiffPayload } from "../../types";
 import { diffSingleFile } from "../../services/diff";
 import { gitMergeApply } from "../../services/git";
 import { normalizeAppError } from "../../services/errors";
 import { t } from "../../i18n";
 import { humanizeMergeSideLabel, sharedBaseLabel } from "./mergeUi";
+import type { WorkspaceRef } from "../../services/project";
 
 const props = defineProps<{
+  workspaceRef?: WorkspaceRef | null;
   mergeInfo: MergeFileInfo;
   filePath: string;
   conflictOids: string;
@@ -15,6 +17,20 @@ const props = defineProps<{
   rightLabel?: string;
   baseLabel?: string;
 }>();
+
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
+  return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 const emit = defineEmits<{
   (e: "resolved"): void;
@@ -31,6 +47,7 @@ const baseToRightDiff = ref<FileDiffPayload | null>(null);
 const leftDiffLoading = ref(false);
 const rightDiffLoading = ref(false);
 const diffsRequested = ref(false);
+let diffLoadGeneration = 0;
 
 const isManuallyEdited = computed(() => !props.mergeInfo.workspaceMatchesCanonical);
 const displayLeftLabel = computed(() => humanizeMergeSideLabel(props.leftLabel, "left"));
@@ -50,6 +67,8 @@ const allBlocksResolved = computed(() =>
 
 function loadDiffsIfNeeded() {
   if (diffsRequested.value) return;
+  const workspaceRef = captureWorkspaceRef();
+  const generation = ++diffLoadGeneration;
   diffsRequested.value = true;
   leftDiffLoading.value = true;
   rightDiffLoading.value = true;
@@ -59,23 +78,59 @@ function loadDiffsIfNeeded() {
     filePath: props.filePath,
     commitHash: props.conflictOids,
     detail: "preview",
-  })
-    .then((d) => { baseToLeftDiff.value = d; })
-    .catch((e) => { console.error("[merge] left diff failed:", e); })
-    .finally(() => { leftDiffLoading.value = false; });
+  }, workspaceRef)
+    .then((d) => {
+      if (generation !== diffLoadGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
+      baseToLeftDiff.value = d;
+    })
+    .catch((e) => {
+      if (generation !== diffLoadGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
+      console.error("[merge] left diff failed:", e);
+    })
+    .finally(() => {
+      if (generation === diffLoadGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+        leftDiffLoading.value = false;
+      }
+    });
 
   diffSingleFile({
     source: "gitConflictBaseToRight",
     filePath: props.filePath,
     commitHash: props.conflictOids,
     detail: "preview",
-  })
-    .then((d) => { baseToRightDiff.value = d; })
-    .catch((e) => { console.error("[merge] right diff failed:", e); })
-    .finally(() => { rightDiffLoading.value = false; });
+  }, workspaceRef)
+    .then((d) => {
+      if (generation !== diffLoadGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
+      baseToRightDiff.value = d;
+    })
+    .catch((e) => {
+      if (generation !== diffLoadGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
+      console.error("[merge] right diff failed:", e);
+    })
+    .finally(() => {
+      if (generation === diffLoadGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+        rightDiffLoading.value = false;
+      }
+    });
 }
 
-loadDiffsIfNeeded();
+watch(
+  () => [
+    props.conflictOids,
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  () => {
+    diffLoadGeneration += 1;
+    diffsRequested.value = false;
+    baseToLeftDiff.value = null;
+    baseToRightDiff.value = null;
+    leftDiffLoading.value = false;
+    rightDiffLoading.value = false;
+    loadDiffsIfNeeded();
+  },
+  { immediate: true },
+);
 
 function selectBlock(blockIndex: number, side: "left" | "right" | "base") {
   const newMap = new Map(blockResolutions.value);
@@ -123,15 +178,22 @@ function rebuildResolvedText() {
 }
 
 async function applyResolution() {
+  const workspaceRef = captureWorkspaceRef();
   saving.value = true;
   error.value = null;
   try {
-    await gitMergeApply(props.filePath, { resolvedText: { text: resolvedText.value } });
+    await gitMergeApply(
+      props.filePath,
+      { resolvedText: { text: resolvedText.value } },
+      workspaceRef,
+    );
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     emit("resolved");
   } catch (e) {
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     error.value = normalizeAppError(e).message;
   } finally {
-    saving.value = false;
+    if (isCurrentWorkspaceRef(workspaceRef)) saving.value = false;
   }
 }
 

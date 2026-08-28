@@ -25,14 +25,25 @@ import {
   openReferenceExternalImportWindow,
   type ReferenceExternalImportSource,
 } from "../services/referenceExternalImportWindow";
+import type { WorkspaceRef } from "../services/project";
 
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
+const KNOWLEDGE_SIDEBAR_WIDTH_KEY = "locus:knowledgeSidebarWidth";
+const KNOWLEDGE_SIDEBAR_MIN_WIDTH = 220;
+const KNOWLEDGE_SIDEBAR_MAX_WIDTH = 420;
+const KNOWLEDGE_SIDEBAR_DEFAULT_WIDTH = 272;
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
   selectedModelId: string;
   modelDefaults: ModelDefaults;
-}>();
+  embedded?: boolean;
+  selectedDocumentId?: string | null;
+}>(), {
+  embedded: false,
+  selectedDocumentId: null,
+});
 
 const {
   sidebarWidth,
@@ -117,6 +128,39 @@ const {
   moveExplorerNodes,
 } = useKnowledgeState(props);
 
+function clampKnowledgeSidebarWidth(value: number): number {
+  return Math.min(
+    KNOWLEDGE_SIDEBAR_MAX_WIDTH,
+    Math.max(KNOWLEDGE_SIDEBAR_MIN_WIDTH, value),
+  );
+}
+
+function readKnowledgeSidebarWidth(): number {
+  try {
+    const raw = window.localStorage.getItem(KNOWLEDGE_SIDEBAR_WIDTH_KEY);
+    if (raw === null) return KNOWLEDGE_SIDEBAR_DEFAULT_WIDTH;
+    const saved = Number(raw);
+    return Number.isFinite(saved)
+      ? clampKnowledgeSidebarWidth(saved)
+      : KNOWLEDGE_SIDEBAR_DEFAULT_WIDTH;
+  } catch {
+    return KNOWLEDGE_SIDEBAR_DEFAULT_WIDTH;
+  }
+}
+
+function persistKnowledgeSidebarWidth(): void {
+  try {
+    window.localStorage.setItem(
+      KNOWLEDGE_SIDEBAR_WIDTH_KEY,
+      String(Math.round(sidebarWidth.value)),
+    );
+  } catch {
+    // The current in-memory width remains usable when browser storage is unavailable.
+  }
+}
+
+sidebarWidth.value = readKnowledgeSidebarWidth();
+
 const deleteDialog = ref<ExplorerNode[] | null>(null);
 const deleteDialogBusy = ref(false);
 const specialPage = ref<null | "retrieval" | "injection">(null);
@@ -125,6 +169,16 @@ const overviewDismissed = ref(false);
 const hasWorkspace = computed(() => !!props.workingDir.trim());
 const embeddingRuntimeLoading = computed(
   () => !!embeddingStatus.value?.activating,
+);
+
+watch(
+  [() => props.selectedDocumentId, documents],
+  ([documentId, items]) => {
+    if (!documentId || selectedDocument.value?.id === documentId) return;
+    const summary = items.find((item) => item.id === documentId);
+    if (summary) handleSelectDocument(summary);
+  },
+  { immediate: true },
 );
 
 let resizing: "sidebar" | null = null;
@@ -143,14 +197,16 @@ function onResizeStart(event: MouseEvent) {
 function onResizeMove(event: MouseEvent) {
   if (!resizing) return;
   const delta = event.clientX - resizeStartX;
-  sidebarWidth.value = Math.min(420, Math.max(220, resizeStartWidth + delta));
+  sidebarWidth.value = clampKnowledgeSidebarWidth(resizeStartWidth + delta);
 }
 
 function onResizeEnd() {
+  const wasResizing = resizing !== null;
   resizing = null;
   document.removeEventListener("mousemove", onResizeMove);
   document.removeEventListener("mouseup", onResizeEnd);
   document.body.style.cursor = "";
+  if (wasResizing) persistKnowledgeSidebarWidth();
 }
 
 function handleSelectType(type: KnowledgeDocumentType) {
@@ -314,12 +370,14 @@ function openExternalImportWindow(
   parentDir = "",
   initialSource: ReferenceExternalImportSource | null = null,
 ) {
+  if (!props.workspaceRef) return;
   activeType.value = "reference";
   const normalizedParent = normalizeRelativePath(parentDir);
   const preferredSource =
     initialSource ??
     (!normalizedParent && !hasUnityReferenceDocs.value ? "unity" : null);
   void openReferenceExternalImportWindow({
+    workspaceRef: props.workspaceRef,
     parentDir: normalizedParent,
     initialSource: preferredSource,
   });
@@ -432,8 +490,7 @@ async function confirmDeleteNode() {
 }
 
 onUnmounted(() => {
-  document.removeEventListener("mousemove", onResizeMove);
-  document.removeEventListener("mouseup", onResizeEnd);
+  onResizeEnd();
 });
 </script>
 
@@ -446,6 +503,7 @@ onUnmounted(() => {
 
     <template v-else>
       <div
+        v-if="!props.embedded"
         class="kx-side"
         :style="{ width: sidebarWidth + 'px' }"
       >
@@ -524,6 +582,7 @@ onUnmounted(() => {
         </div>
       </div>
       <div
+        v-if="!props.embedded"
         class="resize-handle"
         @mousedown="onResizeStart"
       ></div>
@@ -565,6 +624,7 @@ onUnmounted(() => {
             :directory="selectedDirectoryConfig"
             :loading="selectedDirectoryLoading"
             :save-loading="savingDocument"
+            :workspace-ref="workspaceRef!"
             :path-exists="referenceFolderExists"
             :ensure-directory="ensureReferenceDirectory"
             :select-directory="focusReferenceDirectory"
@@ -608,6 +668,7 @@ onUnmounted(() => {
           <KnowledgeInjectionPreviewPanel
             v-else-if="specialPage === 'injection'"
             :working-dir="props.workingDir"
+            :workspace-ref="props.workspaceRef ?? null"
           />
 
           <KnowledgeOverviewPanel
@@ -618,6 +679,7 @@ onUnmounted(() => {
             :documents="documents"
             :directory-count="activeDirectoryCount"
             :tree="visibleExplorerTree"
+            :workspace-ref="props.workspaceRef ?? null"
             @close="handleCloseOverview"
           />
 

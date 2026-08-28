@@ -4,10 +4,28 @@ use crate::eol::{apply_line_ending, normalize_lf, resolve_preferred_line_ending}
 use tauri::Manager;
 use tokio::io::AsyncWriteExt;
 
+fn resolve_context_path(ctx: &crate::tool::ToolExecutionContext, requested: &str) -> String {
+    let requested_path = std::path::Path::new(requested);
+    if requested_path.is_absolute() {
+        return requested.to_string();
+    }
+    let root = ctx
+        .execution
+        .as_ref()
+        .map(|execution| execution.root())
+        .or_else(|| ctx.working_dir.as_deref().map(std::path::Path::new));
+    root.map(|root| root.join(requested_path).to_string_lossy().to_string())
+        .unwrap_or_else(|| requested.to_string())
+}
+
 fn knowledge_registry_for_context(
     ctx: &crate::tool::ToolExecutionContext,
 ) -> Option<crate::knowledge_source_registry::KnowledgeSourceRegistry> {
-    let working_dir = ctx.working_dir.as_deref()?;
+    let working_dir = ctx
+        .execution
+        .as_ref()
+        .map(|execution| execution.root().to_string_lossy().into_owned())
+        .or_else(|| ctx.working_dir.clone())?;
     let app_knowledge_dir = ctx
         .app_handle
         .as_ref()
@@ -15,10 +33,24 @@ fn knowledge_registry_for_context(
         .and_then(|state| state.0.as_ref().as_ref().cloned());
     Some(
         crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
-            working_dir,
+            &working_dir,
             app_knowledge_dir.as_ref(),
         ),
     )
+}
+
+fn knowledge_scope_error(
+    ctx: &crate::tool::ToolExecutionContext,
+    target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
+    operation: &str,
+) -> Option<ToolResult> {
+    if target.is_none() || ctx.execution.is_some() {
+        return None;
+    }
+    Some(ToolResult {
+        output: format!("Knowledge {operation} requires a checkout-scoped ToolExecutionContext."),
+        is_error: true,
+    })
 }
 
 fn knowledge_l1_summary_for_read(
@@ -171,12 +203,20 @@ async fn sync_written_knowledge(
     target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
 ) -> Option<String> {
     let target = target?;
-    let working_dir = ctx.working_dir.as_deref()?;
-    let app_handle = ctx.app_handle.as_ref()?;
-    let Some(state) =
-        app_handle.try_state::<std::sync::Arc<crate::knowledge_index::KnowledgeIndexState>>()
-    else {
-        return Some("Knowledge index: filesystem watcher pending".to_string());
+    let Some(execution) = ctx.execution.as_ref() else {
+        return Some("Knowledge index: checkout-scoped ToolExecutionContext required".to_string());
+    };
+    let Some(app_handle) = ctx.app_handle.as_ref() else {
+        return Some("Knowledge index: Locus application context required".to_string());
+    };
+    let working_dir = execution.root().to_string_lossy().into_owned();
+    let state = match execution.workspace.knowledge_index(app_handle) {
+        Ok(state) => state,
+        Err(error) => {
+            return Some(format!(
+                "Knowledge index: workspace runtime unavailable ({error})"
+            ));
+        }
     };
 
     let result = if target.kind
@@ -184,8 +224,8 @@ async fn sync_written_knowledge(
     {
         crate::commands::sync_visible_document_for_path(
             app_handle,
-            working_dir,
-            state.inner().clone(),
+            &working_dir,
+            state.clone(),
             target.doc_type,
             &target.logical_path,
         )
@@ -193,8 +233,8 @@ async fn sync_written_knowledge(
     } else {
         crate::commands::reconcile_and_emit_knowledge_changed(
             app_handle,
-            working_dir,
-            state.inner().clone(),
+            &working_dir,
+            state.clone(),
             "generic_file_tool",
         )
         .await
@@ -207,7 +247,8 @@ async fn sync_written_knowledge(
             {
                 crate::commands::emit_knowledge_changed(
                     app_handle,
-                    working_dir,
+                    &state,
+                    &working_dir,
                     "generic_file_tool",
                 );
             }
@@ -231,7 +272,7 @@ pub(super) fn read() -> ToolDef {
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
+                    Some(p) => resolve_context_path(&ctx, p),
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
@@ -612,7 +653,7 @@ pub(super) fn write() -> ToolDef {
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
+                    Some(p) => resolve_context_path(&ctx, p),
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
@@ -656,6 +697,10 @@ pub(super) fn write() -> ToolDef {
 
                 let knowledge_target = knowledge_registry_for_context(&ctx)
                     .and_then(|registry| registry.classify_path_string(&file_path));
+                if let Some(error) = knowledge_scope_error(&ctx, knowledge_target.as_ref(), "write")
+                {
+                    return error;
+                }
                 if let Some(target) = knowledge_target.as_ref() {
                     if !target.mutability.is_writable() {
                         return ToolResult {
@@ -845,7 +890,7 @@ pub(super) fn edit() -> ToolDef {
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-                    Some(p) => p.to_string(),
+                    Some(p) => resolve_context_path(&ctx, p),
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: filePath".to_string(),
@@ -872,6 +917,10 @@ pub(super) fn edit() -> ToolDef {
 
                 let knowledge_target = knowledge_registry_for_context(&ctx)
                     .and_then(|registry| registry.classify_path_string(&file_path));
+                if let Some(error) = knowledge_scope_error(&ctx, knowledge_target.as_ref(), "edit")
+                {
+                    return error;
+                }
                 if let Some(target) = knowledge_target.as_ref() {
                     if !target.mutability.is_writable() {
                         return ToolResult {
@@ -1350,7 +1399,7 @@ pub(super) fn list() -> ToolDef {
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,
-        execute: make_exec(|args, _ctx| {
+        execute: make_exec(|args, ctx| {
             Box::pin(async move {
                 let root_path = args
                     .get("path")
@@ -1359,7 +1408,7 @@ pub(super) fn list() -> ToolDef {
                     .filter(|v| !v.is_empty())
                     .map(|v| v.to_string());
                 let root_path = match root_path {
-                    Some(path) => path,
+                    Some(path) => resolve_context_path(&ctx, &path),
                     None => {
                         return ToolResult {
                             output: "Missing required parameter: path".to_string(),
@@ -1532,11 +1581,29 @@ fn list_dir_recursive(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::{edit, list, read, write};
     use crate::process_util::command;
     use crate::tool::ToolExecutionContext;
     use serde_json::json;
     use tempfile::tempdir;
+
+    fn checkout_context(root: &std::path::Path) -> ToolExecutionContext {
+        let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(root)
+            .expect("workspace identity");
+        let runtime = crate::workspace_service::WorkspaceRuntime::new(identity, Vec::new(), 1);
+        let execution = Arc::new(crate::workspace_service::AgentExecutionContext::new(
+            runtime,
+            HashMap::new(),
+        ));
+        ToolExecutionContext {
+            execution: Some(execution),
+            working_dir: Some(root.to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+    }
 
     fn git(cwd: &std::path::Path, args: &[&str]) {
         let output = command("git")
@@ -1721,10 +1788,7 @@ mod tests {
         let target = root
             .path()
             .join("Locus/knowledge/design/gameplay/new-loop.md");
-        let context = ToolExecutionContext {
-            working_dir: Some(root.path().to_string_lossy().to_string()),
-            ..Default::default()
-        };
+        let context = checkout_context(root.path());
 
         let result = tokio::runtime::Runtime::new()
             .expect("runtime")
@@ -1751,15 +1815,39 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_write_rejects_a_working_dir_without_checkout_execution_scope() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("Locus/knowledge/design/unscoped.md");
+        let result = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                (write().execute)(
+                    json!({
+                        "filePath": target.to_string_lossy().to_string(),
+                        "content": "# Unscoped\n"
+                    }),
+                    ToolExecutionContext {
+                        working_dir: Some(root.path().to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
+                .await
+            });
+
+        assert!(result.is_error);
+        assert!(result
+            .output
+            .contains("checkout-scoped ToolExecutionContext"));
+        assert!(!target.exists());
+    }
+
+    #[test]
     fn edit_adds_and_reports_frontmatter_for_unregistered_plain_knowledge_file() {
         let root = tempdir().expect("temp dir");
         let target = root.path().join("Locus/knowledge/memory/context.md");
         std::fs::create_dir_all(target.parent().expect("parent")).expect("create parent");
         std::fs::write(&target, "Durable preference\n").expect("seed plain markdown");
-        let context = ToolExecutionContext {
-            working_dir: Some(root.path().to_string_lossy().to_string()),
-            ..Default::default()
-        };
+        let context = checkout_context(root.path());
 
         let result = tokio::runtime::Runtime::new()
             .expect("runtime")
@@ -1865,6 +1953,62 @@ mod tests {
         assert!(result.output.contains("<content>\n1\talpha\n2\tbeta"));
         assert!(!result.output.starts_with("<content>\n "));
         assert!(!result.output.contains('\r'));
+    }
+
+    #[test]
+    fn relative_file_tool_paths_use_the_execution_working_dir() {
+        let root = tempdir().expect("temp dir");
+        let nested = root.path().join("nested");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(nested.join("existing.txt"), "alpha\n").expect("existing file");
+        let context = ToolExecutionContext {
+            working_dir: Some(root.path().to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let read_result = runtime.block_on(async {
+            (read().execute)(
+                json!({ "filePath": "nested/existing.txt" }),
+                context.clone(),
+            )
+            .await
+        });
+        assert!(!read_result.is_error, "{}", read_result.output);
+        assert!(read_result.output.contains("alpha"));
+
+        let write_result = runtime.block_on(async {
+            (write().execute)(
+                json!({ "filePath": "nested/created.txt", "content": "before\n" }),
+                context.clone(),
+            )
+            .await
+        });
+        assert!(!write_result.is_error, "{}", write_result.output);
+
+        let edit_result = runtime.block_on(async {
+            (edit().execute)(
+                json!({
+                    "filePath": "nested/created.txt",
+                    "oldString": "before",
+                    "newString": "after"
+                }),
+                context.clone(),
+            )
+            .await
+        });
+        assert!(!edit_result.is_error, "{}", edit_result.output);
+        assert_eq!(
+            std::fs::read_to_string(nested.join("created.txt")).expect("edited file"),
+            "after\n"
+        );
+
+        let list_result = runtime.block_on(async {
+            (list().execute)(json!({ "path": "nested", "include_files": true }), context).await
+        });
+        assert!(!list_result.is_error, "{}", list_result.output);
+        assert!(list_result.output.contains("existing.txt"));
+        assert!(list_result.output.contains("created.txt"));
     }
 
     #[test]

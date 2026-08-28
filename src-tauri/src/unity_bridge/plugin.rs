@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use super::strip_extended_path_prefix;
 
@@ -781,21 +781,21 @@ pub async fn install_or_update_plugin_with_force_close(
     Ok(hash)
 }
 
-pub fn emit_plugin_status(app_handle: &AppHandle, project_path: &str) {
-    let status = check_plugin_status(project_path);
-    eprintln!(
-        "[Locus] plugin check result for '{}': {:?}",
-        project_path, status
+pub fn emit_plugin_status_scoped(
+    app_handle: &AppHandle,
+    project_path: &str,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    let status = check_plugin_status(project_path).unwrap_or_else(|error| {
+        eprintln!("[Locus] plugin check error: {}", error);
+        PluginStatus::Missing
+    });
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        scope,
+        "unity-plugin-status",
+        status,
     );
-    match status {
-        Ok(status) => {
-            let _ = app_handle.emit("unity-plugin-status", status);
-        }
-        Err(e) => {
-            eprintln!("[Locus] plugin check error: {}", e);
-            let _ = app_handle.emit("unity-plugin-status", PluginStatus::Missing);
-        }
-    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::asset_db::AssetDbState;
 use crate::diff::content::{is_unity_yaml, unity_asset_kind};
@@ -76,9 +76,19 @@ pub(crate) fn hash_workspace_bytes(workspace_bytes: Option<&[u8]>) -> u64 {
 
 // ── Build merge session ──
 
-fn emit_merge_progress(app_handle: Option<&AppHandle>, profiler: &DiffProfiler, phase: DiffPhase) {
-    if let Some(handle) = app_handle {
-        let _ = handle.emit("merge-progress", profiler.progress_event(phase, None));
+fn emit_merge_progress(
+    app_handle: Option<&AppHandle>,
+    event_scope: Option<&crate::workspace_service::event::WorkspaceEventScope>,
+    profiler: &DiffProfiler,
+    phase: DiffPhase,
+) {
+    if let (Some(handle), Some(scope)) = (app_handle, event_scope) {
+        crate::workspace_service::event::emit_for_workspace_scope(
+            handle,
+            scope,
+            "merge-progress",
+            profiler.progress_event(phase, None),
+        );
     }
 }
 
@@ -90,6 +100,7 @@ pub(crate) fn build_merge_session(
     _right_oid: &str,
     ref_graph_state: &AssetDbState,
     app_handle: Option<&AppHandle>,
+    event_scope: Option<&crate::workspace_service::event::WorkspaceEventScope>,
 ) -> AppResult<MergeSemanticSession> {
     let mut profiler = DiffProfiler::new(format!("merge:{}", path), true, false);
 
@@ -100,7 +111,7 @@ pub(crate) fn build_merge_session(
     let theirs_content = three_way.right.unwrap_or_default();
 
     profiler.record(DiffPhase::FetchContent);
-    emit_merge_progress(app_handle, &profiler, DiffPhase::FetchContent);
+    emit_merge_progress(app_handle, event_scope, &profiler, DiffPhase::FetchContent);
 
     // 2. Validate: if any side is empty and content was expected, this is unusual.
     //    If all three are empty, nothing to merge.
@@ -134,7 +145,7 @@ pub(crate) fn build_merge_session(
 
     profiler.record(DiffPhase::ParseYaml);
     profiler.set_doc_counts(base_docs.len(), ours_docs.len());
-    emit_merge_progress(app_handle, &profiler, DiffPhase::ParseYaml);
+    emit_merge_progress(app_handle, event_scope, &profiler, DiffPhase::ParseYaml);
 
     // 5. Validate parse results: if content was non-empty but docs are empty, parse failed.
     let base_parse_ok = base_content.is_empty() || !base_docs.is_empty();
@@ -193,9 +204,9 @@ pub(crate) fn build_merge_session(
     )?;
 
     profiler.record(DiffPhase::BuildSemantic);
-    emit_merge_progress(app_handle, &profiler, DiffPhase::BuildSemantic);
+    emit_merge_progress(app_handle, event_scope, &profiler, DiffPhase::BuildSemantic);
     profiler.record(DiffPhase::Done);
-    emit_merge_progress(app_handle, &profiler, DiffPhase::Done);
+    emit_merge_progress(app_handle, event_scope, &profiler, DiffPhase::Done);
     profiler.log_summary(path);
 
     // Hash workspace file content to detect external modifications at apply time.

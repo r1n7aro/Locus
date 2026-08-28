@@ -1,4 +1,5 @@
 import type { FileDiffPayload, FileDiffRequest } from "../types";
+import type { WorkspaceRef } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
@@ -12,6 +13,7 @@ export interface ChatDiffReviewWindowPayload {
   request?: FileDiffRequest;
   payload?: FileDiffPayload;
   diffKey?: string;
+  workspaceRef?: WorkspaceRef | null;
 }
 
 function trimOrEmpty(value: string | null | undefined): string {
@@ -47,9 +49,17 @@ export function getChatDiffReviewWindowPayload(
   search = window.location.search,
 ): ChatDiffReviewWindowPayload {
   const params = new URLSearchParams(search);
+  const checkoutId = trimOrEmpty(params.get("checkoutId"));
+  const generationRaw = params.get("workspaceGeneration");
+  const expectedGeneration = generationRaw && /^\d+$/.test(generationRaw)
+    ? Number(generationRaw)
+    : null;
   return {
     request: parseRequestParam(params.get("request")),
     diffKey: trimOrEmpty(params.get("diffKey")),
+    workspaceRef: checkoutId && Number.isSafeInteger(expectedGeneration)
+      ? { checkoutId, expectedGeneration }
+      : null,
   };
 }
 
@@ -66,6 +76,13 @@ export function buildChatDiffReviewWindowQuery(
   } else if (payload.payload?.key.trim()) {
     params.set("diffKey", payload.payload.key.trim());
   }
+  if (
+    payload.workspaceRef?.checkoutId.trim()
+    && Number.isSafeInteger(payload.workspaceRef.expectedGeneration)
+  ) {
+    params.set("checkoutId", payload.workspaceRef.checkoutId.trim());
+    params.set("workspaceGeneration", String(payload.workspaceRef.expectedGeneration));
+  }
   return params.toString();
 }
 
@@ -76,9 +93,12 @@ export function buildChatDiffReviewWindowUrl(
 }
 
 function eventPayload(input: ChatDiffReviewWindowPayload): ChatDiffReviewWindowPayload {
-  if (input.payload) return { payload: input.payload, diffKey: input.payload.key };
-  if (input.request) return { request: input.request };
-  return { diffKey: trimOrEmpty(input.diffKey) };
+  const scoped = input.workspaceRef ? { workspaceRef: input.workspaceRef } : {};
+  if (input.payload) {
+    return { payload: input.payload, diffKey: input.payload.key, ...scoped };
+  }
+  if (input.request) return { request: input.request, ...scoped };
+  return { diffKey: trimOrEmpty(input.diffKey), ...scoped };
 }
 
 export async function openChatDiffReviewWindow(

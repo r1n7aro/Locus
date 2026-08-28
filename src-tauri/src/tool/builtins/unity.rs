@@ -729,13 +729,21 @@ pub(super) fn unity_ref_search() -> ToolDef {
         mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let Some(app_handle) = ctx.app_handle.as_ref() else {
+                let Some(execution) = ctx.execution.as_ref() else {
                     return ToolResult {
-                        output: "unity_ref_search requires the Locus app context.".to_string(),
+                        output: "Tool 'unity_ref_search' requires a checkout-scoped ToolExecutionContext."
+                            .to_string(),
                         is_error: true,
                     };
                 };
-                crate::agent::instance::AgentInstance::execute_unity_ref_search(app_handle, &args)
+                execution
+                    .workspace
+                    .core()
+                    .refresh_asset_db_if_missing(execution.root());
+                crate::agent::instance::AgentInstance::execute_unity_ref_search(
+                    &args,
+                    execution.workspace.core().asset_db(),
+                )
             })
         }),
     }
@@ -752,13 +760,21 @@ pub(super) fn unity_asset_search() -> ToolDef {
         mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let Some(app_handle) = ctx.app_handle.as_ref() else {
+                let Some(execution) = ctx.execution.as_ref() else {
                     return ToolResult {
-                        output: "unity_asset_search requires the Locus app context.".to_string(),
+                        output: "Tool 'unity_asset_search' requires a checkout-scoped ToolExecutionContext."
+                            .to_string(),
                         is_error: true,
                     };
                 };
-                crate::agent::instance::AgentInstance::execute_unity_asset_search(app_handle, &args)
+                execution
+                    .workspace
+                    .core()
+                    .refresh_asset_db_if_missing(execution.root());
+                crate::agent::instance::AgentInstance::execute_unity_asset_search(
+                    &args,
+                    execution.workspace.core().asset_db(),
+                )
             })
         }),
     }
@@ -882,28 +898,35 @@ macro_rules! unity_yaml_tool_def {
             mutates_workspace: false,
             execute: make_exec(|args, ctx| {
                 Box::pin(async move {
+                    let Some(execution) = ctx.execution.as_ref() else {
+                        return ToolResult {
+                            output: concat!(
+                                "Tool '",
+                                $name,
+                                "' requires a checkout-scoped ToolExecutionContext."
+                            )
+                            .to_string(),
+                            is_error: true,
+                        };
+                    };
                     let Some(app_handle) = ctx.app_handle.as_ref() else {
                         return ToolResult {
                             output: concat!($name, " requires the Locus app context.").to_string(),
                             is_error: true,
                         };
                     };
-                    let working_dir = match ctx.working_dir {
-                        Some(ref wd) if !wd.trim().is_empty() => wd.trim().to_string(),
-                        _ => {
-                            return ToolResult {
-                                output: concat!(
-                                    "Tool '",
-                                    $name,
-                                    "' requires a selected Unity project working directory."
-                                )
-                                .to_string(),
-                                is_error: true,
-                            };
-                        }
-                    };
-                    crate::agent::instance::AgentInstance::$impl_fn(app_handle, &working_dir, &args)
-                        .await
+                    execution
+                        .workspace
+                        .core()
+                        .refresh_asset_db_if_missing(execution.root());
+                    let working_dir = execution.root().to_string_lossy().into_owned();
+                    crate::agent::instance::AgentInstance::$impl_fn(
+                        app_handle,
+                        &working_dir,
+                        execution.workspace.core().asset_db(),
+                        &args,
+                    )
+                    .await
                 })
             }),
         }
@@ -1080,6 +1103,30 @@ pub(super) fn unity_recompile() -> ToolDef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn asset_index_tools_require_checkout_execution_scope() {
+        for tool in [
+            unity_ref_search(),
+            unity_asset_search(),
+            unity_yaml_search(),
+            unity_yaml_read(),
+        ] {
+            let result = (tool.execute)(
+                serde_json::json!({}),
+                crate::tool::ToolExecutionContext::default(),
+            )
+            .await;
+            assert!(result.is_error);
+            assert!(
+                result
+                    .output
+                    .contains("checkout-scoped ToolExecutionContext"),
+                "{}",
+                result.output
+            );
+        }
+    }
 
     #[test]
     fn console_logs_are_flat_and_keep_counts() {

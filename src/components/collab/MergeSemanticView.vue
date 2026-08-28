@@ -9,14 +9,30 @@ import type { MergeDisplayStatus } from "./mergeUi";
 import { compactMergeSideLabel, mergeStatusLabel, mergeStatusTone } from "./mergeUi";
 import UnityHierarchyPane from "../diff/UnityHierarchyPane.vue";
 import MergeInspectorPane from "./MergeInspectorPane.vue";
+import type { WorkspaceRef } from "../../services/project";
 
 const props = defineProps<{
+  workspaceRef?: WorkspaceRef | null;
   session: MergeSessionPayload;
   resolution: MergeResolutionState;
   leftLabel?: string;
   rightLabel?: string;
   showConflictsOnly?: boolean;
 }>();
+
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
+  return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 const selectedTargetId = ref<string | null>(null);
 const activeInspector = ref<MergeTargetInspector | null>(null);
@@ -130,6 +146,7 @@ const hierarchyChangeKindOverrides = computed<Record<string, string>>(() => {
 });
 
 async function loadTarget(targetId: string) {
+  const workspaceRef = captureWorkspaceRef();
   const generation = ++targetLoadGeneration;
   selectedTargetId.value = targetId;
   inspectorError.value = null;
@@ -148,17 +165,29 @@ async function loadTarget(targetId: string) {
     const inspector = await mergeSemanticTarget({
       mergeKey: props.session.key,
       targetId,
-    });
-    if (generation !== targetLoadGeneration || selectedTargetId.value !== targetId) return;
+    }, workspaceRef);
+    if (
+      generation !== targetLoadGeneration
+      || selectedTargetId.value !== targetId
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     inspectorCache.value.set(targetId, inspector);
     activeInspector.value = inspector;
     props.resolution.registerConflictFields(inspector);
   } catch (e) {
-    if (generation !== targetLoadGeneration || selectedTargetId.value !== targetId) return;
+    if (
+      generation !== targetLoadGeneration
+      || selectedTargetId.value !== targetId
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     activeInspector.value = null;
     inspectorError.value = normalizeAppError(e).message;
   } finally {
-    if (generation !== targetLoadGeneration || selectedTargetId.value !== targetId) return;
+    if (
+      generation !== targetLoadGeneration
+      || selectedTargetId.value !== targetId
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     inspectorLoading.value = false;
   }
 }
@@ -213,7 +242,11 @@ onUnmounted(() => {
 });
 
 watch(
-  () => props.session.key,
+  () => [
+    props.session.key,
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
   () => {
     targetLoadGeneration += 1;
     selectedTargetId.value = props.session.defaultTargetId ?? props.session.targets?.[0]?.id ?? null;

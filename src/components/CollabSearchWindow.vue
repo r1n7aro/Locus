@@ -14,6 +14,7 @@ import type { GitHistorySearchResult } from "../types";
 import { gitHistorySearch } from "../services/git";
 import {
   COLLAB_SEARCH_SELECT_EVENT,
+  getCollabSearchWindowWorkspaceRef,
   type CollabSearchSelectionPayload,
 } from "../services/collabSearchWindow";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
@@ -77,6 +78,7 @@ const RESULT_COLUMN_MAX_WIDTHS: Record<ResultColumnKey, number> = {
 const CALENDAR_WEEKDAY_KEYS: CalendarWeekdayKey[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 const appWindow = getCurrentWindow();
+const workspaceRef = getCollabSearchWindowWorkspaceRef();
 const query = ref("");
 const useRegex = ref(false);
 const author = ref("");
@@ -708,6 +710,10 @@ function resetResultScrollTop() {
 
 async function runSearch() {
   if (loading.value || !canSearch.value) return;
+  if (!workspaceRef) {
+    error.value = "Workspace checkout is required.";
+    return;
+  }
   closeFilterDropdown();
   loading.value = true;
   searched.value = true;
@@ -719,7 +725,7 @@ async function runSearch() {
       author: author.value,
       dateFrom: dateStartTimestamp(dateFrom.value),
       dateTo: dateEndTimestamp(dateTo.value),
-    });
+    }, workspaceRef);
     results.value = response.results;
     resetResultScrollTop();
     autoFitResultColumnWidths(response.results);
@@ -748,11 +754,13 @@ async function closeWindow() {
 }
 
 async function selectResult(result: GitHistorySearchResult) {
+  if (!workspaceRef) return;
   if (selectingHash.value) return;
   selectingHash.value = result.hash;
   const payload: CollabSearchSelectionPayload = {
     kind: result.kind,
     hash: result.hash,
+    workspaceRef,
   };
   try {
     await emitTo("main", COLLAB_SEARCH_SELECT_EVENT, payload);

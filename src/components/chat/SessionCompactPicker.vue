@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { ChevronRight, Folder, FolderOpen } from "lucide";
+import { ChevronRight, Folder, FolderOpen, GitBranch } from "lucide";
 import { t } from "../../i18n";
 import type { SessionSummary } from "../../types";
 import { formatShortcut, useKeyboardShortcuts } from "../../composables/useKeyboardShortcuts";
@@ -15,6 +15,11 @@ import {
   type ViewPackageSummary,
 } from "../../services/view";
 import { useNotificationStore } from "../../stores/notification";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+} from "../../services/project";
 import LucideIcon from "../icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "../icons/locusViewIcons";
 
@@ -60,17 +65,23 @@ const open = ref(false);
 const pickerRef = ref<HTMLElement | null>(null);
 const { state: shortcutState } = useKeyboardShortcuts();
 const notificationStore = useNotificationStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const viewSummaries = ref<ViewPackageSummary[]>([]);
 const viewFolders = ref<ViewFolderSummary[]>([]);
 const viewTreeOrder = ref<string[]>([]);
 const viewsLoading = ref(false);
 const viewOpeningKey = ref("");
 const viewExpandedState = ref<Record<string, boolean>>(loadViewExpandedState());
-let viewReloadUnsubscribe: RuntimeUnsubscribe | null = null;
-let viewTreeChangedUnsubscribe: RuntimeUnsubscribe | null = null;
+let viewWorkspaceEventUnsubscribe: RuntimeUnsubscribe | null = null;
 
 const hasWorkspace = computed(() => !!props.workingDir?.trim());
 const showSessionViews = computed(() => props.showViews !== false);
+
+function sessionBranchLabel(session: SessionSummary): string {
+  const branchRef = session.executionTarget?.branchRef?.trim();
+  if (branchRef) return branchRef.replace(/^refs\/heads\//, "");
+  return session.executionTarget?.headOid?.trim().slice(0, 8) ?? "";
+}
 
 const sortedSessions = computed(() =>
   [...props.sessions].sort((a, b) => b.updatedAt - a.updatedAt),
@@ -300,7 +311,9 @@ async function loadViews() {
   }
   viewsLoading.value = true;
   try {
-    const snapshot = await viewTree();
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const snapshot = await viewTree(workspaceRef);
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
     viewTreeOrder.value = snapshot.order ?? [];
@@ -322,7 +335,9 @@ async function openView(view: ViewPackageSummary) {
   const key = `${viewDisplayPath(view)}:${view.id}`;
   viewOpeningKey.value = key;
   try {
-    const requirementError = await checkViewOpenRequirements(view);
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const requirementError = await checkViewOpenRequirements(workspaceRef, view);
     if (requirementError) {
       notificationStore.addNotice("error", requirementError.message, {
         code: requirementError.code,
@@ -332,7 +347,7 @@ async function openView(view: ViewPackageSummary) {
       return;
     }
     open.value = false;
-    await viewRun(view.id);
+    await viewRun(workspaceRef, view.id);
   } catch (error) {
     const err = normalizeViewError(error, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
@@ -384,15 +399,18 @@ watch(
 
 onMounted(async () => {
   document.addEventListener("click", onClickOutside);
-  viewReloadUnsubscribe = await getLocusRuntime().subscribe<ViewPackageSummary>(
-    "view-package-reloaded",
-    () => {
-      void loadViews();
-    },
-  );
-  viewTreeChangedUnsubscribe = await getLocusRuntime().subscribe(
-    "view-tree-changed",
-    () => {
+  viewWorkspaceEventUnsubscribe = await getLocusRuntime().subscribe<RoutedWorkspaceEvent>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "view-package-reloaded" && event.eventName !== "view-tree-changed") {
+        return;
+      }
+      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+      if (
+        !workspaceRef
+        || event.checkoutId !== workspaceRef.checkoutId
+        || event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
       void loadViews();
     },
   );
@@ -401,10 +419,8 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener("click", onClickOutside);
-  viewReloadUnsubscribe?.();
-  viewReloadUnsubscribe = null;
-  viewTreeChangedUnsubscribe?.();
-  viewTreeChangedUnsubscribe = null;
+  viewWorkspaceEventUnsubscribe?.();
+  viewWorkspaceEventUnsubscribe = null;
 });
 </script>
 
@@ -476,6 +492,14 @@ onUnmounted(() => {
             >
               <span class="session-compact-option-dot"></span>
               <span class="session-compact-option-title">{{ session.title || t("chat.session.newSession") }}</span>
+              <span
+                v-if="sessionBranchLabel(session)"
+                class="session-compact-option-branch"
+                :title="session.executionTarget?.branchRef || session.executionTarget?.headOid || undefined"
+              >
+                <LucideIcon :icon="GitBranch" :size="11" :stroke-width="1.8" />
+                <span>{{ sessionBranchLabel(session) }}</span>
+              </span>
               <span class="session-compact-option-time">{{ formatSessionTime(session.updatedAt) }}</span>
             </button>
           </template>
@@ -754,6 +778,23 @@ onUnmounted(() => {
   font-size: 11px;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+}
+
+.session-compact-option-branch {
+  min-width: 0;
+  max-width: 88px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono-identifier);
+  font-size: 11px;
+}
+
+.session-compact-option-branch > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-compact-option-shortcut {

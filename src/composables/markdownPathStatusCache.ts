@@ -1,8 +1,11 @@
 import { statWorkspaceEntries, type WorkspaceEntryStat } from "../services/project";
+import type { WorkspaceRef } from "../services/project";
 import type { MarkdownPathStatus } from "./markdownInject";
 
 interface PendingRequest {
   workingDir: string;
+  workspaceRef: WorkspaceRef;
+  scopeKey: string;
   candidates: string[];
   resolve: (statuses: Map<string, MarkdownPathStatus>) => void;
 }
@@ -18,8 +21,12 @@ const statusCache = new Map<string, CachedStatus>();
 let pendingRequests: PendingRequest[] = [];
 let flushScheduled = false;
 
-function cacheKey(workingDir: string, path: string) {
-  return `${workingDir}\u0000${path}`;
+function workspaceScopeKey(workingDir: string, workspaceRef: WorkspaceRef) {
+  return `${workspaceRef.checkoutId}@${workspaceRef.expectedGeneration ?? "current"}\u0000${workingDir}`;
+}
+
+function cacheKey(scopeKey: string, path: string) {
+  return `${scopeKey}\u0000${path}`;
 }
 
 function statusFromEntry(entry: WorkspaceEntryStat): MarkdownPathStatus {
@@ -33,8 +40,8 @@ function statusFromEntry(entry: WorkspaceEntryStat): MarkdownPathStatus {
   };
 }
 
-function cachedStatus(workingDir: string, path: string): MarkdownPathStatus | undefined {
-  const key = cacheKey(workingDir, path);
+function cachedStatus(scopeKey: string, path: string): MarkdownPathStatus | undefined {
+  const key = cacheKey(scopeKey, path);
   const cached = statusCache.get(key);
   if (!cached) return undefined;
   if (cached.expiresAt <= Date.now()) {
@@ -48,21 +55,26 @@ async function flushPendingRequests() {
   flushScheduled = false;
   const requests = pendingRequests;
   pendingRequests = [];
-  const latestWorkingDir = requests[requests.length - 1]?.workingDir ?? "";
-  const activeRequests = requests.filter((request) => request.workingDir === latestWorkingDir);
+  const latestRequest = requests[requests.length - 1];
+  if (!latestRequest) return;
+  const latestScopeKey = latestRequest.scopeKey;
+  const activeRequests = requests.filter((request) => request.scopeKey === latestScopeKey);
   const paths = [...new Set(activeRequests.flatMap((request) => request.candidates))]
-    .filter((path) => !cachedStatus(latestWorkingDir, path));
+    .filter((path) => !cachedStatus(latestScopeKey, path));
 
   if (paths.length > 0) {
     try {
       const batches = [];
       for (let index = 0; index < paths.length; index += STAT_BATCH_SIZE) {
-        batches.push(statWorkspaceEntries(paths.slice(index, index + STAT_BATCH_SIZE)));
+        batches.push(statWorkspaceEntries(
+          paths.slice(index, index + STAT_BATCH_SIZE),
+          latestRequest.workspaceRef,
+        ));
       }
       const entries = (await Promise.all(batches)).flat();
       const expiresAt = Date.now() + CACHE_TTL_MS;
       for (const entry of entries) {
-        statusCache.set(cacheKey(latestWorkingDir, entry.path), {
+        statusCache.set(cacheKey(latestScopeKey, entry.path), {
           value: statusFromEntry(entry),
           expiresAt,
         });
@@ -73,13 +85,13 @@ async function flushPendingRequests() {
   }
 
   for (const request of requests) {
-    if (request.workingDir !== latestWorkingDir) {
+    if (request.scopeKey !== latestScopeKey) {
       request.resolve(new Map());
       continue;
     }
     const statuses = new Map<string, MarkdownPathStatus>();
     for (const candidate of request.candidates) {
-      const status = cachedStatus(request.workingDir, candidate);
+      const status = cachedStatus(request.scopeKey, candidate);
       if (status) statuses.set(candidate, status);
     }
     request.resolve(statuses);
@@ -89,19 +101,21 @@ async function flushPendingRequests() {
 export function loadCachedMarkdownPathStatuses(
   workingDir: string,
   candidates: string[],
+  workspaceRef: WorkspaceRef,
 ): Promise<Map<string, MarkdownPathStatus>> {
+  const scopeKey = workspaceScopeKey(workingDir, workspaceRef);
   if (candidates.length === 0) return Promise.resolve(new Map());
   const cached = new Map<string, MarkdownPathStatus>();
   let complete = true;
   for (const candidate of candidates) {
-    const status = cachedStatus(workingDir, candidate);
+    const status = cachedStatus(scopeKey, candidate);
     if (status) cached.set(candidate, status);
     else complete = false;
   }
   if (complete) return Promise.resolve(cached);
 
   return new Promise((resolve) => {
-    pendingRequests.push({ workingDir, candidates, resolve });
+    pendingRequests.push({ workingDir, workspaceRef, scopeKey, candidates, resolve });
     if (flushScheduled) return;
     flushScheduled = true;
     queueMicrotask(() => {

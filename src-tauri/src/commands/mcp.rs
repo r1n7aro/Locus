@@ -3,6 +3,9 @@ use crate::mcp::config::{self, McpServerConfig};
 use crate::mcp::import::McpImportCandidate;
 use crate::mcp::manager::McpServerRuntimeStatus;
 use crate::mcp::McpServerTestResult;
+use crate::workspace_service::{ProjectRegistry, WorkspaceRef};
+use std::sync::Arc;
+use tauri::State;
 
 #[tauri::command]
 pub async fn mcp_servers_get() -> Result<Vec<McpServerConfig>, AppError> {
@@ -216,27 +219,143 @@ pub async fn mcp_server_tool_inventory(
 
 #[tauri::command]
 pub async fn mcp_server_integrations(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<mcp_server::install::IntegrationStatus>, AppError> {
     let settings = mcp_server::config::load_settings();
+    let (target, _scope) = mcp_server_integration_target(
+        workspace_registry.inner(),
+        &workspace_ref,
+        &settings,
+        "mcp_server_integrations",
+    )?;
     Ok(mcp_server::install::integration_statuses(
-        &settings.endpoint_url(),
+        &target,
         &settings.token,
     ))
 }
 
 #[tauri::command]
 pub async fn mcp_server_integration_apply(
-    id: String,
+    integration_id: String,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<mcp_server::install::IntegrationStatus, AppError> {
     let settings = mcp_server::config::load_settings();
-    mcp_server::install::apply_integration(&id, &settings.endpoint_url(), &settings.token)
+    let (target, _scope) = mcp_server_integration_target(
+        workspace_registry.inner(),
+        &workspace_ref,
+        &settings,
+        "mcp_server_integration_apply",
+    )?;
+    mcp_server::install::apply_integration(&integration_id, &target, &settings.token)
         .map_err(|e| AppError::new("mcp_server.integration_failed", e))
 }
 
 #[tauri::command]
 pub async fn mcp_server_integration_remove(
-    id: String,
+    integration_id: String,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<mcp_server::install::IntegrationStatus, AppError> {
-    mcp_server::install::remove_integration(&id)
+    let settings = mcp_server::config::load_settings();
+    let (target, _scope) = mcp_server_integration_target(
+        workspace_registry.inner(),
+        &workspace_ref,
+        &settings,
+        "mcp_server_integration_remove",
+    )?;
+    mcp_server::install::remove_integration(&integration_id, &target)
         .map_err(|e| AppError::new("mcp_server.integration_failed", e))
+}
+
+fn mcp_server_integration_target(
+    workspace_registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    settings: &mcp_server::config::McpServerSettings,
+    operation: &'static str,
+) -> Result<
+    (
+        mcp_server::install::IntegrationTarget,
+        crate::workspace_service::ResolvedWorkspaceScope,
+    ),
+    AppError,
+> {
+    if workspace_ref.expected_generation.is_none() {
+        return Err(AppError::new(
+            "workspace.generation_required",
+            "MCP integration operations require checkoutId and expectedGeneration",
+        )
+        .operation(operation));
+    }
+    let scope = workspace_registry
+        .resolve_workspace_ref(workspace_ref)
+        .map_err(|error| {
+            AppError::new("workspace.scope_invalid", error.to_string()).operation(operation)
+        })?;
+    let runtime = scope.runtime();
+    let target = mcp_server::install::IntegrationTarget::new(
+        runtime.checkout_id().as_str(),
+        runtime.generation(),
+        settings.scoped_endpoint_url(runtime.checkout_id().as_str(), Some(runtime.generation())),
+    );
+    Ok((target, scope))
+}
+
+#[cfg(test)]
+mod scoped_integration_tests {
+    use super::*;
+
+    fn registry() -> Arc<ProjectRegistry> {
+        let config_dir = tempfile::tempdir().expect("config");
+        let config = Arc::new(crate::config::AppConfig::load_from_path(
+            &config_dir.path().join("config.json"),
+        ));
+        let policy = Arc::new(
+            crate::resource_policy::ResourcePolicyStore::from_config(config).expect("policy"),
+        );
+        ProjectRegistry::new(policy, Vec::new())
+    }
+
+    #[test]
+    fn integration_target_rejects_a_checkout_without_generation() {
+        let workspace_ref = WorkspaceRef::new(
+            crate::workspace_service::CheckoutId::new("checkout-a").expect("checkout id"),
+            None,
+        );
+        let error = mcp_server_integration_target(
+            &registry(),
+            &workspace_ref,
+            &mcp_server::config::McpServerSettings::default(),
+            "test_integration",
+        )
+        .err()
+        .expect("generation must be mandatory");
+        assert_eq!(error.code, "workspace.generation_required");
+        assert_eq!(error.operation.as_deref(), Some("test_integration"));
+    }
+
+    #[test]
+    fn integration_target_uses_the_resolved_runtime_identity() {
+        let registry = registry();
+        let root = tempfile::tempdir().expect("checkout");
+        let runtime = registry.register(root.path()).expect("runtime");
+        let workspace_ref = WorkspaceRef::for_runtime(&runtime);
+        let settings = mcp_server::config::McpServerSettings {
+            port: 28991,
+            ..Default::default()
+        };
+        let (target, _scope) =
+            mcp_server_integration_target(&registry, &workspace_ref, &settings, "test_integration")
+                .expect("target");
+        assert_eq!(target.checkout_id, runtime.checkout_id().as_str());
+        assert_eq!(target.workspace_generation, runtime.generation());
+        assert!(target
+            .endpoint_url
+            .contains(&format!("checkoutId={}", runtime.checkout_id())));
+        assert!(target
+            .endpoint_url
+            .contains(&format!("workspaceGeneration={}", runtime.generation())));
+        assert!(target.entry_name.contains(runtime.checkout_id().as_str()));
+    }
 }

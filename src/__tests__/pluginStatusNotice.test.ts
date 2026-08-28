@@ -14,11 +14,11 @@ describe("plugin status notice", () => {
     const projectStore = read("src/stores/project.ts");
 
     expect(projectStore).toContain('const PLUGIN_STATUS_NOTICE_OPERATION = "unity-plugin-status";');
-    expect(projectStore).toContain('const plan = await unityService.checkUnityPluginInstallPlan();');
+    expect(projectStore).toContain('const plan = await unityService.checkUnityPluginInstallPlan(requireWorkspaceRef());');
     expect(projectStore).toContain("plan.dllUpdateRequired && plan.unityRunning");
     expect(projectStore).toContain('title: t("app.plugin.closeUnityConfirmTitle")');
     expect(projectStore).toContain("forceCloseUnity = true");
-    expect(projectStore).toContain("await unityService.installUnityPlugin({ forceCloseUnity })");
+    expect(projectStore).toContain("await unityService.installUnityPlugin(requireWorkspaceRef(), { forceCloseUnity })");
     expect(projectStore).toContain('notificationStore.addNotice("error", pluginStatusLabel(status)');
     expect(projectStore).toContain("replaceOperation: true");
     expect(projectStore).toContain("notificationStore.clearByOperation(PLUGIN_STATUS_NOTICE_OPERATION)");
@@ -49,7 +49,7 @@ describe("plugin status notice", () => {
     expect(onboarding).toContain("checkUnityPluginInstallPlan");
     expect(onboarding).toContain("plan.dllUpdateRequired && plan.unityRunning");
     expect(onboarding).toContain('okLabel: t("app.plugin.closeUnityConfirmAction")');
-    expect(onboarding).toContain("await installUnityPlugin({ forceCloseUnity })");
+    expect(onboarding).toContain("await installUnityPlugin(requireOnboardingWorkspaceRef(), { forceCloseUnity })");
   });
 
   it("keeps the top tabs single-line when the plugin notice is visible", () => {
@@ -57,8 +57,7 @@ describe("plugin status notice", () => {
 
     expect(app).toMatch(/\.tab-item\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*white-space:\s*nowrap;/);
     expect(app).toMatch(/\.tab-plugin-warn\s*\{[\s\S]*flex:\s*0 0 auto;[\s\S]*white-space:\s*nowrap;/);
-    expect(app).toMatch(/\.workspace-selector\s*\{[\s\S]*flex:\s*0 1 220px;[\s\S]*width:\s*220px;[\s\S]*min-width:\s*120px;[\s\S]*max-width:\s*220px;/);
-    expect(app).toMatch(/\.workspace-btn\s*\{[\s\S]*width:\s*100%;[\s\S]*min-width:\s*0;[\s\S]*max-width:\s*none;/);
-    expect(app).toMatch(/\.ws-name\s*\{[\s\S]*flex:\s*1;[\s\S]*min-width:\s*0;[\s\S]*text-overflow:\s*ellipsis;/);
+    expect(app).not.toContain(".workspace-selector");
+    expect(app).not.toContain(".workspace-btn");
   });
 });

@@ -19,7 +19,7 @@ describe("Session compact picker Views", () => {
     expect(compactPicker).toContain("showViews?: boolean;");
     expect(compactPicker).toContain("workingDir?: string;");
     expect(compactPicker).toContain("const showSessionViews = computed(() => props.showViews !== false)");
-    expect(compactPicker).toContain("viewTree()");
+    expect(compactPicker).toContain("viewTree(workspaceRef)");
     expect(compactPicker).toContain("view-package-reloaded");
     expect(compactPicker).toContain("view-tree-changed");
     expect(compactPicker).toContain("class=\"session-compact-session-region\"");

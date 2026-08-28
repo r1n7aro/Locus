@@ -165,7 +165,9 @@ pub(crate) fn build_preview_summary(
 /// Core diff pipeline — extracted from diff_single_file command.
 pub(crate) async fn build_file_diff_payload(
     app_handle: &AppHandle,
+    event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     cwd: &str,
+    cache_namespace: &str,
     request: &FileDiffRequest,
     undo_mgr: &crate::vcs::UndoManager,
     ref_graph_state: &AssetDbState,
@@ -178,7 +180,7 @@ pub(crate) async fn build_file_diff_payload(
     let is_unity = is_unity_yaml(&file_path);
 
     let key = format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}",
         match request.source {
             DiffSource::GitCommit => "gitCommit",
             DiffSource::GitStaged => "gitStaged",
@@ -198,12 +200,19 @@ pub(crate) async fn build_file_diff_payload(
             "full"
         },
         if request.full_context { "fc" } else { "" },
+        cache_namespace,
     );
 
     let mut profiler = DiffProfiler::new(key.clone(), is_unity, debug);
 
     // Emit FetchContent BEFORE fetch so UI shows progress during the work
-    semantic::emit_diff_progress(app_handle, &profiler, DiffPhase::FetchContent, None);
+    semantic::emit_diff_progress(
+        app_handle,
+        event_scope,
+        &profiler,
+        DiffPhase::FetchContent,
+        None,
+    );
     let mut pair = match super::content::fetch_content(cwd, request, undo_mgr, &mut profiler).await
     {
         Ok(p) => p,
@@ -211,6 +220,7 @@ pub(crate) async fn build_file_diff_payload(
             profiler.record(DiffPhase::Error);
             semantic::emit_diff_progress(
                 app_handle,
+                event_scope,
                 &profiler,
                 DiffPhase::Error,
                 Some(e.message.clone()),
@@ -228,7 +238,7 @@ pub(crate) async fn build_file_diff_payload(
     };
     if let Some((oid, size)) = lfs_not_fetched {
         profiler.record(DiffPhase::Done);
-        semantic::emit_diff_progress(app_handle, &profiler, DiffPhase::Done, None);
+        semantic::emit_diff_progress(app_handle, event_scope, &profiler, DiffPhase::Done, None);
         profiler.log_summary(&file_path);
         return Ok(FileDiffPayload {
             key,
@@ -309,7 +319,7 @@ pub(crate) async fn build_file_diff_payload(
         };
 
         profiler.record(DiffPhase::Done);
-        semantic::emit_diff_progress(app_handle, &profiler, DiffPhase::Done, None);
+        semantic::emit_diff_progress(app_handle, event_scope, &profiler, DiffPhase::Done, None);
         profiler.log_summary(&file_path);
         return Ok(FileDiffPayload {
             key,
@@ -360,7 +370,13 @@ pub(crate) async fn build_file_diff_payload(
             3
         };
         // Emit TextDiff BEFORE compute so UI shows progress during the work
-        semantic::emit_diff_progress(app_handle, &profiler, DiffPhase::TextDiff, None);
+        semantic::emit_diff_progress(
+            app_handle,
+            event_scope,
+            &profiler,
+            DiffPhase::TextDiff,
+            None,
+        );
         let all_hunks = compute_hunks(&pair.old_content, &pair.new_content, context);
         let stats = count_stats(&all_hunks);
         let hunks = if detail == DiffDetail::Preview {
@@ -388,6 +404,7 @@ pub(crate) async fn build_file_diff_payload(
             &build_ctx,
             cwd,
             app_handle,
+            event_scope,
             &mut profiler,
         ) {
             eprintln!(
@@ -412,7 +429,7 @@ pub(crate) async fn build_file_diff_payload(
     };
 
     profiler.record(DiffPhase::Done);
-    semantic::emit_diff_progress(app_handle, &profiler, DiffPhase::Done, None);
+    semantic::emit_diff_progress(app_handle, event_scope, &profiler, DiffPhase::Done, None);
     profiler.log_summary(&file_path);
 
     let preview_summary = if is_large {

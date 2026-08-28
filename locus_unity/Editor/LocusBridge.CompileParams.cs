@@ -57,11 +57,20 @@ namespace Locus
         {
             public bool unchanged;
             public string fingerprint;
+            public string session_id;
             public string domain_generation;
             public string lang_version;
             public string[] defines;
             public string[] reference_paths;
             public bool allow_unsafe;
+        }
+
+        private sealed class CompileParamsMainThreadSnapshot
+        {
+            public List<string> reference_paths;
+            public string[] defines;
+            public bool allow_unsafe;
+            public string session_id;
         }
 
         private static async Task<PipeEnvelope> HandleGetCompileParams(string requestId, string requestJson)
@@ -80,41 +89,36 @@ namespace Locus
                 }
             }
 
-            // The path collection needs Unity APIs (main thread) but is
-            // cached per domain; the per-request fingerprint hashing is pure
-            // file IO and runs here on the pipe worker so a busy editor main
-            // thread (e.g. right after a domain reload) does not stall the
-            // roundtrip.
-            List<string> paths = TryGetCachedCompileReferencePaths();
-            if (paths == null)
+            // Reference collection and the editor session id both touch Unity
+            // APIs (CompilationPipeline / SessionState). Capture every such
+            // value together on the editor thread. Fingerprint hashing remains
+            // pure file IO on the pipe worker.
+            CompileParamsMainThreadSnapshot mainThread;
+            try
             {
-                var collect = LocusAsync.CreateTcs<List<string>>();
-                PostToMainThread(delegate
-                {
-                    try
+                mainThread = await LocusAsync.RunOnMainThreadAsync(
+                    delegate
                     {
-                        collect.SetResult(EnsureCompileReferencePaths());
-                    }
-                    catch (Exception ex)
-                    {
-                        collect.SetException(ex);
-                    }
-                });
-
-                try
-                {
-                    paths = await collect.Task;
-                }
-                catch (Exception ex)
-                {
-                    return ErrorResponse(requestId, "get_compile_params failed: " + ex.Message);
-                }
+                        return new CompileParamsMainThreadSnapshot
+                        {
+                            reference_paths = EnsureCompileReferencePaths(),
+                            defines = SnippetPreprocessorSymbols,
+                            allow_unsafe = GetCachedCompileAllowUnsafe(),
+                            session_id = EnsureEditorSessionId()
+                        };
+                    },
+                    45000).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResponse(requestId, "get_compile_params failed: " + ex.Message);
             }
 
             try
             {
-                string[] defines = SnippetPreprocessorSymbols;
-                bool allowUnsafe = GetCachedCompileAllowUnsafe();
+                List<string> paths = mainThread.reference_paths;
+                string[] defines = mainThread.defines;
+                bool allowUnsafe = mainThread.allow_unsafe;
                 string fingerprint;
                 if (TryUseCachedCompileParamsFingerprint(knownFingerprint, out fingerprint))
                 {
@@ -122,6 +126,7 @@ namespace Locus
                     {
                         unchanged = true,
                         fingerprint = fingerprint,
+                        session_id = mainThread.session_id,
                         domain_generation = _compileDomainGeneration,
                         lang_version = CompileParamsLanguageVersion,
                         defines = Array.Empty<string>(),
@@ -139,6 +144,7 @@ namespace Locus
                 {
                     unchanged = false,
                     fingerprint = fingerprint,
+                    session_id = mainThread.session_id,
                     domain_generation = _compileDomainGeneration,
                     lang_version = CompileParamsLanguageVersion,
                     defines = defines,

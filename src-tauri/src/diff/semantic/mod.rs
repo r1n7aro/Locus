@@ -58,6 +58,7 @@ pub(crate) struct FieldTreeNode {
 
 pub(crate) struct SemanticBuildEnv<'a> {
     pub(crate) app_handle: Option<AppHandle>,
+    pub(crate) event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
     pub(crate) cwd: &'a str,
     pub(crate) profiler: &'a mut DiffProfiler,
     pub(crate) batch_reader: Option<BatchBlobReader>,
@@ -67,8 +68,8 @@ pub(crate) struct SemanticBuildEnv<'a> {
 impl SemanticBuildEnv<'_> {
     pub(crate) fn emit_phase(&mut self, phase: DiffPhase) {
         self.profiler.record(phase);
-        if let Some(ref handle) = self.app_handle {
-            emit_diff_progress(handle, self.profiler, phase, None);
+        if let (Some(handle), Some(scope)) = (&self.app_handle, &self.event_scope) {
+            emit_diff_progress(handle, scope, self.profiler, phase, None);
         }
     }
 }
@@ -77,12 +78,17 @@ impl SemanticBuildEnv<'_> {
 
 pub(crate) fn emit_diff_progress(
     app_handle: &AppHandle,
+    event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     profiler: &DiffProfiler,
     phase: DiffPhase,
     error: Option<String>,
 ) {
-    use tauri::Emitter;
-    let _ = app_handle.emit("diff-progress", profiler.progress_event(phase, error));
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        event_scope,
+        "diff-progress",
+        profiler.progress_event(phase, error),
+    );
 }
 
 pub(crate) fn extract_script_guid(doc: &YamlDoc, lines: &[String]) -> Option<Guid> {
@@ -279,6 +285,7 @@ pub(crate) fn build_semantic_session(
     ctx: &super::context::DiffBuildContext,
     cwd: &str,
     app_handle: &AppHandle,
+    event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     profiler: &mut DiffProfiler,
 ) -> Option<super::service::SemanticSession> {
     match unity_asset_kind(path) {
@@ -289,6 +296,7 @@ pub(crate) fn build_semantic_session(
             ctx,
             cwd,
             app_handle,
+            event_scope,
             profiler,
         ),
         _ => asset::build_asset_semantic_session(
@@ -298,6 +306,7 @@ pub(crate) fn build_semantic_session(
             ctx,
             cwd,
             app_handle,
+            event_scope,
             profiler,
         ),
     }
@@ -357,6 +366,7 @@ mod tests {
     fn test_env<'a>(cwd: &'a str, profiler: &'a mut DiffProfiler) -> SemanticBuildEnv<'a> {
         SemanticBuildEnv {
             app_handle: None,
+            event_scope: None,
             cwd,
             profiler,
             batch_reader: None,

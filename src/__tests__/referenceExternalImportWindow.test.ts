@@ -23,6 +23,11 @@ import {
   openReferenceExternalImportWindow,
 } from "../services/referenceExternalImportWindow";
 
+const workspaceRef = {
+  checkoutId: "checkout-feature",
+  expectedGeneration: 7,
+};
+
 describe("referenceExternalImportWindow", () => {
   beforeEach(() => {
     subWindowMocks.invokeMock.mockReset();
@@ -42,6 +47,7 @@ describe("referenceExternalImportWindow", () => {
 
   it("builds the dedicated window url", () => {
     const url = buildReferenceExternalImportWindowUrl({
+      workspaceRef,
       parentDir: "reference/docs",
       initialSource: "feishu",
     });
@@ -53,6 +59,7 @@ describe("referenceExternalImportWindow", () => {
     const payload = getReferenceExternalImportWindowPayload(url.slice(url.indexOf("?")));
     expect(payload.parentDir).toBe("reference/docs");
     expect(payload.initialSource).toBe("feishu");
+    expect(payload.workspaceRef).toEqual(workspaceRef);
   });
 
   it("updates the payload of an existing window", async () => {
@@ -64,7 +71,7 @@ describe("referenceExternalImportWindow", () => {
     const existingWindow = { emit: vi.fn() };
     subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
-    await openReferenceExternalImportWindow({ parentDir: "reference/docs" });
+    await openReferenceExternalImportWindow({ workspaceRef, parentDir: "reference/docs" });
 
     expect(existingWindow.emit).toHaveBeenCalledWith(
       REFERENCE_EXTERNAL_IMPORT_WINDOW_EVENT,
@@ -79,11 +86,11 @@ describe("referenceExternalImportWindow", () => {
       pooled: true,
     });
 
-    await openReferenceExternalImportWindow({ initialSource: "local" });
+    await openReferenceExternalImportWindow({ workspaceRef, initialSource: "local" });
 
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({
-        kind: "reference-external-import",
+        kind: expect.stringMatching(/^reference-external-import-/),
         title: "Locus External Import",
         width: 1180,
         height: 900,

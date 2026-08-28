@@ -5,6 +5,7 @@ import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelOptionDisplayName } from "../utils/modelDisplay";
 import { groupModelsForSelector, modelListEntryName, type ModelSelectorGroup } from "../utils/modelGrouping";
+import { agentProjectTypesLabel } from "../utils/agentProjectTypes";
 import BaseSwitch from "./ui/BaseSwitch.vue";
 
 const props = defineProps<{
@@ -207,6 +208,9 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
             @click="selectAgent(agent.id)"
           >
             <span class="model-effort-option-name">{{ agent.name }}</span>
+            <span v-if="agentProjectTypesLabel(agent)" class="model-effort-option-meta">
+              {{ agentProjectTypesLabel(agent) }}
+            </span>
           </button>
         </div>
 
@@ -492,6 +496,13 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   font-weight: 500;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-effort-option-meta {
+  flex-shrink: 0;
+  color: var(--text-tertiary, var(--text-secondary));
+  font-size: 10px;
   white-space: nowrap;
 }
 

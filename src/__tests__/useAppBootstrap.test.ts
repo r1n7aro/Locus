@@ -6,6 +6,7 @@ let authStoreMock: any;
 let agentStoreMock: any;
 let modelStoreMock: any;
 let projectStoreMock: any;
+let workspaceContextStoreMock: any;
 let chatStoreMock: any;
 let notificationStoreMock: any;
 let loadSkillsMock: ReturnType<typeof vi.fn>;
@@ -43,6 +44,10 @@ vi.mock("../stores/model", () => ({
 
 vi.mock("../stores/project", () => ({
   useProjectStore: () => projectStoreMock,
+}));
+
+vi.mock("../stores/workspaceContext", () => ({
+  useWorkspaceContextStore: () => workspaceContextStoreMock,
 }));
 
 vi.mock("../stores/chat", () => ({
@@ -223,6 +228,13 @@ describe("useAppBootstrap onboarding completion", () => {
       handleUnityConnectionStatus: vi.fn(),
       handleUnityConnectionStatusDetail: vi.fn(),
     });
+    workspaceContextStoreMock = reactive({
+      focusedWorkspaceRef: {
+        checkoutId: "checkout-test",
+        expectedGeneration: 7,
+      },
+      applyWorkspaceEvent: vi.fn().mockReturnValue(true),
+    });
 
     chatStoreMock = reactive({
       activeSessionId: null,
@@ -314,7 +326,7 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(uiStoreMock.completeOnboarding).toHaveBeenCalledTimes(1);
     expect(modelStoreMock.loadLastEffort).toHaveBeenCalledTimes(1);
     expect(chatStoreMock.refreshSessions).toHaveBeenCalledTimes(1);
-    expect(projectStoreMock.loadWorkingDir).toHaveBeenCalledTimes(1);
+    expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
   });
 
   it("shows sticky startup banners when auth restore fails", async () => {
@@ -433,7 +445,7 @@ describe("useAppBootstrap onboarding completion", () => {
     const { registerListeners, cleanup } = useAppBootstrap();
     await registerListeners();
 
-    const lexicalStatusHandler = handlers.get("knowledge-lexical-rebuild-status");
+    const lexicalStatusHandler = handlers.get("locus://workspace-event");
     expect(lexicalStatusHandler).toBeTypeOf("function");
     expect(
       knowledgeModule.knowledgeGetLexicalRebuildStatus,
@@ -441,15 +453,22 @@ describe("useAppBootstrap onboarding completion", () => {
 
     lexicalStatusHandler?.({
       payload: {
-        running: true,
-        stage: "preparing",
-        detail: "Preparing docs",
-        currentFile: null,
-        processedDocs: 24,
-        totalDocs: 4096,
-        error: null,
-        startedAt: "2026-04-16T00:00:00Z",
-        completedAt: null,
+        eventName: "knowledge-lexical-rebuild-status",
+        streamRevision: 1,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          running: true,
+          stage: "preparing",
+          detail: "Preparing docs",
+          currentFile: null,
+          processedDocs: 24,
+          totalDocs: 4096,
+          error: null,
+          startedAt: "2026-04-16T00:00:00Z",
+          completedAt: null,
+        },
       },
     });
     await Promise.resolve();
@@ -459,15 +478,22 @@ describe("useAppBootstrap onboarding completion", () => {
 
     lexicalStatusHandler?.({
       payload: {
-        running: true,
-        stage: "committing",
-        detail: "Committing docs",
-        currentFile: null,
-        processedDocs: 4096,
-        totalDocs: 4096,
-        error: null,
-        startedAt: "2026-04-16T00:00:00Z",
-        completedAt: null,
+        eventName: "knowledge-lexical-rebuild-status",
+        streamRevision: 2,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          running: true,
+          stage: "committing",
+          detail: "Committing docs",
+          currentFile: null,
+          processedDocs: 4096,
+          totalDocs: 4096,
+          error: null,
+          startedAt: "2026-04-16T00:00:00Z",
+          completedAt: null,
+        },
       },
     });
     await Promise.resolve();
@@ -496,14 +522,21 @@ describe("useAppBootstrap onboarding completion", () => {
     await registerListeners();
     loadSkillsMock.mockClear();
 
-    const knowledgeChangedHandler = handlers.get("knowledge-changed");
+    const knowledgeChangedHandler = handlers.get("locus://workspace-event");
     expect(knowledgeChangedHandler).toBeTypeOf("function");
 
     knowledgeChangedHandler?.({
       payload: {
-        workingDir: "F:/Project",
-        source: "create_skill_scaffold",
-        changedAt: 1,
+        eventName: "knowledge-changed",
+        streamRevision: 1,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          workingDir: "F:/Project",
+          source: "create_skill_scaffold",
+          changedAt: 1,
+        },
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(1);
@@ -511,28 +544,49 @@ describe("useAppBootstrap onboarding completion", () => {
 
     knowledgeChangedHandler?.({
       payload: {
-        workingDir: "F:/Other",
-        source: "delete_skill_package",
-        changedAt: 2,
+        eventName: "knowledge-changed",
+        streamRevision: 2,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          workingDir: "F:/Other",
+          source: "delete_skill_package",
+          changedAt: 2,
+        },
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(1);
 
     knowledgeChangedHandler?.({
       payload: {
-        workingDir: "F:/Project",
-        source: "knowledge_edit",
-        changedAt: 3,
-        docType: "reference",
+        eventName: "knowledge-changed",
+        streamRevision: 3,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          workingDir: "F:/Project",
+          source: "knowledge_edit",
+          changedAt: 3,
+          docType: "reference",
+        },
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(1);
 
     knowledgeChangedHandler?.({
       payload: {
-        workingDir: "F:/Project",
-        source: "plugin_registry_install",
-        changedAt: 4,
+        eventName: "knowledge-changed",
+        streamRevision: 4,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          workingDir: "F:/Project",
+          source: "plugin_registry_install",
+          changedAt: 4,
+        },
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(2);
@@ -540,16 +594,53 @@ describe("useAppBootstrap onboarding completion", () => {
 
     knowledgeChangedHandler?.({
       payload: {
-        workingDir: "F:/Project",
-        source: "knowledge_fs_watcher",
-        changedAt: 5,
-        docType: "skill",
-        targetKind: "document",
-        changeKind: "structure",
+        eventName: "knowledge-changed",
+        streamRevision: 5,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          workingDir: "F:/Project",
+          source: "knowledge_fs_watcher",
+          changedAt: 5,
+          docType: "skill",
+          targetKind: "document",
+          changeKind: "structure",
+        },
       },
     });
     expect(loadSkillsMock).toHaveBeenCalledTimes(3);
     expect(loadSkillsMock).toHaveBeenLastCalledWith({ force: true });
+  });
+
+  it("does not project a workspace event rejected by the scoped revision reducer", async () => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+    workspaceContextStoreMock.applyWorkspaceEvent.mockReturnValue(false);
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+    handlers.get("locus://workspace-event")?.({
+      payload: {
+        eventName: "unity-connection-status",
+        streamRevision: 4,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: true,
+      },
+    });
+
+    expect(workspaceContextStoreMock.applyWorkspaceEvent).toHaveBeenCalledTimes(1);
+    expect(projectStoreMock.handleUnityConnectionStatus).not.toHaveBeenCalled();
   });
 
   it("reloads agents and skills when installed plugins change", async () => {
@@ -606,7 +697,8 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(subscribedEvents).not.toContain("active-session-selection-changed");
     expect(subscribedEvents).toContain("stream-event");
     expect(subscribedEvents).toContain("async-task-updated");
-    expect(subscribedEvents).toContain("session-content-changed");
+    expect(subscribedEvents).toContain("locus://workspace-event");
+    expect(subscribedEvents).not.toContain("session-content-changed");
     expect(subscribedEvents).toContain("session-execution-state-changed");
   });
 
@@ -663,14 +755,13 @@ describe("useAppBootstrap onboarding completion", () => {
     const { registerListeners } = useAppBootstrap();
     await registerListeners();
 
-    const handler = handlers.get("workspace-execution-lock-diagnostic");
+    const handler = handlers.get("locus://workspace-event");
     expect(handler).toBeTypeOf("function");
     const payload = {
       active: true,
       sessionId: "session-waiting",
       runId: "run-waiting",
       iteration: 2,
-      workspace: "F:/Project",
       mode: "write",
       waitedMs: 30_500,
       tools: ["edit", "write"],
@@ -682,7 +773,16 @@ describe("useAppBootstrap onboarding completion", () => {
         tools: ["unity_execute"],
       }],
     };
-    handler?.({ payload });
+    handler?.({
+      payload: {
+        eventName: "workspace-execution-lock-diagnostic",
+        streamRevision: 1,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload,
+      },
+    });
 
     expect(notificationStoreMock.addNotice).toHaveBeenCalledWith(
       "error",
@@ -696,7 +796,16 @@ describe("useAppBootstrap onboarding completion", () => {
     );
     expect(notificationStoreMock.addNotice.mock.calls[0]?.[1]).toContain("Running task");
 
-    handler?.({ payload: { ...payload, active: false, waitedMs: 31_250 } });
+    handler?.({
+      payload: {
+        eventName: "workspace-execution-lock-diagnostic",
+        streamRevision: 2,
+        projectId: "project-test",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: { ...payload, active: false, waitedMs: 31_250 },
+      },
+    });
     expect(notificationStoreMock.clearByOperation).toHaveBeenCalledWith(
       "workspace-lock-wait:session-waiting",
     );
@@ -719,15 +828,20 @@ describe("useAppBootstrap onboarding completion", () => {
     const { registerListeners } = useAppBootstrap();
     await registerListeners();
 
-    const sessionChangedHandler = handlers.get("session-content-changed");
+    const sessionChangedHandler = handlers.get("locus://workspace-event");
     expect(sessionChangedHandler).toBeTypeOf("function");
 
     sessionChangedHandler?.({
       payload: {
-        workingDir: "F:/Project",
-        sessionId: "session-1",
-        source: "undo_perform",
-        changedAt: 1,
+        eventName: "session-content-changed",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: {
+          workingDir: "F:/Project",
+          sessionId: "session-1",
+          source: "undo_perform",
+          changedAt: 1,
+        },
       },
     });
 
@@ -735,10 +849,15 @@ describe("useAppBootstrap onboarding completion", () => {
 
     sessionChangedHandler?.({
       payload: {
-        workingDir: "F:/Other",
-        sessionId: "session-2",
-        source: "undo_perform",
-        changedAt: 2,
+        eventName: "session-content-changed",
+        checkoutId: "checkout-other",
+        workspaceGeneration: 7,
+        payload: {
+          workingDir: "F:/Other",
+          sessionId: "session-2",
+          source: "undo_perform",
+          changedAt: 2,
+        },
       },
     });
 

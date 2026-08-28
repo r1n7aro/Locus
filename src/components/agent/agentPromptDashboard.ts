@@ -40,6 +40,7 @@ export interface AgentPromptDashboardSummary {
   directToolCount: number;
   lazyToolCount: number;
   skillToolCount: number;
+  unavailableToolCount: number;
   disabledToolCount: number;
   health: AgentPromptDashboardHealth;
 }
@@ -74,6 +75,10 @@ export function toolMetaEnabled(meta: unknown): boolean {
   return asRecord(meta)?.enabled !== false;
 }
 
+export function toolMetaRuntimeAvailable(meta: unknown): boolean {
+  return asRecord(meta)?.runtimeAvailable !== false;
+}
+
 function serializeToolMeta(meta: unknown): string {
   try {
     const definition = unwrapToolDefinition(meta);
@@ -99,6 +104,7 @@ function estimateToolPart(items: Array<Pick<InjectedPromptItem, "kind" | "meta">
   const toolItems = items.filter((item) =>
     item.kind === "tools"
       && toolMetaEnabled(item.meta)
+      && toolMetaRuntimeAvailable(item.meta)
       && toolMetaLoadMode(item.meta) === "direct",
   );
   const summary = toolItems.reduce((sum, item) => {
@@ -160,12 +166,15 @@ export function buildAgentPromptDashboard(
   const enabledRuleCount = ruleItems.filter((rule) => rule.enabled).length;
   const injectedContextCount = injectedItems.filter((item) => item.kind !== "tools").length;
   const toolItems = injectedItems.filter((item) => item.kind === "tools");
-  const enabledToolItems = toolItems.filter((item) => toolMetaEnabled(item.meta));
-  const directToolCount = enabledToolItems.filter((item) => toolMetaLoadMode(item.meta) === "direct").length;
-  const lazyToolCount = enabledToolItems.filter((item) => toolMetaLoadMode(item.meta) === "lazy").length;
-  const skillToolCount = enabledToolItems.filter((item) => toolMetaLoadMode(item.meta) === "skill").length;
+  const availableEnabledToolItems = toolItems.filter((item) => (
+    toolMetaEnabled(item.meta) && toolMetaRuntimeAvailable(item.meta)
+  ));
+  const directToolCount = availableEnabledToolItems.filter((item) => toolMetaLoadMode(item.meta) === "direct").length;
+  const lazyToolCount = availableEnabledToolItems.filter((item) => toolMetaLoadMode(item.meta) === "lazy").length;
+  const skillToolCount = availableEnabledToolItems.filter((item) => toolMetaLoadMode(item.meta) === "skill").length;
   const toolCount = toolItems.length;
-  const disabledToolCount = toolCount - enabledToolItems.length;
+  const unavailableToolCount = toolItems.filter((item) => !toolMetaRuntimeAvailable(item.meta)).length;
+  const disabledToolCount = toolItems.filter((item) => !toolMetaEnabled(item.meta)).length;
   const dominantPart = parts.reduce((best, part) => (
     part.share > best.share ? part : best
   ), parts[0]!);
@@ -229,6 +238,7 @@ export function buildAgentPromptDashboard(
     directToolCount,
     lazyToolCount,
     skillToolCount,
+    unavailableToolCount,
     disabledToolCount,
     health: {
       score,

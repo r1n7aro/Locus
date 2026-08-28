@@ -23,6 +23,8 @@ import {
   openFeishuReferenceImportProgressWindow,
 } from "../services/feishuReferenceImportWindow";
 
+const workspaceRef = { checkoutId: "checkout-feature", expectedGeneration: 7 };
+
 describe("feishuReferenceImportWindow", () => {
   beforeEach(() => {
     subWindowMocks.invokeMock.mockReset();
@@ -59,7 +61,7 @@ describe("feishuReferenceImportWindow", () => {
     const existingWindow = { emit: vi.fn() };
     subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
-    await openFeishuReferenceImportProgressWindow();
+    await openFeishuReferenceImportProgressWindow({ workspaceRef });
 
     expect(existingWindow.emit).not.toHaveBeenCalled();
   });
@@ -73,7 +75,7 @@ describe("feishuReferenceImportWindow", () => {
     const existingWindow = { emit: vi.fn() };
     subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
-    await openFeishuReferenceImportProgressWindow({ targetPath: "feishu/docs" });
+    await openFeishuReferenceImportProgressWindow({ workspaceRef, targetPath: "feishu/docs" });
 
     expect(existingWindow.emit).toHaveBeenCalledWith(
       FEISHU_REFERENCE_IMPORT_WINDOW_STATUS_EVENT,
@@ -88,11 +90,11 @@ describe("feishuReferenceImportWindow", () => {
       pooled: true,
     });
 
-    await openFeishuReferenceImportProgressWindow({ targetPath: "feishu/docs" });
+    await openFeishuReferenceImportProgressWindow({ workspaceRef, targetPath: "feishu/docs" });
 
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({
-        kind: "feishu-reference-import-progress",
+        kind: expect.stringMatching(/^feishu-reference-import-progress-/),
         title: "Locus Feishu Knowledge Base",
         width: 760,
         height: 760,

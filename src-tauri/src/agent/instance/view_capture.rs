@@ -39,15 +39,16 @@ impl AgentInstance {
             });
         }
 
-        let capture = match crate::view::capture_view_window(app_handle, &view_id).await {
-            Ok(value) => value,
-            Err(error) => {
-                return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: error,
-                    is_error: true,
-                });
-            }
-        };
+        let capture =
+            match crate::view::capture_view_window(app_handle, &self.working_dir, &view_id).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: error,
+                        is_error: true,
+                    });
+                }
+            };
 
         use base64::Engine as _;
         let image = ImageData {

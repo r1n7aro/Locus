@@ -4,6 +4,8 @@ import { useModelStore } from "./model";
 import { useAgentStore } from "./agent";
 import { useUiStore } from "./ui";
 import { useNotificationStore } from "./notification";
+import { useWorkspaceContextStore } from "./workspaceContext";
+import type { WorkspaceRef } from "../services/project";
 import { normalizeAppError } from "../services/errors";
 import { getToolPermissionMode, saveToolPermissionMode } from "../services/permissions";
 import * as sessionService from "../services/session";
@@ -343,6 +345,20 @@ function logChatStreamDebug(message: string, detail?: Record<string, unknown>) {
   console.info(`[chat-stream] ${message}`, detail ?? {});
 }
 
+function cloneWorkspaceRef(workspaceRef: WorkspaceRef | null): WorkspaceRef | null {
+  return workspaceRef
+    ? {
+      checkoutId: workspaceRef.checkoutId,
+      expectedGeneration: workspaceRef.expectedGeneration,
+    }
+    : null;
+}
+
+function workspaceScopeKey(workspaceRef: WorkspaceRef | null): string | null {
+  if (!workspaceRef) return null;
+  return `${workspaceRef.checkoutId}\u0000${workspaceRef.expectedGeneration ?? ""}`;
+}
+
 export const useChatStore = defineStore("chat", () => {
   // -- State --
   const sessions = ref<SessionSummary[]>([]);
@@ -529,6 +545,8 @@ export const useChatStore = defineStore("chat", () => {
   let pendingSessionId: string | null = null;
   let pendingMessageSeq = 0;
   let sessionLoadSeq = 0;
+  let sessionRefreshEpoch = 0;
+  let chatLaunchEpoch = 0;
   let pendingManagedSessionId: string | null = null;
   let pendingManagedUnboundSession = false;
   // Sessions started from ChatView can be updated incrementally in-memory.
@@ -536,9 +554,6 @@ export const useChatStore = defineStore("chat", () => {
   const managedStreamingSessionIds = new Set<string>();
   const closedRunIds = new Map<string, string>();
   const cancelRequestedRunIds = new Map<string, string>();
-  let activeSessionSelectionRestoreAttempted = false;
-  let activeSessionSelectionPersistSeq = 0;
-  let activeSessionSelectionPersistenceEnabled = true;
   // A cancel clicked while the chat launch is still in flight (no run id yet)
   // is remembered here and re-fired once the run is registered.
   const pendingLaunchCancelRequested = ref(false);
@@ -548,6 +563,24 @@ export const useChatStore = defineStore("chat", () => {
     if (!activeSessionId.value || !currentRunId.value) return false;
     return cancelRequestedRunIds.get(activeSessionId.value) === currentRunId.value;
   });
+
+  function captureFocusedWorkspaceRef(): WorkspaceRef | null {
+    return cloneWorkspaceRef(useWorkspaceContextStore().focusedWorkspaceRef);
+  }
+
+  function isWorkspaceScopeCurrent(expectedScopeKey: string | null): boolean {
+    return workspaceScopeKey(captureFocusedWorkspaceRef()) === expectedScopeKey;
+  }
+
+  function canCommitChatLaunch(
+    launchEpoch: number,
+    expectedScopeKey: string | null,
+    requestSessionId: string | null,
+  ): boolean {
+    if (launchEpoch !== chatLaunchEpoch) return false;
+    if (!isWorkspaceScopeCurrent(expectedScopeKey)) return false;
+    return requestSessionId === null || activeSessionId.value === requestSessionId;
+  }
 
   function nextPendingMessageId(): string {
     pendingMessageSeq += 1;
@@ -640,26 +673,21 @@ export const useChatStore = defineStore("chat", () => {
     return sessions.value.find((session) => session.id === sessionId)?.sessionType ?? null;
   }
 
-  function persistActiveSessionSelection(sessionId: string | null) {
-    const seq = ++activeSessionSelectionPersistSeq;
-    sessionService.saveActiveSessionSelection(sessionId).catch((e) => {
-      if (seq !== activeSessionSelectionPersistSeq) return;
-      console.warn("save_active_session_selection failed:", e);
-    });
-  }
-
   function setActiveSessionSelection(
     sessionId: string | null,
-    options: { persist?: boolean } = {},
+    _options: { persist?: boolean } = {},
   ) {
     activeSessionId.value = sessionId;
-    if (options.persist ?? activeSessionSelectionPersistenceEnabled) {
-      persistActiveSessionSelection(sessionId);
+    const workspaceContextStore = useWorkspaceContextStore();
+    if (workspaceContextStore.focusedWorkspaceRef) {
+      void workspaceContextStore.setActiveSession(sessionId).catch((error) => {
+        console.warn("set_active_session failed:", error);
+      });
     }
   }
 
-  function setActiveSessionSelectionPersistence(enabled: boolean) {
-    activeSessionSelectionPersistenceEnabled = enabled;
+  function setActiveSessionSelectionPersistence(_enabled: boolean) {
+    // Active session recovery is owned by WindowContextRegistry per pane.
   }
 
   function applyActiveSessionExecutionState(
@@ -675,36 +703,6 @@ export const useChatStore = defineStore("chat", () => {
     modelStore.applyContextCodexFastMode(fastMode);
     sessionEffort.value = effort;
     sessionFastMode.value = fastMode;
-  }
-
-  async function restoreActiveSessionSelection(nextSessions: SessionSummary[]) {
-    if (activeSessionSelectionRestoreAttempted || activeSessionId.value) return;
-    activeSessionSelectionRestoreAttempted = true;
-
-    let savedSessionId: string | null = null;
-    try {
-      savedSessionId = await sessionService.getActiveSessionSelection();
-    } catch (e) {
-      console.warn("get_active_session_selection failed:", e);
-      return;
-    }
-
-    const normalizedSessionId = savedSessionId?.trim();
-    if (!normalizedSessionId) return;
-
-    const restoredSession = nextSessions.find((session) => session.id === normalizedSessionId);
-    if (!restoredSession) {
-      if (activeSessionSelectionPersistenceEnabled) {
-        persistActiveSessionSelection(null);
-      }
-      return;
-    }
-
-    if (activeSessionId.value) return;
-    await loadSessionState(normalizedSessionId, {
-      commitSelection: true,
-      persist: false,
-    });
   }
 
   function ensureLivePartStream(partId: string): StreamingTextChunks {
@@ -757,6 +755,27 @@ export const useChatStore = defineStore("chat", () => {
       useAgentStore().resetToDefault();
     }
     applySessionRuntimeSnapshot(detail);
+  }
+
+  async function restoreScopedActiveSessionSelection(
+    nextSessions: SessionSummary[],
+    canCommit: () => boolean = () => true,
+  ) {
+    const workspaceContextStore = useWorkspaceContextStore();
+    const savedSessionId = workspaceContextStore.focusedPaneContext?.activeSessionId?.trim() || null;
+    const activeBelongsToCheckout = activeSessionId.value
+      ? nextSessions.some((session) => session.id === activeSessionId.value)
+      : false;
+    if (activeSessionId.value && !activeBelongsToCheckout) {
+      newChat({ persistSelection: false });
+    }
+    if (!savedSessionId || activeSessionId.value === savedSessionId) return;
+    if (!nextSessions.some((session) => session.id === savedSessionId)) return;
+    await loadSessionState(savedSessionId, {
+      commitSelection: true,
+      persist: false,
+      canCommit,
+    });
   }
 
   function clearSessionAuxiliaryDataForSwitch() {
@@ -1087,9 +1106,11 @@ export const useChatStore = defineStore("chat", () => {
   async function hydrateSessionActiveRun(
     sessionId: string,
     options: { clearMissing?: boolean } = {},
+    canCommit: () => boolean = () => true,
   ) {
     try {
       const run = await sessionService.getSessionActiveRun(sessionId);
+      if (!canCommit()) return;
       if (!run || !isActiveRunStatus(run.status)) {
         if (options.clearMissing === false && sessionRunIds.value.has(sessionId)) {
           return;
@@ -1115,18 +1136,26 @@ export const useChatStore = defineStore("chat", () => {
     }
   }
 
-  async function hydrateActiveRuns(nextSessions: SessionSummary[]) {
+  async function hydrateActiveRuns(
+    nextSessions: SessionSummary[],
+    canCommit: () => boolean = () => true,
+  ) {
     const activeSessions = nextSessions.filter((session) =>
       isActiveRuntimeStatus(session.runtimeStatus ?? null));
     await Promise.all(activeSessions.map(async (session) => {
       await hydrateSessionActiveRun(
         session.id,
         { clearMissing: false },
+        canCommit,
       );
     }));
   }
 
-  async function loadSessionAuxiliaryState(id: string, loadSeq: number) {
+  async function loadSessionAuxiliaryState(
+    id: string,
+    loadSeq: number,
+    canCommit: () => boolean = () => true,
+  ) {
     const [usage, sessionTodos, undoEntries] = await Promise.all([
       sessionService.getSessionUsage(id).catch((error) => {
         console.warn("get_session_usage failed:", error);
@@ -1141,7 +1170,11 @@ export const useChatStore = defineStore("chat", () => {
         return [];
       }),
     ]);
-    if (loadSeq !== sessionLoadSeq || activeSessionId.value !== id) return;
+    if (
+      loadSeq !== sessionLoadSeq
+      || activeSessionId.value !== id
+      || !canCommit()
+    ) return;
     applySessionAuxiliaryData(id, usage, sessionTodos, undoEntries);
     void refreshSessionPlanState(id);
   }
@@ -1152,9 +1185,11 @@ export const useChatStore = defineStore("chat", () => {
       commitSelection?: boolean;
       persist?: boolean;
       preserveLocalMessages?: boolean;
+      canCommit?: () => boolean;
     } = {},
   ): Promise<boolean> {
     const loadSeq = ++sessionLoadSeq;
+    const expectedWorkspaceScopeKey = workspaceScopeKey(captureFocusedWorkspaceRef());
     const commitSelection = options.commitSelection === true;
     if (commitSelection) {
       pendingSelectionSessionId.value = id;
@@ -1169,7 +1204,11 @@ export const useChatStore = defineStore("chat", () => {
           return false;
         }),
       ]);
-      if (loadSeq !== sessionLoadSeq) return false;
+      if (
+        loadSeq !== sessionLoadSeq
+        || !isWorkspaceScopeCurrent(expectedWorkspaceScopeKey)
+        || options.canCommit?.() === false
+      ) return false;
       if (commitSelection) {
         if (pendingSelectionSessionId.value !== id) return false;
         persistTodoPanelState();
@@ -1212,7 +1251,11 @@ export const useChatStore = defineStore("chat", () => {
       if (commitSelection && pendingSelectionSessionId.value === id) {
         pendingSelectionSessionId.value = null;
       }
-      const auxiliaryLoad = loadSessionAuxiliaryState(id, loadSeq);
+      const auxiliaryLoad = loadSessionAuxiliaryState(
+        id,
+        loadSeq,
+        options.canCommit,
+      );
       if (commitSelection) {
         await auxiliaryLoad;
       } else {
@@ -1220,7 +1263,11 @@ export const useChatStore = defineStore("chat", () => {
       }
       return true;
     } catch (e) {
-      if (loadSeq !== sessionLoadSeq) return false;
+      if (
+        loadSeq !== sessionLoadSeq
+        || !isWorkspaceScopeCurrent(expectedWorkspaceScopeKey)
+        || options.canCommit?.() === false
+      ) return false;
       console.error("load_session_view failed:", e);
       if (commitSelection && pendingSelectionSessionId.value === id) {
         pendingSelectionSessionId.value = null;
@@ -2282,14 +2329,27 @@ export const useChatStore = defineStore("chat", () => {
 
   // -- Actions --
   async function refreshSessions() {
+    const workspaceRef = captureFocusedWorkspaceRef();
+    const expectedScopeKey = workspaceScopeKey(workspaceRef);
+    const refreshEpoch = ++sessionRefreshEpoch;
+    const canCommit = () => (
+      refreshEpoch === sessionRefreshEpoch
+      && isWorkspaceScopeCurrent(expectedScopeKey)
+    );
     try {
-      const rawSessions = await sessionService.listSessions();
+      const rawSessions = workspaceRef
+        ? await sessionService.listCheckoutSessions(workspaceRef)
+        : [];
+      if (!canCommit()) return;
       const nextSessions = normalizeSessionRuntimeStatuses(rawSessions);
       sessions.value = nextSessions;
-      await restoreActiveSessionSelection(nextSessions);
-      await hydrateActiveRuns(nextSessions);
+      if (workspaceRef) await restoreScopedActiveSessionSelection(nextSessions, canCommit);
+      if (!canCommit()) return;
+      await hydrateActiveRuns(nextSessions, canCommit);
+      if (!canCommit()) return;
       reconcileStreamingSessions(nextSessions);
     } catch (e) {
+      if (!canCommit()) return;
       console.error("list_sessions failed:", e);
     }
   }
@@ -2348,13 +2408,13 @@ export const useChatStore = defineStore("chat", () => {
     persistSelection?: boolean;
     resetRestoreAttempt?: boolean;
   } = {}) {
+    chatLaunchEpoch += 1;
     sessionLoadSeq += 1;
     pendingSelectionSessionId.value = null;
     const oldSessionId = activeSessionId.value;
     persistTodoPanelState(oldSessionId);
     setActiveSessionSelection(null, { persist: options.persistSelection });
     if (options.resetRestoreAttempt === true) {
-      activeSessionSelectionRestoreAttempted = false;
     }
     activeSessionType.value = null;
     currentRunId.value = null;
@@ -2396,12 +2456,13 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   function resetWorkspaceScope() {
+    chatLaunchEpoch += 1;
+    sessionRefreshEpoch += 1;
     sessionLoadSeq += 1;
     pendingSelectionSessionId.value = null;
     const oldSessionId = activeSessionId.value;
     persistTodoPanelState(oldSessionId);
     setActiveSessionSelection(null);
-    activeSessionSelectionRestoreAttempted = false;
     activeSessionType.value = null;
     currentRunId.value = null;
     pendingSessionId = null;
@@ -2755,6 +2816,10 @@ export const useChatStore = defineStore("chat", () => {
       return;
     }
 
+    const requestWorkspaceRef = captureFocusedWorkspaceRef();
+    const requestWorkspaceScopeKey = workspaceScopeKey(requestWorkspaceRef);
+    const launchEpoch = ++chatLaunchEpoch;
+
     pendingLaunchCancelRequested.value = false;
     pendingLaunchCompactRequested.value = false;
     const pendingMessageId = nextPendingMessageId();
@@ -2812,7 +2877,8 @@ export const useChatStore = defineStore("chat", () => {
 
     try {
       const { sessionId: sid, runId } = await sessionService.chat({
-        sessionId: activeSessionId.value,
+        workspaceRef: requestWorkspaceRef,
+        sessionId: requestSessionId,
         text,
         agentId: agentStore.selectedAgentId || null,
         model,
@@ -2827,6 +2893,11 @@ export const useChatStore = defineStore("chat", () => {
         subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0 ? modelStore.modelDefaults.subagentFastModes : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
+      if (!canCommitChatLaunch(
+        launchEpoch,
+        requestWorkspaceScopeKey,
+        requestSessionId,
+      )) return;
       modelStore.applySessionModel(model);
       logChatStreamDebug("chat request resolved", {
         sessionId: sid,
@@ -2867,6 +2938,11 @@ export const useChatStore = defineStore("chat", () => {
         globalThis.setTimeout(() => void compactSession(), 0);
       }
     } catch (e) {
+      if (!canCommitChatLaunch(
+        launchEpoch,
+        requestWorkspaceScopeKey,
+        requestSessionId,
+      )) return;
       console.error("chat failed:", e);
       pendingLaunchCancelRequested.value = false;
       pendingLaunchCompactRequested.value = false;
@@ -2905,6 +2981,9 @@ export const useChatStore = defineStore("chat", () => {
   async function resumeInterrupted() {
     const sessionId = activeSessionId.value;
     if (!sessionId || !canResumeInterrupted.value) return;
+    const requestWorkspaceRef = captureFocusedWorkspaceRef();
+    const requestWorkspaceScopeKey = workspaceScopeKey(requestWorkspaceRef);
+    const launchEpoch = ++chatLaunchEpoch;
 
     const modelStore = useModelStore();
     const agentStore = useAgentStore();
@@ -2933,6 +3012,7 @@ export const useChatStore = defineStore("chat", () => {
 
     try {
       const { sessionId: sid, runId } = await sessionService.chat({
+        workspaceRef: requestWorkspaceRef,
         sessionId,
         text: "",
         resume: true,
@@ -2955,6 +3035,14 @@ export const useChatStore = defineStore("chat", () => {
           : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
+      if (!canCommitChatLaunch(
+        launchEpoch,
+        requestWorkspaceScopeKey,
+        sessionId,
+      )) {
+        managedStreamingSessionIds.delete(sessionId);
+        return;
+      }
       modelStore.applySessionModel(model);
       if (activeSessionId.value === sid && interruptedToolResultMessages.length > 0) {
         let next = messages.value;
@@ -2987,6 +3075,14 @@ export const useChatStore = defineStore("chat", () => {
         globalThis.setTimeout(() => void compactSession(), 0);
       }
     } catch (e) {
+      if (!canCommitChatLaunch(
+        launchEpoch,
+        requestWorkspaceScopeKey,
+        sessionId,
+      )) {
+        managedStreamingSessionIds.delete(sessionId);
+        return;
+      }
       console.error("resume interrupted chat failed:", e);
       pendingLaunchCancelRequested.value = false;
       pendingLaunchCompactRequested.value = false;
@@ -3046,6 +3142,9 @@ export const useChatStore = defineStore("chat", () => {
     const agentStore = useAgentStore();
     const { state: knowledgeAccessState } = useKnowledgeAccessMode();
     const sessionId = activeSessionId.value;
+    const requestWorkspaceRef = captureFocusedWorkspaceRef();
+    const requestWorkspaceScopeKey = workspaceScopeKey(requestWorkspaceRef);
+    const launchEpoch = ++chatLaunchEpoch;
 
     const { state: displaySettings } = useDisplaySettings();
     if (displaySettings.changesAutoClose) {
@@ -3072,6 +3171,7 @@ export const useChatStore = defineStore("chat", () => {
 
     try {
       const { sessionId: sid, runId } = await sessionService.chat({
+        workspaceRef: requestWorkspaceRef,
         sessionId,
         text: "",
         agentId: agentStore.selectedAgentId || null,
@@ -3087,6 +3187,14 @@ export const useChatStore = defineStore("chat", () => {
         subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0 ? modelStore.modelDefaults.subagentFastModes : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
+      if (!canCommitChatLaunch(
+        launchEpoch,
+        requestWorkspaceScopeKey,
+        sessionId,
+      )) {
+        managedStreamingSessionIds.delete(sessionId);
+        return;
+      }
 
       logChatStreamDebug("compact request resolved", {
         sessionId: sid,
@@ -3114,6 +3222,14 @@ export const useChatStore = defineStore("chat", () => {
         void cancelSession(sid);
       }
     } catch (e) {
+      if (!canCommitChatLaunch(
+        launchEpoch,
+        requestWorkspaceScopeKey,
+        sessionId,
+      )) {
+        managedStreamingSessionIds.delete(sessionId);
+        return;
+      }
       console.error("compact failed:", e);
       pendingLaunchCancelRequested.value = false;
       logChatStreamDebug("compact request failed", {

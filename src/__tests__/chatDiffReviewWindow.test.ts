@@ -50,10 +50,17 @@ describe("chatDiffReviewWindow", () => {
   });
 
   it("builds and parses request URLs for the lightweight window entry", () => {
-    const url = buildChatDiffReviewWindowUrl({ request });
+    const url = buildChatDiffReviewWindowUrl({
+      request,
+      workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 4 },
+    });
 
     expect(url).toContain("/window.html?chatDiffReview=1");
     expect(getChatDiffReviewWindowPayload(url.slice(url.indexOf("?"))).request).toEqual(request);
+    expect(getChatDiffReviewWindowPayload(url.slice(url.indexOf("?"))).workspaceRef).toEqual({
+      checkoutId: "checkout-a",
+      expectedGeneration: 4,
+    });
   });
 
   it("sends the next request to an existing review window", async () => {

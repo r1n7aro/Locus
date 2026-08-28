@@ -4,7 +4,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ExternalLink, Undo2, X } from "lucide";
 import type { FileDiffPayload, FileDiffRequest } from "../types";
-import { diffSingleFile, invalidateDiffCache, parseDiffRequestKey } from "../services/diff";
+import {
+  diffSingleFile,
+  computeRequestKey,
+  invalidateDiffCache,
+  parseDiffRequestKey,
+  parseDiffWorkspaceRefFromKey,
+} from "../services/diff";
+import type { WorkspaceRef } from "../services/project";
 import { openFileExternal } from "../services/unity";
 import { undoRevertFile, UNDO_FILE_DIRTY_ERROR_CODE } from "../services/undo";
 import { normalizeAppError } from "../services/errors";
@@ -21,13 +28,14 @@ import BaseSegmented from "./ui/BaseSegmented.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 
 const appWindow = getCurrentWindow();
-const diffProgress = useDiffProgress();
 const payload = ref<FileDiffPayload | null>(null);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const fileDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const requestSeq = ref(0);
 const currentRequest = ref<FileDiffRequest | null>(null);
+const currentWorkspaceRef = ref<WorkspaceRef | null>(null);
+const diffProgress = useDiffProgress(() => currentWorkspaceRef.value);
 const fullContext = ref(false);
 
 let unlistenPayload: UnlistenFn | null = null;
@@ -87,19 +95,21 @@ async function selectTextTabIfAvailable() {
 async function loadRequest(
   request: FileDiffRequest,
   options?: { invalidateKey?: string; preferTextTab?: boolean },
+  workspaceRef: WorkspaceRef | null = null,
 ): Promise<boolean> {
   const normalizedRequest = normalizeReviewRequest(request);
   const seq = ++requestSeq.value;
   applyCurrentRequest(normalizedRequest);
+  currentWorkspaceRef.value = workspaceRef;
   loading.value = true;
   error.value = null;
   payload.value = null;
-  diffProgress.reset();
+  diffProgress.reset(computeRequestKey(normalizedRequest, workspaceRef));
   if (options?.invalidateKey) {
     invalidateDiffCache(options.invalidateKey);
   }
   try {
-    const nextPayload = await diffSingleFile(normalizedRequest);
+    const nextPayload = await diffSingleFile(normalizedRequest, workspaceRef);
     if (seq !== requestSeq.value) return false;
     payload.value = nextPayload;
     if (options?.preferTextTab) {
@@ -127,9 +137,11 @@ async function loadDiffKey(diffKey: string): Promise<boolean> {
     error.value = t("chat.changes.reviewMissing");
     return false;
   }
-  return loadRequest(request, {
-    invalidateKey: diffKey,
-  });
+  return loadRequest(
+    request,
+    { invalidateKey: diffKey },
+    parseDiffWorkspaceRefFromKey(diffKey) ?? null,
+  );
 }
 
 function applyWindowPayload(next: ChatDiffReviewWindowPayload) {
@@ -137,13 +149,14 @@ function applyWindowPayload(next: ChatDiffReviewWindowPayload) {
     const request = parseDiffRequestKey(next.payload.key);
     requestSeq.value += 1;
     applyCurrentRequest(request);
+    currentWorkspaceRef.value = parseDiffWorkspaceRefFromKey(next.payload.key) ?? null;
     payload.value = next.payload;
     error.value = null;
     loading.value = false;
     return;
   }
   if (next.request) {
-    void loadRequest(next.request);
+    void loadRequest(next.request, undefined, next.workspaceRef ?? null);
     return;
   }
   if (next.diffKey?.trim()) {
@@ -164,7 +177,7 @@ async function toggleFullTextCompare() {
   await loadRequest({
     ...currentRequest.value,
     fullContext: nextFullContext,
-  }, { preferTextTab: true });
+  }, { preferTextTab: true }, currentWorkspaceRef.value);
 }
 
 // ── Per-file revert with confirmation ──
@@ -229,7 +242,11 @@ async function confirmRevertFile(force = false) {
     revertDirtyDetail.value = null;
     // Reload the diff against the reverted worktree; the main window catches
     // up via the undo-file-reverted broadcast.
-    await loadRequest(request, { invalidateKey: currentPayload.key });
+    await loadRequest(
+      request,
+      { invalidateKey: currentPayload.key },
+      currentWorkspaceRef.value,
+    );
   } catch (cause) {
     const err = normalizeAppError(cause);
     if (!force && err.code === UNDO_FILE_DIRTY_ERROR_CODE) {
@@ -357,6 +374,7 @@ onUnmounted(() => {
         v-if="payload"
         ref="fileDiffViewerRef"
         :payload="payload"
+        :workspace-ref="currentWorkspaceRef"
         :hide-builtin-tabs="true"
         :hide-text-display-controls="true"
         @lfs-pulled="onLfsPulled"

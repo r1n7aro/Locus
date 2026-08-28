@@ -64,7 +64,7 @@ const displayModeOptions = computed(() => [
 ]);
 
 function onSelectInUnity() {
-  selectUnityAsset(props.selectedPath).catch((err: unknown) => {
+  selectUnityAsset(projectStore.requireWorkspaceRef(), props.selectedPath).catch((err: unknown) => {
     console.warn("[AssetPreviewHost] selectUnityAsset failed:", err);
   });
 }

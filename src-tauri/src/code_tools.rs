@@ -212,7 +212,7 @@ async fn collect_semantic_warning_feedback(
 
     // Automatic feedback stays on the already-warm fast path. Explicit
     // code_diagnostics remains the entry point that may wait for Roslyn startup.
-    let status = crate::csharp_lsp::status().await;
+    let status = crate::csharp_lsp::status_for_workspace(workspace).await;
     if status.phase != "ready"
         || status
             .workspace

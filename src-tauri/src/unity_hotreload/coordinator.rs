@@ -112,21 +112,6 @@ fn projects() -> &'static Mutex<HashMap<String, ProjectState>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The project whose unapplied count the status card reflects. The connection
-/// monitor sets it to the workspace it watches so a stale project's pending
-/// (another editor that has since converged, a prior workspace) cannot inflate
-/// the badge. Unset → aggregate across projects (back-compat for tests).
-fn active_project() -> &'static std::sync::Mutex<Option<String>> {
-    static ACTIVE: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| std::sync::Mutex::new(None))
-}
-
-pub fn set_active_project(project_path: &str) {
-    if let Ok(mut active) = active_project().lock() {
-        *active = Some(project_key(project_path));
-    }
-}
-
 /// Does this project still hold tracking the monitor must keep reconciling
 /// (pending edits or a cold queue)? Lets the monitor keep observing reload
 /// state after the user toggles hot reload off with work outstanding, so a
@@ -258,20 +243,9 @@ async fn record_patch_failure(project_path: &str) {
     crate::csharp_compile::emit_status_in_background();
 }
 
-/// Hot-patch counters for the settings status card. Scoped to the active project
-/// when the monitor has set one (so a stale/background editor's tallies cannot
-/// inflate the badge), else summed across all — mirroring `unapplied_change_count`'s
-/// active-project discipline. `cold_queued` is the live `cold_paths` depth.
-pub async fn counters() -> super::HotReloadCounters {
-    let active = active_project()
-        .lock()
-        .ok()
-        .and_then(|active| active.clone());
-    let projects = projects().lock().await;
-    let states: Vec<&ProjectState> = match active.as_deref() {
-        Some(key) => projects.get(key).into_iter().collect(),
-        None => projects.values().collect(),
-    };
+fn accumulate_counters<'a>(
+    states: impl IntoIterator<Item = &'a ProjectState>,
+) -> super::HotReloadCounters {
     let mut totals = super::HotReloadCounters::default();
     for state in states {
         totals.patches_applied += state.patches_applied;
@@ -282,6 +256,19 @@ pub async fn counters() -> super::HotReloadCounters {
         totals.cold_queued += state.cold_paths.len() as u64;
     }
     totals
+}
+
+/// Process-level aggregate retained for shared sidecar diagnostics.
+pub async fn counters() -> super::HotReloadCounters {
+    let projects = projects().lock().await;
+    accumulate_counters(projects.values())
+}
+
+/// Checkout/project-scoped counters for status UI and IPC. A background
+/// worktree can update its own counters without changing another pane's view.
+pub async fn counters_for_project(project_path: &str) -> super::HotReloadCounters {
+    let projects = projects().lock().await;
+    accumulate_counters(projects.get(&project_key(project_path)))
 }
 
 /// Total live detours across ALL projects, ignoring active-project scope. The
@@ -780,24 +767,30 @@ async fn is_pending_edit_unapplied(edit: &PendingEdit) -> bool {
 }
 
 pub async fn unapplied_change_count() -> u64 {
-    let active = active_project()
-        .lock()
-        .ok()
-        .and_then(|active| active.clone());
     let snapshot: Vec<PendingEdit> = {
         let projects = projects().lock().await;
-        match active.as_deref() {
-            Some(key) => projects
-                .get(key)
-                .map(|state| state.pending.values().cloned().collect())
-                .unwrap_or_default(),
-            None => projects
-                .values()
-                .flat_map(|state| state.pending.values().cloned())
-                .collect(),
-        }
+        projects
+            .values()
+            .flat_map(|state| state.pending.values().cloned())
+            .collect()
     };
 
+    count_unapplied_edits(snapshot).await
+}
+
+pub async fn unapplied_change_count_for_project(project_path: &str) -> u64 {
+    let snapshot: Vec<PendingEdit> = {
+        let projects = projects().lock().await;
+        projects
+            .get(&project_key(project_path))
+            .map(|state| state.pending.values().cloned().collect())
+            .unwrap_or_default()
+    };
+
+    count_unapplied_edits(snapshot).await
+}
+
+async fn count_unapplied_edits(snapshot: Vec<PendingEdit>) -> u64 {
     let mut count = 0u64;
     for edit in snapshot {
         if is_pending_edit_unapplied(&edit).await {
@@ -1637,6 +1630,10 @@ async fn apply_compiled_hot_patch(
     note_patch_applied(project_path).await;
 
     let image_register_error = match crate::csharp_compile::register_session_image(
+        params
+            .scope_id
+            .as_ref()
+            .ok_or_else(|| "compile scope is unavailable".to_string())?,
         &params.domain_generation,
         assembly_name,
         assembly_b64,
@@ -3552,6 +3549,39 @@ mod tests {
         assert!(!edit_tracking_enabled(false, true));
         assert!(!edit_tracking_enabled(true, false));
         assert!(edit_tracking_enabled(true, true));
+    }
+
+    #[tokio::test]
+    async fn status_counters_are_independent_per_checkout_root() {
+        let project_a = r"C:\HotReloadTest\ScopedStatusA";
+        let project_b = r"C:\HotReloadTest\ScopedStatusB";
+        {
+            let mut projects = projects().lock().await;
+            let a = projects.entry(project_key(project_a)).or_default();
+            a.patches_applied = 3;
+            a.active_patches = 1;
+            a.cold_paths.insert("a.cs".to_string());
+            let b = projects.entry(project_key(project_b)).or_default();
+            b.patches_applied = 7;
+            b.active_patches = 2;
+            b.cold_paths.insert("b.cs".to_string());
+            b.cold_paths.insert("c.cs".to_string());
+        }
+
+        let a = counters_for_project(project_a).await;
+        let b = counters_for_project(project_b).await;
+        assert_eq!(
+            (a.patches_applied, a.active_patches, a.cold_queued),
+            (3, 1, 1)
+        );
+        assert_eq!(
+            (b.patches_applied, b.active_patches, b.cold_queued),
+            (7, 2, 2)
+        );
+
+        let mut projects = projects().lock().await;
+        projects.remove(&project_key(project_a));
+        projects.remove(&project_key(project_b));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 mod background_hook;
 mod capture;
+pub(crate) mod dialog;
 mod flavor;
 mod focus;
 mod native_selftest;
@@ -20,7 +21,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tokio::sync::Mutex;
 
 use flavor::EditorFlavor;
@@ -28,18 +29,66 @@ use flavor::EditorFlavor;
 pub use background_hook::{UnityBackgroundHookState, UnityBackgroundHookStatus};
 pub use capture::{capture_viewport, UnityViewportCapture};
 pub use plugin::{
-    check_plugin_install_plan, check_plugin_status, emit_plugin_status, find_plugin_source_dir,
-    install_or_update_plugin, install_or_update_plugin_with_force_close, plugin_install_root,
-    plugin_skills_root, PluginInstallPlan, PluginStatus,
+    check_plugin_install_plan, check_plugin_status, emit_plugin_status_scoped,
+    find_plugin_source_dir, install_or_update_plugin, install_or_update_plugin_with_force_close,
+    plugin_install_root, plugin_skills_root, PluginInstallPlan, PluginStatus,
 };
 pub use process::{
+    close_current_project_unity_processes, force_close_current_project_unity_processes,
     query_current_project_editor_process, UnityEditorProcessInfo, UnityEditorProcessState,
 };
-pub use state_probe::{SemanticState, UnityStateProbeStatus, UnityStateProbeTier};
-pub use transport::{
-    send_message, send_message_with_timeout, send_message_without_timeout,
-    send_message_without_timeout_with_acceptance, set_event_app_handle,
+pub use state_probe::{
+    ObservedMainThreadState, ObservedSafetyState, SemanticState, UnityStateProbeStatus,
+    UnityStateProbeTier,
 };
+pub use transport::{
+    disconnect_with_reason, send_message, send_message_with_timeout, send_message_without_timeout,
+    send_message_without_timeout_with_acceptance, set_event_app_handle, set_service_event_scope,
+};
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityWorkspaceStatus<T> {
+    pub checkout_id: String,
+    pub workspace_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_generation: Option<u64>,
+    #[serde(flatten)]
+    pub status: T,
+}
+
+impl<T> UnityWorkspaceStatus<T> {
+    pub(crate) fn from_scope(
+        scope: &crate::workspace_service::event::WorkspaceEventScope,
+        status: T,
+    ) -> Self {
+        Self {
+            checkout_id: scope.checkout_id.to_string(),
+            workspace_generation: scope.workspace_generation,
+            service_instance_id: scope.service_instance_id.as_ref().map(ToString::to_string),
+            service_generation: scope.service_generation,
+            status,
+        }
+    }
+}
+
+pub fn bind_workspace_observable_status(
+    project_path: &str,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    background_hook::bind_workspace_scope(project_path, scope);
+    state_probe::bind_workspace_scope(project_path, scope);
+}
+
+pub fn unbind_workspace_observable_status(
+    project_path: &str,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    background_hook::unbind_workspace_scope(project_path, scope);
+    state_probe::unbind_workspace_scope(project_path, scope);
+}
 
 pub fn initialize_background_hook(enabled: bool) {
     background_hook::initialize(enabled);
@@ -49,8 +98,10 @@ pub fn set_background_hook_enabled(value: bool) -> Result<UnityBackgroundHookSta
     background_hook::set_enabled(value)
 }
 
-pub fn background_hook_status() -> UnityBackgroundHookStatus {
-    background_hook::status()
+pub fn background_hook_status_for_scope(
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) -> UnityWorkspaceStatus<UnityBackgroundHookStatus> {
+    UnityWorkspaceStatus::from_scope(scope, background_hook::status_for_scope(scope))
 }
 
 pub fn restore_background_hook_runtime() -> Result<(), String> {
@@ -65,8 +116,10 @@ pub fn set_state_probe_enabled(value: bool) -> UnityStateProbeStatus {
     state_probe::set_enabled(value)
 }
 
-pub fn state_probe_status() -> UnityStateProbeStatus {
-    state_probe::status()
+pub fn state_probe_status_for_scope(
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) -> UnityWorkspaceStatus<UnityStateProbeStatus> {
+    UnityWorkspaceStatus::from_scope(scope, state_probe::status_for_scope(scope))
 }
 
 pub fn start_unity_semantic_state_observer(project_path: &str) {
@@ -79,7 +132,28 @@ pub fn stop_unity_semantic_state_observers() {
 
 /// Fuse pipe + process + native signals into one semantic editor state.
 pub async fn unity_semantic_state(project_path: &str) -> SemanticState {
-    state_probe::semantic_state_for_project(project_path).await
+    let mut state = state_probe::semantic_state_for_project(project_path).await;
+    // A native Unity dialog can keep the status/ping channel responsive while
+    // the managed editor main thread is unavailable for normal API work. Fold
+    // that independent window signal into the semantic surface so callers do
+    // not mistake "pipe ready" for "Unity API ready".
+    let _ = dialog::ensure_project_observed(project_path).await;
+    if let Some(dialog) = dialog::current_dialog(project_path) {
+        // Publish observable blocking and recovery capabilities. The Agent
+        // decides whether to choose a dialog action, wait, or restart Unity.
+        state.transient = false;
+        state.main_thread.state = "blocked".to_string();
+        state.main_thread.cpu_active = false;
+        state.safety.can_call_unity_api = false;
+        state.safety.can_modify_assets_safely = false;
+        state.safety.recommended_action = "resolve_dialog".to_string();
+        state.detail = Some(if dialog.title.trim().is_empty() {
+            "Unity main thread is blocked by a modal dialog".to_string()
+        } else {
+            format!("Unity main thread is blocked by dialog: {}", dialog.title)
+        });
+    }
+    state
 }
 
 pub async fn run_state_probe_selftest(
@@ -89,11 +163,27 @@ pub async fn run_state_probe_selftest(
     state_probe::selftest::run(app, project).await
 }
 
+pub async fn run_state_probe_selftest_scoped(
+    app: tauri::AppHandle,
+    project: String,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
+) -> Result<(), String> {
+    state_probe::selftest::run_scoped(app, project, event_scope).await
+}
+
 pub async fn run_native_bridge_selftest(
     app: tauri::AppHandle,
     project: String,
 ) -> Result<(), String> {
     native_selftest::run(app, project).await
+}
+
+pub async fn run_native_bridge_selftest_scoped(
+    app: tauri::AppHandle,
+    project: String,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
+) -> Result<(), String> {
+    native_selftest::run_scoped(app, project, event_scope).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +336,23 @@ pub struct NativeBrokerStatus {
     pub background_patched: bool,
     #[serde(default)]
     pub background_symbols: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnityBridgeReadinessState {
+    Starting,
+    Connected,
+    Ready,
+    Reloading,
+    Degraded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityBridgeReadinessProbe {
+    pub state: UnityBridgeReadinessState,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -851,7 +958,10 @@ async fn send_message_without_timeout_with_transient_retry(
     }
 }
 
-pub type UnityMonitorHandle = Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>;
+/// Monitors are keyed by normalized project path so one Locus process can
+/// observe several Unity checkouts without replacing the previous monitor.
+pub type UnityMonitorHandle =
+    Arc<tokio::sync::Mutex<HashMap<String, (String, tauri::async_runtime::JoinHandle<()>)>>>;
 
 pub const UNITY_EDITOR_STATUS_DISCONNECTED: &str = "disconnected";
 pub const UNITY_EDITOR_STATUS_EDITING: &str = "editing";
@@ -927,6 +1037,33 @@ pub struct UnityLaunchResult {
     pub project_path: String,
     pub project_version: String,
     pub process_id: u32,
+    pub mode: UnityLaunchMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnityLaunchMode {
+    Interactive,
+    Headless,
+}
+
+impl UnityLaunchMode {
+    pub fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("interactive") => Ok(Self::Interactive),
+            Some("headless") => Ok(Self::Headless),
+            Some(value) => Err(format!(
+                "mode must be 'interactive' or 'headless'; got '{value}'"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Headless => "headless",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -944,6 +1081,9 @@ pub struct UnityConnectionStatus {
     pub editor_process_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor_project_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_mode: Option<UnityLaunchMode>,
+    pub headless: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_checked_at_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1539,11 +1679,31 @@ pub enum UnityLaunchCodeOptimization {
 }
 
 pub async fn launch_project(project_path: &str) -> Result<UnityLaunchResult, String> {
-    launch_project_with_options(project_path, None).await
+    launch_project_with_mode_and_options(project_path, UnityLaunchMode::Interactive, None).await
+}
+
+pub async fn launch_project_with_mode(
+    project_path: &str,
+    mode: UnityLaunchMode,
+) -> Result<UnityLaunchResult, String> {
+    launch_project_with_mode_and_options(project_path, mode, None).await
 }
 
 pub async fn launch_project_with_options(
     project_path: &str,
+    code_optimization: Option<UnityLaunchCodeOptimization>,
+) -> Result<UnityLaunchResult, String> {
+    launch_project_with_mode_and_options(
+        project_path,
+        UnityLaunchMode::Interactive,
+        code_optimization,
+    )
+    .await
+}
+
+pub async fn launch_project_with_mode_and_options(
+    project_path: &str,
+    mode: UnityLaunchMode,
     code_optimization: Option<UnityLaunchCodeOptimization>,
 ) -> Result<UnityLaunchResult, String> {
     if !is_unity_project(project_path) {
@@ -1562,6 +1722,9 @@ pub async fn launch_project_with_options(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if mode == UnityLaunchMode::Headless {
+        command.arg("-batchmode").arg("-nographics");
+    }
     match code_optimization {
         Some(UnityLaunchCodeOptimization::Debug) => {
             command.arg("-debugCodeOptimization");
@@ -1606,8 +1769,11 @@ pub async fn launch_project_with_options(
     state_probe::clear_project_observer_state(&project_path);
 
     eprintln!(
-        "[Locus] launched Unity Editor: editor='{}', project='{}', process_id={}",
-        editor_path, project_path, process_id
+        "[Locus] launched Unity Editor: editor='{}', project='{}', process_id={}, mode={}",
+        editor_path,
+        project_path,
+        process_id,
+        mode.as_str()
     );
 
     Ok(UnityLaunchResult {
@@ -1615,6 +1781,7 @@ pub async fn launch_project_with_options(
         project_path,
         project_version,
         process_id,
+        mode,
     })
 }
 
@@ -1741,6 +1908,16 @@ fn apply_unity_process_info(
     status.process_last_error = process_info.last_error;
 }
 
+async fn sync_unity_launch_mode_for_status(status: &mut UnityConnectionStatus) {
+    if status.editor_process_state != UnityEditorProcessState::Running {
+        status.launch_mode = None;
+        status.headless = false;
+        return;
+    }
+    status.launch_mode = process::query_unity_editor_launch_mode(status.editor_process_id).await;
+    status.headless = status.launch_mode == Some(UnityLaunchMode::Headless);
+}
+
 fn unity_process_info_from_status(
     status: &UnityConnectionStatus,
 ) -> Option<UnityEditorProcessInfo> {
@@ -1845,7 +2022,7 @@ fn process_hint_from_response(
     })
 }
 
-fn inactive_background_hook_status() -> UnityBackgroundHookStatus {
+fn inactive_background_hook_status(project_path: &str) -> UnityBackgroundHookStatus {
     if background_hook::enabled() {
         UnityBackgroundHookStatus {
             enabled: true,
@@ -1859,7 +2036,7 @@ fn inactive_background_hook_status() -> UnityBackgroundHookStatus {
             updated_at_ms: unix_now_ms(),
         }
     } else {
-        background_hook::status()
+        background_hook::status_for_project(project_path)
     }
 }
 
@@ -1877,11 +2054,12 @@ async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, pro
     // The in-process native hook (when active) owns the patch and survives
     // domain reloads; the cross-process path then stands down.
     if let Some(native) = native_owned_background_hook(project_path).await {
+        background_hook::record_status_for_project(project_path, native.clone());
         status.background_hook = native;
         return;
     }
     let Some(process_id) = status.editor_process_id else {
-        let current = background_hook::status();
+        let current = background_hook::status_for_project(project_path);
         if matches!(
             status.editor_process_state,
             UnityEditorProcessState::Running
@@ -1892,12 +2070,14 @@ async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, pro
             return;
         }
 
-        status.background_hook = inactive_background_hook_status();
+        status.background_hook = inactive_background_hook_status(project_path);
+        background_hook::record_status_for_project(project_path, status.background_hook.clone());
         return;
     };
 
     if should_defer_background_hook_to_native(status, project_path) {
-        status.background_hook = inactive_background_hook_status();
+        status.background_hook = inactive_background_hook_status(project_path);
+        background_hook::record_status_for_project(project_path, status.background_hook.clone());
         return;
     }
 
@@ -1913,11 +2093,13 @@ async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, pro
             error: Some("Unity process path is unavailable".to_string()),
             updated_at_ms: unix_now_ms(),
         };
+        background_hook::record_status_for_project(project_path, status.background_hook.clone());
         return;
     };
 
+    let hook_project_path = project_path.to_string();
     let hook_status = tauri::async_runtime::spawn_blocking(move || {
-        background_hook::sync_for_process(process_id, &editor_process_path)
+        background_hook::sync_for_project(&hook_project_path, process_id, &editor_process_path)
     })
     .await
     .map_err(|error| format!("Unity background hook task failed: {error}"))
@@ -1933,6 +2115,7 @@ async fn sync_background_hook_for_status(status: &mut UnityConnectionStatus, pro
         error: Some(error),
         updated_at_ms: unix_now_ms(),
     });
+    background_hook::record_status_for_project(project_path, hook_status.clone());
     status.background_hook = hook_status;
 }
 
@@ -2079,19 +2262,22 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 editor_process_id: None,
                 editor_process_path: None,
                 editor_project_path: None,
+                launch_mode: None,
+                headless: false,
                 process_checked_at_ms: None,
                 process_last_error: None,
                 pipe_name,
                 latency_ms: Some(latency_ms),
                 reconnect_attempts: 0,
                 last_error: None,
-                background_hook: background_hook::status(),
+                background_hook: background_hook::status_for_project(project_path),
                 checked_at_ms,
             };
             let process_info =
                 query_process_info_for_connection_status_bounded(project_path, true, process_hint)
                     .await;
             apply_unity_process_info(&mut status, process_info);
+            sync_unity_launch_mode_for_status(&mut status).await;
             sync_background_hook_for_status(&mut status, project_path).await;
             cache_unity_connection_status(project_path, &status);
             status
@@ -2118,18 +2304,21 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 editor_process_id: None,
                 editor_process_path: None,
                 editor_project_path: None,
+                launch_mode: None,
+                headless: false,
                 process_checked_at_ms: None,
                 process_last_error: None,
                 pipe_name,
                 latency_ms: Some(latency_ms),
                 reconnect_attempts: 0,
                 last_error: Some(error),
-                background_hook: background_hook::status(),
+                background_hook: background_hook::status_for_project(project_path),
                 checked_at_ms,
             };
             let process_info =
                 query_process_info_for_connection_status_bounded(project_path, false, None).await;
             apply_unity_process_info(&mut status, process_info);
+            sync_unity_launch_mode_for_status(&mut status).await;
             apply_observed_editor_status_fallback(project_path, &mut status);
             sync_background_hook_for_status(&mut status, project_path).await;
             cache_unity_connection_status(project_path, &status);
@@ -2164,18 +2353,21 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 editor_process_id: None,
                 editor_process_path: None,
                 editor_project_path: None,
+                launch_mode: None,
+                headless: false,
                 process_checked_at_ms: None,
                 process_last_error: None,
                 pipe_name,
                 latency_ms: None,
                 reconnect_attempts: 0,
                 last_error: Some(error),
-                background_hook: background_hook::status(),
+                background_hook: background_hook::status_for_project(project_path),
                 checked_at_ms,
             };
             let process_info =
                 query_process_info_for_connection_status_bounded(project_path, false, None).await;
             apply_unity_process_info(&mut status, process_info);
+            sync_unity_launch_mode_for_status(&mut status).await;
             apply_observed_editor_status_fallback(project_path, &mut status);
             sync_background_hook_for_status(&mut status, project_path).await;
             // Keep the cache anchored to the last authoritative ready/error
@@ -2205,18 +2397,21 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 editor_process_id: None,
                 editor_process_path: None,
                 editor_project_path: None,
+                launch_mode: None,
+                headless: false,
                 process_checked_at_ms: None,
                 process_last_error: None,
                 pipe_name,
                 latency_ms: None,
                 reconnect_attempts: 0,
                 last_error: Some(error),
-                background_hook: background_hook::status(),
+                background_hook: background_hook::status_for_project(project_path),
                 checked_at_ms,
             };
             let process_info =
                 query_process_info_for_connection_status_bounded(project_path, false, None).await;
             apply_unity_process_info(&mut status, process_info);
+            sync_unity_launch_mode_for_status(&mut status).await;
             apply_observed_editor_status_fallback(project_path, &mut status);
             sync_background_hook_for_status(&mut status, project_path).await;
             cache_unity_connection_status(project_path, &status);
@@ -2255,13 +2450,16 @@ pub async fn ensure_background_hook_for_project(
     project_path: &str,
 ) -> Result<UnityBackgroundHookStatus, String> {
     if !background_hook::enabled() {
-        return Ok(background_hook::status());
+        return Ok(background_hook::status_for_project(project_path));
     }
     if let Some(native) = native_owned_background_hook(project_path).await {
+        background_hook::record_status_for_project(project_path, native.clone());
         return Ok(native);
     }
     if native_bridge_enabled() && native_background_hook_markers_present(project_path) {
-        return Ok(inactive_background_hook_status());
+        let status = inactive_background_hook_status(project_path);
+        background_hook::record_status_for_project(project_path, status.clone());
+        return Ok(status);
     }
     let process_info = query_current_project_editor_process(project_path).await;
     let process_id = process_info.process_id.ok_or_else(|| {
@@ -2272,8 +2470,9 @@ pub async fn ensure_background_hook_for_project(
     let editor_process_path = process_info
         .executable_path
         .ok_or_else(|| "Unity process path is unavailable".to_string())?;
+    let hook_project_path = project_path.to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        background_hook::sync_for_process(process_id, &editor_process_path)
+        background_hook::sync_for_project(&hook_project_path, process_id, &editor_process_path)
     })
     .await
     .map_err(|error| format!("Unity background hook task failed: {error}"))?
@@ -3895,7 +4094,87 @@ async fn query_unity_execute_progress(
     Ok(Some(snapshot))
 }
 
-async fn wait_for_unity_bridge_ready(
+/// Reattach to an execution that Locus detached from after detecting a Unity
+/// modal dialog. The Unity plugin retains completed responses for its
+/// idempotency window, so this retrieves the original result without running
+/// the snippet again.
+pub async fn wait_unity_execution(
+    project_path: &str,
+    execution_id: &str,
+) -> Result<String, String> {
+    let execution_id = execution_id.trim();
+    if execution_id.is_empty() {
+        return Err("execution_id cannot be empty".to_string());
+    }
+    let response =
+        send_message_without_timeout(project_path, "execute_code_wait", execution_id).await?;
+    if response.ok {
+        Ok(response.message.unwrap_or_default())
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| "Unity execution wait failed".to_string()))
+    }
+}
+
+/// Strict checkout-local command readiness probe. A successful pipe status is
+/// connection evidence; command readiness additionally requires a loaded
+/// managed domain and a usable Unity main thread from the fused state probe.
+pub(crate) async fn probe_unity_bridge_readiness(project_path: &str) -> UnityBridgeReadinessProbe {
+    let state = unity_semantic_state(project_path).await;
+    let detail = format!(
+        "phase={}, channel={}, domain={}, mainThread={}, canCallUnityApi={}, action={}",
+        state.phase,
+        state.channel.control_pipe,
+        state.domain.phase,
+        state.main_thread.state,
+        state.safety.can_call_unity_api,
+        state.safety.recommended_action
+    );
+
+    if state.phase == "reloading"
+        || state.domain.phase == "reloading"
+        || state.channel.control_pipe == "reloading"
+    {
+        return UnityBridgeReadinessProbe {
+            state: UnityBridgeReadinessState::Reloading,
+            detail,
+        };
+    }
+
+    let channel_reached_managed_executor =
+        matches!(state.channel.control_pipe.as_str(), "ready" | "busy");
+    let main_thread_usable = !matches!(state.main_thread.state.as_str(), "hung" | "stalled");
+    if channel_reached_managed_executor
+        && state.domain.phase == "none"
+        && main_thread_usable
+        && state.safety.can_call_unity_api
+    {
+        return UnityBridgeReadinessProbe {
+            state: UnityBridgeReadinessState::Ready,
+            detail,
+        };
+    }
+
+    let process_running = state.process.state == "running";
+    let connection_observed = channel_reached_managed_executor
+        || matches!(
+            state.channel.control_pipe.as_str(),
+            "starting" | "reloading"
+        );
+    UnityBridgeReadinessProbe {
+        state: if process_running && connection_observed {
+            UnityBridgeReadinessState::Connected
+        } else if process_running && state.phase == "starting" {
+            UnityBridgeReadinessState::Starting
+        } else {
+            UnityBridgeReadinessState::Degraded
+        },
+        detail,
+    }
+}
+
+pub(crate) async fn wait_for_unity_bridge_ready(
     project_path: &str,
     max_wait: Duration,
     context: &str,
@@ -3903,24 +4182,9 @@ async fn wait_for_unity_bridge_ready(
     let start = std::time::Instant::now();
 
     loop {
-        let mut detail = "Unity bridge status poll returned disconnected".to_string();
-        let mut native_managed_not_ready = false;
-        if native_bridge_enabled() {
-            if let Some(status) = query_native_broker_status(project_path).await {
-                if status.native_alive && status.managed_state == "ready" {
-                    return Ok(());
-                }
-                native_managed_not_ready = true;
-                detail = format!("Native broker managed state is '{}'", status.managed_state);
-            }
-        }
-
-        if !native_managed_not_ready {
-            let (connected, _, _) =
-                query_unity_status_with_timeout(project_path, UNITY_STATUS_POLL_TIMEOUT).await;
-            if connected {
-                return Ok(());
-            }
+        let readiness = probe_unity_bridge_readiness(project_path).await;
+        if readiness.state == UnityBridgeReadinessState::Ready {
+            return Ok(());
         }
 
         if start.elapsed() > max_wait {
@@ -3928,7 +4192,7 @@ async fn wait_for_unity_bridge_ready(
                 "Timed out waiting for Unity bridge to become ready {} ({}s): {}",
                 context,
                 max_wait.as_secs(),
-                detail
+                readiness.detail
             ));
         }
 
@@ -4765,6 +5029,21 @@ where
         };
 
         match attempt_result {
+            Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
+                let request_state = if broker_accepted || saw_unity_progress {
+                    "detached"
+                } else if error.contains("request_state=not_sent") {
+                    "not_sent"
+                } else {
+                    "unknown"
+                };
+                return Err(dialog::blocked_error(
+                    project_path,
+                    request_state,
+                    Some(&execution_id),
+                )
+                .unwrap_or(error));
+            }
             // An older Unity plugin without the execute_loaded handler:
             // retry the same request through the legacy compile path.
             Ok(resp)
@@ -5196,6 +5475,21 @@ where
         };
 
         match attempt_result {
+            Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
+                let request_state = if broker_accepted || saw_unity_progress {
+                    "detached"
+                } else if error.contains("request_state=not_sent") {
+                    "not_sent"
+                } else {
+                    "unknown"
+                };
+                return Err(dialog::blocked_error(
+                    project_path,
+                    request_state,
+                    Some(&execution_id),
+                )
+                .unwrap_or(error));
+            }
             // An older Unity plugin without the execute_loaded handler:
             // retry the same request through the legacy compile path.
             Ok(resp)
@@ -5777,6 +6071,9 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
     };
 
     loop {
+        if let Some(error) = dialog::blocked_error(project_path, "unknown", None) {
+            return Err(error);
+        }
         if disconnected {
             tokio::time::sleep(Duration::from_millis(500)).await;
             match send_message_with_timeout(project_path, "ping", "", RECOMPILE_POLL_TIMEOUT).await
@@ -5824,6 +6121,12 @@ pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
     let _recompile_wait_guard = UnityRecompileWaitGuard::new(project_path);
+    if let Err(error) = dialog::ensure_project_observed(project_path).await {
+        eprintln!("[Locus] Unity modal dialog observation could not be refreshed: {error}");
+    }
+    if let Some(error) = dialog::blocked_error(project_path, "not_sent", None) {
+        return Err(error);
+    }
     let hook_effective = background_hook_effective_for_project(project_path).await;
     let prev_foreground = if hook_effective {
         None
@@ -5896,7 +6199,10 @@ pub async fn run_recompile_probe(project_path: &str) -> Result<String, String> {
     // Surface the hook regime up front. This also patches when possible,
     // mirroring what recompile_and_wait does internally a moment later.
     let hook_effective = background_hook_effective_for_project(project_path).await;
-    report.push(format!("Background hook: {}", describe_background_hook()));
+    report.push(format!(
+        "Background hook: {}",
+        describe_background_hook(project_path)
+    ));
 
     // 1) Write the throwaway source.
     if let Err(error) = std::fs::write(&probe_path, source) {
@@ -5965,8 +6271,8 @@ pub async fn run_recompile_probe(project_path: &str) -> Result<String, String> {
 
 /// Human-readable one-liner for the current background-hook patch state, used in
 /// the recompile-probe report so the user can see which regime they are in.
-fn describe_background_hook() -> String {
-    let status = background_hook::status();
+fn describe_background_hook(project_path: &str) -> String {
+    let status = background_hook::status_for_project(project_path);
     match status.state {
         background_hook::UnityBackgroundHookState::Patched => {
             format!("active (patched, {} symbol(s))", status.symbol_count)
@@ -6023,11 +6329,9 @@ pub async fn start_unity_monitor(
     app_handle: AppHandle,
     project_path: String,
     monitor: &UnityMonitorHandle,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
 ) {
-    stop_unity_monitor(monitor).await;
-    if let Ok(mut slot) = MONITORED_PROJECT.lock() {
-        *slot = Some(project_path.clone());
-    }
+    stop_unity_monitor_for_project(monitor, &project_path).await;
     set_event_app_handle(app_handle.clone());
 
     let pipe_name = get_native_pipe_name(&project_path);
@@ -6036,9 +6340,7 @@ pub async fn start_unity_monitor(
         pipe_name
     );
     state_probe::start_observer(&project_path);
-    // The status badge's unapplied count reflects the workspace this monitor
-    // watches (not stale pending from a prior project / another editor).
-    crate::unity_hotreload::coordinator::set_active_project(&project_path);
+    let monitor_project_path = project_path.clone();
 
     let handle = tauri::async_runtime::spawn(async move {
         let mut last_status: Option<bool> = None;
@@ -6215,6 +6517,7 @@ pub async fn start_unity_monitor(
                     let process_not_running =
                         matches!(process_info.state, UnityEditorProcessState::NotRunning);
                     apply_unity_process_info(&mut status, process_info);
+                    sync_unity_launch_mode_for_status(&mut status).await;
                     if process_not_running {
                         sync_background_hook_for_status(&mut status, &project_path).await;
                         // The editor is gone: reset its dead detour state but KEEP
@@ -6236,6 +6539,7 @@ pub async fn start_unity_monitor(
                     .filter(|info| info.process_id.is_some())
                 {
                     apply_unity_process_info(&mut status, process_info);
+                    sync_unity_launch_mode_for_status(&mut status).await;
                     sync_background_hook_for_status(&mut status, &project_path).await;
                 }
             }
@@ -6255,37 +6559,58 @@ pub async fn start_unity_monitor(
                 ),
             );
 
-            let _ = app_handle.emit("unity-connection-status-detail", status.clone());
+            crate::workspace_service::event::emit_for_workspace_scope(
+                &app_handle,
+                &event_scope,
+                "unity-connection-status-detail",
+                status.clone(),
+            );
 
             if last_status != Some(connected) {
-                last_status = Some(connected);
-                let _ = app_handle.emit("unity-connection-status", connected);
+                crate::workspace_service::event::emit_for_workspace_scope(
+                    &app_handle,
+                    &event_scope,
+                    "unity-connection-status",
+                    connected,
+                );
             }
+            last_status = Some(connected);
 
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     });
 
-    monitor.lock().await.replace(handle);
+    monitor.lock().await.insert(
+        normalize_project_path_for_state_plane(&monitor_project_path),
+        (monitor_project_path, handle),
+    );
 }
 
-/// The project the running monitor watches. `stop_unity_monitor` reads (and
-/// clears) it to hand the abandoned project's hot-reload ledger off — once the
-/// monitor is gone, nothing would ever observe that editor's exit or compiles,
-/// so live-patch tallies would freeze and poison the sidecar's global gates.
-static MONITORED_PROJECT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+pub async fn stop_unity_monitor_for_project(monitor: &UnityMonitorHandle, project_path: &str) {
+    let handle = monitor
+        .lock()
+        .await
+        .remove(&normalize_project_path_for_state_plane(project_path));
+    if let Some((project_path, handle)) = handle {
+        handle.abort();
+        eprintln!(
+            "[Locus] Unity connection monitor stopped for {}",
+            project_path
+        );
+        crate::unity_hotreload::coordinator::on_monitor_stopped_background(project_path);
+    }
+    state_probe::stop_observer(project_path);
+}
 
 pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
-    if let Some(handle) = monitor.lock().await.take() {
+    let handles = {
+        let mut monitors = monitor.lock().await;
+        std::mem::take(&mut *monitors)
+    };
+    for (_, (project, handle)) in handles {
         handle.abort();
-        eprintln!("[Locus] Unity connection monitor stopped");
-        let abandoned = MONITORED_PROJECT
-            .lock()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        if let Some(project) = abandoned {
-            crate::unity_hotreload::coordinator::on_monitor_stopped_background(project);
-        }
+        eprintln!("[Locus] Unity connection monitor stopped for {}", project);
+        crate::unity_hotreload::coordinator::on_monitor_stopped_background(project);
     }
     state_probe::stop_all_observers();
 }
@@ -6300,7 +6625,7 @@ mod tests {
         play_mode_target_status, read_project_unity_version, relative_asset_paths,
         requested_run_states_editor_status, rewrite_run_states_output_for_size, PipeResponse,
         RecompilePollState, RecompileStartAck, RecompileStartDiagnostics, UnityBackgroundHookState,
-        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState,
+        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState, UnityLaunchMode,
         RECOMPILE_START_STATE_HISTORY_LIMIT, UNITY_EDITOR_STATUS_EDITING,
         UNITY_EDITOR_STATUS_PLAYING,
     };
@@ -6334,6 +6659,8 @@ mod tests {
             editor_process_id: Some(42),
             editor_process_path: Some("C:/Unity/Unity.exe".to_string()),
             editor_project_path: Some(project_path.to_string()),
+            launch_mode: Some(UnityLaunchMode::Interactive),
+            headless: false,
             process_checked_at_ms: Some(checked_at_ms),
             process_last_error: None,
             pipe_name: "test-pipe".to_string(),

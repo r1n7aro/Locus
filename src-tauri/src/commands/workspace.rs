@@ -1,21 +1,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
-use crate::asset_db::{AssetDb, AssetDbState, LoadExistingAssetDb};
-use crate::commands::asset::{
-    delete_persisted_last_scan_info, read_persisted_last_scan_info, AssetDbReconcileTaskState,
-    LastScanInfoState, ScanPhaseState, WorkspacePreviewCache,
-};
 use crate::error::AppError;
 use crate::keychain;
-use crate::unity_bridge::UnityMonitorHandle;
-use crate::workspace::Workspace;
-use crate::AssetDbWatcherHandle;
-use crate::KnowledgeFsWatcherHandle;
+use crate::workspace_service::service::{
+    ResolvedServiceBinding, ServiceBindingError, ServiceKind, ServiceReadinessPhase,
+    ServiceReadinessSnapshot, ServiceStatus, WorkspaceServiceStateSnapshot,
+};
+use crate::workspace_service::{AgentExecutionContext, ProjectRegistry, WorkspaceRef};
 
 const ENDPOINT_TEST_HTML_RESPONSE_CODE: &str = "endpoint_test.html_response";
 
@@ -79,703 +74,6 @@ fn read_nonempty_string(path: &std::path::Path) -> Option<String> {
 
 pub(crate) fn custom_endpoints_path(_app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(persistent_config_dir()?.join("custom_endpoints.json"))
-}
-
-#[tauri::command]
-pub async fn get_working_dir(workspace: State<'_, Arc<Workspace>>) -> Result<String, AppError> {
-    let dir = workspace.path.read().await.clone();
-    Ok(dir)
-}
-
-struct WorkspaceSwitchTimer {
-    target: String,
-    started_at: Instant,
-    lap_started_at: Instant,
-}
-
-impl WorkspaceSwitchTimer {
-    fn new(target: &str, started_at: Instant) -> Self {
-        Self {
-            target: target.to_string(),
-            started_at,
-            lap_started_at: started_at,
-        }
-    }
-
-    fn mark(&mut self, phase: &str) {
-        self.mark_detail(phase, "");
-    }
-
-    fn mark_detail(&mut self, phase: &str, detail: impl AsRef<str>) {
-        let now = Instant::now();
-        let detail = detail.as_ref();
-        tracing::info!(
-            log_module = "WorkspaceSwitch",
-            "phase={} total_ms={} delta_ms={} target={}{}",
-            phase,
-            now.duration_since(self.started_at).as_millis(),
-            now.duration_since(self.lap_started_at).as_millis(),
-            self.target,
-            detail
-        );
-        self.lap_started_at = now;
-    }
-}
-
-fn emit_asset_phase_if_current(
-    workspace: &Arc<Workspace>,
-    workspace_generation: u64,
-    app_handle: &AppHandle,
-    scan_phase_state: &ScanPhaseState,
-    phase: crate::asset_db::types::ScanPhase,
-) -> bool {
-    let generation_guard = match workspace.lock_generation() {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("[AssetDb] warning: failed to lock workspace generation: {error}");
-            return false;
-        }
-    };
-
-    if !generation_guard.is_current(workspace_generation) {
-        return false;
-    }
-
-    let _ = app_handle.emit("ref-graph-scan", &phase);
-    scan_phase_state.set(Some(phase));
-    true
-}
-
-fn emit_asset_reconcile_done_if_current(
-    workspace: &Arc<Workspace>,
-    workspace_generation: u64,
-    app_handle: &AppHandle,
-    scan_phase_state: &ScanPhaseState,
-) -> bool {
-    let generation_guard = match workspace.lock_generation() {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("[AssetDb] warning: failed to lock workspace generation: {error}");
-            return false;
-        }
-    };
-
-    if !generation_guard.is_current(workspace_generation) {
-        return false;
-    }
-
-    let phase = crate::asset_db::types::ScanPhase::ReconcileDone;
-    let _ = app_handle.emit("ref-graph-scan", &phase);
-    if scan_phase_state
-        .snapshot()
-        .as_ref()
-        .map(|phase| matches!(phase, crate::asset_db::types::ScanPhase::Reconcile { .. }))
-        .unwrap_or(false)
-    {
-        scan_phase_state.clear();
-    }
-    true
-}
-
-fn emit_asset_reconcile_error_if_current(
-    workspace: &Arc<Workspace>,
-    workspace_generation: u64,
-    app_handle: &AppHandle,
-    scan_phase_state: &ScanPhaseState,
-    error: AppError,
-) -> bool {
-    emit_asset_phase_if_current(
-        workspace,
-        workspace_generation,
-        app_handle,
-        scan_phase_state,
-        crate::asset_db::types::ScanPhase::Error { error },
-    )
-}
-
-fn spawn_background_asset_hash_reconcile(
-    app_handle: AppHandle,
-    workspace: Arc<Workspace>,
-    workspace_generation: u64,
-    project_root: std::path::PathBuf,
-    graph_state: Arc<Mutex<Option<AssetDb>>>,
-    scan_phase_state: ScanPhaseState,
-    reconcile_task_state: AssetDbReconcileTaskState,
-) {
-    let cwd = project_root.display().to_string();
-    let registration = reconcile_task_state.register(cwd.clone(), workspace_generation);
-    let cancel_token = registration.cancel_token();
-    let phase = crate::asset_db::types::ScanPhase::reconcile_started(true);
-
-    if !emit_asset_phase_if_current(
-        &workspace,
-        workspace_generation,
-        &app_handle,
-        &scan_phase_state,
-        phase,
-    ) {
-        return;
-    }
-
-    tauri::async_runtime::spawn(async move {
-        let _registration = registration;
-        let started_at = Instant::now();
-        let root_for_task = project_root.clone();
-        let graph_for_task = graph_state.clone();
-        let cancel_for_task = cancel_token.clone();
-        let app_handle_for_progress = app_handle.clone();
-        let workspace_for_progress = workspace.clone();
-        let scan_phase_state_for_progress = scan_phase_state.clone();
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            crate::asset_db::watcher::reconcile_graph_state_with_cancel_and_progress(
-                &root_for_task,
-                graph_for_task,
-                &cancel_for_task,
-                true,
-                |progress| {
-                    let _ = emit_asset_phase_if_current(
-                        &workspace_for_progress,
-                        workspace_generation,
-                        &app_handle_for_progress,
-                        &scan_phase_state_for_progress,
-                        progress.to_scan_phase(),
-                    );
-                },
-            )
-        })
-        .await;
-
-        if cancel_token.load(Ordering::Relaxed) || workspace.generation() != workspace_generation {
-            eprintln!(
-                "[AssetDb] background hash reconcile discarded for {} generation {}",
-                cwd, workspace_generation
-            );
-            return;
-        }
-
-        match result {
-            Ok(Ok(stats)) => {
-                tracing::info!(
-                    log_module = "AssetDb",
-                    "background hash reconcile complete: workspace={} queued={} processed={} failed={} elapsed_ms={}",
-                    cwd,
-                    stats.queued,
-                    stats.processed,
-                    stats.failed,
-                    started_at.elapsed().as_millis()
-                );
-                emit_asset_reconcile_done_if_current(
-                    &workspace,
-                    workspace_generation,
-                    &app_handle,
-                    &scan_phase_state,
-                );
-            }
-            Ok(Err(err)) => {
-                eprintln!(
-                    "[AssetDb] background hash reconcile failed: workspace={} elapsed_ms={} error={}",
-                    cwd,
-                    started_at.elapsed().as_millis(),
-                    err
-                );
-                let error = AppError::new(
-                    "ref_graph.rescan_required.reconcile_failed",
-                    "Persisted asset database could not be verified. Run a rescan to rebuild it.",
-                )
-                .detail(err)
-                .retryable(true);
-                emit_asset_reconcile_error_if_current(
-                    &workspace,
-                    workspace_generation,
-                    &app_handle,
-                    &scan_phase_state,
-                    error,
-                );
-            }
-            Err(err) => {
-                eprintln!(
-                    "[AssetDb] background hash reconcile task join failed: workspace={} elapsed_ms={} error={}",
-                    cwd,
-                    started_at.elapsed().as_millis(),
-                    err
-                );
-                let error = AppError::new(
-                    "ref_graph.reconcile_task_join_failed",
-                    format!("Task join error: {}", err),
-                )
-                .retryable(true);
-                emit_asset_reconcile_error_if_current(
-                    &workspace,
-                    workspace_generation,
-                    &app_handle,
-                    &scan_phase_state,
-                    error,
-                );
-            }
-        }
-    });
-}
-
-#[tauri::command]
-pub async fn set_working_dir(
-    path: String,
-    workspace: State<'_, Arc<Workspace>>,
-    unity_monitor: State<'_, UnityMonitorHandle>,
-    ref_graph_state: State<'_, AssetDbState>,
-    watcher_handle: State<'_, AssetDbWatcherHandle>,
-    knowledge_watcher_handle: State<'_, KnowledgeFsWatcherHandle>,
-    last_scan_info: State<'_, LastScanInfoState>,
-    scan_phase_state: State<'_, ScanPhaseState>,
-    scan_task_state: State<'_, super::RefGraphScanTaskState>,
-    reconcile_task_state: State<'_, AssetDbReconcileTaskState>,
-    preview_cache: State<'_, WorkspacePreviewCache>,
-    dir_entries_cache: State<'_, DirEntriesPageCache>,
-    watcher_tuning: State<'_, crate::asset_db::watcher::WatcherTuningState>,
-    knowledge_index_state: State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>>,
-    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
-    registry: State<'_, crate::AgentDefRegistryState>,
-    app_agent_dir: State<'_, crate::AppAgentDir>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
-    local_reference_watcher_state: State<'_, crate::local_docs::LocalReferenceWatcherState>,
-    active_tasks: State<'_, crate::ActiveTasks>,
-    async_task_manager: State<'_, Arc<crate::async_tasks::AsyncTaskManager>>,
-    app_handle: AppHandle,
-) -> Result<String, AppError> {
-    let switch_started_at = Instant::now();
-    let path = path.trim().to_string();
-    let mut switch_timer = WorkspaceSwitchTimer::new(&path, switch_started_at);
-    switch_timer.mark("request_received");
-    if path.is_empty() {
-        return Err("Path cannot be empty".to_string().into());
-    }
-
-    let p = std::path::Path::new(&path);
-    if !p.is_dir() {
-        return Err(format!("Directory not found: {}", path).into());
-    }
-
-    if !p.join("Assets").is_dir() {
-        return Err(
-            "Selected directory is not a Unity project (Assets/ folder not found)"
-                .to_string()
-                .into(),
-        );
-    }
-    switch_timer.mark("target_validated");
-
-    let canonical = dunce::canonicalize(p)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| path.clone());
-    switch_timer.mark_detail("canonicalized", format!(" canonical={}", canonical));
-
-    let ws_id = crate::workspace::load_or_create_workspace(&canonical)?;
-    switch_timer.mark_detail("workspace_id_ready", format!(" workspace_id={}", ws_id));
-
-    // Decide whether the workspace is actually changing. We compare the
-    // canonical form against the currently-stored cwd. If unchanged, we keep
-    // the previous `LastScanInfo` so the asset page status row stays accurate;
-    // a re-`set_working_dir` of the same project should not erase its history.
-    let prev_cwd = workspace.path.read().await.clone();
-    let is_real_switch = prev_cwd != canonical;
-    if is_real_switch {
-        {
-            let tasks = active_tasks.lock().await;
-            for task in tasks.values() {
-                let _ = task.cancel_tx.send(true);
-            }
-        }
-        async_task_manager.cancel_workspace(&prev_cwd);
-        let terminated = crate::process_util::terminate_managed_processes_for_workspace(&prev_cwd);
-        switch_timer.mark_detail(
-            "workspace_processes_cancelled",
-            format!(" terminated={}", terminated),
-        );
-        reconcile_task_state.cancel_current("workspace switch");
-        let cancelled = scan_task_state.cancel_current_and_wait("workspace switch");
-        switch_timer.mark_detail(
-            "active_scan_cancel_checked",
-            format!(" cancelled={}", cancelled),
-        );
-        if !cancelled {
-            eprintln!(
-                "[Locus] warning: asset DB scan cancellation did not finish before workspace switch"
-            );
-        }
-    } else {
-        switch_timer.mark("same_workspace_checked");
-    }
-
-    let old_ref_graph_watcher = {
-        let mut dir = workspace.path.write().await;
-        let old_ref_graph_watcher = if is_real_switch {
-            let generation_guard = workspace
-                .lock_generation()
-                .map_err(|e| AppError::new("workspace.generation_lock_failed", e))?;
-            generation_guard.bump_generation();
-            last_scan_info.clear();
-            scan_phase_state.clear();
-            // Drop any preview sessions parsed against the previous workspace —
-            // they hold owned YAML docs that would otherwise be paired with the
-            // new project's AssetDb in `preview_workspace_asset_target`.
-            preview_cache.clear();
-            dir_entries_cache.clear();
-            *ref_graph_state
-                .0
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))? = None;
-            watcher_handle
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))?
-                .take()
-        } else {
-            None
-        };
-        *dir = canonical.clone();
-        old_ref_graph_watcher
-    };
-    switch_timer.mark_detail(
-        "workspace_state_committed",
-        format!(" is_real_switch={}", is_real_switch),
-    );
-    if let Some(old) = old_ref_graph_watcher {
-        old.stop_and_join();
-        switch_timer.mark("old_ref_graph_watcher_stopped");
-        eprintln!("[Locus] stopped ref_graph watcher (working dir changed)");
-    }
-    {
-        let mut wid = workspace.workspace_id.write().await;
-        *wid = Some(ws_id.clone());
-    }
-    switch_timer.mark("workspace_id_state_committed");
-    super::plugin::reload_agent_registry(&registry, &app_agent_dir, &canonical).await;
-    switch_timer.mark("agent_registry_reloaded");
-
-    if is_real_switch {
-        super::reset_unity_embed_control_window(&app_handle);
-        super::refresh_unity_embed_control_server(app_handle.clone());
-        switch_timer.mark("unity_embed_control_refreshed");
-    }
-
-    if let Ok(data_dir) = super::resolve_runtime_storage_dir(&app_handle) {
-        let file: std::path::PathBuf = data_dir.join("working_dir.txt");
-        let _ = std::fs::write(&file, &canonical);
-        save_recent_dir(&data_dir, &canonical);
-    }
-    switch_timer.mark("working_dir_persisted");
-
-    if is_real_switch {
-        let library_dir = crate::knowledge_index::library_dir_for_working_dir(&canonical);
-        let model_storage_dir = super::resolve_runtime_storage_dir(&app_handle)?;
-        switch_timer.mark("knowledge_index_rebuild_start");
-        knowledge_index_state
-            .rebuild(&library_dir, &model_storage_dir)
-            .await?;
-        switch_timer.mark("knowledge_index_rebuild_done");
-        let knowledge_state = knowledge_index_state.inner().clone();
-        let working_dir_for_index = canonical.clone();
-        let app_handle_for_index = app_handle.clone();
-        tauri::async_runtime::spawn(async move {
-            let app_knowledge_dir: tauri::State<'_, crate::commands::AppKnowledgeDir> =
-                app_handle_for_index.state();
-            if let Err(e) = crate::knowledge_index::maybe_auto_activate_embedding_runtime(
-                knowledge_state.clone(),
-                &working_dir_for_index,
-                app_knowledge_dir.0.as_ref().as_ref(),
-            )
-            .await
-            {
-                eprintln!("[Locus] knowledge embedding auto-activate error: {}", e);
-            }
-            if let Err(e) = crate::knowledge_index::reconcile_workspace(
-                &working_dir_for_index,
-                app_knowledge_dir.0.as_ref().as_ref(),
-                knowledge_state,
-            )
-            .await
-            {
-                eprintln!("[Locus] knowledge reconcile error: {}", e);
-            }
-        });
-        switch_timer.mark("knowledge_reconcile_task_spawned");
-    }
-
-    if is_real_switch {
-        if let Err(error) = crate::knowledge_store::ensure_knowledge_roots(&canonical) {
-            eprintln!(
-                "[Locus] warning: failed to prepare knowledge roots for new working dir: {}",
-                error
-            );
-        }
-        switch_timer.mark("knowledge_roots_ready");
-        let mut knowledge_watcher = knowledge_watcher_handle
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        if let Some(old) = knowledge_watcher.take() {
-            old.stop();
-            switch_timer.mark("old_knowledge_watcher_stopped");
-            eprintln!("[Locus] stopped knowledge watcher (working dir changed)");
-        }
-        switch_timer.mark("knowledge_watcher_start_begin");
-        match crate::knowledge_watcher::KnowledgeFsWatcher::start(
-            app_handle.clone(),
-            canonical.clone(),
-            app_knowledge_dir.0.as_ref().as_ref().cloned(),
-            knowledge_index_state.inner().clone(),
-        ) {
-            Ok(watcher) => {
-                *knowledge_watcher = Some(watcher);
-                switch_timer.mark("knowledge_watcher_start_done");
-                eprintln!("[Locus] knowledge watcher started for new working dir");
-            }
-            Err(error) => {
-                switch_timer.mark_detail(
-                    "knowledge_watcher_start_failed",
-                    format!(" error={}", error),
-                );
-                eprintln!(
-                    "[Locus] warning: failed to start knowledge watcher: {}",
-                    error
-                );
-            }
-        }
-        {
-            let app_handle = app_handle.clone();
-            let working_dir = canonical.clone();
-            let knowledge_index_state = knowledge_index_state.inner().clone();
-            let watcher_state = local_reference_watcher_state.inner().clone();
-            tauri::async_runtime::spawn_blocking(move || {
-                crate::local_docs::restore_live_watchers(
-                    app_handle,
-                    working_dir,
-                    knowledge_index_state,
-                    watcher_state,
-                );
-            });
-        }
-        switch_timer.mark("local_reference_watchers_restore_spawned");
-    }
-
-    switch_timer.mark("asset_db_load_existing_start");
-    match AssetDb::load_existing(std::path::Path::new(&canonical)) {
-        LoadExistingAssetDb::Ready(graph) => {
-            switch_timer.mark("asset_db_load_existing_ready");
-            switch_timer.mark_detail("asset_db_reconcile_start", " verify_hashes=false");
-            match crate::asset_db::watcher::reconcile_loaded_db_light(
-                std::path::Path::new(&canonical),
-                graph,
-            ) {
-                Ok((graph, stats)) => {
-                    switch_timer.mark_detail(
-                        "asset_db_reconcile_done",
-                        format!(
-                            " verify_hashes=false queued={} processed={} failed={}",
-                            stats.queued, stats.processed, stats.failed
-                        ),
-                    );
-                    tracing::info!(
-                        log_module = "Locus",
-                        "ref_graph DB light-reconciled for new working dir: queued={}, processed={}, failed={}",
-                        stats.queued,
-                        stats.processed,
-                        stats.failed
-                    );
-                    let db_path = std::path::Path::new(&canonical)
-                        .join("Library")
-                        .join("Locus")
-                        .join("locus.db");
-                    eprintln!(
-                        "[Locus] ref_graph DB loaded for new working dir: {}",
-                        db_path.display()
-                    );
-                    *ref_graph_state
-                        .0
-                        .lock()
-                        .map_err(|e| format!("Lock error: {}", e))? = Some(graph);
-                    match read_persisted_last_scan_info(std::path::Path::new(&canonical)) {
-                        Ok(Some(info)) => last_scan_info.set(info),
-                        Ok(None) => {
-                            if is_real_switch {
-                                last_scan_info.clear();
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "[Locus] warning: failed to load persisted asset scan info: {}",
-                                err
-                            );
-                            if is_real_switch {
-                                last_scan_info.clear();
-                            }
-                        }
-                    }
-                    switch_timer.mark("asset_db_state_ready");
-
-                    let graph_arc = ref_graph_state.0.clone();
-                    let watcher_root = std::path::PathBuf::from(&canonical);
-                    switch_timer.mark("asset_db_watcher_start_begin");
-                    match crate::asset_db::watcher::AssetDbWatcher::start(
-                        watcher_root,
-                        graph_arc,
-                        watcher_tuning.0.clone(),
-                    ) {
-                        Ok(w) => {
-                            *watcher_handle
-                                .lock()
-                                .map_err(|e| format!("Lock error: {}", e))? = Some(w);
-                            switch_timer.mark("asset_db_watcher_start_done");
-                            eprintln!("[Locus] ref_graph watcher started for new working dir");
-                        }
-                        Err(e) => {
-                            switch_timer.mark_detail(
-                                "asset_db_watcher_start_failed",
-                                format!(" error={}", e),
-                            );
-                            eprintln!("[Locus] warning: failed to start ref_graph watcher: {}", e);
-                        }
-                    }
-                    if is_real_switch {
-                        let workspace_generation = workspace.generation();
-                        spawn_background_asset_hash_reconcile(
-                            app_handle.clone(),
-                            workspace.inner().clone(),
-                            workspace_generation,
-                            std::path::PathBuf::from(&canonical),
-                            ref_graph_state.0.clone(),
-                            scan_phase_state.inner().clone(),
-                            reconcile_task_state.inner().clone(),
-                        );
-                        switch_timer.mark("asset_db_background_hash_reconcile_spawned");
-                    }
-                }
-                Err(err) => {
-                    switch_timer
-                        .mark_detail("asset_db_reconcile_failed", format!(" error={}", err));
-                    eprintln!(
-                        "[Locus] ref_graph DB reconcile failed for new working dir, rescan required: {}",
-                        err
-                    );
-                    last_scan_info.clear();
-                    if let Err(clear_err) =
-                        delete_persisted_last_scan_info(std::path::Path::new(&canonical))
-                    {
-                        eprintln!(
-                            "[Locus] warning: failed to clear stale asset scan info: {}",
-                            clear_err
-                        );
-                    }
-                    *ref_graph_state
-                        .0
-                        .lock()
-                        .map_err(|e| format!("Lock error: {}", e))? = None;
-                    scan_phase_state.set(Some(crate::asset_db::types::ScanPhase::Error {
-                        error: crate::error::AppError::new(
-                            "ref_graph.rescan_required.reconcile_failed",
-                            "Persisted asset database could not be reconciled. Run a rescan to rebuild it.",
-                        )
-                        .detail(err)
-                        .retryable(true),
-                    }));
-                }
-            }
-        }
-        LoadExistingAssetDb::NeedsRescan(issue) => {
-            switch_timer.mark_detail(
-                "asset_db_load_existing_needs_rescan",
-                format!(" reason={}", issue.message),
-            );
-            eprintln!(
-                "[Locus] ref_graph DB invalidated for new working dir, rescan required: {}",
-                issue.message
-            );
-            last_scan_info.clear();
-            if let Err(err) = delete_persisted_last_scan_info(std::path::Path::new(&canonical)) {
-                eprintln!(
-                    "[Locus] warning: failed to clear stale asset scan info: {}",
-                    err
-                );
-            }
-            *ref_graph_state
-                .0
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))? = None;
-            scan_phase_state.set(Some(crate::asset_db::types::ScanPhase::Error {
-                error: issue.to_app_error(),
-            }));
-        }
-        LoadExistingAssetDb::Missing => {
-            switch_timer.mark("asset_db_load_existing_missing");
-            eprintln!("[Locus] no ref_graph DB in new working dir, clearing state");
-            last_scan_info.clear();
-            if let Err(err) = delete_persisted_last_scan_info(std::path::Path::new(&canonical)) {
-                eprintln!(
-                    "[Locus] warning: failed to clear stale asset scan info: {}",
-                    err
-                );
-            }
-            *ref_graph_state
-                .0
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))? = None;
-        }
-    }
-
-    if crate::unity_bridge::is_unity_project(&canonical) {
-        if let Err(error) = crate::unity_bridge::sync_native_bridge_marker(
-            &canonical,
-            config.unity_native_bridge_enabled(),
-        ) {
-            eprintln!(
-                "[Locus] warning: failed to sync native bridge marker for workspace: {}",
-                error
-            );
-        }
-        if let Err(error) = crate::unity_bridge::sync_background_hook_marker(
-            &canonical,
-            config.unity_background_hook_enabled(),
-        ) {
-            eprintln!(
-                "[Locus] warning: failed to sync background hook marker for workspace: {}",
-                error
-            );
-        }
-        if let Err(error) = crate::unity_bridge::sync_unity_embed_enabled_marker(
-            &canonical,
-            config.unity_embed_enabled(),
-        ) {
-            eprintln!(
-                "[Locus] warning: failed to sync Unity embed marker for workspace: {}",
-                error
-            );
-        }
-        switch_timer.mark("unity_monitor_start_begin");
-        crate::unity_bridge::start_unity_monitor(
-            app_handle.clone(),
-            canonical.clone(),
-            &unity_monitor,
-        )
-        .await;
-        switch_timer.mark("unity_monitor_start_done");
-        switch_timer.mark("plugin_status_emit_begin");
-        crate::unity_bridge::emit_plugin_status(&app_handle, &canonical);
-        switch_timer.mark("plugin_status_emit_done");
-    } else {
-        crate::unity_bridge::stop_unity_monitor(&unity_monitor).await;
-        let _ = app_handle.emit("unity-connection-status", false);
-        switch_timer.mark("unity_monitor_stopped");
-    }
-
-    switch_timer.mark_detail(
-        "finished",
-        format!(
-            " canonical={} workspace_id={} is_real_switch={}",
-            canonical, ws_id, is_real_switch
-        ),
-    );
-    eprintln!(
-        "[Locus] working_dir changed to: {}, workspace_id: {}",
-        canonical, ws_id
-    );
-    Ok(canonical)
 }
 
 const MAX_RECENT_DIRS: usize = 8;
@@ -2046,14 +1344,15 @@ pub async fn set_file_tool_workspace_boundary(
 
 #[tauri::command]
 pub async fn get_unity_test_tools_workspace_status(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::workspace::UnityTestToolsWorkspaceStatus, AppError> {
-    let working_dir = workspace.path.read().await.trim().to_string();
-    if working_dir.is_empty() {
-        return Err(AppError::from(
-            "Unity Test tools require an active workspace".to_string(),
-        ));
-    }
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "get_unity_test_tools_workspace_status",
+    )?;
+    let working_dir = scope.runtime().root().to_string_lossy().to_string();
     Ok(crate::workspace::unity_test_tools_workspace_status(
         &working_dir,
     ))
@@ -2062,14 +1361,15 @@ pub async fn get_unity_test_tools_workspace_status(
 #[tauri::command]
 pub async fn set_unity_test_tools_workspace_enabled(
     value: bool,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::workspace::UnityTestToolsWorkspaceStatus, AppError> {
-    let working_dir = workspace.path.read().await.trim().to_string();
-    if working_dir.is_empty() {
-        return Err(AppError::from(
-            "Unity Test tools require an active workspace".to_string(),
-        ));
-    }
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "set_unity_test_tools_workspace_enabled",
+    )?;
+    let working_dir = scope.runtime().root().to_string_lossy().to_string();
     crate::workspace::set_unity_test_tools_enabled(&working_dir, value).map_err(AppError::from)?;
     Ok(crate::workspace::unity_test_tools_workspace_status(
         &working_dir,
@@ -2791,9 +2091,15 @@ fn search_workspace_entries_in_dir(
 #[tauri::command]
 pub async fn list_dir_entries(
     sub_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<DirEntry>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "list_dir_entries",
+    )?;
+    let cwd = scope.runtime().root().to_string_lossy().to_string();
     let (target, normalized_sub_path) = resolve_workspace_dir_target(&cwd, &sub_path)?;
     if !target.is_dir() {
         return Ok(vec![]);
@@ -2808,10 +2114,17 @@ pub async fn list_dir_entries_page(
     offset: Option<usize>,
     limit: Option<usize>,
     exclude_meta: Option<bool>,
-    workspace: State<'_, Arc<Workspace>>,
-    dir_entries_cache: State<'_, DirEntriesPageCache>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<DirEntriesPage, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "list_dir_entries_page",
+    )?;
+    let runtime = scope.runtime();
+    let dir_entries_cache = runtime.core().dir_entries_page_cache();
+    let cwd = runtime.root().to_string_lossy().to_string();
     let (target, normalized_sub_path) = resolve_workspace_dir_target(&cwd, &sub_path)?;
     if !target.is_dir() {
         return Ok(DirEntriesPage {
@@ -2826,8 +2139,9 @@ pub async fn list_dir_entries_page(
     let limit = limit.unwrap_or(200).clamp(1, 2_000);
     let exclude_meta = exclude_meta.unwrap_or(false);
     let cache_key = format!(
-        "{}::{}::{}",
-        cwd,
+        "{}::{}::{}::{}",
+        runtime.checkout_id(),
+        runtime.generation(),
         normalized_sub_path,
         u8::from(exclude_meta)
     );
@@ -2858,9 +2172,15 @@ pub async fn list_dir_entries_page(
 pub async fn search_workspace_entries(
     query: String,
     limit: Option<usize>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<WorkspaceSearchEntry>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "search_workspace_entries",
+    )?;
+    let cwd = scope.runtime().root().to_string_lossy().to_string();
     if cwd.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -2877,9 +2197,15 @@ pub async fn search_workspace_entries(
 #[tauri::command]
 pub async fn stat_workspace_entries(
     paths: Vec<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<WorkspaceEntryStat>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "stat_workspace_entries",
+    )?;
+    let cwd = scope.runtime().root().to_string_lossy().to_string();
     let mut stats = Vec::new();
     let mut seen = HashSet::new();
 
@@ -2894,20 +2220,176 @@ pub async fn stat_workspace_entries(
     Ok(stats)
 }
 
+const UNITY_IPC_READY_TIMEOUT: Duration = Duration::from_secs(45);
+
+pub(crate) struct UnityReadyIpcScope {
+    execution: Arc<AgentExecutionContext>,
+    _binding: ResolvedServiceBinding,
+}
+
+impl UnityReadyIpcScope {
+    pub(crate) fn root_text(&self) -> String {
+        self.execution.root().to_string_lossy().to_string()
+    }
+
+    pub(crate) fn checkout_event_scope(
+        &self,
+    ) -> crate::workspace_service::event::WorkspaceEventScope {
+        crate::workspace_service::event::WorkspaceEventScope {
+            project_id: self.execution.project_id.clone(),
+            checkout_id: self.execution.checkout_id.clone(),
+            workspace_generation: self.execution.workspace_generation,
+            service_instance_id: None,
+            service_generation: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnityCheckoutConnectionStatus {
+    pub checkout_id: String,
+    pub workspace_generation: u64,
+    pub connected: bool,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_status: Option<ServiceStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ServiceReadinessSnapshot>,
+}
+
+fn unity_connection_flags(readiness: Option<&ServiceReadinessSnapshot>) -> (bool, bool) {
+    match readiness.map(|snapshot| snapshot.phase) {
+        Some(ServiceReadinessPhase::Connected | ServiceReadinessPhase::Ready) => (
+            true,
+            readiness.is_some_and(|snapshot| snapshot.phase == ServiceReadinessPhase::Ready),
+        ),
+        // The native broker can remain connected while the managed domain is
+        // reloading. Keep the connection indicator visible while commands wait.
+        Some(ServiceReadinessPhase::Reloading) => (true, false),
+        _ => (false, false),
+    }
+}
+
+fn unity_service_operation_error(
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) -> AppError {
+    AppError::new(
+        "unity.checkout_service_unavailable",
+        "The Unity service for this checkout is unavailable.",
+    )
+    .detail(error.to_string())
+    .operation(operation)
+    .retryable(true)
+}
+
+fn unity_ready_binding_error(operation: &'static str, error: ServiceBindingError) -> AppError {
+    let detail = error.diagnostic_json().unwrap_or_else(|| error.to_string());
+    AppError::new(
+        "unity.checkout_not_ready",
+        "Unity is connected to this checkout but is not ready to execute commands.",
+    )
+    .detail(detail)
+    .operation(operation)
+    .retryable(true)
+}
+
+async fn unity_execution_context(
+    workspace_registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    operation: &'static str,
+) -> Result<Arc<AgentExecutionContext>, AppError> {
+    let scope =
+        super::session::resolve_workspace_scope(workspace_registry, workspace_ref, operation)?;
+    let expected_checkout = scope.runtime().checkout_id().clone();
+    let expected_generation = scope.runtime().generation();
+    let execution = workspace_registry
+        .execution_context(&expected_checkout, &[ServiceKind::Unity])
+        .await
+        .map_err(|error| unity_service_operation_error(operation, error))?;
+    if execution.checkout_id != expected_checkout
+        || execution.workspace_generation != expected_generation
+    {
+        return Err(unity_service_operation_error(
+            operation,
+            format!(
+                "Unity execution scope changed: checkout={} generation={}, actualCheckout={} actualGeneration={}",
+                expected_checkout,
+                expected_generation,
+                execution.checkout_id,
+                execution.workspace_generation
+            ),
+        ));
+    }
+    Ok(execution)
+}
+
+pub(crate) async fn resolve_unity_ready_ipc_scope(
+    workspace_registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    operation: &'static str,
+) -> Result<UnityReadyIpcScope, AppError> {
+    let execution = unity_execution_context(workspace_registry, workspace_ref, operation).await?;
+    let binding = execution
+        .resolve_service_ready(ServiceKind::Unity, UNITY_IPC_READY_TIMEOUT)
+        .await
+        .map_err(|error| unity_ready_binding_error(operation, error))?;
+    Ok(UnityReadyIpcScope {
+        execution,
+        _binding: binding,
+    })
+}
+
+async fn unity_checkout_connection_status(
+    workspace_registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    operation: &'static str,
+) -> Result<UnityCheckoutConnectionStatus, AppError> {
+    let scope =
+        super::session::resolve_workspace_scope(workspace_registry, workspace_ref, operation)?;
+    let runtime = scope.runtime();
+    let state: Option<WorkspaceServiceStateSnapshot> =
+        runtime.services().state_snapshot(ServiceKind::Unity).await;
+    let readiness = state
+        .as_ref()
+        .and_then(|snapshot| snapshot.readiness.clone());
+    let (connected, ready) = unity_connection_flags(readiness.as_ref());
+    Ok(UnityCheckoutConnectionStatus {
+        checkout_id: runtime.checkout_id().to_string(),
+        workspace_generation: runtime.generation(),
+        connected,
+        ready,
+        service_status: state.map(|snapshot| snapshot.status),
+        readiness,
+    })
+}
+
 #[tauri::command]
 pub async fn check_unity_connection(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<bool, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    Ok(crate::unity_bridge::is_unity_connected(&cwd).await)
+    Ok(unity_checkout_connection_status(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "check_unity_connection",
+    )
+    .await?
+    .connected)
 }
 
 #[tauri::command]
 pub async fn check_unity_connection_status(
-    workspace: State<'_, Arc<Workspace>>,
-) -> Result<crate::unity_bridge::UnityConnectionStatus, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    Ok(crate::unity_bridge::query_unity_connection_status(&cwd).await)
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<UnityCheckoutConnectionStatus, AppError> {
+    unity_checkout_connection_status(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "check_unity_connection_status",
+    )
+    .await
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -2937,9 +2419,16 @@ pub struct UnityConsoleTextPayload {
 
 #[tauri::command]
 pub async fn get_unity_console_text(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UnityConsoleTextPayload, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "get_unity_console_text",
+    )
+    .await?;
+    let cwd = ready.root_text();
     let resp = crate::unity_bridge::send_message(&cwd, "get_console_text", "").await?;
     if !resp.ok {
         return Err(resp
@@ -2960,9 +2449,15 @@ pub async fn get_unity_console_text(
 
 #[tauri::command]
 pub async fn check_unity_plugin(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::unity_bridge::PluginStatus, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "check_unity_plugin",
+    )?;
+    let cwd = scope.runtime().root().to_string_lossy().to_string();
     if !crate::unity_bridge::is_unity_project(&cwd) {
         return Ok(crate::unity_bridge::PluginStatus::UpToDate);
     }
@@ -2971,9 +2466,15 @@ pub async fn check_unity_plugin(
 
 #[tauri::command]
 pub async fn check_unity_plugin_install_plan(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::unity_bridge::PluginInstallPlan, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "check_unity_plugin_install_plan",
+    )?;
+    let cwd = scope.runtime().root().to_string_lossy().to_string();
     if !crate::unity_bridge::is_unity_project(&cwd) {
         return Ok(crate::unity_bridge::PluginInstallPlan {
             status: crate::unity_bridge::PluginStatus::UpToDate,
@@ -2989,11 +2490,18 @@ pub async fn check_unity_plugin_install_plan(
 
 #[tauri::command]
 pub async fn install_unity_plugin(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     app_handle: AppHandle,
     force_close_unity: Option<bool>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "install_unity_plugin",
+    )?;
+    let runtime = scope.runtime();
+    let cwd = runtime.root().to_string_lossy().to_string();
     if !crate::unity_bridge::is_unity_project(&cwd) {
         return Err("Current working directory is not a Unity project"
             .to_string()
@@ -3003,7 +2511,8 @@ pub async fn install_unity_plugin(
     // The Unity-hosted Locus window is a cross-process WS_CHILD. Detach it on
     // the GUI thread before terminating Unity so WebView2 keeps a valid host
     // HWND throughout the plugin replacement and editor restart.
-    let unity_embed_quiesce = super::quiesce_unity_embed_control_windows(&app_handle).await?;
+    let unity_embed_quiesce =
+        super::quiesce_unity_embed_control_windows(&app_handle, &workspace_ref).await?;
     let install_result = crate::unity_bridge::install_or_update_plugin_with_force_close(
         &cwd,
         force_close_unity.unwrap_or(false),
@@ -3011,18 +2520,63 @@ pub async fn install_unity_plugin(
     .await;
     drop(unity_embed_quiesce);
     let hash = install_result?;
-    crate::unity_bridge::emit_plugin_status(&app_handle, &cwd);
+    let event_scope = crate::workspace_service::event::WorkspaceEventScope {
+        project_id: runtime.project_id().clone(),
+        checkout_id: runtime.checkout_id().clone(),
+        workspace_generation: runtime.generation(),
+        service_instance_id: None,
+        service_generation: None,
+    };
+    crate::unity_bridge::emit_plugin_status_scoped(&app_handle, &cwd, &event_scope);
     Ok(hash)
 }
 
 #[tauri::command]
 pub async fn launch_unity_project(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::unity_bridge::UnityLaunchResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    // Launching is a process operation and does not require an already-ready
+    // editor. Starting the checkout service first establishes its monitor and
+    // readiness barrier before the new process begins connecting.
+    let execution = unity_execution_context(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "launch_unity_project",
+    )
+    .await?;
+    let _monitor_binding = execution
+        .resolve_service(ServiceKind::Unity)
+        .map_err(|error| unity_service_operation_error("launch_unity_project", error))?;
+    let cwd = execution.root().to_string_lossy().to_string();
     crate::unity_bridge::launch_project(&cwd)
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn close_headless_unity_project(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<(), AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let project = scope.runtime().root().to_string_lossy().to_string();
+    let status = crate::unity_bridge::query_unity_connection_status(&project).await;
+    if status.editor_process_state == crate::unity_bridge::UnityEditorProcessState::NotRunning {
+        return Ok(());
+    }
+    if !status.headless {
+        return Err(AppError::from(
+            "The running Unity editor is interactive; close_headless_unity_project only closes a headless editor"
+                .to_string(),
+        ));
+    }
+    crate::unity_bridge::close_current_project_unity_processes(&project, Duration::from_secs(60))
+        .await
+        .map_err(AppError::from)?;
+    Ok(())
 }
 
 /// Drive a Unity recompile + domain reload and wait for it to settle. Thin
@@ -3030,8 +2584,17 @@ pub async fn launch_unity_project(
 /// be converged deterministically from a host driver (the same flow the
 /// `unity_recompile` agent tool uses).
 #[tauri::command]
-pub async fn unity_recompile_run(workspace: State<'_, Arc<Workspace>>) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+pub async fn unity_recompile_run(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<String, AppError> {
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_recompile_run",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::recompile_and_wait(&cwd)
         .await
         .map_err(Into::into)
@@ -3044,9 +2607,16 @@ pub async fn unity_recompile_run(workspace: State<'_, Arc<Workspace>>) -> Result
 /// Returns a line-oriented report for the test page to render.
 #[tauri::command]
 pub async fn unity_recompile_probe_run(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_recompile_probe_run",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::run_recompile_probe(&cwd)
         .await
         .map_err(Into::into)
@@ -3060,9 +2630,16 @@ pub async fn unity_recompile_probe_run(
 #[tauri::command]
 pub async fn unity_execute_snippet_run(
     code: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_execute_snippet_run",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::unity_execute_code(&cwd, &code)
         .await
         .map_err(Into::into)
@@ -3071,9 +2648,13 @@ pub async fn unity_execute_snippet_run(
 #[tauri::command]
 pub async fn send_unity_log(
     message: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready =
+        resolve_unity_ready_ipc_scope(workspace_registry.inner(), &workspace_ref, "send_unity_log")
+            .await?;
+    let cwd = ready.root_text();
     let resp = crate::unity_bridge::send_message(&cwd, "log", &message).await?;
     if resp.ok {
         Ok(format!("Unity log sent: {}", message))
@@ -3089,9 +2670,16 @@ pub async fn send_unity_log(
 pub async fn select_unity_asset(
     asset_path: String,
     focus_project_window: Option<bool>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "select_unity_asset",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::select_asset(&cwd, &asset_path, focus_project_window.unwrap_or(true))
         .await?;
     Ok("ok".to_string())
@@ -3100,9 +2688,16 @@ pub async fn select_unity_asset(
 #[tauri::command]
 pub async fn open_unity_asset_inspector(
     asset_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "open_unity_asset_inspector",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::open_asset_inspector(&cwd, &asset_path).await?;
     Ok("ok".to_string())
 }
@@ -3111,9 +2706,16 @@ pub async fn open_unity_asset_inspector(
 pub async fn select_unity_scene_object(
     scene_path: String,
     object_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "select_unity_scene_object",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::select_scene_object(&cwd, &scene_path, &object_path).await?;
     Ok("ok".to_string())
 }
@@ -3122,9 +2724,16 @@ pub async fn select_unity_scene_object(
 pub async fn validate_unity_scene_object(
     scene_path: String,
     object_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "validate_unity_scene_object",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::validate_scene_object(&cwd, &scene_path, &object_path).await?;
     Ok("ok".to_string())
 }
@@ -3133,26 +2742,24 @@ pub async fn validate_unity_scene_object(
 pub async fn open_unity_scene_object_inspector(
     scene_path: String,
     object_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let ready = resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "open_unity_scene_object_inspector",
+    )
+    .await?;
+    let cwd = ready.root_text();
     crate::unity_bridge::open_scene_object_inspector(&cwd, &scene_path, &object_path).await?;
     Ok("ok".to_string())
 }
 
 #[tauri::command]
 pub async fn reset_all_config(
-    workspace: State<'_, Arc<Workspace>>,
-    unity_monitor: State<'_, UnityMonitorHandle>,
-    ref_graph_state: State<'_, AssetDbState>,
-    watcher_handle: State<'_, AssetDbWatcherHandle>,
-    last_scan_info: State<'_, LastScanInfoState>,
-    scan_phase_state: State<'_, ScanPhaseState>,
-    scan_task_state: State<'_, super::RefGraphScanTaskState>,
-    reconcile_task_state: State<'_, AssetDbReconcileTaskState>,
-    preview_cache: State<'_, WorkspacePreviewCache>,
-    dir_entries_cache: State<'_, DirEntriesPageCache>,
-    knowledge_index_state: State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    window_contexts: State<'_, Arc<crate::workspace_service::WindowContextRegistry>>,
     mode: State<'_, crate::ToolPermissionMode>,
     perms: State<'_, crate::ToolPermissions>,
     api_key_state: State<'_, crate::ApiKeyState>,
@@ -3163,12 +2770,6 @@ pub async fn reset_all_config(
 ) -> Result<(), AppError> {
     let data_dir = super::resolve_runtime_storage_dir(&app_handle)
         .map_err(|e| format!("Failed to get data dir: {}", e))?;
-
-    let cancelled = scan_task_state.cancel_current_and_wait("config reset");
-    if !cancelled {
-        eprintln!("[Locus] warning: asset DB scan cancellation did not finish before reset");
-    }
-    reconcile_task_state.cancel_current("config reset");
 
     // Clear keychain secrets: OpenRouter key
     let _ = keychain::delete_secret(keychain::KEY_OPENROUTER);
@@ -3242,37 +2843,27 @@ pub async fn reset_all_config(
         let _ = webview.clear_all_browsing_data();
     }
 
-    {
-        let mut wh = watcher_handle
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        if let Some(old) = wh.take() {
-            old.stop_and_join();
-            eprintln!("[Locus] stopped ref_graph watcher during reset");
-        }
+    let window_ids = window_contexts
+        .snapshots()
+        .map_err(|error| AppError::new("workspace.focus_context_unavailable", error.to_string()))?
+        .into_iter()
+        .map(|context| context.window_id)
+        .collect::<HashSet<_>>();
+    for window_id in window_ids {
+        let intent_epoch = window_contexts
+            .next_window_intent_epoch(&window_id)
+            .map_err(|error| {
+                AppError::new("workspace.focus_context_unavailable", error.to_string())
+            })?;
+        window_contexts
+            .remove_window(&window_id, intent_epoch)
+            .map_err(|error| {
+                AppError::new("workspace.focus_context_unavailable", error.to_string())
+            })?;
     }
-    {
-        *ref_graph_state
-            .0
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))? = None;
-    }
-    last_scan_info.clear();
-    scan_phase_state.clear();
-    preview_cache.clear();
-    dir_entries_cache.clear();
-
-    crate::unity_bridge::stop_unity_monitor(&unity_monitor).await;
-    let _ = app_handle.emit("unity-connection-status", false);
-
-    *workspace.path.write().await = String::new();
-    *workspace.workspace_id.write().await = None;
+    workspace_registry.shutdown_all().await;
     super::reset_unity_embed_control_window(&app_handle);
     super::refresh_unity_embed_control_server(app_handle.clone());
-    let no_workspace_library_dir = crate::knowledge_index::no_workspace_library_dir();
-    knowledge_index_state
-        .rebuild(&no_workspace_library_dir, &data_dir)
-        .await?;
     *mode.0.write().await = "auto".to_string();
     *perms.0.write().await = std::collections::HashMap::new();
     *api_key_state.write().await = String::new();
@@ -3294,8 +2885,28 @@ pub async fn get_config_registry(
     app_handle: AppHandle,
 ) -> Result<Vec<crate::config_registry::ConfigEntry>, AppError> {
     match category.as_deref() {
-        Some(cat) => crate::config_registry::collect_by_category(&app_handle, cat),
-        None => crate::config_registry::collect_all(&app_handle),
+        Some(cat) => crate::config_registry::collect_by_category(&app_handle, cat, None),
+        None => crate::config_registry::collect_all(&app_handle, None),
+    }
+}
+
+#[tauri::command]
+pub async fn get_workspace_config_registry(
+    category: Option<String>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    app_handle: AppHandle,
+) -> Result<Vec<crate::config_registry::ConfigEntry>, AppError> {
+    let workspace_scope = super::session::resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "get_workspace_config_registry",
+    )?;
+    match category.as_deref() {
+        Some(cat) => {
+            crate::config_registry::collect_by_category(&app_handle, cat, Some(&workspace_scope))
+        }
+        None => crate::config_registry::collect_all(&app_handle, Some(&workspace_scope)),
     }
 }
 
@@ -3306,13 +2917,20 @@ mod tests {
         migrate_endpoint_to_provider, normalize_custom_endpoint_config,
         normalize_custom_provider_config, normalize_tool_permission_mode_request,
         normalize_workspace_sub_path, resolve_workspace_dir_target,
-        rewrite_legacy_custom_model_ref, search_workspace_entries_in_dir, valid_custom_model_refs,
+        rewrite_legacy_custom_model_ref, search_workspace_entries_in_dir,
+        unity_checkout_connection_status, unity_connection_flags, valid_custom_model_refs,
         workspace_entry_stat_for_path, workspace_search_score, ApiFormat, CodexModelConfig,
         CodexTransportMode, CustomEndpoint, CustomProvider, CustomProviderModel, ModelDefaults,
         DEFAULT_CODEX_CONTEXT_WINDOW, DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
     };
     use std::path::Path;
+    use std::sync::Arc;
     use tempfile::tempdir;
+
+    use crate::config::AppConfig;
+    use crate::resource_policy::ResourcePolicyStore;
+    use crate::workspace_service::service::{ServiceReadinessPhase, ServiceReadinessSnapshot};
+    use crate::workspace_service::{ProjectRegistry, WorkspaceRef};
 
     #[cfg(unix)]
     fn create_dir_symlink(source: &Path, link: &Path) -> std::io::Result<()> {
@@ -3332,6 +2950,72 @@ mod tests {
                 false
             }
         }
+    }
+
+    fn test_project_registry(config_dir: &Path) -> Arc<ProjectRegistry> {
+        let config = Arc::new(AppConfig::load_from_path(&config_dir.join("config.json")));
+        let policy = Arc::new(ResourcePolicyStore::from_config(config).expect("resource policy"));
+        ProjectRegistry::new(policy, Vec::new())
+    }
+
+    fn write_shared_project_identity(root: &Path) {
+        let locus = root.join("Locus");
+        std::fs::create_dir_all(&locus).expect("Locus directory");
+        std::fs::write(
+            locus.join("config.json"),
+            r#"{"workspace_id":"unity-ipc-project"}"#,
+        )
+        .expect("workspace identity");
+    }
+
+    #[test]
+    fn connected_readiness_is_visible_before_ready_without_opening_command_barrier() {
+        let connected = ServiceReadinessSnapshot {
+            phase: ServiceReadinessPhase::Connected,
+            revision: 2,
+            detail: Some("managed domain initializing".to_string()),
+        };
+        let ready = ServiceReadinessSnapshot {
+            phase: ServiceReadinessPhase::Ready,
+            revision: 3,
+            detail: None,
+        };
+        assert_eq!(unity_connection_flags(Some(&connected)), (true, false));
+        assert_eq!(unity_connection_flags(Some(&ready)), (true, true));
+    }
+
+    #[tokio::test]
+    async fn checkout_connection_status_is_bound_to_each_explicit_scope() {
+        let root = tempdir().expect("root");
+        let checkout_a = root.path().join("checkout-a");
+        let checkout_b = root.path().join("checkout-b");
+        std::fs::create_dir_all(&checkout_a).expect("checkout A");
+        std::fs::create_dir_all(&checkout_b).expect("checkout B");
+        write_shared_project_identity(&checkout_a);
+        write_shared_project_identity(&checkout_b);
+
+        let registry = test_project_registry(&root.path().join("config"));
+        let runtime_a = registry.open_workspace(&checkout_a).expect("runtime A");
+        let runtime_b = registry.open_workspace(&checkout_b).expect("runtime B");
+        assert_eq!(runtime_a.project_id(), runtime_b.project_id());
+        assert_ne!(runtime_a.checkout_id(), runtime_b.checkout_id());
+
+        let workspace_ref_a = WorkspaceRef::for_runtime(&runtime_a);
+        let workspace_ref_b = WorkspaceRef::for_runtime(&runtime_b);
+        let status_a =
+            unity_checkout_connection_status(&registry, &workspace_ref_a, "test_status_a");
+        let status_b =
+            unity_checkout_connection_status(&registry, &workspace_ref_b, "test_status_b");
+        let (status_a, status_b) = tokio::join!(status_a, status_b);
+        let status_a = status_a.expect("status A");
+        let status_b = status_b.expect("status B");
+
+        assert_eq!(status_a.checkout_id, runtime_a.checkout_id().as_str());
+        assert_eq!(status_b.checkout_id, runtime_b.checkout_id().as_str());
+        assert_eq!(status_a.workspace_generation, runtime_a.generation());
+        assert_eq!(status_b.workspace_generation, runtime_b.generation());
+        assert!(!status_a.connected);
+        assert!(!status_b.connected);
     }
 
     #[test]

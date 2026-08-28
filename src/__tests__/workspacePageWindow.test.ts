@@ -19,11 +19,13 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 }));
 
 import {
+  buildWorkspacePageWindowQuery,
   buildWorkspacePageWindowUrl,
   getWorkspacePageWindowPayload,
   isWorkspacePageWindowLocation,
   openWorkspacePageWindow,
   workspacePageWindowKind,
+  type WorkspacePageWindowPayload,
 } from "../services/workspacePageWindow";
 
 const cwd = process.cwd();
@@ -45,6 +47,17 @@ function stubTauriWindow() {
   });
 }
 
+const checkoutPayload = (
+  checkoutId: string,
+  page: "chat" | "knowledge" | "collab" | "asset" | "views" | "agent" = "knowledge",
+): Extract<WorkspacePageWindowPayload, { scope: "checkout" }> => ({
+  scope: "checkout",
+  page,
+  checkoutId,
+  workspaceGeneration: 7,
+  title: `${page} title`,
+});
+
 describe("workspacePageWindow", () => {
   beforeEach(() => {
     subWindowMocks.invokeMock.mockReset();
@@ -53,70 +66,145 @@ describe("workspacePageWindow", () => {
     stubTauriWindow();
   });
 
-  it("builds and parses a workspace page window URL", () => {
-    const url = buildWorkspacePageWindowUrl({ page: "knowledge", title: "知识" });
-    expect(url).toContain("/window.html?workspacePageWindow=1");
-    expect(isWorkspacePageWindowLocation({ search: url.slice(url.indexOf("?")) } as Location))
-      .toBe(true);
-    expect(getWorkspacePageWindowPayload(url.slice(url.indexOf("?")))).toEqual({
-      page: "knowledge",
-      title: "知识",
-    });
-    expect(isWorkspacePageWindowLocation({ search: "?page=knowledge" } as Location)).toBe(false);
+  it("round-trips checkout and app payloads without an implicit workspace", () => {
+    const checkout = checkoutPayload("checkout-A/unsafe?");
+    const checkoutUrl = buildWorkspacePageWindowUrl(checkout);
+    const checkoutSearch = checkoutUrl.slice(checkoutUrl.indexOf("?"));
+    expect(checkoutUrl).toContain("/window.html?workspacePageWindow=1");
+    expect(isWorkspacePageWindowLocation({ search: checkoutSearch } as Location)).toBe(true);
+    expect(getWorkspacePageWindowPayload(checkoutSearch)).toEqual(checkout);
+
+    const app: WorkspacePageWindowPayload = {
+      scope: "app",
+      page: "plugins",
+      title: "插件",
+    };
+    const appQuery = buildWorkspacePageWindowQuery(app);
+    expect(getWorkspacePageWindowPayload(`?${appQuery}`)).toEqual(app);
+    expect(appQuery).not.toContain("checkoutId");
+    expect(appQuery).not.toContain("workspaceGeneration");
+  });
+
+  it("keeps the same checkout page independent across A and B", () => {
+    const kindA = workspacePageWindowKind(checkoutPayload("checkout-a"));
+    const kindB = workspacePageWindowKind(checkoutPayload("checkout-b"));
+
+    expect(kindA).not.toBe(kindB);
+    expect(kindA).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(kindB).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(workspacePageWindowKind({
+      ...checkoutPayload("checkout-a"),
+      workspaceGeneration: 8,
+    })).not.toBe(kindA);
+    const agentKind = workspacePageWindowKind(checkoutPayload("checkout-a", "agent"));
+    expect(agentKind).toContain("workspace-page-agent-");
+  });
+
+  it("maps legacy app URLs and rejects legacy checkout ambiguity", () => {
+    expect(getWorkspacePageWindowPayload("?workspacePageWindow=1&page=settings&title=设置"))
+      .toEqual({ scope: "app", page: "settings", title: "设置" });
+    expect(getWorkspacePageWindowPayload("?workspacePageWindow=1&page=knowledge&title=知识"))
+      .toBeNull();
     expect(isWorkspacePageWindowLocation({
-      search: "?workspacePageWindow=1&page=chat",
+      search: "?workspacePageWindow=1&page=knowledge",
     } as Location)).toBe(false);
   });
 
-  it("opens one resizable standalone window per page", async () => {
+  it("rejects cross-scope pages and malformed checkout identities", () => {
+    expect(getWorkspacePageWindowPayload(
+      "?workspacePageWindow=1&scope=checkout&page=settings&checkoutId=a&workspaceGeneration=1",
+    )).toBeNull();
+    expect(getWorkspacePageWindowPayload(
+      "?workspacePageWindow=1&scope=app&page=knowledge",
+    )).toBeNull();
+    expect(getWorkspacePageWindowPayload(
+      "?workspacePageWindow=1&scope=app&page=agent&workspaceGeneration=x",
+    )).toBeNull();
+    expect(getWorkspacePageWindowPayload(
+      "?workspacePageWindow=1&scope=checkout&page=knowledge&checkoutId=a&workspaceGeneration=x",
+    )).toBeNull();
+    expect(() => buildWorkspacePageWindowQuery({
+      scope: "checkout",
+      page: "settings",
+      checkoutId: "checkout-a",
+      workspaceGeneration: 1,
+      title: "invalid",
+    } as unknown as WorkspacePageWindowPayload)).toThrow("Invalid workspace page window payload");
+  });
+
+  it("opens a checkout-bound resizable standalone window", async () => {
+    const payload = checkoutPayload("checkout-a", "asset");
     subWindowMocks.invokeMock.mockResolvedValue({
-      label: "workspace-page-asset",
+      label: workspacePageWindowKind(payload),
       existing: false,
       pooled: false,
     });
 
-    await expect(openWorkspacePageWindow({ page: "asset", title: "资产" }))
-      .resolves.toBe(true);
+    await expect(openWorkspacePageWindow(payload)).resolves.toBe(true);
 
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({
-        kind: workspacePageWindowKind("asset"),
-        title: "Locus - 资产",
+        kind: workspacePageWindowKind(payload),
+        title: "Locus - asset title",
         width: 1280,
         height: 820,
         minimizable: true,
         closable: true,
-        query: expect.stringContaining("page=asset"),
+        query: expect.stringContaining("checkoutId=checkout-a"),
       }),
     });
   });
 
-  it("wires top-tab context and Ctrl-click actions to the standalone shell", () => {
+  it("binds checkout pages through window context and keeps app pages process-level", () => {
     const app = read("src/App.vue");
     const windowApp = read("src/WindowApp.vue");
     const pageWindow = read("src/components/WorkspacePageWindow.vue");
     const pageBootstrap = read("src/composables/useWorkspacePageBootstrap.ts");
+    const backend = read("src-tauri/src/lib.rs");
     const capabilities = read("src-tauri/capabilities/default.json");
 
-    expect(app).toContain("openTopTabContextMenu");
-    expect(app).toContain("event.ctrlKey && canOpenTopTabInWindow");
     expect(app).toContain("openWorkspacePageWindow");
-    expect(app).toContain("app.tab.openInWindow");
     expect(windowApp).toContain('kind: "workspace-page"');
-    expect(app).toContain("isWorkspacePageWindowLocation");
-    expect(app).toContain('<WorkspacePageWindow v-else-if="isWorkspacePageWindow" />');
-    expect(pageWindow).toContain("CollabView.vue");
     expect(pageWindow).toContain("KnowledgeView.vue");
-    expect(pageWindow).toContain("AssetView.vue");
-    expect(pageWindow).toContain("SettingsView.vue");
-    expect(app).toContain("WORKSPACE_PAGE_RESET_ONBOARDING_EVENT");
+    expect(pageWindow).toContain("WorkspaceChatPage.vue");
+    expect(pageWindow).toContain("workspaceRef: checkoutWorkspaceRef.value");
+    expect(pageWindow).toContain('workingDir: ""');
     expect(pageWindow).toContain("workspace-page-window-controls");
     expect(pageWindow).toContain("useWorkspacePageBootstrap");
+    expect(pageWindow).toContain("workspaceContextStore.disposeWindow()");
     expect(pageWindow).not.toContain("useAppBootstrap");
-    expect(pageBootstrap).toContain('page === "knowledge" || page === "collab" || page === "settings"');
+    const chatPage = read("src/components/WorkspaceChatPage.vue");
+    expect(chatPage).toContain("ChatWorkspaceView");
+    expect(chatPage).toContain("registerListeners");
+    expect(pageBootstrap).toContain("workspaceContextStore.initialize(currentWindowId, \"main\")");
+    expect(pageBootstrap).toContain("workspaceContextStore.focusWorkspaceRef");
+    expect(pageBootstrap).toContain("expectedGeneration: payload.workspaceGeneration");
+    expect(pageBootstrap).not.toContain("projectStore.loadWorkingDir");
     expect(pageBootstrap).not.toContain("refreshSessions");
     expect(pageBootstrap).not.toContain("loadSkills");
     expect(pageBootstrap).not.toContain("registerListeners");
+    expect(backend).toContain("WindowEvent::Destroyed");
+    expect(backend).toContain("contexts.remove_window(window.label(), intent_epoch)");
     expect(capabilities).toContain('"workspace-page-*"');
+  });
+
+  it("keeps Development and View in the primary navigation with Plugin in app scope", () => {
+    const app = read("src/App.vue");
+    const topTabs = app.slice(app.indexOf("const topTabs"), app.indexOf("const visibleTopTabs"));
+
+    expect(topTabs).toContain('{ id: "chat"');
+    expect(topTabs).toContain('{ id: "views"');
+    expect(topTabs).toContain('{ id: "plugins"');
+    expect(topTabs).toContain('{ id: "agent"');
+    expect(topTabs).not.toContain('{ id: "knowledge"');
+    expect(topTabs).not.toContain('{ id: "collab"');
+    expect(app).not.toContain("const projectTabs");
+    expect(app).not.toContain('class="project-tab-context"');
+    expect(app).toContain("DevelopmentWorkbench");
+    expect(app).toContain("openTopTabInWindow");
+    expect(app).toContain('return tab.id !== "chat"');
+    expect(app).toMatch(
+      /v-show="uiStore\.activeTab === 'plugins'"[\s\S]{0,120}working-dir=""/,
+    );
   });
 });

@@ -7,24 +7,24 @@
 //! registers executable tools from them. They are disabled by default and the
 //! enablement lives in the per-workspace skill config.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::error::AppError;
-use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_store::{
     self, KnowledgeDocument, KnowledgeInjectMode, KnowledgeType, SkillSurface,
 };
-use crate::workspace::Workspace;
+use crate::workspace_service::{ProjectRegistry, WorkspaceRef};
 
 use super::knowledge::{get_updated_at, reconcile_and_emit_knowledge_changed, SkillConfig};
 use super::skill::{
     default_package_command_name, normalize_command_trigger, resolve_config_command_trigger,
-    split_optional_frontmatter, strip_utf8_bom, SkillManifest, SkillManifestKind,
+    resolve_skill_workspace_scope, split_optional_frontmatter, strip_utf8_bom, SkillManifest,
+    SkillManifestKind,
 };
 
 /// First segment of the virtual knowledge path namespace reserved for
@@ -322,29 +322,24 @@ fn discover_claude_plugin_skill_roots(plugins_root: &Path) -> Vec<ExternalSkillS
 /// Fixed scan-root order: project roots first so a project-level skill wins
 /// over a user-level skill with the same provider and slug.
 fn external_skill_scan_roots(working_dir: &str) -> Vec<ExternalSkillScanRoot> {
-    // Unit tests must not observe the developer machine's real skill
-    // directories; they exercise `scan_external_skills_from_roots` directly.
-    #[cfg(test)]
-    {
-        let _ = working_dir;
-        Vec::new()
+    let mut roots = Vec::new();
+    let trimmed = working_dir.trim();
+    if !trimmed.is_empty() {
+        let workspace = Path::new(trimmed);
+        for provider in [ExternalSkillProvider::Claude, ExternalSkillProvider::Agents] {
+            roots.push(ExternalSkillScanRoot {
+                provider,
+                scope: ExternalSkillScope::Project,
+                path: workspace.join(provider.home_component()).join("skills"),
+                slug_prefix: String::new(),
+            });
+        }
     }
 
+    // Unit tests retain project discovery while avoiding the developer
+    // machine's user-level Skill directories.
     #[cfg(not(test))]
     {
-        let mut roots = Vec::new();
-        let trimmed = working_dir.trim();
-        if !trimmed.is_empty() {
-            let workspace = Path::new(trimmed);
-            for provider in [ExternalSkillProvider::Claude, ExternalSkillProvider::Agents] {
-                roots.push(ExternalSkillScanRoot {
-                    provider,
-                    scope: ExternalSkillScope::Project,
-                    path: workspace.join(provider.home_component()).join("skills"),
-                    slug_prefix: String::new(),
-                });
-            }
-        }
         if let Some(home) = dirs::home_dir() {
             for provider in [
                 ExternalSkillProvider::Claude,
@@ -362,8 +357,8 @@ fn external_skill_scan_roots(working_dir: &str) -> Vec<ExternalSkillScanRoot> {
                 &home.join(".claude").join("plugins"),
             ));
         }
-        roots
     }
+    roots
 }
 
 pub(crate) fn external_skill_watch_roots(working_dir: &str) -> Vec<PathBuf> {
@@ -537,17 +532,32 @@ pub(crate) fn scan_external_skills_from_roots(
 
 // ── Cache ────────────────────────────────────────────────────
 
-struct ExternalSkillCacheEntry {
-    working_dir: String,
-    records: Arc<Vec<ExternalSkillRecord>>,
-}
+static EXTERNAL_SKILL_CACHE: LazyLock<Mutex<HashMap<String, Arc<Vec<ExternalSkillRecord>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static EXTERNAL_SKILL_CACHE: Mutex<Option<ExternalSkillCacheEntry>> = Mutex::new(None);
-
-fn cache_lock() -> std::sync::MutexGuard<'static, Option<ExternalSkillCacheEntry>> {
+fn cache_lock() -> std::sync::MutexGuard<'static, HashMap<String, Arc<Vec<ExternalSkillRecord>>>> {
     EXTERNAL_SKILL_CACHE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn external_skill_cache_key(working_dir: &str) -> String {
+    let trimmed = working_dir.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let normalized = dunce::canonicalize(trimmed)
+        .unwrap_or_else(|_| PathBuf::from(trimmed))
+        .to_string_lossy()
+        .replace('\\', "/");
+    #[cfg(windows)]
+    {
+        normalized.to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        normalized
+    }
 }
 
 /// External skill list for the workspace. Scans the disk once per workspace
@@ -555,26 +565,26 @@ fn cache_lock() -> std::sync::MutexGuard<'static, Option<ExternalSkillCacheEntry
 /// re-scan; `invalidate_external_skill_cache` or a workspace switch forces a
 /// fresh scan.
 pub(crate) fn list_external_skills_cached(working_dir: &str) -> Arc<Vec<ExternalSkillRecord>> {
+    let cache_key = external_skill_cache_key(working_dir);
     {
         let guard = cache_lock();
-        if let Some(entry) = guard.as_ref() {
-            if entry.working_dir == working_dir {
-                return entry.records.clone();
-            }
+        if let Some(records) = guard.get(&cache_key) {
+            return Arc::clone(records);
         }
     }
     let records = Arc::new(scan_external_skills_from_roots(&external_skill_scan_roots(
         working_dir,
     )));
-    *cache_lock() = Some(ExternalSkillCacheEntry {
-        working_dir: working_dir.to_string(),
-        records: records.clone(),
-    });
+    cache_lock().insert(cache_key, Arc::clone(&records));
     records
 }
 
 pub(crate) fn invalidate_external_skill_cache() {
-    *cache_lock() = None;
+    cache_lock().clear();
+}
+
+pub(crate) fn invalidate_external_skill_cache_for(working_dir: &str) {
+    cache_lock().remove(&external_skill_cache_key(working_dir));
 }
 
 // ── Configured values (workspace override on top of author defaults) ──
@@ -1101,16 +1111,18 @@ pub(crate) fn external_skill_origin_root_for_virtual_path(
 
 #[tauri::command]
 pub async fn refresh_external_skills(
+    workspace_ref: WorkspaceRef,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    invalidate_external_skill_cache();
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    let knowledge_index = scope.knowledge_index(&app_handle)?;
+    let working_dir = scope.working_dir().to_string();
+    invalidate_external_skill_cache_for(&working_dir);
     reconcile_and_emit_knowledge_changed(
         &app_handle,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index,
         "refresh_external_skills",
     )
     .await?;
@@ -1143,6 +1155,58 @@ mod tests {
             path: path.to_path_buf(),
             slug_prefix: String::new(),
         }
+    }
+
+    #[test]
+    fn project_external_skill_cache_keeps_checkout_roots_isolated() {
+        let temp = tempfile::TempDir::new().expect("temporary root");
+        let checkout_a = temp.path().join("checkout-a");
+        let checkout_b = temp.path().join("checkout-b");
+        let skills_a = checkout_a.join(".agents").join("skills");
+        let skills_b = checkout_b.join(".agents").join("skills");
+        write_skill(
+            &skills_a,
+            "shared-audit",
+            "name: Shared A\ndescription: Checkout A",
+            "# Checkout A",
+        );
+        write_skill(
+            &skills_b,
+            "shared-audit",
+            "name: Shared B\ndescription: Checkout B",
+            "# Checkout B",
+        );
+        invalidate_external_skill_cache();
+
+        let root_a = checkout_a.to_string_lossy().to_string();
+        let root_b = checkout_b.to_string_lossy().to_string();
+        let (records_b, records_a) = std::thread::scope(|scope| {
+            let b = scope.spawn(|| list_external_skills_cached(&root_b));
+            let a = scope.spawn(|| list_external_skills_cached(&root_a));
+            (
+                b.join().expect("scan checkout B"),
+                a.join().expect("scan checkout A"),
+            )
+        });
+
+        assert_eq!(records_a.len(), 1);
+        assert_eq!(records_b.len(), 1);
+        assert_eq!(records_a[0].scope, ExternalSkillScope::Project);
+        assert_eq!(records_b[0].scope, ExternalSkillScope::Project);
+        assert_eq!(records_a[0].name, "Shared A");
+        assert_eq!(records_b[0].name, "Shared B");
+        assert!(records_a[0].root.starts_with(&checkout_a));
+        assert!(records_b[0].root.starts_with(&checkout_b));
+
+        write_skill(
+            &skills_a,
+            "only-a",
+            "name: Only A\ndescription: Checkout A only",
+            "# Only A",
+        );
+        invalidate_external_skill_cache_for(&root_a);
+        assert_eq!(list_external_skills_cached(&root_a).len(), 2);
+        assert_eq!(list_external_skills_cached(&root_b).len(), 1);
     }
 
     #[test]

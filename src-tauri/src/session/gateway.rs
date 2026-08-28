@@ -242,13 +242,39 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
     }
 
     let event_for_persist = event.clone();
-    let _ = app_handle.emit(
-        "stream-event",
-        StreamEventEnvelope {
-            run_id: run_id.to_string(),
-            event,
-        },
-    );
+    let scope = store.get_run_scope(run_id).ok().flatten();
+    let envelope = StreamEventEnvelope {
+        run_id: run_id.to_string(),
+        project_id: scope.as_ref().map(|scope| scope.project_id.clone()),
+        checkout_id: scope.as_ref().map(|scope| scope.checkout_id.clone()),
+        workspace_generation: scope.as_ref().map(|scope| scope.workspace_generation),
+        event,
+    };
+    let routed = scope.and_then(|scope| {
+        let project_id = crate::workspace_service::ProjectId::new(scope.project_id).ok()?;
+        let checkout_id = crate::workspace_service::CheckoutId::new(scope.checkout_id).ok()?;
+        Some(crate::workspace_service::event::WorkspaceEventEnvelope {
+            project_id,
+            checkout_id,
+            workspace_generation: scope.workspace_generation,
+            service_instance_id: None,
+            service_generation: None,
+            payload: envelope.clone(),
+        })
+    });
+    match (
+        routed,
+        app_handle.try_state::<std::sync::Arc<crate::workspace_service::ProjectRegistry>>(),
+    ) {
+        (Some(routed), Some(registry)) => {
+            registry
+                .event_router()
+                .publish(app_handle, "stream-event", routed);
+        }
+        _ => {
+            let _ = app_handle.emit("stream-event", envelope);
+        }
+    }
 
     match serde_json::to_string(&event_for_persist) {
         Ok(payload_json) => {

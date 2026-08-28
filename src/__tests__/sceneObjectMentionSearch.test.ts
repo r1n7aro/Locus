@@ -23,7 +23,7 @@ describe("scene object mention search", () => {
 
     expect(input).toContain("searchWorkspaceSceneObjects");
     expect(input).toContain("projectStore.unityConnectionStatus?.scenePath");
-    expect(input).toContain("await validateUnitySceneObject(target.scenePath, target.objectPath)");
+    expect(input).toContain("await validateUnitySceneObject(workspaceRef, target.scenePath, target.objectPath)");
     expect(input).toContain('entryKind: "sceneObject"');
     expect(input).toContain("meta: relPath");
     expect(input).toContain("shouldContinueMentionWithSpace");

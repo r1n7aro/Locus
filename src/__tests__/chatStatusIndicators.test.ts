@@ -35,12 +35,18 @@ describe("chat status indicators", () => {
     expect(workspace).toContain(':unity-plugin-installing="projectStore.pluginInstalling"');
     expect(workspace).toContain(':unity-launching="projectStore.unityLaunching"');
     expect(workspace).toContain(':unity-launch-state="projectStore.unityLaunchState"');
+    expect(workspace).toContain(':project-services="projectStore.detectedServices"');
     expect(workspace).toContain('@install-plugin="projectStore.installPlugin"');
     expect(workspace).toContain('@launch-unity-project="projectStore.launchUnityProject"');
     expect(sessionPanel).not.toContain("sp-unity-status");
     expect(sessionPanel).not.toContain("sp-scan-status");
     expect(indicators).toContain('id: "assetDb"');
     expect(indicators).toContain('id: "unity"');
+    expect(indicators).toContain('requiredCapability: "assetDatabase"');
+    expect(indicators).toContain('requiredCapability: "editorConnection"');
+    expect(indicators).toContain('requiredCapability: "codeAnalysis"');
+    expect(indicators).toContain('requiredCapability: "hotReload"');
+    expect(indicators).toContain('!item.requiredCapability || hasProjectCapability(item.requiredCapability)');
   });
 
   it("shows Unity pipe and working directory in the Unity popover", () => {
@@ -127,26 +133,53 @@ describe("chat status indicators", () => {
     expect(indicators).toContain('if (effectiveUnityLaunchState.value === "starting") return t("chat.unity.launching");');
     expect(indicators).toContain('return t("chat.status.unity.waitingConnection");');
     expect(indicators).toContain(':variant="activeItem.actionVariant"');
-    expect(indicators).toContain('actionVariant: props.unityPluginStatus ? "neutral" : "primary"');
+    expect(indicators).toContain('actionVariant: unityCanCloseHeadless.value');
     expect(projectStore).toContain('const unityLaunchState = ref<UnityLaunchState>("idle");');
     expect(projectStore).toContain('const unityLaunching = computed(() => unityLaunchState.value === "starting");');
     expect(projectStore).toContain("function connectionStatusFromLaunchResult(result: UnityLaunchResult): UnityConnectionStatus");
     expect(projectStore).toContain("editorProcessId: result.processId");
     expect(projectStore).toContain("async function launchUnityProject()");
-    expect(projectStore).toContain("const launch = await unityService.launchUnityProject();");
+    expect(projectStore).toContain("const launch = await unityService.launchUnityProject(requireWorkspaceRef());");
     expect(projectStore).toContain("setUnityConnectionStatus(connectionStatusFromLaunchResult(launch));");
-    expect(projectStore).toContain("await unityService.checkUnityConnectionStatus()");
+    expect(projectStore).toContain("await unityService.checkUnityConnectionStatus(workspaceRef)");
     expect(projectStore).toContain('unityLaunchState.value = "starting";');
     expect(projectStore).toContain('unityLaunchState.value = "waitingConnection";');
     expect(projectStore).toContain("function handleUnityConnectionStatus(connected: boolean)");
     expect(projectStore).toContain("function handleUnityConnectionStatusDetail(status: UnityConnectionStatus)");
-    expect(bootstrap).toContain("projectStore.handleUnityConnectionStatus(payload);");
+    expect(bootstrap).toContain("projectStore.handleUnityConnectionStatus(connected);");
     expect(bootstrap).toContain('"unity-connection-status-detail"');
-    expect(unityService).toContain('return ipcInvoke<UnityLaunchResult>("launch_unity_project");');
+    expect(unityService).toContain('ipcInvoke<UnityLaunchResult>("launch_unity_project", { workspaceRef })');
     expect(unityService).toContain("processId: number;");
     expect(zh).toContain('"chat.status.unity.launch": "启动"');
     expect(zh).toContain('"chat.status.unity.waitingConnection": "等待连接"');
     expect(zh).toContain('"chat.status.unity.launchTitle": "启动 Unity 项目"');
+  });
+
+  it("shows headless mode and closes only the headless Unity editor", () => {
+    const indicators = read("src/components/chat/ChatStatusIndicators.vue");
+    const unityService = read("src/services/unity.ts");
+    const rust = read("src-tauri/src/commands/workspace.rs");
+    const lib = read("src-tauri/src/lib.rs");
+    const zh = read("src/language/zh.json");
+
+    expect(indicators).toContain('const unityCanCloseHeadless = computed(() =>');
+    expect(indicators).toContain('props.unityConnectionStatus?.launchMode === "headless"');
+    expect(indicators).toContain("await closeHeadlessUnityProject(workspaceRef)");
+    expect(indicators).toContain('actionVariant: unityCanCloseHeadless.value');
+    expect(unityService).toContain('ipcInvoke<void>("close_headless_unity_project", { workspaceRef })');
+    expect(rust).toContain("pub async fn close_headless_unity_project(");
+    expect(rust).toContain("if !status.headless");
+    expect(lib).toContain("commands::close_headless_unity_project");
+    expect(zh).toContain('"chat.status.unity.closeHeadless": "关闭无头编辑器"');
+  });
+
+  it("surfaces blocking dialog state as a primary Unity safety fact", () => {
+    const indicators = read("src/components/chat/ChatStatusIndicators.vue");
+    const zh = read("src/language/zh.json");
+
+    expect(indicators).toContain('semantic.safety.recommendedAction === "resolve_dialog"');
+    expect(indicators).toContain('label: t("chat.status.unity.blockingReason")');
+    expect(zh).toContain('"chat.status.unity.safety.resolve_dialog": "处理前置弹窗"');
   });
 
   it("keeps Unity recompile reconnect waits stable when the editor process is still running", () => {
@@ -224,7 +257,7 @@ describe("chat status indicators", () => {
     // A quit editor is "not running", not an error.
     expect(indicators).toContain('quit: "muted"');
     // A disconnected or not-yet-built editor is idle, not an error.
-    expect(indicators).not.toContain('props.isUnityProject ? "danger" : "muted"');
+    expect(indicators).not.toContain('isUnityProject.value ? "danger" : "muted"');
     // Read-only knowledge is a limited mode (warning), not busy (accent).
     expect(indicators).toContain('? "warning" : "success"');
     // Hot reload turns blue only while actively (re)compiling.

@@ -40,14 +40,13 @@ import {
   forkSession,
   forkSessionFromMessage,
   getSessionActiveRun,
-  listArchivedSessions,
+  listArchivedCheckoutSessions,
   listSessionEvents,
-  listSessions,
+  listCheckoutSessions,
   loadSession as loadLocusSession,
   queueChatInput,
   renameSession,
   rollbackSessionToMessage,
-  saveActiveSessionSelection,
   unarchiveSession,
   undoLatestConversationTurn,
 } from "../services/session";
@@ -86,6 +85,8 @@ import {
   viewHostPoolPrepare,
   viewHostPoolReady,
   viewHostIdFromLocation,
+  viewWorkspaceRefFromLocation,
+  isExactViewWorkspaceBinding,
   isViewHostPoolWindowLocation,
   viewOpenFrontendLog,
   viewRead,
@@ -112,6 +113,11 @@ import {
   type ViewSessionWaitStatus,
   type ViewRuntimeUpdateEvent,
 } from "../services/view";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+} from "../services/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import type {
   AppErrorPayload,
   ChatMessage,
@@ -146,6 +152,7 @@ const props = withDefaults(defineProps<{
 });
 
 const { state: displaySettings } = useDisplaySettings();
+const workspaceContextStore = useWorkspaceContextStore();
 
 interface ViewHostTab {
   id: string;
@@ -241,6 +248,47 @@ function initialHostTab(tabId: string): ViewHostTab {
 }
 
 const initialViewId = viewHostIdFromLocation();
+const viewWorkspaceRef = viewWorkspaceRefFromLocation();
+
+function requireViewWorkspaceRef(): NonNullable<typeof viewWorkspaceRef> {
+  if (viewWorkspaceRef) return viewWorkspaceRef;
+  throw new Error("View window workspace scope is unavailable.");
+}
+
+function assertViewWorkspaceBinding(
+  context: { focusedCheckoutId: string; workspaceGeneration: number } | null,
+): void {
+  const expected = requireViewWorkspaceRef();
+  const runtime = workspaceContextStore.checkoutsById[expected.checkoutId]?.runtime;
+  if (
+    !isExactViewWorkspaceBinding(expected, context && {
+      checkoutId: context.focusedCheckoutId,
+      workspaceGeneration: context.workspaceGeneration,
+    })
+    || !isExactViewWorkspaceBinding(expected, runtime)
+  ) {
+    throw new Error(
+      `View window workspace generation is stale: ${expected.checkoutId}@${expected.expectedGeneration}.`,
+    );
+  }
+}
+
+function subscribeViewWorkspaceStream(
+  handler: (event: StreamEvent) => void,
+): Promise<RuntimeUnsubscribe> {
+  const workspaceRef = requireViewWorkspaceRef();
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<StreamEvent>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (
+        event.eventName !== "stream-event"
+        || event.checkoutId !== workspaceRef.checkoutId
+        || event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
+  );
+}
 const isViewHostPoolWindow = isViewHostPoolWindowLocation();
 const currentWindowLabel = appWindow?.label ?? "";
 const activeViewId = ref(initialViewId);
@@ -448,7 +496,7 @@ async function revealViewHostWindow(reason: string) {
       });
     });
     if (currentWindowLabel) {
-      await viewHostRevealed(currentWindowLabel).catch((ownerError) => {
+      await viewHostRevealed(requireViewWorkspaceRef(), currentWindowLabel).catch((ownerError) => {
         viewHostContentLog("host-reveal-owner-sync-failed", {
           reason,
           message: normalizeAppError(ownerError).message,
@@ -470,11 +518,12 @@ async function revealViewHostWindow(reason: string) {
 }
 
 function prepareViewHostPool(reason: string) {
+  if (viewWorkspaceRef) return;
   if (props.embedded || isViewHostPoolWindow || !appWindow) return;
   if (poolPreparePromise) return;
   const prepareStartedAt = perfNowMs();
   viewHostContentLog("pool-prepare-start", { reason });
-  poolPreparePromise = viewHostPoolPrepare()
+  poolPreparePromise = viewHostPoolPrepare(requireViewWorkspaceRef())
     .then((result) => {
       viewHostContentLog("pool-prepare-done", {
         reason,
@@ -586,7 +635,7 @@ function installViewConsoleLogCapture(activeViewId: string) {
       level,
       message,
     };
-    void viewAppendFrontendLog({ viewId: activeViewId, level, message }).catch(() => undefined);
+    void viewAppendFrontendLog(requireViewWorkspaceRef(), { viewId: activeViewId, level, message }).catch(() => undefined);
   };
 
   for (const level of CONSOLE_LOG_LEVELS) {
@@ -659,7 +708,7 @@ async function refreshLatestFrontendLog() {
   if (!viewId || isLocusAssetInspectorTabId(viewId)) return;
   const record = ensureRuntimeRecord(viewId);
   try {
-    const entries = await viewReadFrontendLog({ viewId, limit: 1 });
+    const entries = await viewReadFrontendLog(requireViewWorkspaceRef(), { viewId, limit: 1 });
     record.latestFrontendLog = entries[entries.length - 1] ?? null;
   } catch {
     record.latestFrontendLog = null;
@@ -670,7 +719,7 @@ async function openFrontendLog() {
   const viewId = activeViewId.value;
   if (!viewId) return;
   try {
-    await viewOpenFrontendLog(viewId);
+    await viewOpenFrontendLog(requireViewWorkspaceRef(), viewId);
   } catch (openError) {
     console.error("[view-host] Failed to open frontend log", openError);
   }
@@ -733,7 +782,7 @@ function removeTab(tabId: string, options: { releaseContent?: boolean } = {}): V
     && !isLocusAssetInspectorTabId(tabId)
   ) {
     viewHostContentLog("hide-from-remove-tab", { tabId });
-    void viewContentHide(tabId);
+    void viewContentHide(requireViewWorkspaceRef(), tabId);
   }
   if (activeViewId.value === tabId) {
     const nextActive = nextTabs[Math.min(index, nextTabs.length - 1)]?.id ?? "";
@@ -758,7 +807,7 @@ async function resolveViewTab(id: string): Promise<ViewHostTab> {
   if (detail.value?.manifest.id === id) return tabFromDetail(detail.value);
   const existing = tabs.value.find((tab) => tab.id === id);
   try {
-    const next = await viewRead(id);
+    const next = await viewRead(requireViewWorkspaceRef(), id);
     return tabFromDetail(next);
   } catch {
     return existing ?? { id, title: id, packageRoot: "" };
@@ -779,7 +828,7 @@ async function registerCurrentTabHost() {
     viewIds: viewIds.join(","),
   });
   try {
-    await viewSetTabHost({ hostLabel: currentWindowLabel, viewIds });
+    await viewSetTabHost(requireViewWorkspaceRef(), { hostLabel: currentWindowLabel, viewIds });
     markStartupPhase("registerHost_done", {
       hostLabel: currentWindowLabel,
       viewIds: viewIds.join(","),
@@ -1147,7 +1196,7 @@ async function mergeTabIntoWindow(tabId: string, targetLabel: string) {
     viewIds: [tab.id],
     activeViewId: tab.id,
   });
-  await viewSetTabHost({
+  await viewSetTabHost(requireViewWorkspaceRef(), {
     hostLabel: targetLabel,
     viewIds: [tab.id],
     keepExistingForHost: true,
@@ -1182,7 +1231,7 @@ async function detachTab(tabId: string, point: { x: number; y: number }) {
   viewHostContentLog("detach-source-removed", { tabId });
   await registerCurrentTabHost();
   try {
-    const result = await viewDetachTab({
+    const result = await viewDetachTab(requireViewWorkspaceRef(), {
       viewId: tab.id,
       sourceHostLabel: currentWindowLabel,
       x: Math.round(point.x - VIEW_HOST_DETACH_OFFSET_X),
@@ -1841,12 +1890,12 @@ async function handleAutomationRequest(request: ViewAutomationRequest) {
             : (() => {
                 throw new Error(`Unsupported View automation kind: ${request.kind}`);
               })();
-    await viewAutomationRespond(request.requestId, true, result);
+    await viewAutomationRespond(requireViewWorkspaceRef(), request.requestId, true, result);
   } catch (automationError) {
     const message = automationError instanceof Error
       ? automationError.message
       : String(automationError);
-    await viewAutomationRespond(request.requestId, false, null, message);
+    await viewAutomationRespond(requireViewWorkspaceRef(), request.requestId, false, null, message);
   }
 }
 
@@ -2031,6 +2080,7 @@ function finalTextFromEvents(events: SessionEventRecord[], runId?: string | null
 
 async function createRuntimeSession(request: ViewSessionCreateRequest = {}): Promise<string> {
   return createLocusSession({
+    workspaceRef: requireViewWorkspaceRef(),
     title: defaultViewSessionTitle(request.title),
     parentSessionId: request.parentSessionId ?? null,
     sessionType: request.sessionType ?? "view",
@@ -2041,7 +2091,7 @@ async function createRuntimeSession(request: ViewSessionCreateRequest = {}): Pro
 async function showRuntimeSession(sessionId: string): Promise<void> {
   const normalized = nonEmptyString(sessionId);
   if (!normalized) throw new Error("Session id is required.");
-  await saveActiveSessionSelection(normalized);
+  await workspaceContextStore.setActiveSession(normalized);
 }
 
 async function finalizeRuntimeSessionWait(
@@ -2105,7 +2155,7 @@ async function waitRuntimeSession(request: ViewSessionWaitRequest): Promise<View
     }
   };
 
-  const unsubscribe = await getLocusRuntime().subscribe<StreamEvent>("stream-event", (event) => {
+  const unsubscribe = await subscribeViewWorkspaceStream((event) => {
     terminal = terminalStatusFromStreamEvent(event, sessionId, targetRunId) ?? terminal;
   });
 
@@ -2182,6 +2232,7 @@ async function sendRuntimeSessionMessage(
   if (!model) throw new Error("No model configured for View LLM calls.");
   const effort = await resolveViewEffort(request.effort);
   const launch = await launchSessionChat({
+    workspaceRef: requireViewWorkspaceRef(),
     sessionId: request.sessionId ?? null,
     text,
     sessionTitle: request.sessionTitle ?? request.title ?? defaultViewSessionTitle(null),
@@ -2384,7 +2435,7 @@ async function mountViewContentFromPool(
       if (!options.updateGeometryOnly && (record.stale || !record.detail)) {
         const viewReadStartedAt = perfNowMs();
         markStartupPhase("viewRead_start", { viewId, mode: "content-pool" });
-        const next = await viewRead(viewId);
+        const next = await viewRead(requireViewWorkspaceRef(), viewId);
         markStartupPhase("viewRead_done", {
           viewId,
           mode: "content-pool",
@@ -2405,7 +2456,7 @@ async function mountViewContentFromPool(
             activeViewId: activeViewId.value,
           });
         }
-        await viewContentHide(viewId);
+        await viewContentHide(requireViewWorkspaceRef(), viewId);
         return;
       }
 
@@ -2434,7 +2485,7 @@ async function mountViewContentFromPool(
         });
         markStartupPhase("viewContentMount_start", { viewId, hostLabel: mountRequest.hostLabel });
       }
-      const mountResult = await viewContentMount(mountRequest);
+      const mountResult = await viewContentMount(requireViewWorkspaceRef(), mountRequest);
       lastViewContentMountGeometry = viewContentMountGeometryFromRequest(mountRequest);
       if (!options.updateGeometryOnly) {
         viewHostContentLog("mount-ipc-done", {
@@ -2514,7 +2565,7 @@ async function hidePersistentViewContentTabs(viewIds: string[]) {
     viewHostContentLog("hide-batch", { viewIds: normalized.join(",") });
   }
   await Promise.allSettled(
-    normalized.map((viewId) => viewContentHide(viewId)),
+    normalized.map((viewId) => viewContentHide(requireViewWorkspaceRef(), viewId)),
   );
 }
 
@@ -2552,7 +2603,7 @@ async function loadView(
     try {
       const viewReadStartedAt = perfNowMs();
       markStartupPhase("viewRead_start", { viewId });
-      const next = await viewRead(viewId);
+      const next = await viewRead(requireViewWorkspaceRef(), viewId);
       markStartupPhase("viewRead_done", {
         viewId,
         elapsedMs: elapsedMs(viewReadStartedAt),
@@ -2566,7 +2617,7 @@ async function loadView(
       if (viewRequiresUnityConnection(next.manifest)) {
         const unityStatusStartedAt = perfNowMs();
         markStartupPhase("unityStatus_start", { viewId });
-        const status = await checkUnityConnectionStatus();
+        const status = await checkUnityConnectionStatus(requireViewWorkspaceRef());
         markStartupPhase("unityStatus_done", {
           viewId,
           elapsedMs: elapsedMs(unityStatusStartedAt),
@@ -2584,14 +2635,20 @@ async function loadView(
         createViewRuntimeComponent({
           detail: next,
           api: {
+            workspaceRef: requireViewWorkspaceRef(),
             callScript: (scriptName, method, args) =>
-              viewCallScript({ viewId: next.manifest.id, scriptName, method, args }),
-            unityPropertyRead: readUnitySerializedProperty,
-            unityPropertyDiscover: discoverUnitySerializedProperties,
-            unityPropertyWrite: writeUnitySerializedProperty,
-            unityPropertyApply: applyUnitySerializedProperties,
+              viewCallScript(requireViewWorkspaceRef(), { viewId: next.manifest.id, scriptName, method, args }),
+            unityPropertyRead: (request) => readUnitySerializedProperty(requireViewWorkspaceRef(), request),
+            unityPropertyDiscover: (request) => discoverUnitySerializedProperties(requireViewWorkspaceRef(), request),
+            unityPropertyWrite: (request) => writeUnitySerializedProperty(requireViewWorkspaceRef(), request),
+            unityPropertyApply: (request) => applyUnitySerializedProperties(requireViewWorkspaceRef(), request),
             searchAssets: (query, roots, limit) =>
-              searchWorkspaceAssets(query, roots?.length ? roots : ["Assets", "Packages"], limit),
+              searchWorkspaceAssets(
+                query,
+                roots?.length ? roots : ["Assets", "Packages"],
+                limit,
+                requireViewWorkspaceRef(),
+              ),
             createSession: (request) => createRuntimeSession(request),
             showSession: (sessionId) => showRuntimeSession(sessionId),
             loadSession: (sessionId) => loadLocusSession(sessionId),
@@ -2604,8 +2661,8 @@ async function loadView(
             forkSession: (sessionId, title) => forkSession(sessionId, title),
             forkSessionFromMessage: (sessionId, messageId, title) =>
               forkSessionFromMessage(sessionId, messageId, title),
-            listSessions: () => listSessions(),
-            listArchivedSessions: () => listArchivedSessions(),
+            listSessions: () => listCheckoutSessions(requireViewWorkspaceRef()),
+            listArchivedSessions: () => listArchivedCheckoutSessions(requireViewWorkspaceRef()),
             renameSession: (sessionId, title) => renameSession(sessionId, title),
             archiveSession: (sessionId) => archiveSession(sessionId),
             unarchiveSession: (sessionId) => unarchiveSession(sessionId),
@@ -2614,26 +2671,25 @@ async function loadView(
             rollbackSessionToMessage: (sessionId, messageId) =>
               rollbackSessionToMessage(sessionId, messageId),
             callLlm: (request) => callRuntimeLlm(request),
-            onSessionEvent: (handler) =>
-              getLocusRuntime().subscribe<StreamEvent>("stream-event", handler),
-            readFrontendLog: (limit) => viewReadFrontendLog({ viewId: next.manifest.id, limit }),
-            openFrontendLog: () => viewOpenFrontendLog(next.manifest.id),
-            storageGet: (key) => viewStorageGet({ viewId: next.manifest.id, key }),
-            storageSet: (key, value) => viewStorageSet({ viewId: next.manifest.id, key, value }),
-            storageRemove: (key) => viewStorageRemove({ viewId: next.manifest.id, key }),
-            fsReadFile: (path, encoding) => viewFsReadFile({ path, encoding }),
-            fsWriteFile: (path, data, encoding) => viewFsWriteFile({ path, data, encoding }),
-            fsAppendFile: (path, data, encoding) => viewFsAppendFile({ path, data, encoding }),
-            fsMkdir: (path, options) => viewFsMkdir({ path, recursive: options?.recursive }),
-            fsReaddir: (path, options) => viewFsReaddir({ path, withFileTypes: options?.withFileTypes }),
-            fsStat: (path) => viewFsStat({ path }),
-            fsLstat: (path) => viewFsLstat({ path }),
-            fsAccess: (path) => viewFsAccess({ path }),
-            fsUnlink: (path) => viewFsUnlink({ path }),
+            onSessionEvent: (handler) => subscribeViewWorkspaceStream(handler),
+            readFrontendLog: (limit) => viewReadFrontendLog(requireViewWorkspaceRef(), { viewId: next.manifest.id, limit }),
+            openFrontendLog: () => viewOpenFrontendLog(requireViewWorkspaceRef(), next.manifest.id),
+            storageGet: (key) => viewStorageGet(requireViewWorkspaceRef(), { viewId: next.manifest.id, key }),
+            storageSet: (key, value) => viewStorageSet(requireViewWorkspaceRef(), { viewId: next.manifest.id, key, value }),
+            storageRemove: (key) => viewStorageRemove(requireViewWorkspaceRef(), { viewId: next.manifest.id, key }),
+            fsReadFile: (path, encoding) => viewFsReadFile(requireViewWorkspaceRef(), { path, encoding }),
+            fsWriteFile: (path, data, encoding) => viewFsWriteFile(requireViewWorkspaceRef(), { path, data, encoding }),
+            fsAppendFile: (path, data, encoding) => viewFsAppendFile(requireViewWorkspaceRef(), { path, data, encoding }),
+            fsMkdir: (path, options) => viewFsMkdir(requireViewWorkspaceRef(), { path, recursive: options?.recursive }),
+            fsReaddir: (path, options) => viewFsReaddir(requireViewWorkspaceRef(), { path, withFileTypes: options?.withFileTypes }),
+            fsStat: (path) => viewFsStat(requireViewWorkspaceRef(), { path }),
+            fsLstat: (path) => viewFsLstat(requireViewWorkspaceRef(), { path }),
+            fsAccess: (path) => viewFsAccess(requireViewWorkspaceRef(), { path }),
+            fsUnlink: (path) => viewFsUnlink(requireViewWorkspaceRef(), { path }),
             fsRm: (path, options) =>
-              viewFsRm({ path, recursive: options?.recursive, force: options?.force }),
-            fsRename: (oldPath, newPath) => viewFsRename({ oldPath, newPath }),
-            fsCopyFile: (src, dest) => viewFsCopyFile({ src, dest }),
+              viewFsRm(requireViewWorkspaceRef(), { path, recursive: options?.recursive, force: options?.force }),
+            fsRename: (oldPath, newPath) => viewFsRename(requireViewWorkspaceRef(), { oldPath, newPath }),
+            fsCopyFile: (src, dest) => viewFsCopyFile(requireViewWorkspaceRef(), { src, dest }),
             onUpdate: (handler) =>
               getLocusRuntime().subscribe<ViewRuntimeUpdateEvent>("unity-editor-update", handler),
             reload: () => loadView(record.viewId, { force: true }),
@@ -2716,6 +2772,12 @@ function onViewContentViewportChanged() {
 }
 
 onMounted(async () => {
+  if (!viewWorkspaceRef) {
+    throw new Error("View window URL is missing checkout scope.");
+  }
+  await workspaceContextStore.initialize(currentWindowLabel || "view", "main");
+  const focusedContext = await workspaceContextStore.focusCheckout(viewWorkspaceRef.checkoutId);
+  assertViewWorkspaceBinding(focusedContext);
   hostMountedAt = perfNowMs();
   viewHostContentLog("host-mounted", { initialViewId });
   void syncMaximizedState();
@@ -2754,9 +2816,15 @@ onMounted(async () => {
         void handleAutomationRequest(payload);
       },
     );
-    unsubscribeReload = await getLocusRuntime().subscribe<ViewPackageSummary>(
-      "view-package-reloaded",
-      (payload) => {
+    unsubscribeReload = await getLocusRuntime().subscribe<RoutedWorkspaceEvent<ViewPackageSummary>>(
+      WORKSPACE_EVENT_NAME,
+      (event) => {
+        if (
+          event.eventName !== "view-package-reloaded"
+          || event.checkoutId !== viewWorkspaceRef.checkoutId
+          || event.workspaceGeneration !== viewWorkspaceRef.expectedGeneration
+        ) return;
+        const payload = event.payload;
         if (!tabs.value.some((tab) => tab.id === payload.id)) return;
         upsertTab(tabFromSummary(payload));
         const record = findRuntimeRecord(payload.id);
@@ -2770,7 +2838,7 @@ onMounted(async () => {
       const readyStartedAt = perfNowMs();
       viewHostContentLog("pool-ready-start");
       try {
-        await viewHostPoolReady(currentWindowLabel);
+        await viewHostPoolReady(requireViewWorkspaceRef(), currentWindowLabel);
         viewHostContentLog("pool-ready-done", { elapsedMs: elapsedMs(readyStartedAt) });
       } catch (readyError) {
         viewHostContentLog("pool-ready-error", {

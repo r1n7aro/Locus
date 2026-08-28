@@ -53,6 +53,7 @@ pub mod plugin;
 pub mod process_util;
 pub mod prompt;
 pub mod python_runtime;
+pub mod resource_policy;
 mod runtime_data_lock;
 mod runtime_paths;
 mod sdk;
@@ -77,6 +78,10 @@ mod windows_resize_sync;
 #[cfg(target_os = "windows")]
 mod windows_window_frame;
 mod workspace;
+pub mod workspace_definition_registry;
+pub mod workspace_service;
+pub mod workspace_tool_registry;
+mod workspace_tree;
 
 use agent::definition::AgentDefRegistry;
 use agent::instance::{AssistantStreamState, RawContextStore};
@@ -87,6 +92,43 @@ const MAIN_WINDOW_CLOSE_REQUESTED_EVENT: &str = "locus-main-window-close-request
 const MAIN_TRAY_ID: &str = "locus-main-tray";
 const TRAY_MENU_SHOW_ID: &str = "locus-tray-show";
 const TRAY_MENU_EXIT_ID: &str = "locus-tray-exit";
+
+fn legacy_active_session_candidates(data_dir: &std::path::Path) -> Vec<String> {
+    let path = data_dir.join("active_session_selection.json");
+    let Some(by_workspace) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("byWorkspace")
+                .or_else(|| value.get("by_workspace"))
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+        })
+    else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    if let Some(session_id) = by_workspace
+        .get("__global__")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+    {
+        candidates.push(session_id.to_string());
+    }
+    for session_id in by_workspace
+        .values()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+    {
+        if !candidates.iter().any(|candidate| candidate == session_id) {
+            candidates.push(session_id.to_string());
+        }
+    }
+    candidates
+}
 
 #[derive(Clone)]
 struct StartupTrace {
@@ -230,20 +272,14 @@ impl AgentDefRegistryState {
     }
 }
 
-use asset_db::watcher::AssetDbWatcher;
 pub use asset_db::AssetDbState;
 use auth::codex::CodexAuthState;
 use auth::AuthState;
 use commands::CodexAuthStateHandle;
 use config::{AppCloseBehavior, AppConfig};
 
-pub type AssetDbWatcherHandle = Arc<std::sync::Mutex<Option<AssetDbWatcher>>>;
-pub type KnowledgeFsWatcherHandle =
-    Arc<std::sync::Mutex<Option<knowledge_watcher::KnowledgeFsWatcher>>>;
 use session::store::SessionStore;
 use tool::ToolRegistry;
-use unity_bridge::UnityMonitorHandle;
-use workspace::Workspace;
 
 pub struct ActiveTaskHandle {
     pub run_id: String,
@@ -420,6 +456,37 @@ pub fn run() {
         .on_window_event(|window, event| {
             commands::handle_locus_window_event(window, event);
             commands::handle_sub_window_event(window, event);
+            // Process exit destroys every native window. Preserve the last
+            // durable pane projection so the next process can restore all
+            // windows/workspaces; interactive closes still detach normally.
+            if matches!(event, WindowEvent::Destroyed) && !commands::app_exit_started() {
+                if let Some(contexts) = window
+                    .app_handle()
+                    .try_state::<Arc<workspace_service::WindowContextRegistry>>()
+                {
+                    if let Some(persistence) = window
+                        .app_handle()
+                        .try_state::<Arc<commands::WindowContextPersistence>>()
+                    {
+                        if let Ok(_mutation) = persistence.mutation.lock() {
+                            if let Ok(intent_epoch) =
+                                contexts.next_window_intent_epoch(window.label())
+                            {
+                                let _ = contexts.remove_window(window.label(), intent_epoch);
+                            }
+                            let _ = commands::persist_window_context_recovery(
+                                window.app_handle(),
+                                &contexts,
+                            );
+                        }
+                    } else {
+                        if let Ok(intent_epoch) = contexts.next_window_intent_epoch(window.label())
+                        {
+                            let _ = contexts.remove_window(window.label(), intent_epoch);
+                        }
+                    }
+                }
+            }
             if window.label() != MAIN_WINDOW_LABEL {
                 return;
             }
@@ -437,7 +504,8 @@ pub fn run() {
         .setup(move |app| {
             startup_for_setup.mark("setup_start");
             log_store_for_setup.attach_app_handle(app.handle().clone());
-            if let Err(error) = commands::ensure_windows_notification_identity(&app.handle().clone())
+            if let Err(error) =
+                commands::ensure_windows_notification_identity(&app.handle().clone())
             {
                 eprintln!(
                     "[Locus] warning: failed to prepare Windows notification identity: {}",
@@ -466,17 +534,41 @@ pub fn run() {
             debug_flag_for_setup.store(loaded_config.debug_enabled(), Ordering::Relaxed);
             loaded_config.debug = debug_flag_for_setup.clone();
             let config = Arc::new(loaded_config);
+            let resource_policy = Arc::new(
+                resource_policy::ResourcePolicyStore::from_config(config.clone())
+                    .map_err(|error| format!("Invalid workspace resource policy: {error}"))?,
+            );
+            let workspace_service_factories: Vec<
+                Arc<dyn workspace_service::service::WorkspaceServiceFactory>,
+            > = vec![Arc::new(
+                workspace_service::unity::UnityServiceFactory::new(
+                    app.handle().clone(),
+                    config.clone(),
+                ),
+            )];
+            let workspace_registry = workspace_service::ProjectRegistry::new(
+                resource_policy.clone(),
+                workspace_service_factories,
+            );
+            let window_contexts = Arc::new(workspace_service::WindowContextRegistry::new());
+            let window_context_persistence =
+                Arc::new(commands::WindowContextPersistence::default());
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             unity_bridge::initialize_state_probe(config.unity_state_probe_enabled());
             unity_bridge::initialize_native_bridge(config.unity_native_bridge_enabled());
             unity_bridge::initialize_external_editor_default(
                 config.unity_external_editor_default_enabled(),
             );
-            csharp_lsp::initialize(config.csharp_lsp_enabled(), app.handle().clone());
+            csharp_lsp::initialize(
+                config.csharp_lsp_enabled(),
+                app.handle().clone(),
+                resource_policy.clone(),
+            );
             csharp_compile::initialize(
                 config.unity_sidecar_compiler_enabled(),
                 config.unity_non_public_access_enabled(),
                 app.handle().clone(),
+                resource_policy.clone(),
             );
             csharp_compile::set_in_process_fallback(
                 config.unity_in_process_compile_fallback_enabled(),
@@ -515,12 +607,75 @@ pub fn run() {
                 SessionStore::new_with_tool_results_root(&data_dir, tool_results_root)
                     .map_err(|e| format!("Failed to initialize SessionStore: {}", e))?,
             );
+            workspace_registry
+                .attach_session_store(&store)
+                .map_err(|error| format!("Failed to attach project session catalog: {error}"))?;
             startup_for_setup.mark("setup_session_store_ready");
             // Deleted sessions leave locus.db at its high-water mark (SQLite
             // never returns freelist pages to the OS on its own); reclaim in
             // the background when most of the file is dead space.
             store.clone().spawn_vacuum_if_fragmented();
 
+            let watcher_tuning = Arc::new(crate::asset_db::watcher::WatcherTuning::new());
+            // Runtime registration is the single initialization boundary for
+            // every open path, including startup recovery and session-driven
+            // activation of persisted checkouts.
+            app.manage(workspace_registry.clone());
+            {
+                let registration_store = Arc::clone(&store);
+                let registration_app_handle = app.handle().clone();
+                let registration_watcher_tuning = Arc::clone(&watcher_tuning);
+                workspace_registry
+                    .add_runtime_registration_hook(Arc::new(move |runtime| {
+                        let opened_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        registration_store.upsert_workspace_checkout(
+                            &session::models::WorkspaceCheckoutRecord {
+                                checkout_id: runtime.checkout_id().to_string(),
+                                project_id: runtime.project_id().to_string(),
+                                root_path: runtime.root().display().to_string(),
+                                normalized_root: runtime.normalized_root().to_string(),
+                                last_opened_at: opened_at,
+                            },
+                        )?;
+                        workspace_service::restore_or_persist_service_settings(
+                            registration_store.as_ref(),
+                            runtime,
+                        )?;
+                        runtime.core().start_background_watchers(
+                            runtime,
+                            &registration_app_handle,
+                            Arc::clone(&registration_watcher_tuning),
+                        )
+                    }))
+                    .map_err(|error| {
+                        format!("Failed to register workspace initialization hook: {error}")
+                    })?;
+            }
+            startup_for_setup.mark("setup_workspace_runtime_data_plane_ready");
+
+            let recovered_window_contexts = commands::load_window_context_recovery(&data_dir);
+            let legacy_active_session_candidates = legacy_active_session_candidates(&data_dir);
+            let recovered_main_context = recovered_window_contexts
+                .iter()
+                .find(|context| context.window_id == MAIN_WINDOW_LABEL && context.pane_id == "main")
+                .cloned();
+            let recovered_main_root = recovered_main_context
+                .as_ref()
+                .and_then(|context| {
+                    store
+                        .get_workspace_checkout(context.focused_checkout_id.as_str())
+                        .ok()
+                        .flatten()
+                })
+                .map(|checkout| checkout.root_path)
+                .filter(|root| std::path::Path::new(root).is_dir());
+
+            // `working_dir.txt` is a one-time upgrade input. It is converted
+            // into the durable main/main recovery context below and never
+            // participates in backend request routing.
             let working_dir_file = data_dir.join("working_dir.txt");
             let driver_working_dir = cli_driver_for_setup
                 .as_ref()
@@ -540,11 +695,13 @@ pub fn run() {
                         .map(|value| value.display().to_string())
                         .unwrap_or(path)
                 });
-            let requested_working_dir = runtime_workspace_for_setup
+            let explicit_main_root = runtime_workspace_for_setup
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .or(driver_working_dir);
-            let initial_working_dir = requested_working_dir.unwrap_or_else(|| {
+            let legacy_migration_root = (explicit_main_root.is_none()
+                && recovered_main_root.is_none())
+            .then(|| {
                 std::fs::read_to_string(&working_dir_file)
                     .ok()
                     .and_then(|s| {
@@ -555,25 +712,43 @@ pub fn run() {
                             None
                         }
                     })
-                    .unwrap_or_default()
-            });
-            println!("[Locus] working_dir: {}", initial_working_dir);
+            })
+            .flatten();
+            let requested_main_root = explicit_main_root.or(legacy_migration_root);
+            let restored_window_contexts = commands::restore_persisted_window_contexts(
+                recovered_window_contexts,
+                requested_main_root.as_deref(),
+                &legacy_active_session_candidates,
+                workspace_registry.as_ref(),
+                window_contexts.as_ref(),
+                store.as_ref(),
+            )
+            .map_err(|error| format!("Failed to restore workspace contexts: {error}"))?;
+            for warning in &restored_window_contexts.warnings {
+                eprintln!("[Locus] warning: {warning}");
+            }
+            println!(
+                "[Locus] restored {} workspace pane context(s)",
+                restored_window_contexts.restored_panes
+            );
+            let initial_workspace_runtime = restored_window_contexts.main_runtime;
+            let main_workspace_root = initial_workspace_runtime
+                .as_ref()
+                .map(|runtime| runtime.root().display().to_string())
+                .unwrap_or_default();
+            println!("[Locus] main workspace: {}", main_workspace_root);
 
-            if !initial_working_dir.is_empty() {
-                let _ = std::fs::write(&working_dir_file, &initial_working_dir);
-                commands::save_recent_dir_pub(&data_dir, &initial_working_dir);
+            if let Some(runtime) = initial_workspace_runtime.as_ref() {
+                commands::save_recent_dir_pub(&data_dir, &runtime.root().to_string_lossy());
             }
 
-            let initial_workspace_id = if !initial_working_dir.is_empty() {
-                workspace::load_or_create_workspace(&initial_working_dir).ok()
-            } else {
-                None
-            };
-            if !initial_working_dir.is_empty()
-                && unity_bridge::is_unity_project(&initial_working_dir)
+            if let Some(runtime) = initial_workspace_runtime
+                .as_ref()
+                .filter(|runtime| unity_bridge::is_unity_project(&runtime.root().to_string_lossy()))
             {
+                let runtime_root = runtime.root().to_string_lossy();
                 if let Err(error) = unity_bridge::sync_native_bridge_marker(
-                    &initial_working_dir,
+                    &runtime_root,
                     config.unity_native_bridge_enabled(),
                 ) {
                     eprintln!(
@@ -582,7 +757,7 @@ pub fn run() {
                     );
                 }
                 if let Err(error) = unity_bridge::sync_background_hook_marker(
-                    &initial_working_dir,
+                    &runtime_root,
                     config.unity_background_hook_enabled(),
                 ) {
                     eprintln!(
@@ -591,7 +766,7 @@ pub fn run() {
                     );
                 }
                 if let Err(error) = unity_bridge::sync_unity_embed_enabled_marker(
-                    &initial_working_dir,
+                    &runtime_root,
                     config.unity_embed_enabled(),
                 ) {
                     eprintln!(
@@ -600,15 +775,21 @@ pub fn run() {
                     );
                 }
             }
-            println!("[Locus] workspace_id: {:?}", initial_workspace_id);
             startup_for_setup.mark("setup_workspace_ready");
 
-            let initial_working_dir_copy = initial_working_dir.clone();
-            let workspace = Arc::new(Workspace::new(initial_working_dir, initial_workspace_id));
-            let pending_external_script_open =
-                unity_bridge::PendingExternalScriptOpenRequest::new(
-                    external_script_open_for_setup.clone(),
-                );
+            commands::persist_window_context_recovery(app.handle(), &window_contexts).map_err(
+                |error| format!("Failed to persist restored workspace contexts: {error}"),
+            )?;
+            if working_dir_file.exists() {
+                let _ = std::fs::remove_file(&working_dir_file);
+            }
+            let legacy_active_session_file = data_dir.join("active_session_selection.json");
+            if legacy_active_session_file.exists() {
+                let _ = std::fs::remove_file(legacy_active_session_file);
+            }
+            let pending_external_script_open = unity_bridge::PendingExternalScriptOpenRequest::new(
+                external_script_open_for_setup.clone(),
+            );
 
             let mut app_agent_dir_candidates = Vec::new();
             #[cfg(debug_assertions)]
@@ -635,24 +816,42 @@ pub fn run() {
             if app_agent_dir.0.is_none() {
                 println!("[Locus] no app agent dir found");
             }
+            let workspace_definitions = Arc::new(
+                workspace_definition_registry::WorkspaceDefinitionRegistry::new(
+                    app_agent_dir.0.as_ref().clone(),
+                ),
+            );
+            {
+                let definitions = Arc::downgrade(&workspace_definitions);
+                workspace_registry
+                    .add_runtime_retirement_hook(Arc::new(move |runtime| {
+                        if let Some(definitions) = definitions.upgrade() {
+                            let _ = definitions
+                                .remove_generation(runtime.checkout_id(), runtime.generation());
+                        }
+                        crate::csharp_compile::retire_workspace_generation(
+                            runtime.checkout_id(),
+                            runtime.generation(),
+                        );
+                        crate::view::retire_workspace_runtime(runtime);
+                    }))
+                    .map_err(|error| {
+                        format!("Failed to register workspace retirement cleanup: {error}")
+                    })?;
+            }
+            workspace_registry.spawn_idle_reaper();
 
-            let project_agent_dir = std::path::Path::new(&initial_working_dir_copy)
-                .join("Locus")
-                .join("agent");
-            let project_agent_opt = if project_agent_dir.is_dir() {
-                println!("[Locus] project agent dir: {:?}", project_agent_dir);
-                Some(project_agent_dir.as_path())
-            } else {
-                None
-            };
-
+            // The process-level registry is the immutable app base. Checkout
+            // Agent and plugin overlays are resolved through
+            // WorkspaceDefinitionRegistry at request time.
             let initial_registry = AgentDefRegistry::load_with_plugins(
                 app_agent_dir.0.as_deref(),
-                project_agent_opt,
-                &crate::plugin::installed_agent_sources(&initial_working_dir_copy),
+                None,
+                &crate::plugin::installed_agent_sources(""),
             );
             let initial_subagents = initial_registry.list_subagent_descriptions();
-            let registry = AgentDefRegistryState(Arc::new(tokio::sync::RwLock::new(initial_registry)));
+            let registry =
+                AgentDefRegistryState(Arc::new(tokio::sync::RwLock::new(initial_registry)));
             startup_for_setup.mark("setup_agents_ready");
 
             let app_knowledge_dir = AppKnowledgeDir(Arc::new(
@@ -665,27 +864,6 @@ pub fn run() {
             if app_knowledge_dir.0.is_none() {
                 println!("[Locus] no app knowledge dir found");
             }
-
-            let knowledge_library_dir = if initial_working_dir_copy.trim().is_empty() {
-                knowledge_index::no_workspace_library_dir()
-            } else {
-                knowledge_index::library_dir_for_working_dir(&initial_working_dir_copy)
-            };
-            let knowledge_runtime =
-                knowledge_index::KnowledgeRuntime::open(&knowledge_library_dir, &data_dir)
-                    .map_err(|e| format!("Failed to initialize knowledge index runtime: {}", e))?;
-            let knowledge_index_state: Arc<knowledge_index::KnowledgeIndexState> =
-                Arc::new(knowledge_index::KnowledgeIndexState::new_with_app_handle(
-                    knowledge_runtime.db,
-                    knowledge_runtime.tantivy,
-                    knowledge_runtime.embedding_mgr,
-                    app.handle().clone(),
-                ));
-            let unity_reference_import_state = unity_docs::UnityReferenceImportState::default();
-            let feishu_reference_import_state = feishu_docs::FeishuReferenceImportState::default();
-            let local_reference_import_state = local_docs::LocalReferenceImportState::default();
-            let local_reference_watcher_state = local_docs::LocalReferenceWatcherState::default();
-            startup_for_setup.mark("setup_knowledge_runtime_ready");
 
             let mut tool_registry = ToolRegistry::with_builtins();
             let skill_tool_count = commands::register_skill_package_tools(&mut tool_registry);
@@ -709,6 +887,9 @@ pub fn run() {
                 );
             }
             let tool_registry = Arc::new(tool_registry);
+            let workspace_tool_registry = Arc::new(
+                workspace_tool_registry::WorkspaceToolRegistry::new(tool_registry.clone()),
+            );
             println!("[Locus] tool registry initialized with built-in tools");
             startup_for_setup.mark("setup_tool_registry_ready");
 
@@ -722,8 +903,9 @@ pub fn run() {
                 Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
             let active_tasks: ActiveTasks = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let pending_input_queue: PendingInputQueueHandle =
-                Arc::new(std::sync::Mutex::new(session::pending_inputs::PendingInputQueue::default()));
+            let pending_input_queue: PendingInputQueueHandle = Arc::new(std::sync::Mutex::new(
+                session::pending_inputs::PendingInputQueue::default(),
+            ));
             let async_task_manager = Arc::new(async_tasks::AsyncTaskManager::default());
 
             let question_store: QuestionStore = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
@@ -735,7 +917,10 @@ pub fn run() {
             let undo_valid_sessions = match store.list_all_session_ids() {
                 Ok(ids) => Some(ids.into_iter().collect::<std::collections::HashSet<_>>()),
                 Err(e) => {
-                    eprintln!("[Locus] failed to list session ids for undo reconcile: {}", e);
+                    eprintln!(
+                        "[Locus] failed to list session ids for undo reconcile: {}",
+                        e
+                    );
                     None
                 }
             };
@@ -785,228 +970,10 @@ pub fn run() {
                 ToolPermissions(Arc::new(tokio::sync::RwLock::new(initial_tool_perms)));
             startup_for_setup.mark("setup_permissions_ready");
 
-            let unity_monitor: UnityMonitorHandle = Arc::new(tokio::sync::Mutex::new(None));
-
-            let last_scan_info_state = commands::asset::LastScanInfoState::new();
-            let scan_phase_state = commands::asset::ScanPhaseState::new();
-            let preview_cache = commands::asset::WorkspacePreviewCache::new();
-            let dir_entries_cache = commands::DirEntriesPageCache::new();
-
-            let mut startup_ref_graph_reconcile: Option<(
-                std::path::PathBuf,
-                Arc<std::sync::Mutex<Option<asset_db::AssetDb>>>,
-            )> = None;
-            let ref_graph_state = match asset_db::AssetDb::load_existing(std::path::Path::new(
-                &initial_working_dir_copy,
-            )) {
-                asset_db::LoadExistingAssetDb::Ready(graph) => {
-                    let project_root = std::path::Path::new(&initial_working_dir_copy);
-                    match commands::asset::read_persisted_last_scan_info(
-                        std::path::Path::new(&initial_working_dir_copy),
-                    ) {
-                        Ok(Some(info)) => last_scan_info_state.set(info),
-                        Ok(None) => {}
-                        Err(err) => {
-                            eprintln!(
-                                "[Locus] warning: failed to load persisted asset scan info: {}",
-                                err
-                            );
-                        }
-                    };
-                    let db_path = project_root.join("Library").join("Locus").join("locus.db");
-                    eprintln!("[Locus] existing ref_graph DB loaded: {}", db_path.display());
-                    let graph_state = Arc::new(std::sync::Mutex::new(Some(graph)));
-                    startup_ref_graph_reconcile =
-                        Some((project_root.to_path_buf(), graph_state.clone()));
-                    AssetDbState(graph_state)
-                }
-                asset_db::LoadExistingAssetDb::NeedsRescan(issue) => {
-                    if let Err(err) = commands::asset::delete_persisted_last_scan_info(
-                        std::path::Path::new(&initial_working_dir_copy),
-                    ) {
-                        eprintln!(
-                            "[Locus] warning: failed to clear stale asset scan info: {}",
-                            err
-                        );
-                    }
-                    eprintln!(
-                        "[Locus] existing ref_graph DB invalidated, rescan required: {}",
-                        issue.message
-                    );
-                    scan_phase_state.set(Some(asset_db::types::ScanPhase::Error {
-                        error: issue.to_app_error(),
-                    }));
-                    AssetDbState(Arc::new(std::sync::Mutex::new(None)))
-                }
-                asset_db::LoadExistingAssetDb::Missing => {
-                    if let Err(err) = commands::asset::delete_persisted_last_scan_info(
-                        std::path::Path::new(&initial_working_dir_copy),
-                    ) {
-                        eprintln!(
-                            "[Locus] warning: failed to clear stale asset scan info: {}",
-                            err
-                        );
-                    }
-                    eprintln!("[Locus] no existing ref_graph DB, waiting for manual scan");
-                    AssetDbState(Arc::new(std::sync::Mutex::new(None)))
-                }
-            };
-            startup_for_setup.mark("setup_asset_db_ready");
-
-            let watcher_handle: AssetDbWatcherHandle = Arc::new(std::sync::Mutex::new(None));
-            let knowledge_watcher_handle: KnowledgeFsWatcherHandle =
-                Arc::new(std::sync::Mutex::new(None));
-            let watcher_tuning = Arc::new(crate::asset_db::watcher::WatcherTuning::new());
-            let ref_graph_scan_task_state = commands::RefGraphScanTaskState::new();
-            let asset_reconcile_task_state = commands::asset::AssetDbReconcileTaskState::new();
-
-            if ref_graph_state.0.lock().unwrap().is_some() {
-                let graph_arc = ref_graph_state.0.clone();
-                let watcher_root = std::path::PathBuf::from(&initial_working_dir_copy);
-                match AssetDbWatcher::start(watcher_root, graph_arc, watcher_tuning.clone()) {
-                    Ok(w) => {
-                        *watcher_handle.lock().unwrap() = Some(w);
-                        eprintln!("[Locus] ref_graph watcher started (from existing DB)");
-                    }
-                    Err(e) => {
-                        eprintln!("[Locus] warning: failed to start ref_graph watcher: {}", e);
-                    }
-                }
-            }
-
-            if let Some((project_root, graph_state)) = startup_ref_graph_reconcile.take() {
-                let startup_for_reconcile = startup_for_setup.clone();
-                let workspace_generation = workspace.generation();
-                let registration = asset_reconcile_task_state.register(
-                    project_root.display().to_string(),
-                    workspace_generation,
-                );
-                let cancel_token = registration.cancel_token();
-                scan_phase_state.set(Some(asset_db::types::ScanPhase::reconcile_started(true)));
-                let app_handle_for_reconcile = app.handle().clone();
-                let scan_phase_state_for_reconcile = scan_phase_state.clone();
-                let workspace_for_reconcile = workspace.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    let _registration = registration;
-                    startup_for_reconcile.mark("asset_reconcile_task_start");
-                    let started_at = Instant::now();
-                    let app_handle_for_progress = app_handle_for_reconcile.clone();
-                    let scan_phase_state_for_progress = scan_phase_state_for_reconcile.clone();
-                    let workspace_for_progress = workspace_for_reconcile.clone();
-                    match asset_db::watcher::reconcile_graph_state_with_cancel_and_progress(
-                        &project_root,
-                        graph_state,
-                        &cancel_token,
-                        true,
-                        |progress| {
-                            if workspace_for_progress.generation() != workspace_generation {
-                                return;
-                            }
-                            let phase = progress.to_scan_phase();
-                            let _ = app_handle_for_progress.emit("ref-graph-scan", &phase);
-                            scan_phase_state_for_progress.set(Some(phase));
-                        },
-                    ) {
-                        Ok(stats) => {
-                            if cancel_token.load(std::sync::atomic::Ordering::Relaxed)
-                                || workspace_for_reconcile.generation() != workspace_generation
-                            {
-                                eprintln!(
-                                    "[Locus] existing ref_graph DB background reconcile cancelled: elapsed={}ms",
-                                    started_at.elapsed().as_millis()
-                                );
-                            } else {
-                                tracing::info!(
-                                    log_module = "Locus",
-                                    "existing ref_graph DB reconciled in background: queued={}, processed={}, failed={}, elapsed={}ms",
-                                    stats.queued,
-                                    stats.processed,
-                                    stats.failed,
-                                    started_at.elapsed().as_millis()
-                                );
-                                let phase = asset_db::types::ScanPhase::ReconcileDone;
-                                let _ = app_handle_for_reconcile.emit("ref-graph-scan", &phase);
-                                if scan_phase_state_for_reconcile
-                                    .snapshot()
-                                    .as_ref()
-                                    .map(|phase| {
-                                        matches!(phase, asset_db::types::ScanPhase::Reconcile { .. })
-                                    })
-                                    .unwrap_or(false)
-                                {
-                                    scan_phase_state_for_reconcile.clear();
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "[Locus] existing ref_graph DB background reconcile failed: {}",
-                                err
-                            );
-                            if !cancel_token.load(std::sync::atomic::Ordering::Relaxed)
-                                && workspace_for_reconcile.generation() == workspace_generation
-                            {
-                                let phase = asset_db::types::ScanPhase::Error {
-                                    error: crate::error::AppError::new(
-                                        "ref_graph.rescan_required.reconcile_failed",
-                                        "Persisted asset database could not be verified. Run a rescan to rebuild it.",
-                                    )
-                                    .detail(err)
-                                    .retryable(true),
-                                };
-                                let _ = app_handle_for_reconcile.emit("ref-graph-scan", &phase);
-                                scan_phase_state_for_reconcile.set(Some(phase));
-                            }
-                        }
-                    }
-                    startup_for_reconcile.mark("asset_reconcile_task_done");
-                });
-            }
-
-            if !initial_working_dir_copy.trim().is_empty() {
-                if let Err(error) =
-                    crate::knowledge_store::ensure_workspace_knowledge_layout(&initial_working_dir_copy)
-                {
-                    eprintln!(
-                        "[Locus] warning: failed to prepare knowledge roots before watcher start: {}",
-                        error
-                    );
-                }
-                match knowledge_watcher::KnowledgeFsWatcher::start(
-                    app.handle().clone(),
-                    initial_working_dir_copy.clone(),
-                    app_knowledge_dir.0.as_ref().as_ref().cloned(),
-                    knowledge_index_state.clone(),
-                ) {
-                    Ok(watcher) => {
-                        *knowledge_watcher_handle.lock().unwrap() = Some(watcher);
-                        eprintln!("[Locus] knowledge fs watcher started");
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "[Locus] warning: failed to start knowledge fs watcher: {}",
-                            error
-                        );
-                    }
-                }
-                {
-                    let app_handle = app.handle().clone();
-                    let working_dir = initial_working_dir_copy.clone();
-                    let knowledge_index_state = knowledge_index_state.clone();
-                    let watcher_state = local_reference_watcher_state.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        local_docs::restore_live_watchers(
-                            app_handle,
-                            working_dir,
-                            knowledge_index_state,
-                            watcher_state,
-                        );
-                    });
-                }
-            }
-            startup_for_setup.mark("setup_watchers_ready");
-
             app.manage(config);
+            app.manage(resource_policy);
+            app.manage(window_contexts);
+            app.manage(window_context_persistence);
             app.manage(pending_external_script_open);
             app.manage(auth_state);
             app.manage(codex_state);
@@ -1014,27 +981,20 @@ pub fn run() {
             app.manage(app_knowledge_dir);
             app.manage(app_agent_dir);
             app.manage(provider_keys);
-            app.manage(store);
+            app.manage(store.clone());
             app.manage(registry);
+            app.manage(workspace_definitions);
             app.manage(tool_registry);
+            app.manage(workspace_tool_registry);
             app.manage(std::sync::Arc::new(mcp::server::McpServerHandle::default()));
             app.manage(std::sync::Arc::new(sdk::SdkServerHandle::default()));
-            app.manage(workspace.clone());
             app.manage(raw_context_store);
             app.manage(active_tasks);
             app.manage(pending_input_queue);
             app.manage(async_task_manager);
-            app.manage(unity_monitor.clone());
-            app.manage(ref_graph_state);
-            app.manage(watcher_handle);
-            app.manage(knowledge_watcher_handle);
-            app.manage(crate::asset_db::watcher::WatcherTuningState(watcher_tuning));
-            app.manage(ref_graph_scan_task_state);
-            app.manage(asset_reconcile_task_state);
-            app.manage(last_scan_info_state);
-            app.manage(scan_phase_state);
-            app.manage(preview_cache);
-            app.manage(dir_entries_cache);
+            app.manage(crate::asset_db::watcher::WatcherTuningState(Arc::clone(
+                &watcher_tuning,
+            )));
             app.manage(question_store);
             app.manage(knowledge_proposal_drafts);
             app.manage(undo_manager);
@@ -1042,11 +1002,6 @@ pub fn run() {
             app.manage(tool_permission_mode);
             app.manage(tool_permissions);
             app.manage(binary_cache);
-            app.manage(knowledge_index_state.clone());
-            app.manage(unity_reference_import_state);
-            app.manage(feishu_reference_import_state);
-            app.manage(local_reference_import_state);
-            app.manage(local_reference_watcher_state.clone());
             app.manage(log_store_for_setup.clone());
             startup_for_setup.mark("setup_state_managed");
             startup_for_setup.mark("setup_backend_ready");
@@ -1065,7 +1020,7 @@ pub fn run() {
             }
 
             if let Some(cli_driver_config) = cli_driver_for_setup.clone() {
-                cli_driver::spawn(app.handle().clone(), workspace.clone(), cli_driver_config);
+                cli_driver::spawn(app.handle().clone(), cli_driver_config);
                 startup_for_setup.mark("setup_cli_driver_scheduled");
                 startup_for_setup.mark("setup_done");
                 return Ok(());
@@ -1103,28 +1058,23 @@ pub fn run() {
             }
             startup_for_setup.mark("setup_native_window_hooks_ready");
 
-            let app_handle = app.handle().clone();
-            let workspace_for_unity = workspace.clone();
+            let initial_runtime_for_unity = initial_workspace_runtime.clone();
+            let workspace_registry_for_unity = workspace_registry.clone();
             let startup_for_unity = startup_for_setup.clone();
             tauri::async_runtime::spawn(async move {
                 startup_for_unity.mark("unity_monitor_task_start");
-                let wd = workspace_for_unity.path.read().await.clone();
-                let is_unity = unity_bridge::is_unity_project(&wd);
-                eprintln!(
-                    "[Locus] working_dir='{}', is_unity_project={}",
-                    wd, is_unity
-                );
-                if is_unity {
-                    unity_bridge::start_unity_monitor(
-                        app_handle.clone(),
-                        wd.clone(),
-                        &unity_monitor,
-                    )
-                    .await;
-                    unity_bridge::emit_plugin_status(&app_handle, &wd);
-                    // Roslyn project loading takes seconds; start it now so
-                    // the first code_* tool call does not pay that latency.
-                    csharp_lsp::warm_up_in_background(wd.clone());
+                if let Some(runtime) = initial_runtime_for_unity.filter(|runtime| {
+                    unity_bridge::is_unity_project(&runtime.root().to_string_lossy())
+                }) {
+                    if let Err(error) = workspace_registry_for_unity
+                        .execution_context(
+                            runtime.checkout_id(),
+                            &[workspace_service::service::ServiceKind::Unity],
+                        )
+                        .await
+                    {
+                        eprintln!("[Locus] failed to start initial Unity service: {error}");
+                    }
                 }
                 startup_for_unity.mark("unity_monitor_task_done");
             });
@@ -1140,10 +1090,9 @@ pub fn run() {
                 let reports = mcp::manager::reconcile().await;
                 for report in &reports {
                     match &report.error {
-                        Some(error) => eprintln!(
-                            "[Mcp] startup connect failed for '{}': {error}",
-                            report.id
-                        ),
+                        Some(error) => {
+                            eprintln!("[Mcp] startup connect failed for '{}': {error}", report.id)
+                        }
                         None => eprintln!(
                             "[Mcp] startup connected '{}' ({} tools)",
                             report.id,
@@ -1163,19 +1112,26 @@ pub fn run() {
                 });
             }
 
-            let knowledge_startup_state = knowledge_index_state.clone();
-            let workspace_for_knowledge = workspace.clone();
+            let initial_runtime_for_knowledge = initial_workspace_runtime.clone();
             let app_handle_for_knowledge = app.handle().clone();
             let startup_for_knowledge = startup_for_setup.clone();
             tauri::async_runtime::spawn(async move {
                 startup_for_knowledge.mark("knowledge_startup_task_start");
-                let wd = workspace_for_knowledge.path.read().await.clone();
-                if wd.trim().is_empty() {
+                let Some(runtime) = initial_runtime_for_knowledge else {
                     startup_for_knowledge.mark("knowledge_startup_task_skipped");
                     return;
-                }
+                };
+                let wd = runtime.root().to_string_lossy().to_string();
                 let app_knowledge_dir: tauri::State<'_, AppKnowledgeDir> =
                     app_handle_for_knowledge.state();
+                let knowledge_startup_state =
+                    match runtime.knowledge_index(&app_handle_for_knowledge) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            eprintln!("[Locus] knowledge index startup error: {error}");
+                            return;
+                        }
+                    };
                 if let Err(e) = knowledge_index::maybe_auto_activate_embedding_runtime(
                     knowledge_startup_state.clone(),
                     &wd,
@@ -1211,12 +1167,19 @@ pub fn run() {
             commands::insert_pending_chat_input,
             commands::delete_pending_chat_input,
             commands::list_agents,
+            commands::list_workspace_agents,
             commands::list_subagent_defs,
+            commands::list_workspace_subagent_defs,
             commands::get_agent_system_prompt,
+            commands::get_workspace_agent_system_prompt,
             commands::get_agent_env_template,
+            commands::get_workspace_agent_env_template,
             commands::get_agent_rendered_env_prompt,
+            commands::get_workspace_agent_rendered_env_prompt,
             commands::get_agent_system_prompt_stats,
+            commands::get_workspace_agent_system_prompt_stats,
             commands::list_agent_injected_items,
+            commands::list_workspace_agent_injected_items,
             commands::set_agent_injection_enabled,
             commands::set_agent_tool_direct_load,
             commands::set_agent_tool_enabled,
@@ -1228,9 +1191,10 @@ pub fn run() {
             commands::save_session_execution_state,
             commands::get_compacted_context_output,
             commands::list_sessions,
+            commands::list_checkout_sessions,
+            commands::list_project_sessions,
             commands::list_archived_sessions,
-            commands::get_active_session_selection,
-            commands::save_active_session_selection,
+            commands::list_archived_checkout_sessions,
             commands::rename_session,
             commands::archive_session,
             commands::unarchive_session,
@@ -1260,8 +1224,20 @@ pub fn run() {
             commands::open_app_temp_dir,
             commands::schedule_app_storage_migration,
             commands::clear_app_storage_migration,
-            commands::get_working_dir,
-            commands::set_working_dir,
+            commands::get_workspace_service_resource_limits,
+            commands::set_workspace_service_resource_limits,
+            commands::get_workspace_service_resource_metrics,
+            commands::list_workspace_runtimes,
+            commands::list_project_contexts,
+            commands::open_workspace,
+            commands::focus_workspace,
+            commands::set_active_session,
+            commands::detach_workspace_pane,
+            commands::detach_workspace_window,
+            commands::list_window_workspace_contexts,
+            commands::list_window_workspace_intent_epochs,
+            commands::start_workspace_unity_service,
+            commands::get_workspace_service_states,
             commands::list_recent_dirs,
             commands::remove_recent_dir,
             commands::extra_workdirs_get,
@@ -1302,6 +1278,7 @@ pub fn run() {
             commands::check_unity_plugin_install_plan,
             commands::install_unity_plugin,
             commands::launch_unity_project,
+            commands::close_headless_unity_project,
             commands::unity_recompile_run,
             commands::unity_recompile_probe_run,
             commands::unity_execute_snippet_run,
@@ -1341,6 +1318,7 @@ pub fn run() {
             commands::answer_question,
             commands::git_log,
             commands::git_history_snapshot,
+            commands::project_collaboration_snapshot,
             commands::git_history_search,
             commands::git_commit_body,
             commands::git_probe,
@@ -1396,10 +1374,6 @@ pub fn run() {
             commands::knowledge_get_local_embedding_model_catalog,
             commands::knowledge_download_local_embedding_model,
             commands::knowledge_cancel_local_embedding_model_download,
-            commands::knowledge_close_download_progress_window,
-            commands::knowledge_close_lexical_progress_window,
-            commands::knowledge_close_unity_reference_import_progress_window,
-            commands::knowledge_close_feishu_reference_import_progress_window,
             commands::knowledge_inspect_local_embedding_model_directory,
             commands::knowledge_rebuild_lexical_index,
             commands::knowledge_get_lexical_rebuild_status,
@@ -1415,14 +1389,28 @@ pub fn run() {
             commands::knowledge_cancel_unity_reference_import,
             commands::knowledge_cancel_feishu_reference_import,
             commands::knowledge_list,
+            commands::project_knowledge_list,
+            commands::project_explorer_snapshot,
+            commands::project_explorer_apply_operations,
+            commands::project_explorer_list_presets,
+            commands::project_explorer_create_preset,
+            commands::project_explorer_switch_preset,
+            commands::project_explorer_rename_preset,
+            commands::project_explorer_delete_preset,
+            commands::project_explorer_list_mount,
+            commands::project_explorer_preview_file,
+            commands::knowledge_list_scoped,
             commands::knowledge_list_page,
+            commands::knowledge_list_page_scoped,
             commands::knowledge_list_directories,
+            commands::knowledge_list_directories_scoped,
             commands::knowledge_list_directory_documents,
             commands::knowledge_list_directory_documents_page,
             commands::knowledge_list_external_reference_directories,
             commands::knowledge_list_unity_managed_directory_stats,
             commands::knowledge_query,
             commands::knowledge_read,
+            commands::knowledge_read_scoped,
             commands::knowledge_import_unity_reference_docs,
             commands::knowledge_import_feishu_reference_docs,
             commands::knowledge_delete_unity_reference_docs,
@@ -1477,6 +1465,8 @@ pub fn run() {
             commands::knowledge_reveal_target,
             commands::resolve_markdown_image,
             commands::preview_workspace_file,
+            commands::list_app_rules,
+            commands::read_app_rule,
             commands::list_rules,
             commands::save_rule,
             commands::read_rule,
@@ -1604,6 +1594,7 @@ pub fn run() {
             commands::get_running_task_count,
             commands::request_app_exit,
             commands::get_config_registry,
+            commands::get_workspace_config_registry,
             commands::get_log_entries,
             commands::clear_log_entries,
             commands::save_log_export,

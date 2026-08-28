@@ -4,15 +4,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::agent::definition::{app_agent_layer_dirs, canonical_agent_id};
 use crate::binary_cache::BinaryCache;
 use crate::error::{AppError, ErrorSeverity};
 use crate::feishu_docs::{
     self, FeishuReferenceConfigInput, FeishuReferenceConnectionTestResult,
-    FeishuReferenceImportRequest, FeishuReferenceImportState, FeishuReferenceImportStatus,
-    FeishuReferenceNodeSummary, FeishuReferenceOauthStartResult,
+    FeishuReferenceImportRequest, FeishuReferenceImportStatus, FeishuReferenceNodeSummary,
+    FeishuReferenceOauthStartResult,
 };
 use crate::knowledge_index::{
     self, EmbeddingActivationBackfillStrategy, EmbeddingConfig, EmbeddingLocalModelCatalog,
@@ -28,14 +28,14 @@ use crate::knowledge_store::{
     KnowledgeTargetKind, KnowledgeType, KnowledgeUpdateOp, KnowledgeUpdateRequest, SkillSurface,
 };
 use crate::local_docs::{
-    self, LocalReferenceImportRequest, LocalReferenceImportState, LocalReferenceImportStatus,
-    LocalReferenceScanPreview, LocalReferenceWatcherState,
+    self, LocalReferenceImportRequest, LocalReferenceImportStatus, LocalReferenceScanPreview,
 };
 use crate::tool::ToolRegistry;
-use crate::unity_docs::{
-    self, UnityManagedDirectoryStat, UnityReferenceImportState, UnityReferenceImportStatus,
+use crate::unity_docs::{self, UnityManagedDirectoryStat, UnityReferenceImportStatus};
+use crate::workspace_service::{
+    ProjectId, ProjectKnowledgeDocument, ProjectRegistry, ResolvedWorkspaceScope,
+    WorkspaceKnowledgeOperationStates, WorkspaceRef, WorkspaceResolveError,
 };
-use crate::workspace::Workspace;
 use crate::AgentDefRegistryState;
 
 #[derive(Clone)]
@@ -91,9 +91,83 @@ pub struct KnowledgeListPageResponse {
     pub next_cursor: Option<String>,
 }
 
-pub(crate) fn emit_knowledge_changed(app_handle: &AppHandle, working_dir: &str, source: &str) {
+fn knowledge_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
+    match error {
+        WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
+            "workspace.registry_unavailable",
+            "The workspace registry is unavailable.",
+        )
+        .detail(detail),
+        WorkspaceResolveError::CheckoutUnavailable { checkout_id } => AppError::new(
+            "workspace.checkout_unavailable",
+            "The requested checkout is unavailable.",
+        )
+        .detail(checkout_id.to_string()),
+        WorkspaceResolveError::StaleGeneration {
+            checkout_id,
+            expected_generation,
+            actual_generation,
+        } => AppError::new(
+            "workspace.generation_stale",
+            "The workspace runtime changed before the request was handled.",
+        )
+        .detail(format!(
+            "checkout={checkout_id}, expected={expected_generation}, actual={actual_generation}"
+        )),
+    }
+}
+
+fn resolve_knowledge_workspace_scope(
+    registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+) -> Result<ResolvedWorkspaceScope, AppError> {
+    registry
+        .resolve_workspace_ref(workspace_ref)
+        .map_err(knowledge_workspace_resolve_error)
+}
+
+fn knowledge_index_for_scope(
+    scope: &ResolvedWorkspaceScope,
+    app_handle: &AppHandle,
+) -> Result<Arc<KnowledgeIndexState>, AppError> {
+    scope
+        .runtime()
+        .knowledge_index(app_handle)
+        .map_err(|detail| {
+            AppError::new(
+                "knowledge.index_unavailable",
+                "Failed to initialize the checkout knowledge index.",
+            )
+            .detail(detail)
+        })
+}
+
+fn knowledge_checkout_operation_states(
+    scope: &ResolvedWorkspaceScope,
+) -> WorkspaceKnowledgeOperationStates {
+    scope.runtime().core().knowledge_operations()
+}
+
+fn knowledge_scope_parts(
+    registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    app_handle: &AppHandle,
+) -> Result<(ResolvedWorkspaceScope, String, Arc<KnowledgeIndexState>), AppError> {
+    let scope = resolve_knowledge_workspace_scope(registry, workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let knowledge_index = knowledge_index_for_scope(&scope, app_handle)?;
+    Ok((scope, working_dir, knowledge_index))
+}
+
+pub(crate) fn emit_knowledge_changed(
+    app_handle: &AppHandle,
+    knowledge_index_state: &KnowledgeIndexState,
+    working_dir: &str,
+    source: &str,
+) {
     emit_knowledge_changed_with_target(
         app_handle,
+        knowledge_index_state,
         working_dir,
         source,
         KnowledgeChangedTarget::default(),
@@ -102,6 +176,7 @@ pub(crate) fn emit_knowledge_changed(app_handle: &AppHandle, working_dir: &str, 
 
 pub(crate) fn emit_knowledge_changed_with_target(
     app_handle: &AppHandle,
+    knowledge_index_state: &KnowledgeIndexState,
     working_dir: &str,
     source: &str,
     target: KnowledgeChangedTarget,
@@ -117,12 +192,40 @@ pub(crate) fn emit_knowledge_changed_with_target(
         change_kind: target.change_kind.map(str::to_string),
         subtree: target.subtree,
     };
-    if let Err(error) = app_handle.emit(KNOWLEDGE_CHANGED_EVENT, payload) {
-        eprintln!(
-            "[Knowledge] failed to emit {} event for {}: {}",
-            KNOWLEDGE_CHANGED_EVENT, source, error
+    if let Some(scope) = knowledge_index_state.event_scope() {
+        crate::workspace_service::event::emit_for_workspace_scope(
+            app_handle,
+            &scope,
+            KNOWLEDGE_CHANGED_EVENT,
+            payload,
         );
     }
+}
+
+pub(crate) fn emit_knowledge_changed_with_target_for_scope(
+    app_handle: &AppHandle,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+    working_dir: &str,
+    source: &str,
+    target: KnowledgeChangedTarget,
+) {
+    let payload = KnowledgeChangedEvent {
+        working_dir: working_dir.to_string(),
+        source: source.to_string(),
+        changed_at: chrono::Utc::now().timestamp_millis(),
+        doc_type: target.doc_type.map(|value| value.as_str().to_string()),
+        path: target.path,
+        parent_path: target.parent_path,
+        target_kind: target.target_kind.map(str::to_string),
+        change_kind: target.change_kind.map(str::to_string),
+        subtree: target.subtree,
+    };
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        scope,
+        KNOWLEDGE_CHANGED_EVENT,
+        payload,
+    );
 }
 
 pub(crate) async fn reconcile_and_emit_knowledge_changed(
@@ -135,6 +238,13 @@ pub(crate) async fn reconcile_and_emit_knowledge_changed(
         return Ok(());
     }
 
+    let event_scope = knowledge_index_state.event_scope().ok_or_else(|| {
+        AppError::new(
+            "knowledge.workspace_scope_unavailable",
+            "The checkout knowledge event scope is unavailable.",
+        )
+        .operation(source)
+    })?;
     let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
     knowledge_index::reconcile_workspace(
         working_dir,
@@ -143,7 +253,41 @@ pub(crate) async fn reconcile_and_emit_knowledge_changed(
     )
     .await
     .map_err(AppError::from)?;
-    emit_knowledge_changed(app_handle, working_dir, source);
+    emit_knowledge_changed_with_target_for_scope(
+        app_handle,
+        &event_scope,
+        working_dir,
+        source,
+        KnowledgeChangedTarget::default(),
+    );
+    Ok(())
+}
+
+pub(crate) async fn reconcile_and_emit_knowledge_changed_for_scope(
+    app_handle: &AppHandle,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+    working_dir: &str,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    source: &str,
+) -> Result<(), AppError> {
+    if working_dir.trim().is_empty() {
+        return Ok(());
+    }
+    let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
+    knowledge_index::reconcile_workspace(
+        working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        knowledge_index_state,
+    )
+    .await
+    .map_err(AppError::from)?;
+    emit_knowledge_changed_with_target_for_scope(
+        app_handle,
+        scope,
+        working_dir,
+        source,
+        KnowledgeChangedTarget::default(),
+    );
     Ok(())
 }
 
@@ -233,6 +377,7 @@ pub(crate) async fn sync_visible_document_for_path(
 
 pub(crate) async fn sync_visible_documents_for_paths_and_emit(
     app_handle: &AppHandle,
+    event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     working_dir: &str,
     knowledge_index_state: Arc<KnowledgeIndexState>,
     source: &str,
@@ -248,7 +393,13 @@ pub(crate) async fn sync_visible_documents_for_paths_and_emit(
         )
         .await?;
     }
-    emit_knowledge_changed(app_handle, working_dir, source);
+    emit_knowledge_changed_with_target_for_scope(
+        app_handle,
+        event_scope,
+        working_dir,
+        source,
+        KnowledgeChangedTarget::default(),
+    );
     Ok(())
 }
 
@@ -430,10 +581,12 @@ pub fn save_skill_config(
 pub async fn get_skill_config(
     rel_path: String,
     source: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SkillConfig, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let map = load_skill_config(&working_dir);
+    let scope =
+        super::skill::resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    let map = load_skill_config(scope.working_dir());
     let key = normalize_skill_config_key(&rel_path, source.as_deref());
     Ok(map.get(&key).cloned().unwrap_or_default())
 }
@@ -450,11 +603,14 @@ pub async fn set_skill_config(
     read_only: Option<bool>,
     ai_edit_mode: Option<KnowledgeAiEditMode>,
     maintenance_rules: Option<String>,
+    workspace_ref: WorkspaceRef,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope =
+        super::skill::resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    let knowledge_index = scope.knowledge_index(&app_handle)?;
+    let working_dir = scope.working_dir().to_string();
     let mut map = load_skill_config(&working_dir);
     let previous_map = map.clone();
     let key = normalize_skill_config_key(&rel_path, source.as_deref());
@@ -489,7 +645,7 @@ pub async fn set_skill_config(
     if let Err(error) = reconcile_and_emit_knowledge_changed(
         &app_handle,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        Arc::clone(&knowledge_index),
         "set_skill_config",
     )
     .await
@@ -499,7 +655,7 @@ pub async fn set_skill_config(
             let _ = reconcile_and_emit_knowledge_changed(
                 &app_handle,
                 &working_dir,
-                knowledge_index_state.inner().clone(),
+                knowledge_index,
                 "set_skill_config_rollback",
             )
             .await;
@@ -518,10 +674,12 @@ pub async fn set_skill_config(
 
 #[tauri::command]
 pub async fn get_all_skill_configs(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<std::collections::HashMap<String, SkillConfig>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    Ok(load_skill_config(&working_dir))
+    let scope =
+        super::skill::resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    Ok(load_skill_config(scope.working_dir()))
 }
 
 fn parse_knowledge_type(value: &str) -> Result<KnowledgeType, String> {
@@ -1364,6 +1522,7 @@ fn ensure_skill_package_target_mutable(
 
 #[tauri::command]
 pub async fn knowledge_query(
+    workspace_ref: WorkspaceRef,
     query: Option<String>,
     lexical_query: Option<String>,
     semantic_query: Option<String>,
@@ -1371,11 +1530,12 @@ pub async fn knowledge_query(
     types: Option<Vec<String>>,
     path_prefix: Option<String>,
     include_hidden: Option<bool>,
-    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<Vec<KnowledgeSearchHit>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let lexical_query = lexical_query
         .or_else(|| query.clone())
         .map(|value| value.trim().to_string())
@@ -1424,7 +1584,7 @@ pub async fn knowledge_query(
         normalized_prefix.as_deref(),
         limit.unwrap_or(5),
         include_hidden.unwrap_or(false),
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
     )
     .await
     .map_err(Into::into)
@@ -1432,68 +1592,58 @@ pub async fn knowledge_query(
 
 #[tauri::command]
 pub async fn knowledge_get_general_config(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<KnowledgeGeneralConfig, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let library_dir = if working_dir.trim().is_empty() {
-        knowledge_index::no_workspace_library_dir()
-    } else {
-        knowledge_index::library_dir_for_working_dir(&working_dir)
-    };
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let library_dir =
+        knowledge_index::library_dir_for_working_dir(&scope.runtime().root().to_string_lossy());
     Ok(knowledge_index::load_general_config(&library_dir))
 }
 
 #[tauri::command]
 pub async fn knowledge_save_general_config(
+    workspace_ref: WorkspaceRef,
     config: KnowledgeGeneralConfig,
-    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<KnowledgeGeneralConfig, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let library_dir = if working_dir.trim().is_empty() {
-        knowledge_index::no_workspace_library_dir()
-    } else {
-        knowledge_index::library_dir_for_working_dir(&working_dir)
-    };
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let library_dir = knowledge_index::library_dir_for_working_dir(&working_dir);
     knowledge_index::save_general_config(&library_dir, &config)?;
-    if !working_dir.trim().is_empty() {
-        knowledge_index::reconcile_workspace(
-            &working_dir,
-            app_knowledge_dir.0.as_ref().as_ref(),
-            knowledge_index_state.inner().clone(),
-        )
-        .await?;
-    }
+    knowledge_index::reconcile_workspace(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        knowledge_index_state,
+    )
+    .await?;
     Ok(config)
 }
 
 #[tauri::command]
 pub async fn knowledge_get_embedding_config(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<EmbeddingConfig, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let library_dir = if working_dir.trim().is_empty() {
-        knowledge_index::no_workspace_library_dir()
-    } else {
-        knowledge_index::library_dir_for_working_dir(&working_dir)
-    };
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let library_dir =
+        knowledge_index::library_dir_for_working_dir(&scope.runtime().root().to_string_lossy());
     Ok(knowledge_index::embedding::load_config(&library_dir))
 }
 
 #[tauri::command]
 pub async fn knowledge_save_embedding_config(
+    workspace_ref: WorkspaceRef,
     config: EmbeddingConfig,
-    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<EmbeddingConfig, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let library_dir = if working_dir.trim().is_empty() {
-        knowledge_index::no_workspace_library_dir()
-    } else {
-        knowledge_index::library_dir_for_working_dir(&working_dir)
-    };
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let library_dir = knowledge_index::library_dir_for_working_dir(&working_dir);
     knowledge_index::embedding::save_config(&library_dir, &config)?;
     let normalized_config = knowledge_index::embedding::load_config(&library_dir);
     let (should_activate, backfill_strategy) = {
@@ -1520,28 +1670,29 @@ pub async fn knowledge_save_embedding_config(
     };
     if should_activate {
         knowledge_index::activate_embedding_runtime(
-            knowledge_index_state.inner().clone(),
+            knowledge_index_state.clone(),
             &working_dir,
             app_knowledge_dir.0.as_ref().as_ref(),
             backfill_strategy,
         )
         .await?;
     } else if !normalized_config.enabled {
-        knowledge_index::deactivate_embedding_runtime(knowledge_index_state.inner().clone())
-            .await?;
+        knowledge_index::deactivate_embedding_runtime(knowledge_index_state).await?;
     }
     Ok(normalized_config)
 }
 
 #[tauri::command]
 pub async fn knowledge_activate_embedding(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     knowledge_index::activate_embedding_runtime(
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
         &working_dir,
         app_knowledge_dir.0.as_ref().as_ref(),
         EmbeddingActivationBackfillStrategy::VectorOnly,
@@ -1552,32 +1703,37 @@ pub async fn knowledge_activate_embedding(
 
 #[tauri::command]
 pub async fn knowledge_deactivate_embedding(
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_ref: WorkspaceRef,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    knowledge_index::deactivate_embedding_runtime(knowledge_index_state.inner().clone())
+    let (_scope, _working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    knowledge_index::deactivate_embedding_runtime(knowledge_index_state)
         .await
         .map_err(Into::into)
 }
 
 #[tauri::command]
 pub async fn knowledge_get_embedding_status(
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_ref: WorkspaceRef,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<EmbeddingStatus, AppError> {
+    let (_scope, _working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     Ok(knowledge_index_state.embedding_status_snapshot())
 }
 
 #[tauri::command]
 pub async fn knowledge_test_embedding_runtime(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
     app_handle: AppHandle,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<EmbeddingRuntimeTestResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let library_dir = if working_dir.trim().is_empty() {
-        knowledge_index::no_workspace_library_dir()
-    } else {
-        knowledge_index::library_dir_for_working_dir(&working_dir)
-    };
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let library_dir = knowledge_index::library_dir_for_working_dir(&working_dir);
     let config = knowledge_index::embedding::load_config(&library_dir);
 
     let model_storage_dir = super::resolve_runtime_storage_dir(&app_handle)?;
@@ -1605,10 +1761,8 @@ pub async fn knowledge_test_embedding_runtime(
 
 #[tauri::command]
 pub async fn knowledge_get_local_embedding_model_catalog(
-    workspace: State<'_, Arc<Workspace>>,
     app_handle: AppHandle,
 ) -> Result<EmbeddingLocalModelCatalog, AppError> {
-    let _working_dir = workspace.path.read().await.clone();
     let model_storage_dir = super::resolve_runtime_storage_dir(&app_handle)?;
     Ok(knowledge_index::embedding::local_model_catalog(
         &model_storage_dir,
@@ -1617,15 +1771,16 @@ pub async fn knowledge_get_local_embedding_model_catalog(
 
 #[tauri::command]
 pub async fn knowledge_download_local_embedding_model(
+    workspace_ref: WorkspaceRef,
     model_id: String,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let model_storage_dir = super::resolve_runtime_storage_dir(&app_handle)?;
     match knowledge_index::download_local_embedding_model(
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state.clone(),
         &model_storage_dir,
         &model_id,
     )
@@ -1634,6 +1789,7 @@ pub async fn knowledge_download_local_embedding_model(
         Ok(()) => {
             emit_knowledge_changed(
                 &app_handle,
+                &knowledge_index_state,
                 &working_dir,
                 "knowledge_download_local_embedding_model",
             );
@@ -1655,94 +1811,20 @@ pub async fn knowledge_download_local_embedding_model(
 
 #[tauri::command]
 pub async fn knowledge_cancel_local_embedding_model_download(
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_ref: WorkspaceRef,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    knowledge_index_state
-        .inner()
-        .request_embedding_download_cancel();
-    let mut status = knowledge_index_state.inner().embedding_status_snapshot();
+    let (_scope, _working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    knowledge_index_state.request_embedding_download_cancel();
+    let mut status = knowledge_index_state.embedding_status_snapshot();
     if status.activating {
         status.stage = Some("cancelling".to_string());
         status.detail = Some("正在取消下载并清理已下载文件。".to_string());
         status.error = None;
-        knowledge_index_state.inner().set_embedding_status(status);
+        knowledge_index_state.set_embedding_status(status);
     }
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn knowledge_close_download_progress_window(
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let Some(window) = super::find_sub_window(&app_handle, KNOWLEDGE_DOWNLOAD_WINDOW_LABEL) else {
-        return Ok(());
-    };
-    window.close().map_err(|error| {
-        AppError::new(
-            "knowledge.download_window_close_failed",
-            format!("Failed to close download progress window: {}", error),
-        )
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn knowledge_close_lexical_progress_window(
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let Some(window) = super::find_sub_window(&app_handle, KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL)
-    else {
-        return Ok(());
-    };
-    window
-        .destroy()
-        .or_else(|_| window.close())
-        .map_err(|error| {
-            AppError::new(
-                "knowledge.lexical_window_close_failed",
-                format!("Failed to close lexical progress window: {}", error),
-            )
-        })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn knowledge_close_unity_reference_import_progress_window(
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let Some(window) = super::find_sub_window(&app_handle, UNITY_REFERENCE_IMPORT_WINDOW_LABEL)
-    else {
-        return Ok(());
-    };
-    window.close().map_err(|error| {
-        AppError::new(
-            "knowledge.unity_reference_import_window_close_failed",
-            format!(
-                "Failed to close unity reference import progress window: {}",
-                error
-            ),
-        )
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn knowledge_close_feishu_reference_import_progress_window(
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let Some(window) = super::find_sub_window(&app_handle, FEISHU_REFERENCE_IMPORT_WINDOW_LABEL)
-    else {
-        return Ok(());
-    };
-    window.close().map_err(|error| {
-        AppError::new(
-            "knowledge.feishu_reference_import_window_close_failed",
-            format!(
-                "Failed to close feishu reference import progress window: {}",
-                error
-            ),
-        )
-    })?;
     Ok(())
 }
 
@@ -1757,13 +1839,15 @@ pub async fn knowledge_inspect_local_embedding_model_directory(
 
 #[tauri::command]
 pub async fn knowledge_rebuild_lexical_index(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<usize, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     knowledge_index::rebuild_lexical_index_runtime(
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
         &working_dir,
         app_knowledge_dir.0.as_ref().as_ref(),
     )
@@ -1773,22 +1857,24 @@ pub async fn knowledge_rebuild_lexical_index(
 
 #[tauri::command]
 pub async fn knowledge_get_lexical_rebuild_status(
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_ref: WorkspaceRef,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<LexicalRebuildStatus, AppError> {
+    let (_scope, _working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     Ok(knowledge_index_state.lexical_rebuild_status_snapshot())
 }
 
 #[tauri::command]
 pub async fn knowledge_get_overview(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
     app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<KnowledgeOverview, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
-        return Ok(KnowledgeOverview::default());
-    }
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let started_at = Instant::now();
     eprintln!(
         "[KnowledgeCommand] knowledge_get_overview start workspace={}",
@@ -1798,7 +1884,7 @@ pub async fn knowledge_get_overview(
     let overview = knowledge_index::build_overview(
         &working_dir,
         app_knowledge_dir.0.as_ref().as_ref(),
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
         &model_storage_dir,
     )
     .await
@@ -1814,15 +1900,17 @@ pub async fn knowledge_get_overview(
 
 #[tauri::command]
 pub async fn knowledge_get_unity_reference_import_status(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
-    unity_reference_import_state: State<'_, UnityReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UnityReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     unity_docs::get_unity_reference_import_status(
         &working_dir,
         target_path.as_deref(),
-        unity_reference_import_state.inner().0.clone(),
+        states.unity_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -1830,9 +1918,11 @@ pub async fn knowledge_get_unity_reference_import_status(
 
 #[tauri::command]
 pub async fn knowledge_find_unity_reference_directory(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Option<KnowledgeDirectoryConfigRecord>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     knowledge_store::find_reference_directory_by_external_provider(
         &working_dir,
         KnowledgeSourceProvider::Unity,
@@ -1842,15 +1932,17 @@ pub async fn knowledge_find_unity_reference_directory(
 
 #[tauri::command]
 pub async fn knowledge_cancel_unity_reference_import(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
-    unity_reference_import_state: State<'_, UnityReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UnityReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     unity_docs::cancel_unity_reference_import(
         &working_dir,
         target_path.as_deref(),
-        unity_reference_import_state.inner().0.clone(),
+        states.unity_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -1858,15 +1950,17 @@ pub async fn knowledge_cancel_unity_reference_import(
 
 #[tauri::command]
 pub async fn knowledge_get_feishu_reference_import_status(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     feishu_docs::get_feishu_reference_import_status(
         &working_dir,
         target_path.as_deref(),
-        feishu_reference_import_state.inner().0.clone(),
+        states.feishu_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -1874,15 +1968,17 @@ pub async fn knowledge_get_feishu_reference_import_status(
 
 #[tauri::command]
 pub async fn knowledge_save_feishu_reference_config(
+    workspace_ref: WorkspaceRef,
     config: FeishuReferenceConfigInput,
-    workspace: State<'_, Arc<Workspace>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     feishu_docs::save_feishu_reference_config(
         &working_dir,
         config,
-        feishu_reference_import_state.inner().0.clone(),
+        states.feishu_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -1890,15 +1986,17 @@ pub async fn knowledge_save_feishu_reference_config(
 
 #[tauri::command]
 pub async fn knowledge_test_feishu_reference_connection(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceConnectionTestResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     feishu_docs::test_feishu_reference_connection(
         &working_dir,
         target_path.as_deref(),
-        feishu_reference_import_state.inner().0.clone(),
+        states.feishu_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -1906,29 +2004,30 @@ pub async fn knowledge_test_feishu_reference_connection(
 
 #[tauri::command]
 pub async fn knowledge_start_feishu_reference_oauth(
-    workspace: State<'_, Arc<Workspace>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceOauthStartResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    feishu_docs::start_feishu_reference_oauth(
-        working_dir,
-        feishu_reference_import_state.inner().0.clone(),
-    )
-    .await
-    .map_err(Into::into)
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
+    feishu_docs::start_feishu_reference_oauth(working_dir, states.feishu_reference_import.0)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
 pub async fn knowledge_cancel_feishu_reference_oauth_wait(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     feishu_docs::cancel_feishu_reference_oauth_wait(
         &working_dir,
         target_path.as_deref(),
-        feishu_reference_import_state.inner().0.clone(),
+        states.feishu_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -1936,11 +2035,13 @@ pub async fn knowledge_cancel_feishu_reference_oauth_wait(
 
 #[tauri::command]
 pub async fn knowledge_list_feishu_reference_space_nodes(
+    workspace_ref: WorkspaceRef,
     space_id: String,
     parent_node_token: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<FeishuReferenceNodeSummary>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     feishu_docs::list_feishu_reference_space_nodes(&working_dir, space_id, parent_node_token)
         .await
         .map_err(Into::into)
@@ -1948,15 +2049,17 @@ pub async fn knowledge_list_feishu_reference_space_nodes(
 
 #[tauri::command]
 pub async fn knowledge_cancel_feishu_reference_import(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     feishu_docs::cancel_feishu_reference_import(
         &working_dir,
         target_path.as_deref(),
-        feishu_reference_import_state.inner().0.clone(),
+        states.feishu_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -1964,32 +2067,56 @@ pub async fn knowledge_cancel_feishu_reference_import(
 
 #[tauri::command]
 pub async fn knowledge_read(
+    workspace_ref: WorkspaceRef,
     request: KnowledgeReadRequest,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
 ) -> Result<KnowledgeReadResponse, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     execute_knowledge_read_request(&working_dir, app_knowledge_dir.0.as_ref().as_ref(), request)
         .map_err(Into::into)
 }
 
 #[tauri::command]
+pub async fn knowledge_read_scoped(
+    workspace_ref: WorkspaceRef,
+    request: KnowledgeReadRequest,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_knowledge_dir: State<'_, AppKnowledgeDir>,
+) -> Result<KnowledgeReadResponse, AppError> {
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let result = execute_knowledge_read_request(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        request,
+    )
+    .map_err(AppError::from);
+    drop(scope);
+    result
+}
+
+#[tauri::command]
 pub async fn knowledge_import_unity_reference_docs(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
     locale: Option<String>,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    unity_reference_import_state: State<'_, UnityReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UnityReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
+    let (_runtime, lease) = scope.into_parts();
     unity_docs::start_unity_reference_import(
         app_handle,
         working_dir,
         target_path,
         locale,
-        knowledge_index_state.inner().clone(),
-        unity_reference_import_state.inner().0.clone(),
+        knowledge_index_state,
+        states.unity_reference_import.0,
+        lease,
     )
     .await
     .map_err(Into::into)
@@ -1997,19 +2124,22 @@ pub async fn knowledge_import_unity_reference_docs(
 
 #[tauri::command]
 pub async fn knowledge_import_feishu_reference_docs(
+    workspace_ref: WorkspaceRef,
     request: FeishuReferenceImportRequest,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
+    let (_runtime, lease) = scope.into_parts();
     feishu_docs::start_feishu_reference_import(
         app_handle,
         working_dir,
         request,
-        knowledge_index_state.inner().clone(),
-        feishu_reference_import_state.inner().0.clone(),
+        knowledge_index_state,
+        states.feishu_reference_import.0,
+        lease,
     )
     .await
     .map_err(Into::into)
@@ -2017,19 +2147,20 @@ pub async fn knowledge_import_feishu_reference_docs(
 
 #[tauri::command]
 pub async fn knowledge_delete_unity_reference_docs(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    unity_reference_import_state: State<'_, UnityReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UnityReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
     unity_docs::delete_unity_reference_docs(
         app_handle,
         working_dir,
         target_path,
-        knowledge_index_state.inner().clone(),
-        unity_reference_import_state.inner().0.clone(),
+        knowledge_index_state,
+        states.unity_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -2037,19 +2168,20 @@ pub async fn knowledge_delete_unity_reference_docs(
 
 #[tauri::command]
 pub async fn knowledge_delete_feishu_reference_docs(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    feishu_reference_import_state: State<'_, FeishuReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<FeishuReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
     feishu_docs::delete_feishu_reference_docs(
         app_handle,
         working_dir,
         target_path,
-        knowledge_index_state.inner().clone(),
-        feishu_reference_import_state.inner().0.clone(),
+        knowledge_index_state,
+        states.feishu_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -2057,10 +2189,12 @@ pub async fn knowledge_delete_feishu_reference_docs(
 
 #[tauri::command]
 pub async fn knowledge_preview_local_reference_import(
+    workspace_ref: WorkspaceRef,
     source_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<LocalReferenceScanPreview, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     tauri::async_runtime::spawn_blocking(move || {
         local_docs::preview_local_reference_import(&working_dir, &source_path)
     })
@@ -2071,21 +2205,23 @@ pub async fn knowledge_preview_local_reference_import(
 
 #[tauri::command]
 pub async fn knowledge_import_local_reference_docs(
+    workspace_ref: WorkspaceRef,
     request: LocalReferenceImportRequest,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    local_reference_import_state: State<'_, LocalReferenceImportState>,
-    local_reference_watcher_state: State<'_, LocalReferenceWatcherState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<LocalReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
+    let (_runtime, lease) = scope.into_parts();
     local_docs::start_local_reference_import(
         app_handle,
         working_dir,
         request,
-        knowledge_index_state.inner().clone(),
-        local_reference_import_state.inner().0.clone(),
-        local_reference_watcher_state.inner().clone(),
+        knowledge_index_state,
+        states.local_reference_import.0,
+        states.local_reference_watcher,
+        lease,
     )
     .await
     .map_err(Into::into)
@@ -2093,15 +2229,17 @@ pub async fn knowledge_import_local_reference_docs(
 
 #[tauri::command]
 pub async fn knowledge_get_local_reference_import_status(
+    workspace_ref: WorkspaceRef,
     target_path: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
-    local_reference_import_state: State<'_, LocalReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<LocalReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
     local_docs::get_local_reference_import_status(
         &working_dir,
         target_path.as_deref(),
-        local_reference_import_state.inner().0.clone(),
+        states.local_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -2109,33 +2247,33 @@ pub async fn knowledge_get_local_reference_import_status(
 
 #[tauri::command]
 pub async fn knowledge_cancel_local_reference_import(
-    workspace: State<'_, Arc<Workspace>>,
-    local_reference_import_state: State<'_, LocalReferenceImportState>,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<LocalReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    local_docs::cancel_local_reference_import(
-        &working_dir,
-        local_reference_import_state.inner().0.clone(),
-    )
-    .await
-    .map_err(Into::into)
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let states = knowledge_checkout_operation_states(&scope);
+    local_docs::cancel_local_reference_import(&working_dir, states.local_reference_import.0)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
 pub async fn knowledge_sync_local_reference_docs(
+    workspace_ref: WorkspaceRef,
     target_path: String,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    local_reference_import_state: State<'_, LocalReferenceImportState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<LocalReferenceImportStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
     local_docs::resync_local_reference_docs(
         app_handle,
         working_dir,
         target_path,
-        knowledge_index_state.inner().clone(),
-        local_reference_import_state.inner().0.clone(),
+        knowledge_index_state,
+        states.local_reference_import.0,
     )
     .await
     .map_err(Into::into)
@@ -2143,19 +2281,20 @@ pub async fn knowledge_sync_local_reference_docs(
 
 #[tauri::command]
 pub async fn knowledge_delete_local_reference_docs(
+    workspace_ref: WorkspaceRef,
     target_path: String,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    local_reference_watcher_state: State<'_, LocalReferenceWatcherState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
     local_docs::delete_local_reference_docs(
         app_handle,
         working_dir,
         target_path,
-        knowledge_index_state.inner().clone(),
-        local_reference_watcher_state.inner().clone(),
+        knowledge_index_state,
+        states.local_reference_watcher,
     )
     .await
     .map_err(Into::into)
@@ -2163,36 +2302,139 @@ pub async fn knowledge_delete_local_reference_docs(
 
 #[tauri::command]
 pub async fn knowledge_list(
+    workspace_ref: WorkspaceRef,
     doc_type: Option<String>,
     path_prefix: Option<String>,
     include_hidden: Option<bool>,
-    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<Vec<KnowledgeListItem>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    execute_knowledge_list(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        knowledge_index_state,
+        doc_type,
+        path_prefix,
+        include_hidden,
+    )
+    .await
+}
+
+/// List the newest materialization of every project-owned knowledge document
+/// across the project's registered worktrees.
+#[tauri::command]
+pub async fn project_knowledge_list(
+    project_id: String,
+    doc_type: Option<String>,
+    path_prefix: Option<String>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_knowledge_dir: State<'_, AppKnowledgeDir>,
+) -> Result<Vec<ProjectKnowledgeDocument>, AppError> {
+    let project_id = ProjectId::new(project_id).map_err(|error| {
+        AppError::new(
+            "workspace.project_identity_invalid",
+            "The project identity is invalid.",
+        )
+        .detail(error.to_string())
+        .operation("projectKnowledgeList")
+    })?;
+    let parsed_type = doc_type.as_deref().map(parse_knowledge_type).transpose()?;
+    let project = registry.project(&project_id).ok_or_else(|| {
+        AppError::new(
+            "workspace.project_unavailable",
+            "The project context is unavailable.",
+        )
+        .detail(project_id.to_string())
+        .operation("projectKnowledgeList")
+    })?;
+    let checkouts = project.checkout_sources().map_err(|error| {
+        AppError::new(
+            "workspace.project_checkout_catalog_unavailable",
+            "The project checkout catalog is unavailable.",
+        )
+        .detail(error)
+        .operation("projectKnowledgeList")
+    })?;
+    let app_root = app_knowledge_dir.0.as_ref().clone();
+    tokio::task::spawn_blocking(move || {
+        project.knowledge().list_latest(
+            checkouts,
+            app_root.as_ref(),
+            parsed_type,
+            path_prefix.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "knowledge.project_catalog_failed",
+            "The project knowledge catalog task failed.",
+        )
+        .detail(error.to_string())
+        .operation("projectKnowledgeList")
+    })?
+    .map_err(AppError::from)
+}
+
+#[tauri::command]
+pub async fn knowledge_list_scoped(
+    workspace_ref: WorkspaceRef,
+    doc_type: Option<String>,
+    path_prefix: Option<String>,
+    include_hidden: Option<bool>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_knowledge_dir: State<'_, AppKnowledgeDir>,
+) -> Result<Vec<KnowledgeListItem>, AppError> {
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let knowledge_index_state = knowledge_index_for_scope(&scope, &app_handle)?;
+    let result = execute_knowledge_list(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        knowledge_index_state,
+        doc_type,
+        path_prefix,
+        include_hidden,
+    )
+    .await;
+    drop(scope);
+    result
+}
+
+async fn execute_knowledge_list(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    doc_type: Option<String>,
+    path_prefix: Option<String>,
+    include_hidden: Option<bool>,
+) -> Result<Vec<KnowledgeListItem>, AppError> {
     let parsed_type = doc_type.as_deref().map(parse_knowledge_type).transpose()?;
     let (resolved_type, resolved_prefix) =
         resolve_knowledge_path_filter(parsed_type, path_prefix.as_deref())?;
-    ensure_memory_builtins_for_type(&working_dir, resolved_type)?;
+    ensure_memory_builtins_for_type(working_dir, resolved_type)?;
     let started_at = Instant::now();
     eprintln!(
         "[KnowledgeCommand] knowledge_list start workspace={} doc_type={:?} path_prefix={:?}",
         working_dir, resolved_type, resolved_prefix
     );
     let items = knowledge_index::list_cached_documents(
-        &working_dir,
-        app_knowledge_dir.0.as_ref().as_ref(),
+        working_dir,
+        app_knowledge_dir,
         resolved_type,
         resolved_prefix.as_deref(),
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
     )
     .await
     .map_err(AppError::from)?;
     let mut items = items;
     if resolved_type.is_none() || resolved_type == Some(KnowledgeType::Skill) {
         let package_items = super::skill::list_skill_package_knowledge_items_sync_with_hidden(
-            &working_dir,
+            working_dir,
             resolved_prefix.as_deref(),
             include_hidden.unwrap_or(false),
         );
@@ -2207,21 +2449,17 @@ pub async fn knowledge_list(
     }
     let include_package_documents = resolved_type == Some(KnowledgeType::Skill)
         && super::skill::skill_package_path_prefix_targets_package_sync(
-            &working_dir,
+            working_dir,
             resolved_prefix.as_deref(),
         );
     if !include_hidden.unwrap_or(false) {
         items.retain(|item| {
             (item.inject_mode != KnowledgeInjectMode::None
                 || (include_package_documents && is_skill_package_item(item)))
-                && item_model_recall_allowed(&working_dir, item).unwrap_or(false)
+                && item_model_recall_allowed(working_dir, item).unwrap_or(false)
         });
     }
-    enrich_knowledge_list_items(
-        &working_dir,
-        app_knowledge_dir.0.as_ref().as_ref(),
-        &mut items,
-    );
+    enrich_knowledge_list_items(working_dir, app_knowledge_dir, &mut items);
     eprintln!(
         "[KnowledgeCommand] knowledge_list finished workspace={} elapsed_ms={} count={}",
         working_dir,
@@ -2263,19 +2501,70 @@ fn merge_live_skill_package_items(
 
 #[tauri::command]
 pub async fn knowledge_list_page(
+    workspace_ref: WorkspaceRef,
     doc_type: Option<String>,
     path_prefix: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
-    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<KnowledgeListPageResponse, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    execute_knowledge_list_page(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        knowledge_index_state,
+        doc_type,
+        path_prefix,
+        cursor,
+        limit,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn knowledge_list_page_scoped(
+    workspace_ref: WorkspaceRef,
+    doc_type: Option<String>,
+    path_prefix: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_knowledge_dir: State<'_, AppKnowledgeDir>,
+) -> Result<KnowledgeListPageResponse, AppError> {
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let knowledge_index_state = knowledge_index_for_scope(&scope, &app_handle)?;
+    let result = execute_knowledge_list_page(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        knowledge_index_state,
+        doc_type,
+        path_prefix,
+        cursor,
+        limit,
+    )
+    .await;
+    drop(scope);
+    result
+}
+
+async fn execute_knowledge_list_page(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    doc_type: Option<String>,
+    path_prefix: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<KnowledgeListPageResponse, AppError> {
     let parsed_type = doc_type.as_deref().map(parse_knowledge_type).transpose()?;
     let (resolved_type, resolved_prefix) =
         resolve_knowledge_path_filter(parsed_type, path_prefix.as_deref())?;
-    ensure_memory_builtins_for_type(&working_dir, resolved_type)?;
+    ensure_memory_builtins_for_type(working_dir, resolved_type)?;
     let started_at = Instant::now();
     let resolved_limit = normalize_knowledge_page_limit(limit);
     let resolved_offset =
@@ -2285,22 +2574,18 @@ pub async fn knowledge_list_page(
         working_dir, resolved_type, resolved_prefix, resolved_offset, resolved_limit
     );
     let page = knowledge_index::list_cached_documents_page(
-        &working_dir,
-        app_knowledge_dir.0.as_ref().as_ref(),
+        working_dir,
+        app_knowledge_dir,
         resolved_type,
         resolved_prefix.as_deref(),
         resolved_limit,
         resolved_offset,
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
     )
     .await
     .map_err(AppError::from)?;
     let mut items = page.items;
-    enrich_knowledge_list_items(
-        &working_dir,
-        app_knowledge_dir.0.as_ref().as_ref(),
-        &mut items,
-    );
+    enrich_knowledge_list_items(working_dir, app_knowledge_dir, &mut items);
     eprintln!(
         "[KnowledgeCommand] knowledge_list_page finished workspace={} elapsed_ms={} count={} next_cursor={:?}",
         working_dir,
@@ -2382,21 +2667,53 @@ fn item_model_recall_allowed(working_dir: &str, item: &KnowledgeListItem) -> Res
 
 #[tauri::command]
 pub async fn knowledge_list_directories(
+    workspace_ref: WorkspaceRef,
     doc_type: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
 ) -> Result<Vec<String>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    execute_knowledge_list_directories(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        doc_type,
+    )
+}
+
+#[tauri::command]
+pub async fn knowledge_list_directories_scoped(
+    workspace_ref: WorkspaceRef,
+    doc_type: String,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_knowledge_dir: State<'_, AppKnowledgeDir>,
+) -> Result<Vec<String>, AppError> {
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let result = execute_knowledge_list_directories(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        doc_type,
+    );
+    drop(scope);
+    result
+}
+
+fn execute_knowledge_list_directories(
+    working_dir: &str,
+    app_knowledge_dir: Option<&std::path::PathBuf>,
+    doc_type: String,
+) -> Result<Vec<String>, AppError> {
     let parsed_type = parse_knowledge_type(&doc_type)?;
-    ensure_memory_builtins_for_type(&working_dir, Some(parsed_type))?;
+    ensure_memory_builtins_for_type(working_dir, Some(parsed_type))?;
     let started_at = Instant::now();
     eprintln!(
         "[KnowledgeCommand] knowledge_list_directories start workspace={} doc_type={}",
         working_dir, doc_type
     );
     let directories = knowledge_store::list_directories_with_app_root(
-        &working_dir,
-        app_knowledge_dir.0.as_ref().as_ref(),
+        working_dir,
+        app_knowledge_dir,
         parsed_type,
     )
     .map_err(AppError::from)?;
@@ -2412,13 +2729,15 @@ pub async fn knowledge_list_directories(
 
 #[tauri::command]
 pub async fn knowledge_list_directory_documents(
+    workspace_ref: WorkspaceRef,
     doc_type: String,
     path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<Vec<KnowledgeListItem>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let parsed_type = parse_knowledge_type(&doc_type)?;
     ensure_memory_builtins_for_type(&working_dir, Some(parsed_type))?;
     let normalized_path = path
@@ -2447,7 +2766,7 @@ pub async fn knowledge_list_directory_documents(
         app_knowledge_dir.0.as_ref().as_ref(),
         parsed_type,
         normalized_path.as_deref(),
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
     )
     .await
     .map_err(AppError::from)?;
@@ -2469,15 +2788,17 @@ pub async fn knowledge_list_directory_documents(
 
 #[tauri::command]
 pub async fn knowledge_list_directory_documents_page(
+    workspace_ref: WorkspaceRef,
     doc_type: String,
     path: String,
     cursor: Option<String>,
     limit: Option<usize>,
-    workspace: State<'_, Arc<Workspace>>,
+    app_handle: AppHandle,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
 ) -> Result<KnowledgeListPageResponse, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let parsed_type = parse_knowledge_type(&doc_type)?;
     ensure_memory_builtins_for_type(&working_dir, Some(parsed_type))?;
     let normalized_path = path
@@ -2511,7 +2832,7 @@ pub async fn knowledge_list_directory_documents_page(
         normalized_path.as_deref(),
         resolved_limit,
         resolved_offset,
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
     )
     .await
     .map_err(AppError::from)?;
@@ -2538,42 +2859,47 @@ pub async fn knowledge_list_directory_documents_page(
 
 #[tauri::command]
 pub async fn knowledge_list_external_reference_directories(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<KnowledgeExternalDirectoryBinding>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     knowledge_store::list_reference_external_directory_bindings(&working_dir)
         .map_err(AppError::from)
 }
 
 #[tauri::command]
 pub async fn knowledge_list_unity_managed_directory_stats(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<UnityManagedDirectoryStat>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     unity_docs::list_managed_directory_stats(&working_dir).map_err(AppError::from)
 }
 
 #[tauri::command]
 pub async fn knowledge_create(
+    workspace_ref: WorkspaceRef,
     request: KnowledgeCreateRequest,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<KnowledgeMutationResponse, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
     let result = execute_knowledge_create_request(&working_dir, request).map_err(AppError::from)?;
     match result.kind {
         KnowledgeTargetKind::Document => {
             if let Some(document) = result.document.clone() {
                 remove_shadowed_documents_for_path(
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     document.doc_type,
                     &document.path,
                     Some(&document.id),
                 )?;
                 knowledge_index::upsert_document(
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     &working_dir,
                     app_knowledge_dir.0.as_ref().as_ref(),
                     document,
@@ -2581,13 +2907,18 @@ pub async fn knowledge_create(
                 .await
                 .map_err(AppError::from)?;
             }
-            emit_knowledge_changed(&app_handle, &working_dir, "knowledge_create");
+            emit_knowledge_changed(
+                &app_handle,
+                &knowledge_index_state,
+                &working_dir,
+                "knowledge_create",
+            );
         }
         KnowledgeTargetKind::Directory => {
             reconcile_and_emit_knowledge_changed(
                 &app_handle,
                 &working_dir,
-                knowledge_index_state.inner().clone(),
+                knowledge_index_state,
                 "knowledge_create",
             )
             .await?;
@@ -2598,12 +2929,13 @@ pub async fn knowledge_create(
 
 #[tauri::command]
 pub async fn knowledge_edit(
+    workspace_ref: WorkspaceRef,
     request: KnowledgeEditRequest,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<KnowledgeMutationResponse, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
     let result = execute_knowledge_edit_request(&working_dir, request).map_err(AppError::from)?;
     match result.kind {
@@ -2611,13 +2943,13 @@ pub async fn knowledge_edit(
             if let Some(document) = result.document.clone() {
                 let previous_path = result.path.clone();
                 remove_shadowed_documents_for_path(
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     document.doc_type,
                     &document.path,
                     Some(&document.id),
                 )?;
                 knowledge_index::upsert_document(
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     &working_dir,
                     app_knowledge_dir.0.as_ref().as_ref(),
                     document.clone(),
@@ -2628,20 +2960,25 @@ pub async fn knowledge_edit(
                     restore_visible_document_for_path(
                         &app_handle,
                         &working_dir,
-                        knowledge_index_state.inner().clone(),
+                        knowledge_index_state.clone(),
                         document.doc_type,
                         &previous_path,
                     )
                     .await?;
                 }
             }
-            emit_knowledge_changed(&app_handle, &working_dir, "knowledge_edit");
+            emit_knowledge_changed(
+                &app_handle,
+                &knowledge_index_state,
+                &working_dir,
+                "knowledge_edit",
+            );
         }
         KnowledgeTargetKind::Directory => {
             reconcile_and_emit_knowledge_changed(
                 &app_handle,
                 &working_dir,
-                knowledge_index_state.inner().clone(),
+                knowledge_index_state,
                 "knowledge_edit",
             )
             .await?;
@@ -2652,12 +2989,13 @@ pub async fn knowledge_edit(
 
 #[tauri::command]
 pub async fn knowledge_move(
+    workspace_ref: WorkspaceRef,
     request: KnowledgeMoveRequest,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<KnowledgeMutationResponse, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
     let result = execute_knowledge_move_request(&working_dir, request).map_err(AppError::from)?;
     match result.kind {
@@ -2665,13 +3003,13 @@ pub async fn knowledge_move(
             if let Some(document) = result.document.clone() {
                 let previous_path = result.path.clone();
                 remove_shadowed_documents_for_path(
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     document.doc_type,
                     &document.path,
                     Some(&document.id),
                 )?;
                 knowledge_index::upsert_document(
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     &working_dir,
                     app_knowledge_dir.0.as_ref().as_ref(),
                     document.clone(),
@@ -2681,19 +3019,24 @@ pub async fn knowledge_move(
                 restore_visible_document_for_path(
                     &app_handle,
                     &working_dir,
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     document.doc_type,
                     &previous_path,
                 )
                 .await?;
             }
-            emit_knowledge_changed(&app_handle, &working_dir, "knowledge_move");
+            emit_knowledge_changed(
+                &app_handle,
+                &knowledge_index_state,
+                &working_dir,
+                "knowledge_move",
+            );
         }
         KnowledgeTargetKind::Directory => {
             reconcile_and_emit_knowledge_changed(
                 &app_handle,
                 &working_dir,
-                knowledge_index_state.inner().clone(),
+                knowledge_index_state,
                 "knowledge_move",
             )
             .await?;
@@ -2704,37 +3047,40 @@ pub async fn knowledge_move(
 
 #[tauri::command]
 pub async fn knowledge_delete(
+    workspace_ref: WorkspaceRef,
     request: KnowledgeDeleteRequest,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<KnowledgeMutationResponse, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (_scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let result = execute_knowledge_delete_request(&working_dir, request).map_err(AppError::from)?;
     match result.kind {
         KnowledgeTargetKind::Document => {
             if let Some(document) = result.document.clone() {
-                knowledge_index::remove_documents(
-                    knowledge_index_state.inner().clone(),
-                    &[document.id],
-                )
-                .map_err(AppError::from)?;
+                knowledge_index::remove_documents(knowledge_index_state.clone(), &[document.id])
+                    .map_err(AppError::from)?;
                 restore_visible_document_for_path(
                     &app_handle,
                     &working_dir,
-                    knowledge_index_state.inner().clone(),
+                    knowledge_index_state.clone(),
                     document.doc_type,
                     &result.path,
                 )
                 .await?;
             }
-            emit_knowledge_changed(&app_handle, &working_dir, "knowledge_delete");
+            emit_knowledge_changed(
+                &app_handle,
+                &knowledge_index_state,
+                &working_dir,
+                "knowledge_delete",
+            );
         }
         KnowledgeTargetKind::Directory => {
             reconcile_and_emit_knowledge_changed(
                 &app_handle,
                 &working_dir,
-                knowledge_index_state.inner().clone(),
+                knowledge_index_state,
                 "knowledge_delete",
             )
             .await?;
@@ -2745,17 +3091,18 @@ pub async fn knowledge_delete(
 
 #[tauri::command]
 pub async fn knowledge_delete_external_reference_directory(
+    workspace_ref: WorkspaceRef,
     path: String,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
-    local_reference_watcher_state: State<'_, LocalReferenceWatcherState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let (scope, working_dir, knowledge_index_state) =
+        knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
+    let states = knowledge_checkout_operation_states(&scope);
     let (_, normalized_path) =
         resolve_knowledge_directory_target(Some(KnowledgeType::Reference), &path)?;
     {
-        let watcher_state = local_reference_watcher_state.inner().clone();
+        let watcher_state = states.local_reference_watcher.clone();
         let target = normalized_path.clone();
         tauri::async_runtime::spawn_blocking(move || {
             local_docs::unregister_live_watcher(&watcher_state, &target);
@@ -2768,7 +3115,7 @@ pub async fn knowledge_delete_external_reference_directory(
     reconcile_and_emit_knowledge_changed(
         &app_handle,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
         "knowledge_delete_external_reference_directory",
     )
     .await?;
@@ -3204,10 +3551,12 @@ fn resolve_knowledge_reveal_path(
 
 #[tauri::command]
 pub async fn open_file_external(
+    workspace_ref: WorkspaceRef,
     file_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let canonical = resolve_openable_file_ref_path(&file_path, &working_dir)?;
 
     if !canonical.exists() {
@@ -3219,21 +3568,25 @@ pub async fn open_file_external(
 
 #[tauri::command]
 pub async fn reveal_workspace_file(
+    workspace_ref: WorkspaceRef,
     file_path: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let reveal_path = resolve_file_ref_reveal_path(&file_path, &working_dir)?;
     reveal_path_native(&reveal_path).map_err(Into::into)
 }
 
 #[tauri::command]
 pub async fn knowledge_reveal_target(
+    workspace_ref: WorkspaceRef,
     request: KnowledgeRevealRequest,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let doc_type = parse_knowledge_type(&request.doc_type).map_err(AppError::from)?;
     let reveal_path = resolve_knowledge_reveal_path(
         &working_dir,
@@ -3338,11 +3691,13 @@ fn resolve_markdown_image_path(
 
 #[tauri::command]
 pub async fn resolve_markdown_image(
+    workspace_ref: WorkspaceRef,
     source: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
     binary_cache: State<'_, Arc<BinaryCache>>,
 ) -> Result<MarkdownImagePreview, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let canonical = resolve_markdown_image_path(&source, &working_dir)?;
     if !canonical.is_file() {
         return Err(AppError::new(
@@ -3449,13 +3804,15 @@ const FULL_PREVIEW_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn preview_workspace_file(
+    workspace_ref: WorkspaceRef,
     file_path: String,
     line: Option<u32>,
     full: Option<bool>,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<WorkspaceFilePreview, AppError> {
     let full = full.unwrap_or(false);
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let canonical = match resolve_openable_file_ref_path(&file_path, &working_dir) {
         Ok(p) => p,
         Err(_) => {
@@ -3771,22 +4128,22 @@ fn resolve_configurable_agent_tool(
 
 #[tauri::command]
 pub async fn set_agent_tool_direct_load(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     tool_name: String,
     direct_load: bool,
-    registry: State<'_, AgentDefRegistryState>,
+    agent_registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
     let agent_id = canonical_agent_id(&agent_id).to_string();
-    let registry = registry.0.read().await;
-    let def = registry
+    let agent_registry = agent_registry.0.read().await;
+    let def = agent_registry
         .get(&agent_id)
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
-        return Err("No working directory selected".to_string().into());
-    }
+    let scope =
+        resolve_knowledge_workspace_scope(workspace_registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
 
     let canonical = resolve_configurable_agent_tool(def, &tool_registry, &agent_id, &tool_name)?;
 
@@ -3810,22 +4167,22 @@ pub async fn set_agent_tool_direct_load(
 
 #[tauri::command]
 pub async fn set_agent_tool_enabled(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     tool_name: String,
     enabled: bool,
-    registry: State<'_, AgentDefRegistryState>,
+    agent_registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
     let agent_id = canonical_agent_id(&agent_id).to_string();
-    let registry = registry.0.read().await;
-    let def = registry
+    let agent_registry = agent_registry.0.read().await;
+    let def = agent_registry
         .get(&agent_id)
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
-        return Err("No working directory selected".to_string().into());
-    }
+    let scope =
+        resolve_knowledge_workspace_scope(workspace_registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
 
     let canonical = resolve_configurable_agent_tool(def, &tool_registry, &agent_id, &tool_name)?;
 
@@ -3970,20 +4327,19 @@ fn valid_injection_id(value: &str) -> bool {
 
 #[tauri::command]
 pub async fn set_agent_injection_enabled(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     injection_id: String,
     enabled: bool,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
     let agent_id = canonical_agent_id(agent_id.trim()).to_string();
     let injection_id = injection_id.trim().to_string();
     if agent_id.is_empty() || !valid_injection_id(&injection_id) {
         return Err("Invalid Agent injection id".to_string().into());
     }
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
-        return Err("No working directory selected".to_string().into());
-    }
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let mut configs = load_workspace_injection_config(&working_dir, &agent_id);
     configs.insert(injection_id, InjectionConfig { enabled });
     save_workspace_injection_config(&working_dir, &agent_id, &configs).map_err(Into::into)
@@ -4350,13 +4706,46 @@ pub fn collect_agent_rule_files(
 }
 
 #[tauri::command]
-pub async fn list_rules(
+pub async fn list_app_rules(
     agent_id: String,
-    workspace: State<'_, Arc<Workspace>>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<Vec<RuleItem>, AppError> {
     let agent_id = canonical_agent_id(&agent_id).to_string();
-    let working_dir = workspace.path.read().await.clone();
+    let items = collect_agent_rule_files(app_agent_dir.0.as_ref(), "", &agent_id, false)?
+        .into_iter()
+        .map(|mut entry| {
+            entry.read_only = true;
+            entry.into_item()
+        })
+        .collect();
+    Ok(items)
+}
+
+#[tauri::command]
+pub async fn read_app_rule(
+    agent_id: String,
+    file_name: String,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<String, AppError> {
+    let agent_id = canonical_agent_id(&agent_id).to_string();
+    let entry = collect_agent_rule_files(app_agent_dir.0.as_ref(), "", &agent_id, false)?
+        .into_iter()
+        .find(|entry| entry.key == file_name)
+        .ok_or_else(|| format!("Rule file not found: {}", file_name))?;
+    std::fs::read_to_string(&entry.path)
+        .map_err(|error| format!("Failed to read rule: {}", error).into())
+}
+
+#[tauri::command]
+pub async fn list_rules(
+    workspace_ref: WorkspaceRef,
+    agent_id: String,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<Vec<RuleItem>, AppError> {
+    let agent_id = canonical_agent_id(&agent_id).to_string();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let items = collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, true)?
         .into_iter()
         .map(AgentRuleFileEntry::into_item)
@@ -4366,10 +4755,11 @@ pub async fn list_rules(
 
 #[tauri::command]
 pub async fn save_rule(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     file_name: String,
     content: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<RuleItem, AppError> {
     if file_name.is_empty()
         || file_name.contains('/')
@@ -4385,7 +4775,8 @@ pub async fn save_rule(
         format!("{}.md", file_name)
     };
 
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let dir = rules_dir(&working_dir, &agent_id)?;
     let path = dir.join(&file_name);
 
@@ -4425,13 +4816,15 @@ pub async fn save_rule(
 
 #[tauri::command]
 pub async fn read_rule(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     file_name: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<String, AppError> {
     let agent_id = canonical_agent_id(&agent_id).to_string();
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     if file_name.starts_with(PLUGIN_RULE_KEY_PREFIX) {
         let entries =
             collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?;
@@ -4466,14 +4859,16 @@ pub async fn read_rule(
 
 #[tauri::command]
 pub async fn delete_rule(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     file_name: String,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
     if file_name.contains("..") || file_name.contains('/') || file_name.contains('\\') {
         return Err("Invalid file name".to_string().into());
     }
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let dir = rules_dir(&working_dir, &agent_id)?;
     let path = dir.join(&file_name);
     if !path.is_file() {
@@ -4489,20 +4884,19 @@ pub async fn delete_rule(
 
 #[tauri::command]
 pub async fn set_rule_enabled(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     file_name: String,
     enabled: bool,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<(), AppError> {
     if file_name.trim().is_empty() {
         return Err("Invalid rule key".to_string().into());
     }
     let agent_id = canonical_agent_id(&agent_id).to_string();
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
-        return Err("No working directory selected".to_string().into());
-    }
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let existing_entry =
         collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?
             .into_iter()
@@ -4531,16 +4925,15 @@ pub async fn set_rule_enabled(
 
 #[tauri::command]
 pub async fn set_rule_order(
+    workspace_ref: WorkspaceRef,
     agent_id: String,
     file_names: Vec<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<(), AppError> {
     let agent_id = canonical_agent_id(&agent_id).to_string();
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
-        return Err("No working directory selected".to_string().into());
-    }
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
     let entries =
         collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?;
     let mut configs = load_rule_config(&working_dir, &agent_id);
@@ -4704,10 +5097,10 @@ mod tests {
 
     #[test]
     fn plugin_rules_default_enabled_and_keep_order_override() {
-        let workspace = TempDir::new().expect("workspace");
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let temp_workspace = TempDir::new().expect("workspace");
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         write_plugin_rule(
-            &workspace,
+            &temp_workspace,
             "com.example.rules",
             "risk_control.md",
             "# Risk Control\n\nUse extra caution.",
@@ -4853,22 +5246,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn validate_workspace_path_allows_junction_to_outside_directory() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
         std::fs::write(external.path().join("Linked.cs"), "class Linked {}").unwrap();
 
-        let link = workspace.path().join("LinkedDir");
+        let link = temp_workspace.path().join("LinkedDir");
         if !try_create_junction(&link, external.path()) {
             eprintln!("skipping: cannot create junctions in this environment");
             return;
         }
 
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         let resolved = validate_workspace_path("LinkedDir/Linked.cs", &working_dir).unwrap();
 
         // The literal in-workspace path is returned; the link target is left
         // for the OS/editor to resolve on open.
-        let ws_canonical = dunce::canonicalize(workspace.path()).unwrap();
+        let ws_canonical = dunce::canonicalize(temp_workspace.path()).unwrap();
         assert_eq!(resolved, ws_canonical.join("LinkedDir").join("Linked.cs"));
 
         let revealed = resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
@@ -4878,11 +5271,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn resolve_workspace_reveal_path_falls_back_to_junction_when_target_is_gone() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
         std::fs::write(external.path().join("Linked.cs"), "class Linked {}").unwrap();
 
-        let link = workspace.path().join("LinkedDir");
+        let link = temp_workspace.path().join("LinkedDir");
         if !try_create_junction(&link, external.path()) {
             eprintln!("skipping: cannot create junctions in this environment");
             return;
@@ -4890,34 +5283,34 @@ mod tests {
         // Make the junction dangling.
         std::fs::remove_dir_all(external.path()).unwrap();
 
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         let revealed = resolve_workspace_reveal_path("LinkedDir/Linked.cs", &working_dir).unwrap();
 
         // The file inside the dead junction is unreachable, but the junction
         // entry itself still exists and stays revealable.
-        let ws_canonical = dunce::canonicalize(workspace.path()).unwrap();
+        let ws_canonical = dunce::canonicalize(temp_workspace.path()).unwrap();
         assert_eq!(revealed, ws_canonical.join("LinkedDir"));
     }
 
     #[cfg(windows)]
     #[test]
     fn validate_workspace_path_allows_file_symlink_to_outside_target() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
         let target = external.path().join("Real.cs");
         std::fs::write(&target, "class Real {}").unwrap();
 
-        let link = workspace.path().join("Link.cs");
+        let link = temp_workspace.path().join("Link.cs");
         // File symlinks need admin rights or developer mode; skip when denied.
         if std::os::windows::fs::symlink_file(&target, &link).is_err() {
             eprintln!("skipping: file symlinks unavailable (needs developer mode or admin)");
             return;
         }
 
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         let resolved = validate_workspace_path("Link.cs", &working_dir).unwrap();
 
-        let ws_canonical = dunce::canonicalize(workspace.path()).unwrap();
+        let ws_canonical = dunce::canonicalize(temp_workspace.path()).unwrap();
         assert_eq!(resolved, ws_canonical.join("Link.cs"));
 
         let revealed = resolve_workspace_reveal_path("Link.cs", &working_dir).unwrap();
@@ -4926,9 +5319,9 @@ mod tests {
 
     #[test]
     fn resolve_openable_file_ref_path_allows_absolute_file() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         let file_path = external.path().join("locus-temp-test.txt");
         std::fs::write(&file_path, "external").unwrap();
 
@@ -4940,9 +5333,9 @@ mod tests {
 
     #[test]
     fn resolve_file_ref_reveal_path_allows_absolute_directory() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
 
         let resolved =
             resolve_file_ref_reveal_path(&external.path().to_string_lossy(), &working_dir).unwrap();
@@ -4952,9 +5345,9 @@ mod tests {
 
     #[test]
     fn resolve_file_ref_reveal_path_falls_back_for_missing_absolute_child() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let external = TempDir::new().unwrap();
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         let missing = external.path().join("missing").join("file.txt");
 
         let resolved =
@@ -4991,9 +5384,9 @@ mod tests {
 
     #[test]
     fn resolve_knowledge_reveal_path_falls_back_to_app_document() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let app_root = TempDir::new().unwrap();
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         let app_knowledge_root = app_root.path().join("knowledge");
         let target = app_knowledge_root
             .join("reference")
@@ -5016,9 +5409,9 @@ mod tests {
 
     #[test]
     fn resolve_knowledge_reveal_path_falls_back_to_app_directory() {
-        let workspace = TempDir::new().unwrap();
+        let temp_workspace = TempDir::new().unwrap();
         let app_root = TempDir::new().unwrap();
-        let working_dir = workspace.path().to_string_lossy().to_string();
+        let working_dir = temp_workspace.path().to_string_lossy().to_string();
         let app_knowledge_root = app_root.path().join("knowledge");
         let target = app_knowledge_root.join("skill").join("workflow");
         std::fs::create_dir_all(&target).unwrap();
@@ -5151,6 +5544,143 @@ mod tests {
         )
         .expect_err("type root creation should be rejected");
         assert!(err.contains("type root"));
+    }
+
+    #[test]
+    fn checkout_scoped_read_helper_keeps_worktree_documents_isolated() {
+        let temp = TempDir::new().unwrap();
+        let checkout_a = temp.path().join("checkout-a");
+        let checkout_b = temp.path().join("checkout-b");
+        std::fs::create_dir_all(&checkout_a).expect("create checkout A");
+        std::fs::create_dir_all(&checkout_b).expect("create checkout B");
+        let checkout_a = checkout_a.to_string_lossy().into_owned();
+        let checkout_b = checkout_b.to_string_lossy().into_owned();
+
+        for (working_dir, body) in [
+            (&checkout_a, "checkout A knowledge"),
+            (&checkout_b, "checkout B knowledge"),
+        ] {
+            execute_knowledge_create_request(
+                working_dir,
+                KnowledgeCreateRequest {
+                    kind: KnowledgeTargetKind::Document,
+                    path: "design/runtime.md".to_string(),
+                    document: Some(KnowledgeDocumentPatch {
+                        body: Some(Some(body.to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect("create checkout-local knowledge document");
+        }
+
+        let read = |working_dir: &str| {
+            execute_knowledge_read_request(
+                working_dir,
+                None,
+                KnowledgeReadRequest {
+                    kind: KnowledgeTargetKind::Document,
+                    path: "design/runtime.md".to_string(),
+                    part: Some("body".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("read checkout-local knowledge document")
+            .document
+            .expect("document response")
+            .document
+            .body
+        };
+
+        assert_eq!(read(&checkout_a), "checkout A knowledge");
+        assert_eq!(read(&checkout_b), "checkout B knowledge");
+    }
+
+    #[test]
+    fn concurrent_checkout_writes_keep_same_relative_path_isolated() {
+        let temp = TempDir::new().unwrap();
+        let checkout_a = temp.path().join("checkout-a");
+        let checkout_b = temp.path().join("checkout-b");
+        std::fs::create_dir_all(&checkout_a).expect("create checkout A");
+        std::fs::create_dir_all(&checkout_b).expect("create checkout B");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            for (root, body, delay_ms) in [
+                (checkout_a.clone(), "slow checkout A", 40_u64),
+                (checkout_b.clone(), "fast checkout B", 0_u64),
+            ] {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    if delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    execute_knowledge_create_request(
+                        root.to_string_lossy().as_ref(),
+                        KnowledgeCreateRequest {
+                            kind: KnowledgeTargetKind::Document,
+                            path: "design/shared.md".to_string(),
+                            document: Some(KnowledgeDocumentPatch {
+                                body: Some(Some(body.to_string())),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("checkout-local write");
+                });
+            }
+        });
+
+        let read_body = |root: &std::path::Path| {
+            execute_knowledge_read_request(
+                root.to_string_lossy().as_ref(),
+                None,
+                KnowledgeReadRequest {
+                    kind: KnowledgeTargetKind::Document,
+                    path: "design/shared.md".to_string(),
+                    part: Some("body".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("checkout-local read")
+            .document
+            .expect("document")
+            .document
+            .body
+        };
+        assert_eq!(read_body(&checkout_a), "slow checkout A");
+        assert_eq!(read_body(&checkout_b), "fast checkout B");
+    }
+
+    #[test]
+    fn concurrent_checkout_knowledge_runtimes_open_without_tantivy_lock_contention() {
+        let temp = TempDir::new().unwrap();
+        let storage_dir = temp.path().join("model-storage");
+        let library_a = temp.path().join("checkout-a").join("Library").join("Locus");
+        let library_b = temp.path().join("checkout-b").join("Library").join("Locus");
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let results = std::thread::scope(|scope| {
+            let handles = [library_a, library_b].map(|library_dir| {
+                let storage_dir = storage_dir.clone();
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    knowledge_index::KnowledgeRuntime::open(&library_dir, &storage_dir).map(|_| ())
+                })
+            });
+            handles.map(|handle| handle.join().expect("runtime open thread"))
+        });
+
+        for result in results {
+            assert!(
+                result.is_ok(),
+                "checkout-local Tantivy runtime should open independently: {result:?}"
+            );
+        }
     }
 
     #[test]

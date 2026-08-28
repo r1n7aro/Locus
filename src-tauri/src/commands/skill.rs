@@ -11,19 +11,117 @@ use tokio::io::AsyncWriteExt;
 use walkdir::WalkDir;
 
 use crate::error::AppError;
-use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_store::{
     self, KnowledgeDocument, KnowledgeDocumentPatch, KnowledgeInjectMode, KnowledgeType,
     SkillSurface,
 };
 use crate::process_util::{async_command, augment_path_with_git, spawn_managed, ProcessOwner};
 use crate::tool::{ToolDef, ToolExecutionContext, ToolRegistry, ToolResult};
-use crate::workspace::Workspace;
+use crate::workspace_service::{
+    ProjectRegistry, ResolvedWorkspaceScope, WorkspaceRef, WorkspaceResolveError,
+};
 
 use super::knowledge::{
     get_updated_at, load_skill_config, reconcile_and_emit_knowledge_changed, save_skill_config,
     AppKnowledgeDir, SkillConfig,
 };
+
+/// Checkout identity captured once at the Skill IPC boundary.
+///
+/// The resolved runtime lease is retained for the full Skill operation,
+/// including asynchronous knowledge reconciliation.
+pub(crate) struct SkillWorkspaceScope {
+    working_dir: String,
+    checkout_id: String,
+    workspace_generation: u64,
+    workspace: ResolvedWorkspaceScope,
+}
+
+impl SkillWorkspaceScope {
+    fn from_resolved(workspace: ResolvedWorkspaceScope) -> Self {
+        let runtime = workspace.runtime();
+        Self {
+            working_dir: runtime.root().to_string_lossy().to_string(),
+            checkout_id: runtime.checkout_id().to_string(),
+            workspace_generation: runtime.generation(),
+            workspace,
+        }
+    }
+
+    pub(crate) fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkout_id(&self) -> &str {
+        &self.checkout_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_generation(&self) -> u64 {
+        self.workspace_generation
+    }
+
+    pub(crate) fn knowledge_index(
+        &self,
+        app_handle: &AppHandle,
+    ) -> Result<Arc<crate::knowledge_index::KnowledgeIndexState>, AppError> {
+        self.workspace
+            .runtime()
+            .knowledge_index(app_handle)
+            .map_err(|detail| {
+                AppError::new(
+                    "knowledge.index_unavailable",
+                    "Failed to initialize the checkout knowledge index.",
+                )
+                .detail(detail)
+            })
+    }
+}
+
+fn skill_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
+    match error {
+        WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
+            "workspace.registry_unavailable",
+            "The workspace registry is unavailable.",
+        )
+        .detail(detail),
+        WorkspaceResolveError::CheckoutUnavailable { checkout_id } => AppError::new(
+            "workspace.checkout_unavailable",
+            "The requested checkout is unavailable.",
+        )
+        .detail(checkout_id.to_string()),
+        WorkspaceResolveError::StaleGeneration {
+            checkout_id,
+            expected_generation,
+            actual_generation,
+        } => AppError::new(
+            "workspace.generation_stale",
+            "The workspace runtime changed before the request was handled.",
+        )
+        .detail(format!(
+            "checkout={checkout_id}, expected={expected_generation}, actual={actual_generation}"
+        )),
+    }
+}
+
+pub(crate) async fn resolve_skill_workspace_scope(
+    workspace_ref: &WorkspaceRef,
+    registry: &ProjectRegistry,
+) -> Result<SkillWorkspaceScope, AppError> {
+    let scope = registry
+        .resolve_workspace_ref(workspace_ref)
+        .map(SkillWorkspaceScope::from_resolved)
+        .map_err(skill_workspace_resolve_error)?;
+    tracing::debug!(
+        log_module = "Skill",
+        workspace = %scope.working_dir,
+        checkout_id = ?scope.checkout_id,
+        workspace_generation = ?scope.workspace_generation,
+        "resolved Skill workspace scope"
+    );
+    Ok(scope)
+}
 
 // ── Manifest ─────────────────────────────────────────────────
 
@@ -508,11 +606,7 @@ fn scan_skill_dir(
         if validate_skill_document_config(&document, &dir_name).is_err() {
             continue;
         }
-        let cfg = if source == "app" {
-            lookup_skill_config_override(configs, source, &dir_name)
-        } else {
-            None
-        };
+        let cfg = lookup_skill_config_override(configs, source, &dir_name);
         manifests.push(build_skill_manifest(
             &document,
             &dir_name,
@@ -2170,9 +2264,12 @@ fn package_tool_api_name_for_working_dir(
     )
 }
 
-pub(crate) fn register_skill_package_tools(registry: &mut ToolRegistry) -> usize {
+fn register_skill_package_tool_records(
+    registry: &mut ToolRegistry,
+    records: Vec<SkillPackageRecord>,
+    replace_non_builtin: bool,
+) -> usize {
     let mut count = 0usize;
-    let records = list_skill_packages_sync();
     let tool_names =
         package_tool_api_names_for_records(&records, &default_package_tool_reserved_names());
     for record in records {
@@ -2181,7 +2278,9 @@ pub(crate) fn register_skill_package_tools(registry: &mut ToolRegistry) -> usize
                 .get(&package_tool_record_key(&record.manifest.id, &tool.name))
                 .cloned()
                 .unwrap_or_else(|| package_tool_api_name(&record.manifest.id, &tool.name));
-            if registry.get(&tool_name).is_some() {
+            if registry.get(&tool_name).is_some()
+                && (!replace_non_builtin || registry.is_built_in(&tool_name))
+            {
                 eprintln!(
                     "[Locus] skipped duplicate Skill package tool '{}'",
                     tool_name
@@ -2201,6 +2300,21 @@ pub(crate) fn register_skill_package_tools(registry: &mut ToolRegistry) -> usize
         }
     }
     count
+}
+
+pub(crate) fn register_skill_package_tools(registry: &mut ToolRegistry) -> usize {
+    register_skill_package_tool_records(registry, list_skill_packages_sync(), false)
+}
+
+pub(crate) fn register_skill_package_tools_for_working_dir(
+    registry: &mut ToolRegistry,
+    working_dir: &str,
+) -> usize {
+    register_skill_package_tool_records(
+        registry,
+        list_skill_packages_sync_for_working_dir(working_dir),
+        true,
+    )
 }
 
 fn find_skill_package_tool_by_api_name(
@@ -4596,12 +4710,13 @@ fn build_package_skill_manifest(
 
 #[tauri::command]
 pub async fn list_skills(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
 ) -> Result<Vec<SkillManifest>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
     Ok(list_skills_sync(
-        &working_dir,
+        scope.working_dir(),
         app_knowledge_dir.0.as_ref().as_ref(),
     ))
 }
@@ -4738,12 +4853,13 @@ pub fn read_skill_manifest_sync(
 pub async fn read_skill_manifest(
     dir_name: String,
     source: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     app_knowledge_dir: State<'_, AppKnowledgeDir>,
 ) -> Result<String, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
     read_skill_manifest_sync(
-        &working_dir,
+        scope.working_dir(),
         app_knowledge_dir.0.as_ref().as_ref(),
         &dir_name,
         source.as_deref(),
@@ -4995,7 +5111,7 @@ fn create_skill_package_in_parent_sync_for_source_with_default_namespace(
     let package_root = package_parent.join(&package_id);
     if package_root.exists()
         || find_skill_package_in_parent(package_parent, &package_id).is_ok()
-        || find_skill_package(&package_id).is_ok()
+        || (source == SkillCreateSource::App && find_skill_package(&package_id).is_ok())
     {
         return Err(format!("Skill package already exists: {}", package_id));
     }
@@ -5448,6 +5564,15 @@ pub fn export_skill_package_sync(
     export_skill_package_record_to_path(&record, file_path)
 }
 
+pub fn export_skill_package_sync_for_working_dir(
+    working_dir: &str,
+    package_id: &str,
+    file_path: &str,
+) -> Result<SkillPackageArchiveResult, String> {
+    let record = find_skill_package_for_working_dir(working_dir, package_id)?;
+    export_skill_package_record_to_path(&record, file_path)
+}
+
 fn skill_package_project_dependency_errors(record: &SkillPackageRecord) -> Vec<String> {
     let mut errors = Vec::new();
     for tool in &record.manifest.tools {
@@ -5765,12 +5890,14 @@ pub async fn create_skill_scaffold(
     command_enabled: Option<bool>,
     model_invocation_enabled: Option<bool>,
     tools: Option<Vec<String>>,
+    workspace_ref: WorkspaceRef,
     config: State<'_, Arc<crate::config::AppConfig>>,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SkillManifest, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    let knowledge_index = scope.knowledge_index(&app_handle)?;
+    let working_dir = scope.working_dir().to_string();
     let kind = kind.unwrap_or_default();
     let fallback_summary = skill_title_from_name(&name);
     let summary = if kind == SkillCreateKind::Md {
@@ -5807,7 +5934,7 @@ pub async fn create_skill_scaffold(
     reconcile_and_emit_knowledge_changed(
         &app_handle,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index,
         "create_skill_scaffold",
     )
     .await?;
@@ -5817,16 +5944,18 @@ pub async fn create_skill_scaffold(
 #[tauri::command]
 pub async fn delete_skill_package(
     package_id: String,
+    workspace_ref: WorkspaceRef,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    let knowledge_index = scope.knowledge_index(&app_handle)?;
+    let working_dir = scope.working_dir().to_string();
     delete_skill_package_sync(&working_dir, &package_id).map_err(AppError::from)?;
     reconcile_and_emit_knowledge_changed(
         &app_handle,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index,
         "delete_skill_package",
     )
     .await?;
@@ -5836,16 +5965,18 @@ pub async fn delete_skill_package(
 #[tauri::command]
 pub async fn import_skill_package(
     source_path: String,
+    workspace_ref: WorkspaceRef,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SkillManifest, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    let knowledge_index = scope.knowledge_index(&app_handle)?;
+    let working_dir = scope.working_dir().to_string();
     let manifest = import_skill_package_sync(&source_path).map_err(AppError::from)?;
     reconcile_and_emit_knowledge_changed(
         &app_handle,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index,
         "import_skill_package",
     )
     .await?;
@@ -5856,8 +5987,12 @@ pub async fn import_skill_package(
 pub async fn export_skill_package(
     package_id: String,
     file_path: String,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SkillPackageArchiveResult, AppError> {
-    export_skill_package_sync(&package_id, &file_path).map_err(AppError::from)
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    export_skill_package_sync_for_working_dir(scope.working_dir(), &package_id, &file_path)
+        .map_err(AppError::from)
 }
 
 fn hash_file(path: &Path) -> Result<String, String> {
@@ -6058,28 +6193,31 @@ fn remove_skill_unity_files_sync(
 #[tauri::command]
 pub async fn get_skill_unity_install_status(
     package_id: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SkillUnityInstallStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    skill_unity_install_status_sync(&working_dir, &package_id).map_err(Into::into)
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    skill_unity_install_status_sync(scope.working_dir(), &package_id).map_err(Into::into)
 }
 
 #[tauri::command]
 pub async fn install_skill_unity_files(
     package_id: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SkillUnityInstallStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    install_skill_unity_files_sync(&working_dir, &package_id).map_err(Into::into)
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    install_skill_unity_files_sync(scope.working_dir(), &package_id).map_err(Into::into)
 }
 
 #[tauri::command]
 pub async fn remove_skill_unity_files(
     package_id: String,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SkillUnityInstallStatus, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    remove_skill_unity_files_sync(&working_dir, &package_id).map_err(Into::into)
+    let scope = resolve_skill_workspace_scope(&workspace_ref, &workspace_registry).await?;
+    remove_skill_unity_files_sync(scope.working_dir(), &package_id).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -6091,8 +6229,288 @@ mod tests {
     use crate::commands::knowledge::SkillConfig;
     use crate::knowledge_store::{KnowledgeInjectMode, SkillSurface};
     use std::io::Write as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn workspace_registry(config_root: &Path) -> Arc<crate::workspace_service::ProjectRegistry> {
+        let config = Arc::new(crate::config::AppConfig::load_from_path(
+            &config_root.join("config.json"),
+        ));
+        let policy = Arc::new(
+            crate::resource_policy::ResourcePolicyStore::from_config(config)
+                .expect("resource policy"),
+        );
+        crate::workspace_service::ProjectRegistry::new(policy, Vec::new())
+    }
+
+    fn write_project_plugin_skill(workspace: &Path, marker: &str) {
+        let plugin_root = workspace
+            .join("Locus")
+            .join("plugins")
+            .join("com.example.checkout-skill");
+        let skill_root = plugin_root.join("skills").join("checkout-audit");
+        std::fs::create_dir_all(&skill_root).expect("plugin Skill root");
+        std::fs::write(
+            plugin_root.join(crate::plugin::PLUGIN_MANIFEST_FILE_NAME),
+            r#"{
+  "schemaVersion": 1,
+  "id": "com.example.checkout-skill",
+  "name": "Checkout Skill",
+  "version": "0.1.0",
+  "components": {
+    "skills": [{ "id": "checkout-audit", "path": "skills/checkout-audit" }]
+  }
+}
+"#,
+        )
+        .expect("plugin manifest");
+        std::fs::write(
+            skill_root.join("skill.json"),
+            format!(
+                r#"{{
+  "schema": "locus.skill.v1",
+  "id": "com.example.checkout-audit",
+  "version": "0.1.0",
+  "name": "Checkout Audit {marker}",
+  "description": "Audit checkout {marker}."
+}}
+"#
+            ),
+        )
+        .expect("Skill package manifest");
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            format!("---\nsummary: Audit checkout {marker}.\n---\n\n# Checkout {marker}\n"),
+        )
+        .expect("Skill package document");
+    }
+
+    #[tokio::test]
+    async fn same_project_worktrees_keep_skill_overlays_and_mutations_isolated() {
+        let temp = TempDir::new().expect("temporary root");
+        let main = temp.path().join("main");
+        let worktree = temp.path().join("feature");
+        std::fs::create_dir_all(&main).expect("main checkout");
+        run_git(&main, &["init", "-b", "main"]);
+        run_git(&main, &["config", "user.name", "Locus Test"]);
+        run_git(&main, &["config", "user.email", "locus@example.invalid"]);
+        std::fs::write(main.join("scope.txt"), "main\n").expect("seed file");
+        run_git(&main, &["add", "scope.txt"]);
+        run_git(&main, &["commit", "-m", "seed"]);
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().expect("worktree path"),
+            ],
+        );
+
+        let registry = workspace_registry(temp.path());
+        let main_runtime = registry.register(&main).expect("register main checkout");
+        let worktree_runtime = registry
+            .register(&worktree)
+            .expect("register feature checkout");
+        assert_eq!(main_runtime.project_id(), worktree_runtime.project_id());
+        assert_ne!(main_runtime.checkout_id(), worktree_runtime.checkout_id());
+
+        let feature_scope = super::resolve_skill_workspace_scope(
+            &crate::workspace_service::WorkspaceRef::for_runtime(&worktree_runtime),
+            &registry,
+        )
+        .await
+        .expect("resolve feature checkout");
+        let main_scope = super::resolve_skill_workspace_scope(
+            &crate::workspace_service::WorkspaceRef::for_runtime(&main_runtime),
+            &registry,
+        )
+        .await
+        .expect("resolve main checkout");
+        assert_eq!(
+            Path::new(feature_scope.working_dir()),
+            worktree_runtime.root()
+        );
+        assert_eq!(Path::new(main_scope.working_dir()), main_runtime.root());
+        assert_eq!(
+            feature_scope.checkout_id(),
+            worktree_runtime.checkout_id().as_str()
+        );
+        assert_eq!(
+            feature_scope.workspace_generation(),
+            worktree_runtime.generation()
+        );
+        let stale_ref = crate::workspace_service::WorkspaceRef::new(
+            worktree_runtime.checkout_id().clone(),
+            Some(worktree_runtime.generation().saturating_add(1)),
+        );
+        let stale_error = match super::resolve_skill_workspace_scope(&stale_ref, &registry).await {
+            Ok(_) => panic!("stale workspace generation must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(stale_error.code, "workspace.generation_stale");
+
+        for (root, marker) in [
+            (main_scope.working_dir(), "A"),
+            (feature_scope.working_dir(), "B"),
+        ] {
+            super::create_skill_document_sync(
+                root,
+                super::SkillCreateRequest {
+                    kind: super::SkillCreateKind::Md,
+                    source: super::SkillCreateSource::Project,
+                    name: "shared-audit".to_string(),
+                    summary: Some(format!("Audit checkout {marker}.")),
+                    body: Some(format!("## Instructions\n{marker} body")),
+                    ..Default::default()
+                },
+            )
+            .expect("create checkout Skill");
+            super::create_skill_package_for_source_sync_with_default_namespace(
+                root,
+                super::SkillCreateRequest {
+                    kind: super::SkillCreateKind::Package,
+                    source: super::SkillCreateSource::Project,
+                    name: format!("Shared Package {marker}"),
+                    package_id: Some("shared-checkout-package".to_string()),
+                    version: Some("0.1.0".to_string()),
+                    summary: Some(format!("Package for checkout {marker}.")),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("create checkout Skill package");
+        }
+
+        super::delete_skill_package_sync(feature_scope.working_dir(), "shared-checkout-package")
+            .expect("delete feature Skill package");
+        assert!(super::find_skill_package_for_working_dir(
+            main_scope.working_dir(),
+            "shared-checkout-package"
+        )
+        .is_ok());
+        assert!(super::find_skill_package_for_working_dir(
+            feature_scope.working_dir(),
+            "shared-checkout-package"
+        )
+        .is_err());
+
+        let mut main_config = std::collections::HashMap::new();
+        main_config.insert(
+            super::config_key("project", "shared-audit"),
+            SkillConfig {
+                enabled: false,
+                description: "main override".to_string(),
+                ..Default::default()
+            },
+        );
+        crate::commands::knowledge::save_skill_config(main_scope.working_dir(), &main_config)
+            .expect("save main config");
+        let mut feature_config = std::collections::HashMap::new();
+        feature_config.insert(
+            super::config_key("project", "shared-audit"),
+            SkillConfig {
+                enabled: true,
+                description: "feature override".to_string(),
+                ..Default::default()
+            },
+        );
+        crate::commands::knowledge::save_skill_config(feature_scope.working_dir(), &feature_config)
+            .expect("save feature config");
+
+        write_project_plugin_skill(Path::new(feature_scope.working_dir()), "B");
+        let (main_skills, feature_skills) = tokio::join!(
+            tokio::task::spawn_blocking({
+                let root = main_scope.working_dir().to_string();
+                move || super::list_skills_sync(&root, None)
+            }),
+            tokio::task::spawn_blocking({
+                let root = feature_scope.working_dir().to_string();
+                move || super::list_skills_sync(&root, None)
+            })
+        );
+        let main_skills = main_skills.expect("list main Skills");
+        let feature_skills = feature_skills.expect("list feature Skills");
+        let main_shared = main_skills
+            .iter()
+            .find(|skill| skill.dir_name == "shared-audit" && skill.source == "project")
+            .expect("main Skill");
+        let feature_shared = feature_skills
+            .iter()
+            .find(|skill| skill.dir_name == "shared-audit" && skill.source == "project")
+            .expect("feature Skill");
+        assert!(!main_shared.skill_enabled);
+        assert_eq!(
+            main_shared.skill_description.as_deref(),
+            Some("main override")
+        );
+        assert!(feature_shared.skill_enabled);
+        assert_eq!(
+            feature_shared.skill_description.as_deref(),
+            Some("feature override")
+        );
+        assert!(main_skills
+            .iter()
+            .all(|skill| skill.package_id.as_deref() != Some("com.example.checkout-audit")));
+        let feature_plugin = feature_skills
+            .iter()
+            .find(|skill| skill.package_id.as_deref() == Some("com.example.checkout-audit"))
+            .expect("feature plugin Skill");
+        assert_eq!(feature_plugin.source, "pluginProject");
+        assert_eq!(feature_plugin.plugin_scope.as_deref(), Some("project"));
+
+        let feature_document = crate::knowledge_store::read_document(
+            feature_scope.working_dir(),
+            crate::knowledge_store::KnowledgeType::Skill,
+            "shared-audit.md",
+            "full",
+        )
+        .expect("read feature Skill")
+        .document;
+        crate::knowledge_store::save_document(
+            feature_scope.working_dir(),
+            crate::knowledge_store::KnowledgeDocument {
+                body: "## Instructions\nB edited".to_string(),
+                ..feature_document
+            },
+        )
+        .expect("edit feature Skill");
+
+        let main_content = super::read_skill_manifest_sync(
+            main_scope.working_dir(),
+            None,
+            "shared-audit",
+            Some("project"),
+        )
+        .expect("read main Skill");
+        let feature_content = super::read_skill_manifest_sync(
+            feature_scope.working_dir(),
+            None,
+            "shared-audit",
+            Some("project"),
+        )
+        .expect("read feature Skill");
+        assert!(main_content.contains("A body"));
+        assert!(!main_content.contains("B edited"));
+        assert!(feature_content.contains("B edited"));
+    }
 
     #[test]
     fn skill_package_unity_output_hides_transport_metadata() {

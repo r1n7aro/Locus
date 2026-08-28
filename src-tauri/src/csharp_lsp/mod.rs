@@ -5,11 +5,11 @@
 //! (see `AgentInstance::resolve_effective_tool_names`), so the agent context
 //! carries no trace of the feature.
 //!
-//! Architecture: one language-server process per active workspace (a Unity
-//! project root). The process is spawned lazily on first use, loads the
-//! Unity-generated `.sln` / `.csproj` files via MSBuild, and is replaced when
-//! the active workspace changes. Server binaries and the .NET runtime are
-//! downloaded on demand (see `assets`).
+//! Architecture: each active checkout owns one language-server process. The
+//! process is spawned lazily, loads that checkout's Unity-generated `.sln` /
+//! `.csproj` files via MSBuild, and is retained by a policy-driven LRU pool.
+//! Server binaries and the .NET runtime are downloaded on demand (see
+//! `assets`).
 
 mod assets;
 mod client;
@@ -17,13 +17,16 @@ mod unity_sync;
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::Emitter;
-use tokio::sync::watch;
+use tauri::Manager;
+use tokio::sync::{watch, Notify};
+
+use crate::resource_policy::ResourcePolicyStore;
+use crate::workspace_service::identity::{CheckoutId, ProjectIdResolver, ServiceInstanceId};
 
 pub use assets::is_platform_supported;
 
@@ -39,9 +42,198 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
 static LAST_STATUS_EMIT: Mutex<Option<Instant>> = Mutex::new(None);
 
-fn active_server() -> &'static tokio::sync::Mutex<Option<Arc<WorkspaceServer>>> {
-    static ACTIVE: OnceLock<tokio::sync::Mutex<Option<Arc<WorkspaceServer>>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| tokio::sync::Mutex::new(None))
+struct LspProcessEntry {
+    checkout_id: CheckoutId,
+    server: Arc<WorkspaceServer>,
+    generation: u64,
+    lease_count: AtomicUsize,
+    last_used_at: Mutex<Instant>,
+    retiring: AtomicBool,
+    startup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl LspProcessEntry {
+    fn acquire(self: &Arc<Self>) -> LspProcessLease {
+        self.lease_count.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut last_used_at) = self.last_used_at.lock() {
+            *last_used_at = Instant::now();
+        }
+        LspProcessLease {
+            entry: Arc::clone(self),
+        }
+    }
+
+    fn idle_for(&self) -> Duration {
+        self.last_used_at
+            .lock()
+            .map(|last_used_at| last_used_at.elapsed())
+            .unwrap_or_default()
+    }
+
+    fn is_dead(&self) -> bool {
+        matches!(self.server.phase(), Phase::Error(_))
+            || self
+                .server
+                .client
+                .get()
+                .is_some_and(|client| client.has_exited())
+    }
+
+    fn is_retiring(&self) -> bool {
+        self.retiring.load(Ordering::Acquire)
+    }
+
+    fn begin_retirement(&self) -> bool {
+        self.retiring
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    fn set_startup_task(&self, task: tokio::task::JoinHandle<()>) {
+        let mut current = self
+            .startup_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = Some(task);
+    }
+
+    fn abort_startup_for_exit(&self) {
+        let mut startup_task = self
+            .startup_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(task) = startup_task.take() {
+            task.abort();
+        }
+    }
+
+    async fn shutdown(&self) {
+        // A Preparing entry can be removed before its client OnceCell is set.
+        // Abort and join the orchestration task first so it cannot spawn an
+        // untracked process after `WorkspaceServer::shutdown` has returned.
+        let startup_task = self
+            .startup_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = startup_task {
+            task.abort();
+            let _ = task.await;
+        }
+        self.server.mark_startup_stopped();
+        self.server.shutdown().await;
+    }
+}
+
+struct LspProcessLease {
+    entry: Arc<LspProcessEntry>,
+}
+
+impl std::ops::Deref for LspProcessLease {
+    type Target = WorkspaceServer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entry.server
+    }
+}
+
+impl Drop for LspProcessLease {
+    fn drop(&mut self) {
+        self.entry.lease_count.fetch_sub(1, Ordering::AcqRel);
+        if let Ok(mut last_used_at) = self.entry.last_used_at.lock() {
+            *last_used_at = Instant::now();
+        }
+        if let Some(pool) = LSP_PROCESS_POOL.get() {
+            pool.notify.notify_waiters();
+        }
+    }
+}
+
+struct LspProcessPool {
+    entries: tokio::sync::Mutex<HashMap<CheckoutId, Arc<LspProcessEntry>>>,
+    next_generation: AtomicU64,
+    resource_policy: Arc<ResourcePolicyStore>,
+    notify: Notify,
+}
+
+static LSP_PROCESS_POOL: OnceLock<Arc<LspProcessPool>> = OnceLock::new();
+
+fn process_pool() -> Result<&'static Arc<LspProcessPool>, String> {
+    LSP_PROCESS_POOL
+        .get()
+        .ok_or_else(|| "C# LSP process pool is not initialized".to_string())
+}
+
+fn lru_eviction_candidate(
+    entries: &HashMap<CheckoutId, Arc<LspProcessEntry>>,
+) -> Option<CheckoutId> {
+    entries
+        .iter()
+        .filter(|(_, entry)| !entry.is_retiring())
+        .filter(|(_, entry)| entry.lease_count.load(Ordering::Acquire) == 0)
+        .max_by_key(|(_, entry)| entry.idle_for())
+        .map(|(checkout_id, _)| checkout_id.clone())
+}
+
+fn convergence_candidates(
+    entries: &HashMap<CheckoutId, Arc<LspProcessEntry>>,
+    limit: usize,
+    idle_timeout: Duration,
+    idle_only: bool,
+) -> Vec<CheckoutId> {
+    let mut candidates = entries
+        .iter()
+        .filter(|(_, entry)| !entry.is_retiring())
+        .filter(|(_, entry)| entry.lease_count.load(Ordering::Acquire) == 0)
+        .map(|(checkout_id, entry)| (checkout_id.clone(), entry.idle_for()))
+        .filter(|(_, idle_for)| !idle_only || *idle_for >= idle_timeout)
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(_, idle_for)| std::cmp::Reverse(*idle_for));
+
+    let mut active_count = entries
+        .values()
+        .filter(|entry| !entry.is_retiring())
+        .count();
+    let mut retire = Vec::new();
+    for (checkout_id, idle_for) in candidates {
+        let over_capacity = active_count > limit;
+        let idle_expired = idle_for >= idle_timeout;
+        if !over_capacity && !idle_expired {
+            continue;
+        }
+        retire.push(checkout_id);
+        active_count = active_count.saturating_sub(1);
+    }
+    retire
+}
+
+fn remove_retired_entry_if_current(
+    entries: &mut HashMap<CheckoutId, Arc<LspProcessEntry>>,
+    retired: &Arc<LspProcessEntry>,
+) -> bool {
+    if !retired.is_retiring() {
+        return false;
+    }
+    let is_current_generation = entries.get(&retired.checkout_id).is_some_and(|current| {
+        current.generation == retired.generation && Arc::ptr_eq(current, retired)
+    });
+    if is_current_generation {
+        entries.remove(&retired.checkout_id);
+        true
+    } else {
+        false
+    }
+}
+
+async fn finish_entry_retirement(pool: &Arc<LspProcessPool>, entry: Arc<LspProcessEntry>) {
+    entry.shutdown().await;
+    let removed = {
+        let mut entries = pool.entries.lock().await;
+        remove_retired_entry_if_current(&mut entries, &entry)
+    };
+    if removed {
+        pool.notify.notify_waiters();
+    }
 }
 
 /// Solution or project set passed to the server after `initialize`.
@@ -99,6 +291,20 @@ struct WorkspaceServer {
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
+struct StartupTaskCompletion {
+    server: Arc<WorkspaceServer>,
+}
+
+impl Drop for StartupTaskCompletion {
+    fn drop(&mut self) {
+        if !matches!(self.server.phase(), Phase::Ready | Phase::Error(_)) {
+            let _ = self.server.phase_tx.send(Phase::Error(
+                "C# language server startup task ended unexpectedly".to_string(),
+            ));
+        }
+    }
+}
+
 impl WorkspaceServer {
     fn new(workspace: PathBuf) -> Arc<Self> {
         let (phase_tx, phase_rx) = watch::channel(Phase::Preparing);
@@ -130,6 +336,24 @@ impl WorkspaceServer {
     fn set_phase_unthrottled(&self, phase: Phase) {
         let _ = self.phase_tx.send(phase);
         emit_status_now();
+    }
+
+    fn mark_startup_stopped(&self) {
+        let _ = self.phase_tx.send(Phase::Error(
+            "C# language server startup was stopped".to_string(),
+        ));
+    }
+
+    async fn wait_startup_finished(&self) {
+        let mut rx = self.phase_rx.clone();
+        loop {
+            if matches!(&*rx.borrow(), Phase::Ready | Phase::Error(_)) {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     async fn wait_ready(&self, timeout: Duration) -> Result<Arc<client::LspClient>, String> {
@@ -263,10 +487,41 @@ fn phase_progress_text(phase: &Phase) -> String {
 
 // ── lifecycle ────────────────────────────────────────────────────────
 
-/// Called once from app setup with the persisted flag.
-pub fn initialize(enabled: bool, app_handle: tauri::AppHandle) {
+/// Called once from app setup with the persisted flag and shared resource policy.
+pub fn initialize(
+    enabled: bool,
+    app_handle: tauri::AppHandle,
+    resource_policy: Arc<ResourcePolicyStore>,
+) {
     ENABLED.store(enabled, Ordering::Relaxed);
     let _ = APP_HANDLE.set(app_handle);
+    let pool = Arc::new(LspProcessPool {
+        entries: tokio::sync::Mutex::new(HashMap::new()),
+        next_generation: AtomicU64::new(0),
+        resource_policy,
+        notify: Notify::new(),
+    });
+    if LSP_PROCESS_POOL.set(Arc::clone(&pool)).is_ok() {
+        tauri::async_runtime::spawn(async move {
+            let mut policy_updates = pool.resource_policy.subscribe();
+            loop {
+                let idle_timeout =
+                    Duration::from_secs(policy_updates.borrow().limits.lsp_idle_timeout_secs);
+                tokio::select! {
+                    _ = tokio::time::sleep(idle_timeout) => {
+                        converge_lsp_pool(&pool, true).await;
+                    }
+                    changed = policy_updates.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                        converge_lsp_pool(&pool, false).await;
+                        pool.notify.notify_waiters();
+                    }
+                }
+            }
+        });
+    }
 }
 
 pub fn is_enabled() -> bool {
@@ -278,9 +533,18 @@ pub fn is_enabled() -> bool {
 pub async fn set_enabled(value: bool, workspace: Option<String>) {
     ENABLED.store(value, Ordering::Relaxed);
     if !value {
-        let server = active_server().lock().await.take();
-        if let Some(server) = server {
-            server.shutdown().await;
+        if let Ok(pool) = process_pool() {
+            let retiring = {
+                let entries = pool.entries.lock().await;
+                entries
+                    .values()
+                    .filter(|entry| entry.begin_retirement())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            for entry in retiring {
+                finish_entry_retirement(pool, entry).await;
+            }
         }
         emit_status_now();
         return;
@@ -299,42 +563,112 @@ pub fn warm_up_in_background(workspace: String) {
         return;
     }
     tokio::spawn(async move {
-        let _ = ensure_workspace_server(&workspace).await;
+        if let Err(error) = warm_up_workspace(&workspace).await {
+            eprintln!(
+                "[CsharpLsp] workspace warm-up failed for '{}': {}",
+                workspace, error
+            );
+        }
     });
+}
+
+/// Deterministically warm one checkout and report startup failures. The
+/// background service path delegates here; integration drivers can await it
+/// when they need evidence that every checkout owns a terminal LSP entry.
+pub async fn warm_up_workspace(workspace: &str) -> Result<(), String> {
+    let lease = ensure_workspace_server(workspace).await?;
+    // Keep the pool lease until orchestration reaches Ready or Error.
+    // Otherwise a second checkout can evict a Preparing entry and let its
+    // detached startup task spawn an untracked process.
+    lease.wait_startup_finished().await;
+    match lease.phase() {
+        Phase::Ready => Ok(()),
+        Phase::Error(message) => Err(message),
+        phase => Err(format!(
+            "C# language server warm-up ended in unexpected phase {}",
+            phase_progress_text(&phase)
+        )),
+    }
+}
+
+/// Remove one checkout from the pool when its owning workspace service stops.
+/// Active query leases make teardown fail explicitly instead of killing work.
+pub async fn stop_workspace(workspace: &str) -> Result<bool, String> {
+    let root = normalize_workspace(workspace)?;
+    let checkout_id = ProjectIdResolver::resolve(&root)
+        .map_err(|error| error.to_string())?
+        .checkout_id;
+    let pool = process_pool()?;
+    let retiring = {
+        let entries = pool.entries.lock().await;
+        let Some(entry) = entries.get(&checkout_id).cloned() else {
+            return Ok(false);
+        };
+        if entry.is_retiring() {
+            return Err("C# language server is already stopping".to_string());
+        }
+        if entry.lease_count.load(Ordering::Acquire) > 0 {
+            return Err("C# language server is busy with active leases".to_string());
+        }
+        if !entry.begin_retirement() {
+            return Err("C# language server is already stopping".to_string());
+        }
+        entry
+    };
+    finish_entry_retirement(pool, retiring).await;
+    emit_status_now();
+    Ok(true)
 }
 
 /// Best-effort synchronous kill of the active server for app-exit paths.
 /// The server also exits on its own when our stdin pipe closes; this just
 /// avoids relying on that during MSBuild-heavy load phases.
 pub fn kill_active_server_for_exit() {
-    if let Ok(guard) = active_server().try_lock() {
-        if let Some(server) = guard.as_ref() {
-            if let Some(client) = server.client.get() {
+    let Ok(pool) = process_pool() else { return };
+    if let Ok(entries) = pool.entries.try_lock() {
+        for entry in entries.values() {
+            entry.abort_startup_for_exit();
+            if let Some(client) = entry.server.client.get() {
                 client.kill_process();
             }
-            remove_analyzer_props(&server.workspace);
+            remove_analyzer_props(&entry.server.workspace);
         }
     }
 }
 
 /// Stop and restart the server for the workspace (reloads all projects).
 pub async fn restart(workspace: &str) -> Result<(), String> {
-    {
-        let server = active_server().lock().await.take();
-        if let Some(server) = server {
-            server.shutdown().await;
+    let root = normalize_workspace(workspace)?;
+    let checkout_id = ProjectIdResolver::resolve(&root)
+        .map_err(|error| error.to_string())?
+        .checkout_id;
+    let pool = process_pool()?;
+    let old = {
+        let entries = pool.entries.lock().await;
+        let old = entries.get(&checkout_id).cloned();
+        if let Some(old) = old.as_ref() {
+            if old.is_retiring() {
+                return Err("C# language server is already stopping".to_string());
+            }
+            if old.lease_count.load(Ordering::Acquire) > 0 {
+                return Err("C# language server is busy with active leases".to_string());
+            }
+            if !old.begin_retirement() {
+                return Err("C# language server is already stopping".to_string());
+            }
         }
+        old
+    };
+    if let Some(old) = old {
+        finish_entry_retirement(pool, old).await;
     }
     emit_status_now();
     ensure_workspace_server(workspace).await.map(|_| ())
 }
 
-/// One server for one active workspace at a time. Querying a different
-/// workspace replaces the running server (full reload there). Sessions that
-/// alternate between two workspaces would thrash; per-workspace instances are
-/// a deliberate non-goal for now because each Roslyn server holds hundreds of
-/// MB and Locus is operated against one Unity project at a time.
-async fn ensure_workspace_server(workspace: &str) -> Result<Arc<WorkspaceServer>, String> {
+/// Acquire one checkout-exclusive language server lease. Capacity and idle
+/// eviction come from the shared resource policy.
+async fn ensure_workspace_server(workspace: &str) -> Result<LspProcessLease, String> {
     if !is_enabled() {
         return Err("C# code analysis is disabled".to_string());
     }
@@ -342,43 +676,111 @@ async fn ensure_workspace_server(workspace: &str) -> Result<Arc<WorkspaceServer>
         return Err("C# code analysis is not supported on this platform yet".to_string());
     }
     let root = normalize_workspace(workspace)?;
+    let checkout_id = ProjectIdResolver::resolve(&root)
+        .map_err(|error| error.to_string())?
+        .checkout_id;
+    let pool = process_pool()?;
+    loop {
+        let mut lease = None;
+        let mut retirement = None;
+        {
+            let mut entries = pool.entries.lock().await;
+            if !is_enabled() {
+                return Err("C# code analysis is disabled".to_string());
+            }
 
-    let mut active = active_server().lock().await;
-    // Re-check under the lock: a concurrent `set_enabled(false)` may have
-    // taken and shut down the active server while we were waiting.
-    if !is_enabled() {
-        return Err("C# code analysis is disabled".to_string());
+            if let Some(existing) = entries.get(&checkout_id).cloned() {
+                if existing.is_retiring() {
+                    return Err("C# language server is being recycled".to_string());
+                }
+                if !existing.is_dead() {
+                    return Ok(existing.acquire());
+                }
+                if existing.lease_count.load(Ordering::Acquire) > 0 {
+                    return Err(
+                        "C# language server exited while an active request still holds its lease"
+                            .to_string(),
+                    );
+                }
+                if existing.begin_retirement() {
+                    retirement = Some(existing);
+                } else {
+                    return Err("C# language server is being recycled".to_string());
+                }
+            } else {
+                let limit = pool.resource_policy.snapshot().limits.max_lsp_processes;
+                if entries.len() >= limit {
+                    if entries.values().any(|entry| entry.is_retiring()) {
+                        return Err(format!(
+                            "C# language server capacity is being recycled (configured limit: {limit})"
+                        ));
+                    }
+                    let Some(eviction) = lru_eviction_candidate(&entries) else {
+                        return Err(format!(
+                            "C# language server capacity is busy (configured limit: {limit})"
+                        ));
+                    };
+                    let evicted = entries
+                        .get(&eviction)
+                        .cloned()
+                        .expect("LRU candidate must still exist while the pool is locked");
+                    if evicted.begin_retirement() {
+                        retirement = Some(evicted);
+                    } else {
+                        return Err("C# language server capacity is being recycled".to_string());
+                    }
+                } else {
+                    let server = WorkspaceServer::new(root.clone());
+                    let entry = Arc::new(LspProcessEntry {
+                        checkout_id: checkout_id.clone(),
+                        server: Arc::clone(&server),
+                        generation: pool.next_generation.fetch_add(1, Ordering::SeqCst) + 1,
+                        lease_count: AtomicUsize::new(0),
+                        last_used_at: Mutex::new(Instant::now()),
+                        retiring: AtomicBool::new(false),
+                        startup_task: Mutex::new(None),
+                    });
+                    let task_server = Arc::clone(&server);
+                    let startup_task = tokio::spawn(async move {
+                        let _completion = StartupTaskCompletion {
+                            server: Arc::clone(&task_server),
+                        };
+                        if let Err(message) = orchestrate(&task_server).await {
+                            task_server.set_phase_unthrottled(Phase::Error(message));
+                        }
+                    });
+                    entry.set_startup_task(startup_task);
+                    entries.insert(checkout_id.clone(), Arc::clone(&entry));
+                    lease = Some(entry.acquire());
+                }
+            }
+        }
+
+        if let Some(entry) = retirement {
+            finish_entry_retirement(pool, entry).await;
+            continue;
+        }
+        if let Some(lease) = lease {
+            emit_status_now();
+            return Ok(lease);
+        }
     }
-    if let Some(existing) = active.as_ref() {
-        let same = paths_equal(&existing.workspace, &root);
-        let dead = matches!(existing.phase(), Phase::Error(_))
-            || existing
-                .client
-                .get()
-                .map(|c| c.has_exited())
-                .unwrap_or(false);
-        if same && !dead {
-            return Ok(Arc::clone(existing));
-        }
-        let old = active.take();
-        if let Some(old) = old {
-            tokio::spawn(async move { old.shutdown().await });
-        }
+}
+
+async fn converge_lsp_pool(pool: &Arc<LspProcessPool>, idle_only: bool) {
+    let limits = pool.resource_policy.snapshot().limits;
+    let idle_timeout = Duration::from_secs(limits.lsp_idle_timeout_secs);
+    let retiring = {
+        let entries = pool.entries.lock().await;
+        convergence_candidates(&entries, limits.max_lsp_processes, idle_timeout, idle_only)
+            .into_iter()
+            .filter_map(|checkout_id| entries.get(&checkout_id).cloned())
+            .filter(|entry| entry.begin_retirement())
+            .collect::<Vec<_>>()
+    };
+    for entry in retiring {
+        finish_entry_retirement(pool, entry).await;
     }
-
-    let server = WorkspaceServer::new(root);
-    *active = Some(Arc::clone(&server));
-    drop(active);
-    emit_status_now();
-
-    let task_server = Arc::clone(&server);
-    tokio::spawn(async move {
-        if let Err(message) = orchestrate(&task_server).await {
-            task_server.set_phase_unthrottled(Phase::Error(message));
-        }
-    });
-
-    Ok(server)
 }
 
 async fn orchestrate(server: &Arc<WorkspaceServer>) -> Result<(), String> {
@@ -725,7 +1127,7 @@ pub struct ReferencesResult {
 
 async fn ready_client(
     workspace: &str,
-) -> Result<(Arc<WorkspaceServer>, Arc<client::LspClient>), String> {
+) -> Result<(LspProcessLease, Arc<client::LspClient>), String> {
     let server = ensure_workspace_server(workspace).await?;
     let client = server.wait_ready(QUERY_READY_TIMEOUT).await?;
     Ok((server, client))
@@ -1564,6 +1966,10 @@ async fn workspace_diagnostics_attempt(workspace: &str) -> Result<Vec<CodeDiagno
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CsharpLspStatusPayload {
+    pub checkout_id: Option<String>,
+    pub workspace_generation: Option<u64>,
+    pub service_instance_id: Option<String>,
+    pub service_generation: Option<u64>,
     pub enabled: bool,
     pub supported: bool,
     pub phase: String,
@@ -1584,10 +1990,72 @@ pub struct CsharpLspStatusPayload {
     pub uptime_secs: Option<u64>,
 }
 
-fn build_status(server: Option<&Arc<WorkspaceServer>>) -> CsharpLspStatusPayload {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspProcessEntryMetrics {
+    pub checkout_id: String,
+    pub generation: u64,
+    pub lease_count: usize,
+    pub idle_secs: u64,
+    pub phase: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspProcessPoolMetrics {
+    pub configured_max_processes: usize,
+    pub configured_idle_timeout_secs: u64,
+    pub process_count: usize,
+    pub waiting_count: usize,
+    pub entries: Vec<LspProcessEntryMetrics>,
+}
+
+pub async fn pool_metrics() -> LspProcessPoolMetrics {
+    let Ok(pool) = process_pool() else {
+        return LspProcessPoolMetrics {
+            configured_max_processes: 0,
+            configured_idle_timeout_secs: 0,
+            process_count: 0,
+            waiting_count: 0,
+            entries: Vec::new(),
+        };
+    };
+    let limits = pool.resource_policy.snapshot().limits;
+    let entries = pool.entries.lock().await;
+    let entries = entries
+        .values()
+        .map(|entry| LspProcessEntryMetrics {
+            checkout_id: entry.checkout_id.to_string(),
+            generation: entry.generation,
+            lease_count: entry.lease_count.load(Ordering::Acquire),
+            idle_secs: entry.idle_for().as_secs(),
+            phase: phase_progress_text(&entry.server.phase()),
+        })
+        .collect::<Vec<_>>();
+    LspProcessPoolMetrics {
+        configured_max_processes: limits.max_lsp_processes,
+        configured_idle_timeout_secs: limits.lsp_idle_timeout_secs,
+        process_count: entries.len(),
+        waiting_count: 0,
+        entries,
+    }
+}
+
+fn build_status(
+    entry: Option<&Arc<LspProcessEntry>>,
+    checkout_id: Option<&CheckoutId>,
+    workspace_generation: Option<u64>,
+) -> CsharpLspStatusPayload {
     let enabled = is_enabled();
     let supported = assets::is_platform_supported();
+    let checkout_id = entry.map(|entry| &entry.checkout_id).or(checkout_id);
+    let service_instance_id = checkout_id
+        .map(|checkout_id| ServiceInstanceId::for_service(checkout_id, "csharp_lsp").to_string());
     let mut payload = CsharpLspStatusPayload {
+        checkout_id: checkout_id.map(ToString::to_string),
+        workspace_generation,
+        service_instance_id,
+        service_generation: entry.map(|entry| entry.generation),
         enabled,
         supported,
         phase: if !enabled {
@@ -1614,9 +2082,10 @@ fn build_status(server: Option<&Arc<WorkspaceServer>>) -> CsharpLspStatusPayload
     if !enabled {
         return payload;
     }
-    let Some(server) = server else {
+    let Some(entry) = entry else {
         return payload;
     };
+    let server = &entry.server;
     payload.workspace = Some(server.workspace.to_string_lossy().to_string());
     payload.project_file = server.project_file.lock().ok().and_then(|g| g.clone());
     payload.dotnet_source = server
@@ -1663,16 +2132,171 @@ fn build_status(server: Option<&Arc<WorkspaceServer>>) -> CsharpLspStatusPayload
     payload
 }
 
-/// Snapshot of the current feature status for the UI.
-pub async fn status() -> CsharpLspStatusPayload {
-    let active = active_server().lock().await;
-    build_status(active.as_ref())
+fn registered_workspace_generation(checkout_id: &CheckoutId) -> Option<u64> {
+    APP_HANDLE
+        .get()
+        .and_then(|app| app.try_state::<Arc<crate::workspace_service::ProjectRegistry>>())
+        .and_then(|registry| registry.runtime(checkout_id))
+        .map(|runtime| runtime.generation())
 }
 
-fn emit_status_with(payload: CsharpLspStatusPayload) {
-    if let Some(app) = APP_HANDLE.get() {
-        let _ = app.emit(STATUS_EVENT, payload);
+fn registered_workspace_scopes() -> Vec<(CheckoutId, u64)> {
+    APP_HANDLE
+        .get()
+        .and_then(|app| app.try_state::<Arc<crate::workspace_service::ProjectRegistry>>())
+        .map(|registry| {
+            registry
+                .runtimes()
+                .into_iter()
+                .map(|runtime| (runtime.checkout_id().clone(), runtime.generation()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Snapshot one explicitly addressed checkout. An idle checkout still keeps
+/// its scope in the payload so callers never fall back to a selected project.
+pub async fn status_for_checkout(
+    checkout_id: &CheckoutId,
+    workspace_generation: Option<u64>,
+) -> CsharpLspStatusPayload {
+    let Ok(pool) = process_pool() else {
+        return build_status(None, Some(checkout_id), workspace_generation);
+    };
+    let entries = pool.entries.lock().await;
+    build_status(
+        entries.get(checkout_id),
+        Some(checkout_id),
+        workspace_generation.or_else(|| registered_workspace_generation(checkout_id)),
+    )
+}
+
+/// Resolve a workspace path only to its stable checkout identity. This is used
+/// by internal code paths that already own an execution root.
+pub async fn status_for_workspace(workspace: &str) -> CsharpLspStatusPayload {
+    let checkout_id = normalize_workspace(workspace)
+        .ok()
+        .and_then(|root| ProjectIdResolver::resolve(root).ok())
+        .map(|identity| identity.checkout_id);
+    match checkout_id {
+        Some(checkout_id) => {
+            let generation = registered_workspace_generation(&checkout_id);
+            status_for_checkout(&checkout_id, generation).await
+        }
+        None => status().await,
     }
+}
+
+/// Process-level feature snapshot. Workspace consumers should call
+/// `status_for_checkout` or `status_for_workspace`.
+pub async fn status() -> CsharpLspStatusPayload {
+    build_status(None, None, None)
+}
+
+async fn emit_status_with(payload: CsharpLspStatusPayload) {
+    let Some(app) = APP_HANDLE.get() else {
+        return;
+    };
+    let Some(checkout_id) = payload.checkout_id.as_deref() else {
+        return;
+    };
+    let Ok(checkout_id) = CheckoutId::new(checkout_id.to_string()) else {
+        return;
+    };
+    let Some(registry) = app.try_state::<Arc<crate::workspace_service::ProjectRegistry>>() else {
+        return;
+    };
+    let Some(runtime) = registry.runtime(&checkout_id) else {
+        return;
+    };
+    if payload
+        .workspace_generation
+        .is_some_and(|generation| generation != runtime.generation())
+    {
+        return;
+    }
+    let service_identity = match (
+        payload.service_instance_id.as_deref(),
+        payload.service_generation,
+    ) {
+        (Some(service_instance_id), Some(service_generation)) => {
+            let expected_instance = ServiceInstanceId::for_service(&checkout_id, "csharp_lsp");
+            if service_instance_id != expected_instance.as_str() {
+                return;
+            }
+            let Ok(pool) = process_pool() else {
+                return;
+            };
+            let is_current = pool
+                .entries
+                .lock()
+                .await
+                .get(&checkout_id)
+                .is_some_and(|entry| {
+                    entry.generation == service_generation && !entry.is_retiring()
+                });
+            if !is_current {
+                return;
+            }
+            Some((expected_instance, service_generation))
+        }
+        (None, None) => None,
+        _ => return,
+    };
+    let envelope = crate::workspace_service::event::WorkspaceEventEnvelope {
+        project_id: runtime.project_id().clone(),
+        checkout_id: runtime.checkout_id().clone(),
+        workspace_generation: runtime.generation(),
+        service_instance_id: service_identity.as_ref().map(|(id, _)| id.clone()),
+        service_generation: service_identity.as_ref().map(|(_, generation)| *generation),
+        payload,
+    };
+    if service_identity.is_some() {
+        registry
+            .event_router()
+            .publish_prevalidated_external_service(app, STATUS_EVENT, envelope);
+    } else {
+        registry.event_router().publish(app, STATUS_EVENT, envelope);
+    }
+}
+
+async fn status_events() -> Vec<CsharpLspStatusPayload> {
+    let Ok(pool) = process_pool() else {
+        return vec![build_status(None, None, None)];
+    };
+    let entries = pool
+        .entries
+        .lock()
+        .await
+        .iter()
+        .map(|(checkout_id, entry)| (checkout_id.clone(), Arc::clone(entry)))
+        .collect::<HashMap<_, _>>();
+    let scopes = registered_workspace_scopes();
+    if !scopes.is_empty() {
+        return scopes
+            .iter()
+            .map(|(checkout_id, workspace_generation)| {
+                build_status(
+                    entries.get(checkout_id),
+                    Some(checkout_id),
+                    Some(*workspace_generation),
+                )
+            })
+            .collect();
+    }
+    if !entries.is_empty() {
+        return entries
+            .values()
+            .map(|entry| {
+                build_status(
+                    Some(entry),
+                    Some(&entry.checkout_id),
+                    registered_workspace_generation(&entry.checkout_id),
+                )
+            })
+            .collect();
+    }
+    vec![build_status(None, None, None)]
 }
 
 fn emit_status_now() {
@@ -1680,8 +2304,9 @@ fn emit_status_now() {
         *last = Some(Instant::now());
     }
     tokio::spawn(async {
-        let payload = status().await;
-        emit_status_with(payload);
+        for payload in status_events().await {
+            emit_status_with(payload).await;
+        }
     });
 }
 
@@ -1695,8 +2320,9 @@ fn emit_status_throttled() {
         *last = Some(Instant::now());
     }
     tokio::spawn(async {
-        let payload = status().await;
-        emit_status_with(payload);
+        for payload in status_events().await {
+            emit_status_with(payload).await;
+        }
     });
 }
 
@@ -1714,17 +2340,205 @@ fn normalize_workspace(workspace: &str) -> Result<PathBuf, String> {
     Ok(dunce::simplified(&path).to_path_buf())
 }
 
-fn paths_equal(a: &Path, b: &Path) -> bool {
-    if cfg!(windows) {
-        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-    } else {
-        a == b
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{document_diagnostics, is_unity_managed_csharp_file};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::sync::Notify;
+
+    use super::{
+        build_status, convergence_candidates, document_diagnostics, is_unity_managed_csharp_file,
+        lru_eviction_candidate, remove_retired_entry_if_current, LspProcessEntry, Phase,
+        WorkspaceServer,
+    };
+    use crate::workspace_service::CheckoutId;
+
+    fn test_entry(checkout: &str, generation: u64, idle_for: Duration) -> Arc<LspProcessEntry> {
+        Arc::new(LspProcessEntry {
+            checkout_id: CheckoutId::new(checkout).expect("checkout id"),
+            server: WorkspaceServer::new(PathBuf::from(checkout)),
+            generation,
+            lease_count: AtomicUsize::new(0),
+            last_used_at: Mutex::new(
+                Instant::now()
+                    .checked_sub(idle_for)
+                    .expect("test idle duration must fit"),
+            ),
+            retiring: AtomicBool::new(false),
+            startup_task: Mutex::new(None),
+        })
+    }
+
+    fn entry_map(entries: &[Arc<LspProcessEntry>]) -> HashMap<CheckoutId, Arc<LspProcessEntry>> {
+        entries
+            .iter()
+            .map(|entry| (entry.checkout_id.clone(), Arc::clone(entry)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn startup_lease_stays_held_until_startup_reaches_a_terminal_phase() {
+        let entry = test_entry("checkout-warmup", 1, Duration::from_secs(30));
+        let lease = entry.acquire();
+        let entries = entry_map(&[Arc::clone(&entry)]);
+
+        assert_eq!(entry.lease_count.load(Ordering::Acquire), 1);
+        assert_eq!(lru_eviction_candidate(&entries), None);
+
+        let _ = entry.server.phase_tx.send(Phase::Ready);
+        lease.wait_startup_finished().await;
+        assert_eq!(entry.lease_count.load(Ordering::Acquire), 1);
+
+        drop(lease);
+        assert_eq!(entry.lease_count.load(Ordering::Acquire), 0);
+        assert_eq!(
+            lru_eviction_candidate(&entries),
+            Some(entry.checkout_id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_preparing_entry_aborts_its_startup_task_before_shutdown() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let entry = test_entry("checkout-preparing", 1, Duration::from_secs(0));
+        let started = Arc::new(Notify::new());
+        let task_started = Arc::clone(&started);
+        let startup_dropped = Arc::new(AtomicBool::new(false));
+        let task_drop = Arc::clone(&startup_dropped);
+        let startup_task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(task_drop);
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+        entry.set_startup_task(startup_task);
+        started.notified().await;
+
+        assert!(entry.begin_retirement());
+        entry.shutdown().await;
+
+        assert!(startup_dropped.load(Ordering::Acquire));
+        assert!(matches!(entry.server.phase(), Phase::Error(_)));
+    }
+
+    #[test]
+    fn lru_eviction_skips_leased_and_retiring_generations() {
+        let leased = test_entry("checkout-leased", 1, Duration::from_secs(90));
+        let retiring = test_entry("checkout-retiring", 2, Duration::from_secs(60));
+        let eligible = test_entry("checkout-eligible", 3, Duration::from_secs(30));
+        let _lease = leased.acquire();
+        assert!(retiring.begin_retirement());
+        let entries = entry_map(&[
+            Arc::clone(&leased),
+            Arc::clone(&retiring),
+            Arc::clone(&eligible),
+        ]);
+
+        assert_eq!(
+            lru_eviction_candidate(&entries),
+            Some(eligible.checkout_id.clone())
+        );
+    }
+
+    #[test]
+    fn policy_shrink_retires_idle_lru_entries_and_preserves_leases() {
+        let leased_a = test_entry("checkout-leased-a", 1, Duration::from_secs(120));
+        let leased_b = test_entry("checkout-leased-b", 2, Duration::from_secs(110));
+        let idle = test_entry("checkout-idle", 3, Duration::from_secs(100));
+        let _lease_a = leased_a.acquire();
+        let _lease_b = leased_b.acquire();
+        let entries = entry_map(&[
+            Arc::clone(&leased_a),
+            Arc::clone(&leased_b),
+            Arc::clone(&idle),
+        ]);
+
+        let candidates = convergence_candidates(&entries, 1, Duration::from_secs(1_000), false);
+
+        assert_eq!(candidates, vec![idle.checkout_id.clone()]);
+        assert!(!candidates.contains(&leased_a.checkout_id));
+        assert!(!candidates.contains(&leased_b.checkout_id));
+    }
+
+    #[test]
+    fn policy_shrink_uses_idle_lru_order_until_the_new_limit_is_met() {
+        let oldest = test_entry("checkout-oldest", 1, Duration::from_secs(90));
+        let middle = test_entry("checkout-middle", 2, Duration::from_secs(60));
+        let newest = test_entry("checkout-newest", 3, Duration::from_secs(30));
+        let entries = entry_map(&[
+            Arc::clone(&oldest),
+            Arc::clone(&middle),
+            Arc::clone(&newest),
+        ]);
+
+        let candidates = convergence_candidates(&entries, 1, Duration::from_secs(1_000), false);
+
+        assert_eq!(
+            candidates,
+            vec![oldest.checkout_id.clone(), middle.checkout_id.clone()]
+        );
+    }
+
+    #[test]
+    fn idle_reaper_keeps_entries_younger_than_the_policy_timeout() {
+        let expired = test_entry("checkout-expired", 1, Duration::from_secs(90));
+        let young = test_entry("checkout-young", 2, Duration::from_secs(10));
+        let entries = entry_map(&[Arc::clone(&expired), Arc::clone(&young)]);
+
+        let candidates = convergence_candidates(&entries, 1, Duration::from_secs(60), true);
+
+        assert_eq!(candidates, vec![expired.checkout_id.clone()]);
+        assert!(!candidates.contains(&young.checkout_id));
+    }
+
+    #[test]
+    fn completed_retirement_cannot_remove_a_newer_generation() {
+        let retired = test_entry("checkout-shared", 7, Duration::from_secs(90));
+        let replacement = test_entry("checkout-shared", 8, Duration::from_secs(0));
+        assert!(retired.begin_retirement());
+        let mut entries = entry_map(&[Arc::clone(&replacement)]);
+
+        assert!(!remove_retired_entry_if_current(&mut entries, &retired));
+        let current = entries
+            .get(&replacement.checkout_id)
+            .expect("replacement generation remains registered");
+        assert_eq!(current.generation, 8);
+        assert!(Arc::ptr_eq(current, &replacement));
+    }
+
+    #[test]
+    fn entry_retirement_can_only_start_once() {
+        let entry = test_entry("checkout-retire-once", 1, Duration::from_secs(0));
+
+        assert!(entry.begin_retirement());
+        assert!(!entry.begin_retirement());
+    }
+
+    #[test]
+    fn status_envelope_keeps_checkout_and_service_generations_separate() {
+        let checkout_a = test_entry("checkout-a", 7, Duration::from_secs(0));
+        let checkout_b = test_entry("checkout-b", 11, Duration::from_secs(0));
+
+        let status_a = build_status(Some(&checkout_a), Some(&checkout_a.checkout_id), Some(101));
+        let status_b = build_status(Some(&checkout_b), Some(&checkout_b.checkout_id), Some(202));
+
+        assert_eq!(status_a.checkout_id.as_deref(), Some("checkout-a"));
+        assert_eq!(status_a.workspace_generation, Some(101));
+        assert_eq!(status_a.service_generation, Some(7));
+        assert_eq!(status_b.checkout_id.as_deref(), Some("checkout-b"));
+        assert_eq!(status_b.workspace_generation, Some(202));
+        assert_eq!(status_b.service_generation, Some(11));
+        assert_ne!(status_a.service_instance_id, status_b.service_instance_id);
+    }
 
     #[test]
     fn unity_managed_csharp_paths_require_unity_source_roots() {

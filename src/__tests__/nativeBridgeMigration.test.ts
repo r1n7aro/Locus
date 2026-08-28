@@ -70,12 +70,11 @@ describe("native bridge migration", () => {
   });
 
   it("gates readiness and semantic state on native managedState", () => {
-    const bridge = read("src-tauri/src/unity_bridge/mod.rs");
     const probe = read("src-tauri/src/unity_bridge/state_probe.rs");
     const native = read("locus_native_plugin/src/lib.rs");
 
-    expect(bridge).toContain("Native broker managed state is");
-    expect(bridge).toContain("native_managed_not_ready");
+    expect(probe).toContain("Native broker lifecycle is the authoritative managed-domain state.");
+    expect(probe).toContain("match status.managed_state.as_str()");
     expect(probe).toContain("native_broker_status: Option<super::NativeBrokerStatus>");
     expect(probe).toContain('SemanticPhase::Reloading');
     expect(probe).toContain('"native_broker"');
@@ -210,7 +209,7 @@ describe("native bridge migration", () => {
     expect(process).toContain("force_close_current_project_unity_processes");
     expect(process).toContain("unity_process_args_are_worker");
     expect(cli).toContain("check_or_install_plugin(&project, config.install_plugin, &sink).await?");
-    expect(workspace).toContain("quiesce_unity_embed_control_windows(&app_handle).await?");
+    expect(workspace).toContain("quiesce_unity_embed_control_windows(&app_handle, &workspace_ref).await?");
     expect(workspace).toContain("drop(unity_embed_quiesce);");
     expect(workspace).toContain("install_or_update_plugin_with_force_close");
   });

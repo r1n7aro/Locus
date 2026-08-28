@@ -14,9 +14,12 @@ use uuid::Uuid;
 
 use super::models::{
     AssistantRenderPart, ChatMessage, KnowledgeProposal, KnowledgeProposalStatus, MessageRole,
-    PlanModeState, SessionContextAttempt, SessionDetail, SessionEventRecord, SessionMessagePage,
-    SessionRunSummary, SessionRuntimeSnapshot, SessionSummary, SessionTurnPreview,
-    SessionViewSnapshot, TodoItem, TodoSnapshot, ToolCallInfo,
+    PersistedSessionRun, PlanModeState, ProjectExplorerMutationResult, ProjectExplorerNode,
+    ProjectExplorerOperation, ProjectExplorerSnapshot, SessionContextAttempt, SessionDetail,
+    SessionEventRecord, SessionExecutionTarget, SessionMessagePage, SessionRunScopeSnapshot,
+    SessionRunServiceBinding, SessionRunSummary, SessionRuntimeSnapshot, SessionSummary,
+    SessionTurnPreview, SessionViewSnapshot, SessionWorkspaceScope, TodoItem, TodoSnapshot,
+    ToolCallInfo, WorkspaceCheckoutRecord, WorkspaceServiceRecord,
 };
 use super::runtime::SessionRuntimeRegistry;
 use crate::commands::{
@@ -889,7 +892,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 35;
+    const SCHEMA_VERSION: i32 = 36;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1322,7 +1325,71 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 35, "add a new migration block above");
+        if current < 36 {
+            Self::migrate(
+                conn,
+                36,
+                "persist project contexts, shared sessions, and scoped runs",
+                |conn| {
+                    Self::create_workspace_persistence_schema(conn)?;
+                    Self::create_project_context_schema(conn)?;
+                    if !Self::table_has_column(conn, "sessions", "default_checkout_id")? {
+                        conn.execute_batch(
+                            "ALTER TABLE sessions
+                             ADD COLUMN default_checkout_id TEXT
+                             REFERENCES workspace_checkouts(checkout_id);",
+                        )?;
+                    }
+                    if !Self::table_has_column(conn, "session_runs", "project_id")? {
+                        conn.execute_batch("ALTER TABLE session_runs ADD COLUMN project_id TEXT;")?;
+                    }
+                    if !Self::table_has_column(conn, "session_runs", "checkout_id")? {
+                        conn.execute_batch(
+                            "ALTER TABLE session_runs
+                             ADD COLUMN checkout_id TEXT
+                             REFERENCES workspace_checkouts(checkout_id);",
+                        )?;
+                    }
+                    if !Self::table_has_column(conn, "session_runs", "workspace_generation")? {
+                        conn.execute_batch(
+                            "ALTER TABLE session_runs ADD COLUMN workspace_generation INTEGER;",
+                        )?;
+                    }
+                    if !Self::table_has_column(conn, "session_runs", "service_bindings_json")? {
+                        conn.execute_batch(
+                            "ALTER TABLE session_runs ADD COLUMN service_bindings_json TEXT;",
+                        )?;
+                    }
+                    if !Self::table_has_column(conn, "session_runs", "git_branch_ref")? {
+                        conn.execute_batch(
+                            "ALTER TABLE session_runs ADD COLUMN git_branch_ref TEXT;",
+                        )?;
+                    }
+                    if !Self::table_has_column(conn, "session_runs", "git_head_oid")? {
+                        conn.execute_batch(
+                            "ALTER TABLE session_runs ADD COLUMN git_head_oid TEXT;",
+                        )?;
+                    }
+                    // The logical project was already persisted on the owning
+                    // session, so this part of the historical run scope is
+                    // deterministic. Checkout and generation remain NULL: the
+                    // old schema did not record enough information to infer
+                    // them without inventing audit data.
+                    conn.execute_batch(
+                        "UPDATE session_runs
+                         SET project_id = (
+                            SELECT sessions.workspace_id
+                            FROM sessions
+                            WHERE sessions.id = session_runs.session_id
+                         )
+                         WHERE project_id IS NULL;",
+                    )?;
+                    Ok(())
+                },
+            )?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 36, "add a new migration block above");
         Ok(())
     }
 
@@ -1569,12 +1636,15 @@ impl SessionStore {
     }
 
     fn create_latest_schema(conn: &Connection) -> rusqlite::Result<()> {
+        Self::create_workspace_persistence_schema(conn)?;
+        Self::create_project_context_schema(conn)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 parent_session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
                 workspace_id TEXT,
+                default_checkout_id TEXT REFERENCES workspace_checkouts(checkout_id),
                 session_type TEXT NOT NULL DEFAULT 'chat',
                 agent_id TEXT,
                 last_model_id TEXT,
@@ -1647,6 +1717,89 @@ impl SessionStore {
         .and_then(|_| Self::create_model_usage_schema(conn))
         .and_then(|_| Self::create_prompt_prefix_cache_schema(conn))
         .and_then(|_| Self::create_prompt_cache_check_schema(conn))
+    }
+
+    fn create_workspace_persistence_schema(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workspace_projects (
+                project_id TEXT PRIMARY KEY,
+                last_opened_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workspace_checkouts (
+                checkout_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                normalized_root TEXT NOT NULL UNIQUE,
+                last_opened_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_checkouts_project
+                ON workspace_checkouts(project_id, last_opened_at DESC);
+
+            CREATE TABLE IF NOT EXISTS workspace_services (
+                checkout_id TEXT NOT NULL
+                    REFERENCES workspace_checkouts(checkout_id) ON DELETE CASCADE,
+                service_kind TEXT NOT NULL,
+                service_instance_id TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+                activation_policy TEXT NOT NULL
+                    CHECK(activation_policy IN ('disabled', 'manual', 'lazy', 'auto')),
+                local_config_json TEXT NOT NULL,
+                PRIMARY KEY(checkout_id, service_kind)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_services_instance
+                ON workspace_services(service_instance_id);",
+        )
+    }
+
+    fn create_project_context_schema(conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS workspace_projects (
+                project_id TEXT PRIMARY KEY,
+                last_opened_at INTEGER NOT NULL
+            );
+            INSERT INTO workspace_projects (project_id, last_opened_at)
+            SELECT project_id, MAX(last_opened_at)
+            FROM workspace_checkouts
+            GROUP BY project_id
+            ON CONFLICT(project_id) DO UPDATE SET
+                last_opened_at = MAX(workspace_projects.last_opened_at, excluded.last_opened_at);
+
+            CREATE TABLE IF NOT EXISTS project_explorer_layouts (
+                project_id TEXT PRIMARY KEY
+                    REFERENCES workspace_projects(project_id) ON DELETE CASCADE,
+                revision INTEGER NOT NULL DEFAULT 0,
+                last_operation_id TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS project_explorer_nodes (
+                node_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL
+                    REFERENCES workspace_projects(project_id) ON DELETE CASCADE,
+                node_kind TEXT NOT NULL
+                    CHECK(node_kind IN ('folder', 'resource')),
+                parent_node_id TEXT
+                    REFERENCES project_explorer_nodes(node_id) ON DELETE RESTRICT,
+                resource_kind TEXT,
+                resource_id TEXT,
+                folder_name TEXT,
+                position INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                CHECK (
+                    (node_kind = 'folder' AND folder_name IS NOT NULL
+                     AND resource_kind IS NULL AND resource_id IS NULL)
+                    OR
+                    (node_kind = 'resource' AND folder_name IS NULL
+                     AND resource_kind IS NOT NULL AND resource_id IS NOT NULL)
+                ),
+                UNIQUE(project_id, resource_kind, resource_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_explorer_children
+                ON project_explorer_nodes(project_id, parent_node_id, position);",
+        )
     }
 
     fn create_prompt_prefix_cache_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -1741,6 +1894,12 @@ impl SessionStore {
             "CREATE TABLE IF NOT EXISTS session_runs (
                 run_id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                project_id TEXT,
+                checkout_id TEXT REFERENCES workspace_checkouts(checkout_id),
+                workspace_generation INTEGER,
+                service_bindings_json TEXT,
+                git_branch_ref TEXT,
+                git_head_oid TEXT,
                 status TEXT NOT NULL,
                 started_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
@@ -2177,6 +2336,800 @@ impl SessionStore {
         self.runtime.clear_run_if_current(session_id, run_id);
     }
 
+    pub fn upsert_workspace_checkout(
+        &self,
+        checkout: &WorkspaceCheckoutRecord,
+    ) -> Result<(), String> {
+        let checkout_id = checkout.checkout_id.trim();
+        let project_id = checkout.project_id.trim();
+        let root_path = checkout.root_path.trim();
+        let normalized_root = checkout.normalized_root.trim();
+        if checkout_id.is_empty()
+            || project_id.is_empty()
+            || root_path.is_empty()
+            || normalized_root.is_empty()
+        {
+            return Err(
+                "Workspace checkout id, project id, root path, and normalized root are required"
+                    .to_string(),
+            );
+        }
+
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let existing = conn
+            .query_row(
+                "SELECT project_id, normalized_root
+                 FROM workspace_checkouts
+                 WHERE checkout_id = ?1",
+                params![checkout_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to inspect workspace checkout: {}", e))?;
+        if let Some((existing_project, existing_root)) = existing {
+            if existing_project != project_id {
+                return Err(format!(
+                    "Checkout {} is already registered to project {}",
+                    checkout_id, existing_project
+                ));
+            }
+            if existing_root != normalized_root {
+                return Err(format!(
+                    "Checkout {} is already registered to normalized root {}",
+                    checkout_id, existing_root
+                ));
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO workspace_projects (project_id, last_opened_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET
+                last_opened_at = MAX(workspace_projects.last_opened_at, excluded.last_opened_at)",
+            params![project_id, checkout.last_opened_at],
+        )
+        .map_err(|e| format!("Failed to persist workspace project: {}", e))?;
+
+        conn.execute(
+            "INSERT INTO workspace_checkouts (
+                checkout_id, project_id, root_path, normalized_root, last_opened_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(checkout_id) DO UPDATE SET
+                root_path = excluded.root_path,
+                normalized_root = excluded.normalized_root,
+                last_opened_at = MAX(workspace_checkouts.last_opened_at, excluded.last_opened_at)",
+            params![
+                checkout_id,
+                project_id,
+                root_path,
+                normalized_root,
+                checkout.last_opened_at,
+            ],
+        )
+        .map_err(|e| format!("Failed to persist workspace checkout: {}", e))?;
+        Ok(())
+    }
+
+    pub fn get_workspace_checkout(
+        &self,
+        checkout_id: &str,
+    ) -> Result<Option<WorkspaceCheckoutRecord>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT checkout_id, project_id, root_path, normalized_root, last_opened_at
+             FROM workspace_checkouts
+             WHERE checkout_id = ?1",
+            params![checkout_id],
+            |row| {
+                Ok(WorkspaceCheckoutRecord {
+                    checkout_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    root_path: row.get(2)?,
+                    normalized_root: row.get(3)?,
+                    last_opened_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to load workspace checkout: {}", e))
+    }
+
+    pub fn list_workspace_checkouts(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<WorkspaceCheckoutRecord>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let sql = if project_id.is_some() {
+            "SELECT checkout_id, project_id, root_path, normalized_root, last_opened_at
+             FROM workspace_checkouts
+             WHERE project_id = ?1
+             ORDER BY last_opened_at DESC, checkout_id ASC"
+        } else {
+            "SELECT checkout_id, project_id, root_path, normalized_root, last_opened_at
+             FROM workspace_checkouts
+             ORDER BY last_opened_at DESC, checkout_id ASC"
+        };
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("Failed to prepare workspace checkout query: {}", e))?;
+        let mapper = |row: &rusqlite::Row<'_>| {
+            Ok(WorkspaceCheckoutRecord {
+                checkout_id: row.get(0)?,
+                project_id: row.get(1)?,
+                root_path: row.get(2)?,
+                normalized_root: row.get(3)?,
+                last_opened_at: row.get(4)?,
+            })
+        };
+        let rows = if let Some(project_id) = project_id {
+            stmt.query_map(params![project_id], mapper)
+        } else {
+            stmt.query_map([], mapper)
+        }
+        .map_err(|e| format!("Failed to query workspace checkouts: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read workspace checkout: {}", e))
+    }
+
+    fn ensure_project_explorer_layout_with_conn(
+        conn: &Connection,
+        project_id: &str,
+    ) -> Result<(), String> {
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM workspace_projects WHERE project_id = ?1",
+                params![project_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect workspace project: {error}"))?
+            .is_some();
+        if !exists {
+            return Err(format!("Unknown workspace project: {project_id}"));
+        }
+        let now = Self::now_ts();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_explorer_layouts (
+                project_id, revision, created_at, updated_at
+             ) VALUES (?1, 0, ?2, ?2)",
+            params![project_id, now],
+        )
+        .map_err(|error| format!("Failed to initialize project explorer layout: {error}"))?;
+        Ok(())
+    }
+
+    fn load_project_explorer_snapshot_with_conn(
+        conn: &Connection,
+        project_id: &str,
+    ) -> Result<ProjectExplorerSnapshot, String> {
+        let revision = conn
+            .query_row(
+                "SELECT revision
+                 FROM project_explorer_layouts WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Failed to load project explorer layout: {error}"))?;
+        let mut statement = conn
+            .prepare(
+                "SELECT node_id, project_id, node_kind, parent_node_id,
+                        resource_kind, resource_id, folder_name, position
+                 FROM project_explorer_nodes
+                 WHERE project_id = ?1
+                 ORDER BY parent_node_id, position, node_id",
+            )
+            .map_err(|error| format!("Failed to prepare project explorer nodes: {error}"))?;
+        let nodes = statement
+            .query_map(params![project_id], |row| {
+                Ok(ProjectExplorerNode {
+                    node_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    node_kind: row.get(2)?,
+                    parent_node_id: row.get(3)?,
+                    resource_kind: row.get(4)?,
+                    resource_id: row.get(5)?,
+                    folder_name: row.get(6)?,
+                    hidden: false,
+                    source_path: None,
+                    source_kind: None,
+                    position: row.get(7)?,
+                })
+            })
+            .map_err(|error| format!("Failed to query project explorer nodes: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Failed to read project explorer node: {error}"))?;
+        Ok(ProjectExplorerSnapshot {
+            project_id: project_id.to_string(),
+            preset_id: "legacy-database".to_string(),
+            preset_name: "Legacy database".to_string(),
+            manifest_path: String::new(),
+            revision,
+            nodes,
+            presets: Vec::new(),
+        })
+    }
+
+    pub fn project_explorer_snapshot(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectExplorerSnapshot, String> {
+        let project_id = project_id.trim();
+        if project_id.is_empty() {
+            return Err("Project identity cannot be empty".to_string());
+        }
+        let conn = self.conn.lock().map_err(|error| error.to_string())?;
+        Self::ensure_project_explorer_layout_with_conn(&conn, project_id)?;
+        Self::load_project_explorer_snapshot_with_conn(&conn, project_id)
+    }
+
+    fn project_explorer_sibling_ids(
+        conn: &Connection,
+        project_id: &str,
+        parent_node_id: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let sql = if parent_node_id.is_some() {
+            "SELECT node_id FROM project_explorer_nodes
+             WHERE project_id = ?1 AND parent_node_id = ?2
+             ORDER BY position, node_id"
+        } else {
+            "SELECT node_id FROM project_explorer_nodes
+             WHERE project_id = ?1 AND parent_node_id IS NULL
+             ORDER BY position, node_id"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| format!("Failed to prepare explorer siblings: {error}"))?;
+        if let Some(parent_node_id) = parent_node_id {
+            let rows = statement
+                .query_map(params![project_id, parent_node_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| format!("Failed to query explorer siblings: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Failed to read explorer sibling: {error}"))
+        } else {
+            let rows = statement
+                .query_map(params![project_id], |row| row.get::<_, String>(0))
+                .map_err(|error| format!("Failed to query explorer siblings: {error}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Failed to read explorer sibling: {error}"))
+        }
+    }
+
+    fn project_explorer_write_positions(
+        conn: &Connection,
+        node_ids: &[String],
+    ) -> Result<(), String> {
+        for (position, node_id) in node_ids.iter().enumerate() {
+            conn.execute(
+                "UPDATE project_explorer_nodes SET position = ?1, updated_at = ?2
+                 WHERE node_id = ?3",
+                params![position as i64, Self::now_ts(), node_id],
+            )
+            .map_err(|error| format!("Failed to order project explorer node: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn validate_project_explorer_parent(
+        conn: &Connection,
+        project_id: &str,
+        parent_node_id: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(parent_node_id) = parent_node_id else {
+            return Ok(());
+        };
+        let parent = conn
+            .query_row(
+                "SELECT project_id, node_kind
+                 FROM project_explorer_nodes WHERE node_id = ?1",
+                params![parent_node_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect explorer parent: {error}"))?
+            .ok_or_else(|| format!("Project explorer parent does not exist: {parent_node_id}"))?;
+        if parent.0 != project_id || parent.1 != "folder" {
+            return Err("Project explorer parent must be a folder in the same project".to_string());
+        }
+        Ok(())
+    }
+
+    fn move_project_explorer_node_with_conn(
+        conn: &Connection,
+        project_id: &str,
+        node_id: &str,
+        parent_node_id: Option<&str>,
+        position: i64,
+    ) -> Result<(), String> {
+        Self::validate_project_explorer_parent(conn, project_id, parent_node_id)?;
+        let (node_project, node_kind, old_parent) = conn
+            .query_row(
+                "SELECT project_id, node_kind, parent_node_id
+                 FROM project_explorer_nodes WHERE node_id = ?1",
+                params![node_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to inspect explorer node: {error}"))?
+            .ok_or_else(|| format!("Project explorer node does not exist: {node_id}"))?;
+        if node_project != project_id {
+            return Err("Project explorer nodes cannot move across projects".to_string());
+        }
+        if node_kind == "folder" {
+            if parent_node_id == Some(node_id) {
+                return Err("Project explorer folder cannot contain itself".to_string());
+            }
+            if let Some(parent_node_id) = parent_node_id {
+                let is_descendant = conn
+                    .query_row(
+                        "WITH RECURSIVE descendants(node_id) AS (
+                            SELECT node_id FROM project_explorer_nodes
+                            WHERE parent_node_id = ?1
+                            UNION ALL
+                            SELECT child.node_id FROM project_explorer_nodes child
+                            JOIN descendants parent ON child.parent_node_id = parent.node_id
+                         )
+                         SELECT 1 FROM descendants WHERE node_id = ?2 LIMIT 1",
+                        params![node_id, parent_node_id],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Failed to validate explorer cycle: {error}"))?
+                    .is_some();
+                if is_descendant {
+                    return Err(
+                        "Project explorer folder cannot move into its descendant".to_string()
+                    );
+                }
+            }
+        }
+        conn.execute(
+            "UPDATE project_explorer_nodes
+             SET parent_node_id = ?1, position = ?2, updated_at = ?3
+             WHERE node_id = ?4",
+            params![parent_node_id, i64::MAX / 2, Self::now_ts(), node_id],
+        )
+        .map_err(|error| format!("Failed to move project explorer node: {error}"))?;
+
+        let old_siblings =
+            Self::project_explorer_sibling_ids(conn, project_id, old_parent.as_deref())?;
+        Self::project_explorer_write_positions(conn, &old_siblings)?;
+        let mut target_siblings =
+            Self::project_explorer_sibling_ids(conn, project_id, parent_node_id)?;
+        target_siblings.retain(|candidate| candidate != node_id);
+        let position = position.clamp(0, target_siblings.len() as i64) as usize;
+        target_siblings.insert(position, node_id.to_string());
+        Self::project_explorer_write_positions(conn, &target_siblings)
+    }
+
+    fn apply_project_explorer_operation_with_conn(
+        conn: &Connection,
+        project_id: &str,
+        operation: &ProjectExplorerOperation,
+    ) -> Result<(), String> {
+        match operation {
+            ProjectExplorerOperation::CreateFolder {
+                node_id,
+                parent_node_id,
+                name,
+                position,
+            } => {
+                Self::validate_project_explorer_parent(
+                    conn,
+                    project_id,
+                    parent_node_id.as_deref(),
+                )?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err("Project explorer folder name cannot be empty".to_string());
+                }
+                let node_id = node_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("folder:{}", Uuid::new_v4()));
+                conn.execute(
+                    "INSERT INTO project_explorer_nodes (
+                        node_id, project_id, node_kind, parent_node_id,
+                        folder_name, position, created_at, updated_at
+                     ) VALUES (?1, ?2, 'folder', ?3, ?4, ?5, ?6, ?6)",
+                    params![
+                        node_id,
+                        project_id,
+                        parent_node_id,
+                        name,
+                        i64::MAX / 2,
+                        Self::now_ts(),
+                    ],
+                )
+                .map_err(|error| format!("Failed to create project explorer folder: {error}"))?;
+                Self::move_project_explorer_node_with_conn(
+                    conn,
+                    project_id,
+                    &node_id,
+                    parent_node_id.as_deref(),
+                    *position,
+                )
+            }
+            ProjectExplorerOperation::RenameFolder { node_id, name } => {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err("Project explorer folder name cannot be empty".to_string());
+                }
+                let changed = conn
+                    .execute(
+                        "UPDATE project_explorer_nodes
+                         SET folder_name = ?1, updated_at = ?2
+                         WHERE node_id = ?3 AND project_id = ?4 AND node_kind = 'folder'",
+                        params![name, Self::now_ts(), node_id, project_id],
+                    )
+                    .map_err(|error| format!("Failed to rename explorer folder: {error}"))?;
+                if changed != 1 {
+                    return Err(format!("Project explorer folder does not exist: {node_id}"));
+                }
+                Ok(())
+            }
+            ProjectExplorerOperation::DeleteFolder { node_id } => {
+                let parent_node_id = conn
+                    .query_row(
+                        "SELECT parent_node_id
+                         FROM project_explorer_nodes
+                         WHERE node_id = ?1 AND project_id = ?2 AND node_kind = 'folder'",
+                        params![node_id, project_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Failed to inspect explorer folder: {error}"))?
+                    .ok_or_else(|| format!("Project explorer folder does not exist: {node_id}"))?;
+                let children = Self::project_explorer_sibling_ids(
+                    conn,
+                    project_id,
+                    Some(node_id),
+                )?;
+                let mut siblings = Self::project_explorer_sibling_ids(
+                    conn,
+                    project_id,
+                    parent_node_id.as_deref(),
+                )?;
+                let insertion = siblings
+                    .iter()
+                    .position(|candidate| candidate == node_id)
+                    .unwrap_or(siblings.len());
+                siblings.retain(|candidate| candidate != node_id);
+                conn.execute(
+                    "UPDATE project_explorer_nodes
+                     SET parent_node_id = ?1, updated_at = ?2
+                     WHERE parent_node_id = ?3 AND project_id = ?4",
+                    params![parent_node_id, Self::now_ts(), node_id, project_id],
+                )
+                .map_err(|error| format!("Failed to promote explorer children: {error}"))?;
+                conn.execute(
+                    "DELETE FROM project_explorer_nodes WHERE node_id = ?1 AND project_id = ?2",
+                    params![node_id, project_id],
+                )
+                .map_err(|error| format!("Failed to delete explorer folder: {error}"))?;
+                for (offset, child) in children.into_iter().enumerate() {
+                    siblings.insert((insertion + offset).min(siblings.len()), child);
+                }
+                Self::project_explorer_write_positions(conn, &siblings)
+            }
+            ProjectExplorerOperation::MoveNode {
+                node_id,
+                parent_node_id,
+                position,
+            } => Self::move_project_explorer_node_with_conn(
+                conn,
+                project_id,
+                node_id,
+                parent_node_id.as_deref(),
+                *position,
+            ),
+            ProjectExplorerOperation::PlaceResource {
+                resource_kind,
+                resource_id,
+                source_kind: _,
+                parent_node_id,
+                position,
+            } => {
+                let resource_kind = resource_kind.trim();
+                let resource_id = resource_id.trim();
+                if resource_kind.is_empty() || resource_id.is_empty() {
+                    return Err("Project explorer resource identity cannot be empty".to_string());
+                }
+                match resource_kind {
+                    "session" | "knowledge" | "system" => {}
+                    _ => {
+                        return Err(format!(
+                            "Unsupported project explorer resource kind: {resource_kind}"
+                        ))
+                    }
+                }
+                let existing = conn
+                    .query_row(
+                        "SELECT node_id FROM project_explorer_nodes
+                         WHERE project_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
+                        params![project_id, resource_kind, resource_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Failed to inspect resource placement: {error}"))?;
+                let node_id = existing.unwrap_or_else(|| {
+                    format!("resource:{resource_kind}:{}", Uuid::new_v4())
+                });
+                if !conn
+                    .query_row(
+                        "SELECT 1 FROM project_explorer_nodes WHERE node_id = ?1",
+                        params![node_id],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|error| format!("Failed to inspect explorer node: {error}"))?
+                    .is_some()
+                {
+                    conn.execute(
+                        "INSERT INTO project_explorer_nodes (
+                            node_id, project_id, node_kind, parent_node_id,
+                            resource_kind, resource_id, position, created_at, updated_at
+                         ) VALUES (?1, ?2, 'resource', ?3, ?4, ?5, ?6, ?7, ?7)",
+                        params![
+                            node_id,
+                            project_id,
+                            parent_node_id,
+                            resource_kind,
+                            resource_id,
+                            i64::MAX / 2,
+                            Self::now_ts(),
+                        ],
+                    )
+                    .map_err(|error| format!("Failed to place explorer resource: {error}"))?;
+                }
+                Self::move_project_explorer_node_with_conn(
+                    conn,
+                    project_id,
+                    &node_id,
+                    parent_node_id.as_deref(),
+                    *position,
+                )
+            }
+            ProjectExplorerOperation::RemoveResourcePlacement {
+                resource_kind,
+                resource_id,
+            } => {
+                conn.execute(
+                    "DELETE FROM project_explorer_nodes
+                     WHERE project_id = ?1 AND resource_kind = ?2 AND resource_id = ?3",
+                    params![project_id, resource_kind, resource_id],
+                )
+                .map_err(|error| format!("Failed to remove resource placement: {error}"))?;
+                Ok(())
+            }
+            ProjectExplorerOperation::MountPath { .. }
+            | ProjectExplorerOperation::SetNodeHidden { .. }
+            | ProjectExplorerOperation::RemoveNode { .. } => Err(
+                "File-backed workspace tree operations are unavailable in the legacy database store"
+                    .to_string(),
+            ),
+        }
+    }
+
+    pub fn apply_project_explorer_operations(
+        &self,
+        project_id: &str,
+        expected_revision: i64,
+        operation_id: &str,
+        operations: &[ProjectExplorerOperation],
+    ) -> Result<ProjectExplorerMutationResult, String> {
+        let project_id = project_id.trim();
+        let operation_id = operation_id.trim();
+        if project_id.is_empty() || operation_id.is_empty() {
+            return Err("Project and operation identities are required".to_string());
+        }
+        let conn = self.conn.lock().map_err(|error| error.to_string())?;
+        conn.execute("BEGIN IMMEDIATE", [])
+            .map_err(|error| format!("Failed to begin explorer transaction: {error}"))?;
+        let result = (|| {
+            Self::ensure_project_explorer_layout_with_conn(&conn, project_id)?;
+            let (revision, last_operation_id) = conn
+                .query_row(
+                    "SELECT revision, last_operation_id FROM project_explorer_layouts
+                     WHERE project_id = ?1",
+                    params![project_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .map_err(|error| format!("Failed to inspect explorer revision: {error}"))?;
+            if last_operation_id.as_deref() == Some(operation_id) {
+                return Self::load_project_explorer_snapshot_with_conn(&conn, project_id);
+            }
+            if revision != expected_revision {
+                return Err(format!(
+                    "project_explorer_revision_conflict:{expected_revision}:{revision}"
+                ));
+            }
+            for operation in operations {
+                Self::apply_project_explorer_operation_with_conn(&conn, project_id, operation)?;
+            }
+            conn.execute(
+                "UPDATE project_explorer_layouts
+                 SET revision = revision + 1, last_operation_id = ?1, updated_at = ?2
+                 WHERE project_id = ?3",
+                params![operation_id, Self::now_ts(), project_id],
+            )
+            .map_err(|error| format!("Failed to advance explorer revision: {error}"))?;
+            Self::load_project_explorer_snapshot_with_conn(&conn, project_id)
+        })();
+        match result {
+            Ok(snapshot) => {
+                conn.execute("COMMIT", [])
+                    .map_err(|error| format!("Failed to commit explorer transaction: {error}"))?;
+                Ok(ProjectExplorerMutationResult {
+                    operation_id: operation_id.to_string(),
+                    snapshot,
+                })
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn upsert_workspace_service(&self, service: &WorkspaceServiceRecord) -> Result<(), String> {
+        let checkout_id = service.checkout_id.trim();
+        let service_kind = service.service_kind.trim();
+        let service_instance_id = service.service_instance_id.trim();
+        let activation_policy = service.activation_policy.trim();
+        if checkout_id.is_empty() || service_kind.is_empty() || service_instance_id.is_empty() {
+            return Err(
+                "Workspace service checkout, kind, and instance id are required".to_string(),
+            );
+        }
+        if !matches!(activation_policy, "disabled" | "manual" | "lazy" | "auto") {
+            return Err(format!(
+                "Invalid workspace service activation policy: {}",
+                activation_policy
+            ));
+        }
+        let local_config_json = serde_json::to_string(&service.local_config)
+            .map_err(|e| format!("Failed to serialize workspace service config: {}", e))?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let existing_instance = conn
+            .query_row(
+                "SELECT service_instance_id
+                 FROM workspace_services
+                 WHERE checkout_id = ?1 AND service_kind = ?2",
+                params![checkout_id, service_kind],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to inspect workspace service: {}", e))?;
+        if existing_instance
+            .as_deref()
+            .is_some_and(|existing| existing != service_instance_id)
+        {
+            return Err(format!(
+                "Service {} for checkout {} is already registered as {}",
+                service_kind,
+                checkout_id,
+                existing_instance.unwrap_or_default()
+            ));
+        }
+        conn.execute(
+            "INSERT INTO workspace_services (
+                checkout_id, service_kind, service_instance_id, enabled,
+                activation_policy, local_config_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(checkout_id, service_kind) DO UPDATE SET
+                enabled = excluded.enabled,
+                activation_policy = excluded.activation_policy,
+                local_config_json = excluded.local_config_json",
+            params![
+                checkout_id,
+                service_kind,
+                service_instance_id,
+                service.enabled,
+                activation_policy,
+                local_config_json,
+            ],
+        )
+        .map_err(|e| format!("Failed to persist workspace service: {}", e))?;
+        Ok(())
+    }
+
+    pub fn list_workspace_services(
+        &self,
+        checkout_id: &str,
+    ) -> Result<Vec<WorkspaceServiceRecord>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT checkout_id, service_kind, service_instance_id, enabled,
+                        activation_policy, local_config_json
+                 FROM workspace_services
+                 WHERE checkout_id = ?1
+                 ORDER BY service_kind ASC",
+            )
+            .map_err(|e| format!("Failed to prepare workspace service query: {}", e))?;
+        let rows = stmt
+            .query_map(params![checkout_id], |row| {
+                let local_config_json = row.get::<_, String>(5)?;
+                let local_config = serde_json::from_str(&local_config_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(WorkspaceServiceRecord {
+                    checkout_id: row.get(0)?,
+                    service_kind: row.get(1)?,
+                    service_instance_id: row.get(2)?,
+                    enabled: row.get(3)?,
+                    activation_policy: row.get(4)?,
+                    local_config,
+                })
+            })
+            .map_err(|e| format!("Failed to query workspace services: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read workspace service: {}", e))
+    }
+
+    /// Backfill only projects that have exactly one known checkout. Callers
+    /// should register the complete startup checkout set before invoking this
+    /// method so a worktree project is never guessed from a partial registry.
+    pub fn backfill_legacy_session_checkouts(&self) -> Result<usize, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions
+             SET default_checkout_id = COALESCE(default_checkout_id, (
+                    SELECT workspace_checkouts.checkout_id
+                    FROM workspace_checkouts
+                    WHERE workspace_checkouts.project_id = sessions.workspace_id
+                 ))
+             WHERE sessions.default_checkout_id IS NULL
+               AND sessions.workspace_id IS NOT NULL
+               AND (
+                    SELECT COUNT(*)
+                    FROM workspace_checkouts
+                    WHERE workspace_checkouts.project_id = sessions.workspace_id
+               ) = 1",
+            [],
+        )
+        .map_err(|e| format!("Failed to backfill legacy session checkouts: {}", e))
+    }
+
+    pub fn get_session_workspace_scope(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionWorkspaceScope, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT sessions.workspace_id,
+                    sessions.default_checkout_id,
+                    workspace_checkouts.root_path
+             FROM sessions
+             LEFT JOIN workspace_checkouts
+               ON workspace_checkouts.checkout_id = sessions.default_checkout_id
+             WHERE sessions.id = ?1",
+            params![session_id],
+            |row| {
+                Ok(SessionWorkspaceScope {
+                    project_id: row.get(0)?,
+                    default_checkout_id: row.get(1)?,
+                    checkout_root: row.get(2)?,
+                })
+            },
+        )
+        .map_err(|e| format!("Session not found: {}", e))
+    }
+
     pub fn create_session(
         &self,
         title: &str,
@@ -2185,12 +3138,54 @@ impl SessionStore {
         session_type: &str,
         agent_id: Option<&str>,
     ) -> Result<String, String> {
+        self.create_session_scoped(title, parent_id, workspace_id, None, session_type, agent_id)
+    }
+
+    pub fn create_session_scoped(
+        &self,
+        title: &str,
+        parent_id: Option<&str>,
+        project_id: Option<&str>,
+        checkout_id: Option<&str>,
+        session_type: &str,
+        agent_id: Option<&str>,
+    ) -> Result<String, String> {
         let id = Uuid::new_v4().to_string();
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        if let Some(checkout_id) = checkout_id {
+            let checkout_project = conn
+                .query_row(
+                    "SELECT project_id FROM workspace_checkouts WHERE checkout_id = ?1",
+                    params![checkout_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to validate session checkout: {}", e))?
+                .ok_or_else(|| format!("Unknown workspace checkout: {}", checkout_id))?;
+            if project_id != Some(checkout_project.as_str()) {
+                return Err(format!(
+                    "Checkout {} belongs to project {}, not {:?}",
+                    checkout_id, checkout_project, project_id
+                ));
+            }
+        }
         conn.execute(
-            "INSERT INTO sessions (id, title, parent_session_id, workspace_id, session_type, agent_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, title, parent_id, workspace_id, session_type, agent_id, now, now],
+            "INSERT INTO sessions (
+                id, title, parent_session_id, workspace_id, default_checkout_id,
+                session_type, agent_id, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                title,
+                parent_id,
+                project_id,
+                checkout_id,
+                session_type,
+                agent_id,
+                now,
+                now,
+            ],
         )
         .map_err(|e| format!("Failed to create session: {}", e))?;
         Ok(id)
@@ -2325,6 +3320,7 @@ impl SessionStore {
                 source_title,
                 parent_session_id,
                 workspace_id,
+                checkout_id,
                 session_type,
                 agent_id,
                 last_model_id,
@@ -2334,7 +3330,10 @@ impl SessionStore {
                 latest_todo_run_id,
             ) = conn
                 .query_row(
-                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, last_fast_mode, latest_completed_run_id, latest_todo_run_id
+                    "SELECT title, parent_session_id, workspace_id,
+                            default_checkout_id,
+                            session_type, agent_id, last_model_id, last_effort,
+                            last_fast_mode, latest_completed_run_id, latest_todo_run_id
                      FROM sessions WHERE id = ?1",
                     params![source_id],
                     |row| {
@@ -2342,13 +3341,14 @@ impl SessionStore {
                             row.get::<_, String>(0)?,
                             row.get::<_, Option<String>>(1)?,
                             row.get::<_, Option<String>>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
                             row.get::<_, Option<String>>(5)?,
                             row.get::<_, Option<String>>(6)?,
-                            row.get::<_, Option<bool>>(7)?,
-                            row.get::<_, Option<String>>(8)?,
+                            row.get::<_, Option<String>>(7)?,
+                            row.get::<_, Option<bool>>(8)?,
                             row.get::<_, Option<String>>(9)?,
+                            row.get::<_, Option<String>>(10)?,
                         ))
                     },
                 )
@@ -2386,6 +3386,7 @@ impl SessionStore {
                     title,
                     parent_session_id,
                     workspace_id,
+                    default_checkout_id,
                     session_type,
                     agent_id,
                     last_model_id,
@@ -2397,11 +3398,12 @@ impl SessionStore {
                     created_at,
                     updated_at
                  )
-                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?11)",
+                 VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?12)",
                 params![
                     new_id,
                     resolved_title,
                     workspace_id,
+                    checkout_id,
                     session_type,
                     agent_id,
                     last_model_id,
@@ -2641,6 +3643,7 @@ impl SessionStore {
             String,
             Option<String>,
             Option<String>,
+            Option<String>,
             String,
             Option<String>,
             Option<String>,
@@ -2657,7 +3660,10 @@ impl SessionStore {
             let conn = snapshot.conn.lock().map_err(|e| e.to_string())?;
             let session = conn
                 .query_row(
-                    "SELECT title, parent_session_id, workspace_id, session_type, agent_id, last_model_id, last_effort, last_fast_mode, latest_completed_run_id, latest_todo_run_id
+                    "SELECT title, parent_session_id, workspace_id,
+                            default_checkout_id,
+                            session_type, agent_id, last_model_id, last_effort,
+                            last_fast_mode, latest_completed_run_id, latest_todo_run_id
                      FROM sessions WHERE id = ?1",
                     params![source_id],
                     |row| {
@@ -2672,6 +3678,7 @@ impl SessionStore {
                             row.get(7)?,
                             row.get(8)?,
                             row.get(9)?,
+                            row.get(10)?,
                         ))
                     },
                 )
@@ -2823,10 +3830,11 @@ impl SessionStore {
         let result = (|| -> Result<(), String> {
             conn.execute(
                 "INSERT INTO sessions (
-                    id, title, parent_session_id, workspace_id, session_type, agent_id,
-                    last_model_id, last_effort, last_fast_mode, archived_at, latest_completed_run_id,
+                    id, title, parent_session_id, workspace_id,
+                    default_checkout_id, session_type, agent_id, last_model_id,
+                    last_effort, last_fast_mode, archived_at, latest_completed_run_id,
                     latest_todo_run_id, created_at, updated_at
-                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, ?11, ?11)",
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?12)",
                 params![
                     new_id,
                     resolved_title,
@@ -2838,6 +3846,7 @@ impl SessionStore {
                     session.7,
                     session.8,
                     session.9,
+                    session.10,
                     now,
                 ],
             )
@@ -2954,49 +3963,200 @@ impl SessionStore {
     }
 
     pub fn try_start_run(&self, session_id: &str, run_id: &str) -> Result<(), String> {
+        self.try_start_run_scoped(session_id, run_id, None)
+    }
+
+    pub fn try_start_run_scoped(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        scope: Option<&SessionRunScopeSnapshot>,
+    ) -> Result<(), String> {
+        let scoped_values = if let Some(scope) = scope {
+            let project_id = scope.project_id.trim();
+            let checkout_id = scope.checkout_id.trim();
+            if project_id.is_empty() || checkout_id.is_empty() {
+                return Err("Scoped run project id and checkout id are required".to_string());
+            }
+            let mut service_kinds = HashSet::new();
+            for binding in &scope.service_bindings {
+                if binding.service_kind.trim().is_empty()
+                    || binding.service_instance_id.trim().is_empty()
+                {
+                    return Err("Scoped run service kind and instance id are required".to_string());
+                }
+                if !service_kinds.insert(binding.service_kind.trim()) {
+                    return Err(format!(
+                        "Scoped run contains duplicate service binding: {}",
+                        binding.service_kind
+                    ));
+                }
+            }
+            let workspace_generation = i64::try_from(scope.workspace_generation)
+                .map_err(|_| "Workspace generation exceeds SQLite integer range".to_string())?;
+            let service_bindings_json = serde_json::to_string(&scope.service_bindings)
+                .map_err(|e| format!("Failed to serialize run service bindings: {}", e))?;
+            Some((
+                project_id.to_string(),
+                checkout_id.to_string(),
+                workspace_generation,
+                service_bindings_json,
+                scope.branch_ref.clone(),
+                scope.head_oid.clone(),
+            ))
+        } else {
+            None
+        };
+
         let now = Self::now_ts();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         conn.execute("BEGIN IMMEDIATE", [])
             .map_err(|e| format!("Failed to begin run transaction: {}", e))?;
 
-        let active_run = conn
-            .query_row(
-                "SELECT run_id FROM session_runs
-                 WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6, ?7)
-                 ORDER BY updated_at DESC
-                 LIMIT 1",
+        let result = (|| -> Result<(), String> {
+            let active_run = conn
+                .query_row(
+                    "SELECT run_id FROM session_runs
+                     WHERE session_id = ?1 AND status IN (?2, ?3, ?4, ?5, ?6, ?7)
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                    params![
+                        session_id,
+                        RUN_STATUS_QUEUED,
+                        RUN_STATUS_STARTING,
+                        RUN_STATUS_RUNNING,
+                        RUN_STATUS_WAITING_INPUT,
+                        RUN_STATUS_FINISHING,
+                        RUN_STATUS_CANCELLING,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| format!("Failed to query active run: {}", e))?;
+
+            if let Some(active_run) = active_run {
+                return Err(format!("Session already has an active run: {}", active_run));
+            }
+
+            let (
+                project_id,
+                checkout_id,
+                workspace_generation,
+                service_bindings_json,
+                git_branch_ref,
+                git_head_oid,
+            ) = match scoped_values.as_ref() {
+                Some((project_id, checkout_id, generation, bindings, branch_ref, head_oid)) => {
+                    let session_project = conn
+                        .query_row(
+                            "SELECT workspace_id FROM sessions WHERE id = ?1",
+                            params![session_id],
+                            |row| row.get::<_, Option<String>>(0),
+                        )
+                        .optional()
+                        .map_err(|e| format!("Failed to validate run session: {}", e))?
+                        .ok_or_else(|| format!("Session not found: {}", session_id))?;
+                    if session_project.as_deref() != Some(project_id.as_str()) {
+                        return Err(format!(
+                            "Session {} belongs to project {:?}, not {}",
+                            session_id, session_project, project_id
+                        ));
+                    }
+                    let checkout_project = conn
+                        .query_row(
+                            "SELECT project_id FROM workspace_checkouts WHERE checkout_id = ?1",
+                            params![checkout_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|e| format!("Failed to validate run checkout: {}", e))?
+                        .ok_or_else(|| format!("Unknown workspace checkout: {}", checkout_id))?;
+                    if checkout_project != *project_id {
+                        return Err(format!(
+                            "Checkout {} belongs to project {}, not {}",
+                            checkout_id, checkout_project, project_id
+                        ));
+                    }
+                    let decoded_bindings = serde_json::from_str::<Vec<SessionRunServiceBinding>>(
+                        bindings,
+                    )
+                    .map_err(|e| format!("Failed to validate run service bindings: {}", e))?;
+                    for binding in decoded_bindings {
+                        let persisted_instance = conn
+                            .query_row(
+                                "SELECT service_instance_id
+                                     FROM workspace_services
+                                     WHERE checkout_id = ?1 AND service_kind = ?2",
+                                params![checkout_id, binding.service_kind],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()
+                            .map_err(|e| format!("Failed to validate run service binding: {}", e))?
+                            .ok_or_else(|| {
+                                format!(
+                                    "Workspace service {} is not registered for checkout {}",
+                                    binding.service_kind, checkout_id
+                                )
+                            })?;
+                        if persisted_instance != binding.service_instance_id {
+                            return Err(format!(
+                                "Workspace service {} for checkout {} is {}, not {}",
+                                binding.service_kind,
+                                checkout_id,
+                                persisted_instance,
+                                binding.service_instance_id
+                            ));
+                        }
+                    }
+                    (
+                        Some(project_id.as_str()),
+                        Some(checkout_id.as_str()),
+                        Some(*generation),
+                        Some(bindings.as_str()),
+                        branch_ref.as_deref(),
+                        head_oid.as_deref(),
+                    )
+                }
+                None => (None, None, None, None, None, None),
+            };
+
+            conn.execute(
+                "INSERT INTO session_runs (
+                    run_id, session_id, project_id, checkout_id, workspace_generation,
+                    service_bindings_json, git_branch_ref, git_head_oid,
+                    status, started_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
+                    run_id,
                     session_id,
-                    RUN_STATUS_QUEUED,
+                    project_id,
+                    checkout_id,
+                    workspace_generation,
+                    service_bindings_json,
+                    git_branch_ref,
+                    git_head_oid,
                     RUN_STATUS_STARTING,
-                    RUN_STATUS_RUNNING,
-                    RUN_STATUS_WAITING_INPUT,
-                    RUN_STATUS_FINISHING,
-                    RUN_STATUS_CANCELLING,
+                    now,
                 ],
-                |row| row.get::<_, String>(0),
             )
-            .optional()
-            .map_err(|e| {
-                let _ = conn.execute("ROLLBACK", []);
-                format!("Failed to query active run: {}", e)
-            })?;
+            .map_err(|e| format!("Failed to start session run: {}", e))?;
+            if let Some(checkout_id) = checkout_id {
+                conn.execute(
+                    "UPDATE sessions
+                         SET default_checkout_id = ?1
+                         WHERE id = ?2",
+                    params![checkout_id, session_id],
+                )
+                .map_err(|e| format!("Failed to update session default checkout: {}", e))?;
+            }
+            Ok(())
+        })();
 
-        if let Some(active_run) = active_run {
+        if let Err(error) = result {
             let _ = conn.execute("ROLLBACK", []);
-            return Err(format!("Session already has an active run: {}", active_run));
+            return Err(error);
         }
-
-        conn.execute(
-            "INSERT INTO session_runs (run_id, session_id, status, started_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![run_id, session_id, RUN_STATUS_STARTING, now],
-        )
-        .map_err(|e| {
-            let _ = conn.execute("ROLLBACK", []);
-            format!("Failed to start session run: {}", e)
-        })?;
 
         conn.execute("COMMIT", [])
             .map_err(|e| format!("Failed to commit run transaction: {}", e))?;
@@ -3114,6 +4274,128 @@ impl SessionStore {
         )
         .optional()
         .map_err(|e| format!("Failed to query session run: {}", e))
+    }
+
+    pub fn list_persisted_session_runs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PersistedSessionRun>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, session_id, status, started_at, updated_at,
+                        finished_at, error_message, project_id, checkout_id,
+                        workspace_generation, service_bindings_json,
+                        git_branch_ref, git_head_oid
+                 FROM session_runs
+                 WHERE session_id = ?1
+                 ORDER BY started_at ASC, rowid ASC",
+            )
+            .map_err(|e| format!("Failed to prepare persisted run query: {}", e))?;
+        let rows = stmt
+            .query_map(params![session_id], Self::persisted_session_run_from_row)
+            .map_err(|e| format!("Failed to query persisted session runs: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read persisted session run: {}", e))
+    }
+
+    pub fn get_run_scope(&self, run_id: &str) -> Result<Option<SessionRunScopeSnapshot>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT project_id, checkout_id, workspace_generation,
+                        service_bindings_json, git_branch_ref, git_head_oid
+                 FROM session_runs WHERE run_id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query run scope: {e}"))?;
+        let Some((
+            Some(project_id),
+            Some(checkout_id),
+            Some(generation),
+            bindings_json,
+            branch_ref,
+            head_oid,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let service_bindings = bindings_json
+            .map(|json| {
+                serde_json::from_str::<Vec<SessionRunServiceBinding>>(&json)
+                    .map_err(|e| format!("Failed to decode run service bindings: {e}"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some(SessionRunScopeSnapshot {
+            project_id,
+            checkout_id,
+            workspace_generation: u64::try_from(generation)
+                .map_err(|_| "Run workspace generation is negative".to_string())?,
+            branch_ref,
+            head_oid,
+            service_bindings,
+        }))
+    }
+
+    fn persisted_session_run_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<PersistedSessionRun> {
+        let workspace_generation = row
+            .get::<_, Option<i64>>(9)?
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Integer,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "negative workspace generation",
+                        )),
+                    )
+                })
+            })
+            .transpose()?;
+        let service_bindings = row
+            .get::<_, Option<String>>(10)?
+            .map(|json| {
+                serde_json::from_str::<Vec<SessionRunServiceBinding>>(&json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(PersistedSessionRun {
+            summary: SessionRunSummary {
+                run_id: row.get(0)?,
+                session_id: row.get(1)?,
+                status: row.get(2)?,
+                started_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                finished_at: row.get(5)?,
+                error_message: row.get(6)?,
+            },
+            project_id: row.get(7)?,
+            checkout_id: row.get(8)?,
+            workspace_generation,
+            branch_ref: row.get(11)?,
+            head_oid: row.get(12)?,
+            service_bindings,
+        })
     }
 
     fn latest_run_record_with_conn(
@@ -3677,6 +4959,9 @@ impl SessionStore {
                 session_type: row.get(3)?,
                 parent_session_id: row.get(4)?,
                 updated_at: row.get(5)?,
+                project_id: row.get(6)?,
+                default_checkout_id: row.get(7)?,
+                execution_target: None,
                 runtime_status: None,
             })
         };
@@ -3687,9 +4972,9 @@ impl SessionStore {
                 let mut stmt = conn
                     .prepare(
                         if archived {
-                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at FROM sessions WHERE workspace_id = ?1 AND archived_at IS NOT NULL ORDER BY archived_at DESC, updated_at DESC"
+                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at, workspace_id, default_checkout_id FROM sessions WHERE workspace_id = ?1 AND archived_at IS NOT NULL ORDER BY archived_at DESC, updated_at DESC"
                         } else {
-                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at FROM sessions WHERE workspace_id = ?1 AND archived_at IS NULL ORDER BY updated_at DESC"
+                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at, workspace_id, default_checkout_id FROM sessions WHERE workspace_id = ?1 AND archived_at IS NULL ORDER BY updated_at DESC"
                         },
                     )
                     .map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -3704,9 +4989,9 @@ impl SessionStore {
                 let mut stmt = conn
                     .prepare(
                         if archived {
-                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at FROM sessions WHERE workspace_id IS NULL AND archived_at IS NOT NULL ORDER BY archived_at DESC, updated_at DESC"
+                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at, workspace_id, default_checkout_id FROM sessions WHERE workspace_id IS NULL AND archived_at IS NOT NULL ORDER BY archived_at DESC, updated_at DESC"
                         } else {
-                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at FROM sessions WHERE workspace_id IS NULL AND archived_at IS NULL ORDER BY updated_at DESC"
+                            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at, workspace_id, default_checkout_id FROM sessions WHERE workspace_id IS NULL AND archived_at IS NULL ORDER BY updated_at DESC"
                         },
                     )
                     .map_err(|e| format!("Failed to prepare query: {}", e))?;
@@ -3718,7 +5003,124 @@ impl SessionStore {
                 }
             }
         }
+        for session in &mut sessions {
+            session.execution_target = Self::latest_session_execution_target_with_conn(
+                &conn,
+                &session.id,
+                session.default_checkout_id.as_deref(),
+            )?;
+        }
         Ok(sessions)
+    }
+
+    pub fn list_sessions_for_checkout(
+        &self,
+        checkout_id: &str,
+    ) -> Result<Vec<SessionSummary>, String> {
+        self.list_sessions_for_checkout_by_archive_state(checkout_id, false)
+    }
+
+    pub fn list_archived_sessions_for_checkout(
+        &self,
+        checkout_id: &str,
+    ) -> Result<Vec<SessionSummary>, String> {
+        self.list_sessions_for_checkout_by_archive_state(checkout_id, true)
+    }
+
+    fn list_sessions_for_checkout_by_archive_state(
+        &self,
+        checkout_id: &str,
+        archived: bool,
+    ) -> Result<Vec<SessionSummary>, String> {
+        let checkout_id = checkout_id.trim();
+        if checkout_id.is_empty() {
+            return Err("Checkout identity cannot be empty".to_string());
+        }
+        let conn = self.conn.lock().map_err(|error| error.to_string())?;
+        let sql = if archived {
+            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at, workspace_id, default_checkout_id
+             FROM sessions
+             WHERE default_checkout_id = ?1 AND archived_at IS NOT NULL
+             ORDER BY archived_at DESC, updated_at DESC"
+        } else {
+            "SELECT id, title, agent_id, session_type, parent_session_id, updated_at, workspace_id, default_checkout_id
+             FROM sessions
+             WHERE default_checkout_id = ?1 AND archived_at IS NULL
+             ORDER BY updated_at DESC"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| format!("Failed to prepare checkout session query: {error}"))?;
+        let rows = statement
+            .query_map(params![checkout_id], |row| {
+                Ok(SessionSummary {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    session_type: row.get(3)?,
+                    parent_session_id: row.get(4)?,
+                    updated_at: row.get(5)?,
+                    project_id: row.get(6)?,
+                    default_checkout_id: row.get(7)?,
+                    execution_target: None,
+                    runtime_status: None,
+                })
+            })
+            .map_err(|error| format!("Failed to query checkout sessions: {error}"))?;
+        let mut sessions = rows
+            .map(|row| row.map_err(|error| format!("Failed to read checkout session: {error}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for session in &mut sessions {
+            session.execution_target = Self::latest_session_execution_target_with_conn(
+                &conn,
+                &session.id,
+                session.default_checkout_id.as_deref(),
+            )?;
+        }
+        Ok(sessions)
+    }
+
+    fn latest_session_execution_target_with_conn(
+        conn: &Connection,
+        session_id: &str,
+        default_checkout_id: Option<&str>,
+    ) -> Result<Option<SessionExecutionTarget>, String> {
+        let latest = conn
+            .query_row(
+                "SELECT checkout_id, git_branch_ref, git_head_oid
+                 FROM session_runs
+                 WHERE session_id = ?1 AND checkout_id IS NOT NULL
+                 ORDER BY
+                    CASE WHEN status IN (?2, ?3, ?4, ?5, ?6, ?7) THEN 0 ELSE 1 END,
+                    updated_at DESC, started_at DESC, rowid DESC
+                 LIMIT 1",
+                params![
+                    session_id,
+                    RUN_STATUS_QUEUED,
+                    RUN_STATUS_STARTING,
+                    RUN_STATUS_RUNNING,
+                    RUN_STATUS_WAITING_INPUT,
+                    RUN_STATUS_FINISHING,
+                    RUN_STATUS_CANCELLING,
+                ],
+                |row| {
+                    Ok(SessionExecutionTarget {
+                        checkout_id: row.get(0)?,
+                        branch_ref: row.get(1)?,
+                        head_oid: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Failed to load session execution target: {error}"))?;
+        Ok(latest.or_else(|| {
+            default_checkout_id.map(|checkout_id| SessionExecutionTarget {
+                checkout_id: checkout_id.to_string(),
+                branch_ref: None,
+                head_oid: None,
+            })
+        }))
     }
 
     /// Sticky plan-mode state for a session. `active` gates the read-only
@@ -3798,12 +5200,14 @@ impl SessionStore {
             last_fast_mode,
             session_type,
             parent_session_id,
+            project_id,
+            default_checkout_id,
             latest_completed_run_id,
             created_at,
             updated_at,
         ) = conn
             .query_row(
-                "SELECT title, agent_id, last_model_id, last_effort, last_fast_mode, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
+                "SELECT title, agent_id, last_model_id, last_effort, last_fast_mode, session_type, parent_session_id, workspace_id, default_checkout_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
@@ -3815,8 +5219,10 @@ impl SessionStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
                     ))
                 },
             )
@@ -3838,6 +5244,8 @@ impl SessionStore {
             last_fast_mode,
             session_type,
             parent_session_id,
+            project_id,
+            default_checkout_id,
             latest_completed_run_id,
             created_at,
             updated_at,
@@ -3861,12 +5269,14 @@ impl SessionStore {
             last_fast_mode,
             session_type,
             parent_session_id,
+            project_id,
+            default_checkout_id,
             latest_completed_run_id,
             created_at,
             updated_at,
         ) = conn
             .query_row(
-                "SELECT title, agent_id, last_model_id, last_effort, last_fast_mode, session_type, parent_session_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
+                "SELECT title, agent_id, last_model_id, last_effort, last_fast_mode, session_type, parent_session_id, workspace_id, default_checkout_id, latest_completed_run_id, created_at, updated_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
@@ -3878,8 +5288,10 @@ impl SessionStore {
                         row.get::<_, String>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
-                        row.get::<_, i64>(9)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
                     ))
                 },
             )
@@ -3902,6 +5314,8 @@ impl SessionStore {
                 last_fast_mode,
                 session_type,
                 parent_session_id,
+                project_id,
+                default_checkout_id,
                 latest_completed_run_id,
                 created_at,
                 updated_at,
@@ -7270,7 +8684,9 @@ mod tests {
     };
     use crate::compact;
     use crate::session::models::{
-        ChatMessage, ImageData, KnowledgeProposalStatus, MessageRole, TodoItem, ToolCallInfo,
+        ChatMessage, ImageData, KnowledgeProposalStatus, MessageRole, ProjectExplorerOperation,
+        SessionRunScopeSnapshot, SessionRunServiceBinding, TodoItem, ToolCallInfo,
+        WorkspaceCheckoutRecord, WorkspaceServiceRecord,
     };
     use rusqlite::{params, Connection, OptionalExtension};
     use std::fs;
@@ -7473,6 +8889,8 @@ mod tests {
         assert_eq!(version, SessionStore::SCHEMA_VERSION);
         assert!(SessionStore::table_has_column(&conn, "sessions", "archived_at").unwrap());
         assert!(SessionStore::table_has_column(&conn, "sessions", "workspace_id").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "sessions", "default_checkout_id").unwrap());
+        assert!(!SessionStore::table_has_column(&conn, "sessions", "checkout_id").unwrap());
         assert!(
             SessionStore::table_has_column(&conn, "sessions", "latest_completed_run_id").unwrap()
         );
@@ -7499,12 +8917,654 @@ mod tests {
                 .unwrap()
         );
         assert!(table_exists(&conn, "session_runs"));
+        assert!(SessionStore::table_has_column(&conn, "session_runs", "project_id").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "session_runs", "checkout_id").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "session_runs", "git_branch_ref").unwrap());
+        assert!(SessionStore::table_has_column(&conn, "session_runs", "git_head_oid").unwrap());
+        assert!(
+            SessionStore::table_has_column(&conn, "session_runs", "workspace_generation").unwrap()
+        );
+        assert!(
+            SessionStore::table_has_column(&conn, "session_runs", "service_bindings_json").unwrap()
+        );
         assert!(table_exists(&conn, "session_events"));
+        assert!(table_exists(&conn, "workspace_checkouts"));
+        assert!(table_exists(&conn, "workspace_services"));
+        assert!(table_exists(&conn, "workspace_projects"));
+        assert!(table_exists(&conn, "project_explorer_layouts"));
+        assert!(table_exists(&conn, "project_explorer_nodes"));
+        assert!(
+            !SessionStore::table_has_column(&conn, "project_explorer_nodes", "section_kind")
+                .unwrap()
+        );
         assert!(table_exists(&conn, "model_usage_events"));
         assert!(table_exists(&conn, "response_request_payloads"));
         assert!(table_exists(&conn, "session_context_attempts"));
         assert!(table_exists(&conn, "session_context_capture_gaps"));
         assert!(table_exists(&conn, "session_prompt_cache_checks"));
+    }
+
+    #[test]
+    fn v35_database_migrates_workspace_scope_and_exports_historical_empty_fields() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v35 db");
+        SessionStore::create_latest_schema(&conn).expect("create latest schema fixture");
+        conn.execute_batch(
+            "INSERT INTO sessions (
+                id, title, workspace_id, session_type, created_at, updated_at
+             ) VALUES (
+                'session-v35', 'Migrated workspace scope', 'project-legacy', 'chat', 100, 100
+             );
+             INSERT INTO session_runs (
+                run_id, session_id, status, started_at, updated_at, finished_at
+             ) VALUES (
+                'run-v35', 'session-v35', 'done', 100, 101, 101
+             );
+             ALTER TABLE sessions DROP COLUMN default_checkout_id;
+             ALTER TABLE session_runs DROP COLUMN project_id;
+             ALTER TABLE session_runs DROP COLUMN checkout_id;
+             ALTER TABLE session_runs DROP COLUMN workspace_generation;
+             ALTER TABLE session_runs DROP COLUMN service_bindings_json;
+             ALTER TABLE session_runs DROP COLUMN git_branch_ref;
+             ALTER TABLE session_runs DROP COLUMN git_head_oid;
+             DROP TABLE project_explorer_nodes;
+             DROP TABLE project_explorer_layouts;
+             DROP TABLE workspace_services;
+             DROP TABLE workspace_checkouts;
+             DROP TABLE workspace_projects;
+             PRAGMA user_version = 35;",
+        )
+        .expect("create v35 workspace schema");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v35 store");
+        let scope = store
+            .get_session_workspace_scope("session-v35")
+            .expect("load migrated session scope");
+        assert_eq!(scope.project_id.as_deref(), Some("project-legacy"));
+        assert_eq!(scope.default_checkout_id, None);
+        assert_eq!(scope.checkout_root, None);
+
+        let runs = store
+            .list_persisted_session_runs("session-v35")
+            .expect("load migrated runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].project_id.as_deref(), Some("project-legacy"));
+        assert_eq!(runs[0].checkout_id, None);
+        assert_eq!(runs[0].workspace_generation, None);
+        assert_eq!(runs[0].service_bindings, None);
+
+        store
+            .add_message("session-v35", MessageRole::User, "Continue after migration")
+            .expect("save message to migrated session");
+        let output = dir.path().join("workspace-v35-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-v35",
+            "F:/currently-selected-but-unrelated",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated workspace context");
+        let raw = fs::read_to_string(output).expect("read migrated export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse migrated export");
+        assert_eq!(
+            yaml["sessions"][0]["metadata"]["defaultCheckoutId"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["runs"][0]["projectId"].as_str(),
+            Some("project-legacy")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["runs"][0]["checkoutId"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["runs"][0]["workspaceGeneration"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["runs"][0]["serviceBindings"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["runs"][0]["branchRef"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["runs"][0]["headOid"].as_str(),
+            Some("empty")
+        );
+        assert_eq!(yaml["source"]["workspace_path"].as_str(), Some("empty"));
+        drop(store);
+
+        let reopened = SessionStore::new(dir.path()).expect("reopen migrated store");
+        assert_eq!(
+            reopened
+                .load_session("session-v35")
+                .expect("reload migrated session")
+                .messages
+                .len(),
+            1
+        );
+        drop(reopened);
+        let conn = Connection::open(&db_path).expect("inspect migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+        let foreign_key_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("check migrated foreign keys");
+        assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[test]
+    fn checkout_services_and_scoped_runs_are_isolated_across_worktrees() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        for checkout in [
+            WorkspaceCheckoutRecord {
+                checkout_id: "checkout-main".to_string(),
+                project_id: "project-shared".to_string(),
+                root_path: "F:\\Project".to_string(),
+                normalized_root: "f:/project".to_string(),
+                last_opened_at: 100,
+            },
+            WorkspaceCheckoutRecord {
+                checkout_id: "checkout-worktree".to_string(),
+                project_id: "project-shared".to_string(),
+                root_path: "F:\\Project-worktree".to_string(),
+                normalized_root: "f:/project-worktree".to_string(),
+                last_opened_at: 101,
+            },
+        ] {
+            store
+                .upsert_workspace_checkout(&checkout)
+                .expect("persist checkout");
+        }
+        for (checkout_id, service_instance_id) in [
+            ("checkout-main", "unity-main"),
+            ("checkout-worktree", "unity-worktree"),
+        ] {
+            store
+                .upsert_workspace_service(&WorkspaceServiceRecord {
+                    checkout_id: checkout_id.to_string(),
+                    service_kind: "unity".to_string(),
+                    service_instance_id: service_instance_id.to_string(),
+                    enabled: true,
+                    activation_policy: "lazy".to_string(),
+                    local_config: serde_json::json!({"channel": checkout_id}),
+                })
+                .expect("persist workspace service");
+        }
+        assert_eq!(
+            store
+                .list_workspace_checkouts(Some("project-shared"))
+                .expect("list project checkouts")
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .get_workspace_checkout("checkout-main")
+                .expect("load main checkout")
+                .expect("main checkout exists")
+                .normalized_root,
+            "f:/project"
+        );
+        let main_services = store
+            .list_workspace_services("checkout-main")
+            .expect("list main services");
+        assert_eq!(main_services.len(), 1);
+        assert_eq!(main_services[0].local_config["channel"], "checkout-main");
+
+        let main_session = store
+            .create_session_scoped(
+                "Main checkout",
+                None,
+                Some("project-shared"),
+                Some("checkout-main"),
+                "chat",
+                Some("dev"),
+            )
+            .expect("create main session");
+        let worktree_session = store
+            .create_session_scoped(
+                "Worktree checkout",
+                None,
+                Some("project-shared"),
+                Some("checkout-worktree"),
+                "chat",
+                Some("dev"),
+            )
+            .expect("create worktree session");
+        let project_sessions = store
+            .list_sessions(Some("project-shared"))
+            .expect("list shared project sessions");
+        assert_eq!(project_sessions.len(), 2);
+        assert!(project_sessions.iter().all(|session| {
+            session.project_id.as_deref() == Some("project-shared")
+                && session.default_checkout_id.is_some()
+        }));
+        let main_checkout_sessions = store
+            .list_sessions_for_checkout("checkout-main")
+            .expect("list main checkout sessions");
+        assert_eq!(main_checkout_sessions.len(), 1);
+        assert_eq!(main_checkout_sessions[0].id, main_session);
+        assert_eq!(
+            main_checkout_sessions[0].default_checkout_id.as_deref(),
+            Some("checkout-main")
+        );
+        let worktree_checkout_sessions = store
+            .list_sessions_for_checkout("checkout-worktree")
+            .expect("list worktree checkout sessions");
+        assert_eq!(worktree_checkout_sessions.len(), 1);
+        assert_eq!(worktree_checkout_sessions[0].id, worktree_session);
+
+        store
+            .try_start_run_scoped(
+                &main_session,
+                "run-main",
+                Some(&SessionRunScopeSnapshot {
+                    project_id: "project-shared".to_string(),
+                    checkout_id: "checkout-main".to_string(),
+                    workspace_generation: 7,
+                    branch_ref: Some("refs/heads/main".to_string()),
+                    head_oid: Some("1111111111111111111111111111111111111111".to_string()),
+                    service_bindings: vec![SessionRunServiceBinding {
+                        service_kind: "unity".to_string(),
+                        service_instance_id: "unity-main".to_string(),
+                        runtime_generation: 3,
+                    }],
+                }),
+            )
+            .expect("start main scoped run");
+        store
+            .try_start_run_scoped(
+                &worktree_session,
+                "run-worktree",
+                Some(&SessionRunScopeSnapshot {
+                    project_id: "project-shared".to_string(),
+                    checkout_id: "checkout-worktree".to_string(),
+                    workspace_generation: 9,
+                    branch_ref: Some("refs/heads/feature/worktree".to_string()),
+                    head_oid: Some("2222222222222222222222222222222222222222".to_string()),
+                    service_bindings: vec![SessionRunServiceBinding {
+                        service_kind: "unity".to_string(),
+                        service_instance_id: "unity-worktree".to_string(),
+                        runtime_generation: 4,
+                    }],
+                }),
+            )
+            .expect("start worktree scoped run");
+
+        let main_runs = store
+            .list_persisted_session_runs(&main_session)
+            .expect("load main runs");
+        let worktree_runs = store
+            .list_persisted_session_runs(&worktree_session)
+            .expect("load worktree runs");
+        assert_eq!(main_runs[0].checkout_id.as_deref(), Some("checkout-main"));
+        assert_eq!(main_runs[0].workspace_generation, Some(7));
+        assert_eq!(main_runs[0].branch_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            main_runs[0].head_oid.as_deref(),
+            Some("1111111111111111111111111111111111111111")
+        );
+        assert_eq!(
+            main_runs[0].service_bindings.as_ref().unwrap()[0].service_instance_id,
+            "unity-main"
+        );
+        assert_eq!(
+            worktree_runs[0].checkout_id.as_deref(),
+            Some("checkout-worktree")
+        );
+        assert_eq!(worktree_runs[0].workspace_generation, Some(9));
+        assert_eq!(
+            worktree_runs[0].service_bindings.as_ref().unwrap()[0].service_instance_id,
+            "unity-worktree"
+        );
+        let forked_main = store
+            .fork_session(&main_session, Some("Forked main checkout"))
+            .expect("fork scoped session");
+        assert_eq!(
+            store
+                .get_session_workspace_scope(&forked_main)
+                .expect("load forked checkout scope")
+                .default_checkout_id
+                .as_deref(),
+            Some("checkout-main")
+        );
+
+        let output = dir.path().join("scoped-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            &main_session,
+            "F:/unrelated-selected-checkout",
+            None,
+            None,
+            &output,
+        )
+        .expect("export scoped context");
+        let raw = fs::read_to_string(output).expect("read scoped export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse scoped export");
+        assert_eq!(
+            yaml["source"]["default_checkout_id"].as_str(),
+            Some("checkout-main")
+        );
+        assert_eq!(
+            yaml["source"]["workspace_path"].as_str(),
+            Some("F:\\Project")
+        );
+        assert_eq!(
+            yaml["sessions"][0]["runs"][0]["serviceBindings"][0]["serviceInstanceId"].as_str(),
+            Some("unity-main")
+        );
+    }
+
+    #[test]
+    fn project_explorer_is_one_revisioned_tree_for_sessions_and_knowledge() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        store
+            .upsert_workspace_checkout(&WorkspaceCheckoutRecord {
+                checkout_id: "checkout-main".to_string(),
+                project_id: "project-tree".to_string(),
+                root_path: "F:\\Project".to_string(),
+                normalized_root: "f:/project".to_string(),
+                last_opened_at: 100,
+            })
+            .expect("persist project checkout");
+
+        let initial = store
+            .project_explorer_snapshot("project-tree")
+            .expect("load initial tree");
+        assert_eq!(initial.revision, 0);
+        assert!(initial.nodes.is_empty());
+
+        let first = store
+            .apply_project_explorer_operations(
+                "project-tree",
+                0,
+                "operation-one",
+                &[
+                    ProjectExplorerOperation::CreateFolder {
+                        node_id: Some("folder:planning".to_string()),
+                        parent_node_id: None,
+                        name: "Planning".to_string(),
+                        position: 0,
+                    },
+                    ProjectExplorerOperation::CreateFolder {
+                        node_id: Some("folder:nested".to_string()),
+                        parent_node_id: Some("folder:planning".to_string()),
+                        name: "Current".to_string(),
+                        position: 0,
+                    },
+                    ProjectExplorerOperation::PlaceResource {
+                        resource_kind: "session".to_string(),
+                        resource_id: "session-a".to_string(),
+                        source_kind: None,
+                        parent_node_id: Some("folder:planning".to_string()),
+                        position: 1,
+                    },
+                    ProjectExplorerOperation::PlaceResource {
+                        resource_kind: "knowledge".to_string(),
+                        resource_id: "knowledge-a".to_string(),
+                        source_kind: None,
+                        parent_node_id: Some("folder:planning".to_string()),
+                        position: 2,
+                    },
+                ],
+            )
+            .expect("build unified tree");
+        assert_eq!(first.snapshot.revision, 1);
+        assert_eq!(first.snapshot.nodes.len(), 4);
+        let planning_children = first
+            .snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.parent_node_id.as_deref() == Some("folder:planning"))
+            .collect::<Vec<_>>();
+        assert_eq!(planning_children.len(), 3);
+        assert!(planning_children
+            .iter()
+            .any(|node| node.resource_kind.as_deref() == Some("session")));
+        assert!(planning_children
+            .iter()
+            .any(|node| node.resource_kind.as_deref() == Some("knowledge")));
+
+        let replay = store
+            .apply_project_explorer_operations(
+                "project-tree",
+                0,
+                "operation-one",
+                &[ProjectExplorerOperation::RenameFolder {
+                    node_id: "folder:planning".to_string(),
+                    name: "ignored replay".to_string(),
+                }],
+            )
+            .expect("replay operation id");
+        assert_eq!(replay.snapshot.revision, 1);
+        assert_eq!(
+            replay
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.node_id == "folder:planning")
+                .and_then(|node| node.folder_name.as_deref()),
+            Some("Planning")
+        );
+
+        let conflict = store
+            .apply_project_explorer_operations(
+                "project-tree",
+                0,
+                "operation-two",
+                &[ProjectExplorerOperation::RenameFolder {
+                    node_id: "folder:planning".to_string(),
+                    name: "conflict".to_string(),
+                }],
+            )
+            .expect_err("stale revision must fail");
+        assert!(conflict.starts_with("project_explorer_revision_conflict:0:1"));
+
+        let cycle = store
+            .apply_project_explorer_operations(
+                "project-tree",
+                1,
+                "operation-cycle",
+                &[ProjectExplorerOperation::MoveNode {
+                    node_id: "folder:planning".to_string(),
+                    parent_node_id: Some("folder:nested".to_string()),
+                    position: 0,
+                }],
+            )
+            .expect_err("folder cycle must fail");
+        assert!(cycle.contains("cannot move into its descendant"));
+
+        let deleted = store
+            .apply_project_explorer_operations(
+                "project-tree",
+                1,
+                "operation-delete",
+                &[ProjectExplorerOperation::DeleteFolder {
+                    node_id: "folder:planning".to_string(),
+                }],
+            )
+            .expect("delete folder and promote children");
+        assert_eq!(deleted.snapshot.revision, 2);
+        assert!(deleted
+            .snapshot
+            .nodes
+            .iter()
+            .all(|node| node.node_id != "folder:planning"));
+        assert!(deleted
+            .snapshot
+            .nodes
+            .iter()
+            .all(|node| node.parent_node_id.is_none()));
+    }
+
+    #[test]
+    fn one_project_session_can_run_across_sibling_worktrees() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        for checkout in [
+            WorkspaceCheckoutRecord {
+                checkout_id: "checkout-main".to_string(),
+                project_id: "project-shared".to_string(),
+                root_path: "F:\\Project".to_string(),
+                normalized_root: "f:/project".to_string(),
+                last_opened_at: 100,
+            },
+            WorkspaceCheckoutRecord {
+                checkout_id: "checkout-feature".to_string(),
+                project_id: "project-shared".to_string(),
+                root_path: "F:\\Project-feature".to_string(),
+                normalized_root: "f:/project-feature".to_string(),
+                last_opened_at: 101,
+            },
+        ] {
+            store
+                .upsert_workspace_checkout(&checkout)
+                .expect("persist checkout");
+        }
+
+        let session_id = store
+            .create_session_scoped(
+                "Shared session",
+                None,
+                Some("project-shared"),
+                Some("checkout-main"),
+                "chat",
+                None,
+            )
+            .expect("create project session");
+        store
+            .try_start_run_scoped(
+                &session_id,
+                "run-main",
+                Some(&SessionRunScopeSnapshot {
+                    project_id: "project-shared".to_string(),
+                    checkout_id: "checkout-main".to_string(),
+                    workspace_generation: 2,
+                    branch_ref: Some("refs/heads/main".to_string()),
+                    head_oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
+                    service_bindings: Vec::new(),
+                }),
+            )
+            .expect("run session in main checkout");
+        store
+            .update_run_status("run-main", RUN_STATUS_DONE, None)
+            .expect("finish main run");
+        store
+            .try_start_run_scoped(
+                &session_id,
+                "run-feature",
+                Some(&SessionRunScopeSnapshot {
+                    project_id: "project-shared".to_string(),
+                    checkout_id: "checkout-feature".to_string(),
+                    workspace_generation: 4,
+                    branch_ref: Some("refs/heads/feature/ui".to_string()),
+                    head_oid: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                    service_bindings: Vec::new(),
+                }),
+            )
+            .expect("run the same session in sibling checkout");
+
+        let scope = store
+            .get_session_workspace_scope(&session_id)
+            .expect("load updated default checkout");
+        assert_eq!(scope.project_id.as_deref(), Some("project-shared"));
+        assert_eq!(
+            scope.default_checkout_id.as_deref(),
+            Some("checkout-feature")
+        );
+        let project_sessions = store
+            .list_sessions(Some("project-shared"))
+            .expect("list project sessions");
+        assert_eq!(project_sessions.len(), 1);
+        assert_eq!(
+            project_sessions[0]
+                .execution_target
+                .as_ref()
+                .map(|target| target.checkout_id.as_str()),
+            Some("checkout-feature")
+        );
+        assert_eq!(
+            project_sessions[0]
+                .execution_target
+                .as_ref()
+                .and_then(|target| target.branch_ref.as_deref()),
+            Some("refs/heads/feature/ui")
+        );
+        let runs = store
+            .list_persisted_session_runs(&session_id)
+            .expect("list run snapshots");
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().any(|run| {
+            run.checkout_id.as_deref() == Some("checkout-main")
+                && run.branch_ref.as_deref() == Some("refs/heads/main")
+        }));
+        assert!(runs.iter().any(|run| {
+            run.checkout_id.as_deref() == Some("checkout-feature")
+                && run.branch_ref.as_deref() == Some("refs/heads/feature/ui")
+        }));
+    }
+
+    #[test]
+    fn legacy_session_checkout_backfill_only_uses_unique_project_mapping() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let unique_session = store
+            .create_session("Unique", None, Some("project-unique"), "chat", None)
+            .expect("create unique legacy session");
+        let ambiguous_session = store
+            .create_session("Ambiguous", None, Some("project-ambiguous"), "chat", None)
+            .expect("create ambiguous legacy session");
+        for checkout in [
+            ("checkout-unique", "project-unique", "f:/unique"),
+            ("checkout-a", "project-ambiguous", "f:/ambiguous-a"),
+            ("checkout-b", "project-ambiguous", "f:/ambiguous-b"),
+        ] {
+            store
+                .upsert_workspace_checkout(&WorkspaceCheckoutRecord {
+                    checkout_id: checkout.0.to_string(),
+                    project_id: checkout.1.to_string(),
+                    root_path: checkout.2.to_string(),
+                    normalized_root: checkout.2.to_string(),
+                    last_opened_at: 100,
+                })
+                .expect("persist backfill checkout");
+        }
+
+        assert_eq!(
+            store
+                .backfill_legacy_session_checkouts()
+                .expect("backfill legacy sessions"),
+            1
+        );
+        assert_eq!(
+            store
+                .get_session_workspace_scope(&unique_session)
+                .expect("load unique scope")
+                .default_checkout_id
+                .as_deref(),
+            Some("checkout-unique")
+        );
+        assert_eq!(
+            store
+                .get_session_workspace_scope(&ambiguous_session)
+                .expect("load ambiguous scope")
+                .default_checkout_id,
+            None
+        );
     }
 
     #[test]

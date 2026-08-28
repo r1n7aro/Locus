@@ -1,5 +1,6 @@
 import { ipcInvoke } from "./ipc";
 import type { ProxyConfig, ProxyStatus, PythonRuntimeState, UnityBackgroundHookStatus } from "../types";
+import type { WorkspaceRef } from "./project";
 
 export const APP_CLOSE_REQUESTED_EVENT = "locus-main-window-close-requested";
 export type AppCloseBehavior = "exit" | "minimizeToTray";
@@ -126,12 +127,22 @@ export function getUnityBackgroundHookEnabled(): Promise<boolean> {
   return ipcInvoke<boolean>("get_unity_background_hook_enabled");
 }
 
-export function setUnityBackgroundHookEnabled(value: boolean): Promise<UnityBackgroundHookStatus> {
-  return ipcInvoke<UnityBackgroundHookStatus>("set_unity_background_hook_enabled", { value });
+export function setUnityBackgroundHookEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<UnityBackgroundHookStatus> {
+  return ipcInvoke<UnityBackgroundHookStatus>("set_unity_background_hook_enabled", {
+    value,
+    workspaceRef,
+  });
 }
 
-export function getUnityBackgroundHookStatus(): Promise<UnityBackgroundHookStatus> {
-  return ipcInvoke<UnityBackgroundHookStatus>("get_unity_background_hook_status");
+export function getUnityBackgroundHookStatus(
+  workspaceRef: WorkspaceRef,
+): Promise<UnityBackgroundHookStatus> {
+  return ipcInvoke<UnityBackgroundHookStatus>("get_unity_background_hook_status", {
+    workspaceRef,
+  });
 }
 
 export interface ExternalScriptOpenRequest {
@@ -145,8 +156,11 @@ export function getUnityExternalEditorDefaultEnabled(): Promise<boolean> {
   return ipcInvoke<boolean>("get_unity_external_editor_default_enabled");
 }
 
-export function setUnityExternalEditorDefaultEnabled(value: boolean): Promise<boolean> {
-  return ipcInvoke<boolean>("set_unity_external_editor_default_enabled", { value });
+export function setUnityExternalEditorDefaultEnabled(
+  value: boolean,
+  workspaceRef: WorkspaceRef,
+): Promise<boolean> {
+  return ipcInvoke<boolean>("set_unity_external_editor_default_enabled", { value, workspaceRef });
 }
 
 export function takeExternalScriptOpenRequest(): Promise<ExternalScriptOpenRequest | null> {

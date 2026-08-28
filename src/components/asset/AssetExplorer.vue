@@ -150,12 +150,10 @@ function asVisibleEntry(item: { key: string }): VisibleEntry {
 
 function activateItem(item: WorkspaceTreeItem) {
   const entry = asVisibleEntry(item);
-  if (entry.kind === "row") emit("select", entry.node.path);
-}
-
-function toggleItem(item: WorkspaceTreeItem) {
-  const entry = asVisibleEntry(item);
-  if (entry.kind === "row") emit("toggle", entry.node.path);
+  if (entry.kind === "row") {
+    emit("select", entry.node.path);
+    emit("toggle", entry.node.path);
+  }
 }
 </script>
 
@@ -166,7 +164,6 @@ function toggleItem(item: WorkspaceTreeItem) {
       :items="visibleRows"
       :row-height="30"
       @activate="activateItem"
-      @toggle="toggleItem"
       @visible-range-change="handleVisibleRangeChange"
     >
       <template #icon="{ item }">

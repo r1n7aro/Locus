@@ -1312,6 +1312,7 @@ pub(crate) fn build_merge_session_targets(
     let contexts = merge_side_contexts(ref_graph_state);
     let mut env = SemanticBuildEnv {
         app_handle: None,
+        event_scope: None,
         cwd,
         profiler,
         batch_reader: BatchBlobReader::new(cwd),
@@ -1636,6 +1637,7 @@ fn rebuild_merge_target_from_locator(
     let mut profiler = DiffProfiler::new(format!("merge-target:{}", target_id), true, false);
     let mut env = SemanticBuildEnv {
         app_handle: None,
+        event_scope: None,
         cwd,
         profiler: &mut profiler,
         batch_reader: BatchBlobReader::new(cwd),
@@ -1715,6 +1717,7 @@ mod tests {
     fn test_env<'a>(profiler: &'a mut DiffProfiler) -> SemanticBuildEnv<'a> {
         SemanticBuildEnv {
             app_handle: None,
+            event_scope: None,
             cwd: ".",
             profiler,
             batch_reader: None,

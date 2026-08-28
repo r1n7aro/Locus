@@ -203,6 +203,18 @@ describe("notification store", () => {
     expect(store.notices.some((notice) => notice.id === errorId)).toBe(false);
   });
 
+  it("allows an owning subsystem to clear its obsolete error notices", () => {
+    const store = useNotificationStore();
+    store.addNotice("error", "Unity service unavailable", {
+      operation: "unity-service",
+      skipConsoleLog: true,
+    });
+
+    store.clearByOperation("unity-service", { includeErrors: true });
+
+    expect(store.notices).toHaveLength(0);
+  });
+
   it("pauses and resumes timed removal", () => {
     const store = useNotificationStore();
     const noticeId = store.addNotice("info", "Hover me");

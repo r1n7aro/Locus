@@ -12,6 +12,7 @@ import {
   getWorkspacePageWindowPayload,
   WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
   type WorkspacePageId,
+  type WorkspacePageWindowPayload,
 } from "../services/workspacePageWindow";
 import {
   canStartWindowDragFromTarget,
@@ -22,6 +23,7 @@ import {
 import TopBannerHost from "./TopBannerHost.vue";
 
 const PAGE_COMPONENTS = {
+  chat: defineAsyncComponent(() => import("./WorkspaceChatPage.vue")),
   collab: defineAsyncComponent(() => import("./CollabView.vue")),
   knowledge: defineAsyncComponent(() => import("./KnowledgeView.vue")),
   asset: defineAsyncComponent(() => import("./AssetView.vue")),
@@ -37,12 +39,16 @@ const page = ref<WorkspacePageId | null>(payload?.page ?? null);
 const pageTitle = ref(payload?.title ?? "Locus");
 const bootstrapped = ref(false);
 const bootstrapError = ref("");
+let allowNativeClose = false;
+let closeRequest: Promise<void> | null = null;
+let unlistenCloseRequested: (() => void) | null = null;
 
 const {
   uiStore,
   modelStore,
   agentStore,
   projectStore,
+  workspaceContextStore,
   bootstrap,
   refreshAuthAndModels,
   cleanup,
@@ -53,11 +59,23 @@ setLocusAssetInspectorPanelHostAvailable(false);
 const pageComponent = computed<Component | null>(() =>
   page.value ? PAGE_COMPONENTS[page.value] : null,
 );
+const checkoutPayload = computed<Extract<WorkspacePageWindowPayload, { scope: "checkout" }> | null>(
+  () => payload?.scope === "checkout" ? payload : null,
+);
+const checkoutWorkingDir = computed(() => (
+  checkoutPayload.value ? workspaceContextStore.focusedRoot : ""
+));
+const checkoutWorkspaceRef = computed(() => (
+  checkoutPayload.value ? workspaceContextStore.focusedWorkspaceRef : null
+));
 const pageProps = computed<Record<string, unknown>>(() => {
   switch (page.value) {
+    case "chat":
+      return {};
     case "collab":
       return {
-        workingDir: projectStore.workingDir,
+        workingDir: checkoutWorkingDir.value,
+        workspaceRef: checkoutWorkspaceRef.value,
         isActive: true,
         selectedModelId: modelStore.selectedModelId,
         selectedAgentId: agentStore.selectedAgentId,
@@ -66,13 +84,15 @@ const pageProps = computed<Record<string, unknown>>(() => {
       };
     case "knowledge":
       return {
-        workingDir: projectStore.workingDir,
+        workingDir: checkoutWorkingDir.value,
+        workspaceRef: checkoutWorkspaceRef.value,
         selectedModelId: modelStore.selectedModelId,
         modelDefaults: modelStore.modelDefaults,
       };
     case "agent":
       return {
-        workingDir: projectStore.workingDir,
+        workingDir: checkoutWorkingDir.value,
+        workspaceRef: checkoutWorkspaceRef.value,
         agentList: [...agentStore.agents, ...agentStore.subagents],
       };
     case "settings":
@@ -87,9 +107,17 @@ const pageProps = computed<Record<string, unknown>>(() => {
         onResetOnboarding: requestResetOnboarding,
       };
     case "asset":
+      return {
+        workingDir: checkoutWorkingDir.value,
+        workspaceRef: checkoutWorkspaceRef.value,
+      };
     case "views":
+      return {
+        workingDir: checkoutWorkingDir.value,
+        workspaceRef: checkoutWorkspaceRef.value,
+      };
     case "plugins":
-      return { workingDir: projectStore.workingDir };
+      return { workingDir: "" };
     default:
       return {};
   }
@@ -115,6 +143,23 @@ function handleTitlebarPointerDown(event: PointerEvent) {
   startCurrentWindowDragging();
 }
 
+function closeWorkspacePageWindow(): Promise<void> {
+  if (closeRequest) return closeRequest;
+  closeRequest = (async () => {
+    try {
+      if (checkoutPayload.value) {
+        await workspaceContextStore.disposeWindow();
+      }
+    } catch (error) {
+      console.warn("Failed to detach checkout window context:", error);
+    } finally {
+      allowNativeClose = true;
+      await uiStore.winClose();
+    }
+  })();
+  return closeRequest;
+}
+
 watch(pageTitle, (title) => {
   if (!hasTauriWindowRuntime()) return;
   void getCurrentWindow().setTitle(`Locus - ${title}`).catch(() => {});
@@ -123,21 +168,32 @@ watch(pageTitle, (title) => {
 onMounted(async () => {
   await nextTick();
   if (hasTauriWindowRuntime()) {
+    if (checkoutPayload.value) {
+      unlistenCloseRequested = await getCurrentWindow().onCloseRequested((event) => {
+        if (allowNativeClose) return;
+        event.preventDefault();
+        void closeWorkspacePageWindow();
+      });
+    }
     void showCurrentTauriWindow().catch(() => {});
   }
-  if (!page.value) {
+  if (!payload || !page.value) {
     bootstrapError.value = t("app.tab.windowUnavailable");
     return;
   }
   try {
-    await bootstrap(page.value);
+    await bootstrap(payload);
     bootstrapped.value = true;
   } catch (cause) {
     bootstrapError.value = normalizeAppError(cause).message;
   }
 });
 
-onUnmounted(() => cleanup());
+onUnmounted(() => {
+  unlistenCloseRequested?.();
+  unlistenCloseRequested = null;
+  cleanup();
+});
 </script>
 
 <template>
@@ -178,7 +234,7 @@ onUnmounted(() => cleanup());
           type="button"
           class="workspace-page-window-control is-close"
           :title="t('app.win.close')"
-          @click="uiStore.winClose"
+          @click="closeWorkspacePageWindow"
         >
           <svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">
             <path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />

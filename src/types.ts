@@ -13,8 +13,17 @@ export interface SessionSummary {
   agentId?: string | null;
   sessionType: string;
   parentSessionId?: string | null;
+  projectId?: string | null;
+  defaultCheckoutId?: string | null;
+  executionTarget?: SessionExecutionTarget | null;
   updatedAt: number;
   runtimeStatus?: SessionRuntimeStatus | null;
+}
+
+export interface SessionExecutionTarget {
+  checkoutId: string;
+  branchRef?: string | null;
+  headOid?: string | null;
 }
 
 export type ServerToolKind = "web_search";
@@ -106,6 +115,10 @@ export type CsharpLspPhase =
   | "error";
 
 export interface CsharpLspStatus {
+  checkoutId?: string | null;
+  workspaceGeneration?: number | null;
+  serviceInstanceId?: string | null;
+  serviceGeneration?: number | null;
   enabled: boolean;
   supported: boolean;
   phase: CsharpLspPhase;
@@ -183,6 +196,7 @@ export function defaultCodeAnalysisToolsConfig(): CodeAnalysisToolsConfig {
 }
 
 export type UnityEditorProcessState = "running" | "not_running" | "unknown";
+export type UnityLaunchMode = "interactive" | "headless";
 
 export type UnityBackgroundHookState =
   | "disabled"
@@ -192,6 +206,10 @@ export type UnityBackgroundHookState =
   | "unsupported";
 
 export interface UnityBackgroundHookStatus {
+  checkoutId?: string;
+  workspaceGeneration?: number;
+  serviceInstanceId?: string | null;
+  serviceGeneration?: number | null;
   enabled: boolean;
   supported: boolean;
   state: UnityBackgroundHookState;
@@ -212,6 +230,8 @@ export interface UnityConnectionStatus {
   editorProcessId?: number | null;
   editorProcessPath?: string | null;
   editorProjectPath?: string | null;
+  launchMode?: UnityLaunchMode | null;
+  headless: boolean;
   processCheckedAtMs?: number | null;
   processLastError?: string | null;
   pipeName: string;
@@ -252,7 +272,7 @@ export interface UnityObservedEditorMode {
 }
 
 export interface UnityObservedMainThreadState {
-  state: "active" | "idle" | "stalled" | "hung" | "unknown" | string;
+  state: "active" | "idle" | "blocked" | "stalled" | "hung" | "unknown" | string;
   cpuActive: boolean;
   quiescentForMs: number;
   stackClass?: string | null;
@@ -262,7 +282,7 @@ export interface UnityObservedMainThreadState {
 export interface UnityObservedSafetyState {
   canCallUnityApi: boolean;
   canModifyAssetsSafely: boolean;
-  recommendedAction: "proceed" | "wait_reload" | "avoid_unity_api" | "diagnose_hang" | "reconnect_control_pipe" | string;
+  recommendedAction: "proceed" | "wait_reload" | "avoid_unity_api" | "diagnose_hang" | "reconnect_control_pipe" | "resolve_dialog" | string;
 }
 
 export interface UnityObservedStatePlane {
@@ -280,7 +300,6 @@ export interface UnitySemanticState {
   source: string;
   confidence: "high" | "medium" | "low" | string;
   transient: boolean;
-  needsUser: boolean;
   detail?: string | null;
   checkedAtMs: number;
   process: UnityObservedProcessState;
@@ -408,6 +427,8 @@ export interface SessionDetail {
   lastFastMode?: boolean | null;
   sessionType: string;
   parentSessionId: string | null;
+  projectId?: string | null;
+  defaultCheckoutId?: string | null;
   latestCompletedRunId?: string | null;
   createdAt: number;
   updatedAt: number;
@@ -537,6 +558,7 @@ export interface AgentInfo {
   id: string;
   name: string;
   description: string;
+  projectTypes: string[];
   isDefault: boolean;
   defaultEffort?: EffortLevel | null;
   modelRecommendation?: ModelRecommendation | null;
@@ -1061,7 +1083,6 @@ export interface WorkspaceExecutionLockDiagnostic {
   sessionId: string;
   runId: string;
   iteration: number;
-  workspace: string;
   mode: "path_write" | "write" | string;
   waitedMs: number;
   tools: string[];
@@ -1087,7 +1108,12 @@ export interface AsyncTaskUpdatedEvent {
 }
 
 /** Every StreamEvent is wrapped in an envelope that carries a runId for filtering stale events. */
-export type StreamEvent = { runId: string } & (
+export type StreamEvent = {
+  runId: string;
+  projectId?: string | null;
+  checkoutId?: string | null;
+  workspaceGeneration?: number | null;
+} & (
   | { type: "runStart"; sessionId: string }
   | { type: "userMessage"; sessionId: string; message: ChatMessage }
   | { type: "pendingInputQueued"; sessionId: string; input: PendingSessionInput }

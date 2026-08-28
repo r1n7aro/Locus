@@ -1,0 +1,99 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../services/ipc", () => ({
+  ipcInvoke: vi.fn(),
+}));
+
+import { ipcInvoke } from "../services/ipc";
+import {
+  getWorkspaceAgentEnvTemplate,
+  getWorkspaceAgentRenderedEnvPrompt,
+  getWorkspaceAgentSystemPrompt,
+  getWorkspaceAgentSystemPromptStats,
+  listAppRules,
+  listRules,
+  listWorkspaceAgentInjectedItems,
+  listWorkspaceAgents,
+  listWorkspaceSubagentDefs,
+  readAppRule,
+  readRule,
+} from "../services/agent";
+
+const mockedInvoke = vi.mocked(ipcInvoke);
+const workspaceRef = {
+  checkoutId: "checkout-agent",
+  expectedGeneration: 17,
+};
+
+describe("Agent workspace scope", () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+    mockedInvoke.mockResolvedValue(undefined);
+  });
+
+  it("forwards the active checkout through effective Agent preview IPC", async () => {
+    await listWorkspaceAgents(workspaceRef);
+    await listWorkspaceSubagentDefs(workspaceRef);
+    await getWorkspaceAgentSystemPrompt(workspaceRef, "dev");
+    await getWorkspaceAgentEnvTemplate(workspaceRef, "dev");
+    await getWorkspaceAgentRenderedEnvPrompt(workspaceRef, "dev", "openai/gpt-5.6");
+    await getWorkspaceAgentSystemPromptStats(workspaceRef, "dev", "openai/gpt-5.6");
+    await listWorkspaceAgentInjectedItems(workspaceRef, "dev", null, "openai/gpt-5.6");
+    await listRules(workspaceRef, "dev");
+    await readRule(workspaceRef, "dev", "workflow.md");
+
+    for (const call of mockedInvoke.mock.calls) {
+      expect(call[1]).toMatchObject({ workspaceRef });
+    }
+    expect(mockedInvoke).toHaveBeenCalledWith("get_workspace_agent_rendered_env_prompt", {
+      workspaceRef,
+      agentId: "dev",
+      selectedModel: "openai/gpt-5.6",
+    });
+    expect(mockedInvoke).toHaveBeenCalledWith("get_workspace_agent_system_prompt_stats", {
+      workspaceRef,
+      agentId: "dev",
+      selectedModel: "openai/gpt-5.6",
+    });
+  });
+
+  it("keeps app Agent rules available without an active checkout", async () => {
+    await listAppRules("simple");
+    await readAppRule("simple", "baseline.md");
+
+    expect(mockedInvoke).toHaveBeenNthCalledWith(1, "list_app_rules", { agentId: "simple" });
+    expect(mockedInvoke).toHaveBeenNthCalledWith(2, "read_app_rule", {
+      agentId: "simple",
+      fileName: "baseline.md",
+    });
+  });
+
+  it("binds the main and detached Agent views to their focused checkout", () => {
+    const root = process.cwd();
+    const app = readFileSync(resolve(root, "src/App.vue"), "utf8");
+    const view = readFileSync(resolve(root, "src/components/AgentView.vue"), "utf8");
+    const detached = readFileSync(resolve(root, "src/components/WorkspacePageWindow.vue"), "utf8");
+
+    expect(app).toContain(':workspace-ref="workspaceContextStore.focusedWorkspaceRef"');
+    expect(app).toContain(':agent-list="[...agentStore.agents, ...agentStore.subagents]"');
+    expect(view).toContain("listWorkspaceAgents(workspaceRef)");
+    expect(view).toContain("listWorkspaceAgentInjectedItems(");
+    expect(view).toContain("getWorkspaceAgentSystemPromptStats(");
+    expect(detached).toContain("workspaceRef: checkoutWorkspaceRef.value");
+  });
+
+  it("keeps configured tools visible and renders runtime unavailability reasons only in details", () => {
+    const root = process.cwd();
+    const view = readFileSync(resolve(root, "src/components/AgentView.vue"), "utf8");
+
+    expect(view).toContain('toolMetaBoolean(item.meta, "runtimeAvailable") !== false');
+    expect(view).toContain('toolMetaString(item.meta, "unavailableReason")');
+    expect(view).toContain("'tool-unavailable': !toolItemRuntimeAvailable(item)");
+    expect(view).not.toContain('class="tool-unavailable-reason"');
+    expect(view).not.toContain(':title="toolItemUnavailableReason(item) || undefined"');
+    expect(view).toContain('class="tool-section tool-availability-section"');
+    expect(view).toContain("{{ selectedToolUnavailableReason }}");
+  });
+});

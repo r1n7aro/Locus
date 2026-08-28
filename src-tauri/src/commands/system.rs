@@ -1,15 +1,159 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use futures::future::join_all;
 use tauri::State;
 use tauri::{AppHandle, Manager};
+
+use crate::error::AppError;
+use crate::workspace_service::event::WorkspaceEventScope;
+use crate::workspace_service::{
+    ProjectRegistry, ResolvedWorkspaceScope, ServiceKind, ServiceStatus, WorkspaceRef,
+};
 
 #[cfg(not(windows))]
 use tauri_plugin_notification::NotificationExt;
 
 #[cfg(windows)]
 const WINDOWS_NOTIFICATION_DISPLAY_NAME: &str = "Locus";
+
+/// Serializes process-level Unity settings whose durable config, per-checkout
+/// markers, and in-process switches form one logical transaction.
+pub(crate) fn unity_process_settings_mutation_gate() -> &'static tokio::sync::Mutex<()> {
+    static GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn resolve_workspace_scope(
+    workspace_registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    operation: &'static str,
+) -> Result<ResolvedWorkspaceScope, AppError> {
+    super::session::resolve_workspace_scope(workspace_registry, workspace_ref, operation)
+}
+
+fn scope_root(scope: &ResolvedWorkspaceScope) -> String {
+    scope.runtime().root().to_string_lossy().to_string()
+}
+
+fn live_unity_runtime_scopes(workspace_registry: &ProjectRegistry) -> Vec<(WorkspaceRef, String)> {
+    let mut scopes = workspace_registry
+        .runtimes()
+        .into_iter()
+        .filter_map(|runtime| {
+            let root = runtime.root().to_string_lossy().to_string();
+            crate::unity_bridge::is_unity_project(&root)
+                .then(|| (WorkspaceRef::for_runtime(&runtime), root))
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| left.0.checkout_id.cmp(&right.0.checkout_id));
+    scopes
+}
+
+fn sync_unity_markers_transactionally<F>(
+    roots: &[String],
+    value: bool,
+    previous: bool,
+    sync: F,
+) -> Result<(), String>
+where
+    F: Fn(&str, bool) -> Result<(), String>,
+{
+    let mut attempted = Vec::new();
+    for root in roots {
+        attempted.push(root.as_str());
+        if let Err(error) = sync(root, value) {
+            let rollback_errors = attempted
+                .iter()
+                .filter_map(|attempted_root| {
+                    sync(attempted_root, previous)
+                        .err()
+                        .map(|rollback| format!("{attempted_root}: {rollback}"))
+                })
+                .collect::<Vec<_>>();
+            let rollback_detail = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; rollback failed: {}", rollback_errors.join("; "))
+            };
+            return Err(format!(
+                "failed to update Unity marker for {root}: {error}{rollback_detail}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn unity_observable_event_scope(scope: &ResolvedWorkspaceScope) -> WorkspaceEventScope {
+    let runtime = scope.runtime();
+    let service_identity = runtime
+        .services()
+        .state_snapshot(ServiceKind::Unity)
+        .await
+        .and_then(|snapshot| {
+            matches!(
+                snapshot.status,
+                ServiceStatus::Starting | ServiceStatus::Running
+            )
+            .then_some(snapshot.identity)
+            .flatten()
+        });
+    let event_scope = WorkspaceEventScope {
+        project_id: runtime.project_id().clone(),
+        checkout_id: runtime.checkout_id().clone(),
+        workspace_generation: runtime.generation(),
+        service_instance_id: service_identity
+            .as_ref()
+            .map(|identity| identity.service_instance_id.clone()),
+        service_generation: service_identity
+            .as_ref()
+            .map(|identity| identity.runtime_generation),
+    };
+    crate::unity_bridge::bind_workspace_observable_status(
+        &runtime.root().to_string_lossy(),
+        &event_scope,
+    );
+    event_scope
+}
+
+fn publish_background_hook_status(
+    app: &AppHandle,
+    workspace_registry: &ProjectRegistry,
+    scope: &WorkspaceEventScope,
+    status: crate::unity_bridge::UnityBackgroundHookStatus,
+) -> crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityBackgroundHookStatus> {
+    workspace_registry.event_router().publish_for_scope(
+        app,
+        scope,
+        "unity-background-hook-status",
+        status.clone(),
+    );
+    crate::unity_bridge::UnityWorkspaceStatus::from_scope(scope, status)
+}
+
+fn publish_state_probe_status(
+    app: &AppHandle,
+    workspace_registry: &ProjectRegistry,
+    scope: &WorkspaceEventScope,
+    status: crate::unity_bridge::UnityStateProbeStatus,
+) -> crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityStateProbeStatus> {
+    workspace_registry.event_router().publish_for_scope(
+        app,
+        scope,
+        "unity-state-probe-status",
+        status.clone(),
+    );
+    crate::unity_bridge::UnityWorkspaceStatus::from_scope(scope, status)
+}
+
+fn bind_integration_request_to_checkout(
+    mut request: crate::cli_driver::UnityIntegrationTestRunRequest,
+    checkout_root: String,
+) -> crate::cli_driver::UnityIntegrationTestRunRequest {
+    request.project_path = Some(checkout_root);
+    request
+}
 
 #[tauri::command]
 pub fn get_system_locale() -> Option<String> {
@@ -125,6 +269,13 @@ pub(crate) fn exit_app(app_handle: &AppHandle) {
 
 static APP_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 
+/// Window teardown during process exit must preserve the last durable
+/// window/pane recovery projection. Interactive window closes still detach
+/// their contexts before this flag is raised.
+pub(crate) fn app_exit_started() -> bool {
+    APP_EXIT_STARTED.load(Ordering::SeqCst)
+}
+
 async fn exit_app_inner(app_handle: AppHandle) {
     if APP_EXIT_STARTED.swap(true, Ordering::SeqCst) {
         return;
@@ -158,6 +309,11 @@ async fn exit_app_inner(app_handle: AppHandle) {
         for (_, task) in tasks.drain() {
             task.join_handle.abort();
         }
+    }
+
+    if let Some(registry) = app_handle.try_state::<Arc<crate::workspace_service::ProjectRegistry>>()
+    {
+        registry.shutdown_all().await;
     }
 
     if let Err(error) = crate::unity_bridge::restore_background_hook_runtime() {
@@ -256,38 +412,115 @@ pub fn get_unity_background_hook_enabled(
 #[tauri::command]
 pub async fn set_unity_background_hook_enabled(
     value: bool,
+    app: AppHandle,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
-) -> Result<crate::unity_bridge::UnityBackgroundHookStatus, crate::error::AppError> {
-    config
-        .set_unity_background_hook_enabled(value)
-        .map_err(crate::error::AppError::from)?;
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<
+    crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityBackgroundHookStatus>,
+    crate::error::AppError,
+> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "set_unity_background_hook_enabled",
+    )?;
+    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
+    let cwd = scope_root(&scope);
+    let event_scope = unity_observable_event_scope(&scope).await;
+    let runtime_scopes = live_unity_runtime_scopes(workspace_registry.inner());
+    let cwd_is_unity = crate::unity_bridge::is_unity_project(&cwd);
+    let roots = runtime_scopes
+        .iter()
+        .map(|(_, root)| root.clone())
+        .collect::<Vec<_>>();
+    let previous = config.unity_background_hook_enabled();
 
-    let status = crate::unity_bridge::set_background_hook_enabled(value).map_err(|error| {
-        crate::error::AppError::new("unity.background_hook.restore_failed", error)
-            .operation("setUnityBackgroundHookEnabled")
-    })?;
+    if let Err(error) = config.set_unity_background_hook_enabled(value) {
+        let _ = config.set_unity_background_hook_enabled(previous);
+        return Err(crate::error::AppError::from(error));
+    }
 
-    // Sync the per-project marker so the in-process native hook (when the native
-    // bridge is on) applies or relaxes the patch on its side; harmless when the
-    // native bridge is off, since the managed hook code only runs under it.
-    let cwd = workspace.path.read().await.clone();
-    let cwd_is_unity = !cwd.trim().is_empty() && crate::unity_bridge::is_unity_project(&cwd);
-    if cwd_is_unity {
-        if let Err(error) = crate::unity_bridge::sync_background_hook_marker(&cwd, value) {
-            eprintln!(
-                "[Locus] warning: failed to sync background hook marker: {}",
-                error
+    if let Err(error) = sync_unity_markers_transactionally(
+        &roots,
+        value,
+        previous,
+        crate::unity_bridge::sync_background_hook_marker,
+    ) {
+        let _ = config.set_unity_background_hook_enabled(previous);
+        return Err(
+            crate::error::AppError::new("unity.background_hook.marker_failed", error)
+                .operation("setUnityBackgroundHookEnabled"),
+        );
+    }
+
+    let status = match crate::unity_bridge::set_background_hook_enabled(value) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = config.set_unity_background_hook_enabled(previous);
+            let _ = sync_unity_markers_transactionally(
+                &roots,
+                previous,
+                value,
+                crate::unity_bridge::sync_background_hook_marker,
             );
+            let _ = crate::unity_bridge::set_background_hook_enabled(previous);
+            return Err(
+                crate::error::AppError::new("unity.background_hook.restore_failed", error)
+                    .operation("setUnityBackgroundHookEnabled"),
+            );
+        }
+    };
+
+    if !value {
+        return Ok(publish_background_hook_status(
+            &app,
+            workspace_registry.inner(),
+            &event_scope,
+            status,
+        ));
+    }
+
+    for (_, root) in &runtime_scopes {
+        if root == &cwd {
+            continue;
+        }
+        match crate::unity_bridge::ensure_background_hook_for_project(root).await {
+            Ok(other_status)
+                if other_status.enabled
+                    && other_status.state
+                        == crate::unity_bridge::UnityBackgroundHookState::Failed =>
+            {
+                eprintln!(
+                    "[Locus] warning: Unity background hook failed for checkout root '{}': {}",
+                    root,
+                    other_status.error.as_deref().unwrap_or("unknown failure")
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let process_info =
+                    crate::unity_bridge::query_current_project_editor_process(root).await;
+                if !matches!(
+                    process_info.state,
+                    crate::unity_bridge::UnityEditorProcessState::NotRunning
+                ) {
+                    eprintln!(
+                        "[Locus] warning: failed to apply Unity background hook for checkout root '{}': {}",
+                        root, error
+                    );
+                }
+            }
         }
     }
 
-    if !value {
-        return Ok(status);
-    }
-
     if !cwd_is_unity {
-        return Ok(status);
+        return Ok(publish_background_hook_status(
+            &app,
+            workspace_registry.inner(),
+            &event_scope,
+            status,
+        ));
     }
 
     match crate::unity_bridge::ensure_background_hook_for_project(&cwd).await {
@@ -304,7 +537,12 @@ pub async fn set_unity_background_hook_enabled(
                         .operation("setUnityBackgroundHookEnabled"),
                 );
             }
-            Ok(status)
+            Ok(publish_background_hook_status(
+                &app,
+                workspace_registry.inner(),
+                &event_scope,
+                status,
+            ))
         }
         Err(error) => {
             let process_info =
@@ -313,7 +551,12 @@ pub async fn set_unity_background_hook_enabled(
                 process_info.state,
                 crate::unity_bridge::UnityEditorProcessState::NotRunning
             ) {
-                return Ok(status);
+                return Ok(publish_background_hook_status(
+                    &app,
+                    workspace_registry.inner(),
+                    &event_scope,
+                    status,
+                ));
             }
             Err(
                 crate::error::AppError::new("unity.background_hook.failed", error)
@@ -324,9 +567,22 @@ pub async fn set_unity_background_hook_enabled(
 }
 
 #[tauri::command]
-pub fn get_unity_background_hook_status(
-) -> Result<crate::unity_bridge::UnityBackgroundHookStatus, crate::error::AppError> {
-    Ok(crate::unity_bridge::background_hook_status())
+pub async fn get_unity_background_hook_status(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<
+    crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityBackgroundHookStatus>,
+    crate::error::AppError,
+> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "get_unity_background_hook_status",
+    )?;
+    let event_scope = unity_observable_event_scope(&scope).await;
+    Ok(crate::unity_bridge::background_hook_status_for_scope(
+        &event_scope,
+    ))
 }
 
 #[tauri::command]
@@ -340,25 +596,69 @@ pub fn get_unity_external_editor_default_enabled(
 pub async fn set_unity_external_editor_default_enabled(
     value: bool,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<bool, crate::error::AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "set_unity_external_editor_default_enabled",
+    )?;
+    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
+    let request_checkout = scope.runtime().checkout_id().clone();
+    let runtime_scopes = live_unity_runtime_scopes(workspace_registry.inner());
+    let registry = workspace_registry.inner();
+    let mut ready_roots = Vec::new();
+    let connection_states = join_all(runtime_scopes.iter().map(|(runtime_ref, root)| async move {
+        (
+            runtime_ref.clone(),
+            root.clone(),
+            crate::unity_bridge::query_unity_status(root).await.0,
+        )
+    }))
+    .await;
+    let ready_states = join_all(
+        connection_states
+            .into_iter()
+            .filter(|(_, _, connected)| *connected)
+            .map(|(runtime_ref, _, _)| async move {
+                let result = super::workspace::resolve_unity_ready_ipc_scope(
+                    registry,
+                    &runtime_ref,
+                    "set_unity_external_editor_default_enabled",
+                )
+                .await;
+                (runtime_ref, result)
+            }),
+    )
+    .await;
+    for (runtime_ref, result) in ready_states {
+        match result {
+            Ok(ready) => ready_roots.push(ready.root_text()),
+            Err(error) if runtime_ref.checkout_id == request_checkout => return Err(error),
+            Err(error) => eprintln!(
+                "[Locus] warning: Unity external editor setting is waiting for checkout {} Ready: {}",
+                runtime_ref.checkout_id, error
+            ),
+        }
+    }
+
     config
         .set_unity_external_editor_default_enabled(value)
         .map_err(crate::error::AppError::from)?;
     crate::unity_bridge::set_external_editor_default(value);
 
-    let project = workspace.path.read().await.clone();
-    if !project.trim().is_empty() && crate::unity_bridge::is_unity_project(&project) {
-        let (connected, _, _) = crate::unity_bridge::query_unity_status(&project).await;
-        if connected {
-            if let Err(error) =
-                crate::unity_bridge::configure_locus_external_editor(&project, value).await
-            {
-                eprintln!(
-                    "[Locus] warning: failed to apply Unity external editor setting immediately: {}",
-                    error
-                );
-            }
+    let apply_results = join_all(ready_roots.into_iter().map(|root| async move {
+        let result = crate::unity_bridge::configure_locus_external_editor(&root, value).await;
+        (root, result)
+    }))
+    .await;
+    for (root, result) in apply_results {
+        if let Err(error) = result {
+            eprintln!(
+                "[Locus] warning: failed to apply Unity external editor setting for checkout root '{}': {}",
+                root, error
+            );
         }
     }
     Ok(value)
@@ -379,20 +679,52 @@ pub fn get_unity_state_probe_enabled(
 }
 
 #[tauri::command]
-pub fn set_unity_state_probe_enabled(
+pub async fn set_unity_state_probe_enabled(
     value: bool,
+    app: AppHandle,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-) -> Result<crate::unity_bridge::UnityStateProbeStatus, crate::error::AppError> {
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<
+    crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityStateProbeStatus>,
+    crate::error::AppError,
+> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "set_unity_state_probe_enabled",
+    )?;
+    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
+    let event_scope = unity_observable_event_scope(&scope).await;
     config
         .set_unity_state_probe_enabled(value)
         .map_err(crate::error::AppError::from)?;
-    Ok(crate::unity_bridge::set_state_probe_enabled(value))
+    let status = crate::unity_bridge::set_state_probe_enabled(value);
+    Ok(publish_state_probe_status(
+        &app,
+        workspace_registry.inner(),
+        &event_scope,
+        status,
+    ))
 }
 
 #[tauri::command]
-pub fn get_unity_state_probe_status(
-) -> Result<crate::unity_bridge::UnityStateProbeStatus, crate::error::AppError> {
-    Ok(crate::unity_bridge::state_probe_status())
+pub async fn get_unity_state_probe_status(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<
+    crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityStateProbeStatus>,
+    crate::error::AppError,
+> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "get_unity_state_probe_status",
+    )?;
+    let event_scope = unity_observable_event_scope(&scope).await;
+    Ok(crate::unity_bridge::state_probe_status_for_scope(
+        &event_scope,
+    ))
 }
 
 #[tauri::command]
@@ -412,20 +744,39 @@ pub fn get_unity_native_bridge_enabled(
 pub async fn set_unity_native_bridge_enabled(
     value: bool,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<bool, crate::error::AppError> {
-    config
-        .set_unity_native_bridge_enabled(value)
-        .map_err(crate::error::AppError::from)?;
-    crate::unity_bridge::set_native_bridge_enabled(value);
+    let _scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "set_unity_native_bridge_enabled",
+    )?;
+    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
+    let roots = live_unity_runtime_scopes(workspace_registry.inner())
+        .into_iter()
+        .map(|(_, root)| root)
+        .collect::<Vec<_>>();
+    let previous = config.unity_native_bridge_enabled();
 
-    let cwd = workspace.path.read().await.clone();
-    if !cwd.trim().is_empty() && crate::unity_bridge::is_unity_project(&cwd) {
-        crate::unity_bridge::sync_native_bridge_marker(&cwd, value).map_err(|error| {
-            crate::error::AppError::new("unity.native_bridge.marker_failed", error)
-                .operation("setUnityNativeBridgeEnabled")
-        })?;
+    if let Err(error) = config.set_unity_native_bridge_enabled(value) {
+        let _ = config.set_unity_native_bridge_enabled(previous);
+        return Err(crate::error::AppError::from(error));
     }
+
+    if let Err(error) = sync_unity_markers_transactionally(
+        &roots,
+        value,
+        previous,
+        crate::unity_bridge::sync_native_bridge_marker,
+    ) {
+        let _ = config.set_unity_native_bridge_enabled(previous);
+        return Err(
+            crate::error::AppError::new("unity.native_bridge.marker_failed", error)
+                .operation("setUnityNativeBridgeEnabled"),
+        );
+    }
+    crate::unity_bridge::set_native_bridge_enabled(value);
     Ok(value)
 }
 
@@ -433,9 +784,15 @@ pub async fn set_unity_native_bridge_enabled(
 /// bridge is disabled or no live broker is serving this project.
 #[tauri::command]
 pub async fn get_unity_native_broker_status(
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Option<crate::unity_bridge::NativeBrokerStatus>, crate::error::AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "get_unity_native_broker_status",
+    )?;
+    let cwd = scope_root(&scope);
     if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
         return Ok(None);
     }
@@ -446,9 +803,15 @@ pub async fn get_unity_native_broker_status(
 /// current workspace. Returns `unknown` when no workspace is selected.
 #[tauri::command]
 pub async fn get_unity_semantic_state(
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::unity_bridge::SemanticState, crate::error::AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "get_unity_semantic_state",
+    )?;
+    let cwd = scope_root(&scope);
     if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
         return Ok(crate::unity_bridge::unity_semantic_state("").await);
     }
@@ -458,10 +821,17 @@ pub async fn get_unity_semantic_state(
 #[tauri::command]
 pub async fn unity_state_probe_selftest_run(
     app: AppHandle,
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), crate::error::AppError> {
-    let cwd = workspace.path.read().await.clone();
-    crate::unity_bridge::run_state_probe_selftest(app, cwd)
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_state_probe_selftest_run",
+    )
+    .await?;
+    let event_scope = ready.checkout_event_scope();
+    crate::unity_bridge::run_state_probe_selftest_scoped(app, ready.root_text(), event_scope)
         .await
         .map_err(|error| {
             crate::error::AppError::new("unity.state_probe.selftest_failed", error)
@@ -472,10 +842,17 @@ pub async fn unity_state_probe_selftest_run(
 #[tauri::command]
 pub async fn unity_native_bridge_selftest_run(
     app: AppHandle,
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), crate::error::AppError> {
-    let cwd = workspace.path.read().await.clone();
-    crate::unity_bridge::run_native_bridge_selftest(app, cwd)
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_native_bridge_selftest_run",
+    )
+    .await?;
+    let event_scope = ready.checkout_event_scope();
+    crate::unity_bridge::run_native_bridge_selftest_scoped(app, ready.root_text(), event_scope)
         .await
         .map_err(|error| {
             crate::error::AppError::new("unity.native_bridge.selftest_failed", error)
@@ -486,10 +863,19 @@ pub async fn unity_native_bridge_selftest_run(
 #[tauri::command]
 pub async fn unity_integration_test_run(
     app: AppHandle,
-    workspace: State<'_, std::sync::Arc<crate::workspace::Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     request: crate::cli_driver::UnityIntegrationTestRunRequest,
 ) -> Result<crate::cli_driver::UnityIntegrationTestRunStarted, crate::error::AppError> {
-    crate::cli_driver::spawn_ui(app, workspace.inner().clone(), request).map_err(|error| {
+    let ready = super::workspace::resolve_unity_ready_ipc_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "unity_integration_test_run",
+    )
+    .await?;
+    let cwd = ready.root_text();
+    let request = bind_integration_request_to_checkout(request, cwd.clone());
+    crate::cli_driver::spawn_ui(app, request).map_err(|error| {
         crate::error::AppError::new("unity.integration_test.start_failed", error)
             .operation("unityIntegrationTestRun")
     })
@@ -635,7 +1021,12 @@ fn split_notification_body(body: Option<&str>) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::split_notification_body;
+    use std::sync::Mutex;
+
+    use super::{
+        bind_integration_request_to_checkout, split_notification_body,
+        sync_unity_markers_transactionally,
+    };
 
     #[test]
     fn split_notification_body_keeps_primary_and_secondary_lines() {
@@ -651,5 +1042,81 @@ mod tests {
             split_notification_body(Some("First\n\nSecond\nThird")),
             ("First".to_string(), "Second Third".to_string())
         );
+    }
+
+    #[test]
+    fn integration_test_request_is_bound_to_resolved_checkout() {
+        let request = crate::cli_driver::UnityIntegrationTestRunRequest {
+            project_path: Some("C:/stale-workspace".to_string()),
+            workspace_paths: Vec::new(),
+            suites: vec!["connect".to_string()],
+            open_unity: None,
+            install_plugin: None,
+            force_edit_mode: None,
+            type_index_sample_mode: None,
+            yaml_parity_sample_count: None,
+            yaml_parity_seed: None,
+            connect_timeout_ms: None,
+            suite_timeout_ms: None,
+            poll_ms: None,
+            no_progress_timeout_ms: None,
+        };
+
+        let bound =
+            bind_integration_request_to_checkout(request, "C:/projects/checkout-b".to_string());
+
+        assert_eq!(
+            bound.project_path.as_deref(),
+            Some("C:/projects/checkout-b")
+        );
+    }
+
+    #[test]
+    fn process_level_marker_fanout_rolls_back_every_attempted_checkout() {
+        let calls = Mutex::new(Vec::<(String, bool)>::new());
+        let roots = vec!["checkout-a".to_string(), "checkout-b".to_string()];
+        let result = sync_unity_markers_transactionally(&roots, true, false, |root, value| {
+            calls
+                .lock()
+                .expect("marker call log")
+                .push((root.to_string(), value));
+            if root == "checkout-b" && value {
+                Err("simulated write failure".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.into_inner().expect("marker call log"),
+            vec![
+                ("checkout-a".to_string(), true),
+                ("checkout-b".to_string(), true),
+                ("checkout-a".to_string(), false),
+                ("checkout-b".to_string(), false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_level_unity_setting_mutations_are_serialized() {
+        let first = super::unity_process_settings_mutation_gate().lock().await;
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _second = super::unity_process_settings_mutation_gate().lock().await;
+            let _ = entered_tx.send(());
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            entered_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(first);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut entered_rx)
+            .await
+            .expect("second mutation entered after first committed")
+            .expect("second mutation signal");
+        waiter.await.expect("setting mutation waiter");
     }
 }

@@ -666,6 +666,27 @@ pub fn managed_python_path_env(
     crate::process_util::prepend_paths(current_path, dirs)
 }
 
+/// Complete environment for launching the selected interpreter directly.
+/// Unlike the shell-wide environment, this is scoped to a Python child, so
+/// managed-runtime PYTHONHOME/PYTHONPATH values cannot leak into unrelated
+/// executables.
+pub fn python_process_env(runtime: &ResolvedPythonRuntime) -> Vec<(String, OsString)> {
+    let mut env = python_invocation_env(runtime)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), OsString::from(value)))
+        .collect::<Vec<_>>();
+    env.push(("PYTHONIOENCODING".to_string(), OsString::from("utf-8")));
+    env.push(("PYTHONUTF8".to_string(), OsString::from("1")));
+
+    if let Some(python_path) = managed_python_path_env(std::env::var_os("PYTHONPATH"), runtime) {
+        env.push(("PYTHONPATH".to_string(), python_path));
+    }
+    if let Some(path) = prepend_python_to_path(std::env::var_os("PATH"), runtime) {
+        env.push(("PATH".to_string(), path));
+    }
+    env
+}
+
 fn config_path() -> Result<PathBuf, String> {
     Ok(crate::commands::persistent_config_dir()?.join(CONFIG_FILE))
 }

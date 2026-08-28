@@ -1,5 +1,6 @@
 import { ref, computed, onUnmounted } from "vue";
 import { listenDiffProgress, type DiffProgressEvent } from "../services/diff";
+import type { WorkspaceRef } from "../services/project";
 import { t } from "../i18n";
 
 const phaseKeys: Record<DiffProgressEvent["phase"], string> = {
@@ -11,7 +12,7 @@ const phaseKeys: Record<DiffProgressEvent["phase"], string> = {
   error: "",
 };
 
-export function useDiffProgress() {
+export function useDiffProgress(getWorkspaceRef: () => WorkspaceRef | null) {
   const phase = ref<DiffProgressEvent["phase"] | null>(null);
   const current = ref(0);
   const total = ref(1);
@@ -19,6 +20,7 @@ export function useDiffProgress() {
   const error = ref<string | null>(null);
   const active = ref(false);
   const phaseDurations = ref<Record<string, number> | null>(null);
+  const expectedRequestKey = ref<string | null>(null);
 
   const phaseLabel = computed(() => {
     if (!phase.value || phase.value === "done" || phase.value === "error") {
@@ -37,8 +39,12 @@ export function useDiffProgress() {
 
   let unlisten: (() => void) | null = null;
 
-  listenDiffProgress((evt) => {
+  listenDiffProgress(getWorkspaceRef, (evt) => {
     if (!active.value) return;
+    if (
+      expectedRequestKey.value
+      && evt.requestKey !== expectedRequestKey.value
+    ) return;
     phase.value = evt.phase;
     current.value = evt.current;
     total.value = evt.total;
@@ -64,7 +70,7 @@ export function useDiffProgress() {
     unlisten?.();
   });
 
-  function reset() {
+  function reset(requestKey: string | null = null) {
     phase.value = null;
     current.value = 0;
     total.value = 1;
@@ -72,6 +78,7 @@ export function useDiffProgress() {
     error.value = null;
     active.value = true;
     phaseDurations.value = null;
+    expectedRequestKey.value = requestKey;
   }
 
   return {

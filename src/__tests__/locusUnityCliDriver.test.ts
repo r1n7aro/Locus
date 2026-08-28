@@ -9,6 +9,7 @@ describe("Locus Unity CLI driver", () => {
   it("exposes the repository script entry", () => {
     const pkg = read("package.json");
     const script = read("scripts/locus-unity-test.mjs");
+    const launcher = read("scripts/run-tauri.mjs");
     const normalizedScript = script.replace(/\r\n/g, "\n");
 
     expect(pkg).toContain('"locus:test:unity": "bun run scripts/locus-unity-test.mjs"');
@@ -22,13 +23,17 @@ describe("Locus Unity CLI driver", () => {
     expect(pkg).toContain("--suite connect,hot-reload-release");
     expect(pkg).toContain('"locus:test:unity:full"');
     expect(pkg).toContain("--suite all --connect-timeout-ms 60000 --timeout-ms 1200000");
-    expect(normalizedScript).toContain(
-      '"dev",\n    "--no-watch",\n    "--",\n    "--",\n    "--locus-driver"',
-    );
+    expect(normalizedScript).toContain('"dev",\n    "--no-watch",');
+    expect(normalizedScript).toContain('"--",\n    "--",\n    "--locus-driver"');
     expect(script).toContain('"--locus-driver"');
     expect(script).toContain('"unity-test"');
     expect(script).toContain('"dev"');
     expect(script).toContain("--prepare-native");
+    expect(script).toContain("--reuse-dev-server");
+    expect(script).toContain('{"build":{"beforeDevCommand":null}}');
+    expect(script).toContain('LOCUS_REUSE_DEV_SERVER: "1"');
+    expect(launcher).toContain('const REUSE_DEV_SERVER_ENV_KEY = "LOCUS_REUSE_DEV_SERVER"');
+    expect(launcher).toContain("isDevCommand && !reuseDevServer");
   });
 
   it("runs through the Rust backend without a WebView/CDP dependency", () => {
@@ -36,12 +41,13 @@ describe("Locus Unity CLI driver", () => {
     const driver = read("src-tauri/src/cli_driver.rs");
 
     expect(lib).toContain("cli_driver::CliDriverConfig::from_env_args()");
-    expect(lib).toContain("cli_driver::spawn(app.handle().clone(), workspace.clone(), cli_driver_config)");
+    expect(lib).toContain("cli_driver::spawn(app.handle().clone(), cli_driver_config)");
     expect(lib.indexOf("setup_cli_driver_scheduled")).toBeLessThan(
       lib.indexOf("main_window_build_start"),
     );
 
     expect(driver).toContain("ensure_connected");
+    expect(driver).toMatch(/async fn run_driver[\s\S]*?set_debug_enabled\(true\)\?/);
     expect(driver).toContain("unity_bridge::launch_project_with_options(project, launch_code_optimization)");
     expect(driver).toContain('"processId": launch.process_id');
     expect(driver).toContain('"codeOptimization": match launch_code_optimization');
@@ -63,6 +69,22 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("activeOwnersAfterFirstEnd");
     expect(driver).toContain("CliDriverSuite::Execute");
     expect(driver).toContain("run_execute_suite");
+    expect(driver).toContain("run_agent_unity_execute_probe");
+    expect(driver).toContain('"E0 agent pipeline"');
+    expect(driver).toContain("MOCK_AGENT_UNITY_EXECUTE_SCENARIO");
+    expect(driver).toContain("run_agent_unity_yaml_read_probe");
+    expect(driver).toContain('"E0Y agent yaml pipeline"');
+    expect(driver).toContain("MOCK_AGENT_UNITY_YAML_READ_SCENARIO");
+    expect(driver).toContain("CliDriverSuite::PythonSdk");
+    expect(driver).toContain("run_python_sdk_editor_suite");
+    expect(driver).toContain('model="mock/tool"');
+    expect(driver).toContain("await locus.ensure_unity_editor(");
+    expect(driver).toContain('await locus.call_tool(\n        "python"');
+    expect(driver).toContain('tools=["python"]');
+    expect(driver).toContain("[[mock:python-tool]]");
+    expect(driver).toContain('mode="headless"');
+    expect(driver).toContain('"P6 headless lifecycle"');
+    expect(driver).toContain('"P7 headless close"');
     expect(driver).toContain("unity_bridge::unity_run_states");
     expect(driver).toContain("UNITY_EXECUTE_CANCELLED");
     expect(driver).toContain("unity_bridge::run_state_probe_selftest");
@@ -122,7 +144,8 @@ describe("Locus Unity CLI driver", () => {
   it("keeps the Hot Reload self-test owned by the driver task", () => {
     const selftest = read("src-tauri/src/unity_hotreload/selftest.rs");
 
-    expect(selftest).toContain("struct SelfTestRunningGuard;");
+    expect(selftest).toContain("struct SelfTestRunningGuard {");
+    expect(selftest).toContain("ownership_key: String");
     expect(selftest).toContain("impl Drop for SelfTestRunningGuard");
     expect(selftest).toContain("test.run().await;");
     expect(selftest).not.toContain("tauri::async_runtime::spawn(async move");

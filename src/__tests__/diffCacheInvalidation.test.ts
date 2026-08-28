@@ -12,6 +12,7 @@ import {
   invalidateDiffCacheForFiles,
 } from "../services/diff";
 import type { FileDiffRequest } from "../types";
+import type { WorkspaceRef } from "../services/project";
 
 function request(filePath: string, oldPath?: string): FileDiffRequest {
   return {
@@ -77,5 +78,30 @@ describe("invalidateDiffCacheForFiles", () => {
 
     await diffSingleFile(target);
     expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("namespaces identical relative paths by checkout generation", async () => {
+    const target = request("Assets/Shared.cs");
+    const checkoutA: WorkspaceRef = {
+      checkoutId: "checkout-a",
+      expectedGeneration: 3,
+    };
+    const checkoutB: WorkspaceRef = {
+      checkoutId: "checkout-b",
+      expectedGeneration: 8,
+    };
+
+    await diffSingleFile(target, checkoutA);
+    await diffSingleFile(target, checkoutB);
+
+    expect(computeRequestKey(target, checkoutA)).not.toBe(computeRequestKey(target, checkoutB));
+    expect(ipcInvokeMock).toHaveBeenNthCalledWith(1, "diff_single_file", {
+      request: target,
+      workspaceRef: checkoutA,
+    });
+    expect(ipcInvokeMock).toHaveBeenNthCalledWith(2, "diff_single_file", {
+      request: target,
+      workspaceRef: checkoutB,
+    });
   });
 });

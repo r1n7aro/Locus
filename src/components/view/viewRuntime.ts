@@ -71,6 +71,8 @@ import type {
   ViewSessionWaitResult,
   ViewRuntimeUpdateEvent,
 } from "../../services/view";
+import type { WorkspaceRef } from "../../services/project";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import type {
   UnitySerializedPropertyApplyRequest,
   UnitySerializedPropertyApplyResult,
@@ -255,6 +257,7 @@ const PROJECT_VIEW_IMPORT_PREFIXES = [
 ];
 
 export interface ViewRuntimeApi {
+  workspaceRef: WorkspaceRef;
   callScript(scriptName: string, method: string, args?: unknown): Promise<ViewCallScriptResult>;
   unityPropertyRead(request: UnitySerializedPropertyReadRequest): Promise<UnitySerializedPropertyReadResult>;
   unityPropertyDiscover(request: UnitySerializedPropertyDiscoverRequest): Promise<UnitySerializedPropertyDiscoverResult>;
@@ -490,26 +493,33 @@ function isUnityAssetReference(ref: AssetRefAttachment): boolean {
   return ref.kind === "asset" && UNITY_ASSET_REF_ROOT_RE.test(normalizeRuntimePath(ref.path));
 }
 
-async function selectUnityReference(input: ViewUnityReferenceInput, options: { focusProjectWindow?: boolean } = {}) {
+async function selectUnityReference(
+  input: ViewUnityReferenceInput,
+  options: { focusProjectWindow?: boolean } = {},
+) {
+  const workspaceRef = useWorkspaceContextStore().focusedWorkspaceRef;
+  if (!workspaceRef) return;
   const sceneObject = sceneObjectTargetFromReference(input);
   if (sceneObject) {
-    await selectUnitySceneObject(sceneObject.scenePath, sceneObject.objectPath);
+    await selectUnitySceneObject(workspaceRef, sceneObject.scenePath, sceneObject.objectPath);
     return;
   }
   const ref = normalizeUnityReference(input);
   if (!ref || !isUnityAssetReference(ref)) return;
-  await selectUnityAsset(ref.path, options);
+  await selectUnityAsset(workspaceRef, ref.path, options);
 }
 
 async function inspectUnityReference(input: ViewUnityReferenceInput) {
+  const workspaceRef = useWorkspaceContextStore().focusedWorkspaceRef;
+  if (!workspaceRef) return;
   const sceneObject = sceneObjectTargetFromReference(input);
   if (sceneObject) {
-    await openUnitySceneObjectInspector(sceneObject.scenePath, sceneObject.objectPath);
+    await openUnitySceneObjectInspector(workspaceRef, sceneObject.scenePath, sceneObject.objectPath);
     return;
   }
   const ref = normalizeUnityReference(input);
   if (!ref || !isUnityAssetReference(ref)) return;
-  await openUnityAssetInspector(ref.path);
+  await openUnityAssetInspector(workspaceRef, ref.path);
 }
 
 function useUnityReferenceDrag(source: ViewUnityReferenceSource): ViewUnityReferenceDragBinding {
@@ -1656,20 +1666,20 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
       const response = await api.callScript(scriptName, method, args);
       return response.result;
     },
-    checkConnection: checkUnityConnectionStatus,
-    connectionStatus: checkUnityConnectionStatus,
+    checkConnection: () => checkUnityConnectionStatus(api.workspaceRef),
+    connectionStatus: () => checkUnityConnectionStatus(api.workspaceRef),
     normalizeReference: normalizeUnityReference,
     sceneObjectTarget: sceneObjectTargetFromReference,
     selectAsset: (path: string, options?: { focusProjectWindow?: boolean }) =>
-      selectUnityAsset(path, options),
-    inspectAsset: (path: string) => openUnityAssetInspector(path),
-    openAssetInspector: (path: string) => openUnityAssetInspector(path),
+      selectUnityAsset(api.workspaceRef, path, options),
+    inspectAsset: (path: string) => openUnityAssetInspector(api.workspaceRef, path),
+    openAssetInspector: (path: string) => openUnityAssetInspector(api.workspaceRef, path),
     selectSceneObject: (scenePath: string, objectPath: string) =>
-      selectUnitySceneObject(scenePath, objectPath),
+      selectUnitySceneObject(api.workspaceRef, scenePath, objectPath),
     inspectSceneObject: (scenePath: string, objectPath: string) =>
-      openUnitySceneObjectInspector(scenePath, objectPath),
+      openUnitySceneObjectInspector(api.workspaceRef, scenePath, objectPath),
     openSceneObjectInspector: (scenePath: string, objectPath: string) =>
-      openUnitySceneObjectInspector(scenePath, objectPath),
+      openUnitySceneObjectInspector(api.workspaceRef, scenePath, objectPath),
     select: selectUnityReference,
     inspect: inspectUnityReference,
     drag: {
@@ -2047,6 +2057,7 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
   }
 
   return {
+    workspaceRef: api.workspaceRef,
     callScript: (scriptName, method, args) =>
       measureRequest("callScript", () => api.callScript(scriptName, method, args), {
         scriptName,

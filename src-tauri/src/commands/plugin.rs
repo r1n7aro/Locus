@@ -10,7 +10,7 @@ use futures::StreamExt;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{sleep, timeout};
 use url::Url;
@@ -26,7 +26,10 @@ use crate::plugin::{
     PLUGIN_MANIFEST_FILE_NAME,
 };
 use crate::process_util::{async_command, resolve_github_cli};
-use crate::workspace::Workspace;
+use crate::workspace_definition_registry::WorkspaceDefinitionRegistry;
+use crate::workspace_service::{
+    ProjectRegistry, ResolvedWorkspaceScope, WorkspaceRef, WorkspaceResolveError,
+};
 use crate::{AgentDefRegistryState, AppAgentDir};
 
 pub const PLUGINS_CHANGED_EVENT: &str = "plugins-changed";
@@ -65,33 +68,120 @@ static REGISTRY_DOWNLOAD_HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> 
 static PLUGIN_GITHUB_CLI_LOGIN_SESSION: LazyLock<Mutex<Option<PluginGithubCliLoginSession>>> =
     LazyLock::new(|| Mutex::new(None));
 
-fn project_agent_dir(working_dir: &str) -> std::path::PathBuf {
-    std::path::Path::new(working_dir)
-        .join("Locus")
-        .join("agent")
-}
-
 pub(crate) async fn reload_agent_registry(
     registry: &AgentDefRegistryState,
     app_agent_dir: &AppAgentDir,
-    working_dir: &str,
+    _working_dir: &str,
 ) {
-    let project_agent_dir = project_agent_dir(working_dir);
-    let project_agent_opt = project_agent_dir
-        .is_dir()
-        .then_some(project_agent_dir.as_path());
     let next = AgentDefRegistry::load_with_plugins(
         app_agent_dir.0.as_deref(),
-        project_agent_opt,
-        &crate::plugin::installed_agent_sources(working_dir),
+        None,
+        &crate::plugin::installed_agent_sources(""),
     );
     *registry.0.write().await = next;
+}
+
+struct PluginOperationContext {
+    workspace: Option<ResolvedWorkspaceScope>,
+    working_dir: String,
+}
+
+impl PluginOperationContext {
+    fn app() -> Self {
+        Self {
+            workspace: None,
+            working_dir: String::new(),
+        }
+    }
+
+    fn for_workspace(scope: ResolvedWorkspaceScope) -> Self {
+        let working_dir = scope.runtime().root().display().to_string();
+        Self {
+            workspace: Some(scope),
+            working_dir,
+        }
+    }
+
+    fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+
+    fn working_dir_for_install_scope(&self, scope: PluginInstallScope) -> Result<&str, AppError> {
+        match scope {
+            PluginInstallScope::App => Ok(""),
+            PluginInstallScope::Project => self
+                .workspace
+                .as_ref()
+                .map(|_| self.working_dir.as_str())
+                .ok_or_else(|| {
+                    AppError::new(
+                        "plugin.workspace_ref_required",
+                        "A checkout reference is required for a project plugin operation.",
+                    )
+                }),
+        }
+    }
+
+    fn workspace_scope(&self) -> Option<&ResolvedWorkspaceScope> {
+        self.workspace.as_ref()
+    }
+}
+
+fn plugin_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
+    match error {
+        WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
+            "workspace.registry_unavailable",
+            "The workspace registry is unavailable.",
+        )
+        .detail(detail),
+        WorkspaceResolveError::CheckoutUnavailable { checkout_id } => AppError::new(
+            "workspace.checkout_unavailable",
+            "The requested checkout is unavailable.",
+        )
+        .detail(checkout_id.to_string()),
+        WorkspaceResolveError::StaleGeneration {
+            checkout_id,
+            expected_generation,
+            actual_generation,
+        } => AppError::new(
+            "workspace.generation_stale",
+            "The workspace runtime changed before the request was handled.",
+        )
+        .detail(format!(
+            "checkout={checkout_id}, expected={expected_generation}, actual={actual_generation}"
+        )),
+    }
+}
+
+fn resolve_plugin_operation_context(
+    registry: &ProjectRegistry,
+    workspace_ref: Option<&WorkspaceRef>,
+) -> Result<PluginOperationContext, AppError> {
+    let Some(workspace_ref) = workspace_ref else {
+        return Ok(PluginOperationContext::app());
+    };
+    registry
+        .resolve_workspace_ref(workspace_ref)
+        .map(PluginOperationContext::for_workspace)
+        .map_err(plugin_workspace_resolve_error)
 }
 
 pub(crate) fn emit_agents_changed(app_handle: &AppHandle) {
     if let Err(error) = app_handle.emit(AGENTS_CHANGED_EVENT, ()) {
         eprintln!("[Locus] failed to emit {}: {}", AGENTS_CHANGED_EVENT, error);
     }
+}
+
+pub(crate) fn emit_agents_changed_for_workspace(
+    app_handle: &AppHandle,
+    runtime: &crate::workspace_service::WorkspaceRuntime,
+) {
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        &crate::workspace_service::event::WorkspaceEventScope::for_runtime(runtime),
+        AGENTS_CHANGED_EVENT,
+        (),
+    );
 }
 
 fn default_registry_entry_base_path() -> String {
@@ -2784,12 +2874,129 @@ fn expected_registry_install_version(request: &PluginRegistryInstallRequest) -> 
     request.latest_version.trim().to_string()
 }
 
-pub(crate) fn emit_plugins_changed(app_handle: &AppHandle, working_dir: &str, source: &str) {
+fn emit_process_plugins_changed(app_handle: &AppHandle) {
     if let Err(error) = app_handle.emit(PLUGINS_CHANGED_EVENT, ()) {
         eprintln!("[Locus] failed to emit plugins changed event: {}", error);
     }
-    crate::view::emit_view_tree_changed(app_handle);
-    super::knowledge::emit_knowledge_changed(app_handle, working_dir, source);
+}
+
+fn emit_checkout_plugins_changed(
+    app_handle: &AppHandle,
+    workspace_registry: &ProjectRegistry,
+    scope: &ResolvedWorkspaceScope,
+    source: &str,
+) {
+    let runtime = scope.runtime();
+    let event_scope = crate::workspace_service::event::WorkspaceEventScope::for_runtime(runtime);
+    workspace_registry.event_router().publish(
+        app_handle,
+        PLUGINS_CHANGED_EVENT,
+        crate::workspace_service::event::WorkspaceEventEnvelope {
+            project_id: runtime.project_id().clone(),
+            checkout_id: runtime.checkout_id().clone(),
+            workspace_generation: runtime.generation(),
+            service_instance_id: None,
+            service_generation: None,
+            payload: (),
+        },
+    );
+    if let Ok(knowledge_index) = runtime.knowledge_index(app_handle) {
+        super::knowledge::emit_knowledge_changed(
+            app_handle,
+            knowledge_index.as_ref(),
+            &runtime.root().display().to_string(),
+            source,
+        );
+    }
+    crate::view::emit_view_tree_changed_for_scope(app_handle, &event_scope);
+}
+
+pub(crate) fn emit_plugins_changed(
+    app_handle: &AppHandle,
+    runtime: Option<&crate::workspace_service::WorkspaceRuntime>,
+    source: &str,
+) {
+    if let Some(definitions) = app_handle.try_state::<Arc<WorkspaceDefinitionRegistry>>() {
+        let invalidation = if let Some(runtime) = runtime {
+            definitions
+                .invalidate_checkout(runtime.checkout_id())
+                .map(|_| ())
+        } else {
+            definitions.invalidate_app_base().map(|_| ())
+        };
+        if let Err(error) = invalidation {
+            eprintln!(
+                "[Locus] failed to invalidate plugin definition cache: {}",
+                error
+            );
+        }
+    }
+    if let Some(runtime) = runtime {
+        let event_scope =
+            crate::workspace_service::event::WorkspaceEventScope::for_runtime(runtime);
+        crate::workspace_service::event::emit_for_workspace_scope(
+            app_handle,
+            &event_scope,
+            PLUGINS_CHANGED_EVENT,
+            (),
+        );
+        if let Ok(knowledge_index) = runtime.knowledge_index(app_handle) {
+            super::knowledge::emit_knowledge_changed(
+                app_handle,
+                knowledge_index.as_ref(),
+                &runtime.root().display().to_string(),
+                source,
+            );
+        }
+        crate::view::emit_view_tree_changed_for_scope(app_handle, &event_scope);
+    } else {
+        emit_process_plugins_changed(app_handle);
+        crate::view::emit_view_tree_changed(app_handle);
+    }
+}
+
+async fn apply_plugin_change(
+    app_handle: &AppHandle,
+    context: &PluginOperationContext,
+    process_changed: bool,
+    checkout_changed: bool,
+    source: &str,
+    registry: &AgentDefRegistryState,
+    app_agent_dir: &AppAgentDir,
+    definitions: &WorkspaceDefinitionRegistry,
+    workspace_registry: &ProjectRegistry,
+) -> Result<(), AppError> {
+    if process_changed {
+        definitions.invalidate_app_base().map_err(|detail| {
+            AppError::new(
+                "plugin.definition_cache_unavailable",
+                "Failed to invalidate the app Agent definition cache.",
+            )
+            .detail(detail)
+        })?;
+        reload_agent_registry(registry, app_agent_dir, "").await;
+        emit_process_plugins_changed(app_handle);
+        crate::view::emit_view_tree_changed(app_handle);
+    }
+    if checkout_changed {
+        let scope = context.workspace_scope().ok_or_else(|| {
+            AppError::new(
+                "plugin.workspace_ref_required",
+                "A checkout reference is required for a project plugin operation.",
+            )
+        })?;
+        definitions
+            .invalidate_checkout(scope.runtime().checkout_id())
+            .map_err(|detail| {
+                AppError::new(
+                    "plugin.definition_cache_unavailable",
+                    "Failed to invalidate the checkout Agent definition cache.",
+                )
+                .detail(detail)
+            })?;
+        emit_checkout_plugins_changed(app_handle, workspace_registry, scope, source);
+    }
+    Ok(())
 }
 
 pub(crate) async fn install_plugin_from_registry_request(
@@ -3505,34 +3712,49 @@ pub async fn plugin_registry_fetch_description(
 
 #[tauri::command]
 pub async fn plugin_list_installed(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<InstalledPluginSummary>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    Ok(list_installed_plugin_summaries(&working_dir))
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    Ok(list_installed_plugin_summaries(context.working_dir()))
 }
 
 #[tauri::command]
 pub async fn plugin_inspector_drawer_packages(
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<PluginDrawerPackage>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    Ok(installed_inspector_drawer_packages(&working_dir))
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    Ok(installed_inspector_drawer_packages(context.working_dir()))
 }
 
 #[tauri::command]
 pub async fn plugin_install_from_path(
     source_path: String,
     scope: PluginInstallScope,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     app_agent_dir: State<'_, AppAgentDir>,
     app_handle: AppHandle,
 ) -> Result<InstalledPluginSummary, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    let working_dir = context.working_dir_for_install_scope(scope)?;
     let summary =
-        install_plugin_from_path_sync(&working_dir, &source_path, scope).map_err(AppError::from)?;
-    reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
-    emit_plugins_changed(&app_handle, &working_dir, "plugin_install");
+        install_plugin_from_path_sync(working_dir, &source_path, scope).map_err(AppError::from)?;
+    apply_plugin_change(
+        &app_handle,
+        &context,
+        scope == PluginInstallScope::App,
+        scope == PluginInstallScope::Project,
+        "plugin_install",
+        &registry,
+        &app_agent_dir,
+        &definitions,
+        &workspace_registry,
+    )
+    .await?;
     Ok(summary)
 }
 
@@ -3540,17 +3762,30 @@ pub async fn plugin_install_from_path(
 pub async fn plugin_install_from_registry(
     request: PluginRegistryInstallRequest,
     scope: PluginInstallScope,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     app_agent_dir: State<'_, AppAgentDir>,
     app_handle: AppHandle,
 ) -> Result<InstalledPluginSummary, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let summary = install_plugin_from_registry_request(&working_dir, request, scope)
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    let working_dir = context.working_dir_for_install_scope(scope)?;
+    let summary = install_plugin_from_registry_request(working_dir, request, scope)
         .await
         .map_err(AppError::from)?;
-    reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
-    emit_plugins_changed(&app_handle, &working_dir, "plugin_registry_install");
+    apply_plugin_change(
+        &app_handle,
+        &context,
+        scope == PluginInstallScope::App,
+        scope == PluginInstallScope::Project,
+        "plugin_registry_install",
+        &registry,
+        &app_agent_dir,
+        &definitions,
+        &workspace_registry,
+    )
+    .await?;
     Ok(summary)
 }
 
@@ -3558,17 +3793,30 @@ pub async fn plugin_install_from_registry(
 pub async fn plugin_install_from_source(
     source: PluginDownloadSource,
     scope: PluginInstallScope,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     app_agent_dir: State<'_, AppAgentDir>,
     app_handle: AppHandle,
 ) -> Result<InstalledPluginSummary, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let summary = install_plugin_from_download_source(&working_dir, source, scope)
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    let working_dir = context.working_dir_for_install_scope(scope)?;
+    let summary = install_plugin_from_download_source(working_dir, source, scope)
         .await
         .map_err(AppError::from)?;
-    reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
-    emit_plugins_changed(&app_handle, &working_dir, "plugin_source_install");
+    apply_plugin_change(
+        &app_handle,
+        &context,
+        scope == PluginInstallScope::App,
+        scope == PluginInstallScope::Project,
+        "plugin_source_install",
+        &registry,
+        &app_agent_dir,
+        &definitions,
+        &workspace_registry,
+    )
+    .await?;
     Ok(summary)
 }
 
@@ -3577,27 +3825,33 @@ pub async fn plugin_set_enabled(
     plugin_id: String,
     scope: PluginInstallScope,
     enabled: bool,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     app_agent_dir: State<'_, AppAgentDir>,
     app_handle: AppHandle,
 ) -> Result<InstalledPluginSummary, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    if scope == PluginInstallScope::Project && working_dir.trim().is_empty() {
-        return Err("No working directory selected".to_string().into());
-    }
-    let summary = set_plugin_enabled_sync(&working_dir, &plugin_id, scope, enabled)
-        .map_err(AppError::from)?;
-    reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
-    emit_plugins_changed(
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    let working_dir = context.working_dir_for_install_scope(scope)?;
+    let summary =
+        set_plugin_enabled_sync(working_dir, &plugin_id, scope, enabled).map_err(AppError::from)?;
+    apply_plugin_change(
         &app_handle,
-        &working_dir,
+        &context,
+        scope == PluginInstallScope::App,
+        scope == PluginInstallScope::Project,
         if enabled {
             "plugin_enable"
         } else {
             "plugin_disable"
         },
-    );
+        &registry,
+        &app_agent_dir,
+        &definitions,
+        &workspace_registry,
+    )
+    .await?;
     Ok(summary)
 }
 
@@ -3791,31 +4045,71 @@ pub async fn plugin_github_auth_logout() -> Result<PluginGithubAuthStatus, AppEr
 pub async fn plugin_uninstall(
     plugin_id: String,
     scope: PluginInstallScope,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     app_agent_dir: State<'_, AppAgentDir>,
     app_handle: AppHandle,
 ) -> Result<String, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let removed = uninstall_plugin_sync(&working_dir, &plugin_id, scope).map_err(AppError::from)?;
-    reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
-    emit_plugins_changed(&app_handle, &working_dir, "plugin_uninstall");
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    let working_dir = context.working_dir_for_install_scope(scope)?;
+    let removed = uninstall_plugin_sync(working_dir, &plugin_id, scope).map_err(AppError::from)?;
+    apply_plugin_change(
+        &app_handle,
+        &context,
+        scope == PluginInstallScope::App,
+        scope == PluginInstallScope::Project,
+        "plugin_uninstall",
+        &registry,
+        &app_agent_dir,
+        &definitions,
+        &workspace_registry,
+    )
+    .await?;
     Ok(removed)
 }
 
 #[tauri::command]
 pub async fn plugin_export(
     request: PluginExportRequest,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: Option<WorkspaceRef>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     app_agent_dir: State<'_, AppAgentDir>,
     app_handle: AppHandle,
 ) -> Result<PluginExportResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
-    let result = export_plugin_archive_sync(&working_dir, request).map_err(AppError::from)?;
+    let context = resolve_plugin_operation_context(&workspace_registry, workspace_ref.as_ref())?;
+    if request.install_after_export
+        && request.install_scope.unwrap_or(PluginInstallScope::App) == PluginInstallScope::Project
+    {
+        context.working_dir_for_install_scope(PluginInstallScope::Project)?;
+    }
+    let result =
+        export_plugin_archive_sync(context.working_dir(), request).map_err(AppError::from)?;
     if result.installed_plugin.is_some() || !result.transferred_components.is_empty() {
-        reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
-        emit_plugins_changed(&app_handle, &working_dir, "plugin_export");
+        let process_changed = result
+            .installed_plugin
+            .as_ref()
+            .is_some_and(|plugin| plugin.scope == PluginInstallScope::App);
+        let checkout_changed = result
+            .installed_plugin
+            .as_ref()
+            .is_some_and(|plugin| plugin.scope == PluginInstallScope::Project)
+            || (!result.transferred_components.is_empty() && context.workspace_scope().is_some());
+        apply_plugin_change(
+            &app_handle,
+            &context,
+            process_changed,
+            checkout_changed,
+            "plugin_export",
+            &registry,
+            &app_agent_dir,
+            &definitions,
+            &workspace_registry,
+        )
+        .await?;
     }
     Ok(result)
 }
@@ -3824,7 +4118,111 @@ pub async fn plugin_export(
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::Arc;
     use tempfile::TempDir;
+
+    fn workspace_registry(config_root: &Path) -> Arc<ProjectRegistry> {
+        let config = Arc::new(crate::config::AppConfig::load_from_path(
+            &config_root.join("config.json"),
+        ));
+        let policy = Arc::new(
+            crate::resource_policy::ResourcePolicyStore::from_config(config)
+                .expect("resource policy"),
+        );
+        ProjectRegistry::new(policy, Vec::new())
+    }
+
+    fn write_agent(root: &Path, id: &str, prompt: &str) {
+        let agent_dir = root.join(id);
+        fs::create_dir_all(&agent_dir).expect("Agent directory");
+        fs::write(
+            agent_dir.join("config.json"),
+            r#"{"name":"Scoped Agent","description":"test","tools":[],"default":true}"#,
+        )
+        .expect("Agent config");
+        fs::write(agent_dir.join("system.md"), prompt).expect("Agent prompt");
+    }
+
+    #[test]
+    fn plugin_operation_context_defaults_to_process_scope() {
+        let temp = TempDir::new().expect("temp root");
+        let registry = workspace_registry(temp.path());
+
+        let context = resolve_plugin_operation_context(&registry, None).expect("app context");
+
+        assert!(context.working_dir().is_empty());
+        assert!(context.workspace_scope().is_none());
+        let error = context
+            .working_dir_for_install_scope(PluginInstallScope::Project)
+            .expect_err("project operations require WorkspaceRef");
+        assert_eq!(error.code, "plugin.workspace_ref_required");
+    }
+
+    #[test]
+    fn plugin_operation_context_resolves_exact_checkout_and_holds_lease() {
+        let temp = TempDir::new().expect("temp root");
+        let checkout = temp.path().join("checkout");
+        fs::create_dir_all(&checkout).expect("checkout root");
+        let registry = workspace_registry(temp.path());
+        let runtime = registry.register(&checkout).expect("register checkout");
+        let initial_lease_count = runtime.lease_count();
+        let workspace_ref = WorkspaceRef::for_runtime(&runtime);
+
+        let context = resolve_plugin_operation_context(&registry, Some(&workspace_ref))
+            .expect("checkout context");
+
+        assert_eq!(
+            Path::new(context.working_dir()),
+            runtime.root(),
+            "plugin path must come from the resolved runtime"
+        );
+        assert_eq!(runtime.lease_count(), initial_lease_count + 1);
+        drop(context);
+        assert_eq!(runtime.lease_count(), initial_lease_count);
+    }
+
+    #[test]
+    fn plugin_operation_context_rejects_stale_workspace_generation() {
+        let temp = TempDir::new().expect("temp root");
+        let checkout = temp.path().join("checkout");
+        fs::create_dir_all(&checkout).expect("checkout root");
+        let registry = workspace_registry(temp.path());
+        let runtime = registry.register(&checkout).expect("register checkout");
+        let stale_ref = WorkspaceRef::new(
+            runtime.checkout_id().clone(),
+            Some(runtime.generation().saturating_add(1)),
+        );
+
+        let error = match resolve_plugin_operation_context(&registry, Some(&stale_ref)) {
+            Ok(_) => panic!("stale WorkspaceRef must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, "workspace.generation_stale");
+    }
+
+    #[tokio::test]
+    async fn process_agent_reload_ignores_checkout_agent_overlay() {
+        let temp = TempDir::new().expect("temp root");
+        let app_agents = temp.path().join("app-agents");
+        let checkout = temp.path().join("checkout");
+        write_agent(&app_agents, "app-only", "app prompt");
+        write_agent(
+            &checkout.join("Locus").join("agent"),
+            "checkout-only",
+            "checkout prompt",
+        );
+        let registry = AgentDefRegistryState(Arc::new(tokio::sync::RwLock::new(
+            AgentDefRegistry::load(None, None),
+        )));
+        let app_agent_dir = AppAgentDir(Arc::new(Some(app_agents)));
+
+        reload_agent_registry(&registry, &app_agent_dir, &checkout.display().to_string()).await;
+
+        let snapshot = registry.0.read().await;
+        assert!(snapshot.get("app-only").is_some());
+        assert!(snapshot.get("checkout-only").is_none());
+    }
 
     #[test]
     fn plugin_git_command_args_use_windows_schannel_backend() {

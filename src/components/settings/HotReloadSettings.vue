@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { t } from "../../i18n";
 import { useCopyFeedback } from "../../composables/useCopyFeedback";
 import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
@@ -18,14 +18,18 @@ import type { CsharpCompileStatus } from "../../types";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { normalizeAppError } from "../../services/errors";
 import { useNotificationStore } from "../../stores/notification";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 
 const notificationStore = useNotificationStore();
+const workspaceContextStore = useWorkspaceContextStore();
 
 const sidecarStatus = ref<CsharpCompileStatus | null>(null);
 const sidecarReady = ref(false);
 const sidecarBusy = ref(false);
 
 let unsubscribeSidecarStatus: RuntimeUnsubscribe | null = null;
+let sidecarSubscriptionVersion = 0;
+let sidecarDisposed = false;
 
 const sidecarEnabled = computed(() => sidecarStatus.value?.enabled ?? false);
 
@@ -64,24 +68,43 @@ const sidecarStatsLabel = computed(() => {
 });
 
 async function refreshSidecarStatus() {
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    sidecarStatus.value = null;
+    sidecarReady.value = false;
+    return;
+  }
+  const scopeKey = `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`;
   try {
-    sidecarStatus.value = await unitySidecarCompilerGetStatus();
+    const status = await unitySidecarCompilerGetStatus(scope);
+    if (focusedScopeKey() === scopeKey) {
+      sidecarStatus.value = status;
+    }
   } catch (e) {
+    if (focusedScopeKey() !== scopeKey) return;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "loadUnitySidecarCompilerStatus",
     });
   } finally {
-    sidecarReady.value = true;
+    if (focusedScopeKey() === scopeKey) sidecarReady.value = true;
   }
 }
 
 async function toggleSidecarEnabled() {
   if (!sidecarReady.value || sidecarBusy.value) return;
   sidecarBusy.value = true;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    sidecarBusy.value = false;
+    return;
+  }
   try {
-    sidecarStatus.value = await unitySidecarCompilerSetEnabled(!sidecarEnabled.value);
+    const status = await unitySidecarCompilerSetEnabled(!sidecarEnabled.value, scope);
+    if (focusedScopeKey() === `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`) {
+      sidecarStatus.value = status;
+    }
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -103,8 +126,19 @@ const nonPublicAccessBusy = ref(false);
 async function toggleNonPublicAccessEnabled() {
   if (!sidecarReady.value || nonPublicAccessBusy.value) return;
   nonPublicAccessBusy.value = true;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    nonPublicAccessBusy.value = false;
+    return;
+  }
   try {
-    sidecarStatus.value = await unityNonPublicAccessSetEnabled(!nonPublicAccessEnabled.value);
+    const status = await unityNonPublicAccessSetEnabled(
+      !nonPublicAccessEnabled.value,
+      scope,
+    );
+    if (focusedScopeKey() === `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`) {
+      sidecarStatus.value = status;
+    }
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -140,8 +174,16 @@ const hotReloadStatsLabel = computed(() => {
 
 async function applyHotReloadEnabled(value: boolean) {
   hotReloadBusy.value = true;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) {
+    hotReloadBusy.value = false;
+    return;
+  }
   try {
-    sidecarStatus.value = await unityHotReloadSetEnabled(value);
+    const status = await unityHotReloadSetEnabled(value, scope);
+    if (focusedScopeKey() === `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`) {
+      sidecarStatus.value = status;
+    }
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -165,7 +207,10 @@ const {
   refreshOptimization: refreshHotReloadOptimization,
   enableHotReload: hotReloadEnable,
   switchToDebug: hotReloadSwitchToDebug,
-} = useHotReloadDebugGuard(() => applyHotReloadEnabled(true));
+} = useHotReloadDebugGuard(
+  () => workspaceContextStore.focusedWorkspaceRef,
+  () => applyHotReloadEnabled(true),
+);
 
 async function toggleHotReloadEnabled() {
   if (!sidecarReady.value || hotReloadBusy.value) return;
@@ -184,15 +229,21 @@ const selfTestSummary = ref("");
 const selfTestLogText = computed(() => selfTestLog.value.join("\n"));
 const { copied: selfTestLogCopied, copyText: copySelfTestLogText } = useCopyFeedback();
 let unsubscribeSelfTest: RuntimeUnsubscribe | null = null;
+let selfTestSubscriptionVersion = 0;
+let selfTestDisposed = false;
 
 async function runHotReloadSelfTest() {
   if (selfTestRunning.value) return;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope) return;
+  const scopeKey = `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`;
   selfTestRunning.value = true;
   selfTestLog.value = [];
   selfTestSummary.value = "";
   try {
-    await unityHotReloadSelfTestRun();
+    await unityHotReloadSelfTestRun(scope);
   } catch (e) {
+    if (focusedScopeKey() !== scopeKey) return;
     const err = normalizeAppError(e);
     selfTestRunning.value = false;
     selfTestLog.value = [...selfTestLog.value, err.message];
@@ -213,16 +264,43 @@ async function copyHotReloadSelfTestLog() {
   });
 }
 
-onMounted(() => {
-  void refreshSidecarStatus();
-  void refreshHotReloadOptimization();
-  void subscribeUnitySidecarCompilerStatus((payload) => {
+function focusedScopeKey(): string {
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
+}
+
+async function bindSidecarStatus() {
+  const version = ++sidecarSubscriptionVersion;
+  unsubscribeSidecarStatus?.();
+  unsubscribeSidecarStatus = null;
+  sidecarStatus.value = null;
+  sidecarReady.value = false;
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope || sidecarDisposed) return;
+  await refreshSidecarStatus();
+  const unsubscribe = await subscribeUnitySidecarCompilerStatus(scope, (payload) => {
+    if (focusedScopeKey() !== `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`) return;
     sidecarStatus.value = payload;
     sidecarReady.value = true;
-  }).then((unsubscribe) => {
-    unsubscribeSidecarStatus = unsubscribe;
   });
-  void subscribeUnityHotReloadSelfTest((payload) => {
+  if (sidecarDisposed || version !== sidecarSubscriptionVersion) {
+    unsubscribe();
+  } else {
+    unsubscribeSidecarStatus = unsubscribe;
+  }
+}
+
+async function bindSelfTestEvents() {
+  const version = ++selfTestSubscriptionVersion;
+  unsubscribeSelfTest?.();
+  unsubscribeSelfTest = null;
+  selfTestRunning.value = false;
+  selfTestLog.value = [];
+  selfTestSummary.value = "";
+  const scope = workspaceContextStore.focusedWorkspaceRef;
+  if (!scope || selfTestDisposed) return;
+  const unsubscribe = await subscribeUnityHotReloadSelfTest(scope, (payload) => {
+    if (focusedScopeKey() !== `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`) return;
     selfTestRunning.value = payload.running && !payload.finished;
     if (payload.line) {
       selfTestLog.value = [...selfTestLog.value, payload.line];
@@ -234,12 +312,36 @@ onMounted(() => {
         payload.failed,
       );
     }
-  }).then((unsubscribe) => {
-    unsubscribeSelfTest = unsubscribe;
   });
+  if (selfTestDisposed || version !== selfTestSubscriptionVersion) {
+    unsubscribe();
+  } else {
+    unsubscribeSelfTest = unsubscribe;
+  }
+}
+
+onMounted(() => {
+  sidecarDisposed = false;
+  selfTestDisposed = false;
+  void bindSidecarStatus();
+  void bindSelfTestEvents();
+  void refreshHotReloadOptimization();
 });
 
+watch(
+  focusedScopeKey,
+  () => {
+    void bindSidecarStatus();
+    void bindSelfTestEvents();
+    void refreshHotReloadOptimization();
+  },
+);
+
 onUnmounted(() => {
+  sidecarDisposed = true;
+  sidecarSubscriptionVersion += 1;
+  selfTestDisposed = true;
+  selfTestSubscriptionVersion += 1;
   unsubscribeSidecarStatus?.();
   unsubscribeSidecarStatus = null;
   unsubscribeSelfTest?.();

@@ -40,7 +40,11 @@ export interface SessionTreeSessionNode {
 
 export type SessionTreeNode = SessionTreeFolderNode | SessionTreeSessionNode;
 
-function normalizeSessionTitle(title: string, sessionType: string, isChild: boolean): string {
+export function sessionTreeDisplayTitle(
+  title: string,
+  sessionType: string,
+  isChild: boolean,
+): string {
   const trimmed = title.trim();
   if (!trimmed) return "";
   if (isChild && trimmed.startsWith("sub:")) {
@@ -79,8 +83,20 @@ function statusPriority(status: SessionTreeStatus | null): number {
   }
 }
 
-function maxStatus(a: SessionTreeStatus | null, b: SessionTreeStatus | null): SessionTreeStatus | null {
+export function maxSessionTreeStatus(
+  a: SessionTreeStatus | null,
+  b: SessionTreeStatus | null,
+): SessionTreeStatus | null {
   return statusPriority(a) >= statusPriority(b) ? a : b;
+}
+
+export function sessionTreeStatusForSession(
+  session: SessionSummary,
+  streamingSessionIds: Set<string> = new Set<string>(),
+): SessionTreeStatus | null {
+  return streamingSessionIds.has(session.id)
+    ? "running"
+    : session.runtimeStatus ?? null;
 }
 
 function sortNodes(nodes: SessionTreeNode[], isChildren = false): SessionTreeNode[] {
@@ -120,8 +136,7 @@ function createActualNode(
     };
   }
 
-  const runtimeStatus = session.runtimeStatus ?? null;
-  const status = streamingSessionIds.has(session.id) ? "running" : runtimeStatus;
+  const status = sessionTreeStatusForSession(session, streamingSessionIds);
   const updatedAt = session.updatedAt;
   const parentSessionId = session.parentSessionId ?? null;
   return {
@@ -129,7 +144,7 @@ function createActualNode(
     key: `session:${session.id}`,
     sessionId: session.id,
     sourceSessionId: session.id,
-    title: normalizeSessionTitle(session.title, session.sessionType, !!parentSessionId),
+    title: sessionTreeDisplayTitle(session.title, session.sessionType, !!parentSessionId),
     rawTitle: session.title,
     sessionType: session.sessionType,
     parentSessionId,
@@ -152,7 +167,7 @@ function foldFolderMetadata(node: SessionTreeNode): SessionTreeStatus | null {
   let updatedAt = node.updatedAt;
   for (const child of node.children) {
     const childStatus = foldFolderMetadata(child);
-    status = maxStatus(status, childStatus);
+    status = maxSessionTreeStatus(status, childStatus);
     updatedAt = Math.max(updatedAt, child.updatedAt);
   }
   node.status = status;

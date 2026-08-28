@@ -23,6 +23,7 @@ import {
   SKILL_COMMAND_NOTICE_OPERATION,
 } from "../../composables/skillCommands";
 import { useNotificationStore } from "../../stores/notification";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import {
   buildKnowledgeEditModePatch,
   getKnowledgeEditMode,
@@ -56,6 +57,7 @@ const emit = defineEmits<{
 
 const { skillItems, loadSkills } = useSkills();
 const notificationStore = useNotificationStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const skillCommandDraft = ref("");
 
 function normalizeRelativePath(path: string): string {
@@ -509,13 +511,15 @@ const rescanning = ref(false);
 
 async function onRescanExternalSkills() {
   if (rescanning.value) return;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
   rescanning.value = true;
   try {
     // The backend rescans the agent skill directories and emits
     // knowledge-changed, which refreshes the tree; reload manifests here so
     // this panel picks up metadata changes immediately.
-    await refreshExternalSkills();
-    await loadSkills({ force: true });
+    await refreshExternalSkills(workspaceRef);
+    await loadSkills({ force: true, workspaceRef });
   } catch (cause) {
     notificationStore.addNotice(
       "error",

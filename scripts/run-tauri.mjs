@@ -22,6 +22,7 @@ const CODEX_CLI_ENV_KEY = "LOCUS_CODEX_CLI";
 const CODEX_NODE_ENV_KEY = "LOCUS_CODEX_NODE";
 const ISOLATED_RUNTIME_BASE_ENV_KEY = "LOCUS_ISOLATED_RUNTIME_BASE";
 const SKIP_ONBOARDING_ENV_KEY = "LOCUS_SKIP_ONBOARDING";
+const REUSE_DEV_SERVER_ENV_KEY = "LOCUS_REUSE_DEV_SERVER";
 const LOCAL_DEV_CONFIG_FILE = ".locus-dev.local.json";
 const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const DEV_ISOLATED_COMMAND = "dev-isolated";
@@ -86,6 +87,7 @@ let tauriArgs = isCustomDevCommand
   ? ["dev", ...isolatedRuntime.remainingArgs]
   : args;
 const env = { ...process.env };
+const reuseDevServer = process.env[REUSE_DEV_SERVER_ENV_KEY]?.trim() === "1";
 
 const isHelpOrVersionCommand =
   tauriArgs.includes("--help") ||
@@ -781,7 +783,13 @@ if (shouldExposeWebView2DebugPort) {
 let tauriResult = { code: 1, signal: null, error: null };
 
 try {
-  const shouldManageDevServer = getTauriCommand(tauriArgs) === "dev" && !isHelpOrVersionCommand;
+  const isDevCommand = getTauriCommand(tauriArgs) === "dev" && !isHelpOrVersionCommand;
+  if (isDevCommand && reuseDevServer && !(await canConnectToPort(DEV_SERVER_PORT))) {
+    throw new Error(
+      `Requested shared dev server on port ${DEV_SERVER_PORT}, but the port is not accepting connections.`,
+    );
+  }
+  const shouldManageDevServer = isDevCommand && !reuseDevServer;
   const devServer = shouldManageDevServer ? await startManagedDevServer() : null;
   const tauri = runTauriCli();
 

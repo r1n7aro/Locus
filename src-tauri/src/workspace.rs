@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, OnceLock};
+
+use crate::workspace_service::identity::ProjectIdResolver;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
@@ -22,58 +23,6 @@ pub struct UnityTestToolsWorkspaceStatus {
     pub enabled: bool,
     pub package_installed: bool,
     pub available: bool,
-}
-
-pub struct Workspace {
-    pub path: tokio::sync::RwLock<String>,
-    pub workspace_id: tokio::sync::RwLock<Option<String>>,
-    generation: AtomicU64,
-    generation_lock: Mutex<()>,
-}
-
-impl Workspace {
-    pub fn new(path: String, workspace_id: Option<String>) -> Self {
-        Self {
-            path: tokio::sync::RwLock::new(path),
-            workspace_id: tokio::sync::RwLock::new(workspace_id),
-            generation: AtomicU64::new(0),
-            generation_lock: Mutex::new(()),
-        }
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-
-    pub fn bump_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::SeqCst) + 1
-    }
-
-    pub fn lock_generation(&self) -> Result<WorkspaceGenerationGuard<'_>, String> {
-        let guard = self
-            .generation_lock
-            .lock()
-            .map_err(|e| format!("Workspace generation lock error: {}", e))?;
-        Ok(WorkspaceGenerationGuard {
-            workspace: self,
-            _guard: guard,
-        })
-    }
-}
-
-pub struct WorkspaceGenerationGuard<'a> {
-    workspace: &'a Workspace,
-    _guard: MutexGuard<'a, ()>,
-}
-
-impl WorkspaceGenerationGuard<'_> {
-    pub fn is_current(&self, generation: u64) -> bool {
-        self.workspace.generation() == generation
-    }
-
-    pub fn bump_generation(&self) -> u64 {
-        self.workspace.bump_generation()
-    }
 }
 
 pub fn workspace_config_path(dir: &str) -> std::path::PathBuf {
@@ -270,53 +219,11 @@ pub fn set_unity_test_tools_enabled(dir: &str, enabled: bool) -> Result<(), Stri
         .map_err(|error| format!("Failed to write workspace config: {error}"))
 }
 
-fn extract_unity_yaml_scalar(content: &str, key: &str) -> Option<String> {
-    let prefix = format!("{}:", key);
-    content.lines().find_map(|line| {
-        let trimmed = line.trim();
-        let value = trimmed.strip_prefix(&prefix)?.trim();
-        let value = value.trim_matches('"').trim_matches('\'').trim();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value.to_string())
-        }
-    })
-}
-
-fn unity_workspace_seed(dir: &str) -> Option<String> {
-    let settings_path = Path::new(dir)
-        .join("ProjectSettings")
-        .join("ProjectSettings.asset");
-    let content = std::fs::read_to_string(&settings_path).ok()?;
-
-    for key in [
-        "productGUID",
-        "projectGUID",
-        "projectGuid",
-        "cloudProjectId",
-    ] {
-        if let Some(value) = extract_unity_yaml_scalar(&content, key) {
-            return Some(format!("unity:{}={}", key, value));
-        }
-    }
-
-    None
-}
-
-fn workspace_id_from_seed(seed: &str) -> String {
-    let digest = blake3::hash(seed.as_bytes()).to_hex().to_string();
-    format!("unity-{}", &digest[..24])
-}
-
-fn random_workspace_id() -> String {
-    format!("workspace-{}", uuid::Uuid::new_v4().simple())
-}
-
 fn generated_workspace_id(dir: &str) -> String {
-    unity_workspace_seed(dir)
-        .map(|seed| workspace_id_from_seed(&seed))
-        .unwrap_or_else(random_workspace_id)
+    ProjectIdResolver::resolve(dir)
+        .expect("generated workspace identity requires an existing directory")
+        .project_id
+        .into_string()
 }
 
 pub fn load_or_create_workspace(dir: &str) -> Result<String, String> {
@@ -338,7 +245,10 @@ pub fn load_or_create_workspace(dir: &str) -> Result<String, String> {
         }
     }
 
-    let workspace_id = generated_workspace_id(dir);
+    let workspace_id = ProjectIdResolver::resolve(dir)
+        .map_err(|error| error.to_string())?
+        .project_id
+        .into_string();
     if should_write_config {
         write_workspace_config(
             dir,
@@ -360,7 +270,7 @@ mod tests {
         clear_unity_test_pending_sources_through, generated_workspace_id, load_or_create_workspace,
         note_unity_test_source_written, read_workspace_config, set_unity_test_tools_enabled,
         unity_test_pending_source_snapshot, unity_test_sources_pending,
-        unity_test_tools_workspace_status, Workspace, WorkspaceConfig,
+        unity_test_tools_workspace_status, WorkspaceConfig,
     };
 
     fn write_project_settings(root: &tempfile::TempDir, body: &str) {
@@ -496,14 +406,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_generation_advances_on_bump() {
-        let workspace = Workspace::new("A".to_string(), Some("workspace-a".to_string()));
-        let initial = workspace.generation();
-        assert_eq!(workspace.bump_generation(), initial + 1);
-        assert_eq!(workspace.generation(), initial + 1);
-    }
-
-    #[test]
     fn generated_workspace_id_prefers_unity_project_guid_like_fields() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
@@ -522,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_workspace_id_falls_back_to_random_id_without_unity_guid() {
+    fn generated_workspace_id_falls_back_to_checkout_id_without_unity_guid() {
         let dir = tempfile::tempdir().unwrap();
         write_project_settings(
             &dir,
@@ -530,12 +432,12 @@ mod tests {
         );
 
         let id = generated_workspace_id(&dir.path().to_string_lossy());
-        assert!(id.starts_with("workspace-"));
-        assert_eq!(id.len(), "workspace-".len() + 32);
+        assert!(id.starts_with("checkout-"));
+        assert_eq!(id.len(), "checkout-".len() + 24);
     }
 
     #[test]
-    fn load_or_create_workspace_persists_random_id_without_unity_guid() {
+    fn load_or_create_workspace_persists_checkout_id_without_unity_guid() {
         let dir = tempfile::tempdir().unwrap();
         write_project_settings(
             &dir,
@@ -546,7 +448,7 @@ mod tests {
         let second = load_or_create_workspace(&dir.path().to_string_lossy()).unwrap();
         let cfg = read_workspace_config(&dir.path().to_string_lossy()).unwrap();
 
-        assert!(first.starts_with("workspace-"));
+        assert!(first.starts_with("checkout-"));
         assert_eq!(first, second);
         assert_eq!(cfg.workspace_id, first);
     }

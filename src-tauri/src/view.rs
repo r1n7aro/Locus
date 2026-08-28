@@ -3761,6 +3761,11 @@ fn view_tab_hosts() -> &'static Mutex<HashMap<String, String>> {
     VIEW_TAB_HOSTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn view_host_scopes() -> &'static Mutex<HashMap<String, String>> {
+    static VIEW_HOST_SCOPES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    VIEW_HOST_SCOPES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Debug, Default)]
 struct ViewHostPoolState {
     next_index: u64,
@@ -4211,8 +4216,86 @@ fn sanitize_view_host_label(label: &str) -> Result<String, String> {
     Ok(normalized.to_string())
 }
 
+fn view_workspace_ref_for_root(
+    app_handle: &AppHandle,
+    working_dir: &str,
+) -> Result<crate::workspace_service::WorkspaceRef, String> {
+    let registry = app_handle.state::<Arc<crate::workspace_service::ProjectRegistry>>();
+    let runtime = registry
+        .runtime_for_root(Path::new(working_dir))
+        .ok_or_else(|| format!("View checkout is not registered: {working_dir}"))?;
+    Ok(crate::workspace_service::WorkspaceRef::for_runtime(
+        &runtime,
+    ))
+}
+
+fn view_workspace_scope_key(workspace_ref: &crate::workspace_service::WorkspaceRef) -> String {
+    format!(
+        "{}@{}",
+        workspace_ref.checkout_id,
+        workspace_ref.expected_generation.unwrap_or_default()
+    )
+}
+
+fn view_scope_token(workspace_ref: &crate::workspace_service::WorkspaceRef) -> String {
+    view_workspace_scope_key(workspace_ref)
+        .bytes()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn scoped_view_registry_key(scope_key: &str, view_id: &str) -> String {
+    format!("{scope_key}\0{view_id}")
+}
+
+fn append_view_workspace_query(
+    url: &str,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+) -> String {
+    format!(
+        "{url}&checkoutId={}&workspaceGeneration={}",
+        encode_view_host_tab_id(&workspace_ref.checkout_id.to_string()),
+        workspace_ref.expected_generation.unwrap_or_default()
+    )
+}
+
+fn scoped_view_window_label(
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+    view_id: &str,
+) -> String {
+    format!("view-{}-{view_id}", view_scope_token(workspace_ref))
+}
+
+fn scoped_view_content_window_label(
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+    view_id: &str,
+) -> String {
+    format!("view-content-{}-{view_id}", view_scope_token(workspace_ref))
+}
+
 pub fn set_view_tab_host_sync(request: ViewSetTabHostRequest) -> Result<(), String> {
+    set_view_tab_host_scoped_sync(request, "legacy")
+}
+
+pub fn set_view_tab_host_scoped_sync(
+    request: ViewSetTabHostRequest,
+    scope_key: &str,
+) -> Result<(), String> {
     let host_label = sanitize_view_host_label(&request.host_label)?;
+    {
+        let mut scopes = view_host_scopes()
+            .lock()
+            .map_err(|_| "View host scope registry is unavailable".to_string())?;
+        if let Some(existing_scope) = scopes.get(&host_label) {
+            if existing_scope != scope_key {
+                return Err(format!(
+                    "View host '{host_label}' belongs to a different checkout runtime"
+                ));
+            }
+        } else {
+            scopes.insert(host_label.clone(), scope_key.to_string());
+        }
+    }
     let mut view_ids = Vec::new();
     for view_id in request.view_ids {
         let normalized = normalize_view_tab_id(&view_id)?;
@@ -4229,7 +4312,11 @@ pub fn set_view_tab_host_sync(request: ViewSetTabHostRequest) -> Result<(), Stri
         .map_err(|_| "View tab host registry is unavailable".to_string())?;
     let previous_host_labels = view_ids
         .iter()
-        .filter_map(|view_id| hosts.get(view_id).cloned())
+        .filter_map(|view_id| {
+            hosts
+                .get(&scoped_view_registry_key(scope_key, view_id))
+                .cloned()
+        })
         .collect::<Vec<_>>();
     let inherited_unity_owner = unity_owned_view_windows().lock().ok().and_then(|windows| {
         previous_host_labels
@@ -4237,12 +4324,24 @@ pub fn set_view_tab_host_sync(request: ViewSetTabHostRequest) -> Result<(), Stri
             .find_map(|label| windows.get(label).cloned())
     });
     if request.keep_existing_for_host {
-        hosts.retain(|view_id, _| !view_ids.contains(view_id));
+        hosts.retain(|view_key, _| {
+            !view_ids
+                .iter()
+                .any(|view_id| view_key == &scoped_view_registry_key(scope_key, view_id))
+        });
     } else {
-        hosts.retain(|view_id, label| label != &host_label && !view_ids.contains(view_id));
+        hosts.retain(|view_key, label| {
+            label != &host_label
+                && !view_ids
+                    .iter()
+                    .any(|view_id| view_key == &scoped_view_registry_key(scope_key, view_id))
+        });
     }
     for view_id in view_ids {
-        hosts.insert(view_id, host_label.clone());
+        hosts.insert(
+            scoped_view_registry_key(scope_key, &view_id),
+            host_label.clone(),
+        );
     }
     if let Some(entry) = inherited_unity_owner {
         if let Ok(mut windows) = unity_owned_view_windows().lock() {
@@ -4253,15 +4352,24 @@ pub fn set_view_tab_host_sync(request: ViewSetTabHostRequest) -> Result<(), Stri
 }
 
 fn registered_view_host_label(view_id: &str) -> Option<String> {
-    view_tab_hosts()
-        .lock()
-        .ok()
-        .and_then(|hosts| hosts.get(view_id).cloned())
+    registered_view_host_label_scoped("legacy", view_id)
+}
+
+fn registered_view_host_label_scoped(scope_key: &str, view_id: &str) -> Option<String> {
+    view_tab_hosts().lock().ok().and_then(|hosts| {
+        hosts
+            .get(&scoped_view_registry_key(scope_key, view_id))
+            .cloned()
+    })
 }
 
 fn clear_registered_view_host(view_id: &str) {
+    clear_registered_view_host_scoped("legacy", view_id);
+}
+
+fn clear_registered_view_host_scoped(scope_key: &str, view_id: &str) {
     if let Ok(mut hosts) = view_tab_hosts().lock() {
-        hosts.remove(view_id);
+        hosts.remove(&scoped_view_registry_key(scope_key, view_id));
     }
 }
 
@@ -4274,6 +4382,23 @@ fn active_view_window_label(app_handle: &AppHandle, view_id: &str) -> String {
         return host_label;
     }
     clear_registered_view_host(view_id);
+    default_label
+}
+
+fn active_view_window_label_scoped(
+    app_handle: &AppHandle,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+    view_id: &str,
+) -> String {
+    let scope_key = view_workspace_scope_key(workspace_ref);
+    let default_label = scoped_view_window_label(workspace_ref, view_id);
+    let Some(host_label) = registered_view_host_label_scoped(&scope_key, view_id) else {
+        return default_label;
+    };
+    if app_handle.get_webview_window(&host_label).is_some() {
+        return host_label;
+    }
+    clear_registered_view_host_scoped(&scope_key, view_id);
     default_label
 }
 
@@ -4320,6 +4445,35 @@ fn reusable_view_host_window_label(app_handle: &AppHandle, view_id: &str) -> Opt
         .find(|label| app_handle.get_webview_window(label).is_some())
 }
 
+fn reusable_view_host_window_label_scoped(
+    app_handle: &AppHandle,
+    scope_key: &str,
+    excluded_label: &str,
+) -> Option<String> {
+    let prefix = format!("{scope_key}\0");
+    let labels = view_tab_hosts()
+        .lock()
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(|(view_key, label)| {
+                    if view_key.starts_with(&prefix)
+                        && label != excluded_label
+                        && is_reusable_view_host_window_label(label)
+                    {
+                        Some(label.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    labels
+        .into_iter()
+        .find(|label| app_handle.get_webview_window(label).is_some())
+}
+
 /// Percent-encodes a tab id for the `/view-host?id=...` query. View package
 /// ids are kebab-case and pass through unchanged; inspector tab ids carry
 /// URL-encoded payloads (`%`, `=`, `&`, ...) that must not break the query.
@@ -4342,6 +4496,13 @@ fn view_host_url_for_tab_id(tab_id: &str) -> String {
     format!("{}&id={}", VIEW_HOST_ROUTE, encode_view_host_tab_id(tab_id))
 }
 
+fn view_host_url_for_tab_id_scoped(
+    tab_id: &str,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+) -> String {
+    append_view_workspace_query(&view_host_url_for_tab_id(tab_id), workspace_ref)
+}
+
 fn view_host_url_for_label(view_id: &str, label: &str) -> String {
     if label.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX) && !is_inspector_tab_id(view_id) {
         return crate::commands::unity_embed_host_url(&format!("view-{view_id}"), "view", view_id);
@@ -4350,6 +4511,14 @@ fn view_host_url_for_label(view_id: &str, label: &str) -> String {
         return VIEW_HOST_POOL_ROUTE.to_string();
     }
     view_host_url_for_tab_id(view_id)
+}
+
+fn view_host_url_for_label_scoped(
+    view_id: &str,
+    label: &str,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+) -> String {
+    append_view_workspace_query(&view_host_url_for_label(view_id, label), workspace_ref)
 }
 
 fn unity_embed_view_window_label(view_id: &str) -> String {
@@ -4464,16 +4633,20 @@ fn focus_view_host_window(
     unity_status: Option<&crate::unity_bridge::UnityConnectionStatus>,
     _reason: &str,
     register_missing: bool,
+    scope_key: &str,
 ) -> Result<ViewRunResult, String> {
     let Some(window) = app_handle.get_webview_window(window_label) else {
         return Err(format!("View host window is not open: {}", window_label));
     };
     if register_missing {
-        if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
-            host_label: window_label.to_string(),
-            view_ids: vec![view_id.to_string()],
-            keep_existing_for_host: true,
-        }) {
+        if let Err(error) = set_view_tab_host_scoped_sync(
+            ViewSetTabHostRequest {
+                host_label: window_label.to_string(),
+                view_ids: vec![view_id.to_string()],
+                keep_existing_for_host: true,
+            },
+            scope_key,
+        ) {
             eprintln!(
                 "[Locus ViewHost] reuse register failed view_id={} target={} error={}",
                 view_id, window_label, error
@@ -4510,15 +4683,19 @@ fn merge_view_tab_into_host_window(
     host_url: &str,
     package_root: &str,
     unity_status: Option<&crate::unity_bridge::UnityConnectionStatus>,
+    scope_key: &str,
 ) -> Result<ViewRunResult, String> {
     let Some(window) = app_handle.get_webview_window(window_label) else {
         return Err(format!("View host window is not open: {}", window_label));
     };
-    set_view_tab_host_sync(ViewSetTabHostRequest {
-        host_label: window_label.to_string(),
-        view_ids: vec![view_id.to_string()],
-        keep_existing_for_host: true,
-    })?;
+    set_view_tab_host_scoped_sync(
+        ViewSetTabHostRequest {
+            host_label: window_label.to_string(),
+            view_ids: vec![view_id.to_string()],
+            keep_existing_for_host: true,
+        },
+        scope_key,
+    )?;
     app_handle
         .emit_to(
             window_label,
@@ -5054,9 +5231,10 @@ pub async fn mount_view_content_window(
     working_dir: &str,
     request: ViewContentMountRequest,
 ) -> Result<ViewRunResult, String> {
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
     let id = normalize_view_id(&request.view_id)?;
-    let label = view_content_window_label(&id);
-    let host_url = view_content_host_url(&id);
+    let label = scoped_view_content_window_label(&workspace_ref, &id);
+    let host_url = append_view_workspace_query(&view_content_host_url(&id), &workspace_ref);
     cancel_view_content_destroy(&label);
     let existing_window = app_handle.get_webview_window(&label);
 
@@ -5110,9 +5288,35 @@ pub fn hide_view_content_window(app_handle: &AppHandle, view_id: &str) -> Result
     Ok(())
 }
 
+pub fn hide_view_content_window_scoped(
+    app_handle: &AppHandle,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+    view_id: &str,
+) -> Result<(), String> {
+    let id = normalize_view_id(view_id)?;
+    let label = scoped_view_content_window_label(workspace_ref, &id);
+    let window = app_handle.get_webview_window(&label);
+    if let Some(window) = window {
+        set_view_content_window_visible(&window, false)?;
+        schedule_view_content_destroy(app_handle, label);
+    }
+    Ok(())
+}
+
 pub fn destroy_view_content_window(app_handle: &AppHandle, view_id: &str) -> Result<(), String> {
     let id = normalize_view_id(view_id)?;
     let label = view_content_window_label(&id);
+    destroy_view_content_window_on_main(app_handle, &label);
+    Ok(())
+}
+
+pub fn destroy_view_content_window_scoped(
+    app_handle: &AppHandle,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+    view_id: &str,
+) -> Result<(), String> {
+    let id = normalize_view_id(view_id)?;
+    let label = scoped_view_content_window_label(workspace_ref, &id);
     destroy_view_content_window_on_main(app_handle, &label);
     Ok(())
 }
@@ -5124,15 +5328,17 @@ pub async fn open_view_window(
     view_windows_above_main: bool,
     view_open_in_existing_window: bool,
 ) -> Result<ViewRunResult, String> {
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
+    let scope_key = view_workspace_scope_key(&workspace_ref);
     let detail = read_view_sync(working_dir, view_id)?;
     let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
     let id = detail.summary.id.clone();
-    let label = view_window_label(&id);
-    let host_url = view_host_url_for_tab_id(&id);
+    let label = scoped_view_window_label(&workspace_ref, &id);
+    let host_url = view_host_url_for_tab_id_scoped(&id, &workspace_ref);
 
-    if let Some(host_label) = registered_view_host_label(&id) {
+    if let Some(host_label) = registered_view_host_label_scoped(&scope_key, &id) {
         if app_handle.get_webview_window(&host_label).is_some() {
-            let target_host_url = view_host_url_for_label(&id, &host_label);
+            let target_host_url = view_host_url_for_label_scoped(&id, &host_label, &workspace_ref);
             return focus_view_host_window(
                 app_handle,
                 working_dir,
@@ -5143,9 +5349,10 @@ pub async fn open_view_window(
                 unity_status.as_ref(),
                 "registered-host",
                 false,
+                &scope_key,
             );
         }
-        clear_registered_view_host(&id);
+        clear_registered_view_host_scoped(&scope_key, &id);
     }
 
     if let Some(window) = app_handle.get_webview_window(&label) {
@@ -5158,11 +5365,19 @@ pub async fn open_view_window(
             unity_status.as_ref(),
         )?;
     } else if app_handle
-        .get_webview_window(&unity_embed_view_window_label(&id))
+        .get_webview_window(&format!(
+            "{}{}-{id}",
+            UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX,
+            view_scope_token(&workspace_ref)
+        ))
         .is_some()
     {
-        let unity_label = unity_embed_view_window_label(&id);
-        let unity_host_url = view_host_url_for_label(&id, &unity_label);
+        let unity_label = format!(
+            "{}{}-{id}",
+            UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX,
+            view_scope_token(&workspace_ref)
+        );
+        let unity_host_url = view_host_url_for_label_scoped(&id, &unity_label, &workspace_ref);
         return focus_view_host_window(
             app_handle,
             working_dir,
@@ -5173,11 +5388,15 @@ pub async fn open_view_window(
             unity_status.as_ref(),
             "existing-unity-embed-host",
             true,
+            &scope_key,
         );
     } else {
         if view_open_in_existing_window {
-            if let Some(target_label) = reusable_view_host_window_label(app_handle, &id) {
-                let target_host_url = view_host_url_for_label(&id, &target_label);
+            if let Some(target_label) =
+                reusable_view_host_window_label_scoped(app_handle, &scope_key, &label)
+            {
+                let target_host_url =
+                    view_host_url_for_label_scoped(&id, &target_label, &workspace_ref);
                 return merge_view_tab_into_host_window(
                     app_handle,
                     working_dir,
@@ -5186,6 +5405,7 @@ pub async fn open_view_window(
                     &target_host_url,
                     &detail.summary.package_root,
                     unity_status.as_ref(),
+                    &scope_key,
                 );
             }
         }
@@ -5200,11 +5420,14 @@ pub async fn open_view_window(
         track_view_host_unity_owner(working_dir, &label, unity_status.as_ref());
     }
 
-    if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
-        host_label: label.clone(),
-        view_ids: vec![id.clone()],
-        keep_existing_for_host: false,
-    }) {
+    if let Err(error) = set_view_tab_host_scoped_sync(
+        ViewSetTabHostRequest {
+            host_label: label.clone(),
+            view_ids: vec![id.clone()],
+            keep_existing_for_host: false,
+        },
+        &scope_key,
+    ) {
         eprintln!(
             "[Locus ViewHost] open register failed view_id={} target={} error={}",
             id, label, error
@@ -5231,15 +5454,28 @@ pub async fn open_view_unity_embed_window(
     working_dir: &str,
     view_id: &str,
 ) -> Result<ViewRunResult, String> {
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
+    let scope_key = view_workspace_scope_key(&workspace_ref);
     let detail = read_view_sync(working_dir, view_id)?;
     let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
     let id = detail.summary.id.clone();
-    let unity_label = unity_embed_view_window_label(&id);
-    let unity_host_url = crate::commands::unity_embed_host_url(&format!("view-{id}"), "view", &id);
+    let unity_label = format!(
+        "{}{}-{id}",
+        UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX,
+        view_scope_token(&workspace_ref)
+    );
+    let unity_host_url = append_view_workspace_query(
+        &crate::commands::unity_embed_host_url(
+            &format!("view-{}-{id}", view_scope_token(&workspace_ref)),
+            "view",
+            &id,
+        ),
+        &workspace_ref,
+    );
 
-    if let Some(host_label) = registered_view_host_label(&id) {
+    if let Some(host_label) = registered_view_host_label_scoped(&scope_key, &id) {
         if app_handle.get_webview_window(&host_label).is_some() {
-            let target_host_url = view_host_url_for_label(&id, &host_label);
+            let target_host_url = view_host_url_for_label_scoped(&id, &host_label, &workspace_ref);
             return focus_view_host_window(
                 app_handle,
                 working_dir,
@@ -5250,9 +5486,10 @@ pub async fn open_view_unity_embed_window(
                 unity_status.as_ref(),
                 "registered-host",
                 false,
+                &scope_key,
             );
         }
-        clear_registered_view_host(&id);
+        clear_registered_view_host_scoped(&scope_key, &id);
     }
 
     if app_handle.get_webview_window(&unity_label).is_some() {
@@ -5266,12 +5503,13 @@ pub async fn open_view_unity_embed_window(
             unity_status.as_ref(),
             "existing-unity-embed-host",
             true,
+            &scope_key,
         );
     }
 
-    let default_label = view_window_label(&id);
+    let default_label = scoped_view_window_label(&workspace_ref, &id);
     if app_handle.get_webview_window(&default_label).is_some() {
-        let default_host_url = view_host_url_for_label(&id, &default_label);
+        let default_host_url = view_host_url_for_label_scoped(&id, &default_label, &workspace_ref);
         return focus_view_host_window(
             app_handle,
             working_dir,
@@ -5282,13 +5520,15 @@ pub async fn open_view_unity_embed_window(
             unity_status.as_ref(),
             "existing-default-host",
             true,
+            &scope_key,
         );
     }
 
     let result = crate::commands::open_unity_embed_frontend_window_for_request(
+        &workspace_ref,
         working_dir,
         crate::commands::UnityEmbedOpenFrontendWindowRequest {
-            window_id: Some(format!("view-{id}")),
+            window_id: Some(format!("view-{}-{id}", view_scope_token(&workspace_ref))),
             target_kind: "view".to_string(),
             target_id: Some(id.clone()),
             title: Some(detail.summary.name.clone()),
@@ -5296,11 +5536,14 @@ pub async fn open_view_unity_embed_window(
     )
     .await?;
 
-    if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
-        host_label: result.window_label.clone(),
-        view_ids: vec![id.clone()],
-        keep_existing_for_host: false,
-    }) {
+    if let Err(error) = set_view_tab_host_scoped_sync(
+        ViewSetTabHostRequest {
+            host_label: result.window_label.clone(),
+            view_ids: vec![id.clone()],
+            keep_existing_for_host: false,
+        },
+        &scope_key,
+    ) {
         eprintln!(
             "[Locus ViewHost] open-unity register failed view_id={} target={} error={}",
             id, result.window_label, error
@@ -5317,7 +5560,7 @@ pub async fn open_view_unity_embed_window(
     Ok(ViewRunResult {
         id,
         window_label: result.window_label,
-        host_url: result.host_url,
+        host_url: append_view_workspace_query(&result.host_url, &workspace_ref),
         package_root: detail.summary.package_root,
     })
 }
@@ -5328,6 +5571,8 @@ pub async fn detach_view_tab_window(
     request: ViewDetachTabRequest,
     view_windows_above_main: bool,
 ) -> Result<ViewRunResult, String> {
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
+    let scope_key = view_workspace_scope_key(&workspace_ref);
     if is_inspector_tab_id(&request.view_id) {
         return detach_inspector_tab_window(
             app_handle,
@@ -5339,18 +5584,18 @@ pub async fn detach_view_tab_window(
     let detail = read_view_sync(working_dir, &request.view_id)?;
     let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
     let id = detail.summary.id.clone();
-    let default_label = view_window_label(&id);
+    let default_label = scoped_view_window_label(&workspace_ref, &id);
     let source_label = request
         .source_host_label
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or_default();
-    let pool_label = take_view_host_pool_window(app_handle);
+    let pool_label = None;
     let using_pool = pool_label.is_some();
     let label = pool_label.unwrap_or_else(|| {
         if source_label == default_label {
-            detached_view_window_label(&id)
+            detached_view_window_label(&format!("{}-{id}", view_scope_token(&workspace_ref)))
         } else {
             default_label
         }
@@ -5358,7 +5603,7 @@ pub async fn detach_view_tab_window(
     let host_url = if using_pool {
         VIEW_HOST_POOL_ROUTE.to_string()
     } else {
-        view_host_url_for_tab_id(&id)
+        view_host_url_for_tab_id_scoped(&id, &workspace_ref)
     };
     let position = match (request.x, request.y) {
         (Some(x), Some(y)) => Some((x, y)),
@@ -5396,11 +5641,14 @@ pub async fn detach_view_tab_window(
         track_view_host_unity_owner(working_dir, &label, unity_status.as_ref());
     }
 
-    if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
-        host_label: label.clone(),
-        view_ids: vec![id.clone()],
-        keep_existing_for_host: false,
-    }) {
+    if let Err(error) = set_view_tab_host_scoped_sync(
+        ViewSetTabHostRequest {
+            host_label: label.clone(),
+            view_ids: vec![id.clone()],
+            keep_existing_for_host: false,
+        },
+        &scope_key,
+    ) {
         eprintln!(
             "[Locus ViewHost] detach register failed view_id={} target={} error={}",
             id, label, error
@@ -5440,9 +5688,11 @@ pub async fn open_inspector_tab_window(
     view_windows_above_main: bool,
     view_open_in_existing_window: bool,
 ) -> Result<ViewRunResult, String> {
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
+    let scope_key = view_workspace_scope_key(&workspace_ref);
     let id = normalize_inspector_tab_id(tab_id)?;
 
-    if let Some(host_label) = registered_view_host_label(&id) {
+    if let Some(host_label) = registered_view_host_label_scoped(&scope_key, &id) {
         if let Some(window) = app_handle.get_webview_window(&host_label) {
             emit_view_host_tab_select(app_handle, &host_label, &id, false);
             focus_view_host_window_with_unity_owner_guard(
@@ -5452,7 +5702,7 @@ pub async fn open_inspector_tab_window(
                 &host_label,
                 None,
             )?;
-            let host_url = view_host_url_for_label(&id, &host_label);
+            let host_url = view_host_url_for_label_scoped(&id, &host_label, &workspace_ref);
             return Ok(ViewRunResult {
                 id,
                 window_label: host_label,
@@ -5460,12 +5710,17 @@ pub async fn open_inspector_tab_window(
                 package_root: String::new(),
             });
         }
-        clear_registered_view_host(&id);
+        clear_registered_view_host_scoped(&scope_key, &id);
     }
 
     if view_open_in_existing_window {
-        if let Some(target_label) = reusable_view_host_window_label(app_handle, &id) {
-            let target_host_url = view_host_url_for_label(&id, &target_label);
+        if let Some(target_label) = reusable_view_host_window_label_scoped(
+            app_handle,
+            &scope_key,
+            &scoped_view_window_label(&workspace_ref, &id),
+        ) {
+            let target_host_url =
+                view_host_url_for_label_scoped(&id, &target_label, &workspace_ref);
             return merge_view_tab_into_host_window(
                 app_handle,
                 working_dir,
@@ -5474,6 +5729,7 @@ pub async fn open_inspector_tab_window(
                 &target_host_url,
                 "",
                 None,
+                &scope_key,
             );
         }
     }
@@ -5497,14 +5753,16 @@ fn detach_inspector_tab_window(
     request: ViewDetachTabRequest,
     view_windows_above_main: bool,
 ) -> Result<ViewRunResult, String> {
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
+    let scope_key = view_workspace_scope_key(&workspace_ref);
     let id = normalize_inspector_tab_id(&request.view_id)?;
-    let pool_label = take_view_host_pool_window(app_handle);
+    let pool_label = None;
     let using_pool = pool_label.is_some();
     let label = pool_label.unwrap_or_else(detached_inspector_window_label);
     let host_url = if using_pool {
         VIEW_HOST_POOL_ROUTE.to_string()
     } else {
-        view_host_url_for_tab_id(&id)
+        view_host_url_for_tab_id_scoped(&id, &workspace_ref)
     };
     let position = match (request.x, request.y) {
         (Some(x), Some(y)) => Some((x, y)),
@@ -5539,11 +5797,14 @@ fn detach_inspector_tab_window(
         )?;
     }
 
-    if let Err(error) = set_view_tab_host_sync(ViewSetTabHostRequest {
-        host_label: label.clone(),
-        view_ids: vec![id.clone()],
-        keep_existing_for_host: false,
-    }) {
+    if let Err(error) = set_view_tab_host_scoped_sync(
+        ViewSetTabHostRequest {
+            host_label: label.clone(),
+            view_ids: vec![id.clone()],
+            keep_existing_for_host: false,
+        },
+        &scope_key,
+    ) {
         eprintln!(
             "[Locus ViewHost] inspector register failed tab_id={} target={} error={}",
             id, label, error
@@ -5590,13 +5851,15 @@ pub fn view_window_label(view_id: &str) -> String {
 
 pub async fn request_view_automation(
     app_handle: &AppHandle,
+    working_dir: &str,
     view_id: &str,
     kind: &str,
     payload: serde_json::Value,
     timeout_ms: u64,
 ) -> Result<serde_json::Value, String> {
-    let host_label = active_view_window_label(app_handle, view_id);
-    let content_label = view_content_window_label(view_id);
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
+    let host_label = active_view_window_label_scoped(app_handle, &workspace_ref, view_id);
+    let content_label = scoped_view_content_window_label(&workspace_ref, view_id);
     let host_window = app_handle.get_webview_window(&host_label);
     let content_window_open = app_handle.get_webview_window(&content_label).is_some();
     if host_window.is_none() && !content_window_open {
@@ -5696,6 +5959,7 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(target_os = "windows")]
 pub async fn capture_view_window(
     app_handle: &AppHandle,
+    working_dir: &str,
     view_id: &str,
 ) -> Result<ViewCaptureResult, String> {
     use base64::Engine as _;
@@ -5704,8 +5968,9 @@ pub async fn capture_view_window(
         Microsoft::Web::WebView2::Win32::ICoreWebView2,
     };
 
-    let host_label = active_view_window_label(app_handle, view_id);
-    let content_label = view_content_window_label(view_id);
+    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
+    let host_label = active_view_window_label_scoped(app_handle, &workspace_ref, view_id);
+    let content_label = scoped_view_content_window_label(&workspace_ref, view_id);
     if app_handle.get_webview_window(&host_label).is_none()
         && app_handle.get_webview_window(&content_label).is_none()
     {
@@ -5717,6 +5982,7 @@ pub async fn capture_view_window(
     emit_view_host_tab_select(app_handle, &host_label, view_id, false);
     let _ = request_view_automation(
         app_handle,
+        working_dir,
         view_id,
         "wait",
         serde_json::json!({
@@ -5822,18 +6088,82 @@ pub async fn capture_view_window(
 #[cfg(not(target_os = "windows"))]
 pub async fn capture_view_window(
     _app_handle: &AppHandle,
+    _working_dir: &str,
     _view_id: &str,
 ) -> Result<ViewCaptureResult, String> {
     Err("view_capture currently requires the Windows WebView2 runtime.".to_string())
 }
 
 pub fn emit_view_reload(app_handle: &AppHandle, summary: &ViewPackageSummary) {
-    let _ = app_handle.emit(VIEW_RELOAD_EVENT, summary);
+    if let Some(registry) = app_handle.try_state::<Arc<crate::workspace_service::ProjectRegistry>>()
+    {
+        for runtime in registry.runtimes() {
+            registry.event_router().publish(
+                app_handle,
+                VIEW_RELOAD_EVENT,
+                crate::workspace_service::event::WorkspaceEventEnvelope {
+                    project_id: runtime.project_id().clone(),
+                    checkout_id: runtime.checkout_id().clone(),
+                    workspace_generation: runtime.generation(),
+                    service_instance_id: None,
+                    service_generation: None,
+                    payload: summary.clone(),
+                },
+            );
+        }
+    }
     emit_view_tree_changed(app_handle);
 }
 
+pub fn emit_view_reload_for_scope(
+    app_handle: &AppHandle,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+    summary: &ViewPackageSummary,
+) {
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        scope,
+        VIEW_RELOAD_EVENT,
+        summary,
+    );
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        scope,
+        VIEW_TREE_CHANGED_EVENT,
+        serde_json::json!({}),
+    );
+}
+
 pub fn emit_view_tree_changed(app_handle: &AppHandle) {
-    let _ = app_handle.emit(VIEW_TREE_CHANGED_EVENT, serde_json::json!({}));
+    if let Some(registry) = app_handle.try_state::<Arc<crate::workspace_service::ProjectRegistry>>()
+    {
+        for runtime in registry.runtimes() {
+            registry.event_router().publish(
+                app_handle,
+                VIEW_TREE_CHANGED_EVENT,
+                crate::workspace_service::event::WorkspaceEventEnvelope {
+                    project_id: runtime.project_id().clone(),
+                    checkout_id: runtime.checkout_id().clone(),
+                    workspace_generation: runtime.generation(),
+                    service_instance_id: None,
+                    service_generation: None,
+                    payload: serde_json::json!({}),
+                },
+            );
+        }
+    }
+}
+
+pub fn emit_view_tree_changed_for_scope(
+    app_handle: &AppHandle,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        scope,
+        VIEW_TREE_CHANGED_EVENT,
+        serde_json::json!({}),
+    );
 }
 
 struct ViewFileWatcherHandle {
@@ -5922,6 +6252,13 @@ fn start_view_file_watcher(
     working_dir: &str,
     view_id: &str,
 ) -> Result<(), String> {
+    let registry = app_handle
+        .try_state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .ok_or_else(|| "workspace registry is unavailable".to_string())?;
+    let runtime = registry
+        .runtime_for_root(Path::new(working_dir))
+        .ok_or_else(|| format!("View checkout is not registered: {working_dir}"))?;
+    let event_scope = crate::workspace_service::event::WorkspaceEventScope::for_runtime(&runtime);
     let root = resolve_view_package_root(working_dir, view_id)?;
     let roots = view_file_watch_roots(&root)?;
     let key = roots
@@ -5998,7 +6335,9 @@ fn start_view_file_watcher(
                         if pending && last_event_at.elapsed() >= Duration::from_millis(150) {
                             pending = false;
                             match reload_view_sync(&working_dir, &view_id) {
-                                Ok(summary) => emit_view_reload(&app_handle, &summary),
+                                Ok(summary) => {
+                                    emit_view_reload_for_scope(&app_handle, &event_scope, &summary)
+                                }
                                 Err(error) => eprintln!(
                                     "[Locus] failed to reload watched View '{}': {}",
                                     view_id, error
@@ -6039,6 +6378,35 @@ fn remove_view_file_watcher_entry(key: &str, cancel: &Arc<AtomicBool>) {
 fn view_script_source_cache() -> &'static Mutex<HashMap<String, CachedViewScriptSource>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CachedViewScriptSource>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Release process registries whose entries are owned by one retired checkout
+/// generation. Open View windows retain a runtime lease, so this runs only
+/// after every window/pane bound to the generation has detached.
+pub(crate) fn retire_workspace_runtime(runtime: &crate::workspace_service::WorkspaceRuntime) {
+    stop_view_file_watchers_under(runtime.root());
+
+    let workspace_ref = crate::workspace_service::WorkspaceRef::for_runtime(runtime);
+    let scope_key = view_workspace_scope_key(&workspace_ref);
+    let registry_prefix = format!("{scope_key}\0");
+    if let Ok(mut hosts) = view_tab_hosts().lock() {
+        hosts.retain(|key, _| !key.starts_with(&registry_prefix));
+    }
+    if let Ok(mut scopes) = view_host_scopes().lock() {
+        scopes.retain(|_, registered_scope| registered_scope != &scope_key);
+    }
+
+    let root_prefix = format!(
+        "{}|",
+        runtime
+            .root()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+    );
+    if let Ok(mut cache) = view_script_source_cache().lock() {
+        cache.retain(|key, _| !key.starts_with(&root_prefix));
+    }
 }
 
 pub async fn compile_view_script(
@@ -6813,19 +7181,21 @@ mod tests {
         import_view_package_sync, is_valid_view_id, is_view_frontend_log_workspace_path,
         list_view_tree_sync, list_views_sync, load_manifest_from_root, move_view_entry_sync,
         normalize_package_rel_path, parse_view_create_request, read_view_frontend_log_sync,
-        read_view_sync, registered_view_host_label, rename_view_entry_sync,
-        resolve_view_package_root, resolve_view_script_sync, set_view_tab_host_sync,
-        should_reload_for_view_event, supported_view_templates, validate_view_manifest,
-        view_file_watch_roots, view_manifest_requirements, view_package_root,
-        view_script_bridge_payload, view_script_cached_invoke_payload, view_storage_get_sync,
-        view_storage_remove_sync, view_storage_set_sync, view_tab_hosts,
-        UnitySerializedPropertyDiscoverResult, UnitySerializedPropertyReadResult,
+        read_view_sync, registered_view_host_label, registered_view_host_label_scoped,
+        rename_view_entry_sync, resolve_view_package_root, resolve_view_script_sync,
+        scoped_view_content_window_label, scoped_view_window_label, set_view_tab_host_scoped_sync,
+        set_view_tab_host_sync, should_reload_for_view_event, supported_view_templates,
+        validate_view_manifest, view_file_watch_roots, view_host_scopes,
+        view_manifest_requirements, view_package_root, view_script_bridge_payload,
+        view_script_cached_invoke_payload, view_storage_get_sync, view_storage_set_sync,
+        view_tab_hosts, UnitySerializedPropertyDiscoverResult, UnitySerializedPropertyReadResult,
         UnitySerializedPropertyTarget, UnitySerializedPropertyWriteResult,
         ViewExportPackageRequest, ViewFrontendLogReadRequest, ViewFrontendLogRequest,
         ViewImportPackageRequest, ViewManifest, ViewSetTabHostRequest, ViewStorageGetRequest,
-        ViewStorageRemoveRequest, ViewStorageSetRequest, LEGACY_VIEW_API_VERSION, VIEW_API_VERSION,
-        VIEW_ROOT_RELATIVE, VIEW_SCHEMA,
+        ViewStorageSetRequest, LEGACY_VIEW_API_VERSION, VIEW_API_VERSION, VIEW_ROOT_RELATIVE,
+        VIEW_SCHEMA,
     };
+    use crate::workspace_service::{CheckoutId, WorkspaceRef};
     use notify::{
         event::{DataChange, ModifyKind},
         Event, EventKind,
@@ -7240,6 +7610,129 @@ mod tests {
             .files
             .iter()
             .any(|file| file.rel_path.ends_with("/material-inspector/src/App.vue")));
+    }
+
+    #[test]
+    fn same_view_id_and_storage_are_isolated_between_checkout_roots() {
+        let checkout_a = tempdir().unwrap();
+        let checkout_b = tempdir().unwrap();
+        let root_a = checkout_a.path().to_string_lossy().to_string();
+        let root_b = checkout_b.path().to_string_lossy().to_string();
+        for (root, name) in [(&root_a, "Checkout A"), (&root_b, "Checkout B")] {
+            create_view_sync(
+                root,
+                super::ViewCreateRequest {
+                    id: "shared-view".to_string(),
+                    package_name: None,
+                    name: Some(name.to_string()),
+                    template: Some("blank".to_string()),
+                    icon: None,
+                    display_path: None,
+                },
+            )
+            .expect("create isolated view");
+        }
+
+        view_storage_set_sync(
+            &root_a,
+            ViewStorageSetRequest {
+                view_id: "shared-view".to_string(),
+                key: "owner".to_string(),
+                value: json!("A"),
+            },
+        )
+        .expect("write A storage");
+        view_storage_set_sync(
+            &root_b,
+            ViewStorageSetRequest {
+                view_id: "shared-view".to_string(),
+                key: "owner".to_string(),
+                value: json!("B"),
+            },
+        )
+        .expect("write B storage");
+
+        assert_eq!(
+            read_view_sync(&root_a, "shared-view")
+                .expect("read A")
+                .summary
+                .name,
+            "Checkout A"
+        );
+        assert_eq!(
+            read_view_sync(&root_b, "shared-view")
+                .expect("read B")
+                .summary
+                .name,
+            "Checkout B"
+        );
+        assert_eq!(
+            view_storage_get_sync(
+                &root_a,
+                ViewStorageGetRequest {
+                    view_id: "shared-view".to_string(),
+                    key: "owner".to_string(),
+                },
+            )
+            .expect("read A storage"),
+            Some(json!("A"))
+        );
+        assert_eq!(
+            view_storage_get_sync(
+                &root_b,
+                ViewStorageGetRequest {
+                    view_id: "shared-view".to_string(),
+                    key: "owner".to_string(),
+                },
+            )
+            .expect("read B storage"),
+            Some(json!("B"))
+        );
+    }
+
+    #[test]
+    fn same_view_id_has_checkout_scoped_host_bindings() {
+        view_tab_hosts().lock().unwrap().clear();
+        view_host_scopes().lock().unwrap().clear();
+        let request = |host_label: &str| ViewSetTabHostRequest {
+            host_label: host_label.to_string(),
+            view_ids: vec!["shared-view".to_string()],
+            keep_existing_for_host: false,
+        };
+        set_view_tab_host_scoped_sync(request("view-checkout-a-shared"), "checkout-a@1")
+            .expect("bind checkout A");
+        set_view_tab_host_scoped_sync(request("view-checkout-b-shared"), "checkout-b@1")
+            .expect("bind checkout B");
+
+        assert_eq!(
+            registered_view_host_label_scoped("checkout-a@1", "shared-view").as_deref(),
+            Some("view-checkout-a-shared")
+        );
+        assert_eq!(
+            registered_view_host_label_scoped("checkout-b@1", "shared-view").as_deref(),
+            Some("view-checkout-b-shared")
+        );
+        let cross_checkout =
+            set_view_tab_host_scoped_sync(request("view-checkout-a-shared"), "checkout-b@1")
+                .expect_err("cross-checkout host reuse must fail");
+        assert!(cross_checkout.contains("different checkout runtime"));
+        view_tab_hosts().lock().unwrap().clear();
+        view_host_scopes().lock().unwrap().clear();
+    }
+
+    #[test]
+    fn same_view_id_has_distinct_checkout_window_labels() {
+        let checkout_a = WorkspaceRef::new(CheckoutId::new("checkout-a").unwrap(), Some(3));
+        let checkout_b = WorkspaceRef::new(CheckoutId::new("checkout-b").unwrap(), Some(7));
+        let host_a = scoped_view_window_label(&checkout_a, "shared-view");
+        let host_b = scoped_view_window_label(&checkout_b, "shared-view");
+        let content_a = scoped_view_content_window_label(&checkout_a, "shared-view");
+        let content_b = scoped_view_content_window_label(&checkout_b, "shared-view");
+
+        assert_ne!(host_a, host_b);
+        assert_ne!(content_a, content_b);
+        assert!(host_a.starts_with("view-"));
+        assert!(content_a.starts_with("view-content-"));
     }
 
     #[test]

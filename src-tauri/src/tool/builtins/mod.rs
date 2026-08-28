@@ -6,6 +6,7 @@ mod knowledge;
 mod mcp;
 mod misc;
 mod plugin;
+mod python;
 mod read_outline;
 mod search;
 mod search_core;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 
 use super::{ToolDef, ToolExecuteFn, ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult};
 
+pub(crate) use python::is_readonly as python_is_readonly;
 pub use shell::{powershell_runtime_env_prompt, shell_display_name};
 
 pub fn register_all(registry: &mut ToolRegistry) {
@@ -26,6 +28,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(filesystem::write());
     registry.register_builtin(filesystem::edit());
     registry.register_builtin(shell::bash());
+    registry.register_builtin(python::python());
     registry.register_builtin_with_load_mode(get_task_status_tool(), ToolLoadMode::Lazy);
     registry.register_builtin_with_load_mode(cancel_task_tool(), ToolLoadMode::Lazy);
     registry.register_builtin(search::grep());

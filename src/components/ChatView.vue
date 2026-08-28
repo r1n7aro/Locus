@@ -32,6 +32,7 @@ import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import { refetchDiffByKey } from "../services/diff";
+import type { WorkspaceRef } from "../services/project";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { broadcastPlanApprovalResolved, openPlanViewWindow } from "../services/planViewWindow";
 import { openContextCompactionWindow } from "../services/contextCompactionWindow";
@@ -44,6 +45,7 @@ import { useChatChangesStore } from "../stores/chatChanges";
 import { useChatStore } from "../stores/chat";
 import { useUiStore } from "../stores/ui";
 import { useNotificationStore } from "../stores/notification";
+import { useProjectStore } from "../stores/project";
 import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
@@ -109,6 +111,7 @@ const chatChangesStore = useChatChangesStore();
 const chatStore = useChatStore();
 const uiStore = useUiStore();
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
 const { state: displaySettings } = useDisplaySettings();
@@ -131,7 +134,7 @@ const showQueuedFollowUp = computed(() =>
 const showCompactQueued = computed(() =>
   chatStore.isCompactQueued && props.isStreaming && !isViewingSubagent.value,
 );
-const diffProgress = useDiffProgress();
+const diffProgress = useDiffProgress(() => props.workspaceRef ?? null);
 const diffProgressWidth = computed(() => `${diffProgress.progress.value * 100}%`);
 const chatInputPlaceholder = computed(() => {
   if (chatInputSettings.submitMode === "mod-enter-send") {
@@ -182,7 +185,7 @@ const chatDiffTabOptions = computed(() => [
 ]);
 
 watch(() => chatChangesStore.inlineDiffLoading, (loading) => {
-  if (loading) diffProgress.reset();
+  if (loading) diffProgress.reset(chatChangesStore.inlineDiffRequestKey);
 });
 
 async function onChatDiffLfsPulled() {
@@ -240,10 +243,11 @@ const props = defineProps<{
   unityLaunching?: boolean;
   unityLaunchState?: "idle" | "starting" | "waitingConnection";
   unityConnectionStatus?: UnityConnectionStatus | null;
+  workspaceRef?: WorkspaceRef | null;
+  projectServices?: string[];
   workingDir?: string;
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
-  isUnityProject?: boolean;
   skills?: SkillManifest[];
   managedLocalFiles?: ManagedLocalFileAttachment[];
   streamingSessionIds?: Set<string>;
@@ -752,14 +756,14 @@ function handleKnowledgeRefClick(docType: KnowledgeDocumentType, path: string) {
 }
 
 function handleUnityAssetInspectorClick(filePath: string) {
-  openUnityAssetInspector(filePath).catch((e: unknown) => {
+  openUnityAssetInspector(projectStore.requireWorkspaceRef(), filePath).catch((e: unknown) => {
     console.warn("openUnityAssetInspector failed:", e);
     handleFileRefClick(filePath);
   });
 }
 
 function handleUnitySceneObjectInspectorClick(scenePath: string, objectPath: string) {
-  openUnitySceneObjectInspector(scenePath, objectPath).catch((e: unknown) => {
+  openUnitySceneObjectInspector(projectStore.requireWorkspaceRef(), scenePath, objectPath).catch((e: unknown) => {
     console.warn("openUnitySceneObjectInspector failed:", e);
     notifyUnitySceneObjectError(e, scenePath, objectPath);
   });
@@ -771,7 +775,7 @@ function handleUnitySceneObjectClick(scenePath: string, objectPath: string) {
 
 function selectUnitySceneObjectRef(scenePath: string, objectPath: string) {
   if (!shouldUseUnitySceneObjectRef(scenePath, objectPath)) return;
-  selectUnitySceneObject(scenePath, objectPath).catch((e: unknown) => {
+  selectUnitySceneObject(projectStore.requireWorkspaceRef(), scenePath, objectPath).catch((e: unknown) => {
     console.warn("selectUnitySceneObject failed:", e);
     notifyUnitySceneObjectError(e, scenePath, objectPath);
   });
@@ -825,7 +829,7 @@ function legacyAssetRefClick(target: AssetRefClickTarget) {
   }
   if (target.entryKind === "folder") {
     if (shouldSelectUnityAsset(target.assetPath)) {
-      selectUnityAsset(target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+      selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
       return;
     }
     showInFolder(target.assetPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
@@ -836,7 +840,7 @@ function legacyAssetRefClick(target: AssetRefClickTarget) {
     return;
   }
   if (shouldSelectUnityAsset(target.assetPath)) {
-    selectUnityAsset(target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+    selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
     return;
   }
   openFileExternal(target.assetPath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
@@ -847,7 +851,7 @@ function openAssetRefInUnityInspector(target: AssetRefClickTarget) {
     handleUnitySceneObjectInspectorClick(target.scenePath, target.objectPath);
     return;
   }
-  openUnityAssetInspector(target.assetPath).catch((e: unknown) => {
+  openUnityAssetInspector(projectStore.requireWorkspaceRef(), target.assetPath).catch((e: unknown) => {
     console.warn("openUnityAssetInspector failed:", e);
     // Fall back to the pre-inspector behavior instead of handleFileRefClick,
     // which would re-enter runAssetRefClickAction and loop on repeat failure.
@@ -954,7 +958,7 @@ async function doAssetRefOpenInLocusInspector(mode: "embedded" | "window" = "emb
         objectPath: target.objectPath,
       }, mode);
       if (!opened) {
-        await openUnitySceneObjectInspector(target.scenePath, target.objectPath);
+        await openUnitySceneObjectInspector(projectStore.requireWorkspaceRef(), target.scenePath, target.objectPath);
       }
       return;
     }
@@ -1011,7 +1015,7 @@ async function doAssetRefShowInFolder() {
         kind: "document",
         docType: target.docType,
         path: target.path,
-      });
+      }, projectStore.requireWorkspaceRef());
       return;
     }
     await showInFolder(target.filePath);
@@ -1035,11 +1039,11 @@ async function doAssetRefSelectInUnity() {
 
   try {
     if (target.kind === "sceneObject") {
-      await selectUnitySceneObject(target.scenePath, target.objectPath);
+      await selectUnitySceneObject(projectStore.requireWorkspaceRef(), target.scenePath, target.objectPath);
       return;
     }
     if (target.kind !== "asset") return;
-    await selectUnityAsset(target.assetPath);
+    await selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath);
   } catch (error) {
     console.warn("selectUnityAsset failed:", error);
     if (target.kind === "sceneObject") {
@@ -2592,8 +2596,9 @@ watch(
       if (questionId === previousQuestionId) return;
       if (displaySettings.planApprovalTarget !== "window") return;
       const confirm = props.pendingToolConfirms.find((item) => item.questionId === questionId);
-      if (confirm?.display.kind === "planApproval") {
+      if (confirm?.display.kind === "planApproval" && props.activeSessionId) {
         void openPlanViewWindow({
+          sessionId: props.activeSessionId,
           planFilePath: confirm.display.planFilePath,
           questionId,
         });
@@ -3110,12 +3115,14 @@ onUnmounted(() => {
       <ToolConfirmBatchCard
         v-if="showBatchToolConfirmCard"
         :tool-confirms="pendingToolConfirms"
+        :session-id="activeSessionId"
         @answer="emit('answerToolConfirm', $event.questionId, $event.answer)"
         @answer-many="emit('answerAllToolConfirms', $event.questionIds, $event.answer)"
       />
       <ToolConfirmCard
         v-else-if="showSingleToolConfirmCard"
         :tool-confirm="pendingToolConfirms[0]!"
+        :session-id="activeSessionId"
         @answer="emit('answerToolConfirm', pendingToolConfirms[0]!.questionId, $event)"
       />
 
@@ -3194,8 +3201,9 @@ onUnmounted(() => {
               :unity-launch-state="unityLaunchState"
               :unity-connection-status="unityConnectionStatus"
               :unity-recompiling="unityRecompileActive"
+              :workspace-ref="workspaceRef"
+              :project-services="projectServices"
               :working-dir="workingDir"
-              :is-unity-project="isUnityProject"
               :scan-phase="scanPhase"
               :last-scan-stats="lastScanStats"
               :knowledge-access-mode="knowledgeAccessMode"

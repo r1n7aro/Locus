@@ -4,6 +4,7 @@ import { useAuthStore } from "../stores/auth";
 import { useAgentStore } from "../stores/agent";
 import { useModelStore } from "../stores/model";
 import { useProjectStore } from "../stores/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import { useChatStore } from "../stores/chat";
 import { useNotificationStore } from "../stores/notification";
 import { useDisplaySettings } from "./useDisplaySettings";
@@ -36,7 +37,6 @@ import {
 import { listAgents, listSubagentDefs } from "../services/agent";
 import type {
   StreamEvent,
-  ActiveSessionSelectionChanged,
   AssetDbScanEvent,
   PluginStatus,
   UnityConnectionStatus,
@@ -66,6 +66,10 @@ import {
   openKnowledgeLexicalProgressWindow,
   shouldAutoOpenKnowledgeLexicalProgressWindow,
 } from "../services/knowledgeLexicalProgressWindow";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+} from "../services/project";
 
 const WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT = "workspace-execution-lock-diagnostic";
 
@@ -148,6 +152,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   const agentStore = useAgentStore();
   const modelStore = useModelStore();
   const projectStore = useProjectStore();
+  const workspaceContextStore = useWorkspaceContextStore();
   const chatStore = useChatStore();
   const { skillItems, loadSkills } = useSkills();
 
@@ -159,14 +164,12 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   let unlistenUnityDetail: RuntimeUnsubscribe | null = null;
   let unlistenScan: RuntimeUnsubscribe | null = null;
   let unlistenPlugin: RuntimeUnsubscribe | null = null;
-  let unlistenActiveSessionSelection: RuntimeUnsubscribe | null = null;
   let unlistenSessionExecutionState: RuntimeUnsubscribe | null = null;
   let unlistenAppError: RuntimeUnsubscribe | null = null;
   let unlistenLexicalRebuildStatus: RuntimeUnsubscribe | null = null;
   let unlistenKnowledgeChanged: RuntimeUnsubscribe | null = null;
   let unlistenSessionContentChanged: RuntimeUnsubscribe | null = null;
   let unlistenSessionTitleUpdated: RuntimeUnsubscribe | null = null;
-  let unlistenWorkspaceLockDiagnostic: RuntimeUnsubscribe | null = null;
   let unlistenAsyncTaskUpdated: RuntimeUnsubscribe | null = null;
   let unlistenPluginsChanged: RuntimeUnsubscribe | null = null;
   let unlistenAgentsChanged: RuntimeUnsubscribe | null = null;
@@ -382,7 +385,6 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       await Promise.all([
         chatStore.refreshSessions(),
         agentStore.loadAgents(),
-        projectStore.loadWorkingDir(),
         loadSkills(),
       ]);
     });
@@ -495,7 +497,9 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     if (runKey === lastAutoOpenedLexicalProgressRun) return;
 
     lastAutoOpenedLexicalProgressRun = runKey;
-    await openKnowledgeLexicalProgressWindow(status);
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    await openKnowledgeLexicalProgressWindow(workspaceRef, status);
   }
 
   // -- Warmup functions (idempotent, reusable promise) --
@@ -528,19 +532,22 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   function warmupCollab(generation: number): Promise<void> {
     if (_wpCollab) return _wpCollab;
     _wpCollab = (async () => {
-      const probe = await gitProbe();
-      setWarmup("collab:probe", probe, generation);
+      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+      if (!workspaceRef) return;
+      const scopeKey = `${workspaceRef.checkoutId}@${workspaceRef.expectedGeneration ?? "current"}`;
+      const probe = await gitProbe(workspaceRef);
+      setWarmup(`collab:probe:${scopeKey}`, probe, generation);
       if (probe.available) {
         const [snapshot, status, branches, submoduleList] = await Promise.all([
-          gitHistorySnapshot(0, 30),
-          gitStatus(),
-          gitBranches(),
-          gitSubmodules(),
+          gitHistorySnapshot(0, 30, workspaceRef),
+          gitStatus(workspaceRef),
+          gitBranches(workspaceRef),
+          gitSubmodules(workspaceRef),
         ]);
-        setWarmup("collab:snapshot", snapshot, generation);
-        setWarmup("collab:status", status, generation);
-        setWarmup("collab:branches", branches, generation);
-        setWarmup("collab:submodules", submoduleList, generation);
+        setWarmup(`collab:snapshot:${scopeKey}`, snapshot, generation);
+        setWarmup(`collab:status:${scopeKey}`, status, generation);
+        setWarmup(`collab:branches:${scopeKey}`, branches, generation);
+        setWarmup(`collab:submodules:${scopeKey}`, submoduleList, generation);
       }
     })();
     return _wpCollab;
@@ -550,7 +557,9 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   function warmupKnowledge(generation: number): Promise<void> {
     if (_wpKnowledge) return _wpKnowledge;
     _wpKnowledge = (async () => {
-      const page = await knowledgeListPage({ type: "design", limit: 64 });
+      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+      if (!workspaceRef) return;
+      const page = await knowledgeListPage({ type: "design", limit: 64 }, workspaceRef);
       setWarmup("knowledge:documents", page.items, generation);
     })();
     return _wpKnowledge;
@@ -560,12 +569,13 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   function warmupAsset(generation: number): Promise<void> {
     if (_wpAsset) return _wpAsset;
     _wpAsset = (async () => {
-      if (!projectStore.workingDir.trim()) return;
+      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+      if (!projectStore.isUnityProject || !workspaceRef) return;
       const [overview, tuning] = await Promise.all([
-        assetDbOverview(),
+        assetDbOverview(workspaceRef),
         getWatcherTuning(),
       ]);
-      setWarmup("asset:dbOverview", overview, generation);
+      setWarmup(`asset:dbOverview:${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`, overview, generation);
       setWarmup("asset:watcherTuning", tuning, generation);
     })();
     return _wpAsset;
@@ -586,6 +596,39 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   }
 
   // -- Event listener registration --
+  function handleStreamEvent(payload: StreamEvent) {
+    const handled = chatStore.handleStreamEvent(payload);
+    if (!handled) return;
+
+    if (
+      displaySettings.cacheInvalidationWarningsEnabled
+      && isPromptCacheInvalidation(payload)
+    ) {
+      notificationStore.addNotice(
+        "warning",
+        t(
+          "notifications.cacheInvalidationWarning",
+          sessionDiagnosticLabel(payload.sessionId),
+          cacheInvalidationReasonLabel(payload.cacheInvalidationReason),
+          payload.cacheBaselineTokens ?? 0,
+          cacheExcessInputTokens(payload),
+        ),
+        {
+          code: "prompt_cache_miss",
+          operation: `prompt-cache-miss:${payload.runId}`,
+          replaceOperation: true,
+        },
+      );
+    }
+
+    const session = chatStore.sessions.find((item) => item.id === payload.sessionId);
+    const notificationContext = {
+      sessionTitle: session?.title ?? null,
+      ...(session?.parentSessionId ? { isSubagent: true } : {}),
+    };
+    void maybeNotifyStreamEvent(payload, notificationContext);
+  }
+
   async function registerListeners() {
     markStartupPhase("register_listeners_enter");
     const runtime = getLocusRuntime();
@@ -594,46 +637,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       markStartupPhase("register_listeners_skipped");
       return;
     }
-    unlisten = await runtime.subscribe<StreamEvent>("stream-event", (payload) => {
-      const handled = chatStore.handleStreamEvent(payload);
-      if (!handled) return;
-
-      if (
-        displaySettings.cacheInvalidationWarningsEnabled
-        && isPromptCacheInvalidation(payload)
-      ) {
-        notificationStore.addNotice(
-          "warning",
-          t(
-            "notifications.cacheInvalidationWarning",
-            sessionDiagnosticLabel(payload.sessionId),
-            cacheInvalidationReasonLabel(payload.cacheInvalidationReason),
-            payload.cacheBaselineTokens ?? 0,
-            cacheExcessInputTokens(payload),
-          ),
-          {
-            code: "prompt_cache_miss",
-            operation: `prompt-cache-miss:${payload.runId}`,
-            replaceOperation: true,
-          },
-        );
-      }
-
-      const session = chatStore.sessions.find((item) => item.id === payload.sessionId);
-      const notificationContext = {
-        sessionTitle: session?.title ?? null,
-        ...(session?.parentSessionId ? { isSubagent: true } : {}),
-      };
-      void maybeNotifyStreamEvent(payload, notificationContext);
-    });
-    if (options.syncActiveSessionSelection !== false) {
-      unlistenActiveSessionSelection = await runtime.subscribe<ActiveSessionSelectionChanged>(
-        "active-session-selection-changed",
-        (payload) => {
-          void chatStore.syncActiveSessionSelection(payload.sessionId);
-        },
-      );
-    }
+    // Bare stream events are retained only for migrated historical runs that
+    // do not have a checkout binding. Current runs arrive through the scoped
+    // workspace event stream below.
+    unlisten = await runtime.subscribe<StreamEvent>("stream-event", handleStreamEvent);
     unlistenSessionExecutionState = await runtime.subscribe<SessionExecutionStateChanged>(
       SESSION_EXECUTION_STATE_CHANGED_EVENT,
       (payload) => {
@@ -645,26 +652,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         );
       },
     );
-    unlistenUnity = await runtime.subscribe<boolean>("unity-connection-status", (payload) => {
-      projectStore.handleUnityConnectionStatus(payload);
-      if (payload) {
-        console.log("[Locus] Unity Editor connected!");
-      } else {
-        console.log("[Locus] Unity Editor disconnected.");
-      }
-    });
-    unlistenUnityDetail = await runtime.subscribe<UnityConnectionStatus>(
-      "unity-connection-status-detail",
-      (payload) => {
-        projectStore.handleUnityConnectionStatusDetail(payload);
-      },
-    );
-    unlistenScan = await runtime.subscribe<AssetDbScanEvent>("ref-graph-scan", (payload) => {
-      projectStore.handleScanEvent(payload);
-    });
-    unlistenPlugin = await runtime.subscribe<PluginStatus>("unity-plugin-status", (payload) => {
-      projectStore.handlePluginStatus(payload);
-    });
+    unlistenUnity = null;
+    unlistenUnityDetail = null;
+    unlistenScan = null;
+    unlistenPlugin = null;
     unlistenAppError = await runtime.subscribe<AppErrorPayload>("app-error", (eventPayload) => {
       const payload = normalizeAppError(eventPayload);
       notificationStore.addNotice(payload.severity, payload.message, {
@@ -672,28 +663,62 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         operation: payload.operation,
       });
     });
-    unlistenWorkspaceLockDiagnostic = await runtime.subscribe<WorkspaceExecutionLockDiagnostic>(
-      WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT,
-      handleWorkspaceLockDiagnostic,
-    );
     unlistenAsyncTaskUpdated = await runtime.subscribe<AsyncTaskUpdatedEvent>(
       "async-task-updated",
       (payload) => chatStore.applyAsyncTaskUpdate(payload),
     );
-    unlistenLexicalRebuildStatus = await runtime.subscribe<LexicalRebuildStatus>(
-      KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
-      (status) => {
-        void maybeOpenLexicalProgressWindow(status);
+    unlistenKnowledgeChanged = await runtime.subscribe<RoutedWorkspaceEvent>(
+      WORKSPACE_EVENT_NAME,
+      (event) => {
+        if (!workspaceContextStore.applyWorkspaceEvent(event)) return;
+        const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+        if (
+          !workspaceRef
+          || event.checkoutId !== workspaceRef.checkoutId
+          || event.workspaceGeneration !== workspaceRef.expectedGeneration
+        ) return;
+        if (event.eventName === "unity-connection-status") {
+          const connected = event.payload as boolean;
+          projectStore.handleUnityConnectionStatus(connected);
+          console.log(
+            connected
+              ? "[Locus] Unity Editor connected!"
+              : "[Locus] Unity Editor disconnected.",
+          );
+        } else if (event.eventName === "unity-connection-status-detail") {
+          projectStore.handleUnityConnectionStatusDetail(event.payload as UnityConnectionStatus);
+        } else if (event.eventName === "ref-graph-scan") {
+          projectStore.handleScanEvent(event.payload as AssetDbScanEvent);
+        } else if (event.eventName === "unity-plugin-status") {
+          projectStore.handlePluginStatus(event.payload as PluginStatus);
+        } else if (event.eventName === KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT) {
+          void maybeOpenLexicalProgressWindow(event.payload as LexicalRebuildStatus);
+        } else if (event.eventName === "knowledge-changed") {
+          handleKnowledgeChanged(event.payload as KnowledgeChangedEvent);
+        } else if (event.eventName === "stream-event") {
+          handleStreamEvent(event.payload as StreamEvent);
+        } else if (event.eventName === "session-content-changed") {
+          handleSessionContentChanged(event.payload as SessionContentChangedEvent);
+        } else if (event.eventName === "session-title-updated") {
+          const payload = event.payload as SessionTitleUpdatedEvent;
+          chatStore.applySessionTitleUpdate(payload.sessionId, payload.title);
+        } else if (event.eventName === WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT) {
+          handleWorkspaceLockDiagnostic(event.payload as WorkspaceExecutionLockDiagnostic);
+        } else if (event.eventName === "plugins-changed") {
+          void agentStore.loadWorkspaceAgents(workspaceRef);
+          void loadSkills({ force: true });
+        } else if (event.eventName === "agents-changed") {
+          void agentStore.loadWorkspaceAgents(workspaceRef);
+        } else if (
+          event.eventName === "locus-open-script"
+          && options.handleExternalScriptOpen === true
+        ) {
+          handleExternalScriptOpen(event.payload as ExternalScriptOpenRequest);
+        }
       },
     );
-    unlistenKnowledgeChanged = await runtime.subscribe<KnowledgeChangedEvent>(
-      "knowledge-changed",
-      handleKnowledgeChanged,
-    );
-    unlistenSessionContentChanged = await runtime.subscribe<SessionContentChangedEvent>(
-      "session-content-changed",
-      handleSessionContentChanged,
-    );
+    unlistenLexicalRebuildStatus = null;
+    unlistenSessionContentChanged = null;
     unlistenSessionTitleUpdated = await runtime.subscribe<SessionTitleUpdatedEvent>(
       "session-title-updated",
       ({ sessionId, title }) => chatStore.applySessionTitleUpdate(sessionId, title),
@@ -706,10 +731,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       void agentStore.loadAgents();
     });
     if (options.handleExternalScriptOpen === true) {
-      unlistenExternalScriptOpen = await runtime.subscribe<ExternalScriptOpenRequest>(
-        "locus-open-script",
-        handleExternalScriptOpen,
-      );
+      unlistenExternalScriptOpen = null;
       const startupRequest = await takeExternalScriptOpenRequest();
       if (startupRequest) handleExternalScriptOpen(startupRequest);
     }
@@ -731,14 +753,12 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     unlistenUnityDetail?.();
     unlistenScan?.();
     unlistenPlugin?.();
-    unlistenActiveSessionSelection?.();
     unlistenSessionExecutionState?.();
     unlistenAppError?.();
     unlistenLexicalRebuildStatus?.();
     unlistenKnowledgeChanged?.();
     unlistenSessionContentChanged?.();
     unlistenSessionTitleUpdated?.();
-    unlistenWorkspaceLockDiagnostic?.();
     unlistenAsyncTaskUpdated?.();
     unlistenPluginsChanged?.();
     unlistenAgentsChanged?.();
@@ -767,8 +787,11 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     _wpSettings = null;
     try {
       await measureWorkspaceSwitchAsync(
-        "set_working_dir",
-        () => projectStore.setWorkingDir(path),
+        "open_and_focus_workspace",
+        async () => {
+          const context = await workspaceContextStore.openAndFocus(path);
+          if (!context) throw new Error("The workspace focus request was superseded.");
+        },
         { target: path },
       );
       chatStore.newChat({ persistSelection: false, resetRestoreAttempt: true });
@@ -780,9 +803,11 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         measureWorkspaceSwitchAsync("load_recent_dirs", () => projectStore.loadRecentDirs(), {
           target: path,
         }),
-        measureWorkspaceSwitchAsync("load_agents", () => agentStore.loadAgents(), {
-          target: path,
-        }),
+        measureWorkspaceSwitchAsync(
+          "load_agents",
+          () => agentStore.loadWorkspaceAgents(projectStore.requireWorkspaceRef()),
+          { target: path },
+        ),
         measureWorkspaceSwitchAsync(
           "check_unity_connection",
           () => projectStore.checkUnityConnection(),
@@ -839,7 +864,6 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     await Promise.all([
       chatStore.refreshSessions(),
       agentStore.loadAgents(),
-      projectStore.loadWorkingDir(),
       projectStore.loadRecentDirs(),
       projectStore.checkUnityConnection(),
       projectStore.checkUnityPlugin(),

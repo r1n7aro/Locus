@@ -35,12 +35,14 @@ import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import { t } from "../i18n";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
 import UnityPropertyFenceBlock from "./unity/UnityPropertyFenceBlock.vue";
 import type { LocusFileDropRef } from "../services/unity";
 import type { AssetRefAttachment } from "../types";
+import type { WorkspaceRef } from "../services/project";
 import type { UnityObjectPreviewInput, UnityObjectPreviewLevel } from "./unity-preview";
 
 const props = defineProps<{
@@ -49,6 +51,7 @@ const props = defineProps<{
   enableFileRefs?: boolean;
   highlightTerms?: string[];
   unityPreviewStateScope?: string | null;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -58,6 +61,7 @@ const emit = defineEmits<{
 const rootRef = ref<HTMLElement | null>(null);
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
 const inlinePathStatuses = ref<Map<string, MarkdownPathStatus>>(new Map());
 const appContext = getCurrentInstance()?.appContext ?? null;
@@ -165,7 +169,8 @@ function resolveInlinePathStatus(path: string): MarkdownPathStatus | null | unde
 
 async function loadInlinePathStatuses(html: string) {
   const candidates = collectInlineCodePathCandidates(html);
-  const nextKey = `${projectStore.workingDir}\n${candidates.join("\n")}`;
+  const focusedWorkspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  const nextKey = `${focusedWorkspaceRef?.checkoutId ?? ""}@${focusedWorkspaceRef?.expectedGeneration ?? ""}\n${projectStore.workingDir}\n${candidates.join("\n")}`;
   if (nextKey === markdownInlinePathStatusKey) return;
   markdownInlinePathStatusKey = nextKey;
   const run = ++markdownInlinePathStatusLoadRun;
@@ -174,9 +179,18 @@ async function loadInlinePathStatuses(html: string) {
     inlinePathStatuses.value = new Map();
     return;
   }
+  const workspaceRef = focusedWorkspaceRef;
+  if (!workspaceRef) {
+    inlinePathStatuses.value = new Map();
+    return;
+  }
 
   try {
-    const statuses = await loadCachedMarkdownPathStatuses(projectStore.workingDir, candidates);
+    const statuses = await loadCachedMarkdownPathStatuses(
+      projectStore.workingDir,
+      candidates,
+      workspaceRef,
+    );
     if (run !== markdownInlinePathStatusLoadRun) return;
     const next = new Map<string, MarkdownPathStatus>();
     for (const [path, status] of statuses) {
@@ -425,6 +439,7 @@ async function resolveMarkdownImages() {
   if (!root) return;
 
   const run = ++markdownImageResolveRun;
+  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
   const images = Array.from(root.querySelectorAll<HTMLImageElement>("img[data-md-image-source]"));
   for (const image of images) {
     const source = image.dataset.mdImageSource?.trim() ?? "";
@@ -438,7 +453,8 @@ async function resolveMarkdownImages() {
       continue;
     }
 
-    const cached = markdownImageCache.get(source);
+    const cacheKey = `${workspaceRef?.checkoutId ?? ""}@${workspaceRef?.expectedGeneration ?? ""}:${source}`;
+    const cached = markdownImageCache.get(cacheKey);
     if (cached) {
       applyResolvedMarkdownImage(image, source, cached);
       continue;
@@ -446,12 +462,13 @@ async function resolveMarkdownImages() {
 
     setMarkdownImageState(image, "loading");
     try {
-      const preview = await resolveMarkdownImage(source);
+      if (!workspaceRef) throw new Error("Workspace scope is required for relative Markdown images");
+      const preview = await resolveMarkdownImage(workspaceRef, source);
       const resolved = {
         url: preview.url,
         displayPath: preview.displayPath || source,
       };
-      markdownImageCache.set(source, resolved);
+      markdownImageCache.set(cacheKey, resolved);
       if (
         run !== markdownImageResolveRun
         || !image.isConnected
@@ -484,7 +501,11 @@ watch(
 );
 
 watch(
-  () => projectStore.workingDir,
+  () => [
+    projectStore.workingDir,
+    workspaceContextStore.focusedWorkspaceRef?.checkoutId ?? "",
+    workspaceContextStore.focusedWorkspaceRef?.expectedGeneration ?? null,
+  ],
   () => {
     void loadInlinePathStatuses(parsedMarkdownHtml.value);
   },
@@ -546,7 +567,9 @@ function resolveViewRefSummary(rawViewId: string): ViewPackageSummary | null {
 async function loadMarkdownViewRefs() {
   const run = ++markdownViewRefLoadRun;
   try {
-    const snapshot = await viewTree();
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const snapshot = await viewTree(workspaceRef);
     if (run === markdownViewRefLoadRun) {
       viewRefSummaries.value = snapshot.views;
     }
@@ -578,7 +601,9 @@ async function resolveMarkdownViewId(rawViewId: string): Promise<string> {
   if (cachedView) return cachedView.id;
 
   try {
-    const snapshot = await viewTree();
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return rawViewId.trim();
+    const snapshot = await viewTree(workspaceRef);
     return snapshot.views.find((view) => viewMatchesRef(view, refKey))?.id ?? rawViewId.trim();
   } catch {
     return rawViewId.trim();
@@ -595,7 +620,9 @@ async function openMarkdownViewRef(button: HTMLButtonElement) {
   if (block) block.dataset.mdViewOpening = "true";
   try {
     const viewId = await resolveMarkdownViewId(rawViewId);
-    await viewRun(viewId);
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    await viewRun(workspaceRef, viewId);
   } catch (error) {
     const err = normalizeViewError(error);
     notificationStore.addNotice("error", err.message, {

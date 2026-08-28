@@ -1,18 +1,17 @@
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::asset_db::types::{guid_to_hex, parse_guid_hex, ScanPhase, ScanStats};
-use crate::asset_db::{AssetDb, AssetDbState};
+use crate::asset_db::AssetDb;
 use crate::commands::asset::{
-    write_persisted_last_scan_info, LastScanInfo, LastScanInfoState, ScanPhaseState,
+    resolve_asset_workspace_scope, write_persisted_last_scan_info, LastScanInfo, LastScanInfoState,
+    ScanPhaseState,
 };
 use crate::error::AppError;
-use crate::workspace::Workspace;
-use crate::AssetDbWatcherHandle;
+use crate::workspace_service::{ProjectRegistry, WorkspaceRef};
 
 const REF_GRAPH_SCAN_CANCEL_WAIT_MS: u64 = 30_000;
 const REF_GRAPH_SCAN_CANCELLED_DETAIL: &str = "Asset database scan cancelled.";
@@ -35,7 +34,12 @@ impl RefGraphScanTaskState {
         Self::default()
     }
 
-    fn register(&self, cwd: String, workspace_generation: u64) -> RefGraphScanRegistration {
+    fn register_scoped(
+        &self,
+        _scope_key: &str,
+        cwd: String,
+        workspace_generation: u64,
+    ) -> RefGraphScanRegistration {
         let task = RefGraphScanTask {
             cwd,
             workspace_generation,
@@ -43,13 +47,38 @@ impl RefGraphScanTaskState {
             done: Arc::new((Mutex::new(false), Condvar::new())),
         };
 
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(previous) = guard.replace(task.clone()) {
-                previous.cancel.store(true, Ordering::Relaxed);
+        let previous = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.replace(task.clone()));
+        if let Some(previous) = previous {
+            previous.cancel.store(true, Ordering::Relaxed);
+            eprintln!(
+                "[AssetDb] replacing active scan for {} generation {}; waiting for cancellation",
+                previous.cwd, previous.workspace_generation
+            );
+            let (done_lock, done_cvar) = &*previous.done;
+            let previous_finished = done_lock
+                .lock()
+                .ok()
+                .and_then(|done| {
+                    done_cvar
+                        .wait_timeout_while(
+                            done,
+                            Duration::from_millis(REF_GRAPH_SCAN_CANCEL_WAIT_MS),
+                            |finished| !*finished,
+                        )
+                        .ok()
+                        .map(|(finished, _)| *finished)
+                })
+                .unwrap_or(false);
+            if !previous_finished {
                 eprintln!(
-                    "[AssetDb] replaced active scan for {} generation {}; cancellation requested",
-                    previous.cwd, previous.workspace_generation
+                    "[AssetDb] replacement scan cancelled because generation {} did not stop in time",
+                    previous.workspace_generation
                 );
+                task.cancel.store(true, Ordering::Relaxed);
             }
         }
 
@@ -164,56 +193,6 @@ pub struct RefGraphScanStartResult {
     pub already_running: bool,
 }
 
-struct RefGraphScanContext {
-    app_handle: AppHandle,
-    workspace: Arc<Workspace>,
-    cwd: String,
-    workspace_generation: u64,
-    ref_graph_state: Arc<Mutex<Option<AssetDb>>>,
-    watcher_handle: AssetDbWatcherHandle,
-    last_scan_info: LastScanInfoState,
-    scan_phase_state: ScanPhaseState,
-    watcher_tuning: Arc<crate::asset_db::watcher::WatcherTuning>,
-    cancel_token: Arc<AtomicBool>,
-}
-
-struct RefGraphScanBegin {
-    cwd: String,
-    workspace_generation: u64,
-    project_root: PathBuf,
-}
-
-enum RefGraphScanBeginResult {
-    Started(RefGraphScanBegin),
-    AlreadyRunning,
-    Stale,
-}
-
-enum RefGraphScanJobOutcome {
-    Completed(ScanStats),
-    Stale,
-}
-
-impl RefGraphScanContext {
-    fn is_current(&self) -> bool {
-        self.workspace.generation() == self.workspace_generation
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancel_token.load(Ordering::Relaxed)
-    }
-
-    fn clear_scan_phase_if_current(&self) {
-        if self.is_current() {
-            self.scan_phase_state.clear();
-        }
-    }
-
-    fn generation_lock_failed(error: String) -> AppError {
-        AppError::new("workspace.generation_lock_failed", error)
-    }
-}
-
 fn scan_already_running_error() -> AppError {
     AppError::new(
         "ref_graph.scan_already_running",
@@ -222,8 +201,8 @@ fn scan_already_running_error() -> AppError {
     .retryable(true)
 }
 
-fn validate_scan_workspace(cwd: &str) -> Result<PathBuf, AppError> {
-    let project_root = Path::new(cwd);
+fn validate_scan_workspace(cwd: &str) -> Result<std::path::PathBuf, AppError> {
+    let project_root = std::path::Path::new(cwd);
     if !project_root.join("Assets").is_dir() {
         return Err(AppError::new(
             "ref_graph.not_unity_project",
@@ -231,324 +210,6 @@ fn validate_scan_workspace(cwd: &str) -> Result<PathBuf, AppError> {
         ));
     }
     Ok(project_root.to_path_buf())
-}
-
-fn emit_scan_phase_if_current(
-    workspace: &Arc<Workspace>,
-    workspace_generation: u64,
-    app_handle: &AppHandle,
-    scan_phase_state: &ScanPhaseState,
-    phase: ScanPhase,
-) -> bool {
-    let generation_guard = match workspace.lock_generation() {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("[AssetDb] warning: failed to lock workspace generation: {error}");
-            return false;
-        }
-    };
-
-    if !generation_guard.is_current(workspace_generation) {
-        return false;
-    }
-
-    let _ = app_handle.emit("ref-graph-scan", &phase);
-    scan_phase_state.set(Some(phase));
-    true
-}
-
-fn emit_scan_error(context: &RefGraphScanContext, error: &AppError) {
-    let phase = ScanPhase::Error {
-        error: error.clone(),
-    };
-    let _ = emit_scan_phase_if_current(
-        &context.workspace,
-        context.workspace_generation,
-        &context.app_handle,
-        &context.scan_phase_state,
-        phase,
-    );
-}
-
-fn emit_scan_done(context: &RefGraphScanContext, stats: ScanStats) {
-    let phase = ScanPhase::Done { stats };
-    let _ = context.app_handle.emit("ref-graph-scan", &phase);
-}
-
-async fn scan_workspace_snapshot(workspace: &Arc<Workspace>) -> (String, u64) {
-    let path = workspace.path.read().await;
-    (path.clone(), workspace.generation())
-}
-
-fn begin_ref_graph_scan_from_snapshot(
-    workspace: &Arc<Workspace>,
-    scan_phase_state: &ScanPhaseState,
-    cwd: String,
-    workspace_generation: u64,
-) -> Result<RefGraphScanBeginResult, AppError> {
-    let generation_guard = workspace
-        .lock_generation()
-        .map_err(RefGraphScanContext::generation_lock_failed)?;
-    if !generation_guard.is_current(workspace_generation) {
-        return Ok(RefGraphScanBeginResult::Stale);
-    }
-
-    let project_root = validate_scan_workspace(&cwd)?;
-    if !scan_phase_state.try_begin_scan()? {
-        return Ok(RefGraphScanBeginResult::AlreadyRunning);
-    }
-
-    Ok(RefGraphScanBeginResult::Started(RefGraphScanBegin {
-        cwd,
-        workspace_generation,
-        project_root,
-    }))
-}
-
-async fn begin_ref_graph_scan(
-    workspace: &Arc<Workspace>,
-    scan_phase_state: &ScanPhaseState,
-) -> Result<RefGraphScanBeginResult, AppError> {
-    let (cwd, workspace_generation) = scan_workspace_snapshot(workspace).await;
-    begin_ref_graph_scan_from_snapshot(workspace, scan_phase_state, cwd, workspace_generation)
-}
-
-async fn run_ref_graph_scan_job(
-    context: RefGraphScanContext,
-    project_root: PathBuf,
-) -> Result<RefGraphScanJobOutcome, AppError> {
-    let scan_started = std::time::Instant::now();
-
-    if context.is_cancelled() {
-        context.clear_scan_phase_if_current();
-        return Ok(RefGraphScanJobOutcome::Stale);
-    }
-
-    if !context.is_current() {
-        return Ok(RefGraphScanJobOutcome::Stale);
-    }
-
-    let old_watcher = {
-        let generation_guard = context
-            .workspace
-            .lock_generation()
-            .map_err(RefGraphScanContext::generation_lock_failed)?;
-        if !generation_guard.is_current(context.workspace_generation) {
-            return Ok(RefGraphScanJobOutcome::Stale);
-        }
-
-        let mut wh = match context.watcher_handle.lock() {
-            Ok(guard) => guard,
-            Err(e) => {
-                let error = AppError::new(
-                    "ref_graph.watcher_lock_failed",
-                    format!("Lock error: {}", e),
-                );
-                drop(generation_guard);
-                emit_scan_error(&context, &error);
-                return Err(error);
-            }
-        };
-        let old_watcher = wh.take();
-
-        // Drop the old AssetDb (and thus its SQLite Connection) BEFORE we let
-        // the rebuild path inside `db::open_db` try to remove the on-disk DB.
-        // SQLite holds an exclusive file lock on Windows for as long as a
-        // Connection is alive; without this drop, schema-version-mismatch
-        // rebuilds would fail with a sharing violation.
-        let mut g = match context.ref_graph_state.lock() {
-            Ok(guard) => guard,
-            Err(e) => {
-                let error = AppError::new("ref_graph.lock_failed", format!("Lock error: {}", e));
-                drop(generation_guard);
-                emit_scan_error(&context, &error);
-                return Err(error);
-            }
-        };
-        *g = None;
-        old_watcher
-    };
-
-    if let Some(old) = old_watcher {
-        old.stop_and_join();
-        eprintln!("[AssetDb] stopped previous watcher before rescan");
-    }
-
-    let root = project_root.clone();
-    let handle = context.app_handle.clone();
-    let scan_phase_state = context.scan_phase_state.clone();
-    let workspace = context.workspace.clone();
-    let workspace_generation = context.workspace_generation;
-    let cancel_token = context.cancel_token.clone();
-    let result = match tokio::task::spawn_blocking(move || {
-        if cancel_token.load(Ordering::Relaxed) {
-            return Err(REF_GRAPH_SCAN_CANCELLED_DETAIL.to_string());
-        }
-        let mut graph = AssetDb::open(&root)?;
-        let cancel_for_progress = cancel_token.clone();
-        let stats = graph.full_scan_with_cancel(
-            |phase| {
-                if cancel_for_progress.load(Ordering::Relaxed) {
-                    return;
-                }
-                let _ = emit_scan_phase_if_current(
-                    &workspace,
-                    workspace_generation,
-                    &handle,
-                    &scan_phase_state,
-                    phase.clone(),
-                );
-            },
-            &cancel_token,
-        )?;
-        if cancel_token.load(Ordering::Relaxed) {
-            return Err(REF_GRAPH_SCAN_CANCELLED_DETAIL.to_string());
-        }
-        let handle_for_reconcile = handle.clone();
-        let scan_phase_state_for_reconcile = scan_phase_state.clone();
-        let workspace_for_reconcile = workspace.clone();
-        let cancel_for_reconcile_progress = cancel_token.clone();
-        let (graph, reconcile_stats) =
-            crate::asset_db::watcher::reconcile_loaded_db_with_cancel_and_progress(
-                &root,
-                graph,
-                &cancel_token,
-                // The full scan just read and hashed every indexed file;
-                // this reconcile only needs to catch mid-scan edits, which
-                // mtime/size detects without a second full content pass.
-                false,
-                |progress| {
-                    if cancel_for_reconcile_progress.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let _ = emit_scan_phase_if_current(
-                        &workspace_for_reconcile,
-                        workspace_generation,
-                        &handle_for_reconcile,
-                        &scan_phase_state_for_reconcile,
-                        progress.to_scan_phase(),
-                    );
-                },
-            )?;
-        eprintln!(
-            "[AssetDb] post-scan reconcile complete: queued={}, processed={}, failed={}",
-            reconcile_stats.queued, reconcile_stats.processed, reconcile_stats.failed
-        );
-        Ok::<(AssetDb, ScanStats), String>((graph, stats))
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            let error = AppError::new(
-                "ref_graph.scan_task_join_failed",
-                format!("Task join error: {}", e),
-            )
-            .retryable(true);
-            emit_scan_error(&context, &error);
-            return Err(error);
-        }
-    };
-
-    if context.is_cancelled() {
-        context.clear_scan_phase_if_current();
-        return Ok(RefGraphScanJobOutcome::Stale);
-    }
-
-    if !context.is_current() {
-        return Ok(RefGraphScanJobOutcome::Stale);
-    }
-
-    match result {
-        Ok((graph, scan_stats)) => {
-            let generation_guard = context
-                .workspace
-                .lock_generation()
-                .map_err(RefGraphScanContext::generation_lock_failed)?;
-            if !generation_guard.is_current(context.workspace_generation) {
-                return Ok(RefGraphScanJobOutcome::Stale);
-            }
-
-            let finished_at_unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let scan_info = LastScanInfo {
-                finished_at_unix_ms,
-                duration_ms: scan_stats
-                    .elapsed_ms
-                    .max(scan_started.elapsed().as_millis() as u64),
-                stats: scan_stats.clone(),
-            };
-
-            {
-                let mut guard = match context.ref_graph_state.lock() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        let error =
-                            AppError::new("ref_graph.lock_failed", format!("Lock error: {}", e));
-                        drop(generation_guard);
-                        emit_scan_error(&context, &error);
-                        return Err(error);
-                    }
-                };
-                *guard = Some(graph);
-            }
-
-            context.last_scan_info.set(scan_info.clone());
-            if let Err(err) = write_persisted_last_scan_info(Path::new(&context.cwd), &scan_info) {
-                eprintln!(
-                    "[AssetDb] warning: failed to persist last successful scan info: {}",
-                    err
-                );
-            }
-            context.scan_phase_state.clear();
-
-            let graph_arc = context.ref_graph_state.clone();
-            let watcher_root = PathBuf::from(&context.cwd);
-            match crate::asset_db::watcher::AssetDbWatcher::start(
-                watcher_root,
-                graph_arc,
-                context.watcher_tuning.clone(),
-            ) {
-                Ok(w) => {
-                    let mut wh = match context.watcher_handle.lock() {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            let error = AppError::new(
-                                "ref_graph.watcher_lock_failed",
-                                format!("Lock error: {}", e),
-                            );
-                            drop(generation_guard);
-                            emit_scan_error(&context, &error);
-                            return Err(error);
-                        }
-                    };
-                    *wh = Some(w);
-                    eprintln!("[AssetDb] incremental watcher started");
-                }
-                Err(e) => {
-                    eprintln!("[AssetDb] warning: failed to start watcher: {}", e);
-                }
-            }
-
-            emit_scan_done(&context, scan_stats.clone());
-            Ok(RefGraphScanJobOutcome::Completed(scan_stats))
-        }
-        Err(e) => {
-            if context.is_cancelled() {
-                context.clear_scan_phase_if_current();
-                return Ok(RefGraphScanJobOutcome::Stale);
-            }
-            if !context.is_current() {
-                return Ok(RefGraphScanJobOutcome::Stale);
-            }
-            eprintln!("[AssetDb] scan failed: {}", e);
-            let scan_error = AppError::new("ref_graph.scan_failed", &e).retryable(true);
-            emit_scan_error(&context, &scan_error);
-            Err(scan_error)
-        }
-    }
 }
 
 fn stale_scan_error() -> AppError {
@@ -559,19 +220,208 @@ fn stale_scan_error() -> AppError {
     .retryable(true)
 }
 
+fn scoped_runtime_is_current(
+    registry: &ProjectRegistry,
+    runtime: &Arc<crate::workspace_service::WorkspaceRuntime>,
+) -> bool {
+    registry
+        .runtime(runtime.checkout_id())
+        .is_some_and(|current| {
+            Arc::ptr_eq(&current, runtime) && current.generation() == runtime.generation()
+        })
+}
+
+fn emit_scoped_scan_phase(
+    app_handle: &AppHandle,
+    registry: &ProjectRegistry,
+    runtime: &crate::workspace_service::WorkspaceRuntime,
+    scan_phase_state: &ScanPhaseState,
+    phase: ScanPhase,
+) {
+    scan_phase_state.set(Some(phase.clone()));
+    registry.event_router().publish(
+        app_handle,
+        "ref-graph-scan",
+        crate::workspace_service::event::WorkspaceEventEnvelope {
+            project_id: runtime.project_id().clone(),
+            checkout_id: runtime.checkout_id().clone(),
+            workspace_generation: runtime.generation(),
+            service_instance_id: None,
+            service_generation: None,
+            payload: phase,
+        },
+    );
+}
+
+async fn run_scoped_ref_graph_scan_job(
+    app_handle: AppHandle,
+    registry: Arc<ProjectRegistry>,
+    resolved_scope: crate::workspace_service::ResolvedWorkspaceScope,
+    last_scan_info: LastScanInfoState,
+    scan_phase_state: ScanPhaseState,
+    watcher_tuning: Arc<crate::asset_db::watcher::WatcherTuning>,
+    cancel_token: Arc<AtomicBool>,
+) -> Result<ScanStats, AppError> {
+    let (runtime, _lease) = resolved_scope.into_parts();
+    let project_root = validate_scan_workspace(&runtime.root().to_string_lossy())?;
+    let scan_started = std::time::Instant::now();
+
+    runtime.core().stop_background_watchers();
+    let graph_state = runtime.core().asset_db();
+    {
+        let mut graph = graph_state.lock().map_err(|error| {
+            AppError::new("ref_graph.lock_failed", format!("Lock error: {error}"))
+        })?;
+        *graph = None;
+    }
+
+    let root = project_root.clone();
+    let handle = app_handle.clone();
+    let registry_for_scan = Arc::clone(&registry);
+    let runtime_for_scan = Arc::clone(&runtime);
+    let phase_for_scan = scan_phase_state.clone();
+    let cancel_for_scan = Arc::clone(&cancel_token);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        if cancel_for_scan.load(Ordering::Relaxed) {
+            return Err(REF_GRAPH_SCAN_CANCELLED_DETAIL.to_string());
+        }
+        let mut graph = AssetDb::open(&root)?;
+        let cancel_for_progress = Arc::clone(&cancel_for_scan);
+        let handle_for_progress = handle.clone();
+        let registry_for_progress = Arc::clone(&registry_for_scan);
+        let runtime_for_progress = Arc::clone(&runtime_for_scan);
+        let phase_for_progress = phase_for_scan.clone();
+        let stats = graph.full_scan_with_cancel(
+            move |phase| {
+                if cancel_for_progress.load(Ordering::Relaxed)
+                    || !scoped_runtime_is_current(&registry_for_progress, &runtime_for_progress)
+                {
+                    return;
+                }
+                emit_scoped_scan_phase(
+                    &handle_for_progress,
+                    &registry_for_progress,
+                    &runtime_for_progress,
+                    &phase_for_progress,
+                    phase.clone(),
+                );
+            },
+            &cancel_for_scan,
+        )?;
+        if cancel_for_scan.load(Ordering::Relaxed) {
+            return Err(REF_GRAPH_SCAN_CANCELLED_DETAIL.to_string());
+        }
+        let (graph, _reconcile_stats) =
+            crate::asset_db::watcher::reconcile_loaded_db_with_cancel_and_progress(
+                &root,
+                graph,
+                &cancel_for_scan,
+                false,
+                |_| {},
+            )?;
+        Ok::<(AssetDb, ScanStats), String>((graph, stats))
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "ref_graph.scan_task_join_failed",
+            format!("Task join error: {error}"),
+        )
+        .retryable(true)
+    })?;
+
+    if cancel_token.load(Ordering::Relaxed) || !scoped_runtime_is_current(&registry, &runtime) {
+        scan_phase_state.clear();
+        return Err(stale_scan_error());
+    }
+
+    match result {
+        Ok((graph, stats)) => {
+            {
+                let mut current = graph_state.lock().map_err(|error| {
+                    AppError::new("ref_graph.lock_failed", format!("Lock error: {error}"))
+                })?;
+                *current = Some(graph);
+            }
+            let scan_info = LastScanInfo {
+                finished_at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0),
+                duration_ms: stats
+                    .elapsed_ms
+                    .max(scan_started.elapsed().as_millis() as u64),
+                stats: stats.clone(),
+            };
+            last_scan_info.set(scan_info.clone());
+            if let Err(error) = write_persisted_last_scan_info(&project_root, &scan_info) {
+                eprintln!("[AssetDb] warning: failed to persist scoped scan info: {error}");
+            }
+            scan_phase_state.clear();
+            if let Err(error) =
+                runtime
+                    .core()
+                    .start_background_watchers(&runtime, &app_handle, watcher_tuning)
+            {
+                eprintln!("[AssetDb] warning: failed to restart scoped watcher: {error}");
+            }
+            registry.event_router().publish(
+                &app_handle,
+                "ref-graph-scan",
+                crate::workspace_service::event::WorkspaceEventEnvelope {
+                    project_id: runtime.project_id().clone(),
+                    checkout_id: runtime.checkout_id().clone(),
+                    workspace_generation: runtime.generation(),
+                    service_instance_id: None,
+                    service_generation: None,
+                    payload: ScanPhase::Done {
+                        stats: stats.clone(),
+                    },
+                },
+            );
+            Ok(stats)
+        }
+        Err(detail) => {
+            let error = AppError::new("ref_graph.scan_failed", detail).retryable(true);
+            emit_scoped_scan_phase(
+                &app_handle,
+                &registry,
+                &runtime,
+                &scan_phase_state,
+                ScanPhase::Error {
+                    error: error.clone(),
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn ref_graph_status(
-    ref_graph_state: State<'_, AssetDbState>,
-    last_scan_info: State<'_, LastScanInfoState>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Option<ScanStats>, AppError> {
-    if workspace.path.read().await.trim().is_empty() {
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    if scope.root().as_os_str().is_empty() {
         return Ok(None);
     }
-    if let Some(info) = last_scan_info.snapshot() {
+    let last = scope
+        .resolved()
+        .runtime()
+        .core()
+        .asset_last_scan_info()
+        .snapshot()
+        .or_else(|| {
+            crate::commands::asset::read_persisted_last_scan_info(scope.root())
+                .ok()
+                .flatten()
+        });
+    if let Some(info) = last {
         return Ok(Some(info.stats));
     }
-    let guard = ref_graph_state
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -593,102 +443,85 @@ pub async fn ref_graph_status(
 #[tauri::command]
 pub async fn ref_graph_scan(
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
-    watcher_handle: State<'_, AssetDbWatcherHandle>,
-    last_scan_info: State<'_, LastScanInfoState>,
-    scan_phase_state: State<'_, ScanPhaseState>,
-    scan_task_state: State<'_, RefGraphScanTaskState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
     watcher_tuning: State<'_, crate::asset_db::watcher::WatcherTuningState>,
 ) -> Result<ScanStats, AppError> {
-    let workspace = workspace.inner().clone();
-    let scan_phase_state = scan_phase_state.inner().clone();
-
-    let begin = match begin_ref_graph_scan(&workspace, &scan_phase_state).await? {
-        RefGraphScanBeginResult::Started(begin) => begin,
-        RefGraphScanBeginResult::AlreadyRunning => return Err(scan_already_running_error()),
-        RefGraphScanBeginResult::Stale => return Err(stale_scan_error()),
-    };
-
-    let scan_registration = scan_task_state.register(begin.cwd.clone(), begin.workspace_generation);
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    validate_scan_workspace(&scope.root_string())?;
+    let resolved = scope.into_resolved();
+    let last_scan_info = resolved.runtime().core().asset_last_scan_info().clone();
+    let scan_phase_state = resolved.runtime().core().asset_scan_phase().clone();
+    let scan_task_state = resolved.runtime().core().ref_graph_scan_tasks().clone();
+    if !scan_phase_state.try_begin_scan()? {
+        return Err(scan_already_running_error());
+    }
+    let runtime_generation = resolved.runtime().generation();
+    let cwd = resolved.runtime().root().to_string_lossy().to_string();
+    let scan_owner_key = resolved.runtime().checkout_id().to_string();
+    let scan_registration =
+        scan_task_state.register_scoped(&scan_owner_key, cwd, runtime_generation);
     let cancel_token = scan_registration.cancel_token();
-
-    run_ref_graph_scan_job(
-        RefGraphScanContext {
-            app_handle,
-            workspace,
-            cwd: begin.cwd,
-            workspace_generation: begin.workspace_generation,
-            ref_graph_state: ref_graph_state.0.clone(),
-            watcher_handle: watcher_handle.inner().clone(),
-            last_scan_info: last_scan_info.inner().clone(),
-            scan_phase_state,
-            watcher_tuning: watcher_tuning.0.clone(),
-            cancel_token,
-        },
-        begin.project_root,
+    let result = run_scoped_ref_graph_scan_job(
+        app_handle,
+        project_registry.inner().clone(),
+        resolved,
+        last_scan_info,
+        scan_phase_state,
+        watcher_tuning.0.clone(),
+        cancel_token,
     )
-    .await
-    .and_then(|outcome| match outcome {
-        RefGraphScanJobOutcome::Completed(stats) => Ok(stats),
-        RefGraphScanJobOutcome::Stale => Err(stale_scan_error()),
-    })
+    .await;
+    drop(scan_registration);
+    result
 }
 
 #[tauri::command]
 pub async fn ref_graph_scan_start(
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
-    watcher_handle: State<'_, AssetDbWatcherHandle>,
-    last_scan_info: State<'_, LastScanInfoState>,
-    scan_phase_state: State<'_, ScanPhaseState>,
-    scan_task_state: State<'_, RefGraphScanTaskState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
     watcher_tuning: State<'_, crate::asset_db::watcher::WatcherTuningState>,
 ) -> Result<RefGraphScanStartResult, AppError> {
-    let workspace = workspace.inner().clone();
-    let scan_phase_state = scan_phase_state.inner().clone();
-
-    let begin = match begin_ref_graph_scan(&workspace, &scan_phase_state).await? {
-        RefGraphScanBeginResult::Started(begin) => begin,
-        RefGraphScanBeginResult::AlreadyRunning => {
-            return Ok(RefGraphScanStartResult {
-                started: false,
-                already_running: true,
-            });
-        }
-        RefGraphScanBeginResult::Stale => return Err(stale_scan_error()),
-    };
-
-    let scan_registration = scan_task_state.register(begin.cwd.clone(), begin.workspace_generation);
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    validate_scan_workspace(&scope.root_string())?;
+    let resolved = scope.into_resolved();
+    let last_scan_info = resolved.runtime().core().asset_last_scan_info().clone();
+    let scan_phase_state = resolved.runtime().core().asset_scan_phase().clone();
+    let scan_task_state = resolved.runtime().core().ref_graph_scan_tasks().clone();
+    if !scan_phase_state.try_begin_scan()? {
+        return Ok(RefGraphScanStartResult {
+            started: false,
+            already_running: true,
+        });
+    }
+    let runtime_generation = resolved.runtime().generation();
+    let cwd = resolved.runtime().root().to_string_lossy().to_string();
+    let scan_owner_key = resolved.runtime().checkout_id().to_string();
+    let scan_registration =
+        scan_task_state.register_scoped(&scan_owner_key, cwd, runtime_generation);
     let cancel_token = scan_registration.cancel_token();
-
-    let context = RefGraphScanContext {
-        app_handle,
-        workspace,
-        cwd: begin.cwd,
-        workspace_generation: begin.workspace_generation,
-        ref_graph_state: ref_graph_state.0.clone(),
-        watcher_handle: watcher_handle.inner().clone(),
-        last_scan_info: last_scan_info.inner().clone(),
-        scan_phase_state,
-        watcher_tuning: watcher_tuning.0.clone(),
-        cancel_token,
-    };
-
+    let app_handle_for_scan = app_handle.clone();
+    let registry_for_scan = project_registry.inner().clone();
+    let last_for_scan = last_scan_info;
+    let phase_for_scan = scan_phase_state;
+    let tuning_for_scan = watcher_tuning.0.clone();
     tauri::async_runtime::spawn(async move {
         let _scan_registration = scan_registration;
-        match run_ref_graph_scan_job(context, begin.project_root).await {
-            Ok(RefGraphScanJobOutcome::Completed(_)) => {}
-            Ok(RefGraphScanJobOutcome::Stale) => {
-                eprintln!("[AssetDb] background scan discarded after workspace switch");
-            }
-            Err(err) => {
-                eprintln!("[AssetDb] background scan failed: {}", err);
-            }
+        if let Err(error) = run_scoped_ref_graph_scan_job(
+            app_handle_for_scan,
+            registry_for_scan,
+            resolved,
+            last_for_scan,
+            phase_for_scan,
+            tuning_for_scan,
+            cancel_token,
+        )
+        .await
+        {
+            eprintln!("[AssetDb] scoped background scan failed: {error}");
         }
     });
-
     Ok(RefGraphScanStartResult {
         started: true,
         already_running: false,
@@ -698,10 +531,13 @@ pub async fn ref_graph_scan_start(
 #[tauri::command]
 pub async fn ref_graph_deps(
     guid_hex: String,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
     let guid = parse_guid_hex(&guid_hex).ok_or("Invalid GUID hex")?;
-    let guard = ref_graph_state
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -715,10 +551,13 @@ pub async fn ref_graph_deps(
 #[tauri::command]
 pub async fn ref_graph_refs(
     guid_hex: String,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
     let guid = parse_guid_hex(&guid_hex).ok_or("Invalid GUID hex")?;
-    let guard = ref_graph_state
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -732,9 +571,12 @@ pub async fn ref_graph_refs(
 #[tauri::command]
 pub async fn ref_graph_resolve_guid(
     path: String,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Option<String>, AppError> {
-    let guard = ref_graph_state
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -747,10 +589,13 @@ pub async fn ref_graph_resolve_guid(
 #[tauri::command]
 pub async fn ref_graph_resolve_path(
     guid_hex: String,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Option<String>, AppError> {
     let guid = parse_guid_hex(&guid_hex).ok_or("Invalid GUID hex")?;
-    let guard = ref_graph_state
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -764,10 +609,13 @@ pub async fn ref_graph_resolve_path(
 pub async fn ref_graph_walk_deps(
     guid_hex: String,
     max_depth: u32,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<String>, AppError> {
     let guid = parse_guid_hex(&guid_hex).ok_or("Invalid GUID hex")?;
-    let guard = ref_graph_state
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -782,10 +630,13 @@ pub async fn ref_graph_walk_deps(
 pub async fn ref_graph_walk_refs(
     guid_hex: String,
     max_depth: u32,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<String>, AppError> {
     let guid = parse_guid_hex(&guid_hex).ok_or("Invalid GUID hex")?;
-    let guard = ref_graph_state
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -848,9 +699,12 @@ fn build_asset_name_query(query: &str) -> Option<String> {
 #[tauri::command]
 pub async fn search_assets(
     query: String,
-    ref_graph_state: State<'_, AssetDbState>,
+    workspace_ref: WorkspaceRef,
+    project_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<serde_json::Value>, AppError> {
-    let guard = ref_graph_state
+    let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
+    let asset_db = scope.asset_db();
+    let guard = asset_db
         .0
         .lock()
         .map_err(|e| format!("Lock error: {}", e))?;
@@ -922,65 +776,32 @@ fn edges_to_json(
 mod tests {
     use super::*;
 
-    fn temp_unity_workspace() -> (tempfile::TempDir, String) {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        std::fs::create_dir_all(temp.path().join("Assets")).expect("create Assets dir");
-        let cwd = temp.path().to_string_lossy().to_string();
-        (temp, cwd)
-    }
-
     #[test]
-    fn begin_scan_rejects_stale_generation_without_setting_phase() {
-        let (_temp, cwd) = temp_unity_workspace();
-        let workspace = Arc::new(Workspace::new(cwd.clone(), Some("workspace-a".to_string())));
-        let scan_phase_state = ScanPhaseState::new();
-        let stale_generation = workspace.generation();
+    fn replacement_scan_waits_for_previous_runtime_task_to_finish() {
+        let state = RefGraphScanTaskState::new();
+        let registration_a = state.register_scoped("checkout-a", "F:/project-a".to_string(), 3);
 
-        workspace.bump_generation();
+        assert!(!registration_a.cancel_token().load(Ordering::Relaxed));
 
-        let result = begin_ref_graph_scan_from_snapshot(
-            &workspace,
-            &scan_phase_state,
-            cwd,
-            stale_generation,
-        )
-        .expect("begin scan should not fail");
-
-        assert!(matches!(result, RefGraphScanBeginResult::Stale));
-        assert!(scan_phase_state.snapshot().is_none());
-    }
-
-    #[test]
-    fn begin_scan_sets_dir_scan_for_current_generation() {
-        let (_temp, cwd) = temp_unity_workspace();
-        let workspace = Arc::new(Workspace::new(cwd.clone(), Some("workspace-a".to_string())));
-        let scan_phase_state = ScanPhaseState::new();
-
-        let result = begin_ref_graph_scan_from_snapshot(
-            &workspace,
-            &scan_phase_state,
-            cwd.clone(),
-            workspace.generation(),
-        )
-        .expect("begin scan should not fail");
-
-        match result {
-            RefGraphScanBeginResult::Started(begin) => {
-                assert_eq!(begin.cwd, cwd);
-                assert_eq!(begin.workspace_generation, workspace.generation());
-            }
-            _ => panic!("expected started scan"),
+        let replacement_state = state.clone();
+        let replacement_thread = std::thread::spawn(move || {
+            replacement_state.register_scoped("checkout-a", "F:/project-a".to_string(), 4)
+        });
+        let started_at = std::time::Instant::now();
+        while !registration_a.cancel_token().load(Ordering::Relaxed) {
+            assert!(started_at.elapsed() < Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(matches!(
-            scan_phase_state.snapshot(),
-            Some(ScanPhase::DirScan)
-        ));
+        assert!(registration_a.cancel_token().load(Ordering::Relaxed));
+        drop(registration_a);
+        let replacement_a = replacement_thread.join().expect("replacement registration");
+        assert!(!replacement_a.cancel_token().load(Ordering::Relaxed));
     }
 
     #[test]
     fn scan_task_state_cancel_waits_until_registration_finishes() {
         let state = RefGraphScanTaskState::new();
-        let registration = state.register("F:/project-a".to_string(), 7);
+        let registration = state.register_scoped("legacy", "F:/project-a".to_string(), 7);
         let cancel_token = registration.cancel_token();
         let waiter_state = state.clone();
 

@@ -1,11 +1,210 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 const CONFIG_FILE_NAME: &str = "config.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WorkspaceServiceResourceLimits {
+    pub max_running_workspace_services: usize,
+    pub max_watched_workspaces: usize,
+    pub max_lsp_processes: usize,
+    pub max_concurrent_service_starts: usize,
+    pub max_concurrent_compile_jobs: usize,
+    pub max_compile_queue_depth: usize,
+    /// Idle TTL for checkout-owned watchers and lazily opened indexes. The
+    /// checkout runtime identity remains registered for the process lifetime.
+    pub workspace_idle_timeout_secs: u64,
+    /// Idle TTL for workspace services. ServiceKind currently contains Unity.
+    pub service_idle_timeout_secs: u64,
+    pub lsp_idle_timeout_secs: u64,
+}
+
+impl Default for WorkspaceServiceResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_running_workspace_services: 4,
+            max_watched_workspaces: 2,
+            max_lsp_processes: 1,
+            max_concurrent_service_starts: 2,
+            max_concurrent_compile_jobs: 1,
+            max_compile_queue_depth: 64,
+            workspace_idle_timeout_secs: 600,
+            service_idle_timeout_secs: 3600,
+            lsp_idle_timeout_secs: 600,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceServiceResourceLimitFieldError {
+    pub field: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceServiceResourceLimitsValidationErrors {
+    pub fields: Vec<WorkspaceServiceResourceLimitFieldError>,
+}
+
+impl std::fmt::Display for WorkspaceServiceResourceLimitsValidationErrors {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = self
+            .fields
+            .iter()
+            .map(|error| format!("{}: {}", error.field, error.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            formatter,
+            "invalid workspace service resource limits: {message}"
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceServiceResourceLimitsValidationErrors {}
+
+impl WorkspaceServiceResourceLimits {
+    pub fn validate(&self) -> Result<(), WorkspaceServiceResourceLimitsValidationErrors> {
+        let mut fields = Vec::new();
+
+        fn require_positive_usize(
+            fields: &mut Vec<WorkspaceServiceResourceLimitFieldError>,
+            field: &'static str,
+            value: usize,
+        ) {
+            if value == 0 {
+                fields.push(WorkspaceServiceResourceLimitFieldError {
+                    field: field.to_string(),
+                    message: "must be greater than zero".to_string(),
+                });
+            }
+        }
+
+        fn require_checked_timeout(
+            fields: &mut Vec<WorkspaceServiceResourceLimitFieldError>,
+            field: &'static str,
+            value: u64,
+        ) {
+            if value == 0 {
+                fields.push(WorkspaceServiceResourceLimitFieldError {
+                    field: field.to_string(),
+                    message: "must be greater than zero".to_string(),
+                });
+                return;
+            }
+
+            let duration = std::time::Duration::from_secs(value);
+            if std::time::Instant::now().checked_add(duration).is_none() {
+                fields.push(WorkspaceServiceResourceLimitFieldError {
+                    field: field.to_string(),
+                    message: "exceeds the platform-supported timeout range".to_string(),
+                });
+            }
+        }
+
+        require_positive_usize(
+            &mut fields,
+            "maxRunningWorkspaceServices",
+            self.max_running_workspace_services,
+        );
+        require_positive_usize(
+            &mut fields,
+            "maxWatchedWorkspaces",
+            self.max_watched_workspaces,
+        );
+        require_positive_usize(&mut fields, "maxLspProcesses", self.max_lsp_processes);
+        require_positive_usize(
+            &mut fields,
+            "maxConcurrentServiceStarts",
+            self.max_concurrent_service_starts,
+        );
+        require_positive_usize(
+            &mut fields,
+            "maxConcurrentCompileJobs",
+            self.max_concurrent_compile_jobs,
+        );
+        require_positive_usize(
+            &mut fields,
+            "maxCompileQueueDepth",
+            self.max_compile_queue_depth,
+        );
+        require_checked_timeout(
+            &mut fields,
+            "workspaceIdleTimeoutSecs",
+            self.workspace_idle_timeout_secs,
+        );
+        require_checked_timeout(
+            &mut fields,
+            "serviceIdleTimeoutSecs",
+            self.service_idle_timeout_secs,
+        );
+        require_checked_timeout(
+            &mut fields,
+            "lspIdleTimeoutSecs",
+            self.lsp_idle_timeout_secs,
+        );
+
+        if fields.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkspaceServiceResourceLimitsValidationErrors { fields })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkspaceServiceResourceLimitsUpdateError {
+    Validation {
+        fields: Vec<WorkspaceServiceResourceLimitFieldError>,
+    },
+    Persistence {
+        message: String,
+    },
+}
+
+impl WorkspaceServiceResourceLimitsUpdateError {
+    pub fn validation_fields(&self) -> &[WorkspaceServiceResourceLimitFieldError] {
+        match self {
+            Self::Validation { fields } => fields,
+            Self::Persistence { .. } => &[],
+        }
+    }
+}
+
+impl std::fmt::Display for WorkspaceServiceResourceLimitsUpdateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Validation { fields } => {
+                let errors = WorkspaceServiceResourceLimitsValidationErrors {
+                    fields: fields.clone(),
+                };
+                std::fmt::Display::fmt(&errors, formatter)
+            }
+            Self::Persistence { message } => write!(formatter, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkspaceServiceResourceLimitsUpdateError {}
+
+impl From<WorkspaceServiceResourceLimitsValidationErrors>
+    for WorkspaceServiceResourceLimitsUpdateError
+{
+    fn from(value: WorkspaceServiceResourceLimitsValidationErrors) -> Self {
+        Self::Validation {
+            fields: value.fields,
+        }
+    }
+}
 
 mod serde_atomic_bool {
     use super::*;
@@ -301,6 +500,34 @@ fn default_skill_package_namespace() -> Arc<Mutex<String>> {
     Arc::new(Mutex::new(String::new()))
 }
 
+mod serde_workspace_service_resource_limits {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Arc<Mutex<WorkspaceServiceResourceLimits>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let value = value.lock().map_err(serde::ser::Error::custom)?;
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<Mutex<WorkspaceServiceResourceLimits>>, D::Error> {
+        let value = WorkspaceServiceResourceLimits::deserialize(deserializer)?;
+        Ok(Arc::new(Mutex::new(value)))
+    }
+}
+
+fn default_workspace_service_resource_limits() -> Arc<Mutex<WorkspaceServiceResourceLimits>> {
+    Arc::new(Mutex::new(WorkspaceServiceResourceLimits::default()))
+}
+
+fn default_config_persist_lock() -> Arc<Mutex<()>> {
+    Arc::new(Mutex::new(()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub model: String,
@@ -338,6 +565,10 @@ pub struct AppConfig {
     /// choice sticks.
     #[serde(default)]
     pub dynamic_tool_loading_native_migrated: bool,
+    /// One-time migration marker for the one-hour Unity service idle TTL.
+    /// Workspace service settings currently apply only to the Unity service.
+    #[serde(default)]
+    pub workspace_service_ttl_hour_migrated: bool,
     /// Whether the configured Anthropic endpoint supports native lazy tool
     /// loading (`defer_loading` + `tool_reference`). Default on — the
     /// official API supports it. Turn off for gateway/proxy `base_url`s that
@@ -479,8 +710,20 @@ pub struct AppConfig {
     /// write.
     #[serde(default = "default_subagent_max_concurrent", with = "serde_atomic_u32")]
     pub subagent_max_concurrent: Arc<AtomicU32>,
+    /// Persisted resource limits shared by workspace runtimes, optional
+    /// workspace services, C# LSP processes, and the compile scheduler.
+    /// Defaults live exclusively in `WorkspaceServiceResourceLimits::default`.
+    #[serde(
+        default = "default_workspace_service_resource_limits",
+        with = "serde_workspace_service_resource_limits"
+    )]
+    pub workspace_service_resource_limits: Arc<Mutex<WorkspaceServiceResourceLimits>>,
     #[serde(skip)]
     config_path: Arc<Mutex<Option<PathBuf>>>,
+    /// Serializes whole-file config replacements so a resource-policy update
+    /// cannot be overwritten by a concurrent setting persistence.
+    #[serde(skip, default = "default_config_persist_lock")]
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl AppConfig {
@@ -489,7 +732,7 @@ impl AppConfig {
         Self::load_from_path(&primary_path)
     }
 
-    fn load_from_path(primary_path: &Path) -> Self {
+    pub(crate) fn load_from_path(primary_path: &Path) -> Self {
         if let Some(mut config) = Self::try_load_file(primary_path) {
             println!(
                 "[Locus] config loaded from persistent path: {:?}",
@@ -521,6 +764,7 @@ impl AppConfig {
             close_behavior: default_close_behavior(),
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
             dynamic_tool_loading_native_migrated: true,
+            workspace_service_ttl_hour_migrated: true,
             anthropic_native_lazy_enabled: default_anthropic_native_lazy_enabled(),
             default_skill_package_namespace: default_skill_package_namespace(),
             view_windows_above_main: default_view_windows_above_main(),
@@ -541,7 +785,9 @@ impl AppConfig {
             llm_strip_inline_think_tags: default_llm_strip_inline_think_tags(),
             subagent_max_depth: default_subagent_max_depth(),
             subagent_max_concurrent: default_subagent_max_concurrent(),
+            workspace_service_resource_limits: default_workspace_service_resource_limits(),
             config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
+            persist_lock: default_config_persist_lock(),
         };
 
         if let Err(err) = Self::persist_to_path(&config, primary_path) {
@@ -585,11 +831,15 @@ impl AppConfig {
             serde_json::from_str(content).map_err(|e| format!("failed to parse config: {}", e))?;
         let scrubbed_legacy_secret = Self::remove_legacy_api_key(&mut value);
         let migrated_native_tool_loading = Self::apply_native_tool_loading_migration(&mut value);
+        let migrated_workspace_service_ttl =
+            Self::apply_workspace_service_ttl_hour_migration(&mut value);
         let config = serde_json::from_value::<AppConfig>(value)
             .map_err(|e| format!("failed to deserialize config: {}", e))?;
         Ok((
             config,
-            scrubbed_legacy_secret || migrated_native_tool_loading,
+            scrubbed_legacy_secret
+                || migrated_native_tool_loading
+                || migrated_workspace_service_ttl,
         ))
     }
 
@@ -622,6 +872,47 @@ impl AppConfig {
                 .as_ref()
                 .and_then(|v| v.as_str())
                 .unwrap_or("<default>")
+        );
+        true
+    }
+
+    fn apply_workspace_service_ttl_hour_migration(value: &mut Value) -> bool {
+        const UNITY_SERVICE_IDLE_TTL_SECS: u64 = 3600;
+
+        let Some(obj) = value.as_object_mut() else {
+            return false;
+        };
+        if obj
+            .get("workspace_service_ttl_hour_migrated")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return false;
+        }
+        obj.insert(
+            "workspace_service_ttl_hour_migrated".to_string(),
+            Value::Bool(true),
+        );
+        let limits = obj
+            .entry("workspace_service_resource_limits".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !limits.is_object() {
+            *limits = Value::Object(serde_json::Map::new());
+        }
+        let previous = limits
+            .as_object_mut()
+            .expect("workspace service resource limits object")
+            .insert(
+                "serviceIdleTimeoutSecs".to_string(),
+                Value::from(UNITY_SERVICE_IDLE_TTL_SECS),
+            );
+        println!(
+            "[Locus] workspace service idle TTL migrated to one hour (previous: {})",
+            previous
+                .as_ref()
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<default>".to_string())
         );
         true
     }
@@ -924,7 +1215,99 @@ impl AppConfig {
         self.persist()
     }
 
+    pub fn workspace_service_resource_limits(&self) -> WorkspaceServiceResourceLimits {
+        self.try_workspace_service_resource_limits()
+            .unwrap_or_default()
+    }
+
+    pub fn try_workspace_service_resource_limits(
+        &self,
+    ) -> Result<WorkspaceServiceResourceLimits, String> {
+        self.workspace_service_resource_limits
+            .lock()
+            .map(|limits| limits.clone())
+            .map_err(|error| format!("workspace service resource limits lock poisoned: {error}"))
+    }
+
+    /// Persist a complete, validated resource-policy replacement and expose
+    /// it in memory only after the on-disk config has been atomically replaced.
+    /// A failed write leaves the prior in-memory snapshot untouched.
+    pub fn set_workspace_service_resource_limits(
+        &self,
+        value: WorkspaceServiceResourceLimits,
+    ) -> Result<(), WorkspaceServiceResourceLimitsUpdateError> {
+        value.validate()?;
+
+        let _persist_guard = self.persist_lock.lock().map_err(|error| {
+            WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                message: format!("config persistence lock poisoned: {error}"),
+            }
+        })?;
+        let path = self
+            .config_path
+            .lock()
+            .map_err(
+                |error| WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                    message: format!("config path lock poisoned: {error}"),
+                },
+            )?
+            .clone()
+            .ok_or_else(|| WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                message: "config path is unknown; cannot persist".to_string(),
+            })?;
+
+        // Serialize a candidate whole-file snapshot without mutating the live
+        // limits. Holding `persist_lock` makes this candidate authoritative
+        // with respect to every other config file replacement.
+        let mut candidate = serde_json::to_value(self).map_err(|error| {
+            WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                message: format!("failed to serialize config: {error}"),
+            }
+        })?;
+        let object = candidate.as_object_mut().ok_or_else(|| {
+            WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                message: "serialized config is not an object".to_string(),
+            }
+        })?;
+        object.insert(
+            "workspace_service_resource_limits".to_string(),
+            serde_json::to_value(&value).map_err(|error| {
+                WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                    message: format!(
+                        "failed to serialize workspace service resource limits: {error}"
+                    ),
+                }
+            })?,
+        );
+        let json = serde_json::to_string_pretty(&candidate).map_err(|error| {
+            WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                message: format!("failed to serialize config: {error}"),
+            }
+        })?;
+
+        // Acquire the state lock before writing. This detects poison before
+        // the disk commit and keeps readers on the old snapshot until the
+        // atomic replacement has succeeded.
+        let mut current = self
+            .workspace_service_resource_limits
+            .lock()
+            .map_err(
+                |error| WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                    message: format!("workspace service resource limits lock poisoned: {error}"),
+                },
+            )?;
+        atomic_write_config(&path, json.as_bytes()).map_err(|message| {
+            WorkspaceServiceResourceLimitsUpdateError::Persistence { message }
+        })?;
+        *current = value;
+        Ok(())
+    }
+
     fn persist(&self) -> Result<(), String> {
+        let _persist_guard = self
+            .persist_lock
+            .lock()
+            .map_err(|e| format!("config persistence lock poisoned: {}", e))?;
         let path = self
             .config_path
             .lock()
@@ -944,10 +1327,84 @@ impl AppConfig {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("failed to serialize config: {}", e))?;
-        fs::write(path, json)
-            .map_err(|e| format!("failed to write config '{}': {}", path.display(), e))?;
-        Ok(())
+        atomic_write_config(path, json.as_bytes())
     }
+}
+
+pub(crate) fn atomic_write_config(path: &Path, contents: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create config dir '{}': {}", parent.display(), e))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid config path '{}'", path.display()))?;
+    let temp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut temp_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|error| {
+            format!(
+                "failed to create temporary config '{}': {}",
+                temp_path.display(),
+                error
+            )
+        })?;
+    if let Err(error) = temp_file
+        .write_all(contents)
+        .and_then(|_| temp_file.sync_all())
+    {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!(
+            "failed to write temporary config '{}': {}",
+            temp_path.display(),
+            error
+        ));
+    }
+    drop(temp_file);
+
+    #[cfg(target_os = "windows")]
+    let replace_result = {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        use windows_core::PCWSTR;
+
+        let source = temp_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let target = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        unsafe {
+            MoveFileExW(
+                PCWSTR(source.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|error| error.to_string())
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let replace_result = fs::rename(&temp_path, path).map_err(|error| error.to_string());
+
+    replace_result.map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        format!("failed to replace config '{}': {}", path.display(), error)
+    })
 }
 
 fn stable_config_path(data_dir: &Path) -> PathBuf {
@@ -1664,5 +2121,186 @@ mod tests {
             reloaded.subagent_max_concurrent(),
             SUBAGENT_MAX_CONCURRENT_LIMIT
         );
+    }
+
+    #[test]
+    fn workspace_service_resource_limits_default_for_legacy_config_and_persist_on_next_save() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "dynamic_tool_loading_native_migrated": true
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+        assert_eq!(
+            config.workspace_service_resource_limits(),
+            WorkspaceServiceResourceLimits::default()
+        );
+
+        config
+            .set_debug_enabled(true)
+            .expect("persist config with resource defaults");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read persisted config"))
+                .expect("parse persisted config");
+        let limits = &persisted["workspace_service_resource_limits"];
+        assert!(limits.get("maxReadyWorkspaceRuntimes").is_none());
+        assert_eq!(limits["maxRunningWorkspaceServices"], 4);
+        assert_eq!(limits["maxWatchedWorkspaces"], 2);
+        assert_eq!(limits["maxLspProcesses"], 1);
+        assert_eq!(limits["maxConcurrentServiceStarts"], 2);
+        assert_eq!(limits["maxConcurrentCompileJobs"], 1);
+        assert_eq!(limits["maxCompileQueueDepth"], 64);
+        assert_eq!(limits["workspaceIdleTimeoutSecs"], 600);
+        assert_eq!(limits["serviceIdleTimeoutSecs"], 3600);
+        assert_eq!(limits["lspIdleTimeoutSecs"], 600);
+    }
+
+    #[test]
+    fn workspace_service_idle_ttl_migrates_existing_configs_to_one_hour_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "dynamic_tool_loading_native_migrated": true,
+  "workspace_service_resource_limits": {
+    "serviceIdleTimeoutSecs": 600
+  }
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert_eq!(
+            config
+                .workspace_service_resource_limits()
+                .service_idle_timeout_secs,
+            3600
+        );
+        let written = fs::read_to_string(&config_path).expect("rewritten config");
+        assert!(written.contains("\"workspace_service_ttl_hour_migrated\": true"));
+        assert!(written.contains("\"serviceIdleTimeoutSecs\": 3600"));
+    }
+
+    #[test]
+    fn workspace_service_idle_ttl_keeps_post_migration_user_value() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "configured-model",
+  "dynamic_tool_loading_native_migrated": true,
+  "workspace_service_ttl_hour_migrated": true,
+  "workspace_service_resource_limits": {
+    "serviceIdleTimeoutSecs": 7200
+  }
+}"#,
+        )
+        .expect("configured config");
+
+        let config = AppConfig::load_from_path(&config_path);
+
+        assert_eq!(
+            config
+                .workspace_service_resource_limits()
+                .service_idle_timeout_secs,
+            7200
+        );
+    }
+
+    #[test]
+    fn workspace_service_resource_limits_validation_reports_every_invalid_field() {
+        let invalid = WorkspaceServiceResourceLimits {
+            max_running_workspace_services: 0,
+            max_watched_workspaces: 0,
+            max_lsp_processes: 0,
+            max_concurrent_service_starts: 0,
+            max_concurrent_compile_jobs: 0,
+            max_compile_queue_depth: 0,
+            workspace_idle_timeout_secs: 0,
+            service_idle_timeout_secs: 0,
+            lsp_idle_timeout_secs: 0,
+        };
+
+        let errors = invalid.validate().expect_err("all zero values are invalid");
+        assert_eq!(
+            errors
+                .fields
+                .iter()
+                .map(|error| error.field.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "maxRunningWorkspaceServices",
+                "maxWatchedWorkspaces",
+                "maxLspProcesses",
+                "maxConcurrentServiceStarts",
+                "maxConcurrentCompileJobs",
+                "maxCompileQueueDepth",
+                "workspaceIdleTimeoutSecs",
+                "serviceIdleTimeoutSecs",
+                "lspIdleTimeoutSecs",
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_service_resource_limits_reject_timeout_outside_platform_range() {
+        let mut invalid = WorkspaceServiceResourceLimits::default();
+        invalid.workspace_idle_timeout_secs = u64::MAX;
+
+        let errors = invalid
+            .validate()
+            .expect_err("unrepresentable scheduler deadline must be rejected");
+        assert_eq!(errors.fields.len(), 1);
+        assert_eq!(errors.fields[0].field, "workspaceIdleTimeoutSecs");
+        assert!(errors.fields[0].message.contains("platform-supported"));
+    }
+
+    #[test]
+    fn workspace_service_resource_limits_set_is_transactional_on_persistence_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config-target-is-a-directory");
+        fs::create_dir(&config_path).expect("create invalid config target");
+        let config = AppConfig::load_from_path(&config_path);
+        let before = config.workspace_service_resource_limits();
+        let mut candidate = before.clone();
+        candidate.max_lsp_processes = 3;
+
+        let error = config
+            .set_workspace_service_resource_limits(candidate)
+            .expect_err("directory target must reject persistence");
+
+        assert!(matches!(
+            error,
+            WorkspaceServiceResourceLimitsUpdateError::Persistence { .. }
+        ));
+        assert_eq!(config.workspace_service_resource_limits(), before);
+    }
+
+    #[test]
+    fn workspace_service_resource_limits_set_persists_complete_replacement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+        let mut candidate = WorkspaceServiceResourceLimits::default();
+        candidate.max_lsp_processes = 3;
+        candidate.max_compile_queue_depth = 19;
+
+        config
+            .set_workspace_service_resource_limits(candidate.clone())
+            .expect("persist resource limits");
+
+        assert_eq!(config.workspace_service_resource_limits(), candidate);
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert_eq!(reloaded.workspace_service_resource_limits(), candidate);
     }
 }

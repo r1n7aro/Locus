@@ -9,8 +9,8 @@ use super::{
     AssistantStreamState, ExecutedToolResult, StreamRenderOrderTracker,
 };
 use crate::agent::workspace_execution_lock::{
-    process_workspace_execution_lock, WorkspaceExecutionGuard, WorkspaceExecutionLockOwner,
-    WorkspaceExecutionLockRequest,
+    process_workspace_execution_lock, WorkspaceExecutionGuard, WorkspaceExecutionLockAcquireError,
+    WorkspaceExecutionLockOwner, WorkspaceExecutionLockRequest,
 };
 use crate::commands::{StreamEvent, ToolCallOutcome};
 use crate::llm::claude_code_cli::{
@@ -803,7 +803,14 @@ impl<'a> ClaudeCodeRoundHost<'a> {
                     .await
                 {
                     if AgentInstance::changed_files_touch_view_tree(&entry.changed_files) {
-                        crate::view::emit_view_tree_changed(self.app_handle);
+                        if let Some(execution) = self.agent.execution_context.as_ref() {
+                            crate::view::emit_view_tree_changed_for_scope(
+                                self.app_handle,
+                                &crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                                    execution.workspace.as_ref(),
+                                ),
+                            );
+                        }
                     }
                 }
                 eprintln!(
@@ -1150,15 +1157,23 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                             workspace: self.agent.working_dir.clone(),
                             tools: tools.clone(),
                         };
-                        match process_workspace_execution_lock(&self.agent.working_dir)
+                        let acquisition = match self.agent.execution_context.as_ref() {
+                            Some(execution) => process_workspace_execution_lock(
+                                &self.agent.working_dir,
+                            )
                             .acquire_with_diagnostics(
                                 lock_request.clone(),
                                 owner,
                                 self.agent.cancel_waiter(),
+                                crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                                    execution.workspace.as_ref(),
+                                ),
                                 self.app_handle,
                             )
-                            .await
-                        {
+                            .await,
+                            None => Err(WorkspaceExecutionLockAcquireError::MissingWorkspaceScope),
+                        };
+                        match acquisition {
                             Ok(guard) => {
                                 if is_deterministic_pre_ask_call {
                                     _single_tool_workspace_guard = Some(guard);

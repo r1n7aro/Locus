@@ -10,7 +10,6 @@ use tauri::Manager;
 
 use crate::error::AppError;
 use crate::keychain;
-use crate::workspace::Workspace;
 
 // ── ConfigEntry ──────────────────────────────────────────────────────────────
 
@@ -33,7 +32,10 @@ pub struct ConfigEntry {
 
 // ── collect ──────────────────────────────────────────────────────────────────
 
-pub fn collect_all(app_handle: &tauri::AppHandle) -> Result<Vec<ConfigEntry>, AppError> {
+pub fn collect_all(
+    app_handle: &tauri::AppHandle,
+    workspace_scope: Option<&crate::workspace_service::ResolvedWorkspaceScope>,
+) -> Result<Vec<ConfigEntry>, AppError> {
     let mut entries = Vec::with_capacity(40);
 
     collect_general(&mut entries);
@@ -42,7 +44,9 @@ pub fn collect_all(app_handle: &tauri::AppHandle) -> Result<Vec<ConfigEntry>, Ap
     collect_api(&mut entries);
     collect_models(&mut entries);
     collect_permissions(app_handle, &mut entries);
-    collect_knowledge(app_handle, &mut entries);
+    if let Some(scope) = workspace_scope {
+        collect_knowledge(app_handle, scope, &mut entries);
+    }
     collect_mcp(&mut entries);
 
     Ok(entries)
@@ -51,6 +55,7 @@ pub fn collect_all(app_handle: &tauri::AppHandle) -> Result<Vec<ConfigEntry>, Ap
 pub fn collect_by_category(
     app_handle: &tauri::AppHandle,
     category: &str,
+    workspace_scope: Option<&crate::workspace_service::ResolvedWorkspaceScope>,
 ) -> Result<Vec<ConfigEntry>, AppError> {
     let mut entries = Vec::new();
     match category {
@@ -60,7 +65,15 @@ pub fn collect_by_category(
         "api" => collect_api(&mut entries),
         "models" => collect_models(&mut entries),
         "permissions" => collect_permissions(app_handle, &mut entries),
-        "knowledge" => collect_knowledge(app_handle, &mut entries),
+        "knowledge" => {
+            let scope = workspace_scope.ok_or_else(|| {
+                AppError::new(
+                    "workspace.scope_required",
+                    "Knowledge configuration inspection requires a checkout scope.",
+                )
+            })?;
+            collect_knowledge(app_handle, scope, &mut entries)
+        }
         "mcp" => collect_mcp(&mut entries),
         _ => {
             return Err(AppError::new(
@@ -584,6 +597,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
         ("write", "File creation (new files only)"),
         ("edit", "File editing (partial)"),
         ("bash", "Shell command execution"),
+        ("python", "Checkout-scoped Python and Locus SDK execution"),
         ("web_fetch", "HTTP fetch from the web"),
         (
             "unity_execute",
@@ -613,8 +627,8 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
 
     for (name, desc) in tool_list {
         let default_mode = match name {
-            "write" | "edit" | "bash" | "web_fetch" | "unity_execute" | "unity_run_states"
-            | "unity_test_run" | "subagent" => "ask",
+            "write" | "edit" | "bash" | "python" | "web_fetch" | "unity_execute"
+            | "unity_run_states" | "unity_test_run" | "subagent" => "ask",
             _ => "auto",
         };
         let current = perms.get(name).map(|s| s.as_str()).unwrap_or(default_mode);
@@ -664,28 +678,20 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
 
 // ── knowledge ────────────────────────────────────────────────────────────────
 
-fn collect_knowledge(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) {
-    // Get project working dir for project-level configs
-    let workspace: Option<tauri::State<Arc<Workspace>>> = app_handle.try_state();
-    let working_dir = workspace.and_then(|_ws| {
-        // We can't .await in sync context, so read the file directly
-        crate::commands::resolve_runtime_storage_dir(app_handle)
-            .ok()
-            .and_then(|dir| std::fs::read_to_string(dir.join("working_dir.txt")).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    });
-
-    let knowledge_root = working_dir
-        .as_ref()
-        .map(|wd| std::path::Path::new(wd).join("Locus").join("knowledge"));
-    let knowledge_root_value = knowledge_root
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "(not set)".into());
-    let knowledge_doc_count = working_dir
-        .as_ref()
-        .and_then(|wd| crate::knowledge_store::list_documents(wd, None, None).ok())
+fn collect_knowledge(
+    app_handle: &tauri::AppHandle,
+    workspace_scope: &crate::workspace_service::ResolvedWorkspaceScope,
+    out: &mut Vec<ConfigEntry>,
+) {
+    let working_dir = workspace_scope.runtime().root().to_string_lossy();
+    let knowledge_root = workspace_scope
+        .runtime()
+        .root()
+        .join("Locus")
+        .join("knowledge");
+    let knowledge_root_value = knowledge_root.display().to_string();
+    let knowledge_doc_count = crate::knowledge_store::list_documents(&working_dir, None, None)
+        .ok()
         .map(|docs| docs.len())
         .unwrap_or(0);
     let default_skill_package_namespace = app_handle

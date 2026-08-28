@@ -14,7 +14,7 @@ use super::client::CompileClient;
 /// match `CompileService.ProtocolVersion` / `WrapperContractVersion` in
 /// `locus_compile_server` (the sidecar ships inside the same bundle, so a
 /// mismatch means a corrupted or foreign install — fall back to Unity).
-const EXPECTED_PROTOCOL_VERSION: i64 = 8;
+const EXPECTED_PROTOCOL_VERSION: i64 = 10;
 const EXPECTED_WRAPPER_CONTRACT_VERSION: i64 = 1;
 
 const SERVER_DLL_NAME: &str = "LocusCompileServer.dll";
@@ -228,10 +228,13 @@ pub async fn ensure_client() -> Result<Arc<CompileClient>, String> {
             eprintln!(
                 "[CsharpCompile] compile server binary changed on disk; restarting the sidecar"
             );
+            super::notify_active_scope_loss("compile server binary changed");
             server.client.kill_process();
             *guard = None;
         } else {
             eprintln!("[CsharpCompile] compile server exited; restarting");
+            server.client.wait_for_process_exit().await;
+            super::notify_active_scope_loss("compile server process exited");
             // The dead process held the in-memory hot-reload session registries
             // (field stores, session images, member surfaces). With patches still
             // live, the respawned server starts blank, so a later hot patch
@@ -262,6 +265,16 @@ pub async fn ensure_client() -> Result<Arc<CompileClient>, String> {
     }
 }
 
+/// Return the current live client without spawning a sidecar. Lifecycle
+/// cleanup uses this to discard server-side checkout scopes opportunistically.
+pub async fn current_client() -> Option<Arc<CompileClient>> {
+    let guard = active_server().lock().await;
+    guard
+        .as_ref()
+        .filter(|server| !server.client.has_exited())
+        .map(|server| Arc::clone(&server.client))
+}
+
 /// Snapshot of the running server (for status surfaces); None when stopped.
 pub async fn current_status() -> Option<(String, &'static str, std::time::Duration)> {
     let guard = active_server().lock().await;
@@ -278,6 +291,7 @@ pub async fn current_status() -> Option<(String, &'static str, std::time::Durati
 pub async fn shutdown() {
     let server = active_server().lock().await.take();
     if let Some(server) = server {
+        super::notify_active_scope_loss("compile server stopped");
         server.client.shutdown().await;
     }
 }

@@ -121,7 +121,10 @@ describe("chatSessionWindow", () => {
       pooled: false,
     });
 
-    await expect(openNewChatSessionWindow()).resolves.toBe(true);
+    await expect(openNewChatSessionWindow({
+      checkoutId: "checkout-a",
+      expectedGeneration: 7,
+    })).resolves.toBe(true);
 
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({
@@ -132,6 +135,38 @@ describe("chatSessionWindow", () => {
         query: expect.stringContaining("newChat=1"),
       }),
     });
+    const request = subWindowMocks.invokeMock.mock.calls[0]?.[1]?.request;
+    expect(request.query).toContain("checkoutId=checkout-a");
+    expect(request.query).toContain("workspaceGeneration=7");
+  });
+
+  it("round-trips the checkout identity for a new-session window", () => {
+    const url = buildChatSessionWindowUrl({
+      sessionId: "",
+      title: "Checkout A",
+      newChat: true,
+      workspaceRef: {
+        checkoutId: "checkout-a",
+        expectedGeneration: 11,
+      },
+    });
+
+    expect(getChatSessionWindowPayload(url.slice(url.indexOf("?")))).toEqual({
+      sessionId: "",
+      title: "Checkout A",
+      newChat: true,
+      workspaceRef: {
+        checkoutId: "checkout-a",
+        expectedGeneration: 11,
+      },
+    });
+  });
+
+  it("rejects a new-session window without a checkout generation", () => {
+    expect(() => buildChatSessionWindowUrl({
+      sessionId: "",
+      newChat: true,
+    })).toThrow("checkout generation");
   });
 
   it("focuses and refreshes the matching existing session window", async () => {

@@ -13,6 +13,7 @@ import type {
 } from "../types";
 import { normalizeAppError } from "./errors";
 import { ipcInvoke } from "./ipc";
+import type { WorkspaceRef } from "./project";
 import { checkUnityConnectionStatus } from "./unity";
 
 export interface ViewScriptManifest {
@@ -452,6 +453,7 @@ export interface ViewLlmCallResult {
 
 export const VIEW_HOST_PATH = "/view-host";
 export const VIEW_CONTENT_PATH = "/view-content";
+export type ViewWorkspaceRef = WorkspaceRef & { expectedGeneration: number };
 
 export function isViewHostWindowLocation(): boolean {
   return window.location.pathname === VIEW_HOST_PATH
@@ -467,6 +469,29 @@ export function viewHostIdFromLocation(): string {
   return new URLSearchParams(window.location.search).get("id") || "";
 }
 
+export function viewWorkspaceRefFromLocation(
+  search = window.location.search,
+): ViewWorkspaceRef | null {
+  const params = new URLSearchParams(search);
+  const checkoutId = params.get("checkoutId")?.trim() ?? "";
+  const generationText = params.get("workspaceGeneration") ?? "";
+  if (checkoutId && /^\d+$/.test(generationText)) {
+    const expectedGeneration = Number(generationText);
+    if (Number.isSafeInteger(expectedGeneration) && expectedGeneration >= 0) {
+      return { checkoutId, expectedGeneration };
+    }
+  }
+  return null;
+}
+
+export function isExactViewWorkspaceBinding(
+  expected: ViewWorkspaceRef,
+  actual: { checkoutId: string; workspaceGeneration: number } | null | undefined,
+): boolean {
+  return actual?.checkoutId === expected.checkoutId
+    && actual.workspaceGeneration === expected.expectedGeneration;
+}
+
 export function isViewHostPoolWindowLocation(): boolean {
   return isViewHostWindowLocation()
     && new URLSearchParams(window.location.search).get("pool") === "1";
@@ -476,96 +501,98 @@ export function viewTemplates(): Promise<ViewTemplateSummary[]> {
   return ipcInvoke<ViewTemplateSummary[]>("view_templates");
 }
 
-export function viewList(): Promise<ViewPackageSummary[]> {
-  return ipcInvoke<ViewPackageSummary[]>("view_list");
+export function viewList(workspaceRef: WorkspaceRef): Promise<ViewPackageSummary[]> {
+  return ipcInvoke<ViewPackageSummary[]>("view_list", { workspaceRef });
 }
 
-export function viewTree(): Promise<ViewTreeSnapshot> {
-  return ipcInvoke<ViewTreeSnapshot>("view_tree");
+export function viewTree(workspaceRef: WorkspaceRef): Promise<ViewTreeSnapshot> {
+  return ipcInvoke<ViewTreeSnapshot>("view_tree", { workspaceRef });
 }
 
-export function viewCreate(request: ViewCreateRequest): Promise<ViewPackageDetail> {
-  return ipcInvoke<ViewPackageDetail>("view_create", { request });
+export function viewCreate(workspaceRef: WorkspaceRef, request: ViewCreateRequest): Promise<ViewPackageDetail> {
+  return ipcInvoke<ViewPackageDetail>("view_create", { workspaceRef, request });
 }
 
-export function viewCreateFolder(request: ViewCreateFolderRequest): Promise<ViewFolderSummary> {
-  return ipcInvoke<ViewFolderSummary>("view_create_folder", { request });
+export function viewCreateFolder(workspaceRef: WorkspaceRef, request: ViewCreateFolderRequest): Promise<ViewFolderSummary> {
+  return ipcInvoke<ViewFolderSummary>("view_create_folder", { workspaceRef, request });
 }
 
-export function viewDeleteEntry(request: ViewDeleteEntryRequest): Promise<ViewTreeSnapshot> {
-  return ipcInvoke<ViewTreeSnapshot>("view_delete_entry", { request });
+export function viewDeleteEntry(workspaceRef: WorkspaceRef, request: ViewDeleteEntryRequest): Promise<ViewTreeSnapshot> {
+  return ipcInvoke<ViewTreeSnapshot>("view_delete_entry", { workspaceRef, request });
 }
 
-export function viewRenameEntry(request: ViewRenameEntryRequest): Promise<ViewTreeSnapshot> {
-  return ipcInvoke<ViewTreeSnapshot>("view_rename_entry", { request });
+export function viewRenameEntry(workspaceRef: WorkspaceRef, request: ViewRenameEntryRequest): Promise<ViewTreeSnapshot> {
+  return ipcInvoke<ViewTreeSnapshot>("view_rename_entry", { workspaceRef, request });
 }
 
-export function viewMoveEntry(request: ViewMoveEntryRequest): Promise<ViewTreeSnapshot> {
-  return ipcInvoke<ViewTreeSnapshot>("view_move_entry", { request });
+export function viewMoveEntry(workspaceRef: WorkspaceRef, request: ViewMoveEntryRequest): Promise<ViewTreeSnapshot> {
+  return ipcInvoke<ViewTreeSnapshot>("view_move_entry", { workspaceRef, request });
 }
 
-export function viewExportPackage(request: ViewExportPackageRequest): Promise<string> {
-  return ipcInvoke<string>("view_export_package", { request });
+export function viewExportPackage(workspaceRef: WorkspaceRef, request: ViewExportPackageRequest): Promise<string> {
+  return ipcInvoke<string>("view_export_package", { workspaceRef, request });
 }
 
 export function viewImportPackage(
+  workspaceRef: WorkspaceRef,
   request: ViewImportPackageRequest,
 ): Promise<ViewPackageImportResult> {
-  return ipcInvoke<ViewPackageImportResult>("view_import_package", { request });
+  return ipcInvoke<ViewPackageImportResult>("view_import_package", { workspaceRef, request });
 }
 
-export function viewRead(viewId: string): Promise<ViewPackageDetail> {
-  return ipcInvoke<ViewPackageDetail>("view_read", { viewId });
+export function viewRead(workspaceRef: WorkspaceRef, viewId: string): Promise<ViewPackageDetail> {
+  return ipcInvoke<ViewPackageDetail>("view_read", { workspaceRef, viewId });
 }
 
-export function viewReload(viewId: string): Promise<ViewPackageSummary> {
-  return ipcInvoke<ViewPackageSummary>("view_reload", { viewId });
+export function viewReload(workspaceRef: WorkspaceRef, viewId: string): Promise<ViewPackageSummary> {
+  return ipcInvoke<ViewPackageSummary>("view_reload", { workspaceRef, viewId });
 }
 
-export function viewRun(viewId: string): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_run", { viewId });
+export function viewRun(workspaceRef: WorkspaceRef, viewId: string): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_run", { workspaceRef, viewId });
 }
 
-export function viewRunInUnity(viewId: string): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_run_in_unity", { viewId });
+export function viewRunInUnity(workspaceRef: WorkspaceRef, viewId: string): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_run_in_unity", { workspaceRef, viewId });
 }
 
-export function viewSetTabHost(request: ViewSetTabHostRequest): Promise<void> {
-  return ipcInvoke<void>("view_set_tab_host", { request });
+export function viewSetTabHost(workspaceRef: WorkspaceRef, request: ViewSetTabHostRequest): Promise<void> {
+  return ipcInvoke<void>("view_set_tab_host", { workspaceRef, request });
 }
 
-export function viewDetachTab(request: ViewDetachTabRequest): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_detach_tab", { request });
+export function viewDetachTab(workspaceRef: WorkspaceRef, request: ViewDetachTabRequest): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_detach_tab", { workspaceRef, request });
 }
 
 export function viewOpenInspectorTab(
+  workspaceRef: WorkspaceRef,
   request: ViewOpenInspectorTabRequest,
 ): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_open_inspector_tab", { request });
+  return ipcInvoke<ViewRunResult>("view_open_inspector_tab", { workspaceRef, request });
 }
 
-export function viewHostPoolPrepare(): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_host_pool_prepare");
+export function viewHostPoolPrepare(workspaceRef: WorkspaceRef): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_host_pool_prepare", { workspaceRef });
 }
 
-export function viewHostPoolReady(hostLabel: string): Promise<void> {
-  return ipcInvoke<void>("view_host_pool_ready", { hostLabel });
+export function viewHostPoolReady(workspaceRef: WorkspaceRef, hostLabel: string): Promise<void> {
+  return ipcInvoke<void>("view_host_pool_ready", { workspaceRef, hostLabel });
 }
 
-export function viewHostRevealed(hostLabel: string): Promise<void> {
-  return ipcInvoke<void>("view_host_revealed", { hostLabel });
+export function viewHostRevealed(workspaceRef: WorkspaceRef, hostLabel: string): Promise<void> {
+  return ipcInvoke<void>("view_host_revealed", { workspaceRef, hostLabel });
 }
 
-export function viewContentMount(request: ViewContentMountRequest): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_content_mount", { request });
+export function viewContentMount(workspaceRef: WorkspaceRef, request: ViewContentMountRequest): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_content_mount", { workspaceRef, request });
 }
 
-export function viewContentHide(viewId: string): Promise<void> {
-  return ipcInvoke<void>("view_content_hide", { viewId });
+export function viewContentHide(workspaceRef: WorkspaceRef, viewId: string): Promise<void> {
+  return ipcInvoke<void>("view_content_hide", { workspaceRef, viewId });
 }
 
-export function viewContentDestroy(viewId: string): Promise<void> {
-  return ipcInvoke<void>("view_content_destroy", { viewId });
+export function viewContentDestroy(workspaceRef: WorkspaceRef, viewId: string): Promise<void> {
+  return ipcInvoke<void>("view_content_destroy", { workspaceRef, viewId });
 }
 
 export function viewRequiresUnityConnection(
@@ -592,6 +619,7 @@ export function viewUnityConnectionRequiredError(viewName?: string | null): AppE
 }
 
 export async function checkViewOpenRequirements(
+  workspaceRef: WorkspaceRef,
   view: {
     name?: string | null;
     requirements?: ViewRequirements | null;
@@ -600,8 +628,8 @@ export async function checkViewOpenRequirements(
 ): Promise<AppErrorPayload | null> {
   if (!viewRequiresUnityConnection(view)) return null;
 
-  const status = await checkUnityConnectionStatus();
-  return status.connected ? null : viewUnityConnectionRequiredError(view.name);
+  const status = await checkUnityConnectionStatus(workspaceRef);
+  return status.ready ? null : viewUnityConnectionRequiredError(view.name);
 }
 
 function parseLegacyUnityConnectionRequiredMessage(message: string): string | null {
@@ -632,94 +660,97 @@ export function normalizeViewError(
 }
 
 export function viewCompileScript(
+  workspaceRef: WorkspaceRef,
   request: ViewCompileScriptRequest,
 ): Promise<ViewCompileScriptResult> {
-  return ipcInvoke<ViewCompileScriptResult>("view_compile_script", { request });
+  return ipcInvoke<ViewCompileScriptResult>("view_compile_script", { workspaceRef, request });
 }
 
-export function viewCallScript(request: ViewCallScriptRequest): Promise<ViewCallScriptResult> {
-  return ipcInvoke<ViewCallScriptResult>("view_call_script", { request });
+export function viewCallScript(workspaceRef: WorkspaceRef, request: ViewCallScriptRequest): Promise<ViewCallScriptResult> {
+  return ipcInvoke<ViewCallScriptResult>("view_call_script", { workspaceRef, request });
 }
 
-export function viewAppendFrontendLog(request: ViewFrontendLogRequest): Promise<void> {
-  return ipcInvoke<void>("view_append_frontend_log", { request });
+export function viewAppendFrontendLog(workspaceRef: WorkspaceRef, request: ViewFrontendLogRequest): Promise<void> {
+  return ipcInvoke<void>("view_append_frontend_log", { workspaceRef, request });
 }
 
-export function viewReadFrontendLog(request: ViewFrontendLogReadRequest): Promise<ViewFrontendLogEntry[]> {
-  return ipcInvoke<ViewFrontendLogEntry[]>("view_read_frontend_log", { request });
+export function viewReadFrontendLog(workspaceRef: WorkspaceRef, request: ViewFrontendLogReadRequest): Promise<ViewFrontendLogEntry[]> {
+  return ipcInvoke<ViewFrontendLogEntry[]>("view_read_frontend_log", { workspaceRef, request });
 }
 
-export function viewOpenFrontendLog(viewId: string): Promise<void> {
-  return ipcInvoke<void>("view_open_frontend_log", { viewId });
+export function viewOpenFrontendLog(workspaceRef: WorkspaceRef, viewId: string): Promise<void> {
+  return ipcInvoke<void>("view_open_frontend_log", { workspaceRef, viewId });
 }
 
-export function viewStorageGet(request: ViewStorageGetRequest): Promise<unknown | null> {
-  return ipcInvoke<unknown | null>("view_storage_get", { request });
+export function viewStorageGet(workspaceRef: WorkspaceRef, request: ViewStorageGetRequest): Promise<unknown | null> {
+  return ipcInvoke<unknown | null>("view_storage_get", { workspaceRef, request });
 }
 
-export function viewStorageSet(request: ViewStorageSetRequest): Promise<void> {
-  return ipcInvoke<void>("view_storage_set", { request });
+export function viewStorageSet(workspaceRef: WorkspaceRef, request: ViewStorageSetRequest): Promise<void> {
+  return ipcInvoke<void>("view_storage_set", { workspaceRef, request });
 }
 
-export function viewStorageRemove(request: ViewStorageRemoveRequest): Promise<void> {
-  return ipcInvoke<void>("view_storage_remove", { request });
+export function viewStorageRemove(workspaceRef: WorkspaceRef, request: ViewStorageRemoveRequest): Promise<void> {
+  return ipcInvoke<void>("view_storage_remove", { workspaceRef, request });
 }
 
-export function viewFsReadFile(request: ViewFsReadFileRequest): Promise<ViewFsReadFileResult> {
-  return ipcInvoke<ViewFsReadFileResult>("view_fs_read_file", { request });
+export function viewFsReadFile(workspaceRef: WorkspaceRef, request: ViewFsReadFileRequest): Promise<ViewFsReadFileResult> {
+  return ipcInvoke<ViewFsReadFileResult>("view_fs_read_file", { workspaceRef, request });
 }
 
-export function viewFsWriteFile(request: ViewFsWriteFileRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_write_file", { request });
+export function viewFsWriteFile(workspaceRef: WorkspaceRef, request: ViewFsWriteFileRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_write_file", { workspaceRef, request });
 }
 
-export function viewFsAppendFile(request: ViewFsWriteFileRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_append_file", { request });
+export function viewFsAppendFile(workspaceRef: WorkspaceRef, request: ViewFsWriteFileRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_append_file", { workspaceRef, request });
 }
 
-export function viewFsMkdir(request: ViewFsMkdirRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_mkdir", { request });
+export function viewFsMkdir(workspaceRef: WorkspaceRef, request: ViewFsMkdirRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_mkdir", { workspaceRef, request });
 }
 
-export function viewFsReaddir(request: ViewFsReaddirRequest): Promise<ViewFsReaddirResult> {
-  return ipcInvoke<ViewFsReaddirResult>("view_fs_readdir", { request });
+export function viewFsReaddir(workspaceRef: WorkspaceRef, request: ViewFsReaddirRequest): Promise<ViewFsReaddirResult> {
+  return ipcInvoke<ViewFsReaddirResult>("view_fs_readdir", { workspaceRef, request });
 }
 
-export function viewFsStat(request: ViewFsPathRequest): Promise<ViewFsStatResult> {
-  return ipcInvoke<ViewFsStatResult>("view_fs_stat", { request });
+export function viewFsStat(workspaceRef: WorkspaceRef, request: ViewFsPathRequest): Promise<ViewFsStatResult> {
+  return ipcInvoke<ViewFsStatResult>("view_fs_stat", { workspaceRef, request });
 }
 
-export function viewFsLstat(request: ViewFsPathRequest): Promise<ViewFsStatResult> {
-  return ipcInvoke<ViewFsStatResult>("view_fs_lstat", { request });
+export function viewFsLstat(workspaceRef: WorkspaceRef, request: ViewFsPathRequest): Promise<ViewFsStatResult> {
+  return ipcInvoke<ViewFsStatResult>("view_fs_lstat", { workspaceRef, request });
 }
 
-export function viewFsAccess(request: ViewFsPathRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_access", { request });
+export function viewFsAccess(workspaceRef: WorkspaceRef, request: ViewFsPathRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_access", { workspaceRef, request });
 }
 
-export function viewFsUnlink(request: ViewFsPathRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_unlink", { request });
+export function viewFsUnlink(workspaceRef: WorkspaceRef, request: ViewFsPathRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_unlink", { workspaceRef, request });
 }
 
-export function viewFsRm(request: ViewFsRmRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_rm", { request });
+export function viewFsRm(workspaceRef: WorkspaceRef, request: ViewFsRmRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_rm", { workspaceRef, request });
 }
 
-export function viewFsRename(request: ViewFsRenameRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_rename", { request });
+export function viewFsRename(workspaceRef: WorkspaceRef, request: ViewFsRenameRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_rename", { workspaceRef, request });
 }
 
-export function viewFsCopyFile(request: ViewFsCopyFileRequest): Promise<void> {
-  return ipcInvoke<void>("view_fs_copy_file", { request });
+export function viewFsCopyFile(workspaceRef: WorkspaceRef, request: ViewFsCopyFileRequest): Promise<void> {
+  return ipcInvoke<void>("view_fs_copy_file", { workspaceRef, request });
 }
 
 export function viewAutomationRespond(
+  workspaceRef: WorkspaceRef,
   requestId: string,
   ok: boolean,
   result?: unknown,
   error?: string | null,
 ): Promise<void> {
   return ipcInvoke<void>("view_automation_respond", {
+    workspaceRef,
     requestId,
     ok,
     result: result ?? null,

@@ -692,6 +692,8 @@ fn source_from_install_args(
 async fn reload_plugin_registries_after_install(
     ctx: &crate::tool::ToolExecutionContext,
     working_dir: &str,
+    process_changed: bool,
+    checkout_changed: bool,
     source: &str,
     tool_name: &str,
 ) -> Result<(), ToolResult> {
@@ -699,10 +701,59 @@ async fn reload_plugin_registries_after_install(
         .app_handle
         .clone()
         .ok_or_else(|| tool_error(format!("{} requires an application context", tool_name)))?;
-    let registry = app_handle.state::<crate::AgentDefRegistryState>();
-    let app_agent_dir = app_handle.state::<crate::AppAgentDir>();
-    crate::commands::reload_agent_registry(&registry, &app_agent_dir, working_dir).await;
-    crate::commands::emit_plugins_changed(&app_handle, working_dir, source);
+    let definitions = app_handle
+        .state::<std::sync::Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>(
+        );
+    if process_changed {
+        definitions.invalidate_app_base().map_err(|error| {
+            tool_error(format!(
+                "{} failed to invalidate app Agent definitions: {}",
+                tool_name, error
+            ))
+        })?;
+        let registry = app_handle.state::<crate::AgentDefRegistryState>();
+        let app_agent_dir = app_handle.state::<crate::AppAgentDir>();
+        crate::commands::reload_agent_registry(&registry, &app_agent_dir, "").await;
+        crate::commands::emit_plugins_changed(&app_handle, None, source);
+    }
+    if checkout_changed {
+        let execution = ctx.execution.as_ref().ok_or_else(|| {
+            tool_error(format!(
+                "{} requires a checkout-scoped ToolExecutionContext for project plugin changes",
+                tool_name
+            ))
+        })?;
+        if !working_dir.trim().is_empty() {
+            let normalized = crate::workspace_service::identity::normalize_existing_workspace_root(
+                std::path::Path::new(working_dir),
+            )
+            .map_err(|error| {
+                tool_error(format!(
+                    "{} failed to normalize its project plugin path: {}",
+                    tool_name, error
+                ))
+            })?;
+            if normalized.key() != execution.workspace.normalized_root() {
+                return Err(tool_error(format!(
+                    "{} rejected a project plugin path outside checkout {}",
+                    tool_name, execution.checkout_id
+                )));
+            }
+        }
+        definitions
+            .invalidate_checkout(&execution.checkout_id)
+            .map_err(|error| {
+                tool_error(format!(
+                    "{} failed to invalidate checkout Agent definitions: {}",
+                    tool_name, error
+                ))
+            })?;
+        crate::commands::emit_plugins_changed(
+            &app_handle,
+            Some(execution.workspace.as_ref()),
+            source,
+        );
+    }
     Ok(())
 }
 
@@ -889,12 +940,17 @@ pub(super) fn plugin_install() -> ToolDef {
                 let scope = parsed
                     .scope
                     .unwrap_or(crate::plugin::PluginInstallScope::App);
-                let working_dir = ctx.working_dir.clone().unwrap_or_default();
-                if scope == crate::plugin::PluginInstallScope::Project
-                    && working_dir.trim().is_empty()
-                {
-                    return tool_error("plugin_install requires a workspace for project scope");
-                }
+                let working_dir = match scope {
+                    crate::plugin::PluginInstallScope::App => String::new(),
+                    crate::plugin::PluginInstallScope::Project => {
+                        let Some(execution) = ctx.execution.as_ref() else {
+                            return tool_error(
+                                "plugin_install requires a checkout-scoped ToolExecutionContext for project scope",
+                            );
+                        };
+                        execution.root().to_string_lossy().into_owned()
+                    }
+                };
 
                 let plugin_id = parsed
                     .plugin_id
@@ -994,6 +1050,8 @@ pub(super) fn plugin_install() -> ToolDef {
                 if let Err(result) = reload_plugin_registries_after_install(
                     &ctx,
                     &working_dir,
+                    scope == crate::plugin::PluginInstallScope::App,
+                    scope == crate::plugin::PluginInstallScope::Project,
                     "plugin_tool_install",
                     "plugin_install",
                 )
@@ -1035,21 +1093,31 @@ pub(super) fn plugin_set_enabled() -> ToolDef {
                 if plugin_id.is_empty() {
                     return tool_error("plugin_set_enabled requires a non-empty pluginId");
                 }
-                let working_dir = ctx.working_dir.clone().unwrap_or_default();
+                let context_working_dir = ctx
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.root().to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let scope = match resolve_installed_plugin_scope(
                     "plugin_set_enabled",
-                    &working_dir,
+                    &context_working_dir,
                     &plugin_id,
                     parsed.scope,
                 ) {
                     Ok(value) => value,
                     Err(result) => return result,
                 };
-                if scope == crate::plugin::PluginInstallScope::Project
-                    && working_dir.trim().is_empty()
-                {
-                    return tool_error("plugin_set_enabled requires a workspace for project scope");
-                }
+                let working_dir = match scope {
+                    crate::plugin::PluginInstallScope::App => String::new(),
+                    crate::plugin::PluginInstallScope::Project => {
+                        let Some(execution) = ctx.execution.as_ref() else {
+                            return tool_error(
+                                "plugin_set_enabled requires a checkout-scoped ToolExecutionContext for project scope",
+                            );
+                        };
+                        execution.root().to_string_lossy().into_owned()
+                    }
+                };
                 if ctx.app_handle.is_none() {
                     return tool_error("plugin_set_enabled requires an application context");
                 }
@@ -1067,6 +1135,8 @@ pub(super) fn plugin_set_enabled() -> ToolDef {
                 if let Err(result) = reload_plugin_registries_after_install(
                     &ctx,
                     &working_dir,
+                    scope == crate::plugin::PluginInstallScope::App,
+                    scope == crate::plugin::PluginInstallScope::Project,
                     if parsed.enabled {
                         "plugin_tool_enable"
                     } else {
@@ -1114,21 +1184,31 @@ pub(super) fn plugin_uninstall() -> ToolDef {
                 if plugin_id.is_empty() {
                     return tool_error("plugin_uninstall requires a non-empty pluginId");
                 }
-                let working_dir = ctx.working_dir.clone().unwrap_or_default();
+                let context_working_dir = ctx
+                    .execution
+                    .as_ref()
+                    .map(|execution| execution.root().to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 let scope = match resolve_installed_plugin_scope(
                     "plugin_uninstall",
-                    &working_dir,
+                    &context_working_dir,
                     &plugin_id,
                     parsed.scope,
                 ) {
                     Ok(value) => value,
                     Err(result) => return result,
                 };
-                if scope == crate::plugin::PluginInstallScope::Project
-                    && working_dir.trim().is_empty()
-                {
-                    return tool_error("plugin_uninstall requires a workspace for project scope");
-                }
+                let working_dir = match scope {
+                    crate::plugin::PluginInstallScope::App => String::new(),
+                    crate::plugin::PluginInstallScope::Project => {
+                        let Some(execution) = ctx.execution.as_ref() else {
+                            return tool_error(
+                                "plugin_uninstall requires a checkout-scoped ToolExecutionContext for project scope",
+                            );
+                        };
+                        execution.root().to_string_lossy().into_owned()
+                    }
+                };
                 if ctx.app_handle.is_none() {
                     return tool_error("plugin_uninstall requires an application context");
                 }
@@ -1142,6 +1222,8 @@ pub(super) fn plugin_uninstall() -> ToolDef {
                 if let Err(result) = reload_plugin_registries_after_install(
                     &ctx,
                     &working_dir,
+                    scope == crate::plugin::PluginInstallScope::App,
+                    scope == crate::plugin::PluginInstallScope::Project,
                     "plugin_tool_uninstall",
                     "plugin_uninstall",
                 )
@@ -1189,15 +1271,30 @@ pub(super) fn plugin_export() -> ToolDef {
                     install_scope: parsed.install_scope,
                     transfer_ownership: parsed.transfer_ownership,
                 };
-                let working_dir = ctx.working_dir.clone().unwrap_or_default();
+                let Some(execution) = ctx.execution.as_ref() else {
+                    return tool_error(
+                        "plugin_export requires a checkout-scoped ToolExecutionContext",
+                    );
+                };
+                let working_dir = execution.root().to_string_lossy().into_owned();
                 match crate::commands::export_plugin_archive_sync(&working_dir, request) {
                     Ok(result) => {
                         if result.installed_plugin.is_some()
                             || !result.transferred_components.is_empty()
                         {
+                            let process_changed =
+                                result.installed_plugin.as_ref().is_some_and(|plugin| {
+                                    plugin.scope == crate::plugin::PluginInstallScope::App
+                                }) || !result.transferred_components.is_empty();
+                            let checkout_changed =
+                                result.installed_plugin.as_ref().is_some_and(|plugin| {
+                                    plugin.scope == crate::plugin::PluginInstallScope::Project
+                                }) || !result.transferred_components.is_empty();
                             if let Err(refresh_result) = reload_plugin_registries_after_install(
                                 &ctx,
                                 &working_dir,
+                                process_changed,
+                                checkout_changed,
                                 "plugin_export",
                                 "plugin_export",
                             )

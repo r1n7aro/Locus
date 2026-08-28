@@ -14,7 +14,6 @@ import {
 import {
   knowledgeCancelFeishuReferenceOauthWait,
   knowledgeCancelFeishuReferenceImport,
-  knowledgeCloseFeishuReferenceImportProgressWindow,
   knowledgeGetFeishuReferenceImportStatus,
   knowledgeImportFeishuReferenceDocs,
   knowledgeListFeishuReferenceSpaceNodes,
@@ -35,6 +34,8 @@ import BaseButton from "./ui/BaseButton.vue";
 import BaseCheckbox from "./ui/BaseCheckbox.vue";
 import BaseDropdown from "./ui/BaseDropdown.vue";
 import BaseSegmented from "./ui/BaseSegmented.vue";
+import type { WorkspaceRef } from "../services/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 interface SpaceOption {
   spaceId: string;
@@ -72,7 +73,9 @@ type ErrorMessageSegment =
 const DEFAULT_OPEN_BASE_URL = "https://open.feishu.cn";
 const AUTO_SAVE_DELAY_MS = 700;
 const appWindow = getCurrentWindow();
+const workspaceContextStore = useWorkspaceContextStore();
 const initialPayload = getFeishuReferenceImportWindowPayload();
+const workspaceRef = ref<WorkspaceRef | null>(initialPayload.workspaceRef ?? null);
 type WindowResizeDirection = Parameters<
   typeof appWindow.startResizeDragging
 >[0];
@@ -400,7 +403,9 @@ function findTreeNodeByToken(
 }
 
 async function fetchNodeEntries(parentNodeToken: string | null) {
+  if (!workspaceRef.value) return [];
   return knowledgeListFeishuReferenceSpaceNodes(
+    workspaceRef.value,
     trimOrEmpty(selectedSpaceId.value),
     parentNodeToken,
   );
@@ -587,6 +592,7 @@ function syncLocalSelectionIntoStatusSnapshot() {
 async function resetImportTarget(
   payload: FeishuReferenceImportWindowPayload = {},
 ) {
+  workspaceRef.value = payload.workspaceRef ?? workspaceRef.value;
   targetPath.value = trimOrEmpty(payload.targetPath);
   statusSnapshot.value = null;
   lastTestSummary.value = "";
@@ -631,16 +637,12 @@ async function destroyWindow() {
     // fall through to backend close
   }
 
-  try {
-    await knowledgeCloseFeishuReferenceImportProgressWindow();
-  } catch {
-    // ignore teardown failures after local close attempts
-  }
 }
 
 async function refreshStatus() {
+  if (!workspaceRef.value) return;
   try {
-    const nextStatus = await knowledgeGetFeishuReferenceImportStatus(targetPath.value || undefined);
+    const nextStatus = await knowledgeGetFeishuReferenceImportStatus(workspaceRef.value, targetPath.value || undefined);
     statusSnapshot.value = nextStatus;
     statusError.value = "";
     if (trimOrEmpty(nextStatus.error)) {
@@ -667,6 +669,7 @@ async function refreshStatus() {
 }
 
 async function saveConfig() {
+  if (!workspaceRef.value) return null;
   if (savePending.value) {
     scheduleAutoSave(180);
     return null;
@@ -679,7 +682,7 @@ async function saveConfig() {
   clearPersistentError();
   statusError.value = "";
   try {
-    const status = await knowledgeSaveFeishuReferenceConfig(configInput);
+    const status = await knowledgeSaveFeishuReferenceConfig(configInput, workspaceRef.value);
     if (requestRevision === formRevision) {
       statusSnapshot.value = status;
       applyStatusToForm(status, true);
@@ -744,6 +747,7 @@ async function ensureNodeChildren(node: FeishuTreeNode) {
 }
 
 async function testConnection() {
+  if (!workspaceRef.value) return;
   if (testPending.value) return;
   testPending.value = true;
   clearPersistentError();
@@ -752,6 +756,7 @@ async function testConnection() {
     const saved = await saveConfig();
     if (!saved) return;
     const result = await knowledgeTestFeishuReferenceConnection(
+      workspaceRef.value,
       targetPath.value || undefined,
     );
     const resolvedOptions = result.spaces.map((item) => ({
@@ -814,6 +819,7 @@ async function testConnection() {
 }
 
 async function startAuthorization() {
+  if (!workspaceRef.value) return;
   if (authorizePending.value) return;
   authorizePending.value = true;
   clearPersistentError();
@@ -821,7 +827,7 @@ async function startAuthorization() {
   try {
     const saved = await saveConfig();
     if (!saved) return;
-    const result = await knowledgeStartFeishuReferenceOauth();
+    const result = await knowledgeStartFeishuReferenceOauth(workspaceRef.value);
     await openUrl(result.authorizeUrl);
     lastTestSummary.value = t(
       "knowledge.feishuReference.window.authorizationStarted",
@@ -840,6 +846,7 @@ async function cancelAuthorizationWait(options?: {
   syncUi?: boolean;
   silent?: boolean;
 }) {
+  if (!workspaceRef.value) return null;
   const syncUi = options?.syncUi ?? true;
   const silent = options?.silent ?? false;
   if (cancelAuthorizationPending.value || !waitingForAuthorization.value)
@@ -850,7 +857,7 @@ async function cancelAuthorizationWait(options?: {
     statusError.value = "";
   }
   try {
-    const status = await knowledgeCancelFeishuReferenceOauthWait(targetPath.value || undefined);
+    const status = await knowledgeCancelFeishuReferenceOauthWait(workspaceRef.value, targetPath.value || undefined);
     if (syncUi) {
       statusSnapshot.value = status;
       applyStatusToForm(status, true);
@@ -928,6 +935,7 @@ async function toggleNodeExpansion(node: FeishuTreeNode) {
 }
 
 async function startImport() {
+  if (!workspaceRef.value) return;
   if (importPending.value || statusSnapshot.value?.running) return;
   importPending.value = true;
   clearPersistentError();
@@ -945,7 +953,7 @@ async function startImport() {
       rootNodeTitle:
         roots.length > 0 ? resolveRootSelectionTitle(roots[0]) || null : null,
     };
-    const status = await knowledgeImportFeishuReferenceDocs(request);
+    const status = await knowledgeImportFeishuReferenceDocs(request, workspaceRef.value);
     statusSnapshot.value = status;
     applyStatusToForm(status, true);
     schedulePoll(260);
@@ -958,12 +966,13 @@ async function startImport() {
 }
 
 async function cancelImport() {
+  if (!workspaceRef.value) return;
   if (cancelling.value) return;
   cancelling.value = true;
   clearPersistentError();
   statusError.value = "";
   try {
-    const status = await knowledgeCancelFeishuReferenceImport(targetPath.value || undefined);
+    const status = await knowledgeCancelFeishuReferenceImport(workspaceRef.value, targetPath.value || undefined);
     statusSnapshot.value = status;
     schedulePoll(260);
   } catch (cause) {
@@ -996,6 +1005,10 @@ async function initializeWindow() {
   } catch {
     // keep local controls available even if close interception is unavailable
   }
+
+  if (!workspaceRef.value) return;
+  await workspaceContextStore.initialize(appWindow.label, "main");
+  await workspaceContextStore.focusCheckout(workspaceRef.value.checkoutId);
 
   await refreshStatus();
   if (trimOrEmpty(selectedSpaceId.value)) {

@@ -4,11 +4,13 @@ import { t } from "../i18n";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
 import ChatChangesPanel from "./ChatChangesPanel.vue";
+import type { WorkspaceRef } from "../services/project";
 
 const props = withDefaults(defineProps<{
   layout?: "side" | "bottom";
   maxSideWidth?: number;
   storageScope?: string;
+  workspaceRef?: WorkspaceRef | null;
 }>(), {
   layout: "side",
   storageScope: "",
@@ -179,6 +181,7 @@ onUnmounted(() => {
         class="chat-sidebar-section chat-sidebar-section-changes"
         embedded
         :show-close="false"
+        :workspace-ref="workspaceRef"
         @close="changesStore.closePanel()"
       />
     </aside>

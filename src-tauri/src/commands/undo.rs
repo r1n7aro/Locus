@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::error::AppError;
 use crate::knowledge_index::KnowledgeIndexState;
@@ -10,7 +10,7 @@ use crate::session::store::SessionStore;
 use crate::vcs::undo::{
     ChangedFile, UndoConflict, UndoEntry, UndoPerformError, UndoPerformOptions, UndoRevertFileError,
 };
-use crate::workspace::Workspace;
+use crate::workspace_service::ProjectRegistry;
 use crate::UndoManagerHandle;
 
 /// Broadcast after a single file is reverted so every webview (main window,
@@ -242,8 +242,39 @@ fn undo_touches_view_tree(files: &[ChangedFile]) -> bool {
     })
 }
 
+fn emit_view_tree_changed_for_scope(
+    app_handle: &AppHandle,
+    scope: &crate::workspace_service::event::WorkspaceEventScope,
+) {
+    crate::workspace_service::event::emit_for_workspace_scope(
+        app_handle,
+        scope,
+        crate::view::VIEW_TREE_CHANGED_EVENT,
+        serde_json::json!({}),
+    );
+}
+
+fn workspace_knowledge_index(
+    app_handle: &AppHandle,
+    scope: &crate::workspace_service::ResolvedWorkspaceScope,
+    operation: &'static str,
+) -> Result<Arc<KnowledgeIndexState>, AppError> {
+    scope
+        .runtime()
+        .knowledge_index(app_handle)
+        .map_err(|detail| {
+            AppError::new(
+                "knowledge.index_unavailable",
+                "Failed to initialize the checkout knowledge index.",
+            )
+            .detail(detail)
+            .operation(operation)
+        })
+}
+
 async fn sync_knowledge_after_undo(
     app_handle: &AppHandle,
+    event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     working_dir: &str,
     knowledge_index_state: Arc<KnowledgeIndexState>,
     files: &[ChangedFile],
@@ -254,6 +285,7 @@ async fn sync_knowledge_after_undo(
             if let Err(error) =
                 crate::commands::knowledge::sync_visible_documents_for_paths_and_emit(
                     app_handle,
+                    event_scope,
                     working_dir,
                     knowledge_index_state.clone(),
                     "undo_perform",
@@ -306,12 +338,21 @@ pub async fn undo_perform(
     force: Option<bool>,
     accept_dirty: Option<bool>,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
     undo_manager: State<'_, UndoManagerHandle>,
     store: State<'_, Arc<SessionStore>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UndoEntry, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = super::session::resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "undo_perform",
+    )?;
+    let working_dir = scope.runtime().root().to_string_lossy().to_string();
+    let event_scope =
+        crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime());
+    let knowledge_index_state = workspace_knowledge_index(&app_handle, &scope, "undo_perform")?;
     let result = match undo_manager
         .perform_undo_checked(
             &session_id,
@@ -341,17 +382,24 @@ pub async fn undo_perform(
 
     sync_knowledge_after_undo(
         &app_handle,
+        &event_scope,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
         &result.restored_files,
     )
     .await;
 
     if undo_touches_view_tree(&result.restored_files) {
-        crate::view::emit_view_tree_changed(&app_handle);
+        emit_view_tree_changed_for_scope(&app_handle, &event_scope);
     }
 
-    super::emit_session_content_changed(&app_handle, &working_dir, &session_id, "undo_perform");
+    super::emit_session_content_changed(
+        &app_handle,
+        Some(&event_scope),
+        &working_dir,
+        &session_id,
+        "undo_perform",
+    );
 
     Ok(result.entry)
 }
@@ -364,12 +412,22 @@ pub async fn undo_perform_to_message(
     force: Option<bool>,
     accept_dirty: Option<bool>,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
     undo_manager: State<'_, UndoManagerHandle>,
     store: State<'_, Arc<SessionStore>>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UndoEntry, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = super::session::resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "undo_perform_to_message",
+    )?;
+    let working_dir = scope.runtime().root().to_string_lossy().to_string();
+    let event_scope =
+        crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime());
+    let knowledge_index_state =
+        workspace_knowledge_index(&app_handle, &scope, "undo_perform_to_message")?;
     let result = match undo_manager
         .perform_undo_checked(
             &session_id,
@@ -397,18 +455,20 @@ pub async fn undo_perform_to_message(
 
     sync_knowledge_after_undo(
         &app_handle,
+        &event_scope,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
         &result.restored_files,
     )
     .await;
 
     if undo_touches_view_tree(&result.restored_files) {
-        crate::view::emit_view_tree_changed(&app_handle);
+        emit_view_tree_changed_for_scope(&app_handle, &event_scope);
     }
 
     super::emit_session_content_changed(
         &app_handle,
+        Some(&event_scope),
         &working_dir,
         &session_id,
         "undo_perform_to_message",
@@ -432,11 +492,21 @@ pub async fn undo_revert_file(
     status: String,
     force: Option<bool>,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
     undo_manager: State<'_, UndoManagerHandle>,
-    knowledge_index_state: State<'_, Arc<KnowledgeIndexState>>,
+    store: State<'_, Arc<SessionStore>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<ChangedFile>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = super::session::resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "undo_revert_file",
+    )?;
+    let working_dir = scope.runtime().root().to_string_lossy().to_string();
+    let event_scope =
+        crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime());
+    let knowledge_index_state = workspace_knowledge_index(&app_handle, &scope, "undo_revert_file")?;
     let file = ChangedFile {
         status,
         path,
@@ -468,13 +538,14 @@ pub async fn undo_revert_file(
     // view tree stay in sync); the session transcript is not touched.
     sync_knowledge_after_undo(
         &app_handle,
+        &event_scope,
         &working_dir,
-        knowledge_index_state.inner().clone(),
+        knowledge_index_state,
         &restored,
     )
     .await;
     if undo_touches_view_tree(&restored) {
-        crate::view::emit_view_tree_changed(&app_handle);
+        emit_view_tree_changed_for_scope(&app_handle, &event_scope);
     }
 
     let event = UndoFileRevertedEvent {
@@ -482,12 +553,12 @@ pub async fn undo_revert_file(
         session_id: session_id.clone(),
         files: restored.clone(),
     };
-    if let Err(error) = app_handle.emit(UNDO_FILE_REVERTED_EVENT, event) {
-        eprintln!(
-            "[undo_revert_file] failed to emit file reverted event for session {}: {}",
-            session_id, error
-        );
-    }
+    crate::workspace_service::event::emit_for_workspace_scope(
+        &app_handle,
+        &event_scope,
+        UNDO_FILE_REVERTED_EVENT,
+        event,
+    );
 
     Ok(restored)
 }
@@ -534,10 +605,18 @@ pub async fn undo_check_conflicts(
 pub async fn undo_check_dirty(
     session_id: String,
     assistant_message_id: String,
-    workspace: State<'_, Arc<Workspace>>,
     undo_manager: State<'_, UndoManagerHandle>,
+    store: State<'_, Arc<SessionStore>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<ChangedFile>, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = super::session::resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "undo_check_dirty",
+    )?;
+    let working_dir = scope.runtime().root().to_string_lossy().to_string();
     undo_manager
         .check_dirty(&session_id, &assistant_message_id, &working_dir)
         .await

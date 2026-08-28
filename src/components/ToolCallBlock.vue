@@ -19,6 +19,7 @@ import { persistedOutputDisplay } from "./toolPersistedOutput";
 import { normalizeViewError, viewRun } from "../services/view";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import { traceToolBlockLayoutChange } from "../services/layoutDiagnostics";
 import { resolveViewToolOpenId } from "./viewToolCallActions";
 import { resolveSkillLoadedMarkerForToolCall } from "./toolCallSkillLoadedMarker";
@@ -59,6 +60,7 @@ const headerRef = ref<HTMLElement | null>(null);
 const outputPre = ref<HTMLPreElement | null>(null);
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
 
 // Streamed tool output (subagent text, shell chunks) repaints at the shared
 // streaming cadence instead of once per delta event; id/status transitions
@@ -453,7 +455,9 @@ async function openViewTool() {
   if (!viewId) return;
   openingViewTool.value = true;
   try {
-    await viewRun(viewId);
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    await viewRun(workspaceRef, viewId);
   } catch (error) {
     const err = normalizeViewError(error);
     notificationStore.addNotice("error", err.message, {

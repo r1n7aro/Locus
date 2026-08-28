@@ -7,7 +7,8 @@ import type {
   InjectedPromptItem,
 } from "../../types";
 import { t } from "../../i18n";
-import { listAgentInjectedItems } from "../../services/agent";
+import { listWorkspaceAgentInjectedItems } from "../../services/agent";
+import type { WorkspaceRef } from "../../services/project";
 import { useAgentStore } from "../../stores/agent";
 import type { ExplorerNode } from "../../composables/useKnowledgeState";
 import { estimateTextTokens } from "../../utils/tokenEstimate";
@@ -28,6 +29,7 @@ const props = defineProps<{
   documents: KnowledgeDocumentSummary[];
   directoryCount: number;
   tree: ExplorerNode[];
+  workspaceRef: WorkspaceRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -283,26 +285,36 @@ function isKnowledgeRuleItem(item: InjectedPromptItem): boolean {
 
 const agentStore = useAgentStore();
 const injectedItems = ref<InjectedPromptItem[]>([]);
+let injectedItemsRequestSeq = 0;
 const knowledgeContext = computed(() =>
   findKnowledgeContext(injectedItems.value),
 );
 
 async function loadKnowledgeContext() {
+  const requestSeq = ++injectedItemsRequestSeq;
   const agentId = agentStore.selectedAgentId.trim();
-  if (!agentId) {
+  const workspaceRef = props.workspaceRef;
+  if (!agentId || !workspaceRef) {
     injectedItems.value = [];
     return;
   }
   try {
-    injectedItems.value = await listAgentInjectedItems(agentId);
+    const items = await listWorkspaceAgentInjectedItems(workspaceRef, agentId);
+    if (
+      requestSeq !== injectedItemsRequestSeq
+      || props.workspaceRef?.checkoutId !== workspaceRef.checkoutId
+      || props.workspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
+    ) return;
+    injectedItems.value = items;
   } catch {
+    if (requestSeq !== injectedItemsRequestSeq) return;
     injectedItems.value = [];
   }
 }
 
 watch(
   () =>
-    `${agentStore.selectedAgentId}::${props.documents.length}::${props.directoryCount}`,
+    `${props.workspaceRef?.checkoutId ?? ""}::${props.workspaceRef?.expectedGeneration ?? ""}::${agentStore.selectedAgentId}::${props.documents.length}::${props.directoryCount}`,
   () => {
     void loadKnowledgeContext();
   },

@@ -22,6 +22,7 @@ pub struct ToolRuntimeState;
 #[derive(Clone, Default)]
 pub struct ToolExecutionContext {
     pub app_handle: Option<AppHandle>,
+    pub execution: Option<Arc<crate::workspace_service::AgentExecutionContext>>,
     pub working_dir: Option<String>,
     pub process_owner: Option<crate::process_util::ProcessOwner>,
     pub unity_connected: Option<bool>,
@@ -139,6 +140,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "grep",
     "list",
     "bash",
+    "python",
     "get_task_status",
     "cancel_task",
     // Planning, delegation & user interaction.
@@ -378,8 +380,43 @@ impl ToolRegistry {
         &self,
         name: &str,
         arguments: &serde_json::Value,
-        context: ToolExecutionContext,
+        mut context: ToolExecutionContext,
     ) -> ToolResult {
+        let _service_lease =
+            if let Some(owner) = crate::workspace_service::service::owner_service_for_tool(name) {
+                let Some(execution) = context.execution.as_ref() else {
+                    return ToolResult {
+                        output: format!(
+                            "Tool '{}' requires a checkout-scoped {:?} service binding",
+                            name, owner
+                        ),
+                        is_error: true,
+                    };
+                };
+                if execution.workspace.generation() != execution.workspace_generation {
+                    return ToolResult {
+                        output: format!(
+                        "Tool '{}' rejected a stale workspace binding (checkout {}, generation {})",
+                        name, execution.checkout_id, execution.workspace_generation
+                    ),
+                        is_error: true,
+                    };
+                }
+                match execution.resolve_service(owner) {
+                    Ok(binding) => Some(binding),
+                    Err(error) => {
+                        return ToolResult {
+                            output: format!("Tool '{}' service binding error: {}", name, error),
+                            is_error: true,
+                        }
+                    }
+                }
+            } else {
+                None
+            };
+        if let Some(execution) = context.execution.as_ref() {
+            context.working_dir = Some(execution.root().to_string_lossy().to_string());
+        }
         match self.get(name) {
             Some(def) => (def.execute)(arguments.clone(), context).await,
             None => match crate::commands::execute_skill_package_tool_by_api_name(

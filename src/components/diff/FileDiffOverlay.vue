@@ -93,7 +93,7 @@ async function onLfsPulled() {
               <button
                 v-if="projectStore.unityConnected && overlay.payload.value"
                 class="diff-overlay-btn"
-                @click="selectUnityAsset(overlay.payload.value!.filePath)"
+                @click="selectUnityAsset(projectStore.requireWorkspaceRef(), overlay.payload.value!.filePath)"
               >
                 {{ t('common.selectInUnity') }}
               </button>

@@ -8,15 +8,45 @@
 //! Mirrors the hot-reload self-test: progress streams to the UI via the
 //! `unity-state-probe-selftest` event, triggered from Settings > Code Analysis.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::Emitter;
 
-use super::{sample_blocking, semantic_state_for_project, status};
+use super::{sample_blocking, semantic_state_for_project, status_for_project};
 
-static RUNNING: AtomicBool = AtomicBool::new(false);
+fn running_checkouts() -> &'static Mutex<HashSet<String>> {
+    static RUNNING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    RUNNING.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct RunningGuard {
+    ownership_key: String,
+}
+
+impl RunningGuard {
+    fn acquire(ownership_key: String) -> Result<Self, String> {
+        let mut running = running_checkouts()
+            .lock()
+            .map_err(|error| format!("state-probe self-test ownership is unavailable: {error}"))?;
+        if !running.insert(ownership_key.clone()) {
+            return Err(
+                "The state-probe self-test is already running for this checkout".to_string(),
+            );
+        }
+        Ok(Self { ownership_key })
+    }
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        if let Ok(mut running) = running_checkouts().lock() {
+            running.remove(&self.ownership_key);
+        }
+    }
+}
 const EXECUTE_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECTION_STATUS_BUDGET: Duration = Duration::from_millis(2_500);
 const PLAY_TRANSITION_TIMEOUT: Duration = Duration::from_secs(90);
@@ -43,6 +73,7 @@ struct SelfTestEvent {
 struct SelfTest {
     app: tauri::AppHandle,
     project: String,
+    event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
     passed: u32,
     failed: u32,
 }
@@ -55,16 +86,23 @@ enum BridgeCapabilityProbe {
 
 impl SelfTest {
     fn emit(&self, line: Option<String>, finished: bool) {
-        let _ = self.app.emit(
-            "unity-state-probe-selftest",
-            SelfTestEvent {
-                running: !finished,
-                finished,
-                line,
-                passed: self.passed,
-                failed: self.failed,
-            },
-        );
+        let payload = SelfTestEvent {
+            running: !finished,
+            finished,
+            line,
+            passed: self.passed,
+            failed: self.failed,
+        };
+        if let Some(scope) = self.event_scope.as_ref() {
+            crate::workspace_service::event::emit_for_workspace_scope(
+                &self.app,
+                scope,
+                "unity-state-probe-selftest",
+                payload,
+            );
+        } else {
+            let _ = self.app.emit("unity-state-probe-selftest", payload);
+        }
     }
 
     fn log(&self, line: impl Into<String>) {
@@ -278,9 +316,12 @@ impl SelfTest {
         hint: String,
         allow_suspend: bool,
     ) -> Result<Option<super::NativeSample>, String> {
-        tauri::async_runtime::spawn_blocking(move || sample_blocking(pid, &hint, allow_suspend))
-            .await
-            .map_err(|e| format!("native sample task failed: {e}"))?
+        let project = self.project.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            sample_blocking(&project, pid, &hint, allow_suspend)
+        })
+        .await
+        .map_err(|e| format!("native sample task failed: {e}"))?
     }
 
     async fn wait_for_edit_mode(&self, timeout: Duration) -> Result<(), String> {
@@ -756,7 +797,7 @@ impl SelfTest {
             }
         }
 
-        let probe = status();
+        let probe = status_for_project(&self.project);
         self.log(format!(
             "DIAG  {label}: probe enabled={} supported={} tier={:?} pid={:?} last_phase={} error={}",
             probe.enabled,
@@ -770,12 +811,11 @@ impl SelfTest {
 
     fn format_semantic_state(state: &super::SemanticState) -> String {
         format!(
-            "phase={} source={} confidence={} transient={} needs_user={} reload_phase={} editor_mode={}/{} channel={} process={} main_thread={} safety={} state_plane={}/{}/{} history={} detail={}",
+            "phase={} source={} confidence={} transient={} reload_phase={} editor_mode={}/{} channel={} process={} main_thread={} safety={} state_plane={}/{}/{} history={} detail={}",
             state.phase,
             state.source,
             state.confidence,
             state.transient,
-            state.needs_user,
             state.reload_phase.as_deref().unwrap_or("none"),
             state.editor_mode.value,
             state.editor_mode.source,
@@ -904,7 +944,7 @@ impl SelfTest {
 
         // Stack tier: opt-in suspend for one bulk read. In idle edit mode it
         // must report NOT reloading.
-        let tier = format!("{:?}", status().tier);
+        let tier = format!("{:?}", status_for_project(&self.project).tier);
         match self.native_sample(pid, hint.to_string(), true).await {
             Ok(Some(sample)) if sample.suspended => {
                 if sample.reloading.is_none() {
@@ -1137,7 +1177,7 @@ impl SelfTest {
                 ),
             ),
             None => {
-                let tier = format!("{:?}", status().tier);
+                let tier = format!("{:?}", status_for_project(&self.project).tier);
                 if tier == "Stack" {
                     self.fail(
                         "R2 native probe observed the reload",
@@ -1341,20 +1381,24 @@ impl SelfTest {
 }
 
 /// Entry point invoked by the `unity_state_probe_selftest_run` command.
-pub async fn run(app: tauri::AppHandle, project: String) -> Result<(), String> {
+async fn run_owned(
+    app: tauri::AppHandle,
+    project: String,
+    ownership_key: String,
+    event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+) -> Result<(), String> {
     if project.trim().is_empty() {
         return Err("No workspace selected".to_string());
     }
     if !crate::unity_bridge::is_unity_project(&project) {
         return Err("Current workspace is not a Unity project".to_string());
     }
-    if RUNNING.swap(true, Ordering::SeqCst) {
-        return Err("A state-probe self-test is already running".to_string());
-    }
+    let _guard = RunningGuard::acquire(ownership_key)?;
 
     let mut test = SelfTest {
         app,
         project,
+        event_scope,
         passed: 0,
         failed: 0,
     };
@@ -1364,6 +1408,37 @@ pub async fn run(app: tauri::AppHandle, project: String) -> Result<(), String> {
     test.log(summary);
     test.emit(None, true);
 
-    RUNNING.store(false, Ordering::SeqCst);
     Ok(())
+}
+
+pub async fn run(app: tauri::AppHandle, project: String) -> Result<(), String> {
+    let ownership_key = format!(
+        "path:{}",
+        crate::unity_bridge::project_state_plane_key(&project)
+    );
+    run_owned(app, project, ownership_key, None).await
+}
+
+pub async fn run_scoped(
+    app: tauri::AppHandle,
+    project: String,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
+) -> Result<(), String> {
+    let ownership_key = format!("checkout:{}", event_scope.checkout_id);
+    run_owned(app, project, ownership_key, Some(event_scope)).await
+}
+
+#[cfg(test)]
+mod checkout_ownership_tests {
+    use super::RunningGuard;
+
+    #[test]
+    fn distinct_checkouts_can_run_while_duplicate_ownership_is_rejected() {
+        let checkout_a = RunningGuard::acquire("test-state:a".to_string()).expect("checkout A");
+        assert!(RunningGuard::acquire("test-state:a".to_string()).is_err());
+        let checkout_b = RunningGuard::acquire("test-state:b".to_string()).expect("checkout B");
+        drop(checkout_b);
+        drop(checkout_a);
+        RunningGuard::acquire("test-state:a".to_string()).expect("checkout A released");
+    }
 }

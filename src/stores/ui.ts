@@ -29,7 +29,7 @@ interface PendingChatPrefill extends ChatPrefillOptions {
 }
 
 export const useUiStore = defineStore("ui", () => {
-  const activeTab = ref<"chat" | "collab" | "knowledge" | "asset" | "views" | "plugins" | "agent" | "settings">("chat");
+  const activeTab = ref<"chat" | "views" | "plugins" | "agent" | "settings">("chat");
   const settingsCategoryHint = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about" | "experimental" | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
@@ -53,9 +53,6 @@ export const useUiStore = defineStore("ui", () => {
     column: number;
   } | null>(null);
 
-  const collabMounted = ref(false);
-  const knowledgeMounted = ref(false);
-  const assetMounted = ref(false);
   const viewMounted = ref(false);
   const pluginsMounted = ref(false);
   const agentMounted = ref(false);
@@ -217,9 +214,6 @@ export const useUiStore = defineStore("ui", () => {
 
   function setTab(tab: typeof activeTab.value) {
     activeTab.value = tab;
-    if (tab === "collab") collabMounted.value = true;
-    if (tab === "knowledge") knowledgeMounted.value = true;
-    if (tab === "asset") assetMounted.value = true;
     if (tab === "views") viewMounted.value = true;
     if (tab === "plugins") pluginsMounted.value = true;
     if (tab === "agent") agentMounted.value = true;
@@ -276,7 +270,6 @@ export const useUiStore = defineStore("ui", () => {
       id: Date.now(),
       ...request,
     };
-    setTab("asset");
   }
 
   function clearPendingAssetOpen(id?: number) {
@@ -338,9 +331,6 @@ export const useUiStore = defineStore("ui", () => {
     pendingChatPrefill,
     pendingKnowledgeSelection,
     pendingAssetOpen,
-    collabMounted,
-    knowledgeMounted,
-    assetMounted,
     viewMounted,
     pluginsMounted,
     agentMounted,

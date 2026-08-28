@@ -14,7 +14,6 @@ const sessionServiceMocks = vi.hoisted(() => ({
   deletePendingChatInput: vi.fn(),
   forkSession: vi.fn(),
   forkSessionFromMessage: vi.fn(),
-  getActiveSessionSelection: vi.fn(),
   getSessionUsage: vi.fn(),
   getSessionActiveRun: vi.fn(),
   getSessionResumeAvailable: vi.fn(),
@@ -22,6 +21,7 @@ const sessionServiceMocks = vi.hoisted(() => ({
   ignoreKnowledgeProposal: vi.fn(),
   listSessionEvents: vi.fn(),
   listArchivedSessions: vi.fn(),
+  listCheckoutSessions: vi.fn(),
   listSessions: vi.fn(),
   loadSession: vi.fn(),
   loadSessionView: vi.fn(),
@@ -31,7 +31,6 @@ const sessionServiceMocks = vi.hoisted(() => ({
   insertPendingChatInput: vi.fn(),
   queueChatInput: vi.fn(),
   renameSession: vi.fn(),
-  saveActiveSessionSelection: vi.fn(),
   saveSessionExecutionState: vi.fn(),
   staleKnowledgeProposals: vi.fn(),
   rollbackSessionToMessage: vi.fn(),
@@ -47,9 +46,6 @@ const undoServiceMocks = vi.hoisted(() => ({
 
 const displaySettingsState = vi.hoisted(() => ({
   showWelcomeSubtitle: true,
-  showKnowledgeTab: true,
-  showCollabTab: true,
-  showAssetTab: true,
   showViewsTab: true,
   showPluginsTab: true,
   showAgentTab: true,
@@ -109,6 +105,23 @@ const projectStoreState = vi.hoisted(() => ({
   workingDir: "C:\\workspace\\locus",
 }));
 
+const workspaceContextStoreMocks = vi.hoisted(() => ({
+  focusedWorkspaceRef: {
+    checkoutId: "checkout-locus",
+    expectedGeneration: 1,
+  },
+  focusedPaneContext: {
+    windowId: "main",
+    paneId: "main",
+    focusedCheckoutId: "checkout-locus",
+    workspaceGeneration: 1,
+    activeSessionId: null as string | null,
+    intentEpoch: 1,
+    revision: 1,
+  },
+  setActiveSession: vi.fn(),
+}));
+
 vi.mock("../services/session", () => sessionServiceMocks);
 vi.mock("../services/undo", () => undoServiceMocks);
 vi.mock("../composables/useDisplaySettings", () => ({
@@ -122,6 +135,9 @@ vi.mock("../stores/model", () => ({
 }));
 vi.mock("../stores/project", () => ({
   useProjectStore: () => projectStoreState,
+}));
+vi.mock("../stores/workspaceContext", () => ({
+  useWorkspaceContextStore: () => workspaceContextStoreMocks,
 }));
 vi.mock("../stores/notification", () => ({
   useNotificationStore: () => notificationStoreMocks,
@@ -180,6 +196,16 @@ function makeUndoEntry(
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("chat session panel state", () => {
   let todoData: Record<string, TodoSnapshot>;
   let undoData: Record<string, ReturnType<typeof makeUndoEntry>[]>;
@@ -212,9 +238,6 @@ describe("chat session panel state", () => {
 
     displaySettingsState.todoAutoOpen = true;
     displaySettingsState.showWelcomeSubtitle = true;
-    displaySettingsState.showKnowledgeTab = true;
-    displaySettingsState.showCollabTab = true;
-    displaySettingsState.showAssetTab = true;
     displaySettingsState.showViewsTab = true;
     displaySettingsState.showPluginsTab = true;
     displaySettingsState.showAgentTab = true;
@@ -228,6 +251,17 @@ describe("chat session panel state", () => {
     displaySettingsState.hideThinkingBlocks = true;
     displaySettingsState.mergeGitTreeStatusIcon = true;
     displaySettingsState.hideGitCommandSuggestions = false;
+
+    workspaceContextStoreMocks.focusedWorkspaceRef = {
+      checkoutId: "checkout-locus",
+      expectedGeneration: 1,
+    };
+    workspaceContextStoreMocks.focusedPaneContext.focusedCheckoutId = "checkout-locus";
+    workspaceContextStoreMocks.focusedPaneContext.workspaceGeneration = 1;
+    workspaceContextStoreMocks.focusedPaneContext.activeSessionId = null;
+    workspaceContextStoreMocks.setActiveSession.mockImplementation(async (sessionId: string | null) => {
+      workspaceContextStoreMocks.focusedPaneContext.activeSessionId = sessionId;
+    });
 
     todoData = {
       s1: { items: [makeTodo("Todo from history")], latestRunId: "run-history" },
@@ -281,7 +315,6 @@ describe("chat session panel state", () => {
     sessionServiceMocks.deletePendingChatInput.mockResolvedValue(true);
     sessionServiceMocks.forkSession.mockResolvedValue("s-copy");
     sessionServiceMocks.forkSessionFromMessage.mockResolvedValue("s-copy");
-    sessionServiceMocks.getActiveSessionSelection.mockResolvedValue(null);
     sessionServiceMocks.getSessionUsage.mockImplementation(async () => emptyUsage());
     sessionServiceMocks.getSessionActiveRun.mockResolvedValue(null);
     sessionServiceMocks.getSessionResumeAvailable.mockResolvedValue(false);
@@ -292,6 +325,21 @@ describe("chat session panel state", () => {
     sessionServiceMocks.listSessionEvents.mockResolvedValue([]);
     sessionServiceMocks.listArchivedSessions.mockImplementation(async () => []);
     sessionServiceMocks.listSessions.mockImplementation(async () => []);
+    sessionServiceMocks.listCheckoutSessions.mockImplementation(async () => {
+      const listed = await sessionServiceMocks.listSessions();
+      if (listed.length > 0) return listed;
+      const activeSessionId = workspaceContextStoreMocks.focusedPaneContext.activeSessionId;
+      return activeSessionId
+        ? [{
+          id: activeSessionId,
+          title: `Session ${activeSessionId}`,
+          agentId: null,
+          sessionType: "chat",
+          updatedAt: 1,
+          runtimeStatus: null,
+        }]
+        : [];
+    });
     sessionServiceMocks.queueChatInput.mockImplementation(async (params: any) => ({
       id: "pending-1",
       sessionId: params.sessionId,
@@ -331,7 +379,6 @@ describe("chat session panel state", () => {
     sessionServiceMocks.rollbackSessionToMessage.mockImplementation(async (sessionId: string) =>
       sessionServiceMocks.loadSession(sessionId),
     );
-    sessionServiceMocks.saveActiveSessionSelection.mockResolvedValue(undefined);
     sessionServiceMocks.staleKnowledgeProposals.mockResolvedValue(undefined);
     sessionServiceMocks.undoLatestConversationTurn.mockImplementation(async (sessionId: string) =>
       sessionServiceMocks.loadSession(sessionId),
@@ -728,7 +775,7 @@ describe("chat session panel state", () => {
   it("restores the persisted active session after refreshing sessions", async () => {
     const chatStore = useChatStore();
 
-    sessionServiceMocks.getActiveSessionSelection.mockResolvedValue("s1");
+    workspaceContextStoreMocks.focusedPaneContext.activeSessionId = "s1";
     sessionServiceMocks.listSessions.mockResolvedValue([
       {
         id: "s1",
@@ -743,10 +790,60 @@ describe("chat session panel state", () => {
 
     expect(chatStore.activeSessionId).toBe("s1");
     expect(sessionServiceMocks.loadSession).toHaveBeenCalledWith("s1");
-    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+    expect(workspaceContextStoreMocks.setActiveSession).toHaveBeenCalledWith("s1");
   });
 
-  it("applies active session selection broadcasts without echoing persistence", async () => {
+  it("keeps a newer checkout session refresh when an older checkout resolves last", async () => {
+    const chatStore = useChatStore();
+    const checkoutA = deferred<any[]>();
+    const checkoutB = deferred<any[]>();
+    sessionServiceMocks.listCheckoutSessions.mockImplementation((workspaceRef: any) => (
+      workspaceRef.checkoutId === "checkout-a" ? checkoutA.promise : checkoutB.promise
+    ));
+
+    workspaceContextStoreMocks.focusedWorkspaceRef = {
+      checkoutId: "checkout-a",
+      expectedGeneration: 1,
+    };
+    workspaceContextStoreMocks.focusedPaneContext.focusedCheckoutId = "checkout-a";
+    workspaceContextStoreMocks.focusedPaneContext.workspaceGeneration = 1;
+    const refreshA = chatStore.refreshSessions();
+
+    workspaceContextStoreMocks.focusedWorkspaceRef = {
+      checkoutId: "checkout-b",
+      expectedGeneration: 4,
+    };
+    workspaceContextStoreMocks.focusedPaneContext.focusedCheckoutId = "checkout-b";
+    workspaceContextStoreMocks.focusedPaneContext.workspaceGeneration = 4;
+    const refreshB = chatStore.refreshSessions();
+
+    checkoutB.resolve([{
+      id: "session-b",
+      title: "Checkout B",
+      agentId: null,
+      sessionType: "chat",
+      checkoutId: "checkout-b",
+      updatedAt: 2,
+    }]);
+    await refreshB;
+    checkoutA.resolve([{
+      id: "session-a",
+      title: "Checkout A",
+      agentId: null,
+      sessionType: "chat",
+      checkoutId: "checkout-a",
+      updatedAt: 1,
+    }]);
+    await refreshA;
+
+    expect(chatStore.sessions.map((session) => session.id)).toEqual(["session-b"]);
+    expect(sessionServiceMocks.listCheckoutSessions.mock.calls).toEqual([
+      [{ checkoutId: "checkout-a", expectedGeneration: 1 }],
+      [{ checkoutId: "checkout-b", expectedGeneration: 4 }],
+    ]);
+  });
+
+  it("applies active session selection broadcasts to the current pane context", async () => {
     const chatStore = useChatStore();
 
     chatStore.activeSessionId = "s2";
@@ -754,18 +851,18 @@ describe("chat session panel state", () => {
 
     expect(chatStore.activeSessionId).toBe("s1");
     expect(chatStore.todos).toHaveLength(1);
-    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+    expect(workspaceContextStoreMocks.setActiveSession).toHaveBeenLastCalledWith("s1");
 
     await chatStore.syncActiveSessionSelection(null);
 
     expect(chatStore.activeSessionId).toBeNull();
-    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+    expect(workspaceContextStoreMocks.setActiveSession).toHaveBeenLastCalledWith(null);
   });
 
   it("keeps an isolated window on new chat across session refreshes", async () => {
     const chatStore = useChatStore();
     chatStore.setActiveSessionSelectionPersistence(false);
-    sessionServiceMocks.getActiveSessionSelection.mockResolvedValue("s1");
+    workspaceContextStoreMocks.focusedPaneContext.activeSessionId = "s1";
     sessionServiceMocks.listSessions.mockResolvedValue([
       {
         id: "s1",
@@ -783,10 +880,10 @@ describe("chat session panel state", () => {
     await chatStore.refreshSessions();
 
     expect(chatStore.activeSessionId).toBeNull();
-    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+    expect(workspaceContextStoreMocks.setActiveSession).toHaveBeenLastCalledWith(null);
   });
 
-  it("does not publish implicit session selection from an isolated window", async () => {
+  it("publishes an isolated window session to that window's pane context", async () => {
     const chatStore = useChatStore();
     chatStore.setActiveSessionSelectionPersistence(false);
     sessionServiceMocks.chat.mockResolvedValueOnce({
@@ -797,7 +894,116 @@ describe("chat session panel state", () => {
     await chatStore.sendMessage("Create locally");
 
     expect(chatStore.activeSessionId).toBe("isolated-new");
-    expect(sessionServiceMocks.saveActiveSessionSelection).not.toHaveBeenCalled();
+    expect(workspaceContextStoreMocks.setActiveSession).toHaveBeenLastCalledWith("isolated-new");
+  });
+
+  it("keeps a newer checkout chat launch when the previous checkout resolves last", async () => {
+    const chatStore = useChatStore();
+    const launchA = deferred<{ sessionId: string; runId: string }>();
+    const launchB = deferred<{ sessionId: string; runId: string }>();
+    sessionServiceMocks.chat.mockImplementation((params: any) => (
+      params.workspaceRef?.checkoutId === "checkout-a" ? launchA.promise : launchB.promise
+    ));
+    sessionServiceMocks.listSessions.mockResolvedValue([{
+      id: "session-b",
+      title: "Checkout B run",
+      agentId: null,
+      sessionType: "chat",
+      checkoutId: "checkout-b",
+      updatedAt: 2,
+      runtimeStatus: "running",
+    }]);
+
+    workspaceContextStoreMocks.focusedWorkspaceRef = {
+      checkoutId: "checkout-a",
+      expectedGeneration: 1,
+    };
+    workspaceContextStoreMocks.focusedPaneContext.focusedCheckoutId = "checkout-a";
+    workspaceContextStoreMocks.focusedPaneContext.workspaceGeneration = 1;
+    const sendA = chatStore.sendMessage("message-a");
+
+    workspaceContextStoreMocks.focusedWorkspaceRef = {
+      checkoutId: "checkout-b",
+      expectedGeneration: 2,
+    };
+    workspaceContextStoreMocks.focusedPaneContext.focusedCheckoutId = "checkout-b";
+    workspaceContextStoreMocks.focusedPaneContext.workspaceGeneration = 2;
+    chatStore.newChat({ persistSelection: false });
+    const sendB = chatStore.sendMessage("message-b");
+
+    launchB.resolve({ sessionId: "session-b", runId: "run-b" });
+    await sendB;
+    launchA.resolve({ sessionId: "session-a", runId: "run-a" });
+    await sendA;
+
+    expect(chatStore.activeSessionId).toBe("session-b");
+    expect(chatStore.currentRunId).toBe("run-b");
+    expect(chatStore.messages.map((message) => message.content)).toEqual(["message-b"]);
+    expect(chatStore.streamingSessionIds.has("session-b")).toBe(true);
+    expect(chatStore.streamingSessionIds.has("session-a")).toBe(false);
+    expect(sessionServiceMocks.chat.mock.calls.map((call) => call[0].workspaceRef)).toEqual([
+      { checkoutId: "checkout-a", expectedGeneration: 1 },
+      { checkoutId: "checkout-b", expectedGeneration: 2 },
+    ]);
+  });
+
+  it("drops a resumed run response after its pane switches to another checkout", async () => {
+    const chatStore = useChatStore();
+    const resumeLaunch = deferred<{ sessionId: string; runId: string }>();
+    sessionServiceMocks.getSessionResumeAvailable.mockResolvedValueOnce(true);
+    sessionServiceMocks.chat.mockReturnValueOnce(resumeLaunch.promise);
+
+    await chatStore.selectSession("s1");
+    const resume = chatStore.resumeInterrupted();
+
+    workspaceContextStoreMocks.focusedWorkspaceRef = {
+      checkoutId: "checkout-b",
+      expectedGeneration: 3,
+    };
+    workspaceContextStoreMocks.focusedPaneContext.focusedCheckoutId = "checkout-b";
+    workspaceContextStoreMocks.focusedPaneContext.workspaceGeneration = 3;
+    chatStore.newChat({ persistSelection: false });
+    resumeLaunch.resolve({ sessionId: "s1", runId: "run-resumed-a" });
+    await resume;
+
+    expect(sessionServiceMocks.chat).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceRef: { checkoutId: "checkout-locus", expectedGeneration: 1 },
+      sessionId: "s1",
+      resume: true,
+    }));
+    expect(chatStore.activeSessionId).toBeNull();
+    expect(chatStore.currentRunId).toBeNull();
+    expect(chatStore.streamingSessionIds.has("s1")).toBe(false);
+    expect(chatStore.isStreaming).toBe(false);
+  });
+
+  it("drops a compact run response after its pane switches to another checkout", async () => {
+    const chatStore = useChatStore();
+    const compactLaunch = deferred<{ sessionId: string; runId: string }>();
+    sessionServiceMocks.chat.mockReturnValueOnce(compactLaunch.promise);
+
+    await chatStore.selectSession("s1");
+    const compact = chatStore.compactSession();
+
+    workspaceContextStoreMocks.focusedWorkspaceRef = {
+      checkoutId: "checkout-b",
+      expectedGeneration: 5,
+    };
+    workspaceContextStoreMocks.focusedPaneContext.focusedCheckoutId = "checkout-b";
+    workspaceContextStoreMocks.focusedPaneContext.workspaceGeneration = 5;
+    chatStore.newChat({ persistSelection: false });
+    compactLaunch.resolve({ sessionId: "s1", runId: "run-compact-a" });
+    await compact;
+
+    expect(sessionServiceMocks.chat).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceRef: { checkoutId: "checkout-locus", expectedGeneration: 1 },
+      sessionId: "s1",
+      mode: "compact",
+    }));
+    expect(chatStore.activeSessionId).toBeNull();
+    expect(chatStore.currentRunId).toBeNull();
+    expect(chatStore.streamingSessionIds.has("s1")).toBe(false);
+    expect(chatStore.isStreaming).toBe(false);
   });
 
   it("marks active chat runs as streaming when runStart arrives from another window", async () => {
@@ -2874,6 +3080,7 @@ describe("chat session panel state", () => {
     chatStore.currentRunId = "run-1";
     chatStore.isStreaming = true;
     chatStore.streamingSessionIds.add("s1");
+    workspaceContextStoreMocks.focusedPaneContext.activeSessionId = "s1";
 
     await chatStore.sendMessage("next turn");
 

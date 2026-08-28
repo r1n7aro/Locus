@@ -9,6 +9,7 @@ import { subtitleForPendingToolConfirm, titleForPendingToolConfirm } from "./too
 
 const props = defineProps<{
   toolConfirms: PendingToolConfirm[];
+  sessionId?: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -103,6 +104,7 @@ function answerAll(answer: string) {
         <ToolConfirmCard
           v-if="selectedToolConfirm"
           :tool-confirm="selectedToolConfirm"
+          :session-id="sessionId"
           @answer="emit('answer', { questionId: selectedToolConfirm.questionId, answer: $event })"
         />
       </div>

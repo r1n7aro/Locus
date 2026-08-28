@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
@@ -22,9 +23,230 @@ use crate::process_util::{
 };
 use crate::session::models::{ChatMessage, MessageRole};
 use crate::tool::ToolResult;
-use crate::workspace::Workspace;
+use crate::workspace_service::runtime::WorkspaceLease;
+use crate::workspace_service::{
+    ProjectCollaborationSnapshot, ProjectId, ProjectRegistry, WorkspaceRef, WorkspaceResolveError,
+};
 use crate::AssetDbState;
 use crate::{ApiKeyState, ProviderKeysState};
+
+/// Checkout identity captured once at the IPC boundary.
+///
+/// Every checkout-owned Git command captures an explicit `WorkspaceRef` at the
+/// IPC boundary. The lease keeps that resolved runtime alive until the command
+/// and every task that owns this scope have completed.
+struct GitWorkspaceScope {
+    root: String,
+    checkout_id: String,
+    workspace_generation: u64,
+    repository_lock_name: String,
+    workspace_fs_lock_name: String,
+    asset_db: Arc<Mutex<Option<crate::asset_db::AssetDb>>>,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
+    _lease: WorkspaceLease,
+}
+
+impl GitWorkspaceScope {
+    fn from_resolved(scope: crate::workspace_service::ResolvedWorkspaceScope) -> Self {
+        let (runtime, lease) = scope.into_parts();
+        let root = runtime.root().to_string_lossy().to_string();
+        let checkout_id = runtime.checkout_id().to_string();
+        let event_scope =
+            crate::workspace_service::event::WorkspaceEventScope::for_runtime(&runtime);
+        Self {
+            root,
+            checkout_id,
+            workspace_generation: runtime.generation(),
+            repository_lock_name: runtime.core().repository_lock_name(),
+            workspace_fs_lock_name: runtime.core().workspace_fs_lock_name(runtime.checkout_id()),
+            asset_db: runtime.core().asset_db(),
+            event_scope,
+            _lease: lease,
+        }
+    }
+
+    fn root(&self) -> &str {
+        &self.root
+    }
+
+    fn task_identity(&self) -> GitTaskWorkspaceIdentity {
+        GitTaskWorkspaceIdentity {
+            root: self.root.clone(),
+            _checkout_id: self.checkout_id.clone(),
+            _workspace_generation: self.workspace_generation,
+        }
+    }
+
+    fn cache_namespace(&self) -> String {
+        format!(
+            "checkout:{}:generation:{}",
+            self.checkout_id, self.workspace_generation
+        )
+    }
+
+    fn asset_db_state(&self) -> AssetDbState {
+        AssetDbState(Arc::clone(&self.asset_db))
+    }
+
+    async fn lock_repository(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        git_named_operation_lock(&self.repository_lock_name)
+            .lock_owned()
+            .await
+    }
+
+    async fn lock_workspace_fs(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        git_named_operation_lock(&self.workspace_fs_lock_name)
+            .lock_owned()
+            .await
+    }
+}
+
+#[derive(Clone)]
+struct GitTaskWorkspaceIdentity {
+    root: String,
+    _checkout_id: String,
+    _workspace_generation: u64,
+}
+
+fn git_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
+    match error {
+        WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
+            "workspace.registry_unavailable",
+            "The workspace registry is unavailable.",
+        )
+        .detail(detail),
+        WorkspaceResolveError::CheckoutUnavailable { checkout_id } => AppError::new(
+            "workspace.checkout_unavailable",
+            "The requested checkout is unavailable.",
+        )
+        .detail(checkout_id.to_string()),
+        WorkspaceResolveError::StaleGeneration {
+            checkout_id,
+            expected_generation,
+            actual_generation,
+        } => AppError::new(
+            "workspace.generation_stale",
+            "The workspace runtime changed before the request was handled.",
+        )
+        .detail(format!(
+            "checkout={checkout_id}, expected={expected_generation}, actual={actual_generation}"
+        )),
+    }
+}
+
+async fn resolve_git_workspace_scope(
+    workspace_ref: &WorkspaceRef,
+    registry: &ProjectRegistry,
+) -> Result<GitWorkspaceScope, AppError> {
+    registry
+        .resolve_workspace_ref(workspace_ref)
+        .map(GitWorkspaceScope::from_resolved)
+        .map_err(git_workspace_resolve_error)
+}
+
+fn git_named_operation_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lock) = locks.get(name).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(name.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+#[cfg(test)]
+mod git_workspace_scope_tests {
+    use super::*;
+    use crate::config::AppConfig;
+    use crate::resource_policy::ResourcePolicyStore;
+    use std::fs;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn registry(config_root: &Path) -> Arc<ProjectRegistry> {
+        let config = Arc::new(AppConfig::load_from_path(&config_root.join("config.json")));
+        let policy = Arc::new(ResourcePolicyStore::from_config(config).expect("resource policy"));
+        ProjectRegistry::new(policy, Vec::new())
+    }
+
+    #[test]
+    fn reverse_resolve_keeps_same_project_worktree_roots_isolated() {
+        let temp = TempDir::new().expect("temporary root");
+        let main = temp.path().join("main");
+        let worktree = temp.path().join("feature");
+        fs::create_dir_all(&main).expect("main checkout");
+        run_git(&main, &["init", "-b", "main"]);
+        run_git(&main, &["config", "user.name", "Locus Test"]);
+        run_git(&main, &["config", "user.email", "locus@example.invalid"]);
+        fs::write(main.join("scope.txt"), "main\n").expect("seed file");
+        run_git(&main, &["add", "scope.txt"]);
+        run_git(&main, &["commit", "-m", "seed"]);
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                worktree.to_str().expect("worktree path"),
+            ],
+        );
+
+        let registry = registry(temp.path());
+        let main_runtime = registry.register(&main).expect("register main");
+        let worktree_runtime = registry.register(&worktree).expect("register worktree");
+        assert_eq!(main_runtime.project_id(), worktree_runtime.project_id());
+        assert_ne!(main_runtime.checkout_id(), worktree_runtime.checkout_id());
+
+        // Resolve B then A to cover the ordering that used to overwrite the
+        // process-wide working directory with whichever request completed last.
+        let worktree_scope = GitWorkspaceScope::from_resolved(
+            registry
+                .resolve_workspace_ref(&WorkspaceRef::for_runtime(&worktree_runtime))
+                .expect("resolve worktree"),
+        );
+        let main_scope = GitWorkspaceScope::from_resolved(
+            registry
+                .resolve_workspace_ref(&WorkspaceRef::for_runtime(&main_runtime))
+                .expect("resolve main"),
+        );
+
+        assert_eq!(Path::new(worktree_scope.root()), worktree_runtime.root());
+        assert_eq!(Path::new(main_scope.root()), main_runtime.root());
+        assert_ne!(worktree_scope.root(), main_scope.root());
+        assert_eq!(
+            worktree_scope.repository_lock_name, main_scope.repository_lock_name,
+            "worktrees of one repository serialize shared ref operations"
+        );
+        assert_ne!(
+            worktree_scope.workspace_fs_lock_name, main_scope.workspace_fs_lock_name,
+            "worktree filesystem operations retain checkout ownership"
+        );
+        assert_ne!(
+            worktree_scope.cache_namespace(),
+            main_scope.cache_namespace(),
+            "merge sessions cannot cross checkout boundaries"
+        );
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -205,7 +427,7 @@ fn collect_stash_root_hashes(cwd: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-fn collect_head_state(cwd: &str) -> GitHeadState {
+pub(crate) fn collect_head_state(cwd: &str) -> GitHeadState {
     let head_hash = command("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(cwd)
@@ -241,6 +463,49 @@ fn collect_head_state(cwd: &str) -> GitHeadState {
             ref_name: None,
         }
     }
+}
+
+/// Return the ProjectContext-owned collaboration projection. Repository refs
+/// are shared while each entry preserves the checkout-specific HEAD binding.
+#[tauri::command]
+pub async fn project_collaboration_snapshot(
+    project_id: String,
+    registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<ProjectCollaborationSnapshot, AppError> {
+    let project_id = ProjectId::new(project_id).map_err(|error| {
+        AppError::new(
+            "workspace.project_identity_invalid",
+            "The project identity is invalid.",
+        )
+        .detail(error.to_string())
+        .operation("projectCollaborationSnapshot")
+    })?;
+    let project = registry.project(&project_id).ok_or_else(|| {
+        AppError::new(
+            "workspace.project_unavailable",
+            "The project context is unavailable.",
+        )
+        .detail(project_id.to_string())
+        .operation("projectCollaborationSnapshot")
+    })?;
+    let checkouts = project.checkout_sources().map_err(|error| {
+        AppError::new(
+            "workspace.project_checkout_catalog_unavailable",
+            "The project checkout catalog is unavailable.",
+        )
+        .detail(error)
+        .operation("projectCollaborationSnapshot")
+    })?;
+    tokio::task::spawn_blocking(move || project.collaboration().snapshot(checkouts))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "git.project_collaboration_failed",
+                "The project collaboration snapshot failed.",
+            )
+            .detail(error.to_string())
+            .operation("projectCollaborationSnapshot")
+        })
 }
 
 fn collect_graph_refs(cwd: &str) -> Vec<GitGraphRef> {
@@ -664,11 +929,13 @@ fn load_visible_history(
 
 #[tauri::command]
 pub async fn git_history_snapshot(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     skip: Option<usize>,
     limit: Option<usize>,
 ) -> Result<GitHistorySnapshot, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(GitHistorySnapshot {
             is_repo: false,
@@ -1079,10 +1346,12 @@ fn collect_stash_history_search_results(
 
 #[tauri::command]
 pub async fn git_history_search(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     request: GitHistorySearchRequest,
 ) -> Result<GitHistorySearchResponse, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(GitHistorySearchResponse {
             is_repo: false,
@@ -1646,8 +1915,12 @@ pub async fn git_save_runtime_selection(
 }
 
 #[tauri::command]
-pub async fn git_probe(workspace: State<'_, Arc<Workspace>>) -> Result<GitProbeResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+pub async fn git_probe(
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
+) -> Result<GitProbeResult, AppError> {
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     let resolved = refresh_git_resolution();
     let available = resolved.is_some();
     let is_repo = if available && !cwd.is_empty() {
@@ -1678,9 +1951,11 @@ pub async fn git_probe(workspace: State<'_, Arc<Workspace>>) -> Result<GitProbeR
 
 #[tauri::command]
 pub async fn git_head_hash(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<Option<String>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(None);
     }
@@ -1873,11 +2148,13 @@ pub async fn git_clear_override(app_handle: AppHandle) -> Result<(), AppError> {
 
 #[tauri::command]
 pub async fn git_log(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     skip: Option<usize>,
     limit: Option<usize>,
 ) -> Result<GitLogResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(GitLogResult {
             is_repo: false,
@@ -2062,10 +2339,12 @@ pub struct GitBlockedPath {
 
 #[tauri::command]
 pub async fn git_commit_body(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     hash: String,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     let output = command("git")
         .args(["show", "-s", "--format=%b", &hash])
         .current_dir(&cwd)
@@ -2926,8 +3205,12 @@ pub struct GitStatusResult {
 }
 
 #[tauri::command]
-pub async fn git_status(workspace: State<'_, Arc<Workspace>>) -> Result<GitStatusResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+pub async fn git_status(
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
+) -> Result<GitStatusResult, AppError> {
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(GitStatusResult {
             unstaged: vec![],
@@ -2986,8 +3269,14 @@ pub async fn git_status(workspace: State<'_, Arc<Workspace>>) -> Result<GitStatu
 }
 
 #[tauri::command]
-pub async fn git_stage(workspace: State<'_, Arc<Workspace>>, path: String) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+pub async fn git_stage(
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
+    path: String,
+) -> Result<(), AppError> {
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -3007,10 +3296,13 @@ pub async fn git_stage(workspace: State<'_, Arc<Workspace>>, path: String) -> Re
 
 #[tauri::command]
 pub async fn git_stage_paths(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     paths: Vec<String>,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -3032,10 +3324,13 @@ pub async fn git_stage_paths(
 
 #[tauri::command]
 pub async fn git_unstage(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     path: String,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -3055,12 +3350,15 @@ pub async fn git_unstage(
 
 #[tauri::command]
 pub async fn git_discard_file(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     path: String,
     status: String,
     old_path: Option<String>,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -3161,10 +3459,13 @@ fn discard_git_file(
 
 #[tauri::command]
 pub async fn git_unstage_paths(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     paths: Vec<String>,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -3252,9 +3553,12 @@ fn run_git_add_with_pathspecs(
 
 #[tauri::command]
 pub async fn git_stage_all(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<GitStageAllResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -3296,8 +3600,13 @@ pub async fn git_stage_all(
 }
 
 #[tauri::command]
-pub async fn git_unstage_all(workspace: State<'_, Arc<Workspace>>) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+pub async fn git_unstage_all(
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
+) -> Result<(), AppError> {
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -3317,10 +3626,12 @@ pub async fn git_unstage_all(workspace: State<'_, Arc<Workspace>>) -> Result<(),
 
 #[tauri::command]
 pub async fn git_commit_files(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     hash: String,
 ) -> Result<Vec<GitFileChange>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(vec![]);
     }
@@ -3401,11 +3712,13 @@ fn git_status_warning_for_rename_aware_fallback(error: &AppError) -> Option<AppE
 
 #[tauri::command]
 pub async fn git_compare_files(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     from_hash: String,
     to_hash: String,
 ) -> Result<Vec<GitFileChange>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory".to_string().into());
     }
@@ -3476,9 +3789,11 @@ pub struct GitBranchesResult {
 
 #[tauri::command]
 pub async fn git_branches(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<GitBranchesResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(GitBranchesResult {
             local: vec![],
@@ -3600,9 +3915,11 @@ pub struct GitStashEntry {
 
 #[tauri::command]
 pub async fn git_stashes(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<Vec<GitStashEntry>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(vec![]);
     }
@@ -3620,9 +3937,11 @@ pub struct GitSubmoduleInfo {
 
 #[tauri::command]
 pub async fn git_submodules(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<Vec<GitSubmoduleInfo>, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Ok(vec![]);
     }
@@ -3670,8 +3989,14 @@ pub async fn git_submodules(
 }
 
 #[tauri::command]
-pub async fn git_init_unity(workspace: State<'_, Arc<Workspace>>) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+pub async fn git_init_unity(
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
+) -> Result<String, AppError> {
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = scope.lock_repository().await;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -4161,13 +4486,15 @@ fn read_git_user_config_value(cwd: Option<&str>, key: &str) -> Result<String, Ap
 
 #[tauri::command]
 pub async fn git_check_user_config(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<GitUserConfig, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let workspace_scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = workspace_scope.root();
     let cwd = if cwd.trim().is_empty() {
         None
     } else {
-        Some(cwd.as_str())
+        Some(cwd)
     };
 
     let name = read_git_user_config_value(cwd, "user.name")?;
@@ -4178,9 +4505,11 @@ pub async fn git_check_user_config(
 
 #[tauri::command]
 pub async fn git_config_snapshot(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<GitConfigSnapshot, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let workspace_scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = workspace_scope.root();
     let cwd = cwd.trim();
     if cwd.is_empty() {
         return Err(AppError::new(
@@ -4197,11 +4526,18 @@ pub async fn git_config_snapshot(
 
 #[tauri::command]
 pub async fn git_save_config(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     scope: GitConfigScope,
     entries: Vec<GitConfigEntry>,
 ) -> Result<GitConfigScopeSnapshot, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let workspace_scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = if scope == GitConfigScope::Repo {
+        Some(workspace_scope.lock_repository().await)
+    } else {
+        None
+    };
+    let cwd = workspace_scope.root();
     let cwd = cwd.trim();
     let cwd = if scope == GitConfigScope::Repo {
         if cwd.is_empty() {
@@ -4520,10 +4856,14 @@ pub struct RunCommandResult {
 
 #[tauri::command]
 pub async fn run_command(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     command: String,
 ) -> Result<RunCommandResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = scope.lock_repository().await;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -4562,9 +4902,13 @@ pub async fn run_command(
 pub async fn git_commit(
     message: String,
     description: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = scope.lock_repository().await;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -5002,14 +5346,17 @@ async fn resolve_codex_commit_request_auth(
 #[tauri::command]
 pub async fn git_generate_commit_message(
     model: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     config: State<'_, Arc<AppConfig>>,
     auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
     api_key_state: State<'_, ApiKeyState>,
     _provider_keys: State<'_, ProviderKeysState>,
     codex: State<'_, CodexAuthStateHandle>,
 ) -> Result<AiCommitMessage, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let task_workspace = scope.task_identity();
+    let cwd = task_workspace.root;
     if cwd.is_empty() {
         return Err("No working directory set".to_string().into());
     }
@@ -5286,7 +5633,8 @@ mod commit_message_prompt_tests {
 
 #[tauri::command]
 pub async fn git_merge_file(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     path: String,
     conflict_code: String,
     base_oid: String,
@@ -5294,7 +5642,8 @@ pub async fn git_merge_file(
     right_oid: String,
     is_lfs: bool,
 ) -> Result<crate::vcs::git_merge::MergeFileInfo, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5314,11 +5663,14 @@ pub async fn git_merge_file(
 
 #[tauri::command]
 pub async fn git_merge_apply(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     path: String,
     mode: crate::vcs::git_merge::MergeApplyMode,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5330,11 +5682,15 @@ pub async fn git_merge_apply(
 
 #[tauri::command]
 pub async fn git_merge_action(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     action: crate::vcs::git_merge::MergeActionKind,
     operation_kind: String,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = scope.lock_repository().await;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5349,11 +5705,12 @@ pub async fn git_merge_action(
 #[tauri::command]
 pub async fn git_merge_semantic_session(
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     request: crate::merge::types::MergeSessionRequest,
 ) -> Result<crate::merge::types::MergeSessionPayload, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5361,12 +5718,14 @@ pub async fn git_merge_semantic_session(
         ));
     }
 
-    let key = crate::merge::session::merge_session_key(
+    let merge_key = crate::merge::session::merge_session_key(
         &request.file_path,
         &request.base_oid,
         &request.left_oid,
         &request.right_oid,
     );
+    let key = format!("{}:{merge_key}", scope.cache_namespace());
+    let scoped_asset_db = scope.asset_db_state();
 
     // Check cache first.
     if let Some(session_lock) = crate::merge::session::get_merge_session(&key) {
@@ -5383,8 +5742,9 @@ pub async fn git_merge_semantic_session(
         &request.base_oid,
         &request.left_oid,
         &request.right_oid,
-        &ref_graph_state,
+        &scoped_asset_db,
         Some(&app_handle),
+        Some(&scope.event_scope),
     ) {
         Ok(session) => session,
         Err(error) => {
@@ -5403,11 +5763,13 @@ pub async fn git_merge_semantic_session(
 
 #[tauri::command]
 pub async fn git_merge_semantic_target(
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     request: crate::merge::types::MergeTargetRequest,
 ) -> Result<crate::merge::types::MergeTargetInspector, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let cwd = scope.root();
+    let scoped_asset_db = scope.asset_db_state();
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5427,7 +5789,7 @@ pub async fn git_merge_semantic_target(
         &mut session,
         &request.target_id,
         &cwd,
-        &ref_graph_state,
+        &scoped_asset_db,
     )
 }
 
@@ -5455,11 +5817,14 @@ fn verify_merge_workspace_hash(
 
 #[tauri::command]
 pub async fn git_merge_semantic_validate(
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     request: crate::merge::types::MergeApplyRequest,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
+    let scoped_asset_db = scope.asset_db_state();
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5477,18 +5842,21 @@ pub async fn git_merge_semantic_validate(
     let mut session = session_lock
         .write()
         .map_err(|_| AppError::new("merge.lock_error", "Failed to write merge session"))?;
-    crate::merge::inspector::materialize_all_merge_targets(&mut session, &cwd, &ref_graph_state)?;
+    crate::merge::inspector::materialize_all_merge_targets(&mut session, &cwd, &scoped_asset_db)?;
     crate::merge::patch::assemble_resolved_yaml(&session, &request.resolutions)?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn git_merge_semantic_apply(
-    workspace: State<'_, Arc<Workspace>>,
-    ref_graph_state: State<'_, AssetDbState>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     request: crate::merge::types::MergeApplyRequest,
 ) -> Result<(), AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
+    let scoped_asset_db = scope.asset_db_state();
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5514,7 +5882,7 @@ pub async fn git_merge_semantic_apply(
         .write()
         .map_err(|_| AppError::new("merge.lock_error", "Failed to write merge session"))?;
 
-    crate::merge::inspector::materialize_all_merge_targets(&mut session, &cwd, &ref_graph_state)?;
+    crate::merge::inspector::materialize_all_merge_targets(&mut session, &cwd, &scoped_asset_db)?;
 
     let assembled = crate::merge::patch::assemble_resolved_yaml(&session, &request.resolutions)?;
     match assembled {
@@ -6115,13 +6483,17 @@ fn run_git_action(cwd: &str, args: &[&str], label: &str) -> Result<GitActionResu
 
 #[tauri::command]
 pub async fn git_commit_action(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     rev: String,
     action: String,
     mode: Option<String>,
     branch_name: Option<String>,
 ) -> Result<GitActionResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = scope.lock_repository().await;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err(AppError::new(
             "git.no_workspace",
@@ -6164,13 +6536,17 @@ pub async fn git_commit_action(
 
 #[tauri::command]
 pub async fn git_branch_action(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     target: String,
     target_kind: String,
     action: String,
     new_name: Option<String>,
 ) -> Result<GitActionResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = scope.lock_repository().await;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err(AppError::new(
             "git.no_workspace",
@@ -6224,11 +6600,15 @@ pub async fn git_branch_action(
 
 #[tauri::command]
 pub async fn git_stash_action(
-    workspace: State<'_, Arc<Workspace>>,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    workspace_ref: WorkspaceRef,
     ref_name: String,
     action: String,
 ) -> Result<GitActionResult, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    let _repository_guard = scope.lock_repository().await;
+    let _workspace_guard = scope.lock_workspace_fs().await;
+    let cwd = scope.root();
     if cwd.is_empty() {
         return Err(AppError::new(
             "git.no_workspace",

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { t } from "../../i18n";
-import { listAgentInjectedItems } from "../../services/agent";
+import { listWorkspaceAgentInjectedItems } from "../../services/agent";
 import { normalizeAppError } from "../../services/errors";
+import type { WorkspaceRef } from "../../services/project";
 import { useAgentStore } from "../../stores/agent";
 import type { InjectedPromptItem } from "../../types";
 import { estimateTextTokens } from "../../utils/tokenEstimate";
@@ -11,6 +12,7 @@ import BaseButton from "../ui/BaseButton.vue";
 
 const props = defineProps<{
   workingDir: string;
+  workspaceRef: WorkspaceRef | null;
 }>();
 
 const agentStore = useAgentStore();
@@ -19,6 +21,7 @@ const loading = ref(false);
 const error = ref("");
 const injectedItems = ref<InjectedPromptItem[]>([]);
 const selectedItemId = ref("");
+let injectedItemsRequestSeq = 0;
 
 const selectedAgentId = computed(() => agentStore.selectedAgentId.trim());
 const selectedAgent = computed(() =>
@@ -119,7 +122,9 @@ function itemCategoryLabel(item: InjectedPromptItem): string {
 }
 
 async function loadInjectedItems() {
-  if (!props.workingDir.trim() || !selectedAgentId.value) {
+  const requestSeq = ++injectedItemsRequestSeq;
+  const workspaceRef = props.workspaceRef;
+  if (!props.workingDir.trim() || !selectedAgentId.value || !workspaceRef) {
     injectedItems.value = [];
     error.value = "";
     return;
@@ -127,13 +132,20 @@ async function loadInjectedItems() {
 
   loading.value = true;
   try {
-    injectedItems.value = await listAgentInjectedItems(selectedAgentId.value);
+    const items = await listWorkspaceAgentInjectedItems(workspaceRef, selectedAgentId.value);
+    if (
+      requestSeq !== injectedItemsRequestSeq
+      || props.workspaceRef?.checkoutId !== workspaceRef.checkoutId
+      || props.workspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
+    ) return;
+    injectedItems.value = items;
     error.value = "";
   } catch (cause) {
+    if (requestSeq !== injectedItemsRequestSeq) return;
     injectedItems.value = [];
     error.value = normalizeAppError(cause).message;
   } finally {
-    loading.value = false;
+    if (requestSeq === injectedItemsRequestSeq) loading.value = false;
   }
 }
 
@@ -151,7 +163,7 @@ watch(
 );
 
 watch(
-  () => `${props.workingDir}::${selectedAgentId.value}`,
+  () => `${props.workspaceRef?.checkoutId ?? ""}::${props.workspaceRef?.expectedGeneration ?? ""}::${props.workingDir}::${selectedAgentId.value}`,
   () => {
     void loadInjectedItems();
   },

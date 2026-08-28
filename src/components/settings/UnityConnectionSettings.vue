@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { t } from "../../i18n";
 import { useCopyFeedback } from "../../composables/useCopyFeedback";
 import { normalizeAppError } from "../../services/errors";
@@ -31,10 +31,16 @@ import {
 } from "../../services/unity";
 import type { UnityBackgroundHookStatus, UnityNativeBrokerStatus } from "../../types";
 import { useNotificationStore } from "../../stores/notification";
+import { useProjectStore } from "../../stores/project";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
+let selfTestBindingVersion = 0;
+let disposed = false;
 
 const externalEditorDefaultEnabled = ref(false);
 const externalEditorDefaultReady = ref(false);
@@ -61,6 +67,7 @@ async function toggleExternalEditorDefaultEnabled() {
   try {
     externalEditorDefaultEnabled.value = await setUnityExternalEditorDefaultEnabled(
       !externalEditorDefaultEnabled.value,
+      projectStore.requireWorkspaceRef(),
     );
   } catch (e) {
     const err = normalizeAppError(e);
@@ -126,7 +133,9 @@ const unityTestToolsDescription = computed(() => {
 
 async function refreshUnityTestToolsStatus() {
   try {
-    unityTestToolsStatus.value = await getUnityTestToolsWorkspaceStatus();
+    unityTestToolsStatus.value = await getUnityTestToolsWorkspaceStatus(
+      projectStore.requireWorkspaceRef(),
+    );
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -143,7 +152,10 @@ async function toggleUnityTestToolsEnabled(value: boolean) {
   if (!unityTestToolsReady.value || unityTestToolsBusy.value) return;
   unityTestToolsBusy.value = true;
   try {
-    unityTestToolsStatus.value = await setUnityTestToolsWorkspaceEnabled(value);
+    unityTestToolsStatus.value = await setUnityTestToolsWorkspaceEnabled(
+      projectStore.requireWorkspaceRef(),
+      value,
+    );
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -215,7 +227,7 @@ async function refreshNativeBridgeStatus() {
   nativeBrokerBusy.value = true;
   try {
     nativeBridgeEnabled.value = await unityNativeBridgeGetEnabled();
-    nativeBrokerStatus.value = await unityNativeBrokerGetStatus();
+    nativeBrokerStatus.value = await unityNativeBrokerGetStatus(projectStore.requireWorkspaceRef());
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -233,8 +245,12 @@ async function toggleNativeBridgeEnabled() {
   if (!nativeBridgeReady.value || nativeBridgeBusy.value) return;
   nativeBridgeBusy.value = true;
   try {
-    nativeBridgeEnabled.value = await unityNativeBridgeSetEnabled(!nativeBridgeEnabled.value);
-    nativeBrokerStatus.value = await unityNativeBrokerGetStatus();
+    const workspaceRef = projectStore.requireWorkspaceRef();
+    nativeBridgeEnabled.value = await unityNativeBridgeSetEnabled(
+      !nativeBridgeEnabled.value,
+      workspaceRef,
+    );
+    nativeBrokerStatus.value = await unityNativeBrokerGetStatus(workspaceRef);
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
@@ -254,7 +270,7 @@ async function runNativeBridgeSelfTest() {
   nativeTestLog.value = [];
   nativeTestSummary.value = "";
   try {
-    await unityNativeBridgeSelfTestRun();
+    await unityNativeBridgeSelfTestRun(projectStore.requireWorkspaceRef());
   } catch (e) {
     const err = normalizeAppError(e);
     nativeTestRunning.value = false;
@@ -281,6 +297,7 @@ async function copyNativeBridgeSelfTestLog() {
 const stateProbeStatus = ref<UnityStateProbeStatus | null>(null);
 const stateProbeReady = ref(false);
 const stateProbeBusy = ref(false);
+let stateProbeLoadVersion = 0;
 
 const stateProbeEnabled = computed(() => stateProbeStatus.value?.enabled ?? false);
 
@@ -304,25 +321,42 @@ const stateProbeStatusLabel = computed(() => {
 });
 
 async function refreshStateProbeStatus() {
+  const version = ++stateProbeLoadVersion;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) {
+    stateProbeStatus.value = null;
+    stateProbeReady.value = true;
+    return;
+  }
   try {
-    stateProbeStatus.value = await unityStateProbeGetStatus();
+    const status = await unityStateProbeGetStatus(workspaceRef);
+    if (version === stateProbeLoadVersion) stateProbeStatus.value = status;
   } catch (e) {
+    if (version !== stateProbeLoadVersion) return;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "loadUnityStateProbeStatus",
     });
   } finally {
-    stateProbeReady.value = true;
+    if (version === stateProbeLoadVersion) stateProbeReady.value = true;
   }
 }
 
 async function toggleStateProbeEnabled() {
   if (!stateProbeReady.value || stateProbeBusy.value) return;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
+  const version = ++stateProbeLoadVersion;
   stateProbeBusy.value = true;
   try {
-    stateProbeStatus.value = await unityStateProbeSetEnabled(!stateProbeEnabled.value);
+    const status = await unityStateProbeSetEnabled(
+      !stateProbeEnabled.value,
+      workspaceRef,
+    );
+    if (version === stateProbeLoadVersion) stateProbeStatus.value = status;
   } catch (e) {
+    if (version !== stateProbeLoadVersion) return;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
@@ -348,7 +382,7 @@ async function runStateProbeSelfTest() {
   probeTestLog.value = [];
   probeTestSummary.value = "";
   try {
-    await unityStateProbeSelfTestRun();
+    await unityStateProbeSelfTestRun(projectStore.requireWorkspaceRef());
   } catch (e) {
     const err = normalizeAppError(e);
     probeTestRunning.value = false;
@@ -375,6 +409,7 @@ async function copyStateProbeSelfTestLog() {
 const backgroundHookStatus = ref<UnityBackgroundHookStatus | null>(null);
 const backgroundHookReady = ref(false);
 const backgroundHookBusy = ref(false);
+let backgroundHookLoadVersion = 0;
 
 const backgroundHookEnabled = computed(() => backgroundHookStatus.value?.enabled ?? false);
 
@@ -398,25 +433,42 @@ const backgroundHookStatusLabel = computed(() => {
 });
 
 async function refreshBackgroundHookStatus() {
+  const version = ++backgroundHookLoadVersion;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) {
+    backgroundHookStatus.value = null;
+    backgroundHookReady.value = true;
+    return;
+  }
   try {
-    backgroundHookStatus.value = await getUnityBackgroundHookStatus();
+    const status = await getUnityBackgroundHookStatus(workspaceRef);
+    if (version === backgroundHookLoadVersion) backgroundHookStatus.value = status;
   } catch (e) {
+    if (version !== backgroundHookLoadVersion) return;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "loadUnityBackgroundHookStatus",
     });
   } finally {
-    backgroundHookReady.value = true;
+    if (version === backgroundHookLoadVersion) backgroundHookReady.value = true;
   }
 }
 
 async function toggleBackgroundHookEnabled() {
   if (!backgroundHookReady.value || backgroundHookBusy.value) return;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
+  const version = ++backgroundHookLoadVersion;
   backgroundHookBusy.value = true;
   try {
-    backgroundHookStatus.value = await setUnityBackgroundHookEnabled(!backgroundHookEnabled.value);
+    const status = await setUnityBackgroundHookEnabled(
+      !backgroundHookEnabled.value,
+      workspaceRef,
+    );
+    if (version === backgroundHookLoadVersion) backgroundHookStatus.value = status;
   } catch (e) {
+    if (version !== backgroundHookLoadVersion) return;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
@@ -429,50 +481,83 @@ async function toggleBackgroundHookEnabled() {
   }
 }
 
+async function bindSelfTestSubscriptions() {
+  const version = ++selfTestBindingVersion;
+  unsubscribeNativeSelfTest?.();
+  unsubscribeNativeSelfTest = null;
+  unsubscribeProbeSelfTest?.();
+  unsubscribeProbeSelfTest = null;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef || disposed) return;
+
+  const [nativeUnsubscribe, probeUnsubscribe] = await Promise.all([
+    subscribeUnityNativeBridgeSelfTest(workspaceRef, (payload) => {
+      nativeTestRunning.value = payload.running && !payload.finished;
+      if (payload.line) nativeTestLog.value = [...nativeTestLog.value, payload.line];
+      if (payload.finished) {
+        nativeTestSummary.value = t(
+          "settings.testing.nativeSelfTestSummary",
+          payload.passed,
+          payload.failed,
+        );
+        void refreshNativeBridgeStatus();
+      }
+    }),
+    subscribeUnityStateProbeSelfTest(workspaceRef, (payload) => {
+      probeTestRunning.value = payload.running && !payload.finished;
+      if (payload.line) probeTestLog.value = [...probeTestLog.value, payload.line];
+      if (payload.finished) {
+        probeTestSummary.value = t(
+          "settings.codeAnalysis.stateProbeSelfTestSummary",
+          payload.passed,
+          payload.failed,
+        );
+        void refreshStateProbeStatus();
+      }
+    }),
+  ]);
+  if (disposed || version !== selfTestBindingVersion) {
+    nativeUnsubscribe();
+    probeUnsubscribe();
+    return;
+  }
+  unsubscribeNativeSelfTest = nativeUnsubscribe;
+  unsubscribeProbeSelfTest = probeUnsubscribe;
+}
+
 onMounted(() => {
+  disposed = false;
   void refreshExternalEditorDefaultEnabled();
   void refreshUnityEmbedEnabled();
   void refreshUnityTestToolsStatus();
   void refreshNativeBridgeStatus();
-  void subscribeUnityNativeBridgeSelfTest((payload) => {
-    nativeTestRunning.value = payload.running && !payload.finished;
-    if (payload.line) {
-      nativeTestLog.value = [...nativeTestLog.value, payload.line];
-    }
-    if (payload.finished) {
-      nativeTestSummary.value = t(
-        "settings.testing.nativeSelfTestSummary",
-        payload.passed,
-        payload.failed,
-      );
-      void refreshNativeBridgeStatus();
-    }
-  }).then((unsubscribe) => {
-    unsubscribeNativeSelfTest = unsubscribe;
-  });
-
   void refreshStateProbeStatus();
-  void subscribeUnityStateProbeSelfTest((payload) => {
-    probeTestRunning.value = payload.running && !payload.finished;
-    if (payload.line) {
-      probeTestLog.value = [...probeTestLog.value, payload.line];
-    }
-    if (payload.finished) {
-      probeTestSummary.value = t(
-        "settings.codeAnalysis.stateProbeSelfTestSummary",
-        payload.passed,
-        payload.failed,
-      );
-      void refreshStateProbeStatus();
-    }
-  }).then((unsubscribe) => {
-    unsubscribeProbeSelfTest = unsubscribe;
-  });
-
+  void bindSelfTestSubscriptions();
   void refreshBackgroundHookStatus();
 });
 
+watch(
+  () => {
+    const scope = workspaceContextStore.focusedWorkspaceRef;
+    return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
+  },
+  () => {
+    nativeTestRunning.value = false;
+    probeTestRunning.value = false;
+    stateProbeStatus.value = null;
+    stateProbeReady.value = false;
+    backgroundHookStatus.value = null;
+    backgroundHookReady.value = false;
+    void bindSelfTestSubscriptions();
+    void refreshNativeBridgeStatus();
+    void refreshStateProbeStatus();
+    void refreshBackgroundHookStatus();
+  },
+);
+
 onUnmounted(() => {
+  disposed = true;
+  selfTestBindingVersion += 1;
   unsubscribeNativeSelfTest?.();
   unsubscribeNativeSelfTest = null;
   unsubscribeProbeSelfTest?.();

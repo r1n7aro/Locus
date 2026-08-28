@@ -77,31 +77,76 @@ pub async fn reconcile(app: AppHandle) {
     }
 
     let runtime_state = Arc::new(ToolRuntimeState::default());
+    let resolve_checkout: http::CheckoutResolver = {
+        let registry = app
+            .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+            .inner()
+            .clone();
+        Arc::new(move |request| {
+            let checkout_id = crate::workspace_service::CheckoutId::new(request.checkout_id)
+                .map_err(|error| error.to_string())?;
+            let workspace_ref = crate::workspace_service::WorkspaceRef::new(
+                checkout_id,
+                request.expected_generation,
+            );
+            let scope = registry
+                .resolve_workspace_ref(&workspace_ref)
+                .map_err(|error| error.to_string())?;
+            Ok(http::CheckoutBinding {
+                checkout_id: scope.runtime().checkout_id().to_string(),
+                workspace_generation: scope.runtime().generation(),
+            })
+        })
+    };
     let dispatcher: http::ToolDispatcher = {
         let app = app.clone();
         let timeout_ms = settings.call_timeout_ms;
         let runtime_state = runtime_state.clone();
-        Arc::new(move |name, args| {
+        Arc::new(move |binding, name, args| {
             let app = app.clone();
             let runtime_state = runtime_state.clone();
             Box::pin(async move {
-                tools::execute_tool(app, name, args, timeout_ms, runtime_state).await
+                let checkout_id = crate::workspace_service::CheckoutId::new(binding.checkout_id)
+                    .expect("resolved MCP checkout id remains valid");
+                let workspace_ref = crate::workspace_service::WorkspaceRef::new(
+                    checkout_id,
+                    Some(binding.workspace_generation),
+                );
+                tools::execute_tool(app, name, args, timeout_ms, runtime_state, workspace_ref).await
             })
         })
     };
     let list_tools: http::ToolListProvider = {
         let app = app.clone();
-        Arc::new(move || tools::listed_tools(&app, &config::load_settings()))
+        Arc::new(move |binding| {
+            let checkout_id =
+                crate::workspace_service::CheckoutId::new(binding.checkout_id.clone())
+                    .expect("resolved MCP checkout id remains valid");
+            let workspace_ref = crate::workspace_service::WorkspaceRef::new(
+                checkout_id,
+                Some(binding.workspace_generation),
+            );
+            tools::listed_tools(&app, &config::load_settings(), &workspace_ref)
+        })
     };
     let instructions: http::InstructionsProvider = {
         let app = app.clone();
-        Arc::new(move || {
+        Arc::new(move |binding| {
             let app = app.clone();
-            Box::pin(async move { tools::build_instructions(&app).await })
+            Box::pin(async move {
+                let checkout_id = crate::workspace_service::CheckoutId::new(binding.checkout_id)
+                    .expect("resolved MCP checkout id remains valid");
+                let workspace_ref = crate::workspace_service::WorkspaceRef::new(
+                    checkout_id,
+                    Some(binding.workspace_generation),
+                );
+                tools::build_instructions(&app, &workspace_ref).await
+            })
         })
     };
     let ctx = Arc::new(http::ServerContext::new(
         settings.token.clone(),
+        resolve_checkout,
         dispatcher,
         list_tools,
         instructions,
@@ -115,7 +160,7 @@ pub async fn reconcile(app: AppHandle) {
             inner.ctx = Some(ctx);
             inner.bound_port = Some(addr.port());
             inner.last_error = None;
-            eprintln!("[McpServer] listening on http://{addr}/mcp");
+            eprintln!("[McpServer] listening on http://{addr}/mcp?checkoutId=<checkout-id>");
         }
         Err(e) => {
             let handle = app.state::<Arc<McpServerHandle>>();

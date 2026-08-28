@@ -71,6 +71,11 @@ import type {
   UnityReferenceImportStatus,
 } from "../types";
 import { normalizeAppError } from "../services/errors";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+  type WorkspaceRef,
+} from "../services/project";
 import { useNotificationStore } from "../stores/notification";
 import { useUiStore } from "../stores/ui";
 import { useSkills } from "./useSkills";
@@ -88,6 +93,7 @@ import { t } from "../i18n";
 
 interface KnowledgeProps {
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
   selectedModelId: string;
   modelDefaults: ModelDefaults;
 }
@@ -821,6 +827,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   let externalRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   type WorkspaceRequestSnapshot = {
     workspaceKey: string;
+    workspaceRef: WorkspaceRef | null;
     requestVersion: number;
   };
   type QueuedKnowledgeChange = {
@@ -858,6 +865,22 @@ export function useKnowledgeState(props: KnowledgeProps) {
     return normalizeWorkspacePath(props.workingDir);
   }
 
+  function currentWorkspaceRef(): WorkspaceRef | null {
+    const value = props.workspaceRef;
+    return value
+      ? {
+          checkoutId: value.checkoutId,
+          expectedGeneration: value.expectedGeneration,
+        }
+      : null;
+  }
+
+  function requireWorkspaceRef(): WorkspaceRef {
+    const value = currentWorkspaceRef();
+    if (!value) throw new Error("Knowledge requires a focused checkout");
+    return value;
+  }
+
   function isCurrentWorkspaceRequest(
     request: WorkspaceRequestSnapshot,
   ): boolean {
@@ -865,6 +888,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       !destroyed &&
       !!request.workspaceKey &&
       request.workspaceKey === currentWorkspaceKey() &&
+      request.workspaceRef?.checkoutId === props.workspaceRef?.checkoutId &&
+      request.workspaceRef?.expectedGeneration === props.workspaceRef?.expectedGeneration &&
       request.requestVersion === workspaceRequestVersion
     );
   }
@@ -872,6 +897,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   function captureWorkspaceRequest(): WorkspaceRequestSnapshot {
     return {
       workspaceKey: currentWorkspaceKey(),
+      workspaceRef: currentWorkspaceRef(),
       requestVersion: workspaceRequestVersion,
     };
   }
@@ -1105,11 +1131,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function refreshRetrievalRuntimeStatus() {
     if (!hasWorkspace.value) return;
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey || !request.workspaceRef) return;
     try {
-      const nextEmbeddingStatus = await knowledgeGetEmbeddingStatus();
+      const [nextEmbeddingStatus, nextLexicalStatus] = await Promise.all([
+        knowledgeGetEmbeddingStatus(request.workspaceRef),
+        knowledgeGetLexicalRebuildStatus(request.workspaceRef),
+      ]);
       if (!isCurrentWorkspaceRequest(request)) return;
       embeddingStatus.value = nextEmbeddingStatus;
+      lexicalRebuildStatus.value = nextLexicalStatus;
       if (retrievalActionPending.value || nextEmbeddingStatus.activating) {
         scheduleRetrievalStatusPoll();
       }
@@ -1119,25 +1149,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
   }
 
-  function handleLexicalRebuildStatus(nextStatus: LexicalRebuildStatus) {
-    if (!hasWorkspace.value) return;
-    lexicalRebuildStatus.value = nextStatus;
-    if (nextStatus.running) return;
-    if (nextStatus.stage === "completed" || nextStatus.stage === "error") {
-      if (!embeddingStatus.value?.activating) {
-        stopRetrievalStatusPoll();
-      }
-      void loadOverview();
-    }
-  }
-
   async function refreshFeishuReferenceImportStatus(handleTransition = false) {
     if (!hasWorkspace.value) return;
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey || !request.workspaceRef) return;
     const previous = feishuReferenceImportStatus.value;
     try {
-      const nextStatus = await knowledgeGetFeishuReferenceImportStatus();
+      const nextStatus = await knowledgeGetFeishuReferenceImportStatus(request.workspaceRef);
       if (!isCurrentWorkspaceRequest(request)) return;
       feishuReferenceImportStatus.value = nextStatus;
       feishuReferenceImportPending.value = nextStatus.running;
@@ -1200,10 +1218,10 @@ export function useKnowledgeState(props: KnowledgeProps) {
   async function refreshUnityReferenceImportStatus(handleTransition = false) {
     if (!hasWorkspace.value) return;
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey || !request.workspaceRef) return;
     const previous = unityReferenceImportStatus.value;
     try {
-      const nextStatus = await knowledgeGetUnityReferenceImportStatus();
+      const nextStatus = await knowledgeGetUnityReferenceImportStatus(request.workspaceRef);
       if (!isCurrentWorkspaceRequest(request)) return;
       unityReferenceImportStatus.value = nextStatus;
       unityReferenceImportPending.value = nextStatus.running;
@@ -1553,10 +1571,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
     options?: { silentSelectedDocument?: boolean },
   ) {
     if (!isCurrentWorkspaceRequest(request)) return;
-    const exactDocuments = (await knowledgeList({
-      type,
-      pathPrefix: path,
-    })).filter((document) => document.path === path);
+    const exactDocuments = (
+      await knowledgeList(
+        {
+          type,
+          pathPrefix: path,
+        },
+        request.workspaceRef!,
+      )
+    ).filter((document) => document.path === path);
     if (!isCurrentWorkspaceRequest(request)) return;
     replaceDocumentPath(type, path, exactDocuments);
     loadedDocumentTypes.add(type);
@@ -1583,6 +1606,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     const nextDocuments = await knowledgeListDirectoryDocuments(
       type,
       normalizedDirectory,
+      request.workspaceRef!,
     );
     if (!isCurrentWorkspaceRequest(request)) return;
     replaceDirectoryDocuments(type, normalizedDirectory, nextDocuments);
@@ -1602,10 +1626,15 @@ export function useKnowledgeState(props: KnowledgeProps) {
       .trim()
       .replace(/\\/g, "/")
       .replace(/^\/+|\/+$/g, "");
-    const nextDocuments = (await knowledgeList({
-      type,
-      pathPrefix: normalizedPrefix,
-    })).filter((document) => pathMatchesSubtree(document.path, normalizedPrefix));
+    const nextDocuments = (
+      await knowledgeList(
+        {
+          type,
+          pathPrefix: normalizedPrefix,
+        },
+        request.workspaceRef!,
+      )
+    ).filter((document) => pathMatchesSubtree(document.path, normalizedPrefix));
     if (!isCurrentWorkspaceRequest(request)) return;
     replaceDocumentSubtree(type, normalizedPrefix, nextDocuments);
     loadedDocumentTypes.add(type);
@@ -1751,7 +1780,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
   function scheduleExternalRefresh(change?: KnowledgeChangedEvent) {
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey || !request.workspaceRef) return;
     if (change) {
       if (!isCurrentWorkspaceChange(change, request)) return;
       pendingExternalChanges.push({ change, request });
@@ -1841,7 +1870,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     },
   ) {
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey || !request.workspaceRef) return;
     const normalizedPath = normalizeDirectorySelectionPath(directoryPath);
     const reset = options?.reset ?? false;
     if (!reset && isDirectoryPageLoading(type, normalizedPath)) return;
@@ -1861,6 +1890,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const page = await knowledgeListDirectoryDocumentsPage(
         type,
         normalizedPath,
+        request.workspaceRef!,
         {
           cursor: currentCursor,
           limit: options?.limit ?? REFERENCE_DOCUMENT_PAGE_SIZE,
@@ -1904,7 +1934,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       return;
     }
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey || !request.workspaceRef) return;
     loading.value = true;
     error.value = "";
     const normalizedPrefix = input.pathPrefix?.trim() ?? "";
@@ -1924,7 +1954,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           silent: true,
         });
       } else {
-        const docs = await knowledgeList(input);
+        const docs = await knowledgeList(input, request.workspaceRef!);
         if (!isCurrentWorkspaceRequest(request)) {
           return;
         }
@@ -2068,12 +2098,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
     if (!request.workspaceKey) return;
     try {
       const [paths, externalBindings, unityManagedStats] = await Promise.all([
-        knowledgeListDirectories(type),
+        knowledgeListDirectories(type, request.workspaceRef!),
         type === "reference"
-          ? knowledgeListExternalReferenceDirectories()
+          ? knowledgeListExternalReferenceDirectories(request.workspaceRef!)
           : Promise.resolve([]),
         type === "reference"
-          ? knowledgeListUnityManagedDirectoryStats()
+          ? knowledgeListUnityManagedDirectoryStats(request.workspaceRef!)
           : Promise.resolve([]),
       ]);
       const nextPaths = [...paths].sort((left, right) =>
@@ -2087,11 +2117,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
       ];
       const settled = await Promise.allSettled(
         configTargets.map(async (target) => {
-          const result = await knowledgeRead({
-            kind: "directory",
-            path: target.path,
-            type,
-          });
+          const result = await knowledgeRead(
+            {
+              kind: "directory",
+              path: target.path,
+              type,
+            },
+            request.workspaceRef!,
+          );
           return { key: target.key, directory: result.directory };
         }),
       );
@@ -2168,7 +2201,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
 
     const request = captureWorkspaceRequest();
-    if (!request.workspaceKey) return;
+    if (!request.workspaceKey || !request.workspaceRef) return;
     overviewLoading.value = true;
     try {
       const [
@@ -2181,14 +2214,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
         nextFeishuReferenceImportStatus,
         nextUnityReferenceImportStatus,
       ] = await Promise.all([
-        knowledgeGetOverview(),
-        knowledgeGetGeneralConfig(),
-        knowledgeGetEmbeddingConfig(),
-        knowledgeGetEmbeddingStatus(),
-        knowledgeGetLexicalRebuildStatus(),
+        knowledgeGetOverview(request.workspaceRef),
+        knowledgeGetGeneralConfig(request.workspaceRef),
+        knowledgeGetEmbeddingConfig(request.workspaceRef),
+        knowledgeGetEmbeddingStatus(request.workspaceRef),
+        knowledgeGetLexicalRebuildStatus(request.workspaceRef),
         knowledgeGetLocalEmbeddingModelCatalog(),
-        knowledgeGetFeishuReferenceImportStatus(),
-        knowledgeGetUnityReferenceImportStatus(),
+        knowledgeGetFeishuReferenceImportStatus(request.workspaceRef),
+        knowledgeGetUnityReferenceImportStatus(request.workspaceRef),
       ]);
       const nextDirectoryInspection = nextEmbeddingConfig.localModelPath.trim()
         ? await knowledgeInspectLocalEmbeddingModelDirectory(
@@ -2265,15 +2298,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
     }
     error.value = "";
     try {
-      const result = await knowledgeRead({
-        kind: "document",
-        path: refTarget.path,
-        type: refTarget.type,
-        part: "full",
-        ...(refTarget.type === "skill" || refTarget.type === "reference"
-          ? { includeHistory: true }
-          : {}),
-      });
+      const result = await knowledgeRead(
+        {
+          kind: "document",
+          path: refTarget.path,
+          type: refTarget.type,
+          part: "full",
+          ...(refTarget.type === "skill" || refTarget.type === "reference"
+            ? { includeHistory: true }
+            : {}),
+        },
+        request.workspaceRef!,
+      );
       const doc = result.document;
       if (!doc) throw new Error("knowledge_read returned no document");
       if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
@@ -2343,11 +2379,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
     selectedDirectoryLoading.value = true;
     error.value = "";
     try {
-      const result = await knowledgeRead({
-        kind: "directory",
-        path: requestPath,
-        type: refType,
-      });
+      const result = await knowledgeRead(
+        {
+          kind: "directory",
+          path: requestPath,
+          type: refType,
+        },
+        request.workspaceRef!,
+      );
       const config = result.directory;
       if (!config)
         throw new Error("knowledge_read returned no directory config");
@@ -2732,7 +2771,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const results = await knowledgeQuery({
         query,
         limit: 30,
-      });
+      }, request.workspaceRef!);
       if (seq !== searchSeq || !isCurrentWorkspaceRequest(request)) return;
       searchResults.value = results;
       searchLatencyMs.value = Math.max(1, Date.now() - startedAt);
@@ -2791,7 +2830,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       embeddingConfig.value = await knowledgeSaveEmbeddingConfig({
         ...embeddingConfig.value,
         ...patch,
-      });
+      }, requireWorkspaceRef());
       await loadOverview();
     } catch (cause) {
       (
@@ -2871,7 +2910,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         knowledgeSaveGeneralConfig({
           ...previous,
           ...patch,
-        }),
+        }, requireWorkspaceRef()),
       );
       await loadOverview();
     } catch (cause) {
@@ -2900,11 +2939,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
         const general = await knowledgeSaveGeneralConfig({
           ...previousGeneral,
           semanticSearchEnabled: enabled,
-        });
+        }, requireWorkspaceRef());
         const embedding = await knowledgeSaveEmbeddingConfig({
           ...previousEmbedding,
           enabled,
-        });
+        }, requireWorkspaceRef());
         return { general, embedding };
       });
       generalConfig.value = savedConfigs.general;
@@ -2927,7 +2966,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     error.value = "";
     scheduleRetrievalStatusPoll(120);
     try {
-      await knowledgeActivateEmbedding();
+      await knowledgeActivateEmbedding(requireWorkspaceRef());
       await loadOverview();
     } catch (cause) {
       notifyEmbeddingRuntimeError(cause);
@@ -2943,7 +2982,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     retrievalActionPending.value = true;
     error.value = "";
     try {
-      await knowledgeDeactivateEmbedding();
+      await knowledgeDeactivateEmbedding(requireWorkspaceRef());
       await loadOverview();
     } catch (cause) {
       notifyError("knowledge_deactivate_embedding", cause);
@@ -2956,7 +2995,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     retrievalActionPending.value = true;
     error.value = "";
     try {
-      await knowledgeRebuildLexicalIndex();
+      await knowledgeRebuildLexicalIndex(requireWorkspaceRef());
       await loadOverview();
     } catch (cause) {
       notifyError("knowledge_rebuild_lexical_index", cause);
@@ -3043,14 +3082,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
     scheduleRetrievalStatusPoll(120);
     try {
       try {
-        await openKnowledgeDownloadProgressWindow(targetModelId);
+        await openKnowledgeDownloadProgressWindow(requireWorkspaceRef(), targetModelId);
       } catch (cause) {
         console.error(
           "Failed to open knowledge download progress window:",
           cause,
         );
       }
-      await knowledgeDownloadLocalEmbeddingModel(targetModelId);
+      await knowledgeDownloadLocalEmbeddingModel(targetModelId, requireWorkspaceRef());
       await loadOverview();
       notificationStore.addNotice(
         "success",
@@ -3103,11 +3142,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
       );
       if (normalizedTargetPath) {
         await openFeishuReferenceImportProgressWindow({
+          workspaceRef: requireWorkspaceRef(),
           targetPath: normalizedTargetPath,
         });
         return;
       }
-      const status = await knowledgeGetFeishuReferenceImportStatus();
+      const status = await knowledgeGetFeishuReferenceImportStatus(requireWorkspaceRef());
       feishuReferenceImportStatus.value = status;
       feishuReferenceImportPending.value = status.running;
       if (status.running || status.stage === "authorizing") {
@@ -3115,7 +3155,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       } else {
         stopFeishuReferenceStatusPoll();
       }
-      await openFeishuReferenceImportProgressWindow();
+      await openFeishuReferenceImportProgressWindow({ workspaceRef: requireWorkspaceRef() });
     } catch (cause) {
       notifyError("knowledge_open_feishu_reference_import_window", cause);
     }
@@ -3137,6 +3177,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         targetPath ?? "",
       );
       const status = await knowledgeDeleteFeishuReferenceDocs(
+        requireWorkspaceRef(),
         normalizedTargetPath || undefined,
       );
       feishuReferenceImportStatus.value = status;
@@ -3167,12 +3208,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const normalizedTargetPath =
         normalizeUnityImportWindowTargetPath(targetPath);
       if (normalizedTargetPath) {
-        await openUnityReferenceImportProgressWindow({
+        await openUnityReferenceImportProgressWindow(requireWorkspaceRef(), {
           targetPath: normalizedTargetPath,
         });
         return;
       }
-      const status = await knowledgeGetUnityReferenceImportStatus();
+      const status = await knowledgeGetUnityReferenceImportStatus(requireWorkspaceRef());
       unityReferenceImportStatus.value = status;
       unityReferenceImportPending.value = status.running;
       if (status.running) {
@@ -3180,7 +3221,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       } else {
         stopUnityReferenceStatusPoll();
       }
-      await openUnityReferenceImportProgressWindow();
+      await openUnityReferenceImportProgressWindow(requireWorkspaceRef());
     } catch (cause) {
       notifyError("knowledge_open_unity_reference_import_window", cause);
     }
@@ -3202,6 +3243,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         targetPath ?? "",
       );
       const status = await knowledgeDeleteUnityReferenceDocs(
+        requireWorkspaceRef(),
         normalizedTargetPath || undefined,
       );
       unityReferenceImportStatus.value = status;
@@ -3252,7 +3294,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
             path,
             summary: documentTitle,
             commandTrigger: `/${slug}`,
-          }),
+          }, requireWorkspaceRef()),
         );
         const docPath = `${manifest.dirName}.md`;
         pendingSelectionPath.value = docPath;
@@ -3278,7 +3320,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
             injectMode: defaults.injectMode,
             aiEditMode: defaults.aiEditMode,
           },
-        }),
+        }, requireWorkspaceRef()),
       );
       const doc = result.document;
       if (!doc) throw new Error("knowledge_create returned no document");
@@ -3326,7 +3368,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
             path: pathName,
             summary: trimmed.replace(/\.md$/i, ""),
             commandTrigger: `/${slug}`,
-          }),
+          }, requireWorkspaceRef()),
         );
         const docPath = `${manifest.dirName}.md`;
         pendingSelectionPath.value = docPath;
@@ -3351,7 +3393,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
             injectMode: defaults.injectMode,
             aiEditMode: defaults.aiEditMode,
           },
-        }),
+        }, requireWorkspaceRef()),
       );
       const doc = result.document;
       if (!doc) throw new Error("knowledge_create returned no document");
@@ -3391,7 +3433,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           kind: "directory",
           type,
           path,
-        }),
+        }, requireWorkspaceRef()),
       );
       await refreshKnowledgeData();
       activeType.value = type;
@@ -3427,7 +3469,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
               section === "maintenanceRules" ? content : undefined,
             body: section === "body" ? content : undefined,
           },
-        });
+        }, requireWorkspaceRef());
         return result.document;
       });
       if (!updated) throw new Error("knowledge_edit returned no document");
@@ -3483,7 +3525,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
             id,
             ...meta,
           },
-        });
+        }, requireWorkspaceRef());
         return result.document;
       });
       if (!updated) throw new Error("knowledge_edit returned no document");
@@ -3557,7 +3599,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
     error.value = "";
     try {
       await enqueueMutation(() =>
-        setSkillConfig(`skill/${packageId}`, skillPackageConfigSource(current), nextConfig),
+        setSkillConfig(
+          `skill/${packageId}`,
+          skillPackageConfigSource(current),
+          nextConfig,
+          requireWorkspaceRef(),
+        ),
       );
       // Manifest-driven bits (slash command availability, capability tags)
       // reconcile in the background; stale-while-revalidate keeps the panel
@@ -3591,7 +3638,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           type: directoryType,
           path: path || directoryType,
           config,
-        });
+        }, requireWorkspaceRef());
         return result.directory;
       });
       if (!updated)
@@ -3626,7 +3673,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           kind: "document",
           type,
           path,
-        }),
+        }, requireWorkspaceRef()),
       );
       clearSelection();
       await refreshKnowledgeData();
@@ -3663,7 +3710,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       error.value = "";
       try {
         const manifest = await enqueueMutation(() =>
-          importSkillPackage(selected),
+          importSkillPackage(selected, requireWorkspaceRef()),
         );
         activeType.value = "skill";
         await refreshKnowledgeData({ force: true, includeOverview: true });
@@ -3713,7 +3760,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
       beginSave();
       error.value = "";
       try {
-        const result = await exportSkillPackage(normalizedPackageId, filePath);
+        const result = await exportSkillPackage(
+          normalizedPackageId,
+          filePath,
+          requireWorkspaceRef(),
+        );
         notificationStore.addNotice(
           "success",
           t("knowledge.skillPackage.exported", result.path),
@@ -3785,7 +3836,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     deletingDocument.value = true;
     error.value = "";
     try {
-      await enqueueMutation(() => deleteSkillPackage(packageId));
+      await enqueueMutation(() => deleteSkillPackage(packageId, requireWorkspaceRef()));
       if (selectionAffectedByPackage(packageId)) {
         clearSelection();
       }
@@ -3817,7 +3868,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       await deleteUnityReferenceDocs(path);
       return;
     }
-    await knowledgeDeleteExternalReferenceDirectory(path);
+    await knowledgeDeleteExternalReferenceDirectory(path, requireWorkspaceRef());
     await refreshKnowledgeData();
   }
 
@@ -3846,7 +3897,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
               kind: "directory",
               type: node.type,
               path: node.relativePath,
-            }),
+            }, requireWorkspaceRef()),
           );
           await refreshKnowledgeData();
         }
@@ -3973,7 +4024,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           type,
           path: normalizedSourcePath,
           newPath: normalizedTargetPath,
-        }),
+        }, requireWorkspaceRef()),
       );
       syncDirectoryMoveSelection(type, normalizedSourcePath, normalizedTargetPath);
       collapseBranch(fullDocumentPath(type, normalizedSourcePath));
@@ -4093,7 +4144,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           : isFolder
             ? node.relativePath
             : (document?.path ?? ""),
-      });
+      }, requireWorkspaceRef());
     } catch (cause) {
       notifyError("knowledge_reveal_target", cause);
     }
@@ -4123,7 +4174,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           type: docType,
           path: normalizedPath,
           newPath: normalizedNextPath,
-        }),
+        }, requireWorkspaceRef()),
       );
       await refreshKnowledgeData();
       expandAncestors(fullDocumentPath(docType, normalizedNextPath));
@@ -4196,22 +4247,28 @@ export function useKnowledgeState(props: KnowledgeProps) {
     // renders with real metadata instead of a "-" placeholder flash.
     if (hasWorkspace.value) void loadSkills();
 
-    const release = await listen<KnowledgeChangedEvent>(
-      "knowledge-changed",
+    const release = await listen<RoutedWorkspaceEvent>(
+      WORKSPACE_EVENT_NAME,
       (event) => {
         if (!hasWorkspace.value) return;
+        const workspaceRef = currentWorkspaceRef();
+        if (
+          !workspaceRef
+          || event.payload.checkoutId !== workspaceRef.checkoutId
+          || event.payload.workspaceGeneration !== workspaceRef.expectedGeneration
+        ) return;
+        if (event.payload.eventName === KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT) {
+          void refreshRetrievalRuntimeStatus();
+          return;
+        }
+        if (event.payload.eventName !== "knowledge-changed") return;
+        const change = event.payload.payload as KnowledgeChangedEvent;
         const eventWorkingDir = normalizeWorkspacePath(
-          event.payload.workingDir,
+          change.workingDir,
         );
         const currentWorkingDir = normalizeWorkspacePath(props.workingDir);
         if (!eventWorkingDir || eventWorkingDir !== currentWorkingDir) return;
-        scheduleExternalRefresh(event.payload);
-      },
-    );
-    const releaseLexicalRebuildStatus = await listen<LexicalRebuildStatus>(
-      KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
-      (event) => {
-        handleLexicalRebuildStatus(event.payload);
+        scheduleExternalRefresh(change);
       },
     );
     const releasePluginsChanged = await listen<void>(
@@ -4225,12 +4282,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
     if (destroyed) {
       release();
       releasePluginsChanged();
-      releaseLexicalRebuildStatus();
       return;
     }
     knowledgeChangedUnlisten = release;
     pluginsChangedUnlisten = releasePluginsChanged;
-    lexicalRebuildStatusUnlisten = releaseLexicalRebuildStatus;
+    lexicalRebuildStatusUnlisten = null;
   });
 
   onUnmounted(() => {

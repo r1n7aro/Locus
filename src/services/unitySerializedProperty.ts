@@ -3,6 +3,7 @@ import type {
   UnitySerializedPropertySnapshot as UnitySerializedPropertySnapshotValue,
   UnitySerializedPropertyTargetSnapshot,
 } from "../components/unity/unitySerializedValue";
+import type { WorkspaceRef } from "./project";
 
 export type UnitySerializedPropertyWriteMode = "commit" | "preview";
 
@@ -96,25 +97,41 @@ export interface UnitySerializedPropertyApplyResult {
 }
 
 export function readUnitySerializedProperty(
+  workspaceRef: WorkspaceRef,
   request: UnitySerializedPropertyReadRequest,
 ): Promise<UnitySerializedPropertyReadResult> {
-  return ipcInvoke<UnitySerializedPropertyReadResult>("unity_serialized_property_read", { request });
+  return ipcInvoke<UnitySerializedPropertyReadResult>("unity_serialized_property_read", {
+    workspaceRef,
+    request,
+  });
 }
 
 export function discoverUnitySerializedProperties(
+  workspaceRef: WorkspaceRef,
   request: UnitySerializedPropertyDiscoverRequest,
 ): Promise<UnitySerializedPropertyDiscoverResult> {
-  return ipcInvoke<UnitySerializedPropertyDiscoverResult>("unity_serialized_property_discover", { request });
+  return ipcInvoke<UnitySerializedPropertyDiscoverResult>("unity_serialized_property_discover", {
+    workspaceRef,
+    request,
+  });
 }
 
 export function writeUnitySerializedProperty(
+  workspaceRef: WorkspaceRef,
   request: UnitySerializedPropertyWriteRequest,
 ): Promise<UnitySerializedPropertyWriteResult> {
-  return ipcInvoke<UnitySerializedPropertyWriteResult>("unity_serialized_property_write", { request });
+  return ipcInvoke<UnitySerializedPropertyWriteResult>("unity_serialized_property_write", {
+    workspaceRef,
+    request,
+  });
 }
 
 export function applyUnitySerializedProperties(
+  workspaceRef: WorkspaceRef,
   request: UnitySerializedPropertyApplyRequest,
 ): Promise<UnitySerializedPropertyApplyResult> {
-  return ipcInvoke<UnitySerializedPropertyApplyResult>("unity_serialized_property_apply", { request });
+  return ipcInvoke<UnitySerializedPropertyApplyResult>("unity_serialized_property_apply", {
+    workspaceRef,
+    request,
+  });
 }

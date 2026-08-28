@@ -4,12 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::FutureExt;
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use serde::Serialize;
+use tauri::{AppHandle, Manager, State};
 
 use super::auth::CodexAuthStateHandle;
 use super::{StreamEvent, TokenUsage};
-use crate::agent::definition::{canonical_agent_id, is_hidden_legacy_agent_id};
+use crate::agent::definition::{
+    canonical_agent_id, is_hidden_legacy_agent_id, AgentDef, AgentDefRegistry,
+    GENERIC_PROJECT_TYPE, UNITY_PROJECT_TYPE,
+};
 use crate::agent::instance::{
     AgentInstance, AgentSystemPromptStats, AssistantStreamSnapshot, KnowledgeAccessMode,
     LlmBackend, MockModelProfile, RawContextStore,
@@ -22,12 +25,18 @@ use crate::session::models::{
     AssetRefData, ChatMessage, ImageData, KnowledgeProposalItem, KnowledgeProposalItemKind,
     KnowledgeProposalStatus, PendingSessionInput, SessionDetail, SessionEventRecord,
     SessionMessagePage, SessionRunSummary, SessionRuntimeSnapshot, SessionRuntimeStatus,
-    SessionSummary, SessionTurnPreview, SessionViewSnapshot, TodoSnapshot, UserIntentPayload,
+    SessionSummary, SessionTurnPreview, SessionViewSnapshot, SessionWorkspaceScope, TodoSnapshot,
+    UserIntentPayload,
 };
 use crate::session::pending_inputs::QueuePendingInputRequest;
 use crate::session::store::{CompactedContextOutput, SessionStore, CHILD_SESSION_FORK_ERROR};
 use crate::tool::ToolRegistry;
-use crate::workspace::Workspace;
+use crate::workspace_definition_registry::WorkspaceDefinitionRegistry;
+use crate::workspace_service::{
+    CheckoutId, ProjectRegistry, ResolvedWorkspaceScope, ServiceKind, WorkspaceRef,
+    WorkspaceRuntime,
+};
+use crate::workspace_tool_registry::WorkspaceToolRegistry;
 use crate::{
     ActiveTaskHandle, ActiveTasks, AgentDefRegistryState, ApiKeyState, PendingInputQueueHandle,
     ProviderKeysState, QuestionStore,
@@ -39,6 +48,7 @@ pub struct AgentInfo {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub project_types: Vec<String>,
     pub is_default: bool,
     pub default_effort: Option<String>,
     pub model_recommendation: Option<String>,
@@ -52,82 +62,38 @@ pub struct ChatLaunch {
     pub run_id: String,
 }
 
-const ACTIVE_SESSION_SELECTION_FILE: &str = "active_session_selection.json";
-const ACTIVE_SESSION_GLOBAL_WORKSPACE_KEY: &str = "__global__";
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentDefinitionSource {
+    Checkout,
+    LegacyGlobal,
+}
+
+fn agent_definition_source(
+    existing_session: bool,
+    persisted_checkout: bool,
+    has_runtime: bool,
+) -> AgentDefinitionSource {
+    if (existing_session && persisted_checkout) || (!existing_session && has_runtime) {
+        AgentDefinitionSource::Checkout
+    } else {
+        AgentDefinitionSource::LegacyGlobal
+    }
+}
+
+struct ChatWorkspaceResolution {
+    scope: Option<ResolvedWorkspaceScope>,
+    definition_source: AgentDefinitionSource,
+}
+
+impl ChatWorkspaceResolution {
+    fn runtime(&self) -> Option<&Arc<WorkspaceRuntime>> {
+        self.scope.as_ref().map(ResolvedWorkspaceScope::runtime)
+    }
+}
+
 // Keep session switching responsive even when a tool-heavy round expands the
 // raw row count while preserving its assistant/tool boundary.
 const DEFAULT_SESSION_VIEW_MESSAGE_LIMIT: u32 = 120;
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ActiveSessionSelectionState {
-    #[serde(default)]
-    by_workspace: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActiveSessionSelectionChanged {
-    pub workspace_key: String,
-    pub session_id: Option<String>,
-}
-
-fn active_session_selection_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
-    Ok(super::resolve_runtime_storage_dir(app_handle)?.join(ACTIVE_SESSION_SELECTION_FILE))
-}
-
-fn read_active_session_selection_state(
-    app_handle: &AppHandle,
-) -> Result<ActiveSessionSelectionState, String> {
-    let path = active_session_selection_path(app_handle)?;
-    if !path.exists() {
-        return Ok(ActiveSessionSelectionState::default());
-    }
-
-    match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<ActiveSessionSelectionState>(&raw).ok())
-    {
-        Some(mut state) => {
-            state
-                .by_workspace
-                .retain(|key, value| !key.trim().is_empty() && !value.trim().is_empty());
-            Ok(state)
-        }
-        None => {
-            eprintln!(
-                "[Locus] warning: ignored invalid active session selection state at {}",
-                path.display()
-            );
-            Ok(ActiveSessionSelectionState::default())
-        }
-    }
-}
-
-fn write_active_session_selection_state(
-    app_handle: &AppHandle,
-    state: &ActiveSessionSelectionState,
-) -> Result<(), String> {
-    let path = active_session_selection_path(app_handle)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create storage dir: {}", e))?;
-    }
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|e| format!("Failed to serialize active session selection: {}", e))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to save active session selection: {}", e))
-}
-
-async fn active_session_workspace_key(workspace: &State<'_, Arc<Workspace>>) -> String {
-    workspace
-        .workspace_id
-        .read()
-        .await
-        .clone()
-        .filter(|id| !id.trim().is_empty())
-        .unwrap_or_else(|| ACTIVE_SESSION_GLOBAL_WORKSPACE_KEY.to_string())
-}
 
 fn emit_session_stream(app_handle: &AppHandle, store: &SessionStore, event: StreamEvent) {
     emit_session_stream_with_run_id(
@@ -499,27 +465,107 @@ fn apply_knowledge_target(
     }
 }
 
-#[tauri::command]
-pub async fn list_agents(
-    registry: State<'_, AgentDefRegistryState>,
-) -> Result<Vec<AgentInfo>, AppError> {
-    let registry = registry.0.read().await;
-    let default_id = registry.default_id().to_string();
-    let sub_agent_ids: std::collections::HashSet<&str> = registry
+fn workspace_scope_error(operation: &'static str, error: impl std::fmt::Display) -> AppError {
+    AppError::new(
+        "workspace.scope_resolution_failed",
+        "Failed to resolve the requested workspace checkout.",
+    )
+    .detail(error.to_string())
+    .operation(operation)
+}
+
+pub(crate) fn resolve_workspace_scope(
+    workspace_registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    operation: &'static str,
+) -> Result<ResolvedWorkspaceScope, AppError> {
+    workspace_registry
+        .resolve_workspace_ref(workspace_ref)
+        .map_err(|error| workspace_scope_error(operation, error))
+}
+
+async fn workspace_agent_registry_snapshot(
+    workspace_ref: &WorkspaceRef,
+    definitions: &WorkspaceDefinitionRegistry,
+    workspace_registry: &ProjectRegistry,
+    operation: &'static str,
+) -> Result<Arc<AgentDefRegistry>, AppError> {
+    let scope = resolve_workspace_scope(workspace_registry, workspace_ref, operation)?;
+    definitions
+        .snapshot(scope.runtime().as_ref())
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "agent.workspace_definitions_unavailable",
+                "Failed to load Agent definitions for this checkout.",
+            )
+            .detail(error)
+            .operation(operation)
+        })
+}
+
+fn preferred_agent_id_for_project_type<'a>(
+    registry: &'a AgentDefRegistry,
+    agents: &[&'a AgentDef],
+    project_type: Option<&str>,
+) -> &'a str {
+    let Some(project_type) = project_type else {
+        return registry.default_id();
+    };
+    let best_score = agents
+        .iter()
+        .map(|agent| agent.project_type_match_score(project_type))
+        .max()
+        .unwrap_or_default();
+    if best_score == 0 {
+        return registry.default_id();
+    }
+    if let Some(default) = agents.iter().find(|agent| {
+        agent.id == registry.default_id() && agent.supports_project_type(project_type)
+    }) {
+        return default.id.as_str();
+    }
+    agents
+        .iter()
+        .filter(|agent| agent.project_type_match_score(project_type) == best_score)
+        .min_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)))
+        .map(|agent| agent.id.as_str())
+        .unwrap_or_else(|| registry.default_id())
+}
+
+fn workspace_project_type(runtime: &WorkspaceRuntime) -> &'static str {
+    if runtime
+        .services()
+        .detected_kinds()
+        .contains(&ServiceKind::Unity)
+    {
+        UNITY_PROJECT_TYPE
+    } else {
+        GENERIC_PROJECT_TYPE
+    }
+}
+
+fn list_agent_infos(registry: &AgentDefRegistry, project_type: Option<&str>) -> Vec<AgentInfo> {
+    let sub_agent_ids: HashSet<&str> = registry
         .list_all()
         .iter()
-        .flat_map(|def| def.sub_agents.iter().map(|s| s.as_str()))
+        .flat_map(|def| def.sub_agents.iter().map(String::as_str))
         .collect();
-    let mut agents: Vec<AgentInfo> = registry
+    let top_level_defs = registry
         .list_all()
         .into_iter()
         .filter(|def| {
             !sub_agent_ids.contains(def.id.as_str()) && !is_hidden_legacy_agent_id(&def.id)
         })
+        .collect::<Vec<_>>();
+    let default_id = preferred_agent_id_for_project_type(registry, &top_level_defs, project_type);
+    let mut agents: Vec<AgentInfo> = top_level_defs
+        .into_iter()
         .map(|def| AgentInfo {
             id: def.id.clone(),
             name: def.name.clone(),
             description: def.description.clone(),
+            project_types: def.project_types.clone(),
             is_default: def.id == default_id,
             default_effort: def.default_effort.clone(),
             model_recommendation: def.model_recommendation.clone(),
@@ -527,15 +573,11 @@ pub async fn list_agents(
         })
         .collect();
     agents.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
-    Ok(agents)
+    agents
 }
 
-#[tauri::command]
-pub async fn list_subagent_defs(
-    registry: State<'_, AgentDefRegistryState>,
-) -> Result<Vec<AgentInfo>, AppError> {
-    let registry = registry.0.read().await;
-    let sub_agent_ids: std::collections::HashSet<String> = registry
+fn list_subagent_infos(registry: &AgentDefRegistry) -> Vec<AgentInfo> {
+    let sub_agent_ids: HashSet<String> = registry
         .list_all()
         .iter()
         .flat_map(|def| def.sub_agents.iter().cloned())
@@ -548,6 +590,7 @@ pub async fn list_subagent_defs(
             id: def.id.clone(),
             name: def.name.clone(),
             description: def.description.clone(),
+            project_types: def.project_types.clone(),
             is_default: false,
             default_effort: def.default_effort.clone(),
             model_recommendation: def.model_recommendation.clone(),
@@ -555,7 +598,234 @@ pub async fn list_subagent_defs(
         })
         .collect();
     agents.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(agents)
+    agents
+}
+
+fn agent_system_prompt(registry: &AgentDefRegistry, agent_id: &str) -> Result<String, AppError> {
+    registry
+        .get(agent_id)
+        .map(|def| def.system_prompt.clone())
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id).into())
+}
+
+fn agent_env_template(registry: &AgentDefRegistry, agent_id: &str) -> Result<String, AppError> {
+    registry
+        .get(agent_id)
+        .map(|def| def.env_template.clone())
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id).into())
+}
+
+fn validate_session_project_scope(
+    persisted: &SessionWorkspaceScope,
+    runtime: &WorkspaceRuntime,
+    operation: &'static str,
+) -> Result<(), AppError> {
+    let Some(expected_project_id) = persisted.project_id.as_deref() else {
+        return Ok(());
+    };
+    if runtime.project_id().as_str() == expected_project_id {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "session.workspace_scope_conflict",
+        "The session checkout belongs to a different project.",
+    )
+    .detail(format!(
+        "session project {}, checkout project {}",
+        expected_project_id,
+        runtime.project_id()
+    ))
+    .operation(operation))
+}
+
+/// Resolve an explicit checkout binding for a project-owned session and hold
+/// its runtime lease for the complete caller operation. When callers omit the
+/// binding, the session's last successful checkout is used as its default.
+pub(crate) fn resolve_session_workspace_scope(
+    store: &SessionStore,
+    workspace_registry: &ProjectRegistry,
+    session_id: &str,
+    requested_workspace_ref: Option<&WorkspaceRef>,
+    operation: &'static str,
+) -> Result<ResolvedWorkspaceScope, AppError> {
+    let persisted = store
+        .get_session_workspace_scope(session_id)
+        .map_err(AppError::from)?;
+    let workspace_ref = if let Some(requested) = requested_workspace_ref {
+        requested.clone()
+    } else {
+        let default_checkout_id = persisted.default_checkout_id.as_deref().ok_or_else(|| {
+            AppError::new(
+                "session.checkout_selection_required",
+                "Select a worktree from this session's project before starting the operation.",
+            )
+            .detail(session_id.to_string())
+            .operation(operation)
+        })?;
+        let checkout_id = CheckoutId::new(default_checkout_id).map_err(|error| {
+            AppError::new(
+                "session.checkout_identity_invalid",
+                "The session default checkout identity is invalid.",
+            )
+            .detail(error.to_string())
+            .operation(operation)
+        })?;
+        WorkspaceRef::new(checkout_id, None)
+    };
+    let runtime = workspace_registry
+        .activate_persisted_checkout(&workspace_ref.checkout_id)
+        .map_err(|error| {
+            AppError::new(
+                "session.checkout_registration_failed",
+                "The session checkout could not be activated.",
+            )
+            .detail(error)
+            .operation(operation)
+        })?;
+    let active_workspace_ref = WorkspaceRef::for_runtime(runtime.as_ref());
+    let scope = resolve_workspace_scope(workspace_registry, &active_workspace_ref, operation)?;
+    validate_session_project_scope(&persisted, scope.runtime().as_ref(), operation)?;
+    Ok(scope)
+}
+
+/// Resolve the last checkout used by a project session for read-only commands.
+pub(crate) fn resolve_optional_session_workspace_scope(
+    store: &SessionStore,
+    workspace_registry: &ProjectRegistry,
+    session_id: &str,
+    operation: &'static str,
+) -> Result<Option<ResolvedWorkspaceScope>, AppError> {
+    let persisted = store
+        .get_session_workspace_scope(session_id)
+        .map_err(AppError::from)?;
+    if persisted.default_checkout_id.as_deref().is_none() {
+        return Ok(None);
+    }
+    resolve_session_workspace_scope(store, workspace_registry, session_id, None, operation)
+        .map(Some)
+}
+
+fn resolve_chat_workspace_scope(
+    store: &SessionStore,
+    workspace_registry: &ProjectRegistry,
+    session_id: Option<&str>,
+    requested_workspace_ref: Option<&WorkspaceRef>,
+) -> Result<ChatWorkspaceResolution, AppError> {
+    let operation = "chat";
+    let Some(session_id) = session_id else {
+        let workspace_ref = requested_workspace_ref.ok_or_else(|| {
+            AppError::new(
+                "session.checkout_selection_required",
+                "Select a checkout before starting a new session.",
+            )
+            .operation(operation)
+        })?;
+        let scope = Some(resolve_workspace_scope(
+            workspace_registry,
+            workspace_ref,
+            operation,
+        )?);
+        return Ok(ChatWorkspaceResolution {
+            definition_source: agent_definition_source(false, false, scope.is_some()),
+            scope,
+        });
+    };
+
+    let scope = Some(resolve_session_workspace_scope(
+        store,
+        workspace_registry,
+        session_id,
+        requested_workspace_ref,
+        operation,
+    )?);
+    Ok(ChatWorkspaceResolution {
+        scope,
+        definition_source: agent_definition_source(true, true, true),
+    })
+}
+
+async fn chat_agent_registry_snapshot(
+    workspace: &ChatWorkspaceResolution,
+    definitions: &WorkspaceDefinitionRegistry,
+    legacy_registry: &AgentDefRegistryState,
+) -> Result<Arc<AgentDefRegistry>, AppError> {
+    match workspace.definition_source {
+        AgentDefinitionSource::Checkout => {
+            let runtime = workspace.runtime().ok_or_else(|| {
+                AppError::new(
+                    "agent.workspace_scope_missing",
+                    "The checkout Agent definition scope is unavailable.",
+                )
+                .operation("chat")
+            })?;
+            definitions
+                .snapshot(runtime.as_ref())
+                .await
+                .map_err(|error| {
+                    AppError::new(
+                        "agent.workspace_definitions_unavailable",
+                        "Failed to load Agent definitions for this checkout.",
+                    )
+                    .detail(error)
+                    .operation("chat")
+                })
+        }
+        AgentDefinitionSource::LegacyGlobal => Ok(legacy_registry.snapshot().await),
+    }
+}
+
+#[tauri::command]
+pub async fn list_agents(
+    registry: State<'_, AgentDefRegistryState>,
+) -> Result<Vec<AgentInfo>, AppError> {
+    let registry = registry.0.read().await;
+    Ok(list_agent_infos(&registry, None))
+}
+
+#[tauri::command]
+pub async fn list_workspace_agents(
+    workspace_ref: WorkspaceRef,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<Vec<AgentInfo>, AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner().as_ref(),
+        &workspace_ref,
+        "listWorkspaceAgents",
+    )?;
+    let project_type = workspace_project_type(scope.runtime());
+    let registry = workspace_agent_registry_snapshot(
+        &workspace_ref,
+        definitions.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        "listWorkspaceAgents",
+    )
+    .await?;
+    Ok(list_agent_infos(&registry, Some(project_type)))
+}
+
+#[tauri::command]
+pub async fn list_subagent_defs(
+    registry: State<'_, AgentDefRegistryState>,
+) -> Result<Vec<AgentInfo>, AppError> {
+    let registry = registry.0.read().await;
+    Ok(list_subagent_infos(&registry))
+}
+
+#[tauri::command]
+pub async fn list_workspace_subagent_defs(
+    workspace_ref: WorkspaceRef,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<Vec<AgentInfo>, AppError> {
+    let registry = workspace_agent_registry_snapshot(
+        &workspace_ref,
+        definitions.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        "listWorkspaceSubagentDefs",
+    )
+    .await?;
+    Ok(list_subagent_infos(&registry))
 }
 
 #[tauri::command]
@@ -564,10 +834,24 @@ pub async fn get_agent_system_prompt(
     agent_id: String,
 ) -> Result<String, AppError> {
     let registry = registry.0.read().await;
-    match registry.get(&agent_id) {
-        Some(def) => Ok(def.system_prompt.clone()),
-        None => Err(format!("Agent '{}' not found", agent_id).into()),
-    }
+    agent_system_prompt(&registry, &agent_id)
+}
+
+#[tauri::command]
+pub async fn get_workspace_agent_system_prompt(
+    workspace_ref: WorkspaceRef,
+    agent_id: String,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<String, AppError> {
+    let registry = workspace_agent_registry_snapshot(
+        &workspace_ref,
+        definitions.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        "getWorkspaceAgentSystemPrompt",
+    )
+    .await?;
+    agent_system_prompt(&registry, &agent_id)
 }
 
 #[tauri::command]
@@ -576,10 +860,123 @@ pub async fn get_agent_env_template(
     agent_id: String,
 ) -> Result<String, AppError> {
     let registry = registry.0.read().await;
-    match registry.get(&agent_id) {
-        Some(def) => Ok(def.env_template.clone()),
-        None => Err(format!("Agent '{}' not found", agent_id).into()),
+    agent_env_template(&registry, &agent_id)
+}
+
+#[tauri::command]
+pub async fn get_workspace_agent_env_template(
+    workspace_ref: WorkspaceRef,
+    agent_id: String,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<String, AppError> {
+    let registry = workspace_agent_registry_snapshot(
+        &workspace_ref,
+        definitions.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        "getWorkspaceAgentEnvTemplate",
+    )
+    .await?;
+    agent_env_template(&registry, &agent_id)
+}
+
+fn requested_agent_services(runtime: &WorkspaceRuntime, def: &AgentDef) -> Vec<ServiceKind> {
+    let needs_unity = runtime
+        .services()
+        .detected_kinds()
+        .contains(&ServiceKind::Unity)
+        && (def.env_template.contains("{{#unity}}")
+            || def.tools.iter().any(|tool_name| {
+                crate::workspace_service::service::owner_service_for_tool(tool_name)
+                    == Some(ServiceKind::Unity)
+            }));
+    if needs_unity {
+        vec![ServiceKind::Unity]
+    } else {
+        Vec::new()
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn workspace_agent_preview_instance(
+    workspace_ref: &WorkspaceRef,
+    agent_id: &str,
+    knowledge_access_mode: KnowledgeAccessMode,
+    selected_model: Option<&str>,
+    operation: &'static str,
+    definitions: &WorkspaceDefinitionRegistry,
+    workspace_tools: &WorkspaceToolRegistry,
+    workspace_registry: &ProjectRegistry,
+    config: &AppConfig,
+    raw_store: RawContextStore,
+    app_knowledge_dir: Arc<Option<PathBuf>>,
+    app_agent_dir: Arc<Option<PathBuf>>,
+) -> Result<AgentInstance, AppError> {
+    let scope = resolve_workspace_scope(workspace_registry, workspace_ref, operation)?;
+    let runtime = scope.runtime();
+    let registry_snapshot = definitions
+        .snapshot(runtime.as_ref())
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "agent.workspace_definitions_unavailable",
+                "Failed to load Agent definitions for this checkout.",
+            )
+            .detail(error)
+            .operation(operation)
+        })?;
+    let def = registry_snapshot
+        .get(agent_id)
+        .cloned()
+        .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
+    let tool_snapshot = workspace_tools
+        .snapshot(runtime.as_ref(), registry_snapshot.as_ref())
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "tool.workspace_definitions_unavailable",
+                "Failed to load tool definitions for this checkout.",
+            )
+            .detail(error)
+            .operation(operation)
+        })?;
+    let requested_services = requested_agent_services(runtime.as_ref(), &def);
+    let execution = workspace_registry
+        .execution_context(runtime.checkout_id(), &requested_services)
+        .await
+        .map_err(|error| workspace_scope_error(operation, error))?;
+    let effective_model = selected_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("__workspace-agent-preview__")
+        .to_string();
+    let mut instance = AgentInstance::new(
+        Arc::new(def),
+        "__workspace-agent-preview__",
+        LlmBackend::ClaudeCodeCli,
+        false,
+        registry_snapshot,
+        tool_snapshot,
+        runtime.root().to_string_lossy().to_string(),
+        raw_store,
+        Some(runtime.project_id().to_string()),
+        effective_model,
+        None,
+        app_knowledge_dir,
+        app_agent_dir,
+        knowledge_access_mode,
+        None,
+        HashMap::new(),
+        tokio::sync::watch::channel(false).1,
+    );
+    instance.set_execution_context(execution);
+    instance.set_async_tasks_enabled(config.async_tasks_enabled());
+    instance.configure_preview_lazy_tool_renderer(
+        selected_model,
+        config.dynamic_tool_loading_mode(),
+        config.base_url.as_deref(),
+    );
+    Ok(instance)
 }
 
 #[tauri::command]
@@ -588,7 +985,6 @@ pub async fn get_agent_rendered_env_prompt(
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     config: State<'_, Arc<AppConfig>>,
-    workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
@@ -598,12 +994,8 @@ pub async fn get_agent_rendered_env_prompt(
         .get(&agent_id)
         .cloned()
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
-    let working_dir = workspace.path.read().await.clone();
-    let workspace_id = if working_dir.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
+    let working_dir = String::new();
+    let workspace_id = None;
 
     let mut instance = AgentInstance::new(
         Arc::new(def),
@@ -630,12 +1022,42 @@ pub async fn get_agent_rendered_env_prompt(
 }
 
 #[tauri::command]
+pub async fn get_workspace_agent_rendered_env_prompt(
+    workspace_ref: WorkspaceRef,
+    agent_id: String,
+    selected_model: Option<String>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_tools: State<'_, Arc<WorkspaceToolRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
+    raw_store: State<'_, RawContextStore>,
+    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<String, AppError> {
+    let instance = workspace_agent_preview_instance(
+        &workspace_ref,
+        &agent_id,
+        KnowledgeAccessMode::Full,
+        selected_model.as_deref(),
+        "getWorkspaceAgentRenderedEnvPrompt",
+        definitions.inner().as_ref(),
+        workspace_tools.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        config.inner().as_ref(),
+        raw_store.inner().clone(),
+        app_knowledge_dir.0.clone(),
+        app_agent_dir.0.clone(),
+    )
+    .await?;
+    Ok(instance.rendered_env_prompt().await)
+}
+
+#[tauri::command]
 pub async fn get_agent_system_prompt_stats(
     agent_id: String,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     config: State<'_, Arc<AppConfig>>,
-    workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
@@ -645,12 +1067,8 @@ pub async fn get_agent_system_prompt_stats(
         .get(&agent_id)
         .cloned()
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
-    let working_dir = workspace.path.read().await.clone();
-    let workspace_id = if working_dir.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
+    let working_dir = String::new();
+    let workspace_id = None;
 
     let mut instance = AgentInstance::new(
         Arc::new(def),
@@ -673,6 +1091,37 @@ pub async fn get_agent_system_prompt_stats(
     );
     instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
+    Ok(instance.system_prompt_stats().await)
+}
+
+#[tauri::command]
+pub async fn get_workspace_agent_system_prompt_stats(
+    workspace_ref: WorkspaceRef,
+    agent_id: String,
+    selected_model: Option<String>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_tools: State<'_, Arc<WorkspaceToolRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
+    raw_store: State<'_, RawContextStore>,
+    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<AgentSystemPromptStats, AppError> {
+    let instance = workspace_agent_preview_instance(
+        &workspace_ref,
+        &agent_id,
+        KnowledgeAccessMode::Full,
+        selected_model.as_deref(),
+        "getWorkspaceAgentSystemPromptStats",
+        definitions.inner().as_ref(),
+        workspace_tools.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        config.inner().as_ref(),
+        raw_store.inner().clone(),
+        app_knowledge_dir.0.clone(),
+        app_agent_dir.0.clone(),
+    )
+    .await?;
     Ok(instance.system_prompt_stats().await)
 }
 
@@ -813,7 +1262,6 @@ pub async fn list_agent_injected_items(
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     config: State<'_, Arc<AppConfig>>,
-    workspace: State<'_, Arc<Workspace>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
@@ -823,12 +1271,8 @@ pub async fn list_agent_injected_items(
         .get(&agent_id)
         .cloned()
         .ok_or_else(|| format!("Agent '{}' not found", agent_id))?;
-    let working_dir = workspace.path.read().await.clone();
-    let workspace_id = if working_dir.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
+    let working_dir = String::new();
+    let workspace_id = None;
     let knowledge_access_mode = KnowledgeAccessMode::from_request(knowledge_mode.as_deref())
         .map_err(|error| AppError::new("agent.invalid_knowledge_mode", error))?;
 
@@ -862,20 +1306,57 @@ pub async fn list_agent_injected_items(
 }
 
 #[tauri::command]
+pub async fn list_workspace_agent_injected_items(
+    workspace_ref: WorkspaceRef,
+    agent_id: String,
+    knowledge_mode: Option<String>,
+    selected_model: Option<String>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    workspace_tools: State<'_, Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
+    raw_store: State<'_, RawContextStore>,
+    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+) -> Result<Vec<crate::agent::instance::InjectedPromptItem>, AppError> {
+    let knowledge_access_mode = KnowledgeAccessMode::from_request(knowledge_mode.as_deref())
+        .map_err(|error| AppError::new("agent.invalid_knowledge_mode", error))?;
+    let instance = workspace_agent_preview_instance(
+        &workspace_ref,
+        &agent_id,
+        knowledge_access_mode,
+        selected_model.as_deref(),
+        "listWorkspaceAgentInjectedItems",
+        definitions.inner().as_ref(),
+        workspace_tools.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        config.inner().as_ref(),
+        raw_store.inner().clone(),
+        app_knowledge_dir.0.clone(),
+        app_agent_dir.0.clone(),
+    )
+    .await?;
+    Ok(instance.list_injected_prompt_items().await)
+}
+
+#[tauri::command]
 pub async fn create_session(
     title: String,
     parent_session_id: Option<String>,
     session_type: Option<String>,
     agent_id: Option<String>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<crate::workspace_service::ProjectRegistry>>,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<String, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    let ws_id = if cwd.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner().as_ref(),
+        &workspace_ref,
+        "createSession",
+    )?;
+    let runtime = scope.runtime();
+    let ws_id = runtime.project_id().to_string();
+    let checkout_id = runtime.checkout_id().to_string();
     let trimmed = title.trim();
     let resolved_title = if trimmed.is_empty() {
         "New session"
@@ -884,10 +1365,11 @@ pub async fn create_session(
     };
     let resolved_agent_id = agent_id.as_deref().map(canonical_agent_id);
     store
-        .create_session(
+        .create_session_scoped(
             resolved_title,
             parent_session_id.as_deref(),
-            ws_id.as_deref(),
+            Some(&ws_id),
+            Some(&checkout_id),
             session_type.as_deref().unwrap_or("chat"),
             resolved_agent_id,
         )
@@ -1056,6 +1538,7 @@ pub async fn fork_session_from_message(
 #[tauri::command]
 pub async fn chat(
     session_id: Option<String>,
+    workspace_ref: Option<WorkspaceRef>,
     text: String,
     resume: Option<bool>,
     session_title: Option<String>,
@@ -1078,26 +1561,44 @@ pub async fn chat(
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     config: State<'_, Arc<AppConfig>>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
+    workspace_tools: State<'_, Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>,
     auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
     api_key_state: State<'_, ApiKeyState>,
     _provider_keys: State<'_, ProviderKeysState>,
     codex: State<'_, CodexAuthStateHandle>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<crate::workspace_service::ProjectRegistry>>,
     raw_store: State<'_, RawContextStore>,
     active_tasks: State<'_, ActiveTasks>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
     undo_manager: State<'_, crate::UndoManagerHandle>,
 ) -> Result<ChatLaunch, AppError> {
-    let registry_snapshot = registry.snapshot().await;
-    let cwd = workspace.path.read().await.clone();
-    let ws_id = if cwd.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
+    let chat_workspace = resolve_chat_workspace_scope(
+        store.inner().as_ref(),
+        workspace_registry.inner().as_ref(),
+        session_id.as_deref(),
+        workspace_ref.as_ref(),
+    )?;
+    let scoped_runtime = chat_workspace.runtime().cloned();
+    let registry_snapshot = chat_agent_registry_snapshot(
+        &chat_workspace,
+        definitions.inner().as_ref(),
+        registry.inner(),
+    )
+    .await?;
+    let cwd = scoped_runtime
+        .as_ref()
+        .map(|runtime| runtime.root().display().to_string())
+        .unwrap_or_default();
+    let ws_id = scoped_runtime
+        .as_ref()
+        .map(|runtime| runtime.project_id().to_string());
+    let checkout_id = scoped_runtime
+        .as_ref()
+        .map(|runtime| runtime.checkout_id().to_string());
 
     let is_new_session = session_id.is_none();
     let resume_requested = resume.unwrap_or(false);
@@ -1162,10 +1663,11 @@ pub async fn chat(
         None => {
             let title = explicit_session_title.unwrap_or_else(|| text.chars().take(20).collect());
             let title = generated_title_fallback.unwrap_or(title);
-            store.create_session(
+            store.create_session_scoped(
                 &title,
                 None,
                 ws_id.as_deref(),
+                checkout_id.as_deref(),
                 session_kind,
                 requested_agent_id.as_deref(),
             )?
@@ -1315,6 +1817,9 @@ pub async fn chat(
         crate::session::title::spawn_codex_session_title_generation(
             app_handle.clone(),
             store.inner().clone(),
+            scoped_runtime
+                .as_deref()
+                .map(crate::workspace_service::event::WorkspaceEventScope::for_runtime),
             codex.inner().clone(),
             codex_model_config.transport,
             config.base_url.clone(),
@@ -1325,10 +1830,24 @@ pub async fn chat(
         );
     }
 
+    let effective_tool_registry = match scoped_runtime.as_ref() {
+        Some(runtime) => workspace_tools
+            .snapshot(runtime.as_ref(), registry_snapshot.as_ref())
+            .await
+            .map_err(|detail| {
+                AppError::new(
+                    "tool.workspace_definitions_unavailable",
+                    "Failed to load tool definitions for this checkout.",
+                )
+                .detail(detail)
+                .operation("chat")
+            })?,
+        None => tool_registry.inner().clone(),
+    };
     let reg = registry_snapshot;
     let tools = match sdk_agent.as_ref() {
-        Some(spec) => crate::sdk::tool_registry_for_agent(tool_registry.inner().as_ref(), spec)?,
-        None => tool_registry.inner().clone(),
+        Some(spec) => crate::sdk::tool_registry_for_agent(effective_tool_registry.as_ref(), spec)?,
+        None => effective_tool_registry,
     };
     let raw = raw_store.inner().clone();
 
@@ -1340,6 +1859,31 @@ pub async fn chat(
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let idle_cancel_rx = cancel_rx.clone();
     let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+    let execution_binding_request = scoped_runtime.as_ref().map(|runtime| {
+        let requested_services = requested_agent_services(runtime.as_ref(), def.as_ref());
+        (runtime.checkout_id().clone(), requested_services)
+    });
+    let execution_context =
+        if let Some((checkout_id, requested_services)) = execution_binding_request.as_ref() {
+            Some(
+                workspace_registry
+                    .execution_context(checkout_id, requested_services)
+                    .await
+                    .map_err(|error| {
+                        AppError::new(
+                            "workspace.execution_context_failed",
+                            "Failed to bind the Agent run to its workspace services.",
+                        )
+                        .detail(error)
+                        .operation("chat")
+                    })?,
+            )
+        } else {
+            None
+        };
+    let persisted_run_scope = execution_context
+        .as_ref()
+        .map(|execution| execution.persisted_run_scope());
     let mut instance = AgentInstance::new(
         def,
         &sid,
@@ -1359,6 +1903,9 @@ pub async fn chat(
         subagent_models.unwrap_or_default(),
         cancel_rx,
     );
+    if let Some(execution_context) = execution_context {
+        instance.set_execution_context(execution_context);
+    }
     let effective_fast_mode = fast_mode.unwrap_or(false);
     instance.set_codex_fast_mode(effective_fast_mode);
     instance.set_session_undo_enabled(config.session_undo_enabled());
@@ -1390,15 +1937,17 @@ pub async fn chat(
             sid
         )));
     }
-    store.try_start_run(&sid, &run_id).map_err(|error| {
-        if error.contains("active run") {
-            session_run_locked_error(error)
-        } else {
-            AppError::new("session.run_start_failed", "Failed to start session run.")
-                .detail(error)
-                .operation("chat")
-        }
-    })?;
+    store
+        .try_start_run_scoped(&sid, &run_id, persisted_run_scope.as_ref())
+        .map_err(|error| {
+            if error.contains("active run") {
+                session_run_locked_error(error)
+            } else {
+                AppError::new("session.run_start_failed", "Failed to start session run.")
+                    .detail(error)
+                    .operation("chat")
+            }
+        })?;
     if let Err(error) = store.set_session_execution_state(
         &sid,
         &selected_model,
@@ -1422,6 +1971,7 @@ pub async fn chat(
     let user_intent_for_task = user_intent;
     let run_id_for_task = run_id.clone();
     let store_for_task = store.clone();
+    let execution_binding_request_for_task = execution_binding_request.clone();
     let initial_system_reminder = resume_requested.then(|| {
         "<system-reminder>\nThe previous run was interrupted before the task was complete. Continue from the existing conversation context. Inspect the current state, finish the remaining work, and verify the result. Do not repeat completed work.\n</system-reminder>"
             .to_string()
@@ -1549,8 +2099,62 @@ pub async fn chat(
                 break;
             }
 
+            // Every queued input/reminder/compact is a new Agent run. Rebind
+            // the checkout's current service generation before persisting it;
+            // the previous run may have crossed an idle stop or service restart.
+            let next_persisted_run_scope = if let Some((checkout_id, requested_services)) =
+                execution_binding_request_for_task.as_ref()
+            {
+                let workspace_registry: tauri::State<
+                    '_,
+                    Arc<crate::workspace_service::ProjectRegistry>,
+                > = handle.state();
+                match workspace_registry
+                    .execution_context(checkout_id, requested_services)
+                    .await
+                {
+                    Ok(execution) => {
+                        let scope = execution.persisted_run_scope();
+                        instance.set_execution_context(execution);
+                        Some(scope)
+                    }
+                    Err(error) => {
+                        if compact_requested {
+                            let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                                handle.state();
+                            if let Ok(mut queue) = queue_state.lock() {
+                                queue.restore_compact(&sid_clone, &current_run_id);
+                            };
+                        } else if let Some(follow_up) = follow_up {
+                            let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
+                                handle.state();
+                            if let Ok(mut queue) = queue_state.lock() {
+                                queue.restore_claimed(vec![follow_up]);
+                            };
+                        } else if let Some(reminder) = async_reminder {
+                            let async_tasks: tauri::State<
+                                '_,
+                                Arc<crate::async_tasks::AsyncTaskManager>,
+                            > = handle.state();
+                            async_tasks.enqueue_notification(&sid_clone, reminder);
+                        }
+                        eprintln!(
+                            "[Locus] failed to rebind queued follow-up for session {} after run {}: {}",
+                            sid_clone, current_run_id, error
+                        );
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+
             let next_run_id = generate_chat_run_id(&sid_clone);
-            if let Err(error) = store_for_task.try_start_run(&sid_clone, &next_run_id) {
+            if let Err(error) = store_for_task.try_start_run_scoped(
+                &sid_clone,
+                &next_run_id,
+                next_persisted_run_scope.as_ref(),
+            ) {
                 if compact_requested {
                     let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
                         handle.state();
@@ -2286,10 +2890,22 @@ pub async fn get_compacted_context_output(
 pub async fn undo_latest_conversation_turn(
     session_id: String,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
     store: State<'_, Arc<SessionStore>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SessionDetail, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_optional_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        "undo_latest_conversation_turn",
+    )?;
+    let working_dir = scope
+        .as_ref()
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string())
+        .unwrap_or_default();
+    let event_scope = scope.as_ref().map(|scope| {
+        crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime())
+    });
     let deleted = store
         .truncate_latest_conversation_turn(&session_id)
         .map_err(AppError::from)?;
@@ -2304,6 +2920,7 @@ pub async fn undo_latest_conversation_turn(
     let detail = store.load_session(&session_id).map_err(AppError::from)?;
     super::emit_session_content_changed(
         &app_handle,
+        event_scope.as_ref(),
         &working_dir,
         &session_id,
         "undo_latest_conversation_turn",
@@ -2316,10 +2933,22 @@ pub async fn rollback_session_to_message(
     session_id: String,
     message_id: String,
     app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
     store: State<'_, Arc<SessionStore>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SessionDetail, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let scope = resolve_optional_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        "rollback_session_to_message",
+    )?;
+    let working_dir = scope
+        .as_ref()
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string())
+        .unwrap_or_default();
+    let event_scope = scope.as_ref().map(|scope| {
+        crate::workspace_service::event::WorkspaceEventScope::for_runtime(scope.runtime())
+    });
     store
         .truncate_after_message(&session_id, &message_id)
         .map_err(AppError::from)?;
@@ -2327,6 +2956,7 @@ pub async fn rollback_session_to_message(
     let detail = store.load_session(&session_id).map_err(AppError::from)?;
     super::emit_session_content_changed(
         &app_handle,
+        event_scope.as_ref(),
         &working_dir,
         &session_id,
         "rollback_session_to_message",
@@ -2334,28 +2964,18 @@ pub async fn rollback_session_to_message(
     Ok(detail)
 }
 
-#[tauri::command]
-pub async fn list_sessions(
-    store: State<'_, Arc<SessionStore>>,
-    workspace: State<'_, Arc<Workspace>>,
-    active_tasks: State<'_, ActiveTasks>,
-) -> Result<Vec<SessionSummary>, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    let ws_id = if cwd.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
-    let mut sessions = store
-        .list_sessions(ws_id.as_deref())
-        .map_err(AppError::from)?;
+async fn populate_session_runtime_statuses(
+    sessions: &mut [SessionSummary],
+    store: &SessionStore,
+    active_tasks: &ActiveTasks,
+) {
     let active_session_runs: HashMap<String, String> = active_tasks
         .lock()
         .await
         .iter()
         .map(|(session_id, task)| (session_id.clone(), task.run_id.clone()))
         .collect();
-    for session in &mut sessions {
+    for session in sessions {
         session.runtime_status = if let Some(run_id) = active_session_runs.get(&session.id) {
             let snapshot = store.runtime_snapshot_for_session(&session.id);
             snapshot
@@ -2367,71 +2987,105 @@ pub async fn list_sessions(
             None
         };
     }
+}
+
+#[tauri::command]
+pub async fn list_sessions(
+    store: State<'_, Arc<SessionStore>>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<Vec<SessionSummary>, AppError> {
+    let mut sessions = store.list_sessions(None).map_err(AppError::from)?;
+    populate_session_runtime_statuses(&mut sessions, store.inner().as_ref(), active_tasks.inner())
+        .await;
+    Ok(sessions)
+}
+
+#[tauri::command]
+pub async fn list_checkout_sessions(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    store: State<'_, Arc<SessionStore>>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<Vec<SessionSummary>, AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner().as_ref(),
+        &workspace_ref,
+        "listCheckoutSessions",
+    )?;
+    let project = workspace_registry
+        .project(scope.runtime().project_id())
+        .ok_or_else(|| {
+            AppError::new(
+                "workspace.project_unavailable",
+                "The checkout project context is unavailable.",
+            )
+        })?;
+    let mut sessions = project.sessions().list().map_err(AppError::from)?;
+    populate_session_runtime_statuses(&mut sessions, store.inner().as_ref(), active_tasks.inner())
+        .await;
+    Ok(sessions)
+}
+
+#[tauri::command]
+pub async fn list_project_sessions(
+    project_id: String,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    store: State<'_, Arc<SessionStore>>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<Vec<SessionSummary>, AppError> {
+    let project_id = crate::workspace_service::ProjectId::new(project_id).map_err(|error| {
+        AppError::new(
+            "workspace.project_identity_invalid",
+            "The project identity is invalid.",
+        )
+        .detail(error.to_string())
+        .operation("listProjectSessions")
+    })?;
+    let project = workspace_registry.project(&project_id).ok_or_else(|| {
+        AppError::new(
+            "workspace.project_unavailable",
+            "The project context is unavailable.",
+        )
+        .detail(project_id.to_string())
+        .operation("listProjectSessions")
+    })?;
+    let mut sessions = project.sessions().list().map_err(AppError::from)?;
+    populate_session_runtime_statuses(&mut sessions, store.inner().as_ref(), active_tasks.inner())
+        .await;
     Ok(sessions)
 }
 
 #[tauri::command]
 pub async fn list_archived_sessions(
     store: State<'_, Arc<SessionStore>>,
-    workspace: State<'_, Arc<Workspace>>,
 ) -> Result<Vec<SessionSummary>, AppError> {
-    let cwd = workspace.path.read().await.clone();
-    let ws_id = if cwd.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
-    store
-        .list_archived_sessions(ws_id.as_deref())
-        .map_err(Into::into)
+    store.list_archived_sessions(None).map_err(Into::into)
 }
 
 #[tauri::command]
-pub async fn get_active_session_selection(
-    app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-) -> Result<Option<String>, AppError> {
-    let key = active_session_workspace_key(&workspace).await;
-    let state = read_active_session_selection_state(&app_handle)?;
-    Ok(state
-        .by_workspace
-        .get(&key)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty()))
-}
-
-#[tauri::command]
-pub async fn save_active_session_selection(
-    session_id: Option<String>,
-    app_handle: AppHandle,
-    workspace: State<'_, Arc<Workspace>>,
-) -> Result<(), AppError> {
-    let key = active_session_workspace_key(&workspace).await;
-    let mut state = read_active_session_selection_state(&app_handle).unwrap_or_default();
-    let normalized_session_id = session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-
-    match normalized_session_id.as_deref() {
-        Some(value) => {
-            state.by_workspace.insert(key.clone(), value.to_string());
-        }
-        None => {
-            state.by_workspace.remove(&key);
-        }
-    }
-
-    write_active_session_selection_state(&app_handle, &state)?;
-    let _ = app_handle.emit(
-        "active-session-selection-changed",
-        ActiveSessionSelectionChanged {
-            workspace_key: key,
-            session_id: normalized_session_id,
-        },
-    );
-    Ok(())
+pub async fn list_archived_checkout_sessions(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    store: State<'_, Arc<SessionStore>>,
+    active_tasks: State<'_, ActiveTasks>,
+) -> Result<Vec<SessionSummary>, AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner().as_ref(),
+        &workspace_ref,
+        "listArchivedCheckoutSessions",
+    )?;
+    let project = workspace_registry
+        .project(scope.runtime().project_id())
+        .ok_or_else(|| {
+            AppError::new(
+                "workspace.project_unavailable",
+                "The checkout project context is unavailable.",
+            )
+        })?;
+    let mut sessions = project.sessions().list_archived().map_err(AppError::from)?;
+    populate_session_runtime_statuses(&mut sessions, store.inner().as_ref(), active_tasks.inner())
+        .await;
+    Ok(sessions)
 }
 
 #[tauri::command]
@@ -2492,18 +3146,39 @@ pub async fn get_session_context_usage_report(
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     registry: State<'_, AgentDefRegistryState>,
+    workspace_definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
+    workspace_tools: State<'_, Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>,
     config: State<'_, Arc<AppConfig>>,
     auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
     api_key_state: State<'_, ApiKeyState>,
     codex: State<'_, CodexAuthStateHandle>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<crate::commands::SessionContextUsageReport, AppError> {
     let detail = store.load_session(&session_id)?;
-    let registry_snapshot = registry.snapshot().await;
+    let workspace_scope = resolve_optional_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        "get_session_context_usage_report",
+    )?;
+    let registry_snapshot = match workspace_scope.as_ref() {
+        Some(scope) => workspace_definitions
+            .snapshot(scope.runtime().as_ref())
+            .await
+            .map_err(|detail| {
+                AppError::new(
+                    "agent.workspace_definitions_unavailable",
+                    "Failed to load Agent definitions for this checkout.",
+                )
+                .detail(detail)
+                .operation("get_session_context_usage_report")
+            })?,
+        None => registry.snapshot().await,
+    };
     let def = detail
         .agent_id
         .as_deref()
@@ -2528,18 +3203,49 @@ pub async fn get_session_context_usage_report(
         codex.inner(),
     )
     .await?;
-    let working_dir = workspace.path.read().await.clone();
-    let workspace_id = if working_dir.trim().is_empty() {
-        None
-    } else {
-        workspace.workspace_id.read().await.clone()
-    };
+    let working_dir = workspace_scope
+        .as_ref()
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string())
+        .unwrap_or_default();
+    let workspace_id = workspace_scope
+        .as_ref()
+        .map(|scope| scope.runtime().project_id().to_string());
     let knowledge_access_mode = KnowledgeAccessMode::from_request(knowledge_mode.as_deref())
         .map_err(|error| AppError::new("session.invalid_knowledge_mode", error))?;
     let prompt_messages = store.get_messages_for_prompt(&session_id)?;
     let session_messages = store.get_messages(&session_id)?;
     let usage = store.get_token_usage(&session_id)?;
     let cache_invalidations = store.list_cache_invalidations(&session_id)?;
+    let effective_tool_registry = match workspace_scope.as_ref() {
+        Some(scope) => workspace_tools
+            .snapshot(scope.runtime().as_ref(), registry_snapshot.as_ref())
+            .await
+            .map_err(|detail| {
+                AppError::new(
+                    "tool.workspace_definitions_unavailable",
+                    "Failed to load tool definitions for this checkout.",
+                )
+                .detail(detail)
+                .operation("get_session_context_usage_report")
+            })?,
+        None => tool_registry.inner().clone(),
+    };
+    let execution_context = match workspace_scope.as_ref() {
+        Some(scope) => Some(
+            workspace_registry
+                .execution_context(scope.runtime().checkout_id(), &[])
+                .await
+                .map_err(|detail| {
+                    AppError::new(
+                        "session.workspace_execution_unavailable",
+                        "Failed to bind the context report to its checkout runtime.",
+                    )
+                    .detail(detail)
+                    .operation("get_session_context_usage_report")
+                })?,
+        ),
+        None => None,
+    };
 
     let mut instance = AgentInstance::new(
         Arc::new(def),
@@ -2547,7 +3253,7 @@ pub async fn get_session_context_usage_report(
         backend,
         config.debug_enabled(),
         registry_snapshot,
-        tool_registry.inner().clone(),
+        effective_tool_registry,
         working_dir,
         raw_store.inner().clone(),
         workspace_id,
@@ -2560,6 +3266,9 @@ pub async fn get_session_context_usage_report(
         HashMap::new(),
         tokio::sync::watch::channel(false).1,
     );
+    if let Some(execution_context) = execution_context {
+        instance.set_execution_context(execution_context);
+    }
     instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     Ok(instance
@@ -2930,8 +3639,7 @@ pub async fn apply_knowledge_proposal(
     _verification_confirmed: Option<bool>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
-    workspace: State<'_, Arc<Workspace>>,
-    knowledge_index_state: State<'_, Arc<crate::knowledge_index::KnowledgeIndexState>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
     let Some(message) = store.get_knowledge_proposal_message(&session_id, &proposal_id)? else {
         return Err(format!("Knowledge proposal not found: {}", proposal_id).into());
@@ -2951,27 +3659,25 @@ pub async fn apply_knowledge_proposal(
         .into());
     }
 
-    let working_dir = workspace.path.read().await.clone();
-    if working_dir.trim().is_empty() {
-        return Err("No working directory selected.".into());
-    }
-
-    let current_workspace_id = workspace.workspace_id.read().await.clone();
-    let session_workspace_id = store.get_session_workspace_id(&session_id)?;
-    match (
-        session_workspace_id.as_deref(),
-        current_workspace_id.as_deref(),
-    ) {
-        (Some(expected), Some(current)) if expected == current => {}
-        (Some(_), Some(_)) => return Err(
-            "Current workspace does not match the session that created this knowledge proposal."
-                .into(),
-        ),
-        _ => return Err(
-            "Knowledge proposals can only be applied while the original workspace is still open."
-                .into(),
-        ),
-    }
+    let scope = resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "apply_knowledge_proposal",
+    )?;
+    let working_dir = scope.runtime().root().to_string_lossy().to_string();
+    let knowledge_index_state = scope
+        .runtime()
+        .knowledge_index(&app_handle)
+        .map_err(|detail| {
+            AppError::new(
+                "knowledge.index_unavailable",
+                "Failed to initialize the checkout knowledge index.",
+            )
+            .detail(detail)
+            .operation("apply_knowledge_proposal")
+        })?;
 
     let mut proposal_targets: Vec<(KnowledgeType, String)> = Vec::new();
     let mut seen_targets = HashSet::new();
@@ -3024,7 +3730,7 @@ pub async fn apply_knowledge_proposal(
         if let Err(error) = super::knowledge::reconcile_and_emit_knowledge_changed(
             &app_handle,
             &working_dir,
-            knowledge_index_state.inner().clone(),
+            knowledge_index_state,
             "apply_knowledge_proposal",
         )
         .await
@@ -3093,11 +3799,20 @@ pub async fn export_session_context(
     file_path: Option<String>,
     raw_store: State<'_, RawContextStore>,
     store: State<'_, Arc<SessionStore>>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     pending_input_queue: State<'_, PendingInputQueueHandle>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<crate::session::context_export::ContextExportResult, AppError> {
-    let working_dir = workspace.path.read().await.clone();
+    let workspace_scope = resolve_optional_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        "export_session_context",
+    )?;
+    let working_dir = workspace_scope
+        .as_ref()
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string())
+        .unwrap_or_default();
     let output_path = match file_path {
         Some(path) if !path.trim().is_empty() => PathBuf::from(path),
         _ => {
@@ -3136,6 +3851,7 @@ pub async fn export_session_context(
     .await?;
 
     tokio::task::spawn_blocking(move || {
+        let _workspace_scope = workspace_scope;
         crate::session::context_export::export_session_context_yaml(
             &snapshot_store,
             &session_id,
@@ -3193,5 +3909,71 @@ pub async fn answer_question(
             Ok(())
         }
         None => Err(format!("Question '{}' not found or already answered", question_id).into()),
+    }
+}
+
+#[cfg(test)]
+mod workspace_definition_scope_tests {
+    use super::{agent_definition_source, list_agent_infos, AgentDefinitionSource};
+    use crate::agent::definition::AgentDefRegistry;
+    use std::path::PathBuf;
+
+    fn repo_agent_registry() -> AgentDefRegistry {
+        let agent_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
+        AgentDefRegistry::load(Some(agent_dir.as_path()), None)
+    }
+
+    #[test]
+    fn checkout_sessions_always_use_checkout_definitions() {
+        assert_eq!(
+            agent_definition_source(true, true, true),
+            AgentDefinitionSource::Checkout
+        );
+    }
+
+    #[test]
+    fn historical_sessions_without_checkout_keep_the_legacy_registry() {
+        assert_eq!(
+            agent_definition_source(true, false, true),
+            AgentDefinitionSource::LegacyGlobal
+        );
+        assert_eq!(
+            agent_definition_source(true, false, false),
+            AgentDefinitionSource::LegacyGlobal
+        );
+    }
+
+    #[test]
+    fn new_workspace_sessions_use_checkout_definitions() {
+        assert_eq!(
+            agent_definition_source(false, false, true),
+            AgentDefinitionSource::Checkout
+        );
+        assert_eq!(
+            agent_definition_source(false, false, false),
+            AgentDefinitionSource::LegacyGlobal
+        );
+    }
+
+    #[test]
+    fn workspace_project_type_selects_the_compatible_builtin_default() {
+        let registry = repo_agent_registry();
+        let generic = list_agent_infos(&registry, Some("generic"));
+        let unity = list_agent_infos(&registry, Some("unity"));
+
+        assert_eq!(
+            generic
+                .iter()
+                .find(|agent| agent.is_default)
+                .map(|agent| agent.id.as_str()),
+            Some("simple")
+        );
+        assert_eq!(
+            unity
+                .iter()
+                .find(|agent| agent.is_default)
+                .map(|agent| agent.id.as_str()),
+            Some("dev")
+        );
     }
 }

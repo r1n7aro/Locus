@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { nextTick, reactive } from "vue";
 import { useCollabState } from "../composables/useCollabState";
+import type { WorkspaceRef } from "../services/project";
+
+const TEST_WORKSPACE_REF: WorkspaceRef = {
+  checkoutId: "checkout-test",
+  expectedGeneration: 1,
+};
 
 const gitServiceMocks = vi.hoisted(() => ({
   gitBranches: vi.fn(),
@@ -181,6 +187,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -221,6 +228,73 @@ describe("useCollabState", () => {
     expect(state.commits.value).toHaveLength(1);
   });
 
+  it("keeps reverse-completing checkout refreshes isolated when the legacy path is unchanged", async () => {
+    const checkoutALog = deferred<any>();
+    const checkoutBLog = deferred<any>();
+    const checkoutA: WorkspaceRef = {
+      checkoutId: "checkout-a",
+      expectedGeneration: 11,
+    };
+    const checkoutB: WorkspaceRef = {
+      checkoutId: "checkout-b",
+      expectedGeneration: 22,
+    };
+
+    gitServiceMocks.gitHistorySnapshot.mockImplementation(
+      (_skip: number, _limit: number, workspaceRef?: WorkspaceRef) => {
+        if (workspaceRef?.checkoutId === checkoutA.checkoutId) return checkoutALog.promise;
+        if (workspaceRef?.checkoutId === checkoutB.checkoutId) return checkoutBLog.promise;
+        throw new Error("unexpected checkout");
+      },
+    );
+
+    const props = reactive({
+      workingDir: "",
+      workspaceRef: null as WorkspaceRef | null,
+      isActive: false,
+      selectedModelId: "",
+      selectedAgentId: "",
+      models: [],
+    });
+
+    const state = useCollabState(props);
+
+    Object.assign(props, {
+      workingDir: "F:/repo/shared-projection",
+      workspaceRef: checkoutA,
+    });
+    await nextTick();
+    await flushPromises();
+
+    Object.assign(props, {
+      workspaceRef: checkoutB,
+    });
+    await nextTick();
+    await flushPromises();
+
+    checkoutBLog.resolve(
+      snapshot(
+        [{ hash: "bbbbbbb", shortHash: "bbbbbbb", parents: [], author: "tester", date: 2, message: "checkout b", refs: [], isStash: false }],
+        "bbbbbbb",
+      ),
+    );
+    await flushPromises();
+
+    checkoutALog.resolve(
+      snapshot(
+        [{ hash: "aaaaaaa", shortHash: "aaaaaaa", parents: [], author: "tester", date: 1, message: "checkout a", refs: [], isStash: false }],
+        "aaaaaaa",
+      ),
+    );
+    await flushPromises();
+
+    expect(state.headHash.value).toBe("bbbbbbb");
+    expect(state.commits.value.map(commit => commit.message)).toEqual(["checkout b"]);
+    expect(gitServiceMocks.gitStatus).toHaveBeenCalledWith(checkoutB);
+    expect(gitServiceMocks.gitBranches).toHaveBeenCalledWith(checkoutB);
+    expect(gitServiceMocks.gitSubmodules).toHaveBeenCalledWith(checkoutB);
+  });
+
   it("refreshes git data when the collab tab becomes active again", async () => {
     vi.useFakeTimers();
 
@@ -230,6 +304,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -264,6 +339,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -316,6 +392,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -363,6 +440,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -390,6 +468,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -416,6 +495,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -454,6 +534,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -500,6 +581,7 @@ describe("useCollabState", () => {
 
       const props = reactive({
         workingDir: "",
+        workspaceRef: TEST_WORKSPACE_REF,
         isActive: false,
         selectedModelId: "",
         selectedAgentId: "",
@@ -549,6 +631,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -567,7 +650,7 @@ describe("useCollabState", () => {
     expect(gitServiceMocks.gitStagePaths).toHaveBeenCalledWith([
       "src/NewName.vue",
       "src/OldName.vue",
-    ]);
+    ], TEST_WORKSPACE_REF);
   });
 
   it("unstages renamed files with both current and old pathspecs", async () => {
@@ -591,6 +674,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -609,7 +693,7 @@ describe("useCollabState", () => {
     expect(gitServiceMocks.gitUnstagePaths).toHaveBeenCalledWith([
       "src/NewName.vue",
       "src/OldName.vue",
-    ]);
+    ], TEST_WORKSPACE_REF);
   });
 
   it("resizes the collab git sidebar and persists the width", async () => {
@@ -617,6 +701,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -681,6 +766,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -721,6 +807,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -770,6 +857,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -807,6 +895,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",
@@ -876,6 +965,7 @@ describe("useCollabState", () => {
 
     const props = reactive({
       workingDir: "",
+      workspaceRef: TEST_WORKSPACE_REF,
       isActive: false,
       selectedModelId: "",
       selectedAgentId: "",

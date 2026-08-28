@@ -96,15 +96,14 @@ describe("KnowledgePreview continuous document layout", () => {
     expect(preview).toContain('@click="removeSkillUnity"');
   });
 
-  it("reserves the side rail for embedded chat", () => {
+  it("uses the full preview width without an embedded chat rail", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
-    expect(preview).toContain('class="preview-side-rail"');
-    expect(preview).toContain('class="preview-side-resize-handle"');
-    expect(preview).toContain('<div v-if="!metaCollapsed" class="preview-side-rail-body">');
-    expect(preview).toContain('<KnowledgeChatPane :document="document" />');
-    expect(preview).not.toContain('class="preview-side-rail-panel preview-side-rail-panel-meta"');
-    expect(preview).toMatch(/\.preview-side-rail\s*\{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;/);
+    expect(preview).toContain('<div class="preview-panel">');
+    expect(preview).not.toContain("KnowledgeChatPane");
+    expect(preview).not.toContain("preview-side-rail");
+    expect(preview).not.toContain("preview-side-resize-handle");
+    expect(preview).not.toContain("metaCollapsed");
   });
 
   it("retains rendered search highlighting for all three content fields", () => {

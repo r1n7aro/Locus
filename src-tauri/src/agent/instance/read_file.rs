@@ -58,11 +58,11 @@ impl AgentInstance {
                 .build_tool_execution_context(app_handle, "read", args)
                 .await;
             let mut result = self
-                .await_tool_result(self.tool_registry.execute_with_context(
+                .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                     "read",
                     args,
                     tool_context,
-                ))
+                )))
                 .await;
             self.enrich_registered_knowledge_read(
                 app_handle,
@@ -82,11 +82,11 @@ impl AgentInstance {
                     .build_tool_execution_context(app_handle, "read", args)
                     .await;
                 return self
-                    .await_tool_result(self.tool_registry.execute_with_context(
+                    .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                         "read",
                         args,
                         tool_context,
-                    ))
+                    )))
                     .await;
             }
         };
@@ -96,11 +96,11 @@ impl AgentInstance {
                 .build_tool_execution_context(app_handle, "read", args)
                 .await;
             return self
-                .await_tool_result(self.tool_registry.execute_with_context(
+                .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                     "read",
                     args,
                     tool_context,
-                ))
+                )))
                 .await;
         }
 

@@ -47,10 +47,11 @@ pub const EXPOSED_TOOLS: &[&str] = &[
 ];
 
 const EMPTY_OBJECT_SCHEMA: &str = r#"{"type":"object","properties":{},"required":[]}"#;
+const MCP_SERVICE_READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 const PROJECT_INFO_DESCRIPTION: &str = "Report which local Unity project the Locus MCP tools currently target: project path and name, workspace id, Unity Editor connection state and editor status, and the Locus app version. Call this first to orient, and again whenever a tool result mentions a workspace change.";
 
-const RECOMPILE_MCP_NOTE: &str = "\n\n(MCP note: editor_status / project_path parameters are not required over MCP; the call targets the active Locus workspace and exits play mode automatically if needed.)";
+const RECOMPILE_MCP_NOTE: &str = "\n\n(MCP note: editor_status / project_path parameters are not required over MCP; the call targets this session's bound checkout and exits play mode automatically if needed.)";
 
 /// Feature gate per tool, mirroring resolve_effective_tool_names
 /// (agent/instance/mod.rs) so the external surface matches what the in-app
@@ -122,14 +123,14 @@ fn tool_available(name: &str, working_dir: Option<&str>) -> (bool, Option<String
     }
 }
 
-fn active_workspace_path(app: &AppHandle) -> Option<String> {
-    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
-    workspace
-        .path
-        .try_read()
+fn scoped_workspace_path(
+    app: &AppHandle,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+) -> Option<String> {
+    app.state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .resolve_workspace_ref(workspace_ref)
         .ok()
-        .map(|path| path.trim().to_string())
-        .filter(|path| !path.is_empty())
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string())
 }
 
 fn empty_object_schema() -> Value {
@@ -163,9 +164,13 @@ fn listing_for(registry: &ToolRegistry, name: &str) -> Option<ToolListing> {
 }
 
 /// Tools currently visible to external harnesses (enabled + feature-gated).
-pub fn listed_tools(app: &AppHandle, settings: &McpServerSettings) -> Vec<ToolListing> {
+pub fn listed_tools(
+    app: &AppHandle,
+    settings: &McpServerSettings,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+) -> Vec<ToolListing> {
     let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
-    let working_dir = active_workspace_path(app);
+    let working_dir = scoped_workspace_path(app, workspace_ref);
     EXPOSED_TOOLS
         .iter()
         .filter(|name| settings.tool_enabled(name))
@@ -188,11 +193,15 @@ pub struct ExposedToolInfo {
 pub fn exposed_tool_inventory(app: &AppHandle) -> Vec<ExposedToolInfo> {
     let settings = super::config::load_settings();
     let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
-    let working_dir = active_workspace_path(app);
     EXPOSED_TOOLS
         .iter()
         .map(|name| {
-            let (available, unavailable_reason) = tool_available(name, working_dir.as_deref());
+            // Inventory is app-level. Checkout-specific gates are evaluated by
+            // tools/list after a session has an immutable checkout binding.
+            let (available, unavailable_reason) = match *name {
+                "unity_test_list" | "unity_test_run" => (true, None),
+                _ => tool_available(name, None),
+            };
             let description = match *name {
                 "unity_project_info" => PROJECT_INFO_DESCRIPTION.to_string(),
                 _ => registry
@@ -223,12 +232,16 @@ fn first_sentence(text: &str, max_chars: usize) -> String {
 
 /// Instructions surfaced in the MCP initialize response so the external
 /// harness knows which project it is driving.
-pub async fn build_instructions(app: &AppHandle) -> String {
-    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
-    let path = workspace.path.read().await.trim().to_string();
-    if path.is_empty() {
-        return "Locus is running but no Unity project workspace is currently open in the Locus app. Ask the user to open one in Locus, then call unity_project_info to confirm.".to_string();
-    }
+pub async fn build_instructions(
+    app: &AppHandle,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+) -> String {
+    let Some(path) = scoped_workspace_path(app, workspace_ref) else {
+        return format!(
+            "This Locus MCP connection is bound to checkout '{}' generation {:?}, but that runtime is no longer available. Reconnect to obtain a current checkout binding.",
+            workspace_ref.checkout_id, workspace_ref.expected_generation
+        );
+    };
     let (connected, status, _scene) = crate::unity_bridge::query_unity_status(&path).await;
     let connected_desc = if connected {
         "connected"
@@ -236,7 +249,7 @@ pub async fn build_instructions(app: &AppHandle) -> String {
         "not connected"
     };
     format!(
-        "Locus exposes Unity-editor tools for the Unity project currently active in the Locus app.\nActive project: {path}\nUnity Editor: {connected_desc} (status: {status})\nThe active project can only be switched inside the Locus app. If a tool result mentions a workspace change, call unity_project_info before continuing."
+        "Locus exposes Unity-editor tools for the checkout bound when this MCP server started.\nBound project: {path}\nUnity Editor: {connected_desc} (status: {status})\nThis connection keeps that checkout identity for its lifetime. Call unity_project_info before continuing after a reconnect."
     )
 }
 
@@ -389,10 +402,13 @@ async fn run_unity_run_states(working_dir: &str, args: &Value) -> ToolResult {
     }
 }
 
-async fn project_info(app: &AppHandle) -> ToolResult {
-    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
-    let path = workspace.path.read().await.trim().to_string();
-    if path.is_empty() {
+async fn project_info(
+    path: Option<&str>,
+    project_id: Option<&str>,
+    checkout_id: Option<&str>,
+    workspace_generation: Option<u64>,
+) -> ToolResult {
+    let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
         return ToolResult {
             output: serde_json::to_string_pretty(&json!({
                 "workspace_open": false,
@@ -402,10 +418,9 @@ async fn project_info(app: &AppHandle) -> ToolResult {
             .unwrap_or_default(),
             is_error: false,
         };
-    }
-    let workspace_id = workspace.workspace_id.read().await.clone();
-    let (connected, status, scene) = crate::unity_bridge::query_unity_status(&path).await;
-    let project_name = std::path::Path::new(&path)
+    };
+    let (connected, status, scene) = crate::unity_bridge::query_unity_status(path).await;
+    let project_name = std::path::Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -414,14 +429,16 @@ async fn project_info(app: &AppHandle) -> ToolResult {
             "workspace_open": true,
             "project_path": path,
             "project_name": project_name,
-            "workspace_id": workspace_id,
+            "project_id": project_id,
+            "checkout_id": checkout_id,
+            "workspace_generation": workspace_generation,
             "unity_editor": {
                 "connected": connected,
                 "editor_status": status,
                 "scene": scene,
             },
             "locus_version": env!("CARGO_PKG_VERSION"),
-            "note": "All Locus MCP tools operate on this project. The active project can only be switched inside the Locus app.",
+            "note": "This tool call is bound to the checkout identity shown above.",
         }))
         .unwrap_or_default(),
         is_error: false,
@@ -437,43 +454,112 @@ fn outcome_from_tool_result(result: ToolResult, workspace_path: Option<String>) 
     }
 }
 
-/// Executes one exposed tool against the active workspace. `timeout_ms` and
-/// `runtime_state` come from the server lifecycle (snapshotted at listener
-/// start; settings changes apply on restart).
+/// Executes one exposed tool against the MCP session's immutable checkout
+/// binding. `timeout_ms` and `runtime_state` come from the process-level
+/// listener lifecycle (settings changes apply on restart).
 pub async fn execute_tool(
     app: AppHandle,
     name: String,
     arguments: Value,
     timeout_ms: u64,
     runtime_state: Arc<ToolRuntimeState>,
+    workspace_ref: crate::workspace_service::WorkspaceRef,
 ) -> ToolCallOutcome {
     let started = Instant::now();
-    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
-    let working_dir = workspace.path.read().await.trim().to_string();
-    let workspace_path = if working_dir.is_empty() {
-        None
-    } else {
-        Some(working_dir.clone())
+    let workspace_registry = app
+        .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .inner()
+        .clone();
+    let workspace_scope = match workspace_registry.resolve_workspace_ref(&workspace_ref) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return outcome_from_tool_result(
+                err(&format!("Workspace scope resolution failed: {error}")),
+                None,
+            )
+        }
     };
+    let working_dir = workspace_scope
+        .runtime()
+        .root()
+        .to_string_lossy()
+        .to_string();
+    let project_id = workspace_scope.runtime().project_id().to_string();
+    let checkout_id = workspace_scope.runtime().checkout_id().to_string();
+    let workspace_generation = workspace_scope.runtime().generation();
+    let workspace_path = Some(working_dir.clone());
 
     if name == "unity_project_info" {
-        let result = project_info(&app).await;
+        let result = project_info(
+            workspace_path.as_deref(),
+            Some(&project_id),
+            Some(&checkout_id),
+            Some(workspace_generation),
+        )
+        .await;
         return outcome_from_tool_result(result, workspace_path);
     }
-    if working_dir.is_empty() {
+    let requested_services = crate::workspace_service::service::owner_service_for_tool(&name)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let execution = match workspace_registry
+        .execution_context(workspace_scope.runtime().checkout_id(), &requested_services)
+        .await
+    {
+        Ok(execution) => execution,
+        Err(error) => {
+            return outcome_from_tool_result(
+                err(&format!("Workspace service binding failed: {error}")),
+                workspace_path,
+            )
+        }
+    };
+    if execution.workspace.generation() != workspace_generation {
         return outcome_from_tool_result(
-            err("No Unity project workspace is open in Locus. Open one in the Locus app first."),
-            None,
+            err(&format!(
+                "Workspace scope resolution failed: checkout {checkout_id} moved from generation {workspace_generation} to {}",
+                execution.workspace.generation()
+            )),
+            workspace_path,
         );
     }
+    let definitions = match app
+        .state::<Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>()
+        .snapshot(execution.workspace.as_ref())
+        .await
+    {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            return outcome_from_tool_result(
+                err(&format!(
+                    "Failed to resolve checkout Agent definitions: {error}"
+                )),
+                workspace_path,
+            )
+        }
+    };
+    let tool_registry = match app
+        .state::<Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>()
+        .snapshot(execution.workspace.as_ref(), definitions.as_ref())
+        .await
+    {
+        Ok(registry) => registry,
+        Err(error) => {
+            return outcome_from_tool_result(
+                err(&format!(
+                    "Failed to resolve checkout tool registry: {error}"
+                )),
+                workspace_path,
+            )
+        }
+    };
 
     let request_run_id = format!("mcp-{}", uuid::Uuid::new_v4());
     let fut = async {
-        let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
         let lock_request = if name == "unity_execute" {
             (!AgentInstance::unity_execute_is_readonly(&arguments))
                 .then_some(WorkspaceExecutionLockRequest::Exclusive)
-        } else if registry.mutates_workspace(&name)
+        } else if tool_registry.mutates_workspace(&name)
             || AgentInstance::is_unity_execution_barrier_tool(&name)
         {
             Some(WorkspaceExecutionLockRequest::Exclusive)
@@ -492,8 +578,18 @@ pub async fn execute_tool(
         // guard are both released by Drop and leave an abandoned/released log.
         let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
         let workspace_guard = if let Some(request) = lock_request {
+            let workspace_event_scope =
+                crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                    execution.workspace.as_ref(),
+                );
             match process_workspace_execution_lock(&working_dir)
-                .acquire_with_diagnostics(request, owner, lock_cancel_rx, &app)
+                .acquire_with_diagnostics(
+                    request,
+                    owner,
+                    lock_cancel_rx,
+                    workspace_event_scope,
+                    &app,
+                )
                 .await
             {
                 Ok(guard) => Some(guard),
@@ -509,8 +605,16 @@ pub async fn execute_tool(
         } else {
             None
         };
-        let outcome =
-            execute_workspace_tool(&app, &name, &arguments, &working_dir, runtime_state).await;
+        let outcome = execute_workspace_tool(
+            &app,
+            &name,
+            &arguments,
+            &working_dir,
+            execution,
+            tool_registry,
+            runtime_state,
+        )
+        .await;
         drop(workspace_guard);
         outcome
     };
@@ -540,8 +644,25 @@ async fn execute_workspace_tool(
     name: &str,
     arguments: &Value,
     working_dir: &str,
+    execution: Arc<crate::workspace_service::AgentExecutionContext>,
+    tool_registry: Arc<ToolRegistry>,
     runtime_state: Arc<ToolRuntimeState>,
 ) -> ToolCallOutcome {
+    let _service_lease = match resolve_owned_service_for_mcp_tool(
+        execution.as_ref(),
+        name,
+        MCP_SERVICE_READY_TIMEOUT,
+    )
+    .await
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            return outcome_from_tool_result(
+                err(&format!("Tool '{name}' service binding error: {error}")),
+                None,
+            )
+        }
+    };
     match name {
         "unity_execute" => {
             outcome_from_tool_result(run_unity_execute(working_dir, arguments).await, None)
@@ -573,28 +694,70 @@ async fn execute_workspace_tool(
                 workspace_path: None,
             }
         }
-        "unity_ref_search" => outcome_from_tool_result(
-            AgentInstance::execute_unity_ref_search(app, arguments),
-            None,
-        ),
-        "unity_asset_search" => outcome_from_tool_result(
-            AgentInstance::execute_unity_asset_search(app, arguments),
-            None,
-        ),
-        "unity_yaml_search" => outcome_from_tool_result(
-            AgentInstance::execute_unity_yaml_search(app, working_dir, arguments).await,
-            None,
-        ),
-        "unity_yaml_read" => outcome_from_tool_result(
-            AgentInstance::execute_unity_yaml_read(app, working_dir, arguments).await,
-            None,
-        ),
+        "unity_ref_search" => {
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            outcome_from_tool_result(
+                AgentInstance::execute_unity_ref_search(
+                    arguments,
+                    execution.workspace.core().asset_db(),
+                ),
+                None,
+            )
+        }
+        "unity_asset_search" => {
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            outcome_from_tool_result(
+                AgentInstance::execute_unity_asset_search(
+                    arguments,
+                    execution.workspace.core().asset_db(),
+                ),
+                None,
+            )
+        }
+        "unity_yaml_search" => {
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            outcome_from_tool_result(
+                AgentInstance::execute_unity_yaml_search(
+                    app,
+                    working_dir,
+                    execution.workspace.core().asset_db(),
+                    arguments,
+                )
+                .await,
+                None,
+            )
+        }
+        "unity_yaml_read" => {
+            execution
+                .workspace
+                .core()
+                .refresh_asset_db_if_missing(execution.root());
+            outcome_from_tool_result(
+                AgentInstance::execute_unity_yaml_read(
+                    app,
+                    working_dir,
+                    execution.workspace.core().asset_db(),
+                    arguments,
+                )
+                .await,
+                None,
+            )
+        }
         // unity_hot_reload / unity_code_usages / code_* have real registry
         // closures; run them through the shared registry path.
         _ => {
-            let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
             let context = ToolExecutionContext {
                 app_handle: Some(app.clone()),
+                execution: Some(execution),
                 working_dir: Some(working_dir.to_string()),
                 process_owner: Some(crate::process_util::ProcessOwner {
                     working_dir: Some(working_dir.to_string()),
@@ -611,7 +774,7 @@ async fn execute_workspace_tool(
                 output: None,
                 background: false,
             };
-            let result = registry
+            let result = tool_registry
                 .execute_with_context(name, arguments, context)
                 .await;
             outcome_from_tool_result(result, None)
@@ -619,9 +782,149 @@ async fn execute_workspace_tool(
     }
 }
 
+async fn resolve_owned_service_for_mcp_tool(
+    execution: &crate::workspace_service::AgentExecutionContext,
+    name: &str,
+    ready_timeout: Duration,
+) -> Result<
+    Option<crate::workspace_service::service::ResolvedServiceBinding>,
+    crate::workspace_service::service::ServiceBindingError,
+> {
+    let Some(owner) = crate::workspace_service::service::owner_service_for_tool(name) else {
+        return Ok(None);
+    };
+    let binding = if crate::workspace_service::service::service_ready_required_for_tool(name) {
+        execution
+            .resolve_service_ready(owner, ready_timeout)
+            .await?
+    } else {
+        execution.resolve_service(owner)?
+    };
+    Ok(Some(binding))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
+    use crate::resource_policy::ResourcePolicyStore;
+    use crate::workspace_service::service::{
+        DetectionResult, PromptFragment, ServiceActivationPolicy, ServiceBindingError,
+        ServiceCapabilities, ServiceContextProvider, ServiceFuture, ServiceLeaseTracker,
+        ServiceReadinessError, ServiceReadinessGate, ServiceReadinessPhase,
+        ServiceReadinessSnapshot, ServiceRuntimeIdentity, ServiceStatus, ServiceToolDefinition,
+        ServiceToolProvider, WorkspaceService, WorkspaceServiceFactory,
+    };
+    use crate::workspace_service::{
+        AgentExecutionContext, ProjectRegistry, ServiceInstanceId, ServiceKind, WorkspaceRuntime,
+    };
+
+    struct ReadyBarrierFactory {
+        gate: Arc<ServiceReadinessGate>,
+    }
+
+    impl WorkspaceServiceFactory for ReadyBarrierFactory {
+        fn kind(&self) -> ServiceKind {
+            ServiceKind::Unity
+        }
+
+        fn detect(&self, _workspace: &WorkspaceRuntime) -> DetectionResult {
+            DetectionResult::detected(ServiceActivationPolicy::Lazy)
+        }
+
+        fn create<'a>(
+            &'a self,
+            workspace: Arc<WorkspaceRuntime>,
+            generation: u64,
+        ) -> ServiceFuture<'a, Result<Arc<dyn WorkspaceService>, String>> {
+            let service: Arc<dyn WorkspaceService> = Arc::new(ReadyBarrierService {
+                identity: ServiceRuntimeIdentity {
+                    project_id: workspace.project_id().clone(),
+                    checkout_id: workspace.checkout_id().clone(),
+                    service_instance_id: ServiceInstanceId::for_service(
+                        workspace.checkout_id(),
+                        ServiceKind::Unity.as_str(),
+                    ),
+                    runtime_generation: generation,
+                },
+                gate: Arc::clone(&self.gate),
+                leases: Arc::new(ServiceLeaseTracker::default()),
+            });
+            Box::pin(async move { Ok(service) })
+        }
+    }
+
+    struct ReadyBarrierService {
+        identity: ServiceRuntimeIdentity,
+        gate: Arc<ServiceReadinessGate>,
+        leases: Arc<ServiceLeaseTracker>,
+    }
+
+    impl WorkspaceService for ReadyBarrierService {
+        fn identity(&self) -> ServiceRuntimeIdentity {
+            self.identity.clone()
+        }
+
+        fn status(&self) -> ServiceStatus {
+            ServiceStatus::Running
+        }
+
+        fn capabilities(&self) -> ServiceCapabilities {
+            ServiceCapabilities::default()
+        }
+
+        fn lease_tracker(&self) -> Arc<ServiceLeaseTracker> {
+            Arc::clone(&self.leases)
+        }
+
+        fn readiness(&self) -> ServiceReadinessSnapshot {
+            self.gate.snapshot()
+        }
+
+        fn await_ready(
+            &self,
+            timeout: Duration,
+        ) -> ServiceFuture<
+            '_,
+            Result<crate::workspace_service::ServiceReadyPermit, ServiceReadinessError>,
+        > {
+            Box::pin(self.gate.await_ready(&self.identity, timeout))
+        }
+
+        fn start(&self) -> ServiceFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn suspend(&self) -> ServiceFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop(&self) -> ServiceFuture<'_, Result<(), String>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn tool_provider(&self) -> Arc<dyn ServiceToolProvider> {
+            Arc::new(EmptyServiceProvider)
+        }
+
+        fn context_provider(&self) -> Arc<dyn ServiceContextProvider> {
+            Arc::new(EmptyServiceProvider)
+        }
+    }
+
+    struct EmptyServiceProvider;
+
+    impl ServiceToolProvider for EmptyServiceProvider {
+        fn tool_definitions(&self) -> Vec<ServiceToolDefinition> {
+            Vec::new()
+        }
+    }
+
+    impl ServiceContextProvider for EmptyServiceProvider {
+        fn prompt_fragments(&self, _execution: &AgentExecutionContext) -> Vec<PromptFragment> {
+            Vec::new()
+        }
+    }
 
     #[test]
     fn exposed_tools_are_unique_and_lead_with_project_info() {
@@ -645,5 +948,109 @@ mod tests {
     fn empty_schema_is_valid_object() {
         let schema = empty_object_schema();
         assert_eq!(schema["type"], "object");
+    }
+
+    #[test]
+    fn mcp_editor_command_tools_use_the_checkout_ready_barrier() {
+        assert_eq!(MCP_SERVICE_READY_TIMEOUT, Duration::from_secs(45));
+        for name in [
+            "unity_set_play_mode",
+            "unity_execute",
+            "unity_run_states",
+            "unity_capture_viewport",
+            "unity_get_console_log",
+            "unity_test_list",
+            "unity_test_run",
+            "unity_recompile",
+            "unity_hot_reload",
+        ] {
+            assert!(
+                crate::workspace_service::service::service_ready_required_for_tool(name),
+                "{name} must wait for checkout command readiness"
+            );
+        }
+        for name in [
+            "unity_asset_search",
+            "unity_ref_search",
+            "unity_yaml_search",
+            "unity_yaml_read",
+        ] {
+            assert!(
+                !crate::workspace_service::service::service_ready_required_for_tool(name),
+                "{name} is a checkout-local data-plane tool"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_editor_command_resolution_blocks_connected_and_reloading_until_ready() {
+        let temp = tempfile::tempdir().expect("workspace");
+        let config = Arc::new(AppConfig::load_from_path(&temp.path().join("config.json")));
+        let policy = Arc::new(ResourcePolicyStore::from_config(config).expect("policy"));
+        let gate = Arc::new(ServiceReadinessGate::new(ServiceReadinessPhase::Connected));
+        let factory: Arc<dyn WorkspaceServiceFactory> = Arc::new(ReadyBarrierFactory {
+            gate: Arc::clone(&gate),
+        });
+        let registry = ProjectRegistry::new(policy, vec![factory]);
+        let runtime = registry.register(temp.path()).expect("runtime");
+        let execution = registry
+            .execution_context(runtime.checkout_id(), &[ServiceKind::Unity])
+            .await
+            .expect("execution context");
+
+        let connected = match resolve_owned_service_for_mcp_tool(
+            execution.as_ref(),
+            "unity_execute",
+            Duration::from_millis(10),
+        )
+        .await
+        {
+            Ok(_) => panic!("connected command channel must stay closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            connected,
+            ServiceBindingError::Readiness {
+                source: ServiceReadinessError::Timeout {
+                    phase: ServiceReadinessPhase::Connected,
+                    ..
+                }
+            }
+        ));
+
+        gate.transition(
+            ServiceReadinessPhase::Reloading,
+            Some("domain reload".to_string()),
+        );
+        let reloading = match resolve_owned_service_for_mcp_tool(
+            execution.as_ref(),
+            "unity_execute",
+            Duration::from_millis(10),
+        )
+        .await
+        {
+            Ok(_) => panic!("reloading command channel must stay closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            reloading,
+            ServiceBindingError::Readiness {
+                source: ServiceReadinessError::Timeout {
+                    phase: ServiceReadinessPhase::Reloading,
+                    ..
+                }
+            }
+        ));
+
+        gate.transition(ServiceReadinessPhase::Ready, Some("ready".to_string()));
+        let ready = resolve_owned_service_for_mcp_tool(
+            execution.as_ref(),
+            "unity_execute",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("ready command channel")
+        .expect("owned Unity service");
+        assert!(ready.ready_permit().is_some());
     }
 }

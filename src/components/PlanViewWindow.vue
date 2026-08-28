@@ -33,12 +33,12 @@ let loadSeq = 0;
 
 const hasApprovalActions = computed(() => questionId.value.length > 0);
 
-async function loadPlan(path: string) {
+async function loadPlan(sessionId: string) {
   const seq = ++loadSeq;
   loading.value = true;
   error.value = "";
   try {
-    const result = await getPlanFileContent(path);
+    const result = await getPlanFileContent(sessionId);
     if (seq !== loadSeq) return;
     planFilePath.value = result.planFilePath;
     content.value = result.content;
@@ -54,9 +54,9 @@ async function loadPlan(path: string) {
 function applyWindowPayload(payload: PlanViewWindowPayload) {
   questionId.value = payload.questionId ?? "";
   feedback.value = "";
-  if (payload.planFilePath) {
-    planFilePath.value = payload.planFilePath;
-    void loadPlan(payload.planFilePath);
+  planFilePath.value = payload.planFilePath ?? "";
+  if (payload.sessionId) {
+    void loadPlan(payload.sessionId);
   }
 }
 

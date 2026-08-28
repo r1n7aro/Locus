@@ -1,4 +1,4 @@
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import { defineStore } from "pinia";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import * as projectService from "../services/project";
@@ -8,6 +8,7 @@ import type { ExtraWorkdirStatus } from "../services/extraWorkdirs";
 import { assetDbLightStatus, assetDbScanStart } from "../services/asset";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "./notification";
+import { useWorkspaceContextStore } from "./workspaceContext";
 import { t } from "../i18n";
 import type { UnityLaunchResult } from "../services/unity";
 import type {
@@ -28,7 +29,8 @@ const UNITY_LAUNCH_CONNECTION_POLL_MS = 1500;
 const UNITY_LAUNCH_WAIT_TIMEOUT_MS = 120_000;
 
 export const useProjectStore = defineStore("project", () => {
-  const workingDir = ref("");
+  const workspaceContextStore = useWorkspaceContextStore();
+  const workingDir = computed(() => workspaceContextStore.focusedRoot);
   const recentDirs = ref<string[]>([]);
   const extraWorkdirs = ref<Record<string, ExtraWorkdirStatus[]>>({});
   const unityConnected = ref(false);
@@ -40,11 +42,36 @@ export const useProjectStore = defineStore("project", () => {
   const unityLaunchState = ref<UnityLaunchState>("idle");
   const unityLaunching = computed(() => unityLaunchState.value === "starting");
   let scanInFlight = false;
+  let assetStatusRequestSeq = 0;
   let unityLaunchPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   let unityLaunchWaitStartedAt = 0;
-  let unityConnectionCheckInFlight: Promise<void> | null = null;
+  const unityConnectionChecksInFlight = new Map<string, Promise<void>>();
 
-  const isUnityProject = computed(() => workingDir.value.length > 0);
+  function requireWorkspaceRef(): projectService.WorkspaceRef {
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) {
+      throw new Error("A focused workspace checkout is required.");
+    }
+    return {
+      checkoutId: workspaceRef.checkoutId,
+      expectedGeneration: workspaceRef.expectedGeneration ?? undefined,
+    };
+  }
+
+  function workspaceRefKey(workspaceRef: projectService.WorkspaceRef): string {
+    return `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`;
+  }
+
+  function isFocusedWorkspaceRef(workspaceRef: projectService.WorkspaceRef): boolean {
+    const focused = workspaceContextStore.focusedWorkspaceRef;
+    return focused?.checkoutId === workspaceRef.checkoutId
+      && focused.expectedGeneration === workspaceRef.expectedGeneration;
+  }
+
+  const detectedServices = computed(() => (
+    workspaceContextStore.focusedRuntime?.detectedServices ?? []
+  ));
+  const isUnityProject = computed(() => detectedServices.value.includes("unity"));
 
   function pluginStatusLabel(status: PluginNoticeStatus): string {
     return status === "missing" ? t("app.plugin.notInstalled") : t("app.plugin.needUpdate");
@@ -61,6 +88,18 @@ export const useProjectStore = defineStore("project", () => {
       });
     } else {
       notificationStore.clearByOperation(PLUGIN_STATUS_NOTICE_OPERATION);
+    }
+  }
+
+  function clearUnityOnlyNotices() {
+    const notificationStore = useNotificationStore();
+    for (const operation of [
+      PLUGIN_STATUS_NOTICE_OPERATION,
+      UNITY_BACKGROUND_HOOK_NOTICE_OPERATION,
+      "ref_graph_scan_start",
+      "ref_graph_scan",
+    ]) {
+      notificationStore.clearByOperation(operation, { includeErrors: true });
     }
   }
 
@@ -117,6 +156,8 @@ export const useProjectStore = defineStore("project", () => {
       editorProcessId: result.processId,
       editorProcessPath: result.editorPath,
       editorProjectPath: result.projectPath,
+      launchMode: result.mode,
+      headless: result.mode === "headless",
       processCheckedAtMs: now,
       processLastError: null,
       pipeName: unityConnectionStatus.value?.pipeName ?? "",
@@ -185,35 +226,12 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function shouldAutoBuildFromLightStatus(status: AssetDbLightStatus): boolean {
-    if (!workingDir.value.trim()) return false;
+    if (!isUnityProject.value) return false;
     if (scanInFlight || isScanRunning(scanPhase.value)) return false;
     if (status.status === "none") return true;
     const phase = status.currentScanPhase;
     return phase?.phase === "error"
       && phase.error.code.startsWith("ref_graph.rescan_required.");
-  }
-
-  async function loadWorkingDir() {
-    try {
-      workingDir.value = await projectService.getWorkingDir();
-      if (workingDir.value) {
-        void checkCurrentExtraWorkdirs();
-      }
-    } catch (e) {
-      console.error("get_working_dir failed:", e);
-    }
-  }
-
-  async function setWorkingDir(path: string): Promise<string> {
-    const result = await projectService.setWorkingDir(path);
-    resetUnityLaunchState();
-    workingDir.value = result;
-    unityConnectionStatus.value = null;
-    scanPhase.value = null;
-    lastScanStats.value = null;
-    scanInFlight = false;
-    void checkCurrentExtraWorkdirs();
-    return result;
   }
 
   async function loadRecentDirs() {
@@ -226,13 +244,28 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function loadExtraWorkdirs() {
-    const paths = [...new Set([...recentDirs.value, workingDir.value].filter(Boolean))];
-    if (paths.length === 0) {
+    const pathKeys = new Set([...recentDirs.value, workingDir.value].filter(Boolean).map(
+      (path) => path.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase(),
+    ));
+    const workspaceRefs: projectService.WorkspaceRef[] = [];
+    for (const checkout of Object.values(workspaceContextStore.checkoutsById)) {
+      const pathKey = checkout.root
+        .trim()
+        .replace(/\\/g, "/")
+        .replace(/\/+$/, "")
+        .toLowerCase();
+      if (!checkout.runtime || !pathKeys.has(pathKey)) continue;
+      workspaceRefs.push({
+        checkoutId: checkout.checkoutId,
+        expectedGeneration: checkout.runtime.workspaceGeneration,
+      });
+    }
+    if (workspaceRefs.length === 0) {
       extraWorkdirs.value = {};
       return;
     }
     try {
-      extraWorkdirs.value = await extraWorkdirsMap(paths);
+      extraWorkdirs.value = await extraWorkdirsMap(workspaceRefs);
     } catch (e) {
       console.error("extra_workdirs_map failed:", e);
     }
@@ -242,10 +275,16 @@ export const useProjectStore = defineStore("project", () => {
    * warning notice alive while any of them is missing on disk. */
   async function checkCurrentExtraWorkdirs() {
     const dir = workingDir.value;
-    if (!dir) return;
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!dir || !workspaceRef) return;
     try {
-      const statuses = await extraWorkdirsGet(dir);
-      if (workingDir.value !== dir) return;
+      const statuses = await extraWorkdirsGet(workspaceRef);
+      if (
+        workingDir.value !== dir
+        || workspaceContextStore.focusedWorkspaceRef?.checkoutId !== workspaceRef.checkoutId
+        || workspaceContextStore.focusedWorkspaceRef?.expectedGeneration
+          !== workspaceRef.expectedGeneration
+      ) return;
       const missing = statuses.filter((status) => !status.exists);
       const notificationStore = useNotificationStore();
       if (missing.length > 0) {
@@ -281,11 +320,12 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function startScan() {
+    if (!isUnityProject.value) return;
     if (scanInFlight || isScanRunning(scanPhase.value)) return;
     scanInFlight = true;
     scanPhase.value = { phase: "dirScan" };
     try {
-      const result = await assetDbScanStart();
+      const result = await assetDbScanStart(requireWorkspaceRef());
       if (!result.started && !result.alreadyRunning) {
         scanInFlight = false;
         scanPhase.value = null;
@@ -304,34 +344,62 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function checkUnityConnection() {
-    if (unityConnectionCheckInFlight) return unityConnectionCheckInFlight;
-    unityConnectionCheckInFlight = (async () => {
+    if (!isUnityProject.value) {
+      setUnityConnected(false);
+      clearUnityOnlyNotices();
+      return;
+    }
+    const workspaceRef = requireWorkspaceRef();
+    const requestKey = workspaceRefKey(workspaceRef);
+    const existing = unityConnectionChecksInFlight.get(requestKey);
+    if (existing) return existing;
+    const request = (async () => {
       try {
-        setUnityConnectionStatus(await unityService.checkUnityConnectionStatus());
+        await projectService.startWorkspaceUnityService(workspaceRef);
+        const status = await unityService.checkUnityConnectionStatus(workspaceRef);
+        if (isFocusedWorkspaceRef(workspaceRef)) {
+          setUnityConnected(status.connected);
+        }
       } catch {
-        setUnityConnected(false);
-      } finally {
-        unityConnectionCheckInFlight = null;
+        if (isFocusedWorkspaceRef(workspaceRef)) {
+          setUnityConnected(false);
+        }
       }
     })();
-    return unityConnectionCheckInFlight;
+    unityConnectionChecksInFlight.set(requestKey, request);
+    void request.then(() => {
+      if (unityConnectionChecksInFlight.get(requestKey) === request) {
+        unityConnectionChecksInFlight.delete(requestKey);
+      }
+    });
+    return request;
   }
 
   async function checkUnityPlugin() {
-    try {
-      const ps = await unityService.checkUnityPlugin();
-      setPluginToast((ps.status === "missing" || ps.status === "outdated") ? ps.status : null);
-    } catch {
+    if (!isUnityProject.value) {
       setPluginToast(null);
+      return;
+    }
+    const workspaceRef = requireWorkspaceRef();
+    try {
+      const ps = await unityService.checkUnityPlugin(workspaceRef);
+      if (isFocusedWorkspaceRef(workspaceRef)) {
+        setPluginToast((ps.status === "missing" || ps.status === "outdated") ? ps.status : null);
+      }
+    } catch {
+      if (isFocusedWorkspaceRef(workspaceRef)) {
+        setPluginToast(null);
+      }
     }
   }
 
   async function installPlugin() {
+    if (!isUnityProject.value) return;
     if (pluginInstalling.value) return;
 
     let forceCloseUnity = false;
     try {
-      const plan = await unityService.checkUnityPluginInstallPlan();
+      const plan = await unityService.checkUnityPluginInstallPlan(requireWorkspaceRef());
       if (plan.dllUpdateRequired && plan.unityRunning) {
         const confirmed = await confirm(t("app.plugin.closeUnityConfirmMessage"), {
           title: t("app.plugin.closeUnityConfirmTitle"),
@@ -348,7 +416,7 @@ export const useProjectStore = defineStore("project", () => {
 
     pluginInstalling.value = true;
     try {
-      await unityService.installUnityPlugin({ forceCloseUnity });
+      await unityService.installUnityPlugin(requireWorkspaceRef(), { forceCloseUnity });
     } catch (e) {
       console.error("install_unity_plugin failed:", e);
     } finally {
@@ -357,11 +425,12 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function launchUnityProject() {
+    if (!isUnityProject.value) return;
     if (unityLaunchState.value !== "idle" || unityConnected.value) return;
     clearUnityLaunchPoll();
     unityLaunchState.value = "starting";
     try {
-      const launch = await unityService.launchUnityProject();
+      const launch = await unityService.launchUnityProject(requireWorkspaceRef());
       setUnityConnectionStatus(connectionStatusFromLaunchResult(launch));
       if (unityConnected.value) {
         resetUnityLaunchState();
@@ -383,8 +452,17 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   async function loadAssetDbStatus() {
+    if (!isUnityProject.value) {
+      scanPhase.value = null;
+      lastScanStats.value = null;
+      clearUnityOnlyNotices();
+      return;
+    }
+    const workspaceRef = requireWorkspaceRef();
+    const requestSeq = ++assetStatusRequestSeq;
     try {
-      const status = await assetDbLightStatus();
+      const status = await assetDbLightStatus(workspaceRef);
+      if (requestSeq !== assetStatusRequestSeq || !isFocusedWorkspaceRef(workspaceRef)) return;
       const currentPhase = status.currentScanPhase ?? null;
 
       if (currentPhase) {
@@ -415,6 +493,7 @@ export const useProjectStore = defineStore("project", () => {
         void startScan();
       }
     } catch {
+      if (requestSeq !== assetStatusRequestSeq || !isFocusedWorkspaceRef(workspaceRef)) return;
       if (!isScanRunning(scanPhase.value)) {
         lastScanStats.value = null;
       }
@@ -422,7 +501,6 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function resetWorkspaceState() {
-    workingDir.value = "";
     recentDirs.value = [];
     extraWorkdirs.value = {};
     unityConnected.value = false;
@@ -430,21 +508,50 @@ export const useProjectStore = defineStore("project", () => {
     scanPhase.value = null;
     lastScanStats.value = null;
     scanInFlight = false;
-    unityConnectionCheckInFlight = null;
+    assetStatusRequestSeq += 1;
+    unityConnectionChecksInFlight.clear();
     setPluginToast(null);
     pluginInstalling.value = false;
     resetUnityLaunchState();
   }
 
+  function resetFocusedWorkspaceState() {
+    resetUnityLaunchState();
+    unityConnected.value = false;
+    unityConnectionStatus.value = null;
+    scanPhase.value = null;
+    lastScanStats.value = null;
+    scanInFlight = false;
+    unityConnectionChecksInFlight.clear();
+    setPluginToast(null);
+    clearUnityOnlyNotices();
+    pluginInstalling.value = false;
+    if (workingDir.value) void checkCurrentExtraWorkdirs();
+  }
+
+  watch(
+    () => {
+      const scope = workspaceContextStore.focusedWorkspaceRef;
+      return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
+    },
+    (_nextScope, previousScope) => {
+      if (previousScope !== undefined) resetFocusedWorkspaceState();
+    },
+    { flush: "sync" },
+  );
+
   function handleUnityConnectionStatus(connected: boolean) {
+    if (!isUnityProject.value) return;
     setUnityConnected(connected);
   }
 
   function handleUnityConnectionStatusDetail(status: UnityConnectionStatus) {
+    if (!isUnityProject.value) return;
     setUnityConnectionStatus(status);
   }
 
   function handleScanEvent(event: AssetDbScanEvent) {
+    if (!isUnityProject.value) return;
     scanPhase.value = event;
     if (event.phase === "done") {
       scanInFlight = false;
@@ -463,6 +570,7 @@ export const useProjectStore = defineStore("project", () => {
   }
 
   function handlePluginStatus(status: PluginStatus) {
+    if (!isUnityProject.value) return;
     const s = status.status;
     if (s === "missing" || s === "outdated") {
       setPluginToast(s);
@@ -483,9 +591,9 @@ export const useProjectStore = defineStore("project", () => {
     pluginInstalling,
     unityLaunchState,
     unityLaunching,
+    detectedServices,
     isUnityProject,
-    loadWorkingDir,
-    setWorkingDir,
+    requireWorkspaceRef,
     loadRecentDirs,
     loadExtraWorkdirs,
     checkCurrentExtraWorkdirs,

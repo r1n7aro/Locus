@@ -1,0 +1,10 @@
+{
+  "name": "Simple",
+  "description": "General software development with essential workspace tools.",
+  "project_types": ["generic"],
+  "tools": ["read", "write", "edit", "bash", "python", "grep", "list"],
+  "sub_agents": [],
+  "default": false,
+  "default_effort": "medium",
+  "model_recommendation": "large"
+}

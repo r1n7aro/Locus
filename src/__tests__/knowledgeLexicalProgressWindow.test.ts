@@ -27,6 +27,7 @@ function read(relPath: string) {
 import {
   LARGE_LEXICAL_REBUILD_DOC_THRESHOLD,
   buildKnowledgeLexicalProgressWindowUrl,
+  getKnowledgeLexicalProgressWindowWorkspaceRef,
   getKnowledgeLexicalProgressRunKey,
   isKnowledgeLexicalProgressWindowLocation,
   openKnowledgeLexicalProgressWindow,
@@ -67,6 +68,15 @@ describe("knowledgeLexicalProgressWindow", () => {
       pathname: "/knowledge",
       search: "",
     } as Location)).toBe(false);
+  });
+
+  it("requires an exact checkout generation in the progress window URL", () => {
+    expect(getKnowledgeLexicalProgressWindowWorkspaceRef(
+      "?knowledgeLexicalProgress=1&checkoutId=checkout-a&workspaceGeneration=7",
+    )).toEqual({ checkoutId: "checkout-a", expectedGeneration: 7 });
+    expect(getKnowledgeLexicalProgressWindowWorkspaceRef(
+      "?knowledgeLexicalProgress=1&checkoutId=checkout-a",
+    )).toBeNull();
   });
 
   it("opens only for large running rebuilds", () => {
@@ -140,7 +150,7 @@ describe("knowledgeLexicalProgressWindow", () => {
       pooled: false,
     });
 
-    await openKnowledgeLexicalProgressWindow({
+    await openKnowledgeLexicalProgressWindow({ checkoutId: "checkout-feature", expectedGeneration: 7 }, {
       running: true,
       stage: "indexing",
       detail: "Indexing docs",
@@ -154,7 +164,7 @@ describe("knowledgeLexicalProgressWindow", () => {
 
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({
-        kind: "knowledge-lexical-progress",
+        kind: expect.stringMatching(/^knowledge-lexical-progress-/),
         focusExisting: false,
         resizable: false,
         closable: true,
@@ -172,10 +182,32 @@ describe("knowledgeLexicalProgressWindow", () => {
     const existingWindow = { emit: vi.fn(), setFocus: vi.fn() };
     subWindowMocks.getByLabelMock.mockResolvedValue(existingWindow);
 
-    await openKnowledgeLexicalProgressWindow();
+    await openKnowledgeLexicalProgressWindow({ checkoutId: "checkout-feature", expectedGeneration: 7 });
 
     expect(existingWindow.emit).not.toHaveBeenCalled();
     expect(existingWindow.setFocus).not.toHaveBeenCalled();
+  });
+
+  it("uses a distinct immutable window kind for each checkout generation", async () => {
+    subWindowMocks.invokeMock.mockResolvedValue({
+      label: "lexical-progress",
+      existing: false,
+      pooled: false,
+    });
+
+    await openKnowledgeLexicalProgressWindow({
+      checkoutId: "checkout-feature",
+      expectedGeneration: 7,
+    });
+    await openKnowledgeLexicalProgressWindow({
+      checkoutId: "checkout-feature",
+      expectedGeneration: 8,
+    });
+
+    const kinds = subWindowMocks.invokeMock.mock.calls.map((call) => call[1].request.kind);
+    expect(kinds[0]).toMatch(/^knowledge-lexical-progress-[0-9a-f]+-g7$/);
+    expect(kinds[1]).toMatch(/^knowledge-lexical-progress-[0-9a-f]+-g8$/);
+    expect(kinds[0]).not.toBe(kinds[1]);
   });
 
   it("uses a titlebar close action instead of duplicate progress text", () => {
@@ -187,15 +219,11 @@ describe("knowledgeLexicalProgressWindow", () => {
     expect(component).toContain('class="lexical-window-close"');
     expect(component).toContain('@click.stop="void requestWindowClose()"');
     expect(component).toContain("await appWindow.destroy()");
-    expect(component).toContain("knowledgeCloseLexicalProgressWindow");
+    expect(component).toContain("async function requestWindowClose()");
+    expect(component).toContain("await destroyWindow();");
     expect(component).not.toContain('class="lexical-window-titlebar-progress"');
-    expect(knowledgeService).toContain(
-      'ipcInvoke<void>("knowledge_close_lexical_progress_window")',
-    );
-    expect(tauriCommands).toContain("knowledge_close_lexical_progress_window");
-    expect(tauriCommands).toMatch(
-      /window\s*\.\s*destroy\(\)\s*\.\s*or_else\(\|_\|\s*window\.close\(\)\)/,
-    );
+    expect(knowledgeService).not.toContain("knowledge_close_lexical_progress_window");
+    expect(tauriCommands).not.toContain("knowledge_close_lexical_progress_window");
     expect(capability).toContain('"core:window:allow-destroy"');
     expect(capability).toContain('"core:window:allow-set-closable"');
   });

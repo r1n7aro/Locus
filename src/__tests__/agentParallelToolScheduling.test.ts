@@ -6,6 +6,16 @@ const root = process.cwd();
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 
 describe("agent parallel tool scheduling safety", () => {
+  it("type-erases tool futures before cancellation selection", () => {
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
+
+    expect(agent).toContain("Box<dyn std::future::Future<Output = ToolResult>");
+    expect(agent).toContain("Box<dyn std::future::Future<Output = ExecutedToolResult>");
+    expect(agent).toContain(".await_tool_result(Box::pin(");
+    expect(agent).toContain(".await_executed_tool_result(Box::pin(");
+    expect(agent).not.toContain("async fn await_tool_result<F>");
+  });
+
   it("coordinates mutations while bypassing read-only tools", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const acquire = agent.indexOf("process_workspace_execution_lock(", agent.indexOf("let prepared"));
@@ -106,22 +116,25 @@ describe("agent parallel tool scheduling safety", () => {
     expect(agent).toContain("external MCP calls must run without local sibling tools");
   });
 
-  it("polls each subagent loop behind an abortable Tokio task boundary", () => {
+  it("runs each subagent behind the active-task registry and a cancel-on-drop boundary", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const runSubagent = agent.indexOf("async fn run_subagent(");
     const childConstruction = agent.indexOf("let mut child = AgentInstance::new(", runSubagent);
     const promptOwnership = agent.indexOf("let child_prompt = prompt.to_owned();", childConstruction);
-    const spawn = agent.indexOf("AbortOnDropTask::new(tokio::spawn(async move", promptOwnership);
-    const childRun = agent.indexOf("child\n                .run(", spawn);
-    const join = agent.indexOf("let child_result = child_task", childRun);
+    const spawn = agent.indexOf("let child_task = tokio::spawn(async move", promptOwnership);
+    const childRun = agent.indexOf(".run_with_run_id(", spawn);
+    const registration = agent.indexOf("join_handle: tauri::async_runtime::JoinHandle::Tokio(child_task)", childRun);
+    const join = agent.indexOf("let child_result = result_rx", registration);
 
     expect(runSubagent).toBeGreaterThan(0);
     expect(childConstruction).toBeGreaterThan(runSubagent);
     expect(promptOwnership).toBeGreaterThan(childConstruction);
     expect(spawn).toBeGreaterThan(promptOwnership);
     expect(childRun).toBeGreaterThan(spawn);
-    expect(join).toBeGreaterThan(childRun);
-    expect(agent).toContain("self.handle.abort()");
+    expect(registration).toBeGreaterThan(childRun);
+    expect(join).toBeGreaterThan(registration);
+    expect(agent).toContain("CancelOnDropSignal::new(child_cancel_tx.clone())");
+    expect(agent).toContain("self.sender.send(true)");
     expect(agent).toContain("child_store.as_ref()");
     expect(agent).not.toContain("let child_args = args.clone()");
   });
@@ -134,7 +147,9 @@ describe("agent parallel tool scheduling safety", () => {
 
     expect(cli).toContain("workspace_guard: Option<WorkspaceExecutionGuard>");
     expect(cli).toContain("cli_round_workspace_policy");
-    expect(cli).toContain("process_workspace_execution_lock(&self.agent.working_dir)");
+    expect(cli).toContain("process_workspace_execution_lock(");
+    expect(cli).toContain("&self.agent.working_dir");
+    expect(cli).toContain("WorkspaceEventScope::for_runtime(");
     expect(cli).toContain("ensure_cli_foreground_subagent_phase().await");
     expect(cli).toContain("precompleted_subagent_results");
     expect(cli).toContain("subagent_call_is_workspace_readonly");
@@ -191,7 +206,7 @@ describe("agent parallel tool scheduling safety", () => {
   it("covers the inbound MCP server tool execution path", () => {
     const mcp = read("src-tauri/src/mcp/server/tools.rs");
     const acquire = mcp.indexOf("process_workspace_execution_lock(");
-    const execute = mcp.indexOf("execute_workspace_tool(&app", acquire);
+    const execute = mcp.indexOf("execute_workspace_tool(", acquire);
     const release = mcp.indexOf("drop(workspace_guard)", execute);
 
     expect(mcp).toContain("WorkspaceExecutionLockRequest::Exclusive");

@@ -10,9 +10,15 @@ import {
   knowledgeList,
   knowledgeQuery,
   knowledgeRead,
+  listSkills,
+  readSkillManifest,
 } from "../services/knowledge";
 
 const mockedInvoke = vi.mocked(ipcInvoke);
+const workspaceRef = {
+  checkoutId: "checkout-feature",
+  expectedGeneration: 7,
+};
 
 describe("knowledge service visibility defaults", () => {
   beforeEach(() => {
@@ -21,17 +27,32 @@ describe("knowledge service visibility defaults", () => {
   });
 
   it("keeps hidden documents in the management list", async () => {
-    await knowledgeList();
+    await knowledgeList({}, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith("knowledge_list", {
       docType: undefined,
       pathPrefix: undefined,
       includeHidden: true,
+      workspaceRef,
+    });
+  });
+
+  it("carries the checkout reference through Skill list and read requests", async () => {
+    await listSkills(workspaceRef);
+    await readSkillManifest("asset-audit", "project", workspaceRef);
+
+    expect(mockedInvoke).toHaveBeenNthCalledWith(1, "list_skills", {
+      workspaceRef,
+    });
+    expect(mockedInvoke).toHaveBeenNthCalledWith(2, "read_skill_manifest", {
+      dirName: "asset-audit",
+      source: "project",
+      workspaceRef,
     });
   });
 
   it("excludes hidden documents from retrieval by default", async () => {
-    await knowledgeQuery({ query: "external skill" });
+    await knowledgeQuery({ query: "external skill" }, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith("knowledge_query", {
       query: "external skill",
@@ -39,11 +60,12 @@ describe("knowledge service visibility defaults", () => {
       types: undefined,
       pathPrefix: undefined,
       includeHidden: false,
+      workspaceRef,
     });
   });
 
   it("preserves an explicit hidden-document query", async () => {
-    await knowledgeQuery({ query: "external skill", includeHidden: true });
+    await knowledgeQuery({ query: "external skill", includeHidden: true }, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith(
       "knowledge_query",
@@ -67,7 +89,7 @@ describe("knowledge service visibility defaults", () => {
         kind: "directory",
         type,
         path: type,
-      });
+      }, workspaceRef);
 
       expect(mockedInvoke).toHaveBeenCalledWith("knowledge_read", {
         request: {
@@ -77,6 +99,7 @@ describe("knowledge service visibility defaults", () => {
           part: "full",
           includeHistory: false,
         },
+        workspaceRef,
       });
     },
   );
@@ -95,7 +118,7 @@ describe("knowledge service visibility defaults", () => {
       kind: "directory",
       type: "design",
       path: "memory",
-    });
+    }, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith(
       "knowledge_read",
@@ -126,7 +149,7 @@ describe("knowledge service visibility defaults", () => {
       config: {
         summary: "Memory 根规则",
       },
-    });
+    }, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith("knowledge_edit", {
       request: {
@@ -138,6 +161,7 @@ describe("knowledge service visibility defaults", () => {
           summary: "Memory 根规则",
         },
       },
+      workspaceRef,
     });
   });
 
@@ -157,7 +181,7 @@ describe("knowledge service visibility defaults", () => {
         aiMaintained: "inherit",
         maintenanceRules: null,
       },
-    });
+    }, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith("knowledge_edit", {
       request: {
@@ -170,6 +194,7 @@ describe("knowledge service visibility defaults", () => {
           inheritAiConfig: true,
         },
       },
+      workspaceRef,
     });
   });
 
@@ -188,7 +213,7 @@ describe("knowledge service visibility defaults", () => {
         readOnly: false,
         aiEditMode: "confirm",
       },
-    });
+    }, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith("knowledge_edit", {
       request: {
@@ -201,6 +226,7 @@ describe("knowledge service visibility defaults", () => {
         },
         config: undefined,
       },
+      workspaceRef,
     });
   });
 });

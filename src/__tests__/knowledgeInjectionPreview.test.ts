@@ -21,7 +21,9 @@ describe("Knowledge injection preview", () => {
   it("filters injected items down to knowledge-related runtime blocks", () => {
     const panel = read("src/components/knowledge/KnowledgeInjectionPreviewPanel.vue");
 
-    expect(panel).toContain("listAgentInjectedItems");
+    expect(panel).toContain("listWorkspaceAgentInjectedItems");
+    expect(panel).toContain("listWorkspaceAgentInjectedItems(workspaceRef, selectedAgentId.value)");
+    expect(panel).toContain("props.workspaceRef?.checkoutId !== workspaceRef.checkoutId");
     expect(panel).toContain('item.id === "knowledge_context" || item.id.startsWith("knowledge_rule::")');
     expect(panel).toContain("function splitKnowledgeItem(item: InjectedPromptItem): InjectedPromptItem[]");
     expect(panel).toContain('line.match(/^###\\s+(.+)$/)');

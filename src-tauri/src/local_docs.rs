@@ -137,6 +137,45 @@ pub struct LocalReferenceWatcherState(
     pub Arc<std::sync::Mutex<HashMap<String, LocalReferenceWatchEntry>>>,
 );
 
+impl LocalReferenceWatcherState {
+    pub fn live_watcher_count(&self) -> usize {
+        self.0.lock().map(|entries| entries.len()).unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_worker(
+        &self,
+        target_path: &str,
+        join_delay: Duration,
+    ) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let os_watcher = RecommendedWatcher::new(tx, Config::default()).expect("test watcher");
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed_stop = Arc::new(AtomicBool::new(false));
+        let worker_exited = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker_observed_stop = Arc::clone(&observed_stop);
+        let worker_exited_after_join = Arc::clone(&worker_exited);
+        let worker = std::thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_observed_stop.store(true, Ordering::Release);
+            std::thread::sleep(join_delay);
+            worker_exited_after_join.store(true, Ordering::Release);
+        });
+        self.0.lock().expect("test watcher state").insert(
+            target_path.to_string(),
+            LocalReferenceWatchEntry {
+                stop,
+                worker: Some(worker),
+                _watcher: os_watcher,
+            },
+        );
+        (observed_stop, worker_exited)
+    }
+}
+
 #[derive(Debug)]
 enum LocalReferenceImportRunError {
     Cancelled,
@@ -2093,6 +2132,7 @@ pub async fn start_local_reference_import(
     knowledge_index_state: Arc<KnowledgeIndexState>,
     state: Arc<tokio::sync::Mutex<LocalReferenceImportRuntime>>,
     watcher_state: LocalReferenceWatcherState,
+    workspace_lease: crate::workspace_service::WorkspaceLease,
 ) -> Result<LocalReferenceImportStatus, String> {
     let mut request = request;
     if request.mode == KnowledgeLocalSourceMode::Live {
@@ -2155,6 +2195,7 @@ pub async fn start_local_reference_import(
     let request_for_task = request.clone();
     let target_path_for_task = target_path.clone();
     tauri::async_runtime::spawn(async move {
+        let _workspace_lease = workspace_lease;
         let outcome = run_local_reference_import(
             app_handle,
             working_dir_for_task.clone(),

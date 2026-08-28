@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use super::code::{require_workspace, string_arg};
+use super::code::string_arg;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::asset_db::types::{guid_to_hex, AssetKind, Guid};
 use crate::unity_project_config::{load_tag_manager, BUILTIN_TAGS};
@@ -65,10 +65,12 @@ pub(super) fn unity_code_usages() -> ToolDef {
         mutates_workspace: false,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let workspace = match require_workspace(&ctx) {
-                    Ok(dir) => dir,
-                    Err(result) => return result,
+                let Some(execution) = ctx.execution.as_ref() else {
+                    return err(
+                        "Tool 'unity_code_usages' requires a checkout-scoped ToolExecutionContext.",
+                    );
                 };
+                let workspace = execution.root().to_string_lossy().to_string();
                 let file_path = match string_arg(&args, "file_path") {
                     Ok(value) => value,
                     Err(result) => return result,
@@ -85,10 +87,14 @@ pub(super) fn unity_code_usages() -> ToolDef {
                     .map(|v| v.clamp(1, 400) as usize)
                     .unwrap_or(100);
 
-                let app_handle = ctx.app_handle.clone();
+                execution
+                    .workspace
+                    .core()
+                    .refresh_asset_db_if_missing(execution.root());
+                let asset_db = execution.workspace.core().asset_db();
                 let task = tokio::task::spawn_blocking(move || {
                     run_code_usages(
-                        app_handle,
+                        asset_db,
                         &workspace,
                         &file_path,
                         member.as_deref(),
@@ -106,14 +112,12 @@ pub(super) fn unity_code_usages() -> ToolDef {
 }
 
 fn run_code_usages(
-    app_handle: Option<tauri::AppHandle>,
+    asset_db: std::sync::Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
     workspace: &str,
     file_path: &str,
     member: Option<&str>,
     max_results: usize,
 ) -> ToolResult {
-    use tauri::Manager;
-
     let root = dunce::simplified(Path::new(workspace)).to_path_buf();
     let script_abs = resolve_in_workspace(&root, file_path);
     if !script_abs.is_file() {
@@ -147,15 +151,7 @@ fn run_code_usages(
     // plus (in member mode) the indexed serialized member bindings. All DB
     // access stays inside this one guard scope; the lock releases afterwards.
     let (candidates, member_hits): (Vec<String>, Vec<crate::asset_db::MemberBindingHit>) = {
-        let Some(app_handle) = app_handle.as_ref() else {
-            return err("App context unavailable for asset database access.");
-        };
-        let Some(state) = app_handle.try_state::<crate::asset_db::AssetDbState>() else {
-            return err(
-                "AssetDbState not available. The reference graph has not been initialized.",
-            );
-        };
-        let guard = match state.0.lock() {
+        let guard = match asset_db.lock() {
             Ok(guard) => guard,
             Err(error) => return err(format!("Failed to lock AssetDb: {error}")),
         };
@@ -1153,4 +1149,24 @@ fn check_scene_ref(
             .map(|s| format!(" (did you mean \"{s}\"?)"))
             .unwrap_or_default()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unity_code_usages;
+
+    #[tokio::test]
+    async fn code_usage_search_requires_checkout_execution_scope() {
+        let tool = unity_code_usages();
+        let result = (tool.execute)(
+            serde_json::json!({ "file_path": "Assets/Scripts/Test.cs" }),
+            crate::tool::ToolExecutionContext::default(),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result
+            .output
+            .contains("checkout-scoped ToolExecutionContext"));
+    }
 }

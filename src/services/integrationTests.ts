@@ -1,5 +1,6 @@
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
+import type { WorkspaceRef } from "./project";
 
 export type UnityIntegrationSuite =
   | "connect"
@@ -41,10 +42,11 @@ export interface UnityIntegrationTestEvent {
 
 export function runUnityIntegrationTests(
   request: UnityIntegrationTestRunRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<UnityIntegrationTestRunStarted> {
   return ipcInvoke<UnityIntegrationTestRunStarted>(
     "unity_integration_test_run",
-    { request },
+    { request, workspaceRef },
     {
       operation: "unityIntegrationTestRun",
       notify: false,
@@ -71,10 +73,10 @@ export function cancelUnityIntegrationTests(): Promise<void> {
  * deletes it and converges the deletion. Resolves to a line-oriented report
  * (`PASS`/`FAIL`/`WARN`-prefixed lines).
  */
-export function runUnityRecompileProbe(): Promise<string> {
+export function runUnityRecompileProbe(workspaceRef: WorkspaceRef): Promise<string> {
   return ipcInvoke<string>(
     "unity_recompile_probe_run",
-    {},
+    { workspaceRef },
     {
       operation: "unityRecompileProbe",
       notify: false,

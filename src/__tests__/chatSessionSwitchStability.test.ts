@@ -19,7 +19,8 @@ describe("chat session switch stability", () => {
     expect(chatStore.indexOf("sessionService.loadSessionView(id, messageLimit),")).toBeLessThan(
       chatStore.indexOf("setActiveSessionSelection(id, { persist: options.persist });"),
     );
-    expect(chatStore).toContain("if (loadSeq !== sessionLoadSeq) return false;");
+    expect(chatStore).toContain("loadSeq !== sessionLoadSeq");
+    expect(chatStore).toContain("!isWorkspaceScopeCurrent(expectedWorkspaceScopeKey)");
     expect(chatStore).toContain("sessionHistoryHasMore.value = snapshot.hasMoreHistory;");
 
     expect(chatView).toContain("function isPendingSessionRestoreAwaitingMessages()");

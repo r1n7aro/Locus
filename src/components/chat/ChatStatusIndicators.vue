@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { BookOpen, Box, CodeXml, Database, Plug, Zap, type IconNode } from "lucide";
+import { BookOpen, CodeXml, Database, Plug, Zap, type IconNode } from "lucide";
 import { t } from "../../i18n";
-import { listAgentInjectedItems } from "../../services/agent";
+import { listWorkspaceAgentInjectedItems } from "../../services/agent";
 import {
   csharpLspGetStatus,
   csharpLspRestart,
@@ -18,6 +18,8 @@ import {
   type UnityStateProbeStatus,
 } from "../../services/csharpLsp";
 import { normalizeAppError } from "../../services/errors";
+import type { WorkspaceRef } from "../../services/project";
+import { closeHeadlessUnityProject } from "../../services/unity";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import {
   knowledgeGetEmbeddingStatus,
@@ -51,6 +53,12 @@ import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
 import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
+import {
+  UNITY_PROJECT_ICON,
+  projectHasCapability,
+  projectHasService,
+  type ProjectCapabilityId,
+} from "../icons/projectIcons";
 
 type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload" | "mcp";
 type StatusTone = "success" | "danger" | "warning" | "accent" | "muted";
@@ -70,6 +78,7 @@ interface StatusDetailRow {
 interface StatusItem {
   id: StatusId;
   icon: StatusIcon;
+  requiredCapability?: ProjectCapabilityId;
   title: string;
   summary: string;
   inlineLabel: string;
@@ -84,7 +93,7 @@ interface StatusItem {
 
 const STATUS_ICONS: Record<StatusIcon, IconNode> = {
   database: Database,
-  unity: Box,
+  unity: UNITY_PROJECT_ICON,
   knowledge: BookOpen,
   code: CodeXml,
   hotReload: Zap,
@@ -99,8 +108,9 @@ const props = defineProps<{
   unityLaunchState?: UnityLaunchState;
   unityConnectionStatus?: UnityConnectionStatus | null;
   unityRecompiling?: boolean;
+  workspaceRef?: WorkspaceRef | null;
+  projectServices?: string[];
   workingDir?: string;
-  isUnityProject?: boolean;
   scanPhase?: AssetDbScanEvent | null;
   lastScanStats?: ScanStats | null;
   knowledgeAccessMode?: KnowledgeAccessMode;
@@ -119,16 +129,22 @@ const csharpLsp = ref<CsharpLspStatus | null>(null);
 const csharpLspPending = ref(false);
 let csharpLspUnsubscribe: RuntimeUnsubscribe | null = null;
 let csharpLspDisposed = false;
+let csharpLspSubscriptionVersion = 0;
 const hotReloadStatus = ref<CsharpCompileStatus | null>(null);
 const hotReloadPending = ref(false);
 const hotReloadRecompilePending = ref(false);
 const hotReloadActionError = ref("");
 let hotReloadUnsubscribe: RuntimeUnsubscribe | null = null;
 let hotReloadDisposed = false;
+let hotReloadSubscriptionVersion = 0;
 const nativeBrokerStatus = ref<UnityNativeBrokerStatus | null>(null);
+let nativeBrokerStatusSeq = 0;
 const stateProbeStatus = ref<UnityStateProbeStatus | null>(null);
+let stateProbeStatusSeq = 0;
 const unitySemanticState = ref<UnitySemanticState | null>(null);
 const unitySemanticError = ref("");
+const unityHeadlessClosing = ref(false);
+const unityHeadlessCloseError = ref("");
 let unitySemanticPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
 let unitySemanticSeq = 0;
 let unitySemanticDisposed = false;
@@ -160,6 +176,18 @@ const UNITY_SEMANTIC_PHASE_TONES: UnitySemanticPhaseTone = {
   quit: "muted",
   unknown: "warning",
 };
+
+const projectServices = computed(() => props.projectServices ?? []);
+const projectServicesKey = computed(() => [...projectServices.value]
+  .map((serviceId) => serviceId.trim().toLowerCase())
+  .filter(Boolean)
+  .sort()
+  .join(","));
+const isUnityProject = computed(() => projectHasService(projectServices.value, "unity"));
+
+function hasProjectCapability(capability: ProjectCapabilityId): boolean {
+  return projectHasCapability(projectServices.value, capability);
+}
 
 function isAssetDbRunningPhase(phase: AssetDbScanEvent | null | undefined): boolean {
   return phase != null
@@ -438,11 +466,22 @@ const unityTone = computed<StatusTone>(() => {
 });
 
 const unityCanLaunch = computed(() =>
-  !!props.isUnityProject
+  isUnityProject.value
   && !props.unityConnected
   && !props.unityPluginStatus
   && !unityRecompileWaitingConnection.value
   && unityEditorProcessState.value !== "running",
+);
+
+const unityIsHeadless = computed(() =>
+  props.unityConnectionStatus?.headless === true
+  || props.unityConnectionStatus?.launchMode === "headless",
+);
+
+const unityCanCloseHeadless = computed(() =>
+  isUnityProject.value
+  && unityIsHeadless.value
+  && unityEditorProcessState.value === "running",
 );
 
 const unityActionLabel = computed(() => {
@@ -451,6 +490,11 @@ const unityActionLabel = computed(() => {
     return props.unityPluginStatus === "missing"
       ? t("app.plugin.clickInstall")
       : t("app.plugin.clickUpdate");
+  }
+  if (unityCanCloseHeadless.value) {
+    return unityHeadlessClosing.value
+      ? t("chat.status.unity.closingHeadless")
+      : t("chat.status.unity.closeHeadless");
   }
   if (!unityCanLaunch.value) return "";
   if (effectiveUnityLaunchState.value === "starting") return t("chat.status.unity.launching");
@@ -462,6 +506,7 @@ const unityActionLabel = computed(() => {
 
 const unityActionTitle = computed(() => {
   if (props.unityPluginStatus) return unityActionLabel.value;
+  if (unityCanCloseHeadless.value) return t("chat.status.unity.closeHeadlessTitle");
   if (effectiveUnityLaunchState.value === "starting") return t("chat.status.unity.launchingTitle");
   if (effectiveUnityLaunchState.value === "waitingConnection") {
     return t("chat.status.unity.waitingConnectionTitle");
@@ -474,7 +519,7 @@ const assetStatusLabel = computed(() => {
   if (isScanning.value) return scanLabel.value;
   if (scanError.value) return scanError.value.message;
   if (scanSummary.value) return t("chat.assetDb.ready");
-  return props.isUnityProject ? t("chat.assetDb.notBuilt") : t("chat.status.assetDb.noWorkspace");
+  return isUnityProject.value ? t("chat.assetDb.notBuilt") : t("chat.status.assetDb.noWorkspace");
 });
 
 const assetTone = computed<StatusTone>(() => {
@@ -609,18 +654,32 @@ function hotReloadCompilerLabel(status: CsharpCompileStatus): string {
 }
 
 async function refreshNativeBrokerStatus() {
-  try {
-    nativeBrokerStatus.value = await unityNativeBrokerGetStatus();
-  } catch {
+  const workspaceRef = props.workspaceRef;
+  const seq = ++nativeBrokerStatusSeq;
+  if (!workspaceRef || !hasProjectCapability("editorConnection")) {
     nativeBrokerStatus.value = null;
+    return;
+  }
+  try {
+    const status = await unityNativeBrokerGetStatus(workspaceRef);
+    if (seq === nativeBrokerStatusSeq) nativeBrokerStatus.value = status;
+  } catch {
+    if (seq === nativeBrokerStatusSeq) nativeBrokerStatus.value = null;
   }
 }
 
 async function refreshStateProbeStatus() {
-  try {
-    stateProbeStatus.value = await unityStateProbeGetStatus();
-  } catch {
+  const workspaceRef = props.workspaceRef;
+  const seq = ++stateProbeStatusSeq;
+  if (!workspaceRef || !hasProjectCapability("editorConnection")) {
     stateProbeStatus.value = null;
+    return;
+  }
+  try {
+    const status = await unityStateProbeGetStatus(workspaceRef);
+    if (seq === stateProbeStatusSeq) stateProbeStatus.value = status;
+  } catch {
+    if (seq === stateProbeStatusSeq) stateProbeStatus.value = null;
   }
 }
 
@@ -643,6 +702,19 @@ const unityRows = computed<StatusDetailRow[]>(() => {
       value: unitySemanticSafetyLabel(semantic.safety.recommendedAction),
       tier: "primary",
     });
+    if (
+      semantic.detail
+      && (
+        semantic.mainThread.state === "blocked"
+        || semantic.safety.recommendedAction === "resolve_dialog"
+      )
+    ) {
+      rows.push({
+        label: t("chat.status.unity.blockingReason"),
+        value: semantic.detail,
+        tier: "primary",
+      });
+    }
   } else if (unitySemanticError.value) {
     rows.push({
       label: t("chat.status.unity.semanticPhase"),
@@ -662,6 +734,12 @@ const unityRows = computed<StatusDetailRow[]>(() => {
     label: t("chat.status.unity.process"),
     value: unityEditorProcessStateLabel(unityEditorProcessState.value),
   });
+  if (status?.launchMode) {
+    rows.push({
+      label: t("chat.status.unity.launchMode"),
+      value: t(`chat.status.unity.launchMode.${status.launchMode}`),
+    });
+  }
   if (status?.editorProjectPath) {
     rows.push({
       label: t("chat.status.unity.editorProjectPath"),
@@ -751,6 +829,13 @@ const unityRows = computed<StatusDetailRow[]>(() => {
     diagnostics.push({
       label: t("chat.status.unity.processLastError"),
       value: status.processLastError,
+      mono: true,
+    });
+  }
+  if (unityHeadlessCloseError.value) {
+    diagnostics.push({
+      label: t("chat.status.unity.closeHeadlessError"),
+      value: unityHeadlessCloseError.value,
       mono: true,
     });
   }
@@ -1120,7 +1205,7 @@ const hotReloadActionLabel = computed(() =>
 );
 
 const hotReloadCanRecompile = computed(() =>
-  !!props.isUnityProject
+  isUnityProject.value
   && !!props.unityConnected
   && !props.unityRecompiling
   && !hotReloadRecompilePending.value,
@@ -1230,14 +1315,15 @@ function clearUnitySemanticPoll() {
 
 async function refreshUnitySemanticState() {
   const seq = ++unitySemanticSeq;
-  if (!props.isUnityProject || !unityWorkingDir.value) {
+  const workspaceRef = props.workspaceRef;
+  if (!isUnityProject.value || !unityWorkingDir.value || !workspaceRef) {
     unitySemanticState.value = null;
     unitySemanticError.value = "";
     return;
   }
 
   try {
-    const state = await unitySemanticStateGet();
+    const state = await unitySemanticStateGet(workspaceRef);
     if (unitySemanticDisposed || seq !== unitySemanticSeq) return;
     unitySemanticState.value = state;
     unitySemanticError.value = "";
@@ -1252,7 +1338,7 @@ async function refreshUnitySemanticState() {
 
 function scheduleUnitySemanticPoll(delayMs = UNITY_SEMANTIC_STATUS_POLL_MS) {
   clearUnitySemanticPoll();
-  if (unitySemanticDisposed) return;
+  if (unitySemanticDisposed || !hasProjectCapability("editorConnection")) return;
   unitySemanticPollTimer = globalThis.setTimeout(() => {
     unitySemanticPollTimer = null;
     void refreshUnitySemanticState().finally(() => scheduleUnitySemanticPoll());
@@ -1260,10 +1346,47 @@ function scheduleUnitySemanticPoll(delayMs = UNITY_SEMANTIC_STATUS_POLL_MS) {
 }
 
 async function refreshCsharpLspStatus() {
+  const scope = props.workspaceRef;
+  if (!scope || !hasProjectCapability("codeAnalysis")) {
+    csharpLsp.value = null;
+    return;
+  }
   try {
-    csharpLsp.value = await csharpLspGetStatus();
+    const status = await csharpLspGetStatus(scope);
+    if (
+      props.workspaceRef?.checkoutId === scope.checkoutId
+      && props.workspaceRef.expectedGeneration === scope.expectedGeneration
+    ) csharpLsp.value = status;
   } catch {
     // status stays stale; the event stream will refresh it
+  }
+}
+
+function workspaceScopeKey(scope = props.workspaceRef): string {
+  if (!scope) return "";
+  return `${scope.checkoutId}:${scope.expectedGeneration ?? ""}`;
+}
+
+async function bindCsharpLspStatus() {
+  const version = ++csharpLspSubscriptionVersion;
+  csharpLspUnsubscribe?.();
+  csharpLspUnsubscribe = null;
+  csharpLsp.value = null;
+  const scope = props.workspaceRef;
+  if (!scope || csharpLspDisposed || !hasProjectCapability("codeAnalysis")) return;
+  await refreshCsharpLspStatus();
+  try {
+    const unsubscribe = await subscribeCsharpLspStatus(scope, (payload) => {
+      if (workspaceScopeKey() !== workspaceScopeKey(scope)) return;
+      csharpLsp.value = payload;
+    });
+    if (csharpLspDisposed || version !== csharpLspSubscriptionVersion) {
+      unsubscribe();
+    } else {
+      csharpLspUnsubscribe = unsubscribe;
+    }
+  } catch {
+    // The explicit status request remains available when the event bridge is unavailable.
   }
 }
 
@@ -1271,8 +1394,13 @@ async function setCodeEnabled(value: boolean) {
   if (csharpLspPending.value) return;
   if (csharpLsp.value && csharpLsp.value.enabled === value) return;
   csharpLspPending.value = true;
+  const scope = props.workspaceRef;
+  if (!scope) {
+    csharpLspPending.value = false;
+    return;
+  }
   try {
-    csharpLsp.value = await csharpLspSetEnabled(value);
+    csharpLsp.value = await csharpLspSetEnabled(value, scope);
     csharpLspActionError.value = "";
   } catch (error) {
     csharpLspActionError.value = normalizeAppError(error).message;
@@ -1285,8 +1413,13 @@ async function setCodeEnabled(value: boolean) {
 async function restartCode() {
   if (csharpLspPending.value) return;
   csharpLspPending.value = true;
+  const scope = props.workspaceRef;
+  if (!scope) {
+    csharpLspPending.value = false;
+    return;
+  }
   try {
-    csharpLsp.value = await csharpLspRestart();
+    csharpLsp.value = await csharpLspRestart(scope);
     csharpLspActionError.value = "";
   } catch (error) {
     csharpLspActionError.value = normalizeAppError(error).message;
@@ -1297,10 +1430,19 @@ async function restartCode() {
 }
 
 async function refreshHotReloadStatus() {
+  const scope = props.workspaceRef;
+  if (!scope || !hasProjectCapability("hotReload")) {
+    hotReloadStatus.value = null;
+    return;
+  }
   try {
-    hotReloadStatus.value = await unitySidecarCompilerGetStatus();
-    hotReloadActionError.value = "";
+    const status = await unitySidecarCompilerGetStatus(scope);
+    if (workspaceScopeKey() === workspaceScopeKey(scope)) {
+      hotReloadStatus.value = status;
+      hotReloadActionError.value = "";
+    }
   } catch (error) {
+    if (workspaceScopeKey() !== workspaceScopeKey(scope)) return;
     const message = normalizeAppError(error).message;
     hotReloadActionError.value = message;
     if (!hotReloadStatus.value) {
@@ -1311,14 +1453,45 @@ async function refreshHotReloadStatus() {
 
 async function applyHotReloadEnabled(value: boolean) {
   hotReloadPending.value = true;
+  const scope = props.workspaceRef;
+  if (!scope) {
+    hotReloadPending.value = false;
+    return;
+  }
   try {
-    hotReloadStatus.value = await unityHotReloadSetEnabled(value);
-    hotReloadActionError.value = "";
+    const status = await unityHotReloadSetEnabled(value, scope);
+    if (workspaceScopeKey() === workspaceScopeKey(scope)) {
+      hotReloadStatus.value = status;
+      hotReloadActionError.value = "";
+    }
   } catch (error) {
     hotReloadActionError.value = normalizeAppError(error).message;
     await refreshHotReloadStatus();
   } finally {
     hotReloadPending.value = false;
+  }
+}
+
+async function bindHotReloadStatus() {
+  const version = ++hotReloadSubscriptionVersion;
+  hotReloadUnsubscribe?.();
+  hotReloadUnsubscribe = null;
+  hotReloadStatus.value = null;
+  const scope = props.workspaceRef;
+  if (!scope || hotReloadDisposed || !hasProjectCapability("hotReload")) return;
+  await refreshHotReloadStatus();
+  try {
+    const unsubscribe = await subscribeUnitySidecarCompilerStatus(scope, (payload) => {
+      if (workspaceScopeKey() !== workspaceScopeKey(scope)) return;
+      hotReloadStatus.value = payload;
+    });
+    if (hotReloadDisposed || version !== hotReloadSubscriptionVersion) {
+      unsubscribe();
+    } else {
+      hotReloadUnsubscribe = unsubscribe;
+    }
+  } catch {
+    // The explicit checkout-scoped status request remains available.
   }
 }
 
@@ -1337,7 +1510,10 @@ const {
   settingPlayModeReload: hotReloadPlayModeReloadSwitching,
   playModeReloadError: hotReloadPlayModeReloadError,
   setPlayModeReload: setHotReloadPlayModeReload,
-} = useHotReloadDebugGuard(() => applyHotReloadEnabled(true));
+} = useHotReloadDebugGuard(
+  () => hasProjectCapability("hotReload") ? props.workspaceRef ?? null : null,
+  () => applyHotReloadEnabled(true),
+);
 
 // Code Optimization selector (hot-reload popover). Debug keeps every method
 // hot-reloadable; Release runs faster but inlines small methods, whose edits
@@ -1471,9 +1647,11 @@ async function setHotReloadEnabled(value: boolean) {
 
 async function runHotReloadRecompile() {
   if (!hotReloadCanRecompile.value) return;
+  const scope = props.workspaceRef;
+  if (!scope) return;
   hotReloadRecompilePending.value = true;
   try {
-    await unityRecompileRun();
+    await unityRecompileRun(scope);
     hotReloadActionError.value = "";
   } catch (error) {
     hotReloadActionError.value = normalizeAppError(error).message;
@@ -1548,10 +1726,12 @@ async function toggleMcpServer(server: McpServerRuntimeStatus) {
   }
 }
 
-const statusItems = computed<StatusItem[]>(() => [
+const statusItems = computed<StatusItem[]>(() => {
+  const items: StatusItem[] = [
   {
     id: "assetDb",
     icon: "database",
+    requiredCapability: "assetDatabase",
     title: t("chat.status.assetDb.title"),
     summary: assetStatusLabel.value,
     inlineLabel: assetStatusLabel.value,
@@ -1559,12 +1739,13 @@ const statusItems = computed<StatusItem[]>(() => [
     rows: assetRows.value,
     actionLabel: assetActionLabel.value,
     actionTitle: assetActionTitle.value,
-    actionDisabled: !props.isUnityProject || isScanning.value,
+    actionDisabled: !isUnityProject.value || isScanning.value,
     actionVariant: "neutral",
   },
   {
     id: "unity",
     icon: "unity",
+    requiredCapability: "editorConnection",
     title: t("chat.status.unity.title"),
     summary: unitySummary.value,
     inlineLabel: unitySummary.value,
@@ -1574,10 +1755,13 @@ const statusItems = computed<StatusItem[]>(() => [
     actionTitle: unityActionTitle.value,
     actionDisabled: props.unityPluginStatus
       ? props.unityPluginInstalling
-      : unityRecompileWaitingConnection.value
+      : unityHeadlessClosing.value
+        || unityRecompileWaitingConnection.value
         || effectiveUnityLaunchState.value !== "idle"
-        || !props.isUnityProject,
-    actionVariant: props.unityPluginStatus ? "neutral" : "primary",
+        || !isUnityProject.value,
+    actionVariant: unityCanCloseHeadless.value
+      ? "danger"
+      : props.unityPluginStatus ? "neutral" : "primary",
   },
   {
     id: "knowledge",
@@ -1592,6 +1776,7 @@ const statusItems = computed<StatusItem[]>(() => [
   {
     id: "code",
     icon: "code",
+    requiredCapability: "codeAnalysis",
     title: t("chat.status.code.title"),
     summary: codeSummary.value,
     inlineLabel: codeSummary.value,
@@ -1609,6 +1794,7 @@ const statusItems = computed<StatusItem[]>(() => [
   {
     id: "hotReload",
     icon: "hotReload",
+    requiredCapability: "hotReload",
     title: t("chat.status.hotReload.title"),
     summary: hotReloadSummary.value,
     inlineLabel: hotReloadSummary.value,
@@ -1636,7 +1822,11 @@ const statusItems = computed<StatusItem[]>(() => [
         },
       ]
     : []),
-]);
+  ];
+  return items.filter((item) => (
+    !item.requiredCapability || hasProjectCapability(item.requiredCapability)
+  ));
+});
 
 const activeItem = computed(() =>
   statusItems.value.find((item) => item.id === activePopover.value) ?? null,
@@ -1711,7 +1901,8 @@ function clearKnowledgeStatus() {
 
 async function loadKnowledgeStatus() {
   const seq = ++knowledgeStatusSeq;
-  if (!knowledgeHasWorkspace.value) {
+  const scope = props.workspaceRef;
+  if (!knowledgeHasWorkspace.value || !scope) {
     clearKnowledgeStatus();
     knowledgeStatusLoading.value = false;
     return;
@@ -1724,17 +1915,18 @@ async function loadKnowledgeStatus() {
 
   knowledgeStatusLoading.value = true;
   const agentId = knowledgeAgentId.value;
+  const requestedScopeKey = workspaceScopeKey(scope);
   const [overviewResult, lexicalResult, embeddingResult, injectedResult] =
     await Promise.allSettled([
-      knowledgeGetOverview(),
-      knowledgeGetLexicalRebuildStatus(),
-      knowledgeGetEmbeddingStatus(),
+      knowledgeGetOverview(scope),
+      knowledgeGetLexicalRebuildStatus(scope),
+      knowledgeGetEmbeddingStatus(scope),
       agentId
-        ? listAgentInjectedItems(agentId, knowledgeMode.value)
+        ? listWorkspaceAgentInjectedItems(scope, agentId, knowledgeMode.value)
         : Promise.resolve([] as InjectedPromptItem[]),
     ]);
 
-  if (seq !== knowledgeStatusSeq) return;
+  if (seq !== knowledgeStatusSeq || workspaceScopeKey() !== requestedScopeKey) return;
 
   knowledgeRetrievalError.value = "";
   knowledgeContextError.value = "";
@@ -1770,6 +1962,9 @@ function runStatusAction(item: StatusItem) {
   } else if (item.id === "unity") {
     if (props.unityPluginStatus) {
       emit("installPlugin");
+    } else if (unityCanCloseHeadless.value) {
+      void closeRunningHeadlessUnity();
+      return;
     } else {
       emit("launchUnityProject");
     }
@@ -1781,6 +1976,22 @@ function runStatusAction(item: StatusItem) {
     return;
   }
   closePopover();
+}
+
+async function closeRunningHeadlessUnity() {
+  const workspaceRef = props.workspaceRef;
+  if (!workspaceRef || unityHeadlessClosing.value) return;
+  unityHeadlessClosing.value = true;
+  unityHeadlessCloseError.value = "";
+  try {
+    await closeHeadlessUnityProject(workspaceRef);
+    closePopover();
+    await refreshUnitySemanticState();
+  } catch (error) {
+    unityHeadlessCloseError.value = normalizeAppError(error).message;
+  } finally {
+    unityHeadlessClosing.value = false;
+  }
 }
 
 function onDocumentKeydown(event: KeyboardEvent) {
@@ -1799,8 +2010,8 @@ onMounted(() => {
   mcpDisposed = false;
   void refreshUnitySemanticState();
   scheduleUnitySemanticPoll();
-  void refreshCsharpLspStatus();
-  void refreshHotReloadStatus();
+  void bindCsharpLspStatus();
+  void bindHotReloadStatus();
   void refreshNativeBrokerStatus();
   void refreshStateProbeStatus();
   void refreshMcpStatus();
@@ -1815,29 +2026,18 @@ onMounted(() => {
       }
     })
     .catch(() => {});
-  subscribeCsharpLspStatus((payload) => {
-    csharpLsp.value = payload;
-  })
-    .then((unsubscribe) => {
-      if (csharpLspDisposed) {
-        unsubscribe();
-      } else {
-        csharpLspUnsubscribe = unsubscribe;
-      }
-    })
-    .catch(() => {});
-  subscribeUnitySidecarCompilerStatus((payload) => {
-    hotReloadStatus.value = payload;
-  })
-    .then((unsubscribe) => {
-      if (hotReloadDisposed) {
-        unsubscribe();
-      } else {
-        hotReloadUnsubscribe = unsubscribe;
-      }
-    })
-    .catch(() => {});
 });
+
+watch(
+  () => `${workspaceScopeKey()}::${projectServicesKey.value}`,
+  () => {
+    void bindCsharpLspStatus();
+    void bindHotReloadStatus();
+    void refreshHotReloadOptimization();
+    void refreshNativeBrokerStatus();
+    void refreshStateProbeStatus();
+  },
+);
 
 watch(
   () => `${props.workingDir ?? ""}::${knowledgeAgentId.value}::${knowledgeMode.value}`,
@@ -1851,13 +2051,18 @@ watch(
 watch(
   () => [
     props.workingDir ?? "",
-    String(props.isUnityProject ?? false),
+    projectServicesKey.value,
     String(props.unityConnected ?? false),
     String(props.unityConnectionStatus?.checkedAtMs ?? 0),
     String(props.unityRecompiling ?? false),
   ].join("::"),
   () => {
+    clearUnitySemanticPoll();
     void refreshUnitySemanticState();
+    scheduleUnitySemanticPoll();
+    if (activePopover.value && !statusItems.value.some((item) => item.id === activePopover.value)) {
+      closePopover();
+    }
   },
 );
 
@@ -1865,7 +2070,9 @@ onUnmounted(() => {
   document.removeEventListener("click", closePopover);
   document.removeEventListener("keydown", onDocumentKeydown);
   csharpLspDisposed = true;
+  csharpLspSubscriptionVersion += 1;
   hotReloadDisposed = true;
+  hotReloadSubscriptionVersion += 1;
   unitySemanticDisposed = true;
   mcpDisposed = true;
   clearUnitySemanticPoll();

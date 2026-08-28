@@ -58,15 +58,16 @@ describe("View sidebar settings", () => {
     expect(sessionPanel).not.toContain("view.list.helpUseCases");
     expect(sessionPanel).toContain("onViewResizeMouseDown");
     expect(sessionPanel).toContain("visibleViewEntries");
-    expect(sessionPanel).toContain("interface ViewPointerDragState");
+    expect(sessionPanel).toContain("SESSION_VIEW_INTERNAL_DRAG_TYPE");
+    expect(sessionPanel).toContain("sessionViewDropTarget");
     expect(sessionPanel).toContain("@pointerdown=\"onViewPointerDown(entry.row, $event)\"");
-    expect(sessionPanel).toContain("sp-view-pointer-dragging");
+    expect(sessionPanel).toContain("internalDrag.start(event");
     expect(sessionPanel).toContain("@contextmenu.prevent.stop=\"openViewContextMenu($event, entry.row)\"");
     expect(sessionPanel).toContain("async function revealViewContextLocation");
     expect(sessionPanel).toContain("projectStore.openDirInFileExplorer(targetPath)");
     expect(sessionPanel).toContain("t('view.action.reveal')");
     expect(sessionPanel).toContain("class=\"sp-view-row-shell\"");
-    expect(sessionPanel).toContain("@drop=\"onViewFolderDrop(entry.row, $event)\"");
+    expect(sessionPanel).not.toContain("@dragstart");
     expect(sessionPanel).toContain("class=\"sp-view-create-actions\"");
     expect(sessionPanel).toContain("class=\"sp-view-rename-input\"");
     expect(sessionPanel).toContain("beginRenameViewEntry");
@@ -110,7 +111,7 @@ describe("View sidebar settings", () => {
   it("renders the View management page as a directory tree", () => {
     const viewPage = read("src/components/ViewPackageView.vue");
 
-    expect(viewPage).toContain("viewTree()");
+    expect(viewPage).toContain("viewTree(workspaceRef)");
     expect(viewPage).toContain("viewCreateFolder");
     expect(viewPage).toContain("viewDeleteEntry");
     expect(viewPage).toContain("viewRenameEntry");
@@ -121,7 +122,8 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("@pointerdown=\"onTreePointerDown(entry.row, $event)\"");
     expect(viewPage).toContain(":data-view-node-kind=\"entry.row.node.kind\"");
     expect(viewPage).toContain("@contextmenu.prevent.stop=\"openTreeContextMenu($event, entry.row)\"");
-    expect(viewPage).toContain("@drop=\"onTreeFolderDrop(entry.row, $event)\"");
+    expect(viewPage).toContain("viewTreeDropTarget");
+    expect(viewPage).not.toContain("@dragstart");
     expect(viewPage).toContain("v-else-if=\"entry.row.depth > 0\"");
     expect(viewPage).toContain("class=\"view-tree-row-actions\"");
     expect(viewPage).toContain("@click.stop=\"openTreeView(entry.row)\"");
@@ -210,8 +212,8 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain('import { open, save } from "@tauri-apps/plugin-dialog"');
     expect(viewPage).toContain("async function importViewPackage");
     expect(viewPage).toContain("async function exportViewPackage");
-    expect(viewPage).toContain("viewImportPackage({");
-    expect(viewPage).toContain("viewExportPackage({");
+    expect(viewPage).toContain("viewImportPackage(requireWorkspaceRef(), {");
+    expect(viewPage).toContain("viewExportPackage(requireWorkspaceRef(), {");
     expect(viewPage).toContain('filters: [{ name: t("view.archive.filter"), extensions: ["zip"] }]');
     expect(viewPage).toContain("view.import.imported");
     expect(viewPage).toContain("view.export.exported");

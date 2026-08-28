@@ -25,6 +25,13 @@ struct AgentReloadOutput {
 pub(super) fn agent_reload() -> ToolDef {
     let execute = make_exec(|_args, ctx| {
         Box::pin(async move {
+            let Some(execution) = ctx.execution else {
+                return ToolResult {
+                    output: "Tool 'agent_reload' requires a checkout-scoped ToolExecutionContext."
+                        .to_string(),
+                    is_error: true,
+                };
+            };
             let Some(app_handle) = ctx.app_handle else {
                 return ToolResult {
                     output: "agent_reload requires an application context".to_string(),
@@ -49,12 +56,33 @@ pub(super) fn agent_reload() -> ToolDef {
                     is_error: true,
                 };
             }
-
-            let working_dir = ctx.working_dir.unwrap_or_default();
-            let registry = app_handle.state::<crate::AgentDefRegistryState>();
-            crate::commands::reload_agent_registry(&registry, &app_agent_dir, &working_dir).await;
-
-            let snapshot = registry.snapshot().await;
+            let definitions =
+                app_handle.state::<std::sync::Arc<
+                    crate::workspace_definition_registry::WorkspaceDefinitionRegistry,
+                >>();
+            if let Err(error) = definitions.invalidate_app_base() {
+                return ToolResult {
+                    output: format!("Failed to invalidate Agent definitions: {error}"),
+                    is_error: true,
+                };
+            }
+            if let Err(error) = definitions.invalidate_checkout(&execution.checkout_id) {
+                return ToolResult {
+                    output: format!("Failed to invalidate checkout Agent definitions: {error}"),
+                    is_error: true,
+                };
+            }
+            let process_registry = app_handle.state::<crate::AgentDefRegistryState>();
+            crate::commands::reload_agent_registry(&process_registry, &app_agent_dir, "").await;
+            let snapshot = match definitions.snapshot(execution.workspace.as_ref()).await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return ToolResult {
+                        output: format!("Failed to reload checkout Agent definitions: {error}"),
+                        is_error: true,
+                    };
+                }
+            };
             let default_agent_id = snapshot.default_id().to_string();
             let mut agents = snapshot
                 .list_all()
@@ -75,6 +103,10 @@ pub(super) fn agent_reload() -> ToolDef {
                     .then(a.id.cmp(&b.id))
             });
             crate::commands::emit_agents_changed(&app_handle);
+            crate::commands::emit_agents_changed_for_workspace(
+                &app_handle,
+                execution.workspace.as_ref(),
+            );
 
             let output = AgentReloadOutput {
                 user_agent_root: user_agent_root.to_string_lossy().replace('\\', "/"),
@@ -102,5 +134,25 @@ pub(super) fn agent_reload() -> ToolDef {
         parameters: prompt.parameters,
         mutates_workspace: false,
         execute,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_reload;
+
+    #[tokio::test]
+    async fn agent_reload_requires_checkout_execution_scope() {
+        let tool = agent_reload();
+        let result = (tool.execute)(
+            serde_json::json!({}),
+            crate::tool::ToolExecutionContext::default(),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result
+            .output
+            .contains("checkout-scoped ToolExecutionContext"));
     }
 }

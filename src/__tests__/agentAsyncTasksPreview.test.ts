@@ -11,16 +11,16 @@ describe("Agent async task preview", () => {
       "utf8",
     );
     const previewSection = source.slice(
-      source.indexOf("pub async fn get_agent_rendered_env_prompt"),
+      source.indexOf("async fn workspace_agent_preview_instance"),
       source.indexOf("pub async fn create_session"),
     );
 
-    expect(previewSection.match(/config: State<'_, Arc<AppConfig>>/g)).toHaveLength(3);
+    expect(previewSection.match(/config: State<'_, Arc<AppConfig>>/g)).toHaveLength(6);
     expect(
       previewSection.match(
         /instance\.set_async_tasks_enabled\(config\.async_tasks_enabled\(\)\)/g,
       ),
-    ).toHaveLength(3);
+    ).toHaveLength(4);
   });
 
   it("delivers notify completion automatically without status polling", () => {

@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import type { WorkspaceRef } from "./project";
 
 export interface ExtraWorkdirEntry {
   path: string;
@@ -10,19 +11,19 @@ export interface ExtraWorkdirStatus extends ExtraWorkdirEntry {
   exists: boolean;
 }
 
-export function extraWorkdirsGet(workspacePath: string): Promise<ExtraWorkdirStatus[]> {
-  return ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_get", { workspacePath });
+export function extraWorkdirsGet(workspaceRef: WorkspaceRef): Promise<ExtraWorkdirStatus[]> {
+  return ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_get", { workspaceRef });
 }
 
 export function extraWorkdirsSet(
-  workspacePath: string,
+  workspaceRef: WorkspaceRef,
   entries: ExtraWorkdirEntry[],
 ): Promise<ExtraWorkdirStatus[]> {
-  return ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_set", { workspacePath, entries });
+  return ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_set", { workspaceRef, entries });
 }
 
 export function extraWorkdirsMap(
-  paths: string[],
+  workspaceRefs: WorkspaceRef[],
 ): Promise<Record<string, ExtraWorkdirStatus[]>> {
-  return ipcInvoke<Record<string, ExtraWorkdirStatus[]>>("extra_workdirs_map", { paths });
+  return ipcInvoke<Record<string, ExtraWorkdirStatus[]>>("extra_workdirs_map", { workspaceRefs });
 }

@@ -19,10 +19,12 @@ import UnityHierarchyPane from "./UnityHierarchyPane.vue";
 import UnityInspectorPane from "./UnityInspectorPane.vue";
 import BinaryPreviewHost from "./BinaryPreviewHost.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
+import type { WorkspaceRef } from "../../services/project";
 
 const props = withDefaults(
   defineProps<{
     payload: FileDiffPayload;
+    workspaceRef?: WorkspaceRef | null;
     mode?: "unified" | "side-by-side";
     compact?: boolean;
     /** Line filter for full-code view: "all" = both red/green, "before" = old only, "after" = new only */
@@ -42,6 +44,20 @@ const props = withDefaults(
   { mode: "unified", compact: false, filter: "all", hideBuiltinTabs: false, hideSemanticSummary: false, hideTextDisplayControls: false },
 );
 
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
+  return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
+
 const emit = defineEmits<{
   lfsPulled: [];
   textToolbarAction: [];
@@ -51,11 +67,13 @@ const lfsPulling = ref(false);
 const lfsPullError = ref<string | null>(null);
 
 async function pullLfsObject() {
+  const workspaceRef = captureWorkspaceRef();
   const path = props.payload.filePath.replace(/\\/g, "/");
   lfsPulling.value = true;
   lfsPullError.value = null;
   try {
-    const result = await gitExecute(`git lfs pull --include="${path}"`);
+    const result = await gitExecute(`git lfs pull --include="${path}"`, workspaceRef);
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     if (result.exitCode !== 0) {
       lfsPullError.value = result.stderr.trim() || "git lfs pull failed";
       return;
@@ -63,9 +81,10 @@ async function pullLfsObject() {
     invalidateDiffCache(props.payload.key);
     emit("lfsPulled");
   } catch (e: any) {
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
     lfsPullError.value = e?.message ?? String(e);
   } finally {
-    lfsPulling.value = false;
+    if (isCurrentWorkspaceRef(workspaceRef)) lfsPulling.value = false;
   }
 }
 
@@ -81,6 +100,7 @@ const selectedTargetId = ref<string | null>(null);
 const includeUnchanged = ref(false);
 const semanticLoading = ref(false);
 const semanticError = ref<string | null>(null);
+let semanticRequestGeneration = 0;
 const activeInspector = ref<SemanticTargetInspector | null>(props.payload.semantic?.inspector ?? null);
 const inspectorCache = ref(new Map<string, SemanticTargetInspector>());
 
@@ -88,18 +108,26 @@ const inspectorCache = ref(new Map<string, SemanticTargetInspector>());
 const lazyText = ref<TextDiff | null>(null);
 const lazyTextLoading = ref(false);
 const lazyTextError = ref<string | null>(null);
+let lazyTextRequestGeneration = 0;
 
 async function loadTextDiff() {
+  const workspaceRef = captureWorkspaceRef();
+  const generation = ++lazyTextRequestGeneration;
   const request = parseDiffRequestKey(props.payload.key);
   if (!request) return;
   lazyTextLoading.value = true;
   lazyTextError.value = null;
   try {
-    lazyText.value = await diffTextForLarge(request);
+    const text = await diffTextForLarge(request, workspaceRef);
+    if (generation !== lazyTextRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
+    lazyText.value = text;
   } catch (e: any) {
+    if (generation !== lazyTextRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     lazyTextError.value = e?.message ?? String(e);
   } finally {
-    lazyTextLoading.value = false;
+    if (generation === lazyTextRequestGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+      lazyTextLoading.value = false;
+    }
   }
 }
 
@@ -240,8 +268,14 @@ const hierarchyColumnStyle = computed(() =>
 );
 
 watch(
-  () => props.payload,
-  (payload) => {
+  () => [
+    props.payload,
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  ([payload]) => {
+    lazyTextRequestGeneration += 1;
+    semanticRequestGeneration += 1;
     activeTab.value = resolveInitialTab(payload);
     textDisplayMode.value = props.mode;
     includeUnchanged.value = false;
@@ -291,6 +325,9 @@ function cacheKey(targetId: string, showAll: boolean): string {
 
 async function loadSemanticTarget(targetId: string, showAll = includeUnchanged.value) {
   if (!props.payload.semantic) return;
+  const workspaceRef = captureWorkspaceRef();
+  const payloadKey = props.payload.key;
+  const generation = ++semanticRequestGeneration;
   const key = cacheKey(targetId, showAll);
   if (inspectorCache.value.has(key)) {
     activeInspector.value = inspectorCache.value.get(key)!;
@@ -302,22 +339,36 @@ async function loadSemanticTarget(targetId: string, showAll = includeUnchanged.v
   semanticError.value = null;
   try {
     const inspector = await diffSemanticTarget({
-      diffKey: props.payload.key,
+      diffKey: payloadKey,
       targetId,
       includeUnchanged: showAll,
     });
+    if (
+      generation !== semanticRequestGeneration
+      || props.payload.key !== payloadKey
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     inspectorCache.value.set(key, inspector);
     activeInspector.value = inspector;
   } catch (error: any) {
+    if (
+      generation !== semanticRequestGeneration
+      || props.payload.key !== payloadKey
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     console.error("[FileDiffViewer] failed to load semantic target:", {
-      diffKey: props.payload.key,
+      diffKey: payloadKey,
       targetId,
       includeUnchanged: showAll,
       error,
     });
     semanticError.value = error?.message ?? String(error);
   } finally {
-    semanticLoading.value = false;
+    if (
+      generation === semanticRequestGeneration
+      && props.payload.key === payloadKey
+      && isCurrentWorkspaceRef(workspaceRef)
+    ) semanticLoading.value = false;
   }
 }
 

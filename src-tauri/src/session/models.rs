@@ -8,6 +8,12 @@ pub struct SessionSummary {
     pub agent_id: Option<String>,
     pub session_type: String,
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_checkout_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_target: Option<SessionExecutionTarget>,
     pub updated_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_status: Option<SessionRuntimeStatus>,
@@ -47,6 +53,10 @@ pub struct SessionDetail {
     pub last_fast_mode: Option<bool>,
     pub session_type: String,
     pub parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_checkout_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_completed_run_id: Option<String>,
     pub created_at: i64,
@@ -106,6 +116,244 @@ pub struct SessionRunSummary {
     pub finished_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+}
+
+/// Stable checkout metadata persisted independently from the in-memory
+/// workspace runtime so historical sessions and runs keep an auditable path
+/// binding across process restarts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCheckoutRecord {
+    pub checkout_id: String,
+    pub project_id: String,
+    pub root_path: String,
+    pub normalized_root: String,
+    pub last_opened_at: i64,
+}
+
+/// Persisted configuration for one optional service hosted by a checkout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceServiceRecord {
+    pub checkout_id: String,
+    pub service_kind: String,
+    pub service_instance_id: String,
+    pub enabled: bool,
+    pub activation_policy: String,
+    pub local_config: serde_json::Value,
+}
+
+/// Immutable service identity captured when an Agent run starts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRunServiceBinding {
+    pub service_kind: String,
+    pub service_instance_id: String,
+    pub runtime_generation: u64,
+}
+
+/// Display and audit metadata for the checkout used by a session run. The
+/// branch and commit are captured when the execution context is created so a
+/// later branch switch or rename cannot rewrite session history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionExecutionTarget {
+    pub checkout_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+}
+
+/// Scoped execution snapshot supplied by the workspace registry when a run
+/// starts. An empty `service_bindings` list means the run was known to have no
+/// optional services; a NULL database value is reserved for historical runs
+/// whose bindings were never captured.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRunScopeSnapshot {
+    pub project_id: String,
+    pub checkout_id: String,
+    pub workspace_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+    #[serde(default)]
+    pub service_bindings: Vec<SessionRunServiceBinding>,
+}
+
+/// Full persisted run row used by context export and diagnostics. The
+/// existing `SessionRunSummary` remains the compatibility IPC payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedSessionRun {
+    #[serde(flatten)]
+    pub summary: SessionRunSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_bindings: Option<Vec<SessionRunServiceBinding>>,
+}
+
+/// Session-level project grouping and default checkout binding. Historical
+/// rows can have no checkout, while retaining their original project id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWorkspaceScope {
+    pub project_id: Option<String>,
+    pub default_checkout_id: Option<String>,
+    pub checkout_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExplorerNode {
+    pub node_id: String,
+    pub project_id: String,
+    pub node_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_name: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    pub position: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExplorerPresetSummary {
+    pub preset_id: String,
+    pub name: String,
+    pub revision: i64,
+    pub active: bool,
+    pub file_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExplorerSnapshot {
+    pub project_id: String,
+    pub preset_id: String,
+    pub preset_name: String,
+    pub manifest_path: String,
+    pub revision: i64,
+    pub nodes: Vec<ProjectExplorerNode>,
+    pub presets: Vec<ProjectExplorerPresetSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ProjectExplorerOperation {
+    CreateFolder {
+        #[serde(default)]
+        node_id: Option<String>,
+        #[serde(default)]
+        parent_node_id: Option<String>,
+        name: String,
+        position: i64,
+    },
+    RenameFolder {
+        node_id: String,
+        name: String,
+    },
+    DeleteFolder {
+        node_id: String,
+    },
+    MoveNode {
+        node_id: String,
+        #[serde(default)]
+        parent_node_id: Option<String>,
+        position: i64,
+    },
+    PlaceResource {
+        resource_kind: String,
+        resource_id: String,
+        #[serde(default)]
+        source_kind: Option<String>,
+        #[serde(default)]
+        parent_node_id: Option<String>,
+        position: i64,
+    },
+    RemoveResourcePlacement {
+        resource_kind: String,
+        resource_id: String,
+    },
+    MountPath {
+        #[serde(default)]
+        node_id: Option<String>,
+        #[serde(default)]
+        parent_node_id: Option<String>,
+        path: String,
+        #[serde(default)]
+        source_kind: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        position: i64,
+    },
+    SetNodeHidden {
+        node_id: String,
+        hidden: bool,
+    },
+    RemoveNode {
+        node_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExplorerMutationResult {
+    pub operation_id: String,
+    pub snapshot: ProjectExplorerSnapshot,
+}
+
+#[cfg(test)]
+mod project_explorer_operation_tests {
+    use super::ProjectExplorerOperation;
+
+    #[test]
+    fn deserializes_camel_case_frontend_fields() {
+        let operation = serde_json::from_value::<ProjectExplorerOperation>(serde_json::json!({
+            "kind": "placeResource",
+            "resourceKind": "knowledge",
+            "resourceId": "memory-a",
+            "parentNodeId": "knowledge-type:project-a:memory",
+            "position": 2
+        }))
+        .expect("frontend explorer operation should deserialize");
+
+        assert_eq!(
+            operation,
+            ProjectExplorerOperation::PlaceResource {
+                resource_kind: "knowledge".to_string(),
+                resource_id: "memory-a".to_string(),
+                source_kind: None,
+                parent_node_id: Some("knowledge-type:project-a:memory".to_string()),
+                position: 2,
+            }
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -99,6 +99,23 @@ describe("Unity embedded session view", () => {
     expect(capability).toContain('"unity-embed-*"');
   });
 
+  it("binds every Unity embed instance to one checkout generation", () => {
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+    const service = read("src/services/unity.ts");
+
+    expect(command).toContain("struct UnityEmbedCheckoutBinding");
+    expect(command).toContain("HashMap<String, CheckoutControlServer>");
+    expect(command).toContain("workspace_ref: WorkspaceRef");
+    expect(command).toContain("resolve_workspace_ref(&binding.workspace_ref)");
+    expect(command).not.toContain("_workspace_lease: WorkspaceLease");
+    expect(command).toContain("workspaceGeneration={}");
+    expect(command).toContain('.focus(label, "main", runtime, intent_epoch)');
+    expect(command).not.toContain("State<'_, Arc<Workspace>>");
+    expect(command).not.toContain("workspace.path");
+    expect(service).toContain("currentUnityEmbedWorkspaceRef");
+    expect(service).toContain("workspaceRef: requireUnityEmbedWorkspaceRef(workspaceRef)");
+  });
+
   it("exits the desktop app when the main window closes", () => {
     const app = read("src-tauri/src/lib.rs");
     const command = read("src-tauri/src/commands/unity_embed.rs");
@@ -183,17 +200,16 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("run_on_main_thread");
     expect(command).toContain("UNITY_EMBED_QUIESCE_TIMEOUT");
     expect(command).toContain("fn quiesce_unity_embed_control_windows_on_main");
-    expect(command).toContain("windows_impl::prepare_for_editor_shutdown();");
     expect(command).toContain("windows_impl::quiesce_owned_overlay(&window)");
     expect(command).toContain("SetParent(child, None)");
     expect(command).toContain("SetWindowLongPtrW(child, GWLP_HWNDPARENT, 0)");
     expect(command).toContain("let _ = ShowWindow(child, SW_HIDE);");
-    expect(command).toContain("record_all_embed_windows_quiesced();");
+    expect(command).toContain("record_embed_windows_quiesced(&scope_key, &labels);");
     expect(command).toContain("received_while_quiesced");
-    expect(command).toContain("unity_embed_control_epoch() != expected_epoch");
+    expect(command).toContain("current_quiesce.1 != expected_epoch");
 
     const quiesceCall = workspace.indexOf(
-      "let unity_embed_quiesce = super::quiesce_unity_embed_control_windows(&app_handle).await?;",
+      "super::quiesce_unity_embed_control_windows(&app_handle, &workspace_ref).await?;",
     );
     const installCall = workspace.indexOf(
       "let install_result = crate::unity_bridge::install_or_update_plugin_with_force_close(",
@@ -339,7 +355,8 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("pub(crate) fn handle_locus_window_event");
     expect(command).toContain("tauri::WindowEvent::DragDrop");
     expect(command).toContain("handle_locus_drop_paths");
-    expect(command).toContain("tauri::DragDropEvent::Drop { paths, .. }");
+    expect(command).toContain("tauri::DragDropEvent::Drop { paths, position }");
+    expect(command).toContain("LocusFileDropPayload { files, x, y }");
     expect(command).toContain("commit_cached_unity_asset_drag_drop_to(webview.app_handle(), webview.label())");
     expect(command).toContain("commit_cached_unity_asset_drag_drop_to(window.app_handle(), window.label())");
     expect(command).toContain("fn commit_cached_unity_asset_drag_drop_to");
@@ -358,7 +375,9 @@ describe("Unity embedded session view", () => {
     expect(command).toContain('"unity-embed-asset-drop"');
     expect(command).toContain("UnityEmbedAssetDragStatePayload");
     expect(command).toContain('"unity-embed-asset-drag-state"');
-    expect(command).toContain("ensure_unity_embed_asset_drag_release_monitor(app_handle)");
+    expect(command).toContain(
+      "ensure_unity_embed_asset_drag_release_monitor(app_handle, &binding.workspace_ref)",
+    );
     expect(command).toContain("monitor_unity_embed_asset_drag_release");
     expect(command).toContain("unity_asset_drag_release_probe");
     expect(command).toContain("UnityAssetDragReleaseTarget::MainWindow");
@@ -493,7 +512,7 @@ describe("Unity embedded session view", () => {
     expect(chat).toContain("function isUnityEmbeddedWindow()");
     expect(chat).toContain('window.location.pathname === "/unity-embed"');
     expect(chat).toContain("e.ctrlKey || e.metaKey");
-    expect(chat).toContain("openUnityAssetInspector(filePath)");
+    expect(chat).toContain("openUnityAssetInspector(projectStore.requireWorkspaceRef(), filePath)");
     expect(service).toContain("open_unity_asset_inspector");
     expect(commands).toContain("pub async fn open_unity_asset_inspector");
     expect(bridge).toContain('send_message(project_path, "open_asset_inspector"');
@@ -538,7 +557,7 @@ describe("Unity embedded session view", () => {
     expect(chat).toContain("openFileExternal(target.filePath)");
     expect(chat).toContain("showInFolder(target.filePath)");
     expect(chat).toContain("navigator.clipboard.writeText(path)");
-    expect(chat).toContain("selectUnityAsset(target.assetPath)");
+    expect(chat).toContain("selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath)");
     expect(chat).toContain('t("common.openInFileExplorer")');
     expect(chat).toContain('t("common.openInKnowledge")');
     expect(chat).toContain('t("common.copyPath")');
@@ -547,7 +566,7 @@ describe("Unity embedded session view", () => {
     expect(assetChip).toContain(":data-knowledge-path=\"knowledgeRef?.path\"");
     expect(assetChip).toContain("await openKnowledgeDocument(knowledgeRef.value.docType");
     expect(knowledgeOpen).toContain("uiStore.stageKnowledgeSelection({");
-    expect(knowledgeOpen).toContain('uiStore.setTab("knowledge")');
+    expect(knowledgeOpen).toContain('uiStore.setTab("chat")');
     expect(assetChip).toContain(':data-asset-path="effectiveKind === \'asset\' ? normalizedPath : undefined"');
     expect(assetChip).toContain(":data-scene-path=\"sceneObjectRef?.scenePath\"");
     expect(assetChip).toContain('contextMenuMode?: "copyPath" | "inherit";');

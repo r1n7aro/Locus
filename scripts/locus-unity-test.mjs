@@ -8,6 +8,7 @@ const args = process.argv.slice(2);
 const passthrough = [];
 let prepareNative = false;
 let prepareUnityBundle = false;
+let reuseDevServer = false;
 let outputDir = "";
 
 for (let index = 0; index < args.length; index += 1) {
@@ -26,6 +27,10 @@ for (let index = 0; index < args.length; index += 1) {
   }
   if (arg === "--prepare-unity-bundle") {
     prepareUnityBundle = true;
+    continue;
+  }
+  if (arg === "--reuse-dev-server") {
+    reuseDevServer = true;
     continue;
   }
   const [name, inlineValue] = splitArg(arg);
@@ -58,6 +63,9 @@ const driverResult = await runUnityDriver(
     "tauri",
     "dev",
     "--no-watch",
+    ...(reuseDevServer
+      ? ["--config", '{"build":{"beforeDevCommand":null}}', "--no-dev-server-wait"]
+      : []),
     "--",
     "--",
     "--locus-driver",
@@ -87,6 +95,8 @@ function printHelp() {
 
 Examples:
   bun run locus:test:unity -- --project F:\\Game --suite connect
+  bun run locus:test:unity -- --project F:\\Game --workspace-project F:\\GameCopy --workspace-project F:\\GameWorktree --suite workspace --install-plugin
+  bun run locus:test:unity -- --project F:\\GameA --workspace-project F:\\GameB --suite workspace-switch --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite type-index --type-index-sample all
   bun run locus:test:unity -- --project F:\\Game --suite state-probe --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite native-bridge --prepare-native --install-plugin
@@ -97,11 +107,15 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload-release --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite parallel-edit-refresh --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
+  bun run locus:test:unity -- --project F:\\Game --suite python-sdk --install-plugin
+  bun run locus:test:unity -- --project F:\\Game --suite modal-dialog --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | execute | yaml-parity | unity-test | all
+  --suite <name>              workspace | workspace-switch | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | execute | python-sdk | modal-dialog | yaml-parity | unity-test | all
                                hot-reload-release runs Release first, then switches to Debug at runtime and runs again
+                               every CLI driver run enables Locus Debug mode inside its isolated config
+  --workspace-project <path>  Additional Unity project for a single-process workspace suite; repeat as needed
   --type-index-sample <mode>  sample32 | all, default sample32
   --type-index-full           Shortcut for --type-index-sample all
   --yaml-parity-samples <n>   Random unloaded scene sample count, 1-50, default 5
@@ -118,6 +132,7 @@ Driver options:
 Wrapper options:
   --prepare-native            Build locus_native.dll before starting Locus
   --prepare-unity-bundle      Rebuild the full locus_unity bundle before starting Locus
+  --reuse-dev-server          Reuse the configured Vite devUrl and skip beforeDevCommand
   --output-dir <dir>          Write driver.log into this directory instead of %TEMP%
 `);
 }
@@ -213,6 +228,7 @@ function runUnityDriver(command, commandArgs, requestedLogDir) {
         WEBVIEW2_USER_DATA_FOLDER: runtime.webviewDataDir,
         TEMP: runtime.systemTempDir,
         TMP: runtime.systemTempDir,
+        ...(reuseDevServer ? { LOCUS_REUSE_DEV_SERVER: "1" } : {}),
       },
     });
 

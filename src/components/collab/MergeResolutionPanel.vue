@@ -20,10 +20,26 @@ import {
 } from "./mergeUi";
 import MergeTextView from "./MergeTextView.vue";
 import MergeSemanticView from "./MergeSemanticView.vue";
+import type { WorkspaceRef } from "../../services/project";
 
 const props = defineProps<{
   file: UnmergedFileEntry;
+  workspaceRef?: WorkspaceRef | null;
 }>();
+
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
+  return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 const emit = defineEmits<{
   (e: "resolved"): void;
@@ -65,26 +81,54 @@ const mergeProgressFraction = computed(() => {
 });
 
 let unlistenProgress: (() => void) | null = null;
+let progressListenerGeneration = 0;
 let loadGeneration = 0;
 let isUnmounted = false;
 let validationGeneration = 0;
+let applyGeneration = 0;
 
-listenMergeProgress((evt: MergeProgressEvent) => {
-  if (evt.requestKey !== `merge:${props.file.path}`) return;
-  mergeProgress.value = {
-    phase: evt.phase,
-    current: evt.current,
-    total: evt.total,
-    elapsedMs: evt.elapsedMs,
-  };
-}).then((unlisten) => {
+async function bindMergeProgressListener() {
+  const generation = ++progressListenerGeneration;
+  const workspaceRef = captureWorkspaceRef();
+  unlistenProgress?.();
+  unlistenProgress = null;
+  const unlisten = await listenMergeProgress((evt: MergeProgressEvent) => {
+    if (!isCurrentWorkspaceRef(workspaceRef)) return;
+    if (evt.requestKey !== `merge:${props.file.path}`) return;
+    mergeProgress.value = {
+      phase: evt.phase,
+      current: evt.current,
+      total: evt.total,
+      elapsedMs: evt.elapsedMs,
+    };
+  }, workspaceRef);
+  if (
+    isUnmounted
+    || generation !== progressListenerGeneration
+    || !isCurrentWorkspaceRef(workspaceRef)
+  ) {
+    unlisten();
+    return;
+  }
   unlistenProgress = unlisten;
-});
+}
 
 onUnmounted(() => {
   isUnmounted = true;
+  progressListenerGeneration += 1;
   unlistenProgress?.();
 });
+
+watch(
+  () => [
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  () => {
+    void bindMergeProgressListener();
+  },
+  { immediate: true },
+);
 
 const isBinaryOrSpecial = computed(() => {
   if (!mergeInfo.value) return false;
@@ -112,6 +156,7 @@ const conflictOids = computed(
 );
 
 async function loadData() {
+  const workspaceRef = captureWorkspaceRef();
   const generation = ++loadGeneration;
   loading.value = true;
   loadError.value = null;
@@ -119,6 +164,7 @@ async function loadData() {
   applyValidationError.value = null;
   validatingApply.value = false;
   validationGeneration += 1;
+  applyGeneration += 1;
   mergeInfo.value = null;
   semanticSession.value = null;
   activeTab.value = "text";
@@ -134,16 +180,21 @@ async function loadData() {
         props.file.leftOid,
         props.file.rightOid,
         props.file.lfs,
+        workspaceRef,
       ),
       mergeSemanticSession({
         filePath: props.file.path,
         baseOid: props.file.baseOid,
         leftOid: props.file.leftOid,
         rightOid: props.file.rightOid,
-      }),
+      }, workspaceRef),
     ]);
 
-    if (isUnmounted || generation !== loadGeneration) return;
+    if (
+      isUnmounted
+      || generation !== loadGeneration
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
 
     if (infoResult.status === "rejected") {
       throw infoResult.reason;
@@ -170,31 +221,57 @@ async function loadData() {
       resolution.initializeSession(null);
     }
   } catch (e) {
-    if (isUnmounted || generation !== loadGeneration) return;
+    if (
+      isUnmounted
+      || generation !== loadGeneration
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     loadError.value = normalizeAppError(e).message;
   } finally {
-    if (isUnmounted || generation !== loadGeneration) return;
+    if (
+      isUnmounted
+      || generation !== loadGeneration
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     loading.value = false;
   }
 }
 
-watch(conflictIdentity, () => {
-  void loadData();
-}, { immediate: true });
+watch(
+  () => [
+    conflictIdentity.value,
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  () => {
+    void loadData();
+  },
+  { immediate: true },
+);
 
-async function materializePendingTargetResolutions() {
-  if (!semanticSession.value?.semanticAvailable) return;
+async function materializePendingTargetResolutions(
+  workspaceRef: WorkspaceRef,
+  mergeKey: string,
+  isCurrentRequest: () => boolean,
+): Promise<boolean> {
+  if (!semanticSession.value?.semanticAvailable) return false;
   const pendingTargetIds = resolution.pendingMaterializationTargetIds();
   for (const targetId of pendingTargetIds) {
     const side = resolution.targetResolutions.value.get(targetId);
     if (!side) continue;
     const inspector = await mergeSemanticTarget({
-      mergeKey: semanticSession.value.key,
+      mergeKey,
       targetId,
-    });
+    }, workspaceRef);
+    if (
+      !isCurrentRequest()
+      || !isCurrentWorkspaceRef(workspaceRef)
+      || semanticSession.value?.key !== mergeKey
+    ) return false;
     resolution.registerConflictFields(inspector);
     resolution.acceptTarget(targetId, side, inspector);
   }
+  return true;
 }
 
 function serializeResolutionMap(map: ReadonlyMap<string, string>): string {
@@ -221,30 +298,54 @@ const canApplyStructured = computed(() =>
 
 async function validateSemanticResolution() {
   if (!semanticSession.value?.semanticAvailable) return;
+  const workspaceRef = captureWorkspaceRef();
   const generation = ++validationGeneration;
+  const mergeKey = semanticSession.value.key;
   validatingApply.value = true;
   applyValidationError.value = null;
   actionError.value = null;
 
   try {
-    await materializePendingTargetResolutions();
-    if (isUnmounted || generation !== validationGeneration) return;
+    const materialized = await materializePendingTargetResolutions(
+      workspaceRef,
+      mergeKey,
+      () => generation === validationGeneration,
+    );
+    if (
+      !materialized
+      || semanticSession.value?.key !== mergeKey
+      || isUnmounted
+      || generation !== validationGeneration
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     if (!resolution.canApply.value) {
       applyValidationError.value = t("merge.footer.applyBlocked");
       return;
     }
     await mergeSemanticValidate({
-      mergeKey: semanticSession.value.key,
+      mergeKey,
       filePath: props.file.path,
       resolutions: resolution.buildResolutions(),
-    });
-    if (isUnmounted || generation !== validationGeneration) return;
+    }, workspaceRef);
+    if (
+      isUnmounted
+      || generation !== validationGeneration
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     applyValidationError.value = null;
   } catch (e) {
-    if (isUnmounted || generation !== validationGeneration) return;
+    if (
+      isUnmounted
+      || generation !== validationGeneration
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     applyValidationError.value = normalizeAppError(e).message;
   } finally {
-    if (isUnmounted || generation !== validationGeneration) return;
+    if (
+      isUnmounted
+      || generation !== validationGeneration
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     validatingApply.value = false;
   }
 }
@@ -261,31 +362,56 @@ watch(resolutionSignature, () => {
 
 async function applySemanticResolution() {
   if (!semanticSession.value?.semanticAvailable) return;
+  const workspaceRef = captureWorkspaceRef();
+  const generation = ++applyGeneration;
+  const mergeKey = semanticSession.value.key;
   saving.value = true;
   actionError.value = null;
   try {
-    await materializePendingTargetResolutions();
+    const materialized = await materializePendingTargetResolutions(
+      workspaceRef,
+      mergeKey,
+      () => generation === applyGeneration,
+    );
+    if (
+      !materialized
+      || semanticSession.value?.key !== mergeKey
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     if (!resolution.canApply.value) {
       throw new Error(t("merge.footer.applyBlocked"));
     }
     await mergeSemanticValidate({
-      mergeKey: semanticSession.value.key,
+      mergeKey,
       filePath: props.file.path,
       resolutions: resolution.buildResolutions(),
-    });
+    }, workspaceRef);
+    if (
+      generation !== applyGeneration
+      || semanticSession.value?.key !== mergeKey
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     applyValidationError.value = null;
     await mergeSemanticApply({
-      mergeKey: semanticSession.value.key,
+      mergeKey,
       filePath: props.file.path,
       resolutions: resolution.buildResolutions(),
-    });
+    }, workspaceRef);
+    if (
+      generation !== applyGeneration
+      || semanticSession.value?.key !== mergeKey
+      || !isCurrentWorkspaceRef(workspaceRef)
+    ) return;
     emit("resolved");
   } catch (e) {
+    if (generation !== applyGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     const message = normalizeAppError(e).message;
     applyValidationError.value = message;
     actionError.value = message;
   } finally {
-    saving.value = false;
+    if (generation === applyGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+      saving.value = false;
+    }
   }
 }
 
@@ -400,6 +526,7 @@ defineExpose({
           :left-label="leftLabel"
           :right-label="rightLabel"
           :show-conflicts-only="showConflictsOnly"
+          :workspace-ref="props.workspaceRef"
           class="merge-semantic-fill"
         />
 
@@ -411,6 +538,7 @@ defineExpose({
             :left-label="leftLabel"
             :right-label="rightLabel"
             :base-label="displayBaseLabel"
+            :workspace-ref="props.workspaceRef"
             @resolved="emit('resolved')"
           />
         </div>

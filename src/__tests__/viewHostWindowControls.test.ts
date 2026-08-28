@@ -33,7 +33,7 @@ describe("View host window controls", () => {
     expect(host).toContain("appWindow.setAlwaysOnTop(alwaysOnTop.value)");
     expect(host).toContain("alwaysOnTop ? t('app.pin.unpin') : t('app.pin.pin')");
     expect(host).toContain("view-host-win-pinned");
-    expect(host).toContain("viewHostRevealed(currentWindowLabel)");
+    expect(host).toContain("viewHostRevealed(requireViewWorkspaceRef(), currentWindowLabel)");
     expect(host).toContain("host-reveal-owner-sync-failed");
 
     expect(capabilities).toContain('"view-*"');

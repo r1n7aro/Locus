@@ -283,10 +283,17 @@ pub(crate) fn build_asset_semantic_session(
     ctx: &DiffBuildContext,
     cwd: &str,
     app_handle: &tauri::AppHandle,
+    event_scope: &crate::workspace_service::event::WorkspaceEventScope,
     profiler: &mut DiffProfiler,
 ) -> Option<SemanticSession> {
     // Emit ParseYaml phase BEFORE parsing so UI shows progress during the work
-    emit_diff_progress(app_handle, profiler, DiffPhase::ParseYaml, None);
+    emit_diff_progress(
+        app_handle,
+        event_scope,
+        profiler,
+        DiffPhase::ParseYaml,
+        None,
+    );
     let old_docs = parse_yaml_docs(old_content.as_bytes());
     let new_docs = parse_yaml_docs(new_content.as_bytes());
     profiler.set_doc_counts(old_docs.len(), new_docs.len());
@@ -326,13 +333,20 @@ pub(crate) fn build_asset_semantic_session(
     };
     let mut env = SemanticBuildEnv {
         app_handle: Some(app_handle.clone()),
+        event_scope: Some(event_scope.clone()),
         cwd,
         profiler,
         batch_reader,
         script_cache: ScriptInfoCache::default(),
     };
     // Emit BuildSemantic BEFORE the actual build so UI shows progress during the work
-    emit_diff_progress(app_handle, env.profiler, DiffPhase::BuildSemantic, None);
+    emit_diff_progress(
+        app_handle,
+        event_scope,
+        env.profiler,
+        DiffPhase::BuildSemantic,
+        None,
+    );
 
     let old_labels =
         build_doc_label_map(&old_docs, &HashMap::new(), &old_lines, &ctx.old, &mut env);

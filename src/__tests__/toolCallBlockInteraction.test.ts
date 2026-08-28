@@ -24,7 +24,7 @@ describe("tool call block interactions", () => {
     expect(source).toContain("const showViewOpenButton = computed");
     expect(source).toContain("resolveViewToolOpenId");
     expect(source).toContain("async function openViewTool()");
-    expect(source).toContain("await viewRun(viewId)");
+    expect(source).toContain("await viewRun(workspaceRef, viewId)");
     expect(source).toContain("@click.stop=\"openViewTool\"");
   });
 

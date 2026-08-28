@@ -16,6 +16,7 @@ import { normalizeAppError } from "../services/errors";
 import { useKnowledgeDocumentOpen } from "../composables/useKnowledgeDocumentOpen";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
+import { useProjectStore } from "../stores/project";
 import type { AssetRefAttachment, AssetRefKind, KnowledgeDocumentType } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
 import {
@@ -36,6 +37,7 @@ const emit = defineEmits<{
 }>();
 
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 const { openDocument: openKnowledgeDocument } = useKnowledgeDocumentOpen();
 const KNOWLEDGE_REF_ROOT_RE = /^(design|plan|memory|skill|reference)\/.+\.md$/i;
 
@@ -115,17 +117,17 @@ async function handleClick(e: MouseEvent) {
     if (sceneObjectRef.value) {
       const { scenePath, objectPath } = sceneObjectRef.value;
       if (e.ctrlKey || e.metaKey) {
-        await openUnitySceneObjectInspector(scenePath, objectPath);
+        await openUnitySceneObjectInspector(projectStore.requireWorkspaceRef(), scenePath, objectPath);
         return;
       }
-      await selectUnitySceneObject(scenePath, objectPath);
+      await selectUnitySceneObject(projectStore.requireWorkspaceRef(), scenePath, objectPath);
       return;
     }
     if (unitySelectableAsset.value) {
-      await selectUnityAsset(props.path);
+      await selectUnityAsset(projectStore.requireWorkspaceRef(), props.path);
       return;
     }
-    await openFileExternal(props.path);
+    await openFileExternal(projectStore.requireWorkspaceRef(), props.path);
   } catch (error) {
     if (knowledgeRef.value) {
       notifyKnowledgeRefError(error);

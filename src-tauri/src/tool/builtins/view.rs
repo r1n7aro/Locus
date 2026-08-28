@@ -80,7 +80,15 @@ async fn request_view_automation_tool(
         .or_else(|| args.get("timeout_ms"))
         .and_then(|value| value.as_u64())
         .unwrap_or(default_timeout_ms);
-    match crate::view::request_view_automation(&app_handle, &view_id, kind, args, timeout_ms).await
+    match crate::view::request_view_automation(
+        &app_handle,
+        &working_dir,
+        &view_id,
+        kind,
+        args,
+        timeout_ms,
+    )
+    .await
     {
         Ok(result) => json_output(&result),
         Err(error) => ToolResult {
@@ -115,8 +123,16 @@ pub(super) fn view_create() -> ToolDef {
 
                 match crate::view::create_view_sync_with_scope(&working_dir, request, temporary) {
                     Ok(detail) => {
-                        if let Some(app_handle) = ctx.app_handle.as_ref() {
-                            crate::view::emit_view_reload(app_handle, &detail.summary);
+                        if let (Some(app_handle), Some(execution)) =
+                            (ctx.app_handle.as_ref(), ctx.execution.as_ref())
+                        {
+                            crate::view::emit_view_reload_for_scope(
+                                app_handle,
+                                &crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                                    execution.workspace.as_ref(),
+                                ),
+                                &detail.summary,
+                            );
                         }
                         json_output(&serde_json::json!({
                             "summary": detail.summary,
@@ -177,8 +193,16 @@ pub(super) fn view_reload() -> ToolDef {
                 };
                 match crate::view::reload_view_sync(&working_dir, &view_id) {
                     Ok(summary) => {
-                        if let Some(app_handle) = ctx.app_handle.as_ref() {
-                            crate::view::emit_view_reload(app_handle, &summary);
+                        if let (Some(app_handle), Some(execution)) =
+                            (ctx.app_handle.as_ref(), ctx.execution.as_ref())
+                        {
+                            crate::view::emit_view_reload_for_scope(
+                                app_handle,
+                                &crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                                    execution.workspace.as_ref(),
+                                ),
+                                &summary,
+                            );
                         }
                         json_output(&summary)
                     }

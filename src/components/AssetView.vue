@@ -10,6 +10,7 @@ import AssetSearchBar from "./asset/AssetSearchBar.vue";
 import AssetSearchResults from "./asset/AssetSearchResults.vue";
 import AssetStatsView from "./asset/AssetStatsView.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
+import type { WorkspaceRef } from "../services/project";
 
 const AssetPreviewHost = defineAsyncComponent(
   () => import("./asset/AssetPreviewHost.vue"),
@@ -17,6 +18,7 @@ const AssetPreviewHost = defineAsyncComponent(
 
 const props = defineProps<{
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 const uiStore = useUiStore();
 
@@ -223,6 +225,7 @@ const layoutToggleTitle = computed(() => (
               :loading="dbLoading"
               :tuning="watcherTuning"
               :tuning-saving="watcherTuningSaving"
+              :workspace-ref="workspaceRef"
               @rescan="triggerRescan"
               @update-tuning="updateWatcherTuning"
             />
@@ -333,6 +336,7 @@ const layoutToggleTitle = computed(() => (
               :loading="dbLoading"
               :tuning="watcherTuning"
               :tuning-saving="watcherTuningSaving"
+              :workspace-ref="workspaceRef"
               @rescan="triggerRescan"
               @update-tuning="updateWatcherTuning"
             />

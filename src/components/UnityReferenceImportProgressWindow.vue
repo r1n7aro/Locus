@@ -6,7 +6,6 @@ import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import {
   knowledgeCancelUnityReferenceImport,
-  knowledgeCloseUnityReferenceImportProgressWindow,
   knowledgeGetUnityReferenceImportStatus,
   knowledgeImportUnityReferenceDocs,
 } from "../services/knowledge";
@@ -18,6 +17,8 @@ import {
 import type { UnityReferenceImportLocale, UnityReferenceImportStatus } from "../types";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseDropdown from "./ui/BaseDropdown.vue";
+import type { WorkspaceRef } from "../services/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 type CloseReason = "success" | "error" | "cancelled" | null;
 type ImportStageKey =
@@ -37,7 +38,9 @@ const IMPORT_STAGE_ORDER: ImportStageKey[] = [
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
 
 const appWindow = getCurrentWindow();
+const workspaceContextStore = useWorkspaceContextStore();
 const initialPayload = getUnityReferenceImportWindowPayload();
+const workspaceRef = ref<WorkspaceRef | null>(initialPayload.workspaceRef ?? null);
 const targetPath = ref(initialPayload.targetPath?.trim() || "");
 const requestedProjectVersion = ref(initialPayload.projectVersion?.trim() || "");
 const requestedDocsVersion = ref(initialPayload.docsVersion?.trim() || "");
@@ -181,6 +184,7 @@ function localeLabel(locale: UnityReferenceImportLocale | null | undefined): str
 }
 
 function resetImportSession(payload: UnityReferenceImportWindowPayload = {}) {
+  workspaceRef.value = payload.workspaceRef ?? workspaceRef.value;
   targetPath.value = payload.targetPath?.trim() || "";
   requestedProjectVersion.value = payload.projectVersion?.trim() || "";
   requestedDocsVersion.value = payload.docsVersion?.trim() || "";
@@ -261,19 +265,15 @@ async function destroyWindow() {
     // fall back to backend close when local handles fail
   }
 
-  try {
-    await knowledgeCloseUnityReferenceImportProgressWindow();
-  } catch {
-    // ignore teardown failures after local close attempts
-  }
 }
 
 async function cancelImport() {
+  if (!workspaceRef.value) return;
   if (cancelling.value || closeReason.value) return;
   cancelling.value = true;
   pollError.value = "";
   try {
-    const status = await knowledgeCancelUnityReferenceImport(requestTargetPath());
+    const status = await knowledgeCancelUnityReferenceImport(workspaceRef.value, requestTargetPath());
     statusSnapshot.value = status;
     hasSeenRunning.value = true;
     schedulePoll(120);
@@ -284,12 +284,14 @@ async function cancelImport() {
 }
 
 async function startImport() {
+  if (!workspaceRef.value) return;
   if (startPending.value || cancelling.value || closeReason.value) return;
   startPending.value = true;
   pollError.value = "";
   clearCloseTimer();
   try {
     const status = await knowledgeImportUnityReferenceDocs(
+      workspaceRef.value,
       requestTargetPath(),
       selectedLocale.value,
     );
@@ -321,8 +323,9 @@ function scheduleAutoClose(reason: Exclude<CloseReason, null>) {
 }
 
 async function refreshStatus() {
+  if (!workspaceRef.value) return;
   try {
-    const nextStatus = await knowledgeGetUnityReferenceImportStatus(requestTargetPath());
+    const nextStatus = await knowledgeGetUnityReferenceImportStatus(workspaceRef.value, requestTargetPath());
     statusSnapshot.value = nextStatus;
     pollError.value = "";
     updateDownloadSpeed(nextStatus);
@@ -564,6 +567,10 @@ async function initializeWindow() {
   } catch {
     // keep polling even if window event hooks are unavailable
   }
+
+  if (!workspaceRef.value) return;
+  await workspaceContextStore.initialize(appWindow.label, "main");
+  await workspaceContextStore.focusCheckout(workspaceRef.value.checkoutId);
 
   schedulePoll(140);
 }

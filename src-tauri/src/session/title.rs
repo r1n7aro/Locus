@@ -101,6 +101,7 @@ pub fn fallback_session_title(prepared_prompt: &str) -> Option<String> {
 pub fn spawn_codex_session_title_generation(
     app_handle: AppHandle,
     store: Arc<SessionStore>,
+    event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
     auth: Arc<tokio::sync::Mutex<CodexAuthState>>,
     transport: CodexTransportMode,
     base_url: Option<String>,
@@ -164,9 +165,16 @@ pub fn spawn_codex_session_title_generation(
                     session_id: session_id.clone(),
                     title,
                 };
-                if let Err(error) = app_handle.emit(SESSION_TITLE_UPDATED_EVENT, event) {
+                if let Some(event_scope) = event_scope.as_ref() {
+                    crate::workspace_service::event::emit_for_workspace_scope(
+                        &app_handle,
+                        event_scope,
+                        SESSION_TITLE_UPDATED_EVENT,
+                        event,
+                    );
+                } else if let Err(error) = app_handle.emit(SESSION_TITLE_UPDATED_EVENT, event) {
                     eprintln!(
-                        "[SessionTitle] failed to emit title update for session {}: {}",
+                        "[SessionTitle] failed to emit legacy title update for session {}: {}",
                         session_id, error
                     );
                 }

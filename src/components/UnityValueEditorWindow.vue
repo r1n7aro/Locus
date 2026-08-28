@@ -84,12 +84,16 @@ async function applyWindowPayload(next: UnityValueEditorPayload) {
 
 async function loadCurrentValue() {
   const target = payload.value?.target;
-  if (!target) return;
+  const workspaceRef = payload.value?.workspaceRef;
+  if (!target || !workspaceRef) return;
   const run = ++loadRun;
   loading.value = true;
   loadError.value = "";
   try {
-    const result = await readUnitySerializedProperty({ target, maxDepth: 1, maxArrayItems: 0 });
+    const result = await readUnitySerializedProperty(
+      workspaceRef,
+      { target, maxDepth: 1, maxArrayItems: 0 },
+    );
     if (run !== loadRun) return;
     if (!result.ok) throw new Error(result.message || t("unity.valueEditor.loadFailed"));
     originalValue.value = result.value;
@@ -120,10 +124,11 @@ function handleEditorChange(next: Record<string, unknown>) {
 
 async function flushPreview() {
   const target = payload.value?.target;
+  const workspaceRef = payload.value?.workspaceRef;
   const value = latestEdit;
-  if (!target || value == null || livePreviewBroken.value) return;
+  if (!target || !workspaceRef || value == null || livePreviewBroken.value) return;
   try {
-    await writeUnitySerializedProperty({ target, value, writeMode: "preview" });
+    await writeUnitySerializedProperty(workspaceRef, { target, value, writeMode: "preview" });
     previewSent = true;
   } catch (error) {
     // Preview is best-effort; keep editing locally and commit at the end.
@@ -134,9 +139,10 @@ async function flushPreview() {
 
 async function restoreOriginalPreview() {
   const target = payload.value?.target;
-  if (!target || !previewSent || originalValue.value == null) return;
+  const workspaceRef = payload.value?.workspaceRef;
+  if (!target || !workspaceRef || !previewSent || originalValue.value == null) return;
   try {
-    await writeUnitySerializedProperty({
+    await writeUnitySerializedProperty(workspaceRef, {
       target,
       value: originalValue.value,
       writeMode: "preview",
@@ -150,12 +156,13 @@ async function restoreOriginalPreview() {
 async function applyChanges() {
   const target = payload.value?.target;
   const kind = payload.value?.kind;
-  if (!target || !kind || !dirty.value || latestEdit == null || saving.value) return;
+  const workspaceRef = payload.value?.workspaceRef;
+  if (!target || !kind || !workspaceRef || !dirty.value || latestEdit == null || saving.value) return;
   clearPreviewTimer();
   saving.value = true;
   saveError.value = "";
   try {
-    const result = await writeUnitySerializedProperty({
+    const result = await writeUnitySerializedProperty(workspaceRef, {
       target,
       value: latestEdit,
       writeMode: "commit",
@@ -165,6 +172,7 @@ async function applyChanges() {
     previewSent = false;
     void emitTauriEvent(UNITY_VALUE_EDITOR_COMMITTED_EVENT, {
       kind,
+      workspaceRef,
       target,
       propertyPath: target.propertyPath ?? "",
       value: latestEdit,

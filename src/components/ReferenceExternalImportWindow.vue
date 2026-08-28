@@ -10,13 +10,16 @@ import {
   REFERENCE_EXTERNAL_IMPORT_WINDOW_TITLE,
   type ReferenceExternalImportWindowPayload,
 } from "../services/referenceExternalImportWindow";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 const appWindow = getCurrentWindow();
+const workspaceContextStore = useWorkspaceContextStore();
 const payload = ref<ReferenceExternalImportWindowPayload>(
   getReferenceExternalImportWindowPayload(),
 );
 const panelKey = ref(0);
 const panelRunning = ref(false);
+const workspaceReady = ref(false);
 let payloadEventUnlisten: UnlistenFn | null = null;
 let closeRequestUnlisten: UnlistenFn | null = null;
 let allowWindowClose = false;
@@ -37,6 +40,7 @@ function referencePathLabel(path: string | null | undefined): string {
 function applyPayload(nextPayload: ReferenceExternalImportWindowPayload) {
   if (panelRunning.value) return;
   payload.value = {
+    workspaceRef: nextPayload.workspaceRef ?? payload.value.workspaceRef ?? null,
     parentDir: normalizeRelativePath(nextPayload.parentDir),
     fixedTargetPath: normalizeRelativePath(nextPayload.fixedTargetPath),
     initialSource: nextPayload.initialSource === "unity" || nextPayload.initialSource === "local"
@@ -102,6 +106,21 @@ async function initializeWindow() {
   } catch {
     // keep the window usable even if event hooks are unavailable
   }
+
+  const workspaceRef = payload.value.workspaceRef;
+  if (!workspaceRef) return;
+  await workspaceContextStore.initialize(appWindow.label, "main");
+  const context = await workspaceContextStore.focusCheckout(workspaceRef.checkoutId);
+  if (
+    !context
+    || (
+      workspaceRef.expectedGeneration != null
+      && context.workspaceGeneration !== workspaceRef.expectedGeneration
+    )
+  ) {
+    return;
+  }
+  workspaceReady.value = true;
 }
 
 onMounted(() => {
@@ -149,7 +168,9 @@ onUnmounted(() => {
     <div class="external-import-window-scroll">
       <div class="external-import-window-body">
         <ReferenceExternalImportPanel
+          v-if="workspaceReady && payload.workspaceRef"
           :key="panelKey"
+          :workspace-ref="payload.workspaceRef"
           mode="window"
           :parent-dir="payload.parentDir || ''"
           :fixed-target-path="payload.fixedTargetPath || null"

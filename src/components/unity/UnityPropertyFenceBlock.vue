@@ -32,6 +32,7 @@ import {
 } from "../../services/unityPropertyPath";
 import { listenUnityValueEditorCommitted } from "../../services/unityValueEditorWindow";
 import { useNotificationStore } from "../../stores/notification";
+import { useProjectStore } from "../../stores/project";
 import UnitySerializedPropertyTree from "./UnitySerializedPropertyTree.vue";
 import type {
   UnitySerializedPropertyCommitEvent,
@@ -57,6 +58,7 @@ interface PropertyRowContextMenu {
 }
 
 const notificationStore = useNotificationStore();
+const projectStore = useProjectStore();
 const rows = ref<PropertyRow[]>([]);
 const issues = ref<UnityPropertyFenceIssue[]>([]);
 const selectedRowId = ref("");
@@ -99,6 +101,11 @@ watch(
 // an object shown here, re-read the affected rows.
 let unlistenValueEditor: (() => void) | null = null;
 void listenUnityValueEditorCommitted((event) => {
+  const workspaceRef = projectStore.requireWorkspaceRef();
+  if (
+    event.workspaceRef.checkoutId !== workspaceRef.checkoutId
+    || event.workspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
+  ) return;
   const objectKey = unityPropertyTargetKey(unityPropertyObjectTarget(event.target));
   rows.value.forEach((row) => {
     if (unityPropertyTargetKey(unityPropertyObjectTarget(row.entry.target)) === objectKey) {
@@ -151,7 +158,7 @@ async function reloadProperties() {
 async function loadProperty(entry: UnityPropertyFenceEntry, run = loadRun) {
   patchRow(entry.id, { loading: true, error: "" });
   try {
-    const result = await readUnitySerializedProperty({
+    const result = await readUnitySerializedProperty(projectStore.requireWorkspaceRef(), {
       bindingId: entry.id,
       target: entry.target,
       maxDepth: 2,
@@ -217,7 +224,7 @@ async function commitProperty(row: PropertyRow, event: UnitySerializedPropertyCo
 
   patchRow(rowId, { saving: true, error: "" });
   try {
-    const result = await writeUnitySerializedProperty({
+    const result = await writeUnitySerializedProperty(projectStore.requireWorkspaceRef(), {
       bindingId: rowId,
       target,
       value: event.value,
@@ -256,7 +263,7 @@ async function flushRowPreview(rowId: string) {
   const row = rowById(rowId);
   if (!pending || !row) return;
   try {
-    await writeUnitySerializedProperty({
+    await writeUnitySerializedProperty(projectStore.requireWorkspaceRef(), {
       bindingId: rowId,
       target: targetWithPropertyPath(row.entry.target, pending.propertyPath),
       value: pending.value,
@@ -346,10 +353,14 @@ async function selectContextRowInUnity() {
 
   try {
     if (selection.kind === "sceneObject") {
-      await selectUnitySceneObject(selection.scenePath, selection.objectPath);
+      await selectUnitySceneObject(
+        projectStore.requireWorkspaceRef(),
+        selection.scenePath,
+        selection.objectPath,
+      );
       return;
     }
-    await selectUnityAsset(selection.path);
+    await selectUnityAsset(projectStore.requireWorkspaceRef(), selection.path);
   } catch (error) {
     notifySelectInUnityError(error, selection);
   }

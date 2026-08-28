@@ -9,13 +9,13 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::instance::RawRound;
 use crate::session::models::{
-    ChatMessage, MessageRole, PendingSessionInput, SessionContextAttempt, SessionRuntimeSnapshot,
-    ToolCallInfo,
+    ChatMessage, MessageRole, PendingSessionInput, PersistedSessionRun, SessionContextAttempt,
+    SessionRuntimeSnapshot, ToolCallInfo,
 };
 use crate::session::store::SessionStore;
 
 const EXPORT_FORMAT: &str = "locus.context_review";
-const EXPORT_FORMAT_VERSION: u32 = 5;
+const EXPORT_FORMAT_VERSION: u32 = 7;
 const EMPTY: &str = "empty";
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,6 +78,8 @@ struct MissingField {
 struct SourceMetadata {
     root_session_id: String,
     session_tree_ids: Vec<String>,
+    project_id: Value,
+    default_checkout_id: Value,
     workspace_path: Value,
     workspace_path_state: &'static str,
 }
@@ -90,6 +92,7 @@ struct SessionExport {
     todos: Value,
     pending_inputs: Value,
     runtime: Value,
+    runs: Value,
     messages: Vec<Value>,
     compactions: Value,
     context_attempts: Value,
@@ -159,7 +162,7 @@ struct ExportIntegrity {
 pub fn export_session_context_yaml(
     store: &SessionStore,
     root_session_id: &str,
-    workspace_path: &str,
+    _workspace_path: &str,
     legacy_raw_rounds: Option<&[RawRound]>,
     live_snapshot: Option<&ContextExportLiveSnapshot>,
     file_path: &Path,
@@ -168,16 +171,23 @@ pub fn export_session_context_yaml(
     if session_tree_ids.is_empty() {
         return Err(format!("Session not found: {}", root_session_id));
     }
+    let root_scope = store.get_session_workspace_scope(root_session_id)?;
 
     let mut sessions = Vec::with_capacity(session_tree_ids.len());
     let mut attempt_count = 0usize;
     let mut has_persisted_attempts = false;
     let mut used_legacy_raw_rounds = false;
     let mut has_context_capture_gap = false;
+    let mut has_missing_session_checkout = false;
+    let mut has_missing_run_checkout = false;
+    let mut has_missing_run_generation = false;
+    let mut has_missing_service_bindings = false;
 
     for session_id in &session_tree_ids {
         has_context_capture_gap |= store.session_has_context_capture_gap(session_id)?;
         let detail = store.load_session(session_id)?;
+        let session_scope = store.get_session_workspace_scope(session_id)?;
+        has_missing_session_checkout |= session_scope.default_checkout_id.is_none();
         let live_session = live_snapshot.and_then(|snapshot| snapshot.sessions.get(session_id));
         let usage = store.get_token_usage(session_id).ok();
         let cache_invalidations = store.list_cache_invalidations(session_id)?;
@@ -213,6 +223,19 @@ pub fn export_session_context_yaml(
                 .map_err(|error| format!("Failed to serialize context attempts: {}", error))?
         };
         let timeline = load_all_events(store, session_id)?;
+        let persisted_runs = store.list_persisted_session_runs(session_id)?;
+        has_missing_run_checkout |= persisted_runs.iter().any(|run| run.checkout_id.is_none());
+        has_missing_run_generation |= persisted_runs
+            .iter()
+            .any(|run| run.workspace_generation.is_none());
+        has_missing_service_bindings |= persisted_runs
+            .iter()
+            .any(|run| run.service_bindings.is_none());
+        let runs = if persisted_runs.is_empty() {
+            empty_value()
+        } else {
+            Value::Array(persisted_runs.into_iter().map(export_run).collect())
+        };
 
         let metadata = json!({
             "sessionId": detail.id,
@@ -223,6 +246,9 @@ pub fn export_session_context_yaml(
             "lastFastMode": detail.last_fast_mode.map(Value::Bool).unwrap_or_else(empty_value),
             "sessionType": non_empty_value(Some(&detail.session_type)),
             "parentSessionId": non_empty_value(detail.parent_session_id.as_deref()),
+            "projectId": non_empty_value(session_scope.project_id.as_deref()),
+            "defaultCheckoutId": non_empty_value(session_scope.default_checkout_id.as_deref()),
+            "checkoutRoot": non_empty_value(session_scope.checkout_root.as_deref()),
             "latestCompletedRunId": non_empty_value(detail.latest_completed_run_id.as_deref()),
             "createdAtUnix": detail.created_at,
             "createdAt": format_timestamp(detail.created_at),
@@ -259,6 +285,7 @@ pub fn export_session_context_yaml(
             todos,
             pending_inputs,
             runtime,
+            runs,
             messages,
             compactions,
             context_attempts,
@@ -278,7 +305,7 @@ pub fn export_session_context_yaml(
         "full"
     }
     .to_string();
-    let missing_fields = if has_context_capture_gap {
+    let mut missing_fields = if has_context_capture_gap {
         vec![
             MissingField {
                 field: "sessions[].contextAttempts".to_string(),
@@ -299,11 +326,49 @@ pub fn export_session_context_yaml(
     } else {
         Vec::new()
     };
+    if has_missing_session_checkout {
+        missing_fields.push(MissingField {
+            field: "sessions[].metadata.checkoutId".to_string(),
+            value: EMPTY,
+            reason: "session predates persisted checkout binding or no checkout could be uniquely inferred"
+                .to_string(),
+        });
+    }
+    if has_missing_run_checkout {
+        missing_fields.push(MissingField {
+            field: "sessions[].runs[].checkoutId".to_string(),
+            value: EMPTY,
+            reason: "run predates persisted checkout scope".to_string(),
+        });
+    }
+    if has_missing_run_generation {
+        missing_fields.push(MissingField {
+            field: "sessions[].runs[].workspaceGeneration".to_string(),
+            value: EMPTY,
+            reason: "run predates persisted workspace generation".to_string(),
+        });
+    }
+    if has_missing_service_bindings {
+        missing_fields.push(MissingField {
+            field: "sessions[].runs[].serviceBindings".to_string(),
+            value: EMPTY,
+            reason: "run predates persisted service binding snapshots".to_string(),
+        });
+    }
 
-    let workspace_path = if workspace_path.trim().is_empty() {
-        empty_value()
+    let workspace_path = root_scope
+        .checkout_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| Value::String(value.to_string()))
+        .unwrap_or_else(empty_value);
+    let workspace_path_state = if root_scope.default_checkout_id.is_none() {
+        "historical_checkout_missing"
+    } else if root_scope.checkout_root.is_none() {
+        "checkout_record_missing"
     } else {
-        Value::String(workspace_path.trim().to_string())
+        "persisted_checkout"
     };
     let mut document = ContextExportDocument {
         format: EXPORT_FORMAT,
@@ -335,8 +400,10 @@ pub fn export_session_context_yaml(
         source: SourceMetadata {
             root_session_id: root_session_id.to_string(),
             session_tree_ids,
+            project_id: non_empty_value(root_scope.project_id.as_deref()),
+            default_checkout_id: non_empty_value(root_scope.default_checkout_id.as_deref()),
             workspace_path,
-            workspace_path_state: "current_at_export",
+            workspace_path_state,
         },
         sessions,
         integrity: ExportIntegrity {
@@ -399,6 +466,38 @@ fn export_message(message: ChatMessage) -> Result<Value, String> {
         "knowledgeProposal": optional_json(message.knowledge_proposal)?,
         "renderParts": optional_json(message.render_parts)?,
     }))
+}
+
+fn export_run(run: PersistedSessionRun) -> Value {
+    let service_bindings = run
+        .service_bindings
+        .map(|bindings| serde_json::to_value(bindings).unwrap_or_else(|_| empty_value()))
+        .unwrap_or_else(empty_value);
+    json!({
+        "runId": run.summary.run_id,
+        "sessionId": run.summary.session_id,
+        "status": run.summary.status,
+        "projectId": non_empty_value(run.project_id.as_deref()),
+        "checkoutId": non_empty_value(run.checkout_id.as_deref()),
+        "workspaceGeneration": run.workspace_generation
+            .map(Value::from)
+            .unwrap_or_else(empty_value),
+        "branchRef": non_empty_value(run.branch_ref.as_deref()),
+        "headOid": non_empty_value(run.head_oid.as_deref()),
+        "serviceBindings": service_bindings,
+        "startedAtUnix": run.summary.started_at,
+        "startedAt": format_timestamp(run.summary.started_at),
+        "updatedAtUnix": run.summary.updated_at,
+        "updatedAt": format_timestamp(run.summary.updated_at),
+        "finishedAtUnix": run.summary.finished_at
+            .map(Value::from)
+            .unwrap_or_else(empty_value),
+        "finishedAt": run.summary.finished_at
+            .map(format_timestamp)
+            .map(Value::String)
+            .unwrap_or_else(empty_value),
+        "errorMessage": non_empty_value(run.summary.error_message.as_deref()),
+    })
 }
 
 fn export_token_usage(usage: crate::commands::TokenUsage) -> Value {

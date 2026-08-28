@@ -9,7 +9,7 @@ function read(relPath: string) {
 }
 
 describe("AssetExplorer branch probe layout", () => {
-  it("probes visible folders before rendering expand toggles", () => {
+  it("probes visible folders and toggles through the folder row", () => {
     const source = read("src/components/asset/AssetExplorer.vue");
     const workspaceTree = read("src/components/explorer/WorkspaceTree.vue");
 
@@ -18,6 +18,9 @@ describe("AssetExplorer branch probe layout", () => {
     expect(source).toContain('if (entry.kind === "row") {');
     expect(source).toContain('emit("probe", entry.node.path);');
     expect(source).toContain("expandable: canToggle");
-    expect(workspaceTree).toContain('v-if="item.treeRow.expandable"');
+    expect(source).toContain('emit("select", entry.node.path);');
+    expect(source).toContain('emit("toggle", entry.node.path);');
+    expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
+    expect(workspaceTree).not.toContain("workspace-tree-branch");
   });
 });

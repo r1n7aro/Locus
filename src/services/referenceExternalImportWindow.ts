@@ -1,5 +1,6 @@
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import type { WorkspaceRef } from "./project";
 
 export type ReferenceExternalImportSource = "feishu" | "unity" | "local";
 
@@ -10,6 +11,7 @@ export const REFERENCE_EXTERNAL_IMPORT_WINDOW_FLAG = "referenceExternalImport";
 export const REFERENCE_EXTERNAL_IMPORT_WINDOW_TITLE = "Locus External Import";
 
 export interface ReferenceExternalImportWindowPayload {
+  workspaceRef?: WorkspaceRef | null;
   parentDir?: string | null;
   fixedTargetPath?: string | null;
   initialSource?: ReferenceExternalImportSource | null;
@@ -31,7 +33,17 @@ export function getReferenceExternalImportWindowPayload(
 ): ReferenceExternalImportWindowPayload {
   const params = new URLSearchParams(search);
   const initialSource = params.get("initialSource");
+  const checkoutId = trimOrEmpty(params.get("checkoutId"));
+  const generation = Number(params.get("workspaceGeneration"));
   return {
+    workspaceRef: checkoutId
+      ? {
+          checkoutId,
+          expectedGeneration: Number.isSafeInteger(generation) && generation > 0
+            ? generation
+            : undefined,
+        }
+      : null,
     parentDir: trimOrEmpty(params.get("parentDir")),
     fixedTargetPath: trimOrEmpty(params.get("fixedTargetPath")),
     initialSource: initialSource === "unity" || initialSource === "feishu" || initialSource === "local"
@@ -46,6 +58,12 @@ export function buildReferenceExternalImportWindowQuery(
   const params = new URLSearchParams({
     [REFERENCE_EXTERNAL_IMPORT_WINDOW_FLAG]: "1",
   });
+  if (payload.workspaceRef?.checkoutId) {
+    params.set("checkoutId", payload.workspaceRef.checkoutId);
+    if (payload.workspaceRef.expectedGeneration != null) {
+      params.set("workspaceGeneration", String(payload.workspaceRef.expectedGeneration));
+    }
+  }
   if (trimOrEmpty(payload.parentDir)) {
     params.set("parentDir", trimOrEmpty(payload.parentDir));
   }
@@ -69,11 +87,11 @@ export function buildReferenceExternalImportWindowUrl(
 }
 
 export async function openReferenceExternalImportWindow(
-  payload: ReferenceExternalImportWindowPayload = {},
+  payload: ReferenceExternalImportWindowPayload & { workspaceRef: WorkspaceRef },
 ): Promise<void> {
   if (!hasTauriWindowRuntime()) return;
   const result = await openSubWindow({
-    kind: REFERENCE_EXTERNAL_IMPORT_WINDOW_LABEL,
+    kind: `${REFERENCE_EXTERNAL_IMPORT_WINDOW_LABEL}-${safeWindowScope(payload.workspaceRef.checkoutId)}`,
     title: REFERENCE_EXTERNAL_IMPORT_WINDOW_TITLE,
     width: 1180,
     height: 900,
@@ -87,4 +105,10 @@ export async function openReferenceExternalImportWindow(
   if (result.existing) {
     await result.window?.emit(REFERENCE_EXTERNAL_IMPORT_WINDOW_EVENT, payload);
   }
+}
+
+function safeWindowScope(value: string): string {
+  return Array.from(new TextEncoder().encode(value))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
 }

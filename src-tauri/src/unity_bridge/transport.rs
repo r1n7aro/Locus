@@ -18,7 +18,7 @@ mod windows_impl {
             OnceLock,
         },
     };
-    use tauri::{AppHandle, Emitter, Manager};
+    use tauri::AppHandle;
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
         net::windows::named_pipe::{ClientOptions, NamedPipeClient},
@@ -104,6 +104,9 @@ mod windows_impl {
     static CONNECTION_ATTEMPT_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
         OnceLock::new();
     static ACTIVE_CONNECTIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    static SERVICE_EVENT_SCOPES: OnceLock<
+        std::sync::RwLock<HashMap<String, crate::workspace_service::event::WorkspaceEventScope>>,
+    > = OnceLock::new();
     static EVENT_APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
     static REQUEST_SEQ: AtomicU64 = AtomicU64::new(1);
     const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -131,6 +134,35 @@ mod windows_impl {
 
     fn active_connections() -> &'static Mutex<HashMap<String, String>> {
         ACTIVE_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn service_event_scopes() -> &'static std::sync::RwLock<
+        HashMap<String, crate::workspace_service::event::WorkspaceEventScope>,
+    > {
+        SERVICE_EVENT_SCOPES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+    }
+
+    pub(super) fn set_service_event_scope(
+        project_path: &str,
+        scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+    ) {
+        let key = project_connection_key(project_path);
+        if let Ok(mut scopes) = service_event_scopes().write() {
+            if let Some(scope) = scope {
+                scopes.insert(key, scope);
+            } else {
+                scopes.remove(&key);
+            }
+        }
+    }
+
+    fn service_event_scope(
+        project_key: &str,
+    ) -> Option<crate::workspace_service::event::WorkspaceEventScope> {
+        service_event_scopes()
+            .read()
+            .ok()
+            .and_then(|scopes| scopes.get(project_key).cloned())
     }
 
     fn project_connection_key(project_path: &str) -> String {
@@ -263,7 +295,7 @@ mod windows_impl {
         })
     }
 
-    fn handle_unsolicited_message(env: &PipeEnvelope) {
+    fn handle_unsolicited_message(project_key: &str, env: &PipeEnvelope) {
         let event_name = env.kind.trim();
         if event_name.is_empty() {
             eprintln!(
@@ -275,18 +307,19 @@ mod windows_impl {
 
         if let Some(app_handle) = EVENT_APP_HANDLE.get() {
             let payload = unsolicited_payload(env);
-            if event_name == "locus-open-script" {
-                let request: Result<crate::unity_bridge::ExternalScriptOpenRequest, _> =
-                    serde_json::from_value(payload.clone());
-                if let Ok(request) = request {
-                    let pending = app_handle
-                        .try_state::<crate::unity_bridge::PendingExternalScriptOpenRequest>();
-                    if let Some(pending) = pending {
-                        pending.stage(request);
-                    }
-                }
-            }
-            let _ = app_handle.emit(event_name, payload);
+            let Some(scope) = service_event_scope(project_key) else {
+                tracing::debug!(
+                    log_module = "Locus",
+                    "dropping unsolicited Unity event without a live service scope: project={}, type={}",
+                    project_key,
+                    event_name
+                );
+                return;
+            };
+            let outcome = crate::workspace_service::event::emit_for_workspace_scope(
+                app_handle, &scope, event_name, payload,
+            );
+            let _ = outcome;
             return;
         }
 
@@ -391,7 +424,7 @@ mod windows_impl {
                 }
             } else {
                 if is_active_connection(&conn).await {
-                    handle_unsolicited_message(&env);
+                    handle_unsolicited_message(&conn.project_key, &env);
                 } else {
                     tracing::debug!(
                         log_module = "Locus",
@@ -479,6 +512,18 @@ mod windows_impl {
         timeout: Option<Duration>,
         acceptance_tx: Option<oneshot::Sender<()>>,
     ) -> Result<PipeResponse, String> {
+        if let Err(error) = super::super::dialog::ensure_project_observed(project_path).await {
+            eprintln!("[Locus] Unity modal dialog observation could not be refreshed: {error}");
+        }
+        let requires_main_thread =
+            super::super::dialog::message_requires_unity_main_thread(msg_type);
+        if requires_main_thread {
+            if let Some(error) = super::super::dialog::blocked_error(project_path, "not_sent", None)
+            {
+                return Err(error);
+            }
+        }
+        let mut dialog_events = super::super::dialog::subscribe();
         let trace_exit_play_mode = msg_type == "exit_play_mode";
         if trace_exit_play_mode {
             tracing::info!(log_module = "Locus", "exit_play_mode transport: connecting");
@@ -503,7 +548,7 @@ mod windows_impl {
         let json =
             serde_json::to_string(&env).map_err(|e| format!("Serialization failed: {}", e))?;
 
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut response_rx) = oneshot::channel();
         {
             let mut pending = conn.pending.lock().await;
             pending.insert(request_id.clone(), tx);
@@ -561,6 +606,33 @@ mod windows_impl {
             );
         }
 
+        let rx = async {
+            loop {
+                tokio::select! {
+                    response = &mut response_rx => {
+                        return match response {
+                            Ok(Ok(env)) => Ok(env),
+                            Ok(Err(error)) => Err(error),
+                            Err(_) => Err("Unity response failed: response channel closed".to_string()),
+                        };
+                    }
+                    changed = dialog_events.changed(), if requires_main_thread => {
+                        if changed.is_err() {
+                            continue;
+                        }
+                        if let Some(error) = super::super::dialog::blocked_error(
+                            project_path,
+                            "unknown",
+                            Some(&request_id),
+                        ) {
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        };
+        tokio::pin!(rx);
+
         let env = if let Some(timeout) = timeout {
             if trace_exit_play_mode {
                 tracing::info!(
@@ -568,12 +640,9 @@ mod windows_impl {
                     "exit_play_mode transport: awaiting response"
                 );
             }
-            match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(Ok(env))) => env,
-                Ok(Ok(Err(e))) => return Err(e),
-                Ok(Err(_)) => {
-                    return Err("Unity response failed: response channel closed".to_string())
-                }
+            match tokio::time::timeout(timeout, &mut rx).await {
+                Ok(Ok(env)) => env,
+                Ok(Err(error)) => return Err(error),
                 Err(_) => {
                     let err = "Unity response timed out".to_string();
                     let mut pending = conn.pending.lock().await;
@@ -586,9 +655,8 @@ mod windows_impl {
             }
         } else {
             match rx.await {
-                Ok(Ok(env)) => env,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err("Unity response failed: response channel closed".to_string()),
+                Ok(env) => env,
+                Err(error) => return Err(error),
             }
         };
         pending_guard.disarm();
@@ -841,6 +909,32 @@ mod windows_impl {
 
             assert_eq!(broker_accepted_request_id(&env).as_deref(), Some("req-42"));
         }
+
+        #[test]
+        fn service_scope_is_removed_at_the_service_generation_boundary() {
+            use crate::workspace_service::event::WorkspaceEventScope;
+            use crate::workspace_service::identity::{CheckoutId, ProjectId, ServiceInstanceId};
+
+            let project_path = format!("transport-scope-{}", uuid::Uuid::new_v4());
+            let project_key = project_connection_key(&project_path);
+            let scope = WorkspaceEventScope {
+                project_id: ProjectId::new("project-test").expect("project id"),
+                checkout_id: CheckoutId::new("checkout-test").expect("checkout id"),
+                workspace_generation: 7,
+                service_instance_id: Some(
+                    ServiceInstanceId::new("unity-test").expect("service instance id"),
+                ),
+                service_generation: Some(11),
+            };
+
+            set_service_event_scope(&project_path, Some(scope.clone()));
+            assert_eq!(
+                service_event_scope(&project_key).and_then(|current| current.service_generation),
+                Some(11)
+            );
+            set_service_event_scope(&project_path, None);
+            assert!(service_event_scope(&project_key).is_none());
+        }
     }
 }
 
@@ -853,6 +947,21 @@ pub fn set_event_app_handle(app_handle: tauri::AppHandle) {
 
 #[cfg(not(target_os = "windows"))]
 pub fn set_event_app_handle(_app_handle: tauri::AppHandle) {}
+
+#[cfg(target_os = "windows")]
+pub fn set_service_event_scope(
+    project_path: &str,
+    scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+) {
+    windows_impl::set_service_event_scope(project_path, scope);
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_service_event_scope(
+    _project_path: &str,
+    _scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+) {
+}
 
 #[cfg(target_os = "windows")]
 pub async fn send_message(

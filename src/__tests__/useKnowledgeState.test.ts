@@ -3,7 +3,7 @@ import { createRenderer, defineComponent, nextTick, reactive } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import {
   buildSearchExplorerTree,
-  useKnowledgeState,
+  useKnowledgeState as useKnowledgeStateImpl,
   type ExplorerNode,
 } from "../composables/useKnowledgeState";
 import type {
@@ -13,6 +13,16 @@ import type {
   KnowledgeSearchResult,
   UnityReferenceImportStatus,
 } from "../types";
+
+const TEST_WORKSPACE_REF = {
+  checkoutId: "checkout-test",
+  expectedGeneration: 7,
+};
+
+function useKnowledgeState(props: Parameters<typeof useKnowledgeStateImpl>[0]) {
+  if (!props.workspaceRef) props.workspaceRef = TEST_WORKSPACE_REF;
+  return useKnowledgeStateImpl(props);
+}
 
 const notificationStoreMocks = vi.hoisted(() => ({
   addNotice: vi.fn(),
@@ -76,18 +86,64 @@ const knowledgeMocks = vi.hoisted(() => ({
   setSkillConfig: vi.fn(),
 }));
 
-vi.mock("../services/knowledge", () => knowledgeMocks);
+vi.mock("../services/knowledge", () => ({
+  ...knowledgeMocks,
+  knowledgeActivateEmbedding: () => knowledgeMocks.knowledgeActivateEmbedding(),
+  knowledgeCreate: (input: unknown) => knowledgeMocks.knowledgeCreate(input),
+  knowledgeDeactivateEmbedding: () => knowledgeMocks.knowledgeDeactivateEmbedding(),
+  knowledgeDelete: (input: unknown) => knowledgeMocks.knowledgeDelete(input),
+  knowledgeDeleteFeishuReferenceDocs: (_ref: unknown, target?: string) => knowledgeMocks.knowledgeDeleteFeishuReferenceDocs(target),
+  knowledgeDeleteUnityReferenceDocs: (_ref: unknown, target?: string) => knowledgeMocks.knowledgeDeleteUnityReferenceDocs(target),
+  knowledgeDownloadLocalEmbeddingModel: (modelId: string) => knowledgeMocks.knowledgeDownloadLocalEmbeddingModel(modelId),
+  knowledgeEdit: (input: unknown) => knowledgeMocks.knowledgeEdit(input),
+  knowledgeGetEmbeddingConfig: () => knowledgeMocks.knowledgeGetEmbeddingConfig(),
+  knowledgeGetEmbeddingStatus: () => knowledgeMocks.knowledgeGetEmbeddingStatus(),
+  knowledgeGetFeishuReferenceImportStatus: () => knowledgeMocks.knowledgeGetFeishuReferenceImportStatus(),
+  knowledgeGetGeneralConfig: () => knowledgeMocks.knowledgeGetGeneralConfig(),
+  knowledgeGetLexicalRebuildStatus: () => knowledgeMocks.knowledgeGetLexicalRebuildStatus(),
+  knowledgeGetOverview: () => knowledgeMocks.knowledgeGetOverview(),
+  knowledgeGetUnityReferenceImportStatus: () => knowledgeMocks.knowledgeGetUnityReferenceImportStatus(),
+  knowledgeImportFeishuReferenceDocs: (request: unknown) => knowledgeMocks.knowledgeImportFeishuReferenceDocs(request),
+  knowledgeImportUnityReferenceDocs: (_ref: unknown, target?: string, locale?: string) => knowledgeMocks.knowledgeImportUnityReferenceDocs(target, locale),
+  knowledgeList: (input: unknown) => knowledgeMocks.knowledgeList(input),
+  knowledgeListPage: (input: unknown) => knowledgeMocks.knowledgeListPage(input),
+  knowledgeListDirectories: (type: unknown) => knowledgeMocks.knowledgeListDirectories(type),
+  knowledgeListDirectoryDocuments: (type: unknown, path: unknown) => knowledgeMocks.knowledgeListDirectoryDocuments(type, path),
+  knowledgeListDirectoryDocumentsPage: (type: unknown, path: unknown, _ref: unknown, options: unknown) => knowledgeMocks.knowledgeListDirectoryDocumentsPage(type, path, options),
+  knowledgeListExternalReferenceDirectories: () => knowledgeMocks.knowledgeListExternalReferenceDirectories(),
+  knowledgeListUnityManagedDirectoryStats: () => knowledgeMocks.knowledgeListUnityManagedDirectoryStats(),
+  knowledgeMove: (input: unknown) => knowledgeMocks.knowledgeMove(input),
+  knowledgeQuery: (input: unknown) => knowledgeMocks.knowledgeQuery(input),
+  knowledgeRead: (input: unknown) => knowledgeMocks.knowledgeRead(input),
+  knowledgeRebuildLexicalIndex: () => knowledgeMocks.knowledgeRebuildLexicalIndex(),
+  knowledgeRevealTarget: (input: unknown) => knowledgeMocks.knowledgeRevealTarget(input),
+  knowledgeSaveEmbeddingConfig: (config: unknown) => knowledgeMocks.knowledgeSaveEmbeddingConfig(config),
+  knowledgeSaveGeneralConfig: (config: unknown) => knowledgeMocks.knowledgeSaveGeneralConfig(config),
+}));
 vi.mock(
   "../services/knowledgeDownloadWindow",
-  () => knowledgeDownloadWindowMocks,
+  () => ({
+    openKnowledgeDownloadProgressWindow: (_ref: unknown, modelId: string) =>
+      knowledgeDownloadWindowMocks.openKnowledgeDownloadProgressWindow(modelId),
+  }),
 );
 vi.mock(
   "../services/feishuReferenceImportWindow",
-  () => feishuReferenceImportWindowMocks,
+  () => ({
+    openFeishuReferenceImportProgressWindow: (payload: Record<string, unknown>) => {
+      const { workspaceRef: _workspaceRef, ...legacyPayload } = payload;
+      return feishuReferenceImportWindowMocks.openFeishuReferenceImportProgressWindow(legacyPayload);
+    },
+  }),
 );
 vi.mock(
   "../services/unityReferenceImportWindow",
-  () => unityReferenceImportWindowMocks,
+  () => ({
+    openUnityReferenceImportProgressWindow: (_ref: unknown, payload?: unknown) =>
+      payload === undefined
+        ? unityReferenceImportWindowMocks.openUnityReferenceImportProgressWindow()
+        : unityReferenceImportWindowMocks.openUnityReferenceImportProgressWindow(payload),
+  }),
 );
 vi.mock("../services/errors", () => ({
   normalizeAppError: (error: unknown) => {
@@ -232,6 +288,21 @@ function emitTauriEvent<T>(eventName: string, payload: T) {
   for (const handler of tauriEventHandlers[eventName] ?? []) {
     handler({ payload });
   }
+}
+
+function emitWorkspaceKnowledgeEvent<T>(
+  eventName: string,
+  payload: T,
+  workspaceRef = TEST_WORKSPACE_REF,
+) {
+  emitTauriEvent("locus://workspace-event", {
+    eventName,
+    streamRevision: 1,
+    projectId: "project-test",
+    checkoutId: workspaceRef.checkoutId,
+    workspaceGeneration: workspaceRef.expectedGeneration,
+    payload,
+  });
 }
 
 const testRenderer = createRenderer<any, any>({
@@ -988,7 +1059,7 @@ describe("useKnowledgeState", () => {
     await flushPromises(8);
     knowledgeMocks.knowledgeList.mockClear();
 
-    emitTauriEvent<KnowledgeChangedEvent>("knowledge-changed", {
+    emitWorkspaceKnowledgeEvent<KnowledgeChangedEvent>("knowledge-changed", {
       workingDir: "F:/repo-a",
       source: "knowledge_fs_watcher",
       changedAt: 1,
@@ -1114,7 +1185,7 @@ describe("useKnowledgeState", () => {
         }),
     );
 
-    emitTauriEvent<KnowledgeChangedEvent>("knowledge-changed", {
+    emitWorkspaceKnowledgeEvent<KnowledgeChangedEvent>("knowledge-changed", {
       workingDir: "F:/repo",
       source: "knowledge_fs_watcher",
       changedAt: 2,
@@ -1269,7 +1340,7 @@ describe("useKnowledgeState", () => {
     });
   });
 
-  it("updates lexical rebuild status from the backend event", async () => {
+  it("refreshes checkout-local lexical rebuild status after the backend event", async () => {
     const mounted = mountKnowledgeState(
       reactive({
         workingDir: "F:/repo",
@@ -1279,8 +1350,20 @@ describe("useKnowledgeState", () => {
     );
     await flushPromises(8);
     knowledgeMocks.knowledgeGetLexicalRebuildStatus.mockClear();
+    knowledgeMocks.knowledgeGetLexicalRebuildStatus.mockResolvedValueOnce({
+      running: true,
+      stage: "indexing",
+      detail: "Indexing docs",
+      currentFile: "design/a.md",
+      progress: 0.42,
+      processedDocs: 42,
+      totalDocs: 100,
+      error: null,
+      startedAt: "2026-04-16T00:00:00Z",
+      completedAt: null,
+    });
 
-    emitTauriEvent("knowledge-lexical-rebuild-status", {
+    emitWorkspaceKnowledgeEvent("knowledge-lexical-rebuild-status", {
       running: true,
       stage: "indexing",
       detail: "Indexing docs",
@@ -1293,6 +1376,7 @@ describe("useKnowledgeState", () => {
       completedAt: null,
     });
     await nextTick();
+    await flushPromises(4);
 
     expect(mounted.state.lexicalRebuildStatus.value).toMatchObject({
       running: true,
@@ -1301,8 +1385,44 @@ describe("useKnowledgeState", () => {
     });
     expect(
       knowledgeMocks.knowledgeGetLexicalRebuildStatus,
-    ).not.toHaveBeenCalled();
+    ).toHaveBeenCalledTimes(1);
 
+    mounted.unmount();
+  });
+
+  it("ignores Knowledge events emitted by a sibling checkout", async () => {
+    const mounted = mountKnowledgeState(
+      reactive({
+        workingDir: "F:/repo-a",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+    await flushPromises(8);
+    knowledgeMocks.knowledgeGetLexicalRebuildStatus.mockClear();
+    knowledgeMocks.knowledgeRead.mockClear();
+
+    emitWorkspaceKnowledgeEvent("knowledge-lexical-rebuild-status", {
+      running: true,
+      stage: "indexing",
+    }, {
+      checkoutId: "checkout-b",
+      expectedGeneration: 11,
+    });
+    emitWorkspaceKnowledgeEvent<KnowledgeChangedEvent>("knowledge-changed", {
+      workingDir: "F:/repo-a",
+      source: "knowledge_fs_watcher",
+      changedAt: 2,
+      docType: "design",
+      path: "combat/core-loop.md",
+    }, {
+      checkoutId: "checkout-b",
+      expectedGeneration: 11,
+    });
+    await flushPromises(4);
+
+    expect(knowledgeMocks.knowledgeGetLexicalRebuildStatus).not.toHaveBeenCalled();
+    expect(knowledgeMocks.knowledgeRead).not.toHaveBeenCalled();
     mounted.unmount();
   });
 
@@ -2543,6 +2663,7 @@ describe("useKnowledgeState", () => {
         path: "create-skill.md",
         commandTrigger: "/create-skill",
       }),
+      TEST_WORKSPACE_REF,
     );
   });
 
@@ -2564,6 +2685,7 @@ describe("useKnowledgeState", () => {
         path: "unity/asset-audit.md",
         commandTrigger: "/asset-audit",
       }),
+      TEST_WORKSPACE_REF,
     );
   });
 
@@ -2769,6 +2891,7 @@ describe("useKnowledgeState", () => {
         readOnly: false,
         aiEditMode: "auto",
       },
+      TEST_WORKSPACE_REF,
     );
 
     await state.copyExplorerRelativePath(packageNode);
@@ -2784,6 +2907,7 @@ describe("useKnowledgeState", () => {
     await state.deleteExplorerNode(packageNode);
     expect(knowledgeMocks.deleteSkillPackage).toHaveBeenCalledWith(
       "com.feishu.cli",
+      TEST_WORKSPACE_REF,
     );
   });
 
@@ -2873,8 +2997,8 @@ describe("useKnowledgeState", () => {
         surface: "both",
         commandTrigger: "/grill-me",
         injectMode: undefined,
-        effectiveInjectMode: undefined,
       },
+      TEST_WORKSPACE_REF,
     );
   });
 

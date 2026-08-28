@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
@@ -16,7 +16,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rand::RngExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tokio::net::TcpListener;
@@ -38,6 +38,9 @@ const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WAIT_MS: u64 = 30_000;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 120_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 3_600_000;
+const DEFAULT_UNITY_ENSURE_TIMEOUT_MS: u64 = 300_000;
+const MAX_UNITY_ENSURE_TIMEOUT_MS: u64 = 1_800_000;
+const UNITY_ENSURE_POLL_INTERVAL_MS: u64 = 500;
 
 const CLAUDE_STANDARD_EFFORTS: &[&str] = &["none", "low", "medium", "high", "max"];
 const CLAUDE_XHIGH_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
@@ -345,6 +348,8 @@ struct PromptAgentParams {
     #[serde(default)]
     session_id: Option<String>,
     #[serde(default)]
+    workspace_ref: Option<crate::workspace_service::WorkspaceRef>,
+    #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -408,6 +413,13 @@ struct ListModelsParams {
     available_only: bool,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListToolsParams {
+    #[serde(default)]
+    workspace_ref: Option<crate::workspace_service::WorkspaceRef>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListSessionsParams {
@@ -415,6 +427,163 @@ struct ListSessionsParams {
     archived: bool,
     #[serde(default)]
     limit: Option<u32>,
+    #[serde(default)]
+    workspace_ref: Option<crate::workspace_service::WorkspaceRef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceScopeParams {
+    workspace_ref: crate::workspace_service::WorkspaceRef,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityDialogParams {
+    project: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChooseUnityDialogParams {
+    project: String,
+    dialog_id: String,
+    choice_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WaitUnityExecutionParams {
+    project: String,
+    execution_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityEditorStatusParams {
+    project: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnsureUnityEditorParams {
+    project: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    wait_until: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestartUnityEditorParams {
+    project: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    wait_until: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnityEnsureTarget {
+    Process,
+    Connected,
+    Ready,
+}
+
+impl UnityEnsureTarget {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("ready") => Ok(Self::Ready),
+            Some("process") => Ok(Self::Process),
+            Some("connected") => Ok(Self::Connected),
+            Some(value) => Err(format!(
+                "waitUntil must be one of 'process', 'connected', or 'ready'; got '{value}'"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Connected => "connected",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SdkUnityEditorStatus {
+    project_path: String,
+    checkout_id: String,
+    workspace_generation: u64,
+    connected: bool,
+    ready: bool,
+    process_state: crate::unity_bridge::UnityEditorProcessState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch_mode: Option<crate::unity_bridge::UnityLaunchMode>,
+    headless: bool,
+    semantic_phase: String,
+    main_thread_blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocking_reason: Option<String>,
+    main_thread: crate::unity_bridge::ObservedMainThreadState,
+    safety: crate::unity_bridge::ObservedSafetyState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocking_dialog: Option<crate::unity_bridge::dialog::UnityModalDialog>,
+    blocking_dialog_recoverable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_status: Option<crate::workspace_service::service::ServiceStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readiness: Option<crate::workspace_service::service::ServiceReadinessSnapshot>,
+    connection: crate::unity_bridge::UnityConnectionStatus,
+    semantic: crate::unity_bridge::SemanticState,
+}
+
+impl SdkUnityEditorStatus {
+    fn satisfies(&self, target: UnityEnsureTarget) -> bool {
+        match target {
+            UnityEnsureTarget::Process => matches!(
+                self.process_state,
+                crate::unity_bridge::UnityEditorProcessState::Running
+            ),
+            UnityEnsureTarget::Connected => self.connected,
+            UnityEnsureTarget::Ready => self.ready,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SdkEnsureUnityEditorResult {
+    launched: bool,
+    wait_until: String,
+    waited_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launch: Option<crate::unity_bridge::UnityLaunchResult>,
+    status: SdkUnityEditorStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SdkRestartUnityEditorResult {
+    closed_process_ids: Vec<u32>,
+    forced_process_ids: Vec<u32>,
+    wait_until: String,
+    waited_ms: u64,
+    launch: crate::unity_bridge::UnityLaunchResult,
+    status: SdkUnityEditorStatus,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,6 +610,8 @@ struct CallToolParams {
     arguments: Value,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    workspace_ref: Option<crate::workspace_service::WorkspaceRef>,
 }
 
 fn validate_agent_id(value: &str) -> Result<String, String> {
@@ -672,9 +843,22 @@ fn is_agent_only_tool(name: &str) -> bool {
     )
 }
 
-async fn list_tools(app: &AppHandle) -> Result<Value, String> {
+async fn list_tools(app: &AppHandle, params: ListToolsParams) -> Result<Value, String> {
     crate::mcp::manager::ensure_fresh().await;
-    let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
+    let registry = match params.workspace_ref.as_ref() {
+        Some(workspace_ref) => {
+            let scope = resolve_sdk_workspace_scope(app, workspace_ref, "tools.list")?;
+            let definitions = app
+                .state::<Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>()
+                .snapshot(scope.runtime().as_ref())
+                .await
+                .map_err(|error| format!("Failed to load checkout Agent definitions: {error}"))?;
+            app.state::<Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>()
+                .snapshot(scope.runtime().as_ref(), definitions.as_ref())
+                .await?
+        }
+        None => app.state::<Arc<ToolRegistry>>().inner().clone(),
+    };
     let mut names = registry.tool_names();
     names.extend(crate::mcp::manager::wire_tool_names());
     names.sort();
@@ -710,11 +894,33 @@ async fn list_tools(app: &AppHandle) -> Result<Value, String> {
 async fn canonical_tool_names(
     app: &AppHandle,
     requested: Vec<String>,
+    workspace_ref: Option<&crate::workspace_service::WorkspaceRef>,
 ) -> Result<Vec<String>, String> {
     crate::mcp::manager::ensure_fresh().await;
-    let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
-    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
-    let working_dir = workspace.path.read().await.clone();
+    let workspace_scope = workspace_ref
+        .map(|workspace_ref| {
+            app.state::<Arc<crate::workspace_service::ProjectRegistry>>()
+                .resolve_workspace_ref(workspace_ref)
+                .map_err(|error| format!("Failed to resolve SDK workspace: {error}"))
+        })
+        .transpose()?;
+    let registry = match workspace_scope.as_ref() {
+        Some(scope) => {
+            let definitions = app
+                .state::<Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>()
+                .snapshot(scope.runtime().as_ref())
+                .await
+                .map_err(|error| format!("Failed to load checkout Agent definitions: {error}"))?;
+            app.state::<Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>()
+                .snapshot(scope.runtime().as_ref(), definitions.as_ref())
+                .await?
+        }
+        None => app.state::<Arc<ToolRegistry>>().inner().clone(),
+    };
+    let working_dir = workspace_scope
+        .as_ref()
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string())
+        .unwrap_or_default();
     let mut names = Vec::new();
     let mut seen = HashSet::new();
     for requested_name in requested {
@@ -785,6 +991,7 @@ impl SdkAgentSpec {
             id: self.id.clone(),
             name: self.name.clone(),
             description: self.description.clone(),
+            project_types: Vec::new(),
             system_prompt: self.system_prompt.clone(),
             env_template: String::new(),
             tools,
@@ -801,6 +1008,7 @@ impl SdkAgentSpec {
 async fn prepare_agent_spec(
     app: &AppHandle,
     mut spec: SdkAgentSpec,
+    workspace_ref: Option<&crate::workspace_service::WorkspaceRef>,
 ) -> Result<SdkAgentSpec, String> {
     spec.id = validate_agent_id(&spec.id)?;
     spec.name = spec.name.trim().to_string();
@@ -812,9 +1020,24 @@ async fn prepare_agent_spec(
     if spec.system_prompt.is_empty() {
         return Err("agentSpec.systemPrompt cannot be empty".to_string());
     }
-    spec.locus_tools = canonical_tool_names(app, spec.locus_tools).await?;
+    spec.locus_tools = canonical_tool_names(app, spec.locus_tools, workspace_ref).await?;
 
-    let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
+    let workspace_scope = workspace_ref
+        .map(|workspace_ref| resolve_sdk_workspace_scope(app, workspace_ref, "agentSpec"))
+        .transpose()?;
+    let registry = match workspace_scope.as_ref() {
+        Some(scope) => {
+            let definitions = app
+                .state::<Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>()
+                .snapshot(scope.runtime().as_ref())
+                .await
+                .map_err(|error| format!("Failed to load checkout Agent definitions: {error}"))?;
+            app.state::<Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>()
+                .snapshot(scope.runtime().as_ref(), definitions.as_ref())
+                .await?
+        }
+        None => app.state::<Arc<ToolRegistry>>().inner().clone(),
+    };
     let mut seen = spec.locus_tools.iter().cloned().collect::<HashSet<_>>();
     for tool in &mut spec.python_tools {
         tool.name = validate_python_tool_name(&tool.name)?;
@@ -1067,7 +1290,7 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
     }
     let agent_spec = match params.agent_spec.take() {
         Some(spec) => {
-            let spec = prepare_agent_spec(app, spec).await?;
+            let spec = prepare_agent_spec(app, spec, params.workspace_ref.as_ref()).await?;
             if spec.id != params.agent_id.trim() {
                 return Err("agentId must match agentSpec.id".to_string());
             }
@@ -1078,12 +1301,7 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
     let agent_id = if let Some(spec) = agent_spec.as_ref() {
         spec.id.clone()
     } else {
-        let agent_id = canonical_agent_id(params.agent_id.trim()).to_string();
-        let registry = app.state::<AgentDefRegistryState>();
-        if registry.0.read().await.get(&agent_id).is_none() {
-            return Err(format!("Unknown agent '{agent_id}'"));
-        }
-        agent_id
+        canonical_agent_id(params.agent_id.trim()).to_string()
     };
 
     let store = app.state::<Arc<SessionStore>>();
@@ -1106,6 +1324,7 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
 
     let launch = crate::commands::chat(
         nonempty(params.session_id),
+        params.workspace_ref,
         prompt.to_string(),
         None,
         nonempty(params.title),
@@ -1128,13 +1347,15 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
         app.clone(),
         app.state::<Arc<SessionStore>>(),
         app.state::<AgentDefRegistryState>(),
+        app.state::<Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>(),
         app.state::<Arc<crate::config::AppConfig>>(),
         app.state::<Arc<ToolRegistry>>(),
+        app.state::<Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>(),
         app.state::<Arc<tokio::sync::Mutex<crate::auth::AuthState>>>(),
         app.state::<ApiKeyState>(),
         app.state::<ProviderKeysState>(),
         app.state::<crate::commands::CodexAuthStateHandle>(),
-        app.state::<Arc<crate::workspace::Workspace>>(),
+        app.state::<Arc<crate::workspace_service::ProjectRegistry>>(),
         app.state::<RawContextStore>(),
         app.state::<ActiveTasks>(),
         app.state::<crate::commands::AppKnowledgeDir>(),
@@ -1275,36 +1496,476 @@ async fn answer_run(app: &AppHandle, params: AnswerParams) -> Result<Value, Stri
     Ok(json!({ "answered": true }))
 }
 
-async fn current_workspace(app: &AppHandle) -> (Option<String>, Option<String>) {
-    let workspace = app.state::<Arc<crate::workspace::Workspace>>();
-    let path = workspace.path.read().await.trim().to_string();
-    if path.is_empty() {
-        return (None, None);
-    }
-    let workspace_id = workspace.workspace_id.read().await.clone();
-    (Some(path), workspace_id)
+fn resolve_sdk_workspace_scope(
+    app: &AppHandle,
+    workspace_ref: &crate::workspace_service::WorkspaceRef,
+    operation: &str,
+) -> Result<crate::workspace_service::ResolvedWorkspaceScope, String> {
+    app.state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .resolve_workspace_ref(workspace_ref)
+        .map_err(|error| format!("{operation} workspace resolution failed: {error}"))
 }
 
-async fn workspace_snapshot(app: &AppHandle) -> Result<Value, String> {
-    let (path, workspace_id) = current_workspace(app).await;
-    let unity_connected = match path.as_deref() {
-        Some(path) => crate::unity_bridge::is_unity_connected(path).await,
-        None => false,
-    };
+async fn workspace_snapshot(
+    app: &AppHandle,
+    params: WorkspaceScopeParams,
+) -> Result<Value, String> {
+    let scope = resolve_sdk_workspace_scope(app, &params.workspace_ref, "workspace.get")?;
+    let runtime = scope.runtime();
+    let services = runtime.services().state_snapshots().await;
     Ok(json!({
-        "path": path,
-        "workspaceId": workspace_id,
-        "unityConnected": unity_connected,
+        "path": runtime.root().to_string_lossy(),
+        "projectId": runtime.project_id(),
+        "checkoutId": runtime.checkout_id(),
+        "workspaceGeneration": runtime.generation(),
+        "services": services,
     }))
 }
 
-async fn list_sdk_sessions(app: &AppHandle, params: ListSessionsParams) -> Result<Value, String> {
-    let (_, workspace_id) = current_workspace(app).await;
-    let store = app.state::<Arc<SessionStore>>();
-    let mut sessions = if params.archived {
-        store.list_archived_sessions(workspace_id.as_deref())?
+fn resolve_sdk_unity_runtime(
+    app: &AppHandle,
+    project: &str,
+    operation: &str,
+) -> Result<Arc<crate::workspace_service::WorkspaceRuntime>, String> {
+    let project = project.trim();
+    if project.is_empty() {
+        return Err(format!("{operation} requires a non-empty project path"));
+    }
+    let registry = app.state::<Arc<crate::workspace_service::ProjectRegistry>>();
+    let runtime = registry
+        .runtime_for_root(std::path::Path::new(project))
+        .ok_or_else(|| {
+            format!("{operation} project is not an active Locus workspace: {project}")
+        })?;
+    let resolved_project = runtime.root().to_string_lossy().to_string();
+    if !crate::unity_bridge::is_unity_project(&resolved_project) {
+        return Err(format!(
+            "{operation} requires an active Unity project: {resolved_project}"
+        ));
+    }
+    Ok(runtime)
+}
+
+fn resolve_sdk_unity_project(
+    app: &AppHandle,
+    project: &str,
+    operation: &str,
+) -> Result<String, String> {
+    resolve_sdk_unity_runtime(app, project, operation)
+        .map(|runtime| runtime.root().to_string_lossy().to_string())
+}
+
+fn unity_ensure_locks() -> &'static tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>
+{
+    static LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn unity_ensure_lock(checkout_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = unity_ensure_locks().lock().await;
+    Arc::clone(
+        locks
+            .entry(checkout_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
+
+async fn sdk_unity_editor_status(
+    runtime: &Arc<crate::workspace_service::WorkspaceRuntime>,
+) -> SdkUnityEditorStatus {
+    use crate::workspace_service::{ServiceKind, ServiceReadinessPhase};
+
+    let project_path = runtime.root().to_string_lossy().to_string();
+    let service = runtime.services().state_snapshot(ServiceKind::Unity).await;
+    let readiness = service
+        .as_ref()
+        .and_then(|snapshot| snapshot.readiness.clone());
+    let service_status = service.as_ref().map(|snapshot| snapshot.status);
+    // Keep the two pipe probes sequential. Running them concurrently makes
+    // one observer see the other's short-lived writer lock as channel busy.
+    let connection = crate::unity_bridge::query_unity_connection_status(&project_path).await;
+    let semantic = crate::unity_bridge::unity_semantic_state(&project_path).await;
+    let blocking_dialog = crate::unity_bridge::dialog::current_dialog(&project_path);
+
+    let process_state = match &connection.editor_process_state {
+        crate::unity_bridge::UnityEditorProcessState::Unknown => {
+            match semantic.process.state.as_str() {
+                "running" => crate::unity_bridge::UnityEditorProcessState::Running,
+                "not_running" => crate::unity_bridge::UnityEditorProcessState::NotRunning,
+                _ => crate::unity_bridge::UnityEditorProcessState::Unknown,
+            }
+        }
+        state => state.clone(),
+    };
+    let process_running = matches!(
+        process_state,
+        crate::unity_bridge::UnityEditorProcessState::Running
+    );
+    let channel_connected =
+        connection.connected || matches!(semantic.channel.control_pipe.as_str(), "ready" | "busy");
+    let service_connected = readiness.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.phase,
+            ServiceReadinessPhase::Connected
+                | ServiceReadinessPhase::Ready
+                | ServiceReadinessPhase::Reloading
+        )
+    });
+    let connected = channel_connected || (process_running && service_connected);
+    let main_thread_blocked = blocking_dialog.is_some()
+        || matches!(
+            semantic.main_thread.state.as_str(),
+            "blocked" | "hung" | "stalled"
+        );
+    let blocking_reason = if blocking_dialog.is_some() {
+        Some("modal_dialog".to_string())
+    } else if matches!(semantic.main_thread.state.as_str(), "hung" | "stalled") {
+        Some(semantic.main_thread.state.clone())
     } else {
-        store.list_sessions(workspace_id.as_deref())?
+        None
+    };
+    let blocking_dialog_recoverable = blocking_dialog
+        .as_ref()
+        .is_some_and(|dialog| !dialog.choices.is_empty());
+    let ready = process_running
+        && channel_connected
+        && semantic.safety.can_call_unity_api
+        && !main_thread_blocked;
+
+    SdkUnityEditorStatus {
+        project_path,
+        checkout_id: runtime.checkout_id().to_string(),
+        workspace_generation: runtime.generation(),
+        connected,
+        ready,
+        process_state,
+        process_id: connection.editor_process_id.or(semantic.process.pid),
+        editor_path: connection
+            .editor_process_path
+            .clone()
+            .or_else(|| semantic.process.path.clone()),
+        launch_mode: connection.launch_mode,
+        headless: connection.headless,
+        semantic_phase: semantic.phase.clone(),
+        main_thread_blocked,
+        blocking_reason,
+        main_thread: semantic.main_thread.clone(),
+        safety: semantic.safety.clone(),
+        blocking_dialog,
+        blocking_dialog_recoverable,
+        service_status,
+        readiness,
+        connection,
+        semantic,
+    }
+}
+
+async fn get_unity_editor_status(
+    app: &AppHandle,
+    params: UnityEditorStatusParams,
+) -> Result<Value, String> {
+    let runtime = resolve_sdk_unity_runtime(app, &params.project, "unity.editor.status")?;
+    serde_json::to_value(sdk_unity_editor_status(&runtime).await).map_err(|error| error.to_string())
+}
+
+async fn ensure_unity_editor(
+    app: &AppHandle,
+    params: EnsureUnityEditorParams,
+) -> Result<Value, String> {
+    use crate::workspace_service::ServiceKind;
+
+    let target = UnityEnsureTarget::parse(params.wait_until.as_deref())?;
+    let launch_mode = crate::unity_bridge::UnityLaunchMode::parse(params.mode.as_deref())?;
+    let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_UNITY_ENSURE_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_UNITY_ENSURE_TIMEOUT_MS {
+        return Err(format!(
+            "timeoutMs must be between 1 and {MAX_UNITY_ENSURE_TIMEOUT_MS}"
+        ));
+    }
+    let started_at = std::time::Instant::now();
+    let runtime = resolve_sdk_unity_runtime(app, &params.project, "unity.editor.ensure")?;
+    let checkout_id = runtime.checkout_id().to_string();
+    let ensure_lock = unity_ensure_lock(&checkout_id).await;
+    let _ensure_guard = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        ensure_lock.lock(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out after {timeout_ms}ms waiting for another Unity ensure operation in checkout {checkout_id}"
+        )
+    })?;
+
+    // Starting the checkout service establishes the monitor and readiness
+    // observer before a newly spawned editor begins connecting.
+    let registry = app.state::<Arc<crate::workspace_service::ProjectRegistry>>();
+    let execution = registry
+        .execution_context(runtime.checkout_id(), &[ServiceKind::Unity])
+        .await
+        .map_err(|error| format!("unity.editor.ensure could not start Unity service: {error}"))?;
+    let _service_binding = execution
+        .resolve_service(ServiceKind::Unity)
+        .map_err(|error| format!("unity.editor.ensure Unity service is unavailable: {error}"))?;
+
+    let initial_status = sdk_unity_editor_status(&runtime).await;
+    if matches!(
+        initial_status.process_state,
+        crate::unity_bridge::UnityEditorProcessState::Running
+    ) {
+        match (launch_mode, initial_status.launch_mode) {
+            (crate::unity_bridge::UnityLaunchMode::Headless, Some(mode))
+                if mode != crate::unity_bridge::UnityLaunchMode::Headless =>
+            {
+                return Err(
+                    "unity.editor.ensure requested headless mode, but this checkout is already open in an interactive editor"
+                        .to_string(),
+                );
+            }
+            (crate::unity_bridge::UnityLaunchMode::Headless, None) => {
+                return Err(
+                    "unity.editor.ensure cannot verify that the running editor is headless"
+                        .to_string(),
+                );
+            }
+            (crate::unity_bridge::UnityLaunchMode::Interactive, Some(mode))
+                if mode == crate::unity_bridge::UnityLaunchMode::Headless =>
+            {
+                return Err(
+                    "unity.editor.ensure requested interactive mode, but this checkout is already open headless"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    if initial_status.satisfies(target) {
+        return serde_json::to_value(SdkEnsureUnityEditorResult {
+            launched: false,
+            wait_until: target.as_str().to_string(),
+            waited_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            launch: None,
+            status: initial_status,
+        })
+        .map_err(|error| error.to_string());
+    }
+
+    let launch = match initial_status.process_state {
+        crate::unity_bridge::UnityEditorProcessState::Running => None,
+        crate::unity_bridge::UnityEditorProcessState::NotRunning => Some(
+            crate::unity_bridge::launch_project_with_mode(
+                &initial_status.project_path,
+                launch_mode,
+            )
+            .await
+            .map_err(|error| format!("unity.editor.ensure failed to launch Unity: {error}"))?,
+        ),
+        crate::unity_bridge::UnityEditorProcessState::Unknown => {
+            return Err(format!(
+                "unity.editor.ensure cannot safely launch while the Unity process state is unknown: {}",
+                initial_status
+                    .connection
+                    .process_last_error
+                    .as_deref()
+                    .or(initial_status.connection.last_error.as_deref())
+                    .unwrap_or("process probe returned no diagnostic")
+            ));
+        }
+    };
+    let launched = launch.is_some();
+
+    loop {
+        let status = sdk_unity_editor_status(&runtime).await;
+        if status.satisfies(target) {
+            return serde_json::to_value(SdkEnsureUnityEditorResult {
+                launched,
+                wait_until: target.as_str().to_string(),
+                waited_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                launch,
+                status,
+            })
+            .map_err(|error| error.to_string());
+        }
+
+        if matches!(
+            status.process_state,
+            crate::unity_bridge::UnityEditorProcessState::NotRunning
+        ) {
+            return Err(format!(
+                "Unity Editor exited before reaching '{}': phase={}, project={}",
+                target.as_str(),
+                status.semantic_phase,
+                status.project_path
+            ));
+        }
+
+        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+            return Err(format!(
+                "Timed out after {}ms waiting for Unity Editor to reach '{}': process={:?}, phase={}, channel={}, project={}",
+                timeout_ms,
+                target.as_str(),
+                status.process_state,
+                status.semantic_phase,
+                status.semantic.channel.control_pipe,
+                status.project_path
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(UNITY_ENSURE_POLL_INTERVAL_MS)).await;
+    }
+}
+
+async fn restart_unity_editor(
+    app: &AppHandle,
+    params: RestartUnityEditorParams,
+) -> Result<Value, String> {
+    use crate::workspace_service::ServiceKind;
+
+    let target = UnityEnsureTarget::parse(params.wait_until.as_deref())?;
+    let launch_mode = crate::unity_bridge::UnityLaunchMode::parse(params.mode.as_deref())?;
+    let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_UNITY_ENSURE_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_UNITY_ENSURE_TIMEOUT_MS {
+        return Err(format!(
+            "timeoutMs must be between 1 and {MAX_UNITY_ENSURE_TIMEOUT_MS}"
+        ));
+    }
+    let started_at = std::time::Instant::now();
+    let runtime = resolve_sdk_unity_runtime(app, &params.project, "unity.editor.restart")?;
+    let checkout_id = runtime.checkout_id().to_string();
+    let restart_lock = unity_ensure_lock(&checkout_id).await;
+    let _restart_guard = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        restart_lock.lock(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out after {timeout_ms}ms waiting for another Unity lifecycle operation in checkout {checkout_id}"
+        )
+    })?;
+
+    // Keep the workspace's Unity monitor alive throughout close and launch so
+    // the replacement process can immediately reconnect to the same checkout.
+    let registry = app.state::<Arc<crate::workspace_service::ProjectRegistry>>();
+    let execution = registry
+        .execution_context(runtime.checkout_id(), &[ServiceKind::Unity])
+        .await
+        .map_err(|error| format!("unity.editor.restart could not start Unity service: {error}"))?;
+    let _service_binding = execution
+        .resolve_service(ServiceKind::Unity)
+        .map_err(|error| format!("unity.editor.restart Unity service is unavailable: {error}"))?;
+
+    let project_path = runtime.root().to_string_lossy().to_string();
+    let close_timeout = Duration::from_millis(timeout_ms.min(60_000));
+    let close = if params.force {
+        crate::unity_bridge::force_close_current_project_unity_processes(
+            &project_path,
+            close_timeout,
+        )
+        .await
+    } else {
+        crate::unity_bridge::close_current_project_unity_processes(&project_path, close_timeout)
+            .await
+    }
+    .map_err(|error| format!("unity.editor.restart failed to close Unity: {error}"))?;
+
+    let launch = crate::unity_bridge::launch_project_with_mode(&project_path, launch_mode)
+        .await
+        .map_err(|error| format!("unity.editor.restart failed to launch Unity: {error}"))?;
+
+    loop {
+        let status = sdk_unity_editor_status(&runtime).await;
+        if status.satisfies(target) {
+            return serde_json::to_value(SdkRestartUnityEditorResult {
+                closed_process_ids: close.process_ids,
+                forced_process_ids: close.forced_process_ids,
+                wait_until: target.as_str().to_string(),
+                waited_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                launch,
+                status,
+            })
+            .map_err(|error| error.to_string());
+        }
+
+        if matches!(
+            status.process_state,
+            crate::unity_bridge::UnityEditorProcessState::NotRunning
+        ) {
+            return Err(format!(
+                "Restarted Unity Editor exited before reaching '{}': phase={}, project={}",
+                target.as_str(),
+                status.semantic_phase,
+                status.project_path
+            ));
+        }
+
+        if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
+            return Err(format!(
+                "Timed out after {}ms waiting for restarted Unity Editor to reach '{}': process={:?}, phase={}, channel={}, project={}",
+                timeout_ms,
+                target.as_str(),
+                status.process_state,
+                status.semantic_phase,
+                status.semantic.channel.control_pipe,
+                status.project_path
+            ));
+        }
+
+        tokio::time::sleep(Duration::from_millis(UNITY_ENSURE_POLL_INTERVAL_MS)).await;
+    }
+}
+
+async fn get_unity_dialog(app: &AppHandle, params: UnityDialogParams) -> Result<Value, String> {
+    let project = resolve_sdk_unity_project(app, &params.project, "unity.dialog.get")?;
+    crate::unity_bridge::dialog::ensure_project_observed(&project).await?;
+    serde_json::to_value(crate::unity_bridge::dialog::current_dialog(&project))
+        .map_err(|error| error.to_string())
+}
+
+async fn choose_unity_dialog(
+    app: &AppHandle,
+    params: ChooseUnityDialogParams,
+) -> Result<Value, String> {
+    let project = resolve_sdk_unity_project(app, &params.project, "unity.dialog.choose")?;
+    let dialog_id = params.dialog_id.trim();
+    let choice_id = params.choice_id.trim();
+    if dialog_id.is_empty() {
+        return Err("unity.dialog.choose requires dialogId".to_string());
+    }
+    if choice_id.is_empty() {
+        return Err("unity.dialog.choose requires choiceId".to_string());
+    }
+    let result = crate::unity_bridge::dialog::choose_dialog(&project, dialog_id, choice_id).await?;
+    serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+async fn wait_unity_execution(
+    app: &AppHandle,
+    params: WaitUnityExecutionParams,
+) -> Result<Value, String> {
+    let project = resolve_sdk_unity_project(app, &params.project, "unity.execution.wait")?;
+    let execution_id = params.execution_id.trim();
+    if execution_id.is_empty() {
+        return Err("unity.execution.wait requires executionId".to_string());
+    }
+    let output = crate::unity_bridge::wait_unity_execution(&project, execution_id).await?;
+    Ok(Value::String(output))
+}
+
+async fn list_sdk_sessions(app: &AppHandle, params: ListSessionsParams) -> Result<Value, String> {
+    let store = app.state::<Arc<SessionStore>>();
+    let mut sessions = match params.workspace_ref.as_ref() {
+        Some(workspace_ref) => {
+            let scope = resolve_sdk_workspace_scope(app, workspace_ref, "sessions.list")?;
+            if params.archived {
+                store.list_archived_sessions_for_checkout(scope.runtime().checkout_id().as_str())?
+            } else {
+                store.list_sessions_for_checkout(scope.runtime().checkout_id().as_str())?
+            }
+        }
+        None if params.archived => store.list_archived_sessions(None)?,
+        None => store.list_sessions(None)?,
     };
     if let Some(limit) = params.limit {
         sessions.truncate(limit.clamp(1, 1_000) as usize);
@@ -1353,7 +2014,11 @@ fn direct_tool_result(
     })
 }
 
-async fn call_knowledge_query(app: &AppHandle, arguments: &Value) -> ToolResult {
+async fn call_knowledge_query(
+    app: &AppHandle,
+    workspace_ref: crate::workspace_service::WorkspaceRef,
+    arguments: &Value,
+) -> ToolResult {
     let string_arg = |name: &str| {
         arguments
             .get(name)
@@ -1366,17 +2031,28 @@ async fn call_knowledge_query(app: &AppHandle, arguments: &Value) -> ToolResult 
         .get("limit")
         .and_then(Value::as_u64)
         .map(|value| value.clamp(1, 20) as usize);
+    let types = arguments
+        .get("types")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        });
     match crate::commands::knowledge_query(
-        None,
+        workspace_ref,
+        string_arg("query"),
         string_arg("lexicalQuery"),
         string_arg("semanticQuery"),
         limit,
-        None,
+        types,
         string_arg("pathPrefix"),
         Some(false),
-        app.state::<Arc<crate::workspace::Workspace>>(),
+        app.clone(),
+        app.state::<Arc<crate::workspace_service::ProjectRegistry>>(),
         app.state::<crate::commands::AppKnowledgeDir>(),
-        app.state::<Arc<crate::knowledge_index::KnowledgeIndexState>>(),
     )
     .await
     {
@@ -1391,15 +2067,21 @@ async fn call_knowledge_query(app: &AppHandle, arguments: &Value) -> ToolResult 
     }
 }
 
-fn call_config_query(app: &AppHandle, arguments: &Value) -> ToolResult {
+fn call_config_query(
+    app: &AppHandle,
+    arguments: &Value,
+    workspace_scope: Option<&crate::workspace_service::ResolvedWorkspaceScope>,
+) -> ToolResult {
     let category = arguments
         .get("category")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let entries = match category {
-        Some(category) => crate::config_registry::collect_by_category(app, category),
-        None => crate::config_registry::collect_all(app),
+        Some(category) => {
+            crate::config_registry::collect_by_category(app, category, workspace_scope)
+        }
+        None => crate::config_registry::collect_all(app, workspace_scope),
     };
     match entries {
         Ok(entries) => ToolResult {
@@ -1421,20 +2103,40 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     if name.is_empty() {
         return Err("name cannot be empty".to_string());
     }
-    let canonical = canonical_tool_names(app, vec![name.to_string()])
-        .await?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "name cannot be empty".to_string())?;
+    let timeout_ms = params
+        .timeout_ms
+        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
+        .clamp(1_000, MAX_TOOL_TIMEOUT_MS);
+    let workspace_scope = params
+        .workspace_ref
+        .as_ref()
+        .map(|workspace_ref| resolve_sdk_workspace_scope(app, workspace_ref, "tools.call"))
+        .transpose()?;
+    let working_dir = workspace_scope
+        .as_ref()
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string());
+    let registry = match workspace_scope.as_ref() {
+        Some(scope) => {
+            let definitions = app
+                .state::<Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>()
+                .snapshot(scope.runtime().as_ref())
+                .await
+                .map_err(|error| format!("Failed to load checkout Agent definitions: {error}"))?;
+            app.state::<Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>()
+                .snapshot(scope.runtime().as_ref(), definitions.as_ref())
+                .await?
+        }
+        None => app.state::<Arc<ToolRegistry>>().inner().clone(),
+    };
+    let canonical = registry
+        .canonical_name(name)
+        .or_else(|| crate::mcp::manager::resolve_wire_tool(name).map(|tool| tool.wire_name))
+        .ok_or_else(|| format!("Unknown Locus tool '{name}'"))?;
     if is_agent_only_tool(&canonical) {
         return Err(format!(
             "Tool '{canonical}' requires an active Agent run and cannot be called directly"
         ));
     }
-    let timeout_ms = params
-        .timeout_ms
-        .unwrap_or(DEFAULT_TOOL_TIMEOUT_MS)
-        .clamp(1_000, MAX_TOOL_TIMEOUT_MS);
 
     if canonical.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX) {
         let outcome = tokio::time::timeout(
@@ -1468,12 +2170,21 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     }
 
     if crate::mcp::server::tools::EXPOSED_TOOLS.contains(&canonical.as_str()) {
+        if workspace_scope.is_none() {
+            return Err(format!(
+                "Tool '{canonical}' requires workspaceRef with a live checkout generation"
+            ));
+        }
         let outcome = crate::mcp::server::tools::execute_tool(
             app.clone(),
             canonical.clone(),
             params.arguments,
             timeout_ms,
             Arc::new(ToolRuntimeState::default()),
+            workspace_scope
+                .as_ref()
+                .expect("workspace scope is required above")
+                .workspace_ref(),
         )
         .await;
         let images = outcome
@@ -1490,11 +2201,17 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         ));
     }
 
-    let (working_dir, _) = current_workspace(app).await;
     if canonical == "knowledge_query" {
+        let workspace_ref = workspace_scope
+            .as_ref()
+            .map(|scope| scope.workspace_ref())
+            .ok_or_else(|| {
+                "Tool 'knowledge_query' requires workspaceRef with a live checkout generation"
+                    .to_string()
+            })?;
         let result = tokio::time::timeout(
             Duration::from_millis(timeout_ms),
-            call_knowledge_query(app, &params.arguments),
+            call_knowledge_query(app, workspace_ref, &params.arguments),
         )
         .await
         .unwrap_or_else(|_| ToolResult {
@@ -1510,7 +2227,7 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         ));
     }
     if canonical == "config_query" {
-        let result = call_config_query(app, &params.arguments);
+        let result = call_config_query(app, &params.arguments, workspace_scope.as_ref());
         return Ok(direct_tool_result(
             &canonical,
             result.output,
@@ -1519,6 +2236,18 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
             working_dir,
         ));
     }
+    if workspace_scope.is_none() {
+        return Err(format!(
+            "Tool '{canonical}' requires workspaceRef with a live checkout generation"
+        ));
+    }
+    let workspace_event_scope = crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+        workspace_scope
+            .as_ref()
+            .expect("workspace scope is required above")
+            .runtime()
+            .as_ref(),
+    );
     let unity_connected = if canonical == "read"
         && params
             .arguments
@@ -1533,8 +2262,17 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     } else {
         None
     };
+    let execution = match working_dir.as_deref() {
+        Some(working_dir) => Some(
+            app.state::<Arc<crate::workspace_service::ProjectRegistry>>()
+                .tool_execution_context(std::path::Path::new(working_dir), &canonical)
+                .await?,
+        ),
+        None => None,
+    };
     let context = ToolExecutionContext {
         app_handle: Some(app.clone()),
+        execution,
         working_dir: working_dir.clone(),
         process_owner: Some(crate::process_util::ProcessOwner {
             working_dir: working_dir.clone(),
@@ -1547,7 +2285,6 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         output: None,
         background: false,
     };
-    let registry = app.state::<Arc<ToolRegistry>>().inner().clone();
     let lock_request = if matches!(canonical.as_str(), "write" | "edit") {
         Some(
             params
@@ -1572,6 +2309,10 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
             &params.arguments,
         )
         .then_some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
+    } else if canonical == "python" {
+        (!crate::tool::builtins::python_is_readonly(&params.arguments)).then_some(
+            crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
+        )
     } else if canonical == "unity_execute" {
         (!crate::agent::instance::AgentInstance::unity_execute_is_readonly(&params.arguments))
             .then_some(
@@ -1597,7 +2338,13 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
             match crate::agent::workspace_execution_lock::process_workspace_execution_lock(
                 &owner.workspace,
             )
-            .acquire_with_diagnostics(request, owner, lock_cancel_rx, &app)
+            .acquire_with_diagnostics(
+                request,
+                owner,
+                lock_cancel_rx,
+                workspace_event_scope,
+                &app,
+            )
             .await
             {
                 Ok(guard) => Some(guard),
@@ -1639,9 +2386,22 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
         "agents.list" => list_agents(app).await,
         "agents.prompt" => prompt_agent(app, parse_params(params)?).await,
         "models.list" => list_models(app, parse_params(params)?).await,
-        "tools.list" => list_tools(app).await,
+        "tools.list" => {
+            let params = if params.is_null() {
+                ListToolsParams::default()
+            } else {
+                parse_params(params)?
+            };
+            list_tools(app, params).await
+        }
         "tools.call" => call_tool(app, parse_params(params)?).await,
-        "workspace.get" => workspace_snapshot(app).await,
+        "workspace.get" => workspace_snapshot(app, parse_params(params)?).await,
+        "unity.editor.status" => get_unity_editor_status(app, parse_params(params)?).await,
+        "unity.editor.ensure" => ensure_unity_editor(app, parse_params(params)?).await,
+        "unity.editor.restart" => restart_unity_editor(app, parse_params(params)?).await,
+        "unity.dialog.get" => get_unity_dialog(app, parse_params(params)?).await,
+        "unity.dialog.choose" => choose_unity_dialog(app, parse_params(params)?).await,
+        "unity.execution.wait" => wait_unity_execution(app, parse_params(params)?).await,
         "sessions.list" => list_sdk_sessions(app, parse_params(params)?).await,
         "sessions.get" => get_sdk_session(app, parse_params(params)?),
         "sessions.events" => list_sdk_session_events(app, parse_params(params)?),
@@ -1790,7 +2550,7 @@ pub async fn start(app: AppHandle) -> Result<SocketAddr, String> {
 mod tests {
     use super::{
         host_allowed, is_agent_only_tool, token_matches, validate_agent_id, ListModelsParams,
-        CODEX_FALLBACK_MODELS, STATIC_MODELS,
+        UnityEnsureTarget, CODEX_FALLBACK_MODELS, STATIC_MODELS,
     };
 
     #[test]
@@ -1826,6 +2586,23 @@ mod tests {
     fn model_listing_defaults_to_available_rows() {
         let params: ListModelsParams = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(params.available_only);
+    }
+
+    #[test]
+    fn unity_ensure_target_defaults_to_ready_and_rejects_unknown_values() {
+        assert_eq!(
+            UnityEnsureTarget::parse(None).unwrap(),
+            UnityEnsureTarget::Ready
+        );
+        assert_eq!(
+            UnityEnsureTarget::parse(Some("process")).unwrap(),
+            UnityEnsureTarget::Process
+        );
+        assert_eq!(
+            UnityEnsureTarget::parse(Some("connected")).unwrap(),
+            UnityEnsureTarget::Connected
+        );
+        assert!(UnityEnsureTarget::parse(Some("running")).is_err());
     }
 
     #[test]

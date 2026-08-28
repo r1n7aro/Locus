@@ -1,4 +1,5 @@
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import type { WorkspaceRef } from "./project";
 import { viewOpenInspectorTab } from "./view";
 
 export const LOCUS_ASSET_INSPECTOR_WINDOW_TITLE = "Locus Inspector";
@@ -124,6 +125,7 @@ export function locusAssetInspectorTabTitle(
  * to an already-open host window, and only then creates a new window.
  */
 export async function openLocusAssetInspectorWindow(
+  workspaceRef: WorkspaceRef,
   payload: LocusAssetInspectorWindowPayload,
 ): Promise<boolean> {
   if (!hasTauriWindowRuntime()) return false;
@@ -131,6 +133,6 @@ export async function openLocusAssetInspectorWindow(
   const nextPayload = normalizeLocusAssetInspectorPayload(payload);
   if (!isValidLocusAssetInspectorPayload(nextPayload)) return false;
 
-  await viewOpenInspectorTab({ tabId: buildLocusAssetInspectorTabId(nextPayload) });
+  await viewOpenInspectorTab(workspaceRef, { tabId: buildLocusAssetInspectorTabId(nextPayload) });
   return true;
 }

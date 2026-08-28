@@ -1,6 +1,7 @@
 import type { LexicalRebuildStatus } from "../types";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import type { WorkspaceRef } from "./project";
 
 export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL = "knowledge-lexical-progress";
 export const KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_PATH = "/knowledge-lexical-progress";
@@ -16,15 +17,31 @@ export function isKnowledgeLexicalProgressWindowLocation(
     || locationLike.search.includes(`${KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_FLAG}=1`);
 }
 
-export function buildKnowledgeLexicalProgressWindowQuery(): string {
+export function buildKnowledgeLexicalProgressWindowQuery(workspaceRef?: WorkspaceRef): string {
   const params = new URLSearchParams({
     [KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_FLAG]: "1",
   });
+  if (workspaceRef) {
+    params.set("checkoutId", workspaceRef.checkoutId);
+    params.set("workspaceGeneration", String(requireWindowGeneration(workspaceRef)));
+  }
   return params.toString();
 }
 
 export function buildKnowledgeLexicalProgressWindowUrl(): string {
   return buildSubWindowUrl(buildKnowledgeLexicalProgressWindowQuery());
+}
+
+export function getKnowledgeLexicalProgressWindowWorkspaceRef(
+  search = window.location.search,
+): (WorkspaceRef & { expectedGeneration: number }) | null {
+  const params = new URLSearchParams(search);
+  const checkoutId = params.get("checkoutId")?.trim() ?? "";
+  const generationText = params.get("workspaceGeneration") ?? "";
+  if (!checkoutId || !/^\d+$/.test(generationText)) return null;
+  const expectedGeneration = Number(generationText);
+  if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) return null;
+  return { checkoutId, expectedGeneration };
 }
 
 export function shouldAutoOpenKnowledgeLexicalProgressWindow(
@@ -44,11 +61,12 @@ export function getKnowledgeLexicalProgressRunKey(
 }
 
 export async function openKnowledgeLexicalProgressWindow(
+  workspaceRef: WorkspaceRef,
   _status?: LexicalRebuildStatus | null,
 ): Promise<void> {
   if (!hasTauriWindowRuntime()) return;
   await openSubWindow({
-    kind: KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL,
+    kind: `${KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_LABEL}-${workspaceWindowScope(workspaceRef)}`,
     title: KNOWLEDGE_LEXICAL_PROGRESS_WINDOW_TITLE,
     width: 560,
     height: 420,
@@ -58,5 +76,20 @@ export async function openKnowledgeLexicalProgressWindow(
     maximizable: false,
     minimizable: false,
     focusExisting: false,
-  }, buildKnowledgeLexicalProgressWindowQuery());
+  }, buildKnowledgeLexicalProgressWindowQuery(workspaceRef));
+}
+
+function workspaceWindowScope(workspaceRef: WorkspaceRef): string {
+  const checkoutToken = Array.from(new TextEncoder().encode(workspaceRef.checkoutId))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return `${checkoutToken}-g${requireWindowGeneration(workspaceRef)}`;
+}
+
+function requireWindowGeneration(workspaceRef: WorkspaceRef): number {
+  const generation = workspaceRef.expectedGeneration;
+  if (!Number.isSafeInteger(generation) || Number(generation) < 0) {
+    throw new Error("Lexical progress windows require an exact workspace generation.");
+  }
+  return Number(generation);
 }

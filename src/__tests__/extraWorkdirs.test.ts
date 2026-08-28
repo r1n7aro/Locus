@@ -27,6 +27,8 @@ describe("extra workdirs (additional working directories)", () => {
     expect(rustCommands).toContain("pub async fn extra_workdirs_get");
     expect(rustCommands).toContain("pub async fn extra_workdirs_set");
     expect(rustCommands).toContain("pub async fn extra_workdirs_map");
+    expect(rustCommands).toContain("workspace_ref: WorkspaceRef");
+    expect(rustCommands).toContain("resolve_workspace_ref(workspace_ref)");
     expect(rustApp).toContain("commands::extra_workdirs_get");
     expect(rustApp).toContain("commands::extra_workdirs_set");
     expect(rustApp).toContain("commands::extra_workdirs_map");
@@ -34,6 +36,7 @@ describe("extra workdirs (additional working directories)", () => {
     expect(service).toContain('ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_get"');
     expect(service).toContain('ipcInvoke<ExtraWorkdirStatus[]>("extra_workdirs_set"');
     expect(service).toContain('ipcInvoke<Record<string, ExtraWorkdirStatus[]>>("extra_workdirs_map"');
+    expect(service).toContain("workspaceRef: WorkspaceRef");
     expect(rustCore).toContain("pub read_only: bool");
     expect(rustCore).toContain("#[serde(default)]");
     expect(service).toContain("readOnly: boolean");
@@ -50,14 +53,17 @@ describe("extra workdirs (additional working directories)", () => {
     expect(instance).toContain('"extra_workdirs" => (0, usize::MAX)');
   });
 
-  it("offers configuration from the workspace dropdown context menu and shows attachments inline", () => {
+  it("offers checkout-scoped configuration from Collaboration checkout nodes", () => {
     const app = read("src/App.vue");
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const windowService = read("src/services/extraWorkdirsWindow.ts");
 
-    expect(app).toContain("configureContextRecentDirExtraWorkdirs");
-    expect(app).toContain('t("app.dir.configureExtraWorkdirs")');
-    expect(app).toContain('class="dir-item-extras"');
-    expect(app).toContain("extraWorkdirsFor(dir)");
-    expect(app).toContain('t("extraWorkdirs.missingBadge")');
+    expect(workbench).toContain("configureCheckoutExtraWorkdirs");
+    expect(workbench).toContain('t("app.dir.configureExtraWorkdirs")');
+    expect(workbench).toContain("workspaceRef:");
+    expect(workbench).toContain("expectedGeneration: runtime.workspaceGeneration");
+    expect(windowService).toContain("workspaceRef: WorkspaceRef");
+    expect(windowService).toContain("workspaceGeneration");
     expect(app).toContain('<ExtraWorkdirsConfigWindow v-else-if="isExtraWorkdirsWindow" />');
     expect(app).toContain("listenExtraWorkdirsUpdated");
   });
@@ -67,9 +73,10 @@ describe("extra workdirs (additional working directories)", () => {
 
     expect(store).toContain("async function checkCurrentExtraWorkdirs()");
     expect(store).toContain('t("app.dir.extraWorkdirsMissing"');
-    // Both open paths run the check: restoring the last workspace at startup
-    // (loadWorkingDir) and switching workspaces (setWorkingDir).
-    expect(occurrences(store, "void checkCurrentExtraWorkdirs();")).toBeGreaterThanOrEqual(2);
+    expect(store).toContain("workspaceContextStore.focusedWorkspaceRef");
+    expect(store).toContain("extraWorkdirsGet(workspaceRef)");
+    expect(store).toContain("void checkCurrentExtraWorkdirs();");
+    expect(store).toContain("await checkCurrentExtraWorkdirs();");
   });
 
   it("honors attached directories in the file-tool workspace boundary", () => {
@@ -84,13 +91,13 @@ describe("extra workdirs (additional working directories)", () => {
   });
 
   it("configures and surfaces read-only attachment state", () => {
-    const app = read("src/App.vue");
     const window = read("src/components/ExtraWorkdirsConfigWindow.vue");
 
     expect(window).toContain('import BaseCheckbox from "./ui/BaseCheckbox.vue"');
     expect(window).toContain(':model-value="entry.readOnly"');
     expect(window).toContain("readOnly: entry.readOnly");
-    expect(app).toContain('v-if="extra.readOnly" class="dir-extra-readonly"');
+    expect(window).toContain("extraWorkdirsSet(");
+    expect(window).toContain("workspaceRef.value");
   });
 
   it("guards the config window against stale loads and pre-listener payloads", () => {

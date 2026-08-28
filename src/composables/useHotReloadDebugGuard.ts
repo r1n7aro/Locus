@@ -4,6 +4,7 @@ import {
   unityHotReloadSetCodeOptimization,
   unityHotReloadSetPlayModeReload,
 } from "../services/csharpLsp";
+import type { WorkspaceRef } from "../services/project";
 import { normalizeAppError } from "../services/errors";
 
 /**
@@ -20,7 +21,10 @@ import { normalizeAppError } from "../services/errors";
  *
  * `enable` is the caller's own "turn it on" routine; it runs unconditionally.
  */
-export function useHotReloadDebugGuard(enable: () => Promise<void>) {
+export function useHotReloadDebugGuard(
+  workspaceRef: () => WorkspaceRef | null,
+  enable: () => Promise<void>,
+) {
   const codeOptimization = ref<string | null>(null);
   const switching = ref(false);
   const switchError = ref("");
@@ -37,8 +41,14 @@ export function useHotReloadDebugGuard(enable: () => Promise<void>) {
   const isRelease = computed(() => codeOptimization.value === "release");
 
   async function refreshOptimization() {
+    const scope = workspaceRef();
+    if (!scope) {
+      codeOptimization.value = null;
+      domainReloadOnPlay.value = null;
+      return;
+    }
     try {
-      const preflight = await unityHotReloadPreflight();
+      const preflight = await unityHotReloadPreflight(scope);
       codeOptimization.value = preflight.codeOptimization;
       domainReloadOnPlay.value = preflight.domainReloadOnPlay;
     } catch {
@@ -51,10 +61,12 @@ export function useHotReloadDebugGuard(enable: () => Promise<void>) {
    * real EditorSettings state (the editor stays authoritative). */
   async function setPlayModeReload(domainReload: boolean) {
     if (settingPlayModeReload.value) return;
+    const scope = workspaceRef();
+    if (!scope) return;
     settingPlayModeReload.value = true;
     playModeReloadError.value = "";
     try {
-      const result = await unityHotReloadSetPlayModeReload(domainReload);
+      const result = await unityHotReloadSetPlayModeReload(domainReload, scope);
       domainReloadOnPlay.value = result.domainReloadOnPlay;
     } catch (error) {
       playModeReloadError.value = normalizeAppError(error).message;
@@ -74,10 +86,12 @@ export function useHotReloadDebugGuard(enable: () => Promise<void>) {
    * Triggers a Unity recompile; on failure we re-read the real state. */
   async function setOptimization(level: "debug" | "release") {
     if (switching.value) return;
+    const scope = workspaceRef();
+    if (!scope) return;
     switching.value = true;
     switchError.value = "";
     try {
-      const result = await unityHotReloadSetCodeOptimization(level);
+      const result = await unityHotReloadSetCodeOptimization(level, scope);
       codeOptimization.value = result.codeOptimization;
     } catch (error) {
       switchError.value = normalizeAppError(error).message;

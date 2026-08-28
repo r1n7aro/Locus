@@ -13,6 +13,7 @@ use crate::commands::{self, KnowledgeChangedTarget};
 use crate::knowledge_index::KnowledgeIndexState;
 use crate::knowledge_source_registry::{KnowledgeSourceKind, KnowledgeSourceRegistry};
 use crate::knowledge_store::KnowledgeType;
+use crate::workspace_service::event::WorkspaceEventScope;
 
 const WATCHER_BATCH_WINDOW_MS: u64 = 180;
 const WATCHER_IDLE_POLL_MS: u64 = 250;
@@ -167,6 +168,7 @@ impl KnowledgeFsWatcher {
     pub fn start(
         app_handle: AppHandle,
         working_dir: String,
+        event_scope: WorkspaceEventScope,
         app_knowledge_dir: Option<PathBuf>,
         knowledge_index_state: Arc<KnowledgeIndexState>,
     ) -> Result<Self, String> {
@@ -200,6 +202,7 @@ impl KnowledgeFsWatcher {
                     worker_stop,
                     app_handle,
                     working_dir,
+                    event_scope,
                     knowledge_index_state,
                     roots,
                 );
@@ -301,6 +304,7 @@ fn watcher_loop(
     stop: Arc<AtomicBool>,
     app_handle: AppHandle,
     working_dir: String,
+    event_scope: WorkspaceEventScope,
     knowledge_index_state: Arc<KnowledgeIndexState>,
     roots: Vec<WatchedKnowledgeRoot>,
 ) {
@@ -333,6 +337,7 @@ fn watcher_loop(
 
         if let Err(error) = tauri::async_runtime::block_on(process_batch_changes(
             &app_handle,
+            &event_scope,
             &working_dir,
             knowledge_index_state.clone(),
             changes,
@@ -609,6 +614,7 @@ fn parent_directory(path: &str) -> Option<String> {
 
 async fn process_batch_changes(
     app_handle: &AppHandle,
+    event_scope: &WorkspaceEventScope,
     working_dir: &str,
     knowledge_index_state: Arc<KnowledgeIndexState>,
     changes: Vec<ResolvedKnowledgeChange>,
@@ -618,8 +624,9 @@ async fn process_batch_changes(
         .any(ResolvedKnowledgeChange::requires_full_reconcile)
     {
         crate::commands::invalidate_external_skill_cache();
-        commands::reconcile_and_emit_knowledge_changed(
+        commands::reconcile_and_emit_knowledge_changed_for_scope(
             app_handle,
+            event_scope,
             working_dir,
             knowledge_index_state,
             "knowledge_fs_watcher",
@@ -627,7 +634,7 @@ async fn process_batch_changes(
         .await
         .map_err(|error| error.to_string())?;
         for change in &changes {
-            emit_change_event(app_handle, working_dir, change);
+            emit_change_event(app_handle, event_scope, working_dir, change);
         }
         return Ok(());
     }
@@ -647,8 +654,9 @@ async fn process_batch_changes(
             }
             ResolvedKnowledgeChange::Directory { doc_type, path, .. } => {
                 if path.trim().is_empty() {
-                    commands::reconcile_and_emit_knowledge_changed(
+                    commands::reconcile_and_emit_knowledge_changed_for_scope(
                         app_handle,
+                        event_scope,
                         working_dir,
                         knowledge_index_state.clone(),
                         "knowledge_fs_watcher",
@@ -669,12 +677,17 @@ async fn process_batch_changes(
             }
         }
 
-        emit_change_event(app_handle, working_dir, &change);
+        emit_change_event(app_handle, event_scope, working_dir, &change);
     }
     Ok(())
 }
 
-fn emit_change_event(app_handle: &AppHandle, working_dir: &str, change: &ResolvedKnowledgeChange) {
+fn emit_change_event(
+    app_handle: &AppHandle,
+    event_scope: &WorkspaceEventScope,
+    working_dir: &str,
+    change: &ResolvedKnowledgeChange,
+) {
     let target = match change {
         ResolvedKnowledgeChange::Document {
             doc_type,
@@ -706,8 +719,9 @@ fn emit_change_event(app_handle: &AppHandle, working_dir: &str, change: &Resolve
             subtree: *subtree,
         },
     };
-    commands::emit_knowledge_changed_with_target(
+    commands::emit_knowledge_changed_with_target_for_scope(
         app_handle,
+        event_scope,
         working_dir,
         "knowledge_fs_watcher",
         target,

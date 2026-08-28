@@ -335,7 +335,9 @@ async function popOutToWindow() {
     ? { kind: "sceneObject", scenePath: target.scenePath, objectPath: target.objectPath }
     : { assetPath: target.path };
   try {
-    const opened = await openLocusAssetInspectorWindow(payload);
+    const workspaceRef = state.workspaceRef;
+    if (!workspaceRef) return;
+    const opened = await openLocusAssetInspectorWindow(workspaceRef, payload);
     if (opened) closePanel();
   } catch (error) {
     console.warn("[LocusAssetInspectorPanel] pop out failed:", error);

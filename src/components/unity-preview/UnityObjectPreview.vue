@@ -7,6 +7,7 @@ import {
   readWorkspaceAssetPreviewFrameCache,
   renderWorkspaceAssetPreviewFrame,
 } from "../../services/asset";
+import type { WorkspaceRef } from "../../services/project";
 
 type WorkspaceAssetThumbnail = Awaited<ReturnType<typeof previewWorkspaceAssetThumbnail>>;
 type WorkspaceAssetPreviewFrame = Awaited<ReturnType<typeof renderWorkspaceAssetPreviewFrame>>;
@@ -38,6 +39,12 @@ function normalizedPreviewCacheKey(value: string): string {
   return value.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
 }
 
+function scopedPreviewCacheKey(path: string, workspaceRef: WorkspaceRef): string {
+  const checkout = workspaceRef.checkoutId;
+  const generation = workspaceRef.expectedGeneration ?? "current";
+  return `${checkout}:${generation}\u0000${normalizedPreviewCacheKey(path)}`;
+}
+
 function normalizedPreviewStateKey(value: string | undefined): string {
   return (value ?? "").trim();
 }
@@ -65,13 +72,17 @@ function rememberUnityObjectPreviewExpandedState(stateKey: string | undefined, e
   }
 }
 
-function loadWorkspaceAssetPreviewCached(path: string): ReturnType<typeof previewWorkspaceAsset> {
-  const key = normalizedPreviewCacheKey(path);
+function loadWorkspaceAssetPreviewCached(
+  path: string,
+  workspaceRef: WorkspaceRef,
+): ReturnType<typeof previewWorkspaceAsset> {
+  const assetPath = normalizedPreviewCacheKey(path);
+  const key = scopedPreviewCacheKey(assetPath, workspaceRef);
   const cached = workspacePreviewPayloadCache.get(key);
   if (cached?.payload) return Promise.resolve(cached.payload);
   if (cached?.promise) return cached.promise;
 
-  const promise = previewWorkspaceAsset(key)
+  const promise = previewWorkspaceAsset(assetPath, undefined, workspaceRef)
     .then((payload) => {
       workspacePreviewPayloadCache.set(key, { payload });
       return payload;
@@ -86,13 +97,15 @@ function loadWorkspaceAssetPreviewCached(path: string): ReturnType<typeof previe
 
 function loadWorkspaceAssetThumbnailCached(
   path: string,
+  workspaceRef: WorkspaceRef,
 ): ReturnType<typeof previewWorkspaceAssetThumbnail> {
-  const key = normalizedPreviewCacheKey(path);
+  const assetPath = normalizedPreviewCacheKey(path);
+  const key = scopedPreviewCacheKey(assetPath, workspaceRef);
   const cached = workspaceAssetThumbnailCache.get(key);
   if (cached?.thumbnail) return Promise.resolve(cached.thumbnail);
   if (cached?.promise) return cached.promise;
 
-  const promise = previewWorkspaceAssetThumbnail(key)
+  const promise = previewWorkspaceAssetThumbnail(assetPath, workspaceRef)
     .then((thumbnail) => {
       workspaceAssetThumbnailCache.set(key, { thumbnail });
       return thumbnail;
@@ -107,13 +120,15 @@ function loadWorkspaceAssetThumbnailCached(
 
 function loadWorkspaceAssetPreviewFrameCacheCached(
   path: string,
+  workspaceRef: WorkspaceRef,
 ): ReturnType<typeof readWorkspaceAssetPreviewFrameCache> {
-  const key = normalizedPreviewCacheKey(path);
+  const assetPath = normalizedPreviewCacheKey(path);
+  const key = scopedPreviewCacheKey(assetPath, workspaceRef);
   const cached = workspaceAssetPreviewFrameCache.get(key);
   if (cached && "frame" in cached) return Promise.resolve(cached.frame ?? null);
   if (cached?.promise) return cached.promise;
 
-  const promise = readWorkspaceAssetPreviewFrameCache(key)
+  const promise = readWorkspaceAssetPreviewFrameCache(assetPath, workspaceRef)
     .then((frame) => {
       workspaceAssetPreviewFrameCache.set(key, { frame });
       return frame;
@@ -126,20 +141,25 @@ function loadWorkspaceAssetPreviewFrameCacheCached(
   return promise;
 }
 
-function rememberWorkspaceAssetPreviewFrameCache(path: string, frame: WorkspaceAssetPreviewFrame) {
-  workspaceAssetPreviewFrameCache.set(normalizedPreviewCacheKey(path), { frame });
+function rememberWorkspaceAssetPreviewFrameCache(
+  path: string,
+  frame: WorkspaceAssetPreviewFrame,
+  workspaceRef: WorkspaceRef,
+) {
+  workspaceAssetPreviewFrameCache.set(scopedPreviewCacheKey(path, workspaceRef), { frame });
 }
 
 function loadWorkspaceAssetTargetCached(
   previewKey: string,
   targetId: string,
+  workspaceRef: WorkspaceRef,
 ): ReturnType<typeof previewWorkspaceAssetTarget> {
-  const key = `${previewKey}:${targetId}`;
+  const key = `${scopedPreviewCacheKey(previewKey, workspaceRef)}:${targetId}`;
   const cached = workspacePreviewTargetCache.get(key);
   if (cached?.inspector) return Promise.resolve(cached.inspector);
   if (cached?.promise) return cached.promise;
 
-  const promise = previewWorkspaceAssetTarget(previewKey, targetId)
+  const promise = previewWorkspaceAssetTarget(previewKey, targetId, workspaceRef)
     .then((inspector) => {
       workspacePreviewTargetCache.set(key, { inspector });
       return inspector;
@@ -207,11 +227,20 @@ import {
 } from "./unityObjectPreview";
 import UnityObjectEditorPanel from "./UnityObjectEditorPanel.vue";
 import UnityObjectIdentity from "./UnityObjectIdentity.vue";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+
+const workspaceContextStore = useWorkspaceContextStore();
+
+function requirePreviewWorkspaceRef(): WorkspaceRef {
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) throw new Error("A focused workspace checkout is required.");
+  return workspaceRef;
+}
 
 const locusInspectorPropertyRuntime = createUnityPropertyRuntime({
-  read: readUnitySerializedProperty,
-  write: writeUnitySerializedProperty,
-  apply: applyUnitySerializedProperties,
+  read: (request) => readUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
+  write: (request) => writeUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
+  apply: (request) => applyUnitySerializedProperties(requirePreviewWorkspaceRef(), request),
 });
 
 const props = withDefaults(defineProps<{
@@ -653,7 +682,11 @@ async function loadStructuredTarget(previewKey: string, targetId: string) {
   autoTargetLoading.value = true;
   autoTargetError.value = "";
   try {
-    const nextInspector = await loadWorkspaceAssetTargetCached(previewKey, targetId);
+    const nextInspector = await loadWorkspaceAssetTargetCached(
+      previewKey,
+      targetId,
+      requirePreviewWorkspaceRef(),
+    );
     if (run !== autoTargetRun || structuredPayload.value?.previewKey !== previewKey) return null;
     const nextCache = new Map(targetCache.value);
     nextCache.set(targetId, nextInspector);
@@ -1000,7 +1033,11 @@ async function renderInteractiveFrame() {
   interactiveFrameLoading.value = true;
   interactiveFrameError.value = "";
   try {
-    const frame = await renderWorkspaceAssetPreviewFrame(path, request);
+    const frame = await renderWorkspaceAssetPreviewFrame(
+      path,
+      request,
+      requirePreviewWorkspaceRef(),
+    );
     if (run !== interactiveFrameRun || path !== autoPreviewPath.value) return;
     await decodeInteractiveFrame(frame.url);
     if (run !== interactiveFrameRun || path !== autoPreviewPath.value) return;
@@ -1066,8 +1103,12 @@ async function cacheInteractiveFrame(frame: WorkspaceAssetPreviewFrame) {
       panX: frame.panX ?? interactivePanX.value,
       panY: frame.panY ?? interactivePanY.value,
       panZ: frame.panZ ?? interactivePanZ.value,
-    });
-    rememberWorkspaceAssetPreviewFrameCache(path, frame);
+    }, requirePreviewWorkspaceRef());
+    rememberWorkspaceAssetPreviewFrameCache(
+      path,
+      frame,
+      requirePreviewWorkspaceRef(),
+    );
   } catch (error) {
     console.warn("[UnityObjectPreview] failed to cache preview frame:", error);
   }
@@ -1216,7 +1257,10 @@ watch(
 
     autoPreviewLoading.value = true;
     try {
-      const payload = await loadWorkspaceAssetPreviewCached(path);
+      const payload = await loadWorkspaceAssetPreviewCached(
+        path,
+        requirePreviewWorkspaceRef(),
+      );
       if (run !== autoPreviewRun) return;
       autoPreviewPayload.value = payload;
     } catch (error) {
@@ -1241,7 +1285,10 @@ watch(
 
     autoThumbnailLoading.value = true;
     try {
-      const thumbnail = await loadWorkspaceAssetThumbnailCached(path);
+      const thumbnail = await loadWorkspaceAssetThumbnailCached(
+        path,
+        requirePreviewWorkspaceRef(),
+      );
       if (run !== autoThumbnailRun) return;
       autoThumbnail.value = thumbnail;
     } catch {
@@ -1262,7 +1309,10 @@ watch(
     resetInteractivePreviewState();
     if (!canLoad || !path) return;
     try {
-      const frame = await loadWorkspaceAssetPreviewFrameCacheCached(path);
+      const frame = await loadWorkspaceAssetPreviewFrameCacheCached(
+        path,
+        requirePreviewWorkspaceRef(),
+      );
       if (run !== interactiveFrameRun || path !== autoPreviewPath.value || !frame) return;
       await decodeInteractiveFrame(frame.url);
       if (run !== interactiveFrameRun || path !== autoPreviewPath.value) return;
@@ -1321,6 +1371,12 @@ watch(
 // the object shown here, refresh the live property tree in the background.
 let unlistenValueEditor: (() => void) | null = null;
 void listenUnityValueEditorCommitted((event) => {
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (
+    !workspaceRef
+    || event.workspaceRef.checkoutId !== workspaceRef.checkoutId
+    || event.workspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
+  ) return;
   const target = liveSerializedTarget.value;
   if (!target) return;
   const eventObjectKey = unitySerializedTargetKey(

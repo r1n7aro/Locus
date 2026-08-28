@@ -44,6 +44,7 @@ describe("agentPromptDashboard", () => {
     expect(summary.directToolCount).toBe(2);
     expect(summary.lazyToolCount).toBe(0);
     expect(summary.skillToolCount).toBe(0);
+    expect(summary.unavailableToolCount).toBe(0);
     expect(summary.parts.map((part) => part.key)).toEqual([
       "base",
       "env",
@@ -127,5 +128,47 @@ describe("agentPromptDashboard", () => {
     expect(summary.skillToolCount).toBe(1);
     expect(toolPart?.tokens).toBeGreaterThan(0);
     expect(toolPart?.tokens).toBeLessThan(200);
+  });
+
+  it("keeps unavailable tools in inventory while excluding them from runtime counts", () => {
+    const summary = buildAgentPromptDashboard(
+      {
+        baseChars: 1200,
+        envChars: 400,
+        rulesChars: 800,
+        knowledgeChars: 600,
+        totalChars: 3000,
+      },
+      [{ enabled: true }],
+      [
+        {
+          kind: "tools",
+          meta: { function: makeToolMeta("read"), loadMode: "direct", runtimeAvailable: true },
+        },
+        {
+          kind: "tools",
+          meta: {
+            function: makeToolMeta("unity_execute"),
+            loadMode: "direct",
+            runtimeAvailable: false,
+            unavailableReason: "requires_unity_workspace",
+          },
+        },
+        {
+          kind: "tools",
+          meta: {
+            function: makeToolMeta("edit"),
+            loadMode: "direct",
+            runtimeAvailable: true,
+            enabled: false,
+          },
+        },
+      ],
+    );
+
+    expect(summary.toolCount).toBe(3);
+    expect(summary.directToolCount).toBe(1);
+    expect(summary.unavailableToolCount).toBe(1);
+    expect(summary.disabledToolCount).toBe(1);
   });
 });

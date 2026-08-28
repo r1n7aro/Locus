@@ -10,6 +10,8 @@ export type ChatDiffReviewTarget = DiffReviewTarget;
 export type GitDiffReviewTarget = DiffReviewTarget;
 export type PlanApprovalTarget = "card" | "window";
 export type MemoryFileOpenTarget = "window" | "knowledge";
+export type WorkspaceDisplayMode = "single" | "multi";
+export type KnowledgeFolderKind = "plan" | "memory" | "design" | "skill" | "reference";
 export type AssetRefClickAction =
   | "unitySelect"
   | "fileBrowser"
@@ -33,12 +35,10 @@ export function normalizeSessionMessagePageSize(value: unknown): number {
 export interface DisplaySettings {
   /** Show the welcome subtitle above the chat input */
   showWelcomeSubtitle: boolean;
-  /** Show Knowledge tab in the top navigation */
-  showKnowledgeTab: boolean;
-  /** Show Collab tab in the top navigation */
-  showCollabTab: boolean;
-  /** Show Asset tab in the top navigation */
-  showAssetTab: boolean;
+  /** Project tree projection used by the Development workbench */
+  workspaceDisplayMode: WorkspaceDisplayMode;
+  /** Knowledge roots projected into the Development tree */
+  knowledgeFolderVisibility: Record<KnowledgeFolderKind, boolean>;
   /** Show Views tab in the top navigation */
   showViewsTab: boolean;
   /** Show Plugins tab in the top navigation */
@@ -47,6 +47,8 @@ export interface DisplaySettings {
   showAgentTab: boolean;
   /** Show the Agent column in chat model selectors */
   showAgentSelector: boolean;
+  /** Show the Git sidebar in the Collaboration workspace */
+  showCollabSidebar: boolean;
   /** Auto-open TODO panel when todos arrive */
   todoAutoOpen: boolean;
   /** Auto-open file changes panel when changes arrive */
@@ -133,15 +135,23 @@ const defaultFonts: Record<FontSlot, string> = {
   monoEditor: "",
 };
 
+const defaultKnowledgeFolderVisibility: Record<KnowledgeFolderKind, boolean> = {
+  plan: true,
+  memory: true,
+  design: true,
+  skill: true,
+  reference: true,
+};
+
 const defaults: DisplaySettings = {
   showWelcomeSubtitle: true,
-  showKnowledgeTab: true,
-  showCollabTab: true,
-  showAssetTab: true,
+  workspaceDisplayMode: "single",
+  knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
   showViewsTab: true,
   showPluginsTab: true,
   showAgentTab: true,
-  showAgentSelector: false,
+  showAgentSelector: true,
+  showCollabSidebar: false,
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
@@ -191,12 +201,21 @@ function load(): DisplaySettings {
       return {
         ...defaults,
         ...parsed,
+        workspaceDisplayMode: parsed.workspaceDisplayMode === "multi" ? "multi" : "single",
+        knowledgeFolderVisibility: {
+          ...defaultKnowledgeFolderVisibility,
+          ...parsed.knowledgeFolderVisibility,
+        },
         sessionMessagePageSize: normalizeSessionMessagePageSize(parsed.sessionMessagePageSize),
         fonts: { ...defaultFonts, ...parsed.fonts },
       };
     }
   } catch { /* ignore */ }
-  return { ...defaults, fonts: { ...defaultFonts } };
+  return {
+    ...defaults,
+    knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
+    fonts: { ...defaultFonts },
+  };
 }
 
 function save(s: DisplaySettings) {
@@ -211,7 +230,10 @@ const state = reactive<DisplaySettings>(load());
 function handleStorageChange(event: StorageEvent) {
   if (event.key !== null && event.key !== STORAGE_KEY) return;
   const next = load();
-  Object.assign(state, next, { fonts: { ...next.fonts } });
+  Object.assign(state, next, {
+    knowledgeFolderVisibility: { ...next.knowledgeFolderVisibility },
+    fonts: { ...next.fonts },
+  });
   applyFonts(state.fonts);
 }
 

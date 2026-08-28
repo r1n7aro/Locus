@@ -23,9 +23,11 @@ mod unity_serialized_property;
 mod update;
 mod view;
 mod workspace;
+mod workspace_explorer;
+mod workspace_service;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 use crate::error::AppError;
 
@@ -49,6 +51,7 @@ fn unix_time_millis() -> i64 {
 
 pub fn emit_session_content_changed(
     app_handle: &AppHandle,
+    scope: Option<&crate::workspace_service::event::WorkspaceEventScope>,
     working_dir: &str,
     session_id: &str,
     source: &str,
@@ -59,10 +62,12 @@ pub fn emit_session_content_changed(
         source: source.to_string(),
         changed_at: unix_time_millis(),
     };
-    if let Err(error) = app_handle.emit(SESSION_CONTENT_CHANGED_EVENT, event) {
-        eprintln!(
-            "[Locus] failed to emit session content changed event for session {}: {}",
-            session_id, error
+    if let Some(scope) = scope {
+        crate::workspace_service::event::emit_for_workspace_scope(
+            app_handle,
+            scope,
+            SESSION_CONTENT_CHANGED_EVENT,
+            event,
         );
     }
 }
@@ -334,6 +339,12 @@ pub enum StreamEvent {
 #[serde(rename_all = "camelCase")]
 pub struct StreamEventEnvelope {
     pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_generation: Option<u64>,
     #[serde(flatten)]
     pub event: StreamEvent,
 }
@@ -550,3 +561,5 @@ pub use unity_serialized_property::*;
 pub use update::*;
 pub use view::*;
 pub use workspace::*;
+pub use workspace_explorer::*;
+pub use workspace_service::*;

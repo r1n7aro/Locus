@@ -33,4 +33,14 @@ describe("GitTerminal pending input handling", () => {
     expect(terminal).toContain("answerPendingToolConfirmFeedback");
     expect(terminal).toContain('@click.stop');
   });
+
+  it("consumes only the bound checkout generation from the workspace event stream", () => {
+    const terminal = read("src/components/GitTerminal.vue");
+
+    expect(terminal).toContain("WORKSPACE_EVENT_NAME");
+    expect(terminal).toContain('event.eventName !== "stream-event"');
+    expect(terminal).toContain("event.checkoutId !== workspaceRef.checkoutId");
+    expect(terminal).toContain("event.workspaceGeneration !== workspaceRef.expectedGeneration");
+    expect(terminal).not.toContain('listen<StreamEvent>("stream-event"');
+  });
 });

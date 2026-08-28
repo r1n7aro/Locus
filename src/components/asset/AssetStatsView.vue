@@ -4,6 +4,7 @@ import { t } from "../../i18n";
 import { useNotificationStore } from "../../stores/notification";
 import { openFileExternal } from "../../services/unity";
 import { assetRiskReport } from "../../services/asset";
+import type { WorkspaceRef } from "../../services/project";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import type {
@@ -19,6 +20,7 @@ const props = defineProps<{
   loading: boolean;
   tuning: WatcherTuning | null;
   tuningSaving: boolean;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -426,8 +428,10 @@ function riskCountLabel(entry: AssetRiskEntry): string {
 async function openRiskDetail(kind: AssetRiskKind) {
   try {
     openingRiskKind.value = kind;
-    const reportPath = await assetRiskReport(kind);
-    await openFileExternal(reportPath);
+    const workspaceRef = props.workspaceRef;
+    if (!workspaceRef) return;
+    const reportPath = await assetRiskReport(kind, workspaceRef);
+    await openFileExternal(workspaceRef, reportPath);
   } catch (error: any) {
     notificationStore.addNotice(
       "error",

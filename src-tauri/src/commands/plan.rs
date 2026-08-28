@@ -1,9 +1,9 @@
 use crate::error::AppError;
 use crate::session::store::SessionStore;
-use crate::workspace::Workspace;
+use crate::workspace_service::ProjectRegistry;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 fn sanitize_slug(path: &str) -> String {
     let last_segment = std::path::Path::new(path)
@@ -61,31 +61,24 @@ pub struct PlanFileContentPayload {
 /// command and must not become an arbitrary-file read primitive.
 #[tauri::command]
 pub async fn get_plan_file_content(
-    path: String,
+    session_id: String,
     app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<PlanFileContentPayload, AppError> {
-    let plan_root = crate::commands::resolve_runtime_storage_dir(&app_handle)
-        .map_err(|e| {
-            AppError::new("plan.path_failed", format!("Failed to get data dir: {}", e))
-                .operation("plan")
-        })?
-        .join("plan");
-    let plan_root = dunce::canonicalize(&plan_root).map_err(|e| {
-        AppError::new("plan.path_failed", format!("Plan root unavailable: {}", e)).operation("plan")
-    })?;
-    let requested = dunce::canonicalize(std::path::Path::new(&path)).map_err(|e| {
-        AppError::new("plan.read_failed", format!("Plan file unavailable: {}", e)).operation("plan")
-    })?;
-    if !requested.starts_with(&plan_root) {
-        return Err(AppError::new(
-            "plan.path_forbidden",
-            format!(
-                "Path is outside the plan directory: {}",
-                requested.to_string_lossy()
-            ),
-        )
-        .operation("plan"));
-    }
+    let scope = super::session::resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "get_plan_file_content",
+    )?;
+    let requested = plan_file_path_for_session(
+        &app_handle,
+        &scope.runtime().root().to_string_lossy(),
+        &session_id,
+    )
+    .map_err(|error| AppError::new("plan.path_failed", error).operation("plan"))?;
     let content = std::fs::read_to_string(&requested).map_err(|e| {
         AppError::new(
             "plan.read_failed",
@@ -119,9 +112,16 @@ pub async fn get_session_plan_state(
     session_id: String,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SessionPlanStatePayload, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "get_session_plan_state",
+    )?;
+    let cwd = scope.runtime().root().to_string_lossy().to_string();
     let state = store
         .get_plan_mode_state(&session_id)
         .map_err(|e| AppError::new("plan.state_failed", e).operation("plan"))?;
@@ -137,24 +137,42 @@ pub async fn set_session_plan_mode(
     active: bool,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
-    workspace: State<'_, Arc<Workspace>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SessionPlanStatePayload, AppError> {
-    let cwd = workspace.path.read().await.clone();
+    let scope = super::session::resolve_session_workspace_scope(
+        store.inner(),
+        workspace_registry.inner(),
+        &session_id,
+        None,
+        "set_session_plan_mode",
+    )?;
+    let runtime = scope.runtime();
+    let cwd = runtime.root().to_string_lossy().to_string();
     let state = store
         .set_plan_mode_active(&session_id, active)
         .map_err(|e| AppError::new("plan.state_failed", e).operation("plan"))?;
     let payload = build_plan_state_payload(&app_handle, &cwd, &session_id, state.active)?;
-    // Keep every window (main + embedded panes) in sync. Emitted directly —
-    // not via the session gateway — because the toggle happens between runs
-    // and must not create a phantom runtime snapshot for a synthetic run id.
-    let _ = app_handle.emit(
+    // Keep every window bound to this checkout in sync without creating a
+    // phantom runtime snapshot for the synthetic toggle run.
+    workspace_registry.event_router().publish(
+        &app_handle,
         "stream-event",
-        crate::commands::StreamEventEnvelope {
-            run_id: format!("{}_plan_toggle", session_id),
-            event: crate::commands::StreamEvent::PlanModeChanged {
-                session_id,
-                active: state.active,
-                plan_file_path: Some(payload.plan_file_path.clone()),
+        crate::workspace_service::event::WorkspaceEventEnvelope {
+            project_id: runtime.project_id().clone(),
+            checkout_id: runtime.checkout_id().clone(),
+            workspace_generation: runtime.generation(),
+            service_instance_id: None,
+            service_generation: None,
+            payload: crate::commands::StreamEventEnvelope {
+                run_id: format!("{}_plan_toggle", session_id),
+                project_id: Some(runtime.project_id().to_string()),
+                checkout_id: Some(runtime.checkout_id().to_string()),
+                workspace_generation: Some(runtime.generation()),
+                event: crate::commands::StreamEvent::PlanModeChanged {
+                    session_id,
+                    active: state.active,
+                    plan_file_path: Some(payload.plan_file_path.clone()),
+                },
             },
         },
     );

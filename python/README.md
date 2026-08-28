@@ -46,6 +46,8 @@ asyncio.run(main())
 - 工具执行：`call_tool(...)`、`ToolInfo.call(...)`；返回 `ToolCallResult`，可通过 `raise_for_error()` 转为异常。
 - Run 生命周期：`status()`、`wait()`、`events()`、`event_stream()`、`cancel()`、`answer()`。
 - 会话续接：`list_sessions()`、`get_session()`、`Session.prompt()`、`Session.events()`。
+- Unity 生命周期：`get_unity_editor_status(project=...)`、`ensure_unity_editor(project=...)`、`restart_unity_editor(project=...)`；查询进程、连接与语义状态，按需拉起或重启当前项目对应的编辑器并等待就绪。
+- Unity 阻塞恢复：`get_unity_dialog(project=...)`、`choose_unity_dialog(...)`、`wait_unity_execution(...)`；弹窗查询与选择由 Locus 原生窗口监听处理，不依赖 Unity 主线程。
 
 `list_models()` 默认只返回当前登录态下可用的模型。`list_models(available_only=False)` 同时返回未登录的内置模型，并通过 `available` 与 `unavailable_reason` 标明状态。模型对象包含上下文窗口、推理强度与速度档位，可供 workflow 自动选择执行配置。
 
@@ -62,6 +64,72 @@ print(result.output)
 ```
 
 直接调用属于会话外操作，工作区执行锁继续生效；会话撤销记录由 Agent 回合生成。需要进入 Locus 撤销链的写操作应交给 Agent 调用工具完成。
+
+Unity 编辑器生命周期由 Locus 托管。`ensure_unity_editor()` 会复用已运行的当前项目编辑器，仅在进程状态明确为 `not_running` 时拉起 `ProjectVersion.txt` 对应的 Unity 或团结引擎版本，并等待指定目标：
+
+```python
+project = r"F:\Project"
+status = await locus.get_unity_editor_status(project=project)
+print(
+    status.process_state,
+    status.semantic_phase,
+    status.ready,
+    status.main_thread_blocked,
+    status.blocking_dialog,
+)
+
+editor = await locus.ensure_unity_editor(
+    project=project,
+    mode="interactive",  # interactive | headless
+    wait_until="ready",  # process | connected | ready
+    timeout=300,
+)
+print(editor.launched, editor.status.process_id, editor.status.editor_path)
+
+restarted = await locus.restart_unity_editor(
+    project=project,
+    mode="headless",
+    wait_until="ready",
+    timeout=300,
+    force=False,  # 先请求正常关闭，超时后再强制结束残留进程
+)
+print(restarted.closed_process_ids, restarted.forced_process_ids)
+```
+
+同一 checkout 的 ensure 与 restart 调用会串行执行，避免重复启动。进程探测为 `unknown` 时 ensure 会返回错误并保留现场；`status.semantic_phase` 可区分 `starting`、`reloading`、`crashed`、`quit` 与 `unresponsive`。restart 结果中的 `forced_process_ids` 可判断关闭阶段是否使用了强制结束。无头编辑器会带有 `status.headless=True` 与 `status.launch_mode="headless"`，可在 Locus 的 Unity 状态面板中手动关闭。
+
+从状态结果启动新 Agent 会话时，将 checkout scope 一并传入：
+
+```python
+result = await reviewer.run(
+    "Review the connected Unity project.",
+    workspace_ref=editor.status.workspace_ref,
+    model="mock/tool",
+)
+```
+
+Unity 模态弹窗阻塞主线程时，失败的 Unity 操作会返回 `dialog_id` 与可选的 `choice_id`。恢复接口按需调用，Agent 工具列表无需增加低频工具：
+
+```python
+dialog = await locus.get_unity_dialog(project=r"F:\Project")
+if dialog is not None:
+    print(dialog.title, dialog.message)
+    for choice in dialog.choices:
+        print(choice.id, choice.label)
+    await locus.choose_unity_dialog(
+        project=dialog.project,
+        dialog_id=dialog.dialog_id,
+        choice_id=dialog.choices[0].id,
+    )
+    # unity_execute 返回 request_state=detached 时，用错误里的 request_id
+    # 获取原执行结果；该调用不会再次运行 snippet。
+    output = await locus.wait_unity_execution(
+        project=dialog.project,
+        execution_id="exec-...",
+    )
+```
+
+选择接口只接受当前快照返回的不透明 id，并在执行前重新验证 Unity PID、owner 窗口、弹窗指纹与按钮集合。窗口已经关闭或内容发生变化时会返回 stale 错误。
 
 ## 自定义 workflow
 

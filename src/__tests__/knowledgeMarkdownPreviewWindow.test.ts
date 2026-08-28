@@ -32,7 +32,11 @@ function read(relativePath: string) {
 }
 
 describe("knowledgeMarkdownPreviewWindow", () => {
-  const payload = { docType: "memory" as const, path: "memory/project-notes.md" };
+  const payload = {
+    docType: "memory" as const,
+    path: "memory/project-notes.md",
+    workspaceRef: { checkoutId: "checkout-feature", expectedGeneration: 7 },
+  };
 
   beforeEach(() => {
     subWindowMocks.invokeMock.mockReset();
@@ -84,7 +88,7 @@ describe("knowledgeMarkdownPreviewWindow", () => {
     await expect(openKnowledgeMarkdownPreviewWindow(payload)).resolves.toBe(true);
     expect(subWindowMocks.invokeMock).toHaveBeenCalledWith("sub_window_open", {
       request: expect.objectContaining({
-        kind: "knowledge-markdown-preview",
+        kind: expect.stringMatching(/^knowledge-markdown-preview-/),
         query: expect.stringContaining("path=memory%2Fproject-notes.md"),
         width: 920,
         height: 720,

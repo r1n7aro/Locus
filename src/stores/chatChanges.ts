@@ -2,6 +2,7 @@ import { computed, ref, triggerRef, watch } from "vue";
 import { defineStore } from "pinia";
 import { useChatStore } from "./chat";
 import { useProjectStore } from "./project";
+import { useWorkspaceContextStore } from "./workspaceContext";
 import * as undoService from "../services/undo";
 import {
   buildRounds,
@@ -11,6 +12,10 @@ import {
   type ChatMergedFileItem,
 } from "../services/chatChanges";
 import { invalidateDiffCacheForFiles, refetchDiffByKey } from "../services/diff";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+} from "../services/project";
 import { getLocusRuntime } from "../services/locusRuntime";
 import type { ChangedFile, FileDiffPayload } from "../types";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
@@ -72,6 +77,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
 
   const chatStore = useChatStore();
   const projectStore = useProjectStore();
+  const workspaceContextStore = useWorkspaceContextStore();
 
   // ── Helpers ──
 
@@ -155,6 +161,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
   const inlineDiffPayload = ref<FileDiffPayload | null>(null);
   const inlineDiffLoading = ref(false);
   const inlineDiffError = ref<string | null>(null);
+  const inlineDiffRequestKey = ref<string | null>(null);
   /** assistantMessageId for the file currently shown in inline diff (used for Undo) */
   const inlineDiffAssistantMsgId = ref<string | null>(null);
 
@@ -163,6 +170,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     inlineDiffAssistantMsgId.value = assistantMessageId;
     inlineDiffLoading.value = false;
     inlineDiffError.value = null;
+    inlineDiffRequestKey.value = null;
   }
 
   function closeInlineDiff() {
@@ -170,10 +178,12 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     inlineDiffLoading.value = false;
     inlineDiffError.value = null;
     inlineDiffAssistantMsgId.value = null;
+    inlineDiffRequestKey.value = null;
   }
 
-  function setInlineDiffLoading(loading: boolean) {
+  function setInlineDiffLoading(loading: boolean, requestKey: string | null = null) {
     inlineDiffLoading.value = loading;
+    inlineDiffRequestKey.value = loading ? requestKey : null;
     if (loading) {
       inlineDiffError.value = null;
       inlineDiffPayload.value = null;
@@ -183,6 +193,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
   function setInlineDiffError(error: string) {
     inlineDiffError.value = error;
     inlineDiffLoading.value = false;
+    inlineDiffRequestKey.value = null;
   }
 
   // ── Actions ──
@@ -353,7 +364,19 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
   }
 
   void getLocusRuntime()
-    .subscribe<UndoFileRevertedEvent>("undo-file-reverted", handleUndoFileReverted)
+    .subscribe<RoutedWorkspaceEvent<UndoFileRevertedEvent>>(
+      WORKSPACE_EVENT_NAME,
+      (event) => {
+        if (event.eventName !== "undo-file-reverted") return;
+        const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+        if (!workspaceRef || event.checkoutId !== workspaceRef.checkoutId) return;
+        if (
+          workspaceRef.expectedGeneration != null
+          && event.workspaceGeneration !== workspaceRef.expectedGeneration
+        ) return;
+        handleUndoFileReverted(event.payload);
+      },
+    )
     .catch((e) => {
       console.warn("[chat-changes] failed to subscribe to undo-file-reverted", e);
     });
@@ -376,6 +399,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     inlineDiffPayload,
     inlineDiffLoading,
     inlineDiffError,
+    inlineDiffRequestKey,
     inlineDiffAssistantMsgId,
     openInlineDiff,
     closeInlineDiff,

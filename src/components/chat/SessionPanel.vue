@@ -10,7 +10,12 @@ import {
   watch,
   type ComponentPublicInstance,
 } from "vue";
-import { AppWindow, Archive, Box, Check, ChevronRight, FileSearch, Folder, FolderInput, FolderOpen, FolderPlus, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, PencilLine, Save, Settings2, Sparkles, Trash2, X } from "lucide";
+import {
+  type InternalDropTargetRegistration,
+  useInternalDragController,
+} from "../../composables/useInternalDrag";
+import { withInternalTreePreview } from "../explorer/internalTreePreview";
+import { AppWindow, Archive, Box, Check, ChevronRight, FileSearch, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, PencilLine, Save, Settings2, Sparkles, Trash2, X } from "lucide";
 import { t } from "../../i18n";
 import { buildSessionTree } from "./sessionTree";
 import BaseButton from "../ui/BaseButton.vue";
@@ -42,6 +47,11 @@ import {
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useNotificationStore } from "../../stores/notification";
 import { useProjectStore } from "../../stores/project";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+} from "../../services/project";
 
 interface VisibleTreeRow {
   node: SessionTreeNode;
@@ -70,7 +80,8 @@ interface VisibleViewRow {
 type VisibleViewEntry =
   | { type: "row"; key: string; row: VisibleViewRow }
   | { type: "create"; key: string; draft: ViewCreateFolderDraft }
-  | { type: "empty-folder"; key: string; depth: number };
+  | { type: "empty-folder"; key: string; depth: number }
+  | { type: "drop-preview"; key: string; depth: number; node: ViewTreeNode };
 
 interface ViewCreateFolderDraft {
   parentRelPath: string;
@@ -97,14 +108,6 @@ interface ViewDeleteConfirmState {
   x: number;
   y: number;
   node: ViewTreeNode;
-}
-
-interface ViewPointerDragState {
-  node: ViewTreeNode;
-  pointerId: number;
-  startX: number;
-  startY: number;
-  active: boolean;
 }
 
 interface ViewDropTarget {
@@ -171,6 +174,7 @@ function persistExpandedState() {
 const { state: shortcutState } = useKeyboardShortcuts();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const newChatTitle = computed(() =>
   t("chat.session.newWithShortcut", formatShortcut(shortcutState.newChat)),
 );
@@ -188,6 +192,7 @@ const viewRenameInputRef = ref<HTMLInputElement | null>(null);
 const draggingViewNode = ref<ViewTreeNode | null>(null);
 const viewDragTargetKey = ref("");
 const viewDragTargetPosition = ref<ViewDropTarget["position"] | "">("");
+const inlineViewDropTarget = ref<ViewDropTarget | null>(null);
 const viewHelpOpen = ref(false);
 const viewHelpDialogRef = ref<HTMLElement | null>(null);
 const viewHelpBtnRef = ref<HTMLButtonElement | null>(null);
@@ -199,14 +204,10 @@ const viewSectionRatio = ref(loadViewSplitRatio());
 const canSubmitViewRename = computed(() => !!viewRenameDraft.value?.name.trim());
 let viewResizeMoveListener: ((event: MouseEvent) => void) | null = null;
 let viewResizeUpListener: (() => void) | null = null;
-let viewReloadUnsubscribe: RuntimeUnsubscribe | null = null;
-let viewTreeChangedUnsubscribe: RuntimeUnsubscribe | null = null;
-let viewPointerDragState: ViewPointerDragState | null = null;
-let viewPointerMoveListener: ((event: PointerEvent) => void) | null = null;
-let viewPointerUpListener: ((event: PointerEvent) => void) | null = null;
-let viewPointerCancelListener: ((event: PointerEvent) => void) | null = null;
-let suppressNextViewClick = false;
-let suppressNextViewClickTimer: number | null = null;
+let viewWorkspaceEventUnsubscribe: RuntimeUnsubscribe | null = null;
+const internalDrag = useInternalDragController();
+let unregisterSessionViewDropTarget: (() => void) | null = null;
+const SESSION_VIEW_INTERNAL_DRAG_TYPE = "locus/session-view-tree";
 
 function clampViewSplitRatio(value: number): number {
   return Math.min(MAX_VIEW_SECTION_RATIO, Math.max(MIN_VIEW_SECTION_RATIO, value));
@@ -459,6 +460,33 @@ const visibleViewEntries = computed<VisibleViewEntry[]>(() => {
   return entries;
 });
 
+const displayedViewEntries = computed<VisibleViewEntry[]>(() => {
+  const source = draggingViewNode.value;
+  const target = inlineViewDropTarget.value;
+  if (!source || !target || internalDrag.previewMode.value === "floating") {
+    return visibleViewEntries.value;
+  }
+  return withInternalTreePreview(
+    visibleViewEntries.value,
+    {
+      sourceKey: source.key,
+      targetKey: target.key === VIEW_ROOT_ANCHOR_KEY ? null : target.key,
+      position: target.key === VIEW_ROOT_ANCHOR_KEY ? "root" : target.position,
+      rootDepth: 0,
+    },
+    (entry) => ({
+      nodeKey: entry.type === "row" ? entry.row.node.key : undefined,
+      depth: entry.type === "row" ? entry.row.depth : entry.type === "create" ? entry.draft.depth : entry.depth,
+    }),
+    (depth) => ({
+      type: "drop-preview",
+      key: `view-drop-preview:${source.key}`,
+      depth,
+      node: source,
+    }),
+  );
+});
+
 async function loadViews() {
   if (!showSessionViews.value || !hasWorkspace.value) {
     viewSummaries.value = [];
@@ -468,7 +496,9 @@ async function loadViews() {
   }
   viewsLoading.value = true;
   try {
-    const snapshot = await viewTree();
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const snapshot = await viewTree(workspaceRef);
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
     viewTreeOrder.value = snapshot.order ?? [];
@@ -522,12 +552,14 @@ async function openView(view: ViewPackageSummary) {
   const key = viewOpenKey(view);
   viewOpeningKey.value = key;
   try {
-    const requirementError = await checkViewOpenRequirements(view);
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const requirementError = await checkViewOpenRequirements(workspaceRef, view);
     if (requirementError) {
       notifyViewOpenError(requirementError);
       return;
     }
-    await viewRun(view.id);
+    await viewRun(workspaceRef, view.id);
   } catch (error) {
     const err = normalizeViewError(error, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
@@ -545,12 +577,14 @@ async function openViewInUnity(view: ViewPackageSummary) {
   const key = `${viewOpenKey(view)}:unity`;
   viewOpeningKey.value = key;
   try {
-    const requirementError = await checkViewOpenRequirements(view);
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const requirementError = await checkViewOpenRequirements(workspaceRef, view);
     if (requirementError) {
       notifyViewOpenError(requirementError);
       return;
     }
-    await viewRunInUnity(view.id);
+    await viewRunInUnity(workspaceRef, view.id);
   } catch (error) {
     const err = normalizeViewError(error, { viewName: view.name });
     notificationStore.addNotice("error", err.message, {
@@ -563,13 +597,7 @@ async function openViewInUnity(view: ViewPackageSummary) {
   }
 }
 
-function onViewRowClick(row: VisibleViewRow, event?: MouseEvent) {
-  if (suppressNextViewClick) {
-    event?.preventDefault();
-    event?.stopPropagation();
-    suppressNextViewClick = false;
-    return;
-  }
+function onViewRowClick(row: VisibleViewRow) {
   if (row.node.kind === "folder") {
     toggleViewRow(row);
     return;
@@ -665,7 +693,9 @@ async function submitViewCreateFolder() {
   const name = draft?.name.trim();
   if (!draft || !name) return;
   try {
-    await viewCreateFolder({ parentRelPath: draft.parentRelPath, name });
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    await viewCreateFolder(workspaceRef, { parentRelPath: draft.parentRelPath, name });
     closeViewCreateFolder();
     await loadViews();
   } catch (error) {
@@ -717,7 +747,9 @@ async function submitViewRename() {
     return;
   }
   try {
-    const snapshot = await viewRenameEntry({ relPath: draft.relPath, name });
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const snapshot = await viewRenameEntry(workspaceRef, { relPath: draft.relPath, name });
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
     viewTreeOrder.value = snapshot.order ?? [];
@@ -804,7 +836,9 @@ async function confirmDeleteViewEntry() {
   const confirm = viewDeleteConfirm.value;
   if (!confirm) return;
   try {
-    const snapshot = await viewDeleteEntry({ relPath: confirm.node.relPath });
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const snapshot = await viewDeleteEntry(workspaceRef, { relPath: confirm.node.relPath });
     viewSummaries.value = snapshot.views;
     viewFolders.value = snapshot.folders;
     viewTreeOrder.value = snapshot.order ?? [];
@@ -824,6 +858,7 @@ function clearViewDragState() {
   draggingViewNode.value = null;
   viewDragTargetKey.value = "";
   viewDragTargetPosition.value = "";
+  inlineViewDropTarget.value = null;
 }
 
 function viewNodeParentRelPath(node: ViewTreeNode): string {
@@ -865,38 +900,6 @@ function viewFolderKeyForRelPath(relPath: string): string {
   return `view-dir:${normalizeViewPath(relPath)}`;
 }
 
-function clearViewPointerDragListeners() {
-  if (viewPointerMoveListener) {
-    window.removeEventListener("pointermove", viewPointerMoveListener);
-    viewPointerMoveListener = null;
-  }
-  if (viewPointerUpListener) {
-    window.removeEventListener("pointerup", viewPointerUpListener);
-    viewPointerUpListener = null;
-  }
-  if (viewPointerCancelListener) {
-    window.removeEventListener("pointercancel", viewPointerCancelListener);
-    viewPointerCancelListener = null;
-  }
-  document.body.classList.remove("sp-view-pointer-dragging");
-}
-
-function clearViewPointerDragState() {
-  viewPointerDragState = null;
-  clearViewPointerDragListeners();
-}
-
-function scheduleSuppressNextViewClick() {
-  suppressNextViewClick = true;
-  if (suppressNextViewClickTimer) {
-    window.clearTimeout(suppressNextViewClickTimer);
-  }
-  suppressNextViewClickTimer = window.setTimeout(() => {
-    suppressNextViewClick = false;
-    suppressNextViewClickTimer = null;
-  }, 240);
-}
-
 function shouldIgnoreViewPointerDrag(event: PointerEvent): boolean {
   const target = event.target;
   return (
@@ -907,16 +910,16 @@ function shouldIgnoreViewPointerDrag(event: PointerEvent): boolean {
   );
 }
 
-function resolveViewDropTargetFromPoint(
-  x: number,
+function resolveViewDropTarget(
+  target: Element,
   y: number,
   node: ViewTreeNode,
 ): ViewDropTarget | null {
-  const target = document.elementFromPoint(x, y);
-  if (!(target instanceof Element)) return null;
-
   const rowElement = target.closest<HTMLElement>(".sp-view-row-shell");
   if (rowElement) {
+    if (rowElement.dataset.inlineDropPreview === "true" && inlineViewDropTarget.value) {
+      return inlineViewDropTarget.value;
+    }
     const row = visibleViewRowByNodeKey(rowElement.dataset.viewNodeKey ?? "");
     if (!row) return null;
     const rect = rowElement.getBoundingClientRect();
@@ -959,14 +962,6 @@ function resolveViewDropTargetFromPoint(
   return null;
 }
 
-function updateViewPointerDropTarget(event: PointerEvent) {
-  const state = viewPointerDragState;
-  if (!state?.active) return;
-  const target = resolveViewDropTargetFromPoint(event.clientX, event.clientY, state.node);
-  viewDragTargetKey.value = target?.key ?? "";
-  viewDragTargetPosition.value = target?.position ?? "";
-}
-
 function onViewPointerDown(row: VisibleViewRow, event: PointerEvent) {
   if (
     event.button !== 0 ||
@@ -978,100 +973,48 @@ function onViewPointerDown(row: VisibleViewRow, event: PointerEvent) {
     return;
   }
 
-  clearViewPointerDragState();
-  viewPointerDragState = {
-    node: row.node,
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    active: false,
-  };
-
-  viewPointerMoveListener = onViewPointerMove;
-  viewPointerUpListener = (upEvent) => {
-    void finishViewPointerDrag(upEvent);
-  };
-  viewPointerCancelListener = () => {
-    clearViewDragState();
-    clearViewPointerDragState();
-  };
-
-  window.addEventListener("pointermove", viewPointerMoveListener);
-  window.addEventListener("pointerup", viewPointerUpListener);
-  window.addEventListener("pointercancel", viewPointerCancelListener);
+  internalDrag.start(event, {
+    id: `session-view-tree:${row.node.key}`,
+    payload: { type: SESSION_VIEW_INTERNAL_DRAG_TYPE, data: { node: row.node } },
+    preview: {
+      label: row.node.label,
+      kind: row.node.kind === "folder" ? "folder" : "package",
+    },
+    allowedOperations: ["move"],
+    onActivated: () => {
+      draggingViewNode.value = row.node;
+      viewDragTargetKey.value = "";
+      viewDragTargetPosition.value = "";
+      closeViewContextMenu();
+      closeViewCreateFolder();
+      closeViewRename();
+    },
+    onFinished: clearViewDragState,
+  });
 }
 
-function onViewPointerMove(event: PointerEvent) {
-  const state = viewPointerDragState;
-  if (!state || event.pointerId !== state.pointerId) return;
-
-  const dx = event.clientX - state.startX;
-  const dy = event.clientY - state.startY;
-  if (!state.active) {
-    if (Math.hypot(dx, dy) < 5) return;
-    state.active = true;
-    draggingViewNode.value = state.node;
-    viewDragTargetKey.value = "";
-    closeViewContextMenu();
-    closeViewCreateFolder();
-    closeViewRename();
-    document.body.classList.add("sp-view-pointer-dragging");
-  }
-
-  event.preventDefault();
-  updateViewPointerDropTarget(event);
+interface SessionViewInternalDragData {
+  node: ViewTreeNode;
 }
 
-async function finishViewPointerDrag(event: PointerEvent) {
-  const state = viewPointerDragState;
-  if (!state || event.pointerId !== state.pointerId) return;
-
-  const target = state.active
-    ? resolveViewDropTargetFromPoint(event.clientX, event.clientY, state.node)
-    : null;
-  const shouldSuppressClick = state.active;
-  clearViewPointerDragState();
-
-  if (shouldSuppressClick) {
-    scheduleSuppressNextViewClick();
-  }
-
-  if (!target) {
-    clearViewDragState();
-    return;
-  }
-
-  await moveViewNodeToTarget(state.node, target);
-}
-
-function onViewDragStart(row: VisibleViewRow, event: DragEvent) {
-  if (viewCreateFolderDraft.value || viewRenameDraft.value || !canDragViewNode(row.node)) {
-    event.preventDefault();
-    return;
-  }
-  closeViewContextMenu();
-  draggingViewNode.value = row.node;
-  viewDragTargetKey.value = "";
-  viewDragTargetPosition.value = "";
-  if (event.dataTransfer) {
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", row.node.relPath);
-  }
-}
-
-function onViewDragEnd() {
-  clearViewDragState();
-}
-
-function onViewFolderDragOver(row: VisibleViewRow, event: DragEvent) {
-  if (!draggingViewNode.value) return;
-  const target = resolveViewDropTargetFromPoint(event.clientX, event.clientY, draggingViewNode.value);
-  if (!target || target.key !== row.node.key) return;
-  event.preventDefault();
-  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  viewDragTargetKey.value = target.key;
-  viewDragTargetPosition.value = target.position;
-}
+const sessionViewDropTarget: InternalDropTargetRegistration<SessionViewInternalDragData, ViewDropTarget> = {
+  id: "session-panel-view-tree",
+  root: () => sessionPanelRef.value,
+  accepts: (source) => source.payload.type === SESSION_VIEW_INTERNAL_DRAG_TYPE,
+  resolve: ({ source, point, hit }) => {
+    const target = resolveViewDropTarget(hit, point.y, source.payload.data.node);
+    return target ? { key: `${target.key}:${target.position}`, operation: "move", intent: target } : null;
+  },
+  onTargetChange: (decision) => {
+    viewDragTargetKey.value = decision?.intent.key ?? "";
+    viewDragTargetPosition.value = decision?.intent.position ?? "";
+    inlineViewDropTarget.value = decision?.intent ?? null;
+  },
+  drop: async ({ source, decision }) => {
+    await moveViewNodeToTarget(source.payload.data.node, decision.intent);
+  },
+  previewMode: ({ hit }) => hit.closest(".sp-view-list") ? "floating-with-gap" : "floating",
+};
 
 async function moveViewNodeToTarget(
   node: ViewTreeNode,
@@ -1090,7 +1033,9 @@ async function moveViewNodeToTarget(
     setViewNodeExpanded(target.key, true);
   }
   try {
-    const snapshot = await viewMoveEntry({
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return;
+    const snapshot = await viewMoveEntry(workspaceRef, {
       sourceRelPath: node.relPath,
       targetDirRelPath: target.targetDirRelPath,
       insertBeforeRelPath: target.insertBeforeRelPath,
@@ -1119,48 +1064,6 @@ async function moveViewNodeToDir(
     targetDirRelPath,
     position: "inside",
   });
-}
-
-async function moveDraggingViewNode(targetDirRelPath: string, targetKey?: string) {
-  const node = draggingViewNode.value;
-  if (!node) {
-    clearViewDragState();
-    return;
-  }
-  await moveViewNodeToDir(node, targetDirRelPath, targetKey);
-}
-
-function onViewFolderDrop(row: VisibleViewRow, event: DragEvent) {
-  if (!draggingViewNode.value) return;
-  const target = resolveViewDropTargetFromPoint(event.clientX, event.clientY, draggingViewNode.value);
-  if (!target || target.key !== row.node.key) {
-    clearViewDragState();
-    return;
-  }
-  event.preventDefault();
-  event.stopPropagation();
-  void moveViewNodeToTarget(draggingViewNode.value, target);
-}
-
-function onViewRootDragOver(event: DragEvent) {
-  const target = event.target;
-  if (target instanceof Element && target.closest(".sp-view-row-shell, .sp-view-create-row")) return;
-  if (!canDropViewNodeInsideDir(draggingViewNode.value, "")) return;
-  event.preventDefault();
-  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
-  viewDragTargetKey.value = VIEW_ROOT_ANCHOR_KEY;
-  viewDragTargetPosition.value = "inside";
-}
-
-function onViewRootDrop(event: DragEvent) {
-  const target = event.target;
-  if (target instanceof Element && target.closest(".sp-view-row-shell, .sp-view-create-row")) return;
-  if (!canDropViewNodeInsideDir(draggingViewNode.value, "")) {
-    clearViewDragState();
-    return;
-  }
-  event.preventDefault();
-  void moveDraggingViewNode("", VIEW_ROOT_ANCHOR_KEY);
 }
 
 function clearViewResizeListeners() {
@@ -1275,15 +1178,19 @@ watch(
 );
 
 onMounted(async () => {
-  viewReloadUnsubscribe = await getLocusRuntime().subscribe<ViewPackageSummary>(
-    "view-package-reloaded",
-    () => {
-      void loadViews();
-    },
-  );
-  viewTreeChangedUnsubscribe = await getLocusRuntime().subscribe(
-    "view-tree-changed",
-    () => {
+  unregisterSessionViewDropTarget = internalDrag.registerTarget(sessionViewDropTarget);
+  viewWorkspaceEventUnsubscribe = await getLocusRuntime().subscribe<RoutedWorkspaceEvent>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "view-package-reloaded" && event.eventName !== "view-tree-changed") {
+        return;
+      }
+      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+      if (
+        !workspaceRef
+        || event.checkoutId !== workspaceRef.checkoutId
+        || event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
       void loadViews();
     },
   );
@@ -1291,16 +1198,12 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  viewReloadUnsubscribe?.();
-  viewReloadUnsubscribe = null;
-  viewTreeChangedUnsubscribe?.();
-  viewTreeChangedUnsubscribe = null;
+  unregisterSessionViewDropTarget?.();
+  unregisterSessionViewDropTarget = null;
+  viewWorkspaceEventUnsubscribe?.();
+  viewWorkspaceEventUnsubscribe = null;
   clearViewResizeListeners();
-  clearViewPointerDragState();
-  if (suppressNextViewClickTimer) {
-    window.clearTimeout(suppressNextViewClickTimer);
-    suppressNextViewClickTimer = null;
-  }
+  if (internalDrag.isDraggingType(SESSION_VIEW_INTERNAL_DRAG_TYPE)) internalDrag.cancel();
 });
 
 function isNodeExpanded(node: SessionTreeNode): boolean {
@@ -1387,6 +1290,15 @@ function isSessionTitleRunning(node: SessionTreeNode): boolean {
   if (node.kind !== "session" || !node.sessionId) return false;
   if (props.streamingSessionIds?.has(node.sessionId)) return true;
   return node.session?.runtimeStatus === "running" || node.session?.runtimeStatus === "finishing";
+}
+
+function sessionBranchLabel(node: SessionTreeNode): string {
+  const target = node.session?.executionTarget;
+  const branchRef = target?.branchRef?.trim();
+  if (branchRef) {
+    return branchRef.replace(/^refs\/heads\//, "");
+  }
+  return target?.headOid?.trim().slice(0, 8) ?? "";
 }
 
 /* Multi-selection state (Ctrl/Cmd toggle, Shift range) */
@@ -1628,9 +1540,11 @@ async function ctxOpenSessionInUnity() {
   const menu = ctxMenu.value;
   if (!menu || menu.ids.length !== 1) return;
   const session = menu.session;
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
   closeCtxMenu();
   try {
-    await openUnityEmbeddedSessionWindow({
+    await openUnityEmbeddedSessionWindow(workspaceRef, {
       sessionId: session.id,
       title: session.title || session.id,
     });
@@ -1670,8 +1584,10 @@ async function ctxOpenSessionInWindow() {
 
 async function openNewSessionInWindow() {
   closeCtxMenu();
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
   try {
-    await openNewChatSessionWindow(t("chat.session.newSession"));
+    await openNewChatSessionWindow(workspaceRef, t("chat.session.newSession"));
   } catch (error) {
     const err = normalizeAppError(error);
     notificationStore.addNotice("error", err.message, {
@@ -1797,6 +1713,14 @@ function ctxArchive() {
               >{{ rowLabel(row.node) }}</span>
               <div class="sp-session-meta">
                 <span
+                  v-if="sessionBranchLabel(row.node)"
+                  class="sp-session-branch"
+                  :title="row.node.session?.executionTarget?.branchRef || row.node.session?.executionTarget?.headOid || undefined"
+                >
+                  <LucideIcon :icon="GitBranch" :size="11" :stroke-width="1.8" />
+                  <span>{{ sessionBranchLabel(row.node) }}</span>
+                </span>
+                <span
                   v-if="row.node.status && row.node.status !== 'running'"
                   class="sp-session-status"
                   :class="`is-${row.node.status}`"
@@ -1859,10 +1783,8 @@ function ctxArchive() {
         class="sp-view-list"
         :class="{ 'is-root-drop-target': viewDragTargetKey === VIEW_ROOT_ANCHOR_KEY }"
         @contextmenu.prevent="onViewTreeContextMenu"
-        @dragover="onViewRootDragOver"
-        @drop="onViewRootDrop"
       >
-        <template v-for="entry in visibleViewEntries" :key="entry.key">
+        <template v-for="entry in displayedViewEntries" :key="entry.key">
           <div
             v-if="entry.type === 'row'"
             class="sp-view-row-shell"
@@ -1881,17 +1803,12 @@ function ctxArchive() {
                 viewDragTargetPosition === 'after',
               opening: isViewRowOpening(entry.row),
             }"
-            draggable="false"
             :style="{ '--sp-view-row-indent': `${viewTreeIndentPx(entry.row.depth)}px` }"
             :data-view-node-key="entry.row.node.key"
             :data-view-node-kind="entry.row.node.kind"
             :title="entry.row.node.label"
             @pointerdown="onViewPointerDown(entry.row, $event)"
             @contextmenu.prevent.stop="openViewContextMenu($event, entry.row)"
-            @dragstart="onViewDragStart(entry.row, $event)"
-            @dragend="onViewDragEnd"
-            @dragover="onViewFolderDragOver(entry.row, $event)"
-            @drop="onViewFolderDrop(entry.row, $event)"
           >
             <div
               v-if="isRenamingViewNode(entry.row.node)"
@@ -1964,7 +1881,7 @@ function ctxArchive() {
               class="sp-view-row"
               :style="{ paddingLeft: `${viewTreeIndentPx(entry.row.depth)}px` }"
               :disabled="!!viewOpeningKey && entry.row.node.kind === 'view'"
-              @click="onViewRowClick(entry.row, $event)"
+              @click="onViewRowClick(entry.row)"
             >
               <span
                 v-if="entry.row.node.kind === 'folder'"
@@ -2013,6 +1930,30 @@ function ctxArchive() {
               </span>
               <span class="sp-view-label">{{ entry.row.node.label }}</span>
             </button>
+          </div>
+
+          <div
+            v-else-if="entry.type === 'drop-preview'"
+            class="sp-view-row-shell is-drop-preview"
+            data-inline-drop-preview="true"
+            aria-hidden="true"
+            :style="{ '--sp-view-row-indent': `${viewTreeIndentPx(entry.depth)}px` }"
+          >
+            <div class="sp-view-row is-drop-preview-row" :style="{ paddingLeft: `${viewTreeIndentPx(entry.depth)}px` }">
+              <span class="sp-view-branch-spacer" aria-hidden="true"></span>
+              <span
+                class="sp-view-kind-icon"
+                :class="entry.node.kind === 'folder' ? 'folder' : 'view'"
+                aria-hidden="true"
+              >
+                <LucideIcon
+                  :icon="entry.node.kind === 'folder' ? Folder : resolveLocusViewIcon(entry.node.view?.icon)"
+                  :size="13"
+                  :stroke-width="2"
+                />
+              </span>
+              <span class="sp-view-label">{{ entry.node.label }}</span>
+            </div>
           </div>
 
           <div
@@ -2066,7 +2007,7 @@ function ctxArchive() {
           </div>
         </template>
 
-        <div v-if="viewsLoading && !visibleViewEntries.length" class="sp-view-empty">{{ t('common.loading') }}</div>
+        <div v-if="viewsLoading && !displayedViewEntries.length" class="sp-view-empty">{{ t('common.loading') }}</div>
         <div v-else-if="!viewsLoading && !viewTreeNodes.length && !viewCreateFolderDraft" class="sp-view-empty">
           <div class="sp-view-empty-title">{{ t('view.list.empty') }}</div>
           <p class="sp-view-empty-hint">{{ t('view.list.emptyHint') }}</p>
@@ -2336,15 +2277,6 @@ function ctxArchive() {
   user-select: none;
 }
 
-:global(body.sp-view-pointer-dragging) {
-  cursor: grabbing;
-  user-select: none;
-}
-
-:global(body.sp-view-pointer-dragging *) {
-  cursor: grabbing !important;
-}
-
 .sp-view-resize {
   position: relative;
   flex: 0 0 10px;
@@ -2600,6 +2532,7 @@ function ctxArchive() {
 }
 
 .sp-view-row-shell {
+  touch-action: none;
   position: relative;
   display: flex;
   align-items: stretch;
@@ -2631,6 +2564,16 @@ function ctxArchive() {
 .sp-view-row-shell.drop-target:hover {
   background: color-mix(in srgb, var(--active-bg) 62%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
+}
+
+.sp-view-row-shell.is-drop-preview {
+  background: color-mix(in srgb, var(--accent-soft) 12%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent-color) 36%, transparent);
+}
+
+.sp-view-row.is-drop-preview-row {
+  opacity: 0;
+  pointer-events: none;
 }
 
 .sp-view-row-shell.drop-before::before,
@@ -3095,6 +3038,23 @@ function ctxArchive() {
   font-size: 12px;
   color: var(--text-secondary);
   transition: opacity 0.12s ease;
+}
+
+.sp-session-branch {
+  min-width: 0;
+  max-width: 96px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono-identifier);
+}
+
+.sp-session-branch > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sp-row-archive-btn {

@@ -59,6 +59,26 @@ class ModelInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceRef:
+    checkout_id: str
+    expected_generation: int | None = None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "checkoutId": self.checkout_id,
+            "expectedGeneration": self.expected_generation,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "WorkspaceRef":
+        generation = payload.get("expectedGeneration")
+        return cls(
+            checkout_id=payload.get("checkoutId", ""),
+            expected_generation=None if generation is None else int(generation),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceInfo:
     path: str | None
     workspace_id: str | None
@@ -70,6 +90,206 @@ class WorkspaceInfo:
             path=payload.get("path"),
             workspace_id=payload.get("workspaceId"),
             unity_connected=bool(payload.get("unityConnected")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnityEditorLaunchInfo:
+    editor_path: str
+    project_path: str
+    project_version: str
+    process_id: int
+    mode: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityEditorLaunchInfo":
+        return cls(
+            editor_path=payload.get("editorPath", ""),
+            project_path=payload.get("projectPath", ""),
+            project_version=payload.get("projectVersion", ""),
+            process_id=int(payload.get("processId", 0)),
+            mode=payload.get("mode", "interactive"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnityEditorStatus:
+    project_path: str
+    workspace_ref: WorkspaceRef
+    connected: bool
+    ready: bool
+    process_state: str
+    process_id: int | None
+    editor_path: str | None
+    launch_mode: str | None
+    headless: bool
+    semantic_phase: str
+    main_thread_blocked: bool
+    blocking_reason: str | None
+    main_thread: dict[str, Any]
+    safety: dict[str, Any]
+    blocking_dialog: UnityModalDialog | None
+    blocking_dialog_recoverable: bool
+    service_status: str | None
+    readiness: dict[str, Any] | None
+    connection: dict[str, Any]
+    semantic: dict[str, Any]
+
+    @property
+    def is_running(self) -> bool:
+        return self.process_state == "running"
+
+    @property
+    def is_crashed(self) -> bool:
+        return self.semantic_phase == "crashed"
+
+    @property
+    def can_call_unity_api(self) -> bool:
+        return bool(self.safety.get("canCallUnityApi")) and not self.main_thread_blocked
+
+    @property
+    def readiness_phase(self) -> str | None:
+        if self.readiness is None:
+            return None
+        value = self.readiness.get("phase")
+        return None if value is None else str(value)
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityEditorStatus":
+        process_id = payload.get("processId")
+        readiness = payload.get("readiness")
+        return cls(
+            project_path=payload.get("projectPath", ""),
+            workspace_ref=WorkspaceRef(
+                checkout_id=payload.get("checkoutId", ""),
+                expected_generation=(
+                    None
+                    if payload.get("workspaceGeneration") is None
+                    else int(payload["workspaceGeneration"])
+                ),
+            ),
+            connected=bool(payload.get("connected")),
+            ready=bool(payload.get("ready")),
+            process_state=payload.get("processState", "unknown"),
+            process_id=None if process_id is None else int(process_id),
+            editor_path=payload.get("editorPath"),
+            launch_mode=payload.get("launchMode"),
+            headless=bool(payload.get("headless")),
+            semantic_phase=payload.get("semanticPhase", "unknown"),
+            main_thread_blocked=bool(payload.get("mainThreadBlocked")),
+            blocking_reason=payload.get("blockingReason"),
+            main_thread=dict(payload.get("mainThread") or {}),
+            safety=dict(payload.get("safety") or {}),
+            blocking_dialog=(
+                UnityModalDialog.from_payload(payload["blockingDialog"])
+                if isinstance(payload.get("blockingDialog"), dict)
+                else None
+            ),
+            blocking_dialog_recoverable=bool(payload.get("blockingDialogRecoverable")),
+            service_status=payload.get("serviceStatus"),
+            readiness=dict(readiness) if isinstance(readiness, dict) else None,
+            connection=dict(payload.get("connection") or {}),
+            semantic=dict(payload.get("semantic") or {}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnityEditorEnsureResult:
+    launched: bool
+    wait_until: str
+    waited_ms: int
+    launch: UnityEditorLaunchInfo | None
+    status: UnityEditorStatus
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityEditorEnsureResult":
+        launch = payload.get("launch")
+        return cls(
+            launched=bool(payload.get("launched")),
+            wait_until=payload.get("waitUntil", "ready"),
+            waited_ms=int(payload.get("waitedMs", 0)),
+            launch=(
+                UnityEditorLaunchInfo.from_payload(launch)
+                if isinstance(launch, dict)
+                else None
+            ),
+            status=UnityEditorStatus.from_payload(payload.get("status") or {}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnityEditorRestartResult:
+    closed_process_ids: tuple[int, ...]
+    forced_process_ids: tuple[int, ...]
+    wait_until: str
+    waited_ms: int
+    launch: UnityEditorLaunchInfo
+    status: UnityEditorStatus
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityEditorRestartResult":
+        return cls(
+            closed_process_ids=tuple(int(value) for value in payload.get("closedProcessIds", [])),
+            forced_process_ids=tuple(int(value) for value in payload.get("forcedProcessIds", [])),
+            wait_until=payload.get("waitUntil", "ready"),
+            waited_ms=int(payload.get("waitedMs", 0)),
+            launch=UnityEditorLaunchInfo.from_payload(payload.get("launch") or {}),
+            status=UnityEditorStatus.from_payload(payload.get("status") or {}),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnityDialogChoice:
+    id: str
+    label: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityDialogChoice":
+        return cls(id=payload["id"], label=payload.get("label", ""))
+
+
+@dataclass(frozen=True, slots=True)
+class UnityModalDialog:
+    code: str
+    dialog_id: str
+    project: str
+    title: str
+    message: str
+    choices: tuple[UnityDialogChoice, ...]
+    main_thread_blocked: bool
+    opened_at_ms: int
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityModalDialog":
+        return cls(
+            code=payload.get("code", "unity_modal_dialog_blocked"),
+            dialog_id=payload["dialogId"],
+            project=payload.get("project", ""),
+            title=payload.get("title", ""),
+            message=payload.get("message", ""),
+            choices=tuple(
+                UnityDialogChoice.from_payload(choice)
+                for choice in payload.get("choices") or ()
+            ),
+            main_thread_blocked=bool(payload.get("mainThreadBlocked", True)),
+            opened_at_ms=int(payload.get("openedAtMs", 0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UnityDialogChoiceResult:
+    dialog_id: str
+    choice_id: str
+    label: str
+    invoked: bool
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityDialogChoiceResult":
+        return cls(
+            dialog_id=payload["dialogId"],
+            choice_id=payload["choiceId"],
+            label=payload.get("label", ""),
+            invoked=bool(payload.get("invoked")),
         )
 
 
@@ -138,10 +358,16 @@ class ToolInfo:
         arguments: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        workspace_ref: WorkspaceRef | None = None,
     ) -> ToolCallResult:
         if self.client is None:
             raise RuntimeError("ToolInfo is not attached to a Locus client")
-        return await self.client.call_tool(self.name, arguments or {}, timeout=timeout)
+        return await self.client.call_tool(
+            self.name,
+            arguments or {},
+            timeout=timeout,
+            workspace_ref=workspace_ref,
+        )
 
 
 class Agent:
@@ -249,6 +475,7 @@ class Agent:
         *,
         session_id: str | None = None,
         new_session: bool = False,
+        workspace_ref: WorkspaceRef | None = None,
         title: str | None = None,
         model: str | None = None,
         effort: str | None = None,
@@ -271,6 +498,7 @@ class Agent:
                 prompt,
                 agent_spec=self._agent_spec(),
                 session_id=effective_session,
+                workspace_ref=workspace_ref,
                 title=title,
                 model=model,
                 effort=effort,

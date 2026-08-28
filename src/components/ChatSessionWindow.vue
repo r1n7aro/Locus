@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { t } from "../i18n";
 import { useAppBootstrap } from "../composables/useAppBootstrap";
 import { normalizeAppError } from "../services/errors";
+import { loadSession } from "../services/session";
 import {
   CHAT_SESSION_WINDOW_EVENT,
   chatSessionWindowKind,
@@ -18,14 +19,18 @@ import {
   startCurrentWindowDragging,
 } from "../services/tauriRuntime";
 import { useChatStore } from "../stores/chat";
+import { useAgentStore } from "../stores/agent";
 import { useUiStore } from "../stores/ui";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import ChatWorkspaceView from "./ChatWorkspaceView.vue";
 import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
 import TopBannerHost from "./TopBannerHost.vue";
 
 const chatStore = useChatStore();
 chatStore.setActiveSessionSelectionPersistence(false);
+const agentStore = useAgentStore();
 const uiStore = useUiStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const { bootstrapCritical, registerListeners, cleanup } = useAppBootstrap({
   syncActiveSessionSelection: false,
   handleExternalScriptOpen: false,
@@ -35,6 +40,7 @@ const payload = ref<ChatSessionWindowPayload>(getChatSessionWindowPayload());
 const bootstrapped = ref(false);
 const bootstrapError = ref("");
 let unlistenPayload: UnlistenFn | null = null;
+let payloadApplicationEpoch = 0;
 
 const activeSession = computed(() =>
   chatStore.sessions.find((session) => session.id === chatStore.activeSessionId) ?? null,
@@ -58,23 +64,70 @@ async function selectPayloadSession(nextPayload: ChatSessionWindowPayload) {
   await chatStore.selectSession(sessionId, { persist: false });
 }
 
-function applyPayload(nextPayload: ChatSessionWindowPayload) {
+async function bindPayloadWorkspace(
+  nextPayload: ChatSessionWindowPayload,
+): Promise<NonNullable<ChatSessionWindowPayload["workspaceRef"]>> {
+  const windowId = getCurrentWindow().label;
+  await workspaceContextStore.initialize(windowId, "main");
+  let workspaceRef = nextPayload.workspaceRef ?? null;
+  if (!nextPayload.newChat) {
+    const sessionId = nextPayload.sessionId.trim();
+    if (!sessionId) throw new Error(t("chat.session.windowUnavailable"));
+    const session = await loadSession(sessionId);
+    if (!session.defaultCheckoutId) throw new Error(t("chat.session.windowUnavailable"));
+    if (workspaceRef && workspaceRef.checkoutId !== session.defaultCheckoutId) {
+      throw new Error(t("chat.session.windowUnavailable"));
+    }
+    workspaceRef = { checkoutId: session.defaultCheckoutId };
+  }
+  if (!workspaceRef?.checkoutId) throw new Error(t("chat.session.windowUnavailable"));
+
+  const context = await workspaceContextStore.focusCheckout(workspaceRef.checkoutId);
+  if (!context) throw new Error(t("chat.session.windowUnavailable"));
+  if (
+    workspaceRef.expectedGeneration != null
+    && context.workspaceGeneration !== workspaceRef.expectedGeneration
+  ) {
+    throw new Error(t("chat.session.windowUnavailable"));
+  }
+  return {
+    checkoutId: context.focusedCheckoutId,
+    expectedGeneration: context.workspaceGeneration,
+  };
+}
+
+async function applyPayload(nextPayload: ChatSessionWindowPayload) {
   const sessionId = nextPayload.sessionId?.trim() || "";
   if (!sessionId && !nextPayload.newChat) return;
+  const epoch = ++payloadApplicationEpoch;
   payload.value = {
     sessionId,
     title: nextPayload.title?.trim() || undefined,
     newChat: nextPayload.newChat === true,
+    workspaceRef: nextPayload.workspaceRef ?? null,
   };
   if (bootstrapped.value) {
+    const workspaceRef = await bindPayloadWorkspace(payload.value);
+    if (epoch !== payloadApplicationEpoch) return;
+    payload.value = { ...payload.value, workspaceRef };
+    await Promise.all([
+      agentStore.loadWorkspaceAgents(workspaceRef),
+      chatStore.refreshSessions(),
+    ]);
+    if (epoch !== payloadApplicationEpoch) return;
     if (payload.value.newChat) {
       createWindowSession();
     } else {
-      void selectPayloadSession(payload.value).catch((cause) => {
-        bootstrapError.value = normalizeAppError(cause).message;
-      });
+      await selectPayloadSession(payload.value);
     }
   }
+}
+
+function applyPayloadSafely(nextPayload: ChatSessionWindowPayload) {
+  bootstrapError.value = "";
+  void applyPayload(nextPayload).catch((cause) => {
+    bootstrapError.value = normalizeAppError(cause).message;
+  });
 }
 
 function handleTitlebarPointerDown(event: PointerEvent) {
@@ -91,6 +144,7 @@ function selectWindowSession(sessionId: string) {
     sessionId,
     title: session?.title?.trim() || undefined,
     newChat: false,
+    workspaceRef: workspaceContextStore.focusedWorkspaceRef,
   };
   void chatStore.selectSession(sessionId, { persist: false });
 }
@@ -100,6 +154,7 @@ function createWindowSession() {
   payload.value = {
     sessionId: "",
     newChat: true,
+    workspaceRef: workspaceContextStore.focusedWorkspaceRef,
   };
   chatStore.newChat({ persistSelection: false });
 }
@@ -113,7 +168,7 @@ onMounted(async () => {
   try {
     unlistenPayload = await listen<ChatSessionWindowPayload>(
       CHAT_SESSION_WINDOW_EVENT,
-      (event) => applyPayload(event.payload),
+      (event) => applyPayloadSafely(event.payload),
     );
 
     const initialSessionId = payload.value.sessionId.trim();
@@ -122,11 +177,17 @@ onMounted(async () => {
         chatSessionWindowKind(initialSessionId),
       ).catch(() => null);
       if (latestQuery) {
-        applyPayload(getChatSessionWindowPayload(`?${latestQuery}`));
+        await applyPayload(getChatSessionWindowPayload(`?${latestQuery}`));
       }
     }
 
+    const workspaceRef = await bindPayloadWorkspace(payload.value);
+    payload.value = { ...payload.value, workspaceRef };
     await bootstrapCritical();
+    await Promise.all([
+      agentStore.loadWorkspaceAgents(workspaceRef),
+      chatStore.refreshSessions(),
+    ]);
     await registerListeners();
     bootstrapped.value = true;
     if (payload.value.newChat) {

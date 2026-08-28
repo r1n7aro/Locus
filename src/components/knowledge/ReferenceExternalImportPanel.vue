@@ -42,6 +42,7 @@ import type {
   UnityReferenceImportLocale,
   UnityReferenceImportStatus,
 } from "../../types";
+import type { WorkspaceRef } from "../../services/project";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
@@ -85,6 +86,7 @@ interface FeishuTreeRow {
 }
 
 const props = withDefaults(defineProps<{
+  workspaceRef: WorkspaceRef;
   mode?: "dialog" | "directory" | "window";
   parentDir?: string;
   fixedTargetPath?: string | null;
@@ -438,7 +440,7 @@ function localPathExists(path: string): boolean {
 
 async function refreshKnownReferenceDirectories() {
   try {
-    const directories = await knowledgeListDirectories("reference");
+    const directories = await knowledgeListDirectories("reference", props.workspaceRef);
     knownReferenceDirectories.value = new Set(
       directories
         .map((path) => normalizeRelativePath(path))
@@ -462,7 +464,7 @@ async function ensureDirectoryReady(path: string): Promise<boolean> {
       kind: "directory",
       type: "reference",
       path: normalized,
-    });
+    }, props.workspaceRef);
   } catch (cause) {
     createCause = cause;
   }
@@ -528,7 +530,7 @@ function scheduleUnityPoll(delay = 600) {
 async function loadUnityExistingDirectory() {
   unityExistingLoading.value = true;
   try {
-    unityExistingDirectory.value = await knowledgeFindUnityReferenceDirectory();
+    unityExistingDirectory.value = await knowledgeFindUnityReferenceDirectory(props.workspaceRef);
   } catch (cause) {
     unityError.value = normalizeAppError(cause).message;
   } finally {
@@ -600,7 +602,7 @@ function applyUnityStatus(
 async function refreshUnityStatus() {
   const targetPath = unityRequestTargetPath(unityTargetPath.value);
   try {
-    const status = await knowledgeGetUnityReferenceImportStatus(targetPath);
+    const status = await knowledgeGetUnityReferenceImportStatus(props.workspaceRef, targetPath);
     applyUnityStatus(status);
     unityError.value = "";
     if (status.running) {
@@ -633,6 +635,7 @@ async function startUnityImport() {
     }
     await focusDirectory(targetPath, true);
     const status = await knowledgeImportUnityReferenceDocs(
+      props.workspaceRef,
       unityRequestTargetPath(targetPath),
       unitySelectedLocale.value,
     );
@@ -651,6 +654,7 @@ async function cancelUnityImport() {
   unityError.value = "";
   try {
     applyUnityStatus(await knowledgeCancelUnityReferenceImport(
+      props.workspaceRef,
       unityRequestTargetPath(unityTargetPath.value),
     ));
     scheduleUnityPoll(200);
@@ -752,6 +756,7 @@ function applyLocalStatus(
 async function refreshLocalStatus() {
   try {
     const status = await knowledgeGetLocalReferenceImportStatus(
+      props.workspaceRef,
       trimOrEmpty(localTargetPath.value) || null,
     );
     applyLocalStatus(status);
@@ -797,7 +802,7 @@ async function previewLocalSource() {
   localPreviewPending.value = true;
   localError.value = "";
   try {
-    localPreview.value = await knowledgePreviewLocalReferenceImport(sourcePath);
+    localPreview.value = await knowledgePreviewLocalReferenceImport(sourcePath, props.workspaceRef);
   } catch (cause) {
     localPreview.value = null;
     localError.value = normalizeAppError(cause).message;
@@ -828,7 +833,7 @@ async function startLocalImport() {
       targetPath,
       mode: localMode.value,
       aiEditable: localMode.value === "snapshot" && localAiEditable.value,
-    });
+    }, props.workspaceRef);
     applyLocalStatus(status, { startedSession: true });
     if (status.running) scheduleLocalPoll();
   } catch (cause) {
@@ -843,7 +848,7 @@ async function cancelLocalImport() {
   localCancelPending.value = true;
   localError.value = "";
   try {
-    applyLocalStatus(await knowledgeCancelLocalReferenceImport());
+    applyLocalStatus(await knowledgeCancelLocalReferenceImport(props.workspaceRef));
     scheduleLocalPoll(200);
   } catch (cause) {
     localError.value = normalizeAppError(cause).message;
@@ -866,7 +871,7 @@ async function syncLocalImport() {
   localSyncPending.value = true;
   localError.value = "";
   try {
-    applyLocalStatus(await knowledgeSyncLocalReferenceDocs(targetPath));
+    applyLocalStatus(await knowledgeSyncLocalReferenceDocs(targetPath, props.workspaceRef));
     if (props.refreshKnowledge) await props.refreshKnowledge();
   } catch (cause) {
     localError.value = normalizeAppError(cause).message;
@@ -887,7 +892,7 @@ async function deleteLocalImport() {
   localDeletePending.value = true;
   localError.value = "";
   try {
-    await knowledgeDeleteLocalReferenceDocs(targetPath);
+    await knowledgeDeleteLocalReferenceDocs(targetPath, props.workspaceRef);
     localImportSessionStarted.value = false;
     localCloseAfterSuccess.value = false;
     localStatus.value = null;
@@ -1210,7 +1215,7 @@ function buildFeishuSelectedRootsPayload(): FeishuReferenceRootSelection[] {
 async function fetchFeishuNodeEntries(parentNodeToken?: string | null) {
   const spaceId = trimOrEmpty(feishuSelectedSpaceId.value);
   if (!spaceId) return [];
-  return knowledgeListFeishuReferenceSpaceNodes(spaceId, parentNodeToken ?? null);
+  return knowledgeListFeishuReferenceSpaceNodes(props.workspaceRef, spaceId, parentNodeToken ?? null);
 }
 
 async function loadFeishuRootNodes() {
@@ -1498,7 +1503,7 @@ function buildFeishuImportRequest(targetPath?: string | null): FeishuReferenceIm
 async function refreshFeishuStatus() {
   const targetPath = trimOrEmpty(feishuCurrentStatusTargetPath.value) || undefined;
   try {
-    const status = await knowledgeGetFeishuReferenceImportStatus(targetPath);
+    const status = await knowledgeGetFeishuReferenceImportStatus(props.workspaceRef, targetPath);
     feishuStatus.value = status;
     feishuError.value = "";
     applyFeishuStatusToForm(status);
@@ -1519,7 +1524,7 @@ async function saveFeishuConfig(targetPath?: string | null) {
   feishuSavePending.value = true;
   feishuError.value = "";
   try {
-    const status = await knowledgeSaveFeishuReferenceConfig(buildFeishuConfigInput(targetPath));
+    const status = await knowledgeSaveFeishuReferenceConfig(buildFeishuConfigInput(targetPath), props.workspaceRef);
     feishuStatus.value = status;
     applyFeishuStatusToForm(status);
     if (status.running || status.stage === "authorizing") {
@@ -1542,7 +1547,7 @@ async function testFeishuConnection() {
     const targetPath = fixedTargetPath.value || null;
     const saved = await saveFeishuConfig(targetPath);
     if (!saved) return;
-    const result = await knowledgeTestFeishuReferenceConnection(targetPath || undefined);
+    const result = await knowledgeTestFeishuReferenceConnection(props.workspaceRef, targetPath || undefined);
     feishuLastMessage.value = result.summary;
     upsertFeishuSpaceOptions(
       result.spaces.map((item) => ({
@@ -1590,7 +1595,7 @@ async function startFeishuAuthorization() {
     const targetPath = fixedTargetPath.value || null;
     const saved = await saveFeishuConfig(targetPath);
     if (!saved) return;
-    const result = await knowledgeStartFeishuReferenceOauth();
+    const result = await knowledgeStartFeishuReferenceOauth(props.workspaceRef);
     await openUrl(result.authorizeUrl);
     feishuLastMessage.value = t("knowledge.feishuReference.window.authorizationStarted", result.callbackUrl);
     await refreshFeishuStatus();
@@ -1610,6 +1615,7 @@ async function cancelFeishuAuthorization() {
   feishuOauthRequestedInSession.value = false;
   try {
     feishuStatus.value = await knowledgeCancelFeishuReferenceOauthWait(
+      props.workspaceRef,
       (trimOrEmpty(feishuCurrentStatusTargetPath.value) || undefined),
     );
     scheduleFeishuPoll(200);
@@ -1640,7 +1646,7 @@ async function startFeishuImport() {
     await focusDirectory(targetPath, true);
     const saved = await saveFeishuConfig(targetPath);
     if (!saved) return;
-    const status = await knowledgeImportFeishuReferenceDocs(buildFeishuImportRequest(targetPath));
+    const status = await knowledgeImportFeishuReferenceDocs(buildFeishuImportRequest(targetPath), props.workspaceRef);
     feishuStatus.value = status;
     if (status.running) scheduleFeishuPoll();
   } catch (cause) {
@@ -1656,6 +1662,7 @@ async function cancelFeishuImport() {
   feishuError.value = "";
   try {
     feishuStatus.value = await knowledgeCancelFeishuReferenceImport(
+      props.workspaceRef,
       trimOrEmpty(feishuCurrentStatusTargetPath.value) || undefined,
     );
     scheduleFeishuPoll(200);

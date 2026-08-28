@@ -28,6 +28,10 @@ interface AddNoticeOptions {
   skipConsoleLog?: boolean;
 }
 
+interface ClearNoticeOptions {
+  includeErrors?: boolean;
+}
+
 const DEFAULT_TTLS: Record<NotificationLevel, number> = {
   info: 2_400,
   success: 2_800,
@@ -221,9 +225,9 @@ export const useNotificationStore = defineStore("notification", () => {
     }
   }
 
-  function clearByOperation(operation: string) {
+  function clearByOperation(operation: string, options: ClearNoticeOptions = {}) {
     const toRemove = notices.value.filter(
-      (n) => n.operation === operation && n.level !== "error",
+      (n) => n.operation === operation && (options.includeErrors || n.level !== "error"),
     );
     for (const n of toRemove) {
       removeNotice(n.id);

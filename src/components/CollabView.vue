@@ -22,7 +22,7 @@ import { useCollabState } from "../composables/useCollabState";
 import { useProjectStore } from "../stores/project";
 import { useNotificationStore } from "../stores/notification";
 import { selectUnityAsset, openFileExternal, showInFolder } from "../services/unity";
-import { diffSingleFile, refetchDiffByKey } from "../services/diff";
+import { computeRequestKey, diffSingleFile, refetchDiffByKey } from "../services/diff";
 import { canOpenInEditor, useHideMeta, withMetaCompanionPaths } from "../composables/useHideMeta";
 import { countLocusManagedFiles } from "../composables/locusManagedFiles";
 import { useDiffProgress } from "../composables/useDiffProgress";
@@ -45,14 +45,49 @@ import {
   openCollabSearchWindow,
   type CollabSearchSelectionPayload,
 } from "../services/collabSearchWindow";
+import type { WorkspaceRef } from "../services/project";
 
 const props = defineProps<{
   workingDir: string;
+  workspaceRef?: WorkspaceRef | null;
   isActive: boolean;
   selectedModelId: string;
   selectedAgentId: string;
   models: ModelOption[];
+  headFocusRequest?: {
+    id: number;
+    checkoutId: string;
+  } | null;
 }>();
+
+interface CollabViewWorkspaceSnapshot {
+  workingDir: string;
+  workspaceRef: WorkspaceRef;
+  checkoutId: string;
+  expectedGeneration: number | null;
+}
+
+function captureWorkspaceSnapshot(): CollabViewWorkspaceSnapshot {
+  if (!props.workspaceRef) {
+    throw new Error("Workspace checkout is required for Collab operations.");
+  }
+  const workspaceRef = {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+  return {
+    workingDir: props.workingDir,
+    workspaceRef,
+    checkoutId: workspaceRef.checkoutId,
+    expectedGeneration: workspaceRef.expectedGeneration ?? null,
+  };
+}
+
+function isCurrentWorkspaceSnapshot(snapshot: CollabViewWorkspaceSnapshot) {
+  return snapshot.workingDir === props.workingDir
+    && snapshot.checkoutId === (props.workspaceRef?.checkoutId ?? null)
+    && snapshot.expectedGeneration === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 const emit = defineEmits<{
   (e: "selectModel", id: string): void;
@@ -130,13 +165,14 @@ const unanchoredStashHashes = computed(() =>
 
 const inlineDiff = ref<FileDiffPayload | null>(null);
 const diffLoading = ref(false);
+let diffRequestGeneration = 0;
 const activeFilePath = ref<string | null>(null);
 const activeDiffSource = ref<DiffSource | null>(null);
 const activeDiffCommitHash = ref<string | null>(null);
 const pendingDiscardPaths = ref<Set<string>>(new Set());
 const discardOperationBusy = computed(() => pendingDiscardPaths.value.size > 0);
 const workspaceMutationBusy = computed(() => stageOperationBusy.value || discardOperationBusy.value);
-const diffProgress = useDiffProgress();
+const diffProgress = useDiffProgress(() => props.workspaceRef ?? null);
 const diffProgressWidth = computed(() => `${diffProgress.progress.value * 100}%`);
 const mergeResolutionRef = ref<{ confirmDiscardChanges?: () => Promise<boolean> } | null>(null);
 const fileDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
@@ -197,6 +233,8 @@ function onConflictQuickResolved(file: UnmergedFileEntry) {
 }
 
 async function onSelectFile(file: GitFileChange, source: DiffSource, commitHash?: string) {
+  const workspace = captureWorkspaceSnapshot();
+  const requestGeneration = ++diffRequestGeneration;
   // Toggle: clicking the same file again closes the diff
   const nextCommitHash = source === "gitCommit" ? (commitHash ?? null) : null;
   if (
@@ -224,9 +262,12 @@ async function onSelectFile(file: GitFileChange, source: DiffSource, commitHash?
     activeDiffCommitHash.value = nextCommitHash;
     inlineDiff.value = null;
     diffLoading.value = false;
-    diffProgress.reset();
+    diffProgress.reset(computeRequestKey(request, workspace.workspaceRef));
     try {
-      const opened = await openFileDiffReviewWindow({ request });
+      const opened = await openFileDiffReviewWindow({
+        request,
+        workspaceRef: workspace.workspaceRef,
+      });
       if (opened) return;
     } catch (e) {
       console.error("[CollabView] failed to open diff review window:", e);
@@ -247,22 +288,47 @@ async function onSelectFile(file: GitFileChange, source: DiffSource, commitHash?
   activeDiffCommitHash.value = nextCommitHash;
   inlineDiff.value = null;
   diffLoading.value = true;
-  diffProgress.reset();
+  diffProgress.reset(computeRequestKey(request, workspace.workspaceRef));
   try {
-    const payload = await diffSingleFile(request);
+    const payload = await diffSingleFile(request, workspace.workspaceRef);
+    if (
+      requestGeneration !== diffRequestGeneration
+      || !isCurrentWorkspaceSnapshot(workspace)
+    ) return;
     inlineDiff.value = payload;
   } catch (e) {
+    if (
+      requestGeneration !== diffRequestGeneration
+      || !isCurrentWorkspaceSnapshot(workspace)
+    ) return;
     console.error("[CollabView] failed to fetch diff:", e);
   } finally {
-    diffLoading.value = false;
+    if (
+      requestGeneration === diffRequestGeneration
+      && isCurrentWorkspaceSnapshot(workspace)
+    ) {
+      diffLoading.value = false;
+    }
   }
 }
 
 function closeDiff() {
+  diffRequestGeneration += 1;
   inlineDiff.value = null;
+  diffLoading.value = false;
   activeFilePath.value = null;
   activeDiffSource.value = null;
   activeDiffCommitHash.value = null;
+}
+
+function selectInlineDiffInUnity(path: string) {
+  if (!props.workspaceRef) return;
+  void selectUnityAsset(props.workspaceRef, path);
+}
+
+function openInlineDiffExternal(path: string) {
+  if (!props.workspaceRef) return;
+  void openFileExternal(path, props.workspaceRef);
 }
 
 function openGitConfigPopover() {
@@ -289,18 +355,47 @@ watch(selectedCommitHash, (hash) => {
   closeDiff();
 });
 
+watch(
+  () => [
+    props.workingDir,
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  () => {
+    closeDiff();
+    selectedConflictFile.value = null;
+    pendingDiscardPaths.value = new Set();
+    gitConfigPopoverOpen.value = false;
+    ctxMenu.value = null;
+    promptDialog.value = null;
+    confirmDialog.value = null;
+  },
+);
+
 async function onLfsPulled() {
   if (!inlineDiff.value) return;
+  const workspace = captureWorkspaceSnapshot();
+  const key = inlineDiff.value.key;
   try {
-    const updated = await refetchDiffByKey(inlineDiff.value.key);
-    if (updated) inlineDiff.value = updated;
+    const updated = await refetchDiffByKey(key);
+    if (
+      updated
+      && isCurrentWorkspaceSnapshot(workspace)
+      && inlineDiff.value?.key === key
+    ) inlineDiff.value = updated;
   } catch (e) {
+    if (!isCurrentWorkspaceSnapshot(workspace)) return;
     console.error("[CollabView] refetch after LFS pull failed:", e);
   }
 }
 
 // ── Git operation progress ───────────────────────────────────────
-async function runGitOp<T>(label: string, command: string, fn: () => Promise<T>): Promise<T> {
+async function runGitOp<T>(
+  label: string,
+  command: string,
+  fn: (workspaceRef: WorkspaceRef) => Promise<T>,
+): Promise<T> {
+  const workspace = captureWorkspaceSnapshot();
   const operation = `collabGitOp:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   notificationStore.addNotice("info", label, {
     operation,
@@ -309,10 +404,12 @@ async function runGitOp<T>(label: string, command: string, fn: () => Promise<T>)
     replaceOperation: true,
   });
   try {
-    const result = await fn();
+    const result = await fn(workspace.workspaceRef);
     const msg = (result as any)?.message || label;
     const isError = (result as any)?.status === "conflict";
-    terminalRef.value?.pushOutput(command, msg, isError);
+    if (isCurrentWorkspaceSnapshot(workspace)) {
+      terminalRef.value?.pushOutput(command, msg, isError);
+    }
     notificationStore.addNotice(isError ? "error" : "success", msg, {
       operation,
       ttl: 3000,
@@ -322,7 +419,9 @@ async function runGitOp<T>(label: string, command: string, fn: () => Promise<T>)
   } catch (e) {
     const err = normalizeAppError(e);
     const errMsg = err.message || "Operation failed";
-    terminalRef.value?.pushOutput(command, errMsg, true);
+    if (isCurrentWorkspaceSnapshot(workspace)) {
+      terminalRef.value?.pushOutput(command, errMsg, true);
+    }
     notificationStore.addNotice("error", errMsg, {
       code: err.code,
       operation,
@@ -420,6 +519,34 @@ function selectHistoryInGraph(target: GitGraphSelectionTarget, options: GitGraph
   return Promise.resolve(false);
 }
 
+let appliedHeadFocusRequestId = 0;
+
+watch(
+  () => [
+    props.headFocusRequest?.id ?? 0,
+    props.headFocusRequest?.checkoutId ?? "",
+    props.workspaceRef?.checkoutId ?? "",
+    headState.value.hash ?? "",
+    loading.value,
+    commits.value,
+  ] as const,
+  async ([requestId, requestedCheckoutId, currentCheckoutId, headHash, isLoading, loadedCommits]) => {
+    if (!requestId || requestId === appliedHeadFocusRequestId) return;
+    if (requestedCheckoutId !== currentCheckoutId || isLoading || !headHash) return;
+    if (!loadedCommits.some((commit) => commit.hash === headHash)) return;
+
+    await nextTick();
+    if (props.headFocusRequest?.id !== requestId) return;
+    if (props.workspaceRef?.checkoutId !== requestedCheckoutId) return;
+    appliedHeadFocusRequestId = requestId;
+    await selectHistoryInGraph(
+      { kind: "commit", hash: headHash },
+      { scroll: true, behavior: "smooth" },
+    );
+  },
+  { flush: "post" },
+);
+
 function onSelectStash(stash: GitStashEntry) {
   void selectHistoryInGraph({ kind: "stash", hash: stash.hash }, { toggle: true });
 }
@@ -439,7 +566,9 @@ function isCollabSearchSelectionPayload(value: unknown): value is CollabSearchSe
   const payload = value as Partial<CollabSearchSelectionPayload>;
   return (payload.kind === "commit" || payload.kind === "stash")
     && typeof payload.hash === "string"
-    && payload.hash.trim().length > 0;
+    && payload.hash.trim().length > 0
+    && typeof payload.workspaceRef?.checkoutId === "string"
+    && typeof payload.workspaceRef?.expectedGeneration === "number";
 }
 
 async function ensureSearchCommitLoaded(hash: string): Promise<boolean> {
@@ -485,7 +614,7 @@ async function selectCollabSearchResult(payload: CollabSearchSelectionPayload) {
 
 async function openCollabSearch() {
   try {
-    await openCollabSearchWindow();
+    await openCollabSearchWindow(captureWorkspaceSnapshot().workspaceRef);
   } catch (cause) {
     const err = normalizeAppError(cause);
     notificationStore.addNotice("error", err.message, {
@@ -501,6 +630,12 @@ onMounted(async () => {
       COLLAB_SEARCH_SELECT_EVENT,
       (event) => {
         if (!isCollabSearchSelectionPayload(event.payload)) return;
+        if (!isCurrentWorkspaceSnapshot({
+          workingDir: props.workingDir,
+          workspaceRef: event.payload.workspaceRef,
+          checkoutId: event.payload.workspaceRef.checkoutId,
+          expectedGeneration: event.payload.workspaceRef.expectedGeneration ?? null,
+        })) return;
         void selectCollabSearchResult(event.payload);
       },
     );
@@ -559,15 +694,17 @@ function confirmDiscardFile() {
         : t("collab.discardLocusWarnMulti", locusManagedCount),
     danger: true,
     action: async () => {
+      const workspace = captureWorkspaceSnapshot();
       addPendingDiscardPaths(expandedPaths);
       try {
         if (source === "gitStaged") {
           await unstageFiles(expandedPaths);
         }
         for (const f of discardFiles) {
-          await gitDiscardFile(f.path, f.status, f.oldPath);
+          await gitDiscardFile(f.path, f.status, f.oldPath, workspace.workspaceRef);
         }
       } catch (e) {
+        if (!isCurrentWorkspaceSnapshot(workspace)) return;
         const err = normalizeAppError(e);
         notificationStore.addNotice("error", err.message || t("collab.discardFailed"), {
           code: err.code,
@@ -575,9 +712,11 @@ function confirmDiscardFile() {
         });
       } finally {
         try {
-          await onRefresh();
+          if (isCurrentWorkspaceSnapshot(workspace)) await onRefresh();
         } finally {
-          removePendingDiscardPaths(expandedPaths);
+          if (isCurrentWorkspaceSnapshot(workspace)) {
+            removePendingDiscardPaths(expandedPaths);
+          }
         }
       }
     },
@@ -614,7 +753,7 @@ async function doShowInFolder() {
   const filePath = target.file.path;
   closeCtxMenu();
   try {
-    await showInFolder(filePath);
+    await showInFolder(filePath, captureWorkspaceSnapshot().workspaceRef);
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message || "Failed to show file in folder", {
@@ -634,7 +773,7 @@ async function doCheckoutBranch(branchName: string) {
   if (hasConflictState.value) return;
   closeCtxMenu();
   try {
-    await runGitOp(`switch ${branchName}`, `git switch ${branchName}`, () => gitBranchAction(branchName, "local", "switch"));
+    await runGitOp(`switch ${branchName}`, `git switch ${branchName}`, (workspaceRef) => gitBranchAction(branchName, "local", "switch", undefined, workspaceRef));
   } catch {}
   onRefresh();
 }
@@ -655,7 +794,7 @@ async function performBranchAction(
   };
   const cmd = cmdMap[action];
   try {
-    await runGitOp(`${action} ${branchName}`, cmd, () => gitBranchAction(branchName, targetKind, action));
+    await runGitOp(`${action} ${branchName}`, cmd, (workspaceRef) => gitBranchAction(branchName, targetKind, action, undefined, workspaceRef));
   } catch {}
   onRefresh();
 }
@@ -679,7 +818,7 @@ async function doCommitAction(action: string, mode?: string) {
   const label = mode ? `${action} (${mode}) → ${shortHash}` : `${action} → ${shortHash}`;
   const cmd = mode ? `git ${action} --${mode} ${shortHash}` : `git ${action} ${shortHash}`;
   try {
-    await runGitOp(label, cmd, () => gitCommitAction(rev, action, mode));
+    await runGitOp(label, cmd, (workspaceRef) => gitCommitAction(rev, action, mode, undefined, workspaceRef));
   } catch {}
   onRefresh();
 }
@@ -693,7 +832,7 @@ async function doStashAction(action: string) {
   const refName = selected[0].refName;
   closeCtxMenu();
   try {
-    await runGitOp(`stash ${action} ${refName}`, `git stash ${action} ${refName}`, () => gitStashAction(refName, action));
+    await runGitOp(`stash ${action} ${refName}`, `git stash ${action} ${refName}`, (workspaceRef) => gitStashAction(refName, action, workspaceRef));
   } catch {}
   onRefresh();
 }
@@ -723,7 +862,7 @@ function confirmResetHard() {
     danger: true,
     action: async () => {
       try {
-        await runGitOp(`reset --hard → ${hash}`, `git reset --hard ${hash}`, () => gitCommitAction(rev, "reset", "hard"));
+        await runGitOp(`reset --hard → ${hash}`, `git reset --hard ${hash}`, (workspaceRef) => gitCommitAction(rev, "reset", "hard", undefined, workspaceRef));
       } catch {}
       onRefresh();
     },
@@ -749,10 +888,10 @@ function confirmDropStash() {
         await runGitOp(
           count === 1 ? `stash drop ${selected[0].refName}` : `stash drop ${count} stashes`,
           count === 1 ? `git stash drop ${selected[0].refName}` : "git stash drop <selected>",
-          async () => {
+          async (workspaceRef) => {
             const dropOrder = [...selected].sort((left, right) => right.index - left.index);
             for (const stash of dropOrder) {
-              await gitStashAction(stash.refName, "drop");
+              await gitStashAction(stash.refName, "drop", workspaceRef);
             }
             return {
               status: "success" as const,
@@ -779,7 +918,7 @@ function confirmDeleteBranch() {
     danger: true,
     action: async () => {
       try {
-        await runGitOp(`delete branch ${name}`, `git branch -d ${name}`, () => gitBranchAction(name, "local", "delete"));
+        await runGitOp(`delete branch ${name}`, `git branch -d ${name}`, (workspaceRef) => gitBranchAction(name, "local", "delete", undefined, workspaceRef));
       } catch {}
       onRefresh();
     },
@@ -798,7 +937,7 @@ function promptNewBranch() {
     value: "",
     action: async (val: string) => {
       try {
-        await runGitOp(`create branch ${val.trim()}`, `git checkout -b ${val.trim()} ${hash}`, () => gitCommitAction(rev, "createBranchAndCheckout", undefined, val.trim()));
+        await runGitOp(`create branch ${val.trim()}`, `git checkout -b ${val.trim()} ${hash}`, (workspaceRef) => gitCommitAction(rev, "createBranchAndCheckout", undefined, val.trim(), workspaceRef));
       } catch {}
       onRefresh();
     },
@@ -816,7 +955,7 @@ function promptRenameBranch() {
     value: oldName,
     action: async (val: string) => {
       try {
-        await runGitOp(`rename ${oldName} → ${val.trim()}`, `git branch -m ${oldName} ${val.trim()}`, () => gitBranchAction(oldName, "local", "rename", val.trim()));
+        await runGitOp(`rename ${oldName} → ${val.trim()}`, `git branch -m ${oldName} ${val.trim()}`, (workspaceRef) => gitBranchAction(oldName, "local", "rename", val.trim(), workspaceRef));
       } catch {}
       onRefresh();
     },
@@ -881,7 +1020,11 @@ function copyBranchName() {
       <template v-if="isRepo">
 
     <div class="left-area" ref="leftAreaRef" :style="{ flexBasis: leftColWidth + '%' }">
-      <div class="git-sidebar-shell" :style="!sidebarCollapsed ? { width: gitSidebarWidth + 'px' } : undefined">
+      <div
+        v-if="displaySettings.showCollabSidebar"
+        class="git-sidebar-shell"
+        :style="!sidebarCollapsed ? { width: gitSidebarWidth + 'px' } : undefined"
+      >
         <GitSidebar
           :local-branches="localBranches"
           :remote-branches="remoteBranches"
@@ -915,7 +1058,7 @@ function copyBranchName() {
         />
       </div>
       <div
-        v-if="!sidebarCollapsed"
+        v-if="displaySettings.showCollabSidebar && !sidebarCollapsed"
         class="git-sidebar-divider"
         @mousedown="onSidebarSplitterMouseDown"
       ></div>
@@ -947,6 +1090,7 @@ function copyBranchName() {
           <GitTerminal
             ref="terminalRef"
             :working-dir="props.workingDir"
+            :workspace-ref="props.workspaceRef"
             :selected-model-id="props.selectedModelId"
             :selected-agent-id="props.selectedAgentId"
             :current-branch="currentBranch"
@@ -960,6 +1104,7 @@ function copyBranchName() {
 
       <GitConfigPopover
         :open="gitConfigPopoverOpen"
+        :workspace-ref="props.workspaceRef"
         @close="closeGitConfigPopover"
         @saved="onGitConfigSaved"
       />
@@ -970,6 +1115,7 @@ function copyBranchName() {
           ref="mergeResolutionRef"
           :key="conflictFileKey(selectedConflictFile)"
           :file="selectedConflictFile"
+          :workspace-ref="props.workspaceRef"
           @resolved="onConflictResolved"
           @back="onConflictBack"
         />
@@ -1003,10 +1149,10 @@ function copyBranchName() {
                 >{{ t('diff.tabs.text') }}</button>
               </span>
               <button
-                v-if="projectStore.unityConnected"
+                v-if="projectStore.unityConnected && props.workspaceRef"
                 class="inline-diff-action-btn"
                 :title="t('common.selectInUnity')"
-                @click="selectUnityAsset(inlineDiff.filePath)"
+                @click="selectInlineDiffInUnity(inlineDiff.filePath)"
               >
                 <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
                 {{ t('common.selectInUnity') }}
@@ -1015,7 +1161,7 @@ function copyBranchName() {
                 v-if="!inlineDiff.isBinary && canOpenInEditor(inlineDiff.filePath)"
                 class="inline-diff-action-btn"
                 :title="t('common.openInEditor')"
-                @click="openFileExternal(inlineDiff.filePath)"
+                @click="openInlineDiffExternal(inlineDiff.filePath)"
               >
                 <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
                 {{ t('common.openInEditor') }}
@@ -1023,7 +1169,13 @@ function copyBranchName() {
             </span>
           </div>
           <div class="inline-diff-body">
-            <FileDiffViewer ref="fileDiffViewerRef" :payload="inlineDiff" :hide-builtin-tabs="true" @lfs-pulled="onLfsPulled" />
+            <FileDiffViewer
+              ref="fileDiffViewerRef"
+              :payload="inlineDiff"
+              :workspace-ref="props.workspaceRef"
+              :hide-builtin-tabs="true"
+              @lfs-pulled="onLfsPulled"
+            />
           </div>
         </template>
         <div v-else class="inline-diff-loading">
@@ -1047,6 +1199,7 @@ function copyBranchName() {
       :current-branch="currentBranch"
       :has-unresolved-files="hasUnresolvedFiles"
       :selected-conflict-path="selectedConflictFile?.path ?? null"
+      :workspace-ref="props.workspaceRef"
       @select-conflict-file="onSelectConflictFile"
       @file-resolved="onConflictQuickResolved"
       @action-done="onMergeActionDone"
@@ -1061,6 +1214,7 @@ function copyBranchName() {
       :detail-kind="commitDetailKind"
       :detail-label="commitDetailLabel"
       :active-file-path="activeCommitFilePath"
+      :workspace-ref="props.workspaceRef"
       @select-file="(f: GitFileChange) => onSelectFile(f, 'gitCommit', selectedCommitHash ?? undefined)"
     />
 
@@ -1078,6 +1232,7 @@ function copyBranchName() {
       :pending-unstage-paths="pendingUnstagePaths"
       :pending-discard-paths="pendingDiscardPaths"
       :stage-operation-busy="workspaceMutationBusy"
+      :workspace-ref="props.workspaceRef"
       @stage="stageFile"
       @unstage="unstageFile"
       @stage-many="stageFiles"

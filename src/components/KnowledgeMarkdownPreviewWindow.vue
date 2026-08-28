@@ -15,8 +15,10 @@ import {
 import { getSubWindowClaimedQuery } from "../services/subWindow";
 import LucideIcon from "./icons/LucideIcon.vue";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 const appWindow = getCurrentWindow();
+const workspaceContextStore = useWorkspaceContextStore();
 const path = ref("");
 const title = ref("");
 const content = ref("");
@@ -41,12 +43,23 @@ async function loadDocument(payload: KnowledgeMarkdownPreviewWindowPayload) {
   void appWindow.setTitle(`Locus - ${title.value}`).catch(() => {});
 
   try {
+    await workspaceContextStore.initialize(appWindow.label, "main");
+    const context = await workspaceContextStore.focusCheckout(payload.workspaceRef.checkoutId);
+    if (
+      !context
+      || (
+        payload.workspaceRef.expectedGeneration != null
+        && context.workspaceGeneration !== payload.workspaceRef.expectedGeneration
+      )
+    ) {
+      throw new Error(t("knowledge.markdownPreview.notFound"));
+    }
     const result = await knowledgeRead({
       kind: "document",
       type: payload.docType,
       path: payload.path,
       part: "full",
-    });
+    }, payload.workspaceRef);
     if (seq !== loadSeq) return;
     const document = result.document;
     if (!document) throw new Error(t("knowledge.markdownPreview.notFound"));

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use walkdir::WalkDir;
 
 use crate::knowledge_store::{
@@ -172,6 +172,7 @@ pub struct KnowledgeIndexState {
     embedding_status: RwLock<Arc<StdMutex<EmbeddingStatus>>>,
     lexical_rebuild_status: RwLock<Arc<StdMutex<LexicalRebuildStatus>>>,
     app_handle: Option<AppHandle>,
+    event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
     embedding_download_cancel_requested: Arc<AtomicBool>,
     catalog_bootstrapped_workspaces: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
@@ -190,7 +191,7 @@ impl KnowledgeIndexState {
         tantivy_inst: KnowledgeTantivyIndex,
         embedding_mgr: EmbeddingManager,
     ) -> Self {
-        Self::new_with_optional_app_handle(db_inst, tantivy_inst, embedding_mgr, None)
+        Self::new_with_optional_app_handle(db_inst, tantivy_inst, embedding_mgr, None, None)
     }
 
     pub fn new_with_app_handle(
@@ -199,7 +200,29 @@ impl KnowledgeIndexState {
         embedding_mgr: EmbeddingManager,
         app_handle: AppHandle,
     ) -> Self {
-        Self::new_with_optional_app_handle(db_inst, tantivy_inst, embedding_mgr, Some(app_handle))
+        Self::new_with_optional_app_handle(
+            db_inst,
+            tantivy_inst,
+            embedding_mgr,
+            Some(app_handle),
+            None,
+        )
+    }
+
+    pub fn new_with_workspace_app_handle(
+        db_inst: KnowledgeDb,
+        tantivy_inst: KnowledgeTantivyIndex,
+        embedding_mgr: EmbeddingManager,
+        app_handle: AppHandle,
+        event_scope: crate::workspace_service::event::WorkspaceEventScope,
+    ) -> Self {
+        Self::new_with_optional_app_handle(
+            db_inst,
+            tantivy_inst,
+            embedding_mgr,
+            Some(app_handle),
+            Some(event_scope),
+        )
     }
 
     fn new_with_optional_app_handle(
@@ -207,6 +230,7 @@ impl KnowledgeIndexState {
         tantivy_inst: KnowledgeTantivyIndex,
         embedding_mgr: EmbeddingManager,
         app_handle: Option<AppHandle>,
+        event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
     ) -> Self {
         let embedding_status = embedding_mgr.status();
         Self {
@@ -218,6 +242,7 @@ impl KnowledgeIndexState {
                 LexicalRebuildStatus::default(),
             ))),
             app_handle,
+            event_scope,
             embedding_download_cancel_requested: Arc::new(AtomicBool::new(false)),
             catalog_bootstrapped_workspaces: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
@@ -225,6 +250,12 @@ impl KnowledgeIndexState {
 
     pub fn db(&self) -> Arc<KnowledgeDb> {
         self.db.read().unwrap().clone()
+    }
+
+    pub(crate) fn event_scope(
+        &self,
+    ) -> Option<crate::workspace_service::event::WorkspaceEventScope> {
+        self.event_scope.clone()
     }
 
     pub fn tantivy(&self) -> Arc<KnowledgeTantivyIndex> {
@@ -260,10 +291,12 @@ impl KnowledgeIndexState {
     pub fn set_lexical_rebuild_status(&self, status: LexicalRebuildStatus) {
         *self.lexical_rebuild_status.read().unwrap().lock().unwrap() = status.clone();
         if let Some(app_handle) = &self.app_handle {
-            if let Err(error) = app_handle.emit(KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT, status) {
-                eprintln!(
-                    "[KnowledgeIndex] failed to emit {}: {}",
-                    KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT, error
+            if let Some(event_scope) = self.event_scope.as_ref() {
+                crate::workspace_service::event::emit_for_workspace_scope(
+                    app_handle,
+                    event_scope,
+                    KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT,
+                    status,
                 );
             }
         }
@@ -6236,6 +6269,44 @@ mod tests {
     use crate::unity_docs;
     use std::{path::Path, sync::Arc, time::Duration};
     use tempfile::tempdir;
+
+    #[test]
+    fn sibling_checkout_runtimes_open_distinct_tantivy_writers_concurrently() {
+        let temp = tempdir().expect("tempdir");
+        let checkout_a = temp.path().join("checkout-a");
+        let checkout_b = temp.path().join("checkout-b");
+        let model_storage = temp.path().join("models");
+        std::fs::create_dir_all(&checkout_a).expect("checkout a");
+        std::fs::create_dir_all(&checkout_b).expect("checkout b");
+
+        let library_a = library_dir_for_working_dir(&checkout_a.to_string_lossy());
+        let library_b = library_dir_for_working_dir(&checkout_b.to_string_lossy());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let (runtime_a, runtime_b) = std::thread::scope(|scope| {
+            let barrier_a = Arc::clone(&barrier);
+            let models_a = model_storage.clone();
+            let handle_a = scope.spawn(move || {
+                barrier_a.wait();
+                KnowledgeRuntime::open(&library_a, &models_a).expect("open checkout a index")
+            });
+            let barrier_b = Arc::clone(&barrier);
+            let models_b = model_storage.clone();
+            let handle_b = scope.spawn(move || {
+                barrier_b.wait();
+                KnowledgeRuntime::open(&library_b, &models_b).expect("open checkout b index")
+            });
+            (
+                handle_a.join().expect("checkout a thread"),
+                handle_b.join().expect("checkout b thread"),
+            )
+        });
+
+        assert_ne!(
+            runtime_a.tantivy.index_dir(),
+            runtime_b.tantivy.index_dir(),
+            "sibling checkouts must never share a Tantivy writer directory"
+        );
+    }
 
     fn sample_state(doc_id: &str) -> DocIndexState {
         DocIndexState {

@@ -101,8 +101,11 @@ describe("mcp server (expose-to-agents) settings page", () => {
     expect(component).not.toContain("<select");
   });
 
-  it("ships one-click integrations for the common harnesses", () => {
+  it("keeps process settings generic and scopes every integration operation", () => {
     const install = read("src-tauri/src/mcp/server/install.rs");
+    const commands = read("src-tauri/src/commands/mcp.rs");
+    const service = read("src/services/mcpServer.ts");
+    const component = read("src/components/settings/McpServerSettings.vue");
     for (const id of ["claude_code", "codex", "opencode", "cursor", "gemini"]) {
       expect(install).toContain(`"${id}"`);
     }
@@ -110,5 +113,17 @@ describe("mcp server (expose-to-agents) settings page", () => {
     expect(install).toContain("config.toml");
     expect(install).toContain("toml_edit");
     expect(install).toContain("refusing to modify");
+    expect(install).toContain("scoped_entry_name");
+    expect(install).toContain("workspace_generation");
+    expect(install).toContain("integration_config_lock");
+    expect(commands).toMatch(/mcp_server_integrations\([\s\S]{0,180}workspace_ref: WorkspaceRef/);
+    expect(commands).toMatch(/mcp_server_integration_apply\([\s\S]{0,220}workspace_ref: WorkspaceRef/);
+    expect(commands).toMatch(/mcp_server_integration_remove\([\s\S]{0,220}workspace_ref: WorkspaceRef/);
+    expect(commands).toContain("workspace.generation_required");
+    expect(service).toContain('"mcp_server_integrations", { workspaceRef }');
+    expect(service).toContain("integrationId,");
+    expect(component).not.toContain("mcpServerIntegrations");
+    expect(component).not.toContain("mcpServerIntegrationApply");
+    expect(component).not.toContain("manualSetup");
   });
 });

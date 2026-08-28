@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import type { WorkspaceRef } from "./project";
 import type {
   AssetDbLightStatus,
   AssetDbOverview,
@@ -11,28 +12,33 @@ import type {
   WatcherTuning,
 } from "../types";
 
-export function assetDbOverview(): Promise<AssetDbOverview> {
-  return ipcInvoke<AssetDbOverview>("asset_db_overview");
+export function assetDbOverview(workspaceRef: WorkspaceRef): Promise<AssetDbOverview> {
+  return ipcInvoke<AssetDbOverview>("asset_db_overview", { workspaceRef });
 }
 
-export function assetDbLightStatus(): Promise<AssetDbLightStatus> {
-  return ipcInvoke<AssetDbLightStatus>("asset_db_light_status");
+export function assetDbLightStatus(workspaceRef: WorkspaceRef): Promise<AssetDbLightStatus> {
+  return ipcInvoke<AssetDbLightStatus>("asset_db_light_status", { workspaceRef });
 }
 
-export function assetRiskReport(kind: AssetRiskKind): Promise<string> {
-  return ipcInvoke<string>("asset_risk_report", { kind });
+export function assetRiskReport(
+  kind: AssetRiskKind,
+  workspaceRef: WorkspaceRef,
+): Promise<string> {
+  return ipcInvoke<string>("asset_risk_report", { kind, workspaceRef });
 }
 
-export function assetDbStatus(): Promise<ScanStats | null> {
-  return ipcInvoke<ScanStats | null>("ref_graph_status");
+export function assetDbStatus(workspaceRef: WorkspaceRef): Promise<ScanStats | null> {
+  return ipcInvoke<ScanStats | null>("ref_graph_status", { workspaceRef });
 }
 
-export function assetDbScan(): Promise<ScanStats> {
-  return ipcInvoke<ScanStats>("ref_graph_scan");
+export function assetDbScan(workspaceRef: WorkspaceRef): Promise<ScanStats> {
+  return ipcInvoke<ScanStats>("ref_graph_scan", { workspaceRef });
 }
 
-export function assetDbScanStart(): Promise<RefGraphScanStartResult> {
-  return ipcInvoke<RefGraphScanStartResult>("ref_graph_scan_start");
+export function assetDbScanStart(
+  workspaceRef: WorkspaceRef,
+): Promise<RefGraphScanStartResult> {
+  return ipcInvoke<RefGraphScanStartResult>("ref_graph_scan_start", { workspaceRef });
 }
 
 /**
@@ -43,9 +49,12 @@ export function assetDbScanStart(): Promise<RefGraphScanStartResult> {
 export function searchWorkspaceAssets(
   query: string,
   roots: string[],
-  limit?: number,
+  limit: number | undefined,
+  workspaceRef: WorkspaceRef,
 ): Promise<AssetSearchResult[]> {
-  const payload = limit === undefined ? { query, roots } : { query, roots, limit };
+  const payload = limit === undefined
+    ? { query, roots, workspaceRef }
+    : { query, roots, limit, workspaceRef };
   return ipcInvoke<AssetSearchResult[]>("search_workspace_assets", payload);
 }
 
@@ -60,19 +69,24 @@ export function searchWorkspaceSceneObjects(
   scenePath: string,
   query: string,
   limit = 160,
+  workspaceRef: WorkspaceRef,
 ): Promise<WorkspaceSceneObjectSearchResult[]> {
   return ipcInvoke<WorkspaceSceneObjectSearchResult[]>("search_workspace_scene_objects", {
     scenePath,
     query,
     limit,
+    workspaceRef,
   });
 }
 
 export function previewWorkspaceAsset(
   filePath: string,
-  focusLine?: number,
+  focusLine: number | undefined,
+  workspaceRef: WorkspaceRef,
 ): Promise<AssetPreviewPayload> {
-  const payload = focusLine == null ? { filePath } : { filePath, focusLine };
+  const payload = focusLine == null
+    ? { filePath, workspaceRef }
+    : { filePath, focusLine, workspaceRef };
   return ipcInvoke<AssetPreviewPayload>("preview_workspace_asset", payload);
 }
 
@@ -84,8 +98,14 @@ export interface AssetThumbnailPreview {
   mimeType: string;
 }
 
-export function previewWorkspaceAssetThumbnail(filePath: string): Promise<AssetThumbnailPreview> {
-  return ipcInvoke<AssetThumbnailPreview>("preview_workspace_asset_thumbnail", { filePath });
+export function previewWorkspaceAssetThumbnail(
+  filePath: string,
+  workspaceRef: WorkspaceRef,
+): Promise<AssetThumbnailPreview> {
+  return ipcInvoke<AssetThumbnailPreview>("preview_workspace_asset_thumbnail", {
+    filePath,
+    workspaceRef,
+  });
 }
 
 export interface AssetPreviewFrame {
@@ -115,15 +135,18 @@ export interface AssetPreviewFrameRequest {
 
 export function readWorkspaceAssetPreviewFrameCache(
   filePath: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<AssetPreviewFrame | null> {
   return ipcInvoke<AssetPreviewFrame | null>("read_workspace_asset_preview_frame_cache", {
     filePath,
+    workspaceRef,
   });
 }
 
 export function cacheWorkspaceAssetPreviewFrame(
   filePath: string,
   frame: AssetPreviewFrame,
+  workspaceRef: WorkspaceRef,
 ): Promise<void> {
   return ipcInvoke<void>("cache_workspace_asset_preview_frame", {
     filePath,
@@ -137,16 +160,19 @@ export function cacheWorkspaceAssetPreviewFrame(
     panX: frame.panX ?? 0,
     panY: frame.panY ?? 0,
     panZ: frame.panZ ?? 0,
+    workspaceRef,
   });
 }
 
 export function renderWorkspaceAssetPreviewFrame(
   filePath: string,
   request: AssetPreviewFrameRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<AssetPreviewFrame> {
   return ipcInvoke<AssetPreviewFrame>("render_workspace_asset_preview_frame", {
     filePath,
     ...request,
+    workspaceRef,
   });
 }
 
@@ -164,9 +190,11 @@ export function setWatcherTuning(
 export function previewWorkspaceAssetTarget(
   previewKey: string,
   targetId: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<SemanticTargetInspector> {
   return ipcInvoke<SemanticTargetInspector>("preview_workspace_asset_target", {
     previewKey,
     targetId,
+    workspaceRef,
   });
 }

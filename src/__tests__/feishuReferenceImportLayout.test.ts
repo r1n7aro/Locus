@@ -55,7 +55,7 @@ describe("FeishuReferenceImportProgressWindow layout", () => {
     expect(windowSource).toContain("function summarizeRootSelections(");
     expect(windowSource).toContain("const selectedRootTokenSet = computed(");
     expect(windowSource).toContain(
-      "knowledgeTestFeishuReferenceConnection(\n      targetPath.value || undefined,",
+      "knowledgeTestFeishuReferenceConnection(\n      workspaceRef.value,\n      targetPath.value || undefined,",
     );
     expect(windowSource).toContain(
       'return t("knowledge.feishuReference.window.selectedRootCount", normalized.length);',

@@ -1,6 +1,7 @@
 import { emit, listen } from "@tauri-apps/api/event";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import type { WorkspaceRef } from "./project";
 
 export const EXTRA_WORKDIRS_WINDOW_LABEL = "extra-workdirs-config";
 export const EXTRA_WORKDIRS_WINDOW_PATH = "/extra-workdirs-config";
@@ -16,10 +17,12 @@ export const EXTRA_WORKDIRS_UPDATED_EVENT = "extra-workdirs:updated";
 
 export interface ExtraWorkdirsWindowPayload {
   workspacePath: string;
+  workspaceRef: WorkspaceRef;
 }
 
 export interface ExtraWorkdirsUpdatedEvent {
   workspacePath: string;
+  workspaceRef: WorkspaceRef;
 }
 
 export function isExtraWorkdirsWindowLocation(
@@ -33,13 +36,28 @@ export function getExtraWorkdirsWindowPayload(
   search = window.location.search,
 ): ExtraWorkdirsWindowPayload {
   const params = new URLSearchParams(search);
-  return { workspacePath: params.get("workspacePath")?.trim() || "" };
+  const checkoutId = params.get("checkoutId")?.trim() || "";
+  const generationRaw = params.get("workspaceGeneration") ?? "";
+  const expectedGeneration = /^\d+$/.test(generationRaw)
+    ? Number(generationRaw)
+    : null;
+  return {
+    workspacePath: params.get("workspacePath")?.trim() || "",
+    workspaceRef: {
+      checkoutId,
+      expectedGeneration: Number.isSafeInteger(expectedGeneration)
+        ? expectedGeneration
+        : undefined,
+    },
+  };
 }
 
 export function buildExtraWorkdirsWindowQuery(payload: ExtraWorkdirsWindowPayload): string {
   const params = new URLSearchParams({
     [EXTRA_WORKDIRS_WINDOW_FLAG]: "1",
     workspacePath: payload.workspacePath,
+    checkoutId: payload.workspaceRef.checkoutId,
+    workspaceGeneration: String(payload.workspaceRef.expectedGeneration ?? ""),
   });
   return params.toString();
 }
@@ -52,7 +70,7 @@ export async function openExtraWorkdirsWindow(
   payload: ExtraWorkdirsWindowPayload,
 ): Promise<boolean> {
   if (!hasTauriWindowRuntime()) return false;
-  if (!payload.workspacePath.trim()) return false;
+  if (!payload.workspacePath.trim() || !payload.workspaceRef.checkoutId.trim()) return false;
 
   const result = await openSubWindow({
     kind: EXTRA_WORKDIRS_WINDOW_LABEL,
@@ -71,8 +89,14 @@ export async function openExtraWorkdirsWindow(
   return true;
 }
 
-export function broadcastExtraWorkdirsUpdated(workspacePath: string): Promise<void> {
-  return emit(EXTRA_WORKDIRS_UPDATED_EVENT, { workspacePath } satisfies ExtraWorkdirsUpdatedEvent);
+export function broadcastExtraWorkdirsUpdated(
+  workspacePath: string,
+  workspaceRef: WorkspaceRef,
+): Promise<void> {
+  return emit(EXTRA_WORKDIRS_UPDATED_EVENT, {
+    workspacePath,
+    workspaceRef,
+  } satisfies ExtraWorkdirsUpdatedEvent);
 }
 
 export function listenExtraWorkdirsUpdated(
@@ -80,7 +104,11 @@ export function listenExtraWorkdirsUpdated(
 ): Promise<() => void> {
   if (!hasTauriWindowRuntime()) return Promise.resolve(() => {});
   return listen<ExtraWorkdirsUpdatedEvent>(EXTRA_WORKDIRS_UPDATED_EVENT, (event) => {
-    if (event.payload && typeof event.payload.workspacePath === "string") {
+    if (
+      event.payload
+      && typeof event.payload.workspacePath === "string"
+      && typeof event.payload.workspaceRef?.checkoutId === "string"
+    ) {
       handler(event.payload);
     }
   });

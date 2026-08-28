@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import type { WorkspaceRef } from "./project";
 import type {
   KnowledgeConfigSource,
   KnowledgeDirectoryConfigRecord,
@@ -388,12 +389,17 @@ function normalizeMutationResult(
 
 export async function knowledgeList(
   input: KnowledgeDocumentListInput = {},
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeDocumentSummary[]> {
-  const payload = await ipcInvoke<KnowledgeDocumentSummaryPayload[]>("knowledge_list", {
-    docType: input.type,
-    pathPrefix: input.pathPrefix,
-    includeHidden: input.includeHidden ?? true,
-  });
+  const payload = await ipcInvoke<KnowledgeDocumentSummaryPayload[]>(
+    "knowledge_list",
+    {
+      workspaceRef,
+      docType: input.type,
+      pathPrefix: input.pathPrefix,
+      includeHidden: input.includeHidden ?? true,
+    },
+  );
   return payload.map(normalizeDocumentSummary);
 }
 
@@ -474,11 +480,13 @@ function directoryPatchForIpc(
 
 export async function knowledgeListPage(
   input: KnowledgeDocumentListInput = {},
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeDocumentListPage> {
   const payload = await ipcInvoke<{
     items: KnowledgeDocumentSummaryPayload[];
     nextCursor?: string | null;
   }>("knowledge_list_page", {
+    workspaceRef,
     docType: input.type,
     pathPrefix: input.pathPrefix,
     cursor: input.cursor,
@@ -492,17 +500,19 @@ export async function knowledgeListPage(
 
 export function knowledgeListDirectories(
   type: KnowledgeDocument["type"],
+  workspaceRef: WorkspaceRef,
 ): Promise<string[]> {
-  return ipcInvoke<string[]>("knowledge_list_directories", { docType: type });
+  return ipcInvoke<string[]>("knowledge_list_directories", { workspaceRef, docType: type });
 }
 
 export async function knowledgeListDirectoryDocuments(
   type: KnowledgeDocument["type"],
   path: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeDocumentSummary[]> {
   const payload = await ipcInvoke<KnowledgeDocumentSummaryPayload[]>(
     "knowledge_list_directory_documents",
-    { docType: type, path },
+    { workspaceRef, docType: type, path },
   );
   return payload.map(normalizeDocumentSummary);
 }
@@ -510,6 +520,7 @@ export async function knowledgeListDirectoryDocuments(
 export async function knowledgeListDirectoryDocumentsPage(
   type: KnowledgeDocument["type"],
   path: string,
+  workspaceRef: WorkspaceRef,
   options: { cursor?: string | null; limit?: number } = {},
 ): Promise<KnowledgeDocumentListPage> {
   const payload = await ipcInvoke<{
@@ -520,6 +531,7 @@ export async function knowledgeListDirectoryDocumentsPage(
     {
       docType: type,
       path,
+      workspaceRef,
       cursor: options.cursor,
       limit: options.limit,
     },
@@ -530,27 +542,35 @@ export async function knowledgeListDirectoryDocumentsPage(
   };
 }
 
-export async function knowledgeListExternalReferenceDirectories(): Promise<
+export async function knowledgeListExternalReferenceDirectories(
+  workspaceRef: WorkspaceRef,
+): Promise<
   KnowledgeExternalDirectoryBinding[]
 > {
   const payload = await ipcInvoke<KnowledgeExternalDirectoryBindingPayload[]>(
     "knowledge_list_external_reference_directories",
+    { workspaceRef },
   );
   return payload.map(normalizeExternalDirectoryBinding);
 }
 
-export function knowledgeListUnityManagedDirectoryStats(): Promise<
+export function knowledgeListUnityManagedDirectoryStats(
+  workspaceRef: WorkspaceRef,
+): Promise<
   KnowledgeManagedDirectoryStat[]
 > {
   return ipcInvoke<KnowledgeManagedDirectoryStat[]>(
     "knowledge_list_unity_managed_directory_stats",
+    { workspaceRef },
   );
 }
 
 export async function knowledgeQuery(
   input: KnowledgeDocumentQueryInput,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeSearchResult[]> {
   const results = await ipcInvoke<KnowledgeQueryPayload[]>("knowledge_query", {
+    workspaceRef,
     query: input.query,
     limit: input.limit,
     types: input.types,
@@ -584,45 +604,50 @@ export async function knowledgeQuery(
   }));
 }
 
-export function knowledgeGetGeneralConfig(): Promise<KnowledgeGeneralConfig> {
-  return ipcInvoke<KnowledgeGeneralConfig>("knowledge_get_general_config");
+export function knowledgeGetGeneralConfig(workspaceRef: WorkspaceRef): Promise<KnowledgeGeneralConfig> {
+  return ipcInvoke<KnowledgeGeneralConfig>("knowledge_get_general_config", { workspaceRef });
 }
 
 export function knowledgeSaveGeneralConfig(
   config: KnowledgeGeneralConfig,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeGeneralConfig> {
   return ipcInvoke<KnowledgeGeneralConfig>("knowledge_save_general_config", {
     config,
+    workspaceRef,
   });
 }
 
-export function knowledgeGetEmbeddingConfig(): Promise<EmbeddingConfig> {
-  return ipcInvoke<EmbeddingConfig>("knowledge_get_embedding_config");
+export function knowledgeGetEmbeddingConfig(workspaceRef: WorkspaceRef): Promise<EmbeddingConfig> {
+  return ipcInvoke<EmbeddingConfig>("knowledge_get_embedding_config", { workspaceRef });
 }
 
 export function knowledgeSaveEmbeddingConfig(
   config: EmbeddingConfig,
+  workspaceRef: WorkspaceRef,
 ): Promise<EmbeddingConfig> {
   return ipcInvoke<EmbeddingConfig>("knowledge_save_embedding_config", {
     config,
+    workspaceRef,
   });
 }
 
-export function knowledgeActivateEmbedding(): Promise<void> {
-  return ipcInvoke<void>("knowledge_activate_embedding");
+export function knowledgeActivateEmbedding(workspaceRef: WorkspaceRef): Promise<void> {
+  return ipcInvoke<void>("knowledge_activate_embedding", { workspaceRef });
 }
 
-export function knowledgeDeactivateEmbedding(): Promise<void> {
-  return ipcInvoke<void>("knowledge_deactivate_embedding");
+export function knowledgeDeactivateEmbedding(workspaceRef: WorkspaceRef): Promise<void> {
+  return ipcInvoke<void>("knowledge_deactivate_embedding", { workspaceRef });
 }
 
-export function knowledgeGetEmbeddingStatus(): Promise<EmbeddingStatus> {
-  return ipcInvoke<EmbeddingStatus>("knowledge_get_embedding_status");
+export function knowledgeGetEmbeddingStatus(workspaceRef: WorkspaceRef): Promise<EmbeddingStatus> {
+  return ipcInvoke<EmbeddingStatus>("knowledge_get_embedding_status", { workspaceRef });
 }
 
-export function knowledgeTestEmbeddingRuntime(): Promise<EmbeddingRuntimeTestResult> {
+export function knowledgeTestEmbeddingRuntime(workspaceRef: WorkspaceRef): Promise<EmbeddingRuntimeTestResult> {
   return ipcInvoke<EmbeddingRuntimeTestResult>(
     "knowledge_test_embedding_runtime",
+    { workspaceRef },
   );
 }
 
@@ -634,34 +659,16 @@ export function knowledgeGetLocalEmbeddingModelCatalog(): Promise<EmbeddingLocal
 
 export function knowledgeDownloadLocalEmbeddingModel(
   modelId: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<void> {
   return ipcInvoke<void>("knowledge_download_local_embedding_model", {
     modelId,
+    workspaceRef,
   });
 }
 
-export function knowledgeCancelLocalEmbeddingModelDownload(): Promise<void> {
-  return ipcInvoke<void>("knowledge_cancel_local_embedding_model_download");
-}
-
-export function knowledgeCloseDownloadProgressWindow(): Promise<void> {
-  return ipcInvoke<void>("knowledge_close_download_progress_window");
-}
-
-export function knowledgeCloseLexicalProgressWindow(): Promise<void> {
-  return ipcInvoke<void>("knowledge_close_lexical_progress_window");
-}
-
-export function knowledgeCloseUnityReferenceImportProgressWindow(): Promise<void> {
-  return ipcInvoke<void>(
-    "knowledge_close_unity_reference_import_progress_window",
-  );
-}
-
-export function knowledgeCloseFeishuReferenceImportProgressWindow(): Promise<void> {
-  return ipcInvoke<void>(
-    "knowledge_close_feishu_reference_import_progress_window",
-  );
+export function knowledgeCancelLocalEmbeddingModelDownload(workspaceRef: WorkspaceRef): Promise<void> {
+  return ipcInvoke<void>("knowledge_cancel_local_embedding_model_download", { workspaceRef });
 }
 
 export function knowledgeInspectLocalEmbeddingModelDirectory(
@@ -673,72 +680,83 @@ export function knowledgeInspectLocalEmbeddingModelDirectory(
   );
 }
 
-export function knowledgeRebuildLexicalIndex(): Promise<number> {
-  return ipcInvoke<number>("knowledge_rebuild_lexical_index");
+export function knowledgeRebuildLexicalIndex(workspaceRef: WorkspaceRef): Promise<number> {
+  return ipcInvoke<number>("knowledge_rebuild_lexical_index", { workspaceRef });
 }
 
-export function knowledgeGetLexicalRebuildStatus(): Promise<LexicalRebuildStatus> {
+export function knowledgeGetLexicalRebuildStatus(workspaceRef: WorkspaceRef): Promise<LexicalRebuildStatus> {
   return ipcInvoke<LexicalRebuildStatus>(
     "knowledge_get_lexical_rebuild_status",
+    { workspaceRef },
   );
 }
 
-export function knowledgeGetOverview(): Promise<KnowledgeRetrievalOverview> {
-  return ipcInvoke<KnowledgeRetrievalOverview>("knowledge_get_overview");
+export function knowledgeGetOverview(workspaceRef: WorkspaceRef): Promise<KnowledgeRetrievalOverview> {
+  return ipcInvoke<KnowledgeRetrievalOverview>("knowledge_get_overview", { workspaceRef });
 }
 
 export function knowledgeGetUnityReferenceImportStatus(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<UnityReferenceImportStatus> {
   return ipcInvoke<UnityReferenceImportStatus>(
     "knowledge_get_unity_reference_import_status",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
-export async function knowledgeFindUnityReferenceDirectory(): Promise<KnowledgeDirectoryConfigRecord | null> {
+export async function knowledgeFindUnityReferenceDirectory(workspaceRef: WorkspaceRef): Promise<KnowledgeDirectoryConfigRecord | null> {
   const payload = await ipcInvoke<KnowledgeDirectoryConfigPayload | null>(
     "knowledge_find_unity_reference_directory",
+    { workspaceRef },
   );
   return payload ? normalizeDirectoryConfig(payload) : null;
 }
 
 export function knowledgeGetFeishuReferenceImportStatus(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<FeishuReferenceImportStatus> {
   return ipcInvoke<FeishuReferenceImportStatus>(
     "knowledge_get_feishu_reference_import_status",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeCancelUnityReferenceImport(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<UnityReferenceImportStatus> {
   return ipcInvoke<UnityReferenceImportStatus>(
     "knowledge_cancel_unity_reference_import",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeCancelFeishuReferenceImport(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<FeishuReferenceImportStatus> {
   return ipcInvoke<FeishuReferenceImportStatus>(
     "knowledge_cancel_feishu_reference_import",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeImportUnityReferenceDocs(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
   locale?: UnityReferenceImportLocale,
 ): Promise<UnityReferenceImportStatus> {
@@ -747,50 +765,59 @@ export function knowledgeImportUnityReferenceDocs(
     {
       targetPath: targetPath ?? null,
       locale,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeSaveFeishuReferenceConfig(
   config: FeishuReferenceConfigInput,
+  workspaceRef: WorkspaceRef,
 ): Promise<FeishuReferenceImportStatus> {
   return ipcInvoke<FeishuReferenceImportStatus>(
     "knowledge_save_feishu_reference_config",
     {
       config,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeTestFeishuReferenceConnection(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<FeishuSourceTestResult> {
   return ipcInvoke<FeishuSourceTestResult>(
     "knowledge_test_feishu_reference_connection",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
-export function knowledgeStartFeishuReferenceOauth(): Promise<FeishuReferenceOauthStartResult> {
+export function knowledgeStartFeishuReferenceOauth(workspaceRef: WorkspaceRef): Promise<FeishuReferenceOauthStartResult> {
   return ipcInvoke<FeishuReferenceOauthStartResult>(
     "knowledge_start_feishu_reference_oauth",
+    { workspaceRef },
   );
 }
 
 export function knowledgeCancelFeishuReferenceOauthWait(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<FeishuReferenceImportStatus> {
   return ipcInvoke<FeishuReferenceImportStatus>(
     "knowledge_cancel_feishu_reference_oauth_wait",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeListFeishuReferenceSpaceNodes(
+  workspaceRef: WorkspaceRef,
   spaceId: string,
   parentNodeToken?: string | null,
 ): Promise<FeishuReferenceNodeSummary[]> {
@@ -799,98 +826,116 @@ export function knowledgeListFeishuReferenceSpaceNodes(
     {
       spaceId,
       parentNodeToken: parentNodeToken ?? null,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeImportFeishuReferenceDocs(
   request: FeishuReferenceImportRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<FeishuReferenceImportStatus> {
   return ipcInvoke<FeishuReferenceImportStatus>(
     "knowledge_import_feishu_reference_docs",
     {
       request,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeDeleteUnityReferenceDocs(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<UnityReferenceImportStatus> {
   return ipcInvoke<UnityReferenceImportStatus>(
     "knowledge_delete_unity_reference_docs",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeDeleteFeishuReferenceDocs(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<FeishuReferenceImportStatus> {
   return ipcInvoke<FeishuReferenceImportStatus>(
     "knowledge_delete_feishu_reference_docs",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgePreviewLocalReferenceImport(
   sourcePath: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<LocalReferenceScanPreview> {
   return ipcInvoke<LocalReferenceScanPreview>(
     "knowledge_preview_local_reference_import",
     {
       sourcePath,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeImportLocalReferenceDocs(
   request: LocalReferenceImportRequest,
+  workspaceRef: WorkspaceRef,
 ): Promise<LocalReferenceImportStatus> {
   return ipcInvoke<LocalReferenceImportStatus>(
     "knowledge_import_local_reference_docs",
     {
       request,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeGetLocalReferenceImportStatus(
+  workspaceRef: WorkspaceRef,
   targetPath?: string | null,
 ): Promise<LocalReferenceImportStatus> {
   return ipcInvoke<LocalReferenceImportStatus>(
     "knowledge_get_local_reference_import_status",
     {
       targetPath: targetPath ?? null,
+      workspaceRef,
     },
   );
 }
 
-export function knowledgeCancelLocalReferenceImport(): Promise<LocalReferenceImportStatus> {
+export function knowledgeCancelLocalReferenceImport(workspaceRef: WorkspaceRef): Promise<LocalReferenceImportStatus> {
   return ipcInvoke<LocalReferenceImportStatus>(
     "knowledge_cancel_local_reference_import",
+    { workspaceRef },
   );
 }
 
 export function knowledgeSyncLocalReferenceDocs(
   targetPath: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<LocalReferenceImportStatus> {
   return ipcInvoke<LocalReferenceImportStatus>(
     "knowledge_sync_local_reference_docs",
     {
       targetPath,
+      workspaceRef,
     },
   );
 }
 
 export function knowledgeDeleteLocalReferenceDocs(
   targetPath: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<void> {
   return ipcInvoke<void>("knowledge_delete_local_reference_docs", {
     targetPath,
+    workspaceRef,
   });
 }
 
@@ -898,14 +943,16 @@ export function knowledgeRevealTarget(input: {
   kind: "document" | "directory";
   docType: KnowledgeDocument["type"];
   path: string;
-}): Promise<void> {
+}, workspaceRef: WorkspaceRef): Promise<void> {
   return ipcInvoke<void>("knowledge_reveal_target", {
     request: input,
+    workspaceRef,
   });
 }
 
 export async function knowledgeRead(
   input: KnowledgeReadInput,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeReadResult> {
   const path =
     input.kind === "directory"
@@ -914,6 +961,7 @@ export async function knowledgeRead(
   const payload = await ipcInvoke<KnowledgeReadResultPayload>(
     "knowledge_read",
     {
+      workspaceRef,
       request: {
         kind: input.kind,
         path,
@@ -928,6 +976,7 @@ export async function knowledgeRead(
 
 export async function knowledgeCreate(
   input: KnowledgeCreateInput,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeMutationResult> {
   const path =
     input.kind === "directory"
@@ -942,6 +991,7 @@ export async function knowledgeCreate(
         type: input.type,
         document: input.document ? documentPatchForIpc(input.document) : undefined,
       },
+      workspaceRef,
     },
   );
   return normalizeMutationResult(payload);
@@ -949,12 +999,14 @@ export async function knowledgeCreate(
 
 export async function knowledgeEdit(
   input: KnowledgeEditInput,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeMutationResult> {
   const path =
     input.kind === "directory"
       ? resolveKnowledgeDirectoryPath(input.path, input.type)
       : resolveKnowledgeDocumentPath(input.path, input.type);
   const payload = await ipcInvoke<KnowledgeMutationPayload>("knowledge_edit", {
+    workspaceRef,
     request: {
       kind: input.kind,
       path,
@@ -968,6 +1020,7 @@ export async function knowledgeEdit(
 
 export async function knowledgeMove(
   input: KnowledgeMoveInput,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeMutationResult> {
   const path =
     input.kind === "directory"
@@ -978,6 +1031,7 @@ export async function knowledgeMove(
       ? resolveKnowledgeDirectoryPath(input.newPath, input.type)
       : resolveKnowledgeDocumentPath(input.newPath, input.type);
   const payload = await ipcInvoke<KnowledgeMutationPayload>("knowledge_move", {
+    workspaceRef,
     request: {
       kind: input.kind,
       path,
@@ -990,6 +1044,7 @@ export async function knowledgeMove(
 
 export async function knowledgeDelete(
   input: KnowledgeDeleteInput,
+  workspaceRef: WorkspaceRef,
 ): Promise<KnowledgeMutationResult> {
   const path =
     input.kind === "directory"
@@ -998,6 +1053,7 @@ export async function knowledgeDelete(
   const payload = await ipcInvoke<KnowledgeMutationPayload>(
     "knowledge_delete",
     {
+      workspaceRef,
       request: {
         kind: input.kind,
         path,
@@ -1010,23 +1066,31 @@ export async function knowledgeDelete(
 
 export function knowledgeDeleteExternalReferenceDirectory(
   path: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<void> {
   return ipcInvoke<void>("knowledge_delete_external_reference_directory", {
     path: resolveKnowledgeDirectoryPath(path, "reference"),
+    workspaceRef,
   });
 }
 
 export function getSkillConfig(
   relPath: string,
-  source?: string,
+  source: string | undefined,
+  workspaceRef: WorkspaceRef,
 ): Promise<SkillConfig> {
-  return ipcInvoke<SkillConfig>("get_skill_config", { relPath, source });
+  return ipcInvoke<SkillConfig>("get_skill_config", {
+    relPath,
+    source,
+    workspaceRef,
+  });
 }
 
 export function setSkillConfig(
   relPath: string,
   source: string | undefined,
   config: SkillConfig,
+  workspaceRef: WorkspaceRef,
 ): Promise<void> {
   return ipcInvoke("set_skill_config", {
     relPath,
@@ -1039,27 +1103,45 @@ export function setSkillConfig(
     readOnly: config.readOnly,
     aiEditMode: config.aiEditMode,
     maintenanceRules: config.maintenanceRules,
+    workspaceRef,
   });
 }
 
-export function getAllSkillConfigs(): Promise<Record<string, SkillConfig>> {
-  return ipcInvoke<Record<string, SkillConfig>>("get_all_skill_configs");
+export function getAllSkillConfigs(
+  workspaceRef: WorkspaceRef,
+): Promise<Record<string, SkillConfig>> {
+  return ipcInvoke<Record<string, SkillConfig>>("get_all_skill_configs", {
+    workspaceRef,
+  });
 }
 
-export function listSkills(): Promise<SkillManifest[]> {
-  return ipcInvoke<SkillManifest[]>("list_skills");
+export function listSkills(
+  workspaceRef: WorkspaceRef,
+): Promise<SkillManifest[]> {
+  return ipcInvoke<SkillManifest[]>("list_skills", {
+    workspaceRef,
+  });
 }
 
 /** Rescan the external agent skill directories (~/.claude/skills, ...). */
-export function refreshExternalSkills(): Promise<void> {
-  return ipcInvoke<void>("refresh_external_skills");
+export function refreshExternalSkills(
+  workspaceRef: WorkspaceRef,
+): Promise<void> {
+  return ipcInvoke<void>("refresh_external_skills", {
+    workspaceRef,
+  });
 }
 
 export function readSkillManifest(
   dirName: string,
-  source?: string,
+  source: string | undefined,
+  workspaceRef: WorkspaceRef,
 ): Promise<string> {
-  return ipcInvoke<string>("read_skill_manifest", { dirName, source });
+  return ipcInvoke<string>("read_skill_manifest", {
+    dirName,
+    source,
+    workspaceRef,
+  });
 }
 
 export function getDefaultSkillPackageNamespace(): Promise<string> {
@@ -1070,7 +1152,10 @@ export function setDefaultSkillPackageNamespace(value: string): Promise<string> 
   return ipcInvoke<string>("set_default_skill_package_namespace", { value });
 }
 
-export function createSkillScaffold(input: SkillCreateInput): Promise<SkillManifest> {
+export function createSkillScaffold(
+  input: SkillCreateInput,
+  workspaceRef: WorkspaceRef,
+): Promise<SkillManifest> {
   return ipcInvoke<SkillManifest>("create_skill_scaffold", {
     kind: input.kind ?? "md",
     source: input.source,
@@ -1085,51 +1170,68 @@ export function createSkillScaffold(input: SkillCreateInput): Promise<SkillManif
     commandEnabled: input.commandEnabled,
     modelInvocationEnabled: input.modelInvocationEnabled,
     tools: input.tools,
+    workspaceRef,
   });
 }
 
-export function deleteSkillPackage(packageId: string): Promise<void> {
+export function deleteSkillPackage(
+  packageId: string,
+  workspaceRef: WorkspaceRef,
+): Promise<void> {
   return ipcInvoke<void>("delete_skill_package", {
     packageId,
+    workspaceRef,
   });
 }
 
-export function importSkillPackage(sourcePath: string): Promise<SkillManifest> {
+export function importSkillPackage(
+  sourcePath: string,
+  workspaceRef: WorkspaceRef,
+): Promise<SkillManifest> {
   return ipcInvoke<SkillManifest>("import_skill_package", {
     sourcePath,
+    workspaceRef,
   });
 }
 
 export function exportSkillPackage(
   packageId: string,
   filePath: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<SkillPackageArchiveResult> {
   return ipcInvoke<SkillPackageArchiveResult>("export_skill_package", {
     packageId,
     filePath,
+    workspaceRef,
   });
 }
 
 export function getSkillUnityInstallStatus(
   packageId: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<SkillUnityInstallStatus> {
   return ipcInvoke<SkillUnityInstallStatus>("get_skill_unity_install_status", {
     packageId,
+    workspaceRef,
   });
 }
 
 export function installSkillUnityFiles(
   packageId: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<SkillUnityInstallStatus> {
   return ipcInvoke<SkillUnityInstallStatus>("install_skill_unity_files", {
     packageId,
+    workspaceRef,
   });
 }
 
 export function removeSkillUnityFiles(
   packageId: string,
+  workspaceRef: WorkspaceRef,
 ): Promise<SkillUnityInstallStatus> {
   return ipcInvoke<SkillUnityInstallStatus>("remove_skill_unity_files", {
     packageId,
+    workspaceRef,
   });
 }

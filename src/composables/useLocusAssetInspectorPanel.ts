@@ -5,6 +5,8 @@ import {
   openLocusAssetInspectorWindow,
   type LocusAssetInspectorWindowPayload,
 } from "../services/locusAssetInspectorWindow";
+import type { WorkspaceRef } from "../services/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 export type LocusAssetInspectorMode = "embedded" | "window" | "auto";
 
@@ -28,6 +30,7 @@ export function canFitEmbeddedLocusAssetInspectorPanel(
 export interface LocusAssetInspectorPanelState {
   open: boolean;
   payload: LocusAssetInspectorWindowPayload | null;
+  workspaceRef: WorkspaceRef | null;
   /** Bumped on every open so the panel can re-focus / unfold for repeat targets. */
   revision: number;
 }
@@ -35,6 +38,7 @@ export interface LocusAssetInspectorPanelState {
 const state = reactive<LocusAssetInspectorPanelState>({
   open: false,
   payload: null,
+  workspaceRef: null,
   revision: 0,
 });
 
@@ -56,11 +60,13 @@ export function isLocusAssetInspectorPanelHostAvailable(): boolean {
 
 export function openLocusAssetInspectorPanel(
   payload: LocusAssetInspectorWindowPayload,
+  workspaceRef: WorkspaceRef,
 ): boolean {
   if (!panelHostAvailable.value) return false;
   const nextPayload = normalizeLocusAssetInspectorPayload(payload);
   if (!isValidLocusAssetInspectorPayload(nextPayload)) return false;
   state.payload = nextPayload;
+  state.workspaceRef = { ...workspaceRef };
   state.open = true;
   state.revision++;
   return true;
@@ -88,10 +94,12 @@ export async function openLocusAssetInspector(
   payload: LocusAssetInspectorWindowPayload,
   mode: LocusAssetInspectorMode = "auto",
 ): Promise<boolean> {
+  const workspaceRef = useWorkspaceContextStore().focusedWorkspaceRef;
+  if (!workspaceRef) return false;
   const preferEmbedded = mode === "embedded"
     || (mode === "auto" && canFitEmbeddedLocusAssetInspectorPanel());
-  if (preferEmbedded && openLocusAssetInspectorPanel(payload)) {
+  if (preferEmbedded && openLocusAssetInspectorPanel(payload, workspaceRef)) {
     return true;
   }
-  return openLocusAssetInspectorWindow(payload);
+  return openLocusAssetInspectorWindow(workspaceRef, payload);
 }

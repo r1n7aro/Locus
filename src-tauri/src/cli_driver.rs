@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     path::Path,
     sync::{
@@ -11,15 +11,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Listener};
+use tauri::{AppHandle, Emitter, Listener, Manager};
 use tokio::sync::watch;
 
-use crate::{
-    unity_bridge::{
-        self, PluginStatus, UnityConnectionStatus, UnityEditorProcessState,
-        UnityLaunchCodeOptimization, UNITY_EDITOR_STATUS_EDITING,
-    },
-    workspace::Workspace,
+use crate::unity_bridge::{
+    self, PluginStatus, UnityConnectionStatus, UnityEditorProcessState,
+    UnityLaunchCodeOptimization, UNITY_EDITOR_STATUS_EDITING,
 };
 
 const DRIVER_NAME: &str = "unity-test";
@@ -45,6 +42,8 @@ static UI_RUN_CANCEL: Mutex<Option<watch::Sender<bool>>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliDriverSuite {
+    Workspace,
+    WorkspaceSwitch,
     Connect,
     Sidecar,
     TypeIndex,
@@ -54,6 +53,8 @@ pub enum CliDriverSuite {
     HotReloadRelease,
     ParallelEditRefresh,
     Execute,
+    PythonSdk,
+    ModalDialog,
     YamlParity,
     UnityTest,
 }
@@ -61,6 +62,8 @@ pub enum CliDriverSuite {
 impl CliDriverSuite {
     fn as_str(self) -> &'static str {
         match self {
+            CliDriverSuite::Workspace => "workspace",
+            CliDriverSuite::WorkspaceSwitch => "workspace-switch",
             CliDriverSuite::Connect => "connect",
             CliDriverSuite::Sidecar => "sidecar",
             CliDriverSuite::TypeIndex => "type-index",
@@ -70,6 +73,8 @@ impl CliDriverSuite {
             CliDriverSuite::HotReloadRelease => "hot-reload-release",
             CliDriverSuite::ParallelEditRefresh => "parallel-edit-refresh",
             CliDriverSuite::Execute => "execute",
+            CliDriverSuite::PythonSdk => "python-sdk",
+            CliDriverSuite::ModalDialog => "modal-dialog",
             CliDriverSuite::YamlParity => "yaml-parity",
             CliDriverSuite::UnityTest => "unity-test",
         }
@@ -77,6 +82,8 @@ impl CliDriverSuite {
 
     fn event_name(self) -> Option<&'static str> {
         match self {
+            CliDriverSuite::Workspace => None,
+            CliDriverSuite::WorkspaceSwitch => None,
             CliDriverSuite::Connect => None,
             CliDriverSuite::Sidecar => None,
             CliDriverSuite::TypeIndex => None,
@@ -87,6 +94,8 @@ impl CliDriverSuite {
             CliDriverSuite::ParallelEditRefresh => None,
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
+            CliDriverSuite::PythonSdk => None,
+            CliDriverSuite::ModalDialog => None,
             CliDriverSuite::YamlParity => None,
             CliDriverSuite::UnityTest => None,
         }
@@ -96,6 +105,7 @@ impl CliDriverSuite {
 #[derive(Debug, Clone)]
 pub struct CliDriverConfig {
     pub project_path: Option<String>,
+    pub workspace_paths: Vec<String>,
     pub suites: Vec<CliDriverSuite>,
     pub open_unity: bool,
     pub install_plugin: bool,
@@ -114,6 +124,8 @@ pub struct CliDriverConfig {
 pub struct UnityIntegrationTestRunRequest {
     #[serde(default)]
     pub project_path: Option<String>,
+    #[serde(default)]
+    pub workspace_paths: Vec<String>,
     #[serde(default)]
     pub suites: Vec<String>,
     #[serde(default)]
@@ -258,6 +270,7 @@ impl UnityIntegrationTestRunRequest {
         }
         Ok(CliDriverConfig {
             project_path: self.project_path,
+            workspace_paths: self.workspace_paths,
             suites,
             open_unity: self.open_unity.unwrap_or(true),
             install_plugin: self.install_plugin.unwrap_or(false),
@@ -309,6 +322,7 @@ impl CliDriverConfig {
     fn parse(args: Vec<String>) -> Option<Result<Self, String>> {
         let mut driver_requested = false;
         let mut project_path = None;
+        let mut workspace_paths = Vec::new();
         let mut suites = Vec::new();
         let mut open_unity = true;
         let mut install_plugin = false;
@@ -354,6 +368,14 @@ impl CliDriverConfig {
                         Err(error) => return Some(Err(error)),
                     };
                     project_path = Some(value);
+                }
+                Some(("--workspace-project", value)) => {
+                    let value =
+                        match read_option_value("--workspace-project", value, &args, &mut index) {
+                            Ok(value) => value,
+                            Err(error) => return Some(Err(error)),
+                        };
+                    workspace_paths.push(value);
                 }
                 Some(("--suite", value)) => {
                     let value = match read_option_value("--suite", value, &args, &mut index) {
@@ -487,6 +509,7 @@ impl CliDriverConfig {
 
         Some(Ok(Self {
             project_path,
+            workspace_paths,
             suites,
             open_unity,
             install_plugin,
@@ -508,6 +531,7 @@ fn split_arg(arg: &str) -> Option<(&str, &str)> {
         "--locus-driver"
         | "--locus-cli"
         | "--project"
+        | "--workspace-project"
         | "--suite"
         | "--timeout-ms"
         | "--suite-timeout-ms"
@@ -567,6 +591,8 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
                 CliDriverSuite::HotReloadRelease,
                 CliDriverSuite::ParallelEditRefresh,
                 CliDriverSuite::Execute,
+                CliDriverSuite::PythonSdk,
+                CliDriverSuite::ModalDialog,
                 CliDriverSuite::YamlParity,
             ] {
                 if !suites.contains(&suite) {
@@ -576,6 +602,10 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
             return Ok(());
         }
         "connect" => CliDriverSuite::Connect,
+        "workspace" | "multi-workspace" | "multi_workspace" => CliDriverSuite::Workspace,
+        "workspace-switch" | "workspace_switch" | "cross-project" | "cross_project" => {
+            CliDriverSuite::WorkspaceSwitch
+        }
         "sidecar" | "compile-server" | "compile_server" => CliDriverSuite::Sidecar,
         "type-index" | "type_index" | "typeindex" | "schema" | "serialized-schema"
         | "serialized_schema" => CliDriverSuite::TypeIndex,
@@ -592,6 +622,12 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
+        "python-sdk" | "python_sdk" | "sdk" | "sdk-editor" | "sdk_editor" => {
+            CliDriverSuite::PythonSdk
+        }
+        "modal-dialog" | "modal_dialog" | "dialog" | "unity-dialog" | "unity_dialog" => {
+            CliDriverSuite::ModalDialog
+        }
         "yaml-parity" | "yaml_parity" | "yaml-diff" | "yaml_diff" => {
             CliDriverSuite::YamlParity
         }
@@ -600,7 +636,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, execute, yaml-parity, unity-test, or all.",
+            "Unknown --suite '{}'. Use workspace, workspace-switch, connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, execute, python-sdk, modal-dialog, yaml-parity, unity-test, or all.",
             value
         ))
         }
@@ -611,21 +647,14 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
     Ok(())
 }
 
-pub fn spawn(app_handle: AppHandle, workspace: Arc<Workspace>, config: CliDriverConfig) {
+pub fn spawn(app_handle: AppHandle, config: CliDriverConfig) {
     // The headless CLI driver is not interruptible; hand `run_driver` a receiver
     // whose sender stays alive for the whole run so its cancel selects never fire.
     let (cancel_tx, cancel_rx) = watch::channel(false);
     tauri::async_runtime::spawn(async move {
         let _cancel_guard = cancel_tx;
         let sink = DriverEventSink::cli();
-        let exit_code = match run_driver(
-            app_handle.clone(),
-            workspace,
-            config,
-            sink.clone(),
-            cancel_rx,
-        )
-        .await
+        let exit_code = match run_driver(app_handle.clone(), config, sink.clone(), cancel_rx).await
         {
             Ok(()) => 0,
             Err(error) => {
@@ -639,7 +668,6 @@ pub fn spawn(app_handle: AppHandle, workspace: Arc<Workspace>, config: CliDriver
 
 pub fn spawn_ui(
     app_handle: AppHandle,
-    workspace: Arc<Workspace>,
     request: UnityIntegrationTestRunRequest,
 ) -> Result<UnityIntegrationTestRunStarted, String> {
     if UI_RUN_ACTIVE
@@ -663,7 +691,7 @@ pub fn spawn_ui(
         *guard = Some(cancel_tx);
     }
     tauri::async_runtime::spawn(async move {
-        let result = run_driver(app_handle, workspace, config, sink.clone(), cancel_rx).await;
+        let result = run_driver(app_handle, config, sink.clone(), cancel_rx).await;
         match result {
             Ok(()) => {}
             Err(error) if error == UNITY_INTEGRATION_TEST_CANCELLED => {
@@ -700,16 +728,19 @@ fn run_cancelled(cancel_rx: &watch::Receiver<bool>) -> bool {
 
 async fn run_driver(
     app_handle: AppHandle,
-    workspace: Arc<Workspace>,
     config: CliDriverConfig,
     sink: DriverEventSink,
     mut cancel_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    app_handle
+        .state::<Arc<crate::config::AppConfig>>()
+        .set_debug_enabled(true)?;
     sink.emit(
         "start",
         json!({
             "driver": DRIVER_NAME,
             "suites": config.suites.iter().map(|suite| suite.as_str()).collect::<Vec<_>>(),
+            "workspaceProjects": &config.workspace_paths,
             "openUnity": config.open_unity,
             "installPlugin": config.install_plugin,
             "typeIndexSampleMode": config.type_index_sample_mode.as_str(),
@@ -721,10 +752,35 @@ async fn run_driver(
         }),
     );
 
-    let project = resolve_project_path(config.project_path.as_deref(), &workspace).await?;
-    set_workspace_for_driver(&workspace, &project).await?;
+    if config.suites.contains(&CliDriverSuite::Workspace)
+        || config.suites.contains(&CliDriverSuite::WorkspaceSwitch)
+    {
+        if config.suites.len() != 1 {
+            return Err(
+                "Multi-workspace suites must run alone because they own multiple Unity projects"
+                    .to_string(),
+            );
+        }
+        if config.suites.contains(&CliDriverSuite::WorkspaceSwitch) {
+            run_workspace_switch_suite(&app_handle, &config, &sink, &mut cancel_rx).await?;
+        } else {
+            run_workspace_suite(&app_handle, &config, &sink, &mut cancel_rx).await?;
+        }
+        sink.emit("finished", json!({ "ok": true }));
+        return Ok(());
+    }
+
+    let project = resolve_project_path(config.project_path.as_deref(), &app_handle).await?;
+    set_workspace_for_driver(&app_handle, &project).await?;
     prepare_suite_environment(&project, &config, &sink)?;
     let plugin_outcome = check_or_install_plugin(&project, config.install_plugin, &sink).await?;
+
+    let python_sdk_ran = if config.suites.contains(&CliDriverSuite::PythonSdk) {
+        run_python_sdk_editor_suite(&app_handle, &project, &config, &sink).await?;
+        true
+    } else {
+        false
+    };
 
     let status = ensure_connected(&project, &config, plugin_outcome, &sink, &mut cancel_rx).await?;
     let transport = resolve_active_transport(&project).await;
@@ -747,6 +803,13 @@ async fn run_driver(
             return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
         }
         let suite_result = match suite {
+            CliDriverSuite::Workspace => Err(
+                "The workspace suite must be dispatched before single-project suites".to_string(),
+            ),
+            CliDriverSuite::WorkspaceSwitch => Err(
+                "The workspace-switch suite must be dispatched before single-project suites"
+                    .to_string(),
+            ),
             CliDriverSuite::Connect => {
                 sink.emit(
                     "suite_start",
@@ -904,7 +967,43 @@ async fn run_driver(
                 };
                 match edit_mode_result {
                     Ok(()) => {
-                        run_execute_suite(&project, *suite, &config, &sink, &mut cancel_rx).await
+                        run_execute_suite(
+                            &app_handle,
+                            &project,
+                            *suite,
+                            &config,
+                            &sink,
+                            &mut cancel_rx,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            CliDriverSuite::PythonSdk if python_sdk_ran => Ok(()),
+            CliDriverSuite::PythonSdk => Err(
+                "The python-sdk suite did not run before the shared connection preflight"
+                    .to_string(),
+            ),
+            CliDriverSuite::ModalDialog => {
+                crate::csharp_compile::set_enabled(true).await;
+                crate::csharp_compile::warm_up_in_background();
+                let edit_mode_result = if config.force_edit_mode {
+                    ensure_edit_mode(
+                        &project,
+                        *suite,
+                        config.connect_timeout,
+                        config.poll_interval,
+                        &sink,
+                        &mut cancel_rx,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                match edit_mode_result {
+                    Ok(()) => {
+                        run_modal_dialog_suite(&app_handle, &project, *suite, &config, &sink).await
                     }
                     Err(error) => Err(error),
                 }
@@ -975,6 +1074,1050 @@ async fn run_driver(
 
     sink.emit("finished", json!({ "ok": true }));
     Ok(())
+}
+
+#[derive(Clone)]
+struct WorkspaceSuiteTarget {
+    index: usize,
+    project: String,
+    runtime: Arc<crate::workspace_service::WorkspaceRuntime>,
+    session_id: String,
+    plugin_outcome: PluginPrepareOutcome,
+}
+
+async fn run_workspace_suite(
+    app_handle: &AppHandle,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let projects = resolve_workspace_project_paths(app_handle, config).await?;
+    sink.emit(
+        "suite_start",
+        json!({
+            "suite": CliDriverSuite::Workspace.as_str(),
+            "projects": projects,
+        }),
+    );
+
+    let registry = app_handle
+        .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .inner()
+        .clone();
+    let resource_policy = app_handle
+        .state::<Arc<crate::resource_policy::ResourcePolicyStore>>()
+        .inner()
+        .clone();
+    let policy_before = resource_policy.snapshot();
+    let mut workspace_limits = policy_before.limits.clone();
+    workspace_limits.max_running_workspace_services = workspace_limits
+        .max_running_workspace_services
+        .max(projects.len());
+    workspace_limits.max_lsp_processes = workspace_limits.max_lsp_processes.max(projects.len());
+    let policy_after = if workspace_limits == policy_before.limits {
+        policy_before.clone()
+    } else {
+        resource_policy
+            .update(workspace_limits)
+            .map_err(|error| format!("Failed to prepare workspace test resource policy: {error}"))?
+    };
+    registry.notify_policy_changed();
+    registry.converge_resource_policy().await;
+    sink.emit(
+        "workspace_policy",
+        json!({
+            "before": policy_before,
+            "after": policy_after,
+            "targetWorkspaceCount": projects.len(),
+        }),
+    );
+
+    crate::csharp_lsp::set_enabled(true, None).await;
+    crate::csharp_compile::set_enabled(true).await;
+    let mut scoped_events = registry.event_router().subscribe();
+
+    let mut plugin_outcomes = Vec::with_capacity(projects.len());
+    for (index, project) in projects.iter().enumerate() {
+        if run_cancelled(cancel_rx) {
+            return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+        }
+        sink.emit(
+            "workspace_target",
+            json!({ "index": index, "project": project, "phase": "plugin" }),
+        );
+        plugin_outcomes.push(check_or_install_plugin(project, config.install_plugin, sink).await?);
+    }
+
+    let mut targets = Vec::with_capacity(projects.len());
+    for (index, (project, plugin_outcome)) in
+        projects.iter().zip(plugin_outcomes.into_iter()).enumerate()
+    {
+        if run_cancelled(cancel_rx) {
+            return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+        }
+        open_and_focus_workspace_for_driver(app_handle, project).await?;
+        let runtime = registry
+            .runtime_for_root(Path::new(project))
+            .ok_or_else(|| format!("Workspace runtime was not registered for {project}"))?;
+        let session_id =
+            create_workspace_driver_session(app_handle, index, runtime.as_ref()).await?;
+        sink.emit(
+            "workspace_registered",
+            json!({
+                "index": index,
+                "project": project,
+                "projectId": runtime.project_id(),
+                "checkoutId": runtime.checkout_id(),
+                "workspaceGeneration": runtime.generation(),
+                "sessionId": session_id,
+            }),
+        );
+        targets.push(WorkspaceSuiteTarget {
+            index,
+            project: project.clone(),
+            runtime,
+            session_id,
+            plugin_outcome,
+        });
+    }
+
+    validate_workspace_identities(&targets)?;
+
+    let connection_futures = targets.iter().cloned().map(|target| {
+        let config = config.clone();
+        let sink = sink.clone();
+        let mut target_cancel = cancel_rx.clone();
+        async move {
+            let status = ensure_connected(
+                &target.project,
+                &config,
+                target.plugin_outcome,
+                &sink,
+                &mut target_cancel,
+            )
+            .await?;
+            Ok::<_, String>((target, status))
+        }
+    });
+    let connected = futures::future::join_all(connection_futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let process_ids = connected
+        .iter()
+        .filter_map(|(_, status)| status.editor_process_id)
+        .collect::<BTreeSet<_>>();
+    if process_ids.len() != targets.len() {
+        return Err(format!(
+            "Expected {} distinct Unity Editor processes, observed {:?}",
+            targets.len(),
+            process_ids
+        ));
+    }
+    sink.emit(
+        "workspace_connections",
+        json!({
+            "connected": connected.iter().map(|(target, status)| json!({
+                "index": target.index,
+                "project": target.project,
+                "checkoutId": target.runtime.checkout_id(),
+                "processId": status.editor_process_id,
+                "channel": status.control_channel_state,
+            })).collect::<Vec<_>>()
+        }),
+    );
+
+    let probe_contexts = create_workspace_probe_contexts(&registry, &targets).await?;
+    validate_workspace_tool_routing(app_handle, &targets, &probe_contexts).await?;
+    validate_workspace_event_routing(
+        app_handle,
+        &registry,
+        &targets,
+        &mut scoped_events,
+        config.suite_timeout,
+    )
+    .await?;
+
+    let compile_futures = targets.iter().map(|target| compile_workspace_probe(target));
+    let compile_results = futures::future::join_all(compile_futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let compile_checkout_ids = compile_results
+        .iter()
+        .filter_map(|value| value.get("checkoutId").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let compile_session_ids = compile_results
+        .iter()
+        .filter_map(|value| value.get("editorSessionId").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    if compile_checkout_ids.len() != targets.len() || compile_session_ids.len() != targets.len() {
+        return Err(format!(
+            "Compile scopes were not isolated: checkoutIds={}, editorSessionIds={}, targets={}",
+            compile_checkout_ids.len(),
+            compile_session_ids.len(),
+            targets.len()
+        ));
+    }
+    sink.emit(
+        "workspace_compile_scopes",
+        json!({ "scopes": compile_results }),
+    );
+
+    let launches = futures::future::join_all(
+        targets
+            .iter()
+            .map(|target| launch_workspace_mock_chat(app_handle, target)),
+    )
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    let agent_results =
+        futures::future::join_all(launches.iter().zip(targets.iter()).map(|(launch, target)| {
+            wait_for_workspace_mock_chat(app_handle, launch, target, config.suite_timeout)
+        }))
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    sink.emit(
+        "workspace_mock_agents",
+        json!({ "model": "mock/tool", "runs": agent_results }),
+    );
+
+    futures::future::join_all(targets.iter().map(|target| async move {
+        crate::csharp_lsp::warm_up_workspace(&target.project)
+            .await
+            .map_err(|error| format!("LSP warm-up failed for {}: {error}", target.project))
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    let lsp_metrics = wait_for_workspace_lsp_entries(&targets, config.suite_timeout).await?;
+    let workspace_metrics = registry.metrics().await;
+    if workspace_metrics.running_workspace_services < targets.len() {
+        return Err(format!(
+            "Expected at least {} running workspace services, observed {}",
+            targets.len(),
+            workspace_metrics.running_workspace_services
+        ));
+    }
+    sink.emit(
+        "workspace_metrics",
+        json!({
+            "workspaces": workspace_metrics,
+            "lsp": lsp_metrics,
+            "compile": crate::csharp_compile::scheduler::metrics(),
+        }),
+    );
+
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": CliDriverSuite::Workspace.as_str(),
+            "passed": 8,
+            "failed": 0,
+            "workspaceCount": targets.len(),
+            "projectId": targets[0].runtime.project_id(),
+            "checkoutIds": targets.iter().map(|target| target.runtime.checkout_id()).collect::<Vec<_>>(),
+            "unityProcessIds": process_ids,
+            "mockModel": "mock/tool",
+        }),
+    );
+    drop(probe_contexts);
+    Ok(())
+}
+
+async fn run_workspace_switch_suite(
+    app_handle: &AppHandle,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let projects = resolve_workspace_project_paths(app_handle, config).await?;
+    if projects.len() != 2 {
+        return Err(format!(
+            "The workspace-switch suite requires exactly two Unity projects, observed {}",
+            projects.len()
+        ));
+    }
+    sink.emit(
+        "suite_start",
+        json!({
+            "suite": CliDriverSuite::WorkspaceSwitch.as_str(),
+            "projects": projects,
+        }),
+    );
+
+    let registry = app_handle
+        .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .inner()
+        .clone();
+    let resource_policy = app_handle
+        .state::<Arc<crate::resource_policy::ResourcePolicyStore>>()
+        .inner()
+        .clone();
+    let policy_before = resource_policy.snapshot();
+    let mut workspace_limits = policy_before.limits.clone();
+    workspace_limits.max_running_workspace_services = workspace_limits
+        .max_running_workspace_services
+        .max(projects.len());
+    let policy_after = if workspace_limits == policy_before.limits {
+        policy_before.clone()
+    } else {
+        resource_policy
+            .update(workspace_limits)
+            .map_err(|error| format!("Failed to prepare workspace test resource policy: {error}"))?
+    };
+    registry.notify_policy_changed();
+    registry.converge_resource_policy().await;
+    sink.emit(
+        "workspace_policy",
+        json!({
+            "before": policy_before,
+            "after": policy_after,
+            "targetWorkspaceCount": projects.len(),
+        }),
+    );
+
+    crate::csharp_compile::set_enabled(true).await;
+    let mut scoped_events = registry.event_router().subscribe();
+    let mut plugin_outcomes = Vec::with_capacity(projects.len());
+    for (index, project) in projects.iter().enumerate() {
+        if run_cancelled(cancel_rx) {
+            return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+        }
+        sink.emit(
+            "workspace_target",
+            json!({ "index": index, "project": project, "phase": "plugin" }),
+        );
+        plugin_outcomes.push(check_or_install_plugin(project, config.install_plugin, sink).await?);
+    }
+
+    let mut targets = Vec::with_capacity(projects.len());
+    for (index, (project, plugin_outcome)) in
+        projects.iter().zip(plugin_outcomes.into_iter()).enumerate()
+    {
+        open_and_focus_workspace_for_driver(app_handle, project).await?;
+        let runtime = registry
+            .runtime_for_root(Path::new(project))
+            .ok_or_else(|| format!("Workspace runtime was not registered for {project}"))?;
+        let session_id =
+            create_workspace_driver_session(app_handle, index, runtime.as_ref()).await?;
+        sink.emit(
+            "workspace_registered",
+            json!({
+                "index": index,
+                "project": project,
+                "projectId": runtime.project_id(),
+                "checkoutId": runtime.checkout_id(),
+                "workspaceGeneration": runtime.generation(),
+                "sessionId": session_id,
+            }),
+        );
+        targets.push(WorkspaceSuiteTarget {
+            index,
+            project: project.clone(),
+            runtime,
+            session_id,
+            plugin_outcome,
+        });
+    }
+    validate_distinct_workspace_identities(&targets)?;
+
+    let connection_futures = targets.iter().cloned().map(|target| {
+        let config = config.clone();
+        let sink = sink.clone();
+        let mut target_cancel = cancel_rx.clone();
+        async move {
+            let status = ensure_connected(
+                &target.project,
+                &config,
+                target.plugin_outcome,
+                &sink,
+                &mut target_cancel,
+            )
+            .await?;
+            Ok::<_, String>((target, status))
+        }
+    });
+    let connected = futures::future::join_all(connection_futures)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let process_ids = connected
+        .iter()
+        .filter_map(|(_, status)| status.editor_process_id)
+        .collect::<BTreeSet<_>>();
+    if process_ids.len() != targets.len() {
+        return Err(format!(
+            "Expected {} distinct Unity Editor processes, observed {:?}",
+            targets.len(),
+            process_ids
+        ));
+    }
+    sink.emit(
+        "workspace_connections",
+        json!({
+            "connected": connected.iter().map(|(target, status)| json!({
+                "index": target.index,
+                "project": target.project,
+                "projectId": target.runtime.project_id(),
+                "checkoutId": target.runtime.checkout_id(),
+                "processId": status.editor_process_id,
+                "channel": status.control_channel_state,
+            })).collect::<Vec<_>>()
+        }),
+    );
+
+    let probe_contexts = create_workspace_probe_contexts(&registry, &targets).await?;
+    validate_workspace_tool_routing(app_handle, &targets, &probe_contexts).await?;
+    validate_workspace_event_routing(
+        app_handle,
+        &registry,
+        &targets,
+        &mut scoped_events,
+        config.suite_timeout,
+    )
+    .await?;
+
+    let first = &targets[0];
+    let second = &targets[1];
+    open_and_focus_workspace_for_driver(app_handle, &first.project).await?;
+    let first_launch = launch_workspace_mock_chat_with_prompt(
+        app_handle,
+        first,
+        format!(
+            "{} Keep this local model run active while the focused project changes.",
+            crate::agent::instance::MOCK_WORKSPACE_SWITCH_HOLD_SCENARIO
+        ),
+    )
+    .await?;
+    wait_for_workspace_runs_running(
+        app_handle,
+        std::slice::from_ref(&first_launch),
+        config.suite_timeout,
+    )
+    .await?;
+    let first_scope_before = workspace_run_scope(app_handle, &first_launch, first)?;
+
+    open_and_focus_workspace_for_driver(app_handle, &second.project).await?;
+    if !main_pane_focuses_runtime(app_handle, &second.runtime)? {
+        return Err("The frontend-equivalent workspace switch did not focus project B".to_string());
+    }
+    let first_status_after_switch = workspace_run_status(app_handle, &first_launch.run_id)?;
+    if first_status_after_switch != "running" {
+        return Err(format!(
+            "Project A run ended during workspace switch with status {first_status_after_switch}"
+        ));
+    }
+    let first_scope_after = workspace_run_scope(app_handle, &first_launch, first)?;
+    if first_scope_after != first_scope_before {
+        return Err("Project A run scope changed while focusing project B".to_string());
+    }
+
+    let second_launch = launch_workspace_mock_chat(app_handle, second).await?;
+    wait_for_workspace_runs_running(
+        app_handle,
+        &[first_launch.clone(), second_launch.clone()],
+        config.suite_timeout,
+    )
+    .await?;
+    sink.emit(
+        "workspace_switch_parallel_active",
+        json!({
+            "focusedProjectId": second.runtime.project_id(),
+            "focusedCheckoutId": second.runtime.checkout_id(),
+            "backgroundRun": {
+                "runId": first_launch.run_id,
+                "projectId": first.runtime.project_id(),
+                "checkoutId": first.runtime.checkout_id(),
+                "status": workspace_run_status(app_handle, &first_launch.run_id)?,
+            },
+            "focusedRun": {
+                "runId": second_launch.run_id,
+                "projectId": second.runtime.project_id(),
+                "checkoutId": second.runtime.checkout_id(),
+                "status": workspace_run_status(app_handle, &second_launch.run_id)?,
+            },
+        }),
+    );
+
+    let agent_results = futures::future::join_all([
+        wait_for_workspace_mock_chat(app_handle, &first_launch, first, config.suite_timeout),
+        wait_for_workspace_mock_chat(app_handle, &second_launch, second, config.suite_timeout),
+    ])
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    if !main_pane_focuses_runtime(app_handle, &second.runtime)? {
+        return Err("Project B focus changed while the background run completed".to_string());
+    }
+    let workspace_metrics = registry.metrics().await;
+    if workspace_metrics.running_workspace_services < targets.len() {
+        return Err(format!(
+            "Expected at least {} running workspace services, observed {}",
+            targets.len(),
+            workspace_metrics.running_workspace_services
+        ));
+    }
+    sink.emit(
+        "workspace_switch_completed",
+        json!({
+            "focusedProjectId": second.runtime.project_id(),
+            "focusedCheckoutId": second.runtime.checkout_id(),
+            "runs": agent_results,
+            "workspaces": workspace_metrics,
+        }),
+    );
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": CliDriverSuite::WorkspaceSwitch.as_str(),
+            "passed": 6,
+            "failed": 0,
+            "projectIds": targets.iter().map(|target| target.runtime.project_id()).collect::<Vec<_>>(),
+            "checkoutIds": targets.iter().map(|target| target.runtime.checkout_id()).collect::<Vec<_>>(),
+            "unityProcessIds": process_ids,
+            "backgroundRunPreserved": true,
+            "mockModel": "mock/tool",
+        }),
+    );
+    drop(probe_contexts);
+    Ok(())
+}
+
+async fn resolve_workspace_project_paths(
+    app_handle: &AppHandle,
+    config: &CliDriverConfig,
+) -> Result<Vec<String>, String> {
+    let first = resolve_project_path(config.project_path.as_deref(), app_handle).await?;
+    let mut projects = vec![first];
+    for requested in &config.workspace_paths {
+        let project = canonicalize_lossy(requested);
+        if !unity_bridge::is_unity_project(&project) {
+            return Err(format!("Path is not a Unity project: {project}"));
+        }
+        projects.push(project);
+    }
+    let mut unique = BTreeSet::new();
+    projects.retain(|project| unique.insert(project.replace('\\', "/").to_ascii_lowercase()));
+    if projects.len() < 2 {
+        return Err(
+            "The workspace suite requires --project plus at least one --workspace-project"
+                .to_string(),
+        );
+    }
+    Ok(projects)
+}
+
+async fn open_and_focus_workspace_for_driver(
+    app_handle: &AppHandle,
+    project: &str,
+) -> Result<(), String> {
+    let registry = app_handle
+        .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .inner()
+        .clone();
+    let runtime = registry.open_workspace(project)?;
+
+    let contexts = app_handle.state::<Arc<crate::workspace_service::WindowContextRegistry>>();
+    let persistence = app_handle.state::<Arc<crate::commands::WindowContextPersistence>>();
+    let mutation = persistence
+        .mutation
+        .lock()
+        .map_err(|error| format!("workspace focus persistence lock poisoned: {error}"))?;
+    let intent_epoch = contexts
+        .next_pane_intent_epoch("main", "main")
+        .map_err(|error| error.to_string())?;
+    contexts
+        .focus("main", "main", Arc::clone(&runtime), intent_epoch)
+        .map_err(|error| error.to_string())?;
+    crate::commands::persist_window_context_recovery(app_handle, &contexts)?;
+    drop(mutation);
+
+    if crate::unity_bridge::is_unity_project(project) {
+        registry
+            .execution_context(
+                runtime.checkout_id(),
+                &[crate::workspace_service::service::ServiceKind::Unity],
+            )
+            .await?;
+    }
+    registry.converge_resource_policy().await;
+    if let Ok(data_dir) = crate::commands::resolve_runtime_storage_dir(app_handle) {
+        crate::commands::save_recent_dir_pub(&data_dir, &runtime.root().to_string_lossy());
+    }
+    Ok(())
+}
+
+fn main_pane_focuses_runtime(
+    app_handle: &AppHandle,
+    runtime: &crate::workspace_service::WorkspaceRuntime,
+) -> Result<bool, String> {
+    let contexts = app_handle.state::<Arc<crate::workspace_service::WindowContextRegistry>>();
+    Ok(contexts
+        .pane("main", "main")
+        .map_err(|error| error.to_string())?
+        .is_some_and(|context| {
+            context.focused_checkout_id == *runtime.checkout_id()
+                && context.workspace_generation == runtime.generation()
+        }))
+}
+
+async fn create_workspace_driver_session(
+    app_handle: &AppHandle,
+    index: usize,
+    runtime: &crate::workspace_service::WorkspaceRuntime,
+) -> Result<String, String> {
+    crate::commands::create_session(
+        format!("Workspace driver target {index}"),
+        None,
+        Some("chat".to_string()),
+        Some("dev".to_string()),
+        crate::workspace_service::WorkspaceRef::for_runtime(runtime),
+        app_handle.state(),
+        app_handle.state(),
+    )
+    .await
+    .map_err(|error| format!("Failed to create workspace driver session: {error}"))
+}
+
+fn validate_workspace_identities(targets: &[WorkspaceSuiteTarget]) -> Result<(), String> {
+    let project_ids = targets
+        .iter()
+        .map(|target| target.runtime.project_id().to_string())
+        .collect::<BTreeSet<_>>();
+    let checkout_ids = targets
+        .iter()
+        .map(|target| target.runtime.checkout_id().to_string())
+        .collect::<BTreeSet<_>>();
+    if project_ids.len() != 1 {
+        return Err(format!(
+            "Copied project and worktree did not share one projectId: {:?}",
+            project_ids
+        ));
+    }
+    if checkout_ids.len() != targets.len() {
+        return Err(format!(
+            "Expected {} distinct checkoutIds, observed {:?}",
+            targets.len(),
+            checkout_ids
+        ));
+    }
+    Ok(())
+}
+
+fn validate_distinct_workspace_identities(targets: &[WorkspaceSuiteTarget]) -> Result<(), String> {
+    let project_ids = targets
+        .iter()
+        .map(|target| target.runtime.project_id().to_string())
+        .collect::<BTreeSet<_>>();
+    let checkout_ids = targets
+        .iter()
+        .map(|target| target.runtime.checkout_id().to_string())
+        .collect::<BTreeSet<_>>();
+    if project_ids.len() != targets.len() {
+        return Err(format!(
+            "Expected {} distinct projectIds, observed {:?}",
+            targets.len(),
+            project_ids
+        ));
+    }
+    if checkout_ids.len() != targets.len() {
+        return Err(format!(
+            "Expected {} distinct checkoutIds, observed {:?}",
+            targets.len(),
+            checkout_ids
+        ));
+    }
+    Ok(())
+}
+
+async fn create_workspace_probe_contexts(
+    registry: &Arc<crate::workspace_service::ProjectRegistry>,
+    targets: &[WorkspaceSuiteTarget],
+) -> Result<Vec<Arc<crate::workspace_service::AgentExecutionContext>>, String> {
+    let mut contexts = Vec::with_capacity(targets.len());
+    let mut service_ids = BTreeSet::new();
+    for target in targets {
+        let execution = registry
+            .execution_context(
+                target.runtime.checkout_id(),
+                &[crate::workspace_service::service::ServiceKind::Unity],
+            )
+            .await?;
+        let binding = execution
+            .binding(crate::workspace_service::service::ServiceKind::Unity)
+            .ok_or_else(|| format!("Unity binding missing for {}", target.project))?;
+        service_ids.insert(binding.service_instance_id.to_string());
+        contexts.push(execution);
+    }
+    if service_ids.len() != targets.len() {
+        return Err(format!(
+            "Expected {} distinct Unity service instances, observed {:?}",
+            targets.len(),
+            service_ids
+        ));
+    }
+    Ok(contexts)
+}
+
+async fn validate_workspace_tool_routing(
+    app_handle: &AppHandle,
+    targets: &[WorkspaceSuiteTarget],
+    contexts: &[Arc<crate::workspace_service::AgentExecutionContext>],
+) -> Result<(), String> {
+    let tool_registry = app_handle
+        .state::<Arc<crate::tool::ToolRegistry>>()
+        .inner()
+        .clone();
+    for (target, execution) in targets.iter().zip(contexts.iter()) {
+        let marker = format!(
+            "workspace-driver:{}:{}",
+            target.index,
+            target.runtime.checkout_id()
+        );
+        let marker_path = target
+            .runtime
+            .root()
+            .join("Library")
+            .join("Locus")
+            .join("workspace-driver-marker.txt");
+        if let Some(parent) = marker_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create workspace marker directory: {error}"))?;
+        }
+        std::fs::write(&marker_path, &marker)
+            .map_err(|error| format!("Failed to write workspace marker: {error}"))?;
+        let result = tool_registry
+            .execute_with_context(
+                "read",
+                &json!({ "filePath": "Library/Locus/workspace-driver-marker.txt" }),
+                crate::tool::ToolExecutionContext {
+                    app_handle: Some(app_handle.clone()),
+                    execution: Some(execution.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let _ = std::fs::remove_file(&marker_path);
+        if result.is_error || !result.output.contains(&marker) {
+            return Err(format!(
+                "Checkout-scoped read was misrouted for {}: {}",
+                target.project, result.output
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn validate_workspace_event_routing(
+    app_handle: &AppHandle,
+    registry: &Arc<crate::workspace_service::ProjectRegistry>,
+    targets: &[WorkspaceSuiteTarget],
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<
+        crate::workspace_service::event::RoutedWorkspaceEvent,
+    >,
+    timeout: Duration,
+) -> Result<(), String> {
+    for target in targets {
+        let outcome = registry.event_router().publish_for_scope(
+            app_handle,
+            &crate::workspace_service::event::WorkspaceEventScope::for_runtime(&target.runtime),
+            "workspace-driver-probe",
+            json!({ "index": target.index }),
+        );
+        if outcome != crate::workspace_service::event::WorkspaceEventPublishOutcome::PublishedScoped
+        {
+            return Err(format!(
+                "Workspace probe was not published with its scoped envelope: {}",
+                target.project
+            ));
+        }
+    }
+    let expected = targets
+        .iter()
+        .map(|target| target.runtime.checkout_id().to_string())
+        .collect::<BTreeSet<_>>();
+    let mut observed = BTreeSet::new();
+    tokio::time::timeout(timeout, async {
+        while observed.len() < expected.len() {
+            let event = receiver
+                .recv()
+                .await
+                .ok_or_else(|| "Workspace event subscriber closed".to_string())?;
+            if event.event_name == "workspace-driver-probe" {
+                observed.insert(event.envelope.checkout_id.to_string());
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "Timed out waiting for scoped workspace probe events".to_string())??;
+    if observed != expected {
+        return Err(format!(
+            "Scoped event checkoutIds differ: expected {:?}, observed {:?}",
+            expected, observed
+        ));
+    }
+    Ok(())
+}
+
+async fn compile_workspace_probe(target: &WorkspaceSuiteTarget) -> Result<Value, String> {
+    let params = crate::csharp_compile::params::get_params(&target.project).await?;
+    let scope = params
+        .scope_id
+        .as_ref()
+        .ok_or_else(|| format!("Compile scope missing for {}", target.project))?;
+    let code = format!(
+        "var workspaceDriverTarget = {}; System.Console.WriteLine(workspaceDriverTarget);",
+        target.index
+    );
+    let compiled = crate::csharp_compile::compile_snippet(&params, &code, false, false).await?;
+    let assembly = compiled.map_err(|failure| {
+        format!(
+            "Compile probe failed for {} at {}: {}",
+            target.project, failure.stage, failure.message
+        )
+    })?;
+    Ok(json!({
+        "index": target.index,
+        "checkoutId": scope.checkout_id,
+        "workspaceGeneration": scope.workspace_generation,
+        "serviceGeneration": scope.service_generation,
+        "editorSessionId": scope.unity_editor_session_id,
+        "assemblyName": assembly.assembly_name,
+    }))
+}
+
+async fn launch_workspace_mock_chat(
+    app_handle: &AppHandle,
+    target: &WorkspaceSuiteTarget,
+) -> Result<crate::commands::ChatLaunch, String> {
+    launch_workspace_mock_chat_with_prompt(
+        app_handle,
+        target,
+        format!(
+            "Run the local workspace routing probe for checkout {}.",
+            target.runtime.checkout_id()
+        ),
+    )
+    .await
+}
+
+async fn launch_workspace_mock_chat_with_prompt(
+    app_handle: &AppHandle,
+    target: &WorkspaceSuiteTarget,
+    prompt: String,
+) -> Result<crate::commands::ChatLaunch, String> {
+    crate::commands::chat(
+        Some(target.session_id.clone()),
+        Some(crate::workspace_service::WorkspaceRef::for_runtime(
+            target.runtime.as_ref(),
+        )),
+        prompt,
+        Some(false),
+        None,
+        Some("dev".to_string()),
+        None,
+        Some("mock/tool".to_string()),
+        None,
+        Some(false),
+        None,
+        None,
+        None,
+        Some("build".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        app_handle.clone(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+        app_handle.state(),
+    )
+    .await
+    .map_err(|error| format!("Failed to launch local mock model: {error}"))
+}
+
+fn workspace_run_status(app_handle: &AppHandle, run_id: &str) -> Result<String, String> {
+    app_handle
+        .state::<Arc<crate::session::store::SessionStore>>()
+        .run_by_id(run_id)?
+        .map(|run| run.status)
+        .ok_or_else(|| format!("Mock run disappeared: {run_id}"))
+}
+
+fn workspace_run_scope(
+    app_handle: &AppHandle,
+    launch: &crate::commands::ChatLaunch,
+    target: &WorkspaceSuiteTarget,
+) -> Result<Value, String> {
+    let scope = app_handle
+        .state::<Arc<crate::session::store::SessionStore>>()
+        .get_run_scope(&launch.run_id)?
+        .ok_or_else(|| format!("Mock run scope missing: {}", launch.run_id))?;
+    if scope.project_id != target.runtime.project_id().as_str()
+        || scope.checkout_id != target.runtime.checkout_id().as_str()
+        || !scope
+            .service_bindings
+            .iter()
+            .any(|binding| binding.service_kind == "unity")
+    {
+        return Err(format!(
+            "Mock run scope mismatch for {}: {:?}",
+            target.project, scope
+        ));
+    }
+    Ok(json!(scope))
+}
+
+async fn wait_for_workspace_runs_running(
+    app_handle: &AppHandle,
+    launches: &[crate::commands::ChatLaunch],
+    timeout: Duration,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let statuses = launches
+                .iter()
+                .map(|launch| {
+                    workspace_run_status(app_handle, &launch.run_id)
+                        .map(|status| (launch.run_id.as_str(), status))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if statuses.iter().all(|(_, status)| status == "running") {
+                return Ok(());
+            }
+            if let Some((run_id, status)) = statuses
+                .iter()
+                .find(|(_, status)| matches!(status.as_str(), "done" | "error" | "cancelled"))
+            {
+                return Err(format!(
+                    "Mock run {run_id} reached terminal status {status} before the parallel checkpoint"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| "Timed out waiting for workspace mock runs to become active".to_string())?
+}
+
+async fn wait_for_workspace_mock_chat(
+    app_handle: &AppHandle,
+    launch: &crate::commands::ChatLaunch,
+    target: &WorkspaceSuiteTarget,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let store = app_handle
+        .state::<Arc<crate::session::store::SessionStore>>()
+        .inner()
+        .clone();
+    let run = tokio::time::timeout(timeout, async {
+        loop {
+            let run = store
+                .run_by_id(&launch.run_id)?
+                .ok_or_else(|| format!("Mock run disappeared: {}", launch.run_id))?;
+            if matches!(run.status.as_str(), "done" | "error" | "cancelled") {
+                return Ok::<_, String>(run);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("Mock run timed out: {}", launch.run_id))??;
+    if run.status != "done" {
+        return Err(format!(
+            "Mock run {} ended as {}: {}",
+            launch.run_id,
+            run.status,
+            run.error_message.unwrap_or_default()
+        ));
+    }
+    let scope = store
+        .get_run_scope(&launch.run_id)?
+        .ok_or_else(|| format!("Mock run scope missing: {}", launch.run_id))?;
+    if scope.project_id != target.runtime.project_id().as_str()
+        || scope.checkout_id != target.runtime.checkout_id().as_str()
+        || !scope
+            .service_bindings
+            .iter()
+            .any(|binding| binding.service_kind == "unity")
+    {
+        return Err(format!(
+            "Mock run scope mismatch for {}: {:?}",
+            target.project, scope
+        ));
+    }
+    let messages = store.get_messages(&launch.session_id)?;
+    let tool_messages = messages
+        .iter()
+        .filter(|message| message.role == crate::session::models::MessageRole::Tool)
+        .count();
+    let assistant_messages = messages
+        .iter()
+        .filter(|message| message.role == crate::session::models::MessageRole::Assistant)
+        .count();
+    if tool_messages == 0 || assistant_messages == 0 {
+        return Err(format!(
+            "Mock tool pipeline did not complete for {}: tool={}, assistant={}",
+            target.project, tool_messages, assistant_messages
+        ));
+    }
+    Ok(json!({
+        "index": target.index,
+        "sessionId": launch.session_id,
+        "runId": launch.run_id,
+        "projectId": scope.project_id,
+        "checkoutId": scope.checkout_id,
+        "workspaceGeneration": scope.workspace_generation,
+        "serviceBindings": scope.service_bindings,
+        "toolMessages": tool_messages,
+        "assistantMessages": assistant_messages,
+    }))
+}
+
+async fn wait_for_workspace_lsp_entries(
+    targets: &[WorkspaceSuiteTarget],
+    timeout: Duration,
+) -> Result<crate::csharp_lsp::LspProcessPoolMetrics, String> {
+    let expected = targets
+        .iter()
+        .map(|target| target.runtime.checkout_id().to_string())
+        .collect::<BTreeSet<_>>();
+    tokio::time::timeout(timeout, async {
+        loop {
+            let metrics = crate::csharp_lsp::pool_metrics().await;
+            let observed = metrics
+                .entries
+                .iter()
+                .map(|entry| entry.checkout_id.clone())
+                .collect::<BTreeSet<_>>();
+            if expected.is_subset(&observed) {
+                return metrics;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .map_err(|_| format!("Timed out waiting for LSP checkout entries: {:?}", expected))
 }
 
 async fn run_yaml_parity_suite(
@@ -1201,11 +2344,21 @@ fn prepare_suite_environment(
 
 async fn resolve_project_path(
     requested: Option<&str>,
-    workspace: &Arc<Workspace>,
+    app_handle: &AppHandle,
 ) -> Result<String, String> {
     let raw = match requested.map(str::trim).filter(|value| !value.is_empty()) {
         Some(value) => value.to_string(),
-        None => workspace.path.read().await.trim().to_string(),
+        None => {
+            let contexts =
+                app_handle.state::<Arc<crate::workspace_service::WindowContextRegistry>>();
+            let registry = app_handle.state::<Arc<crate::workspace_service::ProjectRegistry>>();
+            contexts
+                .pane("main", "main")
+                .map_err(|error| error.to_string())?
+                .and_then(|context| registry.runtime(&context.focused_checkout_id))
+                .map(|runtime| runtime.root().display().to_string())
+                .unwrap_or_default()
+        }
     };
     if raw.is_empty() {
         return Err("Missing --project and no saved Unity workspace is available".to_string());
@@ -1217,18 +2370,8 @@ async fn resolve_project_path(
     Ok(path)
 }
 
-async fn set_workspace_for_driver(workspace: &Arc<Workspace>, project: &str) -> Result<(), String> {
-    let workspace_id = crate::workspace::load_or_create_workspace(project).ok();
-    {
-        let mut path = workspace.path.write().await;
-        *path = project.to_string();
-    }
-    {
-        let mut id = workspace.workspace_id.write().await;
-        *id = workspace_id;
-    }
-    workspace.bump_generation();
-    Ok(())
+async fn set_workspace_for_driver(app_handle: &AppHandle, project: &str) -> Result<(), String> {
+    open_and_focus_workspace_for_driver(app_handle, project).await
 }
 
 fn canonicalize_lossy(path: &str) -> String {
@@ -1484,7 +2627,6 @@ fn semantic_connection_wait_sample(state: &unity_bridge::SemanticState) -> serde
         "source": &state.source,
         "confidence": &state.confidence,
         "transient": state.transient,
-        "needsUser": state.needs_user,
         "detail": &state.detail,
         "reloadPhase": &state.reload_phase,
         "editorMode": &state.editor_mode.value,
@@ -3821,6 +4963,708 @@ fn clip(text: &str, max: usize) -> String {
     format!("{truncated}…")
 }
 
+async fn wait_for_modal_dialog(
+    project: &str,
+    present: bool,
+    timeout: Duration,
+) -> Result<Option<crate::unity_bridge::dialog::UnityModalDialog>, String> {
+    let started = Instant::now();
+    loop {
+        let dialog = crate::unity_bridge::dialog::current_dialog(project);
+        if dialog.is_some() == present {
+            return Ok(dialog);
+        }
+        if started.elapsed() >= timeout {
+            return Err(format!(
+                "Unity modal dialog did not become {} within {}ms",
+                if present { "visible" } else { "closed" },
+                timeout.as_millis()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn run_python_sdk_script(
+    app_handle: &AppHandle,
+    project: &str,
+    script: &str,
+    extra_args: &[String],
+    timeout: Duration,
+    operation: &str,
+) -> Result<String, String> {
+    let runtime = crate::python_runtime::resolve_effective_python(Some(app_handle))
+        .ok_or_else(|| format!("No Python runtime is available for {operation}"))?;
+    crate::python_runtime::ensure_runtime_package_environment(&runtime)?;
+    let sdk_env = crate::python_runtime::locus_sdk_invocation_env();
+    if sdk_env.is_empty() {
+        return Err("Locus SDK bridge connection is not ready".to_string());
+    }
+
+    let mut command = tokio::process::Command::new(&runtime.path);
+    command
+        .arg("-c")
+        .arg(script)
+        .arg(project)
+        .args(extra_args)
+        .current_dir(project)
+        .kill_on_drop(true);
+    for (name, value) in sdk_env {
+        command.env(name, value);
+    }
+
+    let repository_python = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+        .join("python");
+    let python_path = crate::process_util::prepend_paths(
+        crate::python_runtime::managed_python_path_env(std::env::var_os("PYTHONPATH"), &runtime),
+        vec![repository_python],
+    );
+    if let Some(python_path) = python_path {
+        command.env("PYTHONPATH", python_path);
+    }
+
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| format!("{operation} timed out after {}s", timeout.as_secs()))?
+        .map_err(|error| format!("Could not launch {operation}: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(format!(
+            "{operation} exited with {}: {}",
+            output.status,
+            clip(&stderr, 4_000)
+        ));
+    }
+    Ok(stdout)
+}
+
+async fn resolve_modal_dialog_through_python_sdk(
+    app_handle: &AppHandle,
+    project: &str,
+) -> Result<String, String> {
+    let script = r#"import asyncio, json, locus, sys
+async def main():
+    status = await locus.get_unity_editor_status(project=sys.argv[1])
+    if status.ready or not status.main_thread_blocked:
+        raise RuntimeError(f"Unity status did not expose the blocked main thread: {status}")
+    if status.blocking_reason != "modal_dialog":
+        raise RuntimeError(f"Unexpected blocking reason: {status.blocking_reason}")
+    if not status.blocking_dialog_recoverable:
+        raise RuntimeError("Unity dialog was not marked Agent-recoverable")
+    dialog = status.blocking_dialog
+    if dialog is None:
+        dialog = await locus.get_unity_dialog(project=sys.argv[1])
+    if dialog is None:
+        raise RuntimeError("Locus SDK returned no Unity dialog")
+    choice = next((item for item in dialog.choices if item.label == "Cancel Probe"), None)
+    if choice is None:
+        raise RuntimeError("Cancel Probe choice was not exposed")
+    result = await locus.choose_unity_dialog(
+        project=dialog.project,
+        dialog_id=dialog.dialog_id,
+        choice_id=choice.id,
+    )
+    print(json.dumps({
+        "title": dialog.title,
+        "message": dialog.message,
+        "choice": choice.label,
+        "invoked": result.invoked,
+        "ready": status.ready,
+        "mainThreadBlocked": status.main_thread_blocked,
+        "recoverable": status.blocking_dialog_recoverable,
+        "blockingReason": status.blocking_reason,
+    }, ensure_ascii=False))
+asyncio.run(main())"#;
+    run_python_sdk_script(
+        app_handle,
+        project,
+        script,
+        &[],
+        Duration::from_secs(15),
+        "Python SDK dialog resolver",
+    )
+    .await
+}
+
+/// Exercises the public Python SDK before the driver's shared Unity connection
+/// preflight. An unopened editor covers launch; an existing editor covers
+/// idempotent reuse. Both paths must reach the managed bridge and complete one
+/// deterministic local-model Agent run through the first-class Python tool.
+async fn run_python_sdk_editor_suite(
+    app_handle: &AppHandle,
+    project: &str,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+) -> Result<(), String> {
+    let suite = CliDriverSuite::PythonSdk;
+    sink.emit(
+        "suite_start",
+        json!({ "suite": suite.as_str(), "project": project }),
+    );
+    let mut run = ExecuteSuiteRun::new(suite, sink);
+    let ensure_timeout = config
+        .connect_timeout
+        .max(Duration::from_secs(30))
+        .min(Duration::from_secs(1_800));
+    let script_timeout = ensure_timeout.saturating_add(Duration::from_secs(60));
+    let script = r#"import asyncio, json, locus, sys
+async def main():
+    project = sys.argv[1]
+    timeout = float(sys.argv[2])
+    before = await locus.get_unity_editor_status(project=project)
+    ensured = await locus.ensure_unity_editor(
+        project=project,
+        wait_until="ready",
+        timeout=timeout,
+    )
+    after = await locus.get_unity_editor_status(project=project)
+
+    python_tool = await locus.call_tool(
+        "python",
+        {
+            "action": "run",
+            "code": "status = await locus.get_unity_editor_status(project=project)\nprint(f'LOCUS_PYTHON_TOOL_DIRECT:{status.process_state}:{status.ready}')",
+            "description": "Verify first-class Python tool SDK injection",
+            "readonly": True,
+            "timeout": 30000,
+        },
+        timeout=35,
+        workspace_ref=after.workspace_ref,
+    )
+    python_tool.raise_for_error()
+
+    agent = locus.Agent(
+        name="Unity SDK Local Probe",
+        id="unity-sdk-local-probe",
+        system_prompt="Use the Python tool to inspect the current Unity lifecycle, then report completion.",
+        tools=["python"],
+    )
+    try:
+        model_run = await agent.prompt(
+            "[[mock:python-tool]] Run the first-class Python tool lifecycle probe.",
+            model="mock/tool",
+            workspace_ref=after.workspace_ref,
+        )
+        model_result = await model_run.wait()
+        model_result.raise_for_error()
+        model_events = await model_run.events()
+        model_python_event = next((
+            event for event in model_events
+            if event.get("eventType") == "toolCallDone"
+            and event.get("payload", {}).get("toolName") == "python"
+        ), None)
+    finally:
+        agent.close()
+
+    headless = await locus.restart_unity_editor(
+        project=project,
+        mode="headless",
+        wait_until="ready",
+        timeout=timeout,
+        force=True,
+    )
+    headless_status = await locus.get_unity_editor_status(project=project)
+
+    print(json.dumps({
+        "before": {
+            "processState": before.process_state,
+            "semanticPhase": before.semantic_phase,
+        },
+        "ensure": {
+            "launched": ensured.launched,
+            "waitUntil": ensured.wait_until,
+            "processId": ensured.status.process_id,
+            "ready": ensured.status.ready,
+        },
+        "after": {
+            "processState": after.process_state,
+            "semanticPhase": after.semantic_phase,
+            "connected": after.connected,
+            "ready": after.ready,
+        },
+        "pythonTool": {
+            "name": python_tool.name,
+            "isError": python_tool.is_error,
+            "output": python_tool.output,
+        },
+        "model": {
+            "id": "mock/tool",
+            "status": model_result.status,
+            "text": model_result.text,
+            "pythonToolOutput": (
+                model_python_event.get("payload", {}).get("output", "")
+                if model_python_event else ""
+            ),
+        },
+        "headless": {
+            "launchMode": headless.launch.mode,
+            "statusMode": headless_status.launch_mode,
+            "headless": headless_status.headless,
+            "processId": headless_status.process_id,
+            "ready": headless_status.ready,
+        },
+    }, ensure_ascii=False))
+asyncio.run(main())"#;
+    let output = run_python_sdk_script(
+        app_handle,
+        project,
+        script,
+        &[ensure_timeout.as_secs_f64().to_string()],
+        script_timeout,
+        "Python SDK Unity lifecycle probe",
+    )
+    .await?;
+    let payload: Value = serde_json::from_str(&output).map_err(|error| {
+        format!(
+            "Python SDK Unity lifecycle probe returned invalid JSON: {error}; output={}",
+            clip(&output, 1_000)
+        )
+    })?;
+
+    let before_process = payload["before"]["processState"].as_str().unwrap_or("");
+    if matches!(before_process, "not_running" | "running") {
+        run.pass(
+            "P1 initial status",
+            format!("public SDK observed processState={before_process}"),
+        );
+    } else {
+        run.fail(
+            "P1 initial status",
+            format!("expected not_running or running, observed '{before_process}'"),
+        );
+    }
+
+    let launched = payload["ensure"]["launched"].as_bool().unwrap_or(false);
+    let ensured_ready = payload["ensure"]["ready"].as_bool().unwrap_or(false);
+    let process_id = payload["ensure"]["processId"].as_u64();
+    let lifecycle_action_ok = match before_process {
+        "not_running" => launched,
+        "running" => !launched,
+        _ => false,
+    };
+    if lifecycle_action_ok && ensured_ready && process_id.is_some() {
+        run.pass(
+            "P2 SDK ensure launch",
+            format!(
+                "{} PID {} and reached ready",
+                if launched { "launched" } else { "reused" },
+                process_id.unwrap_or_default(),
+            ),
+        );
+    } else {
+        run.fail(
+            "P2 SDK ensure launch",
+            format!("launched={launched}, ready={ensured_ready}, processId={process_id:?}"),
+        );
+    }
+
+    let after_running = payload["after"]["processState"] == "running";
+    let after_connected = payload["after"]["connected"].as_bool().unwrap_or(false);
+    let after_ready = payload["after"]["ready"].as_bool().unwrap_or(false);
+    if after_running && after_connected && after_ready {
+        run.pass(
+            "P3 final status",
+            format!(
+                "phase={}, connected=true, ready=true",
+                payload["after"]["semanticPhase"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            ),
+        );
+    } else {
+        run.fail(
+            "P3 final status",
+            format!(
+                "processState={}, connected={after_connected}, ready={after_ready}",
+                payload["after"]["processState"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            ),
+        );
+    }
+
+    let python_tool_ok = payload["pythonTool"]["name"] == "python"
+        && !payload["pythonTool"]["isError"].as_bool().unwrap_or(true)
+        && payload["pythonTool"]["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("LOCUS_PYTHON_TOOL_DIRECT:running:True");
+    if python_tool_ok {
+        run.pass(
+            "P4 first-class Python tool",
+            "checkout injection and nested lifecycle SDK call succeeded",
+        );
+    } else {
+        run.fail(
+            "P4 first-class Python tool",
+            clip(payload["pythonTool"]["output"].as_str().unwrap_or(""), 500),
+        );
+    }
+
+    let model_id = payload["model"]["id"].as_str().unwrap_or("");
+    let model_status = payload["model"]["status"].as_str().unwrap_or("");
+    let model_text = payload["model"]["text"].as_str().unwrap_or("");
+    let model_python_output = payload["model"]["pythonToolOutput"].as_str().unwrap_or("");
+    if model_id == "mock/tool"
+        && model_status == "done"
+        && model_text.contains("simulated tool call completed")
+        && model_python_output.contains("LOCUS_PYTHON_TOOL_OK:running:True")
+    {
+        run.pass(
+            "P5 local model Python call",
+            format!(
+                "mock/tool completed the Python tool round: {}",
+                clip(model_text, 160)
+            ),
+        );
+    } else {
+        run.fail(
+            "P5 local model Python call",
+            format!(
+                "model={model_id}, status={model_status}, text={}, pythonOutput={}",
+                clip(model_text, 160),
+                clip(model_python_output, 240)
+            ),
+        );
+    }
+
+    let headless_pid = payload["headless"]["processId"].as_u64();
+    let headless_ready = payload["headless"]["ready"].as_bool().unwrap_or(false);
+    let headless_mode_ok = payload["headless"]["launchMode"] == "headless"
+        && payload["headless"]["statusMode"] == "headless"
+        && payload["headless"]["headless"].as_bool().unwrap_or(false);
+    if headless_mode_ok && headless_ready && headless_pid.is_some() {
+        run.pass(
+            "P6 headless lifecycle",
+            format!(
+                "restarted PID {} in headless mode and reached ready",
+                headless_pid.unwrap_or_default()
+            ),
+        );
+    } else {
+        run.fail(
+            "P6 headless lifecycle",
+            format!(
+                "launchMode={}, statusMode={}, headless={}, ready={headless_ready}, processId={headless_pid:?}",
+                payload["headless"]["launchMode"].as_str().unwrap_or(""),
+                payload["headless"]["statusMode"].as_str().unwrap_or(""),
+                payload["headless"]["headless"].as_bool().unwrap_or(false),
+            ),
+        );
+    }
+
+    let close_result = crate::unity_bridge::force_close_current_project_unity_processes(
+        project,
+        Duration::from_secs(30),
+    )
+    .await;
+    let closed_headless = match close_result {
+        Ok(result) => headless_pid.is_some_and(|process_id| {
+            result
+                .process_ids
+                .iter()
+                .any(|closed| u64::from(*closed) == process_id)
+        }),
+        Err(_) => false,
+    };
+    if closed_headless {
+        run.pass(
+            "P7 headless close",
+            "the headless editor process was explicitly closed",
+        );
+    } else {
+        run.fail(
+            "P7 headless close",
+            "the headless editor process was not reported by the close operation",
+        );
+    }
+
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": suite.as_str(),
+            "passed": run.passed,
+            "failed": run.failed,
+            "processId": process_id,
+            "launched": launched,
+            "semanticPhase": payload["after"]["semanticPhase"],
+            "mockModel": model_id,
+            "headlessProcessId": headless_pid,
+        }),
+    );
+    if run.failed == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "python-sdk suite finished with {} failed check(s)",
+            run.failed
+        ))
+    }
+}
+
+/// Opens a real Unity Editor modal dialog from an active `unity_execute`,
+/// proves that a second main-thread request fails fast, and resolves the dialog
+/// through the public Python SDK while Unity's managed main thread is blocked.
+async fn run_modal_dialog_suite(
+    app_handle: &AppHandle,
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+) -> Result<(), String> {
+    sink.emit(
+        "suite_start",
+        json!({ "suite": suite.as_str(), "project": project }),
+    );
+    let mut run = ExecuteSuiteRun::new(suite, sink);
+
+    crate::unity_bridge::dialog::ensure_project_observed(project).await?;
+    if crate::unity_bridge::dialog::current_dialog(project).is_some() {
+        return Err("A Unity modal dialog was already open before the probe".to_string());
+    }
+
+    let marker_name = format!(
+        "locus-modal-dialog-probe-{}.txt",
+        uuid::Uuid::new_v4().simple()
+    );
+    let marker_path = Path::new(project).join("Temp").join(&marker_name);
+    let _ = std::fs::remove_file(&marker_path);
+    let code = format!(
+        r#"bool accepted = EditorUtility.DisplayDialog(
+    "Locus Native Dialog Probe",
+    "This dialog belongs to the isolated Unity probe project. The event hook must target this dialog only.",
+    "Continue Probe",
+    "Cancel Probe");
+var markerPath = System.IO.Path.Combine(
+    System.IO.Directory.GetParent(Application.dataPath).FullName,
+    "Temp",
+    "{marker_name}");
+System.IO.File.WriteAllText(markerPath, accepted ? "continued" : "cancelled");
+print("MODAL_PROBE:" + (accepted ? "continued" : "cancelled"));"#
+    );
+    let execute_project = project.to_string();
+    let execute_task = tauri::async_runtime::spawn(async move {
+        unity_bridge::unity_execute_code_with_progress(&execute_project, &code, |_| {}).await
+    });
+
+    let dialog = wait_for_modal_dialog(
+        project,
+        true,
+        config.suite_timeout.min(Duration::from_secs(20)),
+    )
+    .await
+    .map_err(|_| "WinEventHook did not publish the Unity modal dialog within 20s".to_string())?
+    .ok_or_else(|| "Unity modal dialog snapshot was unexpectedly empty".to_string())?;
+
+    let labels = dialog
+        .choices
+        .iter()
+        .map(|choice| choice.label.as_str())
+        .collect::<Vec<_>>();
+    if dialog.title == "Locus Native Dialog Probe"
+        && dialog.message.contains("isolated Unity probe project")
+        && labels.contains(&"Continue Probe")
+        && labels.contains(&"Cancel Probe")
+        && dialog.main_thread_blocked
+    {
+        run.pass(
+            "D1 native event snapshot",
+            format!(
+                "title/body/{} choices captured for dialog_id={}",
+                dialog.choices.len(),
+                dialog.dialog_id
+            ),
+        );
+    } else {
+        run.fail(
+            "D1 native event snapshot",
+            format!(
+                "unexpected snapshot title='{}' message='{}' choices={labels:?}",
+                dialog.title,
+                clip(&dialog.message, 180)
+            ),
+        );
+    }
+
+    let preflight_started = Instant::now();
+    let preflight = tokio::time::timeout(
+        Duration::from_secs(2),
+        unity_bridge::set_editor_status(project, UNITY_EDITOR_STATUS_EDITING),
+    )
+    .await;
+    match preflight {
+        Ok(Err(error))
+            if crate::unity_bridge::dialog::is_unity_modal_dialog_blocked_error(&error)
+                && error.contains("request_state=not_sent") =>
+        {
+            run.pass(
+                "D2 main-thread preflight",
+                format!(
+                    "failed fast in {}ms",
+                    preflight_started.elapsed().as_millis()
+                ),
+            );
+        }
+        Ok(Err(error)) => run.fail(
+            "D2 main-thread preflight",
+            format!("unexpected error: {}", clip(&error, 240)),
+        ),
+        Ok(Ok(())) => run.fail(
+            "D2 main-thread preflight",
+            "request unexpectedly reached the blocked Unity main thread",
+        ),
+        Err(_) => run.fail(
+            "D2 main-thread preflight",
+            "request did not return within 2s",
+        ),
+    }
+
+    let execute_result = tokio::time::timeout(Duration::from_secs(5), execute_task)
+        .await
+        .map_err(|_| "The active unity_execute did not detach after dialog detection".to_string())?
+        .map_err(|error| format!("unity_execute task join failed: {error}"))?;
+    match execute_result {
+        Err(error)
+            if crate::unity_bridge::dialog::is_unity_modal_dialog_blocked_error(&error)
+                && (error.contains("request_state=detached")
+                    || error.contains("request_state=unknown")) =>
+        {
+            run.pass(
+                "D3 active request detach",
+                "unity_execute returned dialog content without waiting for its normal timeout",
+            );
+        }
+        Err(error) => run.fail(
+            "D3 active request detach",
+            format!("unexpected error: {}", clip(&error, 300)),
+        ),
+        Ok(output) => run.fail(
+            "D3 active request detach",
+            format!("execute unexpectedly completed: {}", clip(&output, 180)),
+        ),
+    }
+
+    let python_result = resolve_modal_dialog_through_python_sdk(app_handle, project).await;
+    match &python_result {
+        Ok(output)
+            if output.contains("Locus Native Dialog Probe")
+                && output.contains("Cancel Probe")
+                && output.contains("\"invoked\": true")
+                && output.contains("\"ready\": false")
+                && output.contains("\"mainThreadBlocked\": true")
+                && output.contains("\"recoverable\": true")
+                && output.contains("\"blockingReason\": \"modal_dialog\"") =>
+        {
+            run.pass(
+                "D4 Python SDK choice",
+                "status exposed the blocked main thread and SDK invoked Cancel Probe",
+            );
+        }
+        Ok(output) => run.fail(
+            "D4 Python SDK choice",
+            format!("unexpected SDK output: {}", clip(output, 300)),
+        ),
+        Err(error) => {
+            run.fail(
+                "D4 Python SDK choice",
+                format!("SDK error: {}", clip(error, 300)),
+            );
+            if let Some(current) = crate::unity_bridge::dialog::current_dialog(project) {
+                if let Some(cancel) = current
+                    .choices
+                    .iter()
+                    .find(|choice| choice.label == "Cancel Probe")
+                {
+                    let _ = crate::unity_bridge::dialog::choose_dialog(
+                        project,
+                        &current.dialog_id,
+                        &cancel.id,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    let marker_started = Instant::now();
+    let marker = loop {
+        if let Ok(value) = std::fs::read_to_string(&marker_path) {
+            break Some(value);
+        }
+        if marker_started.elapsed() >= Duration::from_secs(10) {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if marker.as_deref() == Some("cancelled") {
+        run.pass(
+            "D5 Unity main-thread resume",
+            "DisplayDialog returned false and the post-dialog marker was written",
+        );
+    } else {
+        run.fail(
+            "D5 Unity main-thread resume",
+            format!("marker was {:?}", marker.as_deref()),
+        );
+    }
+
+    let dialog_closed = wait_for_modal_dialog(project, false, Duration::from_secs(5))
+        .await
+        .is_ok();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        execute_capture(project, r#"print("MODAL_RECOVERED:42");"#),
+    )
+    .await
+    {
+        Ok(Ok(output)) if dialog_closed && output.contains("MODAL_RECOVERED:42") => {
+            run.pass(
+                "D6 recovered request",
+                "dialog registry cleared and a new Unity main-thread request completed",
+            );
+        }
+        Ok(Ok(output)) => run.fail(
+            "D6 recovered request",
+            format!(
+                "dialog_closed={dialog_closed}, output='{}'",
+                clip(&output, 180)
+            ),
+        ),
+        Ok(Err(error)) => run.fail(
+            "D6 recovered request",
+            format!("recovered execute failed: {}", clip(&error, 240)),
+        ),
+        Err(_) => run.fail(
+            "D6 recovered request",
+            "recovered execute did not complete within 30s",
+        ),
+    }
+
+    let _ = std::fs::remove_file(&marker_path);
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": suite.as_str(),
+            "passed": run.passed,
+            "failed": run.failed,
+            "dialogId": dialog.dialog_id,
+            "pythonSdk": python_result.is_ok(),
+        }),
+    );
+    if run.failed == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "modal-dialog suite finished with {} failed check(s)",
+            run.failed
+        ))
+    }
+}
+
 /// Drives the real `unity_execute` / `unity_run_states` code paths end to end:
 /// round-trip correctness, many sequential compiled snippets, async/blocking
 /// execution with progress + cancellation, op-lock serialization, the legacy
@@ -3828,6 +5672,7 @@ fn clip(text: &str, max: usize) -> String {
 /// recompile. Bespoke suite shaped like `run_sidecar_suite`: emits `suite_event`
 /// lines per check and a final `suite_result`, returning `Err` if any failed.
 async fn run_execute_suite(
+    app_handle: &AppHandle,
     project: &str,
     suite: CliDriverSuite,
     config: &CliDriverConfig,
@@ -3843,6 +5688,31 @@ async fn run_execute_suite(
     );
 
     let mut run = ExecuteSuiteRun::new(suite, sink);
+
+    match run_agent_unity_execute_probe(app_handle, project, config.suite_timeout).await {
+        Ok(output) => run.pass(
+            "E0 agent pipeline",
+            format!("mock Agent unity_execute returned '{}'", clip(&output, 160)),
+        ),
+        Err(error) => run.fail(
+            "E0 agent pipeline",
+            format!("mock Agent unity_execute failed: {}", clip(&error, 240)),
+        ),
+    }
+
+    match run_agent_unity_yaml_read_probe(app_handle, project, config.suite_timeout).await {
+        Ok(output) => run.pass(
+            "E0Y agent yaml pipeline",
+            format!(
+                "mock Agent unity_yaml_read returned '{}'",
+                clip(&output, 160)
+            ),
+        ),
+        Err(error) => run.fail(
+            "E0Y agent yaml pipeline",
+            format!("mock Agent unity_yaml_read failed: {}", clip(&error, 240)),
+        ),
+    }
 
     // Baseline correctness: compile -> load -> run -> capture output, with both
     // UnityEngine and UnityEditor references resolving on the editor main thread.
@@ -3994,6 +5864,124 @@ async fn run_execute_suite(
             run.failed
         ))
     }
+}
+
+async fn run_agent_unity_execute_probe(
+    app_handle: &AppHandle,
+    project: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    open_and_focus_workspace_for_driver(app_handle, project).await?;
+    let registry = app_handle
+        .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .inner()
+        .clone();
+    let runtime = registry
+        .runtime_for_root(Path::new(project))
+        .ok_or_else(|| format!("Workspace runtime was not registered for {project}"))?;
+    let session_id = create_workspace_driver_session(app_handle, 0, runtime.as_ref()).await?;
+    let target = WorkspaceSuiteTarget {
+        index: 0,
+        project: project.to_string(),
+        runtime,
+        session_id,
+        plugin_outcome: PluginPrepareOutcome::UpToDate,
+    };
+    let launch = launch_workspace_mock_chat_with_prompt(
+        app_handle,
+        &target,
+        format!(
+            "{} Reproduce the Agent unity_execute pipeline.",
+            crate::agent::instance::MOCK_AGENT_UNITY_EXECUTE_SCENARIO
+        ),
+    )
+    .await?;
+    wait_for_workspace_mock_chat(app_handle, &launch, &target, timeout).await?;
+
+    let store = app_handle
+        .state::<Arc<crate::session::store::SessionStore>>()
+        .inner()
+        .clone();
+    let messages = store.get_messages(&launch.session_id)?;
+    let tool_call_id = messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .find(|tool_call| tool_call.name == "unity_execute")
+        .map(|tool_call| tool_call.id.clone())
+        .ok_or_else(|| "Mock Agent did not emit unity_execute".to_string())?;
+    let output = messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
+        .map(|message| message.content.trim().to_string())
+        .ok_or_else(|| "Mock Agent unity_execute result was not persisted".to_string())?;
+    if output.is_empty()
+        || output.contains("failed")
+        || output.contains("not connected")
+        || output.contains("service binding error")
+    {
+        return Err(format!("unexpected tool result: {output}"));
+    }
+    Ok(output)
+}
+
+async fn run_agent_unity_yaml_read_probe(
+    app_handle: &AppHandle,
+    project: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    open_and_focus_workspace_for_driver(app_handle, project).await?;
+    let registry = app_handle
+        .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .inner()
+        .clone();
+    let runtime = registry
+        .runtime_for_root(Path::new(project))
+        .ok_or_else(|| format!("Workspace runtime was not registered for {project}"))?;
+    let session_id = create_workspace_driver_session(app_handle, 0, runtime.as_ref()).await?;
+    let target = WorkspaceSuiteTarget {
+        index: 0,
+        project: project.to_string(),
+        runtime,
+        session_id,
+        plugin_outcome: PluginPrepareOutcome::UpToDate,
+    };
+    let launch = launch_workspace_mock_chat_with_prompt(
+        app_handle,
+        &target,
+        format!(
+            "{} Reproduce the Agent unity_yaml_read pipeline.",
+            crate::agent::instance::MOCK_AGENT_UNITY_YAML_READ_SCENARIO
+        ),
+    )
+    .await?;
+    wait_for_workspace_mock_chat(app_handle, &launch, &target, timeout).await?;
+
+    let store = app_handle
+        .state::<Arc<crate::session::store::SessionStore>>()
+        .inner()
+        .clone();
+    let messages = store.get_messages(&launch.session_id)?;
+    let tool_call_id = messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .find(|tool_call| tool_call.name == "unity_yaml_read")
+        .map(|tool_call| tool_call.id.clone())
+        .ok_or_else(|| "Mock Agent did not emit unity_yaml_read".to_string())?;
+    let output = messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id.as_str()))
+        .map(|message| message.content.trim().to_string())
+        .ok_or_else(|| "Mock Agent unity_yaml_read result was not persisted".to_string())?;
+    if output.is_empty()
+        || output.contains("failed")
+        || output.contains("not connected")
+        || output.contains("service binding error")
+    {
+        return Err(format!("unexpected tool result: {output}"));
+    }
+    Ok(output)
 }
 
 async fn run_hot_reload_suite(
@@ -4635,6 +6623,67 @@ mod tests {
     }
 
     #[test]
+    fn parse_python_sdk_suite() {
+        let parsed = parse(&[
+            "--locus-driver",
+            "unity-test",
+            "--project",
+            "F:/Game",
+            "--suite",
+            "python-sdk",
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(parsed.suites, vec![CliDriverSuite::PythonSdk]);
+        assert!(parsed.open_unity);
+    }
+
+    #[test]
+    fn parse_workspace_suite_keeps_repeated_project_paths() {
+        let parsed = parse(&[
+            "--locus-driver",
+            "unity-test",
+            "--project",
+            "F:/Game",
+            "--workspace-project",
+            "F:/GameCopy",
+            "--workspace-project=F:/GameWorktree",
+            "--suite",
+            "workspace",
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(parsed.suites, vec![CliDriverSuite::Workspace]);
+        assert_eq!(parsed.project_path.as_deref(), Some("F:/Game"));
+        assert_eq!(
+            parsed.workspace_paths,
+            vec!["F:/GameCopy".to_string(), "F:/GameWorktree".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_workspace_switch_suite_keeps_the_second_project() {
+        let parsed = parse(&[
+            "--locus-driver",
+            "unity-test",
+            "--project",
+            "F:/GameA",
+            "--workspace-project",
+            "F:/GameB",
+            "--suite",
+            "workspace-switch",
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(parsed.suites, vec![CliDriverSuite::WorkspaceSwitch]);
+        assert_eq!(parsed.project_path.as_deref(), Some("F:/GameA"));
+        assert_eq!(parsed.workspace_paths, vec!["F:/GameB".to_string()]);
+    }
+
+    #[test]
     fn parse_all_expands_in_stable_order() {
         let parsed = parse(&["--locus-unity-test", "--suite=all"])
             .unwrap()
@@ -4652,6 +6701,8 @@ mod tests {
                 CliDriverSuite::HotReloadRelease,
                 CliDriverSuite::ParallelEditRefresh,
                 CliDriverSuite::Execute,
+                CliDriverSuite::PythonSdk,
+                CliDriverSuite::ModalDialog,
                 CliDriverSuite::YamlParity
             ]
         );

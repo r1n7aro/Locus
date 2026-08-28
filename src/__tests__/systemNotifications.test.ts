@@ -23,14 +23,20 @@ const translations = {
 
 function createDisplayState(): DisplaySettings {
   return {
+    workspaceDisplayMode: "single",
+    knowledgeFolderVisibility: {
+      plan: true,
+      memory: true,
+      design: true,
+      skill: true,
+      reference: true,
+    },
     showWelcomeSubtitle: true,
-    showKnowledgeTab: true,
-    showCollabTab: true,
-    showAssetTab: true,
     showViewsTab: true,
     showPluginsTab: true,
     showAgentTab: true,
     showAgentSelector: false,
+    showCollabSidebar: false,
     todoAutoOpen: true,
     changesAutoOpen: true,
     changesAutoClose: true,

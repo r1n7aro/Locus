@@ -5,18 +5,12 @@ import { useCopyFeedback } from "../../composables/useCopyFeedback";
 import { normalizeAppError } from "../../services/errors";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import {
-  claudeCodeCommand,
-  genericJsonSnippet,
   mcpServerGetState,
-  mcpServerIntegrationApply,
-  mcpServerIntegrationRemove,
-  mcpServerIntegrations,
   mcpServerRegenerateToken,
   mcpServerToolInventory,
   mcpServerUpdateSettings,
   subscribeMcpServerStatus,
   type McpExposedToolInfo,
-  type McpIntegrationStatus,
   type McpServerStateView,
   type McpServerStatus,
 } from "../../services/mcpServer";
@@ -28,17 +22,13 @@ const notificationStore = useNotificationStore();
 
 const state = ref<McpServerStateView | null>(null);
 const tools = ref<McpExposedToolInfo[]>([]);
-const integrations = ref<McpIntegrationStatus[]>([]);
 const ready = ref(false);
 const busy = ref(false);
-const integrationBusyId = ref<string | null>(null);
 
 const portDraft = ref("");
 const timeoutDraft = ref("");
 
 const { copied: tokenCopied, copyText: copyTokenText } = useCopyFeedback();
-const { copied: commandCopied, copyText: copyCommandText } = useCopyFeedback();
-const { copied: jsonCopied, copyText: copyJsonText } = useCopyFeedback();
 
 /// Two-click confirm for token regeneration (arming resets after 4s).
 const regenerateArmed = ref(false);
@@ -70,17 +60,6 @@ const maskedToken = computed(() => {
   return `${token.slice(0, 8)}••••••••`;
 });
 
-const claudeCommandSnippet = computed(() =>
-  state.value
-    ? claudeCodeCommand(state.value.endpointUrl, state.value.settings.token)
-    : "",
-);
-const jsonSnippet = computed(() =>
-  state.value
-    ? genericJsonSnippet(state.value.endpointUrl, state.value.settings.token)
-    : "",
-);
-
 function applyState(next: McpServerStateView) {
   state.value = next;
   portDraft.value = String(next.settings.port);
@@ -100,7 +79,6 @@ async function refreshAll() {
   try {
     applyState(await mcpServerGetState());
     tools.value = await mcpServerToolInventory();
-    integrations.value = await mcpServerIntegrations();
   } catch (e) {
     notifyError(e, "loadMcpServerState");
   } finally {
@@ -126,8 +104,6 @@ async function pushSettings(input: {
         callTimeoutMs: input.callTimeoutMs ?? current.callTimeoutMs,
       }),
     );
-    // Endpoint identity may have changed; refresh integration states.
-    integrations.value = await mcpServerIntegrations();
   } catch (e) {
     notifyError(e, "updateMcpServerSettings");
     await refreshAll();
@@ -212,66 +188,12 @@ function requestRegenerate() {
     busy.value = true;
     try {
       applyState(await mcpServerRegenerateToken());
-      integrations.value = await mcpServerIntegrations();
     } catch (e) {
       notifyError(e, "regenerateMcpServerToken");
     } finally {
       busy.value = false;
     }
   })();
-}
-
-function integrationStateLabel(row: McpIntegrationStatus): string {
-  switch (row.state) {
-    case "current":
-      return t("settings.mcpServer.integrationCurrent");
-    case "stale":
-      return t("settings.mcpServer.integrationStale");
-    default:
-      return t("settings.mcpServer.integrationAbsent");
-  }
-}
-
-function integrationActionLabel(row: McpIntegrationStatus): string {
-  switch (row.state) {
-    case "current":
-      return t("settings.mcpServer.integrationRemove");
-    case "stale":
-      return t("settings.mcpServer.integrationUpdate");
-    default:
-      return t("settings.mcpServer.integrationApply");
-  }
-}
-
-async function runIntegrationAction(row: McpIntegrationStatus) {
-  if (integrationBusyId.value) return;
-  integrationBusyId.value = row.id;
-  try {
-    const next =
-      row.state === "current"
-        ? await mcpServerIntegrationRemove(row.id)
-        : await mcpServerIntegrationApply(row.id);
-    integrations.value = integrations.value.map((entry) =>
-      entry.id === next.id ? next : entry,
-    );
-  } catch (e) {
-    notifyError(e, "mcpServerIntegration");
-  } finally {
-    integrationBusyId.value = null;
-  }
-}
-
-async function copySnippet(kind: "command" | "json") {
-  const text = kind === "command" ? claudeCommandSnippet.value : jsonSnippet.value;
-  if (!text) return;
-  const copy = kind === "command" ? copyCommandText : copyJsonText;
-  const copied = await copy(text);
-  if (!copied) {
-    notificationStore.addNotice("warning", t("settings.mcpServer.copyFailed"), {
-      operation: "copyMcpServerSnippet",
-      replaceOperation: true,
-    });
-  }
 }
 
 onMounted(() => {
@@ -383,67 +305,6 @@ onUnmounted(() => {
   </div>
 
   <div class="settings-section">
-    <div class="section-label">{{ t("settings.mcpServer.integrations") }}</div>
-    <p class="section-desc">{{ t("settings.mcpServer.integrationsDesc") }}</p>
-    <div class="tool-card">
-      <div v-for="row in integrations" :key="row.id" class="tool-row">
-        <div class="tool-info">
-          <span class="tool-name">{{ row.name }}</span>
-          <span class="tool-desc">
-            <template v-if="row.detected">
-              {{ integrationStateLabel(row) }} · {{ row.configPath }}
-            </template>
-            <template v-else>{{ t("settings.mcpServer.integrationNotDetected") }}</template>
-          </span>
-          <span v-if="row.id === 'codex'" class="tool-desc">
-            {{ t("settings.mcpServer.codexHeaderHint") }}
-          </span>
-        </div>
-        <div class="master-actions">
-          <span
-            class="integration-badge"
-            :class="`integration-${row.state}`"
-            :data-state="row.state"
-          >
-            {{ integrationStateLabel(row) }}
-          </span>
-          <BaseButton
-            :disabled="!row.detected || integrationBusyId !== null"
-            @click="runIntegrationAction(row)"
-          >
-            {{ integrationActionLabel(row) }}
-          </BaseButton>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="settings-section">
-    <div class="section-label">{{ t("settings.mcpServer.manualSetup") }}</div>
-    <p class="section-desc">{{ t("settings.mcpServer.manualSetupDesc") }}</p>
-    <div class="tool-card">
-      <div class="snippet-block">
-        <div class="snippet-header">
-          <span class="snippet-title">{{ t("settings.mcpServer.claudeCommand") }}</span>
-          <BaseButton :disabled="!claudeCommandSnippet" @click="copySnippet('command')">
-            {{ commandCopied ? t("common.copied") : t("settings.mcpServer.copy") }}
-          </BaseButton>
-        </div>
-        <pre class="snippet-body">{{ claudeCommandSnippet }}</pre>
-      </div>
-      <div class="snippet-block">
-        <div class="snippet-header">
-          <span class="snippet-title">{{ t("settings.mcpServer.genericJson") }}</span>
-          <BaseButton :disabled="!jsonSnippet" @click="copySnippet('json')">
-            {{ jsonCopied ? t("common.copied") : t("settings.mcpServer.copy") }}
-          </BaseButton>
-        </div>
-        <pre class="snippet-body">{{ jsonSnippet }}</pre>
-      </div>
-    </div>
-  </div>
-
-  <div class="settings-section">
     <div class="section-label">{{ t("settings.mcpServer.tools") }}</div>
     <p class="section-desc">{{ t("settings.mcpServer.toolsHint") }}</p>
     <div class="tool-card">
@@ -491,8 +352,7 @@ onUnmounted(() => {
   padding: 11px 16px;
   transition: background 0.12s;
 }
-.tool-row + .tool-row,
-.snippet-block + .snippet-block {
+.tool-row + .tool-row {
   border-top: 1px solid var(--border-color);
 }
 .tool-row:hover {
@@ -555,55 +415,5 @@ onUnmounted(() => {
 .num-input:focus {
   outline: none;
   border-color: var(--accent-color);
-}
-.integration-badge {
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
-  border: 1px solid var(--border-color);
-  color: var(--text-secondary);
-}
-.integration-current {
-  color: var(--success-color, #2f9e5f);
-  border-color: color-mix(in srgb, var(--success-color, #2f9e5f) 45%, transparent);
-}
-.integration-stale {
-  color: var(--warning-color, #d7a021);
-  border-color: color-mix(in srgb, var(--warning-color, #d7a021) 45%, transparent);
-}
-.snippet-block {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 11px 16px;
-}
-.snippet-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.snippet-title {
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-  text-transform: uppercase;
-  color: var(--text-secondary);
-}
-.snippet-body {
-  margin: 0;
-  padding: 9px 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--input-bg) 90%, var(--panel-bg) 10%);
-  font-family: var(--font-mono-identifier);
-  font-size: 11px;
-  line-height: 1.55;
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-all;
-  user-select: text;
 }
 </style>

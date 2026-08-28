@@ -20,9 +20,12 @@ import {
   type ExtraWorkdirsWindowPayload,
 } from "../services/extraWorkdirsWindow";
 import { getSubWindowClaimedQuery } from "../services/subWindow";
+import type { WorkspaceRef } from "../services/project";
 
 const appWindow = getCurrentWindow();
-const workspacePath = ref(getExtraWorkdirsWindowPayload().workspacePath);
+const initialPayload = getExtraWorkdirsWindowPayload();
+const workspacePath = ref(initialPayload.workspacePath);
+const workspaceRef = ref<WorkspaceRef>(initialPayload.workspaceRef);
 const entries = ref<ExtraWorkdirStatus[]>([]);
 const loading = ref(false);
 const saving = ref(false);
@@ -50,14 +53,19 @@ function normalizedKey(path: string): string {
 }
 
 async function loadEntries() {
-  if (!workspacePath.value) return;
+  if (!workspacePath.value || !workspaceRef.value.checkoutId) return;
   const requestId = ++loadEntriesRequestId;
   loading.value = true;
   loadError.value = "";
   formNotice.value = "";
   try {
-    const next = await extraWorkdirsGet(workspacePath.value);
+    const requestedScope = { ...workspaceRef.value };
+    const next = await extraWorkdirsGet(requestedScope);
     if (requestId !== loadEntriesRequestId) return;
+    if (
+      workspaceRef.value.checkoutId !== requestedScope.checkoutId
+      || workspaceRef.value.expectedGeneration !== requestedScope.expectedGeneration
+    ) return;
     entries.value = next;
   } catch (error) {
     if (requestId !== loadEntriesRequestId) return;
@@ -72,8 +80,14 @@ async function loadEntries() {
 
 async function applyPayload(payload: ExtraWorkdirsWindowPayload) {
   const nextPath = payload.workspacePath?.trim() || "";
-  if (!nextPath || nextPath === workspacePath.value) return;
+  if (!nextPath || !payload.workspaceRef?.checkoutId) return;
+  if (
+    nextPath === workspacePath.value
+    && payload.workspaceRef.checkoutId === workspaceRef.value.checkoutId
+    && payload.workspaceRef.expectedGeneration === workspaceRef.value.expectedGeneration
+  ) return;
   workspacePath.value = nextPath;
+  workspaceRef.value = { ...payload.workspaceRef };
   await loadEntries();
 }
 
@@ -124,7 +138,7 @@ async function save() {
   formNotice.value = "";
   try {
     const saved = await extraWorkdirsSet(
-      workspacePath.value,
+      workspaceRef.value,
       entries.value.map((entry) => ({
         path: entry.path,
         comment: entry.comment,
@@ -132,7 +146,7 @@ async function save() {
       })),
     );
     entries.value = saved;
-    await broadcastExtraWorkdirsUpdated(workspacePath.value);
+    await broadcastExtraWorkdirsUpdated(workspacePath.value, workspaceRef.value);
     await closeWindow();
   } catch (error) {
     const err = normalizeAppError(error);
@@ -161,7 +175,10 @@ onMounted(() => {
   void appWindow
     .listen<ExtraWorkdirsWindowPayload>(EXTRA_WORKDIRS_PAYLOAD_EVENT, (event) => {
       payloadEventSeen = true;
-      void applyPayload(event.payload ?? { workspacePath: "" });
+      void applyPayload(event.payload ?? {
+        workspacePath: "",
+        workspaceRef: { checkoutId: "" },
+      });
     })
     .then(async (dispose) => {
       payloadEventUnlisten = dispose;

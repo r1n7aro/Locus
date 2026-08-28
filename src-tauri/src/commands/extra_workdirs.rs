@@ -1,33 +1,41 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use tauri::State;
 
 use crate::error::AppError;
 use crate::extra_workdirs::{self, ExtraWorkdirEntry, ExtraWorkdirStatus};
+use crate::workspace_service::{ProjectRegistry, WorkspaceRef};
 
-fn validated_workspace_dir(workspace_path: &str) -> Result<String, AppError> {
-    let trimmed = workspace_path.trim();
-    if trimmed.is_empty() {
-        return Err("Workspace path cannot be empty".to_string().into());
-    }
-    if !std::path::Path::new(trimmed).is_dir() {
-        return Err(format!("Directory not found: {}", trimmed).into());
-    }
-    Ok(trimmed.to_string())
+fn workspace_dir(
+    registry: &ProjectRegistry,
+    workspace_ref: &WorkspaceRef,
+    operation: &'static str,
+) -> Result<String, AppError> {
+    registry
+        .resolve_workspace_ref(workspace_ref)
+        .map(|scope| scope.runtime().root().to_string_lossy().to_string())
+        .map_err(|error| {
+            AppError::new("workspace.scope_invalid", error.to_string()).operation(operation)
+        })
 }
 
 #[tauri::command]
 pub async fn extra_workdirs_get(
-    workspace_path: String,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<ExtraWorkdirStatus>, AppError> {
-    let dir = validated_workspace_dir(&workspace_path)?;
+    let dir = workspace_dir(registry.inner(), &workspace_ref, "extra_workdirs_get")?;
     Ok(extra_workdirs::load_statuses(&dir))
 }
 
 #[tauri::command]
 pub async fn extra_workdirs_set(
-    workspace_path: String,
+    workspace_ref: WorkspaceRef,
     entries: Vec<ExtraWorkdirEntry>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<ExtraWorkdirStatus>, AppError> {
-    let dir = validated_workspace_dir(&workspace_path)?;
+    let dir = workspace_dir(registry.inner(), &workspace_ref, "extra_workdirs_set")?;
     let normalized = extra_workdirs::normalize_entries(&dir, entries);
     extra_workdirs::save_entries(&dir, &normalized)
         .map_err(|e| AppError::new("workspace.extra_workdirs_write_failed", e))?;
@@ -39,14 +47,13 @@ pub async fn extra_workdirs_set(
 /// Workspaces without attachments are omitted.
 #[tauri::command]
 pub async fn extra_workdirs_map(
-    paths: Vec<String>,
+    workspace_refs: Vec<WorkspaceRef>,
+    registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<HashMap<String, Vec<ExtraWorkdirStatus>>, AppError> {
     let mut map = HashMap::new();
-    for path in paths {
-        if path.trim().is_empty() {
-            continue;
-        }
-        let statuses = extra_workdirs::load_statuses(path.trim());
+    for workspace_ref in workspace_refs {
+        let path = workspace_dir(registry.inner(), &workspace_ref, "extra_workdirs_map")?;
+        let statuses = extra_workdirs::load_statuses(&path);
         if !statuses.is_empty() {
             map.insert(path, statuses);
         }

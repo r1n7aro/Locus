@@ -335,7 +335,7 @@ public sealed class CompileAccessProbeRequestDto
 
 public sealed class CompileService
 {
-    public const int ProtocolVersion = 8;
+    public const int ProtocolVersion = 10;
 
     /// <summary>
     /// Version of the generated wrapper's entry-point contract with the Unity

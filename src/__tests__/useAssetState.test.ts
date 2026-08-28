@@ -129,6 +129,10 @@ function dirEntriesPage(
 }
 
 describe("useAssetState preview flow", () => {
+  const workspaceRef = {
+    checkoutId: "checkout-a",
+    expectedGeneration: 3,
+  };
   beforeEach(() => {
     vi.clearAllMocks();
     projectServiceMocks.listDirEntriesPage.mockResolvedValue(
@@ -144,7 +148,7 @@ describe("useAssetState preview flow", () => {
       .mockImplementationOnce(() => firstRequest.promise)
       .mockImplementationOnce(() => secondRequest.promise);
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.previewPayload.value = textPreview("old preview");
     state.previewNode.value = {
       kind: "file",
@@ -199,7 +203,7 @@ describe("useAssetState preview flow", () => {
     assetServiceMocks.previewWorkspaceAsset.mockResolvedValue(structuredPreview("new-key"));
     assetServiceMocks.previewWorkspaceAssetTarget.mockImplementationOnce(() => targetRequest.promise);
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.previewPayload.value = structuredPreview("old-key");
     state.previewNode.value = {
       kind: "file",
@@ -240,7 +244,7 @@ describe("useAssetState preview flow", () => {
     );
     assetServiceMocks.previewWorkspaceAssetTarget.mockResolvedValue(inspector(root.id));
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
 
     await state.loadPreview({
       kind: "file",
@@ -255,6 +259,7 @@ describe("useAssetState preview flow", () => {
     expect(assetServiceMocks.previewWorkspaceAssetTarget).toHaveBeenCalledWith(
       "prefab-key",
       root.id,
+      workspaceRef,
     );
   });
 
@@ -271,7 +276,7 @@ describe("useAssetState preview flow", () => {
       .mockImplementationOnce(() => rootRequest.promise)
       .mockImplementationOnce(() => childRequest.promise);
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
 
     const previewLoad = state.loadPreview({
       kind: "file",
@@ -329,7 +334,7 @@ describe("useAssetState preview flow", () => {
         ),
       );
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
 
     await state.togglePath("Assets");
@@ -338,6 +343,7 @@ describe("useAssetState preview flow", () => {
     expect(assetsRoot?.kind).toBe("folder");
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets",
+      workspaceRef,
       0,
       200,
       true,
@@ -349,6 +355,7 @@ describe("useAssetState preview flow", () => {
 
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets",
+      workspaceRef,
       2,
       200,
       true,
@@ -359,7 +366,7 @@ describe("useAssetState preview flow", () => {
 
   it("prefetches one level of child folders when expanding a directory", async () => {
     projectServiceMocks.listDirEntriesPage.mockImplementation(
-      async (subPath: string, offset = 0, limit = 200) => {
+      async (subPath: string, _workspaceRef: unknown, offset = 0, limit = 200) => {
         if (subPath === "Assets" && offset === 0 && limit === 200) {
           return dirEntriesPage([
             { name: "Art", relPath: "Assets/Art", isDir: true },
@@ -381,7 +388,7 @@ describe("useAssetState preview flow", () => {
       },
     );
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
 
     await state.togglePath("Assets");
@@ -408,12 +415,14 @@ describe("useAssetState preview flow", () => {
 
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets/Art",
+      workspaceRef,
       0,
       1,
       true,
     );
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets/Docs",
+      workspaceRef,
       0,
       1,
       true,
@@ -428,7 +437,7 @@ describe("useAssetState preview flow", () => {
       ]),
     );
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
 
     await state.selectFolder("Assets", { preservePreview: true, revealInTree: "none" });
@@ -449,7 +458,7 @@ describe("useAssetState preview flow", () => {
       ]),
     );
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
     await state.selectFolder("Assets", { preservePreview: true, revealInTree: "none" });
 
@@ -468,7 +477,7 @@ describe("useAssetState preview flow", () => {
       ]),
     );
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
 
     await state.selectFolder("Assets", { preservePreview: true, revealInTree: "none" });
@@ -491,7 +500,7 @@ describe("useAssetState preview flow", () => {
       ]),
     );
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
 
     await state.togglePath("ProjectSettings");
@@ -500,6 +509,7 @@ describe("useAssetState preview flow", () => {
     expect(state.isPathExpanded("ProjectSettings")).toBe(false);
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "ProjectSettings",
+      workspaceRef,
       0,
       200,
       true,
@@ -512,7 +522,7 @@ describe("useAssetState preview flow", () => {
 
   it("probes folder branches before showing toggle affordances in the folder-only tree", async () => {
     projectServiceMocks.listDirEntriesPage.mockImplementation(
-      async (subPath: string, offset = 0, limit = 200) => {
+      async (subPath: string, _workspaceRef: unknown, offset = 0, limit = 200) => {
         if (subPath === "ProjectSettings" && offset === 0 && limit === 1) {
           return dirEntriesPage([
             {
@@ -526,7 +536,7 @@ describe("useAssetState preview flow", () => {
       },
     );
 
-    const state = useAssetState(reactive({ workingDir: "F:/repo" }));
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
 
     await state.probeFolderPath("ProjectSettings");
@@ -534,6 +544,7 @@ describe("useAssetState preview flow", () => {
     const projectSettingsRoot = state.explorerTree.value[2];
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "ProjectSettings",
+      workspaceRef,
       0,
       1,
       true,

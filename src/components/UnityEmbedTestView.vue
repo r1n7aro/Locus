@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { getLocusRuntime } from "../services/locusRuntime";
+import { currentUnityEmbedWorkspaceRef } from "../services/unity";
 import { t } from "../i18n";
 import BaseButton from "./ui/BaseButton.vue";
 
@@ -30,6 +31,12 @@ const error = ref<string | null>(null);
 const ping = ref<PingResponse | null>(null);
 const invokePing = ref<PingResponse | null>(null);
 
+function statusArgs() {
+  const workspaceRef = currentUnityEmbedWorkspaceRef();
+  if (!workspaceRef) throw new Error("Unity embed test URL is missing checkout scope.");
+  return { workspaceRef };
+}
+
 const statusText = computed(() => {
   if (error.value) return t("unity.embed.status.failed");
   if (loading.value) return t("unity.embed.status.checking");
@@ -41,7 +48,7 @@ async function refresh() {
   loading.value = true;
   error.value = null;
   try {
-    ping.value = await runtime.invoke<PingResponse>("unity_embed_status");
+    ping.value = await runtime.invoke<PingResponse>("unity_embed_status", statusArgs());
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause);
     ping.value = null;
@@ -53,7 +60,7 @@ async function refresh() {
 async function runInvokePing() {
   error.value = null;
   try {
-    invokePing.value = await runtime.invoke<PingResponse>("unity_embed_status");
+    invokePing.value = await runtime.invoke<PingResponse>("unity_embed_status", statusArgs());
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : String(cause);
     invokePing.value = null;

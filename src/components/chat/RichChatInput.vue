@@ -16,6 +16,7 @@ import {
 } from "../../services/project";
 import { useChatStore } from "../../stores/chat";
 import { useNotificationStore } from "../../stores/notification";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import type {
   AssetRefAttachment,
   ChatComposerSendPayload,
@@ -218,8 +219,25 @@ const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
 const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
 const slots = useSlots();
 const { state: chatInputSettings } = useChatInputSettings();
+
+function captureWorkspaceRef() {
+  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  return workspaceRef
+    ? {
+        checkoutId: workspaceRef.checkoutId,
+        expectedGeneration: workspaceRef.expectedGeneration ?? undefined,
+      }
+    : null;
+}
+
+function isCurrentWorkspaceRef(workspaceRef: ReturnType<typeof captureWorkspaceRef>) {
+  const current = workspaceContextStore.focusedWorkspaceRef;
+  return (workspaceRef?.checkoutId ?? null) === (current?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null) === (current?.expectedGeneration ?? null);
+}
 
 const skillsRef = computed(() => props.skills);
 const agentIdRef = computed(() => props.selectedAgentId);
@@ -666,6 +684,8 @@ function replaceMentionToken(nextQuery: string) {
 }
 
 async function loadDirEntries(subPath: string) {
+  const workspaceRef = captureWorkspaceRef();
+  if (!workspaceRef) return;
   const requestSeq = ++mentionRequestSeq;
   mentionLoading.value = true;
   mentionEntries.value = [];
@@ -676,9 +696,10 @@ async function loadDirEntries(subPath: string) {
     const allEntries: DirEntry[] = [];
 
     while (hasMore) {
-      const page = await listDirEntriesPage(subPath, offset, 200, false);
+      const page = await listDirEntriesPage(subPath, workspaceRef, offset, 200, false);
       if (
         requestSeq !== mentionRequestSeq
+        || !isCurrentWorkspaceRef(workspaceRef)
         || !showMentionPopup.value
         || mentionMode.value !== "browse"
         || mentionSubPath.value !== subPath
@@ -695,6 +716,7 @@ async function loadDirEntries(subPath: string) {
   } catch {
     if (
       requestSeq !== mentionRequestSeq
+      || !isCurrentWorkspaceRef(workspaceRef)
       || !showMentionPopup.value
       || mentionMode.value !== "browse"
       || mentionSubPath.value !== subPath
@@ -714,6 +736,8 @@ async function searchAssets(query: string) {
   if (query === lastSearchQuery && mentionSearchSettledQuery.value === query) return;
   lastSearchQuery = query;
   const requestSeq = ++mentionRequestSeq;
+  const workspaceRef = captureWorkspaceRef();
+  if (!workspaceRef) return;
   mentionLoading.value = true;
   let assetResults: MentionSearchResult[] = [];
   let folderResults: MentionSearchResult[] = [];
@@ -722,6 +746,7 @@ async function searchAssets(query: string) {
 
   function requestIsCurrent() {
     return requestSeq === mentionRequestSeq
+      && isCurrentWorkspaceRef(workspaceRef)
       && showMentionPopup.value
       && mentionMode.value === "search"
       && mentionQuery.value === query;
@@ -744,6 +769,7 @@ async function searchAssets(query: string) {
       scenePath,
       query,
       MAX_SCENE_OBJECT_MENTION_RESULTS,
+      workspaceRef!,
     );
     if (!requestIsCurrent()) return;
     sceneObjectResults = results.map(mapSceneObjectSearchResult);
@@ -755,13 +781,13 @@ async function searchAssets(query: string) {
       "Assets",
       "Packages",
       "ProjectSettings",
-    ])
+    ], undefined, workspaceRef)
       .then((results) => {
         assetResults = results.map(mapAssetSearchResult);
         publishResults();
         return results;
       });
-    const folderSearchPromise = searchWorkspaceEntries(query)
+    const folderSearchPromise = searchWorkspaceEntries(query, workspaceRef)
       .then((results) => {
         folderResults = mapWorkspaceFolderMentionResults(results);
         publishResults();
@@ -771,7 +797,7 @@ async function searchAssets(query: string) {
       query,
       limit: 16,
       types: KNOWLEDGE_MENTION_TYPES,
-    })
+    }, workspaceRef)
       .then((results) => {
         knowledgeResults = results
           .filter((result) => (result.storageSource ?? "project") === "project")
@@ -1080,13 +1106,14 @@ async function selectMentionEntry(entry: MentionDisplayEntry) {
 
   if (entry.entryKind === "sceneObject") {
     const target = sceneObjectMentionTarget(mentionPath);
-    if (!target) return;
+    const workspaceRef = captureWorkspaceRef();
+    if (!target || !workspaceRef) return;
     const expectedText = props.modelValue;
     const expectedAnchor = mentionAnchor.value;
     const expectedTokenEnd = mentionTokenEnd.value;
     mentionSelectionPending.value = true;
     try {
-      await validateUnitySceneObject(target.scenePath, target.objectPath);
+      await validateUnitySceneObject(workspaceRef, target.scenePath, target.objectPath);
     } catch (error) {
       mentionSearchResults.value = mentionSearchResults.value.filter(
         (result) => result.relPath !== entry.relPath,
@@ -1882,11 +1909,13 @@ function clearActionCommandInput() {
 
 async function attachUnityConsoleFromCommand(filter: "all" | "error" = "all") {
   if (unityConsoleCommandPending.value) return;
+  const workspaceRef = captureWorkspaceRef();
+  if (!workspaceRef) return;
 
   const operation = filter === "error" ? "unityConsoleErrorCommand" : "unityConsoleCommand";
   unityConsoleCommandPending.value = true;
   try {
-    const status = await checkUnityConnectionStatus();
+    const status = await checkUnityConnectionStatus(workspaceRef);
     if (!status.connected) {
       notificationStore.addNotice("error", t("chat.command.unityConsoleDisconnected"), {
         operation,
@@ -1895,7 +1924,7 @@ async function attachUnityConsoleFromCommand(filter: "all" | "error" = "all") {
       return;
     }
 
-    const consolePayload = await getUnityConsoleText();
+    const consolePayload = await getUnityConsoleText(workspaceRef);
     const payload = filter === "error"
       ? filterUnityConsoleErrorPayload(consolePayload)
       : consolePayload;
@@ -2589,7 +2618,12 @@ onMounted(() => {
       console.warn("[Locus] Unity text drop subscription failed:", error);
     });
   subscribeLocusFileDrop((payload) => {
-    addLocalFileAttachments(payload.files ?? []);
+    const composer = composerRef.value?.getTextarea()?.closest<HTMLElement>(".chat-composer");
+    const bounds = composer?.getBoundingClientRect();
+    const hasPosition = Number.isFinite(payload.x) && Number.isFinite(payload.y);
+    const insideComposer = !hasPosition || !!bounds && payload.x! >= bounds.left
+      && payload.x! <= bounds.right && payload.y! >= bounds.top && payload.y! <= bounds.bottom;
+    if (insideComposer) addLocalFileAttachments(payload.files ?? []);
   })
     .then((release) => {
       if (locusFileDropSubscriptionDisposed) {

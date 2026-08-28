@@ -3,6 +3,7 @@ import { computed, nextTick, ref, watch } from "vue";
 import { ChevronRight } from "lucide";
 import type { GitCommitInfo, GitFileChange } from "../../types";
 import { selectUnityAsset, openFileExternal } from "../../services/unity";
+import type { WorkspaceRef } from "../../services/project";
 import { useProjectStore } from "../../stores/project";
 import { t } from "../../i18n";
 import { useHideMeta, canOpenInEditor, partitionMetaPaths } from "../../composables/useHideMeta";
@@ -65,7 +66,18 @@ const props = defineProps<{
   detailKind: "commit" | "stash";
   detailLabel: string;
   activeFilePath: string | null;
+  workspaceRef?: WorkspaceRef | null;
 }>();
+
+function selectCommitAsset(path: string) {
+  if (!props.workspaceRef) return;
+  void selectUnityAsset(props.workspaceRef, path);
+}
+
+function openCommitFile(path: string) {
+  if (!props.workspaceRef) return;
+  void openFileExternal(path, props.workspaceRef);
+}
 
 const emit = defineEmits<{
   (e: "selectFile", file: GitFileChange): void;
@@ -383,10 +395,10 @@ function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
                 <span v-if="row.file.lfs" class="lfs-badge ui-select-none">LFS</span>
                 <span v-if="orphanMetaPaths.has(row.file.path)" class="orphan-meta-badge ui-select-none" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
               </span>
-              <button v-if="projectStore.unityConnected" class="file-action-btn unity-btn ui-select-none" @click.stop="selectUnityAsset(row.file.path)" :title="t('common.selectInUnity')">
+              <button v-if="projectStore.unityConnected && props.workspaceRef" class="file-action-btn unity-btn ui-select-none" @click.stop="selectCommitAsset(row.file.path)" :title="t('common.selectInUnity')">
                 <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
               </button>
-              <button v-if="canOpenInEditor(row.file.path)" class="file-action-btn open-btn ui-select-none" @click.stop="openFileExternal(row.file.path)" :title="t('common.openInEditor')">
+              <button v-if="canOpenInEditor(row.file.path)" class="file-action-btn open-btn ui-select-none" @click.stop="openCommitFile(row.file.path)" :title="t('common.openInEditor')">
                 <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
               </button>
             </div>
@@ -408,10 +420,10 @@ function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
             <span v-if="f.lfs" class="lfs-badge ui-select-none">LFS</span>
             <span v-if="orphanMetaPaths.has(f.path)" class="orphan-meta-badge ui-select-none" :title="t('collab.orphanMetaHint')">{{ t("collab.orphanMetaTag") }}</span>
             <span class="file-dir ui-select-text">{{ fileDir(f.path) }}</span>
-            <button v-if="projectStore.unityConnected" class="file-action-btn unity-btn ui-select-none" @click.stop="selectUnityAsset(f.path)" :title="t('common.selectInUnity')">
+            <button v-if="projectStore.unityConnected && props.workspaceRef" class="file-action-btn unity-btn ui-select-none" @click.stop="selectCommitAsset(f.path)" :title="t('common.selectInUnity')">
               <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M6.4 1L1 8l5.4 7h3.2L6.2 9.5H15v-3H6.2L9.6 1H6.4z"/></svg>
             </button>
-            <button v-if="canOpenInEditor(f.path)" class="file-action-btn open-btn ui-select-none" @click.stop="openFileExternal(f.path)" :title="t('common.openInEditor')">
+            <button v-if="canOpenInEditor(f.path)" class="file-action-btn open-btn ui-select-none" @click.stop="openCommitFile(f.path)" :title="t('common.openInEditor')">
               <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
             </button>
           </div>

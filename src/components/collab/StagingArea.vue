@@ -28,6 +28,7 @@ import {
   type StagingTreeRow,
 } from "./stagingTree";
 import LucideIcon from "../icons/LucideIcon.vue";
+import type { WorkspaceRef } from "../../services/project";
 import {
   unityAssetIconClassForPath,
   unityFolderIconClass,
@@ -36,6 +37,7 @@ import {
 } from "../icons/unityAssetIcons";
 
 const props = defineProps<{
+  workspaceRef?: WorkspaceRef | null;
   unstagedFiles: GitFileChange[];
   stagedFiles: GitFileChange[];
   blockedFiles: GitBlockedPath[];
@@ -416,35 +418,62 @@ const commitDescription = ref("");
 const commitLoading = ref(false);
 const commitError = ref<string | null>(null);
 const aiGenerating = ref(false);
+let commitRequestGeneration = 0;
+
+function captureWorkspaceRef(): WorkspaceRef {
+  if (!props.workspaceRef) throw new Error("Workspace checkout is required.");
+  return {
+    checkoutId: props.workspaceRef.checkoutId,
+    expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+  };
+}
+
+function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
+  return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
+    && (workspaceRef?.expectedGeneration ?? null)
+      === (props.workspaceRef?.expectedGeneration ?? null);
+}
 
 async function aiGenerateCommitMessage() {
+  const workspaceRef = captureWorkspaceRef();
+  const generation = ++commitRequestGeneration;
   aiGenerating.value = true;
   commitError.value = null;
   try {
-    const result = await gitGenerateCommitMessage(props.selectedModelId || null);
+    const result = await gitGenerateCommitMessage(props.selectedModelId || null, workspaceRef);
+    if (generation !== commitRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     commitMessage.value = result.title;
     commitDescription.value = result.description;
   } catch (e) {
+    if (generation !== commitRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     commitError.value = normalizeAppError(e).message;
   } finally {
-    aiGenerating.value = false;
+    if (generation === commitRequestGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+      aiGenerating.value = false;
+    }
   }
 }
 
 async function doCommit() {
   if (!commitMessage.value.trim()) return;
+  const workspaceRef = captureWorkspaceRef();
+  const generation = ++commitRequestGeneration;
   commitLoading.value = true;
   commitError.value = null;
   try {
-    await gitCommit(commitMessage.value, commitDescription.value || null);
+    await gitCommit(commitMessage.value, commitDescription.value || null, workspaceRef);
+    if (generation !== commitRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     showCommitModal.value = false;
     commitMessage.value = "";
     commitDescription.value = "";
     emit("committed");
   } catch (e) {
+    if (generation !== commitRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
     commitError.value = normalizeAppError(e).message;
   } finally {
-    commitLoading.value = false;
+    if (generation === commitRequestGeneration && isCurrentWorkspaceRef(workspaceRef)) {
+      commitLoading.value = false;
+    }
   }
 }
 
@@ -456,6 +485,22 @@ function openCommitModal() {
 function closeCommitModal() {
   showCommitModal.value = false;
 }
+
+watch(
+  () => [
+    props.workspaceRef?.checkoutId ?? null,
+    props.workspaceRef?.expectedGeneration ?? null,
+  ] as const,
+  () => {
+    commitRequestGeneration += 1;
+    showCommitModal.value = false;
+    commitLoading.value = false;
+    aiGenerating.value = false;
+    commitError.value = null;
+    commitMessage.value = "";
+    commitDescription.value = "";
+  },
+);
 
 function fileStatusClass(status: string): string {
   switch (status) {

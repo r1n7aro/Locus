@@ -66,9 +66,10 @@ describe("KnowledgeExplorer contextual selection", () => {
 
     expect(explorer).toContain("function isRenamingRow(row: FlatRow): boolean {");
     expect(explorer).toContain("editing: isRenamingRow(row)");
-    expect(explorer).toContain("draggable: !isSearchMode.value && canDragNode(node)");
+    expect(explorer).toContain("dragEnabled: !isSearchMode.value && canDragNode(node)");
     const workspaceTree = read("src/components/explorer/WorkspaceTree.vue");
-    expect(workspaceTree).toContain(':draggable="item.treeRow.draggable && !item.treeRow.editing"');
+    expect(workspaceTree).toContain("item.treeRow.dragEnabled && !item.treeRow.editing");
+    expect(workspaceTree).toContain("emit('dragPointerDown', item, $event)");
     expect(workspaceTree).toContain(`:is="item.treeRow.editing ? 'div' : 'button'"`);
     expect(explorer).toContain("@pointerdown.stop");
   });

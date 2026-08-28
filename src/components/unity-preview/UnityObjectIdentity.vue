@@ -17,6 +17,7 @@ import {
   startUnityReferenceHtmlDrag,
 } from "../../composables/useUnityReferenceDragSource";
 import { resolveRefGraphGuid, resolveRefGraphPath } from "../../services/refGraph";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 
 const props = withDefaults(defineProps<{
   model: UnityObjectPreviewInput | UnityObjectPreviewModel;
@@ -42,6 +43,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   select: [model: UnityObjectPreviewModel];
 }>();
+const workspaceContextStore = useWorkspaceContextStore();
 
 const objectModel = computed(() => normalizeUnityObjectPreviewModel(props.model));
 const resolvedGuid = ref("");
@@ -96,9 +98,10 @@ watch(
     const token = ++resolveToken;
     resolvedGuid.value = guid;
     resolvedPath.value = path;
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
 
-    if (!guid && /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i.test(path)) {
-      void resolveRefGraphGuid(path)
+    if (workspaceRef && !guid && /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i.test(path)) {
+      void resolveRefGraphGuid(path, workspaceRef)
         .then((nextGuid) => {
           if (token !== resolveToken) return;
           resolvedGuid.value = nextGuid || "";
@@ -111,8 +114,8 @@ watch(
       return;
     }
 
-    if (guid && !path) {
-      void resolveRefGraphPath(guid)
+    if (workspaceRef && guid && !path) {
+      void resolveRefGraphPath(guid, workspaceRef)
         .then((nextPath) => {
           if (token !== resolveToken) return;
           resolvedPath.value = nextPath || "";
