@@ -45,6 +45,19 @@ describe("development workbench session experience", () => {
     expect(workbench).not.toContain(".workspace-tree-row-shell.is-session-pending .workspace-tree-name");
   });
 
+  it("wires ctrl and shift session multi-selection into batch context actions", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+
+    expect(workbench).toContain("resolveWorkspaceSessionSelection({");
+    expect(workbench).toContain("visibleWorkspaceSessionTargets()");
+    expect(workbench).toContain("selected: selected || multiSelected || contextSelected");
+    expect(workbench).toContain("resolveWorkspaceSessionContextIds({");
+    expect(workbench).toContain('t("chat.session.archiveMany", contextMenu.sessionTargets?.length ?? 0)');
+    expect(workbench).toContain('t("chat.session.deleteMany", contextMenu.sessionTargets?.length ?? 0)');
+    expect(workbench).toContain("for (const target of targets) await archiveSessionEntry(target);");
+    expect(workbench).toContain("for (const target of dialog.targets)");
+  });
+
   it("restores the primary session actions from the legacy session tree", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const chatWorkspace = read("src/components/ChatWorkspaceView.vue");
@@ -57,6 +70,17 @@ describe("development workbench session experience", () => {
     expect(workbench).toContain("beginDeleteSession");
     expect(chatWorkspace).toContain("defineExpose({");
     expect(chatWorkspace).toContain("reviewSessionContext,");
+  });
+
+  it("renames sessions in place inside the workspace tree", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+
+    expect(workbench).toContain("editing: sessionInlineRename.value?.sessionId === session.id");
+    expect(workbench).toContain('class="development-session-rename-input"');
+    expect(workbench).toContain('@keydown.enter.prevent="submitSessionRename"');
+    expect(workbench).toContain('@keydown.esc.prevent.stop="cancelSessionRename"');
+    expect(workbench).toContain('@blur="submitSessionRename"');
+    expect(workbench).not.toContain("sessionDialog.mode === 'rename'");
   });
 
   it("places drops over empty folder rows and child rows inside the folder", () => {
@@ -78,14 +102,17 @@ describe("development workbench session experience", () => {
     expect(workbench).toContain('@click.stop="archiveSessionItem(item as DevelopmentTreeItem)"');
     expect(workbench).toContain(".workspace-tree-row-shell.is-session-row:hover .development-session-archive-button");
     expect(workbench).toMatch(/\.development-session-archive-button\s*\{[\s\S]*?right:\s*14px;/);
-    expect(workbench).toContain("await archiveSessionEntry(item.meta.projectId, item.meta.session);");
+    expect(workbench).toContain("await archiveSessionEntry({");
+    expect(workbench).toContain(".workspace-tree-row-shell.is-session-row:hover .development-branch-label");
+    expect(workbench).toContain(":has(.development-session-archive-button:focus-visible) .development-branch-label");
+    expect(workbench).not.toContain(".workspace-tree-row-shell.is-session-row:focus-within .development-branch-label");
   });
 
-  it("keeps the standard pointer cursor on draggable session rows", () => {
+  it("keeps the default cursor across workspace tree rows", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
     expect(workbench).toMatch(
-      /\.workspace-tree-row-shell\.is-session-row \.workspace-tree-row\.drag-enabled\)\s*\{\s*cursor:\s*pointer;/,
+      /\.development-tree :deep\(\.workspace-tree-row\)\s*\{[^}]*cursor:\s*default;/s,
     );
   });
 });

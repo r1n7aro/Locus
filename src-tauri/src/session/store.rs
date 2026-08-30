@@ -892,7 +892,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 36;
+    const SCHEMA_VERSION: i32 = 38;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1389,7 +1389,80 @@ impl SessionStore {
             )?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 36, "add a new migration block above");
+        if current < 37 {
+            Self::migrate(
+                conn,
+                37,
+                "backfill unambiguous legacy session checkout bindings",
+                |conn| Self::backfill_legacy_session_checkouts_on_conn(conn).map(|_| ()),
+            )?;
+        }
+
+        if current < 38 {
+            Self::migrate(
+                conn,
+                38,
+                "persist explicit citation arrays on assistant text render parts",
+                Self::migrate_text_render_part_citations,
+            )?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 38, "add a new migration block above");
+        Ok(())
+    }
+
+    fn migrate_text_render_part_citations(conn: &Connection) -> rusqlite::Result<()> {
+        let rows = {
+            let mut statement = conn.prepare(
+                "SELECT id, metadata_json
+                 FROM messages
+                 WHERE metadata_json IS NOT NULL",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+
+        for (message_id, metadata_json) in rows {
+            let mut metadata: serde_json::Value =
+                serde_json::from_str(&metadata_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let Some(render_parts) = metadata
+                .get_mut("renderParts")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            let mut changed = false;
+            for part in render_parts {
+                let Some(part) = part.as_object_mut() else {
+                    continue;
+                };
+                if part.get("kind").and_then(serde_json::Value::as_str) == Some("text")
+                    && !part.contains_key("citations")
+                {
+                    part.insert("citations".to_string(), serde_json::json!([]));
+                    changed = true;
+                }
+            }
+            if !changed {
+                continue;
+            }
+            let migrated = serde_json::to_string(&metadata)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            conn.execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2",
+                params![migrated, message_id],
+            )?;
+        }
         Ok(())
     }
 
@@ -3081,11 +3154,7 @@ impl SessionStore {
             .map_err(|e| format!("Failed to read workspace service: {}", e))
     }
 
-    /// Backfill only projects that have exactly one known checkout. Callers
-    /// should register the complete startup checkout set before invoking this
-    /// method so a worktree project is never guessed from a partial registry.
-    pub fn backfill_legacy_session_checkouts(&self) -> Result<usize, String> {
-        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+    fn backfill_legacy_session_checkouts_on_conn(conn: &Connection) -> rusqlite::Result<usize> {
         conn.execute(
             "UPDATE sessions
              SET default_checkout_id = COALESCE(default_checkout_id, (
@@ -3102,7 +3171,81 @@ impl SessionStore {
                ) = 1",
             [],
         )
-        .map_err(|e| format!("Failed to backfill legacy session checkouts: {}", e))
+    }
+
+    /// Backfill only projects that have exactly one known checkout. Callers
+    /// should register the complete startup checkout set before invoking this
+    /// method so a worktree project is never guessed from a partial registry.
+    pub fn backfill_legacy_session_checkouts(&self) -> Result<usize, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Self::backfill_legacy_session_checkouts_on_conn(&conn)
+            .map_err(|e| format!("Failed to backfill legacy session checkouts: {}", e))
+    }
+
+    /// Persist the pane checkout as the default for a historical project
+    /// session that predates checkout bindings. The update is a NULL-only CAS:
+    /// concurrent panes may both use the shared session, while the first
+    /// explicit selection supplies its fallback checkout.
+    pub fn bind_session_default_checkout_if_missing(
+        &self,
+        session_id: &str,
+        checkout_id: &str,
+    ) -> Result<bool, String> {
+        let session_id = session_id.trim();
+        let checkout_id = checkout_id.trim();
+        if session_id.is_empty() || checkout_id.is_empty() {
+            return Err("Session id and checkout id are required".to_string());
+        }
+
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let session = conn
+            .query_row(
+                "SELECT workspace_id, default_checkout_id FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to inspect session checkout binding: {}", e))?
+            .ok_or_else(|| format!("Session not found: {}", session_id))?;
+        let checkout_project = conn
+            .query_row(
+                "SELECT project_id FROM workspace_checkouts WHERE checkout_id = ?1",
+                params![checkout_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to inspect workspace checkout: {}", e))?
+            .ok_or_else(|| format!("Unknown workspace checkout: {}", checkout_id))?;
+        let session_project = session
+            .0
+            .as_deref()
+            .map(str::trim)
+            .filter(|project_id| !project_id.is_empty())
+            .ok_or_else(|| format!("Session {} does not belong to a project", session_id))?;
+        if checkout_project != session_project {
+            return Err(format!(
+                "Checkout {} belongs to project {}, not session project {}",
+                checkout_id, checkout_project, session_project
+            ));
+        }
+        if session.1.is_some() {
+            return Ok(false);
+        }
+
+        let updated = conn
+            .execute(
+                "UPDATE sessions
+                 SET default_checkout_id = ?1
+                 WHERE id = ?2 AND default_checkout_id IS NULL",
+                params![checkout_id, session_id],
+            )
+            .map_err(|e| format!("Failed to bind historical session checkout: {}", e))?;
+        Ok(updated > 0)
     }
 
     pub fn get_session_workspace_scope(
@@ -8684,9 +8827,9 @@ mod tests {
     };
     use crate::compact;
     use crate::session::models::{
-        ChatMessage, ImageData, KnowledgeProposalStatus, MessageRole, ProjectExplorerOperation,
-        SessionRunScopeSnapshot, SessionRunServiceBinding, TodoItem, ToolCallInfo,
-        WorkspaceCheckoutRecord, WorkspaceServiceRecord,
+        AssistantRenderPart, ChatMessage, ImageData, KnowledgeProposalStatus, MessageRole,
+        ProjectExplorerOperation, SessionRunScopeSnapshot, SessionRunServiceBinding, TodoItem,
+        ToolCallInfo, WorkspaceCheckoutRecord, WorkspaceServiceRecord,
     };
     use rusqlite::{params, Connection, OptionalExtension};
     use std::fs;
@@ -9062,6 +9205,141 @@ mod tests {
             })
             .expect("check migrated foreign keys");
         assert_eq!(foreign_key_errors, 0);
+    }
+
+    #[test]
+    fn v36_database_backfills_only_unambiguous_legacy_session_checkouts() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v36 db");
+        SessionStore::create_latest_schema(&conn).expect("create latest schema fixture");
+        conn.execute_batch(
+            "INSERT INTO workspace_checkouts (
+                checkout_id, project_id, root_path, normalized_root, last_opened_at
+             ) VALUES
+                ('checkout-unique', 'project-unique', 'F:/unique', 'f:/unique', 100),
+                ('checkout-a', 'project-ambiguous', 'F:/ambiguous-a', 'f:/ambiguous-a', 100),
+                ('checkout-b', 'project-ambiguous', 'F:/ambiguous-b', 'f:/ambiguous-b', 101);
+             INSERT INTO sessions (
+                id, title, workspace_id, session_type, created_at, updated_at
+             ) VALUES
+                ('session-unique', 'Unique legacy session', 'project-unique', 'chat', 100, 100),
+                ('session-ambiguous', 'Ambiguous legacy session', 'project-ambiguous', 'chat', 100, 100);
+             PRAGMA user_version = 36;",
+        )
+        .expect("create v36 checkout binding fixture");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v36 store");
+        assert_eq!(
+            store
+                .get_session_workspace_scope("session-unique")
+                .expect("load unique session scope")
+                .default_checkout_id
+                .as_deref(),
+            Some("checkout-unique")
+        );
+        assert_eq!(
+            store
+                .get_session_workspace_scope("session-ambiguous")
+                .expect("load ambiguous session scope")
+                .default_checkout_id,
+            None
+        );
+
+        let output = dir.path().join("workspace-v36-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-unique",
+            "F:/unrelated-ui-selection",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated unique session");
+        let raw = fs::read_to_string(output).expect("read migrated export");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse migrated export");
+        assert_eq!(
+            yaml["sessions"][0]["metadata"]["defaultCheckoutId"].as_str(),
+            Some("checkout-unique")
+        );
+        assert_eq!(yaml["source"]["workspace_path"].as_str(), Some("F:/unique"));
+    }
+
+    #[test]
+    fn v37_database_migrates_text_render_parts_with_explicit_empty_citations() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v37 db");
+        SessionStore::create_latest_schema(&conn).expect("create latest schema fixture");
+        conn.execute_batch(
+            "INSERT INTO sessions (
+                id, title, session_type, created_at, updated_at
+             ) VALUES ('session-citations', 'Citation migration', 'chat', 100, 100);
+             INSERT INTO messages (
+                id, session_id, role, content, created_at, metadata_json
+             ) VALUES (
+                'message-citations',
+                'session-citations',
+                'assistant',
+                'answer',
+                101,
+                '{\"renderParts\":[{\"kind\":\"text\",\"id\":\"text-1\",\"order\":{\"runId\":\"run-1\",\"seq\":1},\"content\":\"answer\"}]}'
+             );
+             PRAGMA user_version = 37;",
+        )
+        .expect("create v37 citation fixture");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v37 store");
+        let detail = store
+            .load_session("session-citations")
+            .expect("load migrated citation session");
+        let citations = detail.messages[0]
+            .render_parts
+            .as_ref()
+            .and_then(|parts| parts.first())
+            .and_then(|part| match part {
+                AssistantRenderPart::Text { citations, .. } => Some(citations),
+                _ => None,
+            })
+            .expect("migrated text citations");
+        assert!(citations.is_empty());
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let metadata_json: String = conn
+            .query_row(
+                "SELECT metadata_json FROM messages WHERE id = 'message-citations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated message metadata");
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json).expect("parse migrated metadata");
+        assert_eq!(
+            metadata["renderParts"][0]["citations"],
+            serde_json::json!([])
+        );
+        drop(conn);
+
+        let output = dir.path().join("citation-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-citations",
+            "F:/workspace",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated citation session");
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            &fs::read_to_string(output).expect("read migrated citation export"),
+        )
+        .expect("parse migrated citation export");
+        assert_eq!(
+            yaml["sessions"][0]["messages"][0]["citations"].as_str(),
+            Some("empty")
+        );
     }
 
     #[test]
@@ -9565,6 +9843,48 @@ mod tests {
                 .default_checkout_id,
             None
         );
+    }
+
+    #[test]
+    fn historical_session_checkout_binding_uses_explicit_same_project_selection() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        for checkout in [
+            ("checkout-a", "project-shared", "f:/shared-a"),
+            ("checkout-b", "project-shared", "f:/shared-b"),
+            ("checkout-other", "project-other", "f:/other"),
+        ] {
+            store
+                .upsert_workspace_checkout(&WorkspaceCheckoutRecord {
+                    checkout_id: checkout.0.to_string(),
+                    project_id: checkout.1.to_string(),
+                    root_path: checkout.2.to_string(),
+                    normalized_root: checkout.2.to_string(),
+                    last_opened_at: 100,
+                })
+                .expect("persist checkout");
+        }
+        let session_id = store
+            .create_session("Historical", None, Some("project-shared"), "chat", None)
+            .expect("create historical session");
+
+        assert!(store
+            .bind_session_default_checkout_if_missing(&session_id, "checkout-b")
+            .expect("bind historical session"));
+        assert_eq!(
+            store
+                .get_session_workspace_scope(&session_id)
+                .expect("load bound scope")
+                .default_checkout_id
+                .as_deref(),
+            Some("checkout-b")
+        );
+        assert!(!store
+            .bind_session_default_checkout_if_missing(&session_id, "checkout-a")
+            .expect("preserve first fallback checkout"));
+        assert!(store
+            .bind_session_default_checkout_if_missing(&session_id, "checkout-other")
+            .is_err());
     }
 
     #[test]

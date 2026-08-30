@@ -16,6 +16,8 @@ const assetServiceMocks = vi.hoisted(() => ({
 
 const projectServiceMocks = vi.hoisted(() => ({
   listDirEntriesPage: vi.fn(),
+  searchWorkspaceEntries: vi.fn(),
+  statWorkspaceEntries: vi.fn(),
 }));
 
 vi.mock("../services/asset", () => assetServiceMocks);
@@ -138,6 +140,8 @@ describe("useAssetState preview flow", () => {
     projectServiceMocks.listDirEntriesPage.mockResolvedValue(
       dirEntriesPage([], 0, 0, false),
     );
+    projectServiceMocks.searchWorkspaceEntries.mockResolvedValue([]);
+    projectServiceMocks.statWorkspaceEntries.mockResolvedValue([]);
   });
 
   it("keeps the current preview visible until the latest asset request resolves", async () => {
@@ -309,8 +313,111 @@ describe("useAssetState preview flow", () => {
     expect(state.targetLoading.value).toBe(false);
   });
 
+  it("builds the file tree from the current workspace root", async () => {
+    projectServiceMocks.statWorkspaceEntries.mockResolvedValue([
+      { path: "Assets", exists: false, entryKind: "missing" },
+      { path: "ProjectSettings/ProjectVersion.txt", exists: false, entryKind: "missing" },
+    ]);
+    projectServiceMocks.listDirEntriesPage.mockResolvedValueOnce(dirEntriesPage([
+      { name: "src", relPath: "src", isDir: true },
+      { name: "Library", relPath: "Library", isDir: true },
+      { name: "README.md", relPath: "README.md", isDir: false },
+    ]));
+
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
+    await state.initializeExplorer();
+
+    const root = state.explorerTree.value[0];
+    expect(root?.kind).toBe("folder");
+    expect(root?.name).toBe("repo");
+    expect(root?.kind === "folder" && root.children.map((child) => child.path)).toEqual([
+      "src",
+      "Library",
+      "README.md",
+    ]);
+    expect(state.selectedFolderPath.value).toBe(".");
+    expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
+      ".",
+      workspaceRef,
+      0,
+      200,
+      false,
+      expect.arrayContaining([".git", "node_modules"]),
+    );
+    const hidden = projectServiceMocks.listDirEntriesPage.mock.calls[0]?.[5] as string[];
+    expect(hidden).not.toContain("Library");
+  });
+
+  it("applies Unity-only hidden directories after detecting a Unity workspace", async () => {
+    projectServiceMocks.statWorkspaceEntries.mockResolvedValue([
+      { path: "Assets", exists: true, entryKind: "folder" },
+      { path: "ProjectSettings/ProjectVersion.txt", exists: true, entryKind: "file" },
+    ]);
+    projectServiceMocks.listDirEntriesPage.mockResolvedValueOnce(dirEntriesPage([
+      { name: "Assets", relPath: "Assets", isDir: true },
+      { name: "ProjectSettings", relPath: "ProjectSettings", isDir: true },
+    ]));
+
+    const state = useAssetState(reactive({ workingDir: "F:/unity-project", workspaceRef }));
+    await state.initializeExplorer();
+
+    expect(state.isUnityWorkspace.value).toBe(true);
+    expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
+      ".",
+      workspaceRef,
+      0,
+      200,
+      true,
+      expect.arrayContaining(["Library", "Temp", "Logs"]),
+    );
+  });
+
+  it("uses workspace-wide file search for the Files page", async () => {
+    vi.useFakeTimers();
+    try {
+      projectServiceMocks.searchWorkspaceEntries.mockResolvedValue([
+        {
+          relPath: "src/components/FilePanel.vue",
+          name: "FilePanel.vue",
+          parentPath: "src/components",
+          isDir: false,
+          matchScore: 100,
+        },
+        {
+          relPath: "src/files",
+          name: "files",
+          parentPath: "src",
+          isDir: true,
+          matchScore: 90,
+        },
+      ]);
+      const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
+      state.updateSearchScope("global");
+      state.runFilenameSearch("file");
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(projectServiceMocks.searchWorkspaceEntries).toHaveBeenCalledWith(
+        "file",
+        workspaceRef,
+        200,
+        expect.arrayContaining([".git", "node_modules"]),
+      );
+      expect(state.searchResults.value.map((result) => [result.path, result.isDirectory])).toEqual([
+        ["src/components/FilePanel.vue", false],
+        ["src/files", true],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("loads folder pages incrementally for large directories", async () => {
     projectServiceMocks.listDirEntriesPage
+      .mockResolvedValueOnce(
+        dirEntriesPage([
+          { name: "Assets", relPath: "Assets", isDir: true },
+        ]),
+      )
       .mockResolvedValueOnce(
         dirEntriesPage(
           [
@@ -336,17 +443,22 @@ describe("useAssetState preview flow", () => {
 
     const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
+    await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
 
     await state.togglePath("Assets");
 
-    const assetsRoot = state.explorerTree.value[0];
+    const workspaceRoot = state.explorerTree.value[0];
+    const assetsRoot = workspaceRoot?.kind === "folder"
+      ? workspaceRoot.children.find((child) => child.path === "Assets")
+      : null;
     expect(assetsRoot?.kind).toBe("folder");
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets",
       workspaceRef,
       0,
       200,
-      true,
+      false,
+      expect.any(Array),
     );
     expect(assetsRoot?.kind === "folder" && assetsRoot.children).toHaveLength(2);
     expect(assetsRoot?.kind === "folder" && assetsRoot.hasMore).toBe(true);
@@ -358,7 +470,8 @@ describe("useAssetState preview flow", () => {
       workspaceRef,
       2,
       200,
-      true,
+      false,
+      expect.any(Array),
     );
     expect(assetsRoot?.kind === "folder" && assetsRoot.children).toHaveLength(4);
     expect(assetsRoot?.kind === "folder" && assetsRoot.hasMore).toBe(false);
@@ -367,6 +480,11 @@ describe("useAssetState preview flow", () => {
   it("prefetches one level of child folders when expanding a directory", async () => {
     projectServiceMocks.listDirEntriesPage.mockImplementation(
       async (subPath: string, _workspaceRef: unknown, offset = 0, limit = 200) => {
+        if (subPath === "." && offset === 0 && limit === 200) {
+          return dirEntriesPage([
+            { name: "Assets", relPath: "Assets", isDir: true },
+          ]);
+        }
         if (subPath === "Assets" && offset === 0 && limit === 200) {
           return dirEntriesPage([
             { name: "Art", relPath: "Assets/Art", isDir: true },
@@ -390,11 +508,15 @@ describe("useAssetState preview flow", () => {
 
     const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
+    await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
 
     await state.togglePath("Assets");
     await flushPromises();
 
-    const assetsRoot = state.explorerTree.value[0];
+    const workspaceRoot = state.explorerTree.value[0];
+    const assetsRoot = workspaceRoot?.kind === "folder"
+      ? workspaceRoot.children.find((child) => child.path === "Assets")
+      : null;
     expect(assetsRoot?.kind).toBe("folder");
 
     const artFolder = assetsRoot?.kind === "folder"
@@ -418,27 +540,32 @@ describe("useAssetState preview flow", () => {
       workspaceRef,
       0,
       1,
-      true,
+      false,
+      expect.any(Array),
     );
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "Assets/Docs",
       workspaceRef,
       0,
       1,
-      true,
+      false,
+      expect.any(Array),
     );
   });
 
   it("exposes the selected folder entries for the current-directory pane", async () => {
-    projectServiceMocks.listDirEntriesPage.mockResolvedValueOnce(
-      dirEntriesPage([
-        { name: "Scripts", relPath: "Assets/Scripts", isDir: true },
-        { name: "Player.prefab", relPath: "Assets/Player.prefab", isDir: false },
-      ]),
-    );
+    projectServiceMocks.listDirEntriesPage
+      .mockResolvedValueOnce(dirEntriesPage([
+        { name: "Assets", relPath: "Assets", isDir: true },
+      ]))
+      .mockResolvedValueOnce(dirEntriesPage([
+          { name: "Scripts", relPath: "Assets/Scripts", isDir: true },
+          { name: "Player.prefab", relPath: "Assets/Player.prefab", isDir: false },
+      ]));
 
     const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
+    await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
 
     await state.selectFolder("Assets", { preservePreview: true, revealInTree: "none" });
 
@@ -451,34 +578,40 @@ describe("useAssetState preview flow", () => {
   });
 
   it("filters the current folder locally without calling global asset search", async () => {
-    projectServiceMocks.listDirEntriesPage.mockResolvedValueOnce(
-      dirEntriesPage([
-        { name: "HUD.prefab", relPath: "Assets/HUD.prefab", isDir: false },
-        { name: "MainScene.unity", relPath: "Assets/MainScene.unity", isDir: false },
-      ]),
-    );
+    projectServiceMocks.listDirEntriesPage
+      .mockResolvedValueOnce(dirEntriesPage([
+        { name: "Assets", relPath: "Assets", isDir: true },
+      ]))
+      .mockResolvedValueOnce(dirEntriesPage([
+          { name: "HUD.prefab", relPath: "Assets/HUD.prefab", isDir: false },
+          { name: "MainScene.unity", relPath: "Assets/MainScene.unity", isDir: false },
+      ]));
 
     const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
+    await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
     await state.selectFolder("Assets", { preservePreview: true, revealInTree: "none" });
 
     state.runFilenameSearch("hud");
 
-    expect(assetServiceMocks.searchWorkspaceAssets).not.toHaveBeenCalled();
+    expect(projectServiceMocks.searchWorkspaceEntries).not.toHaveBeenCalled();
     expect(state.visibleDirectoryEntries.value.map((entry) => entry.name)).toEqual([
       "HUD.prefab",
     ]);
   });
 
   it("selects folders without expanding them by default", async () => {
-    projectServiceMocks.listDirEntriesPage.mockResolvedValueOnce(
-      dirEntriesPage([
-        { name: "Art", relPath: "Assets/Art", isDir: true },
-      ]),
-    );
+    projectServiceMocks.listDirEntriesPage
+      .mockResolvedValueOnce(dirEntriesPage([
+        { name: "Assets", relPath: "Assets", isDir: true },
+      ]))
+      .mockResolvedValueOnce(dirEntriesPage([
+          { name: "Art", relPath: "Assets/Art", isDir: true },
+      ]));
 
     const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
+    await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
 
     await state.selectFolder("Assets", { preservePreview: true, revealInTree: "none" });
 
@@ -490,29 +623,36 @@ describe("useAssetState preview flow", () => {
   });
 
   it("clears expanded state after loading a leaf folder", async () => {
-    projectServiceMocks.listDirEntriesPage.mockResolvedValueOnce(
-      dirEntriesPage([
-        {
-          name: "AudioManager.asset",
-          relPath: "ProjectSettings/AudioManager.asset",
-          isDir: false,
-        },
-      ]),
-    );
+    projectServiceMocks.listDirEntriesPage
+      .mockResolvedValueOnce(dirEntriesPage([
+        { name: "ProjectSettings", relPath: "ProjectSettings", isDir: true },
+      ]))
+      .mockResolvedValueOnce(dirEntriesPage([
+          {
+            name: "AudioManager.asset",
+            relPath: "ProjectSettings/AudioManager.asset",
+            isDir: false,
+          },
+      ]));
 
     const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
+    await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
 
     await state.togglePath("ProjectSettings");
 
-    const projectSettingsRoot = state.explorerTree.value[2];
+    const workspaceRoot = state.explorerTree.value[0];
+    const projectSettingsRoot = workspaceRoot?.kind === "folder"
+      ? workspaceRoot.children.find((child) => child.path === "ProjectSettings")
+      : null;
     expect(state.isPathExpanded("ProjectSettings")).toBe(false);
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "ProjectSettings",
       workspaceRef,
       0,
       200,
-      true,
+      false,
+      expect.any(Array),
     );
     expect(projectSettingsRoot?.kind === "folder" && projectSettingsRoot.loaded).toBe(true);
     expect(
@@ -523,6 +663,11 @@ describe("useAssetState preview flow", () => {
   it("probes folder branches before showing toggle affordances in the folder-only tree", async () => {
     projectServiceMocks.listDirEntriesPage.mockImplementation(
       async (subPath: string, _workspaceRef: unknown, offset = 0, limit = 200) => {
+        if (subPath === "." && offset === 0 && limit === 200) {
+          return dirEntriesPage([
+            { name: "ProjectSettings", relPath: "ProjectSettings", isDir: true },
+          ]);
+        }
         if (subPath === "ProjectSettings" && offset === 0 && limit === 1) {
           return dirEntriesPage([
             {
@@ -538,16 +683,21 @@ describe("useAssetState preview flow", () => {
 
     const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
     state.initRoots();
+    await state.selectFolder(".", { preservePreview: true, revealInTree: "none" });
 
     await state.probeFolderPath("ProjectSettings");
 
-    const projectSettingsRoot = state.explorerTree.value[2];
+    const workspaceRoot = state.explorerTree.value[0];
+    const projectSettingsRoot = workspaceRoot?.kind === "folder"
+      ? workspaceRoot.children.find((child) => child.path === "ProjectSettings")
+      : null;
     expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
       "ProjectSettings",
       workspaceRef,
       0,
       1,
-      true,
+      false,
+      expect.any(Array),
     );
     expect(projectSettingsRoot?.kind === "folder" && projectSettingsRoot.loaded).toBe(false);
     expect(

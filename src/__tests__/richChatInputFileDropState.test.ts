@@ -30,7 +30,8 @@ describe("RichChatInput file drop state", () => {
     expect(richInput).toContain("function handleLocalFileDragOver(event: DragEvent)");
     expect(richInput).toContain("function handleLocalFileDragLeave(event: DragEvent)");
     expect(richInput).toContain("function handleLocalFileDrop(event: DragEvent)");
-    expect(richInput).toContain(':drop-active="localFileDragActive"');
+    expect(richInput).toContain(':drop-available="localFileDragActive || referenceDropAvailable || referenceDropActive"');
+    expect(richInput).toContain(':drop-active="localFileDragActive || referenceDropActive"');
     expect(richInput).toContain(':drop-label="t(\'chat.input.dropFileHint\')"');
     expect(richInput).toContain('@dragenter="handleLocalFileDragEnter"');
     expect(richInput).toContain('@dragover="handleLocalFileDragOver"');
@@ -39,9 +40,12 @@ describe("RichChatInput file drop state", () => {
     expect(richInput).toContain('document.addEventListener("drop", handleDocumentLocalFileDrop)');
     expect(richInput).toContain('window.addEventListener("blur", handleWindowLocalFileDragBlur)');
 
+    expect(composer).toContain("dropAvailable?: boolean;");
     expect(composer).toContain("dropActive?: boolean;");
     expect(composer).toContain("dropLabel?: string;");
+    expect(composer).toContain("'is-drop-available': dropAvailable || dropActive");
     expect(composer).toContain("'is-drop-active': dropActive");
+    expect(composer).toMatch(/\.chat-composer\.is-drop-available\s*\{[\s\S]*border-style:\s*dashed;/);
     expect(composer).toContain('class="chat-composer-drop-overlay"');
     expect(composer).toContain('class="chat-composer-drop-label"');
     expect(composer).toContain(".chat-composer.is-drop-active");

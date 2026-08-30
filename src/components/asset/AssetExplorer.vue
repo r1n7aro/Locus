@@ -15,6 +15,7 @@ const props = defineProps<{
   tree: AssetExplorerNode[];
   selectedPath: string | null;
   isPathExpanded: (path: string) => boolean;
+  dragEnabled?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -22,6 +23,7 @@ const emit = defineEmits<{
   (e: "toggle", path: string): void;
   (e: "loadMore", path: string): void;
   (e: "probe", path: string): void;
+  (e: "dragPointerDown", node: AssetFolderNode, event: PointerEvent): void;
 }>();
 
 type VisibleEntry =
@@ -66,6 +68,7 @@ const visibleRows = computed<VisibleEntry[]>(() => {
           expandable: canToggle,
           expanded,
           selected: props.selectedPath === node.path,
+          dragEnabled: props.dragEnabled === true,
           title: node.path,
         },
       });
@@ -155,6 +158,12 @@ function activateItem(item: WorkspaceTreeItem) {
     emit("toggle", entry.node.path);
   }
 }
+
+function beginDrag(item: WorkspaceTreeItem, event: PointerEvent) {
+  const entry = asVisibleEntry(item);
+  if (entry.kind !== "row" || !props.dragEnabled) return;
+  emit("dragPointerDown", entry.node, event);
+}
 </script>
 
 <template>
@@ -164,6 +173,7 @@ function activateItem(item: WorkspaceTreeItem) {
       :items="visibleRows"
       :row-height="30"
       @activate="activateItem"
+      @drag-pointer-down="beginDrag"
       @visible-range-change="handleVisibleRangeChange"
     >
       <template #icon="{ item }">

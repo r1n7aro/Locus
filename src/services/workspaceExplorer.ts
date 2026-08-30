@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import type { WorkspaceRef } from "./project";
 import type {
   ProjectCollaborationSnapshot,
   ProjectExplorerMutationResult,
@@ -97,6 +98,44 @@ export function projectExplorerPreviewFile(
   return ipcInvoke<ProjectExplorerFilePreview>("project_explorer_preview_file", {
     projectId,
     path,
+  });
+}
+
+export function projectExplorerWriteFile(
+  projectId: string,
+  path: string,
+  content: string,
+  expectedContentHash: string,
+): Promise<ProjectExplorerFilePreview> {
+  return ipcInvoke<ProjectExplorerFilePreview>("project_explorer_write_file", {
+    projectId,
+    path,
+    content,
+    expectedContentHash,
+  });
+}
+
+export function workspaceFilePreview(
+  filePath: string,
+  workspaceRef: WorkspaceRef,
+): Promise<ProjectExplorerFilePreview> {
+  return ipcInvoke<ProjectExplorerFilePreview>("workspace_file_preview", {
+    filePath,
+    workspaceRef,
+  });
+}
+
+export function workspaceFileWrite(
+  filePath: string,
+  content: string,
+  expectedContentHash: string,
+  workspaceRef: WorkspaceRef,
+): Promise<ProjectExplorerFilePreview> {
+  return ipcInvoke<ProjectExplorerFilePreview>("workspace_file_write", {
+    filePath,
+    content,
+    expectedContentHash,
+    workspaceRef,
   });
 }
 

@@ -8,7 +8,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { t } from "./i18n";
 import { normalizeAppError } from "./services/errors";
-import { useUiStore } from "./stores/ui";
+import { useUiStore, type AppPage } from "./stores/ui";
 import { useAuthStore } from "./stores/auth";
 import { useAgentStore } from "./stores/agent";
 import { useModelStore } from "./stores/model";
@@ -270,8 +270,7 @@ const settingsViewComponent = settingsView.component;
 const settingsViewLoading = settingsView.loading;
 const settingsViewError = settingsView.error;
 
-type AppTab = typeof uiStore.activeTab;
-type ProcessTab = Extract<AppTab, "chat" | "views" | "plugins" | "agent" | "settings">;
+type ProcessTab = AppPage;
 
 interface TopTabItem {
   id: ProcessTab;
@@ -280,7 +279,7 @@ interface TopTabItem {
 }
 
 const topTabs = computed<TopTabItem[]>(() => [
-  { id: "chat", labelKey: "app.tab.development", visible: true },
+  { id: "development", labelKey: "app.tab.development", visible: true },
   { id: "views", labelKey: "app.tab.views", visible: displaySettings.showViewsTab },
   { id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab },
   { id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab },
@@ -291,11 +290,11 @@ const visibleTopTabs = computed(() => topTabs.value.filter((tab) => tab.visible)
 const topTabContextMenu = ref<{ x: number; y: number; tab: TopTabItem } | null>(null);
 
 function isTopTabActive(tab: TopTabItem) {
-  return uiStore.activeTab === tab.id;
+  return uiStore.activePage === tab.id;
 }
 
 function canOpenTopTabInWindow(tab: TopTabItem) {
-  return tab.id !== "chat" && (
+  return tab.id !== "development" && (
     isAppWorkspacePageId(tab.id)
     || (workspaceContextStore.focusedRuntime !== null && isCheckoutWorkspacePageId(tab.id))
   );
@@ -336,7 +335,7 @@ function onTopTabClick(event: MouseEvent, tab: TopTabItem) {
     void openTopTabInWindow(tab);
     return;
   }
-  uiStore.setTab(tab.id);
+  uiStore.setPage(tab.id);
 }
 
 function openTopTabContextMenu(event: MouseEvent, tab: TopTabItem) {
@@ -346,12 +345,12 @@ function openTopTabContextMenu(event: MouseEvent, tab: TopTabItem) {
   topTabContextMenu.value = { x: event.clientX, y: event.clientY, tab };
 }
 
-watch(() => uiStore.activeTab, (tab) => {
+watch(() => uiStore.activePage, (tab) => {
   if (tab === "views") void viewPackageView.ensureLoaded();
 }, { immediate: true });
 
 // 离开设置页时做一次兜底刷新（顶栏切 Tab 不走 setTab 之外的逻辑，原 closeSettings 的副作用迁移到这里）。
-watch(() => uiStore.activeTab, (tab, prev) => {
+watch(() => uiStore.activePage, (tab, prev) => {
   if (prev === "settings" && tab !== "settings") void refreshAfterSettings();
 });
 
@@ -375,9 +374,9 @@ watch(() => uiStore.settingsMounted, (mounted) => {
   void settingsView.ensureLoaded();
 }, { immediate: true });
 
-watch([() => uiStore.activeTab, visibleTopTabs], () => {
-  if (visibleTopTabs.value.some((tab) => tab.id === uiStore.activeTab)) return;
-  uiStore.setTab("chat");
+watch([() => uiStore.activePage, visibleTopTabs], () => {
+  if (visibleTopTabs.value.some((tab) => tab.id === uiStore.activePage)) return;
+  uiStore.setPage("development");
 }, { immediate: true });
 
 const appCloseConfirmOpen = ref(false);
@@ -832,17 +831,17 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
       </div>
       <TopBannerHost />
       <div class="tab-content">
-        <DevelopmentWorkbench v-show="uiStore.activeTab === 'chat'" />
+        <DevelopmentWorkbench v-show="uiStore.activePage === 'development'" />
 
         <component
           :is="viewPackageViewComponent"
           v-if="uiStore.viewMounted && viewPackageViewComponent"
-          v-show="uiStore.activeTab === 'views'"
+          v-show="uiStore.activePage === 'views'"
           :working-dir="focusedWorkspaceRoot"
           :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
         />
         <div
-          v-else-if="uiStore.viewMounted && uiStore.activeTab === 'views'"
+          v-else-if="uiStore.viewMounted && uiStore.activePage === 'views'"
           class="tab-loading-state"
           :class="{ 'is-loading': viewPackageViewLoading, 'is-error': !!viewPackageViewError }"
         >
@@ -852,11 +851,11 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
         <component
           :is="pluginViewComponent"
           v-if="showPluginEntry && uiStore.pluginsMounted && pluginViewComponent"
-          v-show="uiStore.activeTab === 'plugins'"
+          v-show="uiStore.activePage === 'plugins'"
           working-dir=""
         />
         <div
-          v-else-if="showPluginEntry && uiStore.pluginsMounted && uiStore.activeTab === 'plugins'"
+          v-else-if="showPluginEntry && uiStore.pluginsMounted && uiStore.activePage === 'plugins'"
           class="tab-loading-state"
           :class="{ 'is-loading': pluginViewLoading, 'is-error': !!pluginViewError }"
         >
@@ -866,13 +865,13 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
         <component
           :is="agentViewComponent"
           v-if="uiStore.agentMounted && agentViewComponent"
-          v-show="uiStore.activeTab === 'agent'"
+          v-show="uiStore.activePage === 'agent'"
           :working-dir="focusedWorkspaceRoot"
           :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
           :agent-list="[...agentStore.agents, ...agentStore.subagents]"
         />
         <div
-          v-else-if="uiStore.agentMounted && uiStore.activeTab === 'agent'"
+          v-else-if="uiStore.agentMounted && uiStore.activePage === 'agent'"
           class="tab-loading-state"
           :class="{ 'is-loading': agentViewLoading, 'is-error': !!agentViewError }"
         >
@@ -882,7 +881,7 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
         <component
           :is="settingsViewComponent"
           v-if="uiStore.settingsMounted && settingsViewComponent"
-          v-show="uiStore.activeTab === 'settings'"
+          v-show="uiStore.activePage === 'settings'"
           :all-models="modelStore.availableModels"
           :agents="agentStore.appAgents"
           :subagents="agentStore.appSubagents"
@@ -893,7 +892,7 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
           @reset-onboarding="onResetOnboarding"
         />
         <div
-          v-else-if="uiStore.settingsMounted && uiStore.activeTab === 'settings'"
+          v-else-if="uiStore.settingsMounted && uiStore.activePage === 'settings'"
           class="tab-loading-state"
           :class="{ 'is-loading': settingsViewLoading, 'is-error': !!settingsViewError }"
         >

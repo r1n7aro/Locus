@@ -37,6 +37,50 @@ describe("workspace tree presets and mounted files", () => {
     expect(preview).toContain("AssetTextViewer");
   });
 
+  it("drags file-explorer entries into the workspace and previews folders in tabs", () => {
+    const assetView = read("src/components/AssetView.vue");
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const directoryPreview = read("src/components/workbench/WorkspaceDirectoryPreview.vue");
+
+    expect(assetView).toContain("assetWorkspaceReferenceDragData");
+    expect(assetView).toContain("workbenchReferenceInternalDragSource");
+    expect(assetView).toContain('@drag-pointer-down="startAssetWorkspaceDrag"');
+    expect(read("src/components/asset/AssetExplorer.vue"))
+      .toContain('@drag-pointer-down="beginDrag"');
+    expect(read("src/components/asset/AssetDirectoryList.vue"))
+      .toContain('@pointerdown="beginDrag(entry.node, $event)"');
+    expect(workbench).toContain('kind: "localDirectory"');
+    expect(workbench).toContain("<WorkspaceDirectoryPreview");
+    expect(directoryPreview).toContain("entry.relativePath");
+    expect(directoryPreview).toContain("explorerStore.loadMount");
+  });
+
+  it("edits mounted source files while keeping Unity assets on Locus Inspector", () => {
+    const command = read("src-tauri/src/commands/workspace_explorer.rs");
+    const service = read("src/services/workspaceExplorer.ts");
+    const fileEditor = read("src/components/workbench/WorkspaceFilePreview.vue");
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const sharedAssetPreview = read("src/components/asset/WorkspaceAssetPreview.vue");
+
+    expect(command).toContain("pub async fn project_explorer_write_file(");
+    expect(command).toContain("pub async fn workspace_file_write(");
+    expect(command).toContain("expected_content_hash");
+    expect(command).toContain("workspace.explorer_file_changed");
+    expect(command).toContain("workspace.explorer_file_uses_unity_inspector");
+    expect(service).toContain('"project_explorer_write_file"');
+    expect(fileEditor).toContain("<BaseMarkdownEditor");
+    expect(fileEditor).toContain("projectExplorerWriteFile(");
+    expect(fileEditor).toContain("workspaceFileWrite(");
+    expect(fileEditor).toContain('@shortcut-save="saveFile"');
+    expect(fileEditor).toContain('emit("dirtyChange", value)');
+    expect(workbench).toContain("dirtyEditorCloseDialog");
+    expect(workbench).toContain("saveAndCloseDirtyEditor");
+    expect(fileEditor).toContain("preview?.kind === 'unity'");
+    expect(fileEditor).toContain("<WorkspaceAssetPreview");
+    expect(sharedAssetPreview).toContain("UnityObjectPreview");
+    expect(sharedAssetPreview).toContain("edit: props.writable");
+  });
+
   it("copies knowledge documents and folders from the full knowledge panel", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
@@ -77,18 +121,17 @@ describe("workspace tree presets and mounted files", () => {
     expect(workbench).toContain('case "collaboration": return GitMerge;');
     expect(workbench).toContain('case "knowledgeRoot": return BookOpen;');
     expect(workbench).toContain('kind: "knowledgeRoot"');
-    expect(workbench).toContain('v-show="showKnowledge"');
+    expect(workbench).toContain("editor.resource.kind === 'knowledgeRoot'");
     expect(read("src/stores/workspaceExplorer.ts")).not.toContain("KNOWLEDGE_FOLDERS");
   });
 
   it("keeps knowledge and collaboration views mounted in the workspace", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    expect(workbench).toContain('<template v-if="workspaceContextStore.focusedWorkspaceRef">');
-    expect(workbench).toMatch(/<KnowledgeView\s+v-show="showKnowledge"/);
-    expect(workbench).toMatch(/<CollabView\s+v-show="showCollab"/);
-    expect(workbench).toContain(':is-active="showCollab"');
-    expect(workbench).not.toContain('v-else-if="showKnowledge"');
-    expect(workbench).not.toContain('v-else-if="showCollab"');
+    expect(workbench).toContain('v-show="group.activeEditorId === editor.editorId"');
+    expect(workbench).toMatch(/<KnowledgeView\s+v-else-if="editor\.resource\.kind === 'knowledge'/);
+    expect(workbench).toMatch(/<CollabView\s+v-else-if="editor\.resource\.kind === 'collaboration'/);
+    expect(workbench).toContain(':workspace-ref="editorWorkspaceRef(editor)"');
+    expect(workbench).toContain(':is-active="focused && group.activeEditorId === editor.editorId"');
   });
 
   it("routes native drops by pointer position", () => {
@@ -97,6 +140,32 @@ describe("workspace tree presets and mounted files", () => {
     expect(command).toContain("LocusFileDropPayload { files, x, y }");
     expect(richInput).toContain("insideComposer");
     expect(richInput).toContain("getBoundingClientRect()");
+  });
+
+  it("turns the new-session row into a reference drop zone", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const zh = read("src/language/zh.json");
+    const newSessionTarget = workbench.indexOf(
+      'rowHit?.item.meta.kind === "newSession"',
+    );
+    const layoutMove = workbench.indexOf(
+      'if (sourceType === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE)',
+      newSessionTarget,
+    );
+
+    expect(workbench).toContain("function workspaceLayoutAttachmentDraft(");
+    expect(workbench).toContain("function newSessionDropDraft(");
+    expect(workbench).toContain("workspaceLayoutNewSessionDraft(");
+    expect(workbench).toContain("await createNewSessionWithAttachments(intent.target, draft)");
+    expect(newSessionTarget).toBeGreaterThan(0);
+    expect(newSessionTarget).toBeLessThan(layoutMove);
+    expect(workbench).toContain('\"is-new-session-drop-zone\": dropAvailable');
+    expect(workbench).toContain('hit.closest(".workspace-tree-row-shell.is-new-session-row")');
+    expect(workbench).toContain('return "inline";');
+    expect(workbench).toContain(".workspace-tree-row-shell.is-new-session-drop-zone .workspace-tree-row");
+    expect(workbench).toMatch(/\.workspace-tree-row-shell\.is-new-session-drop-zone \.workspace-tree-row\)[^{]*\{[\s\S]*border:\s*1px dashed var\(--border-strong\);/);
+    expect(workbench).toMatch(/\.workspace-tree-row-shell\.is-new-session-drop-zone \.workspace-tree-name\)[^{]*\{[\s\S]*text-align:\s*center;/);
+    expect(zh).toContain('\"development.dropToCreateSession\": \"拖到此处以创建新会话\"');
   });
 
   it("resizes and persists the workspace explorer width", () => {

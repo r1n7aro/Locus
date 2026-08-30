@@ -6,11 +6,12 @@ import {
   type LocusAssetInspectorWindowPayload,
 } from "../services/locusAssetInspectorWindow";
 import { t } from "../i18n";
-import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
-import type { UnityObjectPreviewInput } from "./unity-preview/unityObjectPreview";
+import type { WorkspaceRef } from "../services/project";
+import WorkspaceAssetPreview from "./asset/WorkspaceAssetPreview.vue";
 
 const props = defineProps<{
   payload: LocusAssetInspectorWindowPayload;
+  workspaceRef: WorkspaceRef | null;
 }>();
 
 const targetPath = computed(() => locusAssetInspectorTargetPath(props.payload));
@@ -21,19 +22,6 @@ const selectedName = computed(() => {
   const segments = path.split("/").filter(Boolean);
   return segments[segments.length - 1] || LOCUS_ASSET_INSPECTOR_WINDOW_TITLE;
 });
-const previewModel = computed<UnityObjectPreviewInput>(() => ({
-  kind: props.payload.kind ?? "asset",
-  path: targetPath.value,
-  title: selectedName.value,
-  writable: true,
-  capabilities: {
-    inspect: true,
-    edit: true,
-    preview: true,
-    select: true,
-    drag: true,
-  },
-}));
 </script>
 
 <template>
@@ -41,13 +29,14 @@ const previewModel = computed<UnityObjectPreviewInput>(() => ({
     <div v-if="!targetPath" class="locus-asset-inspector-state">
       {{ t("asset.inspector.missingAsset") }}
     </div>
-    <UnityObjectPreview
+    <WorkspaceAssetPreview
       v-else
-      :key="`${previewModel.kind}:${targetPath}`"
-      :model="previewModel"
-      level="inspector"
+      :workspace-ref="workspaceRef"
+      :kind="payload.kind ?? 'asset'"
+      :path="targetPath"
+      :title="selectedName"
       :auto-load-preview="true"
-      :collapsible="false"
+      :show-header="false"
     />
   </div>
 </template>

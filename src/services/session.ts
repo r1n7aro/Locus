@@ -324,15 +324,26 @@ export interface SessionPlanState {
   planFileExists: boolean;
 }
 
-export function getSessionPlanState(sessionId: string): Promise<SessionPlanState> {
-  return ipcInvoke<SessionPlanState>("get_session_plan_state", { sessionId });
+export function getSessionPlanState(
+  sessionId: string,
+  workspaceRef?: WorkspaceRef | null,
+): Promise<SessionPlanState> {
+  return ipcInvoke<SessionPlanState>("get_session_plan_state", {
+    sessionId,
+    workspaceRef: workspaceRef ?? null,
+  });
 }
 
 export function setSessionPlanMode(
   sessionId: string,
   active: boolean,
+  workspaceRef?: WorkspaceRef | null,
 ): Promise<SessionPlanState> {
-  return ipcInvoke<SessionPlanState>("set_session_plan_mode", { sessionId, active });
+  return ipcInvoke<SessionPlanState>("set_session_plan_mode", {
+    sessionId,
+    active,
+    workspaceRef: workspaceRef ?? null,
+  });
 }
 
 export interface PlanFileContent {

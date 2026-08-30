@@ -27,6 +27,8 @@ const SYSTEM_RESOURCE_KIND = "system" as const;
 const NEW_SESSION_SYSTEM_RESOURCE_ID = "newSession";
 const KNOWLEDGE_SYSTEM_RESOURCE_ID = "knowledge";
 const COLLABORATION_SYSTEM_RESOURCE_ID = "collaboration";
+const ASSETS_SYSTEM_RESOURCE_ID = "assets";
+const VIEWS_SYSTEM_RESOURCE_ID = "views";
 
 function emptyResources(): ProjectExplorerResources {
   return { sessions: [], knowledge: [], collaboration: null };
@@ -268,6 +270,36 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
         kind: "placeResource",
         resourceKind: SYSTEM_RESOURCE_KIND,
         resourceId: COLLABORATION_SYSTEM_RESOURCE_ID,
+        position,
+      });
+      insertPlacementNode(null, position, {
+        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${COLLABORATION_SYSTEM_RESOURCE_ID}`,
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId: COLLABORATION_SYSTEM_RESOURCE_ID,
+        position,
+      });
+    }
+    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${ASSETS_SYSTEM_RESOURCE_ID}`)) {
+      const position = siblingsByParent.get(null)?.length ?? 0;
+      operations.push({
+        kind: "placeResource",
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId: ASSETS_SYSTEM_RESOURCE_ID,
+        position,
+      });
+      insertPlacementNode(null, position, {
+        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${ASSETS_SYSTEM_RESOURCE_ID}`,
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId: ASSETS_SYSTEM_RESOURCE_ID,
+        position,
+      });
+    }
+    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${VIEWS_SYSTEM_RESOURCE_ID}`)) {
+      const position = siblingsByParent.get(null)?.length ?? 0;
+      operations.push({
+        kind: "placeResource",
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId: VIEWS_SYSTEM_RESOURCE_ID,
         position,
       });
     }

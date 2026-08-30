@@ -12,11 +12,8 @@ import {
 } from "../services/locusAssetInspectorWindow";
 import { t } from "../i18n";
 import LucideIcon from "./icons/LucideIcon.vue";
-import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
-import type {
-  UnityObjectPreviewInput,
-  UnityObjectPreviewSourceState,
-} from "./unity-preview/unityObjectPreview";
+import WorkspaceAssetPreview from "./asset/WorkspaceAssetPreview.vue";
+import type { UnityObjectPreviewSourceState } from "./unity-preview/unityObjectPreview";
 
 type LocusInspectorTarget =
   | {
@@ -52,19 +49,6 @@ const inspectorSourceState = ref<UnityObjectPreviewSourceState>("disk");
 const panelRect = ref<PanelRect>(loadInitialRect());
 
 const targetPath = computed(() => inspectorTarget.value?.path ?? "");
-const previewModel = computed<UnityObjectPreviewInput>(() => ({
-  kind: inspectorTarget.value?.kind ?? "asset",
-  path: targetPath.value,
-  title: panelTitleName.value,
-  writable: true,
-  capabilities: {
-    inspect: true,
-    edit: true,
-    preview: true,
-    select: true,
-    drag: true,
-  },
-}));
 const panelTitleName = computed(() => {
   const path = inspectorTarget.value?.kind === "sceneObject"
     ? inspectorTarget.value.objectPath
@@ -432,13 +416,13 @@ onUnmounted(() => {
       <div v-if="!targetPath" class="locus-asset-inspector-panel-state">
         {{ t("asset.inspector.missingAsset") }}
       </div>
-      <UnityObjectPreview
+      <WorkspaceAssetPreview
         v-else
-        :key="`${previewModel.kind}:${targetPath}`"
-        :model="previewModel"
-        level="inspector"
+        :workspace-ref="state.workspaceRef"
+        :kind="inspectorTarget?.kind ?? 'asset'"
+        :path="targetPath"
+        :title="panelTitleName"
         :auto-load-preview="true"
-        :collapsible="false"
         @source-change="handlePreviewSourceChange"
       />
     </div>

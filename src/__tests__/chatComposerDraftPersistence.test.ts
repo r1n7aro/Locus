@@ -21,11 +21,23 @@ describe("chat composer draft persistence", () => {
     expect(chatView).toContain("if (props.activeSessionId === null) {");
   });
 
+  it("keeps workbench session previews as tabs once their composer has a draft", () => {
+    const sessionEditor = read("src/components/workbench/WorkbenchSessionEditor.vue");
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+
+    expect(sessionEditor).toContain('() => inputText.value.length > 0');
+    expect(sessionEditor).toContain('emit("composer-draft-change", {');
+    expect(workbench).toContain('@composer-draft-change="handleWorkbenchComposerDraftChange(paneId, $event)"');
+    expect(workbench).toContain("if (!payload.hasDraft) return;");
+    expect(workbench).toContain("workbenchStore.pinEditor(WORKBENCH_WINDOW_ID, paneId, payload.editorId);");
+  });
+
   it("syncs asset reference drafts between chat windows by session", () => {
     const chatView = read("src/components/ChatView.vue");
     const richInput = read("src/components/chat/RichChatInput.vue");
 
-    expect(chatView).toContain("const composerAssetRefSyncKey = computed(() => `chat:${draftSessionKey(props.activeSessionId)}`);");
+    expect(chatView).toContain("const composerAssetRefSyncKey = computed(() => `chat:${sessionSurfaceKey.value}`);");
+    expect(chatView).toContain("props.sessionSurfaceKey?.trim() || draftSessionKey(props.activeSessionId)");
     expect(chatView).toContain(':asset-ref-sync-key="composerAssetRefSyncKey"');
     expect(richInput).toContain('const ASSET_REF_SYNC_CHANNEL = "locus-chat-asset-ref-drafts";');
     expect(richInput).toContain("function setAssetRefAttachments(");

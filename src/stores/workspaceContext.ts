@@ -84,6 +84,38 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     .map((projectId) => projectsById.value[projectId])
     .filter((project): project is ProjectContextDescriptor => Boolean(project)));
 
+  function paneContextAt(
+    targetWindowId: string,
+    targetPaneId: string,
+  ): WindowPaneWorkspaceContext | null {
+    return paneContexts.value[paneContextKey(targetWindowId, targetPaneId)] ?? null;
+  }
+
+  function checkoutForPane(
+    targetWindowId: string,
+    targetPaneId: string,
+  ): WorkspaceCheckoutDescriptor | null {
+    const checkoutId = paneContextAt(targetWindowId, targetPaneId)?.focusedCheckoutId;
+    return checkoutId ? checkoutsById.value[checkoutId] ?? null : null;
+  }
+
+  function workspaceRefForPane(
+    targetWindowId: string,
+    targetPaneId: string,
+  ): WorkspaceRef | null {
+    const context = paneContextAt(targetWindowId, targetPaneId);
+    if (!context) return null;
+    return {
+      checkoutId: context.focusedCheckoutId,
+      expectedGeneration: context.workspaceGeneration,
+    };
+  }
+
+  function activatePane(targetWindowId: string, targetPaneId: string): void {
+    windowId.value = targetWindowId;
+    paneId.value = targetPaneId;
+  }
+
   function currentIntentEpoch(key: string): number {
     return mutationIntentEpochs.get(key) ?? 0;
   }
@@ -338,9 +370,11 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
 
   async function ensureRuntime(
     checkout: WorkspaceCheckoutDescriptor,
+    targetWindowId = windowId.value,
+    targetPaneId = paneId.value,
   ): Promise<WorkspaceRuntimeDescriptor> {
     const currentRuntime = checkoutsById.value[checkout.checkoutId]?.runtime ?? checkout.runtime;
-    const focusedContext = focusedPaneContext.value;
+    const focusedContext = paneContextAt(targetWindowId, targetPaneId);
     if (
       currentRuntime
       && focusedContext?.focusedCheckoutId === checkout.checkoutId
@@ -373,6 +407,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     targetWindowId: string,
     targetPaneId: string,
     expectedIntentEpoch: number,
+    activate = true,
   ): Promise<WindowPaneWorkspaceContext | null> {
     const key = paneContextKey(targetWindowId, targetPaneId);
     if (currentIntentEpoch(key) !== expectedIntentEpoch) return null;
@@ -382,15 +417,20 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
         checkoutId: runtime.checkoutId,
         expectedGeneration: runtime.workspaceGeneration,
       }, expectedIntentEpoch);
-      return applyPaneContext(context, expectedIntentEpoch) ? context : null;
+      if (!applyPaneContext(context, expectedIntentEpoch)) return null;
+      if (activate) activatePane(targetWindowId, targetPaneId);
+      return context;
     } catch (error) {
       if (currentIntentEpoch(key) !== expectedIntentEpoch) return null;
       throw error;
     }
   }
 
-  async function focusCheckout(
+  async function focusCheckoutInPane(
     checkoutOrId: WorkspaceCheckoutDescriptor | string,
+    targetWindowId: string,
+    targetPaneId: string,
+    options: { activate?: boolean } = {},
   ): Promise<WindowPaneWorkspaceContext | null> {
     const checkoutId = typeof checkoutOrId === "string"
       ? checkoutOrId
@@ -400,47 +440,84 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
         ?? (typeof checkoutOrId === "string" ? undefined : checkoutOrId),
       checkoutId,
     );
-    const targetWindowId = windowId.value;
-    const targetPaneId = paneId.value;
     const epoch = nextPaneIntentEpoch(targetWindowId, targetPaneId);
-    const runtime = await ensureRuntime(checkout);
-    return focusRuntime(runtime, targetWindowId, targetPaneId, epoch);
+    const runtime = await ensureRuntime(checkout, targetWindowId, targetPaneId);
+    return focusRuntime(
+      runtime,
+      targetWindowId,
+      targetPaneId,
+      epoch,
+      options.activate !== false,
+    );
   }
 
-  async function focusWorkspaceRef(
+  async function focusCheckout(
+    checkoutOrId: WorkspaceCheckoutDescriptor | string,
+  ): Promise<WindowPaneWorkspaceContext | null> {
+    return focusCheckoutInPane(checkoutOrId, windowId.value, paneId.value);
+  }
+
+  async function focusWorkspaceRefInPane(
     workspaceRef: WorkspaceRef,
+    targetWindowId: string,
+    targetPaneId: string,
+    options: { activate?: boolean } = {},
   ): Promise<WindowPaneWorkspaceContext | null> {
     const checkout = requireCheckout(
       checkoutsById.value[workspaceRef.checkoutId],
       workspaceRef.checkoutId,
     );
-    const targetWindowId = windowId.value;
-    const targetPaneId = paneId.value;
     const epoch = nextPaneIntentEpoch(targetWindowId, targetPaneId);
-    const runtime = await ensureRuntime(checkout);
+    const runtime = await ensureRuntime(checkout, targetWindowId, targetPaneId);
     if (
       workspaceRef.expectedGeneration != null
       && runtime.workspaceGeneration !== workspaceRef.expectedGeneration
     ) {
       throw new Error("The requested checkout runtime generation is stale.");
     }
-    return focusRuntime(runtime, targetWindowId, targetPaneId, epoch);
+    return focusRuntime(
+      runtime,
+      targetWindowId,
+      targetPaneId,
+      epoch,
+      options.activate !== false,
+    );
   }
 
-  async function openAndFocus(path: string): Promise<WindowPaneWorkspaceContext | null> {
-    const targetWindowId = windowId.value;
-    const targetPaneId = paneId.value;
+  async function focusWorkspaceRef(
+    workspaceRef: WorkspaceRef,
+  ): Promise<WindowPaneWorkspaceContext | null> {
+    return focusWorkspaceRefInPane(workspaceRef, windowId.value, paneId.value);
+  }
+
+  async function openAndFocusInPane(
+    path: string,
+    targetWindowId: string,
+    targetPaneId: string,
+    options: { activate?: boolean } = {},
+  ): Promise<WindowPaneWorkspaceContext | null> {
     const epoch = nextPaneIntentEpoch(targetWindowId, targetPaneId);
     const runtime = await projectService.openWorkspace(path);
     upsertRuntime(runtime);
-    return focusRuntime(runtime, targetWindowId, targetPaneId, epoch);
+    return focusRuntime(
+      runtime,
+      targetWindowId,
+      targetPaneId,
+      epoch,
+      options.activate !== false,
+    );
   }
 
-  async function setActiveSession(
+  async function openAndFocus(path: string): Promise<WindowPaneWorkspaceContext | null> {
+    return openAndFocusInPane(path, windowId.value, paneId.value);
+  }
+
+  async function setActiveSessionInPane(
     activeSessionId: string | null,
+    targetWindowId: string,
+    targetPaneId: string,
+    options: { activate?: boolean } = {},
   ): Promise<WindowPaneWorkspaceContext | null> {
-    const targetWindowId = windowId.value;
-    const targetPaneId = paneId.value;
     const key = paneContextKey(targetWindowId, targetPaneId);
     const intentEpoch = nextPaneIntentEpoch(targetWindowId, targetPaneId);
 
@@ -451,11 +528,23 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
         activeSessionId,
         intentEpoch,
       );
-      return applyPaneContext(context, intentEpoch) ? context : null;
+      if (!applyPaneContext(context, intentEpoch)) return null;
+      if (options.activate !== false) activatePane(targetWindowId, targetPaneId);
+      return context;
     } catch (error) {
       if (currentIntentEpoch(key) !== intentEpoch) return null;
       throw error;
     }
+  }
+
+  async function setActiveSession(
+    activeSessionId: string | null,
+  ): Promise<WindowPaneWorkspaceContext | null> {
+    return setActiveSessionInPane(
+      activeSessionId,
+      windowId.value,
+      paneId.value,
+    );
   }
 
   async function disposePane(
@@ -508,12 +597,20 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     focusedRuntime,
     focusedWorkspaceRef,
     focusedRoot,
+    paneContextAt,
+    checkoutForPane,
+    workspaceRefForPane,
+    activatePane,
     applyWorkspaceEvent,
     initialize,
     openAndFocus,
+    openAndFocusInPane,
     focusCheckout,
+    focusCheckoutInPane,
     focusWorkspaceRef,
+    focusWorkspaceRefInPane,
     setActiveSession,
+    setActiveSessionInPane,
     disposePane,
     disposeWindow,
   };

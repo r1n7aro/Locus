@@ -2535,7 +2535,7 @@ describe("chat session panel state", () => {
     expect(chatStore.canResumeInterrupted).toBe(false);
   });
 
-  it("keeps the persisted user message when a run is cancelled after the user message event", async () => {
+  it("keeps a persisted prompt in the transcript without returning it to the composer", async () => {
     const chatStore = useChatStore();
     const uiStore = useUiStore();
     sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-cancel-late" });
@@ -2661,6 +2661,38 @@ describe("chat session panel state", () => {
     await vi.waitFor(() => {
       expect(sessionServiceMocks.cancelChat).toHaveBeenCalledWith("s1");
     });
+  });
+
+  it("keeps an already-cancelled launch closed when the chat command resolves later", async () => {
+    const chatStore = useChatStore();
+    const uiStore = useUiStore();
+    let resolveChat!: (value: { sessionId: string; runId: string }) => void;
+    sessionServiceMocks.chat.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveChat = resolve;
+    }));
+
+    const sending = chatStore.sendMessage("cancel during launch");
+    chatStore.handleStreamEvent({
+      type: "runStart",
+      sessionId: "s1",
+      runId: "run-launch-race",
+    });
+    await chatStore.cancelChat();
+    chatStore.handleStreamEvent({
+      type: "cancelled",
+      sessionId: "s1",
+      runId: "run-launch-race",
+    });
+
+    await vi.waitFor(() => {
+      expect(uiStore.pendingChatPrefill?.draft?.text).toBe("cancel during launch");
+    });
+    resolveChat({ sessionId: "s1", runId: "run-launch-race" });
+    await sending;
+
+    expect(chatStore.isStreaming).toBe(false);
+    expect(chatStore.currentRunId).toBeNull();
+    expect(chatStore.streamingSessionIds.has("s1")).toBe(false);
   });
 
   it("sends a client message id that matches the local pending user message", async () => {

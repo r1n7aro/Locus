@@ -7,6 +7,28 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import type { UserMessageDraft } from "../composables/chatMessageDraft";
 
+export type AppPage = "development" | "views" | "plugins" | "agent" | "settings";
+export type LegacyAppTab =
+  | "project"
+  | "chat"
+  | "collab"
+  | "knowledge"
+  | "asset"
+  | "development"
+  | "views"
+  | "plugins"
+  | "agent"
+  | "settings";
+
+const ACTIVE_PAGE_STORAGE_KEY = "locus:activePage:v1";
+
+export function migrateAppPage(value: unknown): AppPage {
+  if (value === "views" || value === "plugins" || value === "agent" || value === "settings") {
+    return value;
+  }
+  return "development";
+}
+
 const WINDOW_RESIZE_SETTLE_DELAY_MS = 420;
 const MIN_TRACKABLE_WINDOW_WIDTH_PX = 320;
 const MIN_TRACKABLE_WINDOW_HEIGHT_PX = 120;
@@ -29,7 +51,12 @@ interface PendingChatPrefill extends ChatPrefillOptions {
 }
 
 export const useUiStore = defineStore("ui", () => {
-  const activeTab = ref<"chat" | "views" | "plugins" | "agent" | "settings">("chat");
+  const activePage = ref<AppPage>("development");
+  /** Temporary read-compatible alias for components outside the app router. */
+  const activeTab = computed<"chat" | "views" | "plugins" | "agent" | "settings">({
+    get: () => activePage.value === "development" ? "chat" : activePage.value,
+    set: (value) => { activePage.value = migrateAppPage(value); },
+  });
   const settingsCategoryHint = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about" | "experimental" | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
@@ -46,6 +73,13 @@ export const useUiStore = defineStore("ui", () => {
     path: string;
   } | null>(null);
   const pendingAssetOpen = ref<{
+    id: number;
+    projectPath: string;
+    assetPath: string;
+    line: number;
+    column: number;
+  } | null>(null);
+  const pendingExternalScriptOpen = ref<{
     id: number;
     projectPath: string;
     assetPath: string;
@@ -190,10 +224,12 @@ export const useUiStore = defineStore("ui", () => {
       }
     }
     try {
-      setTab("chat");
+      const savedPage = localStorage.getItem(ACTIVE_PAGE_STORAGE_KEY)
+        ?? localStorage.getItem("locus:activeTab");
+      setPage(migrateAppPage(savedPage));
       showOnboarding.value = !localStorage.getItem("locus-onboarding-completed");
     } catch (error) {
-      setTab("chat");
+      setPage("development");
       console.error("Failed to read onboarding completion state:", error);
       showOnboarding.value = false;
     }
@@ -212,12 +248,21 @@ export const useUiStore = defineStore("ui", () => {
     unlistenNativeClientSize = null;
   }
 
-  function setTab(tab: typeof activeTab.value) {
-    activeTab.value = tab;
-    if (tab === "views") viewMounted.value = true;
-    if (tab === "plugins") pluginsMounted.value = true;
-    if (tab === "agent") agentMounted.value = true;
-    if (tab === "settings") settingsMounted.value = true;
+  function setPage(page: AppPage) {
+    activePage.value = page;
+    if (page === "views") viewMounted.value = true;
+    if (page === "plugins") pluginsMounted.value = true;
+    if (page === "agent") agentMounted.value = true;
+    if (page === "settings") settingsMounted.value = true;
+    try {
+      localStorage.setItem(ACTIVE_PAGE_STORAGE_KEY, page);
+    } catch {
+      // A read-only WebView still keeps the in-memory route.
+    }
+  }
+
+  function setTab(tab: LegacyAppTab) {
+    setPage(migrateAppPage(tab));
   }
 
   function openSettingsCategory(category: NonNullable<typeof settingsCategoryHint.value>) {
@@ -278,6 +323,21 @@ export const useUiStore = defineStore("ui", () => {
     pendingAssetOpen.value = null;
   }
 
+  function stageExternalScriptOpen(
+    request: Omit<NonNullable<typeof pendingExternalScriptOpen.value>, "id">,
+  ) {
+    pendingExternalScriptOpen.value = {
+      id: Date.now(),
+      ...request,
+    };
+  }
+
+  function clearPendingExternalScriptOpen(id?: number) {
+    if (!pendingExternalScriptOpen.value) return;
+    if (id != null && pendingExternalScriptOpen.value.id !== id) return;
+    pendingExternalScriptOpen.value = null;
+  }
+
   async function toggleAlwaysOnTop() {
     const window = resolveAppWindow();
     if (!window) return;
@@ -320,6 +380,7 @@ export const useUiStore = defineStore("ui", () => {
 
   return {
     activeTab,
+    activePage,
     settingsCategoryHint,
     alwaysOnTop,
     isMaximized,
@@ -331,6 +392,7 @@ export const useUiStore = defineStore("ui", () => {
     pendingChatPrefill,
     pendingKnowledgeSelection,
     pendingAssetOpen,
+    pendingExternalScriptOpen,
     viewMounted,
     pluginsMounted,
     agentMounted,
@@ -338,6 +400,7 @@ export const useUiStore = defineStore("ui", () => {
     init,
     cleanup,
     setTab,
+    setPage,
     openSettingsCategory,
     clearSettingsCategoryHint,
     stageChatPrefill,
@@ -347,6 +410,8 @@ export const useUiStore = defineStore("ui", () => {
     clearPendingKnowledgeSelection,
     stageAssetOpen,
     clearPendingAssetOpen,
+    stageExternalScriptOpen,
+    clearPendingExternalScriptOpen,
     toggleAlwaysOnTop,
     winMinimize,
     winToggleMaximize,

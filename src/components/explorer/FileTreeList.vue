@@ -108,9 +108,15 @@ function scrollToIndex(index: number, options?: { align?: "auto" | "center" }) {
   const clamped = Math.max(0, Math.min(index, props.items.length - 1));
   const top = clamped * rowHeight;
   const bottom = top + rowHeight;
+  const align = options?.align ?? "auto";
+  if (
+    align === "auto"
+    && viewportHeight.value > 0
+    && top >= scrollTop.value
+    && bottom <= scrollTop.value + viewportHeight.value
+  ) return;
   const viewTop = element.scrollTop;
   const viewBottom = viewTop + element.clientHeight;
-  const align = options?.align ?? "auto";
   if (align === "auto" && top >= viewTop && bottom <= viewBottom) return;
   const nextTop =
     align === "center"

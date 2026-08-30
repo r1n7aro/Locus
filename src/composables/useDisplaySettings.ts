@@ -11,6 +11,7 @@ export type GitDiffReviewTarget = DiffReviewTarget;
 export type PlanApprovalTarget = "card" | "window";
 export type MemoryFileOpenTarget = "window" | "knowledge";
 export type WorkspaceDisplayMode = "single" | "multi";
+export type WorkspaceSectionVisibilityKind = "knowledge" | "collab" | "assets" | "views";
 export type KnowledgeFolderKind = "plan" | "memory" | "design" | "skill" | "reference";
 export type AssetRefClickAction =
   | "unitySelect"
@@ -22,6 +23,46 @@ export type AssetRefClickAction =
 
 export const DEFAULT_SESSION_MESSAGE_PAGE_SIZE = 120;
 export const SESSION_MESSAGE_PAGE_SIZE_OPTIONS = [80, 120, 160, 240, 400] as const;
+export const DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES = [
+  ".git",
+  ".vs",
+  ".vscode",
+  ".idea",
+  "node_modules",
+  "__pycache__",
+  ".next",
+  "dist",
+  "build",
+  "obj",
+] as const;
+export const DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES = [
+  "Library",
+  "Temp",
+  "Logs",
+  "UserSettings",
+  "MemoryCaptures",
+] as const;
+
+export function normalizeHiddenDirectoryNames(
+  value: unknown,
+  fallback: readonly string[] = [],
+): string[] {
+  const source = Array.isArray(value) ? value : fallback;
+  const normalized: string[] = [];
+  const seen = new Set<string>();
+  for (const item of source) {
+    if (typeof item !== "string") continue;
+    const name = item.trim().replace(/[\\/]+$/g, "");
+    if (!name || name === "." || name === ".." || name.includes("/") || name.includes("\\")) {
+      continue;
+    }
+    const key = name.toLocaleLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(name);
+  }
+  return normalized;
+}
 
 export function normalizeSessionMessagePageSize(value: unknown): number {
   const parsed = Number(value);
@@ -37,8 +78,14 @@ export interface DisplaySettings {
   showWelcomeSubtitle: boolean;
   /** Project tree projection used by the Development workbench */
   workspaceDisplayMode: WorkspaceDisplayMode;
+  /** Fixed Development-tree sections visible for each ProjectContext. */
+  workspaceSectionVisibility: Record<WorkspaceSectionVisibilityKind, boolean>;
   /** Knowledge roots projected into the Development tree */
   knowledgeFolderVisibility: Record<KnowledgeFolderKind, boolean>;
+  /** Directory names hidden from the Files page in every workspace. */
+  fileExplorerHiddenDirectories: string[];
+  /** Additional directory names hidden when the workspace is a Unity project. */
+  unityFileExplorerHiddenDirectories: string[];
   /** Show Views tab in the top navigation */
   showViewsTab: boolean;
   /** Show Plugins tab in the top navigation */
@@ -143,10 +190,20 @@ const defaultKnowledgeFolderVisibility: Record<KnowledgeFolderKind, boolean> = {
   reference: true,
 };
 
+const defaultWorkspaceSectionVisibility: Record<WorkspaceSectionVisibilityKind, boolean> = {
+  knowledge: true,
+  collab: true,
+  assets: true,
+  views: true,
+};
+
 const defaults: DisplaySettings = {
   showWelcomeSubtitle: true,
   workspaceDisplayMode: "single",
+  workspaceSectionVisibility: { ...defaultWorkspaceSectionVisibility },
   knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
+  fileExplorerHiddenDirectories: [...DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES],
+  unityFileExplorerHiddenDirectories: [...DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES],
   showViewsTab: true,
   showPluginsTab: true,
   showAgentTab: true,
@@ -202,10 +259,22 @@ function load(): DisplaySettings {
         ...defaults,
         ...parsed,
         workspaceDisplayMode: parsed.workspaceDisplayMode === "multi" ? "multi" : "single",
+        workspaceSectionVisibility: {
+          ...defaultWorkspaceSectionVisibility,
+          ...parsed.workspaceSectionVisibility,
+        },
         knowledgeFolderVisibility: {
           ...defaultKnowledgeFolderVisibility,
           ...parsed.knowledgeFolderVisibility,
         },
+        fileExplorerHiddenDirectories: normalizeHiddenDirectoryNames(
+          parsed.fileExplorerHiddenDirectories,
+          DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES,
+        ),
+        unityFileExplorerHiddenDirectories: normalizeHiddenDirectoryNames(
+          parsed.unityFileExplorerHiddenDirectories,
+          DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES,
+        ),
         sessionMessagePageSize: normalizeSessionMessagePageSize(parsed.sessionMessagePageSize),
         fonts: { ...defaultFonts, ...parsed.fonts },
       };
@@ -214,6 +283,9 @@ function load(): DisplaySettings {
   return {
     ...defaults,
     knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
+    workspaceSectionVisibility: { ...defaultWorkspaceSectionVisibility },
+    fileExplorerHiddenDirectories: [...DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES],
+    unityFileExplorerHiddenDirectories: [...DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES],
     fonts: { ...defaultFonts },
   };
 }
@@ -232,6 +304,9 @@ function handleStorageChange(event: StorageEvent) {
   const next = load();
   Object.assign(state, next, {
     knowledgeFolderVisibility: { ...next.knowledgeFolderVisibility },
+    workspaceSectionVisibility: { ...next.workspaceSectionVisibility },
+    fileExplorerHiddenDirectories: [...next.fileExplorerHiddenDirectories],
+    unityFileExplorerHiddenDirectories: [...next.unityFileExplorerHiddenDirectories],
     fonts: { ...next.fonts },
   });
   applyFonts(state.fonts);
@@ -246,6 +321,8 @@ export function useDisplaySettings() {
     state[key] = (
       key === "sessionMessagePageSize"
         ? normalizeSessionMessagePageSize(value)
+        : key === "fileExplorerHiddenDirectories" || key === "unityFileExplorerHiddenDirectories"
+          ? normalizeHiddenDirectoryNames(value)
         : value
     ) as DisplaySettings[K];
     save({ ...state });

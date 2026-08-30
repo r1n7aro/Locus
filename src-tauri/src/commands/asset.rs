@@ -443,6 +443,7 @@ pub struct AssetDbOverview {
     /// processing, or `None` when the worker is idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watcher_current_file: Option<String>,
+    pub change_journal: crate::workspace_changes::WorkspaceChangeStatus,
     pub by_kind: Vec<AssetKindCount>,
     pub asset_risks: Vec<AssetRiskEntry>,
     pub duplicate_guids: DuplicateGuidOverview,
@@ -581,11 +582,9 @@ pub async fn asset_db_overview(
 ) -> Result<AssetDbOverview, AppError> {
     let scope = resolve_asset_workspace_scope(&workspace_ref, project_registry.inner()).await?;
     let runtime_core = scope.resolved().runtime().core();
-    let (watcher_running, watcher_queue_len, watcher_current_file) = (
-        scope.resolved().runtime().core().watchers_running(),
-        0,
-        None,
-    );
+    let (watcher_running, watcher_queue_len, watcher_current_file) =
+        runtime_core.asset_watcher_diagnostics();
+    let change_journal = runtime_core.workspace_changes().status();
     let project_root = scope.root();
     let last = runtime_core
         .asset_last_scan_info()
@@ -635,6 +634,7 @@ pub async fn asset_db_overview(
             watcher_running,
             watcher_queue_len,
             watcher_current_file: watcher_current_file.clone(),
+            change_journal: change_journal.clone(),
             by_kind: Vec::new(),
             asset_risks: Vec::new(),
             duplicate_guids: DuplicateGuidOverview::default(),
@@ -677,6 +677,7 @@ pub async fn asset_db_overview(
                 watcher_running,
                 watcher_queue_len,
                 watcher_current_file,
+                change_journal,
                 by_kind,
                 asset_risks,
                 duplicate_guids,
@@ -1009,6 +1010,7 @@ fn walker_score_match(rel_path: &str, query_terms: &[String]) -> Option<i32> {
 
 /// Return the [`AssetSearchRoot`] that owns `rel_path`, or `None` if the path
 /// does not begin with one of the three known roots.
+#[cfg(test)]
 fn root_for_rel_path(rel_path: &str) -> Option<AssetSearchRoot> {
     if let Some(rest) = rel_path.strip_prefix("Assets") {
         if rest.is_empty() || rest.starts_with('/') {
@@ -1975,9 +1977,14 @@ fn text_language_for_ext(ext: &str) -> Option<&'static str> {
         "yaml" | "yml" => Some("yaml"),
         "toml" => Some("toml"),
         "ini" | "cfg" | "conf" => Some("ini"),
-        "js" | "ts" => Some("typescript"),
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "vue" | "svelte" => Some("typescript"),
         "py" => Some("python"),
         "rs" => Some("rust"),
+        "go" => Some("go"),
+        "java" | "kt" | "kts" => Some("java"),
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" => Some("cpp"),
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => Some("shell"),
+        "sql" => Some("sql"),
         "html" | "htm" => Some("html"),
         "css" => Some("css"),
         // CSV / TSV / log are technically text but rarely useful as previews;
@@ -1988,9 +1995,9 @@ fn text_language_for_ext(ext: &str) -> Option<&'static str> {
 }
 
 /// Validates that `requested` is a workspace-relative file path. Symlinked
-/// directories are accepted when the path is reached through the workspace
-/// tree, matching Unity's treatment of linked asset folders.
-fn resolve_workspace_path(
+/// directories are accepted when the path is reached through an allowed
+/// linked Unity asset folder.
+pub(crate) fn resolve_workspace_path(
     workspace_root: &Path,
     requested: &str,
 ) -> Result<(PathBuf, String), AppError> {
@@ -2006,15 +2013,6 @@ fn resolve_workspace_path(
             "Asset preview path cannot be empty.",
         ));
     }
-    if root_for_rel_path(&rel_path).is_none() {
-        return Err(AppError::new(
-            "asset.preview.invalid_root",
-            format!(
-                "Asset preview only supports Assets, Packages, and ProjectSettings paths: {}",
-                requested
-            ),
-        ));
-    }
     let candidate = workspace_root.join(&rel_path);
     if !candidate.exists() {
         return Err(AppError::new(
@@ -2026,6 +2024,12 @@ fn resolve_workspace_path(
         return Err(AppError::new(
             "asset.preview.not_file",
             format!("Path is not a regular file: {}", requested),
+        ));
+    }
+    if !super::workspace::workspace_entry_target_allowed(workspace_root, &rel_path, &candidate) {
+        return Err(AppError::new(
+            "asset.preview.invalid_path",
+            format!("Path is not within the workspace: {}", requested),
         ));
     }
     Ok((candidate, rel_path))
@@ -3507,7 +3511,7 @@ mod tests {
     }
 
     #[test]
-    fn asset_preview_resolution_allows_files_inside_symlinked_asset_folders() {
+    fn file_preview_resolution_allows_files_inside_symlinked_asset_folders() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let workspace = temp.path().join("project");
         let external = temp.path().join("external-assets");
@@ -3529,7 +3533,7 @@ mod tests {
     }
 
     #[test]
-    fn asset_preview_resolution_rejects_symlinks_outside_asset_roots() {
+    fn file_preview_resolution_rejects_symlinks_outside_allowed_asset_roots() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let workspace = temp.path().join("project");
         let external = temp.path().join("external-docs");
@@ -3543,7 +3547,24 @@ mod tests {
 
         let err = resolve_workspace_path(&workspace, "Docs/Secret.txt")
             .expect_err("reject non-asset linked file");
-        assert_eq!(err.code, "asset.preview.invalid_root");
+        assert_eq!(err.code, "asset.preview.invalid_path");
+    }
+
+    #[test]
+    fn file_preview_resolution_accepts_regular_workspace_files() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(workspace.join("src/components")).expect("create source dir");
+        std::fs::write(workspace.join("src/components/App.vue"), b"<template />")
+            .expect("write source file");
+
+        let (resolved, rel_path) = resolve_workspace_path(&workspace, "src/components/App.vue")
+            .expect("resolve regular workspace file");
+        assert_eq!(rel_path, "src/components/App.vue");
+        assert_eq!(
+            std::fs::read_to_string(resolved).expect("read source file"),
+            "<template />"
+        );
     }
 
     #[test]

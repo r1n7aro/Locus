@@ -13,7 +13,8 @@ describe("Development collaboration navigation", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
     expect(workbench).toContain("function isCollaborationExpanded(projectId: string): boolean");
-    expect(workbench).toContain('resource.kind === "collaboration" || resource.kind === "checkout"');
+    expect(workbench).toContain('resource.kind === "checkout"');
+    expect(workbench).toContain('resource.kind === "section" && resource.section === "collab"');
     expect(workbench).toContain("const collaborationExpanded = isCollaborationExpanded(project.projectId);");
     expect(workbench).toContain("expanded: collaborationExpanded");
     expect(workbench).toContain("if (collaborationExpanded)");

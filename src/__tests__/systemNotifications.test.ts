@@ -23,7 +23,13 @@ const translations = {
 
 function createDisplayState(): DisplaySettings {
   return {
-    workspaceDisplayMode: "single",
+  workspaceDisplayMode: "single",
+  workspaceSectionVisibility: {
+    knowledge: true,
+    collab: true,
+    assets: true,
+    views: true,
+  },
     knowledgeFolderVisibility: {
       plan: true,
       memory: true,
@@ -31,6 +37,8 @@ function createDisplayState(): DisplaySettings {
       skill: true,
       reference: true,
     },
+    fileExplorerHiddenDirectories: [".git", "node_modules"],
+    unityFileExplorerHiddenDirectories: ["Library", "Temp"],
     showWelcomeSubtitle: true,
     showViewsTab: true,
     showPluginsTab: true,

@@ -11,7 +11,7 @@ use crate::session::models::{
     ProjectExplorerMutationResult, ProjectExplorerOperation, ProjectExplorerPresetSummary,
     ProjectExplorerSnapshot,
 };
-use crate::workspace_service::{ProjectId, ProjectRegistry};
+use crate::workspace_service::{ProjectId, ProjectRegistry, ResolvedWorkspaceScope, WorkspaceRef};
 
 pub const PROJECT_EXPLORER_CHANGED_EVENT: &str = "project-explorer-changed";
 
@@ -60,10 +60,13 @@ pub struct ProjectExplorerFilePreview {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_lines: Option<usize>,
     pub truncated: bool,
+    pub editable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkout_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,6 +546,13 @@ fn is_text_extension(extension: &str) -> bool {
             | "tsv"
             | "asmdef"
             | "asmref"
+            | "shader"
+            | "compute"
+            | "cginc"
+            | "hlsl"
+            | "glsl"
+            | "uss"
+            | "uxml"
     )
 }
 
@@ -573,21 +583,12 @@ fn unity_workspace_binding(
     None
 }
 
-#[tauri::command]
-pub async fn project_explorer_preview_file(
-    project_id: String,
-    path: String,
-    registry: State<'_, Arc<ProjectRegistry>>,
+fn build_file_preview(
+    registry: &ProjectRegistry,
+    project_id: &ProjectId,
+    canonical: &Path,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
-    let (project_id, root) = resolve_project(
-        registry.inner().as_ref(),
-        project_id,
-        "projectExplorerPreviewFile",
-    )?;
-    let snapshot = crate::workspace_tree::snapshot(&root, project_id.as_str())
-        .map_err(|error| explorer_error(error, "projectExplorerPreviewFile"))?;
-    let canonical = ensure_preview_path_authorized(&snapshot, Path::new(&path))?;
-    let metadata = std::fs::metadata(&canonical).map_err(|error| {
+    let metadata = std::fs::metadata(canonical).map_err(|error| {
         AppError::new(
             "workspace.explorer_file_metadata_failed",
             "The selected file could not be inspected.",
@@ -604,24 +605,28 @@ pub async fn project_explorer_preview_file(
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if let Some((checkout_id, workspace_generation, relative_path)) =
-        unity_workspace_binding(registry.inner().as_ref(), &project_id, &canonical)
-    {
-        return Ok(ProjectExplorerFilePreview {
-            path: canonical.to_string_lossy().into_owned(),
-            name,
-            extension,
-            size,
-            kind: "unity".to_string(),
-            mime_type: "application/x-unity-asset".to_string(),
-            text: None,
-            data_url: None,
-            total_lines: None,
-            truncated: false,
-            checkout_id: Some(checkout_id),
-            workspace_generation: Some(workspace_generation),
-            workspace_relative_path: Some(relative_path),
-        });
+    if !is_text_extension(&extension) {
+        if let Some((checkout_id, workspace_generation, relative_path)) =
+            unity_workspace_binding(registry, project_id, canonical)
+        {
+            return Ok(ProjectExplorerFilePreview {
+                path: canonical.to_string_lossy().into_owned(),
+                name,
+                extension,
+                size,
+                kind: "unity".to_string(),
+                mime_type: "application/x-unity-asset".to_string(),
+                text: None,
+                content_hash: None,
+                data_url: None,
+                total_lines: None,
+                truncated: false,
+                editable: false,
+                checkout_id: Some(checkout_id),
+                workspace_generation: Some(workspace_generation),
+                workspace_relative_path: Some(relative_path),
+            });
+        }
     }
 
     let mime_type = mime_for_extension(&extension).to_string();
@@ -638,7 +643,7 @@ pub async fn project_explorer_preview_file(
     };
     if let Some(kind) = media_kind {
         if size <= MAX_MEDIA_PREVIEW_BYTES {
-            let bytes = std::fs::read(&canonical).map_err(|error| {
+            let bytes = std::fs::read(canonical).map_err(|error| {
                 AppError::new(
                     "workspace.explorer_file_read_failed",
                     "The selected file could not be read.",
@@ -654,9 +659,11 @@ pub async fn project_explorer_preview_file(
                 kind: kind.to_string(),
                 mime_type: mime_type.clone(),
                 text: None,
+                content_hash: None,
                 data_url: Some(format!("data:{mime_type};base64,{encoded}")),
                 total_lines: None,
                 truncated: false,
+                editable: false,
                 checkout_id: None,
                 workspace_generation: None,
                 workspace_relative_path: None,
@@ -664,7 +671,7 @@ pub async fn project_explorer_preview_file(
         }
     }
 
-    let mut file = std::fs::File::open(&canonical).map_err(|error| {
+    let mut file = std::fs::File::open(canonical).map_err(|error| {
         AppError::new(
             "workspace.explorer_file_read_failed",
             "The selected file could not be read.",
@@ -686,6 +693,11 @@ pub async fn project_explorer_preview_file(
     if truncated {
         bytes.truncate(MAX_TEXT_PREVIEW_BYTES as usize);
     }
+    let content_hash = if truncated {
+        None
+    } else {
+        Some(blake3::hash(&bytes).to_hex().to_string())
+    };
     let looks_text = is_text_extension(&extension) || !bytes.contains(&0);
     if looks_text {
         if let Ok(text) = String::from_utf8(bytes) {
@@ -702,9 +714,11 @@ pub async fn project_explorer_preview_file(
                     mime_type
                 },
                 text: Some(text),
+                content_hash,
                 data_url: None,
                 total_lines: Some(total_lines),
                 truncated,
+                editable: !truncated,
                 checkout_id: None,
                 workspace_generation: None,
                 workspace_relative_path: None,
@@ -719,11 +733,251 @@ pub async fn project_explorer_preview_file(
         kind: "binary".to_string(),
         mime_type,
         text: None,
+        content_hash: None,
         data_url: None,
         total_lines: None,
         truncated: size > MAX_MEDIA_PREVIEW_BYTES,
+        editable: false,
         checkout_id: None,
         workspace_generation: None,
         workspace_relative_path: None,
     })
+}
+
+#[tauri::command]
+pub async fn project_explorer_preview_file(
+    project_id: String,
+    path: String,
+    registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<ProjectExplorerFilePreview, AppError> {
+    let (project_id, root) = resolve_project(
+        registry.inner().as_ref(),
+        project_id,
+        "projectExplorerPreviewFile",
+    )?;
+    let snapshot = crate::workspace_tree::snapshot(&root, project_id.as_str())
+        .map_err(|error| explorer_error(error, "projectExplorerPreviewFile"))?;
+    let canonical = ensure_preview_path_authorized(&snapshot, Path::new(&path))?;
+    build_file_preview(registry.inner().as_ref(), &project_id, &canonical)
+}
+
+fn resolve_workspace_file(
+    workspace_ref: &WorkspaceRef,
+    path: &str,
+    registry: &ProjectRegistry,
+) -> Result<(ResolvedWorkspaceScope, ProjectId, PathBuf), AppError> {
+    let resolved = registry
+        .resolve_workspace_ref(workspace_ref)
+        .map_err(|error| {
+            AppError::new(
+                "workspace.file_scope_unavailable",
+                "The requested workspace is unavailable.",
+            )
+            .detail(error.to_string())
+        })?;
+    let runtime = resolved.runtime();
+    let project_id = runtime.project_id().clone();
+    let (canonical, _) = super::asset::resolve_workspace_path(runtime.root(), path)?;
+    Ok((resolved, project_id, canonical))
+}
+
+#[tauri::command]
+pub async fn workspace_file_preview(
+    file_path: String,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<ProjectExplorerFilePreview, AppError> {
+    let (_scope, project_id, canonical) =
+        resolve_workspace_file(&workspace_ref, &file_path, registry.inner().as_ref())?;
+    build_file_preview(registry.inner().as_ref(), &project_id, &canonical)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextFileWriteValidationError {
+    CurrentFileNotEditable,
+    CurrentFileChanged,
+    EditedFileTooLarge,
+}
+
+fn validate_text_file_write(
+    current: &[u8],
+    content: &str,
+    expected_content_hash: &str,
+) -> Result<(), TextFileWriteValidationError> {
+    if current.len() as u64 > MAX_TEXT_PREVIEW_BYTES
+        || current.contains(&0)
+        || std::str::from_utf8(current).is_err()
+    {
+        return Err(TextFileWriteValidationError::CurrentFileNotEditable);
+    }
+    let expected_content_hash = expected_content_hash.trim();
+    let current_hash = blake3::hash(current).to_hex().to_string();
+    if expected_content_hash.is_empty() || expected_content_hash != current_hash {
+        return Err(TextFileWriteValidationError::CurrentFileChanged);
+    }
+    if content.len() as u64 > MAX_TEXT_PREVIEW_BYTES || content.as_bytes().contains(&0) {
+        return Err(TextFileWriteValidationError::EditedFileTooLarge);
+    }
+    Ok(())
+}
+
+fn write_text_file(
+    registry: &ProjectRegistry,
+    project_id: &ProjectId,
+    canonical: &Path,
+    content: &str,
+    expected_content_hash: &str,
+    operation: &'static str,
+) -> Result<ProjectExplorerFilePreview, AppError> {
+    let extension = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if unity_workspace_binding(registry, project_id, canonical).is_some()
+        && !is_text_extension(&extension)
+    {
+        return Err(AppError::new(
+            "workspace.explorer_file_uses_unity_inspector",
+            "This Unity asset is edited through Locus Inspector.",
+        )
+        .detail(canonical.to_string_lossy().into_owned())
+        .operation(operation));
+    }
+
+    let current = std::fs::read(canonical).map_err(|error| {
+        AppError::new(
+            "workspace.explorer_file_read_failed",
+            "The selected file could not be read.",
+        )
+        .detail(error.to_string())
+        .operation(operation)
+    })?;
+    if let Err(validation_error) =
+        validate_text_file_write(&current, content, expected_content_hash)
+    {
+        let (code, message) = match validation_error {
+            TextFileWriteValidationError::CurrentFileNotEditable => (
+                "workspace.explorer_file_not_editable",
+                "This file cannot be edited as UTF-8 text.",
+            ),
+            TextFileWriteValidationError::CurrentFileChanged => (
+                "workspace.explorer_file_changed",
+                "The file changed on disk after this editor loaded it.",
+            ),
+            TextFileWriteValidationError::EditedFileTooLarge => (
+                "workspace.explorer_file_too_large",
+                "The edited file exceeds the text editor limit.",
+            ),
+        };
+        return Err(AppError::new(code, message)
+            .detail(canonical.to_string_lossy().into_owned())
+            .operation(operation));
+    }
+    crate::config::atomic_write_config(canonical, content.as_bytes()).map_err(|error| {
+        AppError::new(
+            "workspace.explorer_file_write_failed",
+            "The edited file could not be saved.",
+        )
+        .detail(error)
+        .operation(operation)
+    })?;
+
+    build_file_preview(registry, project_id, canonical)
+}
+
+#[tauri::command]
+pub async fn project_explorer_write_file(
+    project_id: String,
+    path: String,
+    content: String,
+    expected_content_hash: String,
+    registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<ProjectExplorerFilePreview, AppError> {
+    let (resolved_project_id, root) = resolve_project(
+        registry.inner().as_ref(),
+        project_id,
+        "projectExplorerWriteFile",
+    )?;
+    let snapshot = crate::workspace_tree::snapshot(&root, resolved_project_id.as_str())
+        .map_err(|error| explorer_error(error, "projectExplorerWriteFile"))?;
+    let canonical = ensure_preview_path_authorized(&snapshot, Path::new(&path))?;
+    write_text_file(
+        registry.inner().as_ref(),
+        &resolved_project_id,
+        &canonical,
+        &content,
+        &expected_content_hash,
+        "projectExplorerWriteFile",
+    )
+}
+
+#[tauri::command]
+pub async fn workspace_file_write(
+    file_path: String,
+    content: String,
+    expected_content_hash: String,
+    workspace_ref: WorkspaceRef,
+    registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<ProjectExplorerFilePreview, AppError> {
+    let (_scope, project_id, canonical) =
+        resolve_workspace_file(&workspace_ref, &file_path, registry.inner().as_ref())?;
+    write_text_file(
+        registry.inner().as_ref(),
+        &project_id,
+        &canonical,
+        &content,
+        &expected_content_hash,
+        "workspaceFileWrite",
+    )
+}
+
+#[cfg(test)]
+mod file_write_tests {
+    use super::{
+        is_text_extension, validate_text_file_write, TextFileWriteValidationError,
+        MAX_TEXT_PREVIEW_BYTES,
+    };
+
+    #[test]
+    fn source_extensions_are_editable_while_structured_unity_assets_use_inspector() {
+        assert!(is_text_extension("cs"));
+        assert!(is_text_extension("shader"));
+        assert!(is_text_extension("asmdef"));
+        assert!(!is_text_extension("prefab"));
+        assert!(!is_text_extension("unity"));
+        assert!(!is_text_extension("asset"));
+    }
+
+    #[test]
+    fn text_writes_require_the_loaded_content_hash() {
+        let current = b"const value = 1;\n";
+        let hash = blake3::hash(current).to_hex().to_string();
+        assert_eq!(
+            validate_text_file_write(current, "const value = 2;\n", &hash),
+            Ok(())
+        );
+        assert_eq!(
+            validate_text_file_write(current, "const value = 2;\n", "stale"),
+            Err(TextFileWriteValidationError::CurrentFileChanged)
+        );
+    }
+
+    #[test]
+    fn text_writes_reject_binary_and_oversized_content() {
+        let binary = b"text\0binary";
+        let binary_hash = blake3::hash(binary).to_hex().to_string();
+        assert_eq!(
+            validate_text_file_write(binary, "next", &binary_hash),
+            Err(TextFileWriteValidationError::CurrentFileNotEditable)
+        );
+
+        let current = b"small";
+        let hash = blake3::hash(current).to_hex().to_string();
+        let oversized = "x".repeat(MAX_TEXT_PREVIEW_BYTES as usize + 1);
+        assert_eq!(
+            validate_text_file_write(current, &oversized, &hash),
+            Err(TextFileWriteValidationError::EditedFileTooLarge)
+        );
+    }
 }

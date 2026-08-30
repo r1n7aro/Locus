@@ -1,7 +1,6 @@
 import {
   computed,
   markRaw,
-  onMounted,
   onUnmounted,
   reactive,
   shallowRef,
@@ -11,15 +10,24 @@ import {
 } from "vue";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
-import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import * as sessionService from "../services/session";
 import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import { StreamingTextChunks } from "./streamingTextChunks";
 import { useThrottledStreamingText } from "./streamingRenderThrottle";
 import { hydrateChatMessagesIntent, withClientMessageId } from "./chatInputIntents";
 import { useChatInputSettings } from "./useChatInputSettings";
-import { buildPendingSessionInputDraft } from "./chatMessageDraft";
+import {
+  buildPendingSessionInputDraft,
+  buildUserMessageDraft,
+  type UserMessageDraft,
+} from "./chatMessageDraft";
 import { useModelStore } from "../stores/model";
+import type { WorkspaceRef } from "../services/project";
+import {
+  bindSessionStreamEventConsumer,
+  sessionStreamSourceMatchesWorkspace,
+  subscribeSessionStreamEventConsumer,
+} from "../services/sessionStreamEventHub";
 import {
   buildToolResultMessages,
   mergeUserMessage,
@@ -55,18 +63,29 @@ export interface EmbeddedChatRequest {
   assetRefs?: AssetRefAttachment[] | null;
 }
 
+interface EmbeddedSubmittedUserMessage {
+  draft: UserMessageDraft;
+  ownerKey: string;
+}
+
 interface EmbeddedChatState extends StreamState {
   key: string;
   sessionId: string | null;
   currentRunId: string | null;
-  inputText: string;
   error: string | null;
+  loading: boolean;
+  sessionAgentId: string | null;
+  sessionModelId: string | null;
+  sessionEffort: EffortLevel | null;
+  sessionFastMode: boolean | null;
   pendingRun: boolean;
   pendingInputs: PendingSessionInput[];
   acceptedPendingInputIds: Set<string>;
   deferredUserMessagesByRun: Map<string, ChatMessage[]>;
   localMergeGroupId: string | null;
   localFallbackMergeGroupId: string | null;
+  submittedUserMessagesByRun: Map<string, EmbeddedSubmittedUserMessage>;
+  cancelPendingLaunch: boolean;
   /** Chunked mirrors of the streaming text; see the chat store's counterparts.
    * markRaw keeps the reactive proxy from deep-wrapping them — growth is
    * observed through each stream's own version ref. */
@@ -81,6 +100,10 @@ export interface EmbeddedChatKnowledgeFocus {
 
 export interface UseEmbeddedChatSessionOptions {
   sessionKey: MaybeRefOrGetter<string>;
+  /** Attach the pane to an existing durable session. */
+  initialSessionId?: MaybeRefOrGetter<string | null | undefined>;
+  /** Required when a new embedded session is launched from an empty editor. */
+  workspaceRef?: MaybeRefOrGetter<WorkspaceRef | null | undefined>;
   sessionType?: string;
   sessionTitle?: MaybeRefOrGetter<string | null | undefined>;
   selectedModelId: MaybeRefOrGetter<string>;
@@ -113,14 +136,20 @@ function createState(key: string): EmbeddedChatState {
     key,
     sessionId: null,
     currentRunId: null,
-    inputText: "",
     error: null,
+    loading: false,
+    sessionAgentId: null,
+    sessionModelId: null,
+    sessionEffort: null,
+    sessionFastMode: null,
     pendingRun: false,
     pendingInputs: [],
     acceptedPendingInputIds: new Set<string>(),
     deferredUserMessagesByRun: new Map<string, ChatMessage[]>(),
     localMergeGroupId: null,
     localFallbackMergeGroupId: null,
+    submittedUserMessagesByRun: markRaw(new Map<string, EmbeddedSubmittedUserMessage>()),
+    cancelPendingLaunch: false,
     messages: [] as ChatMessage[],
     streamingText: "",
     rawStreamText: "",
@@ -144,6 +173,119 @@ function createState(key: string): EmbeddedChatState {
     thinkingStream: markRaw(new StreamingTextChunks()),
     livePartStreams: markRaw(new Map<string, StreamingTextChunks>()),
   });
+}
+
+// Editor tabs can move between groups, which briefly remounts their Vue
+// subtree. Keep the session reducer state keyed by the stable editor/session
+// key so drafts and live output survive that reparenting.
+const sharedEmbeddedChatStates = new Map<string, EmbeddedChatState>();
+const sharedEmbeddedChatSessionStates = new Map<string, EmbeddedChatState>();
+const sharedEmbeddedChatDrafts = new Map<string, { value: string }>();
+const sharedEmbeddedRestoredDrafts = new Map<string, { value: UserMessageDraft | null }>();
+const sharedEmbeddedChatRetainCounts = new WeakMap<EmbeddedChatState, number>();
+const MAX_SHARED_EMBEDDED_CHAT_STATES = 64;
+
+function sharedEmbeddedChatDraft(key: string): { value: string } {
+  const existing = sharedEmbeddedChatDrafts.get(key);
+  if (existing) {
+    sharedEmbeddedChatDrafts.delete(key);
+    sharedEmbeddedChatDrafts.set(key, existing);
+    return existing;
+  }
+  const created = reactive({ value: "" });
+  sharedEmbeddedChatDrafts.set(key, created);
+  if (sharedEmbeddedChatDrafts.size > MAX_SHARED_EMBEDDED_CHAT_STATES) {
+    const oldest = sharedEmbeddedChatDrafts.keys().next().value as string | undefined;
+    if (oldest && oldest !== key) sharedEmbeddedChatDrafts.delete(oldest);
+  }
+  return created;
+}
+
+function sharedEmbeddedRestoredDraft(key: string): { value: UserMessageDraft | null } {
+  const existing = sharedEmbeddedRestoredDrafts.get(key);
+  if (existing) return existing;
+  const created = reactive<{ value: UserMessageDraft | null }>({ value: null });
+  sharedEmbeddedRestoredDrafts.set(key, created);
+  if (sharedEmbeddedRestoredDrafts.size > MAX_SHARED_EMBEDDED_CHAT_STATES) {
+    const oldest = sharedEmbeddedRestoredDrafts.keys().next().value as string | undefined;
+    if (oldest && oldest !== key) sharedEmbeddedRestoredDrafts.delete(oldest);
+  }
+  return created;
+}
+
+function restoreEmbeddedSubmittedDraft(submitted: EmbeddedSubmittedUserMessage): void {
+  const composer = sharedEmbeddedChatDraft(submitted.ownerKey);
+  if (composer.value) return;
+  sharedEmbeddedRestoredDraft(submitted.ownerKey).value = submitted.draft;
+}
+
+function removeEvictedSharedState(state: EmbeddedChatState): void {
+  if ([...sharedEmbeddedChatStates.values()].some((candidate) => candidate === state)) return;
+  if ((sharedEmbeddedChatRetainCounts.get(state) ?? 0) > 0) return;
+  if (state.sessionId && sharedEmbeddedChatSessionStates.get(state.sessionId) === state) {
+    sharedEmbeddedChatSessionStates.delete(state.sessionId);
+  }
+}
+
+function retainSharedEmbeddedChatState(state: EmbeddedChatState): void {
+  sharedEmbeddedChatRetainCounts.set(state, (sharedEmbeddedChatRetainCounts.get(state) ?? 0) + 1);
+}
+
+function releaseSharedEmbeddedChatState(state: EmbeddedChatState): void {
+  const nextCount = Math.max(0, (sharedEmbeddedChatRetainCounts.get(state) ?? 0) - 1);
+  if (nextCount > 0) {
+    sharedEmbeddedChatRetainCounts.set(state, nextCount);
+    return;
+  }
+  sharedEmbeddedChatRetainCounts.delete(state);
+  removeEvictedSharedState(state);
+}
+
+function rememberSharedEmbeddedChatState(key: string, state: EmbeddedChatState): EmbeddedChatState {
+  sharedEmbeddedChatStates.delete(key);
+  sharedEmbeddedChatStates.set(key, state);
+  if (sharedEmbeddedChatStates.size > MAX_SHARED_EMBEDDED_CHAT_STATES) {
+    const oldest = sharedEmbeddedChatStates.keys().next().value as string | undefined;
+    if (oldest && oldest !== key) {
+      const evicted = sharedEmbeddedChatStates.get(oldest);
+      sharedEmbeddedChatStates.delete(oldest);
+      if (evicted) removeEvictedSharedState(evicted);
+    }
+  }
+  return state;
+}
+
+function bindSharedEmbeddedChatSession(
+  state: EmbeddedChatState,
+  sessionId: string,
+): EmbeddedChatState {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) return state;
+  const existing = sharedEmbeddedChatSessionStates.get(normalizedSessionId);
+  if (existing) return existing;
+  state.sessionId = normalizedSessionId;
+  sharedEmbeddedChatSessionStates.set(normalizedSessionId, state);
+  return state;
+}
+
+function sharedEmbeddedChatState(key: string, sessionId?: string | null): EmbeddedChatState {
+  const normalizedSessionId = sessionId?.trim() ?? "";
+  if (normalizedSessionId) {
+    const sessionState = sharedEmbeddedChatSessionStates.get(normalizedSessionId);
+    if (sessionState) return rememberSharedEmbeddedChatState(key, sessionState);
+  }
+  const existing = sharedEmbeddedChatStates.get(key);
+  if (existing) {
+    const bound = normalizedSessionId
+      ? bindSharedEmbeddedChatSession(existing, normalizedSessionId)
+      : existing;
+    return rememberSharedEmbeddedChatState(key, bound);
+  }
+  const created = createState(key);
+  const bound = normalizedSessionId
+    ? bindSharedEmbeddedChatSession(created, normalizedSessionId)
+    : created;
+  return rememberSharedEmbeddedChatState(key, bound);
 }
 
 function ensureEmbeddedPartStream(state: EmbeddedChatState, partId: string): StreamingTextChunks {
@@ -382,29 +524,6 @@ function cloneRuntimeToolCalls(toolCalls: ToolCallDisplay[] | undefined): ToolCa
 
 function cloneRuntimeJson<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
-}
-
-function clearState(state: EmbeddedChatState) {
-  state.sessionId = null;
-  state.currentRunId = null;
-  state.inputText = "";
-  state.error = null;
-  state.pendingRun = false;
-  state.pendingInputs = [];
-  state.acceptedPendingInputIds.clear();
-  state.deferredUserMessagesByRun.clear();
-  state.localMergeGroupId = null;
-  state.localFallbackMergeGroupId = null;
-  state.messages = [];
-  state.pendingQuestion = null;
-  state.pendingToolConfirms = [];
-  state.tokenUsage = emptyTokenUsage();
-  state.todos = [];
-  state.showTodoPanel = false;
-  state.undoableMessageIds = new Set<string>();
-  state.streamSequence = 0;
-  state.isCompacting = false;
-  resetRoundState(state);
 }
 
 function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDetail) {
@@ -700,34 +819,101 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
 export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const modelStore = useModelStore();
   const statesByKey = new Map<string, EmbeddedChatState>();
-  const sessionIdToKey = new Map<string, string>();
-  const activeState = shallowRef<EmbeddedChatState>(createState(toValue(options.sessionKey)));
+  const sessionStates = new Map<string, EmbeddedChatState>();
+  const activeState = shallowRef<EmbeddedChatState>(sharedEmbeddedChatState(
+    toValue(options.sessionKey),
+    toValue(options.initialSessionId) ?? null,
+  ));
+  const activeDraft = shallowRef(sharedEmbeddedChatDraft(toValue(options.sessionKey)));
+  const activeRestoredDraft = shallowRef(sharedEmbeddedRestoredDraft(toValue(options.sessionKey)));
+  retainSharedEmbeddedChatState(activeState.value);
 
-  function ensureState(key: string) {
-    const existing = statesByKey.get(key);
-    if (existing) return existing;
-    const created = createState(key);
-    statesByKey.set(key, created);
-    return created;
+  function replaceActiveState(state: EmbeddedChatState): void {
+    if (activeState.value === state) return;
+    const previous = activeState.value;
+    retainSharedEmbeddedChatState(state);
+    activeState.value = state;
+    releaseSharedEmbeddedChatState(previous);
   }
 
-  function syncActiveState(key: string) {
-    activeState.value = ensureState(key);
+  function ensureState(key: string, sessionId?: string | null) {
+    const shared = sharedEmbeddedChatState(key, sessionId);
+    statesByKey.set(key, shared);
+    if (shared.sessionId) sessionStates.set(shared.sessionId, shared);
+    return shared;
+  }
+
+  function syncActiveState(key: string, sessionId?: string | null) {
+    replaceActiveState(ensureState(key, sessionId));
+    activeDraft.value = sharedEmbeddedChatDraft(key);
+    activeRestoredDraft.value = sharedEmbeddedRestoredDraft(key);
+  }
+
+  const sessionHydrationEpochs = new Map<string, number>();
+
+  function replayBufferedSessionEvents(sessionId: string): void {
+    for (const dispatch of bindSessionStreamEventConsumer(sessionId)) {
+      if (!sessionStreamSourceMatchesWorkspace(dispatch.source, toValue(options.workspaceRef))) continue;
+      handleStreamEvent(dispatch.event);
+    }
+  }
+
+  async function hydrateExistingSession(state: EmbeddedChatState, sessionId: string) {
+    const normalizedSessionId = sessionId.trim();
+    if (!normalizedSessionId) return;
+    if (state.sessionId === normalizedSessionId && state.messages.length > 0) {
+      // The shared state is already authoritative. Mark the transport binding
+      // and drop any pre-bind buffer that the state has already materialized.
+      bindSessionStreamEventConsumer(normalizedSessionId);
+      return;
+    }
+    const epoch = (sessionHydrationEpochs.get(state.key) ?? 0) + 1;
+    sessionHydrationEpochs.set(state.key, epoch);
+    if (state.sessionId && state.sessionId !== normalizedSessionId) {
+      sessionStates.delete(state.sessionId);
+    }
+    state = bindSharedEmbeddedChatSession(state, normalizedSessionId);
+    state.loading = true;
+    state.error = null;
+    sessionStates.set(normalizedSessionId, state);
+    let hydrated = false;
+    try {
+      const [detail, usage] = await Promise.all([
+        sessionService.loadSession(normalizedSessionId),
+        sessionService.getSessionUsage(normalizedSessionId).catch(() => null),
+      ]);
+      if (
+        sessionHydrationEpochs.get(state.key) !== epoch
+        || state.sessionId !== normalizedSessionId
+      ) return;
+      state.messages = hydrateChatMessagesIntent(detail.messages);
+      state.pendingInputs = visiblePendingInputs(detail.pendingInputs ?? []);
+      state.sessionAgentId = detail.agentId ?? null;
+      state.sessionModelId = detail.lastModelId ?? null;
+      state.sessionEffort = detail.lastEffort ?? null;
+      state.sessionFastMode = detail.lastFastMode ?? null;
+      if (usage) state.tokenUsage = usage;
+      applySessionRuntimeSnapshot(state, detail);
+      hydrated = true;
+    } catch (error) {
+      if (
+        sessionHydrationEpochs.get(state.key) !== epoch
+        || state.sessionId !== normalizedSessionId
+      ) return;
+      state.error = normalizeAppError(error).message;
+    } finally {
+      if (sessionHydrationEpochs.get(state.key) === epoch) state.loading = false;
+      if (hydrated) {
+        // The backend snapshot includes all events received before this load.
+        bindSessionStreamEventConsumer(normalizedSessionId);
+      } else {
+        replayBufferedSessionEvents(normalizedSessionId);
+      }
+    }
   }
 
   function resolveStateForEvent(event: StreamEvent) {
-    const mappedKey = sessionIdToKey.get(event.sessionId);
-    if (mappedKey) {
-      return statesByKey.get(mappedKey) ?? null;
-    }
-    if (event.type !== "runStart") return null;
-    const pendingState = [...statesByKey.values()].find((state) => state.pendingRun && !state.sessionId);
-    if (!pendingState) return null;
-    pendingState.sessionId = event.sessionId;
-    pendingState.currentRunId = event.runId;
-    pendingState.pendingRun = false;
-    sessionIdToKey.set(event.sessionId, pendingState.key);
-    return pendingState;
+    return sessionStates.get(event.sessionId) ?? null;
   }
 
   async function reloadSessionMessagesAfterError(state: EmbeddedChatState, sessionId: string) {
@@ -802,6 +988,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       return;
     }
 
+    const submittedUserMessage = event.type === "cancelled"
+      ? state.submittedUserMessagesByRun.get(event.runId) ?? null
+      : null;
     const mutations = reduceStreamEvent(state, event);
     traceEmbeddedOrder(state, "streamEventMutationBatch", {
       event: traceEmbeddedStreamEvent(event),
@@ -820,6 +1009,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.error = normalizeAppError(event.error).message;
       state.currentRunId = null;
       state.pendingRun = false;
+      state.submittedUserMessagesByRun.delete(event.runId);
       void reloadSessionMessagesAfterError(state, event.sessionId);
       return;
     }
@@ -856,6 +1046,10 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       }
       state.currentRunId = null;
       state.pendingRun = false;
+      state.submittedUserMessagesByRun.delete(event.runId);
+      if (event.type === "cancelled" && event.removedUserMessage && submittedUserMessage) {
+        restoreEmbeddedSubmittedDraft(submittedUserMessage);
+      }
       if (queuedRequest) {
         globalThis.setTimeout(() => {
           void send(queuedRequest);
@@ -867,7 +1061,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   async function send(requestOverride?: EmbeddedChatRequest | null) {
     const state = activeState.value;
 
-    const input = state.inputText.trim();
+    const input = activeDraft.value.value.trim();
     const request = requestOverride ?? (input ? options.buildRequest(input) : null);
     if (!request) return;
     if (!requestOverride && !input) return;
@@ -922,7 +1116,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
             mergePendingInputList(state.pendingInputs, pending),
           );
         }
-        state.inputText = "";
+        activeDraft.value.value = "";
         state.error = null;
       } catch (error) {
         const err = normalizeAppError(error);
@@ -966,7 +1160,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
             mergePendingInputList(state.pendingInputs, pending),
           );
           state.localFallbackMergeGroupId = mergeGroupId;
-          state.inputText = "";
+          activeDraft.value.value = "";
           state.error = null;
           if (!state.isStreaming || state.currentRunId !== pending.runId) {
             state.pendingInputs = state.pendingInputs.filter((input) => input.id !== pending.id);
@@ -993,7 +1187,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const userIntent = withClientMessageId(request.userIntent, pendingMessageId);
     const userIntentSignature = JSON.stringify(userIntent);
 
-    state.messages.push({
+    const pendingUserMessage: ChatMessage = {
       id: pendingMessageId,
       role: "user",
       content: displayText,
@@ -1002,9 +1196,15 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : undefined,
       thinkingSignature: userIntentSignature,
       intentMeta: userIntent,
-    });
+    };
+    const submittedUserMessage: EmbeddedSubmittedUserMessage = {
+      draft: buildUserMessageDraft(pendingUserMessage),
+      ownerKey: toValue(options.sessionKey),
+    };
+    state.cancelPendingLaunch = false;
+    state.messages.push(pendingUserMessage);
 
-    state.inputText = "";
+    activeDraft.value.value = "";
     state.error = null;
     state.pendingQuestion = null;
     state.pendingToolConfirms = [];
@@ -1018,6 +1218,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
     try {
       const launch = await sessionService.chat({
+        workspaceRef: toValue(options.workspaceRef) ?? null,
         sessionId: state.sessionId,
         text: request.text,
         sessionTitle: toValue(options.sessionTitle) ?? null,
@@ -1043,15 +1244,33 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         knowledgeDocPath: knowledgeFocus?.path ?? null,
       });
 
-      state.sessionId = launch.sessionId;
-      state.currentRunId = launch.runId;
-      state.pendingRun = false;
-      sessionIdToKey.set(launch.sessionId, state.key);
+      const boundState = bindSharedEmbeddedChatSession(state, launch.sessionId);
+      const cancelAfterLaunch = state.cancelPendingLaunch;
+      state.cancelPendingLaunch = false;
+      boundState.submittedUserMessagesByRun.set(launch.runId, submittedUserMessage);
+      boundState.currentRunId = launch.runId;
+      boundState.pendingRun = false;
+      boundState.sessionAgentId = toValue(options.selectedAgentId) ?? null;
+      boundState.sessionModelId = selectedModelId;
+      boundState.sessionEffort = toValue(options.effort) ?? null;
+      boundState.sessionFastMode = toValue(options.fastMode) ?? false;
+      sessionStates.set(launch.sessionId, boundState);
+      if (activeState.value === state && boundState !== state) {
+        replaceActiveState(boundState);
+      }
+      replayBufferedSessionEvents(launch.sessionId);
+      if (cancelAfterLaunch) {
+        void sessionService.cancelChat(launch.sessionId).catch((error) => {
+          boundState.error = normalizeAppError(error).message;
+        });
+      }
     } catch (error) {
       state.isStreaming = false;
       state.pendingRun = false;
       state.isCompacting = false;
       state.messages = state.messages.filter((message) => message.id !== pendingMessageId);
+      state.cancelPendingLaunch = false;
+      restoreEmbeddedSubmittedDraft(submittedUserMessage);
       resetRoundState(state);
       state.error = normalizeAppError(error).message;
     }
@@ -1150,13 +1369,17 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const deleted = await deleteQueuedFollowUp();
     if (!deleted) return null;
 
-    state.inputText = draft.text;
+    activeDraft.value.value = draft.text;
     return draft;
   }
 
   async function cancel() {
     const state = activeState.value;
-    if (!state.sessionId || !state.isStreaming) return;
+    if (!state.isStreaming) return;
+    if (state.pendingRun && !state.currentRunId) {
+      state.cancelPendingLaunch = true;
+    }
+    if (!state.sessionId) return;
     try {
       await sessionService.cancelChat(state.sessionId);
     } catch (error) {
@@ -1227,19 +1450,45 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   }
 
   function resetSession() {
+    const previous = activeState.value;
+    if (previous.sessionId) sessionStates.delete(previous.sessionId);
+
+    // A durable session state can be shared by several editor panes. Starting a
+    // new session detaches only this editor key so the other panes keep their
+    // existing transcript and runtime state.
+    const key = toValue(options.sessionKey);
+    const fresh = rememberSharedEmbeddedChatState(key, createState(key));
+    statesByKey.set(key, fresh);
+    replaceActiveState(fresh);
+    activeDraft.value.value = "";
+    activeRestoredDraft.value.value = null;
+  }
+
+  function setExecutionSelection(selection: {
+    agentId?: string | null;
+    modelId?: string | null;
+    effort?: EffortLevel | null;
+    fastMode?: boolean | null;
+  }): void {
     const state = activeState.value;
-    if (state.sessionId) {
-      sessionIdToKey.delete(state.sessionId);
-    }
-    clearState(state);
+    state.sessionAgentId = selection.agentId ?? null;
+    state.sessionModelId = selection.modelId ?? null;
+    state.sessionEffort = selection.effort ?? null;
+    state.sessionFastMode = selection.fastMode ?? null;
   }
 
   const inputText = computed({
-    get: () => activeState.value.inputText,
+    get: () => activeDraft.value.value,
     set: (value: string) => {
-      activeState.value.inputText = value;
+      activeDraft.value.value = value;
     },
   });
+  const restoredComposerDraft = computed(() => activeRestoredDraft.value.value);
+
+  function clearRestoredComposerDraft(draft?: UserMessageDraft | null): void {
+    if (draft && activeRestoredDraft.value.value !== draft) return;
+    activeRestoredDraft.value.value = null;
+  }
 
   const activeKey = computed(() => toValue(options.sessionKey));
   const messages = computed(() => activeState.value.messages);
@@ -1255,8 +1504,14 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const isStreaming = computed(() => activeState.value.isStreaming);
   const isCompacting = computed(() => activeState.value.isCompacting);
   const isThinking = computed(() => activeState.value.isThinking);
+  const hasThinking = computed(() => (
+    activeState.value.streamingThinking.length > 0
+    || activeState.value.liveRenderParts.some((part) => part.kind === "thinking")
+  ));
   const thinkingDuration = computed(() => activeState.value.thinkingDuration);
   const activeToolCalls = computed(() => activeState.value.activeToolCalls);
+  const tokenUsage = computed(() => activeState.value.tokenUsage);
+  const undoableMessageIds = computed(() => activeState.value.undoableMessageIds);
   const pendingQuestion = computed(() => activeState.value.pendingQuestion);
   const pendingToolConfirms = computed(() => activeState.value.pendingToolConfirms);
   const queuedFollowUp = computed(() => {
@@ -1273,33 +1528,40 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     };
   });
   const errorMessage = computed(() => activeState.value.error);
+  const isLoading = computed(() => activeState.value.loading);
   const sessionId = computed(() => activeState.value.sessionId);
+  const sessionAgentId = computed(() => activeState.value.sessionAgentId);
+  const sessionModelId = computed(() => activeState.value.sessionModelId);
+  const sessionEffort = computed(() => activeState.value.sessionEffort);
+  const sessionFastMode = computed(() => activeState.value.sessionFastMode);
 
-  watch(activeKey, (key) => {
-    syncActiveState(key);
+  const requestedSessionId = computed(() => toValue(options.initialSessionId)?.trim() ?? "");
+
+  // Subscribe synchronously during setup. The app bootstrap owns the Tauri
+  // listeners; this in-memory subscription has no async registration window
+  // while an editor is reparented between workbench panes.
+  const unsubscribeStreamEvents = subscribeSessionStreamEventConsumer(
+    ({ event, source }) => {
+      if (!sessionStreamSourceMatchesWorkspace(source, toValue(options.workspaceRef))) return null;
+      return resolveStateForEvent(event);
+    },
+    ({ event }) => handleStreamEvent(event),
+  );
+
+  watch([activeKey, requestedSessionId], ([key, requestedId]) => {
+    syncActiveState(key, requestedId || null);
+    if (requestedId) void hydrateExistingSession(activeState.value, requestedId);
   }, { immediate: true });
 
-  let unlisten: RuntimeUnsubscribe | null = null;
-  let destroyed = false;
-
-  onMounted(async () => {
-    const release = await getLocusRuntime().subscribe<StreamEvent>("stream-event", (payload) => {
-      handleStreamEvent(payload);
-    });
-    if (destroyed) {
-      release();
-      return;
-    }
-    unlisten = release;
-  });
-
   onUnmounted(() => {
-    destroyed = true;
-    unlisten?.();
+    unsubscribeStreamEvents();
+    releaseSharedEmbeddedChatState(activeState.value);
   });
 
   return {
     inputText,
+    restoredComposerDraft,
+    clearRestoredComposerDraft,
     messages,
     streamingText,
     thinkingText,
@@ -1310,13 +1572,21 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     isStreaming,
     isCompacting,
     isThinking,
+    hasThinking,
     thinkingDuration,
     activeToolCalls,
+    tokenUsage,
+    undoableMessageIds,
     pendingQuestion,
     pendingToolConfirms,
     queuedFollowUp,
     errorMessage,
+    isLoading,
     sessionId,
+    sessionAgentId,
+    sessionModelId,
+    sessionEffort,
+    sessionFastMode,
     send,
     sendComposerPayload,
     insertQueuedFollowUp,
@@ -1324,6 +1594,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     reEditQueuedFollowUp,
     cancel,
     resetSession,
+    setExecutionSelection,
     answerQuestion,
     answerToolConfirm,
     answerAllToolConfirms,

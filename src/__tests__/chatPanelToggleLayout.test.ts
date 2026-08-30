@@ -15,7 +15,7 @@ describe("chat panel toggle layout", () => {
     const tokenUsageBar = read("src/components/chat/TokenUsageBar.vue");
     const transcript = read("src/components/chat/ChatTranscript.vue");
 
-    expect(chatView).toContain("const hasPanelToggleRow = computed(() => chatChangesStore.hasAnyChanges);");
+    expect(chatView).toContain("const hasPanelToggleRow = computed(() => !props.scopedSession && chatChangesStore.hasAnyChanges);");
     expect(chatView).toContain("const inputControlsCollapsed = ref(false);");
     expect(chatView).toContain("const inputControlsSwitching = ref(false);");
     expect(chatView).toContain("const INPUT_CONTROLS_SWITCH_VISIBLE_MS = 120;");

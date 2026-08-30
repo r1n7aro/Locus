@@ -74,19 +74,47 @@ import { useProjectStore } from "../../stores/project";
 import { useUiStore } from "../../stores/ui";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import { useWorkspaceExplorerStore } from "../../stores/workspaceExplorer";
+import {
+  createWorkbenchEditorInput,
+  useWorkbenchStore,
+} from "../../stores/workbench";
 import type {
   DevelopmentResourceRef,
   ProjectExplorerMountEntry,
   ProjectExplorerNode,
+  ProjectExplorerOperation,
   ProjectKnowledgeDocument,
+  WorkbenchDropDirection,
+  WorkbenchEditorGroup,
+  WorkbenchEditorInput,
 } from "../../types/workbench";
-import type { AssetRefAttachment, SessionSummary } from "../../types";
+import type { AssetRefAttachment, KnowledgeDocumentType, SessionSummary } from "../../types";
 import type { UserMessageDraft } from "../../composables/chatMessageDraft";
 import { emptyComposerIntent } from "../../composables/chatInputIntents";
-import ChatWorkspaceView from "../ChatWorkspaceView.vue";
 import CollabView from "../CollabView.vue";
+import AssetView from "../AssetView.vue";
 import KnowledgeView from "../KnowledgeView.vue";
+import ViewPackageView from "../ViewPackageView.vue";
+import WorkbenchEditorTabs from "./WorkbenchEditorTabs.vue";
+import WorkbenchSessionEditor from "./WorkbenchSessionEditor.vue";
+import WorkbenchAssetEditor from "./WorkbenchAssetEditor.vue";
+import WorkbenchSplitHost from "./WorkbenchSplitHost.vue";
+import WorkspaceDirectoryPreview from "./WorkspaceDirectoryPreview.vue";
 import WorkspaceFilePreview from "./WorkspaceFilePreview.vue";
+import {
+  WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE,
+  type WorkbenchEditorTabInternalDragData,
+} from "./workbenchDrag";
+import {
+  workbenchSplitDirectionAtPoint,
+  workbenchTabInsertionIndexAtPoint,
+} from "./workbenchDropGeometry";
+import { workbenchComposerFileAttachment } from "./workbenchComposerDrop";
+import {
+  WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE,
+  type WorkbenchReferenceDragData,
+  type WorkbenchReferenceDragEntry,
+} from "./workbenchReferenceDrag";
 import {
   KNOWLEDGE_INTERNAL_DRAG_TYPE,
   type KnowledgeInternalDragData,
@@ -118,12 +146,18 @@ import {
   type InternalDropTargetRegistration,
   useInternalDragController,
 } from "../../composables/useInternalDrag";
+import {
+  resolveWorkspaceSessionContextIds,
+  resolveWorkspaceSessionSelection,
+} from "./workspaceSessionSelection";
 
 type ItemKind =
   | "project"
   | "newSession"
   | "knowledgeRoot"
   | "collaboration"
+  | "assetsRoot"
+  | "viewsRoot"
   | "checkout"
   | "folder"
   | "empty"
@@ -145,11 +179,25 @@ interface WorkspaceDragPreview {
 
 interface WorkspaceLayoutInternalDragData {
   item: DevelopmentTreeItem;
+  items?: DevelopmentTreeItem[];
 }
+
+type WorkbenchInternalDragData =
+  | WorkspaceLayoutInternalDragData
+  | KnowledgeInternalDragData
+  | WorkbenchReferenceDragData
+  | WorkbenchEditorTabInternalDragData;
 
 type WorkbenchInternalDropIntent =
   | { kind: "layout"; layout: LayoutDropIntent; target: DevelopmentTreeItem | null }
-  | { kind: "newSession"; target: DevelopmentTreeItem };
+  | { kind: "newSession"; target: DevelopmentTreeItem }
+  | { kind: "composer"; paneId: string; editorId: string }
+  | {
+      kind: "editor";
+      paneId: string;
+      direction: WorkbenchDropDirection;
+      index?: number;
+    };
 
 const WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE = "locus/workspace-layout";
 
@@ -168,6 +216,19 @@ interface DevelopmentTreeItem extends WorkspaceTreeItem {
     dropPreview?: WorkspaceDragPreview;
     dropParentNodeId?: string | null;
   };
+}
+
+interface DevelopmentSessionTarget {
+  item: DevelopmentTreeItem;
+  projectId: string;
+  session: SessionSummary;
+}
+
+interface DevelopmentContextMenuState {
+  x: number;
+  y: number;
+  item: DevelopmentTreeItem;
+  sessionTargets?: DevelopmentSessionTarget[];
 }
 
 interface FolderDialogState {
@@ -196,11 +257,20 @@ interface PresetDialogState {
   value: string;
 }
 
-interface SessionDialogState {
-  mode: "rename" | "delete";
-  projectId: string;
-  session: SessionSummary;
+interface SessionDeleteDialogState {
+  targets: DevelopmentSessionTarget[];
+}
+
+interface SessionInlineRenameState {
+  sessionId: string;
+  originalTitle: string;
   value: string;
+}
+
+interface DirtyEditorCloseDialogState {
+  paneId: string;
+  editorId: string;
+  title: string;
 }
 
 interface LayoutDropIntent {
@@ -219,6 +289,7 @@ interface SettlingLayoutDrop {
 
 const workspaceContextStore = useWorkspaceContextStore();
 const explorerStore = useWorkspaceExplorerStore();
+const workbenchStore = useWorkbenchStore();
 const chatStore = useChatStore();
 const modelStore = useModelStore();
 const agentStore = useAgentStore();
@@ -227,9 +298,27 @@ const projectStore = useProjectStore();
 const uiStore = useUiStore();
 const { state: displaySettings, set: setDisplaySetting } = useDisplaySettings();
 
+const WORKBENCH_WINDOW_ID = "main";
+const initialWorkbenchWorkspaceScopeId = displaySettings.workspaceDisplayMode === "single"
+  ? workspaceContextStore.focusedCheckout?.checkoutId ?? null
+  : null;
+workbenchStore.switchWorkspaceScope(WORKBENCH_WINDOW_ID, initialWorkbenchWorkspaceScopeId);
+const workbenchWindow = computed(() => workbenchStore.ensureWindow(WORKBENCH_WINDOW_ID));
+const workbenchWorkspaceScopeId = computed(() => (
+  displaySettings.workspaceDisplayMode === "single"
+    ? workspaceContextStore.focusedCheckout?.checkoutId
+      ?? workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID)
+      ?? null
+    : null
+));
+
 const expanded = ref<Set<string>>(new Set());
-const activeResource = ref<DevelopmentResourceRef | null>(null);
-const contextMenu = ref<{ x: number; y: number; item: DevelopmentTreeItem } | null>(null);
+const activeResource = ref<DevelopmentResourceRef | null>(
+  workbenchStore.activeEditor(WORKBENCH_WINDOW_ID)?.resource ?? null,
+);
+const selectedSessionIds = ref<Set<string>>(new Set());
+const lastSessionSelectionAnchorId = ref<string | null>(null);
+const contextMenu = ref<DevelopmentContextMenuState | null>(null);
 const displayMenu = ref<{ x: number; y: number } | null>(null);
 const workspaceMenu = ref<{ x: number; y: number } | null>(null);
 const folderDialog = ref<FolderDialogState | null>(null);
@@ -239,9 +328,12 @@ const inlineCreateInput = ref<HTMLInputElement | null>(null);
 const inlineCreateRow = ref<HTMLElement | null>(null);
 const presetDialog = ref<PresetDialogState | null>(null);
 const presetInput = ref<HTMLInputElement | null>(null);
-const sessionDialog = ref<SessionDialogState | null>(null);
-const sessionInput = ref<HTMLInputElement | null>(null);
-const chatWorkspaceView = ref<InstanceType<typeof ChatWorkspaceView> | null>(null);
+const sessionDeleteDialog = ref<SessionDeleteDialogState | null>(null);
+const sessionInlineRename = ref<SessionInlineRenameState | null>(null);
+const sessionRenameInput = ref<HTMLInputElement | null>(null);
+const sessionEditorRefs = new Map<string, InstanceType<typeof WorkbenchSessionEditor>>();
+const workspaceFileEditorRefs = new Map<string, InstanceType<typeof WorkspaceFilePreview>>();
+const dirtyEditorCloseDialog = ref<DirtyEditorCloseDialogState | null>(null);
 const internalDrag = useInternalDragController();
 const workbenchRootRef = ref<HTMLElement | null>(null);
 const explorerRootRef = ref<HTMLElement | null>(null);
@@ -253,6 +345,10 @@ const dragging = computed<DevelopmentTreeItem | null>(() => {
 });
 const dropTargetKey = ref<string | null>(null);
 const layoutDropIntent = ref<LayoutDropIntent | null>(null);
+const editorDropIntent = ref<Extract<WorkbenchInternalDropIntent, { kind: "editor" }> | null>(null);
+const composerDropTarget = ref<
+  Extract<WorkbenchInternalDropIntent, { kind: "composer" }> | null
+>(null);
 const settlingLayoutDrop = ref<SettlingLayoutDrop | null>(null);
 const renderedLayoutDropIntent = computed(() => (
   layoutDropIntent.value ?? settlingLayoutDrop.value?.intent ?? null
@@ -268,18 +364,25 @@ const unityAssetWorkspaceDragRefs = ref<AssetRefAttachment[]>([]);
 const workspaceDragPointer = ref({ x: 0, y: 0, visible: false });
 const workspaceDropAffordanceActive = computed(() => (
   internalDrag.isDraggingType(KNOWLEDGE_INTERNAL_DRAG_TYPE)
+  || internalDrag.isDraggingType(WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE)
   || internalDrag.isDraggingType(WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE)
   || locusFileWorkspaceDragActive.value
   || unityAssetWorkspaceDragActive.value
   || explorerRootDropActive.value
 ));
+const activeEditorDropKey = computed(() => {
+  const intent = editorDropIntent.value;
+  return intent ? `editor:${intent.paneId}:${intent.direction}` : null;
+});
 const UNITY_WORKSPACE_DRAG_STATE_TTL_MS = 1200;
 const showHiddenNodes = ref(false);
 const externalDropTarget = ref<DevelopmentTreeItem | null>(null);
 const WORKSPACE_EXPLORER_WIDTH_KEY = "locus:developmentExplorerWidth";
 const explorerWidth = ref((() => {
   const saved = Number(window.localStorage.getItem(WORKSPACE_EXPLORER_WIDTH_KEY));
-  return Number.isFinite(saved) ? Math.min(520, Math.max(220, saved)) : 300;
+  const versioned = workbenchWindow.value.sidebar.width;
+  if (Number.isFinite(versioned) && versioned !== 300) return versioned;
+  return Number.isFinite(saved) ? Math.min(520, Math.max(220, saved)) : versioned;
 })());
 const resizingExplorer = ref(false);
 let explorerResizeStartX = 0;
@@ -302,6 +405,8 @@ const SYSTEM_RESOURCE_KIND = "system";
 const NEW_SESSION_SYSTEM_RESOURCE_ID = "newSession";
 const KNOWLEDGE_SYSTEM_RESOURCE_ID = "knowledge";
 const COLLABORATION_SYSTEM_RESOURCE_ID = "collaboration";
+const ASSETS_SYSTEM_RESOURCE_ID = "assets";
+const VIEWS_SYSTEM_RESOURCE_ID = "views";
 const collabHeadFocusRequest = ref<CollabHeadFocusRequest | null>(null);
 let collabHeadFocusRequestId = 0;
 
@@ -366,6 +471,7 @@ function onExplorerResizeEnd(): void {
   document.body.style.cursor = "";
   document.body.classList.remove("is-dragging-select-lock");
   window.localStorage.setItem(WORKSPACE_EXPLORER_WIDTH_KEY, String(Math.round(explorerWidth.value)));
+  workbenchStore.setSidebarWidth(WORKBENCH_WINDOW_ID, Math.round(explorerWidth.value));
 }
 
 function shortPath(path: string): string {
@@ -387,6 +493,87 @@ function isCurrentWorkspacePath(path: string): boolean {
 
 function normalizeKnowledgeSelectionPath(path: string): string {
   return path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "").toLocaleLowerCase();
+}
+
+function normalizeExternalProjectPath(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+}
+
+function externalScriptWorkspacePath(projectPath: string, assetPath: string): string {
+  const root = projectPath.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  const candidate = assetPath.trim().replace(/\\/g, "/");
+  const prefix = `${root}/`;
+  if (candidate.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())) {
+    return candidate.slice(prefix.length).replace(/^\/+/, "");
+  }
+  return candidate.replace(/^\.\//, "").replace(/^\/+/, "");
+}
+
+let externalScriptOpenEpoch = 0;
+
+async function revealPendingExternalScriptOpen(): Promise<void> {
+  const pending = uiStore.pendingExternalScriptOpen;
+  if (!pending?.assetPath.trim() || !pending.projectPath.trim()) return;
+  const epoch = ++externalScriptOpenEpoch;
+  const requestId = pending.id;
+  const paneId = workbenchWindow.value.focusedPaneId;
+  try {
+    const normalizedProjectPath = normalizeExternalProjectPath(pending.projectPath);
+    const existingCheckout = Object.values(workspaceContextStore.checkoutsById).find(
+      (checkout) => normalizeExternalProjectPath(checkout.root) === normalizedProjectPath,
+    );
+    const context = existingCheckout
+      ? await workspaceContextStore.focusCheckoutInPane(
+        existingCheckout,
+        WORKBENCH_WINDOW_ID,
+        paneId,
+      )
+      : await workspaceContextStore.openAndFocusInPane(
+        pending.projectPath,
+        WORKBENCH_WINDOW_ID,
+        paneId,
+      );
+    if (
+      !context
+      || epoch !== externalScriptOpenEpoch
+      || uiStore.pendingExternalScriptOpen?.id !== requestId
+    ) return;
+
+    const checkout = workspaceContextStore.checkoutsById[context.focusedCheckoutId];
+    if (!checkout) return;
+    if (displaySettings.workspaceDisplayMode === "single") {
+      await syncWorkbenchWorkspaceScope(checkout.checkoutId);
+    }
+    if (
+      epoch !== externalScriptOpenEpoch
+      || uiStore.pendingExternalScriptOpen?.id !== requestId
+    ) return;
+
+    await explorerStore.loadProject(checkout.projectId);
+    const path = externalScriptWorkspacePath(pending.projectPath, pending.assetPath);
+    const editor = await openWorkbenchResource({
+      resource: {
+        kind: "workspaceFile",
+        projectId: checkout.projectId,
+        path,
+      },
+      title: shortPath(path),
+      checkoutId: checkout.checkoutId,
+    }, {
+      paneId: workbenchWindow.value.focusedPaneId,
+      preview: false,
+      pinned: true,
+    });
+    await nextTick();
+    await workspaceFileEditorRefs.get(editor.editorId)?.revealPosition(
+      pending.line,
+      pending.column,
+    );
+    uiStore.clearPendingExternalScriptOpen(requestId);
+  } catch (error) {
+    if (uiStore.pendingExternalScriptOpen?.id !== requestId) return;
+    notificationStore.addNotice("error", normalizeAppError(error).message);
+  }
 }
 
 function knowledgeDocumentMatchesPendingSelection(
@@ -496,6 +683,11 @@ function itemSessionIsPending(item: DevelopmentTreeItem): boolean {
     && item.meta.session?.id === chatStore.pendingSelectionSessionId;
 }
 
+function isRenamingSessionItem(item: DevelopmentTreeItem): boolean {
+  return item.meta.kind === "session"
+    && item.meta.session?.id === sessionInlineRename.value?.sessionId;
+}
+
 function isWorkspaceSessionSelected(projectId: string, sessionId: string): boolean {
   const pendingSessionId = chatStore.pendingSelectionSessionId;
   if (pendingSessionId) return pendingSessionId === sessionId;
@@ -508,6 +700,23 @@ function isWorkspaceSessionSelected(projectId: string, sessionId: string): boole
   return chatStore.activeSessionId === sessionId;
 }
 
+function isWorkspaceSessionMultiSelected(sessionId: string): boolean {
+  return selectedSessionIds.value.has(sessionId);
+}
+
+function isWorkspaceSessionContextSelected(sessionId: string): boolean {
+  return contextMenu.value?.sessionTargets?.some((target) => target.session.id === sessionId) === true;
+}
+
+function clearSessionMultiSelection(): void {
+  if (selectedSessionIds.value.size > 0) selectedSessionIds.value = new Set();
+}
+
+function resetSessionMultiSelection(): void {
+  clearSessionMultiSelection();
+  lastSessionSelectionAnchorId.value = null;
+}
+
 function checkoutBranchLabel(projectId: string, checkoutId?: string): string {
   if (!checkoutId) return "";
   const checkout = explorerStore.resources[projectId]?.collaboration?.checkouts.find(
@@ -518,6 +727,805 @@ function checkoutBranchLabel(projectId: string, checkoutId?: string): string {
   return checkout?.headOid?.trim().slice(0, 8) ?? "";
 }
 
+interface TreeEditorDescriptor {
+  resource: DevelopmentResourceRef;
+  title: string;
+  checkoutId?: string | null;
+  sourcePath?: string | null;
+}
+
+function workbenchGroup(paneId: string): WorkbenchEditorGroup | null {
+  return workbenchWindow.value.groups[paneId] ?? null;
+}
+
+function editorForPane(paneId: string): WorkbenchEditorInput | null {
+  return workbenchStore.activeEditor(WORKBENCH_WINDOW_ID, paneId);
+}
+
+function projectCheckout(
+  projectId: string,
+  checkoutId?: string | null,
+): WorkspaceCheckoutDescriptor | null {
+  const project = workspaceContextStore.projectsById[projectId];
+  if (!project) return null;
+  return project.checkouts.find((checkout) => checkout.checkoutId === checkoutId)
+    ?? project.checkouts[0]
+    ?? null;
+}
+
+function preferredCheckoutIdForResource(
+  resource: DevelopmentResourceRef,
+  paneId: string,
+  explicitCheckoutId?: string | null,
+): string | null {
+  if (explicitCheckoutId && workspaceContextStore.checkoutsById[explicitCheckoutId]) {
+    return explicitCheckoutId;
+  }
+  if (resource.kind === "checkout") return resource.checkoutId;
+  const currentGroupCheckoutId = workbenchGroup(paneId)?.focusedCheckoutId;
+  const currentGroupCheckout = currentGroupCheckoutId
+    ? workspaceContextStore.checkoutsById[currentGroupCheckoutId]
+    : null;
+  if (resource.kind === "session") {
+    const session = explorerStore.resources[resource.projectId]?.sessions.find(
+      (candidate) => candidate.id === resource.sessionId,
+    ) ?? chatStore.sessions.find((candidate) => candidate.id === resource.sessionId);
+    return session?.executionTarget?.checkoutId
+      ?? session?.defaultCheckoutId
+      ?? (currentGroupCheckout?.projectId === resource.projectId ? currentGroupCheckout.checkoutId : null)
+      ?? projectCheckout(resource.projectId)?.checkoutId
+      ?? null;
+  }
+  if (resource.kind === "knowledge") {
+    const document = explorerStore.resources[resource.projectId]?.knowledge.find(
+      (candidate) => candidate.id === resource.documentId,
+    );
+    if (
+      currentGroupCheckout?.projectId === resource.projectId
+      && document?.availableCheckoutIds.includes(currentGroupCheckout.checkoutId)
+    ) return currentGroupCheckout.checkoutId;
+    return document?.sourceCheckoutId
+      ?? projectCheckout(resource.projectId)?.checkoutId
+      ?? null;
+  }
+  return currentGroupCheckout?.projectId === resource.projectId
+    ? currentGroupCheckout.checkoutId
+    : projectCheckout(resource.projectId)?.checkoutId ?? null;
+}
+
+function titleForResource(resource: DevelopmentResourceRef, sourcePath?: string | null): string {
+  switch (resource.kind) {
+    case "project": {
+      const project = workspaceContextStore.projectsById[resource.projectId];
+      return project ? projectLabel(project) : resource.projectId;
+    }
+    case "newSession": return t("chat.session.newSession");
+    case "checkout": return shortPath(
+      workspaceContextStore.checkoutsById[resource.checkoutId]?.root ?? resource.checkoutId,
+    );
+    case "section": {
+      const key = resource.section === "sessions"
+        ? "chat"
+        : resource.section === "assets"
+          ? "asset"
+          : resource.section === "collab"
+            ? "collab"
+            : resource.section;
+      return t(`app.tab.${key}`);
+    }
+    case "knowledgeRoot": return t("app.tab.knowledge");
+    case "collaboration": return t("app.tab.collab");
+    case "folder": {
+      const node = explorerStore.snapshots[resource.projectId]?.nodes.find(
+        (candidate) => candidate.nodeId === resource.nodeId,
+      );
+      return node?.folderName || t("development.untitledFolder");
+    }
+    case "session": {
+      const session = explorerStore.resources[resource.projectId]?.sessions.find(
+        (candidate) => candidate.id === resource.sessionId,
+      ) ?? chatStore.sessions.find((candidate) => candidate.id === resource.sessionId);
+      return session?.title || t("chat.session.newSession");
+    }
+    case "knowledge": {
+      const document = explorerStore.resources[resource.projectId]?.knowledge.find(
+        (candidate) => candidate.id === resource.documentId,
+      );
+      return document ? knowledgeDocumentName(document) : resource.documentId;
+    }
+    case "workspaceFile": return shortPath(resource.path);
+    case "asset": return shortPath(resource.path);
+    case "sceneObject": return shortPath(resource.objectPath);
+    case "view": return resource.viewId;
+    case "localDirectory": return sourcePath ? shortPath(sourcePath) : resource.relativePath
+      ? shortPath(resource.relativePath)
+      : resource.nodeId;
+    case "localFile": return sourcePath ? shortPath(sourcePath) : resource.relativePath
+      ? shortPath(resource.relativePath)
+      : resource.nodeId;
+  }
+}
+
+function createEditorForResource(
+  resource: DevelopmentResourceRef,
+  options: {
+    paneId?: string;
+    title?: string;
+    checkoutId?: string | null;
+    sourcePath?: string | null;
+    preview?: boolean;
+    pinned?: boolean;
+  } = {},
+): WorkbenchEditorInput {
+  const paneId = options.paneId ?? workbenchWindow.value.focusedPaneId;
+  const checkoutId = preferredCheckoutIdForResource(resource, paneId, options.checkoutId);
+  const checkout = checkoutId ? workspaceContextStore.checkoutsById[checkoutId] : null;
+  return createWorkbenchEditorInput(resource, options.title ?? titleForResource(resource, options.sourcePath), {
+    preview: options.preview ?? true,
+    pinned: options.pinned ?? false,
+    checkoutBinding: checkoutId
+      ? {
+          checkoutId,
+          expectedGeneration: checkout?.runtime?.workspaceGeneration ?? null,
+        }
+      : null,
+    sourcePath: options.sourcePath ?? null,
+  });
+}
+
+function treeEditorDescriptor(item: DevelopmentTreeItem): TreeEditorDescriptor | null {
+  switch (item.meta.kind) {
+    case "project":
+      return {
+        resource: { kind: "project", projectId: item.meta.projectId },
+        title: item.treeRow?.name ?? item.meta.projectId,
+      };
+    case "newSession":
+      return {
+        resource: { kind: "newSession", projectId: item.meta.projectId },
+        title: item.treeRow?.name ?? t("chat.session.newSession"),
+        checkoutId: item.meta.checkoutId,
+      };
+    case "knowledgeRoot":
+      return {
+        resource: { kind: "section", projectId: item.meta.projectId, section: "knowledge" },
+        title: item.treeRow?.name ?? t("app.tab.knowledge"),
+        checkoutId: item.meta.checkoutId,
+      };
+    case "collaboration":
+      return {
+        resource: { kind: "section", projectId: item.meta.projectId, section: "collab" },
+        title: item.treeRow?.name ?? t("app.tab.collab"),
+      };
+    case "assetsRoot":
+      return {
+        resource: { kind: "section", projectId: item.meta.projectId, section: "assets" },
+        title: item.treeRow?.name ?? t("app.tab.asset"),
+        checkoutId: item.meta.checkoutId,
+      };
+    case "viewsRoot":
+      return {
+        resource: { kind: "section", projectId: item.meta.projectId, section: "views" },
+        title: item.treeRow?.name ?? t("app.tab.views"),
+        checkoutId: item.meta.checkoutId,
+      };
+    case "checkout":
+      return item.meta.checkoutId ? {
+        resource: {
+          kind: "checkout",
+          projectId: item.meta.projectId,
+          checkoutId: item.meta.checkoutId,
+        },
+        title: item.treeRow?.name ?? item.meta.checkoutId,
+        checkoutId: item.meta.checkoutId,
+      } : null;
+    case "folder":
+      if (!item.meta.explorerNode) return null;
+      return item.meta.explorerNode.sourcePath ? {
+        resource: {
+          kind: "localDirectory",
+          projectId: item.meta.projectId,
+          nodeId: item.meta.explorerNode.nodeId,
+        },
+        title: item.treeRow?.name ?? shortPath(item.meta.explorerNode.sourcePath),
+        sourcePath: item.meta.explorerNode.sourcePath,
+      } : {
+        resource: {
+          kind: "folder",
+          projectId: item.meta.projectId,
+          nodeId: item.meta.explorerNode.nodeId,
+        },
+        title: item.treeRow?.name ?? t("development.untitledFolder"),
+      };
+    case "session":
+      return item.meta.session ? {
+        resource: {
+          kind: "session",
+          projectId: item.meta.projectId,
+          sessionId: item.meta.session.id,
+        },
+        title: item.treeRow?.name ?? item.meta.session.title,
+        checkoutId: item.meta.session.executionTarget?.checkoutId
+          ?? item.meta.session.defaultCheckoutId,
+      } : null;
+    case "knowledge":
+      return item.meta.knowledge ? {
+        resource: {
+          kind: "knowledge",
+          projectId: item.meta.projectId,
+          documentId: item.meta.knowledge.id,
+        },
+        title: item.treeRow?.name ?? knowledgeDocumentName(item.meta.knowledge),
+        checkoutId: item.meta.knowledge.sourceCheckoutId,
+      } : null;
+    case "localFile":
+      return item.meta.explorerNode?.sourcePath ? {
+        resource: {
+          kind: "localFile",
+          projectId: item.meta.projectId,
+          nodeId: item.meta.explorerNode.nodeId,
+        },
+        title: item.treeRow?.name ?? shortPath(item.meta.explorerNode.sourcePath),
+        sourcePath: item.meta.explorerNode.sourcePath,
+      } : null;
+    case "mountedFile":
+      return item.meta.mountEntry ? {
+        resource: {
+          kind: "localFile",
+          projectId: item.meta.projectId,
+          nodeId: item.meta.mountEntry.nodeId,
+          relativePath: item.meta.mountEntry.relativePath,
+        },
+        title: item.treeRow?.name ?? item.meta.mountEntry.name,
+        sourcePath: item.meta.mountEntry.absolutePath,
+      } : null;
+    case "mountedFolder":
+      return item.meta.mountEntry ? {
+        resource: {
+          kind: "localDirectory",
+          projectId: item.meta.projectId,
+          nodeId: item.meta.mountEntry.nodeId,
+          relativePath: item.meta.mountEntry.relativePath,
+        },
+        title: item.treeRow?.name ?? item.meta.mountEntry.name,
+        sourcePath: item.meta.mountEntry.absolutePath,
+      } : null;
+    default:
+      return null;
+  }
+}
+
+async function focusWorkbenchEditor(paneId: string, editorId: string): Promise<void> {
+  if (!workbenchStore.activateEditor(WORKBENCH_WINDOW_ID, paneId, editorId)) return;
+  const editor = workbenchWindow.value.groups[paneId]?.tabs.find(
+    (candidate) => candidate.editorId === editorId,
+  );
+  if (!editor) return;
+  activeResource.value = editor.resource;
+  const binding = editor.checkoutBinding;
+  if (!binding?.checkoutId) {
+    workspaceContextStore.activatePane(WORKBENCH_WINDOW_ID, paneId);
+    return;
+  }
+  const context = await workspaceContextStore.focusCheckoutInPane(
+    binding.checkoutId,
+    WORKBENCH_WINDOW_ID,
+    paneId,
+  );
+  if (!context) return;
+  workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, paneId, editorId, {
+    checkoutBinding: {
+      checkoutId: context.focusedCheckoutId,
+      expectedGeneration: context.workspaceGeneration,
+    },
+  });
+  await workspaceContextStore.setActiveSessionInPane(
+    editor.resource.kind === "session" ? editor.resource.sessionId : null,
+    WORKBENCH_WINDOW_ID,
+    paneId,
+  );
+  if (
+    workbenchWindow.value.focusedPaneId === paneId
+    && workbenchWindow.value.groups[paneId]?.activeEditorId === editorId
+  ) await refreshFocusedCheckoutServices();
+}
+
+async function openWorkbenchResource(
+  descriptor: TreeEditorDescriptor,
+  options: {
+    paneId?: string;
+    preview?: boolean;
+    pinned?: boolean;
+    focus?: boolean;
+  } = {},
+): Promise<WorkbenchEditorInput> {
+  const paneId = options.paneId ?? workbenchWindow.value.focusedPaneId;
+  const input = createEditorForResource(descriptor.resource, {
+    paneId,
+    title: descriptor.title,
+    checkoutId: descriptor.checkoutId,
+    sourcePath: descriptor.sourcePath,
+    preview: options.preview,
+    pinned: options.pinned,
+  });
+  const editor = workbenchStore.openEditor(WORKBENCH_WINDOW_ID, input, {
+    paneId,
+    preview: options.preview,
+    pinned: options.pinned,
+  });
+  activeResource.value = editor.resource;
+  if (options.focus !== false) await focusWorkbenchEditor(paneId, editor.editorId);
+  return editor;
+}
+
+async function focusWorkbenchPane(paneId: string): Promise<void> {
+  if (!workbenchStore.focusPane(WORKBENCH_WINDOW_ID, paneId)) return;
+  const editor = editorForPane(paneId);
+  if (!editor) {
+    activeResource.value = null;
+    workspaceContextStore.activatePane(WORKBENCH_WINDOW_ID, paneId);
+    return;
+  }
+  await focusWorkbenchEditor(paneId, editor.editorId);
+}
+
+function editorMatchesWorkbenchScope(
+  editor: WorkbenchEditorInput,
+  projectId: string,
+  checkoutId?: string | null,
+): boolean {
+  return checkoutId
+    ? editor.checkoutBinding?.checkoutId === checkoutId
+    : editor.resource.projectId === projectId;
+}
+
+function findWorkbenchScopeFallback(
+  projectId: string,
+  checkoutId: string | null,
+  preferredPaneId: string,
+): { paneId: string; editor: WorkbenchEditorInput } | null {
+  const groups = Object.values(workbenchWindow.value.groups);
+  const orderedGroups = [
+    ...groups.filter((group) => group.paneId === preferredPaneId),
+    ...groups.filter((group) => group.paneId !== preferredPaneId),
+  ];
+  for (const group of orderedGroups) {
+    const active = group.tabs.find((editor) => editor.editorId === group.activeEditorId);
+    if (active && editorMatchesWorkbenchScope(active, projectId, checkoutId)) {
+      return { paneId: group.paneId, editor: active };
+    }
+    const editor = group.tabs.find((candidate) => (
+      editorMatchesWorkbenchScope(candidate, projectId, checkoutId)
+    ));
+    if (editor) return { paneId: group.paneId, editor };
+  }
+  return null;
+}
+
+function openWorkbenchScopeFallback(
+  projectId: string,
+  checkoutId: string | null,
+  paneId: string,
+): { paneId: string; editor: WorkbenchEditorInput } {
+  const input = createEditorForResource({ kind: "newSession", projectId }, {
+    paneId,
+    title: t("chat.session.newSession"),
+    checkoutId,
+    preview: true,
+    pinned: false,
+  });
+  const editor = workbenchStore.openEditor(WORKBENCH_WINDOW_ID, input, {
+    paneId,
+    preview: true,
+    pinned: false,
+    replacePreview: false,
+  });
+  return { paneId, editor };
+}
+
+async function focusEmptyWorkbenchScope(
+  projectId: string,
+  checkoutId: string | null,
+  paneId: string,
+): Promise<void> {
+  activeResource.value = { kind: "newSession", projectId };
+  if (!checkoutId) {
+    workspaceContextStore.activatePane(WORKBENCH_WINDOW_ID, paneId);
+    return;
+  }
+  const context = await workspaceContextStore.focusCheckoutInPane(
+    checkoutId,
+    WORKBENCH_WINDOW_ID,
+    paneId,
+  );
+  if (!context) return;
+  await workspaceContextStore.setActiveSessionInPane(
+    null,
+    WORKBENCH_WINDOW_ID,
+    paneId,
+  );
+  await refreshFocusedCheckoutServices();
+}
+
+async function closeWorkbenchEditor(
+  paneId: string,
+  editorId: string,
+  force = false,
+): Promise<void> {
+  const groupBefore = workbenchWindow.value.groups[paneId];
+  const closingEditor = groupBefore?.tabs.find((editor) => editor.editorId === editorId) ?? null;
+  if (closingEditor?.dirty && !force) {
+    dirtyEditorCloseDialog.value = {
+      paneId,
+      editorId,
+      title: closingEditor.title,
+    };
+    return;
+  }
+  const wasActive = groupBefore?.activeEditorId === editorId;
+  const paneCountBefore = Object.keys(workbenchWindow.value.groups).length;
+  if (!workbenchStore.closeEditor(WORKBENCH_WINDOW_ID, paneId, editorId)) return;
+  const paneRemoved = paneCountBefore > Object.keys(workbenchWindow.value.groups).length;
+  const focusedPaneId = workbenchWindow.value.focusedPaneId;
+
+  if (wasActive && closingEditor) {
+    const projectId = closingEditor.resource.projectId;
+    const checkoutId = closingEditor.checkoutBinding?.checkoutId ?? null;
+    let fallback = findWorkbenchScopeFallback(projectId, checkoutId, focusedPaneId);
+    if (!fallback && closingEditor.resource.kind !== "newSession") {
+      fallback = openWorkbenchScopeFallback(projectId, checkoutId, focusedPaneId);
+    }
+    if (fallback) {
+      await focusWorkbenchEditor(fallback.paneId, fallback.editor.editorId);
+    } else {
+      await focusEmptyWorkbenchScope(projectId, checkoutId, focusedPaneId);
+    }
+  } else if (paneRemoved) {
+    await focusWorkbenchPane(focusedPaneId);
+  }
+
+  if (paneRemoved) await workspaceContextStore.disposePane(WORKBENCH_WINDOW_ID, paneId);
+}
+
+async function saveAndCloseDirtyEditor(): Promise<void> {
+  const dialog = dirtyEditorCloseDialog.value;
+  if (!dialog) return;
+  const saved = await workspaceFileEditorRefs.get(dialog.editorId)?.saveFile();
+  if (!saved) return;
+  dirtyEditorCloseDialog.value = null;
+  await closeWorkbenchEditor(dialog.paneId, dialog.editorId, true);
+}
+
+async function discardAndCloseDirtyEditor(): Promise<void> {
+  const dialog = dirtyEditorCloseDialog.value;
+  if (!dialog) return;
+  dirtyEditorCloseDialog.value = null;
+  await closeWorkbenchEditor(dialog.paneId, dialog.editorId, true);
+}
+
+function pinWorkbenchEditor(paneId: string, editorId: string): void {
+  workbenchStore.pinEditor(WORKBENCH_WINDOW_ID, paneId, editorId);
+}
+
+function handleWorkbenchComposerDraftChange(
+  paneId: string,
+  payload: { editorId: string; hasDraft: boolean },
+): void {
+  if (!payload.hasDraft) return;
+  workbenchStore.pinEditor(WORKBENCH_WINDOW_ID, paneId, payload.editorId);
+}
+
+function resizeWorkbenchSplit(splitId: string, ratio: number, commit: boolean): void {
+  workbenchStore.updateSplitRatio(WORKBENCH_WINDOW_ID, splitId, ratio, {
+    persist: commit,
+  });
+}
+
+async function splitFocusedWorkbenchEditor(
+  direction: Exclude<WorkbenchDropDirection, "center"> = "right",
+): Promise<void> {
+  const paneId = workbenchWindow.value.focusedPaneId;
+  const editor = editorForPane(paneId);
+  if (!editor?.capabilities.split) return;
+  const duplicate = createEditorForResource(editor.resource, {
+    paneId,
+    title: editor.title,
+    checkoutId: editor.checkoutBinding?.checkoutId,
+    sourcePath: editor.sourcePath,
+    preview: false,
+    pinned: true,
+  });
+  const newPaneId = workbenchStore.splitPane(
+    WORKBENCH_WINDOW_ID,
+    paneId,
+    direction,
+    duplicate,
+  );
+  if (newPaneId) await focusWorkbenchEditor(newPaneId, duplicate.editorId);
+}
+
+async function cycleFocusedEditor(delta: number): Promise<void> {
+  const group = workbenchStore.activeGroup(WORKBENCH_WINDOW_ID);
+  if (group.tabs.length < 2) return;
+  const activeIndex = Math.max(0, group.tabs.findIndex(
+    (editor) => editor.editorId === group.activeEditorId,
+  ));
+  const nextIndex = (activeIndex + delta + group.tabs.length) % group.tabs.length;
+  const editor = group.tabs[nextIndex];
+  if (editor) await focusWorkbenchEditor(group.paneId, editor.editorId);
+}
+
+function handleWorkbenchKeydown(event: KeyboardEvent): void {
+  const primary = event.ctrlKey || event.metaKey;
+  if (!primary || event.altKey) return;
+  if (event.key === "\\") {
+    event.preventDefault();
+    void splitFocusedWorkbenchEditor("right");
+    return;
+  }
+  if (event.key === "Tab") {
+    event.preventDefault();
+    void cycleFocusedEditor(event.shiftKey ? -1 : 1);
+    return;
+  }
+  if (event.key.toLocaleLowerCase() === "w") {
+    const group = workbenchStore.activeGroup(WORKBENCH_WINDOW_ID);
+    if (!group.activeEditorId) return;
+    event.preventDefault();
+    void closeWorkbenchEditor(group.paneId, group.activeEditorId);
+  }
+}
+
+function editorWorkspaceRef(editor: WorkbenchEditorInput): WorkspaceRef | null {
+  const checkoutId = editor.checkoutBinding?.checkoutId;
+  if (!checkoutId) return null;
+  const runtime = workspaceContextStore.checkoutsById[checkoutId]?.runtime;
+  return {
+    checkoutId,
+    expectedGeneration: runtime?.workspaceGeneration
+      ?? editor.checkoutBinding?.expectedGeneration
+      ?? undefined,
+  };
+}
+
+function editorWorkingDir(editor: WorkbenchEditorInput): string {
+  const checkoutId = editor.checkoutBinding?.checkoutId;
+  return checkoutId ? workspaceContextStore.checkoutsById[checkoutId]?.root ?? "" : "";
+}
+
+function editorKnowledgeDocument(editor: WorkbenchEditorInput): ProjectKnowledgeDocument | null {
+  const resource = editor.resource;
+  if (resource.kind !== "knowledge") return null;
+  return explorerStore.resources[resource.projectId]?.knowledge.find(
+    (document) => document.id === resource.documentId,
+  ) ?? null;
+}
+
+function editorProject(editor: WorkbenchEditorInput): ProjectContextDescriptor | null {
+  return workspaceContextStore.projectsById[editor.resource.projectId] ?? null;
+}
+
+function setSessionEditorRef(
+  editorId: string,
+  value: unknown,
+): void {
+  if (value && typeof value === "object" && "applyDraftPrefill" in value) {
+    sessionEditorRefs.set(editorId, value as InstanceType<typeof WorkbenchSessionEditor>);
+  }
+  else sessionEditorRefs.delete(editorId);
+}
+
+function setWorkspaceFileEditorRef(editorId: string, value: unknown): void {
+  if (value && typeof value === "object" && "saveFile" in value) {
+    workspaceFileEditorRefs.set(editorId, value as InstanceType<typeof WorkspaceFilePreview>);
+  } else {
+    workspaceFileEditorRefs.delete(editorId);
+  }
+}
+
+function setWorkspaceFileEditorDirty(
+  paneId: string,
+  editorId: string,
+  dirty: boolean,
+): void {
+  workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, paneId, editorId, { dirty });
+}
+
+async function handleWorkbenchSessionCreated(
+  paneId: string,
+  payload: { editorId: string; sessionId: string },
+): Promise<void> {
+  const editor = workbenchWindow.value.groups[paneId]?.tabs.find(
+    (candidate) => candidate.editorId === payload.editorId,
+  );
+  if (!editor || editor.resource.kind !== "newSession") return;
+  workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, paneId, payload.editorId, {
+    resource: {
+      kind: "session",
+      projectId: editor.resource.projectId,
+      sessionId: payload.sessionId,
+    },
+    preview: false,
+    pinned: true,
+  });
+  await workspaceContextStore.setActiveSessionInPane(
+    payload.sessionId,
+    WORKBENCH_WINDOW_ID,
+    paneId,
+  );
+  await explorerStore.refreshProjectSessions(editor.resource.projectId);
+}
+
+function handleWorkbenchNewSessionRequested(
+  paneId: string,
+  payload: { editorId: string },
+): void {
+  const group = workbenchWindow.value.groups[paneId];
+  const editor = group?.tabs.find((candidate) => candidate.editorId === payload.editorId);
+  if (!editor || (
+    editor.resource.kind !== "session"
+    && editor.resource.kind !== "newSession"
+  )) return;
+
+  const resource = {
+    kind: "newSession" as const,
+    projectId: editor.resource.projectId,
+  };
+  workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, paneId, payload.editorId, {
+    resource,
+    title: t("chat.session.newSession"),
+  });
+  if (group?.activeEditorId === payload.editorId) activeResource.value = resource;
+  void workspaceContextStore.setActiveSessionInPane(
+    null,
+    WORKBENCH_WINDOW_ID,
+    paneId,
+  ).catch((error) => {
+    console.warn("[DevelopmentWorkbench] failed to clear active session", error);
+  });
+}
+
+let workbenchReconcileEpoch = 0;
+
+async function reconcileRestoredWorkbenchEditors(): Promise<void> {
+  const epoch = ++workbenchReconcileEpoch;
+  const projectIds = new Set(
+    Object.values(workbenchWindow.value.groups).flatMap((group) => (
+      group.tabs.map((editor) => editor.resource.projectId)
+    )),
+  );
+  await Promise.all([...projectIds]
+    .filter((projectId) => !!workspaceContextStore.projectsById[projectId])
+    .map((projectId) => explorerStore.loadProject(projectId)));
+  if (epoch !== workbenchReconcileEpoch) return;
+
+  for (const group of Object.values(workbenchWindow.value.groups)) {
+    for (const editor of group.tabs) {
+      const resource = editor.resource;
+      const project = workspaceContextStore.projectsById[resource.projectId];
+      let available = !!project;
+      let sourcePath = editor.sourcePath ?? null;
+      let reason: string | null = project ? null : t("workbench.unavailable.project");
+
+      if (available) {
+        switch (resource.kind) {
+          case "checkout":
+            available = !!workspaceContextStore.checkoutsById[resource.checkoutId];
+            reason = available ? null : t("workbench.unavailable.checkout");
+            break;
+          case "folder":
+            available = explorerStore.snapshots[resource.projectId]?.nodes.some(
+              (node) => node.nodeId === resource.nodeId,
+            ) === true;
+            reason = available ? null : t("workbench.unavailable.removed");
+            break;
+          case "session":
+            available = explorerStore.resources[resource.projectId]?.sessions.some(
+              (session) => session.id === resource.sessionId,
+            ) === true;
+            reason = available ? null : t("workbench.unavailable.session");
+            break;
+          case "knowledge":
+            available = explorerStore.resources[resource.projectId]?.knowledge.some(
+              (document) => document.id === resource.documentId,
+            ) === true;
+            reason = available ? null : t("workbench.unavailable.knowledge");
+            break;
+          case "workspaceFile":
+          case "asset":
+          case "sceneObject": {
+            const checkoutId = preferredCheckoutIdForResource(
+              resource,
+              group.paneId,
+              editor.checkoutBinding?.checkoutId,
+            );
+            available = !!checkoutId && !!workspaceContextStore.checkoutsById[checkoutId];
+            reason = available ? null : t("workbench.unavailable.file");
+            break;
+          }
+          case "localDirectory":
+          case "localFile": {
+            const node = explorerStore.snapshots[resource.projectId]?.nodes.find(
+              (candidate) => candidate.nodeId === resource.nodeId,
+            );
+            if (node && resource.relativePath) {
+              try {
+                await explorerStore.loadMount(resource.projectId, resource.nodeId);
+              } catch {
+                // The editor becomes unavailable below while the persisted tab stays closeable.
+              }
+              sourcePath = explorerStore.mountListing(
+                resource.projectId,
+                resource.nodeId,
+              )?.entries.find(
+                (entry) => entry.relativePath === resource.relativePath
+                  && entry.isDir === (resource.kind === "localDirectory"),
+              )?.absolutePath ?? sourcePath;
+            } else if (node?.sourcePath) {
+              sourcePath = node.sourcePath;
+            }
+            available = !!node && !!sourcePath;
+            reason = available ? null : t("workbench.unavailable.file");
+            break;
+          }
+          default:
+            break;
+        }
+      }
+
+      const checkoutId = preferredCheckoutIdForResource(
+        editor.resource,
+        group.paneId,
+        editor.checkoutBinding?.checkoutId,
+      );
+      const checkout = checkoutId ? workspaceContextStore.checkoutsById[checkoutId] : null;
+      workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, group.paneId, editor.editorId, {
+        title: titleForResource(editor.resource, sourcePath),
+        sourcePath,
+        availability: available ? "available" : "unavailable",
+        unavailableReason: reason,
+        checkoutBinding: checkoutId
+          ? {
+              checkoutId,
+              expectedGeneration: checkout?.runtime?.workspaceGeneration ?? null,
+            }
+          : null,
+      });
+    }
+  }
+}
+
+async function restoreWorkbenchPaneContexts(
+  expectedWorkspaceScopeId = workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID),
+): Promise<void> {
+  const focusedPaneId = workbenchWindow.value.focusedPaneId;
+  for (const group of Object.values(workbenchWindow.value.groups)) {
+    if (workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) !== expectedWorkspaceScopeId) return;
+    const editor = group.tabs.find((candidate) => candidate.editorId === group.activeEditorId);
+    const checkoutId = editor?.checkoutBinding?.checkoutId;
+    if (!editor || editor.availability === "unavailable" || !checkoutId) {
+      await workspaceContextStore.disposePane(WORKBENCH_WINDOW_ID, group.paneId).catch(() => false);
+      continue;
+    }
+    const context = await workspaceContextStore.focusCheckoutInPane(
+      checkoutId,
+      WORKBENCH_WINDOW_ID,
+      group.paneId,
+      { activate: false },
+    );
+    if (workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) !== expectedWorkspaceScopeId) return;
+    if (!context) continue;
+    await workspaceContextStore.setActiveSessionInPane(
+      editor.resource.kind === "session" ? editor.resource.sessionId : null,
+      WORKBENCH_WINDOW_ID,
+      group.paneId,
+      { activate: false },
+    );
+  }
+  if (workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) !== expectedWorkspaceScopeId) return;
+  await focusWorkbenchPane(focusedPaneId);
+}
+
 function isExpanded(key: string): boolean {
   return expanded.value.has(key);
 }
@@ -525,7 +1533,11 @@ function isExpanded(key: string): boolean {
 function isCollaborationExpanded(projectId: string): boolean {
   const resource = activeResource.value;
   return resource?.projectId === projectId
-    && (resource.kind === "collaboration" || resource.kind === "checkout");
+    && (
+      resource.kind === "checkout"
+      || resource.kind === "collaboration"
+      || (resource.kind === "section" && resource.section === "collab")
+    );
 }
 
 function knowledgeFolderKind(nodeId: string): KnowledgeFolderKind | null {
@@ -538,6 +1550,24 @@ function isExplorerNodeVisible(
   node: ProjectExplorerNode,
   knowledge: ProjectKnowledgeDocument[],
 ): boolean {
+  if (node.resourceKind === SYSTEM_RESOURCE_KIND) {
+    if (
+      node.resourceId === KNOWLEDGE_SYSTEM_RESOURCE_ID
+      && !displaySettings.workspaceSectionVisibility.knowledge
+    ) return false;
+    if (
+      node.resourceId === COLLABORATION_SYSTEM_RESOURCE_ID
+      && !displaySettings.workspaceSectionVisibility.collab
+    ) return false;
+    if (
+      node.resourceId === ASSETS_SYSTEM_RESOURCE_ID
+      && !displaySettings.workspaceSectionVisibility.assets
+    ) return false;
+    if (
+      node.resourceId === VIEWS_SYSTEM_RESOURCE_ID
+      && !displaySettings.workspaceSectionVisibility.views
+    ) return false;
+  }
   if ((node.resourceKind === "knowledge" && node.sourceKind !== "knowledge")
     || node.nodeId.startsWith("knowledge-type:")
     || node.nodeId.startsWith("knowledge-path:")) return false;
@@ -552,6 +1582,14 @@ function knowledgeDocumentName(document: ProjectKnowledgeDocument): string {
   const normalized = document.path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
   const segments = normalized.split("/").filter(Boolean);
   return segments[segments.length - 1] || document.title;
+}
+
+function isKnowledgeFolderPlacement(item: DevelopmentTreeItem): boolean {
+  const node = item.meta.explorerNode;
+  return item.meta.kind === "folder"
+    && node?.nodeKind === "folder"
+    && node.sourceKind === "knowledge"
+    && !!node.sourcePath;
 }
 
 function knowledgePathFromFolderId(
@@ -695,6 +1733,30 @@ function mountedEntryKey(projectId: string, nodeId: string, relativePath: string
   return `mounted:${projectId}:${nodeId}:${encodeURIComponent(relativePath)}`;
 }
 
+function isActiveLocalFile(
+  projectId: string,
+  nodeId: string,
+  relativePath?: string | null,
+): boolean {
+  const resource = activeResource.value;
+  return resource?.kind === "localFile"
+    && resource.projectId === projectId
+    && resource.nodeId === nodeId
+    && (resource.relativePath ?? null) === (relativePath ?? null);
+}
+
+function isActiveLocalDirectory(
+  projectId: string,
+  nodeId: string,
+  relativePath?: string | null,
+): boolean {
+  const resource = activeResource.value;
+  return resource?.kind === "localDirectory"
+    && resource.projectId === projectId
+    && resource.nodeId === nodeId
+    && (resource.relativePath ?? null) === (relativePath ?? null);
+}
+
 function appendMountedEntries(
   items: DevelopmentTreeItem[],
   projectId: string,
@@ -716,14 +1778,16 @@ function appendMountedEntries(
       && !isExpanded(mountedEntryKey(projectId, mountNode.nodeId, path))
     ))) continue;
     const key = mountedEntryKey(projectId, mountNode.nodeId, entry.relativePath);
-    const selected = activeResource.value?.kind === "localFile"
-      && activeResource.value.path === entry.absolutePath;
+    const selected = entry.isDir
+      ? isActiveLocalDirectory(projectId, mountNode.nodeId, entry.relativePath)
+      : isActiveLocalFile(projectId, mountNode.nodeId, entry.relativePath);
     items.push({
       key,
       treeRow: makeRow(key, entry.name, depth + entry.depth, entry.isDir ? "folder" : "file", {
         expandable: entry.isDir,
         expanded: entry.isDir ? isExpanded(key) : undefined,
         selected,
+        dragEnabled: !entry.isDir,
         title: entry.absolutePath,
         classes: {
           "is-open": selected,
@@ -807,8 +1871,10 @@ function appendLayoutChildren(
       const children = layoutChildren || mountedDirectory || hasDropPreview || hasInlineCreate;
       const isKnowledgeRoot = knowledgeFolderKind(node.nodeId) !== null;
       const isPackage = isSkillPackageFolder(project.projectId, node, projectResources.knowledge);
-      const selected = activeResource.value?.kind === "folder"
-        && activeResource.value.nodeId === node.nodeId;
+      const selected = mountedDirectory
+        ? isActiveLocalDirectory(project.projectId, node.nodeId)
+        : activeResource.value?.kind === "folder"
+          && activeResource.value.nodeId === node.nodeId;
       const runtimeStatus = runtimeStatusByNodeId.get(node.nodeId) ?? null;
       items.push({
         key,
@@ -825,6 +1891,7 @@ function appendLayoutChildren(
             "is-open": selected,
             "is-hidden-node": node.hidden,
             "is-mounted-root": mountedDirectory,
+            "is-knowledge-row": node.sourceKind === "knowledge" && mountedDirectory,
           },
         }),
         meta: {
@@ -876,21 +1943,39 @@ function appendLayoutChildren(
         : project.checkouts[0];
       if (!preferredCheckout) continue;
       const key = `new-session:${project.projectId}`;
-      items.push({
+      const dropTarget: DevelopmentTreeItem = {
         key,
-        treeRow: makeRow(key, t("chat.session.newSession"), depth, "file", {
-          selected: activeResource.value?.kind === "newSession"
-            && activeResource.value.projectId === project.projectId
-            && chatStore.activeSessionId === null,
-          dragEnabled: true,
-          classes: { "is-hidden-node": node.hidden },
-        }),
+        treeRow: null,
         meta: {
           kind: "newSession",
           projectId: project.projectId,
           checkoutId: preferredCheckout.checkoutId,
           explorerNode: node,
         },
+      };
+      const dropAvailable = isNewSessionDropAvailable(dropTarget);
+      items.push({
+        ...dropTarget,
+        treeRow: makeRow(
+          key,
+          dropAvailable
+            ? t("development.dropToCreateSession")
+            : t("chat.session.newSession"),
+          depth,
+          "file",
+          {
+            selected: activeResource.value?.kind === "newSession"
+              && activeResource.value.projectId === project.projectId
+              && chatStore.activeSessionId === null,
+            dragEnabled: true,
+            title: dropAvailable ? t("development.dropToCreateSession") : undefined,
+            classes: {
+              "is-new-session-row": true,
+              "is-new-session-drop-zone": dropAvailable,
+              "is-hidden-node": node.hidden,
+            },
+          },
+        ),
       });
       continue;
     }
@@ -903,8 +1988,11 @@ function appendLayoutChildren(
         : project.checkouts[0];
       if (!preferredCheckout) continue;
       const key = `knowledge-root:${project.projectId}`;
-      const selected = activeResource.value?.kind === "knowledgeRoot"
-        && activeResource.value.projectId === project.projectId;
+      const selected = activeResource.value?.projectId === project.projectId
+        && (
+          activeResource.value.kind === "knowledgeRoot"
+          || (activeResource.value.kind === "section" && activeResource.value.section === "knowledge")
+        );
       items.push({
         key,
         treeRow: makeRow(key, t("app.tab.knowledge"), depth, "folder", {
@@ -935,8 +2023,11 @@ function appendLayoutChildren(
         treeRow: makeRow(key, t("app.tab.collab"), depth, "folder", {
           expandable: project.checkouts.length > 0,
           expanded: collaborationExpanded,
-          selected: activeResource.value?.kind === "collaboration"
-            && activeResource.value.projectId === project.projectId,
+          selected: activeResource.value?.projectId === project.projectId
+            && (
+              activeResource.value.kind === "collaboration"
+              || (activeResource.value.kind === "section" && activeResource.value.section === "collab")
+            ),
           dragEnabled: true,
           classes: { "is-hidden-node": node.hidden },
         }),
@@ -967,12 +2058,53 @@ function appendLayoutChildren(
       }
       continue;
     }
+    if (
+      node.resourceKind === SYSTEM_RESOURCE_KIND
+      && (node.resourceId === ASSETS_SYSTEM_RESOURCE_ID || node.resourceId === VIEWS_SYSTEM_RESOURCE_ID)
+    ) {
+      const section = node.resourceId === ASSETS_SYSTEM_RESOURCE_ID ? "assets" as const : "views" as const;
+      const preferredCheckout = workspaceContextStore.focusedCheckout?.projectId === project.projectId
+        ? workspaceContextStore.focusedCheckout
+        : project.checkouts[0];
+      if (!preferredCheckout) continue;
+      const kind = section === "assets" ? "assetsRoot" as const : "viewsRoot" as const;
+      const key = `${section}:${project.projectId}`;
+      const selected = activeResource.value?.kind === "section"
+        && activeResource.value.projectId === project.projectId
+        && activeResource.value.section === section;
+      items.push({
+        key,
+        treeRow: makeRow(
+          key,
+          section === "assets" ? t("app.tab.asset") : t("app.tab.views"),
+          depth,
+          section === "assets" ? "folder" : "package",
+          {
+            selected,
+            dragEnabled: true,
+            classes: {
+              "is-open": selected,
+              "is-hidden-node": node.hidden,
+            },
+          },
+        ),
+        meta: {
+          kind,
+          projectId: project.projectId,
+          checkoutId: preferredCheckout.checkoutId,
+          explorerNode: node,
+        },
+      });
+      continue;
+    }
     if (node.resourceKind === "session" && node.resourceId) {
       const session = sessionById.get(node.resourceId);
       if (!session) continue;
       const key = `session:${project.projectId}:${session.id}`;
       const runtimeStatus = runtimeStatusByNodeId.get(node.nodeId) ?? null;
       const selected = isWorkspaceSessionSelected(project.projectId, session.id);
+      const multiSelected = isWorkspaceSessionMultiSelected(session.id);
+      const contextSelected = isWorkspaceSessionContextSelected(session.id);
       const displayTitle = sessionTreeDisplayTitle(
         session.title,
         session.sessionType,
@@ -981,7 +2113,8 @@ function appendLayoutChildren(
       items.push({
         key,
         treeRow: makeRow(key, displayTitle, depth, "file", {
-          selected,
+          selected: selected || multiSelected || contextSelected,
+          editing: sessionInlineRename.value?.sessionId === session.id,
           dragEnabled: true,
           title: runtimeStatus
             ? `${session.title || displayTitle} — ${sessionStatusLabel(runtimeStatus)}`
@@ -989,6 +2122,8 @@ function appendLayoutChildren(
           classes: {
             ...runtimeStatusClasses(runtimeStatus, "session"),
             "is-open": selected,
+            "is-multi-selected": multiSelected,
+            "is-context-selected": contextSelected,
             "is-session-pending": chatStore.pendingSelectionSessionId === session.id,
             "is-hidden-node": node.hidden,
           },
@@ -1015,6 +2150,7 @@ function appendLayoutChildren(
           title: `${knowledge.type}/${knowledge.path}`,
           classes: {
             "kx-leaf": true,
+            "is-knowledge-row": true,
             "is-hidden-node": node.hidden,
             "is-open": activeResource.value?.kind === "knowledge"
               && activeResource.value.documentId === knowledge.id,
@@ -1026,8 +2162,7 @@ function appendLayoutChildren(
     }
     if (node.resourceKind === "local_file" && node.sourcePath) {
       const key = `local-file:${project.projectId}:${node.nodeId}`;
-      const selected = activeResource.value?.kind === "localFile"
-        && activeResource.value.path === node.sourcePath;
+      const selected = isActiveLocalFile(project.projectId, node.nodeId);
       items.push({
         key,
         treeRow: makeRow(key, node.folderName || shortPath(node.sourcePath), depth, "file", {
@@ -1092,6 +2227,39 @@ const treeItems = computed<DevelopmentTreeItem[]>(() => {
   return items;
 });
 
+function visibleWorkspaceSessionTargets(): DevelopmentSessionTarget[] {
+  return treeItems.value.flatMap((item) => (
+    item.meta.kind === "session" && item.meta.session
+      ? [{ item, projectId: item.meta.projectId, session: item.meta.session }]
+      : []
+  ));
+}
+
+function activeWorkspaceSessionId(): string | null {
+  const resource = activeResource.value;
+  if (resource?.kind === "session") return resource.sessionId;
+  return chatStore.activeSessionId;
+}
+
+function resolveSessionClickSelection(item: DevelopmentTreeItem, event?: MouseEvent): boolean {
+  const sessionId = item.meta.session?.id;
+  if (!sessionId) return false;
+  const visibleSessionIds = visibleWorkspaceSessionTargets().map((target) => target.session.id);
+  const result = resolveWorkspaceSessionSelection({
+    visibleSessionIds,
+    selectedSessionIds: selectedSessionIds.value,
+    anchorSessionId: lastSessionSelectionAnchorId.value,
+    activeSessionId: activeWorkspaceSessionId(),
+    clickedSessionId: sessionId,
+    shiftKey: event?.shiftKey ?? false,
+    ctrlKey: event?.ctrlKey ?? false,
+    metaKey: event?.metaKey ?? false,
+  });
+  selectedSessionIds.value = result.nextSelectedSessionIds;
+  lastSessionSelectionAnchorId.value = result.nextAnchorSessionId;
+  return result.shouldActivateSession;
+}
+
 function itemIcon(item: DevelopmentTreeItem) {
   switch (item.meta.kind) {
     case "project": {
@@ -1101,6 +2269,8 @@ function itemIcon(item: DevelopmentTreeItem) {
       return item.treeRow?.expanded ? FolderOpen : Folder;
     }
     case "collaboration": return GitMerge;
+    case "assetsRoot": return Folder;
+    case "viewsRoot": return Eye;
     case "newSession": return Plus;
     case "dropPreview": return item.meta.dropPreview?.icon ?? File;
     case "knowledgeRoot": return BookOpen;
@@ -1194,6 +2364,7 @@ const internalLayoutDragPreview = computed<WorkspaceDragPreview | null>(() => {
   if (!source || (
     source.payload.type !== WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE
     && source.payload.type !== KNOWLEDGE_INTERNAL_DRAG_TYPE
+    && source.payload.type !== WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE
   )) return null;
   return workspaceDragPreviewForInternalSource(source);
 });
@@ -1386,12 +2557,42 @@ async function revealPendingKnowledgeSelection(): Promise<void> {
   }
   expanded.value = nextExpanded;
   explorerStore.selectedNodeKey = `knowledge:${project.projectId}:${document.id}`;
-  activeResource.value = {
-    kind: "knowledge",
-    projectId: project.projectId,
-    documentId: document.id,
-    sourceCheckoutId: document.sourceCheckoutId,
-  };
+  await openWorkbenchResource({
+    resource: {
+      kind: "knowledge",
+      projectId: project.projectId,
+      documentId: document.id,
+    },
+    title: knowledgeDocumentName(document),
+    checkoutId: document.sourceCheckoutId,
+  }, { preview: true });
+}
+
+async function activateDirectoryPreviewEntry(
+  paneId: string,
+  editor: WorkbenchEditorInput,
+  entry: ProjectExplorerMountEntry,
+): Promise<void> {
+  if (editor.resource.kind !== "localDirectory") return;
+  await openWorkbenchResource({
+    resource: entry.isDir ? {
+      kind: "localDirectory",
+      projectId: editor.resource.projectId,
+      nodeId: editor.resource.nodeId,
+      relativePath: entry.relativePath,
+    } : {
+      kind: "localFile",
+      projectId: editor.resource.projectId,
+      nodeId: editor.resource.nodeId,
+      relativePath: entry.relativePath,
+    },
+    title: entry.name,
+    checkoutId: editor.checkoutBinding?.checkoutId,
+    sourcePath: entry.absolutePath,
+  }, {
+    paneId,
+    preview: true,
+  });
 }
 
 async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise<void> {
@@ -1403,23 +2604,29 @@ async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise
       toggleItem(item);
       return;
     }
+    const pinEditor = (event?.detail ?? 1) >= 2;
     explorerStore.selectedNodeKey = item.key;
     if (item.meta.kind === "folder") {
+      resetSessionMultiSelection();
       if (item.treeRow?.expandable) toggleItem(item);
       if (item.meta.explorerNode?.sourcePath) {
         await explorerStore.loadMount(project.projectId, item.meta.explorerNode.nodeId);
       }
-      if (item.meta.explorerNode) {
-        activeResource.value = {
-          kind: "folder",
-          projectId: project.projectId,
-          nodeId: item.meta.explorerNode.nodeId,
-        };
-      }
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource(descriptor, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       return;
     }
     if (item.meta.kind === "mountedFolder") {
       toggleItem(item);
+      resetSessionMultiSelection();
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource(descriptor, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       return;
     }
     if (item.meta.kind === "newSession") {
@@ -1432,39 +2639,68 @@ async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise
         }
         return;
       }
-      chatStore.newChat();
-      activeResource.value = {
-        kind: "newSession",
-        projectId: project.projectId,
+      resetSessionMultiSelection();
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource({
+        ...descriptor,
         checkoutId: checkout.checkoutId,
-      };
+      }, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       return;
     }
     if (item.meta.kind === "knowledgeRoot") {
+      resetSessionMultiSelection();
       const checkout = await ensureProjectCheckout(project, item.meta.checkoutId);
       if (!checkout) return;
-      activeResource.value = {
-        kind: "knowledgeRoot",
-        projectId: project.projectId,
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource({
+        ...descriptor,
         checkoutId: checkout.checkoutId,
-      };
+      }, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       return;
     }
     if (item.meta.kind === "collaboration") {
-      await ensureProjectCheckout(project);
-      activeResource.value = { kind: "collaboration", projectId: project.projectId };
+      resetSessionMultiSelection();
+      const checkout = await ensureProjectCheckout(project);
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource({
+        ...descriptor,
+        checkoutId: checkout?.checkoutId,
+      }, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
+      return;
+    }
+    if (item.meta.kind === "assetsRoot" || item.meta.kind === "viewsRoot") {
+      resetSessionMultiSelection();
+      const checkout = await ensureProjectCheckout(project, item.meta.checkoutId);
+      const descriptor = treeEditorDescriptor(item);
+      if (checkout && descriptor) await openWorkbenchResource({
+        ...descriptor,
+        checkoutId: checkout.checkoutId,
+      }, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       return;
     }
     if (item.meta.kind === "checkout" && item.meta.checkoutId) {
+      resetSessionMultiSelection();
       if (workspaceContextStore.focusedCheckout?.checkoutId !== item.meta.checkoutId) {
         await workspaceContextStore.focusCheckout(item.meta.checkoutId);
         await refreshFocusedCheckoutServices();
       }
-      activeResource.value = {
-        kind: "checkout",
-        projectId: project.projectId,
-        checkoutId: item.meta.checkoutId,
-      };
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource(descriptor, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       collabHeadFocusRequest.value = {
         id: ++collabHeadFocusRequestId,
         checkoutId: item.meta.checkoutId,
@@ -1472,46 +2708,47 @@ async function activateItem(raw: WorkspaceTreeItem, event?: MouseEvent): Promise
       return;
     }
     if (item.meta.kind === "session" && item.meta.session) {
-      if (event?.ctrlKey || event?.metaKey) {
-        await openSessionWindow(item.meta.session);
-        return;
-      }
+      if (!resolveSessionClickSelection(item, event)) return;
       const preferred = workspaceContextStore.focusedCheckout?.projectId === project.projectId
         ? workspaceContextStore.focusedCheckout.checkoutId
         : item.meta.session.executionTarget?.checkoutId
           ?? item.meta.session.defaultCheckoutId;
       const checkout = await ensureProjectCheckout(project, preferred);
       if (!checkout) return;
-      await chatStore.selectSession(item.meta.session.id);
-      activeResource.value = {
-        kind: "session",
-        projectId: project.projectId,
-        sessionId: item.meta.session.id,
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource({
+        ...descriptor,
         checkoutId: checkout.checkoutId,
-      };
+      }, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       return;
     }
     if (item.meta.kind === "knowledge" && item.meta.knowledge) {
+      resetSessionMultiSelection();
       const checkout = await ensureProjectCheckout(project, item.meta.knowledge.sourceCheckoutId);
       if (!checkout) return;
-      activeResource.value = {
-        kind: "knowledge",
-        projectId: project.projectId,
-        documentId: item.meta.knowledge.id,
-        sourceCheckoutId: checkout.checkoutId,
-      };
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource({
+        ...descriptor,
+        checkoutId: checkout.checkoutId,
+      }, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
       return;
     }
     if (
       (item.meta.kind === "localFile" || item.meta.kind === "mountedFile")
       && (item.meta.explorerNode?.sourcePath || item.meta.mountEntry?.absolutePath)
     ) {
-      activeResource.value = {
-        kind: "localFile",
-        projectId: project.projectId,
-        path: item.meta.mountEntry?.absolutePath ?? item.meta.explorerNode!.sourcePath!,
-        nodeId: item.meta.explorerNode?.nodeId ?? item.meta.mountEntry!.nodeId,
-      };
+      resetSessionMultiSelection();
+      const descriptor = treeEditorDescriptor(item);
+      if (descriptor) await openWorkbenchResource(descriptor, {
+        preview: !pinEditor,
+        pinned: pinEditor,
+      });
     }
   } catch (error) {
     notificationStore.addNotice("error", normalizeAppError(error).message);
@@ -1531,10 +2768,12 @@ function contextSessionEntry(): {
   project: ProjectContextDescriptor;
   session: SessionSummary;
 } | null {
-  const item = contextMenu.value?.item;
-  const session = item?.meta.kind === "session" ? item.meta.session : null;
-  const project = item ? workspaceContextStore.projectsById[item.meta.projectId] : null;
-  return item && session && project ? { item, project, session } : null;
+  const targets = contextMenu.value?.sessionTargets ?? [];
+  const target = targets.length === 1 ? targets[0] : null;
+  const project = target ? workspaceContextStore.projectsById[target.projectId] : null;
+  return target && project
+    ? { item: target.item, project, session: target.session }
+    : null;
 }
 
 async function openSessionWindow(session: SessionSummary): Promise<void> {
@@ -1607,24 +2846,36 @@ function beginRenameSession(): void {
   const entry = contextSessionEntry();
   contextMenu.value = null;
   if (!entry) return;
-  sessionDialog.value = {
-    mode: "rename",
-    projectId: entry.project.projectId,
-    session: entry.session,
+  sessionInlineRename.value = {
+    sessionId: entry.session.id,
+    originalTitle: entry.session.title || "",
     value: entry.session.title || "",
   };
-  void nextTick(() => sessionInput.value?.select());
+  void nextTick(() => {
+    sessionRenameInput.value?.focus();
+    sessionRenameInput.value?.select();
+  });
+}
+
+function cancelSessionRename(): void {
+  sessionInlineRename.value = null;
+}
+
+async function submitSessionRename(): Promise<void> {
+  const draft = sessionInlineRename.value;
+  if (!draft) return;
+  const title = draft.value.trim();
+  sessionInlineRename.value = null;
+  if (!title || title === draft.originalTitle.trim()) return;
+  await chatStore.renameSession(draft.sessionId, title);
 }
 
 function beginDeleteSession(): void {
-  const entry = contextSessionEntry();
+  const targets = [...(contextMenu.value?.sessionTargets ?? [])];
   contextMenu.value = null;
-  if (!entry) return;
-  sessionDialog.value = {
-    mode: "delete",
-    projectId: entry.project.projectId,
-    session: entry.session,
-    value: entry.session.title || t("chat.session.newSession"),
+  if (targets.length === 0) return;
+  sessionDeleteDialog.value = {
+    targets,
   };
 }
 
@@ -1636,48 +2887,70 @@ function resetActiveSessionResource(projectId: string): void {
     activeResource.value = null;
     return;
   }
-  activeResource.value = {
-    kind: "newSession",
-    projectId,
+  void openWorkbenchResource({
+    resource: { kind: "newSession", projectId },
+    title: t("chat.session.newSession"),
     checkoutId: checkout.checkoutId,
-  };
+  }, { preview: true });
 }
 
-async function archiveSessionEntry(projectId: string, session: SessionSummary): Promise<void> {
-  await chatStore.archiveSession(session.id);
+function markWorkbenchSessionUnavailable(sessionId: string): void {
+  for (const group of Object.values(workbenchWindow.value.groups)) {
+    for (const editor of group.tabs) {
+      if (editor.resource.kind !== "session" || editor.resource.sessionId !== sessionId) continue;
+      workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, group.paneId, editor.editorId, {
+        availability: "unavailable",
+        unavailableReason: t("workbench.unavailable.session"),
+      });
+    }
+  }
+}
+
+async function archiveSessionEntry(target: DevelopmentSessionTarget): Promise<void> {
+  await chatStore.archiveSession(target.session.id);
+  markWorkbenchSessionUnavailable(target.session.id);
   if (activeResource.value?.kind === "session"
-    && activeResource.value.sessionId === session.id) {
-    resetActiveSessionResource(projectId);
+    && activeResource.value.sessionId === target.session.id) {
+    resetActiveSessionResource(target.projectId);
   }
 }
 
 async function archiveSessionItem(item: DevelopmentTreeItem): Promise<void> {
   if (item.meta.kind !== "session" || !item.meta.session) return;
-  await archiveSessionEntry(item.meta.projectId, item.meta.session);
+  const nextSelectedIds = new Set(selectedSessionIds.value);
+  nextSelectedIds.delete(item.meta.session.id);
+  selectedSessionIds.value = nextSelectedIds;
+  if (lastSessionSelectionAnchorId.value === item.meta.session.id) {
+    lastSessionSelectionAnchorId.value = null;
+  }
+  await archiveSessionEntry({
+    item,
+    projectId: item.meta.projectId,
+    session: item.meta.session,
+  });
 }
 
 async function archiveContextSession(): Promise<void> {
-  const entry = contextSessionEntry();
+  const targets = [...(contextMenu.value?.sessionTargets ?? [])];
   contextMenu.value = null;
-  if (!entry) return;
-  await archiveSessionEntry(entry.project.projectId, entry.session);
+  if (targets.length === 0) return;
+  resetSessionMultiSelection();
+  for (const target of targets) await archiveSessionEntry(target);
 }
 
-async function commitSessionDialog(): Promise<void> {
-  const dialog = sessionDialog.value;
+async function commitSessionDeleteDialog(): Promise<void> {
+  const dialog = sessionDeleteDialog.value;
   if (!dialog) return;
-  if (dialog.mode === "rename") {
-    const title = dialog.value.trim();
-    if (!title) return;
-    await chatStore.renameSession(dialog.session.id, title);
-  } else {
-    await chatStore.deleteSession(dialog.session.id);
+  resetSessionMultiSelection();
+  for (const target of dialog.targets) {
+    await chatStore.deleteSession(target.session.id);
+    markWorkbenchSessionUnavailable(target.session.id);
     if (activeResource.value?.kind === "session"
-      && activeResource.value.sessionId === dialog.session.id) {
-      resetActiveSessionResource(dialog.projectId);
+      && activeResource.value.sessionId === target.session.id) {
+      resetActiveSessionResource(target.projectId);
     }
   }
-  sessionDialog.value = null;
+  sessionDeleteDialog.value = null;
 }
 
 async function exportContextSession(): Promise<void> {
@@ -1714,15 +2987,15 @@ async function reviewContextSession(): Promise<void> {
       ?? entry.session.defaultCheckoutId;
     const checkout = await ensureProjectCheckout(entry.project, preferredCheckoutId);
     if (!checkout) return;
-    await chatStore.selectSession(entry.session.id);
-    activeResource.value = {
-      kind: "session",
-      projectId: entry.project.projectId,
-      sessionId: entry.session.id,
+    await openWorkbenchResource({
+      resource: {
+        kind: "session",
+        projectId: entry.project.projectId,
+        sessionId: entry.session.id,
+      },
+      title: entry.session.title || t("chat.session.newSession"),
       checkoutId: checkout.checkoutId,
-    };
-    await nextTick();
-    await chatWorkspaceView.value?.reviewSessionContext({ sessionId: entry.session.id });
+    }, { preview: false, pinned: true });
   } catch (error) {
     const normalized = normalizeAppError(error);
     notificationStore.addNotice("error", normalized.message, {
@@ -1743,6 +3016,26 @@ function openContextMenu(raw: WorkspaceTreeItem, event: MouseEvent): void {
     || item.meta.kind === "knowledge"
     || item.meta.kind === "localFile")) return;
   event.preventDefault();
+  if (item.meta.kind === "session" && item.meta.session) {
+    const visibleTargets = visibleWorkspaceSessionTargets();
+    const targetIds = resolveWorkspaceSessionContextIds({
+      visibleSessionIds: visibleTargets.map((target) => target.session.id),
+      selectedSessionIds: selectedSessionIds.value,
+      targetSessionId: item.meta.session.id,
+    });
+    if (targetIds.length === 1 && !selectedSessionIds.value.has(item.meta.session.id)) {
+      clearSessionMultiSelection();
+    }
+    const targetIdSet = new Set(targetIds);
+    contextMenu.value = {
+      x: event.clientX,
+      y: event.clientY,
+      item,
+      sessionTargets: visibleTargets.filter((target) => targetIdSet.has(target.session.id)),
+    };
+    return;
+  }
+  resetSessionMultiSelection();
   contextMenu.value = { x: event.clientX, y: event.clientY, item };
 }
 
@@ -1754,6 +3047,7 @@ function openExplorerBackgroundContextMenu(event: MouseEvent): void {
     ?? visibleProjects.value[0]?.projectId;
   if (!projectId) return;
   event.preventDefault();
+  resetSessionMultiSelection();
   contextMenu.value = {
     x: event.clientX,
     y: event.clientY,
@@ -2027,7 +3321,7 @@ async function setContextNodeHidden(hidden: boolean): Promise<void> {
   const item = contextMenu.value?.item;
   contextMenu.value = null;
   const node = item?.meta.explorerNode;
-  if (!item || !node) return;
+  if (!item || !node || node.resourceKind !== SYSTEM_RESOURCE_KIND) return;
   try {
     await explorerStore.applyOperations(item.meta.projectId, [{
       kind: "setNodeHidden",
@@ -2039,22 +3333,66 @@ async function setContextNodeHidden(hidden: boolean): Promise<void> {
   }
 }
 
-async function removeContextMountedNode(): Promise<void> {
+async function removeKnowledgeItemFromWorkspace(item: DevelopmentTreeItem): Promise<void> {
+  if (item.meta.kind !== "knowledge" || !item.meta.knowledge) return;
+  try {
+    await explorerStore.applyOperations(item.meta.projectId, [{
+      kind: "removeResourcePlacement",
+      resourceKind: "knowledge",
+      resourceId: item.meta.knowledge.id,
+    }]);
+  } catch (error) {
+    notificationStore.addNotice("error", normalizeAppError(error).message);
+  }
+}
+
+async function removeContextKnowledgeItemFromWorkspace(): Promise<void> {
   const item = contextMenu.value?.item;
   contextMenu.value = null;
+  if (!item) return;
+  await removeKnowledgeItemFromWorkspace(item);
+}
+
+async function removeMountedNodeFromWorkspace(item: DevelopmentTreeItem): Promise<void> {
   const node = item?.meta.explorerNode;
-  if (!item || !node?.sourcePath) return;
+  if (!node?.sourcePath) return;
   try {
     await explorerStore.applyOperations(item.meta.projectId, [{
       kind: "removeNode",
       nodeId: node.nodeId,
     }]);
-    if (activeResource.value?.kind === "localFile" && activeResource.value.nodeId === node.nodeId) {
-      activeResource.value = null;
+    if (
+      (activeResource.value?.kind === "localFile" || activeResource.value?.kind === "localDirectory")
+      && activeResource.value.nodeId === node.nodeId
+    ) {
+      for (const group of Object.values(workbenchWindow.value.groups)) {
+        for (const editor of group.tabs) {
+          if (
+            (editor.resource.kind !== "localFile" && editor.resource.kind !== "localDirectory")
+            || editor.resource.nodeId !== node.nodeId
+          ) continue;
+          workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, group.paneId, editor.editorId, {
+            availability: "unavailable",
+            unavailableReason: t("workbench.unavailable.removed"),
+          });
+        }
+      }
     }
   } catch (error) {
     notificationStore.addNotice("error", normalizeAppError(error).message);
   }
+}
+
+async function removeKnowledgeFolderFromWorkspace(item: DevelopmentTreeItem): Promise<void> {
+  if (!isKnowledgeFolderPlacement(item)) return;
+  await removeMountedNodeFromWorkspace(item);
+}
+
+async function removeContextMountedNode(): Promise<void> {
+  const item = contextMenu.value?.item;
+  contextMenu.value = null;
+  if (!item) return;
+  await removeMountedNodeFromWorkspace(item);
 }
 
 function developmentTreeItemAt(element: Element | null): DevelopmentTreeItem | null {
@@ -2090,10 +3428,212 @@ function nearestExternalDropTarget(element: Element | null): DevelopmentTreeItem
   };
 }
 
+function nativeWorkbenchDropDecisionAt(
+  x: number,
+  y: number,
+): InternalDropDecision<WorkbenchInternalDropIntent> | null {
+  const hit = document.elementFromPoint(x, y);
+  if (!(hit instanceof Element) || !workbenchRootRef.value?.contains(hit)) return null;
+
+  const composer = hit.closest<HTMLElement>(".chat-composer");
+  const composerGroup = composer?.closest<HTMLElement>(
+    ".workbench-editor-group[data-workbench-pane-id]",
+  );
+  if (composer && composerGroup) {
+    const paneId = composerGroup.dataset.workbenchPaneId ?? "";
+    const editor = paneId ? editorForPane(paneId) : null;
+    if (paneId && editor && (
+      editor.resource.kind === "session" || editor.resource.kind === "newSession"
+    )) {
+      return {
+        key: `composer:${paneId}:${editor.editorId}`,
+        operation: "copy",
+        intent: { kind: "composer", paneId, editorId: editor.editorId },
+      };
+    }
+  }
+
+  const tabStrip = hit.closest<HTMLElement>(
+    ".workbench-editor-tabs[data-workbench-pane-id]",
+  );
+  if (tabStrip) {
+    const paneId = tabStrip.dataset.workbenchPaneId ?? "";
+    const group = workbenchWindow.value.groups[paneId];
+    if (paneId && group) {
+      const tabBounds = [...tabStrip.querySelectorAll<HTMLElement>("[data-workbench-tab-id]")]
+        .map((tab) => tab.getBoundingClientRect());
+      const index = workbenchTabInsertionIndexAtPoint(x, tabBounds);
+      return {
+        key: `editor:${paneId}:center:${index}`,
+        operation: "copy",
+        intent: { kind: "editor", paneId, direction: "center", index },
+      };
+    }
+  }
+
+  const editorGroup = hit.closest<HTMLElement>(
+    ".workbench-editor-group[data-workbench-pane-id]",
+  );
+  if (editorGroup) {
+    const paneId = editorGroup.dataset.workbenchPaneId ?? "";
+    if (paneId && workbenchWindow.value.groups[paneId]) {
+      const bounds = editorGroup.getBoundingClientRect();
+      const tab = editorGroup.querySelector<HTMLElement>(".workbench-editor-tabs");
+      const direction = workbenchSplitDirectionAtPoint({ x, y }, {
+        left: bounds.left,
+        right: bounds.right,
+        top: tab?.getBoundingClientRect().bottom ?? bounds.top,
+        bottom: bounds.bottom,
+      });
+      return {
+        key: `editor:${paneId}:${direction}`,
+        operation: "copy",
+        intent: { kind: "editor", paneId, direction },
+      };
+    }
+  }
+
+  if (!explorerRootRef.value?.contains(hit)) return null;
+  const rowHit = developmentTreeItemFromHit(hit);
+  const target = rowHit?.item ?? nearestExternalDropTarget(hit);
+  externalDropTarget.value = target;
+  if (target?.meta.kind === "newSession") {
+    return {
+      key: `new-session:${target.key}`,
+      operation: "copy",
+      intent: { kind: "newSession", target },
+    };
+  }
+  const intent = rowHit
+    ? resolveLayoutDropIntentAt(rowHit.item, y, rowHit.rowElement)
+    : resolveExplorerRootDropIntent();
+  return intent ? {
+    key: `layout:${intent.targetKey}:${intent.position}`,
+    operation: "copy",
+    intent: { kind: "layout", layout: intent, target: rowHit?.item ?? null },
+  } : null;
+}
+
+function updateNativeWorkbenchDropTarget(x: number, y: number): void {
+  const decision = nativeWorkbenchDropDecisionAt(x, y);
+  handleWorkbenchInternalTargetChange(decision);
+  if (!decision) externalDropTarget.value = null;
+}
+
+function clearNativeWorkbenchDropTarget(): void {
+  externalDropTarget.value = null;
+  layoutDropIntent.value = null;
+  dropTargetKey.value = null;
+  editorDropIntent.value = null;
+  composerDropTarget.value = null;
+}
+
+function currentNativeWorkbenchDropIntent(): WorkbenchInternalDropIntent | null {
+  if (composerDropTarget.value) return composerDropTarget.value;
+  if (editorDropIntent.value) return editorDropIntent.value;
+  if (externalDropTarget.value?.meta.kind === "newSession") {
+    return { kind: "newSession", target: externalDropTarget.value };
+  }
+  if (layoutDropIntent.value) {
+    return {
+      kind: "layout",
+      layout: layoutDropIntent.value,
+      target: externalDropTarget.value,
+    };
+  }
+  return null;
+}
+
+function nativeDropScope(intent: WorkbenchInternalDropIntent): WorkbenchReferenceDragData["origin"] | null {
+  const paneId = intent.kind === "composer" || intent.kind === "editor" ? intent.paneId : null;
+  const editor = paneId ? editorForPane(paneId) : null;
+  const projectId = editor?.resource.projectId
+    ?? (intent.kind === "newSession" ? intent.target.meta.projectId : null)
+    ?? (intent.kind === "layout" ? intent.layout.projectId : null);
+  if (!projectId) return null;
+  const checkoutId = editor?.checkoutBinding?.checkoutId
+    ?? (
+      workspaceContextStore.focusedCheckout?.projectId === projectId
+        ? workspaceContextStore.focusedCheckout.checkoutId
+        : workspaceContextStore.projectsById[projectId]?.checkouts[0]?.checkoutId
+    );
+  const checkout = checkoutId ? workspaceContextStore.checkoutsById[checkoutId] : null;
+  if (!checkout) return null;
+  return {
+    projectId,
+    workspaceRef: {
+      checkoutId: checkout.checkoutId,
+      expectedGeneration: checkout.runtime?.workspaceGeneration,
+    },
+    workspaceRoot: checkout.root,
+  };
+}
+
+function nativeFileReferenceData(
+  payload: LocusFileDropPayload,
+  intent: WorkbenchInternalDropIntent,
+): WorkbenchReferenceDragData | null {
+  const origin = nativeDropScope(intent);
+  if (!origin) return null;
+  return {
+    version: 1,
+    origin,
+    entries: payload.files.map((file) => ({
+      kind: "file" as const,
+      path: file.path,
+      isDir: file.isDir,
+      name: file.name,
+      typeLabel: file.typeLabel,
+    })),
+  };
+}
+
+function nativeAssetReferenceData(
+  payload: UnityEmbedAssetDropPayload,
+  intent: WorkbenchInternalDropIntent,
+): WorkbenchReferenceDragData | null {
+  const origin = nativeDropScope(intent);
+  if (!origin) return null;
+  const entries = payload.refs.flatMap((ref): WorkbenchReferenceDragEntry[] => {
+    if (ref.kind === "sceneObject") {
+      const match = normalizeReferencePath(ref.path).match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
+      return match ? [{
+        kind: "sceneObject",
+        scenePath: match[1]!,
+        objectPath: match[2]!,
+        name: ref.name,
+        typeLabel: ref.typeLabel,
+      }] : [];
+    }
+    if (ref.kind === "knowledge") {
+      const match = normalizeReferencePath(ref.path).match(
+        /^(?:Locus\/knowledge\/)?(design|plan|memory|skill|reference)\/(.+\.md)$/i,
+      );
+      if (!match) return [];
+      return [{
+        kind: "knowledge",
+        type: match[1]!.toLocaleLowerCase() as KnowledgeDocumentType,
+        path: `${match[1]!.toLocaleLowerCase()}/${match[2]}`,
+        name: ref.name,
+      } as WorkbenchReferenceDragEntry];
+    }
+    return [{
+      kind: "asset",
+      path: ref.path,
+      name: ref.name,
+      typeLabel: ref.typeLabel,
+    }];
+  });
+  return entries.length > 0 ? { version: 1, origin, entries } : null;
+}
+
 function handleLocusFileDragState(payload: LocusFileDragStatePayload): void {
   locusFileWorkspaceDragActive.value = payload.active && payload.phase !== "leave";
   if (payload.fileCount > 0) locusFileWorkspaceDragCount.value = payload.fileCount;
-  if (payload.active) updateWorkspaceDragPointer(payload.x, payload.y);
+  if (payload.active) {
+    updateWorkspaceDragPointer(payload.x, payload.y);
+    updateNativeWorkbenchDropTarget(payload.x, payload.y);
+  }
   if (payload.phase === "leave") {
     locusFileWorkspaceDragCount.value = 0;
     clearWorkspaceDragPointer();
@@ -2105,63 +3645,20 @@ function handleLocusFileDragState(payload: LocusFileDragStatePayload): void {
         unityAssetWorkspaceDragRefs.value = [];
       }, UNITY_WORKSPACE_DRAG_STATE_TTL_MS);
     }
-    externalDropTarget.value = null;
-    dropTargetKey.value = null;
-    layoutDropIntent.value = null;
-    return;
+    clearNativeWorkbenchDropTarget();
   }
-  const explorer = document.querySelector<HTMLElement>(".development-explorer");
-  const bounds = explorer?.getBoundingClientRect();
-  if (!bounds
-    || payload.x < bounds.left
-    || payload.x > bounds.right
-    || payload.y < bounds.top
-    || payload.y > bounds.bottom) {
-    externalDropTarget.value = null;
-    dropTargetKey.value = null;
-    layoutDropIntent.value = null;
-    return;
-  }
-  const hit = document.elementFromPoint(payload.x, payload.y);
-  const exactTarget = developmentTreeItemAt(hit);
-  if (exactTarget?.meta.kind === "dropPreview") return;
-  const target = nearestExternalDropTarget(hit);
-  externalDropTarget.value = target;
-  if (exactTarget?.meta.kind === "newSession") {
-    layoutDropIntent.value = null;
-    dropTargetKey.value = exactTarget.key;
-    externalDropTarget.value = exactTarget;
-    return;
-  }
-  const row = hit?.closest<HTMLElement>("[data-tree-key]") ?? null;
-  const intent = exactTarget
-    ? resolveLayoutDropIntentAt(exactTarget, payload.y, row)
-    : resolveExplorerRootDropIntent();
-  if (intent) activateLayoutDropIntent(intent, exactTarget);
-  else dropTargetKey.value = target?.key ?? null;
 }
 
 async function handleLocusFileDrop(payload: LocusFileDropPayload): Promise<void> {
-  const target = externalDropTarget.value;
-  const intent = layoutDropIntent.value;
-  externalDropTarget.value = null;
-  dropTargetKey.value = null;
-  layoutDropIntent.value = null;
+  const intent = currentNativeWorkbenchDropIntent();
+  const data = intent ? nativeFileReferenceData(payload, intent) : null;
+  clearNativeWorkbenchDropTarget();
   locusFileWorkspaceDragActive.value = false;
   locusFileWorkspaceDragCount.value = 0;
   clearWorkspaceDragPointer();
-  if ((!target && !intent) || !payload.files.length) return;
-  if (target?.meta.kind === "newSession") {
-    await createNewSessionWithAttachments(target, attachmentDraft({
-      localFiles: payload.files,
-    }));
-    return;
-  }
-  const projectId = intent?.projectId ?? target!.meta.projectId;
-  const parentNodeId = intent?.parentNodeId
-    ?? (target?.meta.kind === "folder" ? target.meta.explorerNode?.nodeId ?? null : null);
+  if (!intent || !data || data.entries.length === 0) return;
   try {
-    await mountPaths(projectId, parentNodeId, payload.files, undefined, intent?.position);
+    await commitWorkbenchInternalDrop(WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE, data, intent);
   } catch (error) {
     notificationStore.addNotice("error", normalizeAppError(error).message);
   }
@@ -2170,40 +3667,17 @@ async function handleLocusFileDrop(payload: LocusFileDropPayload): Promise<void>
 async function handleWorkspaceUnityAssetDrop(
   payload: UnityEmbedAssetDropPayload,
 ): Promise<void> {
-  const target = externalDropTarget.value;
-  const intent = layoutDropIntent.value;
-  externalDropTarget.value = null;
-  dropTargetKey.value = null;
-  layoutDropIntent.value = null;
+  const intent = currentNativeWorkbenchDropIntent();
+  const data = intent ? nativeAssetReferenceData(payload, intent) : null;
+  clearNativeWorkbenchDropTarget();
   window.clearTimeout(unityWorkspaceDragStateClearTimer);
   unityWorkspaceDragStateClearTimer = 0;
   unityAssetWorkspaceDragActive.value = false;
   unityAssetWorkspaceDragRefs.value = [];
   clearWorkspaceDragPointer();
-  if ((!target && !intent) || !payload.refs.length) return;
-  if (target?.meta.kind === "newSession") {
-    await createNewSessionWithAttachments(target, attachmentDraft({
-      assetRefs: payload.refs,
-    }));
-    return;
-  }
-  const projectId = intent?.projectId ?? target!.meta.projectId;
-  const project = workspaceContextStore.projectsById[projectId];
-  const checkout = workspaceContextStore.focusedCheckout?.projectId === projectId
-    ? workspaceContextStore.focusedCheckout
-    : project?.checkouts[0];
-  if (!checkout) return;
-  const parentNodeId = intent?.parentNodeId
-    ?? (target?.meta.kind === "folder" ? target.meta.explorerNode?.nodeId ?? null : null);
-  const root = checkout.root.replace(/[\\/]+$/, "");
+  if (!intent || !data || data.entries.length === 0) return;
   try {
-    await mountPaths(projectId, parentNodeId, payload.refs.map((asset) => ({
-      path: `${root}/${asset.path.replace(/^\/+/, "")}`,
-      name: asset.name,
-      typeLabel: asset.typeLabel,
-      isDir: false,
-      source: "unity",
-    })), undefined, intent?.position);
+    await commitWorkbenchInternalDrop(WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE, data, intent);
   } catch (error) {
     notificationStore.addNotice("error", normalizeAppError(error).message);
   }
@@ -2212,19 +3686,27 @@ async function handleWorkspaceUnityAssetDrop(
 function onDragPointerDown(raw: WorkspaceTreeItem, event: PointerEvent): void {
   const item = raw as DevelopmentTreeItem;
   if (settlingLayoutDrop.value || !item.meta.explorerNode || isKnowledgeTypeFolder(item)) return;
+  const items = item.meta.kind === "session" && item.meta.session && selectedSessionIds.value.has(item.meta.session.id)
+    ? treeItems.value.filter((candidate) => (
+        candidate.meta.kind === "session"
+        && candidate.meta.session
+        && selectedSessionIds.value.has(candidate.meta.session.id)
+      ))
+    : [item];
   internalDrag.start(event, {
     id: `workspace-layout:${item.meta.projectId}:${item.meta.explorerNode.nodeId}`,
     payload: {
       type: WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE,
-      data: { item } satisfies WorkspaceLayoutInternalDragData,
+      data: { item, items } satisfies WorkspaceLayoutInternalDragData,
     },
     preview: {
       label: item.treeRow?.name ?? "",
       kind: item.treeRow?.kind ?? "item",
       icon: itemIcon(item),
       iconClass: itemIconClass(item),
+      count: items.length,
     },
-    allowedOperations: ["move"],
+    allowedOperations: item.meta.kind === "mountedFile" ? ["copy"] : ["move", "copy"],
     onActivated: () => {
       contextMenu.value = null;
       displayMenu.value = null;
@@ -2233,6 +3715,8 @@ function onDragPointerDown(raw: WorkspaceTreeItem, event: PointerEvent): void {
     onFinished: () => {
       dropTargetKey.value = null;
       layoutDropIntent.value = null;
+      editorDropIntent.value = null;
+      composerDropTarget.value = null;
     },
   });
 }
@@ -2355,7 +3839,7 @@ function handleUnityAssetWorkspaceDragState(
   if (!payload.hasRefs || refs.length === 0) {
     unityAssetWorkspaceDragActive.value = false;
     unityAssetWorkspaceDragRefs.value = [];
-    externalDropTarget.value = null;
+    if (!locusFileWorkspaceDragActive.value) clearNativeWorkbenchDropTarget();
     return;
   }
   unityAssetWorkspaceDragActive.value = true;
@@ -2365,7 +3849,7 @@ function handleUnityAssetWorkspaceDragState(
     if (locusFileWorkspaceDragActive.value) return;
     unityAssetWorkspaceDragActive.value = false;
     unityAssetWorkspaceDragRefs.value = [];
-    if (!locusFileWorkspaceDragActive.value) externalDropTarget.value = null;
+    if (!locusFileWorkspaceDragActive.value) clearNativeWorkbenchDropTarget();
   }, UNITY_WORKSPACE_DRAG_STATE_TTL_MS);
 }
 
@@ -2400,6 +3884,376 @@ function knowledgeDragAssetRefs(
   }));
 }
 
+function normalizeReferencePath(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function isAbsoluteReferencePath(path: string): boolean {
+  return /^[A-Za-z]:\//.test(path) || path.startsWith("//") || path.startsWith("/");
+}
+
+function absoluteReferencePath(path: string, workspaceRoot: string): string {
+  const normalized = normalizeReferencePath(path);
+  if (isAbsoluteReferencePath(normalized)) return normalized;
+  return `${normalizeReferencePath(workspaceRoot)}/${normalized.replace(/^\/+/, "")}`;
+}
+
+function workspaceRelativeReferencePath(path: string, workspaceRoot: string): string | null {
+  const normalized = normalizeReferencePath(path);
+  if (!normalized) return null;
+  if (!isAbsoluteReferencePath(normalized)) {
+    if (normalized.split("/").some((segment) => segment === "..")) return null;
+    return normalized.replace(/^\.\//, "");
+  }
+  const root = normalizeReferencePath(workspaceRoot);
+  const prefix = `${root}/`;
+  if (!root || !normalized.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())) return null;
+  return normalized.slice(prefix.length);
+}
+
+function knowledgeDocumentForReference(
+  data: WorkbenchReferenceDragData,
+  entry: Extract<WorkbenchReferenceDragEntry, { kind: "knowledge" }>,
+): ProjectKnowledgeDocument | null {
+  const documents = explorerStore.resources[data.origin.projectId]?.knowledge ?? [];
+  if (entry.documentId) {
+    const byId = documents.find((document) => document.id === entry.documentId);
+    if (byId) return byId;
+  }
+  const key = normalizeReferencePath(entry.path).replace(/^Locus\/knowledge\//i, "").toLocaleLowerCase();
+  return documents.find((document) => (
+    `${document.type}/${normalizeReferencePath(document.path)}`.toLocaleLowerCase() === key
+  )) ?? null;
+}
+
+function referenceAttachmentDraft(data: WorkbenchReferenceDragData): UserMessageDraft | null {
+  const assetRefs: AssetRefAttachment[] = [];
+  const localFiles: LocusFileDropRef[] = [];
+  for (const entry of data.entries) {
+    if (entry.kind === "knowledge") {
+      assetRefs.push({
+        kind: "knowledge",
+        path: entry.path,
+        name: entry.name,
+        source: "manual",
+      });
+      continue;
+    }
+    if (entry.kind === "asset") {
+      assetRefs.push({
+        kind: "asset",
+        path: entry.path,
+        name: entry.name,
+        typeLabel: entry.typeLabel,
+        source: "manual",
+      });
+      continue;
+    }
+    if (entry.kind === "sceneObject") {
+      assetRefs.push({
+        kind: "sceneObject",
+        path: `${entry.scenePath}/${entry.objectPath}`,
+        name: entry.name,
+        typeLabel: entry.typeLabel,
+        source: "manual",
+      });
+      continue;
+    }
+    const attachment = workbenchComposerFileAttachment({
+      absolutePath: absoluteReferencePath(entry.path, data.origin.workspaceRoot),
+      workspaceRoot: data.origin.workspaceRoot,
+      relativePath: workspaceRelativeReferencePath(entry.path, data.origin.workspaceRoot),
+      name: entry.name,
+      typeLabel: entry.typeLabel,
+      source: "locus",
+    });
+    if (attachment?.assetRef) assetRefs.push(attachment.assetRef);
+    if (attachment?.localFile) localFiles.push(attachment.localFile);
+  }
+  return assetRefs.length || localFiles.length
+    ? attachmentDraft({ assetRefs, localFiles })
+    : null;
+}
+
+async function mountedReferenceDescriptor(
+  data: WorkbenchReferenceDragData,
+  entry: Extract<WorkbenchReferenceDragEntry, { kind: "file" }>,
+): Promise<TreeEditorDescriptor | null> {
+  const absolutePath = absoluteReferencePath(entry.path, data.origin.workspaceRoot);
+  await mountPaths(data.origin.projectId, null, [{
+    path: absolutePath,
+    isDir: entry.isDir,
+    name: entry.name,
+    typeLabel: entry.typeLabel,
+    source: "local",
+  }]);
+  const normalized = normalizeReferencePath(absolutePath).toLocaleLowerCase();
+  const node = explorerStore.snapshots[data.origin.projectId]?.nodes.find((candidate) => (
+    normalizeReferencePath(candidate.sourcePath ?? "").toLocaleLowerCase() === normalized
+  ));
+  if (!node) return null;
+  return {
+    resource: {
+      kind: entry.isDir ? "localDirectory" : "localFile",
+      projectId: data.origin.projectId,
+      nodeId: node.nodeId,
+    },
+    title: entry.name || shortPath(absolutePath),
+    checkoutId: data.origin.workspaceRef.checkoutId,
+    sourcePath: absolutePath,
+  };
+}
+
+async function referenceEditorDescriptors(
+  data: WorkbenchReferenceDragData,
+): Promise<TreeEditorDescriptor[]> {
+  await explorerStore.loadProject(data.origin.projectId);
+  const descriptors: TreeEditorDescriptor[] = [];
+  for (const entry of data.entries) {
+    if (entry.kind === "knowledge") {
+      const document = knowledgeDocumentForReference(data, entry);
+      if (!document) continue;
+      descriptors.push({
+        resource: {
+          kind: "knowledge",
+          projectId: data.origin.projectId,
+          documentId: document.id,
+        },
+        title: entry.name || knowledgeDocumentName(document),
+        checkoutId: document.sourceCheckoutId || data.origin.workspaceRef.checkoutId,
+      });
+      continue;
+    }
+    if (entry.kind === "asset") {
+      descriptors.push({
+        resource: { kind: "asset", projectId: data.origin.projectId, path: entry.path },
+        title: entry.name || shortPath(entry.path),
+        checkoutId: data.origin.workspaceRef.checkoutId,
+      });
+      continue;
+    }
+    if (entry.kind === "sceneObject") {
+      descriptors.push({
+        resource: {
+          kind: "sceneObject",
+          projectId: data.origin.projectId,
+          scenePath: entry.scenePath,
+          objectPath: entry.objectPath,
+        },
+        title: entry.name || shortPath(entry.objectPath),
+        checkoutId: data.origin.workspaceRef.checkoutId,
+      });
+      continue;
+    }
+    const mounted = await mountedReferenceDescriptor(data, entry);
+    if (mounted) descriptors.push(mounted);
+  }
+  return descriptors;
+}
+
+async function placeWorkbenchReferenceDrag(
+  intent: LayoutDropIntent,
+  data: WorkbenchReferenceDragData,
+): Promise<void> {
+  if (intent.projectId !== data.origin.projectId) return;
+  await explorerStore.loadProject(data.origin.projectId);
+  const operations = data.entries.flatMap<ProjectExplorerOperation>((entry, index) => {
+    const position = intent.position + index;
+    if (entry.kind === "knowledge") {
+      const document = knowledgeDocumentForReference(data, entry);
+      if (document) {
+        return [{
+          kind: "placeResource" as const,
+          resourceKind: "knowledge" as const,
+          resourceId: document.id,
+          sourceKind: "knowledge",
+          parentNodeId: intent.parentNodeId,
+          position,
+        }];
+      }
+      return [{
+        kind: "mountPath" as const,
+        parentNodeId: intent.parentNodeId,
+        path: absoluteReferencePath(`Locus/knowledge/${entry.path}`, data.origin.workspaceRoot),
+        sourceKind: "knowledge" as const,
+        name: entry.name,
+        position,
+      }];
+    }
+    const referencePath = entry.kind === "sceneObject" ? entry.scenePath : entry.path;
+    return [{
+      kind: "mountPath" as const,
+      parentNodeId: intent.parentNodeId,
+      path: absoluteReferencePath(referencePath, data.origin.workspaceRoot),
+      sourceKind: "local" as const,
+      name: entry.name,
+      position,
+    }];
+  });
+  if (operations.length === 0) return;
+  const snapshot = await explorerStore.applyOperations(intent.projectId, operations);
+  for (const entry of data.entries) {
+    if (entry.kind !== "file" || !entry.isDir) continue;
+    const absolutePath = absoluteReferencePath(entry.path, data.origin.workspaceRoot);
+    const normalized = normalizeReferencePath(absolutePath).toLocaleLowerCase();
+    const node = snapshot.nodes.find((candidate) => (
+      normalizeReferencePath(candidate.sourcePath ?? "").toLocaleLowerCase() === normalized
+    ));
+    if (!node) continue;
+    expanded.value = new Set([...expanded.value, `folder:${intent.projectId}:${node.nodeId}`]);
+    void explorerStore.loadMount(intent.projectId, node.nodeId);
+  }
+}
+
+function workspaceLayoutAttachmentDraft(
+  data: WorkspaceLayoutInternalDragData,
+  workspaceRoot: string,
+): UserMessageDraft | null {
+  if (!workspaceRoot) return null;
+  const assetRefs: AssetRefAttachment[] = [];
+  const localFiles: LocusFileDropRef[] = [];
+  const items = data.items?.length ? data.items : [data.item];
+
+  for (const item of items) {
+    if (item.meta.kind === "knowledge" && item.meta.knowledge) {
+      const path = item.meta.knowledge.path
+        .replace(/\\/g, "/")
+        .replace(/^\/+/, "");
+      assetRefs.push({
+        path: `${item.meta.knowledge.type}/${path}`,
+        kind: "knowledge",
+        name: item.treeRow?.name ?? knowledgeDocumentName(item.meta.knowledge),
+        source: "manual",
+      });
+      continue;
+    }
+
+    const mountEntry = item.meta.kind === "mountedFile" ? item.meta.mountEntry : null;
+    const explorerNode = item.meta.explorerNode;
+    const absolutePath = mountEntry?.absolutePath
+      ?? (item.meta.kind === "localFile" ? explorerNode?.sourcePath : null);
+    if (!absolutePath) continue;
+    const attachment = workbenchComposerFileAttachment({
+      absolutePath,
+      workspaceRoot,
+      relativePath: mountEntry?.relativePath,
+      name: item.treeRow?.name ?? mountEntry?.name,
+      source: explorerNode?.sourceKind,
+      knowledgeSource: explorerNode?.sourceKind === "knowledge",
+    });
+    if (attachment?.assetRef) assetRefs.push(attachment.assetRef);
+    else if (attachment?.localFile) localFiles.push(attachment.localFile);
+  }
+
+  if (assetRefs.length === 0 && localFiles.length === 0) return null;
+  return attachmentDraft({ assetRefs, localFiles });
+}
+
+function workspaceLayoutComposerDraft(
+  data: WorkspaceLayoutInternalDragData,
+  paneId: string,
+  editorId?: string,
+): UserMessageDraft | null {
+  const targetEditor = editorId
+    ? workbenchGroup(paneId)?.tabs.find((editor) => editor.editorId === editorId) ?? null
+    : editorForPane(paneId);
+  return targetEditor
+    ? workspaceLayoutAttachmentDraft(data, editorWorkingDir(targetEditor))
+    : null;
+}
+
+function workspaceLayoutNewSessionDraft(
+  data: WorkspaceLayoutInternalDragData,
+  target: DevelopmentTreeItem,
+): UserMessageDraft | null {
+  const checkoutId = target.meta.checkoutId;
+  const workspaceRoot = checkoutId
+    ? workspaceContextStore.checkoutsById[checkoutId]?.root ?? ""
+    : "";
+  return workspaceLayoutAttachmentDraft(data, workspaceRoot);
+}
+
+function newSessionDropDraft(
+  sourceType: string,
+  sourceData: WorkbenchInternalDragData,
+  target: DevelopmentTreeItem,
+): UserMessageDraft | null {
+  if (target.meta.kind !== "newSession") return null;
+  if (sourceType === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE) {
+    return workspaceLayoutNewSessionDraft(
+      sourceData as WorkspaceLayoutInternalDragData,
+      target,
+    );
+  }
+  if (sourceType === WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE) {
+    return referenceAttachmentDraft(sourceData as WorkbenchReferenceDragData);
+  }
+  if (sourceType === KNOWLEDGE_INTERNAL_DRAG_TYPE) {
+    const assetRefs = knowledgeDragAssetRefs(
+      (sourceData as KnowledgeInternalDragData).payload,
+    );
+    return assetRefs.length > 0 ? attachmentDraft({ assetRefs }) : null;
+  }
+  return null;
+}
+
+function isNewSessionDropAvailable(target: DevelopmentTreeItem): boolean {
+  if (locusFileWorkspaceDragActive.value || unityAssetWorkspaceDragRefs.value.length > 0) {
+    return true;
+  }
+  if (!internalDrag.dragging.value) return false;
+  const source = internalDrag.source.value;
+  return !!source && newSessionDropDraft(
+    source.payload.type,
+    source.payload.data as WorkbenchInternalDragData,
+    target,
+  ) !== null;
+}
+
+function composerDraftForInternalDrop(
+  sourceType: string,
+  sourceData: WorkbenchInternalDragData,
+  paneId: string,
+  editorId?: string,
+): UserMessageDraft | null {
+  if (sourceType === KNOWLEDGE_INTERNAL_DRAG_TYPE) {
+    const refs = knowledgeDragAssetRefs(
+      (sourceData as KnowledgeInternalDragData).payload,
+    );
+    return refs.length > 0 ? attachmentDraft({ assetRefs: refs }) : null;
+  }
+  if (sourceType === WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE) {
+    return referenceAttachmentDraft(sourceData as WorkbenchReferenceDragData);
+  }
+  if (sourceType === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE) {
+    return workspaceLayoutComposerDraft(
+      sourceData as WorkspaceLayoutInternalDragData,
+      paneId,
+      editorId,
+    );
+  }
+  return null;
+}
+
+function composerAcceptsCurrentDrag(
+  paneId: string,
+  editor: WorkbenchEditorInput,
+): boolean {
+  if (editor.resource.kind !== "session" && editor.resource.kind !== "newSession") return false;
+  if (internalDrag.dragging.value) {
+    const source = internalDrag.source.value;
+    if (!source) return false;
+    return composerDraftForInternalDrop(
+      source.payload.type,
+      source.payload.data as WorkbenchInternalDragData,
+      paneId,
+      editor.editorId,
+    ) !== null;
+  }
+  return locusFileWorkspaceDragActive.value
+    || (unityAssetWorkspaceDragActive.value && unityAssetWorkspaceDragRefs.value.length > 0);
+}
+
 async function createNewSessionWithAttachments(
   target: DevelopmentTreeItem,
   draft: UserMessageDraft,
@@ -2408,17 +4262,13 @@ async function createNewSessionWithAttachments(
   if (!project) return;
   const checkout = await ensureProjectCheckout(project, target.meta.checkoutId);
   if (!checkout) return;
-  chatStore.newChat();
-  activeResource.value = {
-    kind: "newSession",
-    projectId: project.projectId,
+  const editor = await openWorkbenchResource({
+    resource: { kind: "newSession", projectId: project.projectId },
+    title: t("chat.session.newSession"),
     checkoutId: checkout.checkoutId,
-  };
+  }, { preview: false, pinned: true });
   await nextTick();
-  uiStore.stageChatDraftPrefill(draft, {
-    sessionId: null,
-    requireEmptyComposer: true,
-  });
+  await sessionEditorRefs.get(editor.editorId)?.applyDraftPrefill(draft);
 }
 
 async function placeKnowledgeWorkspaceDrag(
@@ -2476,11 +4326,88 @@ function developmentTreeItemFromHit(hit: Element): {
 }
 
 function resolveWorkbenchInternalDrop(
-  context: InternalDropResolveContext<WorkspaceLayoutInternalDragData | KnowledgeInternalDragData>,
+  context: InternalDropResolveContext<WorkbenchInternalDragData>,
 ): InternalDropDecision<WorkbenchInternalDropIntent> | null {
+  const sourceType = context.source.payload.type;
+  const sourceData = context.source.payload.data as WorkbenchInternalDragData;
+  const sourceCanOpenEditor = sourceType === WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE
+    || (
+      sourceType === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE
+      && treeEditorDescriptor((sourceData as WorkspaceLayoutInternalDragData).item) !== null
+    )
+    || (
+      sourceType === KNOWLEDGE_INTERNAL_DRAG_TYPE
+      && (sourceData as KnowledgeInternalDragData).payload.entries.some(
+        (entry) => entry.kind === "document" && !!entry.documentId,
+      )
+    );
+  const referenceSourceCanOpenEditor = sourceType === WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE
+    && (sourceData as WorkbenchReferenceDragData).entries.length > 0;
+  const canOpenEditor = sourceCanOpenEditor || referenceSourceCanOpenEditor;
+
+  const composer = context.hit.closest<HTMLElement>(".chat-composer");
+  const composerGroup = composer?.closest<HTMLElement>(
+    ".workbench-editor-group[data-workbench-pane-id]",
+  );
+  if (composer && composerGroup && workbenchRootRef.value?.contains(composer)) {
+    const paneId = composerGroup.dataset.workbenchPaneId ?? "";
+    const editor = paneId ? editorForPane(paneId) : null;
+    const acceptsComposerDrop = editor?.resource.kind === "session"
+      || editor?.resource.kind === "newSession";
+    if (
+      paneId
+      && editor
+      && acceptsComposerDrop
+      && composerDraftForInternalDrop(sourceType, sourceData, paneId, editor.editorId)
+    ) {
+      return {
+        key: `composer:${paneId}:${editor.editorId}`,
+        operation: "copy",
+        intent: { kind: "composer", paneId, editorId: editor.editorId },
+      };
+    }
+  }
+
+  const tabStrip = context.hit.closest<HTMLElement>(".workbench-editor-tabs[data-workbench-pane-id]");
+  if (tabStrip && workbenchRootRef.value?.contains(tabStrip) && canOpenEditor) {
+    const paneId = tabStrip.dataset.workbenchPaneId ?? "";
+    const targetGroup = workbenchWindow.value.groups[paneId];
+    if (paneId && targetGroup) {
+      const tabBounds = [...tabStrip.querySelectorAll<HTMLElement>("[data-workbench-tab-id]")]
+        .map((tab) => tab.getBoundingClientRect());
+      const index = workbenchTabInsertionIndexAtPoint(context.point.x, tabBounds);
+      return {
+        key: `editor:${paneId}:center:${index}`,
+        operation: sourceType === WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE ? "move" : "copy",
+        intent: { kind: "editor", paneId, direction: "center", index },
+      };
+    }
+  }
+
+  const editorGroup = context.hit.closest<HTMLElement>(
+    ".workbench-editor-group[data-workbench-pane-id]",
+  );
+  if (editorGroup && workbenchRootRef.value?.contains(editorGroup) && canOpenEditor) {
+    const paneId = editorGroup.dataset.workbenchPaneId ?? "";
+    if (paneId && workbenchWindow.value.groups[paneId]) {
+      const groupBounds = editorGroup.getBoundingClientRect();
+      const renderedTabStrip = editorGroup.querySelector<HTMLElement>(".workbench-editor-tabs");
+      const contentTop = renderedTabStrip?.getBoundingClientRect().bottom ?? groupBounds.top;
+      const direction = workbenchSplitDirectionAtPoint(context.point, {
+        left: groupBounds.left,
+        right: groupBounds.right,
+        top: contentTop,
+        bottom: groupBounds.bottom,
+      });
+      return {
+        key: `editor:${paneId}:${direction}`,
+        operation: sourceType === WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE ? "move" : "copy",
+        intent: { kind: "editor", paneId, direction },
+      };
+    }
+  }
   if (!explorerRootRef.value?.contains(context.hit)) return null;
   const rowHit = developmentTreeItemFromHit(context.hit);
-  const sourceType = context.source.payload.type;
   if (rowHit?.item.meta.kind === "dropPreview") {
     const intent = layoutDropIntent.value;
     return intent ? {
@@ -2490,8 +4417,20 @@ function resolveWorkbenchInternalDrop(
     } : null;
   }
 
+  if (
+    rowHit?.item.meta.kind === "newSession"
+    && newSessionDropDraft(sourceType, sourceData, rowHit.item)
+  ) {
+    return {
+      key: `new-session:${rowHit.item.key}`,
+      operation: "copy",
+      intent: { kind: "newSession", target: rowHit.item },
+    };
+  }
+
   if (sourceType === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE) {
     const source = (context.source.payload.data as WorkspaceLayoutInternalDragData).item;
+    if (source.meta.kind === "mountedFile" || source.meta.kind === "mountedFolder") return null;
     const intent = rowHit
       ? resolveLayoutDropIntentAt(rowHit.item, context.point.y, rowHit.rowElement)
       : resolveExplorerRootDropIntent();
@@ -2505,18 +4444,18 @@ function resolveWorkbenchInternalDrop(
     };
   }
 
-  if (sourceType !== KNOWLEDGE_INTERNAL_DRAG_TYPE) return null;
-  if (rowHit?.item.meta.kind === "newSession") {
-    return {
-      key: `new-session:${rowHit.item.key}`,
-      operation: "copy",
-      intent: { kind: "newSession", target: rowHit.item },
-    };
-  }
+  if (
+    sourceType !== KNOWLEDGE_INTERNAL_DRAG_TYPE
+    && sourceType !== WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE
+  ) return null;
   const intent = rowHit
     ? resolveLayoutDropIntentAt(rowHit.item, context.point.y, rowHit.rowElement)
     : resolveExplorerRootDropIntent();
   if (!intent) return null;
+  if (
+    sourceType === WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE
+    && (sourceData as WorkbenchReferenceDragData).origin.projectId !== intent.projectId
+  ) return null;
   return {
     key: `layout:${intent.targetKey}:${intent.position}`,
     operation: "copy",
@@ -2530,8 +4469,26 @@ function handleWorkbenchInternalTargetChange(
   if (!decision) {
     layoutDropIntent.value = null;
     dropTargetKey.value = null;
+    editorDropIntent.value = null;
+    composerDropTarget.value = null;
     return;
   }
+  if (decision.intent.kind === "composer") {
+    layoutDropIntent.value = null;
+    dropTargetKey.value = null;
+    editorDropIntent.value = null;
+    composerDropTarget.value = decision.intent;
+    return;
+  }
+  if (decision.intent.kind === "editor") {
+    layoutDropIntent.value = null;
+    dropTargetKey.value = null;
+    editorDropIntent.value = decision.intent;
+    composerDropTarget.value = null;
+    return;
+  }
+  editorDropIntent.value = null;
+  composerDropTarget.value = null;
   if (decision.intent.kind === "newSession") {
     layoutDropIntent.value = null;
     dropTargetKey.value = decision.intent.target.key;
@@ -2542,34 +4499,142 @@ function handleWorkbenchInternalTargetChange(
 
 async function commitWorkbenchInternalDrop(
   sourceType: string,
-  sourceData: WorkspaceLayoutInternalDragData | KnowledgeInternalDragData,
+  sourceData: WorkbenchInternalDragData,
   intent: WorkbenchInternalDropIntent,
 ): Promise<void> {
+  if (intent.kind === "composer") {
+    const editor = workbenchGroup(intent.paneId)?.tabs.find(
+      (candidate) => candidate.editorId === intent.editorId,
+    );
+    if (!editor || (
+      editor.resource.kind !== "session"
+      && editor.resource.kind !== "newSession"
+    )) return;
+    const draft = composerDraftForInternalDrop(
+      sourceType,
+      sourceData,
+      intent.paneId,
+      intent.editorId,
+    );
+    if (!draft) return;
+    await focusWorkbenchEditor(intent.paneId, intent.editorId);
+    await nextTick();
+    await sessionEditorRefs.get(intent.editorId)?.applyDraftPrefill(draft);
+    return;
+  }
+  if (intent.kind === "editor") {
+    if (sourceType === WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE) {
+      const data = sourceData as WorkbenchEditorTabInternalDragData;
+      const paneIdsBefore = new Set(Object.keys(workbenchWindow.value.groups));
+      const destinationPaneId = workbenchStore.moveEditor(
+        data.windowId,
+        data.paneId,
+        data.editorId,
+        intent.paneId,
+        { direction: intent.direction, index: intent.index },
+      );
+      for (const paneId of paneIdsBefore) {
+        if (!workbenchWindow.value.groups[paneId]) {
+          await workspaceContextStore.disposePane(WORKBENCH_WINDOW_ID, paneId);
+        }
+      }
+      if (destinationPaneId) await focusWorkbenchPane(destinationPaneId);
+      return;
+    }
+
+    let descriptors: TreeEditorDescriptor[] = [];
+    if (sourceType === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE) {
+      const data = sourceData as WorkspaceLayoutInternalDragData;
+      descriptors = (data.items?.length ? data.items : [data.item])
+        .map(treeEditorDescriptor)
+        .filter((descriptor): descriptor is TreeEditorDescriptor => descriptor !== null);
+    } else if (sourceType === KNOWLEDGE_INTERNAL_DRAG_TYPE) {
+      const targetEditor = editorForPane(intent.paneId);
+      const projectId = targetEditor?.resource.projectId ?? presetProjectId.value;
+      descriptors = (sourceData as KnowledgeInternalDragData).payload.entries.flatMap((entry) => {
+        if (entry.kind !== "document" || !entry.documentId || !projectId) return [];
+        const document = explorerStore.resources[projectId]?.knowledge.find(
+          (candidate) => candidate.id === entry.documentId,
+        );
+        return [{
+          resource: { kind: "knowledge", projectId, documentId: entry.documentId } as DevelopmentResourceRef,
+          title: document ? knowledgeDocumentName(document) : entry.name,
+          checkoutId: document?.sourceCheckoutId,
+        }];
+      });
+    } else if (sourceType === WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE) {
+      descriptors = await referenceEditorDescriptors(sourceData as WorkbenchReferenceDragData);
+    }
+    if (descriptors.length === 0) return;
+
+    let destinationPaneId = intent.paneId;
+    if (intent.direction === "center") {
+      for (const descriptor of descriptors) {
+        await openWorkbenchResource(descriptor, {
+          paneId: destinationPaneId,
+          preview: false,
+          pinned: true,
+        });
+      }
+      return;
+    }
+
+    const firstInput = createEditorForResource(descriptors[0]!.resource, {
+      paneId: intent.paneId,
+      title: descriptors[0]!.title,
+      checkoutId: descriptors[0]!.checkoutId,
+      sourcePath: descriptors[0]!.sourcePath,
+      preview: false,
+      pinned: true,
+    });
+    destinationPaneId = workbenchStore.splitPane(
+      WORKBENCH_WINDOW_ID,
+      intent.paneId,
+      intent.direction,
+      firstInput,
+    ) ?? intent.paneId;
+    for (const descriptor of descriptors.slice(1)) {
+      await openWorkbenchResource(descriptor, {
+        paneId: destinationPaneId,
+        preview: false,
+        pinned: true,
+        focus: false,
+      });
+    }
+    await focusWorkbenchEditor(destinationPaneId, firstInput.editorId);
+    return;
+  }
+  if (intent.kind === "newSession") {
+    const draft = newSessionDropDraft(sourceType, sourceData, intent.target);
+    if (draft) await createNewSessionWithAttachments(intent.target, draft);
+    return;
+  }
   if (sourceType === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE) {
     if (intent.kind === "layout") {
       await moveExplorerNodeToIntent((sourceData as WorkspaceLayoutInternalDragData).item, intent.layout);
     }
     return;
   }
-  if (sourceType !== KNOWLEDGE_INTERNAL_DRAG_TYPE) return;
-  const payload = (sourceData as KnowledgeInternalDragData).payload;
-  if (intent.kind === "newSession") {
-    await createNewSessionWithAttachments(intent.target, attachmentDraft({
-      assetRefs: knowledgeDragAssetRefs(payload),
-    }));
+  if (sourceType === WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE) {
+    const data = sourceData as WorkbenchReferenceDragData;
+    if (intent.kind === "layout") await placeWorkbenchReferenceDrag(intent.layout, data);
     return;
   }
-  await placeKnowledgeWorkspaceDrag(intent.layout, payload);
+  if (sourceType !== KNOWLEDGE_INTERNAL_DRAG_TYPE) return;
+  const payload = (sourceData as KnowledgeInternalDragData).payload;
+  if (intent.kind === "layout") await placeKnowledgeWorkspaceDrag(intent.layout, payload);
 }
 
 const workbenchInternalDropTarget: InternalDropTargetRegistration<
-  WorkspaceLayoutInternalDragData | KnowledgeInternalDragData,
+  WorkbenchInternalDragData,
   WorkbenchInternalDropIntent
 > = {
   id: "development-workbench",
   root: () => workbenchRootRef.value,
   accepts: (source) => source.payload.type === WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE
-    || source.payload.type === KNOWLEDGE_INTERNAL_DRAG_TYPE,
+    || source.payload.type === KNOWLEDGE_INTERNAL_DRAG_TYPE
+    || source.payload.type === WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE
+    || source.payload.type === WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE,
   resolve: resolveWorkbenchInternalDrop,
   onTargetChange: handleWorkbenchInternalTargetChange,
   drop: async ({ source, decision }) => {
@@ -2593,9 +4658,14 @@ const workbenchInternalDropTarget: InternalDropTargetRegistration<
       if (settlingLayoutDrop.value?.id === settlingId) {
         settlingLayoutDrop.value = null;
       }
+      editorDropIntent.value = null;
+      composerDropTarget.value = null;
     }
   },
-  previewMode: ({ hit }) => explorerRootRef.value?.contains(hit) ? "floating-with-gap" : "floating",
+  previewMode: ({ hit }) => {
+    if (hit.closest(".workspace-tree-row-shell.is-new-session-row")) return "inline";
+    return explorerRootRef.value?.contains(hit) ? "floating-with-gap" : "floating";
+  },
   priority: 10,
 };
 
@@ -2710,30 +4780,62 @@ function setWorkspaceMode(mode: "single" | "multi"): void {
   workspaceMenu.value = null;
 }
 
-const activeProject = computed(() => {
-  const projectId = activeResource.value?.projectId;
-  return projectId ? workspaceContextStore.projectsById[projectId] ?? null : null;
-});
+let workbenchWorkspaceScopeEpoch = 0;
 
-const selectedKnowledge = computed(() => {
-  if (activeResource.value?.kind !== "knowledge") return null;
-  const resource = activeResource.value;
-  return explorerStore.resources[resource.projectId]?.knowledge.find(
-    (document) => document.id === resource.documentId,
-  ) ?? null;
-});
+async function syncWorkbenchWorkspaceScope(nextWorkspaceScopeId: string | null): Promise<void> {
+  if (workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) === nextWorkspaceScopeId) return;
+  const epoch = ++workbenchWorkspaceScopeEpoch;
+  const state = workbenchStore.switchWorkspaceScope(
+    WORKBENCH_WINDOW_ID,
+    nextWorkspaceScopeId,
+  );
+  const activeEditor = workbenchStore.activeEditor(WORKBENCH_WINDOW_ID);
+  activeResource.value = activeEditor?.resource ?? null;
+  resetSessionMultiSelection();
+  collabHeadFocusRequest.value = null;
 
-const showChat = computed(() => activeResource.value?.kind === "session"
-  || activeResource.value?.kind === "newSession");
-const showKnowledge = computed(() => activeResource.value?.kind === "knowledge"
-  || activeResource.value?.kind === "knowledgeRoot");
-const showCollab = computed(() => activeResource.value?.kind === "collaboration"
-  || activeResource.value?.kind === "checkout");
+  const checkout = nextWorkspaceScopeId
+    ? workspaceContextStore.checkoutsById[nextWorkspaceScopeId] ?? null
+    : null;
+  const hasOpenTabs = Object.values(state.groups).some((group) => group.tabs.length > 0);
+  if (checkout && !hasOpenTabs) {
+    await openWorkbenchResource({
+      resource: { kind: "newSession", projectId: checkout.projectId },
+      title: t("chat.session.newSession"),
+      checkoutId: checkout.checkoutId,
+    }, {
+      preview: true,
+      focus: false,
+    });
+  }
+
+  if (checkout) await explorerStore.loadProject(checkout.projectId);
+  if (
+    epoch !== workbenchWorkspaceScopeEpoch
+    || workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) !== nextWorkspaceScopeId
+  ) return;
+  await reconcileRestoredWorkbenchEditors();
+  if (
+    epoch !== workbenchWorkspaceScopeEpoch
+    || workbenchStore.workspaceScope(WORKBENCH_WINDOW_ID) !== nextWorkspaceScopeId
+  ) return;
+  await restoreWorkbenchPaneContexts(nextWorkspaceScopeId);
+}
 
 async function activateCheckoutOverview(checkoutId: string): Promise<void> {
   const item = treeItems.value.find((candidate) => candidate.meta.checkoutId === checkoutId);
   if (item) await activateItem(item);
 }
+
+watch(
+  workbenchWorkspaceScopeId,
+  (workspaceScopeId) => {
+    void syncWorkbenchWorkspaceScope(workspaceScopeId).catch((error) => {
+      console.warn("[DevelopmentWorkbench] workspace layout switch failed", error);
+    });
+  },
+  { flush: "sync" },
+);
 
 watch(
   [visibleProjects, () => workspaceContextStore.focusedProject?.projectId] as const,
@@ -2747,11 +4849,11 @@ watch(
     if (!activeResource.value && projects[0]) {
       const checkout = projects[0].checkouts[0];
       if (checkout) {
-        activeResource.value = {
-          kind: "newSession",
-          projectId: projects[0].projectId,
+        void openWorkbenchResource({
+          resource: { kind: "newSession", projectId: projects[0].projectId },
+          title: t("chat.session.newSession"),
           checkoutId: checkout.checkoutId,
-        };
+        }, { preview: true });
       }
     }
   },
@@ -2763,45 +4865,33 @@ watch(
   () => {
     const projectId = workspaceContextStore.focusedProject?.projectId;
     if (!projectId) return;
-    void explorerStore.refreshProjectSessions(projectId).catch((error) => {
-      console.warn("[DevelopmentWorkbench] session catalog refresh failed", error);
-    });
+    void explorerStore.refreshProjectSessions(projectId)
+      .then(reconcileRestoredWorkbenchEditors)
+      .catch((error) => {
+        console.warn("[DevelopmentWorkbench] session catalog refresh failed", error);
+      });
   },
 );
 
 watch(
-  [
-    () => chatStore.activeSessionId,
-    () => workspaceContextStore.focusedProject?.projectId ?? null,
-  ] as const,
-  ([sessionId, projectId]) => {
-    const current = activeResource.value;
-    if (current && current.kind !== "session" && current.kind !== "newSession") return;
-    if (!projectId) return;
-    if (!sessionId) {
-      if (current?.kind === "session") resetActiveSessionResource(projectId);
-      return;
+  () => Object.entries(explorerStore.resources).map(([projectId, resources]) => [
+    projectId,
+    resources.sessions.map((session) => `${session.id}:${session.title}`).join(","),
+    resources.knowledge.map((document) => `${document.id}:${document.title}:${document.path}`).join(","),
+  ].join("|")).join("\n"),
+  () => {
+    for (const group of Object.values(workbenchWindow.value.groups)) {
+      for (const editor of group.tabs) {
+        const title = titleForResource(editor.resource, editor.sourcePath);
+        if (title !== editor.title) {
+          workbenchStore.updateEditor(WORKBENCH_WINDOW_ID, group.paneId, editor.editorId, { title });
+        }
+      }
     }
-    const session = chatStore.sessions.find((candidate) => candidate.id === sessionId);
-    if (!session || (session.projectId && session.projectId !== projectId)) return;
-    const project = workspaceContextStore.projectsById[projectId];
-    const preferredCheckout = project?.checkouts.find((candidate) => (
-      candidate.checkoutId === session.executionTarget?.checkoutId
-      || candidate.checkoutId === session.defaultCheckoutId
-    ));
-    const checkout = preferredCheckout
-      ?? (workspaceContextStore.focusedCheckout?.projectId === projectId
-        ? workspaceContextStore.focusedCheckout
-        : project?.checkouts[0]);
-    if (!checkout) return;
-    activeResource.value = {
-      kind: "session",
-      projectId,
-      sessionId,
-      checkoutId: checkout.checkoutId,
-    };
+    void reconcileRestoredWorkbenchEditors().catch((error) => {
+      console.warn("[DevelopmentWorkbench] editor reconciliation failed", error);
+    });
   },
-  { immediate: true },
 );
 
 watch(activeResource, (resource) => {
@@ -2818,7 +4908,14 @@ onMounted(() => {
   window.addEventListener("dragover", trackWorkspaceDragPointer, true);
   window.addEventListener("drop", handleWindowWorkspaceDrop, true);
   window.addEventListener("dragend", clearWorkspaceDragPointer, true);
-  for (const project of visibleProjects.value) void explorerStore.loadProject(project.projectId);
+  void Promise.all(
+    visibleProjects.value.map((project) => explorerStore.loadProject(project.projectId)),
+  ).then(async () => {
+    await reconcileRestoredWorkbenchEditors();
+    await restoreWorkbenchPaneContexts();
+  }).catch((error) => {
+    console.warn("[DevelopmentWorkbench] workbench restore failed", error);
+  });
   void subscribeLocusFileDragState(handleLocusFileDragState).then((release) => {
     releaseLocusFileDragState = release;
   }).catch((error) => {
@@ -2876,12 +4973,21 @@ watch(
   },
   { immediate: true },
 );
+
+watch(
+  () => uiStore.pendingExternalScriptOpen?.id ?? null,
+  (requestId) => {
+    if (requestId) void revealPendingExternalScriptOpen();
+  },
+  { immediate: true },
+);
 </script>
 
 <template>
   <div
     ref="workbenchRootRef"
     class="development-workbench"
+    @keydown.capture="handleWorkbenchKeydown"
     @dragover.capture="trackWorkspaceDragPointer"
     @dragend.capture="clearWorkspaceDragPointer"
     @drop.capture="clearWorkspaceDragPointer"
@@ -2972,6 +5078,21 @@ watch(
           >{{ row.name }}</span>
           <span v-else>{{ row.name }}</span>
         </template>
+        <template #editor="{ item }">
+          <input
+            v-if="isRenamingSessionItem(item as DevelopmentTreeItem)"
+            ref="sessionRenameInput"
+            v-model="sessionInlineRename!.value"
+            class="development-session-rename-input"
+            :aria-label="t('chat.session.rename')"
+            autocomplete="off"
+            @pointerdown.stop
+            @click.stop
+            @keydown.enter.prevent="submitSessionRename"
+            @keydown.esc.prevent.stop="cancelSessionRename"
+            @blur="submitSessionRename"
+          />
+        </template>
         <template #trailing="{ item }">
           <span
             v-if="itemSessionIsPending(item as DevelopmentTreeItem)"
@@ -3016,6 +5137,28 @@ watch(
             @click.stop="archiveSessionItem(item as DevelopmentTreeItem)"
           >
             <LucideIcon :icon="Archive" :size="12" :stroke-width="2" />
+          </button>
+          <button
+            v-else-if="(item as DevelopmentTreeItem).meta.kind === 'knowledge'"
+            type="button"
+            class="development-knowledge-remove-button"
+            :title="t('development.removeFromWorkspace')"
+            :aria-label="t('development.removeFromWorkspace')"
+            @pointerdown.stop
+            @click.stop="removeKnowledgeItemFromWorkspace(item as DevelopmentTreeItem)"
+          >
+            <LucideIcon :icon="X" :size="12" :stroke-width="2" />
+          </button>
+          <button
+            v-else-if="isKnowledgeFolderPlacement(item as DevelopmentTreeItem)"
+            type="button"
+            class="development-knowledge-remove-button"
+            :title="t('development.removeFromWorkspace')"
+            :aria-label="t('development.removeFromWorkspace')"
+            @pointerdown.stop
+            @click.stop="removeKnowledgeFolderFromWorkspace(item as DevelopmentTreeItem)"
+          >
+            <LucideIcon :icon="X" :size="12" :stroke-width="2" />
           </button>
         </template>
         <template #custom="{ item }">
@@ -3074,68 +5217,158 @@ watch(
     />
 
     <main class="development-editor">
-      <ChatWorkspaceView
-        v-if="showChat"
-        ref="chatWorkspaceView"
-        :active="true"
-        :show-session-navigation="false"
-        :persist-session-selection="true"
-        layout-mode="auto"
-      />
-      <template v-if="workspaceContextStore.focusedWorkspaceRef">
-        <KnowledgeView
-          v-show="showKnowledge"
-          :embedded="activeResource?.kind === 'knowledge'"
-          :selected-document-id="selectedKnowledge?.id ?? null"
-          :working-dir="workspaceContextStore.focusedRoot"
-          :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
-          :selected-model-id="modelStore.selectedModelId"
-          :model-defaults="modelStore.modelDefaults"
-        />
-        <CollabView
-          v-show="showCollab"
-          :working-dir="workspaceContextStore.focusedRoot"
-          :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
-          :is-active="showCollab"
-          :selected-model-id="modelStore.selectedModelId"
-          :selected-agent-id="agentStore.selectedAgentId"
-          :models="modelStore.availableModels"
-          :head-focus-request="collabHeadFocusRequest"
-          @select-model="(id: string) => modelStore.selectModel(id)"
-        />
-      </template>
-      <WorkspaceFilePreview
-        v-if="activeResource?.kind === 'localFile'"
-        :project-id="activeResource.projectId"
-        :path="activeResource.path"
-      />
-      <div
-        v-if="!showChat && !showKnowledge && activeResource?.kind !== 'localFile' && !showCollab"
-        class="development-overview"
+      <WorkbenchSplitHost
+        :node="workbenchWindow.layout"
+        :groups="workbenchWindow.groups"
+        :focused-pane-id="workbenchWindow.focusedPaneId"
+        :active-drop-key="activeEditorDropKey"
+        :show-single-tabs="workbenchWindow.layout.kind === 'split'"
+        @focus-pane="focusWorkbenchPane"
+        @resize="resizeWorkbenchSplit"
       >
-        <template v-if="activeResource?.kind === 'checkout'">
-          <div class="development-overview-title">
-            {{ shortPath(workspaceContextStore.checkoutsById[activeResource.checkoutId]?.root || activeResource.checkoutId) }}
-          </div>
-          <div class="development-overview-path">
-            {{ workspaceContextStore.checkoutsById[activeResource.checkoutId]?.root || activeResource.checkoutId }}
-          </div>
+        <template #group="{ group, paneId, focused }">
+          <template v-if="group">
+            <WorkbenchEditorTabs
+              :window-id="WORKBENCH_WINDOW_ID"
+              :group="group"
+              :show-single-tab="workbenchWindow.layout.kind === 'split'"
+              :drop-active="editorDropIntent?.paneId === paneId && editorDropIntent.direction === 'center'"
+              :drop-index="editorDropIntent?.paneId === paneId && editorDropIntent.direction === 'center' ? editorDropIntent.index : undefined"
+              @activate="focusWorkbenchEditor(paneId, $event)"
+              @close="closeWorkbenchEditor(paneId, $event)"
+              @pin="pinWorkbenchEditor(paneId, $event)"
+            />
+            <div class="workbench-editor-stack">
+              <div
+                v-for="editor in group.tabs"
+                :key="editor.editorId"
+                v-show="group.activeEditorId === editor.editorId"
+                class="workbench-editor-instance"
+                :data-editor-id="editor.editorId"
+              >
+                <div
+                  v-if="editor.availability === 'unavailable'"
+                  class="workbench-unavailable-editor"
+                >
+                  <div class="workbench-unavailable-title">{{ editor.title }}</div>
+                  <div class="workbench-unavailable-reason">
+                    {{ editor.unavailableReason || t('workbench.unavailable.default') }}
+                  </div>
+                  <BaseButton size="sm" @click="closeWorkbenchEditor(paneId, editor.editorId)">
+                    {{ t('common.close') }}
+                  </BaseButton>
+                </div>
+                <WorkbenchSessionEditor
+                  v-else-if="editor.resource.kind === 'session' || editor.resource.kind === 'newSession'"
+                  :ref="(value) => setSessionEditorRef(editor.editorId, value)"
+                  :editor="editor"
+                  :workspace-ref="editorWorkspaceRef(editor)"
+                  :reference-drop-available="composerAcceptsCurrentDrag(paneId, editor)"
+                  :reference-drop-active="
+                    composerDropTarget?.paneId === paneId
+                      && composerDropTarget.editorId === editor.editorId
+                  "
+                  :shortcut-active="focused && group.activeEditorId === editor.editorId"
+                  @session-created="handleWorkbenchSessionCreated(paneId, $event)"
+                  @new-session-requested="handleWorkbenchNewSessionRequested(paneId, $event)"
+                  @composer-draft-change="handleWorkbenchComposerDraftChange(paneId, $event)"
+                />
+                <KnowledgeView
+                  v-else-if="editor.resource.kind === 'knowledge' || editor.resource.kind === 'knowledgeRoot' || (editor.resource.kind === 'section' && editor.resource.section === 'knowledge')"
+                  :embedded="editor.resource.kind === 'knowledge'"
+                  :active="group.activeEditorId === editor.editorId"
+                  :selected-document-id="editorKnowledgeDocument(editor)?.id ?? null"
+                  :selected-document-target="editorKnowledgeDocument(editor)"
+                  :working-dir="editorWorkingDir(editor)"
+                  :workspace-ref="editorWorkspaceRef(editor)"
+                  :selected-model-id="modelStore.selectedModelId"
+                  :model-defaults="modelStore.modelDefaults"
+                />
+                <CollabView
+                  v-else-if="editor.resource.kind === 'collaboration' || editor.resource.kind === 'checkout' || (editor.resource.kind === 'section' && editor.resource.section === 'collab')"
+                  :working-dir="editorWorkingDir(editor)"
+                  :workspace-ref="editorWorkspaceRef(editor)"
+                  :is-active="focused && group.activeEditorId === editor.editorId"
+                  :selected-model-id="modelStore.selectedModelId"
+                  :selected-agent-id="agentStore.selectedAgentId"
+                  :models="modelStore.availableModels"
+                  :head-focus-request="collabHeadFocusRequest"
+                  @select-model="(id: string) => modelStore.selectModel(id)"
+                />
+                <AssetView
+                  v-else-if="editor.resource.kind === 'section' && editor.resource.section === 'assets'"
+                  :project-id="editor.resource.projectId"
+                  :working-dir="editorWorkingDir(editor)"
+                  :workspace-ref="editorWorkspaceRef(editor)"
+                />
+                <WorkbenchAssetEditor
+                  v-else-if="editor.resource.kind === 'asset' || editor.resource.kind === 'sceneObject'"
+                  :editor="editor"
+                  :workspace-ref="editorWorkspaceRef(editor)"
+                />
+                <WorkspaceFilePreview
+                  v-else-if="editor.resource.kind === 'workspaceFile'"
+                  :ref="(value) => setWorkspaceFileEditorRef(editor.editorId, value)"
+                  :project-id="editor.resource.projectId"
+                  :path="editor.resource.path"
+                  :workspace-ref="editorWorkspaceRef(editor)"
+                  :active="group.activeEditorId === editor.editorId"
+                  @dirty-change="setWorkspaceFileEditorDirty(paneId, editor.editorId, $event)"
+                />
+                <ViewPackageView
+                  v-else-if="editor.resource.kind === 'section' && editor.resource.section === 'views'"
+                  :working-dir="editorWorkingDir(editor)"
+                  :workspace-ref="editorWorkspaceRef(editor)"
+                />
+                <WorkspaceDirectoryPreview
+                  v-else-if="editor.resource.kind === 'localDirectory' && editor.sourcePath"
+                  :project-id="editor.resource.projectId"
+                  :node-id="editor.resource.nodeId"
+                  :relative-path="editor.resource.relativePath"
+                  :path="editor.sourcePath"
+                  :title="editor.title"
+                  @activate="activateDirectoryPreviewEntry(paneId, editor, $event)"
+                />
+                <WorkspaceFilePreview
+                  v-else-if="editor.resource.kind === 'localFile' && editor.sourcePath"
+                  :ref="(value) => setWorkspaceFileEditorRef(editor.editorId, value)"
+                  :project-id="editor.resource.projectId"
+                  :path="editor.sourcePath"
+                  :active="group.activeEditorId === editor.editorId"
+                  @dirty-change="setWorkspaceFileEditorDirty(paneId, editor.editorId, $event)"
+                />
+                <div v-else class="development-overview">
+                  <template v-if="editor.resource.kind === 'folder'">
+                    <div class="development-overview-title">{{ editor.title }}</div>
+                    <div v-if="editor.sourcePath" class="development-overview-path">
+                      {{ editor.sourcePath }}
+                    </div>
+                  </template>
+                  <template v-else-if="editorProject(editor)">
+                    <div class="development-overview-title">
+                      {{ projectLabel(editorProject(editor)!) }}
+                    </div>
+                    <button
+                      v-for="checkout in editorProject(editor)!.checkouts"
+                      :key="checkout.checkoutId"
+                      type="button"
+                      class="development-worktree-row"
+                      @click="activateCheckoutOverview(checkout.checkoutId)"
+                    >
+                      <LucideIcon :icon="GitBranch" :size="13" />
+                      <span>{{ shortPath(checkout.root) }}</span>
+                      <span>{{ checkout.root }}</span>
+                    </button>
+                  </template>
+                </div>
+              </div>
+              <div v-if="group.tabs.length === 0" class="workbench-editor-empty">
+                {{ t('workbench.empty') }}
+              </div>
+            </div>
+          </template>
         </template>
-        <template v-else-if="activeProject">
-          <div class="development-overview-title">{{ projectLabel(activeProject) }}</div>
-          <button
-            v-for="checkout in activeProject.checkouts"
-            :key="checkout.checkoutId"
-            type="button"
-            class="development-worktree-row"
-            @click="activateCheckoutOverview(checkout.checkoutId)"
-          >
-            <LucideIcon :icon="GitBranch" :size="13" />
-            <span>{{ shortPath(checkout.root) }}</span>
-            <span>{{ checkout.root }}</span>
-          </button>
-        </template>
-      </div>
+      </WorkbenchSplitHost>
     </main>
 
     <BaseContextMenu
@@ -3168,52 +5401,47 @@ watch(
         </button>
       </template>
       <template v-else-if="contextMenu.item.meta.kind === 'session'">
-        <button type="button" @click="beginRenameSession">
-          <LucideIcon :icon="PencilLine" :size="13" />
-          {{ t("chat.session.rename") }}
-        </button>
-        <button type="button" @click="contextOpenSessionWindow">
-          <LucideIcon :icon="AppWindow" :size="13" />
-          {{ t("chat.session.openInWindow") }}
-        </button>
-        <button type="button" @click="contextOpenSessionInUnity">
-          <LucideIcon :icon="Box" :size="13" />
-          {{ t("chat.session.openInUnity") }}
-        </button>
-        <button type="button" @click="exportContextSession">
-          <LucideIcon :icon="Save" :size="13" />
-          {{ t("chat.exportContext") }}
-        </button>
-        <button type="button" @click="reviewContextSession">
-          <LucideIcon :icon="FileSearch" :size="13" />
-          {{ t("chat.reviewContext") }}
-        </button>
-        <div class="base-context-menu-separator" />
-        <button
-          v-if="contextMenu.item.meta.explorerNode && !contextMenu.item.meta.explorerNode.hidden"
-          type="button"
-          @click="setContextNodeHidden(true)"
-        >
-          <LucideIcon :icon="EyeOff" :size="13" />
-          {{ t("development.hideNode") }}
-        </button>
-        <button
-          v-if="contextMenu.item.meta.explorerNode?.hidden"
-          type="button"
-          @click="setContextNodeHidden(false)"
-        >
-          <LucideIcon :icon="Eye" :size="13" />
-          {{ t("development.showNode") }}
-        </button>
-        <div class="base-context-menu-separator" />
-        <button type="button" @click="archiveContextSession">
-          <LucideIcon :icon="Archive" :size="13" />
-          {{ t("chat.session.archive") }}
-        </button>
-        <button type="button" class="danger" @click="beginDeleteSession">
-          <LucideIcon :icon="Trash2" :size="13" />
-          {{ t("chat.session.delete") }}
-        </button>
+        <template v-if="(contextMenu.sessionTargets?.length ?? 0) <= 1">
+          <button type="button" @click="beginRenameSession">
+            <LucideIcon :icon="PencilLine" :size="13" />
+            {{ t("chat.session.rename") }}
+          </button>
+          <button type="button" @click="contextOpenSessionWindow">
+            <LucideIcon :icon="AppWindow" :size="13" />
+            {{ t("chat.session.openInWindow") }}
+          </button>
+          <button type="button" @click="contextOpenSessionInUnity">
+            <LucideIcon :icon="Box" :size="13" />
+            {{ t("chat.session.openInUnity") }}
+          </button>
+          <button type="button" @click="exportContextSession">
+            <LucideIcon :icon="Save" :size="13" />
+            {{ t("chat.exportContext") }}
+          </button>
+          <button type="button" @click="reviewContextSession">
+            <LucideIcon :icon="FileSearch" :size="13" />
+            {{ t("chat.reviewContext") }}
+          </button>
+          <div class="base-context-menu-separator" />
+          <button type="button" @click="archiveContextSession">
+            <LucideIcon :icon="Archive" :size="13" />
+            {{ t("chat.session.archive") }}
+          </button>
+          <button type="button" class="danger" @click="beginDeleteSession">
+            <LucideIcon :icon="Trash2" :size="13" />
+            {{ t("chat.session.delete") }}
+          </button>
+        </template>
+        <template v-else>
+          <button type="button" @click="archiveContextSession">
+            <LucideIcon :icon="Archive" :size="13" />
+            {{ t("chat.session.archiveMany", contextMenu.sessionTargets?.length ?? 0) }}
+          </button>
+          <button type="button" class="danger" @click="beginDeleteSession">
+            <LucideIcon :icon="Trash2" :size="13" />
+            {{ t("chat.session.deleteMany", contextMenu.sessionTargets?.length ?? 0) }}
+          </button>
+        </template>
       </template>
       <template v-else>
         <button
@@ -3277,7 +5505,15 @@ watch(
           {{ t("development.removeMount") }}
         </button>
         <button
-          v-if="contextMenu.item.meta.explorerNode && !contextMenu.item.meta.explorerNode.hidden"
+          v-if="contextMenu.item.meta.kind === 'knowledge'"
+          type="button"
+          @click="removeContextKnowledgeItemFromWorkspace"
+        >
+          <LucideIcon :icon="X" :size="13" />
+          {{ t("development.removeFromWorkspace") }}
+        </button>
+        <button
+          v-if="contextMenu.item.meta.explorerNode?.resourceKind === SYSTEM_RESOURCE_KIND && !contextMenu.item.meta.explorerNode.hidden"
           type="button"
           @click="setContextNodeHidden(true)"
         >
@@ -3285,7 +5521,7 @@ watch(
           {{ t("development.hideNode") }}
         </button>
         <button
-          v-if="contextMenu.item.meta.explorerNode?.hidden"
+          v-if="contextMenu.item.meta.explorerNode?.resourceKind === SYSTEM_RESOURCE_KIND && contextMenu.item.meta.explorerNode.hidden"
           type="button"
           @click="setContextNodeHidden(false)"
         >
@@ -3434,31 +5670,48 @@ watch(
         </div>
       </form>
     </div>
-    <div v-if="sessionDialog" class="development-dialog-backdrop" @click.self="sessionDialog = null">
-      <form class="development-dialog" @submit.prevent="commitSessionDialog">
+    <div
+      v-if="sessionDeleteDialog"
+      class="development-dialog-backdrop"
+      @click.self="sessionDeleteDialog = null"
+    >
+      <form class="development-dialog" @submit.prevent="commitSessionDeleteDialog">
         <div class="development-dialog-title">
-          {{ sessionDialog.mode === 'rename'
-            ? t('chat.session.rename')
+          {{ sessionDeleteDialog.targets.length > 1
+            ? t('chat.session.deleteMany', sessionDeleteDialog.targets.length)
             : t('chat.session.delete') }}
         </div>
-        <input
-          v-if="sessionDialog.mode === 'rename'"
-          ref="sessionInput"
-          v-model="sessionDialog.value"
-          class="development-dialog-input"
-          @keydown.esc.prevent="sessionDialog = null"
-        />
-        <div v-else class="development-dialog-message">
-          {{ t('chat.session.deleteConfirm') }}
+        <div class="development-dialog-message">
+          {{ sessionDeleteDialog.targets.length > 1
+            ? t('chat.session.deleteManyConfirm', sessionDeleteDialog.targets.length)
+            : t('chat.session.deleteConfirm') }}
         </div>
         <div class="development-dialog-actions">
-          <button type="button" @click="sessionDialog = null">{{ t("common.cancel") }}</button>
-          <button
-            type="submit"
-            :class="{ danger: sessionDialog.mode === 'delete' }"
-          >
-            {{ sessionDialog.mode === 'delete' ? t("common.delete") : t("common.confirm") }}
+          <button type="button" @click="sessionDeleteDialog = null">{{ t("common.cancel") }}</button>
+          <button type="submit" class="danger">{{ t("common.delete") }}</button>
+        </div>
+      </form>
+    </div>
+    <div
+      v-if="dirtyEditorCloseDialog"
+      class="development-dialog-backdrop"
+      @click.self="dirtyEditorCloseDialog = null"
+    >
+      <form class="development-dialog" @submit.prevent="saveAndCloseDirtyEditor">
+        <div class="development-dialog-title">
+          {{ t("development.editor.discardTitle") }}
+        </div>
+        <div class="development-dialog-message">
+          {{ t("development.editor.discardMessage", dirtyEditorCloseDialog.title) }}
+        </div>
+        <div class="development-dialog-actions">
+          <button type="button" @click="dirtyEditorCloseDialog = null">
+            {{ t("common.cancel") }}
           </button>
+          <button type="button" class="danger" @click="discardAndCloseDirtyEditor">
+            {{ t("development.editor.discard") }}
+          </button>
+          <button type="submit">{{ t("common.save") }}</button>
         </div>
       </form>
     </div>
@@ -3633,6 +5886,7 @@ watch(
 
 .development-tree :deep(.workspace-tree-row) {
   gap: 6px;
+  cursor: default;
 }
 
 .development-tree :deep(.workspace-tree-row-shell.is-open),
@@ -3644,14 +5898,6 @@ watch(
 .development-tree :deep(.workspace-tree-row-shell.is-empty-folder-row),
 .development-tree :deep(.workspace-tree-row-shell.is-empty-folder-row:hover) {
   background: transparent;
-}
-
-.development-tree :deep(.workspace-tree-row-shell.is-empty-folder-row .workspace-tree-row) {
-  cursor: default;
-}
-
-.development-tree :deep(.workspace-tree-row-shell.is-session-row .workspace-tree-row.drag-enabled) {
-  cursor: pointer;
 }
 
 .development-tree :deep(.workspace-tree-icon.kind-folder) {
@@ -3669,6 +5915,38 @@ watch(
 .development-tree :deep(.workspace-tree-row-shell.drop-target) {
   background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
   box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent-color) 64%, transparent);
+}
+
+.development-tree :deep(.workspace-tree-row-shell.is-new-session-drop-zone),
+.development-tree :deep(.workspace-tree-row-shell.is-new-session-drop-zone:hover),
+.development-tree :deep(.workspace-tree-row-shell.is-new-session-drop-zone.drop-target) {
+  background: transparent;
+  box-shadow: none;
+}
+
+.development-tree :deep(.workspace-tree-row-shell.is-new-session-drop-zone .workspace-tree-row) {
+  min-height: 26px;
+  margin: 2px 6px;
+  padding: 1px 8px;
+  justify-content: center;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  color: var(--text-secondary);
+}
+
+.development-tree :deep(.workspace-tree-row-shell.is-new-session-drop-zone .workspace-tree-icon) {
+  display: none;
+}
+
+.development-tree :deep(.workspace-tree-row-shell.is-new-session-drop-zone .workspace-tree-name) {
+  flex: 0 1 auto;
+  text-align: center;
+}
+
+.development-tree :deep(.workspace-tree-row-shell.is-new-session-drop-zone.drop-target .workspace-tree-row) {
+  border-color: color-mix(in srgb, var(--accent-color) 72%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+  color: var(--text-color);
 }
 
 .development-tree :deep(.workspace-tree-row-shell.is-drop-preview) {
@@ -3724,7 +6002,11 @@ watch(
   color: color-mix(in srgb, var(--accent-color) 72%, var(--text-secondary) 28%);
 }
 
-.development-session-archive-button {
+.development-tree :deep(.workspace-tree-row-shell.editing .workspace-tree-trailing) {
+  display: none;
+}
+
+:where(.development-session-archive-button, .development-knowledge-remove-button) {
   position: absolute;
   top: 50%;
   right: 14px;
@@ -3745,8 +6027,14 @@ watch(
   transition: opacity 0.1s ease, background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
 }
 
+.development-session-archive-button {
+  right: 14px;
+}
+
 .development-tree :deep(.workspace-tree-row-shell.is-session-row:hover .development-session-archive-button),
-.development-session-archive-button:focus-visible {
+.development-session-archive-button:focus-visible,
+.development-tree :deep(.workspace-tree-row-shell.is-knowledge-row:hover .development-knowledge-remove-button),
+.development-knowledge-remove-button:focus-visible {
   opacity: 1;
   pointer-events: auto;
 }
@@ -3755,15 +6043,15 @@ watch(
 .development-tree :deep(.workspace-tree-row-shell.is-session-row:hover .development-session-spinner),
 .development-tree :deep(.workspace-tree-row-shell.is-session-row:hover .development-session-status),
 .development-tree :deep(.workspace-tree-row-shell.is-session-row:hover .development-branch-label),
-.development-tree :deep(.workspace-tree-row-shell.is-session-row:focus-within .development-session-dot),
-.development-tree :deep(.workspace-tree-row-shell.is-session-row:focus-within .development-session-spinner),
-.development-tree :deep(.workspace-tree-row-shell.is-session-row:focus-within .development-session-status),
-.development-tree :deep(.workspace-tree-row-shell.is-session-row:focus-within .development-branch-label) {
+.development-tree :deep(.workspace-tree-row-shell.is-session-row:has(.development-session-archive-button:focus-visible) .development-session-dot),
+.development-tree :deep(.workspace-tree-row-shell.is-session-row:has(.development-session-archive-button:focus-visible) .development-session-spinner),
+.development-tree :deep(.workspace-tree-row-shell.is-session-row:has(.development-session-archive-button:focus-visible) .development-session-status),
+.development-tree :deep(.workspace-tree-row-shell.is-session-row:has(.development-session-archive-button:focus-visible) .development-branch-label) {
   opacity: 0;
 }
 
-.development-session-archive-button:hover,
-.development-session-archive-button:focus-visible {
+:where(.development-session-archive-button, .development-knowledge-remove-button):hover,
+:where(.development-session-archive-button, .development-knowledge-remove-button):focus-visible {
   border-color: var(--border-color);
   background: var(--hover-bg);
   color: var(--text-color);
@@ -3839,6 +6127,25 @@ watch(
   min-width: 24px;
   height: 24px;
   padding: 0;
+}
+
+.development-session-rename-input {
+  width: 100%;
+  height: 22px;
+  padding: 0 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-bg) 82%, var(--bg-color));
+  color: var(--text-color);
+  font: inherit;
+  font-family: var(--font-ui);
+  font-size: 12px;
+}
+
+.development-session-rename-input:focus {
+  border-color: var(--accent-color);
+  outline: none;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-color) 24%, transparent);
 }
 
 .development-session-title {
@@ -4028,7 +6335,57 @@ watch(
   min-width: 0;
   min-height: 0;
   display: flex;
+  overflow: hidden;
   background: var(--panel-bg);
+}
+
+.development-editor :deep(> .workbench-split),
+.development-editor :deep(> .workbench-editor-group) {
+  flex: 1 1 0;
+}
+
+.workbench-editor-stack,
+.workbench-editor-instance {
+  display: flex;
+  flex: 1 1 0;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-editor-instance > :deep(*) {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.workbench-editor-empty,
+.workbench-unavailable-editor {
+  display: flex;
+  flex: 1 1 0;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.workbench-unavailable-editor {
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workbench-unavailable-title {
+  color: var(--text-color);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workbench-unavailable-reason {
+  max-width: 420px;
+  text-align: center;
 }
 
 .development-overview {

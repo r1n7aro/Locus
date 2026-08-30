@@ -531,6 +531,58 @@ pub fn focus_workspace(
     Ok(context)
 }
 
+fn validate_or_bind_active_session_checkout(
+    store: &SessionStore,
+    session_id: &str,
+    checkout_id: &CheckoutId,
+) -> Result<(), AppError> {
+    let session_scope = store.get_session_workspace_scope(session_id)?;
+    let session_project_id = session_scope
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+        .ok_or_else(|| {
+            AppError::new(
+                "session.project_scope_missing",
+                "The session does not belong to a project.",
+            )
+            .detail(session_id.to_string())
+        })?;
+    let checkout = store
+        .get_workspace_checkout(checkout_id.as_str())?
+        .ok_or_else(|| {
+            AppError::new(
+                "workspace.checkout_unavailable",
+                "The pane checkout is unavailable.",
+            )
+            .detail(checkout_id.to_string())
+        })?;
+    if checkout.project_id != session_project_id {
+        return Err(AppError::new(
+            "session.workspace_scope_conflict",
+            "The session belongs to a different project.",
+        )
+        .detail(format!(
+            "session={session_id}, sessionProject={session_project_id}, paneCheckout={checkout_id}, paneProject={}",
+            checkout.project_id
+        )));
+    }
+
+    if session_scope.default_checkout_id.is_none() {
+        store
+            .bind_session_default_checkout_if_missing(session_id, checkout_id.as_str())
+            .map_err(|error| {
+                AppError::new(
+                    "session.checkout_binding_failed",
+                    "The historical session checkout binding could not be saved.",
+                )
+                .detail(error)
+            })?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_active_session(
     window_id: String,
@@ -563,24 +615,11 @@ pub fn set_active_session(
                     pane_id: pane_id.trim().to_string(),
                 })
             })?;
-        let session_scope = store.get_session_workspace_scope(session_id)?;
-        let session_checkout_id = session_scope.default_checkout_id.ok_or_else(|| {
-            AppError::new(
-                "session.checkout_scope_missing",
-                "The session does not have a checkout binding.",
-            )
-            .detail(session_id.to_string())
-        })?;
-        if session_checkout_id != pane.focused_checkout_id.as_str() {
-            return Err(AppError::new(
-                "session.checkout_scope_mismatch",
-                "The session belongs to a different checkout.",
-            )
-            .detail(format!(
-                "session={session_id}, sessionCheckout={session_checkout_id}, paneCheckout={}",
-                pane.focused_checkout_id
-            )));
-        }
+        validate_or_bind_active_session_checkout(
+            store.inner().as_ref(),
+            session_id,
+            &pane.focused_checkout_id,
+        )?;
     }
     let context = window_contexts
         .set_active_session(&window_id, &pane_id, active_session_id, intent_epoch)
@@ -719,6 +758,57 @@ mod tests {
             .expect("write malformed recovery");
 
         assert!(load_window_context_recovery(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn active_session_checkout_binding_repairs_history_and_allows_sibling_worktrees() {
+        let store_dir = tempfile::tempdir().expect("store dir");
+        let store = SessionStore::new(store_dir.path()).expect("session store");
+        for checkout in [
+            ("checkout-a", "project-shared", "f:/shared-a"),
+            ("checkout-b", "project-shared", "f:/shared-b"),
+            ("checkout-other", "project-other", "f:/other"),
+        ] {
+            store
+                .upsert_workspace_checkout(&crate::session::models::WorkspaceCheckoutRecord {
+                    checkout_id: checkout.0.to_string(),
+                    project_id: checkout.1.to_string(),
+                    root_path: checkout.2.to_string(),
+                    normalized_root: checkout.2.to_string(),
+                    last_opened_at: 1,
+                })
+                .expect("persist checkout");
+        }
+        let session_id = store
+            .create_session("Historical", None, Some("project-shared"), "chat", None)
+            .expect("create historical session");
+
+        validate_or_bind_active_session_checkout(
+            &store,
+            &session_id,
+            &CheckoutId::new("checkout-a").expect("checkout A"),
+        )
+        .expect("bind historical session from explicit pane");
+        validate_or_bind_active_session_checkout(
+            &store,
+            &session_id,
+            &CheckoutId::new("checkout-b").expect("checkout B"),
+        )
+        .expect("open shared session in sibling checkout");
+        assert_eq!(
+            store
+                .get_session_workspace_scope(&session_id)
+                .expect("load repaired session scope")
+                .default_checkout_id
+                .as_deref(),
+            Some("checkout-a")
+        );
+        assert!(validate_or_bind_active_session_checkout(
+            &store,
+            &session_id,
+            &CheckoutId::new("checkout-other").expect("other checkout"),
+        )
+        .is_err());
     }
 
     #[test]

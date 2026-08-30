@@ -20,6 +20,8 @@ Locus  开发  视图  插件  Agent  设置
 
 同一逻辑工作区由 `ProjectContext` 表达。它下面的多个 Git worktree 共享会话、知识、协作和逻辑资产目录。每个 `WorkspaceRuntime` 继续维护具体 worktree 的执行环境、Unity service、Knowledge index、AssetDB 和文件版本。
 
+多工作区模式继续沿用当前 Workspace Tree 投影：每个 ProjectContext 只有一棵共享虚拟树，【知识】与【协作】在同一 ProjectContext 下各出现一次，不为主工作树和其他 worktree 复制节点。【协作】可以展开具体 worktree，用于选择分支、工作目录和 checkout 级操作；【知识】始终使用 ProjectContext 级资源身份。窗口化只改变右侧 EditorGroup，不改变左侧 Workspace Tree 的层级、布局预设和拖动语义。
+
 “开发”是 ProjectContext 资源工作台。“视图”是跨工作区 View 总入口。“插件”“Agent”“设置”继续承载进程级、跨工作区通用能力。checkout 级 Agent / Plugin overlay、Unity、扫描和项目状态由对应 worktree 节点及其详情承载。
 
 后续出现的会话、知识文档和资产标签属于右侧编辑器组。编辑器标签可以分屏和拖出窗口，和已删除的应用级第二层栏具有不同的状态模型与生命周期。
@@ -82,15 +84,17 @@ Locus  开发  视图  插件  Agent  设置
 2. 编辑区显示明确的左、右、上、下分屏落点；释放后创建新的 EditorGroup。
 3. 原编辑器和目标资源同时可见，每个 EditorGroup 使用独立稳定的 `paneId`。
 4. 用户拖动两个 EditorGroup 之间的分隔条，实时调整宽度或高度；释放后保存比例。
-5. 用户可以把已打开的标签拖到另一个 EditorGroup，或拖到组边缘继续拆分。
-6. 两个 pane 可以分别显示不同会话、会话与知识文档，或属于不同 checkout 的资源；消息、流式状态、模型上下文和 workspace scope 保持独立。
-7. 关闭并重新打开应用后恢复主窗口的 split tree、比例、pane ID、标签和活动标签；失效资源显示可关闭的 unavailable editor。
+5. EditorGroup 内只有一个分页时隐藏 tab strip，正文顶部与当前界面一致；同组打开第二个分页后才显示标签栏。
+6. 显示标签栏后，用户可以把已打开的标签拖到另一个 EditorGroup，或拖到组边缘继续拆分。
+7. 两个 pane 可以分别显示不同会话、会话与知识文档，或属于不同 checkout 的资源；消息、流式状态、模型上下文和 workspace scope 保持独立。
+8. 关闭并重新打开应用后恢复主窗口的 split tree、比例、pane ID、标签和活动标签；失效资源显示可关闭的 unavailable editor。
 
 首个验收节点的范围包括：
 
 - 主窗口内水平与垂直分屏。
 - 从资源树拖入分屏，以及标签在组间移动和继续拆分。
 - 可拖动分隔条、最小 pane 尺寸、窄窗口约束和键盘可访问的 separator 语义。
+- 每个 EditorGroup 按分页数量显示标签栏：一个分页保持当前无 tab 的界面，两个及以上分页显示 tab strip。
 - Session、Knowledge document 和本地文件三类 Editor Adapter；至少验证双会话、会话与知识文档两种组合。
 - `(windowId, paneId)` workspace focus、active session、VisiblePane lease 和 scoped event 隔离。
 - 主窗口布局的版本化持久化与恢复。
@@ -148,7 +152,7 @@ Locus  开发  视图  插件  Agent  设置
 
 ### 单工作区模式
 
-单工作区模式只投影当前 pane 聚焦的 checkout：
+单工作区模式隐藏 ProjectContext 外层，只投影当前 ProjectContext 的共享 Workspace Tree：
 
 ```text
 unity-sample-project
@@ -165,61 +169,65 @@ unity-sample-project
 ```
 
 - 默认使用该模式，保持现有单工作区用户的认知成本。
-- checkout 根节点不可被虚拟文件夹替代。
-- 切换 checkout 通过根节点选择器或“切换工作区”命令完成。
+- 【知识】与【协作】继续是 ProjectContext 级公共入口，在同一项目内保持唯一。
+- 当前 checkout 只作为右侧 EditorGroup 的执行绑定，不改变共享树节点的身份和位置。
+- 切换具体 worktree 通过【协作】下的 checkout 节点或“切换工作区”命令完成。
 - 模式切换只改变资源树投影，不关闭 runtime，也不终止后台任务。
 
 ### 多工作区模式
 
-多工作区模式按真实后端层级显示项目与 checkout：
+多工作区模式为每个 ProjectContext 增加项目根节点，根节点内部继续显示同一棵共享 Workspace Tree：
 
 ```text
 unity-sample-project                         ProjectContext
-├─ main                                  Checkout
-│  ├─ 会话
-│  ├─ 知识
-│  ├─ 协作
-│  ├─ 资产
-│  └─ 视图
-└─ feature/hot-reload                    Checkout
-   ├─ 会话
-   ├─ 知识
-   ├─ 协作
-   ├─ 资产
-   └─ 视图
+├─ 新建会话
+├─ Gameplay                               虚拟文件夹
+│  ├─ 修复移动状态机                      Session
+│  └─ 战斗规则.md                         Knowledge document
+├─ 知识                                   ProjectContext 共享入口
+├─ 协作                                   ProjectContext 共享入口
+│  ├─ main                                Checkout
+│  └─ feature/hot-reload                  Checkout
+├─ 资产
+└─ 视图
 
-locus                                    ProjectContext
-└─ main
-   └─ ...
+locus                                     ProjectContext
+├─ 新建会话
+├─ 知识
+├─ 协作
+│  └─ main
+└─ ...
 ```
 
-- `ProjectContext` 和 checkout 节点由 `ProjectRegistry` 投影，不能被改造成普通虚拟文件夹。
-- 项目和 checkout 的展示顺序可以由用户调整；身份和归属保持不变。
+- `ProjectContext` 根节点和【协作】下的 checkout 子节点由 `ProjectRegistry` 投影，不能被改造成普通虚拟文件夹。
+- 多工作区模式只增加 ProjectContext 根层级，不把共享树复制到每个 worktree 下。
+- 【知识】、【协作】、会话和虚拟布局继续以 `projectId` 为共享归属；现有左侧树的节点顺序与拖动行为保持不变。
 - 展开根节点只加载资源摘要，不自动 focus checkout，不启动 Unity，不抢占正在运行的 pane。
-- 点击具体资源并进入右侧编辑器时，才把对应 checkout 绑定到目标 pane。
+- 点击共享资源并进入右侧编辑器时，Editor Adapter 根据当前 pane、会话执行目标或资源可用 checkout 解析独立 `CheckoutBinding`。
+- 点击【协作】下的 worktree 节点时，才把该 checkout 聚焦到目标 pane，并打开对应 worktree 的协作上下文。
 - 同一窗口的不同编辑器组最终可以同时绑定不同 checkout。
-- 后台正在运行的会话或服务保留轻量状态标记，即使其 checkout 根节点折叠。
+- 后台正在运行的会话或服务保留轻量状态标记；共享知识与协作节点始终保持单一 ProjectContext 身份。
 
 ## 节点类型与点击行为
 
 | 节点 | 身份来源 | 是否可移动 | 点击后的右侧内容 |
 | --- | --- | --- | --- |
 | ProjectContext | `projectId` | 只可调整根顺序 | 项目及 checkout 摘要 |
-| Checkout | `checkoutId` | 只可在所属项目内排序 | checkout 概览、分支、路径和服务状态 |
-| 固定分区 | `checkoutId + sectionKind` | 可在 checkout 内排序 | 对应分区首页或现有页面主体 |
-| 虚拟文件夹 | explorer node UUID | 可在同 checkout、同分区内移动 | 文件夹子项列表与操作 |
-| 会话 | session ID | 可在会话分区内移动 | Chat 正文 |
-| 知识 | `checkoutId + knowledge` | 固定入口 | 现有完整 KnowledgeView |
+| Checkout | `projectId + checkoutId` | 结构节点 | 具体 worktree 的协作上下文、分支、路径和服务状态 |
+| 固定分区 | `projectId + sectionKind` | 可在 ProjectContext 共享树内排序 | 对应分区首页或现有页面主体 |
+| 虚拟文件夹 | `projectId + explorer node UUID` | 可在同一 ProjectContext 预设内移动 | 文件夹子项列表与操作 |
+| 会话 | `projectId + sessionId` | 可在 ProjectContext 共享树内移动 | Chat 正文 |
+| 知识 | `projectId + documentId` | 可在 ProjectContext 共享树内布局 | 现有完整 KnowledgeView 或具体文档 |
 | 本地文件 / 目录挂载 | explorer node UUID + path | 可在当前预设内移动 | 通用文件预览 / Unity 资产预览 |
 | View | View ID | 可在视图分区内移动 | View 运行或配置页面 |
-| 协作 | 固定分区 | 不产生子资源布局 | 现有 Collab 页面 |
+| 协作 | `projectId + collab` | 共享固定分区；checkout 子节点保持结构位置 | ProjectContext 协作入口与 worktree 子上下文 |
 | 资产 | 固定分区 | 不预载全部资产 | 现有 Asset 页面 |
 
 展开箭头只负责折叠。点击节点行负责选中并打开内容，避免一次操作同时改变两种状态。双击资源固定为编辑器标签；单击可在后续标签阶段使用 preview tab 语义。
 
 ### 固定分区
 
-每个 checkout 默认包含以下固定分区：
+Workspace Tree 使用以下固定分区语义：
 
 ```ts
 type WorkspaceSectionKind =
@@ -230,8 +238,11 @@ type WorkspaceSectionKind =
   | "views";
 ```
 
+- `knowledge` 与 `collab` 属于 ProjectContext，共享于该项目的主工作树和全部 worktree；左侧树各显示一个节点。
+- `sessions` 与虚拟资源布局继续使用当前 ProjectContext 级预设，不按 checkout 复制。
+- checkout 级资源或服务状态由 Editor Adapter 和 `CheckoutBinding` 投影，不改变共享节点的布局所有权。
 - 分区可以排序、折叠，并通过显示设置隐藏。
-- 分区名称不可重命名，不能移出 checkout，不能放入另一个分区。
+- 分区名称不可重命名，不能移出所属 ProjectContext，不能放入另一个分区。
 - 当前 `showKnowledgeTab / showCollabTab / showAssetTab / showViewsTab` 迁移为分区可见性设置。
 - `showViewsInSessionPanel` 在统一资源树完成后废弃。
 - checkout 级 Agent / Plugin overlay、Unity 和扫描状态先进入 checkout 概览；需要独立页面时再增加稳定分区，避免先制造空节点。
@@ -254,13 +265,13 @@ type WorkspaceSectionKind =
 
 ### 允许的拖动
 
-- 虚拟文件夹和资源可在同一 checkout、同一固定分区内移动与排序。
-- 固定分区可在同一 checkout 内调整顺序。
-- checkout 可在所属 ProjectContext 内排序。
+- 虚拟文件夹和资源可在同一 ProjectContext 预设内移动与排序。
+- 固定分区可在同一 ProjectContext 共享树内调整顺序。
+- 【协作】下的 checkout 是结构投影，不参与普通虚拟布局拖动。
 - ProjectContext 可调整显示顺序。
 - 多选移动作为一个原子操作提交。
-- 拖入自身或后代、跨分区、跨 checkout 和未知目标会被前端预判并由后端再次拒绝。
-- 跨 checkout 资源迁移未来使用“复制 / 创建快捷方式”显式命令，初期不赋予拖动该语义。
+- 拖入自身或后代、非法跨分区、跨 ProjectContext 和未知目标会被前端预判并由后端再次拒绝。
+- worktree 切换只改变 EditorGroup 的 `CheckoutBinding`；普通树拖动不迁移 checkout，也不复制【知识】或【协作】节点。
 
 ### 删除与重命名
 
@@ -288,19 +299,27 @@ type WorkspaceSectionKind =
 ```ts
 type WorkbenchResourceRef =
   | { kind: "project"; projectId: string }
-  | { kind: "checkout"; checkoutId: string }
-  | { kind: "section"; checkoutId: string; section: WorkspaceSectionKind }
-  | { kind: "folder"; checkoutId: string; section: WorkspaceSectionKind; nodeId: string }
-  | { kind: "session"; checkoutId: string; sessionId: string }
-  | { kind: "knowledge"; checkoutId: string; documentId: string }
-  | { kind: "view"; checkoutId: string; viewId: string };
+  | { kind: "checkout"; projectId: string; checkoutId: string }
+  | { kind: "section"; projectId: string; section: WorkspaceSectionKind }
+  | { kind: "folder"; projectId: string; nodeId: string }
+  | { kind: "session"; projectId: string; sessionId: string }
+  | { kind: "knowledge"; projectId: string; documentId: string }
+  | { kind: "view"; projectId: string; viewId: string }
+  | { kind: "localFile"; projectId: string; nodeId: string };
+
+interface EditorCheckoutBinding {
+  checkoutId: string;
+  expectedGeneration?: number;
+}
 ```
 
 规则：
 
-- 持久化时保存稳定 ID，不保存 generation。
-- 打开或恢复时通过 `workspaceContextStore` 获取当前 runtime，再构造 live `WorkspaceRef`。
-- 会话命令继续以 `sessionId` 在后端解析 checkout；前端 `checkoutId` 只用于树投影和 pane 路由，后端验证真实归属。
+- 持久化的 `WorkbenchResourceRef` 保存 ProjectContext 级稳定 ID，不保存 generation，也不把 worktree 当作【知识】或【协作】的资源身份。
+- `EditorCheckoutBinding` 属于 EditorGroup 的运行时绑定；打开或恢复时通过 `workspaceContextStore` 获取当前 runtime，再构造 live `WorkspaceRef`。
+- 同一知识文档在多个 worktree 下保持同一个 `projectId + documentId`；需要 checkout 级索引、文件预览或工具调用时单独解析 EditorCheckoutBinding。
+- 【协作】使用 `projectId` 作为共享入口身份，具体 worktree 子页面通过 `checkoutId` 选择 working tree 状态。
+- 会话命令继续以 `sessionId` 在后端解析真实执行目标；pane binding 负责当前编辑器需要读取的 worktree 上下文。
 - View 命令以 `viewId` 解析 checkout；Knowledge 与 Asset 命令使用 `WorkspaceRef + resourceId`。
 - 标题、物理路径、分支名和图标均为可更新元数据，不参与引用相等判断。
 - runtime generation 失效时重新解析资源并恢复编辑器；资源已经删除时显示可关闭的 unavailable editor，不把旧 generation 写回。
@@ -452,7 +471,7 @@ ExplorerLayout 只保存布局与本地路径 locator。真实标题、状态、
 
 ### Sessions provider
 
-- 按 checkout 列出活动与归档会话，返回 session ID、title、type、parent session、updatedAt 和运行状态。
+- 按 ProjectContext 列出活动与归档会话，返回 session ID、title、type、parent session、updatedAt、执行目标和运行状态。
 - 新建会话后立即在 Sessions 根部插入默认 placement，并通过 scoped event 更新。
 - 点击 session 复用 `ChatWorkspaceView`，传入 `showSessionNavigation=false`。
 - `SessionPanel` 的会话导航逐步退役；Chat 正文、输入框、Diff 和运行状态继续复用。
@@ -461,7 +480,7 @@ ExplorerLayout 只保存布局与本地路径 locator。真实标题、状态、
 
 ### Knowledge provider
 
-- 工作区树只生成一个固定“知识”节点，使用 BookOpen 图标。
+- 每个 ProjectContext 的工作区树只生成一个固定“知识”节点，主工作树和其他 worktree 共用该入口与文档 placement。
 - 点击“知识”挂载现有完整 `KnowledgeView`，保留其分类、目录、检索和文档操作能力。
 - KnowledgeExplorer 的文档与普通文件夹可以拖到左侧工作区树；文档生成稳定知识 placement，文件夹生成 `sourceKind = knowledge` 目录挂载。
 - 知识面板内部拖动继续执行知识领域移动；拖到工作区树使用 copy 语义并只修改当前 tree preset。
@@ -469,11 +488,14 @@ ExplorerLayout 只保存布局与本地路径 locator。真实标题、状态、
 - 用户主动挂载的知识目录通过 `sourceKind = knowledge` 进入虚拟树，使用通用目录与文件预览。
 - `KnowledgeExplorer.vue` 的领域操作继续管理真实知识类型、路径和文档。
 - Design、Memory、Reference、Skill 继续是知识语义；虚拟目录位置不改变知识类型。
+- 知识文档使用 `projectId + documentId` 去重；切换 pane 的 checkout binding 不复制节点、标签或文档模型。
 
 ### Collab provider
 
-- 初期只有固定分区节点，点击挂载现有 `CollabView`。
-- checkout scope 由节点所属 checkout 传入，不能读取全局 active project。
+- 每个 ProjectContext 只有一个固定“协作”节点，点击挂载 ProjectContext 级 `CollabView`。
+- “协作”节点按当前 Workspace Tree 行为展开该项目的 worktree / checkout 子节点；这些子节点选择具体 working tree 上下文，不复制协作入口。
+- ProjectContext 级历史、分支图和共享协作信息按 `projectId` 路由；staging、冲突、工作目录状态等 worktree 操作使用显式 `CheckoutBinding`。
+- checkout scope 由活动 EditorGroup 或被点击的 worktree 子节点传入，不能读取全局 active project。
 - 协作对象稳定 ID 明确后再增加子节点，避免提前把瞬态任务写入 layout。
 
 ### Assets provider
@@ -514,19 +536,21 @@ WorkspaceContextStore
 WorkspaceExplorerStore
 ├─ modeByWindow[windowId]
 ├─ rootPreferences
-├─ snapshots[checkoutId]
-├─ providerState[checkoutId][section]
+├─ snapshots[projectId]
+├─ providerState[projectId][section]
+├─ checkoutProjection[checkoutId]
 ├─ expandedNodeIdsByWindow[windowId]
 ├─ selectedNodeByWindow[windowId]
 ├─ loading / error / requestEpoch
 └─ dragIntent
 ```
 
-- snapshot 和 provider 数据按 checkout 隔离。
+- Explorer snapshot、【知识】、【协作】和共享资源 provider 按 ProjectContext 隔离。
+- checkoutProjection 只保存 worktree 级 runtime、Unity、文件状态和服务投影，不拥有共享节点布局。
 - 单工作区 / 多工作区是窗口投影状态。
 - 多窗口共享持久 layout revision，各自保存展开和选择状态。
-- provider 首次展开时懒加载；event 只使对应 checkout / section 失效。
-- 反向完成的请求通过 checkout 级 request epoch 丢弃。
+- provider 首次展开时懒加载；ProjectContext 资源事件只使对应 `projectId / section` 失效，runtime 事件只使对应 checkoutProjection 失效。
+- 反向完成的请求分别通过 project 级和 checkout 级 request epoch 丢弃。
 
 ### Workbench 状态
 
@@ -629,17 +653,17 @@ const topTabs = computed(() => [
 第一个可交付版本需要同时满足以下流程：
 
 1. 启动 Locus，一级导航显示“开发 / 插件 / Agent / 设置”，界面中没有第二层栏和标题栏工作区选择器。
-2. 开发页默认进入单工作区模式，左侧显示当前 checkout 的固定分区和会话列表。
+2. 开发页默认进入单工作区模式，左侧显示当前 ProjectContext 的共享 Workspace Tree。
 3. 点击会话后，右侧显示现有 Chat；运行中的会话继续执行。
 4. 点击“知识”后，右侧显示现有完整知识面板；挂载知识目录后可以直接浏览其中的文件。
 5. 点击协作、资产和视图分区后，右侧能进入现有功能主体。
-6. 切换多工作区模式后，同时显示同一项目的主 checkout 与 worktree。
-7. 展开两个 checkout 的 Sessions / Knowledge 并打开各自资源，所有 IPC 和事件落入正确 checkout。
+6. 切换多工作区模式后，为每个 ProjectContext 增加项目根节点；同一项目的【知识】与【协作】继续各显示一次，【协作】下列出主工作树与其他 worktree。
+7. 打开共享知识文档或协作入口时保持同一 ResourceRef；选择具体 worktree 后，checkout 级 IPC 和事件落入对应 EditorCheckoutBinding。
 8. 创建虚拟文件夹、移动会话、挂载本地文件或知识目录，重启应用后布局保持。
 9. 拖动会话不会改变 `parentSessionId`；拖动 View 不会改变 package 目录或 `displayPath`。
 10. A checkout 运行会话时浏览 B checkout，不改变 A 的 AgentExecutionContext 和服务绑定。
 
-该闭环完成后再开始通用 editor tabs、分屏与拖出窗口，降低一次性重构范围。
+该闭环作为首个主窗口拖动分屏验收的内部前置条件，不单独改变或重新验收左侧 Workspace Tree 行为。
 
 ## 编辑器标签、分屏与窗口化演进
 
@@ -669,13 +693,19 @@ interface EditorInput {
 - 同一 group 内默认对同一资源去重。
 - 跨 group 可以打开同一只读资源；可写资源通过共享 document model 同步 dirty 状态。
 - section 和 checkout overview 也可以成为 EditorInput，但默认保持 preview。
+- tab strip 的显示条件按 EditorGroup 独立计算：`tabs.length >= 2` 时显示，`tabs.length === 1` 时完全收起。
+- 单分页 EditorGroup 不预留标签栏高度，不常驻标题、关闭按钮或额外 header；EditorHost 正文沿用当前顶部位置和视觉结构。
+- 同一窗口分屏后，每个只有一个分页的 EditorGroup 都保持无标签栏形态，pane 之间只显示必要的分隔条。
+- 加入第二个分页时显示 tab strip；关闭或移动分页后剩余一个时自动收起。显示状态由 `tabs.length` 派生，不单独持久化。
+- tab strip 显隐过程中保持活动 Editor 实例、滚动位置、输入草稿和流式渲染状态，不通过卸载正文实现切换。
+- pane focus、编辑区边缘 drop zone、分隔调整和快捷命令独立于 tab strip；单分页状态仍可从资源树拖入拆分，并可通过“移动编辑器 / 拆分编辑器”命令操作。
 
 ### 分屏
 
 - group layout 使用二叉 split tree，方向为 horizontal / vertical，叶子是 `paneId`。
 - 每个叶子 pane 对应 `WindowContextRegistry` 的一个 PaneContext。
 - 激活 tab 时，根据资源重新解析 checkout 并调用 `focus_workspace(windowId, paneId, checkoutId)`。
-- 一个窗口内可以让左 pane 显示 checkout A 会话、右 pane 显示 checkout B 知识文档。
+- 一个窗口内可以让左 pane 显示绑定 checkout A 的会话、右 pane 显示同一 ProjectContext 的共享知识文档并按需绑定 checkout B；知识资源身份保持唯一。
 - 关闭最后一个 checkout 资源 tab 后释放该 pane 的 runtime lease。
 - 运行中会话 lease 由任务所有权持有，不依赖 tab 是否可见。
 
@@ -729,13 +759,13 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 - 将旧 `activeTab` 值迁移到 `development`。
 - 第二层栏没有运行时回退分支。开发阶段通过小步提交和隔离实例验证控制风险，主渲染路径始终只有一级导航。
 
-完成条件：应用只显示一层导航，单 checkout 会话可以从新树打开并正常执行。
+完成条件：应用只显示一层导航，当前 ProjectContext 的会话可以从共享 Workspace Tree 打开并在解析出的 checkout 中正常执行。
 
 ### P1：单工作区资源树闭环
 
 目标：替换 SessionPanel 的主导航职责。
 
-- 使用 WorkspaceTree / FileTreeList 实现 checkout、固定分区、folder 和 session 节点。
+- 使用 WorkspaceTree / FileTreeList 实现 ProjectContext 共享树、固定分区、folder、session，以及【协作】下的 checkout 结构节点。
 - 接入单工作区模式、展开状态、键盘导航、上下文菜单和虚拟文件夹。
 - 接入预设创建、复制、切换、重命名与删除；切换与管理入口统一放入三个点菜单，工具栏保持单行。
 - 接入节点隐藏、本地文件拖入、知识目录整体挂载与按需子树列出。
@@ -743,16 +773,17 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 - Chat 以 `showSessionNavigation=false` 嵌入 EditorHost。
 - 实现 session 默认布局、legacy folder 导入、archive / restore reconcile。
 - 将“新建会话”迁入 Sessions 分区工具项或上下文菜单。
-- checkout 根节点打开 Overview，并显示分支、物理路径和 scoped service 状态。
+- 【协作】下的 checkout 节点打开 worktree Overview，并显示分支、物理路径和 scoped service 状态。
 - 移除新工作台内对 `SessionPanel` 的依赖。
 
-完成条件：单 checkout 的会话创建、打开、运行、归档、虚拟移动和重启恢复全部可用。
+完成条件：单 ProjectContext 的会话创建、打开、运行、归档、虚拟移动和重启恢复全部可用；【知识】与【协作】保持共享单一入口。
 
 ### P2：多工作区与全部分区闭环
 
 目标：形成可以验证后端多 checkout 隔离的前端入口。
 
-- 加入单 / 多工作区模式切换和 ProjectContext -> Checkout 投影。
+- 加入单 / 多工作区模式切换；多工作区模式只增加 ProjectContext 根层级，【知识】与【协作】继续保持 ProjectContext 级单一入口。
+- 【协作】沿用当前树行为展开 worktree / checkout 子节点，普通虚拟布局拖动继续作用于 ProjectContext 共享预设。
 - 根节点展开只做 lazy hydrate；资源打开时才 focus pane。
 - 拆分 KnowledgeView 的左树和右内容，接入 document ID provider。
 - 接入 Collab、Asset 和 View 的 scoped adapters。
@@ -761,7 +792,7 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 - 删除标题栏 workspace selector 及其焦点副作用。
 - 增加两个 checkout 并发打开、反向完成和后台 event reducer 测试。
 
-完成条件：两个 worktree 的会话、知识、协作、资产和视图均可从同一树访问；虚拟拖动不会改变磁盘。
+完成条件：同一 ProjectContext 的多个 worktree 共用一棵 Workspace Tree、一个【知识】入口和一个【协作】入口；worktree 级执行与服务状态通过 checkout binding 隔离，虚拟拖动不会改变磁盘。
 
 ### P3：主窗口内拖动分屏（首个验收节点）
 
@@ -773,16 +804,18 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 2. 将 session、knowledge document 和 local file 接入 EditorHost；Chat 的活动会话状态改为按 editor/session 隔离。
 3. 实现二叉 split tree、稳定 paneId、pane focus 和 group resize。
 4. 为资源树拖动增加 editor drop intent；Explorer 内部落点继续修改虚拟布局，EditorHost 落点打开资源并创建或复用 EditorGroup。
-5. 实现标签在组间移动、拖到组边缘继续拆分，以及关闭 group 后的 split tree 收缩。
-6. 将 VisiblePane lease、workspace focus 和 active session 绑定到 `(windowId, paneId)`，接入 scoped event reducer。
-7. 持久化并恢复主窗口 split tree、比例、pane ID、标签、活动标签和 unavailable editor。
+5. 实现按 EditorGroup 分页数量派生的 tab strip：一个分页完全隐藏，两个及以上分页显示；显隐不重建活动 Editor。
+6. 实现可见标签在组间移动、拖到组边缘继续拆分，以及关闭 group 后的 split tree 收缩；单分页组继续通过资源树拖放和编辑器命令完成移动与拆分。
+7. 将 VisiblePane lease、workspace focus 和 active session 绑定到 `(windowId, paneId)`，接入 scoped event reducer。
+8. 持久化并恢复主窗口 split tree、比例、pane ID、标签、活动标签和 unavailable editor。
 
 完成条件：
 
 - 从左侧资源树拖动会话或知识文档到编辑区边缘，可以创建左、右、上、下分屏。
 - 两个可见 pane 可以同时运行两个会话，或同时显示会话与知识文档，状态与 workspace scope 互不串联。
 - 水平和垂直分隔条可手动调整，释放后保存比例，重启后恢复。
-- 标签可以在 EditorGroup 之间移动，也可以拖到组边缘继续拆分。
+- 每个 EditorGroup 只有一个分页时保持当前无 tab 的表现；打开第二个分页后显示标签栏，回到一个分页后自动收起。
+- 可见标签可以在 EditorGroup 之间移动，也可以拖到组边缘继续拆分。
 - A/B checkout 同屏运行、反向完成、关闭 group、窄窗口和恢复测试通过。
 
 ### P4：编辑器组完整能力
@@ -868,10 +901,11 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 - 本地文件预览只允许当前预设引用路径及挂载目录后代。
 - 历史缺失字段在导出中为 `empty`。
 - folder create / rename / promote-delete / multi-move 的事务测试。
-- cycle、跨 checkout、跨 section、重复 resource placement 被拒绝。
+- cycle、非法跨 section、跨 ProjectContext、重复 resource placement 被拒绝。
 - expectedRevision 冲突不产生部分写入。
 - 相同 operationId 重试只提交一次。
-- A/B checkout 并发 layout mutation 互不阻塞。
+- 同一 ProjectContext 的多个 checkout 共用 layout revision；并发 layout mutation 使用 revision CAS 与 operationId 安全重放。
+- 不同 ProjectContext 的 layout mutation 互不阻塞。
 
 ### 前端单元测试
 
@@ -882,9 +916,11 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 - 单击 disclosure 不打开 editor；单击 row 不意外折叠。
 - drag preview 与后端允许规则一致。
 - 先发慢 snapshot 不覆盖后发结果。
-- scoped event 只更新 matching checkout。
+- ProjectContext 共享资源事件只更新 matching project；runtime 与工作目录事件只更新 matching checkout。
 - stale generation 触发重新解析，不回退到全局 workspace。
-- hidden section 可恢复，固定 section 不能删除或跨 checkout。
+- hidden section 可恢复，固定 section 不能删除或跨 ProjectContext。
+- `showTabStrip` 按 EditorGroup 独立派生：0/1 个分页为 false，2 个及以上分页为 true。
+- tab strip 从隐藏到显示、再收起时保持相同活动 Editor 实例，不清空 scroll、composer draft 或 streaming state。
 
 ### 物理隔离回归
 
@@ -901,17 +937,21 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 
 使用两个 checkout 验证：
 
-- 多工作区树同时显示主工作区和 worktree。
-- 两边 Sessions / Knowledge 标题相同也不会串数据。
+- 多工作区树为 ProjectContext 增加一个项目根节点，内部 Workspace Tree 的顺序、虚拟文件夹和普通拖动行为与当前实现一致。
+- 同一 ProjectContext 下只显示一个【知识】节点和一个【协作】节点；【协作】展开后显示主工作树和其他 worktree。
+- 切换或新增 worktree 不复制 Knowledge placement、Collab placement、虚拟文件夹和 project-owned session placement。
+- 同一知识文档在绑定 A/B checkout 的两个 pane 中使用相同 `projectId + documentId`，checkout 级索引与工具事件各自路由。
 - A 会话执行时切换并操作 B，A 的完成事件仍更新 A。
 - 反向快速打开 A -> B，B 先完成后 A 的旧响应不覆盖焦点。
-- A/B 同时发起 layout move，只递增各自 revision。
+- A/B 对同一 ProjectContext 发起 layout move 时共享 project revision，并通过冲突重放得到一个确定顺序。
 - Unity A Connected、Unity B Ready 时，命令只等待目标 checkout 的 Ready。
 - 重启后根顺序、虚拟文件夹和资源位置恢复。
 
 ### 窗口与分屏 E2E
 
 - 两个 pane 分别绑定 A/B checkout，焦点和 active session 独立。
+- 每个 pane 只有一个分页时均不渲染 tab strip，Chat / Knowledge / File 内容顶部与当前单页布局一致。
+- 同组打开第二个分页后显示 tab strip；关闭、移动回一个分页后收起，同时保持活动 Editor 实例、滚动位置和草稿。
 - tab 在 group 间移动后 runtime lease 正确转移。
 - tab 拖出窗口完成 ready ack 后才移除源 tab。
 - 目标窗口创建失败时源 tab 和运行状态保持。
@@ -922,6 +962,7 @@ Unity 节点状态使用 `Starting -> Connected -> Ready -> Reloading/Degraded -
 
 - 深色 / 浅色主题、125% / 150% 缩放和窄窗口检查。
 - 侧栏保持现有 `sidebar-bg`，编辑区使用 `panel-bg`，不新增营销卡片式 surface。
+- 单分页 EditorGroup 不增加常驻 header 或标签栏；双分页开始使用现有中性桌面控件风格的轻量 tab strip。
 - 仅图标按钮具有 focus-visible、tooltip 和足够点击区域。
 - 可点击行使用 button / treeitem 语义，不使用不可聚焦的 click div。
 - 拖动是增强能力；键盘和“移动到…”菜单可完成相同操作。
@@ -939,11 +980,11 @@ bun run typecheck:test
 ## 性能预算
 
 - 树继续使用 `FileTreeList` 虚拟化；目标为 10,000 个可见扁平节点仍可滚动。
-- 多工作区模式只先加载 ProjectContext / checkout 元数据。
-- Sessions、Knowledge 和 Views 在分区首次展开时独立加载。
-- provider snapshot 按 checkout + revision 缓存，并使用 LRU 释放后台数据。
+- 多工作区模式只先加载 ProjectContext 元数据；checkout 元数据在【协作】展开或 EditorCheckoutBinding 解析时加载。
+- ProjectContext 级 Sessions、Knowledge、Collab 和 Views 在分区首次展开时独立加载。
+- 共享 provider snapshot 按 projectId + revision 缓存；runtime provider 按 checkoutId + generation 缓存，并使用 LRU 释放后台数据。
 - Asset 不进入默认全量树。
-- 一次 scoped event 只失效对应 checkout / section，不能重载整棵树。
+- 一次共享资源事件只失效对应 project / section，一次 runtime 事件只失效对应 checkout projection，不能重载整棵树。
 - 拖动期间只更新本地 projection；后端确认后提交 snapshot，冲突时精确回滚。
 - 资源标题变化采用增量 patch，避免重新 flatten 所有 project roots。
 
@@ -965,7 +1006,7 @@ bun run typecheck:test
 | 风险 | 控制措施 |
 | --- | --- |
 | 树拖动误触物理移动 | Explorer operation 与 Knowledge/View 领域 move 使用不同 service、类型和菜单文案；E2E 校验 hash/path |
-| 多窗口最后写入覆盖 | checkout 级 revision CAS、事务、operationId 和 event reducer |
+| 多窗口最后写入覆盖 | ProjectContext 级 layout revision CAS、事务、operationId 和 event reducer；checkout 级 runtime projection 独立路由 |
 | 树展开抢占 checkout | hydrate 与 focus 分离；只有 EditorGroup 激活资源才更新 PaneContext |
 | 重复 Explorer 嵌套 | Knowledge / Chat / View 提供 embedded content mode，统一树完成后删除内层导航 |
 | 旧 session folder 迁移破坏会话 | 只读导入 placement，不删除或改写历史 session；保留 export 回归 |
@@ -983,7 +1024,8 @@ bun run typecheck:test
 - 第二层栏和顶部 workspace selector 已删除。
 - 工作区级入口全部位于开发页资源树。
 - 单 / 多工作区模式可切换。
-- 两个 checkout 的会话和知识可并发打开且作用域正确。
+- 同一 ProjectContext 的【知识】与【协作】在多个 worktree 下保持单一入口和共享资源身份。
+- 两个 checkout 绑定的编辑器可并发打开，ProjectContext 资源与 checkout runtime 事件分别按作用域更新。
 - 会话、知识和 View 的虚拟拖动持久化且不改变物理数据。
 - 协作、资产和视图没有因为删除分页而失去入口。
 - Chat 与 Knowledge 页面不再显示重复左侧导航。
@@ -992,10 +1034,66 @@ bun run typecheck:test
 ### 首个用户验收：主窗口内拖动分屏
 
 - 从资源树拖动 Session、Knowledge document 或 local file 到主编辑区边缘可以创建分屏。
-- 从标签栏拖动活动标签到另一组或组边缘，可以移动标签或继续拆分。
+- 单个 EditorGroup 只有一个分页时保持当前无 tab 的界面；同组存在两个及以上分页时显示标签栏。
+- 从已显示的标签栏拖动活动标签到另一组或组边缘，可以移动标签或继续拆分。
 - 左右、上下分屏均可创建，分隔条可实时调整并遵守 pane 最小尺寸。
 - 两个可见 pane 的会话、流式状态、workspace focus、active session 和 scoped event 保持独立。
 - 重启后恢复 split tree、比例、pane ID、标签和活动标签。
+
+### 会话引用拖动与公共资产预览
+
+会话正文中的文件、Unity 资产和知识文档引用进入统一的语义拖动链路。消息引用是只读来源，拖动操作固定为 `copy`；工作区放置只修改 ExplorerLayout，TabGroup 放置只创建或激活 EditorInput，原始文件、资产和知识文档保持原位。
+
+统一载荷使用版本化结构，并显式携带来源作用域：
+
+```ts
+interface WorkbenchReferenceDragData {
+  version: 1;
+  origin: {
+    projectId: string;
+    workspaceRef: WorkspaceRef;
+    workspaceRoot: string;
+  };
+  entries: Array<
+    | { kind: "file"; path: string; isDir: boolean; name?: string }
+    | { kind: "asset"; path: string; name?: string; typeLabel?: string }
+    | { kind: "sceneObject"; scenePath: string; objectPath: string; name?: string }
+    | { kind: "knowledge"; type: KnowledgeDocumentType; path: string; documentId?: string; name?: string }
+  >;
+}
+```
+
+落点语义：
+
+| 引用 | 左侧 Workspace Tree | TabGroup / EditorGroup |
+| --- | --- | --- |
+| 文件 | 通过 `mountPath` 创建或复用路径挂载 | 打开 workspace file editor |
+| Unity 资产 | 挂载对应物理资产文件 | 打开 asset editor |
+| 场景对象 | 放置所属 scene 资产 | 打开 scene object inspector editor |
+| 知识文档 | 解析 `documentId` 后 `placeResource` | 打开 Knowledge document editor |
+
+- Tab strip 落点按指针所在 tab 的左右半区插入；EditorGroup 正文落点沿用左、右、上、下半组拆分预览。
+- Composer 落点优先级高于 EditorGroup，可把同一语义载荷转换为输入附件。
+- 多工作区模式下，Workspace Tree 放置只接受来源 ProjectContext；TabGroup 可以承载来源项目的 EditorInput，并依据资源自身的 EditorCheckoutBinding 切换 pane scope。
+- 引用解析器由 Chat 点击、右键菜单、内部拖动和原生拖动适配器共同使用，统一覆盖 `design / plan / memory / skill / reference`。
+- 原生文件与 Unity 拖动事件由 Workbench 单点订阅并按指针位置定向提交；已挂载的多个 Chat composer 不直接广播消费同一次 drop。
+
+资产编辑器首版复用现有 Locus Inspector / Asset 预览能力。公共前端设施分为显式 scope 的加载状态与现有渲染层：
+
+```text
+WorkspaceAssetPreview
+├─ 显式 WorkspaceRef、资源身份、受控/自动加载与宿主操作
+└─ UnityObjectPreview：加载缓存、目标选择、文本、二进制、结构化资产、Live Inspector 与交互预览
+```
+
+- 公共入口必须接收 `workspaceRef`，缓存键包含 `checkoutId + expectedGeneration + assetPath`。
+- Asset 页面、Locus Inspector、Workbench asset editor 和 Unity workspace file preview 复用同一入口。
+- 首版保持现有 Inspector 展示与控件密度；不同资产类型的专用界面在公共资源身份和生命周期稳定后迭代。
+- 资产与场景对象 EditorInput 使用稳定逻辑路径作为资源身份，runtime generation 保留在 EditorCheckoutBinding，恢复时重新校验物理文件与 checkout generation。
+
+实施状态（2026-08-28）：版本化引用载荷、会话引用解析、Workbench Tree/Composer/TabGroup 路由、原生 drop 单点分发、Asset/Locus Inspector/Workbench/Workspace file 公共预览入口与恢复类型已经落地；验证覆盖语义解析、拖动外部化、布局路由、Inspector 集成、store 恢复、完整 Vitest、应用/测试类型检查、生产构建与隔离实例启动。
+
+验收覆盖：会话内三类引用拖入根目录、虚拟文件夹、Tab strip 和组边缘；双 pane 定向 drop；同路径双 checkout 隔离；隐藏 editor 不消费 drop；重启恢复资产与知识标签；原生 Unity / OS 拖出能力保持。
 
 ### 完整工作台完成
 

@@ -118,7 +118,7 @@ describe("display settings transcript alignment", () => {
     expect(app).toContain('import { initFonts, useDisplaySettings } from "./composables/useDisplaySettings";');
     expect(app).toContain("const { state: displaySettings } = useDisplaySettings();");
     const topTabsSection = app.slice(app.indexOf("const topTabs ="), app.indexOf("const visibleTopTabs ="));
-    expect(topTabsSection).toContain('{ id: "chat", labelKey: "app.tab.development", visible: true }');
+    expect(topTabsSection).toContain('{ id: "development", labelKey: "app.tab.development", visible: true }');
     expect(topTabsSection).toContain('{ id: "views", labelKey: "app.tab.views", visible: displaySettings.showViewsTab }');
     expect(topTabsSection).toContain('{ id: "settings", labelKey: "app.tab.settings", visible: true }');
     expect(topTabsSection).toContain('{ id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab }');
@@ -129,7 +129,7 @@ describe("display settings transcript alignment", () => {
     expect(app).toContain('v-for="tab in visibleTopTabs"');
     expect(app).not.toContain('v-for="tab in visibleProjectTabs"');
     expect(app).toContain('@click="onTopTabClick($event, tab)"');
-    expect(app).toContain('if (visibleTopTabs.value.some((tab) => tab.id === uiStore.activeTab)) return;');
+    expect(app).toContain('if (visibleTopTabs.value.some((tab) => tab.id === uiStore.activePage)) return;');
     expect(app).toContain('scope: "checkout"');
     expect(app).toContain('checkoutId: runtime.checkoutId');
     expect(app).toContain('workspaceGeneration: runtime.workspaceGeneration');
@@ -150,6 +150,36 @@ describe("display settings transcript alignment", () => {
     expect(en).toContain('"settings.display.showPluginsTab": "Show Plugins"');
     expect(en).toContain('"settings.display.showAgentTab": "Show Agent"');
     expect(en).toContain('"settings.display.showAgentSelector": "Show Agent selector"');
+  });
+
+  it("configures common and Unity-specific hidden directories for the Files page", () => {
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const displayPanel = read("src/components/settings/DisplaySettings.vue");
+    const assetState = read("src/composables/useAssetState.ts");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(displaySettings).toContain("DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES");
+    expect(displaySettings).toContain("DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES");
+    expect(displaySettings).toContain("fileExplorerHiddenDirectories: string[];");
+    expect(displaySettings).toContain("unityFileExplorerHiddenDirectories: string[];");
+    expect(displaySettings).toContain("normalizeHiddenDirectoryNames");
+
+    expect(displayPanel).toContain("settings.display.fileExplorerTitle");
+    expect(displayPanel).toContain("file-explorer-hidden-directories");
+    expect(displayPanel).toContain("unity-file-explorer-hidden-directories");
+    expect(displayPanel).toContain("updateHiddenDirectories('fileExplorerHiddenDirectories', $event)");
+    expect(displayPanel).toContain("updateHiddenDirectories('unityFileExplorerHiddenDirectories', $event)");
+
+    expect(assetState).toContain("statWorkspaceEntries");
+    expect(assetState).toContain("displaySettings.fileExplorerHiddenDirectories");
+    expect(assetState).toContain("displaySettings.unityFileExplorerHiddenDirectories");
+    expect(assetState).toContain("const WORKSPACE_ROOT_PATH = \".\";");
+
+    expect(zh).toContain('"app.tab.asset": "文件"');
+    expect(zh).toContain('"settings.display.fileExplorerTitle": "文件目录"');
+    expect(en).toContain('"app.tab.asset": "Files"');
+    expect(en).toContain('"settings.display.fileExplorerTitle": "File Directories"');
   });
 
   it("adds a session user message right-align toggle that defaults to on", () => {

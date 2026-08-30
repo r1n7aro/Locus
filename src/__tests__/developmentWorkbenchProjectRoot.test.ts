@@ -45,7 +45,7 @@ describe("Development workbench project roots", () => {
     expect(workbench).toContain("explorerNode: node");
     expect(workbench).toContain('kind: "knowledgeRoot"');
     expect(workbench).toContain('case "knowledgeRoot": return BookOpen;');
-    expect(workbench).toContain('v-show="showKnowledge"');
+    expect(workbench).toContain("editor.resource.kind === 'knowledgeRoot'");
     expect(workbench).toContain("<KnowledgeView");
   });
 

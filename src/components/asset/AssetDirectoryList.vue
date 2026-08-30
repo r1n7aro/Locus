@@ -20,11 +20,13 @@ const props = defineProps<{
   loaded: boolean;
   hasMore: boolean;
   emptyLabel: string;
+  dragEnabled?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "select", node: AssetExplorerNode): void;
   (e: "loadMore"): void;
+  (e: "dragPointerDown", node: AssetExplorerNode, event: PointerEvent): void;
 }>();
 
 type VisibleEntry =
@@ -76,6 +78,11 @@ function iconClass(node: AssetExplorerNode) {
     ? unityFolderIconClass(false)
     : unityAssetIconClassForPath(node.path, { isFolder: false });
 }
+
+function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
+  if (!props.dragEnabled) return;
+  emit("dragPointerDown", node, event);
+}
 </script>
 
 <template>
@@ -98,6 +105,7 @@ function iconClass(node: AssetExplorerNode) {
             class="adl-row"
             :class="{ selected: selectedPath === entry.node.path }"
             :title="entry.node.path"
+            @pointerdown="beginDrag(entry.node, $event)"
             @click="emit('select', entry.node)"
           >
             <span

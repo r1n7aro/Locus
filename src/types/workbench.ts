@@ -60,7 +60,7 @@ export type ProjectExplorerOperation =
   | { kind: "deleteFolder"; nodeId: string }
   | { kind: "moveNode"; nodeId: string; parentNodeId?: string | null; position: number }
   | { kind: "placeResource"; resourceKind: "session" | "knowledge" | "system"; resourceId: string; sourceKind?: "knowledge" | string | null; parentNodeId?: string | null; position: number }
-  | { kind: "removeResourcePlacement"; resourceKind: "session" | "knowledge" | "system"; resourceId: string }
+  | { kind: "removeResourcePlacement"; resourceKind: "knowledge"; resourceId: string }
   | { kind: "mountPath"; nodeId?: string | null; parentNodeId?: string | null; path: string; sourceKind?: "local" | "knowledge" | null; name?: string | null; position: number }
   | { kind: "setNodeHidden"; nodeId: string; hidden: boolean }
   | { kind: "removeNode"; nodeId: string };
@@ -109,21 +109,116 @@ export interface ProjectExplorerFilePreview {
   kind: ProjectExplorerFilePreviewKind;
   mimeType: string;
   text?: string;
+  contentHash?: string;
   dataUrl?: string;
   totalLines?: number;
   truncated: boolean;
+  editable: boolean;
   checkoutId?: string;
   workspaceGeneration?: number;
   workspaceRelativePath?: string;
 }
 
-export type DevelopmentResourceRef =
+export type WorkspaceSectionKind =
+  | "sessions"
+  | "knowledge"
+  | "collab"
+  | "assets"
+  | "views";
+
+/**
+ * Stable editor identity. Runtime generations and physical titles are kept on
+ * the editor input so a restored tab can resolve them again.
+ */
+export type WorkbenchResourceRef =
   | { kind: "project"; projectId: string }
-  | { kind: "newSession"; projectId: string; checkoutId: string }
+  | { kind: "newSession"; projectId: string }
   | { kind: "checkout"; projectId: string; checkoutId: string }
-  | { kind: "knowledgeRoot"; projectId: string; checkoutId: string }
+  | { kind: "section"; projectId: string; section: WorkspaceSectionKind }
+  | { kind: "knowledgeRoot"; projectId: string }
   | { kind: "collaboration"; projectId: string }
   | { kind: "folder"; projectId: string; nodeId: string }
-  | { kind: "session"; projectId: string; sessionId: string; checkoutId: string }
-  | { kind: "knowledge"; projectId: string; documentId: string; sourceCheckoutId: string }
-  | { kind: "localFile"; projectId: string; path: string; nodeId: string };
+  | { kind: "session"; projectId: string; sessionId: string }
+  | { kind: "knowledge"; projectId: string; documentId: string }
+  | { kind: "workspaceFile"; projectId: string; path: string }
+  | { kind: "asset"; projectId: string; path: string }
+  | { kind: "sceneObject"; projectId: string; scenePath: string; objectPath: string }
+  | { kind: "view"; projectId: string; viewId: string }
+  | { kind: "localDirectory"; projectId: string; nodeId: string; relativePath?: string | null }
+  | { kind: "localFile"; projectId: string; nodeId: string; relativePath?: string | null };
+
+export type DevelopmentResourceRef = WorkbenchResourceRef;
+
+export interface EditorCheckoutBinding {
+  checkoutId: string;
+  expectedGeneration?: number | null;
+}
+
+export interface EditorCapabilities {
+  split: boolean;
+  detach: boolean;
+  duplicate: boolean;
+}
+
+export type WorkbenchEditorAvailability = "available" | "unavailable";
+
+export interface WorkbenchEditorInput {
+  editorId: string;
+  resource: WorkbenchResourceRef;
+  title: string;
+  icon?: string | null;
+  preview: boolean;
+  pinned: boolean;
+  dirty: boolean;
+  capabilities: EditorCapabilities;
+  checkoutBinding?: EditorCheckoutBinding | null;
+  /** Resolved locator for local-file and mounted-file adapters. */
+  sourcePath?: string | null;
+  availability: WorkbenchEditorAvailability;
+  unavailableReason?: string | null;
+}
+
+export interface WorkbenchEditorGroup {
+  paneId: string;
+  tabs: WorkbenchEditorInput[];
+  activeEditorId: string | null;
+  focusedCheckoutId?: string | null;
+}
+
+export type WorkbenchSplitOrientation = "horizontal" | "vertical";
+
+export type WorkbenchSplitNode =
+  | {
+      kind: "group";
+      paneId: string;
+    }
+  | {
+      kind: "split";
+      splitId: string;
+      orientation: WorkbenchSplitOrientation;
+      ratio: number;
+      first: WorkbenchSplitNode;
+      second: WorkbenchSplitNode;
+    };
+
+export interface WorkbenchSidebarState {
+  width: number;
+  collapsed: boolean;
+}
+
+export interface WorkbenchWindowState {
+  schemaVersion: number;
+  windowId: string;
+  sidebar: WorkbenchSidebarState;
+  layout: WorkbenchSplitNode;
+  groups: Record<string, WorkbenchEditorGroup>;
+  focusedPaneId: string;
+}
+
+export type WorkbenchDropDirection = "center" | "left" | "right" | "top" | "bottom";
+
+export interface WorkbenchEditorDragData {
+  windowId: string;
+  paneId: string;
+  editorId: string;
+}

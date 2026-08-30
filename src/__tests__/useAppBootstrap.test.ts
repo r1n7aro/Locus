@@ -702,6 +702,56 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(subscribedEvents).toContain("session-execution-state-changed");
   });
 
+  it("publishes routed session events before focused-workspace projection", async () => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+    const { subscribeSessionStreamEvents } = await import("../services/sessionStreamEventHub");
+    const routedListener = vi.fn();
+    const unsubscribe = subscribeSessionStreamEvents(routedListener);
+
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap();
+    await registerListeners();
+
+    handlers.get("locus://workspace-event")?.({
+      payload: {
+        eventName: "stream-event",
+        streamRevision: 1,
+        projectId: "project-other",
+        checkoutId: "checkout-other",
+        workspaceGeneration: 9,
+        payload: {
+          type: "runStart",
+          sessionId: "session-other",
+          runId: "run-other",
+        },
+      },
+    });
+
+    expect(routedListener).toHaveBeenCalledWith({
+      event: expect.objectContaining({
+        type: "runStart",
+        sessionId: "session-other",
+      }),
+      source: {
+        kind: "workspace",
+        projectId: "project-other",
+        checkoutId: "checkout-other",
+        workspaceGeneration: 9,
+        streamRevision: 1,
+      },
+    });
+    expect(chatStoreMock.handleStreamEvent).not.toHaveBeenCalled();
+    unsubscribe();
+  });
+
   it("applies execution-state changes only through the active-session store", async () => {
     const eventModule = await import("@tauri-apps/api/event");
     const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;

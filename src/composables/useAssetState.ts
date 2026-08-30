@@ -4,19 +4,23 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   assetDbOverview,
   assetDbScanStart,
-  searchWorkspaceAssets,
   previewWorkspaceAsset,
   previewWorkspaceAssetTarget,
   getWatcherTuning,
   setWatcherTuning,
 } from "../services/asset";
-import { listDirEntriesPage } from "../services/project";
+import {
+  listDirEntriesPage,
+  searchWorkspaceEntries,
+  statWorkspaceEntries,
+} from "../services/project";
 import { WORKSPACE_EVENT_NAME } from "../services/project";
 import type { RoutedWorkspaceEvent, WorkspaceRef } from "../services/project";
 import { t } from "../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../services/errors";
 import { getWarmup } from "./warmupCache";
 import { acquireSelectionLock } from "./useSelectionLock";
+import { useDisplaySettings } from "./useDisplaySettings";
 import type {
   AssetDbOverview,
   AssetSearchResult,
@@ -59,7 +63,7 @@ export type AssetExplorerNode =
 type AssetPreviewFileNode = Extract<AssetExplorerNode, { kind: "file" }>;
 type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
-const FIXED_ROOTS = ["Assets", "Packages", "ProjectSettings"] as const;
+const WORKSPACE_ROOT_PATH = ".";
 const ASSET_EXPLORER_PAGE_SIZE = 200;
 const ASSET_EXPLORER_BRANCH_PROBE_PAGE_SIZE = 1;
 const ASSET_EXPLORER_BRANCH_PROBE_CONCURRENCY = 8;
@@ -73,6 +77,7 @@ function assetPreviewErrorMessage(error: unknown): string {
 }
 
 export function useAssetState(props: AssetProps) {
+  const { state: displaySettings } = useDisplaySettings();
   // ── Reactive state ────────────────────────────────────────
   const loading = ref(false);
   const error = ref("");
@@ -83,6 +88,7 @@ export function useAssetState(props: AssetProps) {
   const expandedPaths = ref<Set<string>>(new Set());
   const selectedFolderPath = ref<string | null>(null);
   const selectedNode = ref<AssetExplorerNode | null>(null);
+  const isUnityWorkspace = ref(false);
 
   const viewMode = ref<ViewMode>("stats");
 
@@ -155,7 +161,22 @@ export function useAssetState(props: AssetProps) {
   // watcher tuning
   const watcherTuning = ref<WatcherTuning | null>(null);
   const watcherTuningSaving = ref(false);
+  let explorerInitialization = 0;
+  let explorerInitializing = false;
   const hasWorkspace = computed(() => !!props.workingDir.trim() && !!props.workspaceRef);
+  const hiddenDirectories = computed(() => {
+    const names = [
+      ...displaySettings.fileExplorerHiddenDirectories,
+      ...(isUnityWorkspace.value ? displaySettings.unityFileExplorerHiddenDirectories : []),
+    ];
+    const seen = new Set<string>();
+    return names.filter((name) => {
+      const key = name.toLocaleLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  });
 
   function requireAssetWorkspaceRef(): WorkspaceRef {
     const workspaceRef = props.workspaceRef;
@@ -164,11 +185,14 @@ export function useAssetState(props: AssetProps) {
   }
 
   function resetWorkspaceState() {
+    explorerInitialization += 1;
+    explorerInitializing = false;
     invalidatePreviewSession();
     explorerTree.value = [];
     expandedPaths.value = new Set();
     selectedFolderPath.value = null;
     selectedNode.value = null;
+    isUnityWorkspace.value = false;
     viewMode.value = "stats";
     searchQuery.value = "";
     searchScope.value = "folder";
@@ -186,24 +210,20 @@ export function useAssetState(props: AssetProps) {
   }
 
   // ── Explorer ──────────────────────────────────────────────
+  function workspaceRootName(): string {
+    const normalized = props.workingDir.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+    return normalized.split("/").filter(Boolean).pop() || t("asset.explorer.workspaceRoot");
+  }
+
   function initRoots() {
-    explorerTree.value = FIXED_ROOTS.map((name) => ({
-      kind: "folder",
-      name,
-      path: name,
-      depth: 0,
-      isRoot: true,
-      loaded: false,
-      loading: false,
-      hasMore: false,
-      nextOffset: 0,
-      totalCount: 0,
-      hasChildFoldersKnown: false,
-      hasChildFolders: false,
-      branchProbeLoading: false,
-      children: [],
-    }));
-    selectedFolderPath.value = FIXED_ROOTS[0];
+    explorerTree.value = [createFolderNode(
+      workspaceRootName(),
+      WORKSPACE_ROOT_PATH,
+      0,
+      true,
+    )];
+    expandedPaths.value = new Set([WORKSPACE_ROOT_PATH]);
+    selectedFolderPath.value = WORKSPACE_ROOT_PATH;
   }
 
   function isPathExpanded(path: string): boolean {
@@ -226,7 +246,7 @@ export function useAssetState(props: AssetProps) {
 
   function parentFolderPath(path: string): string | null {
     const segments = path.split("/").filter(Boolean);
-    if (segments.length <= 1) return segments[0] ?? null;
+    if (segments.length <= 1) return segments.length ? WORKSPACE_ROOT_PATH : null;
     return segments.slice(0, -1).join("/");
   }
 
@@ -323,7 +343,8 @@ export function useAssetState(props: AssetProps) {
         workspaceRef,
         options.append ? folder.nextOffset : 0,
         ASSET_EXPLORER_PAGE_SIZE,
-        true,
+        isUnityWorkspace.value,
+        hiddenDirectories.value,
       );
       assignFolderPage(folder, page, !!options.append);
     } catch (e) {
@@ -352,7 +373,8 @@ export function useAssetState(props: AssetProps) {
         workspaceRef,
         0,
         ASSET_EXPLORER_BRANCH_PROBE_PAGE_SIZE,
-        true,
+        isUnityWorkspace.value,
+        hiddenDirectories.value,
       );
       folder.hasChildFoldersKnown = true;
       folder.hasChildFolders = page.entries[0]?.isDir === true;
@@ -385,16 +407,6 @@ export function useAssetState(props: AssetProps) {
     });
 
     await Promise.all(workers);
-    explorerTree.value = [...explorerTree.value];
-  }
-
-  async function prefetchRootFolderBranchState() {
-    if (!hasWorkspace.value) return;
-    const rootFolders = explorerTree.value.filter(
-      (node): node is AssetFolderNode => node.kind === "folder",
-    );
-    if (!rootFolders.length) return;
-    await Promise.all(rootFolders.map((folder) => probeFolderBranchState(folder)));
     explorerTree.value = [...explorerTree.value];
   }
 
@@ -447,6 +459,11 @@ export function useAssetState(props: AssetProps) {
 
   async function expandToPath(path: string) {
     if (!hasWorkspace.value) return;
+    const workspaceRoot = findNodeByPath(WORKSPACE_ROOT_PATH);
+    if (workspaceRoot?.kind === "folder" && !workspaceRoot.loaded) {
+      await loadFolderChildren(workspaceRoot);
+    }
+    expandedPaths.value = new Set(expandedPaths.value).add(WORKSPACE_ROOT_PATH);
     // Expand each ancestor and ensure children are loaded.
     const segments = path.split("/").filter(Boolean);
     let current = "";
@@ -464,6 +481,15 @@ export function useAssetState(props: AssetProps) {
 
   async function expandFolderPath(path: string, includeSelf = true) {
     if (!hasWorkspace.value) return;
+    if (path === WORKSPACE_ROOT_PATH) {
+      const workspaceRoot = findNodeByPath(WORKSPACE_ROOT_PATH);
+      if (workspaceRoot?.kind === "folder" && !workspaceRoot.loaded) {
+        await loadFolderChildren(workspaceRoot);
+      }
+      expandedPaths.value = new Set(expandedPaths.value).add(WORKSPACE_ROOT_PATH);
+      explorerTree.value = [...explorerTree.value];
+      return;
+    }
     const segments = path.split("/").filter(Boolean);
     if (!segments.length) return;
     let current = "";
@@ -483,8 +509,10 @@ export function useAssetState(props: AssetProps) {
 
   async function materializePath(path: string) {
     const segments = path.split("/").filter(Boolean);
-    if (segments.length <= 1) return;
-    const parentPath = segments.slice(0, -1).join("/");
+    if (!segments.length) return;
+    const parentPath = segments.length === 1
+      ? WORKSPACE_ROOT_PATH
+      : segments.slice(0, -1).join("/");
     const filePath = segments.join("/");
     const parentNode = findNodeByPath(parentPath);
     if (!parentNode || parentNode.kind !== "folder") return;
@@ -554,6 +582,14 @@ export function useAssetState(props: AssetProps) {
     return result.path;
   }
 
+  function workspaceSearchResultKind(name: string, isDirectory: boolean): string {
+    if (isDirectory) return t("asset.search.kind.folder");
+    const extension = name.toLocaleLowerCase().split(".").pop();
+    return extension && extension !== name.toLocaleLowerCase()
+      ? extension
+      : t("asset.search.kind.file");
+  }
+
   function runFilenameSearch(query: string) {
     searchQuery.value = query;
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
@@ -586,14 +622,23 @@ export function useAssetState(props: AssetProps) {
       }
       searching.value = true;
       try {
-        const results = await searchWorkspaceAssets(query, [
-          "Assets",
-          "Packages",
-          "ProjectSettings",
-        ], undefined, requireAssetWorkspaceRef());
-        searchResults.value = results;
-        searchTruncated.value = results.length === 200;
-        searchHasFallback.value = results.some((r) => r.source === "filesystem");
+        const entries = await searchWorkspaceEntries(
+          query,
+          requireAssetWorkspaceRef(),
+          200,
+          hiddenDirectories.value,
+        );
+        searchResults.value = entries.map((entry) => ({
+          path: entry.relPath,
+          name: entry.name,
+          root: "workspace",
+          kind: workspaceSearchResultKind(entry.name, entry.isDir),
+          isDirectory: entry.isDir,
+          matchScore: entry.matchScore,
+          source: "filesystem",
+        }));
+        searchTruncated.value = entries.length === 200;
+        searchHasFallback.value = false;
       } catch (e) {
         const err = normalizeAppError(e);
         error.value = err.message;
@@ -625,6 +670,12 @@ export function useAssetState(props: AssetProps) {
   async function selectFromSearchResult(result: AssetSearchResult) {
     if (!hasWorkspace.value) return;
     selectedSearchKey.value = searchResultKey(result);
+    if (result.isDirectory) {
+      await expandFolderPath(result.path, false);
+      await materializePath(result.path);
+      await selectFolder(result.path, { revealInTree: "ancestors" });
+      return;
+    }
     await expandToPath(result.path);
     await materializePath(result.path);
     const parentPath = parentFolderPath(result.path);
@@ -658,12 +709,17 @@ export function useAssetState(props: AssetProps) {
     const normalized = path.trim().replace(/\\/g, "/");
     if (!normalized) return null;
     const workspace = props.workingDir.trim().replace(/\\/g, "/").replace(/\/+$/g, "");
-    const relative = normalized.toLowerCase().startsWith(`${workspace.toLowerCase()}/`)
+    const isAbsolute = /^[a-z]:\//i.test(normalized) || normalized.startsWith("/");
+    const isWithinWorkspace = normalized.toLowerCase().startsWith(`${workspace.toLowerCase()}/`);
+    if (isAbsolute && !isWithinWorkspace) return null;
+    const relative = isWithinWorkspace
       ? normalized.slice(workspace.length + 1)
       : normalized.replace(/^\/+/, "");
-    return FIXED_ROOTS.some((root) => relative === root || relative.startsWith(`${root}/`))
-      ? relative
-      : null;
+    const segments = relative.split("/").filter(Boolean);
+    if (!segments.length || segments.some((segment) => segment === "." || segment === "..")) {
+      return null;
+    }
+    return segments.join("/");
   }
 
   async function openAssetPath(path: string, focusLine?: number): Promise<boolean> {
@@ -807,7 +863,7 @@ export function useAssetState(props: AssetProps) {
 
   // ── DB Overview ──────────────────────────────────────────
   async function refreshDbOverview() {
-    if (!hasWorkspace.value) {
+    if (!hasWorkspace.value || !isUnityWorkspace.value) {
       dbOverview.value = null;
       dbLoading.value = false;
       return;
@@ -824,7 +880,7 @@ export function useAssetState(props: AssetProps) {
   }
 
   async function refreshWatcherTuning() {
-    if (!hasWorkspace.value) {
+    if (!hasWorkspace.value || !isUnityWorkspace.value) {
       watcherTuning.value = null;
       return;
     }
@@ -837,7 +893,7 @@ export function useAssetState(props: AssetProps) {
   }
 
   async function updateWatcherTuning(debounceMs: number, workerCount: number) {
-    if (!hasWorkspace.value) return;
+    if (!hasWorkspace.value || !isUnityWorkspace.value) return;
     watcherTuningSaving.value = true;
     try {
       watcherTuning.value = await setWatcherTuning(debounceMs, workerCount);
@@ -850,7 +906,7 @@ export function useAssetState(props: AssetProps) {
   }
 
   async function triggerRescan() {
-    if (!hasWorkspace.value) return;
+    if (!hasWorkspace.value || !isUnityWorkspace.value) return;
     try {
       const result = await assetDbScanStart(requireAssetWorkspaceRef());
       if ((result.started || result.alreadyRunning) && dbOverview.value) {
@@ -866,6 +922,79 @@ export function useAssetState(props: AssetProps) {
     }
   }
 
+  async function detectUnityWorkspace(): Promise<boolean> {
+    if (!hasWorkspace.value) return false;
+    try {
+      const entries = await statWorkspaceEntries(
+        ["Assets", "ProjectSettings/ProjectVersion.txt"],
+        requireAssetWorkspaceRef(),
+      );
+      const assets = entries.find((entry) => entry.path === "Assets");
+      const projectVersion = entries.find(
+        (entry) => entry.path === "ProjectSettings/ProjectVersion.txt",
+      );
+      return assets?.entryKind === "folder" && projectVersion?.entryKind === "file";
+    } catch {
+      return false;
+    }
+  }
+
+  async function initializeExplorer(options: { detectUnity?: boolean } = {}) {
+    if (!hasWorkspace.value) return false;
+    const initialization = ++explorerInitialization;
+    explorerInitializing = true;
+    try {
+      if (options.detectUnity !== false) {
+        const detected = await detectUnityWorkspace();
+        if (initialization !== explorerInitialization) return false;
+        isUnityWorkspace.value = detected;
+      }
+      initRoots();
+      closePreview();
+      await selectFolder(WORKSPACE_ROOT_PATH, {
+        preservePreview: true,
+        revealInTree: "none",
+      });
+      if (initialization !== explorerInitialization) return false;
+      const root = findNodeByPath(WORKSPACE_ROOT_PATH);
+      if (root?.kind === "folder") {
+        void prefetchChildFolderBranchState(root);
+      }
+      return true;
+    } finally {
+      if (initialization === explorerInitialization) {
+        explorerInitializing = false;
+      }
+    }
+  }
+
+  async function initializeUnityAssetState() {
+    if (!isUnityWorkspace.value) {
+      dbOverview.value = null;
+      dbLoading.value = false;
+      watcherTuning.value = null;
+      return;
+    }
+    const workspaceRef = requireAssetWorkspaceRef();
+    const cachedDbOverview = getWarmup<AssetDbOverview>(
+      `asset:dbOverview:${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`,
+    );
+    const cachedWatcherTuning = getWarmup<WatcherTuning>("asset:watcherTuning");
+
+    if (cachedDbOverview) {
+      dbOverview.value = cachedDbOverview;
+      dbLoading.value = false;
+    } else {
+      await refreshDbOverview();
+    }
+
+    if (cachedWatcherTuning) {
+      watcherTuning.value = cachedWatcherTuning;
+    } else {
+      void refreshWatcherTuning();
+    }
+  }
+
   // ── Lifecycle ────────────────────────────────────────────
   let unlistenScoped: UnlistenFn | null = null;
   let watcherPollTimer: ReturnType<typeof setInterval> | null = null;
@@ -875,7 +1004,7 @@ export function useAssetState(props: AssetProps) {
   // Skips while a full scan is running (the scan-event subscription drives
   // updates in that case) and while the page is hidden.
   function startWatcherPoll() {
-    if (!hasWorkspace.value) return;
+    if (!hasWorkspace.value || !isUnityWorkspace.value) return;
     if (watcherPollTimer) return;
     watcherPollTimer = setInterval(() => {
       if (!hasWorkspace.value) return;
@@ -893,30 +1022,8 @@ export function useAssetState(props: AssetProps) {
 
   onMounted(async () => {
     if (hasWorkspace.value) {
-      initRoots();
-      void prefetchRootFolderBranchState();
-      await selectFolder(FIXED_ROOTS[0], {
-        preservePreview: true,
-        revealInTree: "none",
-      });
-      const workspaceRef = requireAssetWorkspaceRef();
-      const cachedDbOverview = getWarmup<AssetDbOverview>(
-        `asset:dbOverview:${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`,
-      );
-      const cachedWatcherTuning = getWarmup<WatcherTuning>("asset:watcherTuning");
-
-      if (cachedDbOverview) {
-        dbOverview.value = cachedDbOverview;
-        dbLoading.value = false;
-      } else {
-        await refreshDbOverview();
-      }
-
-      if (cachedWatcherTuning) {
-        watcherTuning.value = cachedWatcherTuning;
-      } else {
-        refreshWatcherTuning();
-      }
+      const initialized = await initializeExplorer();
+      if (initialized) await initializeUnityAssetState();
     } else {
       resetWorkspaceState();
     }
@@ -969,7 +1076,7 @@ export function useAssetState(props: AssetProps) {
       // listen failure shouldn't break the page
       console.warn("[useAssetState] failed to listen ref-graph-scan", e);
     }
-    if (hasWorkspace.value) startWatcherPoll();
+    if (hasWorkspace.value && isUnityWorkspace.value) startWatcherPoll();
   });
 
   onUnmounted(() => {
@@ -988,35 +1095,22 @@ export function useAssetState(props: AssetProps) {
       props.workspaceRef?.checkoutId ?? "",
       props.workspaceRef?.expectedGeneration ?? null,
     ] as const,
-    ([workingDir]) => {
+    async ([workingDir]) => {
       stopWatcherPoll();
       resetWorkspaceState();
       if (!workingDir.trim()) return;
-      initRoots();
-      void prefetchRootFolderBranchState();
-      void selectFolder(FIXED_ROOTS[0], {
-        preservePreview: true,
-        revealInTree: "none",
-      });
-      const workspaceRef = requireAssetWorkspaceRef();
-      const cachedDbOverview = getWarmup<AssetDbOverview>(
-        `asset:dbOverview:${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`,
-      );
-      const cachedWatcherTuning = getWarmup<WatcherTuning>("asset:watcherTuning");
-
-      if (cachedDbOverview) {
-        dbOverview.value = cachedDbOverview;
-        dbLoading.value = false;
-      } else {
-        refreshDbOverview();
-      }
-
-      if (cachedWatcherTuning) {
-        watcherTuning.value = cachedWatcherTuning;
-      } else {
-        refreshWatcherTuning();
-      }
+      const initialized = await initializeExplorer();
+      if (!initialized) return;
+      await initializeUnityAssetState();
       startWatcherPoll();
+    },
+  );
+
+  watch(
+    () => hiddenDirectories.value.join("\u0000"),
+    () => {
+      if (!hasWorkspace.value || explorerInitializing) return;
+      void initializeExplorer({ detectUnity: false });
     },
   );
 
@@ -1090,7 +1184,9 @@ export function useAssetState(props: AssetProps) {
   });
 
   const currentFolderLabel = computed(() =>
-    selectedFolderPath.value
+    selectedFolderPath.value === WORKSPACE_ROOT_PATH
+      ? workspaceRootName()
+      : selectedFolderPath.value
       ? selectedFolderPath.value.split("/").filter(Boolean).join(" / ")
       : "",
   );
@@ -1125,6 +1221,7 @@ export function useAssetState(props: AssetProps) {
     expandedPaths,
     selectedFolderPath,
     selectedNode,
+    isUnityWorkspace,
     viewMode,
     searchQuery,
     searchScope,
@@ -1152,6 +1249,7 @@ export function useAssetState(props: AssetProps) {
     watcherTuningSaving,
     // actions
     initRoots,
+    initializeExplorer,
     isPathExpanded,
     selectFolder,
     togglePath,

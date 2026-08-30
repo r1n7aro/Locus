@@ -24,6 +24,7 @@ const props = withDefaults(
     error?: string | null;
     includeUnchanged: boolean;
     hideToolbar?: boolean;
+    hideHeader?: boolean;
     displayMode?: SemanticDisplayMode;
     headerLayout?: "default" | "unity";
   }>(),
@@ -230,7 +231,7 @@ function gameObjectFieldLabel(propertyPath: string, fallback: string): string {
     <!-- Body -->
     <div v-else class="inspector-body">
       <!-- Inspector header — hidden when redundant with single panel -->
-      <div v-if="!headerRedundant" class="inspector-header" :class="{ 'unity-layout': unityHeaderLayout }">
+      <div v-if="!hideHeader && !headerRedundant" class="inspector-header" :class="{ 'unity-layout': unityHeaderLayout }">
         <template v-if="unityHeaderLayout">
           <div class="unity-header-shell">
             <div class="unity-header-main">

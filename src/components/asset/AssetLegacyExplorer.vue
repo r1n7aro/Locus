@@ -19,12 +19,14 @@ const props = defineProps<{
   tree: AssetExplorerNode[];
   selectedPath: string | null;
   isPathExpanded: (path: string) => boolean;
+  dragEnabled?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "select", node: AssetExplorerNode): void;
   (e: "toggle", path: string): void;
   (e: "loadMore", path: string): void;
+  (e: "dragPointerDown", node: AssetExplorerNode, event: PointerEvent): void;
 }>();
 
 type VisibleEntry =
@@ -117,6 +119,11 @@ function fileIconClass(node: AssetExplorerNode) {
     ? unityFolderIconClass(false)
     : unityAssetIconClassForPath(node.path, { isFolder: false });
 }
+
+function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
+  if (!props.dragEnabled) return;
+  emit("dragPointerDown", node, event);
+}
 </script>
 
 <template>
@@ -138,6 +145,7 @@ function fileIconClass(node: AssetExplorerNode) {
             class="alx-row"
             :class="{ selected: selectedPath === entry.node.path }"
             :style="{ paddingLeft: `${indentPx(entry.node)}px` }"
+            @pointerdown="beginDrag(entry.node, $event)"
             @click="rowClick(entry)"
           >
             <span

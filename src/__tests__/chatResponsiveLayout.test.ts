@@ -55,13 +55,18 @@ describe("chat responsive layout", () => {
   it("keeps Unity and the native app on the same chat workspace contract", () => {
     const app = read("src/App.vue") + read("src/styles/app-global.css");
     const developmentWorkbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const workbenchSession = read("src/components/workbench/WorkbenchSessionEditor.vue");
     const unityView = read("src/components/UnityEmbeddedSessionView.vue");
     const workspace = read("src/components/ChatWorkspaceView.vue");
     const sidebar = read("src/components/ChatSidebarPanel.vue");
 
     expect(app).toContain('import DevelopmentWorkbench from "./components/workbench/DevelopmentWorkbench.vue"');
-    expect(app).toContain('<DevelopmentWorkbench v-show="uiStore.activeTab === \'chat\'" />');
-    expect(developmentWorkbench).toContain("<ChatWorkspaceView");
+    expect(app).toContain('<DevelopmentWorkbench v-show="uiStore.activePage === \'development\'" />');
+    expect(developmentWorkbench).toContain("<WorkbenchSessionEditor");
+    expect(workbenchSession).toContain("<ChatView");
+    expect(workbenchSession).toContain("scoped-session");
+    expect(workbenchSession).not.toContain("<EmbeddedChatPane");
+    expect(workbenchSession).toContain("useEmbeddedChatSession");
     expect(app).toContain("await registerListeners();");
     expect(unityView).toContain("<ChatWorkspaceView");
     expect(workspace).toContain("<ChatView");

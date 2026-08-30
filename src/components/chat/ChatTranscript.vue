@@ -63,6 +63,7 @@ import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
 import ChatWaitingIndicator from "./ChatWaitingIndicator.vue";
 import AssetChip from "../AssetChip.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
+import type { WorkspaceRef } from "../../services/project";
 
 type TranscriptVariant = "session" | "embedded";
 type UserContentMode = "plain" | "asset";
@@ -148,6 +149,7 @@ const props = withDefaults(defineProps<{
   userContentMode?: UserContentMode;
   sessionKey?: string | null;
   selectedMessageId?: string | null;
+  workspaceRef?: WorkspaceRef | null;
 }>(), {
   variant: "embedded",
   hasThinking: undefined,
@@ -189,6 +191,7 @@ const emit = defineEmits<{
   (e: "scroll", event: Event): void;
   (e: "contentClick", event: MouseEvent): void;
   (e: "contentContextmenu", event: MouseEvent): void;
+  (e: "contentPointerdown", event: PointerEvent): void;
   (e: "userScrollIntent", event: Event): void;
   (e: "toolHandoffQuietChange", quiet: boolean): void;
   (e: "toolViewportAnchorStart", anchor: HTMLElement): void;
@@ -1390,7 +1393,10 @@ const promotableHistoryToolCalls = computed<PromotedHistoryToolCallsState>(() =>
 
   const collectedItemIds = new Set<string>();
   const collectedBatches: ToolCallDisplay[][] = [];
-  const segments = historyRenderSegmentsForGroup(lastGroup);
+  // Promotion starts from the base grouping and participates in computing the
+  // final grouping. Reading the final-group cache here closes a computed cycle:
+  // promotion -> cached segments -> groupedMessages -> promotion.
+  const segments = buildHistoryRenderSegmentsForGroup(lastGroup);
 
   for (let index = segments.length - 1; index >= 0; index -= 1) {
     const segment = segments[index];
@@ -1781,7 +1787,7 @@ const pendingContinuationToolItemIds = computed(() => {
 
   const segments =
     lastGroup?.role === "assistant"
-      ? historyRenderSegmentsForGroup(lastGroup).map((segment): PendingContinuationRenderSegment => ({
+      ? buildHistoryRenderSegmentsForGroup(lastGroup).map((segment): PendingContinuationRenderSegment => ({
           type: segment.type === "toolCalls" || segment.type === "content" ? segment.type : "other",
           itemIds: segment.type === "toolCalls" ? segment.itemIds : undefined,
         }))
@@ -1800,7 +1806,7 @@ function pendingContinuationSegmentSnapshot() {
   const lastGroup = groups[groups.length - 1];
   const segments =
     lastGroup?.role === "assistant"
-      ? historyRenderSegmentsForGroup(lastGroup).map((segment, index) => ({
+      ? buildHistoryRenderSegmentsForGroup(lastGroup).map((segment, index) => ({
           index,
           type: segment.type === "toolCalls" || segment.type === "content" ? segment.type : "other",
           itemIds: segment.type === "toolCalls" ? segment.itemIds : [],
@@ -1861,7 +1867,7 @@ function markdownUnityPreviewStateScope(segment: { key: string; itemId?: string 
 type HistoryRenderSegment =
   | { type: "thinking"; key: string; part: AssistantRenderPart; itemId: string; content: string; duration?: number }
   | { type: "toolCalls"; key: string; part: Extract<AssistantRenderPart, { kind: "toolCall" }>; itemId: string; itemIds: string[]; toolCalls: ToolCallDisplay[] }
-  | { type: "content"; key: string; part: AssistantRenderPart; itemId: string; content: string }
+  | { type: "content"; key: string; part: Extract<AssistantRenderPart, { kind: "text" }>; itemId: string; content: string }
   | { type: "knowledgeProposal"; key: string; part: AssistantRenderPart; itemId: string; message: ChatMessage };
 
 type TransientRenderSegment =
@@ -1880,7 +1886,7 @@ type TransientRenderSegment =
   | {
       type: "content";
       key: string;
-      part: AssistantRenderPart;
+      part: Extract<AssistantRenderPart, { kind: "text" }>;
       content: string;
       stream?: StreamingTextSource | null;
       streamInitial?: string;
@@ -2768,6 +2774,11 @@ function emitPointerScrollIntent(event: PointerEvent) {
   }
 }
 
+function emitContentPointerdown(event: PointerEvent) {
+  emit("contentPointerdown", event);
+  emitPointerScrollIntent(event);
+}
+
 function emitPointerMoveScrollIntent(event: PointerEvent) {
   if (event.buttons !== 0 && event.target === scrollRef.value) {
     emit("userScrollIntent", event);
@@ -2810,7 +2821,7 @@ function openImage(src: string) {
     @scroll="emitScroll"
     @wheel.passive="emitUserScrollIntent"
     @touchstart.passive="emitUserScrollIntent"
-    @pointerdown="emitPointerScrollIntent"
+    @pointerdown.capture="emitContentPointerdown"
     @pointermove.passive="emitPointerMoveScrollIntent"
     @keydown="emitKeyboardScrollIntent"
     @click="emitContentClick"
@@ -2966,6 +2977,7 @@ function openImage(src: string) {
                     <MarkdownRenderer
                       class="chat-transcript-user-local-file-ref"
                       :content="localFileEntryMarkdown(entry)"
+                      :workspace-ref="workspaceRef"
                       enable-file-refs
                     />
                     <span
@@ -3087,7 +3099,9 @@ function openImage(src: string) {
                   :data-chat-message-id="segment.itemId"
                   data-chat-message-role="assistant"
                   :content="segment.content"
+                  :citations="segment.part.citations"
                   :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
+                  :workspace-ref="workspaceRef"
                   finalized
                   enable-file-refs
                   @open-image="openImage"
@@ -3101,7 +3115,9 @@ function openImage(src: string) {
                   :data-chat-message-id="segment.itemId"
                   data-chat-message-role="assistant"
                   :content="segment.content"
+                  :citations="segment.part.citations"
                   :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
+                  :workspace-ref="workspaceRef"
                   enable-file-refs
                   @open-image="openImage"
                 />
@@ -3249,9 +3265,11 @@ function openImage(src: string) {
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
                   :content="segment.stream ? undefined : segment.content"
+                  :citations="segment.part.citations"
                   :stream="segment.stream"
                   :stream-initial="segment.streamInitial"
                   :unity-preview-state-scope="markdownUnityPreviewStateScope(segment)"
+                  :workspace-ref="workspaceRef"
                   cursor
                   enable-file-refs
                   @open-image="openImage"

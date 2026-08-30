@@ -10,6 +10,7 @@ describe("plan workspace scope", () => {
   it("resolves plan content from session identity", () => {
     const backend = read("src-tauri/src/commands/plan.rs");
     const service = read("src/services/session.ts");
+    const chatStore = read("src/stores/chat.ts");
     const windowService = read("src/services/planViewWindow.ts");
     const window = read("src/components/PlanViewWindow.vue");
 
@@ -18,6 +19,10 @@ describe("plan workspace scope", () => {
     expect(backend).not.toContain("pub async fn get_plan_file_content(\n    path: String");
     expect(service).toContain('getPlanFileContent(sessionId: string)');
     expect(service).toContain('{ sessionId }');
+    expect(backend).toContain("workspace_ref: Option<WorkspaceRef>");
+    expect(backend).toContain("workspace_ref.as_ref()");
+    expect(service).toContain("workspaceRef: workspaceRef ?? null");
+    expect(chatStore).toContain("captureFocusedWorkspaceRef(),");
     expect(windowService).toContain("sessionId: string");
     expect(window).toContain("getPlanFileContent(sessionId)");
   });

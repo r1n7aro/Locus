@@ -530,7 +530,10 @@ export const useChatStore = defineStore("chat", () => {
 
   async function refreshSessionPlanState(sessionId: string) {
     try {
-      const state = await sessionService.getSessionPlanState(sessionId);
+      const state = await sessionService.getSessionPlanState(
+        sessionId,
+        captureFocusedWorkspaceRef(),
+      );
       setSessionPlanModeLocal(sessionId, state.active);
     } catch (e) {
       console.warn("[plan] failed to load session plan state:", e);
@@ -538,7 +541,11 @@ export const useChatStore = defineStore("chat", () => {
   }
 
   async function setSessionPlanMode(sessionId: string, active: boolean) {
-    const state = await sessionService.setSessionPlanMode(sessionId, active);
+    const state = await sessionService.setSessionPlanMode(
+      sessionId,
+      active,
+      captureFocusedWorkspaceRef(),
+    );
     setSessionPlanModeLocal(sessionId, state.active);
   }
 
@@ -1955,7 +1962,6 @@ export const useChatStore = defineStore("chat", () => {
         pendingManagedSessionId = event.sessionId;
         pendingManagedUnboundSession = false;
       }
-
       if (!sessions.value.some((session) => session.id === event.sessionId)) {
         void refreshSessions();
       }
@@ -2893,6 +2899,9 @@ export const useChatStore = defineStore("chat", () => {
         subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0 ? modelStore.modelDefaults.subagentFastModes : null,
         knowledgeMode: knowledgeAccessState.mode,
       });
+      if (closedRunIds.get(sid) === runId) {
+        return;
+      }
       if (!canCommitChatLaunch(
         launchEpoch,
         requestWorkspaceScopeKey,

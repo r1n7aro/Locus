@@ -204,7 +204,9 @@ describe("workspace explorer store", () => {
     expect(store.resources["project-a"].sessions.map((session) => session.id))
       .toEqual(["session-a", "session-b"]);
     expect(explorerMocks.projectExplorerApplyOperations).toHaveBeenCalledTimes(1);
-    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2].filter(
+      (operation: { resourceKind?: string }) => operation.resourceKind === "session",
+    )).toEqual([
       expect.objectContaining({
         kind: "placeResource",
         resourceKind: "session",
@@ -257,7 +259,9 @@ describe("workspace explorer store", () => {
 
     await store.refreshProjectSessions("project-a");
 
-    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([{
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2].filter(
+      (operation: { resourceKind?: string }) => operation.resourceKind === "session",
+    )).toEqual([{
       kind: "placeResource",
       resourceKind: "session",
       resourceId: "session-b",
@@ -334,7 +338,9 @@ describe("workspace explorer store", () => {
 
     await store.refreshProjectSessions("project-a");
 
-    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([{
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2].filter(
+      (operation: { resourceKind?: string }) => operation.resourceKind === "session",
+    )).toEqual([{
       kind: "placeResource",
       resourceKind: "session",
       resourceId: "session-b",

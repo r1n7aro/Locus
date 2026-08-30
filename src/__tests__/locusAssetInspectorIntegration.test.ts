@@ -12,7 +12,9 @@ describe("Locus asset inspector integration", () => {
   it("routes asset context menu actions to the Locus Inspector", () => {
     const chat = read("src/components/ChatView.vue");
     const app = read("src/App.vue");
+    const assetView = read("src/components/AssetView.vue");
     const pane = read("src/components/LocusAssetInspectorPane.vue");
+    const workspacePreview = read("src/components/asset/WorkspaceAssetPreview.vue");
     const service = read("src/services/locusAssetInspectorWindow.ts");
     const tauriCapability = read("src-tauri/capabilities/default.json");
     const zh = read("src/language/zh.json");
@@ -45,14 +47,19 @@ describe("Locus asset inspector integration", () => {
     expect(service).toContain("scenePath");
     expect(service).toContain("objectPath");
 
-    expect(pane).toContain("UnityObjectPreview");
+    expect(pane).toContain("WorkspaceAssetPreview");
     expect(pane).toContain('kind === "sceneObject"');
     expect(pane).toContain("objectPath");
-    expect(pane).toContain('level="inspector"');
+    expect(pane).toContain(':workspace-ref="workspaceRef"');
     expect(pane).toContain(":auto-load-preview=\"true\"");
-    // The tab hosts exactly one target; a fold toggle would collapse the
-    // whole window content, so the preview renders without it.
-    expect(pane).toContain(":collapsible=\"false\"");
+    expect(pane).toContain(":show-header=\"false\"");
+    expect(workspacePreview).toContain("UnityObjectPreview");
+    expect(workspacePreview).toContain('level="inspector"');
+    expect(workspacePreview).toContain(":collapsible=\"false\"");
+    expect(workspacePreview).toContain(':workspace-ref="workspaceRef"');
+    expect(assetView).toContain("WorkspaceAssetPreview");
+    expect(assetView).toContain(':workspace-ref="workspaceRef ?? null"');
+    expect(assetView).toContain(':auto-load-preview="false"');
     // The preview header already names the target; no extra path/source row.
     expect(pane).not.toContain("locus-asset-inspector-pane-header");
 
@@ -72,6 +79,7 @@ describe("Locus asset inspector integration", () => {
 
   it("hosts inspector tabs inside the View host window system", () => {
     const host = read("src/components/ViewHostWindow.vue");
+    const baseTabs = read("src/components/ui/BaseTabStrip.vue");
     const viewService = read("src/services/view.ts");
     const commands = read("src-tauri/src/commands/view.rs");
     const runtime = read("src-tauri/src/view.rs");
@@ -83,15 +91,17 @@ describe("Locus asset inspector integration", () => {
     expect(host).toContain("import LocusAssetInspectorPane from \"./LocusAssetInspectorPane.vue\"");
     expect(host).toContain("isLocusAssetInspectorTabId");
     expect(host).toContain("inspectorPaneRecords");
-    expect(host).toContain("<LocusAssetInspectorPane :payload=\"record.payload\" />");
+    expect(host).toContain("<LocusAssetInspectorPane");
+    expect(host).toContain(':workspace-ref="viewWorkspaceRef"');
     expect(host).toContain("activeTabIsInspector");
     expect(host).toContain("inspectorTabFromId");
 
     // Every tab can be closed in place; the last tab closes the window.
     expect(host).toContain("async function closeTab(tabId: string)");
-    expect(host).toContain("@click.stop=\"closeTab(tab.id)\"");
-    expect(host).toContain("onTabAuxClick");
-    expect(host).toContain('t(\'view.host.closeTab\')');
+    expect(host).toContain('@close="closeTab($event)"');
+    expect(baseTabs).toContain('@click.stop="emit(\'close\', tab.id)"');
+    expect(baseTabs).toContain("handleAuxClick");
+    expect(baseTabs).toContain("t('common.close')");
     expect(zh).toContain('"view.host.closeTab"');
     expect(en).toContain('"view.host.closeTab"');
 
@@ -127,10 +137,9 @@ describe("Locus asset inspector integration", () => {
     expect(composable).toContain("isValidLocusAssetInspectorPayload");
 
     // Draggable / resizable floating panel with the shared inspector preview.
-    expect(panel).toContain("UnityObjectPreview");
-    expect(panel).toContain('level="inspector"');
+    expect(panel).toContain("WorkspaceAssetPreview");
+    expect(panel).toContain(':workspace-ref="state.workspaceRef"');
     expect(panel).toContain(":auto-load-preview=\"true\"");
-    expect(panel).toContain(":collapsible=\"false\"");
     expect(panel).toContain("@source-change=\"handlePreviewSourceChange\"");
     expect(panel).toContain("handleTitlebarPointerDown");
     expect(panel).toContain("handleResizePointerDown");

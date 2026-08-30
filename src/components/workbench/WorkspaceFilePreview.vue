@@ -1,27 +1,68 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import type { Text } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { computed, nextTick, ref, watch } from "vue";
+import { Save } from "lucide";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
-import { previewWorkspaceAsset, previewWorkspaceAssetTarget } from "../../services/asset";
-import { projectExplorerPreviewFile } from "../../services/workspaceExplorer";
-import type { AssetPreviewPayload, SemanticTargetInspector } from "../../types";
+import { previewWorkspaceAsset } from "../../services/asset";
+import type { WorkspaceRef } from "../../services/project";
+import {
+  projectExplorerPreviewFile,
+  projectExplorerWriteFile,
+  workspaceFilePreview,
+  workspaceFileWrite,
+} from "../../services/workspaceExplorer";
+import type { AssetPreviewPayload } from "../../types";
 import type { ProjectExplorerFilePreview } from "../../types/workbench";
-import AssetPreviewHost from "../asset/AssetPreviewHost.vue";
+import WorkspaceAssetPreview from "../asset/WorkspaceAssetPreview.vue";
 import AssetTextViewer from "../asset/AssetTextViewer.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
+import BaseButton from "../ui/BaseButton.vue";
+import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 
 const props = defineProps<{
-  projectId: string;
+  projectId?: string;
   path: string;
+  workspaceRef?: WorkspaceRef | null;
+  active?: boolean;
+}>();
+
+const emit = defineEmits<{
+  (event: "dirtyChange", dirty: boolean): void;
 }>();
 
 const preview = ref<ProjectExplorerFilePreview | null>(null);
 const loading = ref(false);
 const error = ref("");
 const assetPayload = ref<AssetPreviewPayload | null>(null);
-const activeTargetId = ref<string | null>(null);
-const targetCache = ref<Map<string, SemanticTargetInspector>>(new Map());
-const targetLoading = ref(false);
+const sourceText = ref("");
+const editorDocument = ref<Text | null>(null);
+const dirty = ref(false);
+const saving = ref(false);
+const saveStatus = ref<"idle" | "saved">("idle");
+const originalLineEnding = ref<"\n" | "\r\n" | "\r">("\n");
+const sourceEditor = ref<InstanceType<typeof BaseMarkdownEditor> | null>(null);
+const pendingPosition = ref<{ line: number; column: number } | null>(null);
 let requestEpoch = 0;
+
+const normalizedSourceText = computed(() => (
+  sourceText.value.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+));
+const editorContentKey = computed(() => [
+  props.workspaceRef?.checkoutId ?? props.projectId ?? "workspace-file",
+  props.workspaceRef?.expectedGeneration ?? "current",
+  props.path,
+  preview.value?.contentHash ?? "unloaded",
+].join(":"));
+const editorStatus = computed(() => {
+  if (saving.value) return t("development.editor.saving");
+  if (error.value && preview.value) return error.value;
+  if (dirty.value) return t("development.editor.unsaved");
+  if (saveStatus.value === "saved") return t("development.editor.saved");
+  return "";
+});
 
 const language = computed(() => {
   const extension = preview.value?.extension ?? "";
@@ -53,12 +94,22 @@ async function loadPreview(): Promise<void> {
   error.value = "";
   preview.value = null;
   assetPayload.value = null;
-  activeTargetId.value = null;
-  targetCache.value = new Map();
+  sourceText.value = "";
+  editorDocument.value = null;
+  setDirty(false);
+  saveStatus.value = "idle";
   try {
-    const next = await projectExplorerPreviewFile(props.projectId, props.path);
+    const next = props.workspaceRef
+      ? await workspaceFilePreview(props.path, props.workspaceRef)
+      : await projectExplorerPreviewFile(props.projectId ?? "", props.path);
     if (epoch !== requestEpoch) return;
     preview.value = next;
+    sourceText.value = next.text ?? "";
+    originalLineEnding.value = next.text?.includes("\r\n")
+      ? "\r\n"
+      : next.text?.includes("\r")
+        ? "\r"
+        : "\n";
     if (
       next.kind === "unity"
       && next.checkoutId
@@ -73,6 +124,7 @@ async function loadPreview(): Promise<void> {
         },
       );
     }
+    if (epoch === requestEpoch) void applyPendingPosition();
   } catch (cause) {
     if (epoch !== requestEpoch) return;
     error.value = normalizeAppError(cause).message;
@@ -81,38 +133,107 @@ async function loadPreview(): Promise<void> {
   }
 }
 
-async function loadTarget(
-  previewKey: string,
-  targetId: string,
-): Promise<SemanticTargetInspector | null> {
-  const file = preview.value;
-  if (!file?.checkoutId) return null;
-  const cached = targetCache.value.get(targetId);
-  activeTargetId.value = targetId;
-  if (cached) return cached;
-  targetLoading.value = true;
+async function applyPendingPosition(): Promise<boolean> {
+  const position = pendingPosition.value;
+  if (!position || preview.value?.kind !== "text") return false;
+  await nextTick();
+  const view = sourceEditor.value?.getEditorView();
+  if (!view) return false;
+  const lineNumber = Math.min(view.state.doc.lines, Math.max(1, Math.floor(position.line)));
+  const line = view.state.doc.line(lineNumber);
+  const columnOffset = Math.min(line.length, Math.max(0, Math.floor(position.column) - 1));
+  const anchor = line.from + columnOffset;
+  view.dispatch({
+    selection: { anchor },
+    effects: EditorView.scrollIntoView(anchor, { y: "center" }),
+  });
+  view.focus();
+  pendingPosition.value = null;
+  return true;
+}
+
+async function revealPosition(line: number, column = 1): Promise<boolean> {
+  pendingPosition.value = {
+    line: Math.max(1, Math.floor(line || 1)),
+    column: Math.max(1, Math.floor(column || 1)),
+  };
+  return applyPendingPosition();
+}
+
+function setDirty(value: boolean): void {
+  if (dirty.value === value) return;
+  dirty.value = value;
+  emit("dirtyChange", value);
+}
+
+function onEditorDocumentChange(change: MarkdownEditorDocumentChange): void {
+  editorDocument.value = change.doc;
+  saveStatus.value = "idle";
+  setDirty(change.doc.toString() !== normalizedSourceText.value);
+}
+
+function serializedEditorText(): string {
+  const normalized = editorDocument.value?.toString() ?? normalizedSourceText.value;
+  if (originalLineEnding.value === "\r\n") return normalized.replace(/\n/g, "\r\n");
+  if (originalLineEnding.value === "\r") return normalized.replace(/\n/g, "\r");
+  return normalized;
+}
+
+async function saveFile(): Promise<boolean> {
+  const current = preview.value;
+  if (
+    !current
+    || current.kind !== "text"
+    || !current.editable
+    || !current.contentHash
+    || saving.value
+  ) return false;
+  if (!dirty.value) return true;
+  saving.value = true;
+  error.value = "";
   try {
-    const inspector = await previewWorkspaceAssetTarget(
-      previewKey,
-      targetId,
-      {
-        checkoutId: file.checkoutId,
-        expectedGeneration: file.workspaceGeneration,
-      },
-    );
-    const next = new Map(targetCache.value);
-    next.set(targetId, inspector);
-    targetCache.value = next;
-    return inspector;
+    const next = props.workspaceRef
+      ? await workspaceFileWrite(
+        props.path,
+        serializedEditorText(),
+        current.contentHash,
+        props.workspaceRef,
+      )
+      : await projectExplorerWriteFile(
+        props.projectId ?? "",
+        props.path,
+        serializedEditorText(),
+        current.contentHash,
+      );
+    preview.value = next;
+    sourceText.value = next.text ?? "";
+    editorDocument.value = null;
+    saveStatus.value = "saved";
+    setDirty(false);
+    return true;
   } catch (cause) {
     error.value = normalizeAppError(cause).message;
-    return null;
+    return false;
   } finally {
-    targetLoading.value = false;
+    saving.value = false;
   }
 }
 
-watch(() => [props.projectId, props.path] as const, loadPreview, { immediate: true });
+watch(
+  () => [
+    props.projectId,
+    props.path,
+    props.workspaceRef?.checkoutId,
+    props.workspaceRef?.expectedGeneration,
+  ] as const,
+  loadPreview,
+  { immediate: true },
+);
+watch(() => props.active, (active) => {
+  if (active) void applyPendingPosition();
+});
+
+defineExpose({ saveFile, revealPosition });
 </script>
 
 <template>
@@ -122,28 +243,57 @@ watch(() => [props.projectId, props.path] as const, loadPreview, { immediate: tr
     </div>
     <div v-else-if="error && !preview" class="workspace-file-preview-state error">{{ error }}</div>
 
-    <AssetPreviewHost
+    <WorkspaceAssetPreview
       v-else-if="preview?.kind === 'unity'"
+      :workspace-ref="preview.checkoutId ? {
+        checkoutId: preview.checkoutId,
+        expectedGeneration: preview.workspaceGeneration,
+      } : null"
+      :path="preview.workspaceRelativePath || preview.path"
+      :title="preview.name"
       :payload="assetPayload"
       :loading="loading"
       :error="error"
-      :selected-name="preview.name"
-      :selected-path="preview.workspaceRelativePath || preview.path"
-      :active-target-id="activeTargetId"
-      :target-cache="targetCache"
-      :target-loading="targetLoading"
-      :load-target="loadTarget"
-      :show-close="false"
+      :auto-load-preview="false"
     />
 
     <template v-else-if="preview">
       <header class="workspace-file-preview-header">
-        <span>{{ preview.name }}</span>
-        <span :title="preview.path">{{ preview.path }}</span>
+        <span class="workspace-file-preview-title">{{ preview.name }}</span>
+        <span class="workspace-file-preview-path" :title="preview.path">{{ preview.path }}</span>
+        <span
+          v-if="editorStatus"
+          class="workspace-file-preview-status"
+          :class="{ error: !!error && !!preview }"
+          :title="editorStatus"
+        >{{ editorStatus }}</span>
+        <BaseButton
+          v-if="preview.kind === 'text' && preview.editable"
+          class="workspace-file-preview-save"
+          :disabled="!dirty || saving"
+          :title="t('common.save')"
+          @click="saveFile"
+        >
+          <LucideIcon :icon="Save" :size="12" :stroke-width="2" />
+          {{ t("common.save") }}
+        </BaseButton>
       </header>
       <div class="workspace-file-preview-body">
+        <BaseMarkdownEditor
+          v-if="preview.kind === 'text' && preview.editable"
+          ref="sourceEditor"
+          :model-value="normalizedSourceText"
+          :content-key="editorContentKey"
+          :content-path="preview.path"
+          :workspace-ref="workspaceRef"
+          :active="active !== false"
+          view-mode="native"
+          transaction-model
+          @document-change="onEditorDocumentChange"
+          @shortcut-save="saveFile"
+        />
         <AssetTextViewer
-          v-if="preview.kind === 'text'"
+          v-else-if="preview.kind === 'text'"
           :snippet="preview.text || ''"
           :truncated="preview.truncated"
           :total-lines="preview.totalLines || 1"
@@ -206,13 +356,14 @@ watch(() => [props.projectId, props.path] as const, loadPreview, { immediate: tr
   border-bottom: 1px solid var(--border-color);
 }
 
-.workspace-file-preview-header > span:first-child {
+.workspace-file-preview-title {
   flex-shrink: 0;
   font-size: 12px;
   font-weight: 600;
 }
 
-.workspace-file-preview-header > span:last-child {
+.workspace-file-preview-path {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   color: var(--text-secondary);
@@ -220,6 +371,23 @@ watch(() => [props.projectId, props.path] as const, loadPreview, { immediate: tr
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workspace-file-preview-status {
+  max-width: min(260px, 30%);
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-file-preview-status.error {
+  color: var(--status-error-fg, var(--text-color));
+}
+
+.workspace-file-preview-save {
+  flex-shrink: 0;
 }
 
 .workspace-file-preview-body {

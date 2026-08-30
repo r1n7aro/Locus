@@ -192,7 +192,7 @@ describe("workspacePageWindow", () => {
     const app = read("src/App.vue");
     const topTabs = app.slice(app.indexOf("const topTabs"), app.indexOf("const visibleTopTabs"));
 
-    expect(topTabs).toContain('{ id: "chat"');
+    expect(topTabs).toContain('{ id: "development"');
     expect(topTabs).toContain('{ id: "views"');
     expect(topTabs).toContain('{ id: "plugins"');
     expect(topTabs).toContain('{ id: "agent"');
@@ -202,9 +202,9 @@ describe("workspacePageWindow", () => {
     expect(app).not.toContain('class="project-tab-context"');
     expect(app).toContain("DevelopmentWorkbench");
     expect(app).toContain("openTopTabInWindow");
-    expect(app).toContain('return tab.id !== "chat"');
+    expect(app).toContain('return tab.id !== "development"');
     expect(app).toMatch(
-      /v-show="uiStore\.activeTab === 'plugins'"[\s\S]{0,120}working-dir=""/,
+      /v-show="uiStore\.activePage === 'plugins'"[\s\S]{0,120}working-dir=""/,
     );
   });
 });

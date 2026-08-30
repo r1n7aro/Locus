@@ -45,6 +45,10 @@ import {
   captureTranscriptLayoutSnapshot,
   traceViewportAnchorSample,
 } from "../../services/layoutDiagnostics";
+import {
+  embeddedChatViewportStates as viewportStates,
+  rememberEmbeddedChatViewportState,
+} from "../../composables/embeddedChatViewportState";
 
 interface MetaRow {
   label: string;
@@ -164,7 +168,6 @@ const effectiveThoughtDurationLabel = computed(() =>
 const effectiveThoughtMomentLabel = computed(() =>
   props.thoughtMomentLabel || t("chat.transcript.thoughtMoment"),
 );
-const viewportStates = new Map<string, SessionScrollState>();
 let suppressScrollCapture = false;
 let transcriptResizeObserver: ResizeObserverHandle | null = null;
 const toolHandoffViewportQuiet = ref(false);
@@ -224,7 +227,7 @@ function captureViewportState(el: HTMLElement): SessionScrollState {
 function rememberViewportState(key = getViewportStateKey()) {
   const el = getTranscriptElement();
   if (!el) return;
-  viewportStates.set(key, captureViewportState(el));
+  rememberEmbeddedChatViewportState(key, captureViewportState(el));
 }
 
 function runProgrammaticScrollUpdate(update: (el: HTMLElement) => void, key = getViewportStateKey()) {
@@ -233,7 +236,7 @@ function runProgrammaticScrollUpdate(update: (el: HTMLElement) => void, key = ge
 
   suppressScrollCapture = true;
   update(el);
-  viewportStates.set(key, captureViewportState(el));
+  rememberEmbeddedChatViewportState(key, captureViewportState(el));
 
   requestAnimationFrame(() => {
     suppressScrollCapture = false;
@@ -300,7 +303,7 @@ function restoreToolViewportAnchor() {
     },
   });
   if (restored) {
-    viewportStates.set(getViewportStateKey(), captureViewportState(el));
+    rememberEmbeddedChatViewportState(getViewportStateKey(), captureViewportState(el));
   }
 
   requestViewportFrame(() => {
@@ -460,7 +463,7 @@ function handleTranscriptScroll() {
   if (!userScrollIntent.isRecent()) {
     const el = getTranscriptElement();
     if (el && isNearBottom(readTranscriptMetrics(el))) {
-      viewportStates.set(getViewportStateKey(), { mode: "bottom" });
+      rememberEmbeddedChatViewportState(getViewportStateKey(), { mode: "bottom" });
     }
     return;
   }
@@ -607,7 +610,7 @@ watch(
   () => props.messages.length,
   (length) => {
     if (length === 0 && !props.isStreaming) {
-      viewportStates.set(getViewportStateKey(), { mode: "bottom" });
+      rememberEmbeddedChatViewportState(getViewportStateKey(), { mode: "bottom" });
     }
   },
 );
@@ -751,7 +754,6 @@ onUnmounted(() => {
         :model-value="inputValue"
         :selected-agent-id="selectedAgentId"
         :skills="skills"
-        :message-history="messages"
         :placeholder="placeholder"
         :disabled="disabled"
         :is-streaming="isStreaming"

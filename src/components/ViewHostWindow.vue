@@ -12,13 +12,18 @@ import {
   type ComponentPublicInstance,
 } from "vue";
 import {
-  cursorPosition,
   getCurrentWindow,
   Window as TauriWindow,
   type Window as TauriWindowHandle,
 } from "@tauri-apps/api/window";
 import { emitTo, type UnlistenFn } from "@tauri-apps/api/event";
+import { PanelsTopLeft, ScanSearch } from "lucide";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import {
+  useInternalDragController,
+  type InternalDropTargetRegistration,
+} from "../composables/useInternalDrag";
+import { useWindowTabDrag } from "../composables/useWindowTabDrag";
 import { t } from "../i18n";
 import { searchWorkspaceAssets } from "../services/asset";
 import {
@@ -53,8 +58,6 @@ import {
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import {
   checkUnityConnectionStatus,
-  startLocusDragPreview,
-  stopLocusDragPreview,
 } from "../services/unity";
 import {
   applyUnitySerializedProperties,
@@ -127,19 +130,25 @@ import type {
   StreamEvent,
 } from "../types";
 import { createViewRuntimeComponent } from "./view/viewRuntime";
+import BaseTabStrip, {
+  type BaseTabDragFinishedPayload,
+  type BaseTabStripItem,
+} from "./ui/BaseTabStrip.vue";
+import {
+  moveTabAtInsertionIndex,
+  tabInsertionIndexAtPoint,
+} from "./ui/tabDropGeometry";
 
 const CONSOLE_LOG_LEVELS: ViewFrontendLogLevel[] = ["debug", "log", "info", "warn", "error"];
 const AUTOMATION_REQUEST_TTL_MS = 120_000;
 const VIEW_HOST_TABS_MERGE_EVENT = "view-host-tabs-merge";
 const VIEW_HOST_TABS_MERGE_DONE_EVENT = "view-host-tabs-merge-done";
 const VIEW_HOST_TABS_SELECT_EVENT = "view-host-tabs-select";
-const VIEW_HOST_TABS_DROP_TARGET_EVENT = "view-host-tabs-drop-target";
 const VIEW_HOST_WINDOW_LABEL_PREFIX = "view-";
 const VIEW_HOST_TAB_DROP_HEIGHT_PX = 40;
-const VIEW_HOST_TAB_DRAG_THRESHOLD_PX = 8;
-const VIEW_HOST_TAB_DRAG_FRAME_MS = 16;
 const VIEW_HOST_DETACH_OFFSET_X = 96;
 const VIEW_HOST_DETACH_OFFSET_Y = 18;
+const VIEW_HOST_TAB_INTERNAL_DRAG_TYPE = "locus/view-host-tab";
 const UNITY_EMBED_WINDOW_LABEL_PREFIX = "unity-embed-";
 const VIEW_CONTENT_WINDOW_LABEL_PREFIX = "view-content-";
 const VIEW_CONTENT_SYNC_FRAME_MS = 16;
@@ -179,20 +188,14 @@ interface ViewHostTabsSelectPayload {
   allowPoolClaim?: boolean;
 }
 
-interface ViewHostTabsDropTargetPayload {
-  sourceLabel: string;
-  active: boolean;
+interface ViewHostTabDragData {
+  hostLabel: string;
+  tabId: string;
+  title: string;
 }
 
-interface ViewHostDragState {
-  pointerId: number;
-  tabId: string;
-  originX: number;
-  originY: number;
-  cursorX: number;
-  cursorY: number;
-  dragging: boolean;
-  raf: number | null;
+interface ViewHostTabDropIntent {
+  insertionIndex: number;
 }
 
 interface ViewRuntimeRecord {
@@ -291,6 +294,16 @@ function subscribeViewWorkspaceStream(
 }
 const isViewHostPoolWindow = isViewHostPoolWindowLocation();
 const currentWindowLabel = appWindow?.label ?? "";
+const internalDrag = useInternalDragController();
+const windowTabDrag = useWindowTabDrag({
+  family: "view-host",
+  appWindow,
+  windowLabel: currentWindowLabel,
+  acceptsWindowLabel: (label) => label.startsWith(VIEW_HOST_WINDOW_LABEL_PREFIX)
+    && !label.startsWith(VIEW_CONTENT_WINDOW_LABEL_PREFIX),
+  tabBandHeight: VIEW_HOST_TAB_DROP_HEIGHT_PX,
+  prepare: () => prepareViewHostPool("tab-drag"),
+});
 const activeViewId = ref(initialViewId);
 const tabs = ref<ViewHostTab[]>(initialViewId
   ? [initialHostTab(initialViewId)]
@@ -312,9 +325,8 @@ const runtimeRecords = ref<ViewRuntimeRecord[]>(
     : []);
 const isMaximized = ref(false);
 const alwaysOnTop = ref(false);
-const tabDragState = ref<ViewHostDragState | null>(null);
-const tabDropTargetLabel = ref("");
-const externalTabDropActive = ref(false);
+const viewHostTabsRoot = ref<HTMLElement | null>(null);
+const viewTabDropIndex = ref(-1);
 const embeddedLogbarSlot = shallowRef<HTMLElement | null>(null);
 const viewHostBodyRef = ref<HTMLElement | null>(null);
 const runtimeFrameRefs = new Map<string, HTMLElement>();
@@ -322,10 +334,8 @@ let unsubscribeReload: RuntimeUnsubscribe | null = null;
 let restoreConsoleLogCapture: (() => void) | null = null;
 let unlistenTabMerge: UnlistenFn | null = null;
 let unlistenTabSelect: UnlistenFn | null = null;
-let unlistenTabDropTarget: UnlistenFn | null = null;
+let unregisterViewTabDropTarget: (() => void) | null = null;
 let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-let suppressNextTabClickId = "";
-let suppressNextTabClickTimer: ReturnType<typeof setTimeout> | null = null;
 let statusbarObserver: MutationObserver | null = null;
 let embeddedLogbarSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let viewContentSyncTimer: ReturnType<typeof setTimeout> | null = null;
@@ -334,9 +344,6 @@ let unlistenWindowResize: UnlistenFn | null = null;
 let unlistenWindowMove: UnlistenFn | null = null;
 let unsubscribeAutomation: RuntimeUnsubscribe | null = null;
 let automationElementSeq = 0;
-let lastEmittedTabDropTargetLabel = "";
-let externalTabDropSourceLabel = "";
-let nativeTabDragPreviewActive = false;
 let hostWindowRevealStarted = false;
 let poolPreparePromise: Promise<void> | null = null;
 let lastViewContentMountGeometry: ViewContentMountGeometry | null = null;
@@ -438,6 +445,12 @@ const usePersistentViewContentPool = computed(() => !props.embedded && !!appWind
 const manifest = computed(() => detail.value?.manifest ?? null);
 const activeTab = computed(() => tabs.value.find((tab) => tab.id === activeViewId.value) ?? null);
 const activeTabIsInspector = computed(() => isLocusAssetInspectorTabId(activeViewId.value));
+const tabItems = computed<BaseTabStripItem[]>(() => tabs.value.map((tab) => ({
+  id: tab.id,
+  title: tab.title,
+  icon: isLocusAssetInspectorTabId(tab.id) ? ScanSearch : PanelsTopLeft,
+  closeable: true,
+})));
 
 interface InspectorPaneRecord {
   tabId: string;
@@ -518,7 +531,7 @@ async function revealViewHostWindow(reason: string) {
 }
 
 function prepareViewHostPool(reason: string) {
-  if (viewWorkspaceRef) return;
+  if (!viewWorkspaceRef) return;
   if (props.embedded || isViewHostPoolWindow || !appWindow) return;
   if (poolPreparePromise) return;
   const prepareStartedAt = perfNowMs();
@@ -910,34 +923,6 @@ async function closeTab(tabId: string) {
   await registerCurrentTabHost();
 }
 
-function onTabAuxClick(event: MouseEvent, tabId: string) {
-  if (event.button !== 1) return;
-  event.preventDefault();
-  void closeTab(tabId);
-}
-
-function suppressNextTabClick(tabId: string) {
-  suppressNextTabClickId = tabId;
-  if (suppressNextTabClickTimer) clearTimeout(suppressNextTabClickTimer);
-  suppressNextTabClickTimer = setTimeout(() => {
-    if (suppressNextTabClickId === tabId) suppressNextTabClickId = "";
-    suppressNextTabClickTimer = null;
-  }, 250);
-}
-
-function onTabClick(event: MouseEvent, tabId: string) {
-  if (suppressNextTabClickId === tabId) {
-    event.preventDefault();
-    suppressNextTabClickId = "";
-    if (suppressNextTabClickTimer) {
-      clearTimeout(suppressNextTabClickTimer);
-      suppressNextTabClickTimer = null;
-    }
-    return;
-  }
-  void setActiveViewTab(tabId);
-}
-
 async function applyMergedViewTabs(payload: ViewHostTabsMergePayload) {
   const incomingIds = normalizeTabIds(payload.viewIds);
   if (incomingIds.length === 0) return;
@@ -1002,82 +987,6 @@ async function selectHostedViewTab(payload: ViewHostTabsSelectPayload) {
   await revealViewHostWindow("claim-mounted");
 }
 
-async function findTabDropTargetAt(point: { x: number; y: number }): Promise<string> {
-  if (!currentWindowLabel) return "";
-  let windows: TauriWindowHandle[] = [];
-  try {
-    windows = await TauriWindow.getAll();
-  } catch {
-    return "";
-  }
-
-  for (const candidate of windows) {
-    if (
-      candidate.label === currentWindowLabel
-      || !candidate.label.startsWith(VIEW_HOST_WINDOW_LABEL_PREFIX)
-      || candidate.label.startsWith(VIEW_CONTENT_WINDOW_LABEL_PREFIX)
-    ) {
-      continue;
-    }
-    try {
-      const [position, size] = await Promise.all([
-        candidate.outerPosition(),
-        candidate.outerSize(),
-      ]);
-      const withinX = point.x >= position.x && point.x <= position.x + size.width;
-      const withinY = point.y >= position.y && point.y <= position.y + size.height;
-      const withinDropBand = point.y >= position.y && point.y <= position.y + VIEW_HOST_TAB_DROP_HEIGHT_PX;
-      if (withinX && withinY && withinDropBand) return candidate.label;
-    } catch {
-      continue;
-    }
-  }
-  return "";
-}
-
-function emitTabDropTargetState(targetLabel: string, active: boolean) {
-  if (!currentWindowLabel || !targetLabel || targetLabel === currentWindowLabel) return;
-  void emitTo<ViewHostTabsDropTargetPayload>(targetLabel, VIEW_HOST_TABS_DROP_TARGET_EVENT, {
-    sourceLabel: currentWindowLabel,
-    active,
-  }).catch((dropTargetError) => {
-    console.warn("[view-host] Failed to update View tab drop target", dropTargetError);
-  });
-}
-
-function setTabDropTargetLabel(nextLabel: string) {
-  const normalized = nextLabel || "";
-  if (normalized === tabDropTargetLabel.value) return;
-  if (lastEmittedTabDropTargetLabel) {
-    emitTabDropTargetState(lastEmittedTabDropTargetLabel, false);
-  }
-  tabDropTargetLabel.value = normalized;
-  lastEmittedTabDropTargetLabel = normalized;
-  if (normalized) {
-    emitTabDropTargetState(normalized, true);
-  }
-}
-
-async function isCurrentTabBandAt(point: { x: number; y: number }): Promise<boolean> {
-  if (!appWindow) return false;
-  try {
-    const [position, size] = await Promise.all([
-      appWindow.outerPosition(),
-      appWindow.outerSize(),
-    ]);
-    const withinX = point.x >= position.x && point.x <= position.x + size.width;
-    const withinY = point.y >= position.y && point.y <= position.y + size.height;
-    const withinTabBand = point.y >= position.y && point.y <= position.y + VIEW_HOST_TAB_DROP_HEIGHT_PX;
-    return withinX && withinY && withinTabBand;
-  } catch {
-    return false;
-  }
-}
-
-async function updateTabDropTarget(point: { x: number; y: number }) {
-  setTabDropTargetLabel(await findTabDropTargetAt(point));
-}
-
 function createTabMergeDoneWaiter(
   targetLabel: string,
   viewIds: string[],
@@ -1122,66 +1031,6 @@ function createTabMergeDoneWaiter(
       unlisten?.();
     }),
   };
-}
-
-function tabDragPreviewLabel(tabId: string): string {
-  const tab = tabs.value.find((item) => item.id === tabId);
-  return (tab?.title || tabId || t("view.host.title")).trim();
-}
-
-function startTabDragPreview(tabId: string) {
-  if (nativeTabDragPreviewActive) return;
-  nativeTabDragPreviewActive = true;
-  void startLocusDragPreview(tabDragPreviewLabel(tabId)).catch((previewError) => {
-    nativeTabDragPreviewActive = false;
-    console.warn("[view-host] Failed to start View tab drag preview", previewError);
-  });
-}
-
-function stopTabDragPreview() {
-  if (!nativeTabDragPreviewActive) return;
-  nativeTabDragPreviewActive = false;
-  void stopLocusDragPreview().catch((previewError) => {
-    console.warn("[view-host] Failed to stop View tab drag preview", previewError);
-  });
-}
-
-function scheduleTabDragFrame() {
-  const state = tabDragState.value;
-  if (!state || state.raf !== null) return;
-  state.raf = window.setTimeout(() => {
-    const current = tabDragState.value;
-    if (!current) return;
-    current.raf = null;
-    void updateDraggedTabFrame();
-  }, VIEW_HOST_TAB_DRAG_FRAME_MS);
-}
-
-async function updateDraggedTabFrame() {
-  const state = tabDragState.value;
-  if (!state || !state.dragging) return;
-  try {
-    const cursor = await cursorPosition();
-    state.cursorX = cursor.x;
-    state.cursorY = cursor.y;
-    await updateTabDropTarget(cursor);
-  } catch (dragError) {
-    console.warn("[view-host] Failed to inspect View tab drag", dragError);
-  }
-  if (tabDragState.value?.dragging) scheduleTabDragFrame();
-}
-
-function onTabDragPointerMove(event: PointerEvent) {
-  const state = tabDragState.value;
-  if (!state || event.pointerId !== state.pointerId) return;
-  const distance = Math.hypot(event.screenX - state.originX, event.screenY - state.originY);
-  if (!state.dragging && distance >= VIEW_HOST_TAB_DRAG_THRESHOLD_PX) {
-    state.dragging = true;
-    startTabDragPreview(state.tabId);
-    prepareViewHostPool("tab-drag");
-    scheduleTabDragFrame();
-  }
-  if (state.dragging) event.preventDefault();
 }
 
 async function mergeTabIntoWindow(tabId: string, targetLabel: string) {
@@ -1249,110 +1098,76 @@ async function detachTab(tabId: string, point: { x: number; y: number }) {
   }
 }
 
-async function finishTabDrag(event?: PointerEvent) {
-  const state = tabDragState.value;
-  if (!state) return;
-  if (event && event.pointerId !== state.pointerId) return;
-  if (state.raf !== null) clearTimeout(state.raf);
-  tabDragState.value = null;
-  window.removeEventListener("pointermove", onTabDragPointerMove);
-  window.removeEventListener("pointerup", onTabDragPointerUp);
-  window.removeEventListener("pointercancel", onTabDragPointerCancel);
-
-  const wasDragging = state.dragging;
-  if (wasDragging) {
-    stopTabDragPreview();
-  }
-  if (!wasDragging) {
-    setTabDropTargetLabel("");
-    return;
-  }
-  suppressNextTabClick(state.tabId);
-  let targetLabel = tabDropTargetLabel.value;
-  let releasePoint = { x: state.cursorX, y: state.cursorY };
-  try {
-    const cursor = await cursorPosition();
-    releasePoint = { x: cursor.x, y: cursor.y };
-    targetLabel = await findTabDropTargetAt(cursor) || targetLabel;
-  } catch {
-    targetLabel = targetLabel || "";
-  }
-  setTabDropTargetLabel("");
-  if (targetLabel) {
-    await mergeTabIntoWindow(state.tabId, targetLabel);
-    return;
-  }
-  if (await isCurrentTabBandAt(releasePoint)) {
-    return;
-  }
-  await detachTab(state.tabId, releasePoint);
-}
-
-function applyExternalTabDropTarget(payload: ViewHostTabsDropTargetPayload) {
-  if (!payload.sourceLabel || payload.sourceLabel === currentWindowLabel) return;
-  if (payload.active) {
-    externalTabDropSourceLabel = payload.sourceLabel;
-    externalTabDropActive.value = true;
-    return;
-  }
-  if (!externalTabDropSourceLabel || externalTabDropSourceLabel === payload.sourceLabel) {
-    externalTabDropSourceLabel = "";
-    externalTabDropActive.value = false;
-  }
-}
-
-function onTabDragPointerUp(event: PointerEvent) {
-  void finishTabDrag(event);
-}
-
-function onTabDragPointerCancel(event: PointerEvent) {
-  void finishTabDrag(event);
-}
-
-async function startTabDrag(event: PointerEvent, tabId: string) {
-  if (!appWindow || event.button !== 0 || event.detail > 1) return;
-  event.preventDefault();
-  if (tabId !== activeViewId.value) {
-    viewHostContentLog("drag-activate-request", {
-      tabId,
-      previousActiveViewId: activeViewId.value,
-    });
-    void setActiveViewTab(tabId)
-      .then(() => {
-        viewHostContentLog("drag-activate-done", {
-          tabId,
-          stillHosted: tabs.value.some((tab) => tab.id === tabId),
-        });
-      })
-      .catch((activateError) => {
-        viewHostContentLog("drag-activate-error", {
-          tabId,
-          message: normalizeAppError(activateError).message,
-        });
-      });
-  }
-  let cursor: { x: number; y: number };
-  try {
-    cursor = await cursorPosition();
-  } catch (dragError) {
-    console.warn("[view-host] Failed to start View tab drag", dragError);
-    return;
-  }
-  (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
-  tabDragState.value = {
-    pointerId: event.pointerId,
-    tabId,
-    originX: event.screenX,
-    originY: event.screenY,
-    cursorX: cursor.x,
-    cursorY: cursor.y,
-    dragging: false,
-    raf: null,
+function viewTabDragData(tab: BaseTabStripItem): ViewHostTabDragData {
+  return {
+    hostLabel: currentWindowLabel,
+    tabId: tab.id,
+    title: tab.title,
   };
-  window.addEventListener("pointermove", onTabDragPointerMove);
-  window.addEventListener("pointerup", onTabDragPointerUp);
-  window.addEventListener("pointercancel", onTabDragPointerCancel);
 }
+
+function viewTabDragSourceId(tab: BaseTabStripItem): string {
+  return `view-host-tab:${currentWindowLabel}:${tab.id}`;
+}
+
+function canDragViewTab(): boolean {
+  return !props.embedded && !!appWindow;
+}
+
+function handleViewTabDragActivated(tab: BaseTabStripItem): void {
+  windowTabDrag.begin({
+    id: tab.id,
+    title: tab.title,
+    canDetach: () => tabs.value.length > 1 && tabs.value.some((item) => item.id === tab.id),
+    transfer: (targetLabel) => mergeTabIntoWindow(tab.id, targetLabel),
+    detach: (point) => detachTab(tab.id, point),
+  });
+}
+
+function handleViewTabDragFinished(payload: BaseTabDragFinishedPayload): void {
+  void windowTabDrag.finish(payload.tab.id, payload.result).catch((dragError) => {
+    console.error("[view-host] Failed to finish tab drag", dragError);
+  });
+}
+
+async function reorderViewTab(tabId: string, insertionIndex: number): Promise<void> {
+  const fromIndex = tabs.value.findIndex((tab) => tab.id === tabId);
+  if (fromIndex < 0) return;
+  const nextTabs = moveTabAtInsertionIndex(tabs.value, fromIndex, insertionIndex);
+  if (nextTabs.every((tab, index) => tab.id === tabs.value[index]?.id)) return;
+  tabs.value = nextTabs;
+  await registerCurrentTabHost();
+}
+
+const viewTabDropTarget: InternalDropTargetRegistration<
+  ViewHostTabDragData,
+  ViewHostTabDropIntent
+> = {
+  id: `view-host-tabs:${currentWindowLabel || "embedded"}`,
+  root: () => viewHostTabsRoot.value,
+  accepts: (source) => source.payload.type === VIEW_HOST_TAB_INTERNAL_DRAG_TYPE
+    && (source.payload.data as ViewHostTabDragData | undefined)?.hostLabel === currentWindowLabel,
+  resolve: ({ source, point, hit }) => {
+    const strip = hit.closest<HTMLElement>("[data-locus-tab-strip]");
+    if (!strip || !viewHostTabsRoot.value?.contains(strip)) return null;
+    const bounds = [...strip.querySelectorAll<HTMLElement>("[data-locus-tab-id]")]
+      .map((tab) => tab.getBoundingClientRect());
+    const insertionIndex = tabInsertionIndexAtPoint(point.x, bounds);
+    const data = source.payload.data as ViewHostTabDragData;
+    return {
+      key: `view-tab:${data.tabId}:${insertionIndex}`,
+      operation: "move",
+      intent: { insertionIndex },
+    };
+  },
+  onTargetChange: (decision) => {
+    viewTabDropIndex.value = decision?.intent.insertionIndex ?? -1;
+  },
+  drop: ({ source, decision }) => {
+    const data = source.payload.data as ViewHostTabDragData;
+    return reorderViewTab(data.tabId, decision.intent.insertionIndex);
+  },
+};
 
 function automationRoot(): HTMLElement {
   return activeRuntimeFrame() ?? document.body;
@@ -2772,12 +2587,20 @@ function onViewContentViewportChanged() {
 }
 
 onMounted(async () => {
+  // Pool windows are created without a checkout binding. Keep the hidden shell
+  // inert; only an active host URL with an exact workspace scope mounts data.
+  if (isViewHostPoolWindow && !viewWorkspaceRef) {
+    hostMountedAt = perfNowMs();
+    viewHostContentLog("pool-idle-mounted");
+    return;
+  }
   if (!viewWorkspaceRef) {
     throw new Error("View window URL is missing checkout scope.");
   }
   await workspaceContextStore.initialize(currentWindowLabel || "view", "main");
   const focusedContext = await workspaceContextStore.focusCheckout(viewWorkspaceRef.checkoutId);
   assertViewWorkspaceBinding(focusedContext);
+  unregisterViewTabDropTarget = internalDrag.registerTarget(viewTabDropTarget);
   hostMountedAt = perfNowMs();
   viewHostContentLog("host-mounted", { initialViewId });
   void syncMaximizedState();
@@ -2803,12 +2626,7 @@ onMounted(async () => {
           void selectHostedViewTab(event.payload);
         },
       );
-      unlistenTabDropTarget = await appWindow.listen<ViewHostTabsDropTargetPayload>(
-        VIEW_HOST_TABS_DROP_TARGET_EVENT,
-        (event) => {
-          applyExternalTabDropTarget(event.payload);
-        },
-      );
+      await windowTabDrag.startListening();
     }
     unsubscribeAutomation = await getLocusRuntime().subscribe<ViewAutomationRequest>(
       "view-automation-request",
@@ -2879,19 +2697,10 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  const state = tabDragState.value;
-  if (state && state.raf !== null) clearTimeout(state.raf);
-  stopTabDragPreview();
-  setTabDropTargetLabel("");
-  tabDragState.value = null;
-  externalTabDropActive.value = false;
-  externalTabDropSourceLabel = "";
-  window.removeEventListener("pointermove", onTabDragPointerMove);
-  window.removeEventListener("pointerup", onTabDragPointerUp);
-  window.removeEventListener("pointercancel", onTabDragPointerCancel);
+  windowTabDrag.dispose();
+  unregisterViewTabDropTarget?.();
+  unregisterViewTabDropTarget = null;
   window.removeEventListener("keydown", handleHostWindowKeydown);
-  if (suppressNextTabClickTimer) clearTimeout(suppressNextTabClickTimer);
-  suppressNextTabClickTimer = null;
   if (reloadTimer) clearTimeout(reloadTimer);
   reloadTimer = null;
   if (embeddedLogbarSyncTimer) clearTimeout(embeddedLogbarSyncTimer);
@@ -2923,8 +2732,6 @@ onUnmounted(() => {
   unlistenTabMerge = null;
   unlistenTabSelect?.();
   unlistenTabSelect = null;
-  unlistenTabDropTarget?.();
-  unlistenTabDropTarget = null;
   handledAutomationRequests.clear();
   restoreConsoleLogCapture?.();
   restoreConsoleLogCapture = null;
@@ -2936,9 +2743,9 @@ onUnmounted(() => {
     class="view-host-window"
     :class="{
       'is-embedded': props.embedded,
-      'is-tab-dragging': tabDragState?.dragging,
-      'is-tab-drop-target': !!tabDropTargetLabel,
-      'is-external-tab-drop-target': externalTabDropActive,
+      'is-tab-dragging': !!windowTabDrag.draggingTabId.value,
+      'is-tab-drop-target': !!windowTabDrag.dropTargetLabel.value,
+      'is-external-tab-drop-target': windowTabDrag.externalDropActive.value,
     }"
   >
     <header
@@ -2948,43 +2755,31 @@ onUnmounted(() => {
       @dblclick="toggleMaximizeWindow"
     >
       <div
-        class="view-host-tabs"
+        ref="viewHostTabsRoot"
+        class="view-host-tabs-region"
         data-tauri-drag-region
-        role="tablist"
         @dblclick.stop="toggleMaximizeWindow"
       >
-        <button
-          v-for="tab in tabs"
-          :key="tab.id"
-          type="button"
-          class="view-host-tab"
-          :class="{
-            active: tab.id === activeViewId,
-            dragging: tabDragState?.dragging && tabDragState.tabId === tab.id,
-          }"
-          :title="tab.title"
-          role="tab"
-          :aria-selected="tab.id === activeViewId"
-          @pointerdown="startTabDrag($event, tab.id)"
-          @click="onTabClick($event, tab.id)"
-          @auxclick="onTabAuxClick($event, tab.id)"
-        >
-          <span class="view-host-tab-title">{{ tab.title }}</span>
-          <span
-            class="view-host-tab-close"
-            role="button"
-            tabindex="-1"
-            :aria-label="t('view.host.closeTab')"
-            :title="t('view.host.closeTab')"
-            @pointerdown.stop
-            @click.stop="closeTab(tab.id)"
-          >
-            <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true">
-              <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-            </svg>
-          </span>
-        </button>
-        <span v-if="tabs.length === 0" class="view-host-title-main">{{ windowTitle }}</span>
+        <BaseTabStrip
+          v-if="tabs.length > 0"
+          class="view-host-tab-strip"
+          :tabs="tabItems"
+          :active-id="activeViewId"
+          :label="t('view.host.title')"
+          :drag-type="VIEW_HOST_TAB_INTERNAL_DRAG_TYPE"
+          :drag-data="viewTabDragData"
+          :drag-source-id="viewTabDragSourceId"
+          :can-drag="canDragViewTab"
+          :drop-active="viewTabDropIndex >= 0"
+          :drop-index="viewTabDropIndex"
+          :cancel-drag-on-window-blur="false"
+          activate-on-pointer-down
+          @activate="setActiveViewTab($event)"
+          @close="closeTab($event)"
+          @drag-activated="handleViewTabDragActivated"
+          @drag-finished="handleViewTabDragFinished"
+        />
+        <span v-else class="view-host-title-main">{{ windowTitle }}</span>
       </div>
       <div class="view-host-window-controls" data-window-no-drag @dblclick.stop>
         <button
@@ -3064,7 +2859,10 @@ onUnmounted(() => {
         :key="record.tabId"
         class="view-inspector-frame"
       >
-        <LocusAssetInspectorPane :payload="record.payload" />
+        <LocusAssetInspectorPane
+          :payload="record.payload"
+          :workspace-ref="viewWorkspaceRef"
+        />
       </div>
       <div v-if="error" class="view-host-state view-host-state-error">{{ error }}</div>
       <div v-else-if="loading && !detail" class="view-host-state">{{ t("common.loading") }}</div>
@@ -3126,91 +2924,24 @@ onUnmounted(() => {
   background: var(--sidebar-bg);
 }
 
-.view-host-tabs {
+.view-host-tabs-region {
   -webkit-app-region: drag;
   align-self: stretch;
   min-width: 0;
   flex: 1;
   display: flex;
-  align-items: flex-end;
-  gap: 2px;
+  align-items: stretch;
   overflow: hidden;
 }
 
-.view-host-tab {
+.view-host-tab-strip {
   -webkit-app-region: no-drag;
-  max-width: 220px;
-  min-width: 96px;
-  height: 29px;
-  min-height: 29px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 0 7px 0 12px;
-  border: 1px solid var(--border-color);
-  border-bottom-color: transparent;
-  border-radius: 5px 5px 0 0;
-  background: color-mix(in srgb, var(--panel-bg) 64%, var(--sidebar-bg) 36%);
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 550;
-  text-align: left;
-  cursor: grab;
-  user-select: none;
-  transition: background 0.1s ease, border-color 0.1s ease, color 0.1s ease;
-}
-
-.view-host-tab:hover,
-.view-host-tab:focus-visible {
-  border-color: var(--border-strong);
-  border-bottom-color: transparent;
-  background: color-mix(in srgb, var(--panel-bg) 78%, var(--sidebar-bg) 22%);
-  color: var(--text-color);
-  outline: none;
-}
-
-.view-host-tab.active {
+  flex: 0 1 auto;
+  width: fit-content;
+  max-width: 100%;
   height: 31px;
-  min-height: 31px;
-  border-color: var(--border-strong);
-  border-bottom-color: var(--bg-color);
-  background: var(--bg-color);
-  color: var(--text-color);
-  box-shadow: inset 0 2px 0 var(--accent-color);
-  font-weight: 650;
-}
-
-.view-host-tab-title {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.view-host-tab-close {
-  width: 16px;
-  height: 16px;
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 4px;
-  color: var(--text-secondary);
-  opacity: 0;
-  transition: background 0.1s ease, color 0.1s ease, opacity 0.1s ease;
-}
-
-.view-host-tab:hover .view-host-tab-close,
-.view-host-tab:focus-visible .view-host-tab-close,
-.view-host-tab.active .view-host-tab-close {
-  opacity: 1;
-}
-
-.view-host-tab-close:hover {
-  background: var(--hover-bg);
-  color: var(--text-color);
+  border-bottom: 0;
+  background: transparent;
 }
 
 .view-host-title-main {
@@ -3228,15 +2959,8 @@ onUnmounted(() => {
   cursor: grabbing;
 }
 
-.view-host-window.is-tab-dragging .view-host-tab {
+.view-host-window.is-tab-dragging .view-host-tab-strip :deep(.base-tab) {
   cursor: grabbing;
-}
-
-.view-host-tab.dragging {
-  opacity: 0.72;
-  border-color: var(--accent-color);
-  color: var(--text-color);
-  transform: translateY(1px);
 }
 
 .view-host-window.is-tab-drop-target .view-host-titlebar {
@@ -3250,7 +2974,7 @@ onUnmounted(() => {
     inset 0 2px 0 var(--accent-color);
 }
 
-.view-host-window.is-external-tab-drop-target .view-host-tabs::after {
+.view-host-window.is-external-tab-drop-target .view-host-tabs-region::after {
   content: "";
   align-self: stretch;
   width: 32px;
@@ -3293,8 +3017,8 @@ onUnmounted(() => {
 
 .view-host-win-close:hover,
 .view-host-win-close:focus-visible {
-  background: #e81123;
-  color: #fff;
+  background: var(--status-danger-fg);
+  color: var(--bg-color);
 }
 
 .view-host-body {

@@ -11,10 +11,12 @@ const props = defineProps<{
   truncated: boolean;
   selectedPath?: string | null;
   selectedKey?: string | null;
+  dragEnabled?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "select", result: AssetSearchResult): void;
+  (e: "dragPointerDown", result: AssetSearchResult, event: PointerEvent): void;
 }>();
 
 // Parse query into:
@@ -106,6 +108,11 @@ function resultDisplayPath(result: AssetSearchResult): string {
   if (result.isSubAsset && result.name.trim()) return `${result.path}/${result.name.trim()}`;
   return result.path;
 }
+
+function beginDrag(result: AssetSearchResult, event: PointerEvent) {
+  if (!props.dragEnabled) return;
+  emit("dragPointerDown", result, event);
+}
 </script>
 
 <template>
@@ -126,6 +133,7 @@ function resultDisplayPath(result: AssetSearchResult): string {
       type="button"
       class="asr-row"
       :class="{ selected: selectedKey ? selectedKey === resultKey(r) : selectedPath === r.path }"
+      @pointerdown="beginDrag(r, $event)"
       @click="emit('select', r)"
       :title="resultDisplayPath(r)"
     >

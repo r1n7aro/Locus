@@ -228,12 +228,14 @@ export function listDirEntriesPage(
   offset = 0,
   limit = 200,
   excludeMeta = false,
+  hiddenDirs?: string[],
 ): Promise<DirEntriesPage> {
   return ipcInvoke<DirEntriesPage>("list_dir_entries_page", {
     subPath,
     offset,
     limit,
     excludeMeta,
+    hiddenDirs,
     workspaceRef,
   });
 }
@@ -242,10 +244,12 @@ export function searchWorkspaceEntries(
   query: string,
   workspaceRef: WorkspaceRef,
   limit = 200,
+  hiddenDirs?: string[],
 ): Promise<WorkspaceSearchEntry[]> {
   return ipcInvoke<WorkspaceSearchEntry[]>("search_workspace_entries", {
     query,
     limit,
+    hiddenDirs,
     workspaceRef,
   });
 }

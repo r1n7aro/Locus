@@ -35,7 +35,8 @@ describe("EmbeddedChatPane contract", () => {
     expect(pane).toContain('<slot name="composer-actions" />');
     expect(pane).toContain("<RichChatInput");
     expect(pane).toContain("<ChatTranscript");
-    expect(pane).toContain("const viewportStates = new Map<string, SessionScrollState>()");
+    expect(pane).toContain("embeddedChatViewportStates as viewportStates");
+    expect(pane).toContain("rememberEmbeddedChatViewportState");
     expect(pane).toContain("const toolHandoffViewportQuiet = ref(false);");
     expect(pane).toContain("() => props.activeToolCalls.map((toolCall) => `${toolCall.id}:${toolCall.status}`).join(\",\"),");
     expect(pane).not.toContain("watch(() => props.activeToolCalls, () => reconcileViewport(), { deep: true });");
@@ -49,6 +50,9 @@ describe("EmbeddedChatPane contract", () => {
     expect(embeddedSession).toContain("async function reloadSessionMessagesAfterError");
     expect(embeddedSession).toContain("sessionService.loadSession(sessionId)");
     expect(embeddedSession).toContain("hydrateChatMessagesIntent(detail.messages)");
+    expect(embeddedSession).toContain("subscribeSessionStreamEventConsumer");
+    expect(embeddedSession).toContain("sharedEmbeddedChatSessionStates");
+    expect(embeddedSession).not.toContain('subscribe<StreamEvent>("stream-event"');
     expect(embeddedSession).toContain("sessionService.queueChatInput");
     expect(embeddedSession).toContain("sessionService.deletePendingChatInput");
     expect(embeddedSession).toContain("async function reEditQueuedFollowUp()");

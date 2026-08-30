@@ -653,11 +653,11 @@ describe("Unity embedded session view", () => {
     expect(dragSource).toContain("shouldWarmupUnityDrag(refs)");
     expect(dragSource).toContain("isUnityAssetRefPath(ref.path)");
     expect(dragSource).toContain("suppressHtmlDraggable(event)");
-    expect(dragSource).toContain("startUnityNativeAssetFileDrag(refs)");
-    expect(dragSource).toContain("startLocusNativeFileDrag(files)");
-    expect(dragSource).toContain("setUnityEmbedDragPassthrough(true)");
-    expect(dragSource).toContain("startUnityEmbedAssetDrag(refs)");
-    expect(dragSource).toContain("startUnityAssetDragWarmup(refs)");
+    expect(dragSource).toContain("startUnityNativeAssetFileDrag(refs, workspaceRef)");
+    expect(dragSource).toContain("startLocusNativeFileDrag(files, workspaceRef)");
+    expect(dragSource).toContain("setUnityEmbedDragPassthrough(true, workspaceRef)");
+    expect(dragSource).toContain("startUnityEmbedAssetDrag(refs, workspaceRef)");
+    expect(dragSource).toContain("startUnityAssetDragWarmup(refs, workspaceRef)");
     expect(dragSource).toContain("beginNativeAssetFileDrag(refs)");
     expect(dragSource).toContain("beginUnityReferencePointerDrag(refs)");
     // Warmup must stay lazy (inside the begin* paths): warming up on

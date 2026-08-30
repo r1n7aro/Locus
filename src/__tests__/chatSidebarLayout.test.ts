@@ -190,7 +190,7 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("const shouldPromoteHistoryToolCalls = computed(");
     expect(transcript).toContain("props.activeToolCalls.length > 0");
     expect(transcript).toContain("const promotableHistoryToolCalls = computed<PromotedHistoryToolCallsState>(() => {");
-    expect(transcript).toContain("const segments = historyRenderSegmentsForGroup(lastGroup);");
+    expect(transcript).toContain("const segments = buildHistoryRenderSegmentsForGroup(lastGroup);");
     expect(transcript).toContain("if (!segment || segment.type !== \"toolCalls\") break;");
     expect(transcript).toContain("const transientCollapseCandidateToolCalls = computed(() => {");
     expect(transcript).toContain("if (promotableHistoryToolCalls.value.toolCalls.length === 0) {");
@@ -301,7 +301,7 @@ describe("chat sidebar layout", () => {
     expect(transcript).toContain("function buildTailHiddenToolCallMap(");
     expect(transcript).toContain("filterToolCallsByConsumableMatchState(");
     expect(transcript).toContain("cloneToolCallMatchState(hiddenToolCallMatchState)");
-    expect(chatView).toContain(":session-key=\"activeSessionId || NEW_CHAT_DRAFT_KEY\"");
+    expect(chatView).toContain(":session-key=\"sessionSurfaceKey\"");
     expect(transcript).toContain("function shouldKeepToolItemExpanded(itemId: string) {");
     expect(transcript).toContain("return nonCollapsibleToolItemIds.value.has(itemId);");
     expect(transcript).toContain("if (toolCallHandoff.value?.collapseArmed) {");

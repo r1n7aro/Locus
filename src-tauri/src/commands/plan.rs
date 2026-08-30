@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::session::store::SessionStore;
-use crate::workspace_service::ProjectRegistry;
+use crate::workspace_service::{ProjectRegistry, WorkspaceRef};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, State};
@@ -110,6 +110,7 @@ fn build_plan_state_payload(
 #[tauri::command]
 pub async fn get_session_plan_state(
     session_id: String,
+    workspace_ref: Option<WorkspaceRef>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
@@ -118,7 +119,7 @@ pub async fn get_session_plan_state(
         store.inner(),
         workspace_registry.inner(),
         &session_id,
-        None,
+        workspace_ref.as_ref(),
         "get_session_plan_state",
     )?;
     let cwd = scope.runtime().root().to_string_lossy().to_string();
@@ -135,6 +136,7 @@ pub async fn get_session_plan_state(
 pub async fn set_session_plan_mode(
     session_id: String,
     active: bool,
+    workspace_ref: Option<WorkspaceRef>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
@@ -143,7 +145,7 @@ pub async fn set_session_plan_mode(
         store.inner(),
         workspace_registry.inner(),
         &session_id,
-        None,
+        workspace_ref.as_ref(),
         "set_session_plan_mode",
     )?;
     let runtime = scope.runtime();

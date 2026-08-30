@@ -11,22 +11,33 @@ import AssetSearchResults from "./asset/AssetSearchResults.vue";
 import AssetStatsView from "./asset/AssetStatsView.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
 import type { WorkspaceRef } from "../services/project";
+import { useInternalDragController } from "../composables/useInternalDrag";
+import {
+  workbenchReferenceInternalDragSource,
+} from "./workbench/workbenchReferenceDrag";
+import {
+  assetWorkspaceReferenceDragData,
+  type AssetWorkspaceDragEntry,
+} from "./asset/assetWorkspaceDrag";
 
-const AssetPreviewHost = defineAsyncComponent(
-  () => import("./asset/AssetPreviewHost.vue"),
+const WorkspaceAssetPreview = defineAsyncComponent(
+  () => import("./asset/WorkspaceAssetPreview.vue"),
 );
 
 const props = defineProps<{
   workingDir: string;
   workspaceRef?: WorkspaceRef | null;
+  projectId?: string | null;
 }>();
 const uiStore = useUiStore();
+const internalDrag = useInternalDragController();
 
 const {
   error,
   sidebarWidth,
   directoryPaneWidth,
   explorerTree,
+  isUnityWorkspace,
   selectedFolderPath,
   selectedNode,
   isPathExpanded,
@@ -58,10 +69,6 @@ const {
   previewLoading,
   previewError,
   previewFocusLine,
-  activeTargetId,
-  targetCache,
-  targetLoading,
-  loadTarget,
   dbOverview,
   dbLoading,
   triggerRescan,
@@ -92,6 +99,11 @@ type AssetLayoutMode = "single" | "double";
 
 const hasWorkspace = computed(() => !!props.workingDir.trim());
 const selectedAssetPath = computed(() => selectedNode.value?.path ?? null);
+const workspaceDragEnabled = computed(() => (
+  !!props.projectId?.trim()
+  && !!props.workspaceRef
+  && !!props.workingDir.trim()
+));
 const legacySelectedPath = computed(() => selectedAssetPath.value ?? selectedFolderPath.value);
 const previewDisplayName = computed(() => previewNode.value?.name ?? selectedNode.value?.name ?? "");
 const previewDisplayPath = computed(() => previewNode.value?.path ?? selectedNode.value?.path ?? "");
@@ -133,6 +145,20 @@ const layoutToggleTitle = computed(() => (
     ? t("asset.layout.toggleToSingle")
     : t("asset.layout.toggleToDouble")
 ));
+
+function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerEvent): void {
+  if (!props.projectId || !props.workspaceRef) return;
+  const data = assetWorkspaceReferenceDragData({
+    projectId: props.projectId,
+    workspaceRef: props.workspaceRef,
+    workspaceRoot: props.workingDir,
+  }, entry);
+  if (!data) return;
+  internalDrag.start(event, workbenchReferenceInternalDragSource(
+    data,
+    event.currentTarget instanceof HTMLElement ? event.currentTarget : undefined,
+  ));
+}
 </script>
 
 <template>
@@ -175,9 +201,11 @@ const layoutToggleTitle = computed(() => (
               :tree="explorerTree"
               :selected-path="legacySelectedPath"
               :is-path-expanded="isPathExpanded"
+              :drag-enabled="workspaceDragEnabled"
               @select="selectNode"
               @toggle="togglePath"
               @load-more="loadMoreFolder"
+              @drag-pointer-down="startAssetWorkspaceDrag"
             />
           </div>
         </section>
@@ -201,26 +229,27 @@ const layoutToggleTitle = computed(() => (
               :truncated="searchTruncated"
               :selected-path="selectedAssetPath"
               :selected-key="selectedSearchKey"
+              :drag-enabled="workspaceDragEnabled"
               @select="selectFromSearchResult"
+              @drag-pointer-down="startAssetWorkspaceDrag"
             />
 
-            <AssetPreviewHost
+            <WorkspaceAssetPreview
               v-else-if="viewMode === 'preview' && previewDisplayPath"
+              :workspace-ref="workspaceRef ?? null"
+              :path="previewDisplayPath"
+              :title="previewDisplayName"
               :payload="previewPayload"
               :loading="previewLoading"
               :error="previewError"
               :focus-line="previewFocusLine"
-              :selected-name="previewDisplayName"
-              :selected-path="previewDisplayPath"
-              :active-target-id="activeTargetId"
-              :target-cache="targetCache"
-              :target-loading="targetLoading"
-              :load-target="loadTarget"
+              :auto-load-preview="false"
+              show-close
               @close="closePreview"
             />
 
             <AssetStatsView
-              v-else
+              v-else-if="isUnityWorkspace"
               :overview="dbOverview"
               :loading="dbLoading"
               :tuning="watcherTuning"
@@ -229,6 +258,9 @@ const layoutToggleTitle = computed(() => (
               @rescan="triggerRescan"
               @update-tuning="updateWatcherTuning"
             />
+            <div v-else class="ax-preview-empty">
+              {{ t("asset.preview.selectFile") }}
+            </div>
           </div>
         </section>
       </div>
@@ -264,10 +296,12 @@ const layoutToggleTitle = computed(() => (
               :tree="explorerTree"
               :selected-path="selectedFolderPath"
               :is-path-expanded="isPathExpanded"
+              :drag-enabled="workspaceDragEnabled"
               @select="selectFolder"
               @toggle="togglePath"
               @probe="probeFolderPath"
               @load-more="loadMoreFolder"
+              @drag-pointer-down="startAssetWorkspaceDrag"
             />
           </div>
         </section>
@@ -294,7 +328,9 @@ const layoutToggleTitle = computed(() => (
               :truncated="searchTruncated"
               :selected-path="selectedAssetPath"
               :selected-key="selectedSearchKey"
+              :drag-enabled="workspaceDragEnabled"
               @select="selectFromSearchResult"
+              @drag-pointer-down="startAssetWorkspaceDrag"
             />
 
             <AssetDirectoryList
@@ -305,8 +341,10 @@ const layoutToggleTitle = computed(() => (
               :loaded="currentFolderLoaded"
               :has-more="currentFolderHasMore"
               :empty-label="directoryEmptyLabel"
+              :drag-enabled="workspaceDragEnabled"
               @select="selectNode"
               @load-more="loadCurrentFolderMore"
+              @drag-pointer-down="startAssetWorkspaceDrag"
             />
           </div>
         </section>
@@ -315,23 +353,22 @@ const layoutToggleTitle = computed(() => (
 
         <section class="ax-pane ax-pane-preview">
           <div class="ax-pane-body ax-pane-preview-body">
-            <AssetPreviewHost
+            <WorkspaceAssetPreview
               v-if="viewMode === 'preview' && previewDisplayPath"
+              :workspace-ref="workspaceRef ?? null"
+              :path="previewDisplayPath"
+              :title="previewDisplayName"
               :payload="previewPayload"
               :loading="previewLoading"
               :error="previewError"
               :focus-line="previewFocusLine"
-              :selected-name="previewDisplayName"
-              :selected-path="previewDisplayPath"
-              :active-target-id="activeTargetId"
-              :target-cache="targetCache"
-              :target-loading="targetLoading"
-              :load-target="loadTarget"
+              :auto-load-preview="false"
+              show-close
               @close="closePreview"
             />
 
             <AssetStatsView
-              v-else
+              v-else-if="isUnityWorkspace"
               :overview="dbOverview"
               :loading="dbLoading"
               :tuning="watcherTuning"
@@ -340,6 +377,9 @@ const layoutToggleTitle = computed(() => (
               @rescan="triggerRescan"
               @update-tuning="updateWatcherTuning"
             />
+            <div v-else class="ax-preview-empty">
+              {{ t("asset.preview.selectFile") }}
+            </div>
           </div>
         </section>
       </div>
@@ -399,6 +439,17 @@ const layoutToggleTitle = computed(() => (
 
 .ax-pane-preview {
   flex: 1;
+}
+
+.ax-preview-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-align: center;
 }
 
 .ax-pane-single-main {

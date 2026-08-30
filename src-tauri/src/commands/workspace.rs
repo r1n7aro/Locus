@@ -1221,9 +1221,22 @@ pub async fn get_debug_mode(
 #[tauri::command]
 pub async fn set_debug_mode(
     value: bool,
+    app_handle: AppHandle,
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<(), AppError> {
     config.set_debug_enabled(value).map_err(AppError::from)?;
+    if let Err(error) = crate::cdp_debug::reconcile(app_handle, value).await {
+        if value {
+            let rollback_error = config.set_debug_enabled(false).err();
+            let message = match rollback_error {
+                Some(rollback_error) => {
+                    format!("{error}; failed to roll back debug mode: {rollback_error}")
+                }
+                None => error,
+            };
+            return Err(AppError::from(message));
+        }
+    }
     Ok(())
 }
 
@@ -1626,16 +1639,48 @@ fn resolve_workspace_dir_target(
         .into())
 }
 
-fn should_skip_workspace_entry(file_name: &str, is_dir: bool, exclude_meta: bool) -> bool {
-    if file_name.starts_with('.') {
-        return true;
-    }
+fn normalized_hidden_directory_set(hidden_dirs: Vec<String>) -> HashSet<String> {
+    hidden_dirs
+        .into_iter()
+        .filter_map(|name| {
+            let trimmed = name.trim().trim_end_matches(['/', '\\']);
+            if trimmed.is_empty()
+                || trimmed == "."
+                || trimmed == ".."
+                || trimmed.contains('/')
+                || trimmed.contains('\\')
+            {
+                None
+            } else {
+                Some(trimmed.to_lowercase())
+            }
+        })
+        .collect()
+}
 
+fn should_skip_workspace_entry_with_hidden(
+    file_name: &str,
+    is_dir: bool,
+    exclude_meta: bool,
+    hidden_dirs: Option<&HashSet<String>>,
+) -> bool {
     if exclude_meta && file_name.ends_with(".meta") {
         return true;
     }
 
-    is_dir && WORKSPACE_HIDDEN_DIRS.contains(&file_name)
+    if !is_dir {
+        return false;
+    }
+
+    match hidden_dirs {
+        Some(names) => names.contains(&file_name.to_lowercase()),
+        None => {
+            file_name.starts_with('.')
+                || WORKSPACE_HIDDEN_DIRS
+                    .iter()
+                    .any(|hidden| hidden.eq_ignore_ascii_case(file_name))
+        }
+    }
 }
 
 fn join_workspace_rel_path(sub_path: &str, file_name: &str) -> String {
@@ -1726,6 +1771,15 @@ fn collect_dir_entries(
     sub_path: &str,
     exclude_meta: bool,
 ) -> Result<Vec<DirEntry>, AppError> {
+    collect_dir_entries_with_hidden(target, sub_path, exclude_meta, None)
+}
+
+fn collect_dir_entries_with_hidden(
+    target: &std::path::Path,
+    sub_path: &str,
+    exclude_meta: bool,
+    hidden_dirs: Option<&HashSet<String>>,
+) -> Result<Vec<DirEntry>, AppError> {
     let mut entries: Vec<DirEntry> = Vec::new();
     let read_dir =
         std::fs::read_dir(target).map_err(|e| format!("Failed to read directory: {}", e))?;
@@ -1740,7 +1794,7 @@ fn collect_dir_entries(
 
         let is_dir = entry_is_dir(&entry, &rel_path);
 
-        if should_skip_workspace_entry(&file_name, is_dir, exclude_meta) {
+        if should_skip_workspace_entry_with_hidden(&file_name, is_dir, exclude_meta, hidden_dirs) {
             continue;
         }
 
@@ -1797,7 +1851,7 @@ fn is_workspace_entry_stat_absolute_path(path: &str) -> bool {
         || normalized.starts_with("//")
 }
 
-fn workspace_entry_target_allowed(
+pub(crate) fn workspace_entry_target_allowed(
     workspace_root: &std::path::Path,
     rel_path: &str,
     target: &std::path::Path,
@@ -1949,6 +2003,7 @@ fn collect_workspace_search_entries(
     include_files: bool,
     query: &str,
     results: &mut Vec<WorkspaceSearchEntry>,
+    hidden_dirs: Option<&HashSet<String>>,
 ) -> Result<(), AppError> {
     let initial_linked_visit_keys = path_is_symlink_dir(root_dir).then(|| Arc::new(HashSet::new()));
     let mut stack = vec![(
@@ -1986,7 +2041,7 @@ fn collect_workspace_search_entries(
                 continue;
             }
             let is_dir = entry_is_dir(&entry, &rel_path);
-            if should_skip_workspace_entry(&file_name, is_dir, false) {
+            if should_skip_workspace_entry_with_hidden(&file_name, is_dir, false, hidden_dirs) {
                 continue;
             }
 
@@ -2025,10 +2080,20 @@ fn collect_workspace_search_entries(
     Ok(())
 }
 
+#[cfg(test)]
 fn search_workspace_entries_in_dir(
     workspace_root: &std::path::Path,
     query: &str,
     limit: usize,
+) -> Result<Vec<WorkspaceSearchEntry>, AppError> {
+    search_workspace_entries_in_dir_with_hidden(workspace_root, query, limit, None)
+}
+
+fn search_workspace_entries_in_dir_with_hidden(
+    workspace_root: &std::path::Path,
+    query: &str,
+    limit: usize,
+    hidden_dirs: Option<&HashSet<String>>,
 ) -> Result<Vec<WorkspaceSearchEntry>, AppError> {
     if !workspace_root.is_dir() {
         return Ok(Vec::new());
@@ -2045,7 +2110,7 @@ fn search_workspace_entries_in_dir(
             continue;
         }
         let is_dir = entry_is_dir(&entry, &rel_path);
-        if should_skip_workspace_entry(&file_name, is_dir, false) {
+        if should_skip_workspace_entry_with_hidden(&file_name, is_dir, false, hidden_dirs) {
             continue;
         }
 
@@ -2062,13 +2127,14 @@ fn search_workspace_entries_in_dir(
             continue;
         }
 
-        let include_files = !ASSET_ROOT_DIRS.contains(&rel_path.as_str());
+        let include_files = hidden_dirs.is_some() || !ASSET_ROOT_DIRS.contains(&rel_path.as_str());
         collect_workspace_search_entries(
             &entry.path(),
             &rel_path,
             include_files,
             query,
             &mut results,
+            hidden_dirs,
         )?;
     }
 
@@ -2114,6 +2180,7 @@ pub async fn list_dir_entries_page(
     offset: Option<usize>,
     limit: Option<usize>,
     exclude_meta: Option<bool>,
+    hidden_dirs: Option<Vec<String>>,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<DirEntriesPage, AppError> {
@@ -2138,21 +2205,47 @@ pub async fn list_dir_entries_page(
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(200).clamp(1, 2_000);
     let exclude_meta = exclude_meta.unwrap_or(false);
+    let uses_configured_hidden_dirs = hidden_dirs.is_some();
+    let hidden_dirs = hidden_dirs.map(normalized_hidden_directory_set);
+    let mut hidden_cache_key = hidden_dirs
+        .as_ref()
+        .map(|names| names.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    hidden_cache_key.sort();
     let cache_key = format!(
-        "{}::{}::{}::{}",
+        "{}::{}::{}::{}::{}",
         runtime.checkout_id(),
         runtime.generation(),
         normalized_sub_path,
-        u8::from(exclude_meta)
+        u8::from(exclude_meta),
+        format!(
+            "{}:{}",
+            if uses_configured_hidden_dirs {
+                "configured"
+            } else {
+                "default"
+            },
+            hidden_cache_key.join("\u{1f}")
+        )
     );
 
     let listing = if offset == 0 {
-        let entries = collect_dir_entries(&target, &normalized_sub_path, exclude_meta)?;
+        let entries = collect_dir_entries_with_hidden(
+            &target,
+            &normalized_sub_path,
+            exclude_meta,
+            hidden_dirs.as_ref(),
+        )?;
         dir_entries_cache.insert(cache_key.clone(), entries)
     } else if let Some(cached) = dir_entries_cache.get(&cache_key) {
         cached
     } else {
-        let entries = collect_dir_entries(&target, &normalized_sub_path, exclude_meta)?;
+        let entries = collect_dir_entries_with_hidden(
+            &target,
+            &normalized_sub_path,
+            exclude_meta,
+            hidden_dirs.as_ref(),
+        )?;
         dir_entries_cache.insert(cache_key.clone(), entries)
     };
 
@@ -2172,6 +2265,7 @@ pub async fn list_dir_entries_page(
 pub async fn search_workspace_entries(
     query: String,
     limit: Option<usize>,
+    hidden_dirs: Option<Vec<String>>,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<WorkspaceSearchEntry>, AppError> {
@@ -2191,7 +2285,13 @@ pub async fn search_workspace_entries(
     }
 
     let limit = limit.unwrap_or(200).clamp(1, 500);
-    search_workspace_entries_in_dir(std::path::Path::new(&cwd), trimmed, limit)
+    let hidden_dirs = hidden_dirs.map(normalized_hidden_directory_set);
+    search_workspace_entries_in_dir_with_hidden(
+        std::path::Path::new(&cwd),
+        trimmed,
+        limit,
+        hidden_dirs.as_ref(),
+    )
 }
 
 #[tauri::command]
@@ -2913,16 +3013,19 @@ pub async fn get_workspace_config_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_dir_entries, default_provider_prefix_cache_ttl_seconds, is_stale_custom_model_ref,
+        collect_dir_entries, collect_dir_entries_with_hidden,
+        default_provider_prefix_cache_ttl_seconds, is_stale_custom_model_ref,
         migrate_endpoint_to_provider, normalize_custom_endpoint_config,
         normalize_custom_provider_config, normalize_tool_permission_mode_request,
         normalize_workspace_sub_path, resolve_workspace_dir_target,
         rewrite_legacy_custom_model_ref, search_workspace_entries_in_dir,
-        unity_checkout_connection_status, unity_connection_flags, valid_custom_model_refs,
-        workspace_entry_stat_for_path, workspace_search_score, ApiFormat, CodexModelConfig,
-        CodexTransportMode, CustomEndpoint, CustomProvider, CustomProviderModel, ModelDefaults,
-        DEFAULT_CODEX_CONTEXT_WINDOW, DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
+        search_workspace_entries_in_dir_with_hidden, unity_checkout_connection_status,
+        unity_connection_flags, valid_custom_model_refs, workspace_entry_stat_for_path,
+        workspace_search_score, ApiFormat, CodexModelConfig, CodexTransportMode, CustomEndpoint,
+        CustomProvider, CustomProviderModel, ModelDefaults, DEFAULT_CODEX_CONTEXT_WINDOW,
+        DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
     };
+    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -3290,6 +3393,42 @@ mod tests {
         assert!(!folder_results
             .iter()
             .any(|entry| { entry.rel_path == "Assets/Scripts/UI/Hud.prefab" }));
+    }
+
+    #[test]
+    fn configured_hidden_directories_control_workspace_listing() {
+        let temp = tempdir().expect("create temp dir");
+        std::fs::create_dir_all(temp.path().join("Library")).expect("create Library");
+        std::fs::create_dir_all(temp.path().join("src")).expect("create src");
+
+        let defaults = collect_dir_entries(temp.path(), "", false).expect("default listing");
+        assert!(!defaults.iter().any(|entry| entry.rel_path == "Library"));
+
+        let visible = HashSet::new();
+        let configured = collect_dir_entries_with_hidden(temp.path(), "", false, Some(&visible))
+            .expect("configured listing");
+        assert!(configured.iter().any(|entry| entry.rel_path == "Library"));
+
+        let hidden = HashSet::from(["src".to_string()]);
+        let configured = collect_dir_entries_with_hidden(temp.path(), "", false, Some(&hidden))
+            .expect("custom hidden listing");
+        assert!(!configured.iter().any(|entry| entry.rel_path == "src"));
+    }
+
+    #[test]
+    fn configured_workspace_search_includes_files_under_unity_roots() {
+        let temp = tempdir().expect("create temp dir");
+        std::fs::create_dir_all(temp.path().join("Assets/Scripts")).expect("create Assets");
+        std::fs::write(temp.path().join("Assets/Scripts/Hud.cs"), "class Hud {}")
+            .expect("write asset source");
+
+        let configured = HashSet::new();
+        let results =
+            search_workspace_entries_in_dir_with_hidden(temp.path(), "Hud", 100, Some(&configured))
+                .expect("configured search");
+        assert!(results
+            .iter()
+            .any(|entry| entry.rel_path == "Assets/Scripts/Hud.cs" && !entry.is_dir));
     }
 
     #[test]

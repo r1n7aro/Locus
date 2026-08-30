@@ -10,11 +10,13 @@ use crate::session::models::{
     ProjectExplorerPresetSummary, ProjectExplorerSnapshot,
 };
 
-const WORKSPACE_TREE_SCHEMA_VERSION: u32 = 1;
+const WORKSPACE_TREE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_WORKSPACE_TREE_SCHEMA_VERSION: u32 = 1;
 const WORKSPACE_TREE_DIR: &str = "workspace-trees";
 const WORKSPACE_TREE_INDEX: &str = "index.json";
 const DEFAULT_PRESET_ID: &str = "default";
 const DEFAULT_PRESET_NAME: &str = "Default";
+const WORKSPACE_TREE_V2_MIGRATION_ID: &str = "workspace-tree-migration-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -127,20 +129,64 @@ fn read_index(root: &Path) -> Result<WorkspaceTreeIndex, String> {
             path.display()
         )
     })?;
-    let index = serde_json::from_str::<WorkspaceTreeIndex>(&raw).map_err(|error| {
+    let mut index = serde_json::from_str::<WorkspaceTreeIndex>(&raw).map_err(|error| {
         format!(
             "Failed to parse workspace tree index '{}': {error}",
             path.display()
         )
     })?;
-    if index.schema_version != WORKSPACE_TREE_SCHEMA_VERSION {
-        return Err(format!(
-            "Unsupported workspace tree index schema version: {}",
-            index.schema_version
-        ));
+    match index.schema_version {
+        WORKSPACE_TREE_SCHEMA_VERSION => {}
+        LEGACY_WORKSPACE_TREE_SCHEMA_VERSION => {
+            index.schema_version = WORKSPACE_TREE_SCHEMA_VERSION;
+            write_json(&path, &index)?;
+        }
+        version => {
+            return Err(format!(
+                "Unsupported workspace tree index schema version: {version}"
+            ));
+        }
     }
     validate_preset_id(&index.active_preset_id)?;
     Ok(index)
+}
+
+fn migrate_preset_to_v2(preset: &mut WorkspaceTreePresetFile) -> Result<bool, String> {
+    match preset.schema_version {
+        WORKSPACE_TREE_SCHEMA_VERSION => return Ok(false),
+        LEGACY_WORKSPACE_TREE_SCHEMA_VERSION => {}
+        version => {
+            return Err(format!(
+                "Unsupported workspace tree preset schema version: {version}"
+            ));
+        }
+    }
+
+    // Knowledge removal is represented by the absence of a placement. Sessions
+    // use their archive state. Visibility remains a property of Locus system nodes.
+    preset
+        .nodes
+        .retain(|node| !(node.hidden && node.resource_kind.as_deref() == Some("knowledge")));
+    for node in &mut preset.nodes {
+        if node.resource_kind.as_deref() != Some("system") {
+            node.hidden = false;
+        }
+    }
+    let parents = preset
+        .nodes
+        .iter()
+        .map(|node| node.parent_node_id.clone())
+        .collect::<HashSet<_>>();
+    for parent in parents {
+        normalize_siblings(&mut preset.nodes, parent.as_deref());
+    }
+    preset.schema_version = WORKSPACE_TREE_SCHEMA_VERSION;
+    preset.revision = preset
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| "Workspace tree revision is exhausted".to_string())?;
+    preset.last_operation_id = Some(WORKSPACE_TREE_V2_MIGRATION_ID.to_string());
+    Ok(true)
 }
 
 fn read_preset(
@@ -162,12 +208,7 @@ fn read_preset(
             path.display()
         )
     })?;
-    if preset.schema_version != WORKSPACE_TREE_SCHEMA_VERSION {
-        return Err(format!(
-            "Unsupported workspace tree preset schema version: {}",
-            preset.schema_version
-        ));
-    }
+    let migrated = migrate_preset_to_v2(&mut preset)?;
     if preset.preset_id != preset_id {
         return Err(format!(
             "Workspace tree preset id '{}' does not match its file name '{}'",
@@ -184,6 +225,9 @@ fn read_preset(
         ));
     }
     validate_nodes(project_id, &preset.nodes)?;
+    if migrated {
+        write_json(&path, &preset)?;
+    }
     Ok(preset)
 }
 
@@ -315,6 +359,12 @@ fn validate_nodes(project_id: &str, nodes: &[ProjectExplorerNode]) -> Result<(),
             return Err(format!(
                 "Workspace tree node '{}' has unsupported kind '{}'",
                 node.node_id, node.node_kind
+            ));
+        }
+        if node.hidden && node.resource_kind.as_deref() != Some("system") {
+            return Err(format!(
+                "Only Locus system resources can be hidden: '{}'",
+                node.node_id
             ));
         }
     }
@@ -662,6 +712,8 @@ fn apply_operation(
                 if source_kind.is_some() {
                     node.source_kind = source_kind.clone();
                 }
+                // Explicit placement restores a system resource that was hidden earlier.
+                node.hidden = false;
             }
             move_node(nodes, &node_id, parent_node_id.as_deref(), *position)
         }
@@ -669,6 +721,11 @@ fn apply_operation(
             resource_kind,
             resource_id,
         } => {
+            if resource_kind != "knowledge" {
+                return Err(
+                    "Only knowledge documents can be removed from the workspace".to_string()
+                );
+            }
             nodes.retain(|node| {
                 node.resource_kind.as_deref() != Some(resource_kind)
                     || node.resource_id.as_deref() != Some(resource_id)
@@ -697,6 +754,11 @@ fn apply_operation(
                 .iter_mut()
                 .find(|node| node.node_id == *node_id)
                 .ok_or_else(|| format!("Workspace tree node does not exist: {node_id}"))?;
+            if node.resource_kind.as_deref() != Some("system") {
+                return Err(format!(
+                    "Only Locus system resources can be hidden: '{node_id}'"
+                ));
+            }
             node.hidden = *hidden;
             Ok(())
         }
@@ -903,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn mounted_paths_and_hidden_state_round_trip() {
+    fn mounted_paths_round_trip_and_reject_hidden_state() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("notes");
         std::fs::create_dir_all(&source).unwrap();
@@ -928,7 +990,7 @@ mod tests {
         assert_eq!(node.source_kind.as_deref(), Some("knowledge"));
         assert_eq!(node.node_kind, "folder");
 
-        let hidden = apply_operations(
+        let error = apply_operations(
             temp.path(),
             "project-a",
             mounted.snapshot.revision,
@@ -938,8 +1000,181 @@ mod tests {
                 hidden: true,
             }],
         )
+        .unwrap_err();
+        assert!(error.contains("Only Locus system resources can be hidden"));
+        assert!(!snapshot(temp.path(), "project-a").unwrap().nodes[0].hidden);
+    }
+
+    #[test]
+    fn v1_presets_migrate_hidden_state_to_resource_specific_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree_dir(temp.path())).unwrap();
+        write_json(
+            &index_path(temp.path()),
+            &WorkspaceTreeIndex {
+                schema_version: LEGACY_WORKSPACE_TREE_SCHEMA_VERSION,
+                active_preset_id: DEFAULT_PRESET_ID.to_string(),
+                preset_order: vec![DEFAULT_PRESET_ID.to_string()],
+            },
+        )
         .unwrap();
+        let resource = |node_id: &str, resource_kind: &str, resource_id: &str, position: i64| {
+            ProjectExplorerNode {
+                node_id: node_id.to_string(),
+                project_id: "project-a".to_string(),
+                node_kind: "resource".to_string(),
+                parent_node_id: None,
+                resource_kind: Some(resource_kind.to_string()),
+                resource_id: Some(resource_id.to_string()),
+                folder_name: None,
+                hidden: true,
+                source_path: None,
+                source_kind: None,
+                position,
+            }
+        };
+        write_json(
+            &preset_path(temp.path(), DEFAULT_PRESET_ID),
+            &WorkspaceTreePresetFile {
+                schema_version: LEGACY_WORKSPACE_TREE_SCHEMA_VERSION,
+                preset_id: DEFAULT_PRESET_ID.to_string(),
+                name: DEFAULT_PRESET_NAME.to_string(),
+                project_id: "project-a".to_string(),
+                revision: 7,
+                last_operation_id: Some("legacy-operation".to_string()),
+                nodes: vec![
+                    resource(
+                        "knowledge-user-preference",
+                        "knowledge",
+                        "kd_builtin_memory_user_preference",
+                        0,
+                    ),
+                    resource("session-a", "session", "session-a", 1),
+                    resource("collaboration", "system", "collaboration", 2),
+                ],
+            },
+        )
+        .unwrap();
+
+        let migrated = snapshot(temp.path(), "project-a").unwrap();
+        assert_eq!(migrated.revision, 8);
+        assert_eq!(migrated.nodes.len(), 2);
+        assert!(migrated.nodes.iter().all(|node| {
+            node.resource_id.as_deref() != Some("kd_builtin_memory_user_preference")
+        }));
+        assert!(
+            !migrated
+                .nodes
+                .iter()
+                .find(|node| node.resource_kind.as_deref() == Some("session"))
+                .unwrap()
+                .hidden
+        );
+        assert!(
+            migrated
+                .nodes
+                .iter()
+                .find(|node| node.resource_id.as_deref() == Some("collaboration"))
+                .unwrap()
+                .hidden
+        );
+
+        let persisted_index = read_index(temp.path()).unwrap();
+        let persisted_preset = read_preset(temp.path(), "project-a", DEFAULT_PRESET_ID).unwrap();
+        assert_eq!(
+            persisted_index.schema_version,
+            WORKSPACE_TREE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            persisted_preset.schema_version,
+            WORKSPACE_TREE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            persisted_preset.last_operation_id.as_deref(),
+            Some(WORKSPACE_TREE_V2_MIGRATION_ID)
+        );
+        assert_eq!(
+            snapshot(temp.path(), "project-a").unwrap().revision,
+            migrated.revision
+        );
+    }
+
+    #[test]
+    fn system_resources_can_toggle_hidden_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let placed = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "place-collaboration",
+            &[ProjectExplorerOperation::PlaceResource {
+                resource_kind: "system".to_string(),
+                resource_id: "collaboration".to_string(),
+                source_kind: None,
+                parent_node_id: None,
+                position: 0,
+            }],
+        )
+        .unwrap();
+        let node_id = placed.snapshot.nodes[0].node_id.clone();
+        let hidden = apply_operations(
+            temp.path(),
+            "project-a",
+            placed.snapshot.revision,
+            "hide-collaboration",
+            &[ProjectExplorerOperation::SetNodeHidden {
+                node_id,
+                hidden: true,
+            }],
+        )
+        .unwrap();
+
         assert!(hidden.snapshot.nodes[0].hidden);
+    }
+
+    #[test]
+    fn knowledge_removal_drops_the_placement_and_allows_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let placement = ProjectExplorerOperation::PlaceResource {
+            resource_kind: "knowledge".to_string(),
+            resource_id: "kd_builtin_memory_user_preference".to_string(),
+            source_kind: Some("knowledge".to_string()),
+            parent_node_id: None,
+            position: 0,
+        };
+        let placed = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "place-user-preference",
+            std::slice::from_ref(&placement),
+        )
+        .unwrap();
+        let removed = apply_operations(
+            temp.path(),
+            "project-a",
+            placed.snapshot.revision,
+            "remove-user-preference",
+            &[ProjectExplorerOperation::RemoveResourcePlacement {
+                resource_kind: "knowledge".to_string(),
+                resource_id: "kd_builtin_memory_user_preference".to_string(),
+            }],
+        )
+        .unwrap();
+        assert!(removed.snapshot.nodes.is_empty());
+
+        let replaced = apply_operations(
+            temp.path(),
+            "project-a",
+            removed.snapshot.revision,
+            "replace-user-preference",
+            &[placement],
+        )
+        .unwrap();
+        assert_eq!(replaced.snapshot.nodes.len(), 1);
+        assert!(!replaced.snapshot.nodes[0].hidden);
     }
 
     #[test]

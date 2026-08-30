@@ -20,7 +20,6 @@ import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import type {
   AssetRefAttachment,
   ChatComposerSendPayload,
-  ChatMessage,
   ImageAttachment,
   KnowledgeDocumentType,
   KnowledgeSearchResult,
@@ -46,15 +45,9 @@ import {
 } from "../../composables/chatInputIntents";
 import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";
 import {
-  buildUserMessageDraft,
   readUserMessageDraftFromClipboardData,
   type UserMessageDraft,
 } from "../../composables/chatMessageDraft";
-import {
-  createChatInputHistoryState,
-  navigateChatInputHistory,
-  shouldNavigateChatInputHistory,
-} from "../../composables/chatInputHistory";
 import { rankSearchResults } from "../../composables/searchMatcher";
 import { useCommandRegistry } from "../../composables/useCommandRegistry";
 import { normalizeAppError } from "../../services/errors";
@@ -153,10 +146,6 @@ interface LocalFileAttachment extends LocusFileDropRef {
   id: string;
 }
 
-interface ComposerHistorySnapshot extends UserMessageDraft {
-  pastedContent: string;
-}
-
 const props = withDefaults(defineProps<{
   modelValue: string;
   selectedAgentId: string;
@@ -177,8 +166,10 @@ const props = withDefaults(defineProps<{
   compact?: boolean;
   showAction?: boolean;
   assetRefSyncKey?: string;
-  messageHistory?: ChatMessage[];
   managedLocalFiles?: ManagedLocalFileAttachment[];
+  referenceDropAvailable?: boolean;
+  referenceDropActive?: boolean;
+  managedNativeDrops?: boolean;
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -197,8 +188,10 @@ const props = withDefaults(defineProps<{
   compact: false,
   showAction: true,
   assetRefSyncKey: "",
-  messageHistory: () => [],
   managedLocalFiles: () => [],
+  referenceDropAvailable: false,
+  referenceDropActive: false,
+  managedNativeDrops: false,
 });
 
 const emit = defineEmits<{
@@ -307,13 +300,6 @@ let assetRefSyncChannel: BroadcastChannel | null = null;
 let assetRefSyncSeq = 0;
 let lastAssetRefSyncKey = "";
 const assetRefSyncSourceId = `rich-chat-input-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-let messageHistoryNavigation = createChatInputHistoryState<ComposerHistorySnapshot>();
-let applyingMessageHistory = false;
-
-function resetMessageHistoryNavigation() {
-  messageHistoryNavigation = createChatInputHistoryState<ComposerHistorySnapshot>();
-}
-
 const hasTopAttachments = computed(() =>
   imageAttachments.value.length > 0
   || assetRefAttachments.value.length > 0
@@ -338,13 +324,6 @@ const canSend = computed(() =>
     || props.managedLocalFiles.some((file) => file.status === "ready" && !!file.path?.trim())
   ),
 );
-
-const userMessageHistory = computed(() => props.messageHistory
-  .filter((message) => message.role === "user")
-  .map((message) => ({
-    ...buildUserMessageDraft(message),
-    pastedContent: "",
-  })));
 
 function isDraftEmpty() {
   return !props.modelValue
@@ -610,9 +589,6 @@ function showIntentBlockedNotice(command: CommandDef) {
 }
 
 function setInputValue(value: string) {
-  if (!applyingMessageHistory) {
-    resetMessageHistoryNavigation();
-  }
   emit("update:modelValue", value);
 }
 
@@ -1779,70 +1755,6 @@ async function applyDraftPrefill(draft: UserMessageDraft) {
   await applyUserMessageDraft(draft);
 }
 
-function captureComposerHistorySnapshot(): ComposerHistorySnapshot {
-  return {
-    text: props.modelValue,
-    pastedContent: pastedContent.value,
-    images: imageAttachments.value.map((image) => ({
-      data: image.data,
-      mimeType: image.mimeType,
-    })),
-    assetRefs: cloneAssetRefs(assetRefAttachments.value),
-    localFiles: localFileAttachments.value.map((file) => ({
-      path: file.path,
-      isDir: file.isDir,
-      name: file.name,
-      typeLabel: file.typeLabel,
-      source: file.source,
-    })),
-    consoleTexts: consoleTextAttachments.value.map((entry) => ({
-      title: entry.title,
-      source: entry.source,
-      level: entry.level,
-      text: entry.text,
-    })),
-    intent: {
-      mode: composerIntent.value.mode,
-      skills: composerIntent.value.skills.map((skill) => ({ ...skill })),
-    },
-  };
-}
-
-function applyComposerHistorySnapshot(snapshot: ComposerHistorySnapshot) {
-  resetDraft();
-  setInputValue(snapshot.text);
-  pastedContent.value = snapshot.pastedContent;
-  imageAttachments.value = snapshot.images
-    .slice(0, props.maxImages)
-    .map((image) => ({
-      data: image.data,
-      mimeType: image.mimeType,
-    }));
-  setAssetRefAttachments(snapshot.assetRefs);
-  consoleTextAttachments.value = snapshot.consoleTexts
-    .map((entry) => normalizeConsoleTextAttachment(entry))
-    .filter((entry): entry is ConsoleTextAttachment => !!entry);
-  addLocalFileAttachments(snapshot.localFiles);
-  composerIntent.value = {
-    mode: snapshot.intent.mode,
-    skills: snapshot.intent.skills.map((skill) => ({ ...skill })),
-  };
-  nextTick(() => {
-    autoResizeTextarea();
-    focusComposerSelection(snapshot.text.length);
-    syncOperatorState();
-  });
-}
-
-function startApplyingComposerHistorySnapshot(snapshot: ComposerHistorySnapshot) {
-  applyingMessageHistory = true;
-  try {
-    applyComposerHistorySnapshot(snapshot);
-  } finally {
-    applyingMessageHistory = false;
-  }
-}
-
 function appendDraftText(text: string) {
   if (!text) {
     return props.modelValue.length;
@@ -2108,33 +2020,6 @@ function handleSend() {
   emit("send", payload);
 }
 
-function tryNavigateMessageHistory(event: KeyboardEvent): boolean {
-  const textarea = getComposerTextarea();
-  if (!textarea || !shouldNavigateChatInputHistory(event, {
-    value: textarea.value,
-    selectionStart: textarea.selectionStart,
-    selectionEnd: textarea.selectionEnd,
-    isNavigating: messageHistoryNavigation.index != null,
-  })) {
-    return false;
-  }
-
-  const direction = event.key === "ArrowUp" ? "previous" : "next";
-  const step = navigateChatInputHistory(
-    userMessageHistory.value,
-    messageHistoryNavigation,
-    direction,
-    captureComposerHistorySnapshot(),
-  );
-  if (!step) return false;
-
-  event.preventDefault();
-  event.stopPropagation();
-  messageHistoryNavigation = step.state;
-  startApplyingComposerHistorySnapshot(step.value);
-  return true;
-}
-
 function mentionCanContinueWithSpace() {
   if (mentionMode.value !== "search") return false;
   return shouldContinueMentionWithSpace(
@@ -2260,10 +2145,6 @@ function handleKeydown(event: KeyboardEvent) {
       executeCommandFromPopup(commands[commandHighlightIndex.value]);
       return;
     }
-  }
-
-  if (tryNavigateMessageHistory(event)) {
-    return;
   }
 
   if (shouldSubmitOnEnter(event, chatInputSettings.submitMode)) {
@@ -2504,31 +2385,6 @@ watch(() => props.modelValue, () => {
 });
 
 watch(
-  [
-    pastedContent,
-    imageAttachments,
-    assetRefAttachments,
-    consoleTextAttachments,
-    localFileAttachments,
-    composerIntent,
-  ],
-  () => {
-    if (!applyingMessageHistory) {
-      resetMessageHistoryNavigation();
-    }
-  },
-  { deep: true, flush: "sync" },
-);
-
-watch(
-  () => props.messageHistory
-    .filter((message) => message.role === "user")
-    .map((message) => message.id)
-    .join("\u0000"),
-  resetMessageHistoryNavigation,
-);
-
-watch(
   () => [showCommandPopup.value, commandHighlightIndex.value, filteredCommands.value.length],
   async ([visible]) => {
     if (!visible) return;
@@ -2591,19 +2447,21 @@ onMounted(() => {
   document.addEventListener("drop", handleDocumentLocalFileDrop);
   document.addEventListener("dragend", handleDocumentLocalFileDragEnd);
   window.addEventListener("blur", handleWindowLocalFileDragBlur);
-  subscribeUnityEmbedAssetDrop((payload) => {
-    addAssetRefs(payload.refs ?? [], { respectRecentRemoval: true });
-  })
-    .then((release) => {
-      if (unityAssetDropSubscriptionDisposed) {
-        release();
-        return;
-      }
-      releaseUnityAssetDrop = release;
+  if (!props.managedNativeDrops) {
+    subscribeUnityEmbedAssetDrop((payload) => {
+      addAssetRefs(payload.refs ?? [], { respectRecentRemoval: true });
     })
-    .catch((error) => {
-      console.warn("[Locus] Unity asset drop subscription failed:", error);
-    });
+      .then((release) => {
+        if (unityAssetDropSubscriptionDisposed) {
+          release();
+          return;
+        }
+        releaseUnityAssetDrop = release;
+      })
+      .catch((error) => {
+        console.warn("[Locus] Unity asset drop subscription failed:", error);
+      });
+  }
   subscribeUnityEmbedTextDrop((payload) => {
     addConsoleTextAttachment(payload);
   })
@@ -2617,35 +2475,37 @@ onMounted(() => {
     .catch((error) => {
       console.warn("[Locus] Unity text drop subscription failed:", error);
     });
-  subscribeLocusFileDrop((payload) => {
-    const composer = composerRef.value?.getTextarea()?.closest<HTMLElement>(".chat-composer");
-    const bounds = composer?.getBoundingClientRect();
-    const hasPosition = Number.isFinite(payload.x) && Number.isFinite(payload.y);
-    const insideComposer = !hasPosition || !!bounds && payload.x! >= bounds.left
-      && payload.x! <= bounds.right && payload.y! >= bounds.top && payload.y! <= bounds.bottom;
-    if (insideComposer) addLocalFileAttachments(payload.files ?? []);
-  })
-    .then((release) => {
-      if (locusFileDropSubscriptionDisposed) {
-        release();
-        return;
-      }
-      releaseLocusFileDrop = release;
+  if (!props.managedNativeDrops) {
+    subscribeLocusFileDrop((payload) => {
+      const composer = composerRef.value?.getTextarea()?.closest<HTMLElement>(".chat-composer");
+      const bounds = composer?.getBoundingClientRect();
+      const hasPosition = Number.isFinite(payload.x) && Number.isFinite(payload.y);
+      const insideComposer = !hasPosition || !!bounds && payload.x! >= bounds.left
+        && payload.x! <= bounds.right && payload.y! >= bounds.top && payload.y! <= bounds.bottom;
+      if (insideComposer) addLocalFileAttachments(payload.files ?? []);
     })
-    .catch((error) => {
-      console.warn("[Locus] local file drop subscription failed:", error);
-    });
-  subscribeLocusFileDragState(handleLocusFileDragState)
-    .then((release) => {
-      if (locusFileDragStateSubscriptionDisposed) {
-        release();
-        return;
-      }
-      releaseLocusFileDragState = release;
-    })
-    .catch((error) => {
-      console.warn("[Locus] local file drag state subscription failed:", error);
-    });
+      .then((release) => {
+        if (locusFileDropSubscriptionDisposed) {
+          release();
+          return;
+        }
+        releaseLocusFileDrop = release;
+      })
+      .catch((error) => {
+        console.warn("[Locus] local file drop subscription failed:", error);
+      });
+    subscribeLocusFileDragState(handleLocusFileDragState)
+      .then((release) => {
+        if (locusFileDragStateSubscriptionDisposed) {
+          release();
+          return;
+        }
+        releaseLocusFileDragState = release;
+      })
+      .catch((error) => {
+        console.warn("[Locus] local file drag state subscription failed:", error);
+      });
+  }
 });
 
 onUnmounted(() => {
@@ -2903,7 +2763,8 @@ defineExpose({
       :show-action="showAction"
       :show-header="hasHeaderContent"
       :extend-top="hasTopAttachments"
-      :drop-active="localFileDragActive"
+      :drop-available="localFileDragActive || referenceDropAvailable || referenceDropActive"
+      :drop-active="localFileDragActive || referenceDropActive"
       :drop-label="t('chat.input.dropFileHint')"
       @update:model-value="setInputValue"
       @keydown="handleKeydown"

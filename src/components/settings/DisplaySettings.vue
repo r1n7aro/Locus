@@ -12,6 +12,7 @@ import {
   type MemoryFileOpenTarget,
   type PlanApprovalTarget,
   type WorkspaceDisplayMode,
+  type WorkspaceSectionVisibilityKind,
 } from "../../composables/useDisplaySettings";
 import { normalizeAppError } from "../../services/errors";
 import { ipcInvoke } from "../../services/ipc";
@@ -25,6 +26,7 @@ import { useNotificationStore } from "../../stores/notification";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
+import BaseCheckbox from "../ui/BaseCheckbox.vue";
 
 const { mainPreference, unityEmbedPreference, setThemePreference } = useTheme();
 const { state: display, set: setDisplay, setFont } = useDisplaySettings();
@@ -62,11 +64,43 @@ const knowledgeFolderToggles: { kind: KnowledgeFolderKind; labelKey: string }[] 
   { kind: "reference", labelKey: "knowledge.type.reference" },
 ];
 
+const workspaceSectionToggles: {
+  kind: WorkspaceSectionVisibilityKind;
+  labelKey: string;
+}[] = [
+  { kind: "knowledge", labelKey: "app.tab.knowledge" },
+  { kind: "collab", labelKey: "app.tab.collab" },
+  { kind: "assets", labelKey: "app.tab.asset" },
+  { kind: "views", labelKey: "app.tab.views" },
+];
+
+function setWorkspaceSectionVisibility(
+  kind: WorkspaceSectionVisibilityKind,
+  visible: boolean,
+): void {
+  setDisplay("workspaceSectionVisibility", {
+    ...display.workspaceSectionVisibility,
+    [kind]: visible,
+  });
+}
+
 function setKnowledgeFolderVisibility(kind: KnowledgeFolderKind, visible: boolean): void {
   setDisplay("knowledgeFolderVisibility", {
     ...display.knowledgeFolderVisibility,
     [kind]: visible,
   });
+}
+
+function hiddenDirectoriesText(directories: readonly string[]): string {
+  return directories.join(", ");
+}
+
+function updateHiddenDirectories(
+  key: "fileExplorerHiddenDirectories" | "unityFileExplorerHiddenDirectories",
+  event: Event,
+): void {
+  const value = (event.target as HTMLInputElement).value;
+  setDisplay(key, value.split(/[,，;；\n]+/));
 }
 
 const sessionMessagePageSizeOptions = computed<DropdownOption[]>(() =>
@@ -311,6 +345,15 @@ async function updateViewWindowsAboveMain(value: boolean) {
       <span>{{ t("settings.display.showKnowledgeFolder", t(item.labelKey)) }}</span>
     </div>
 
+    <div v-for="item in workspaceSectionToggles" :key="`section:${item.kind}`" class="toggle-row">
+      <BaseCheckbox
+        :model-value="display.workspaceSectionVisibility[item.kind]"
+        :aria-label="t('settings.display.showWorkspaceSection', t(item.labelKey))"
+        @update:model-value="setWorkspaceSectionVisibility(item.kind, $event)"
+      />
+      <span>{{ t("settings.display.showWorkspaceSection", t(item.labelKey)) }}</span>
+    </div>
+
     <div class="toggle-row">
       <BaseSwitch
         :model-value="display.showAgentSelector"
@@ -336,6 +379,41 @@ async function updateViewWindowsAboveMain(value: boolean) {
         @update:model-value="setDisplay(item.key, $event)"
       />
       <span>{{ t(item.labelKey) }}</span>
+    </div>
+  </div>
+
+  <div class="settings-section">
+    <div class="section-label">{{ t("settings.display.fileExplorerTitle") }}</div>
+    <p class="section-desc">{{ t("settings.display.fileExplorerDesc") }}</p>
+
+    <div class="directory-filter-row">
+      <label class="directory-filter-label" for="file-explorer-hidden-directories">
+        {{ t("settings.display.fileExplorerHiddenDirectories") }}
+      </label>
+      <input
+        id="file-explorer-hidden-directories"
+        class="directory-filter-input"
+        type="text"
+        spellcheck="false"
+        :value="hiddenDirectoriesText(display.fileExplorerHiddenDirectories)"
+        :placeholder="t('settings.display.fileExplorerHiddenDirectoriesPlaceholder')"
+        @change="updateHiddenDirectories('fileExplorerHiddenDirectories', $event)"
+      />
+    </div>
+
+    <div class="directory-filter-row">
+      <label class="directory-filter-label" for="unity-file-explorer-hidden-directories">
+        {{ t("settings.display.fileExplorerUnityHiddenDirectories") }}
+      </label>
+      <input
+        id="unity-file-explorer-hidden-directories"
+        class="directory-filter-input"
+        type="text"
+        spellcheck="false"
+        :value="hiddenDirectoriesText(display.unityFileExplorerHiddenDirectories)"
+        :placeholder="t('settings.display.fileExplorerUnityHiddenDirectoriesPlaceholder')"
+        @change="updateHiddenDirectories('unityFileExplorerHiddenDirectories', $event)"
+      />
     </div>
   </div>
 
@@ -648,6 +726,42 @@ async function updateViewWindowsAboveMain(value: boolean) {
 
 .toggle-row.disabled {
   color: var(--text-secondary);
+}
+
+.directory-filter-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  width: min(560px, 100%);
+  padding: 7px 0;
+}
+
+.directory-filter-label {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.directory-filter-input {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--input-bg);
+  color: var(--text-color);
+  font: 12px var(--font-mono-identifier);
+  outline: none;
+}
+
+.directory-filter-input:hover {
+  border-color: var(--border-strong);
+}
+
+.directory-filter-input:focus {
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-color) 12%, transparent);
 }
 
 .font-grid {

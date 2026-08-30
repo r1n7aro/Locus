@@ -46,6 +46,7 @@ import { useChatStore } from "../stores/chat";
 import { useUiStore } from "../stores/ui";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import {
   captureScrollAnchor,
   captureLiveScrollAnchor,
@@ -94,6 +95,7 @@ import {
   buildChatMessageClipboardPayload,
   buildUserMessageDraft,
   writeChatMessageClipboard,
+  type UserMessageDraft,
 } from "../composables/chatMessageDraft";
 import { isMessageFromActiveStream } from "../composables/chatMessageFork";
 import { selectionTextAtPoint } from "../composables/chatSelectionContext";
@@ -103,15 +105,30 @@ import {
   recordLayoutDiagnostic,
   traceViewportAnchorSample,
 } from "../services/layoutDiagnostics";
+import { useInternalDragController } from "../composables/useInternalDrag";
+import {
+  claimWorkbenchReferencePointerEvent,
+  workbenchReferenceFromElement,
+  workbenchReferenceInternalDragSource,
+  type WorkbenchReferenceDragData,
+} from "./workbench/workbenchReferenceDrag";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
+
+interface ScopedQueuedFollowUp {
+  displayText: string;
+  canInsert: boolean;
+  isInserting: boolean;
+}
 
 const chatChangesStore = useChatChangesStore();
 const chatStore = useChatStore();
 const uiStore = useUiStore();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
+const internalDrag = useInternalDragController();
 const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
 const { state: displaySettings } = useDisplaySettings();
@@ -121,18 +138,24 @@ const {
 } = useKnowledgeDocumentOpen();
 const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnowledgeAccessMode();
 
-const planModeActive = computed(() => chatStore.activeSessionPlanMode);
+const planModeActive = computed(() => (
+  props.scopedSession ? !!props.planModeActive : chatStore.activeSessionPlanMode
+));
 const isViewingSubagent = computed(() => {
   if (!props.activeSessionId) return false;
   const session = props.sessions.find(s => s.id === props.activeSessionId);
   return !!session?.parentSessionId;
 });
-const activeQueuedFollowUp = computed(() => chatStore.activeQueuedFollowUp);
+const activeQueuedFollowUp = computed(() => (
+  props.scopedSession ? props.queuedFollowUp ?? null : chatStore.activeQueuedFollowUp
+));
 const showQueuedFollowUp = computed(() =>
   !!activeQueuedFollowUp.value && props.isStreaming,
 );
 const showCompactQueued = computed(() =>
-  chatStore.isCompactQueued && props.isStreaming && !isViewingSubagent.value,
+  (props.scopedSession ? !!props.compactQueued : chatStore.isCompactQueued)
+  && props.isStreaming
+  && !isViewingSubagent.value,
 );
 const diffProgress = useDiffProgress(() => props.workspaceRef ?? null);
 const diffProgressWidth = computed(() => `${diffProgress.progress.value * 100}%`);
@@ -174,9 +197,14 @@ function toggleInputControlsCollapsed() {
 }
 
 const showInlineDiff = computed(() =>
-  !!chatChangesStore.inlineDiffPayload || chatChangesStore.inlineDiffLoading || !!chatChangesStore.inlineDiffError,
+  !props.scopedSession
+  && (
+    !!chatChangesStore.inlineDiffPayload
+    || chatChangesStore.inlineDiffLoading
+    || !!chatChangesStore.inlineDiffError
+  ),
 );
-const hasPanelToggleRow = computed(() => chatChangesStore.hasAnyChanges);
+const hasPanelToggleRow = computed(() => !props.scopedSession && chatChangesStore.hasAnyChanges);
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const chatDiffTabOptions = computed(() => [
@@ -244,6 +272,7 @@ const props = defineProps<{
   unityLaunchState?: "idle" | "starting" | "waitingConnection";
   unityConnectionStatus?: UnityConnectionStatus | null;
   workspaceRef?: WorkspaceRef | null;
+  projectId?: string;
   projectServices?: string[];
   workingDir?: string;
   scanPhase?: AssetDbScanEvent | null;
@@ -257,6 +286,17 @@ const props = defineProps<{
   sessionPanelStorageScope?: string;
   showSessionNavigation?: boolean;
   contentStartInset?: number;
+  /** Uses pane-owned session state while preserving the standard Chat surface. */
+  scopedSession?: boolean;
+  sessionSurfaceKey?: string;
+  queuedFollowUp?: ScopedQueuedFollowUp | null;
+  compactQueued?: boolean;
+  planModeActive?: boolean;
+  composerValue?: string;
+  referenceDropAvailable?: boolean;
+  referenceDropActive?: boolean;
+  managedNativeDrops?: boolean;
+  shortcutActive?: boolean;
 }>();
 
 const chatContentStyle = computed(() => ({
@@ -288,6 +328,12 @@ const emit = defineEmits<{
   answerQuestion: [answer: string];
   answerToolConfirm: [questionId: string, answer: string];
   answerAllToolConfirms: [questionIds: string[], answer: string];
+  insertQueuedFollowUp: [];
+  reEditQueuedFollowUp: [];
+  deleteQueuedFollowUp: [];
+  applyKnowledgeProposal: [proposalId: string];
+  ignoreKnowledgeProposal: [proposalId: string];
+  updateComposerValue: [value: string];
   openThinking: [content: string];
   selectSession: [id: string];
   newChat: [];
@@ -307,13 +353,41 @@ function openLightbox(src: string) {
 }
 
 function handleInsertQueuedFollowUp() {
+  if (props.scopedSession) {
+    emit("insertQueuedFollowUp");
+    return;
+  }
   void chatStore.insertActiveQueuedFollowUp();
 }
 function handleDeleteQueuedFollowUp() {
+  if (props.scopedSession) {
+    emit("deleteQueuedFollowUp");
+    return;
+  }
   void chatStore.deleteActiveQueuedFollowUp();
 }
 function handleReEditQueuedFollowUp() {
+  if (props.scopedSession) {
+    emit("reEditQueuedFollowUp");
+    return;
+  }
   void chatStore.reEditActiveQueuedFollowUp();
+}
+
+function handleApplyKnowledgeProposal(proposalId: string) {
+  if (props.scopedSession) {
+    emit("applyKnowledgeProposal", proposalId);
+    return;
+  }
+  void chatStore.applyKnowledgeProposal(proposalId);
+}
+
+function handleIgnoreKnowledgeProposal(proposalId: string) {
+  if (props.scopedSession) {
+    emit("ignoreKnowledgeProposal", proposalId);
+    return;
+  }
+  void chatStore.ignoreKnowledgeProposal(proposalId);
 }
 function closeLightbox() {
   lightboxSrc.value = "";
@@ -443,6 +517,7 @@ function toKnowledgeDocumentType(value: string): KnowledgeDocumentType | null {
   const normalized = value.trim().toLowerCase();
   if (
     normalized === "design" ||
+    normalized === "plan" ||
     normalized === "memory" ||
     normalized === "skill" ||
     normalized === "reference"
@@ -991,6 +1066,35 @@ async function openInlineDiffInWindow() {
   }
 }
 
+function handleContentPointerDown(event: PointerEvent) {
+  if (!props.scopedSession || event.button !== 0 || event.isPrimary === false) return;
+  if (!(event.target instanceof Element)) return;
+  const entry = workbenchReferenceFromElement(event.target);
+  const workspaceRef = props.workspaceRef;
+  if (!entry || !workspaceRef) return;
+  const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
+  const projectId = props.projectId?.trim() || checkout?.projectId || "";
+  const workspaceRoot = props.workingDir?.trim() || checkout?.root || "";
+  if (!projectId || !workspaceRoot) return;
+
+  const data: WorkbenchReferenceDragData = {
+    version: 1,
+    origin: {
+      projectId,
+      workspaceRef: { ...workspaceRef },
+      workspaceRoot,
+    },
+    entries: [entry],
+  };
+  const captureElement = event.target.closest<HTMLElement>(
+    ".asset-chip, .md-file-ref, .md-workspace-ref, .md-asset-chip, .unity-object-identity",
+  ) ?? undefined;
+  if (!internalDrag.start(event, workbenchReferenceInternalDragSource(data, captureElement))) return;
+  claimWorkbenchReferencePointerEvent(event);
+  closeAssetRefContextMenu();
+  closeMessageContextMenu();
+}
+
 async function openCompactedContext(messageId: string) {
   const sessionId = props.activeSessionId?.trim();
   if (!sessionId || !messageId.trim()) return;
@@ -1184,7 +1288,7 @@ function handleQuestionAnswer(answer: string) {
 }
 
 const NEW_CHAT_DRAFT_KEY = "__new_chat__";
-const inputText = ref("");
+const inputText = ref(props.composerValue ?? "");
 const composerDrafts = ref(new Map<string, string>());
 const composerPanelRef = ref<InstanceType<typeof RichChatInput> | null>(null);
 const transcriptRef = ref<InstanceType<typeof ChatTranscript> | null>(null);
@@ -1194,7 +1298,10 @@ function draftSessionKey(sessionId: string | null) {
   return sessionId ?? NEW_CHAT_DRAFT_KEY;
 }
 
-const composerAssetRefSyncKey = computed(() => `chat:${draftSessionKey(props.activeSessionId)}`);
+const sessionSurfaceKey = computed(() => (
+  props.sessionSurfaceKey?.trim() || draftSessionKey(props.activeSessionId)
+));
+const composerAssetRefSyncKey = computed(() => `chat:${sessionSurfaceKey.value}`);
 type UndoChoice = "conversation" | "files";
 const undoChooserVisible = ref(false);
 const undoChooserRef = ref<HTMLElement | null>(null);
@@ -1280,6 +1387,12 @@ function storeComposerDraft(sessionId: string | null, value: string) {
 }
 
 async function restoreComposerDraft(sessionId: string | null) {
+  if (props.scopedSession && props.composerValue !== undefined) {
+    inputText.value = props.composerValue;
+    await nextTick();
+    composerPanelRef.value?.resizeTextarea();
+    return;
+  }
   inputText.value = composerDrafts.value.get(draftSessionKey(sessionId)) ?? "";
   await nextTick();
   composerPanelRef.value?.resizeTextarea();
@@ -1462,6 +1575,21 @@ function isComposerDraftEmpty() {
   return composerPanelRef.value?.isDraftEmpty() ?? inputText.value.length === 0;
 }
 
+async function applyDraftPrefill(draft: UserMessageDraft) {
+  if (composerPanelRef.value) {
+    await composerPanelRef.value.applyDraftPrefill(draft);
+    return;
+  }
+  inputText.value = draft.text;
+  await focusComposerInput();
+}
+
+defineExpose({
+  applyDraftPrefill,
+  applyExternalComposerPrefill,
+  isComposerDraftEmpty,
+});
+
 function canApplyPendingChatPrefill(prefill: NonNullable<typeof uiStore.pendingChatPrefill>) {
   if (prefill.sessionId !== undefined && prefill.sessionId !== props.activeSessionId) {
     return false;
@@ -1475,6 +1603,7 @@ function canApplyPendingChatPrefill(prefill: NonNullable<typeof uiStore.pendingC
 watch(
   () => uiStore.pendingChatPrefill?.id,
   async (prefillId) => {
+    if (props.scopedSession) return;
     const prefill = uiStore.pendingChatPrefill;
     if (!prefillId || !prefill) return;
     if (!canApplyPendingChatPrefill(prefill)) {
@@ -1501,7 +1630,17 @@ watch(
 
 watch(inputText, (value) => {
   storeComposerDraft(props.activeSessionId, value);
+  if (props.scopedSession) emit("updateComposerValue", value);
 });
+
+watch(
+  () => props.composerValue,
+  (value) => {
+    if (!props.scopedSession || value === undefined || value === inputText.value) return;
+    inputText.value = value;
+    nextTick(() => composerPanelRef.value?.resizeTextarea());
+  },
+);
 
 const hasStreamingContent = computed(
   () => (props.hasStreamingText ?? !!displayedStreamingText.value)
@@ -2771,6 +2910,7 @@ function clearCancelShortcutConfirmation() {
 
 function onGlobalChatKeydown(e: KeyboardEvent) {
   if (uiStore.activeTab !== "chat") return;
+  if (props.shortcutActive === false) return;
 
   if (e.key === "Escape" && showInlineDiff.value) {
     e.preventDefault();
@@ -2998,7 +3138,8 @@ onUnmounted(() => {
           ref="transcriptRef"
           variant="session"
           :class="{ 'is-session-restore-stabilizing': sessionRestoreLayoutStabilizing }"
-          :session-key="activeSessionId || NEW_CHAT_DRAFT_KEY"
+          :session-key="sessionSurfaceKey"
+          :workspace-ref="workspaceRef"
           :messages="messages"
           :streaming-text="displayedStreamingText"
           :typed-text-stream="typedTextStream"
@@ -3032,11 +3173,12 @@ onUnmounted(() => {
           @user-scroll-intent="markMessagesUserScrollIntent"
           @content-click="handleContentClick"
           @content-contextmenu="handleContentContextMenu"
+          @content-pointerdown="handleContentPointerDown"
           @open-thinking="emit('openThinking', $event)"
           @open-image="openLightbox"
           @open-compacted-context="openCompactedContext"
-          @apply-knowledge-proposal="chatStore.applyKnowledgeProposal"
-          @ignore-knowledge-proposal="chatStore.ignoreKnowledgeProposal"
+          @apply-knowledge-proposal="handleApplyKnowledgeProposal"
+          @ignore-knowledge-proposal="handleIgnoreKnowledgeProposal"
           @tool-handoff-quiet-change="handleToolHandoffQuietChange"
           @tool-viewport-anchor-start="handleToolViewportAnchorStart"
           @tool-viewport-anchor-end="handleToolViewportAnchorEnd"
@@ -3044,7 +3186,7 @@ onUnmounted(() => {
         >
         </ChatTranscript>
         <ChatTurnNavigationRail
-          v-if="displaySettings.showTurnNavigationRail"
+          v-if="displaySettings.showTurnNavigationRail && !scopedSession"
           :messages="messages"
           :session-id="activeSessionId"
           :user-message-ids="chatStore.sessionUserMessageIds"
@@ -3150,6 +3292,7 @@ onUnmounted(() => {
       :class="{
         'is-controls-collapsed': inputControlsCollapsed,
         'is-controls-switching': inputControlsSwitching,
+        'is-reference-drop-available': referenceDropAvailable || referenceDropActive,
       }"
     >
       <div class="chat-input-frame">
@@ -3246,7 +3389,9 @@ onUnmounted(() => {
           :resume-label="t('chat.input.resume')"
           :compact="inputControlsCollapsed"
           :asset-ref-sync-key="composerAssetRefSyncKey"
-          :message-history="messages"
+          :reference-drop-available="referenceDropAvailable"
+          :reference-drop-active="referenceDropActive"
+          :managed-native-drops="managedNativeDrops"
           @send="handleComposerSend"
           @compact="emit('compact')"
           @fork="emit('fork')"
@@ -3870,6 +4015,10 @@ onUnmounted(() => {
 
 .input-area.is-controls-collapsed {
   padding-bottom: 14px;
+}
+
+.input-area.is-reference-drop-available {
+  z-index: 41;
 }
 
 .chat-input-frame {

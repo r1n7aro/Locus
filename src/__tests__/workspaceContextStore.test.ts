@@ -149,6 +149,60 @@ describe("workspace context store", () => {
     });
   });
 
+  it("focuses and updates active sessions for independent editor panes", async () => {
+    const checkoutA = checkout("checkout-a", { runtime: runtime("checkout-a") });
+    const checkoutB = checkout("checkout-b", { runtime: runtime("checkout-b") });
+    projectServiceMocks.listProjectContexts.mockResolvedValue([project(checkoutA, checkoutB)]);
+    projectServiceMocks.focusWorkspace.mockImplementation(
+      (
+        targetWindowId: string,
+        targetPaneId: string,
+        workspaceRef: { checkoutId: string },
+        intentEpoch: number,
+      ) => Promise.resolve(paneContext(workspaceRef.checkoutId, 1, {
+        windowId: targetWindowId,
+        paneId: targetPaneId,
+        intentEpoch,
+      })),
+    );
+    projectServiceMocks.setActiveWorkspaceSession.mockImplementation(
+      (
+        targetWindowId: string,
+        targetPaneId: string,
+        sessionId: string,
+        intentEpoch: number,
+      ) => {
+        const checkoutId = targetPaneId === "left" ? "checkout-a" : "checkout-b";
+        return Promise.resolve(paneContext(checkoutId, 2, {
+          windowId: targetWindowId,
+          paneId: targetPaneId,
+          activeSessionId: sessionId,
+          intentEpoch,
+        }));
+      },
+    );
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+
+    await store.focusCheckoutInPane("checkout-a", "main", "left", { activate: false });
+    await store.focusCheckoutInPane("checkout-b", "main", "right");
+    await store.setActiveSessionInPane("session-a", "main", "left", { activate: false });
+    await store.setActiveSessionInPane("session-b", "main", "right");
+
+    expect(store.workspaceRefForPane("main", "left")).toEqual({
+      checkoutId: "checkout-a",
+      expectedGeneration: 1,
+    });
+    expect(store.workspaceRefForPane("main", "right")).toEqual({
+      checkoutId: "checkout-b",
+      expectedGeneration: 1,
+    });
+    expect(store.paneContextAt("main", "left")?.activeSessionId).toBe("session-a");
+    expect(store.paneContextAt("main", "right")?.activeSessionId).toBe("session-b");
+    expect(store.paneId).toBe("right");
+    expect(store.focusedCheckout?.checkoutId).toBe("checkout-b");
+  });
+
   it("keeps the latest checkout intent when focus responses complete in reverse order", async () => {
     const checkoutA = checkout("checkout-a", { runtime: runtime("checkout-a") });
     const checkoutB = checkout("checkout-b", { runtime: runtime("checkout-b") });

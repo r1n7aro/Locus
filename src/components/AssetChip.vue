@@ -24,6 +24,7 @@ import {
   unityAssetIconKindForPath,
   unityAssetIconNodeForKind,
 } from "./icons/unityAssetIcons";
+import { isWorkbenchReferencePointerEventClaimed } from "./workbench/workbenchReferenceDrag";
 
 const props = defineProps<{
   path: string;
@@ -195,6 +196,7 @@ function handleDragStart(event: DragEvent) {
 }
 
 function handlePointerDown(event: PointerEvent) {
+  if (isWorkbenchReferencePointerEventClaimed(event)) return;
   const ref = unityDragRef.value;
   if (!ref) return;
   armUnityReferencePointerDrag(event, [ref]);

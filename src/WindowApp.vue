@@ -4,6 +4,7 @@ import {
   defineAsyncComponent,
   nextTick,
   onMounted,
+  onUnmounted,
   ref,
   watch,
   type Component,
@@ -41,6 +42,8 @@ import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWin
 import { isExtraWorkdirsWindowLocation } from "./services/extraWorkdirsWindow";
 import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
 import SubWindowLoading from "./components/SubWindowLoading.vue";
+import InternalDragOverlay from "./components/ui/InternalDragOverlay.vue";
+import { provideInternalDragController } from "./composables/useInternalDrag";
 
 // Router for the lightweight window.html entry: resolves which standalone
 // window component the current location asks for, adopts pool assignments,
@@ -157,6 +160,9 @@ const WINDOW_KINDS: WindowKindEntry[] = [
 initTheme("main");
 initFonts();
 
+const internalDragController = provideInternalDragController();
+onUnmounted(() => internalDragController.dispose());
+
 const isPoolWindow = isSubWindowPoolLocation();
 // Bumped when a pool assignment rewrites the location so the kind
 // resolvers (which read window.location live) re-evaluate.
@@ -233,6 +239,7 @@ onMounted(async () => {
     v-bind="activeEntry.props"
   />
   <div v-else class="sub-window-idle" />
+  <InternalDragOverlay />
 </template>
 
 <style scoped>

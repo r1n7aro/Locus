@@ -70,6 +70,10 @@ import {
   WORKSPACE_EVENT_NAME,
   type RoutedWorkspaceEvent,
 } from "../services/project";
+import {
+  publishSessionStreamEvent,
+  workspaceStreamEventSource,
+} from "../services/sessionStreamEventHub";
 
 const WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT = "workspace-execution-lock-diagnostic";
 
@@ -307,13 +311,14 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   function handleExternalScriptOpen(request: ExternalScriptOpenRequest) {
     if (!request.projectPath?.trim()) return;
     if (request.assetPath?.trim()) {
-      uiStore.stageAssetOpen({
+      uiStore.stageExternalScriptOpen({
         projectPath: request.projectPath,
         assetPath: request.assetPath,
         line: Math.max(1, Math.floor(request.line || 1)),
         column: Math.max(1, Math.floor(request.column || 1)),
       });
     }
+    uiStore.setPage("development");
     void showCurrentTauriWindow();
   }
 
@@ -629,6 +634,14 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     void maybeNotifyStreamEvent(payload, notificationContext);
   }
 
+  function handleLegacyStreamEvent(payload: StreamEvent) {
+    publishSessionStreamEvent({
+      event: payload,
+      source: { kind: "legacy" },
+    });
+    handleStreamEvent(payload);
+  }
+
   async function registerListeners() {
     markStartupPhase("register_listeners_enter");
     const runtime = getLocusRuntime();
@@ -640,7 +653,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     // Bare stream events are retained only for migrated historical runs that
     // do not have a checkout binding. Current runs arrive through the scoped
     // workspace event stream below.
-    unlisten = await runtime.subscribe<StreamEvent>("stream-event", handleStreamEvent);
+    unlisten = await runtime.subscribe<StreamEvent>("stream-event", handleLegacyStreamEvent);
     unlistenSessionExecutionState = await runtime.subscribe<SessionExecutionStateChanged>(
       SESSION_EXECUTION_STATE_CHANGED_EVENT,
       (payload) => {
@@ -671,6 +684,13 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       WORKSPACE_EVENT_NAME,
       (event) => {
         if (!workspaceContextStore.applyWorkspaceEvent(event)) return;
+        if (event.eventName === "stream-event") {
+          const streamEvent = event as RoutedWorkspaceEvent<StreamEvent>;
+          publishSessionStreamEvent({
+            event: streamEvent.payload,
+            source: workspaceStreamEventSource(streamEvent),
+          });
+        }
         const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
         if (
           !workspaceRef

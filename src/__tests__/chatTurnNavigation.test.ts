@@ -116,7 +116,7 @@ describe("chat turn navigation", () => {
 
     expect(display).toContain("showTurnNavigationRail: true");
     expect(displayView).toContain("display.showTurnNavigationRail");
-    expect(chatView).toContain('v-if="displaySettings.showTurnNavigationRail"');
+    expect(chatView).toContain('v-if="displaySettings.showTurnNavigationRail && !scopedSession"');
     expect(chatView).toContain(":scroll-element=\"transcriptScrollElement\"");
     expect(chatView).toContain(":user-message-ids=\"chatStore.sessionUserMessageIds\"");
     expect(chatView).toContain(":load-preview=\"chatStore.loadSessionTurnPreview\"");

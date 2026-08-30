@@ -23,6 +23,7 @@ const props = withDefaults(defineProps<{
   showAction?: boolean;
   showHeader?: boolean | null;
   extendTop?: boolean;
+  dropAvailable?: boolean;
   dropActive?: boolean;
   dropLabel?: string;
 }>(), {
@@ -41,6 +42,7 @@ const props = withDefaults(defineProps<{
   showAction: true,
   showHeader: null,
   extendTop: false,
+  dropAvailable: false,
   dropActive: false,
   dropLabel: "",
 });
@@ -176,7 +178,12 @@ watch(() => props.compact, () => {
 <template>
   <div
     class="chat-composer"
-    :class="{ 'is-compact': compact, 'has-top-extension': extendTop, 'is-drop-active': dropActive }"
+    :class="{
+      'is-compact': compact,
+      'has-top-extension': extendTop,
+      'is-drop-available': dropAvailable || dropActive,
+      'is-drop-active': dropActive,
+    }"
     @dragenter="emit('dragenter', $event as DragEvent)"
     @dragover="emit('dragover', $event as DragEvent)"
     @dragleave="emit('dragleave', $event as DragEvent)"
@@ -279,6 +286,11 @@ watch(() => props.compact, () => {
 .chat-composer.is-drop-active {
   border-color: color-mix(in srgb, var(--accent-color) 48%, var(--border-color));
   background: color-mix(in srgb, var(--accent-soft) 12%, var(--input-bg) 88%);
+}
+
+.chat-composer.is-drop-available {
+  border-color: color-mix(in srgb, var(--accent-color) 58%, var(--border-color));
+  border-style: dashed;
 }
 
 .chat-composer-drop-overlay {
