@@ -71,6 +71,7 @@ import {
   startKnowledgeInternalDrag,
   type KnowledgeInternalDragData,
 } from "./knowledgeWorkspaceDrag";
+import { shouldShowKnowledgeEmptyFolder } from "./knowledgeExplorerEmptyFolder";
 import {
   type InternalDropDecision,
   type InternalDropResolveContext,
@@ -93,6 +94,7 @@ const props = defineProps<{
   folderStats: Record<string, KnowledgeFolderDisplayStats>;
   selectedPath: string | null;
   isPathExpanded: (path: string) => boolean;
+  rootContentsLoaded: (type: KnowledgeDocumentType) => boolean;
   hasMoreRootDocuments: (type: KnowledgeDocumentType) => boolean;
   rootDocumentsLoading: (type: KnowledgeDocumentType) => boolean;
   hasMoreFolderDocuments: (type: KnowledgeDocumentType, path: string) => boolean;
@@ -207,6 +209,12 @@ interface InlineRenameState {
 
 type VisibleEntry =
   | { type: "row"; key: string; row: FlatRow; treeRow: WorkspaceTreeRow }
+  | {
+      type: "emptyFolder";
+      key: string;
+      parentRow: FlatRow;
+      treeRow: WorkspaceTreeRow;
+    }
   | { type: "create"; key: string; draft: InlineCreateState; treeRow: null }
   | {
       type: "loadMore";
@@ -369,7 +377,7 @@ const visibleRows = computed<VisibleEntry[]>(() => {
           name: node.name,
           depth: node.depth,
           kind: node.kind === "document" ? "file" : node.kind,
-          expandable: branch && directChildCount > 0,
+          expandable: branch,
           expanded,
           selected:
             props.selectedPath === node.path
@@ -415,6 +423,41 @@ const visibleRows = computed<VisibleEntry[]>(() => {
       }
       if (branch && expanded) {
         walk(node.children, node);
+        if (
+          node.kind === "folder"
+          && shouldShowKnowledgeEmptyFolder({
+            searchMode: isSearchMode.value,
+            expanded,
+            directChildCount: Math.max(directChildCount, node.children.length),
+            contentsLoaded: node.specialRoot
+              ? props.rootContentsLoaded(node.type)
+              : folderLoaded,
+            contentsLoading: node.specialRoot
+              ? props.rootDocumentsLoading(node.type)
+              : props.folderDocumentsLoading(node.type, node.relativePath),
+            hasMoreContents: node.specialRoot
+              ? props.hasMoreRootDocuments(node.type)
+              : props.hasMoreFolderDocuments(node.type, node.relativePath),
+            hasTransientChild:
+              inlineCreate.value?.anchorPath === node.path
+              || knowledgePreviewParentMatches(node),
+          })
+        ) {
+          const emptyKey = `${node.path}::empty`;
+          out.push({
+            type: "emptyFolder",
+            key: emptyKey,
+            parentRow: row,
+            treeRow: {
+              key: emptyKey,
+              name: t("knowledge.explorer.emptyFolder"),
+              depth: node.depth + 1,
+              kind: "file",
+              disabled: true,
+              classes: { "is-empty-folder-row": true },
+            },
+          });
+        }
         if (
           !isSearchMode.value &&
           node.kind === "folder" &&
@@ -849,21 +892,26 @@ function resolveKnowledgeExplorerDrop(
         intent: inlineDropIntent.value,
       };
     }
-    const entry = visibleRows.value.find((candidate) => (
-      candidate.type === "row" && candidate.key === rowElement.dataset.treeKey
-    ));
-    if (!entry || entry.type !== "row" || entry.row.node.kind !== "folder") return null;
-    if (isManagedNode(entry.row.node)) return null;
-    const targetDir = entry.row.node.relativePath;
-    if (!nodes.some((node) => canDropOnDir(node, targetDir, entry.row.node.type))) return null;
+    const entry = visibleRows.value.find(
+      (candidate) => candidate.key === rowElement.dataset.treeKey,
+    );
+    const targetRow = entry?.type === "row"
+      ? entry.row
+      : entry?.type === "emptyFolder"
+        ? entry.parentRow
+        : null;
+    if (!targetRow || targetRow.node.kind !== "folder") return null;
+    if (isManagedNode(targetRow.node)) return null;
+    const targetDir = targetRow.node.relativePath;
+    if (!nodes.some((node) => canDropOnDir(node, targetDir, targetRow.node.type))) return null;
     return {
-      key: entry.row.node.path,
+      key: targetRow.node.path,
       operation: "move",
       intent: {
         targetDir,
-        targetType: entry.row.node.type,
-        targetPath: entry.row.node.path,
-        row: entry.row,
+        targetType: targetRow.node.type,
+        targetPath: targetRow.node.path,
+        row: targetRow,
       },
     };
   }
@@ -1400,7 +1448,7 @@ const keyboardRows = computed<KnowledgeTreeKeyboardRow[]>(() =>
     kind: entry.row.node.kind,
     depth: entry.row.node.depth,
     expanded: entry.row.expanded,
-    hasChildren: entry.row.directChildCount > 0,
+    hasChildren: isBranchNode(entry.row.node),
   })),
 );
 
@@ -1754,8 +1802,13 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
       >
         <template #icon="{ item }">
           <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
+            <span
+              v-if="entry.type === 'emptyFolder'"
+              class="kx-empty-folder-icon"
+              aria-hidden="true"
+            />
             <LucideIcon
-              v-if="entry.type === 'row' && entry.row.node.kind === 'folder'"
+              v-else-if="entry.type === 'row' && entry.row.node.kind === 'folder'"
               :icon="entry.row.expanded ? FolderOpen : Folder"
               :size="13"
               :stroke-width="2"
@@ -1780,6 +1833,9 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
           <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
             <span v-if="entry.type === 'row'" class="kx-name">
               {{ entry.row.node.name }}
+            </span>
+            <span v-else-if="entry.type === 'emptyFolder'">
+              {{ entry.treeRow.name }}
             </span>
           </template>
         </template>
@@ -2335,6 +2391,19 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
 .kx-tree :deep(.workspace-tree-row-shell.is-drop-preview .workspace-tree-row.disabled) {
   opacity: 0;
   transition: none;
+}
+
+.kx-tree :deep(.workspace-tree-row-shell.is-empty-folder-row),
+.kx-tree :deep(.workspace-tree-row-shell.is-empty-folder-row:hover) {
+  background: transparent;
+}
+
+.kx-tree :deep(.workspace-tree-row-shell.is-empty-folder-row .workspace-tree-row) {
+  cursor: default;
+}
+
+.kx-tree :deep(.workspace-tree-row-shell.kx-leaf .workspace-tree-row) {
+  cursor: default;
 }
 
 .kx-tree :deep(.workspace-tree-icon.kind-folder) {

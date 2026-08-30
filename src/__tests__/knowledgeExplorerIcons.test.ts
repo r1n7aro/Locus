@@ -31,7 +31,8 @@ describe("KnowledgeExplorer row icons", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
     const workspaceTree = read("src/components/explorer/WorkspaceTree.vue");
 
-    expect(explorer).toContain("entry.row.directChildCount > 0");
+    expect(explorer).toContain("expandable: branch");
+    expect(explorer).toContain("hasChildren: isBranchNode(entry.row.node)");
     expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
     expect(workspaceTree).not.toContain("workspace-tree-branch-spacer");
     expect(workspaceTree).not.toContain("workspace-tree-branch");

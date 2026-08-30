@@ -55,13 +55,17 @@ describe("KnowledgePreview continuous document layout", () => {
     expect(preview).not.toContain('class="preview-main-divider"');
     expect(preview).toMatch(/\.preview-main\s*\{[\s\S]*overflow:\s*auto;/);
     expect(preview.match(/\sauto-grow\s/g)).toHaveLength(3);
-    expect(preview.match(/\sdefer-rendered-editor\s/g)).toHaveLength(3);
+    expect(preview).not.toContain("defer-rendered-editor");
     expect(preview.match(/:content-key=/g)).toHaveLength(3);
+    expect(preview.match(/:session-cache="markdownEditorSessions"/g)).toHaveLength(3);
+    expect(preview.match(/:session-pinned=/g)).toHaveLength(3);
+    expect(preview).toContain("function isMarkdownEditorSessionPinned(section: KnowledgeDocumentSection)");
     expect(preview).toContain("const documentContentKey = computed(() =>");
+    expect(preview).toContain("const documentContentKey = computed(() => activeDocumentSessionKey.value)");
     expect(preview).toContain(':min-height="64"');
     expect(preview).toContain(':min-height="104"');
     expect(preview).toContain(':min-height="360"');
-    expect(preview).toMatch(/\.document-body\s*:deep\(\.base-markdown-editor \.vditor-ir pre\.vditor-reset\),[\s\S]*overflow-y:\s*visible;/);
+    expect(preview).toMatch(/\.document-body\s*:deep\(\.base-markdown-editor \.cm-scroller\)\s*\{[\s\S]*overflow:\s*visible;[\s\S]*overscroll-behavior:\s*auto;/);
     expect(preview).not.toMatch(/\.document-body\.is-loading\s*\{[\s\S]*opacity:/);
   });
 
@@ -106,12 +110,12 @@ describe("KnowledgePreview continuous document layout", () => {
     expect(preview).not.toContain("metaCollapsed");
   });
 
-  it("retains rendered search highlighting for all three content fields", () => {
+  it("keeps all three markdown editors mounted while showing search hits", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
-    expect(preview).toContain('ref="summaryRenderedSearchRef"');
-    expect(preview).toContain('ref="rulesRenderedSearchRef"');
-    expect(preview).toContain('ref="bodyRenderedSearchRef"');
+    expect(preview).not.toContain("showSearchRenderedContent");
+    expect(preview).not.toContain("<MarkdownRenderer");
+    expect(preview.match(/<BaseMarkdownEditor/g)).toHaveLength(3);
     expect(preview).toContain("isSearchMatchSection('summary')");
     expect(preview).toContain("isSearchMatchSection('maintenanceRules')");
     expect(preview).toContain("isSearchMatchSection('body')");

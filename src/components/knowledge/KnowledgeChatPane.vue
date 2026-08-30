@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { t } from "../../i18n";
 import type { KnowledgeDocument } from "../../types";
 import EmbeddedChatPane from "../chat/EmbeddedChatPane.vue";
@@ -45,6 +45,8 @@ const placeholder = computed(() => (
 
 const {
   inputText,
+  restoredComposerDraft,
+  clearRestoredComposerDraft,
   messages,
   streamingText,
   thinkingText,
@@ -96,6 +98,13 @@ const {
 });
 
 const embeddedChatPaneRef = ref<InstanceType<typeof EmbeddedChatPane> | null>(null);
+
+watch(restoredComposerDraft, async (draft) => {
+  if (!draft) return;
+  await nextTick();
+  await embeddedChatPaneRef.value?.applyDraftPrefill(draft);
+  clearRestoredComposerDraft(draft);
+}, { flush: "post" });
 
 async function handleReEditQueuedFollowUp() {
   const draft = await reEditQueuedFollowUp();

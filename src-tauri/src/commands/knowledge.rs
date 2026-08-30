@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -48,12 +49,16 @@ pub const UNITY_REFERENCE_IMPORT_WINDOW_LABEL: &str = "unity-reference-import-pr
 pub const FEISHU_REFERENCE_IMPORT_WINDOW_LABEL: &str = "feishu-reference-import-progress";
 const DEFAULT_KNOWLEDGE_PAGE_SIZE: usize = 200;
 const MAX_KNOWLEDGE_PAGE_SIZE: usize = 500;
+static LAST_KNOWLEDGE_CHANGED_AT: AtomicI64 = AtomicI64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeChangedEvent {
     pub working_dir: String,
     pub source: String,
+    /// A process-monotonic event watermark expressed in epoch milliseconds.
+    /// Consumers can discard an event whose value is older than the latest
+    /// watermark already applied for the same knowledge target.
     pub changed_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub doc_type: Option<String>,
@@ -81,6 +86,23 @@ pub(crate) struct KnowledgeChangedTarget {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn next_knowledge_changed_at() -> i64 {
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut previous = LAST_KNOWLEDGE_CHANGED_AT.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(previous.saturating_add(1));
+        match LAST_KNOWLEDGE_CHANGED_AT.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,7 +206,7 @@ pub(crate) fn emit_knowledge_changed_with_target(
     let payload = KnowledgeChangedEvent {
         working_dir: working_dir.to_string(),
         source: source.to_string(),
-        changed_at: chrono::Utc::now().timestamp_millis(),
+        changed_at: next_knowledge_changed_at(),
         doc_type: target.doc_type.map(|value| value.as_str().to_string()),
         path: target.path,
         parent_path: target.parent_path,
@@ -202,6 +224,24 @@ pub(crate) fn emit_knowledge_changed_with_target(
     }
 }
 
+fn emit_knowledge_changed_with_targets(
+    app_handle: &AppHandle,
+    knowledge_index_state: &KnowledgeIndexState,
+    working_dir: &str,
+    source: &str,
+    targets: impl IntoIterator<Item = KnowledgeChangedTarget>,
+) {
+    for target in targets {
+        emit_knowledge_changed_with_target(
+            app_handle,
+            knowledge_index_state,
+            working_dir,
+            source,
+            target,
+        );
+    }
+}
+
 pub(crate) fn emit_knowledge_changed_with_target_for_scope(
     app_handle: &AppHandle,
     scope: &crate::workspace_service::event::WorkspaceEventScope,
@@ -212,7 +252,7 @@ pub(crate) fn emit_knowledge_changed_with_target_for_scope(
     let payload = KnowledgeChangedEvent {
         working_dir: working_dir.to_string(),
         source: source.to_string(),
-        changed_at: chrono::Utc::now().timestamp_millis(),
+        changed_at: next_knowledge_changed_at(),
         doc_type: target.doc_type.map(|value| value.as_str().to_string()),
         path: target.path,
         parent_path: target.parent_path,
@@ -260,6 +300,43 @@ pub(crate) async fn reconcile_and_emit_knowledge_changed(
         source,
         KnowledgeChangedTarget::default(),
     );
+    Ok(())
+}
+
+async fn reconcile_and_emit_knowledge_changed_with_targets(
+    app_handle: &AppHandle,
+    working_dir: &str,
+    knowledge_index_state: Arc<KnowledgeIndexState>,
+    source: &str,
+    targets: Vec<KnowledgeChangedTarget>,
+) -> Result<(), AppError> {
+    if working_dir.trim().is_empty() {
+        return Ok(());
+    }
+
+    let event_scope = knowledge_index_state.event_scope().ok_or_else(|| {
+        AppError::new(
+            "knowledge.workspace_scope_unavailable",
+            "The knowledge workspace scope is unavailable.",
+        )
+    })?;
+    let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
+    knowledge_index::reconcile_workspace(
+        working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        knowledge_index_state,
+    )
+    .await
+    .map_err(AppError::from)?;
+    for target in targets {
+        emit_knowledge_changed_with_target_for_scope(
+            app_handle,
+            &event_scope,
+            working_dir,
+            source,
+            target,
+        );
+    }
     Ok(())
 }
 
@@ -959,6 +1036,76 @@ fn parent_directory_from_directory_path(path: &str) -> Option<String> {
         .map(|value| value.to_string_lossy().replace('\\', "/"))
         .map(|value| value.trim_matches('/').to_string())
         .filter(|value| !value.is_empty() && value != ".")
+}
+
+fn document_change_target(
+    doc_type: KnowledgeType,
+    path: impl Into<String>,
+    change_kind: &'static str,
+) -> KnowledgeChangedTarget {
+    let path = path.into();
+    KnowledgeChangedTarget {
+        doc_type: Some(doc_type),
+        parent_path: parent_directory_from_document_path(&path),
+        path: Some(path),
+        target_kind: Some("document"),
+        change_kind: Some(change_kind),
+        subtree: false,
+    }
+}
+
+fn directory_change_target(
+    doc_type: KnowledgeType,
+    path: impl Into<String>,
+    change_kind: &'static str,
+) -> KnowledgeChangedTarget {
+    let path = path.into();
+    KnowledgeChangedTarget {
+        doc_type: Some(doc_type),
+        parent_path: parent_directory_from_directory_path(&path),
+        path: Some(path),
+        target_kind: Some("directory"),
+        change_kind: Some(change_kind),
+        subtree: true,
+    }
+}
+
+fn document_mutation_targets(
+    result: &KnowledgeMutationResponse,
+    default_change_kind: &'static str,
+) -> Vec<KnowledgeChangedTarget> {
+    let result_path = result.result_path.as_deref().unwrap_or(&result.path);
+    if result_path == result.path {
+        return vec![document_change_target(
+            result.doc_type,
+            result_path,
+            default_change_kind,
+        )];
+    }
+
+    vec![
+        document_change_target(result.doc_type, result.path.clone(), "structure"),
+        document_change_target(result.doc_type, result_path, "structure"),
+    ]
+}
+
+fn directory_mutation_targets(
+    result: &KnowledgeMutationResponse,
+    default_change_kind: &'static str,
+) -> Vec<KnowledgeChangedTarget> {
+    let result_path = result.result_path.as_deref().unwrap_or(&result.path);
+    if result_path == result.path {
+        return vec![directory_change_target(
+            result.doc_type,
+            result_path,
+            default_change_kind,
+        )];
+    }
+
+    vec![
+        directory_change_target(result.doc_type, result.path.clone(), "structure"),
+        directory_change_target(result.doc_type, result_path, "structure"),
+    ]
 }
 
 fn merge_document_create_patch(
@@ -2907,19 +3054,22 @@ pub async fn knowledge_create(
                 .await
                 .map_err(AppError::from)?;
             }
-            emit_knowledge_changed(
+            emit_knowledge_changed_with_targets(
                 &app_handle,
                 &knowledge_index_state,
                 &working_dir,
                 "knowledge_create",
+                document_mutation_targets(&result, "structure"),
             );
         }
         KnowledgeTargetKind::Directory => {
-            reconcile_and_emit_knowledge_changed(
+            let targets = directory_mutation_targets(&result, "structure");
+            reconcile_and_emit_knowledge_changed_with_targets(
                 &app_handle,
                 &working_dir,
                 knowledge_index_state,
                 "knowledge_create",
+                targets,
             )
             .await?;
         }
@@ -2967,19 +3117,22 @@ pub async fn knowledge_edit(
                     .await?;
                 }
             }
-            emit_knowledge_changed(
+            emit_knowledge_changed_with_targets(
                 &app_handle,
                 &knowledge_index_state,
                 &working_dir,
                 "knowledge_edit",
+                document_mutation_targets(&result, "content"),
             );
         }
         KnowledgeTargetKind::Directory => {
-            reconcile_and_emit_knowledge_changed(
+            let targets = directory_mutation_targets(&result, "config");
+            reconcile_and_emit_knowledge_changed_with_targets(
                 &app_handle,
                 &working_dir,
                 knowledge_index_state,
                 "knowledge_edit",
+                targets,
             )
             .await?;
         }
@@ -3025,19 +3178,22 @@ pub async fn knowledge_move(
                 )
                 .await?;
             }
-            emit_knowledge_changed(
+            emit_knowledge_changed_with_targets(
                 &app_handle,
                 &knowledge_index_state,
                 &working_dir,
                 "knowledge_move",
+                document_mutation_targets(&result, "structure"),
             );
         }
         KnowledgeTargetKind::Directory => {
-            reconcile_and_emit_knowledge_changed(
+            let targets = directory_mutation_targets(&result, "structure");
+            reconcile_and_emit_knowledge_changed_with_targets(
                 &app_handle,
                 &working_dir,
                 knowledge_index_state,
                 "knowledge_move",
+                targets,
             )
             .await?;
         }
@@ -3069,19 +3225,22 @@ pub async fn knowledge_delete(
                 )
                 .await?;
             }
-            emit_knowledge_changed(
+            emit_knowledge_changed_with_targets(
                 &app_handle,
                 &knowledge_index_state,
                 &working_dir,
                 "knowledge_delete",
+                document_mutation_targets(&result, "structure"),
             );
         }
         KnowledgeTargetKind::Directory => {
-            reconcile_and_emit_knowledge_changed(
+            let targets = directory_mutation_targets(&result, "structure");
+            reconcile_and_emit_knowledge_changed_with_targets(
                 &app_handle,
                 &working_dir,
                 knowledge_index_state,
                 "knowledge_delete",
+                targets,
             )
             .await?;
         }
@@ -3112,11 +3271,16 @@ pub async fn knowledge_delete_external_reference_directory(
     }
     knowledge_store::delete_external_reference_directory(&working_dir, &normalized_path)
         .map_err(AppError::from)?;
-    reconcile_and_emit_knowledge_changed(
+    reconcile_and_emit_knowledge_changed_with_targets(
         &app_handle,
         &working_dir,
         knowledge_index_state,
         "knowledge_delete_external_reference_directory",
+        vec![directory_change_target(
+            KnowledgeType::Reference,
+            normalized_path,
+            "structure",
+        )],
     )
     .await?;
     Ok(())
@@ -5022,6 +5186,83 @@ mod tests {
             allow_move_directories: true,
             maintenance_rules: "- Keep inherited child knowledge stable".to_string(),
         }
+    }
+
+    #[test]
+    fn knowledge_changed_watermark_is_strictly_monotonic() {
+        let first = next_knowledge_changed_at();
+        let second = next_knowledge_changed_at();
+
+        assert!(second > first);
+    }
+
+    #[test]
+    fn document_edit_target_is_scoped_to_the_exact_document() {
+        let result = KnowledgeMutationResponse {
+            kind: KnowledgeTargetKind::Document,
+            doc_type: KnowledgeType::Design,
+            path: "combat/core-loop.md".to_string(),
+            result_path: Some("combat/core-loop.md".to_string()),
+            document: None,
+            directory: None,
+        };
+
+        let targets = document_mutation_targets(&result, "content");
+
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.doc_type, Some(KnowledgeType::Design));
+        assert_eq!(target.path.as_deref(), Some("combat/core-loop.md"));
+        assert_eq!(target.parent_path.as_deref(), Some("combat"));
+        assert_eq!(target.target_kind, Some("document"));
+        assert_eq!(target.change_kind, Some("content"));
+        assert!(!target.subtree);
+    }
+
+    #[test]
+    fn document_move_targets_both_old_and_new_paths() {
+        let result = KnowledgeMutationResponse {
+            kind: KnowledgeTargetKind::Document,
+            doc_type: KnowledgeType::Memory,
+            path: "old/note.md".to_string(),
+            result_path: Some("new/note.md".to_string()),
+            document: None,
+            directory: None,
+        };
+
+        let targets = document_mutation_targets(&result, "content");
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].path.as_deref(), Some("old/note.md"));
+        assert_eq!(targets[0].parent_path.as_deref(), Some("old"));
+        assert_eq!(targets[1].path.as_deref(), Some("new/note.md"));
+        assert_eq!(targets[1].parent_path.as_deref(), Some("new"));
+        assert!(targets
+            .iter()
+            .all(|target| target.change_kind == Some("structure") && !target.subtree));
+    }
+
+    #[test]
+    fn directory_edit_target_invalidates_only_its_subtree() {
+        let result = KnowledgeMutationResponse {
+            kind: KnowledgeTargetKind::Directory,
+            doc_type: KnowledgeType::Reference,
+            path: "external/api".to_string(),
+            result_path: None,
+            document: None,
+            directory: None,
+        };
+
+        let targets = directory_mutation_targets(&result, "config");
+
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.doc_type, Some(KnowledgeType::Reference));
+        assert_eq!(target.path.as_deref(), Some("external/api"));
+        assert_eq!(target.parent_path.as_deref(), Some("external"));
+        assert_eq!(target.target_kind, Some("directory"));
+        assert_eq!(target.change_kind, Some("config"));
+        assert!(target.subtree);
     }
 
     fn package_list_item(path: &str) -> KnowledgeListItem {

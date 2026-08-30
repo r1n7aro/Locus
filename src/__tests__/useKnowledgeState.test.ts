@@ -6,6 +6,9 @@ import {
   useKnowledgeState as useKnowledgeStateImpl,
   type ExplorerNode,
 } from "../composables/useKnowledgeState";
+import { clearKnowledgeDocumentCacheForTests } from "../composables/knowledgeDocumentCache";
+import { clearKnowledgeCatalogCacheForTests } from "../composables/knowledgeCatalogCache";
+import { resetKnowledgeWorkspaceEventHubForTests } from "../services/knowledgeWorkspaceEventHub";
 import type {
   FeishuReferenceImportStatus,
   KnowledgeChangedEvent,
@@ -278,6 +281,8 @@ type KnowledgeStateProps = {
   workingDir: string;
   selectedModelId: string;
   modelDefaults: any;
+  embedded?: boolean;
+  active?: boolean;
 };
 
 type TauriEventHandler<T> = (event: { payload: T }) => void;
@@ -355,6 +360,9 @@ function mountKnowledgeState(props: KnowledgeStateProps) {
 
 describe("useKnowledgeState", () => {
   beforeEach(() => {
+    clearKnowledgeDocumentCacheForTests();
+    clearKnowledgeCatalogCacheForTests();
+    resetKnowledgeWorkspaceEventHubForTests();
     setActivePinia(createPinia());
     vi.clearAllMocks();
     vi.useRealTimers();
@@ -1048,6 +1056,59 @@ describe("useKnowledgeState", () => {
     expect(knowledgeMocks.knowledgeList).toHaveBeenCalledTimes(8);
   });
 
+  it("resets documents and selection when the checkout generation changes", async () => {
+    let currentDocs: KnowledgeDocumentSummary[] = [
+      {
+        id: "design-generation-7",
+        type: "design",
+        path: "generation-7.md",
+        title: "Generation 7",
+        injectMode: "excerpt",
+        effectiveInjectMode: "excerpt",
+        readOnly: false,
+        aiMaintained: false,
+        effectiveAiMaintained: false,
+        summary: "old generation",
+        modifiedAt: 7,
+      },
+    ];
+    knowledgeMocks.knowledgeList.mockImplementation(async () => currentDocs);
+    const props = reactive({
+      workingDir: "F:/repo",
+      workspaceRef: {
+        checkoutId: "checkout-a",
+        expectedGeneration: 7,
+      },
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const state = useKnowledgeState(props);
+
+    await state.refreshKnowledgeData();
+    await state.selectDocument(currentDocs[0]);
+    expect(state.selectedDocument.value?.path).toBe("generation-7.md");
+
+    currentDocs = [
+      {
+        ...currentDocs[0],
+        id: "design-generation-8",
+        path: "generation-8.md",
+        title: "Generation 8",
+        summary: "new generation",
+        modifiedAt: 8,
+      },
+    ];
+    props.workspaceRef.expectedGeneration = 8;
+    await nextTick();
+    await flushPromises(8);
+
+    expect(state.selectedDocument.value).toBeNull();
+    expect(state.selectedDirectoryConfig.value).toBeNull();
+    expect(state.documents.value.map((document) => document.path)).toEqual([
+      "generation-8.md",
+    ]);
+  });
+
   it("drops queued external knowledge changes after the workspace changes", async () => {
     vi.useFakeTimers();
     const props = reactive({
@@ -1232,6 +1293,115 @@ describe("useKnowledgeState", () => {
     await flushPromises(8);
 
     expect(mounted.state.selectedDocument.value?.body).toBe("正文 v3");
+    mounted.unmount();
+  });
+
+  it("serializes directory refresh events and ignores an older changedAt watermark", async () => {
+    vi.useFakeTimers();
+    const mounted = mountKnowledgeState(reactive({
+      workingDir: "F:/repo",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    }));
+    await flushPromises(8);
+    await mounted.state.selectDirectory("combat");
+    knowledgeMocks.knowledgeListDirectories.mockClear();
+
+    let resolveFirst!: (value: string[]) => void;
+    knowledgeMocks.knowledgeListDirectories
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveFirst = resolve;
+      }))
+      .mockResolvedValueOnce(["combat"]);
+
+    const emitDirectoryChange = (changedAt: number) => {
+      emitWorkspaceKnowledgeEvent<KnowledgeChangedEvent>("knowledge-changed", {
+        workingDir: "F:/repo",
+        source: "knowledge_fs_watcher",
+        changedAt,
+        docType: "design",
+        path: "combat",
+        parentPath: "",
+        targetKind: "directory",
+        changeKind: "config",
+        subtree: true,
+      });
+    };
+
+    emitDirectoryChange(10);
+    vi.advanceTimersByTime(100);
+    await flushPromises(8);
+    expect(knowledgeMocks.knowledgeListDirectories).toHaveBeenCalledTimes(1);
+
+    emitDirectoryChange(11);
+    emitDirectoryChange(9);
+    vi.advanceTimersByTime(100);
+    await flushPromises(8);
+    expect(knowledgeMocks.knowledgeListDirectories).toHaveBeenCalledTimes(1);
+
+    resolveFirst(["combat"]);
+    await flushPromises(24);
+
+    const callsAfterLatestEvent = knowledgeMocks.knowledgeListDirectories.mock.calls.length;
+    expect(callsAfterLatestEvent).toBeGreaterThan(1);
+    emitDirectoryChange(9);
+    vi.advanceTimersByTime(100);
+    await flushPromises(8);
+    expect(knowledgeMocks.knowledgeListDirectories).toHaveBeenCalledTimes(
+      callsAfterLatestEvent,
+    );
+    mounted.unmount();
+  });
+
+  it("revalidates a hidden embedded directory when its pane becomes active", async () => {
+    const props = reactive({
+      workingDir: "F:/repo",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+      embedded: true,
+      active: true,
+    });
+    const mounted = mountKnowledgeState(props);
+    await mounted.state.refreshKnowledgeData();
+    await mounted.state.selectDirectory("combat");
+    const previous = mounted.state.selectedDirectoryConfig.value!;
+
+    props.active = false;
+    await nextTick();
+    knowledgeMocks.knowledgeRead.mockClear();
+    knowledgeMocks.knowledgeRead.mockResolvedValueOnce({
+      kind: "directory",
+      directory: {
+        ...previous,
+        summary: "revalidated after hidden event",
+        modifiedAt: 20,
+      },
+    });
+    emitWorkspaceKnowledgeEvent<KnowledgeChangedEvent>("knowledge-changed", {
+      workingDir: "F:/repo",
+      source: "knowledge_fs_watcher",
+      changedAt: 20,
+      docType: "design",
+      path: "combat",
+      targetKind: "directory",
+      changeKind: "config",
+      subtree: true,
+    });
+    await flushPromises(4);
+    expect(knowledgeMocks.knowledgeRead).not.toHaveBeenCalled();
+
+    props.active = true;
+    await nextTick();
+    await flushPromises(8);
+
+    expect(knowledgeMocks.knowledgeRead).toHaveBeenCalledWith({
+      kind: "directory",
+      path: "combat",
+      type: "design",
+    });
+    expect(mounted.state.selectedDirectoryConfig.value?.summary).toBe(
+      "revalidated after hidden event",
+    );
     mounted.unmount();
   });
 
@@ -1871,6 +2041,41 @@ describe("useKnowledgeState", () => {
       part: "full",
     });
     expect(state.selectedDocument.value?.body).toBe("正文");
+  });
+
+  it("opens an embedded target without loading the full catalog", async () => {
+    const mounted = mountKnowledgeState(reactive({
+      workingDir: "F:/repo",
+      selectedModelId: "",
+      modelDefaults: {} as any,
+      embedded: true,
+      active: true,
+    }));
+    await flushPromises(4);
+    expect(knowledgeMocks.knowledgeList).not.toHaveBeenCalled();
+    expect(knowledgeMocks.knowledgeListDirectories).not.toHaveBeenCalled();
+
+    await mounted.state.selectDocument({
+      id: "design-1",
+      type: "design",
+      path: "combat/core-loop.md",
+      title: "核心循环",
+      injectMode: "excerpt",
+      effectiveInjectMode: "excerpt",
+      readOnly: false,
+      aiMaintained: false,
+      effectiveAiMaintained: false,
+      summary: "摘要",
+      modifiedAt: 2,
+    });
+    expect(mounted.state.selectedDocument.value?.body).toBe("正文");
+    expect(knowledgeMocks.knowledgeRead).toHaveBeenCalledWith({
+      kind: "document",
+      path: "combat/core-loop.md",
+      type: "design",
+      part: "full",
+    });
+    mounted.unmount();
   });
 
   it("does not reread a selected document after deleting it from the explorer", async () => {
@@ -2561,6 +2766,60 @@ describe("useKnowledgeState", () => {
     );
     expect(state.selectedDocument.value?.body).toBe("正文 v2");
     expect(state.selectedDocument.value?.fileMetadata).toEqual(fileMetadata);
+  });
+
+  it("saves collaborative replacement operations as one document mutation", async () => {
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+    await state.refreshKnowledgeData();
+    knowledgeMocks.knowledgeEdit.mockResolvedValueOnce({
+      kind: "document",
+      type: "design",
+      path: "combat/core-loop.md",
+      resultPath: "combat/core-loop.md",
+      document: {
+        id: "design-1",
+        type: "design",
+        path: "combat/core-loop.md",
+        title: "核心循环",
+        injectMode: "excerpt",
+        effectiveInjectMode: "excerpt",
+        readOnly: false,
+        aiMaintained: false,
+        effectiveAiMaintained: false,
+        summary: "摘要",
+        body: "正文 v2",
+        maintenanceRules: null,
+        modifiedAt: 3,
+      },
+    });
+
+    const edits = [{
+      section: "body" as const,
+      oldString: "正文",
+      newString: "正文 v2",
+    }];
+    const updated = await state.updateDocumentEdits(
+      "design-1",
+      "combat/core-loop.md",
+      edits,
+    );
+
+    expect(knowledgeMocks.knowledgeEdit).toHaveBeenCalledWith({
+      kind: "document",
+      type: "design",
+      path: "combat/core-loop.md",
+      document: {
+        id: "design-1",
+        edits,
+      },
+    });
+    expect(updated?.body).toBe("正文 v2");
   });
 
   it("creates a new design document with inherited category defaults", async () => {
@@ -3489,6 +3748,106 @@ describe("useKnowledgeState", () => {
       "维护战斗与角色组织",
     );
     expect(state.selectedDirectoryConfig.value?.injectMode).toBe("path");
+  });
+
+  it("does not let a delayed directory save response replace a newer selection", async () => {
+    let resolveSave!: (value: any) => void;
+    knowledgeMocks.knowledgeEdit.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+    const state = useKnowledgeState(
+      reactive({
+        workingDir: "F:/repo",
+        selectedModelId: "",
+        modelDefaults: {} as any,
+      }),
+    );
+
+    await state.refreshKnowledgeData();
+    await state.selectDirectory("design", "combat");
+    const combat = state.selectedDirectoryConfig.value!;
+    const pending = state.saveDirectoryConfig("combat", {
+      ...combat,
+      summary: "saved combat",
+    });
+    await flushPromises(2);
+
+    await state.selectDirectory("design", "systems");
+    expect(state.selectedDirectoryConfig.value?.path).toBe("systems");
+
+    resolveSave({
+      kind: "directory",
+      type: "design",
+      path: "combat",
+      resultPath: null,
+      document: null,
+      directory: {
+        ...combat,
+        summary: "saved combat",
+        updatedAt: 3,
+      },
+    });
+    await pending;
+    await nextTick();
+
+    expect(state.selectedDirectoryConfig.value?.path).toBe("systems");
+    expect(state.selectedDirectoryConfig.value?.summary).toBe("维护战斗结构缓存");
+  });
+
+  it("drops a delayed directory save response after the workspace changes", async () => {
+    let resolveSave!: (value: any) => void;
+    knowledgeMocks.knowledgeEdit.mockImplementationOnce(
+      () => new Promise((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+    const props = reactive({
+      workingDir: "F:/repo-a",
+      workspaceRef: {
+        checkoutId: "checkout-a",
+        expectedGeneration: 1,
+      },
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const state = useKnowledgeState(props);
+
+    await state.refreshKnowledgeData();
+    await state.selectDirectory("design", "combat");
+    const combat = state.selectedDirectoryConfig.value!;
+    const pending = state.saveDirectoryConfig("combat", {
+      ...combat,
+      summary: "workspace A save",
+    });
+    await flushPromises(2);
+
+    props.workingDir = "F:/repo-b";
+    props.workspaceRef = {
+      checkoutId: "checkout-b",
+      expectedGeneration: 1,
+    };
+    await nextTick();
+    await flushPromises(8);
+    expect(state.selectedDirectoryConfig.value).toBeNull();
+
+    resolveSave({
+      kind: "directory",
+      type: "design",
+      path: "combat",
+      resultPath: null,
+      document: null,
+      directory: {
+        ...combat,
+        summary: "workspace A save",
+        updatedAt: 3,
+      },
+    });
+    await pending;
+    await nextTick();
+
+    expect(state.selectedDirectoryConfig.value).toBeNull();
   });
 
   it("deletes a folder from the explorer tree", async () => {

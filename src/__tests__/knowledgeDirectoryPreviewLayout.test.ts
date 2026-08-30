@@ -57,11 +57,14 @@ describe("KnowledgeDirectoryPreview layout", () => {
     expect(preview).toContain(":view-mode=\"editorViewMode\"");
     expect(preview).toContain(':content-key="`${directoryContentKey}:summary`"');
     expect(preview).toContain(':content-key="`${directoryContentKey}:maintenanceRules`"');
-    expect(preview).toContain("defer-rendered-editor");
+    expect(preview.match(/:session-cache="markdownEditorSessions"/g)).toHaveLength(2);
+    expect(preview.match(/:session-pinned="isDirty"/g)).toHaveLength(2);
+    expect(preview).not.toContain("defer-rendered-editor");
     expect(preview).toContain("auto-grow");
     expect(preview).toContain(':min-height="64"');
     expect(preview).toContain(':min-height="104"');
     expect(preview).toContain("const directoryContentKey = computed(() =>");
+    expect(preview).toContain("const directoryContentKey = computed(() => directoryKey(props.directory))");
     expect(preview).toContain("import BaseSegmented from \"../ui/BaseSegmented.vue\"");
     expect(preview).toMatch(/\.directory-inline-field\s*:deep\(\.base-markdown-editor\)\s*\{[\s\S]*height:\s*auto;[\s\S]*border-left:\s*1px solid var\(--border-color\);/);
   });

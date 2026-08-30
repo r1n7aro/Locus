@@ -17,6 +17,14 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(workspaceTree).not.toContain("workspace-tree-branch");
   });
 
+  it("keeps the default cursor on draggable knowledge documents", () => {
+    const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
+
+    expect(explorer).toMatch(
+      /\.workspace-tree-row-shell\.kx-leaf \.workspace-tree-row\) \{\s*cursor:\s*default;/,
+    );
+  });
+
   it("locks row heights to the virtualizer's row-height", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
     const workspaceTree = read("src/components/explorer/WorkspaceTree.vue");
@@ -56,6 +64,23 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(explorer).not.toContain("onRowDoubleClick");
     expect(explorer).not.toContain("@double-click");
     expect(explorer).toContain('@click="startRenameSelection"');
+  });
+
+  it("renders a disabled child row when an expanded knowledge folder is empty", () => {
+    const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    expect(explorer).toContain("shouldShowKnowledgeEmptyFolder({");
+    expect(explorer).toContain('type: "emptyFolder"');
+    expect(explorer).toContain('t("knowledge.explorer.emptyFolder")');
+    expect(explorer).toContain('classes: { "is-empty-folder-row": true }');
+    expect(explorer).toContain("disabled: true");
+    expect(explorer).toContain("expandable: branch");
+    expect(explorer).toContain('entry?.type === "emptyFolder"');
+    expect(explorer).toContain("entry.parentRow");
+    expect(zh).toContain('"knowledge.explorer.emptyFolder": "暂无文件"');
+    expect(en).toContain('"knowledge.explorer.emptyFolder": "No files"');
   });
 
   it("provides keyboard navigation with tree ARIA semantics", () => {

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { Text } from "@codemirror/state";
 import { computed, onUnmounted, ref, watch } from "vue";
 import type {
   EffectiveCapabilityState,
@@ -20,6 +21,11 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import {
+  markdownEditorTextHasContent,
+  markdownEditorTextFromString,
+  type MarkdownEditorDocumentChange,
+} from "../ui/markdown-editor/markdownEditorDocumentChange";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import ReferenceExternalImportPanel from "./ReferenceExternalImportPanel.vue";
 import {
@@ -28,23 +34,34 @@ import {
 } from "../ui/markdownEditorViewMode";
 import type { WorkspaceRef } from "../../services/project";
 import {
+  KnowledgeEditorWorkspaceSessionStore,
+  knowledgeDirectoryEditorSessionKey,
+  type DirectoryMarkdownField,
+  type KnowledgeDirectoryEditorSession,
+} from "./knowledgeEditorWorkspaceSession";
+import {
   buildKnowledgeFolderWorkspaceDragPayload,
   startKnowledgeInternalDrag,
 } from "./knowledgeWorkspaceDrag";
 import { useInternalDragController } from "../../composables/useInternalDrag";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   workspaceRef: WorkspaceRef;
   directory: KnowledgeDirectoryConfigRecord | null;
   loading: boolean;
   saveLoading: boolean;
+  active?: boolean;
+  sessionStore?: KnowledgeEditorWorkspaceSessionStore | null;
   pathExists?: ((path: string) => boolean) | null;
   ensureDirectory?: ((path: string) => Promise<boolean>) | null;
   selectDirectory?: ((path: string) => Promise<void>) | null;
   refreshKnowledge?: (() => Promise<void>) | null;
   deleteFeishuImport?: ((path: string) => Promise<void>) | null;
   deleteUnityImport?: ((path: string) => Promise<void>) | null;
-}>();
+}>(), {
+  active: true,
+  sessionStore: null,
+});
 const internalDrag = useInternalDragController();
 
 const emit = defineEmits<{
@@ -77,31 +94,162 @@ const draft = ref<KnowledgeDirectoryConfig>({
 });
 const autoSaveQueued = ref(false);
 const autoSaveInFlight = ref(false);
+const markdownTextBuffers = new Map<DirectoryMarkdownField, Text>();
+const markdownBaseTexts = new Map<DirectoryMarkdownField, Text>();
+const markdownDirtyFields = ref<Set<DirectoryMarkdownField>>(new Set());
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let submittedDirectoryKey = "";
+let submittedDraft: KnowledgeDirectoryConfig | null = null;
+let activeDirectoryKey = "";
+let activeDirectoryBaseDraft: KnowledgeDirectoryConfig = { ...draft.value };
+const localEditorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
+const editorWorkspaceSessions = props.sessionStore ?? localEditorWorkspaceSessions;
+const directorySessions = editorWorkspaceSessions.directories;
+const markdownEditorSessions = editorWorkspaceSessions.markdownEditors;
+
+function directoryKey(directory: KnowledgeDirectoryConfigRecord | null | undefined): string {
+  return knowledgeDirectoryEditorSessionKey(props.workspaceRef, directory);
+}
+
+function configFromDirectory(directory: KnowledgeDirectoryConfigRecord): KnowledgeDirectoryConfig {
+  return {
+    version: directory.version,
+    summary: directory.summary ?? "",
+    injectMode: directory.injectMode,
+    effectiveInjectMode: directory.effectiveInjectMode,
+    aiMaintained: directory.aiMaintained,
+    effectiveAiMaintained: directory.effectiveAiMaintained,
+    lexicalSearch: directory.lexicalSearch ?? "inherit",
+    vectorSearch: directory.vectorSearch ?? "inherit",
+    inheritToChildren: directory.inheritToChildren !== false,
+    allowCreateDocuments: directory.allowCreateDocuments !== false,
+    allowCreateDirectories: directory.allowCreateDirectories !== false,
+    allowMoveDocuments: directory.allowMoveDocuments !== false,
+    allowMoveDirectories: directory.allowMoveDirectories !== false,
+    maintenanceRules: directory.maintenanceRules,
+    effectiveMaintenanceRules: directory.effectiveMaintenanceRules,
+  };
+}
+
+function mergeDirectorySaveResponse(
+  remote: KnowledgeDirectoryConfig,
+  local: KnowledgeDirectoryConfig,
+  submitted: KnowledgeDirectoryConfig,
+): KnowledgeDirectoryConfig {
+  const merged = { ...remote };
+  for (const key of Object.keys(remote) as Array<keyof KnowledgeDirectoryConfig>) {
+    if (JSON.stringify(local[key]) === JSON.stringify(submitted[key])) continue;
+    (merged as Record<string, unknown>)[key] = local[key];
+  }
+  return merged;
+}
+
+function directoryConfigValuesEqual(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergeUnsavedDirectoryDraft(
+  remote: KnowledgeDirectoryConfig,
+  local: KnowledgeDirectoryConfig,
+  base: KnowledgeDirectoryConfig,
+): KnowledgeDirectoryConfig {
+  const merged = { ...remote };
+  for (const key of Object.keys(remote) as Array<keyof KnowledgeDirectoryConfig>) {
+    if (directoryConfigValuesEqual(local[key], base[key])) continue;
+    (merged as Record<string, unknown>)[key] = local[key];
+  }
+  return merged;
+}
+
+function currentDirectorySession(): KnowledgeDirectoryEditorSession {
+  const materialized = { ...materializedDirectoryDraft() };
+  return {
+    draft: materialized,
+    baseDraft: { ...activeDirectoryBaseDraft },
+    markdownTextBuffers: new Map(markdownTextBuffers),
+    markdownBaseTexts: new Map(markdownBaseTexts),
+    markdownDirtyFields: new Set(markdownDirtyFields.value),
+    submittedDraft: submittedDirectoryKey === activeDirectoryKey && submittedDraft
+      ? { ...submittedDraft }
+      : null,
+    dirty: markdownDirtyFields.value.size > 0
+      || !directoryConfigValuesEqual(materialized, activeDirectoryBaseDraft),
+  };
+}
+
+function captureDirectorySession(key = activeDirectoryKey): void {
+  if (!key) return;
+  directorySessions.set(key, currentDirectorySession());
+}
+
+function replaceDirectoryTextMap<K>(target: Map<K, Text>, source: Map<K, Text>): void {
+  target.clear();
+  for (const [key, text] of source) target.set(key, text);
+}
+
+function applyRemoteDirectory(
+  remote: KnowledgeDirectoryConfig,
+  session?: KnowledgeDirectoryEditorSession,
+): void {
+  if (!session) {
+    draft.value = { ...remote };
+    activeDirectoryBaseDraft = { ...remote };
+    markdownTextBuffers.clear();
+    markdownDirtyFields.value = new Set();
+    setDirectoryMarkdownBase(remote);
+    submittedDirectoryKey = "";
+    submittedDraft = null;
+    return;
+  }
+
+  const local = { ...session.draft };
+  const merged = session.submittedDraft
+    ? mergeDirectorySaveResponse(remote, local, session.submittedDraft)
+    : mergeUnsavedDirectoryDraft(remote, local, session.baseDraft);
+  draft.value = merged;
+  activeDirectoryBaseDraft = { ...remote };
+  replaceDirectoryTextMap(markdownTextBuffers, session.markdownTextBuffers);
+  replaceDirectoryTextMap(markdownBaseTexts, session.markdownBaseTexts);
+  for (const field of ["summary", "maintenanceRules"] as const) {
+    if (directoryMarkdownValue(merged, field) === directoryMarkdownValue(remote, field)) {
+      markdownTextBuffers.delete(field);
+    }
+  }
+  setDirectoryMarkdownBase(remote);
+  refreshMarkdownDirtyFields(remote);
+  submittedDirectoryKey = "";
+  submittedDraft = null;
+}
 
 watch(
-  () => props.directory,
-  (directory) => {
+  () => [props.directory, directoryKey(props.directory)] as const,
+  ([directory, nextKey]) => {
     clearAutoSaveTimer();
     autoSaveInFlight.value = false;
-    if (!directory) return;
-    draft.value = {
-      version: directory.version,
-      summary: directory.summary ?? "",
-      injectMode: directory.injectMode,
-      effectiveInjectMode: directory.effectiveInjectMode,
-      aiMaintained: directory.aiMaintained,
-      effectiveAiMaintained: directory.effectiveAiMaintained,
-      lexicalSearch: directory.lexicalSearch ?? "inherit",
-      vectorSearch: directory.vectorSearch ?? "inherit",
-      inheritToChildren: directory.inheritToChildren !== false,
-      allowCreateDocuments: directory.allowCreateDocuments !== false,
-      allowCreateDirectories: directory.allowCreateDirectories !== false,
-      allowMoveDocuments: directory.allowMoveDocuments !== false,
-      allowMoveDirectories: directory.allowMoveDirectories !== false,
-      maintenanceRules: directory.maintenanceRules,
-      effectiveMaintenanceRules: directory.effectiveMaintenanceRules,
-    };
+    let session: KnowledgeDirectoryEditorSession | undefined;
+    if (activeDirectoryKey && activeDirectoryKey === nextKey) {
+      session = currentDirectorySession();
+    } else {
+      captureDirectorySession(activeDirectoryKey);
+      session = nextKey ? directorySessions.get(nextKey) : undefined;
+    }
+    if (!directory) {
+      activeDirectoryKey = "";
+      markdownTextBuffers.clear();
+      markdownBaseTexts.clear();
+      markdownDirtyFields.value = new Set();
+      submittedDirectoryKey = "";
+      submittedDraft = null;
+      return;
+    }
+    const remote = configFromDirectory(directory);
+    activeDirectoryKey = nextKey;
+    applyRemoteDirectory(remote, session);
+    if (session?.dirty) {
+      void Promise.resolve().then(() => {
+        if (activeDirectoryKey === nextKey && isDirty.value) maybeScheduleAutoSave();
+      });
+    }
   },
   { immediate: true },
 );
@@ -135,7 +283,7 @@ const footerLabel = computed(() => {
   if (props.directory.readOnly) return statusLabel.value;
   return `${statusLabel.value} · ${t("knowledge.editor.shortcut")}`;
 });
-const interactionDisabled = computed(() => props.saveLoading || !!props.directory?.readOnly);
+const interactionDisabled = computed(() => !!props.directory?.readOnly);
 const editorViewOptions = computed(() => [
   { value: "rendered", label: t("knowledge.editor.view.rendered") },
   { value: "native", label: t("knowledge.editor.view.native") },
@@ -144,14 +292,17 @@ const editorViewMode = computed<MarkdownEditorViewMode>({
   get: () => markdownEditorViewMode.value,
   set: (value) => setMarkdownEditorViewMode(value),
 });
-const directoryContentKey = computed(() =>
-  `${props.directory?.type ?? ""}:${props.directory?.path ?? ""}:maintenanceRules`
-);
+const directoryContentKey = computed(() => directoryKey(props.directory));
 
+const hasExplicitRulesContent = computed(() => {
+  void markdownDirtyFields.value;
+  const buffered = markdownTextBuffers.get("maintenanceRules");
+  return buffered
+    ? markdownEditorTextHasContent(buffered)
+    : !!draft.value.maintenanceRules?.trim();
+});
 const hasRulesWarning = computed(
-  () =>
-    draft.value.aiMaintained === true &&
-    !draft.value.maintenanceRules?.trim(),
+  () => draft.value.aiMaintained === true && !hasExplicitRulesContent.value,
 );
 
 const injectModeOptions = computed(() => [
@@ -235,7 +386,7 @@ const aiConfigDropdownLabel = computed(() => {
   return t("knowledge.meta.inheritParent");
 });
 
-const rulesEditorDisabled = computed(() => props.saveLoading || draft.value.aiMaintained === "inherit");
+const rulesEditorDisabled = computed(() => interactionDisabled.value || draft.value.aiMaintained === "inherit");
 
 const effectiveLexicalSearch = computed<EffectiveCapabilityState>(() => (
   props.directory?.effectiveLexicalSearch ?? {
@@ -254,7 +405,7 @@ const effectiveVectorSearch = computed<EffectiveCapabilityState>(() => (
 const isDirty = computed(() => {
   const directory = props.directory;
   if (!directory) return false;
-  return (
+  return markdownDirtyFields.value.size > 0 || (
     JSON.stringify({
       version: directory.version,
       summary: directory.summary ?? "",
@@ -325,6 +476,7 @@ watch(() => props.saveLoading, (loading, wasLoading) => {
 });
 
 onUnmounted(() => {
+  captureDirectorySession();
   clearAutoSaveTimer();
 });
 
@@ -338,7 +490,13 @@ function clearAutoSaveTimer() {
 
 function maybeScheduleAutoSave() {
   clearAutoSaveTimer();
-  if (!props.directory || props.loading || interactionDisabled.value || !isDirty.value) return;
+  if (
+    !props.directory
+    || props.loading
+    || props.saveLoading
+    || interactionDisabled.value
+    || !isDirty.value
+  ) return;
   autoSaveQueued.value = true;
   autoSaveTimer = setTimeout(() => {
     autoSaveTimer = null;
@@ -347,13 +505,18 @@ function maybeScheduleAutoSave() {
 }
 
 function saveConfig(mode: "auto" | "manual" = "manual") {
-  if (!props.directory || interactionDisabled.value || !isDirty.value) return;
+  if (!props.directory || props.saveLoading || interactionDisabled.value || !isDirty.value) return;
   clearAutoSaveTimer();
   autoSaveInFlight.value = mode === "auto";
-  emit("save", props.directory.path, {
+  draft.value = materializedDirectoryDraft();
+  const nextDraft = {
     ...draft.value,
     version: draft.value.version || 4,
-  });
+  };
+  submittedDirectoryKey = directoryKey(props.directory);
+  submittedDraft = { ...nextDraft };
+  captureDirectorySession(submittedDirectoryKey);
+  emit("save", props.directory.path, nextDraft);
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -374,6 +537,9 @@ function toggle<K extends keyof KnowledgeDirectoryConfig>(
   key: K,
   value: KnowledgeDirectoryConfig[K],
 ) {
+  if (key === "summary" || key === "maintenanceRules") {
+    markdownTextBuffers.delete(key);
+  }
   draft.value = {
     ...draft.value,
     [key]: value,
@@ -383,10 +549,12 @@ function toggle<K extends keyof KnowledgeDirectoryConfig>(
 
 function toggleExplicitMaintenanceRules(value: boolean) {
   if (draft.value.aiMaintained === "inherit" || (!value && draft.value.aiMaintained === true)) return;
+  const currentRules = bufferedDirectoryMarkdownValue("maintenanceRules");
+  markdownTextBuffers.delete("maintenanceRules");
   draft.value = {
     ...draft.value,
     maintenanceRules: value
-      ? draft.value.maintenanceRules ||
+      ? currentRules ||
         defaultMaintenanceRulesForType(props.directory?.type ?? "design") ||
         ""
       : null,
@@ -412,6 +580,8 @@ function onInjectModeChange(value: string) {
 }
 
 function onAiConfigChange(value: string) {
+  draft.value = materializedDirectoryDraft();
+  markdownTextBuffers.clear();
   if (value === "inherit_parent") {
     draft.value = {
       ...draft.value,
@@ -440,6 +610,82 @@ function onAiConfigChange(value: string) {
     aiMaintained: false,
     effectiveAiMaintained: false,
   };
+  maybeScheduleAutoSave();
+}
+
+function directoryMarkdownValue(
+  config: KnowledgeDirectoryConfig,
+  field: DirectoryMarkdownField,
+): string {
+  return field === "summary" ? config.summary : config.maintenanceRules ?? "";
+}
+
+function bufferedDirectoryMarkdownValue(field: DirectoryMarkdownField): string {
+  return markdownTextBuffers.get(field)?.toString() ?? directoryMarkdownValue(draft.value, field);
+}
+
+function materializedDirectoryDraft(): KnowledgeDirectoryConfig {
+  if (!markdownTextBuffers.size) return draft.value;
+  return {
+    ...draft.value,
+    summary: bufferedDirectoryMarkdownValue("summary"),
+    maintenanceRules: draft.value.maintenanceRules === null
+      && !markdownTextBuffers.has("maintenanceRules")
+      ? null
+      : bufferedDirectoryMarkdownValue("maintenanceRules"),
+  };
+}
+
+function refreshMarkdownDirtyFields(remote: KnowledgeDirectoryConfig): void {
+  const next = new Set<DirectoryMarkdownField>();
+  for (const field of ["summary", "maintenanceRules"] as const) {
+    const buffered = markdownTextBuffers.get(field);
+    const matchesRemote = buffered
+      ? buffered.eq(
+        markdownBaseTexts.get(field)
+          ?? markdownEditorTextFromString(directoryMarkdownValue(remote, field)),
+      )
+      : directoryMarkdownValue(draft.value, field) === directoryMarkdownValue(remote, field);
+    if (!matchesRemote) next.add(field);
+  }
+  markdownDirtyFields.value = next;
+}
+
+function setDirectoryMarkdownBase(remote: KnowledgeDirectoryConfig): void {
+  for (const field of ["summary", "maintenanceRules"] as const) {
+    markdownBaseTexts.set(
+      field,
+      markdownEditorTextFromString(directoryMarkdownValue(remote, field)),
+    );
+  }
+}
+
+function onMarkdownModelUpdate(field: DirectoryMarkdownField, value: string): void {
+  markdownTextBuffers.delete(field);
+  draft.value = {
+    ...draft.value,
+    [field]: value,
+  };
+  const remote = props.directory ? configFromDirectory(props.directory) : null;
+  if (remote) refreshMarkdownDirtyFields(remote);
+  maybeScheduleAutoSave();
+}
+
+function onMarkdownDocumentChange(
+  field: DirectoryMarkdownField,
+  change: MarkdownEditorDocumentChange,
+): void {
+  markdownTextBuffers.set(field, change.doc);
+  const next = new Set(markdownDirtyFields.value);
+  const baseText = markdownBaseTexts.get(field)
+    ?? markdownEditorTextFromString(
+      props.directory
+        ? directoryMarkdownValue(configFromDirectory(props.directory), field)
+        : directoryMarkdownValue(draft.value, field),
+    );
+  if (change.doc.eq(baseText)) next.delete(field);
+  else next.add(field);
+  markdownDirtyFields.value = next;
   maybeScheduleAutoSave();
 }
 
@@ -687,7 +933,7 @@ function effectiveCapabilityLabel(
                 {{ t("knowledge.directoryConfig.explicitMaintenanceRules") }}
               </span>
               <BaseCheckbox
-                :model-value="!!draft.maintenanceRules?.trim()"
+                :model-value="hasExplicitRulesContent"
                 :disabled="
                   interactionDisabled ||
                   draft.aiMaintained === 'inherit' ||
@@ -765,14 +1011,19 @@ function effectiveCapabilityLabel(
             </div>
             <BaseMarkdownEditor
               :model-value="draft.summary"
+              :active="active"
+              :session-cache="markdownEditorSessions"
+              :session-pinned="isDirty"
+              :workspace-ref="workspaceRef"
+              transaction-model
               :disabled="interactionDisabled"
               :view-mode="editorViewMode"
               :content-key="`${directoryContentKey}:summary`"
-              defer-rendered-editor
               auto-grow
               :min-height="64"
               :placeholder="t('knowledge.directoryConfig.summaryPlaceholder')"
-              @update:model-value="toggle('summary', $event)"
+              @update:model-value="onMarkdownModelUpdate('summary', $event)"
+              @document-change="onMarkdownDocumentChange('summary', $event)"
               @shortcut-save="saveConfig('manual')"
             />
           </section>
@@ -782,7 +1033,7 @@ function effectiveCapabilityLabel(
           </div>
 
           <section
-            v-if="draft.aiMaintained !== 'inherit' && !!draft.maintenanceRules?.trim()"
+            v-if="draft.aiMaintained !== 'inherit' && hasExplicitRulesContent"
             class="directory-inline-field directory-inline-rules"
             :class="{ 'is-warning': hasRulesWarning }"
           >
@@ -791,14 +1042,19 @@ function effectiveCapabilityLabel(
             </div>
             <BaseMarkdownEditor
               :model-value="draft.maintenanceRules ?? ''"
+              :active="active"
+              :session-cache="markdownEditorSessions"
+              :session-pinned="isDirty"
+              :workspace-ref="workspaceRef"
+              transaction-model
               :disabled="rulesEditorDisabled || interactionDisabled"
               :view-mode="editorViewMode"
               :content-key="`${directoryContentKey}:maintenanceRules`"
-              defer-rendered-editor
               auto-grow
               :min-height="104"
               :placeholder="t('knowledge.directoryConfig.maintenanceRulesPlaceholder')"
-              @update:model-value="toggle('maintenanceRules', $event)"
+              @update:model-value="onMarkdownModelUpdate('maintenanceRules', $event)"
+              @document-change="onMarkdownDocumentChange('maintenanceRules', $event)"
               @shortcut-save="saveConfig('manual')"
             />
           </section>
@@ -1034,9 +1290,7 @@ function effectiveCapabilityLabel(
   min-height: 104px;
 }
 
-.directory-inline-field :deep(.base-markdown-editor .vditor),
-.directory-inline-field :deep(.base-markdown-editor-native),
-.directory-inline-field :deep(.base-markdown-editor-rendered) {
+.directory-inline-field :deep(.base-markdown-editor .cm-editor) {
   background: transparent;
 }
 

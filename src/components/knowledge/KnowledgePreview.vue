@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import type { Text } from "@codemirror/state";
+import { computed, onUnmounted, ref, watch } from "vue";
 import type {
   KnowledgeDocument,
+  KnowledgeDocumentEditOperation,
   KnowledgeDocumentPatch,
   KnowledgeEditMode,
   KnowledgeDocumentSection,
@@ -27,10 +29,15 @@ import {
   SKILL_COMMAND_NOTICE_OPERATION,
 } from "../../composables/skillCommands";
 import BaseDropdown from "../ui/BaseDropdown.vue";
+import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import {
+  markdownEditorTextHasContent,
+  markdownEditorTextFromString,
+  type MarkdownEditorDocumentChange,
+} from "../ui/markdown-editor/markdownEditorDocumentChange";
+import type { MarkdownReferenceToken } from "../ui/markdown-editor/markdownComplexTokens";
 import BaseSwitch from "../ui/BaseSwitch.vue";
-import MarkdownRenderer from "../MarkdownRenderer.vue";
-import SemanticCodeRenderer from "../ui/SemanticCodeRenderer.vue";
 import {
   getSkillUnityInstallStatus,
   installSkillUnityFiles,
@@ -45,9 +52,14 @@ import {
 } from "./knowledgeMetaLabels";
 import {
   createKnowledgeEditorDraftValues,
-  mergeKnowledgeEditorDraftValues,
+  getKnowledgeEditorDraftValue,
   normalizeKnowledgeEditorValue,
 } from "./knowledgeEditorDrafts";
+import {
+  buildKnowledgeDocumentEditOperations,
+  rebaseKnowledgeText,
+  type KnowledgeTextConflict,
+} from "./knowledgeCollaborativeEditing";
 import {
   buildKnowledgeEditModePatch,
   defaultMaintenanceRulesForType,
@@ -59,12 +71,25 @@ import {
   useMarkdownEditorViewMode,
   type MarkdownEditorViewMode,
 } from "../ui/markdownEditorViewMode";
-import { semanticCodeLanguageFromPath } from "../../composables/semanticCodeRendering";
+import {
+  KnowledgeEditorWorkspaceSessionStore,
+  knowledgeDocumentEditorSessionKey,
+  type KnowledgeDocumentEditorSession,
+  type KnowledgeEditorDraftValues,
+  type KnowledgeSectionConflicts,
+} from "./knowledgeEditorWorkspaceSession";
 import {
   buildKnowledgeDocumentWorkspaceDragPayload,
   startKnowledgeInternalDrag,
 } from "./knowledgeWorkspaceDrag";
 import { useInternalDragController } from "../../composables/useInternalDrag";
+import type { WorkspaceRef } from "../../services/project";
+import {
+  claimWorkbenchReferencePointerEvent,
+  workbenchReferenceFromElement,
+  workbenchReferenceInternalDragSource,
+  type WorkbenchReferenceDragData,
+} from "../workbench/workbenchReferenceDrag";
 
 const AUTO_SAVE_DELAY_MS = 700;
 const MEMORY_PREVIEW_PATH_PREFIX = "unity-project-understanding";
@@ -78,12 +103,21 @@ const { skillItems, loadSkills } = useSkills();
 const { markdownEditorViewMode, setMarkdownEditorViewMode } = useMarkdownEditorViewMode();
 type InjectModeSelection = KnowledgeInjectMode | "inherit_parent";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   document: KnowledgeDocument | null;
   searchContext?: KnowledgeSearchSelectionContext | null;
   loading: boolean;
   saveLoading: boolean;
-}>();
+  embedded?: boolean;
+  active?: boolean;
+  workspaceRef?: WorkspaceRef | null;
+  sessionStore?: KnowledgeEditorWorkspaceSessionStore | null;
+  saveEdits?: (edits: KnowledgeDocumentEditOperation[]) => Promise<KnowledgeDocument | null>;
+}>(), {
+  active: true,
+  workspaceRef: null,
+  sessionStore: null,
+});
 const internalDrag = useInternalDragController();
 
 const emit = defineEmits<{
@@ -91,14 +125,25 @@ const emit = defineEmits<{
   (e: "delete"): void;
   (e: "saveSection", section: KnowledgeDocumentSection, value: string): void;
   (e: "updateMeta", patch: KnowledgeDocumentPatch): void;
+  (e: "referenceOpen", reference: MarkdownReferenceToken): void;
 }>();
 
 const summaryDraft = ref("");
 const rulesDraft = ref("");
 const bodyDraft = ref("");
+const sectionTextBuffers = new Map<KnowledgeDocumentSection, Text>();
+const baseSectionTexts = new Map<KnowledgeDocumentSection, Text>();
 const fileNameDraft = ref("");
 const fileNameDirty = ref(false);
 const dirtySections = ref<Set<KnowledgeDocumentSection>>(new Set());
+const baseDrafts = ref(createKnowledgeEditorDraftValues(null));
+const sectionConflicts = ref<Record<KnowledgeDocumentSection, KnowledgeTextConflict[]>>({
+  summary: [],
+  maintenanceRules: [],
+  body: [],
+});
+const conflictResolutionDrafts = ref(createKnowledgeEditorDraftValues(null));
+const saveBlockedSections = ref<Set<KnowledgeDocumentSection>>(new Set());
 const autoSaveQueued = ref(false);
 const autoSaveInFlight = ref(false);
 const skillCommandDraft = ref("");
@@ -106,12 +151,13 @@ const skillArgumentHintDraft = ref("");
 const skillUnityStatus = ref<SkillUnityInstallStatus | null>(null);
 const skillUnityStatusLoading = ref(false);
 const skillUnityActionPending = ref(false);
-const summaryRenderedSearchRef = ref<HTMLElement | null>(null);
-const rulesRenderedSearchRef = ref<HTMLElement | null>(null);
-const bodyRenderedSearchRef = ref<HTMLElement | null>(null);
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
-let searchMatchScrollFrame = 0;
 let skillUnityStatusRequestId = 0;
+
+const localEditorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
+const editorWorkspaceSessions = props.sessionStore ?? localEditorWorkspaceSessions;
+const editorSessions = editorWorkspaceSessions.documents;
+const markdownEditorSessions = editorWorkspaceSessions.markdownEditors;
 
 function formatDocumentDisplayPath(document: KnowledgeDocument | null | undefined): string {
   if (!document) return "";
@@ -147,9 +193,12 @@ const documentMetaDisabled = computed(() => isReadOnly.value || packageDocumentC
 const isEditModeLocked = computed(() =>
   isKnowledgeEditModeLocked(props.document) || packageDocumentConfigLocked.value,
 );
-const documentContentKey = computed(() =>
-  `${props.document?.type ?? ""}:${props.document?.id ?? ""}:${documentPath.value}`
+const activeDocumentSessionKey = computed(() =>
+  knowledgeDocumentEditorSessionKey(props.workspaceRef, props.document)
 );
+// CodeMirror state follows the same stable document identity as the draft
+// session, so a path rename keeps selection and undo history.
+const documentContentKey = computed(() => activeDocumentSessionKey.value);
 const documentDisplayPath = computed(() => formatDocumentDisplayPath(props.document));
 const documentTitle = computed(() => currentDocumentFileStem.value || t("knowledge.preview.untitled"));
 const titleMeasureText = computed(() => fileNameDraft.value || " ");
@@ -162,6 +211,35 @@ function onDocumentDragPointerDown(event: PointerEvent): void {
   startKnowledgeInternalDrag(internalDrag, event, {
     payload: buildKnowledgeDocumentWorkspaceDragPayload(props.document),
   });
+}
+
+function onEditorReferenceOpen(reference: MarkdownReferenceToken): void {
+  emit("referenceOpen", reference);
+}
+
+function onEditorReferencePointerDown(payload: {
+  reference: MarkdownReferenceToken;
+  event: PointerEvent;
+  element: HTMLElement;
+}): void {
+  const { event, element } = payload;
+  const workspaceRef = props.workspaceRef;
+  if (!workspaceRef || event.button !== 0 || event.isPrimary === false) return;
+  const entry = workbenchReferenceFromElement(element);
+  const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
+  if (!entry || !checkout?.projectId || !checkout.root) return;
+
+  const data: WorkbenchReferenceDragData = {
+    version: 1,
+    origin: {
+      projectId: checkout.projectId,
+      workspaceRef: { ...workspaceRef },
+      workspaceRoot: checkout.root,
+    },
+    entries: [entry],
+  };
+  if (!internalDrag.start(event, workbenchReferenceInternalDragSource(data, element))) return;
+  claimWorkbenchReferencePointerEvent(event);
 }
 // Skill documents show the effective auto-channel mode: a surface without the
 // auto side reads as "none" regardless of the stored injectMode.
@@ -255,6 +333,13 @@ const usesInheritedMaintenanceRules = computed(() => props.document?.aiEditMode 
 const rulesEditorDisabled = computed(() => documentMetaDisabled.value);
 const rulesHint = computed(() => t("knowledge.preview.rulesHint"));
 const rulesPropertyValue = computed(() => rulesDraft.value);
+const rulesPropertyHasContent = computed(() => {
+  void dirtySections.value;
+  const buffered = sectionTextBuffers.get("maintenanceRules");
+  return buffered
+    ? markdownEditorTextHasContent(buffered)
+    : !!rulesDraft.value.trim();
+});
 
 const sourceSummary = computed(() => {
   const source = props.document?.externalSource;
@@ -295,15 +380,20 @@ const lastCommitLabel = computed(() => {
 });
 const showLastCommit = computed(() => !!lastCommitLabel.value);
 
-const hasUnsavedSectionChanges = computed(() => {
-  const doc = props.document;
-  if (!doc) return false;
-  return normalizeKnowledgeEditorValue(summaryDraft.value) !== normalizeKnowledgeEditorValue(doc.summary ?? "")
-    || normalizeKnowledgeEditorValue(rulesDraft.value) !== normalizeKnowledgeEditorValue(doc.maintenanceRules ?? "")
-    || normalizeKnowledgeEditorValue(bodyDraft.value) !== normalizeKnowledgeEditorValue(doc.body ?? "");
-});
+const hasUnsavedSectionChanges = computed(() => dirtySections.value.size > 0);
 const currentDocumentFileStem = computed(() => extractDocumentFileStem(props.document?.path));
 const hasUnsavedChanges = computed(() => hasUnsavedSectionChanges.value || fileNameDirty.value);
+const conflictCount = computed(() =>
+  Object.values(sectionConflicts.value).reduce((total, conflicts) => total + conflicts.length, 0)
+  + saveBlockedSections.value.size,
+);
+const hasBlockingConflicts = computed(() => conflictCount.value > 0);
+
+function isMarkdownEditorSessionPinned(section: KnowledgeDocumentSection): boolean {
+  return dirtySections.value.has(section)
+    || sectionConflicts.value[section].length > 0
+    || saveBlockedSections.value.has(section);
+}
 
 const statusLabel = computed(() => {
   if (!props.document) return "";
@@ -316,7 +406,8 @@ const footerLabel = computed(() =>
   props.document ? `${statusLabel.value} · ${t("knowledge.editor.shortcut")}` : "",
 );
 const footerWarning = computed(() =>
-  hasUnsavedChanges.value && !autoSaveQueued.value && !autoSaveInFlight.value,
+  hasBlockingConflicts.value
+  || (hasUnsavedChanges.value && !autoSaveQueued.value && !autoSaveInFlight.value),
 );
 const editorViewOptions = computed(() => [
   { value: "rendered", label: t("knowledge.editor.view.rendered") },
@@ -415,10 +506,6 @@ const searchQueryTerms = computed(() => {
   if (!raw) return [];
   return [...new Set(raw.split(/\s+/).filter(Boolean))].sort((left, right) => right.length - left.length);
 });
-const showSearchRenderedContent = computed(() =>
-  !!activeSearchContext.value && editorViewMode.value === "rendered"
-);
-const bodyCodeLanguage = computed(() => semanticCodeLanguageFromPath(documentPath.value));
 const searchHighlightRe = computed<RegExp | null>(() => {
   if (!searchQueryTerms.value.length) return null;
   return new RegExp(`(${searchQueryTerms.value.map(escapeRegExp).join("|")})`, "gi");
@@ -497,130 +584,34 @@ function searchSnippetSegments(section: KnowledgeSearchMatchSection) {
   return result;
 }
 
-function normalizeSearchText(value: string): string {
-  return value.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function renderedSearchContainer(section: KnowledgeSearchMatchSection): HTMLElement | null {
-  if (section === "summary") return summaryRenderedSearchRef.value;
-  if (section === "maintenanceRules") return rulesRenderedSearchRef.value;
-  return bodyRenderedSearchRef.value;
-}
-
-function clearTargetSearchMark() {
-  for (const container of [
-    summaryRenderedSearchRef.value,
-    rulesRenderedSearchRef.value,
-    bodyRenderedSearchRef.value,
-  ]) {
-    if (!container) continue;
-    for (const node of container.querySelectorAll<HTMLElement>("mark.markdown-search-mark-target")) {
-      node.classList.remove("markdown-search-mark-target");
-    }
-  }
-}
-
-function pickTargetSearchMark(
-  container: HTMLElement,
-  snippet: string,
-): HTMLElement | null {
-  const marks = [...container.querySelectorAll<HTMLElement>("mark.markdown-search-mark")];
-  if (!marks.length) return null;
-  const normalizedSnippet = normalizeSearchText(snippet);
-  if (!normalizedSnippet) return marks[0] ?? null;
-
-  let bestMark = marks[0] ?? null;
-  let bestScore = -1;
-
-  for (const mark of marks) {
-    const contextText = normalizeSearchText(mark.parentElement?.textContent ?? "");
-    const markText = normalizeSearchText(mark.textContent ?? "");
-    let score = 0;
-    if (markText && normalizedSnippet.includes(markText)) {
-      score += markText.length * 2;
-    }
-    if (contextText && normalizedSnippet && contextText.includes(normalizedSnippet)) {
-      score += normalizedSnippet.length;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      bestMark = mark;
-    }
-  }
-
-  return bestMark;
-}
-
-function scrollSearchMatchIntoView(): boolean {
-  const searchContext = activeSearchContext.value;
-  if (!searchContext || !showSearchRenderedContent.value) return false;
-  const container = renderedSearchContainer(searchMatchSection.value);
-  if (!container) return false;
-
-  clearTargetSearchMark();
-  const target = pickTargetSearchMark(container, searchContext.result.snippet);
-  if (!target) {
-    container.scrollTop = 0;
-    return false;
-  }
-
-  target.classList.add("markdown-search-mark-target");
-  const containerRect = container.getBoundingClientRect();
-  const targetRect = target.getBoundingClientRect();
-  const offsetTop = container.scrollTop + (targetRect.top - containerRect.top);
-  const padding = Math.max(18, Math.round(container.clientHeight * 0.18));
-  const nextTop = Math.max(0, offsetTop - padding);
-  container.scrollTo({
-    top: nextTop,
-    behavior: "smooth",
-  });
-  return true;
-}
-
-function cancelSearchMatchScroll() {
-  if (!searchMatchScrollFrame || typeof window === "undefined" || typeof window.cancelAnimationFrame !== "function") {
-    searchMatchScrollFrame = 0;
-    return;
-  }
-  window.cancelAnimationFrame(searchMatchScrollFrame);
-  searchMatchScrollFrame = 0;
-}
-
-function scheduleSearchMatchScroll() {
-  cancelSearchMatchScroll();
-  void nextTick(() => {
-    if (scrollSearchMatchIntoView()) return;
-    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") return;
-    searchMatchScrollFrame = window.requestAnimationFrame(() => {
-      searchMatchScrollFrame = 0;
-      void nextTick(() => {
-        scrollSearchMatchIntoView();
-      });
-    });
-  });
-}
-
 watch(
-  () => props.document,
-  (document, previousDocument) => {
-    const resetDrafts = (document?.id ?? "") !== (previousDocument?.id ?? "")
-      || (document?.type ?? "") !== (previousDocument?.type ?? "");
-    syncDrafts(resetDrafts);
+  () => [props.document, activeDocumentSessionKey.value] as const,
+  ([document, nextKey], previous) => {
+    const previousKey = previous?.[1] ?? "";
+    if (previousKey && previousKey !== nextKey) {
+      captureEditorSession(previousKey);
+    }
+    if (!nextKey) {
+      syncDrafts(true, null);
+      fileNameDraft.value = "";
+      fileNameDirty.value = false;
+      return;
+    }
+    if (nextKey !== previousKey) {
+      restoreEditorSession(nextKey, document);
+      return;
+    }
+    syncDrafts(false, document);
   },
   { immediate: true },
 );
 
 watch(
-  () => [props.document?.id ?? "", props.document?.path ?? ""],
-  (current, previous = ["", ""]) => {
-    const [documentId, documentPathValue] = current;
-    const [previousId] = previous;
+  () => [activeDocumentSessionKey.value, props.document?.path ?? ""],
+  (current, previous) => {
+    if (!previous || current[0] !== previous[0]) return;
+    const [, documentPathValue] = current;
     const currentStem = extractDocumentFileStem(documentPathValue);
-    if (documentId !== previousId) {
-      fileNameDraft.value = currentStem;
-      fileNameDirty.value = false;
-      return;
-    }
 
     const normalizedDocumentName = normalizeDocumentFileStemValue(currentStem);
     const normalizedDraftName = normalizeDocumentFileStemValue(fileNameDraft.value);
@@ -633,28 +624,10 @@ watch(
     }
     fileNameDraft.value = currentStem;
   },
-  { immediate: true },
-);
-
-watch(
-  () => [
-    props.document?.id ?? "",
-    props.loading,
-    showSearchRenderedContent.value,
-    searchMatchSection.value,
-    activeSearchContext.value?.query ?? "",
-    activeSearchContext.value?.result.snippet ?? "",
-  ] as const,
-  ([documentId, loading, showRenderedContent, , query]) => {
-    if (!documentId || loading || !showRenderedContent || !query) return;
-    scheduleSearchMatchScroll();
-  },
-  { flush: "post" },
 );
 
 watch(() => props.saveLoading, (loading, wasLoading) => {
-  if (!loading && wasLoading) {
-    autoSaveInFlight.value = false;
+  if (!loading && wasLoading && !autoSaveInFlight.value) {
     maybeScheduleAutoSave();
   }
 });
@@ -688,38 +661,257 @@ watch(skillPackageId, () => {
 }, { immediate: true });
 
 onUnmounted(() => {
+  captureEditorSession(activeDocumentSessionKey.value);
   clearAutoSaveTimer();
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
-  cancelSearchMatchScroll();
 });
 
 function currentDraftValues() {
   return {
-    summary: summaryDraft.value,
-    maintenanceRules: rulesDraft.value,
-    body: bodyDraft.value,
+    summary: sectionValue("summary"),
+    maintenanceRules: sectionValue("maintenanceRules"),
+    body: sectionValue("body"),
+  };
+}
+
+function cloneSectionConflicts(
+  conflicts: KnowledgeSectionConflicts,
+): KnowledgeSectionConflicts {
+  return {
+    summary: [...conflicts.summary],
+    maintenanceRules: [...conflicts.maintenanceRules],
+    body: [...conflicts.body],
+  };
+}
+
+function captureEditorSession(key = activeDocumentSessionKey.value): void {
+  if (!key) return;
+  const previous = editorSessions.get(key);
+  editorSessions.set(key, {
+    drafts: { ...currentDraftValues() },
+    baseDrafts: { ...baseDrafts.value },
+    conflictResolutionDrafts: { ...conflictResolutionDrafts.value },
+    dirtySections: new Set(dirtySections.value),
+    sectionConflicts: cloneSectionConflicts(sectionConflicts.value),
+    saveBlockedSections: new Set(saveBlockedSections.value),
+    sectionTextBuffers: new Map(sectionTextBuffers),
+    baseSectionTexts: new Map(baseSectionTexts),
+    fileNameDraft: fileNameDraft.value,
+    fileNameDirty: fileNameDirty.value,
+    saveRevision: previous?.saveRevision ?? 0,
+  });
+}
+
+function applyEditorSession(session: KnowledgeDocumentEditorSession): void {
+  applyDraftValues({ ...session.drafts });
+  setBaseDraftValues({ ...session.baseDrafts });
+  sectionTextBuffers.clear();
+  for (const [section, text] of session.sectionTextBuffers) {
+    sectionTextBuffers.set(section, text);
+  }
+  baseSectionTexts.clear();
+  for (const [section, text] of session.baseSectionTexts) {
+    baseSectionTexts.set(section, text);
+  }
+  conflictResolutionDrafts.value = { ...session.conflictResolutionDrafts };
+  dirtySections.value = new Set(session.dirtySections);
+  sectionConflicts.value = cloneSectionConflicts(session.sectionConflicts);
+  saveBlockedSections.value = new Set(session.saveBlockedSections);
+  fileNameDraft.value = session.fileNameDraft;
+  fileNameDirty.value = session.fileNameDirty;
+}
+
+function draftValuesEqual(
+  left: KnowledgeEditorDraftValues,
+  right: KnowledgeEditorDraftValues,
+): boolean {
+  return (["summary", "maintenanceRules", "body"] as const).every((section) =>
+    normalizeKnowledgeEditorValue(getKnowledgeEditorDraftValue(left, section))
+    === normalizeKnowledgeEditorValue(getKnowledgeEditorDraftValue(right, section)),
+  );
+}
+
+function restoreEditorSession(key: string, document: KnowledgeDocument | null): void {
+  clearAutoSaveTimer();
+  autoSaveInFlight.value = false;
+  const session = editorSessions.get(key);
+  if (!session) {
+    syncDrafts(true, document);
+    fileNameDraft.value = extractDocumentFileStem(document?.path);
+    fileNameDirty.value = false;
+    captureEditorSession(key);
+    return;
+  }
+  applyEditorSession(session);
+  const currentStem = extractDocumentFileStem(document?.path);
+  if (!fileNameDirty.value) {
+    fileNameDraft.value = currentStem;
+  } else if (
+    normalizeDocumentFileStemValue(fileNameDraft.value)
+    === normalizeDocumentFileStemValue(currentStem)
+  ) {
+    fileNameDraft.value = currentStem;
+    fileNameDirty.value = false;
+  }
+  if (!draftValuesEqual(session.baseDrafts, createKnowledgeEditorDraftValues(document))) {
+    syncDrafts(false, document);
+  }
+  captureEditorSession(key);
+  maybeScheduleAutoSave();
+}
+
+function rebaseCachedEditorSession(
+  session: KnowledgeDocumentEditorSession,
+  sourceDocument: KnowledgeDocument,
+  rebaseBaseDrafts: KnowledgeEditorDraftValues,
+): KnowledgeDocumentEditorSession {
+  const remoteDrafts = createKnowledgeEditorDraftValues(sourceDocument);
+  const nextDrafts = { ...session.drafts };
+  const nextConflictResolutions = { ...session.conflictResolutionDrafts };
+  const nextDirtySections = new Set<KnowledgeDocumentSection>();
+  const nextSectionTextBuffers = new Map<KnowledgeDocumentSection, Text>();
+  const nextBaseSectionTexts = new Map<KnowledgeDocumentSection, Text>();
+  const nextConflicts: KnowledgeSectionConflicts = {
+    summary: [],
+    maintenanceRules: [],
+    body: [],
+  };
+
+  for (const section of ["summary", "maintenanceRules", "body"] as const) {
+    const rebased = rebaseKnowledgeText(
+      getKnowledgeEditorDraftValue(rebaseBaseDrafts, section),
+      getKnowledgeEditorDraftValue(session.drafts, section),
+      getKnowledgeEditorDraftValue(remoteDrafts, section),
+    );
+    setDraftSectionValue(nextDrafts, section, rebased.text);
+    setDraftSectionValue(nextConflictResolutions, section, rebased.remotePreferredText);
+    nextSectionTextBuffers.set(section, markdownEditorTextFromString(rebased.text));
+    nextBaseSectionTexts.set(section, markdownEditorTextFromString(
+      getKnowledgeEditorDraftValue(remoteDrafts, section),
+    ));
+    nextConflicts[section] = rebased.conflicts;
+    if (
+      normalizeKnowledgeEditorValue(rebased.text)
+      !== normalizeKnowledgeEditorValue(getKnowledgeEditorDraftValue(remoteDrafts, section))
+    ) {
+      nextDirtySections.add(section);
+    }
+  }
+
+  return {
+    drafts: nextDrafts,
+    baseDrafts: remoteDrafts,
+    conflictResolutionDrafts: nextConflictResolutions,
+    dirtySections: nextDirtySections,
+    sectionConflicts: nextConflicts,
+    saveBlockedSections: new Set(
+      [...session.saveBlockedSections].filter((section) => nextDirtySections.has(section)),
+    ),
+    sectionTextBuffers: nextSectionTextBuffers,
+    baseSectionTexts: nextBaseSectionTexts,
+    fileNameDraft: session.fileNameDirty
+      ? session.fileNameDraft
+      : extractDocumentFileStem(sourceDocument.path),
+    fileNameDirty: session.fileNameDirty,
+    saveRevision: session.saveRevision,
   };
 }
 
 function applyDraftValues(nextDrafts: ReturnType<typeof createKnowledgeEditorDraftValues>) {
+  sectionTextBuffers.clear();
   summaryDraft.value = nextDrafts.summary;
   rulesDraft.value = nextDrafts.maintenanceRules;
   bodyDraft.value = nextDrafts.body;
 }
 
-function syncDrafts(force = false) {
-  const { drafts, dirtySections: nextDirtySections } = mergeKnowledgeEditorDraftValues(
-    props.document,
-    currentDraftValues(),
-    dirtySections.value,
-    force,
-  );
-  applyDraftValues(drafts);
-  dirtySections.value = nextDirtySections;
+function setBaseDraftValues(nextDrafts: KnowledgeEditorDraftValues): void {
+  baseDrafts.value = nextDrafts;
+  for (const section of ["summary", "maintenanceRules", "body"] as const) {
+    baseSectionTexts.set(
+      section,
+      markdownEditorTextFromString(getKnowledgeEditorDraftValue(nextDrafts, section)),
+    );
+  }
+}
+
+function setDraftSectionValue(
+  drafts: ReturnType<typeof createKnowledgeEditorDraftValues>,
+  section: KnowledgeDocumentSection,
+  value: string,
+) {
+  if (section === "summary") drafts.summary = value;
+  else if (section === "maintenanceRules") drafts.maintenanceRules = value;
+  else drafts.body = value;
+}
+
+function resetSectionConflicts() {
+  sectionConflicts.value = {
+    summary: [],
+    maintenanceRules: [],
+    body: [],
+  };
+  saveBlockedSections.value = new Set();
+}
+
+function syncDrafts(
+  force = false,
+  sourceDocument = props.document,
+  rebaseBaseDrafts?: ReturnType<typeof createKnowledgeEditorDraftValues>,
+) {
+  const remoteDrafts = createKnowledgeEditorDraftValues(sourceDocument);
   if (force) {
+    setBaseDraftValues(remoteDrafts);
+    conflictResolutionDrafts.value = remoteDrafts;
+    applyDraftValues(remoteDrafts);
+    dirtySections.value = new Set();
+    resetSectionConflicts();
     autoSaveInFlight.value = false;
     clearAutoSaveTimer();
     return;
+  }
+
+  const currentDrafts = currentDraftValues();
+  const nextDrafts = { ...currentDrafts };
+  const nextBases = { ...baseDrafts.value };
+  const nextConflictResolutions = { ...conflictResolutionDrafts.value };
+  const nextDirtySections = new Set<KnowledgeDocumentSection>();
+  const nextConflicts: Record<KnowledgeDocumentSection, KnowledgeTextConflict[]> = {
+    summary: [],
+    maintenanceRules: [],
+    body: [],
+  };
+
+  for (const section of ["summary", "maintenanceRules", "body"] as const) {
+    const base = getKnowledgeEditorDraftValue(rebaseBaseDrafts ?? baseDrafts.value, section);
+    const local = getKnowledgeEditorDraftValue(currentDrafts, section);
+    const remote = getKnowledgeEditorDraftValue(remoteDrafts, section);
+    const rebased = rebaseKnowledgeText(base, local, remote);
+    setDraftSectionValue(nextDrafts, section, rebased.text);
+    setDraftSectionValue(nextBases, section, remote);
+    setDraftSectionValue(
+      nextConflictResolutions,
+      section,
+      rebased.remotePreferredText,
+    );
+    nextConflicts[section] = rebased.conflicts;
+    if (
+      normalizeKnowledgeEditorValue(rebased.text)
+      !== normalizeKnowledgeEditorValue(remote)
+    ) {
+      nextDirtySections.add(section);
+    }
+  }
+
+  setBaseDraftValues(nextBases);
+  conflictResolutionDrafts.value = nextConflictResolutions;
+  sectionConflicts.value = nextConflicts;
+  saveBlockedSections.value = new Set(
+    [...saveBlockedSections.value].filter((section) => nextDirtySections.has(section)),
+  );
+  applyDraftValues(nextDrafts);
+  dirtySections.value = nextDirtySections;
+  if (Object.values(nextConflicts).some((conflicts) => conflicts.length > 0)) {
+    clearAutoSaveTimer();
   }
   if (!nextDirtySections.size) {
     clearAutoSaveTimer();
@@ -735,58 +927,188 @@ function clearAutoSaveTimer() {
   autoSaveQueued.value = false;
 }
 
-function markDirty(section: KnowledgeDocumentSection) {
+function markDirty(section: KnowledgeDocumentSection, documentText?: Text) {
   const next = new Set(dirtySections.value);
-  next.add(section);
+  const matchesBase = documentText
+    ? documentText.eq(
+      baseSectionTexts.get(section)
+        ?? markdownEditorTextFromString(getKnowledgeEditorDraftValue(baseDrafts.value, section)),
+    )
+    : normalizeKnowledgeEditorValue(sectionValue(section))
+      === normalizeKnowledgeEditorValue(getKnowledgeEditorDraftValue(baseDrafts.value, section));
+  if (matchesBase) {
+    next.delete(section);
+    sectionConflicts.value = {
+      ...sectionConflicts.value,
+      [section]: [],
+    };
+  } else {
+    next.add(section);
+  }
   dirtySections.value = next;
+  const nextBlocked = new Set(saveBlockedSections.value);
+  nextBlocked.delete(section);
+  saveBlockedSections.value = nextBlocked;
   maybeScheduleAutoSave();
 }
 
 function maybeScheduleAutoSave() {
   clearAutoSaveTimer();
-  if (!props.document || props.loading || props.saveLoading || isReadOnly.value || !dirtySections.value.size) {
+  if (
+    !props.document
+    || props.loading
+    || props.saveLoading
+    || autoSaveInFlight.value
+    || isReadOnly.value
+    || hasBlockingConflicts.value
+    || !dirtySections.value.size
+  ) {
     return;
   }
   if (!hasUnsavedSectionChanges.value) return;
   autoSaveQueued.value = true;
   autoSaveTimer = setTimeout(() => {
     autoSaveTimer = null;
-    flushPendingChanges("auto");
+    void flushPendingChanges("auto");
   }, AUTO_SAVE_DELAY_MS);
 }
 
-function flushPendingChanges(mode: "auto" | "manual") {
-  if (!props.document || props.saveLoading || isReadOnly.value) return;
+async function flushPendingChanges(mode: "auto" | "manual") {
+  if (!props.document || props.saveLoading || autoSaveInFlight.value || isReadOnly.value) return;
+  const requestDocumentKey = activeDocumentSessionKey.value;
+  if (!requestDocumentKey) return;
   const shouldRenameDocument = mode === "manual" && fileNameDirty.value;
   if (!hasUnsavedSectionChanges.value && !shouldRenameDocument) return;
 
+  if (hasBlockingConflicts.value) {
+    clearAutoSaveTimer();
+    return;
+  }
+
   clearAutoSaveTimer();
-  autoSaveInFlight.value = mode === "auto";
-  emitPendingSectionChanges();
-  if (shouldRenameDocument) {
+  const sections = [...dirtySections.value];
+  const submittedDrafts = currentDraftValues();
+  const edits = sections.flatMap((section) =>
+    buildKnowledgeDocumentEditOperations(
+      section,
+      getKnowledgeEditorDraftValue(baseDrafts.value, section),
+      getKnowledgeEditorDraftValue(submittedDrafts, section),
+    ),
+  );
+  if (edits.length) {
+    autoSaveInFlight.value = true;
+    if (props.saveEdits) {
+      captureEditorSession(requestDocumentKey);
+      const requestSession = editorSessions.get(requestDocumentKey);
+      if (!requestSession) return;
+      const requestRevision = requestSession.saveRevision + 1;
+      editorSessions.set(requestDocumentKey, {
+        ...requestSession,
+        saveRevision: requestRevision,
+      });
+      const updated = await props.saveEdits(edits);
+      const latestSession = editorSessions.get(requestDocumentKey);
+      if (latestSession?.saveRevision === requestRevision) {
+        if (updated) {
+          if (activeDocumentSessionKey.value === requestDocumentKey) {
+            syncDrafts(false, updated, submittedDrafts);
+            captureEditorSession(requestDocumentKey);
+          } else {
+            editorSessions.set(
+              requestDocumentKey,
+              rebaseCachedEditorSession(latestSession, updated, submittedDrafts),
+            );
+          }
+        } else if (activeDocumentSessionKey.value === requestDocumentKey) {
+          saveBlockedSections.value = new Set([
+            ...saveBlockedSections.value,
+            ...sections,
+          ]);
+          captureEditorSession(requestDocumentKey);
+        } else {
+          editorSessions.set(requestDocumentKey, {
+            ...latestSession,
+            saveBlockedSections: new Set([
+              ...latestSession.saveBlockedSections,
+              ...sections,
+            ]),
+          });
+        }
+      }
+      if (activeDocumentSessionKey.value === requestDocumentKey) {
+        autoSaveInFlight.value = false;
+      }
+    } else {
+      emitPendingSectionChanges();
+      autoSaveInFlight.value = false;
+    }
+  }
+  if (shouldRenameDocument && activeDocumentSessionKey.value === requestDocumentKey) {
     persistDocumentNameChange();
+  }
+  if (activeDocumentSessionKey.value === requestDocumentKey) {
+    maybeScheduleAutoSave();
   }
 }
 
 function sectionValue(section: KnowledgeDocumentSection): string {
+  const buffered = sectionTextBuffers.get(section);
+  if (buffered) return buffered.toString();
   if (section === "summary") return summaryDraft.value;
   if (section === "maintenanceRules") return rulesDraft.value;
   return bodyDraft.value;
 }
 
 function onSectionInput(section: KnowledgeDocumentSection, value: string) {
+  sectionTextBuffers.delete(section);
   if (section === "summary") summaryDraft.value = value;
   else if (section === "maintenanceRules") rulesDraft.value = value;
   else bodyDraft.value = value;
   markDirty(section);
 }
 
+function onSectionDocumentChange(
+  section: KnowledgeDocumentSection,
+  change: MarkdownEditorDocumentChange,
+): void {
+  sectionTextBuffers.set(section, change.doc);
+  markDirty(section, change.doc);
+}
+
 function emitPendingSectionChanges() {
   const sections = [...dirtySections.value];
-  dirtySections.value = new Set();
   for (const section of sections) {
     emit("saveSection", section, sectionValue(section));
   }
+}
+
+function acceptRemoteChanges() {
+  const nextDrafts = currentDraftValues();
+  const nextDirty = new Set(dirtySections.value);
+  for (const section of ["summary", "maintenanceRules", "body"] as const) {
+    if (!sectionConflicts.value[section].length && !saveBlockedSections.value.has(section)) continue;
+    setDraftSectionValue(
+      nextDrafts,
+      section,
+      sectionConflicts.value[section].length
+        ? getKnowledgeEditorDraftValue(conflictResolutionDrafts.value, section)
+        : getKnowledgeEditorDraftValue(baseDrafts.value, section),
+    );
+    if (
+      normalizeKnowledgeEditorValue(getKnowledgeEditorDraftValue(nextDrafts, section))
+      === normalizeKnowledgeEditorValue(getKnowledgeEditorDraftValue(baseDrafts.value, section))
+    ) nextDirty.delete(section);
+    else nextDirty.add(section);
+  }
+  applyDraftValues(nextDrafts);
+  dirtySections.value = nextDirty;
+  resetSectionConflicts();
+  clearAutoSaveTimer();
+}
+
+function keepLocalChanges() {
+  resetSectionConflicts();
+  maybeScheduleAutoSave();
 }
 
 function extractDocumentFileName(path?: string | null): string {
@@ -871,7 +1193,7 @@ function onFileNameInputEvent(event: Event) {
 function onFileNameKeydown(event: KeyboardEvent) {
   if (event.key === "Enter") {
     event.preventDefault();
-    flushPendingChanges("manual");
+    void flushPendingChanges("manual");
     return;
   }
 
@@ -925,10 +1247,11 @@ function onEditModeChange(value: string) {
     updateMeta(nextPatch);
     return;
   }
-  const needsDefaultRules = nextMode === "auto" && !rulesDraft.value.trim();
+  const needsDefaultRules = nextMode === "auto" && !sectionValue("maintenanceRules").trim();
   if (needsDefaultRules) {
     const defaultRules = defaultMaintenanceRulesForType(props.document.type);
     if (defaultRules) {
+      sectionTextBuffers.delete("maintenanceRules");
       rulesDraft.value = defaultRules;
       nextPatch.maintenanceRules = defaultRules;
     }
@@ -1167,7 +1490,7 @@ function labelForProvider(provider?: string | null): string {
   <div class="preview-panel">
     <div class="preview-shell">
       <div class="preview-main-column">
-        <div class="preview-header">
+        <div v-if="!props.embedded" class="preview-header">
           <div
             class="preview-header-main"
             :class="{ 'drag-enabled': !!document }"
@@ -1212,6 +1535,20 @@ function labelForProvider(provider?: string | null): string {
               </span>
               <h1 v-else class="document-title">{{ documentTitle }}</h1>
             </header>
+
+            <div v-if="hasBlockingConflicts" class="document-conflict" role="status">
+              <span class="document-conflict-text">
+                {{ t("knowledge.editor.conflict", conflictCount) }}
+              </span>
+              <span class="document-conflict-actions">
+                <BaseButton size="sm" @click="acceptRemoteChanges">
+                  {{ t("knowledge.editor.useLatest") }}
+                </BaseButton>
+                <BaseButton size="sm" @click="keepLocalChanges">
+                  {{ t("knowledge.editor.keepLocal") }}
+                </BaseButton>
+              </span>
+            </div>
 
             <section class="document-properties" :aria-label="t('knowledge.preview.properties')">
               <div class="document-properties-title">{{ t("knowledge.preview.properties") }}</div>
@@ -1365,33 +1702,36 @@ function labelForProvider(provider?: string | null): string {
                   </template>
                 </div>
               </div>
-              <div v-if="showSearchRenderedContent" ref="summaryRenderedSearchRef" class="preview-rendered-search">
-                <MarkdownRenderer :content="summaryDraft" :highlight-terms="searchQueryTerms" />
-              </div>
               <BaseMarkdownEditor
-                v-else
                 :model-value="summaryDraft"
+                :active="active"
+                :session-cache="markdownEditorSessions"
+                :session-pinned="isMarkdownEditorSessionPinned('summary')"
+                :workspace-ref="workspaceRef"
+                transaction-model
                 :disabled="isReadOnly"
                 :view-mode="editorViewMode"
                 :content-key="`${documentContentKey}:summary`"
-                defer-rendered-editor
                 auto-grow
                 :min-height="64"
                 :placeholder="t('knowledge.preview.summaryPlaceholder')"
                 @update:model-value="onSectionInput('summary', $event)"
+                @document-change="onSectionDocumentChange('summary', $event)"
                 @shortcut-save="flushPendingChanges('manual')"
+                @reference-open="onEditorReferenceOpen"
+                @reference-pointer-down="onEditorReferencePointerDown"
               />
             </section>
 
             <section
               v-if="
                 !usesInheritedMaintenanceRules &&
-                (rulesPropertyValue.trim() || !rulesEditorDisabled)
+                (rulesPropertyHasContent || !rulesEditorDisabled)
               "
               class="document-inline-field document-inline-rules"
               :class="{
                 'is-search-match': isSearchMatchSection('maintenanceRules'),
-                'is-warning': document.effectiveAiMaintained && !rulesPropertyValue.trim(),
+                'is-warning': document.effectiveAiMaintained && !rulesPropertyHasContent,
               }"
             >
               <div class="document-inline-label-row">
@@ -1406,21 +1746,24 @@ function labelForProvider(provider?: string | null): string {
                   </template>
                 </div>
               </div>
-              <div v-if="showSearchRenderedContent" ref="rulesRenderedSearchRef" class="preview-rendered-search">
-                <MarkdownRenderer :content="rulesPropertyValue" :highlight-terms="searchQueryTerms" />
-              </div>
               <BaseMarkdownEditor
-                v-else
                 :model-value="rulesPropertyValue"
+                :active="active"
+                :session-cache="markdownEditorSessions"
+                :session-pinned="isMarkdownEditorSessionPinned('maintenanceRules')"
+                :workspace-ref="workspaceRef"
+                transaction-model
                 :disabled="rulesEditorDisabled"
                 :view-mode="editorViewMode"
                 :content-key="`${documentContentKey}:maintenanceRules`"
-                defer-rendered-editor
                 auto-grow
                 :min-height="104"
                 :placeholder="t('knowledge.preview.rulesPlaceholder')"
                 @update:model-value="onSectionInput('maintenanceRules', $event)"
+                @document-change="onSectionDocumentChange('maintenanceRules', $event)"
                 @shortcut-save="flushPendingChanges('manual')"
+                @reference-open="onEditorReferenceOpen"
+                @reference-pointer-down="onEditorReferencePointerDown"
               />
             </section>
 
@@ -1428,7 +1771,7 @@ function labelForProvider(provider?: string | null): string {
               v-if="
                 !usesInheritedMaintenanceRules &&
                 document.effectiveAiMaintained &&
-                !rulesPropertyValue.trim()
+                !rulesPropertyHasContent
               "
               class="document-property-warning"
             >
@@ -1444,36 +1787,25 @@ function labelForProvider(provider?: string | null): string {
                     </template>
                   </div>
                 </div>
-                <div
-                  v-if="showSearchRenderedContent"
-                  ref="bodyRenderedSearchRef"
-                  class="preview-rendered-search preview-rendered-search-body"
-                >
-                  <SemanticCodeRenderer
-                    v-if="bodyCodeLanguage"
-                    :content="bodyDraft"
-                    :language="bodyCodeLanguage"
-                    :highlight-terms="searchQueryTerms"
-                  />
-                  <MarkdownRenderer
-                    v-else
-                    :content="bodyDraft"
-                    :highlight-terms="searchQueryTerms"
-                  />
-                </div>
                 <BaseMarkdownEditor
-                  v-else
                   :model-value="bodyDraft"
+                  :active="active"
+                  :session-cache="markdownEditorSessions"
+                  :session-pinned="isMarkdownEditorSessionPinned('body')"
+                  :workspace-ref="workspaceRef"
+                  transaction-model
                   :disabled="isReadOnly"
                   :view-mode="editorViewMode"
                   :content-path="documentPath"
                   :content-key="`${documentContentKey}:body`"
-                  defer-rendered-editor
                   auto-grow
                   :min-height="360"
                   :placeholder="t('knowledge.preview.bodyPlaceholder')"
                   @update:model-value="onSectionInput('body', $event)"
+                  @document-change="onSectionDocumentChange('body', $event)"
                   @shortcut-save="flushPendingChanges('manual')"
+                  @reference-open="onEditorReferenceOpen"
+                  @reference-pointer-down="onEditorReferencePointerDown"
                 />
             </section>
 
@@ -1787,7 +2119,7 @@ function labelForProvider(provider?: string | null): string {
 }
 
 .preview-support-section.is-warning .preview-support-title,
-.preview-support-section.is-warning :deep(.vditor) {
+.preview-support-section.is-warning :deep(.cm-content) {
   color: var(--status-warn-fg);
 }
 
@@ -1861,7 +2193,7 @@ function labelForProvider(provider?: string | null): string {
   padding-bottom: 10px;
 }
 
-.preview-support-section-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset) {
+.preview-support-section-body :deep(.base-markdown-editor .cm-scroller) {
   height: 100%;
   min-height: 100%;
   box-sizing: border-box;
@@ -1871,54 +2203,23 @@ function labelForProvider(provider?: string | null): string {
   scrollbar-color: color-mix(in srgb, var(--text-secondary) 40%, transparent) transparent;
 }
 
-.preview-support-section-body :deep(.base-markdown-editor .base-markdown-editor-textarea) {
-  height: 100%;
-  min-height: 100%;
-  box-sizing: border-box;
-  overflow: auto;
-  overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--text-secondary) 40%, transparent) transparent;
-}
-
-.preview-support-section-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar) {
+.preview-support-section-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar) {
   width: 10px;
   height: 10px;
 }
 
-.preview-support-section-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar) {
-  width: 10px;
-  height: 10px;
-}
-
-.preview-support-section-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar-track) {
+.preview-support-section-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar-track) {
   background: transparent;
 }
 
-.preview-support-section-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar-track) {
-  background: transparent;
-}
-
-.preview-support-section-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar-thumb) {
+.preview-support-section-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar-thumb) {
   border: 2px solid transparent;
   border-radius: 999px;
   background: color-mix(in srgb, var(--text-secondary) 34%, transparent);
   background-clip: padding-box;
 }
 
-.preview-support-section-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar-thumb) {
-  border: 2px solid transparent;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text-secondary) 34%, transparent);
-  background-clip: padding-box;
-}
-
-.preview-support-section-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar-thumb:hover) {
-  background: color-mix(in srgb, var(--text-secondary) 54%, transparent);
-  background-clip: padding-box;
-}
-
-.preview-support-section-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar-thumb:hover) {
+.preview-support-section-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar-thumb:hover) {
   background: color-mix(in srgb, var(--text-secondary) 54%, transparent);
   background-clip: padding-box;
 }
@@ -2045,44 +2346,7 @@ function labelForProvider(provider?: string | null): string {
   color: var(--text-color);
 }
 
-.preview-rendered-search {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: 14px 16px 16px;
-  overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--text-secondary) 40%, transparent) transparent;
-}
-
-.preview-rendered-search-body {
-  padding-bottom: 44px;
-}
-
-.preview-rendered-search :deep(.markdown-body) {
-  min-height: 100%;
-}
-
-.preview-rendered-search::-webkit-scrollbar {
-  width: 10px;
-}
-
-.preview-rendered-search::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.preview-rendered-search::-webkit-scrollbar-thumb {
-  border-radius: 999px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
-  background: color-mix(in srgb, var(--text-secondary) 32%, transparent);
-}
-
-.preview-rendered-search::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--text-secondary) 46%, transparent);
-}
-
-.preview-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset) {
+.preview-body :deep(.base-markdown-editor .cm-scroller) {
   height: 100%;
   min-height: 100%;
   box-sizing: border-box;
@@ -2092,54 +2356,23 @@ function labelForProvider(provider?: string | null): string {
   scrollbar-color: color-mix(in srgb, var(--text-secondary) 40%, transparent) transparent;
 }
 
-.preview-body :deep(.base-markdown-editor .base-markdown-editor-textarea) {
-  height: 100%;
-  min-height: 100%;
-  box-sizing: border-box;
-  overflow: auto;
-  overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--text-secondary) 40%, transparent) transparent;
-}
-
-.preview-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar) {
+.preview-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar) {
   width: 10px;
   height: 10px;
 }
 
-.preview-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar) {
-  width: 10px;
-  height: 10px;
-}
-
-.preview-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar-track) {
+.preview-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar-track) {
   background: transparent;
 }
 
-.preview-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar-track) {
-  background: transparent;
-}
-
-.preview-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar-thumb) {
+.preview-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar-thumb) {
   border: 2px solid transparent;
   border-radius: 999px;
   background: color-mix(in srgb, var(--text-secondary) 34%, transparent);
   background-clip: padding-box;
 }
 
-.preview-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar-thumb) {
-  border: 2px solid transparent;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text-secondary) 34%, transparent);
-  background-clip: padding-box;
-}
-
-.preview-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset::-webkit-scrollbar-thumb:hover) {
-  background: color-mix(in srgb, var(--text-secondary) 54%, transparent);
-  background-clip: padding-box;
-}
-
-.preview-body :deep(.base-markdown-editor .base-markdown-editor-textarea::-webkit-scrollbar-thumb:hover) {
+.preview-body :deep(.base-markdown-editor .cm-scroller::-webkit-scrollbar-thumb:hover) {
   background: color-mix(in srgb, var(--text-secondary) 54%, transparent);
   background-clip: padding-box;
 }
@@ -2372,6 +2605,31 @@ function labelForProvider(provider?: string | null): string {
   margin: 0 0 22px;
 }
 
+.document-conflict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin: -8px 0 20px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--status-warn-border);
+  background: color-mix(in srgb, var(--status-warn-bg) 56%, transparent);
+  color: var(--status-warn-fg);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.document-conflict-text {
+  min-width: 0;
+}
+
+.document-conflict-actions {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+}
+
 .document-title,
 .document-title-input {
   margin: 0;
@@ -2557,9 +2815,7 @@ function labelForProvider(provider?: string | null): string {
   min-height: 104px;
 }
 
-.document-inline-field :deep(.base-markdown-editor .vditor),
-.document-inline-field :deep(.base-markdown-editor-native),
-.document-inline-field :deep(.base-markdown-editor-rendered) {
+.document-inline-field :deep(.base-markdown-editor .cm-editor) {
   background: transparent;
 }
 
@@ -2584,26 +2840,15 @@ function labelForProvider(provider?: string | null): string {
   padding-bottom: 32px;
 }
 
-.document-body :deep(.base-markdown-editor .vditor-ir pre.vditor-reset),
-.document-body :deep(.base-markdown-editor .base-markdown-editor-textarea) {
+.document-body :deep(.base-markdown-editor .cm-scroller) {
   height: auto;
   min-height: 360px;
-  overflow-y: visible;
+  overflow: visible;
+  overscroll-behavior: auto;
 }
 
 .document-page .preview-search-hit {
   margin: 6px 0 8px;
-}
-
-.document-page .preview-rendered-search {
-  min-height: 80px;
-  overflow: visible;
-  padding: 8px 0;
-}
-
-.document-page .preview-rendered-search-body {
-  min-height: 360px;
-  padding-bottom: 32px;
 }
 
 .document-page .editor-footnote {

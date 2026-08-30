@@ -485,6 +485,9 @@ pub struct KnowledgeDocumentFileMetadata {
     pub char_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_tokens: Option<u64>,
+    /// Physical file mtime in epoch milliseconds. Document reads apply the
+    /// same value to the flattened `updatedAt`, making either field suitable
+    /// as the content freshness watermark for stale-response guards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -698,6 +701,8 @@ pub struct KnowledgeDocumentEditOperation {
     pub new_string: String,
     #[serde(default)]
     pub replace_all: bool,
+    #[serde(default)]
+    pub expected_empty: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -3527,27 +3532,152 @@ fn set_document_section_content(
     }
 }
 
+fn apply_document_section_edits(
+    content: &str,
+    section: KnowledgeDocumentEditSection,
+    edits: &[(usize, &KnowledgeDocumentEditOperation)],
+) -> Result<String, String> {
+    struct Replacement<'a> {
+        index: usize,
+        start: usize,
+        end: usize,
+        new_string: &'a str,
+    }
+
+    let content = normalize_partial_edit_text(content);
+    let normalized = edits
+        .iter()
+        .map(|(index, edit)| {
+            (
+                *index,
+                edit,
+                normalize_partial_edit_text(&edit.old_string),
+                normalize_partial_edit_text(&edit.new_string),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut replacements = Vec::<Replacement<'_>>::new();
+
+    for (index, edit, old_string, new_string) in &normalized {
+        let error_prefix = || format!("document.edits[{}] {}: ", index, section.as_str());
+        if old_string == new_string {
+            return Err(format!(
+                "{}oldString and newString are identical, no changes to apply.",
+                error_prefix(),
+            ));
+        }
+        if edit.expected_empty && !content.is_empty() {
+            return Err(format!(
+                "{}selected knowledge section changed before the edit was saved",
+                error_prefix(),
+            ));
+        }
+        if old_string.is_empty() {
+            if normalized.len() > 1 {
+                return Err(format!(
+                    "{}an empty oldString cannot be combined with other edits in the same section",
+                    error_prefix(),
+                ));
+            }
+            replacements.push(Replacement {
+                index: *index,
+                start: 0,
+                end: content.len(),
+                new_string,
+            });
+            continue;
+        }
+
+        let positions = content
+            .match_indices(old_string.as_str())
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        let selected = match positions.as_slice() {
+            [] => {
+                return Err(format!(
+                    "{}Could not find oldString in the selected knowledge section. It must match exactly.",
+                    error_prefix(),
+                ));
+            }
+            [position] => vec![*position],
+            _ if edit.replace_all => positions,
+            _ => {
+                let line_numbers = positions
+                    .iter()
+                    .take(20)
+                    .map(|position| line_number_at_offset(&content, *position).to_string())
+                    .collect::<Vec<_>>();
+                return Err(format!(
+                    "{}Found multiple matches for oldString at lines: {}. Provide more surrounding context so oldString matches exactly once.",
+                    error_prefix(),
+                    line_numbers.join(", "),
+                ));
+            }
+        };
+        replacements.extend(selected.into_iter().map(|start| Replacement {
+            index: *index,
+            start,
+            end: start + old_string.len(),
+            new_string,
+        }));
+    }
+
+    replacements.sort_by(|left, right| {
+        left.start
+            .cmp(&right.start)
+            .then(left.end.cmp(&right.end))
+            .then(left.index.cmp(&right.index))
+    });
+    for pair in replacements.windows(2) {
+        if pair[1].start < pair[0].end {
+            return Err(format!(
+                "document.edits[{}] {}: replacement overlaps document.edits[{}]",
+                pair[1].index,
+                section.as_str(),
+                pair[0].index,
+            ));
+        }
+    }
+
+    let replacement_bytes = replacements
+        .iter()
+        .map(|replacement| replacement.new_string.len())
+        .sum::<usize>();
+    let removed_bytes = replacements
+        .iter()
+        .map(|replacement| replacement.end - replacement.start)
+        .sum::<usize>();
+    let mut result = String::with_capacity(content.len() + replacement_bytes - removed_bytes);
+    let mut cursor = 0;
+    for replacement in replacements {
+        result.push_str(&content[cursor..replacement.start]);
+        result.push_str(replacement.new_string);
+        cursor = replacement.end;
+    }
+    result.push_str(&content[cursor..]);
+    Ok(result)
+}
+
 pub fn apply_document_content_edits(
     document: &mut KnowledgeDocument,
     edits: &[KnowledgeDocumentEditOperation],
 ) -> Result<(), String> {
-    for (index, edit) in edits.iter().enumerate() {
-        let current = document_section_content(document, edit.section);
-        let updated = replace_unique_text(
-            &current,
-            &edit.old_string,
-            &edit.new_string,
-            edit.replace_all,
-        )
-        .map_err(|error| {
-            format!(
-                "document.edits[{}] {}: {}",
-                index,
-                edit.section.as_str(),
-                error
-            )
-        })?;
-        set_document_section_content(document, edit.section, updated);
+    for section in [
+        KnowledgeDocumentEditSection::Summary,
+        KnowledgeDocumentEditSection::Body,
+        KnowledgeDocumentEditSection::MaintenanceRules,
+    ] {
+        let section_edits = edits
+            .iter()
+            .enumerate()
+            .filter(|(_, edit)| edit.section == section)
+            .collect::<Vec<_>>();
+        if section_edits.is_empty() {
+            continue;
+        }
+        let current = document_section_content(document, section);
+        let updated = apply_document_section_edits(&current, section, &section_edits)?;
+        set_document_section_content(document, section, updated);
     }
     Ok(())
 }
@@ -6546,6 +6676,25 @@ fn build_document_file_metadata(
     document: &KnowledgeDocument,
     include_history: bool,
 ) -> KnowledgeDocumentFileMetadata {
+    build_document_file_metadata_with_history_reader(
+        working_dir,
+        file_path,
+        document,
+        include_history,
+        read_last_commit_metadata,
+    )
+}
+
+fn build_document_file_metadata_with_history_reader<F>(
+    working_dir: Option<&str>,
+    file_path: &Path,
+    document: &KnowledgeDocument,
+    include_history: bool,
+    history_reader: F,
+) -> KnowledgeDocumentFileMetadata
+where
+    F: FnOnce(&str, &Path) -> Option<(Option<String>, Option<i64>)>,
+{
     let rendered = render_document(document).ok();
     let byte_size = rendered
         .as_ref()
@@ -6560,7 +6709,7 @@ fn build_document_file_metadata(
         .map(|value| value.as_millis().min(i64::MAX as u128) as i64);
     let (last_commit_author, last_commit_at) = if include_history {
         working_dir
-            .and_then(|value| read_last_commit_metadata(value, file_path))
+            .and_then(|value| history_reader(value, file_path))
             .unwrap_or((None, None))
     } else {
         (None, None)
@@ -6727,6 +6876,76 @@ mod tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn fast_file_metadata_never_invokes_history_reader() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("document.md");
+        let document = sample_doc();
+        std::fs::write(
+            &file_path,
+            render_document(&document).expect("render document"),
+        )
+        .expect("write document");
+
+        let metadata = build_document_file_metadata_with_history_reader(
+            Some(temp.path().to_string_lossy().as_ref()),
+            &file_path,
+            &document,
+            false,
+            |_, _| panic!("fast metadata must not query Git history"),
+        );
+
+        assert!(metadata.modified_at.is_some());
+        assert!(metadata.last_commit_author.is_none());
+        assert!(metadata.last_commit_at.is_none());
+    }
+
+    #[test]
+    fn history_metadata_reader_runs_only_when_explicitly_requested() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("document.md");
+        let document = sample_doc();
+        std::fs::write(
+            &file_path,
+            render_document(&document).expect("render document"),
+        )
+        .expect("write document");
+
+        let metadata = build_document_file_metadata_with_history_reader(
+            Some(temp.path().to_string_lossy().as_ref()),
+            &file_path,
+            &document,
+            true,
+            |_, _| Some((Some("Test Author".to_string()), Some(1_700_000_000_000))),
+        );
+
+        assert_eq!(metadata.last_commit_author.as_deref(), Some("Test Author"));
+        assert_eq!(metadata.last_commit_at, Some(1_700_000_000_000));
+    }
+
+    #[test]
+    fn fast_read_exposes_file_mtime_as_content_revision() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let saved = save_document(&working_dir, sample_doc()).expect("save document");
+
+        let read = read_document_with_app_root(
+            &working_dir,
+            None,
+            KnowledgeType::Design,
+            "gameplay/core-loop.md",
+            "full",
+            false,
+        )
+        .expect("fast read");
+        let metadata = read.file_metadata.expect("file metadata");
+
+        assert_eq!(read.document.updated_at, saved.updated_at);
+        assert_eq!(metadata.modified_at, Some(read.document.updated_at));
+        assert!(metadata.last_commit_author.is_none());
+        assert!(metadata.last_commit_at.is_none());
     }
 
     fn sample_directory_config() -> KnowledgeDirectoryConfig {
@@ -9482,12 +9701,14 @@ Body content
                         old_string: "alpha".to_string(),
                         new_string: "omega".to_string(),
                         replace_all: true,
+                        expected_empty: false,
                     },
                     KnowledgeDocumentEditOperation {
                         section: KnowledgeDocumentEditSection::MaintenanceRules,
                         old_string: "old".to_string(),
                         new_string: "new".to_string(),
                         replace_all: false,
+                        expected_empty: false,
                     },
                 ],
                 ..Default::default()
@@ -9520,6 +9741,7 @@ Body content
                     old_string: "alpha".to_string(),
                     new_string: "omega".to_string(),
                     replace_all: false,
+                    expected_empty: false,
                 }],
                 ..Default::default()
             },
@@ -9528,6 +9750,75 @@ Body content
 
         assert!(error.contains("document.edits[0] body"));
         assert!(error.contains("Found multiple matches"));
+    }
+
+    #[test]
+    fn edit_document_plans_same_section_replacements_against_one_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut doc = sample_doc();
+        doc.body = "alpha beta".to_string();
+        save_document(&working_dir, doc).expect("save");
+
+        let updated = edit_document(
+            &working_dir,
+            "gameplay/core-loop.md",
+            Some(KnowledgeType::Design),
+            KnowledgeDocumentPatch {
+                edits: vec![
+                    KnowledgeDocumentEditOperation {
+                        section: KnowledgeDocumentEditSection::Body,
+                        old_string: "alpha".to_string(),
+                        new_string: "beta-new".to_string(),
+                        replace_all: false,
+                        expected_empty: false,
+                    },
+                    KnowledgeDocumentEditOperation {
+                        section: KnowledgeDocumentEditSection::Body,
+                        old_string: "beta".to_string(),
+                        new_string: "gamma".to_string(),
+                        replace_all: false,
+                        expected_empty: false,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .expect("batch edit");
+
+        assert_eq!(updated.body, "beta-new gamma");
+    }
+
+    #[test]
+    fn edit_document_rejects_empty_section_insert_after_external_content_arrives() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let mut doc = sample_doc();
+        doc.summary = Some("Agent summary".to_string());
+        save_document(&working_dir, doc).expect("save");
+
+        let error = edit_document(
+            &working_dir,
+            "gameplay/core-loop.md",
+            Some(KnowledgeType::Design),
+            KnowledgeDocumentPatch {
+                edits: vec![KnowledgeDocumentEditOperation {
+                    section: KnowledgeDocumentEditSection::Summary,
+                    old_string: String::new(),
+                    new_string: "User summary".to_string(),
+                    replace_all: false,
+                    expected_empty: true,
+                }],
+                ..Default::default()
+            },
+        )
+        .expect_err("stale empty-section insert should fail");
+
+        assert!(error.contains("selected knowledge section changed"));
+        let current =
+            load_document_by_path(&working_dir, KnowledgeType::Design, "gameplay/core-loop.md")
+                .expect("reload");
+        assert_eq!(current.summary.as_deref(), Some("Agent summary"));
     }
 
     #[test]

@@ -14,10 +14,16 @@ describe("KnowledgeExplorer load-more flow", () => {
     const knowledgeState = read("src/composables/useKnowledgeState.ts");
 
     expect(knowledgeState).toContain("function hasLoadedDirectoryDocuments(");
+    expect(knowledgeState).toContain("function hasLoadedRootContents(");
     expect(knowledgeState).toContain("hasLoadedDirectoryDocuments,");
+    expect(knowledgeState).toContain("hasLoadedRootContents,");
     expect(knowledgeView).toContain("hasLoadedDirectoryDocuments,");
+    expect(knowledgeView).toContain("hasLoadedRootContents,");
     expect(knowledgeView).toContain(
       ':folder-documents-loaded="hasLoadedDirectoryDocuments"',
+    );
+    expect(knowledgeView).toContain(
+      ':root-contents-loaded="hasLoadedRootContents"',
     );
   });
 

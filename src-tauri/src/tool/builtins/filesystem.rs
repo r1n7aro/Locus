@@ -201,6 +201,7 @@ fn prepare_missing_knowledge_frontmatter(
 async fn sync_written_knowledge(
     ctx: &crate::tool::ToolExecutionContext,
     target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
+    change_kind: &'static str,
 ) -> Option<String> {
     let target = target?;
     let Some(execution) = ctx.execution.as_ref() else {
@@ -245,11 +246,23 @@ async fn sync_written_knowledge(
             if target.kind
                 == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
             {
-                crate::commands::emit_knowledge_changed(
+                let parent_path = std::path::Path::new(&target.logical_path)
+                    .parent()
+                    .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+                    .filter(|parent| !parent.is_empty() && parent != ".");
+                crate::commands::emit_knowledge_changed_with_target(
                     app_handle,
                     &state,
                     &working_dir,
                     "generic_file_tool",
+                    crate::commands::KnowledgeChangedTarget {
+                        doc_type: Some(target.doc_type),
+                        path: Some(target.logical_path.clone()),
+                        parent_path,
+                        target_kind: Some("document"),
+                        change_kind: Some(change_kind),
+                        subtree: false,
+                    },
                 );
             }
             Some("Knowledge index: updated".to_string())
@@ -827,7 +840,7 @@ pub(super) fn write() -> ToolDef {
                             ));
                         }
                         if let Some(sync_status) =
-                            sync_written_knowledge(&ctx, knowledge_target.as_ref()).await
+                            sync_written_knowledge(&ctx, knowledge_target.as_ref(), "structure").await
                         {
                             base_output.push('\n');
                             base_output.push_str(&sync_status);
@@ -1197,7 +1210,7 @@ pub(super) fn edit() -> ToolDef {
                             ));
                         }
                         if let Some(sync_status) =
-                            sync_written_knowledge(&ctx, knowledge_target.as_ref()).await
+                            sync_written_knowledge(&ctx, knowledge_target.as_ref(), "content").await
                         {
                             output.push('\n');
                             output.push_str(&sync_status);

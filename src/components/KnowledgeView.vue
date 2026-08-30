@@ -2,6 +2,8 @@
 import { computed, onUnmounted, ref, watch } from "vue";
 import type {
   KnowledgeDocumentPatch,
+  KnowledgeDocumentEditOperation,
+  KnowledgeDocumentSummary,
   ModelDefaults,
   KnowledgeDocumentSection,
   KnowledgeDocumentType,
@@ -26,6 +28,23 @@ import {
   type ReferenceExternalImportSource,
 } from "../services/referenceExternalImportWindow";
 import type { WorkspaceRef } from "../services/project";
+import { KnowledgeEditorWorkspaceSessionStore } from "./knowledge/knowledgeEditorWorkspaceSession";
+import type { MarkdownReferenceToken } from "./ui/markdown-editor/markdownComplexTokens";
+import { knowledgeRead } from "../services/knowledge";
+import { readKnowledgeDocumentCached } from "../composables/knowledgeDocumentCache";
+import {
+  openFileExternal,
+  openUnityAssetInspector,
+  openUnitySceneObjectInspector,
+  showInFolder,
+} from "../services/unity";
+import { viewRun, viewTree, type ViewPackageSummary } from "../services/view";
+import {
+  parseUnityPropertyFence,
+  unityPropertyFenceUnitySelectionTarget,
+} from "../composables/unityPropertyFence";
+import { normalizeAppError } from "../services/errors";
+import { useNotificationStore } from "../stores/notification";
 
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
 const KNOWLEDGE_SIDEBAR_WIDTH_KEY = "locus:knowledgeSidebarWidth";
@@ -39,11 +58,17 @@ const props = withDefaults(defineProps<{
   selectedModelId: string;
   modelDefaults: ModelDefaults;
   embedded?: boolean;
+  active?: boolean;
   selectedDocumentId?: string | null;
+  selectedDocumentTarget?: KnowledgeDocumentSummary | null;
 }>(), {
   embedded: false,
+  active: true,
   selectedDocumentId: null,
+  selectedDocumentTarget: null,
 });
+const editorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
+const notificationStore = useNotificationStore();
 
 const {
   sidebarWidth,
@@ -82,6 +107,7 @@ const {
   isPathExpanded,
   togglePath,
   expandAncestors,
+  hasLoadedRootContents,
   hasMoreRootDocuments,
   hasMoreDirectoryDocuments,
   hasLoadedDirectoryDocuments,
@@ -112,6 +138,7 @@ const {
   createDocumentAt,
   createFolder,
   updateSection,
+  updateDocumentEdits,
   updateMeta,
   updatePackageConfig,
   importSkillPackageArchive,
@@ -172,40 +199,54 @@ const embeddingRuntimeLoading = computed(
 );
 
 watch(
-  [() => props.selectedDocumentId, documents],
-  ([documentId, items]) => {
-    if (!documentId || selectedDocument.value?.id === documentId) return;
-    const summary = items.find((item) => item.id === documentId);
-    if (summary) handleSelectDocument(summary);
+  [
+    () => props.selectedDocumentTarget,
+    () => props.selectedDocumentId,
+    documents,
+  ],
+  ([target, documentId, items]) => {
+    const summary = target
+      ?? (documentId ? items.find((item) => item.id === documentId) ?? null : null);
+    if (!summary) return;
+    if (
+      selectedDocument.value?.id === summary.id
+      && selectedDocument.value.type === summary.type
+      && selectedDocument.value.path === summary.path
+    ) return;
+    void handleSelectDocument(summary);
   },
   { immediate: true },
 );
 
-let resizing: "sidebar" | null = null;
+const resizingSidebar = ref(false);
 let resizeStartX = 0;
 let resizeStartWidth = 0;
 
 function onResizeStart(event: MouseEvent) {
-  resizing = "sidebar";
+  if (event.button !== 0) return;
+  event.preventDefault();
+  resizingSidebar.value = true;
   resizeStartX = event.clientX;
   resizeStartWidth = sidebarWidth.value;
   document.addEventListener("mousemove", onResizeMove);
   document.addEventListener("mouseup", onResizeEnd);
   document.body.style.cursor = "col-resize";
+  document.body.classList.add("is-dragging-select-lock");
 }
 
 function onResizeMove(event: MouseEvent) {
-  if (!resizing) return;
+  if (!resizingSidebar.value) return;
   const delta = event.clientX - resizeStartX;
   sidebarWidth.value = clampKnowledgeSidebarWidth(resizeStartWidth + delta);
 }
 
 function onResizeEnd() {
-  const wasResizing = resizing !== null;
-  resizing = null;
+  const wasResizing = resizingSidebar.value;
+  resizingSidebar.value = false;
   document.removeEventListener("mousemove", onResizeMove);
   document.removeEventListener("mouseup", onResizeEnd);
   document.body.style.cursor = "";
+  document.body.classList.remove("is-dragging-select-lock");
   if (wasResizing) persistKnowledgeSidebarWidth();
 }
 
@@ -292,6 +333,171 @@ watch(
 
 function handleLoadMoreRoot(type: KnowledgeDocumentType) {
   void loadMoreRootDocuments(type);
+}
+
+const KNOWLEDGE_REFERENCE_TYPES = new Set<KnowledgeDocumentType>([
+  "design",
+  "plan",
+  "memory",
+  "skill",
+  "reference",
+]);
+
+function normalizeReferencePath(path: string): string {
+  return path.trim().replace(/\\/g, "/").replace(/\/+/g, "/");
+}
+
+function knowledgeReferenceTarget(path: string): {
+  type: KnowledgeDocumentType;
+  path: string;
+} | null {
+  const normalized = normalizeReferencePath(path)
+    .replace(/^\/+/, "")
+    .replace(/^Locus\/knowledge\//i, "");
+  const [rawType, ...segments] = normalized.split("/");
+  const type = rawType?.toLowerCase() as KnowledgeDocumentType;
+  const relativePath = segments.join("/").replace(/^\/+/, "");
+  if (!KNOWLEDGE_REFERENCE_TYPES.has(type) || !relativePath) return null;
+  return { type, path: relativePath };
+}
+
+function knowledgeDocumentRelativePath(type: KnowledgeDocumentType, path: string): string {
+  const normalized = normalizeReferencePath(path).replace(/^\/+/, "");
+  return normalized.toLowerCase().startsWith(`${type}/`)
+    ? normalized.slice(type.length + 1)
+    : normalized;
+}
+
+async function openKnowledgeEditorReference(reference: MarkdownReferenceToken): Promise<void> {
+  const target = knowledgeReferenceTarget(reference.path);
+  const workspaceRef = props.workspaceRef;
+  if (!target || !workspaceRef) return;
+  const existing = documents.value.find((document) => (
+    document.type === target.type
+    && knowledgeDocumentRelativePath(document.type, document.path) === target.path
+  ));
+
+  specialPage.value = null;
+  overviewDismissed.value = false;
+  if (existing) {
+    await selectDocument(existing);
+    return;
+  }
+
+  const document = await readKnowledgeDocumentCached(
+    props.workingDir,
+    workspaceRef,
+    target,
+    async () => {
+      const result = await knowledgeRead({
+        kind: "document",
+        type: target.type,
+        path: target.path,
+        part: "full",
+      }, workspaceRef);
+      if (!result.document) throw new Error(`Knowledge document not found: ${reference.path}`);
+      return result.document;
+    },
+  );
+  await selectDocument(document);
+}
+
+function normalizeViewReferenceKey(value: string): string {
+  return normalizeReferencePath(value).replace(/^\/+|\/+$/g, "").toLowerCase();
+}
+
+function viewMatchesReference(view: ViewPackageSummary, referenceKey: string): boolean {
+  return [view.id, view.displayPath, view.packageRelPath, view.name]
+    .some((candidate) => candidate && normalizeViewReferenceKey(candidate) === referenceKey);
+}
+
+async function openViewEditorReference(reference: MarkdownReferenceToken, workspaceRef: WorkspaceRef): Promise<void> {
+  const referenceKey = normalizeViewReferenceKey(reference.path);
+  const snapshot = await viewTree(workspaceRef);
+  const viewId = snapshot.views.find((view) => viewMatchesReference(view, referenceKey))?.id
+    ?? reference.path;
+  await viewRun(workspaceRef, viewId);
+}
+
+function unitySceneObjectTarget(path: string): { scenePath: string; objectPath: string } | null {
+  const normalized = normalizeReferencePath(path);
+  const match = normalized.match(/^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i);
+  if (!match?.[1] || !match[2]) return null;
+  return { scenePath: match[1], objectPath: match[2].replace(/^\/+|\/+$/g, "") };
+}
+
+async function openUnityEditorReference(
+  reference: MarkdownReferenceToken,
+  workspaceRef: WorkspaceRef,
+): Promise<void> {
+  if (reference.kind === "unity-property") {
+    const parsed = parseUnityPropertyFence(reference.raw);
+    const target = parsed.entries[0]
+      ? unityPropertyFenceUnitySelectionTarget(parsed.entries[0].target)
+      : null;
+    if (target?.kind === "sceneObject") {
+      await openUnitySceneObjectInspector(workspaceRef, target.scenePath, target.objectPath);
+      return;
+    }
+    if (target?.kind === "asset") {
+      await openUnityAssetInspector(workspaceRef, target.path);
+      return;
+    }
+  }
+
+  const sceneObject = unitySceneObjectTarget(reference.path);
+  if (sceneObject) {
+    await openUnitySceneObjectInspector(workspaceRef, sceneObject.scenePath, sceneObject.objectPath);
+    return;
+  }
+  const assetPath = normalizeReferencePath(reference.path).replace(/#fileID:-?\d+$/i, "");
+  await openUnityAssetInspector(workspaceRef, assetPath);
+}
+
+async function handleEditorReferenceOpen(reference: MarkdownReferenceToken): Promise<void> {
+  try {
+    if (reference.kind === "knowledge") {
+      await openKnowledgeEditorReference(reference);
+      return;
+    }
+    const workspaceRef = props.workspaceRef;
+    if (!workspaceRef) return;
+    if (reference.kind === "view") {
+      await openViewEditorReference(reference, workspaceRef);
+      return;
+    }
+    if (
+      reference.kind === "unity-asset"
+      || reference.kind === "unity-scene-object"
+      || reference.kind === "unity-property"
+    ) {
+      await openUnityEditorReference(reference, workspaceRef);
+      return;
+    }
+
+    const path = normalizeReferencePath(reference.path).replace(/\/+$/, "");
+    if (!path) return;
+    if (/\/$/.test(reference.raw.trim())) {
+      await showInFolder(workspaceRef, path);
+      return;
+    }
+    await openFileExternal(workspaceRef, path);
+  } catch (cause) {
+    const error = normalizeAppError(cause);
+    notificationStore.addNotice("warning", error.message, {
+      code: error.code,
+      operation: "openMarkdownEditorReference",
+      replaceOperation: true,
+    });
+  }
+}
+
+function handleSaveEdits(
+  edits: KnowledgeDocumentEditOperation[],
+) {
+  const document = selectedDocument.value;
+  if (!document) return Promise.resolve(null);
+  return updateDocumentEdits(document.id, document.path, edits);
 }
 
 function handleLoadMoreFolder(type: KnowledgeDocumentType, path: string) {
@@ -521,6 +727,7 @@ onUnmounted(() => {
           :folder-stats="referenceManagedDirectoryStats"
           :selected-path="selectedPath"
           :is-path-expanded="isPathExpanded"
+          :root-contents-loaded="hasLoadedRootContents"
           :has-more-root-documents="hasMoreRootDocuments"
           :root-documents-loading="isRootDocumentsLoading"
           :has-more-folder-documents="hasMoreDirectoryDocuments"
@@ -584,6 +791,9 @@ onUnmounted(() => {
       <div
         v-if="!props.embedded"
         class="resize-handle"
+        :class="{ active: resizingSidebar }"
+        role="separator"
+        aria-orientation="vertical"
         @mousedown="onResizeStart"
       ></div>
 
@@ -613,10 +823,16 @@ onUnmounted(() => {
             :search-context="selectedSearchContext"
             :loading="selectedDocumentLoading"
             :save-loading="savingDocument"
+            :save-edits="handleSaveEdits"
+            :embedded="props.embedded"
+            :active="props.active"
+            :workspace-ref="props.workspaceRef ?? null"
+            :session-store="editorWorkspaceSessions"
             @close="handleClosePreview"
             @delete="handleDelete"
             @save-section="handleSaveSection"
             @update-meta="handleUpdateMeta"
+            @reference-open="handleEditorReferenceOpen"
           />
 
           <KnowledgeDirectoryPreview
@@ -624,7 +840,9 @@ onUnmounted(() => {
             :directory="selectedDirectoryConfig"
             :loading="selectedDirectoryLoading"
             :save-loading="savingDocument"
+            :active="props.active"
             :workspace-ref="workspaceRef!"
+            :session-store="editorWorkspaceSessions"
             :path-exists="referenceFolderExists"
             :ensure-directory="ensureReferenceDirectory"
             :select-directory="focusReferenceDirectory"
@@ -791,7 +1009,8 @@ onUnmounted(() => {
 }
 
 .resize-handle {
-  width: 0;
+  width: 6px;
+  margin: 0 -3px;
   cursor: col-resize;
   background: transparent;
   flex-shrink: 0;
@@ -802,10 +1021,7 @@ onUnmounted(() => {
 .resize-handle::before {
   content: "";
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: -3px;
-  width: 6px;
+  inset: 0;
 }
 
 .resize-handle::after {
@@ -813,13 +1029,14 @@ onUnmounted(() => {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: -1px;
+  left: 2px;
   width: 2px;
   background: transparent;
   transition: background 0.15s;
 }
 
-.resize-handle:hover::after {
+.resize-handle:hover::after,
+.resize-handle.active::after {
   background: color-mix(in srgb, var(--accent-color) 40%, transparent);
 }
 
