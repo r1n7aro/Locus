@@ -8,6 +8,8 @@ import {
 } from "../../composables/streamingMarkdownBlocks";
 import { STREAMING_RENDER_THROTTLE_MS } from "../../composables/streamingRenderThrottle";
 import type { StreamingTextSource } from "../../composables/streamingTextChunks";
+import type { WorkspaceRef } from "../../services/project";
+import type { Citation } from "../../types";
 
 /**
  * Streaming markdown surface with amortized O(n) total render cost.
@@ -30,6 +32,7 @@ import type { StreamingTextSource } from "../../composables/streamingTextChunks"
  */
 const props = defineProps<{
   content?: string;
+  citations?: Citation[];
   stream?: StreamingTextSource | null;
   streamInitial?: string;
   /** Full response has landed. Deferred atomic tails render from their final
@@ -39,6 +42,7 @@ const props = defineProps<{
   cursor?: boolean;
   enableFileRefs?: boolean;
   unityPreviewStateScope?: string | null;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -67,6 +71,12 @@ function visibleTail(next: StreamingMarkdownSplit): string {
 
 const renderTail = computed(() => {
   return visibleTail(split.value);
+});
+
+const citationContent = computed(() => {
+  if (!props.citations?.length) return "";
+  if (props.content !== undefined) return props.content;
+  return `${props.streamInitial ?? ""}${props.stream?.full() ?? ""}`;
 });
 
 // Vue post-flush watchers run after this component's DOM patch and before the
@@ -219,30 +229,44 @@ function blockPreviewScope(blockId: string): string | null | undefined {
 <template>
   <div class="streaming-markdown">
     <MarkdownRenderer
-      v-for="block in split.blocks"
-      :key="block.id"
+      v-if="citations?.length"
       class="streaming-markdown-block"
-      :content="block.text"
+      :content="citationContent"
+      :citations="citations"
       :enable-file-refs="enableFileRefs"
-      :unity-preview-state-scope="blockPreviewScope(block.id)"
+      :workspace-ref="workspaceRef"
+      :unity-preview-state-scope="blockPreviewScope('citations')"
       @open-image="emit('openImage', $event)"
     />
-    <pre
-      v-if="renderTail && renderTail.length > TAIL_MARKDOWN_LIMIT"
-      class="streaming-markdown-block streaming-markdown-tail-plain ui-select-text"
-    ><span
-      v-for="(part, index) in plainTailParts"
-      :key="index"
-    >{{ part }}</span><span>{{ plainTailActive }}</span></pre>
-    <MarkdownRenderer
-      v-else-if="renderTail"
-      class="streaming-markdown-block"
-      :content="renderTail"
-      :cursor="cursor"
-      :enable-file-refs="enableFileRefs"
-      :unity-preview-state-scope="blockPreviewScope('tail')"
-      @open-image="emit('openImage', $event)"
-    />
+    <template v-else>
+      <MarkdownRenderer
+        v-for="block in split.blocks"
+        :key="block.id"
+        class="streaming-markdown-block"
+        :content="block.text"
+        :enable-file-refs="enableFileRefs"
+        :workspace-ref="workspaceRef"
+        :unity-preview-state-scope="blockPreviewScope(block.id)"
+        @open-image="emit('openImage', $event)"
+      />
+      <pre
+        v-if="renderTail && renderTail.length > TAIL_MARKDOWN_LIMIT"
+        class="streaming-markdown-block streaming-markdown-tail-plain ui-select-text"
+      ><span
+        v-for="(part, index) in plainTailParts"
+        :key="index"
+      >{{ part }}</span><span>{{ plainTailActive }}</span></pre>
+      <MarkdownRenderer
+        v-else-if="renderTail"
+        class="streaming-markdown-block"
+        :content="renderTail"
+        :cursor="cursor"
+        :enable-file-refs="enableFileRefs"
+        :workspace-ref="workspaceRef"
+        :unity-preview-state-scope="blockPreviewScope('tail')"
+        @open-image="emit('openImage', $event)"
+      />
+    </template>
   </div>
 </template>
 

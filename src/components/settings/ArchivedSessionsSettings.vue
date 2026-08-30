@@ -68,6 +68,12 @@ function roleLabel(role: ChatMessage["role"]): string {
   }
 }
 
+function messageCitations(message: ChatMessage) {
+  return (message.renderParts ?? []).flatMap((part) => (
+    part.kind === "text" ? (part.citations ?? []) : []
+  ));
+}
+
 function isUnarchiving(sessionId: string): boolean {
   return unarchivingIds.value.has(sessionId);
 }
@@ -280,7 +286,11 @@ onMounted(() => {
               </header>
               <div class="archived-message-body">
                 <pre v-if="message.role === 'tool'" class="archived-tool-output">{{ message.content }}</pre>
-                <MarkdownRenderer v-else :content="message.content" />
+                <MarkdownRenderer
+                  v-else
+                  :content="message.content"
+                  :citations="messageCitations(message)"
+                />
               </div>
             </article>
           </div>

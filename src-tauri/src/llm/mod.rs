@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod anthropic_usage;
 pub mod chat_completions;
+pub mod citations;
 pub mod claude_code_cli;
 pub mod codex;
 pub mod codex_models;
@@ -13,6 +14,7 @@ pub mod retry;
 pub mod streaming;
 pub mod think_tag_filter;
 pub mod tool_references;
+pub mod utf8_stream;
 
 pub(crate) const CODEX_CLIENT_VERSION: &str = "0.144.1";
 

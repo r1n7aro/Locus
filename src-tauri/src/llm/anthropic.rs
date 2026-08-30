@@ -3,6 +3,7 @@ use regex::Regex;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::utf8_stream::Utf8StreamDecoder;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
 
 #[derive(Debug, Clone)]
@@ -962,6 +963,7 @@ where
     let mut full_thinking = String::new();
     let mut thinking_signature = String::new();
     let mut raw_response = String::new();
+    let mut utf8_decoder = Utf8StreamDecoder::default();
     let mut tool_calls: Vec<PartialToolCall> = Vec::new();
     let mut _current_block_index: Option<usize> = None;
     let mut stop_reason = String::from("end_turn");
@@ -1037,7 +1039,7 @@ where
             }
         };
 
-        let chunk_text = String::from_utf8_lossy(&chunk);
+        let chunk_text = utf8_decoder.push(&chunk);
         raw_response.push_str(&chunk_text);
         buffer.push_str(&chunk_text);
 

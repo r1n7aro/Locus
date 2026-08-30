@@ -183,6 +183,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
                 &round.thinking_text,
                 None,
                 (!round.thinking_signature.is_empty()).then_some(round.thinking_signature.as_str()),
+                &[],
                 &round.tool_calls,
             );
             if let Err(err) = self.store.update_message_tool_calls_and_render_parts(
@@ -917,6 +918,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
             &message.thinking_text,
             None,
             (!message.thinking_signature.is_empty()).then_some(message.thinking_signature.as_str()),
+            &[],
             &ordered_tool_calls,
         );
 
@@ -1655,6 +1657,7 @@ impl AgentInstance {
                 thinking_text.unwrap_or_default(),
                 None,
                 thinking_signature,
+                &[],
                 &[],
             );
             done_message_id = store.add_message_with_thinking_and_render_parts(

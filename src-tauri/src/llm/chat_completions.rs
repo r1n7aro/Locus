@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use super::openrouter::LlmResponse;
 use super::think_tag_filter::{ThinkTagEmit, ThinkTagFilter};
+use super::utf8_stream::Utf8StreamDecoder;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
@@ -211,6 +212,7 @@ where
     let mut buffer = String::new();
     let mut raw_response = String::new();
     let mut state = ChatStreamState::new();
+    let mut utf8_decoder = Utf8StreamDecoder::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
@@ -220,7 +222,7 @@ where
             }
         };
 
-        let chunk_text = String::from_utf8_lossy(&chunk);
+        let chunk_text = utf8_decoder.push(&chunk);
         raw_response.push_str(&chunk_text);
         buffer.push_str(&chunk_text);
 
@@ -247,6 +249,10 @@ where
             );
         }
     }
+
+    let trailing_text = utf8_decoder.finish();
+    raw_response.push_str(&trailing_text);
+    buffer.push_str(&trailing_text);
 
     if drain_sse_buffer(
         &mut buffer,
@@ -1300,6 +1306,7 @@ fn finalize_stream_response(
 
     let resp = LlmResponse {
         text: state.full_text,
+        citations: Vec::new(),
         tool_calls,
         finish_reason: state.finish_reason,
         end_turn: None,

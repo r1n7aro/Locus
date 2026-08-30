@@ -2,11 +2,13 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use super::think_tag_filter::{ThinkTagEmit, ThinkTagFilter};
-use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
+use super::utf8_stream::Utf8StreamDecoder;
+use crate::session::models::{ChatMessage, Citation, ImageData, MessageRole, ToolCallInfo};
 
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub text: String,
+    pub citations: Vec<Citation>,
     pub tool_calls: Vec<ToolCallInfo>,
     pub finish_reason: String,
     pub end_turn: Option<bool>,
@@ -258,6 +260,7 @@ where
     let mut full_text = String::new();
     let mut think = ThinkChannel::new();
     let mut raw_response = String::new();
+    let mut utf8_decoder = Utf8StreamDecoder::default();
     let mut tool_calls_map: std::collections::HashMap<i64, PartialToolCall> =
         std::collections::HashMap::new();
     let mut finish_reason = String::from("stop");
@@ -294,7 +297,7 @@ where
                 continue;
             }
         };
-        let chunk_text = String::from_utf8_lossy(&chunk);
+        let chunk_text = utf8_decoder.push(&chunk);
         raw_response.push_str(&chunk_text);
         buffer.push_str(&chunk_text);
 
@@ -495,6 +498,7 @@ fn finalize_stream_response(
     think.finish_timing();
     let resp = LlmResponse {
         text: full_text,
+        citations: Vec::new(),
         tool_calls,
         finish_reason,
         end_turn: None,

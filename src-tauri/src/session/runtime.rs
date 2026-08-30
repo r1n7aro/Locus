@@ -643,6 +643,7 @@ fn upsert_live_text_part(
             id: existing_id,
             order: existing_order,
             content,
+            ..
         } = part
         {
             if *existing_id == id {
@@ -656,6 +657,7 @@ fn upsert_live_text_part(
         id,
         order,
         content: delta.to_string(),
+        citations: Vec::new(),
     });
 }
 

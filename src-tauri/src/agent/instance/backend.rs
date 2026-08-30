@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
 
-use crate::session::models::ToolCallInfo;
+use crate::session::models::{Citation, ToolCallInfo};
 
 pub type RawContextStore = Arc<tokio::sync::Mutex<HashMap<String, Vec<RawRound>>>>;
 type SessionUnityStateStore = tokio::sync::Mutex<HashMap<String, (String, Option<String>)>>;
@@ -693,6 +693,7 @@ pub enum LlmBackend {
 
 pub(super) struct LlmCallResult {
     pub text: String,
+    pub citations: Vec<Citation>,
     pub tool_calls: Vec<ToolCallInfo>,
     #[allow(dead_code)]
     pub finish_reason: String,
@@ -1078,6 +1079,7 @@ pub(super) async fn stream_mock_response(
 
     Ok(LlmCallResult {
         text: plan.text,
+        citations: Vec::new(),
         tool_calls: plan.tool_calls,
         finish_reason: if has_tool_calls { "tool_calls" } else { "stop" }.to_string(),
         end_turn: Some(!has_tool_calls),

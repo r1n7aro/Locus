@@ -552,6 +552,36 @@ pub struct RenderOrderKey {
     pub seq: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CitationKind {
+    Url,
+    File,
+    ContainerFile,
+    Reference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Citation {
+    pub id: String,
+    pub kind: CitationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum AssistantRenderPart {
@@ -572,6 +602,8 @@ pub enum AssistantRenderPart {
         id: String,
         order: RenderOrderKey,
         content: String,
+        #[serde(default)]
+        citations: Vec<Citation>,
     },
     #[serde(rename_all = "camelCase")]
     ToolCall {

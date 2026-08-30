@@ -21,6 +21,7 @@ import {
   type MarkdownPathStatus,
 } from "../composables/markdownInject";
 import { resolveMathSentinels } from "../composables/markdownMath";
+import { prepareMarkdownCitations } from "../composables/markdownCitations";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
 import { loadCachedMarkdownPathStatuses } from "../composables/markdownPathStatusCache";
@@ -41,12 +42,14 @@ import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
 import UnityPropertyFenceBlock from "./unity/UnityPropertyFenceBlock.vue";
 import type { LocusFileDropRef } from "../services/unity";
-import type { AssetRefAttachment } from "../types";
+import type { AssetRefAttachment, Citation } from "../types";
 import type { WorkspaceRef } from "../services/project";
 import type { UnityObjectPreviewInput, UnityObjectPreviewLevel } from "./unity-preview";
+import { isWorkbenchReferencePointerEventClaimed } from "./workbench/workbenchReferenceDrag";
 
 const props = defineProps<{
   content: string;
+  citations?: Citation[];
   cursor?: boolean;
   enableFileRefs?: boolean;
   highlightTerms?: string[];
@@ -160,7 +163,8 @@ function highlightHtml(html: string, terms: string[]): string {
 
 const parsedMarkdownHtml = computed(() => {
   if (!props.content) return "";
-  return markdownEngine.parse(normalizeMarkdownForRender(props.content)) as string;
+  const content = prepareMarkdownCitations(props.content, props.citations);
+  return markdownEngine.parse(normalizeMarkdownForRender(content)) as string;
 });
 
 function resolveInlinePathStatus(path: string): MarkdownPathStatus | null | undefined {
@@ -358,6 +362,7 @@ function mountMarkdownUnityObjectPreviews() {
 
     const vnode = h(UnityObjectPreview, {
       model,
+      workspaceRef: props.workspaceRef ?? undefined,
       level,
       draggable: false,
       autoLoadPreview: true,
@@ -748,6 +753,7 @@ function handleMarkdownDragStart(event: DragEvent) {
 }
 
 function handleMarkdownPointerDown(event: PointerEvent) {
+  if (isWorkbenchReferencePointerEventClaimed(event)) return;
   if (!(event.target instanceof Element)) return;
   const ref = unityRefFromMarkdownDragTarget(event.target);
   if (ref) {
@@ -1422,6 +1428,29 @@ img.md-ref-icon-image {
   font-weight: 400;
   transform: translateX(1px);
   animation: streaming-cursor-blink 0.8s step-end infinite;
+}
+
+.markdown-body .md-citation {
+  display: inline;
+  margin-left: 2px;
+  color: var(--accent-color);
+  font-size: 0.78em;
+  font-weight: 500;
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.markdown-body a.md-citation:hover {
+  color: color-mix(in srgb, var(--accent-color) 82%, var(--text-color));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-body .md-citation sup {
+  position: relative;
+  top: -0.08em;
+  vertical-align: baseline;
 }
 
 @keyframes streaming-cursor-blink {

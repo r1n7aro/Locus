@@ -6,7 +6,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use super::citations::CitationCollector;
 use super::openrouter::LlmResponse;
+use super::utf8_stream::Utf8StreamDecoder;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ToolCallInfo};
 
 pub async fn stream_chat<F, G, H>(
@@ -147,6 +149,7 @@ where
     let mut buffer = String::new();
     let mut raw_response = String::new();
     let mut state = ResponsesStreamState::new();
+    let mut utf8_decoder = Utf8StreamDecoder::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = match chunk {
@@ -161,7 +164,7 @@ where
             }
         };
 
-        let chunk_text = String::from_utf8_lossy(&chunk);
+        let chunk_text = utf8_decoder.push(&chunk);
         raw_response.push_str(&chunk_text);
         buffer.push_str(&chunk_text);
 
@@ -175,6 +178,10 @@ where
             &on_tool_call_start,
         )?;
     }
+
+    let trailing_text = utf8_decoder.finish();
+    raw_response.push_str(&trailing_text);
+    buffer.push_str(&trailing_text);
 
     drain_sse_buffer(
         &mut buffer,
@@ -203,8 +210,12 @@ where
         state.finish_reason = "tool_calls".to_string();
     }
 
+    let citations = state
+        .citation_collector
+        .collect(&state.response_items, &state.full_text);
     Ok(LlmResponse {
         text: state.full_text,
+        citations,
         tool_calls,
         finish_reason: state.finish_reason,
         end_turn: state.end_turn,
@@ -220,8 +231,8 @@ where
         thinking_duration_secs: state.thinking_duration_secs,
         thinking_signature: String::new(),
         continuation_request: None,
-        response_items: Vec::new(),
-        response_completed: true,
+        response_items: state.response_items,
+        response_completed: state.response_completed,
     })
 }
 
@@ -547,6 +558,8 @@ struct ResponsesStreamState {
     end_turn: Option<bool>,
     response_completed: bool,
     stream_broke_early: bool,
+    response_items: Vec<serde_json::Value>,
+    citation_collector: CitationCollector,
 }
 
 impl ResponsesStreamState {
@@ -566,6 +579,8 @@ impl ResponsesStreamState {
             end_turn: None,
             response_completed: false,
             stream_broke_early: false,
+            response_items: Vec::new(),
+            citation_collector: CitationCollector::default(),
         }
     }
 
@@ -709,10 +724,21 @@ where
 
     match event_type.as_str() {
         "response.output_text.delta" => {
-            if let Ok(ev) = serde_json::from_str::<TextDeltaEvent>(&data_str) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data_str) {
+                state
+                    .citation_collector
+                    .observe_text_delta(&value, &state.full_text);
+                let Ok(ev) = serde_json::from_value::<TextDeltaEvent>(value) else {
+                    return Ok(());
+                };
                 state.finish_thinking_timing();
                 state.full_text.push_str(&ev.delta);
                 on_text_delta(ev.delta);
+            }
+        }
+        "response.output_text.annotation.added" => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data_str) {
+                state.citation_collector.observe_annotation_event(&value);
             }
         }
         "response.reasoning_summary_text.delta" => {
@@ -749,6 +775,9 @@ where
             }
         }
         "response.content_part.done" => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data_str) {
+                state.citation_collector.observe_content_part(&value);
+            }
             if let Some(text) = parse_part_text(&data_str, "reasoning_text") {
                 state.sync_reasoning_text(ReasoningContentKind::Text, &text, on_thinking_delta);
             }
@@ -792,11 +821,22 @@ where
                 }
             }
         }
+        "response.output_item.done" => {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data_str) {
+                state.citation_collector.observe_output_item(&value);
+                if let Some(item) = value.get("item") {
+                    state.response_items.push(item.clone());
+                }
+            }
+        }
         "response.completed" | "response.incomplete" => {
             if let Ok(ev) = serde_json::from_str::<CompletedEvent>(&data_str) {
                 state.finish_thinking_timing();
                 state.response_id = ev.response.id.filter(|value| !value.is_empty());
                 state.end_turn = ev.response.end_turn;
+                if !ev.response.output.is_empty() {
+                    state.response_items = ev.response.output;
+                }
                 if let Some(usage) = ev.response.usage {
                     state.cached_tokens = usage
                         .input_tokens_details
@@ -912,6 +952,8 @@ struct CompletedResponse {
     status: Option<String>,
     #[serde(default)]
     end_turn: Option<bool>,
+    #[serde(default)]
+    output: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -934,7 +976,8 @@ struct InputTokensDetails {
 mod tests {
     use super::{
         build_input_messages, build_request_body, build_request_input, collect_tool_calls,
-        drain_sse_buffer, is_retryable_response_status, PendingToolCall, ResponsesStreamState,
+        drain_sse_buffer, is_retryable_response_status, process_sse_event_block, PendingToolCall,
+        ResponsesStreamState,
     };
     use crate::session::models::{
         ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo,
@@ -944,6 +987,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn ignore_text(_: String) {}
+    fn ignore_thinking(_: String) {}
     fn ignore_tool(_: String, _: String) {}
 
     fn user_message_with_images(text: &str, images: Vec<ImageData>) -> ChatMessage {
@@ -1274,6 +1318,60 @@ mod tests {
             thinking.lock().expect("thinking mutex poisoned").as_str(),
             "Plan first."
         );
+    }
+
+    #[test]
+    fn collects_streamed_url_citations_from_output_items() {
+        let marker = "\u{e200}cite\u{e202}turn1view0\u{e201}";
+        let mut state = ResponsesStreamState::new();
+        let delta = serde_json::json!({
+            "output_index": 0,
+            "content_index": 0,
+            "delta": format!("结论{marker}")
+        });
+        process_sse_event_block(
+            &format!("event: response.output_text.delta\ndata: {delta}"),
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("text delta should parse");
+
+        let item_done = serde_json::json!({
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": format!("结论{marker}"),
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 2,
+                        "end_index": 2 + marker.encode_utf16().count(),
+                        "url": "https://example.com",
+                        "title": "Example"
+                    }]
+                }]
+            }
+        });
+        process_sse_event_block(
+            &format!("event: response.output_item.done\ndata: {item_done}"),
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("output item should parse");
+
+        let citations = state
+            .citation_collector
+            .collect(&state.response_items, &state.full_text);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0].url.as_deref(), Some("https://example.com"));
+        assert_eq!(citations[0].reference_ids, vec!["turn1view0"]);
     }
 
     #[test]

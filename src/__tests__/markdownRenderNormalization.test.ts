@@ -24,7 +24,8 @@ describe("markdownRender normalization", () => {
       normalizeMarkdownForRender(markdown),
     ) as string;
 
-    expect(source).toContain('markdownEngine.parse(normalizeMarkdownForRender(props.content))');
+    expect(source).toContain('const content = prepareMarkdownCitations(props.content, props.citations);');
+    expect(source).toContain('markdownEngine.parse(normalizeMarkdownForRender(content))');
     expect(normalizeMarkdownForRender(markdown)).toBe([
       "> 受击打断",
       ">",

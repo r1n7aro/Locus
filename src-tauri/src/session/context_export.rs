@@ -15,7 +15,7 @@ use crate::session::models::{
 use crate::session::store::SessionStore;
 
 const EXPORT_FORMAT: &str = "locus.context_review";
-const EXPORT_FORMAT_VERSION: u32 = 7;
+const EXPORT_FORMAT_VERSION: u32 = 8;
 const EMPTY: &str = "empty";
 
 #[derive(Debug, Clone, Serialize)]
@@ -441,6 +441,27 @@ fn export_message(message: ChatMessage) -> Result<Value, String> {
             .map(|value| value.unwrap_or_else(empty_value))
     }
 
+    let citations = message
+        .render_parts
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|part| match part {
+            crate::session::models::AssistantRenderPart::Text { citations, .. } => {
+                Some(citations.as_slice())
+            }
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let citations = if citations.is_empty() {
+        empty_value()
+    } else {
+        serde_json::to_value(citations)
+            .map_err(|error| format!("Failed to serialize exported citations: {}", error))?
+    };
+
     Ok(json!({
         "id": message.id,
         "role": match message.role {
@@ -464,6 +485,7 @@ fn export_message(message: ChatMessage) -> Result<Value, String> {
         "thinkingDuration": optional_json(message.thinking_duration)?,
         "thinkingSignature": non_empty_value(message.thinking_signature.as_deref()),
         "knowledgeProposal": optional_json(message.knowledge_proposal)?,
+        "citations": citations,
         "renderParts": optional_json(message.render_parts)?,
     }))
 }

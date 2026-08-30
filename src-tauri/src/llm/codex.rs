@@ -1,5 +1,7 @@
+use super::citations::CitationCollector;
 use super::openai_reasoning::{apply_reasoning_effort, apply_text_verbosity_default};
 use super::openrouter::LlmResponse;
+use super::utf8_stream::Utf8StreamDecoder;
 use super::CODEX_CLIENT_VERSION;
 use crate::commands::CodexTransportMode;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
@@ -2053,6 +2055,7 @@ struct CodexStreamState {
     cached_tokens: u32,
     response_id: Option<String>,
     items_added: Vec<serde_json::Value>,
+    citation_collector: CitationCollector,
     got_terminal_event: bool,
     got_completed_event: bool,
 }
@@ -2076,6 +2079,7 @@ impl CodexStreamState {
             cached_tokens: 0,
             response_id: None,
             items_added: Vec::new(),
+            citation_collector: CitationCollector::default(),
             got_terminal_event: false,
             got_completed_event: false,
         }
@@ -2208,10 +2212,16 @@ where
             match event.get("type").and_then(|t| t.as_str()) {
                 Some("response.output_text.delta") => {
                     if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                        state
+                            .citation_collector
+                            .observe_text_delta(&event, &state.full_text);
                         state.finish_thinking_timing();
                         state.full_text.push_str(delta);
                         on_text_delta(delta.to_string());
                     }
+                }
+                Some("response.output_text.annotation.added") => {
+                    state.citation_collector.observe_annotation_event(&event);
                 }
                 Some("response.reasoning_summary_text.delta") => {
                     if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
@@ -2263,6 +2273,7 @@ where
                     }
                 }
                 Some("response.content_part.done") => {
+                    state.citation_collector.observe_content_part(&event);
                     let maybe_reasoning_text = event
                         .get("part")
                         .filter(|part| {
@@ -2394,6 +2405,7 @@ where
                     }
                 }
                 Some("response.output_item.done") => {
+                    state.citation_collector.observe_output_item(&event);
                     if let Some(item) = event.get("item") {
                         state.items_added.push(item.clone());
                         let item_type = item.get("type").and_then(|t| t.as_str());
@@ -2533,6 +2545,13 @@ where
                             .and_then(|v| v.as_str())
                             .filter(|value| !value.is_empty())
                             .map(|value| value.to_string());
+                        if let Some(output) =
+                            response.get("output").and_then(|value| value.as_array())
+                        {
+                            if !output.is_empty() {
+                                state.items_added = output.clone();
+                            }
+                        }
                         if let Some(usage) = response.get("usage") {
                             state.cached_tokens = usage
                                 .get("input_tokens_details")
@@ -3083,6 +3102,7 @@ where
     let mut buffer = String::new();
     let mut stream_state = CodexStreamState::new();
     let mut raw_response = String::new();
+    let mut utf8_decoder = Utf8StreamDecoder::default();
 
     let mut terminal_stream_error: Option<String> = None;
     let mut consecutive_errors = 0u32;
@@ -3112,7 +3132,7 @@ where
             }
         };
 
-        let chunk_text = String::from_utf8_lossy(&chunk);
+        let chunk_text = utf8_decoder.push(&chunk);
         raw_response.push_str(&chunk_text);
         buffer.push_str(&chunk_text);
         if drain_sse_buffer(
@@ -3285,6 +3305,10 @@ where
         */
     }
 
+    let trailing_text = utf8_decoder.finish();
+    raw_response.push_str(&trailing_text);
+    buffer.push_str(&trailing_text);
+
     let _ = drain_sse_buffer(
         &mut buffer,
         true,
@@ -3352,8 +3376,12 @@ where
         );
     }
 
+    let citations = stream_state
+        .citation_collector
+        .collect(&stream_state.items_added, &stream_state.full_text);
     Ok(LlmResponse {
         text: stream_state.full_text,
+        citations,
         tool_calls,
         finish_reason: stream_state.finish_reason,
         end_turn: stream_state.end_turn,
@@ -3763,8 +3791,12 @@ where
         );
     }
 
+    let citations = stream_state
+        .citation_collector
+        .collect(&stream_state.items_added, &stream_state.full_text);
     Ok(CodexWebsocketAttempt::Response(LlmResponse {
         text: stream_state.full_text,
+        citations,
         tool_calls,
         finish_reason: stream_state.finish_reason,
         end_turn: stream_state.end_turn,
@@ -5089,6 +5121,60 @@ mod tests {
 
         assert!(stopped);
         assert_eq!(state.response_id.as_deref(), Some("resp_456"));
+    }
+
+    #[test]
+    fn codex_stream_collects_annotation_events_and_final_citations() {
+        let marker = "\u{e200}cite\u{e202}turn5view0\u{e201}";
+        let mut state = CodexStreamState::new();
+        let delta = serde_json::json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": format!("资料{marker}")
+        });
+        process_sse_event_block(
+            &format!("data: {delta}"),
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("Codex text delta should parse");
+
+        let annotation = serde_json::json!({
+            "type": "response.output_text.annotation.added",
+            "output_index": 0,
+            "content_index": 0,
+            "annotation_index": 0,
+            "annotation": {
+                "type": "url_citation",
+                "start_index": 2,
+                "end_index": 2 + marker.encode_utf16().count(),
+                "url": "https://example.com/codex",
+                "title": "Codex source"
+            }
+        });
+        process_sse_event_block(
+            &format!("data: {annotation}"),
+            false,
+            &mut state,
+            &ignore_text,
+            &ignore_thinking,
+            &ignore_tool,
+        )
+        .expect("Codex citation annotation should parse");
+
+        let citations = state
+            .citation_collector
+            .collect(&state.items_added, &state.full_text);
+        assert_eq!(citations.len(), 1);
+        assert_eq!(
+            citations[0].url.as_deref(),
+            Some("https://example.com/codex")
+        );
+        assert_eq!(citations[0].reference_ids, vec!["turn5view0"]);
     }
 
     #[test]

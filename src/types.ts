@@ -47,6 +47,20 @@ export interface RenderOrderKey {
   seq: number;
 }
 
+export type CitationKind = "url" | "file" | "containerFile" | "reference";
+
+export interface Citation {
+  id: string;
+  kind: CitationKind;
+  startIndex?: number;
+  endIndex?: number;
+  url?: string;
+  title?: string;
+  fileId?: string;
+  filename?: string;
+  referenceIds?: string[];
+}
+
 export type AssistantRenderPart =
   | {
       kind: "thinking";
@@ -62,6 +76,7 @@ export type AssistantRenderPart =
       id: string;
       order: RenderOrderKey;
       content: string;
+      citations?: Citation[];
     }
   | {
       kind: "toolCall";
@@ -1875,6 +1890,7 @@ export interface KnowledgeDocumentEditOperation {
   oldString: string;
   newString: string;
   replaceAll?: boolean;
+  expectedEmpty?: boolean;
 }
 
 export interface KnowledgeDocumentPatch {
@@ -3186,6 +3202,7 @@ export interface AssetDbOverview {
   watcherQueueLen: number;
   /** Workspace-relative path of the asset currently being processed, if any. */
   watcherCurrentFile?: string;
+  changeJournal: WorkspaceChangeJournalStatus;
   byKind: AssetKindCount[];
   assetRisks: AssetRiskEntry[];
   duplicateGuids: DuplicateGuidOverview;
@@ -3215,7 +3232,7 @@ export interface WatcherTuning {
   maxWorkerCount: number;
 }
 
-export type AssetSearchRoot = "assets" | "packages" | "projectSettings";
+export type AssetSearchRoot = "assets" | "packages" | "projectSettings" | "workspace";
 export type AssetSearchSource = "assetDb" | "filesystem";
 
 export interface AssetSearchResult {
@@ -3228,6 +3245,7 @@ export interface AssetSearchResult {
   kind: string;
   typeLabel?: string;
   typeSearch?: string;
+  isDirectory?: boolean;
   isSubAsset?: boolean;
   targetId?: string;
   matchScore: number;
@@ -3240,6 +3258,23 @@ export interface AssetTextPreview {
   totalLines: number;
   startLine?: number;
   language?: string;
+}
+
+export interface WorkspaceChangeJournalStatus {
+  projectKey: string;
+  watcherActive: boolean;
+  health: "unverified" | "healthy" | "suspect";
+  healthReason: string;
+  generation: number;
+  nextSeq: number;
+  compileAck: number;
+  pendingCount: number;
+  unityPendingCount: number;
+  rescanCount: number;
+  watchErrorCount: number;
+  overflowCount: number;
+  lastSyncMode?: "none" | "targeted" | "full";
+  lastSyncReason?: string;
 }
 
 export interface AssetBinaryMeta {
