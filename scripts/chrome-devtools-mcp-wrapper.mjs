@@ -2,6 +2,7 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync } f
 import { spawn } from "node:child_process";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveLocusBrowserArgs } from "./locus-cdp-discovery.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const logPath = resolve(scriptDir, "..", ".tmp", "chrome-devtools-mcp-wrapper.log");
@@ -12,7 +13,7 @@ const bunPath = findBunExecutable();
 const chromeDevtoolsMcpVersion = "0.23.0";
 const packageName = "chrome-devtools-mcp";
 const packageBin = join("build", "src", "bin", "chrome-devtools-mcp.js");
-const mcpArgs = process.argv.slice(2);
+const configuredMcpArgs = process.argv.slice(2);
 
 function findBunExecutable() {
   const configured = process.env.BUN_EXE?.trim();
@@ -108,6 +109,11 @@ function findCachedChromeDevtoolsMcpBin() {
 }
 
 const cachedMcpBin = findCachedChromeDevtoolsMcpBin();
+const {
+  args: mcpArgs,
+  browserUrl: resolvedBrowserUrl,
+  preferredUrl: configuredBrowserUrl,
+} = await resolveLocusBrowserArgs(configuredMcpArgs);
 const childCommand = cachedMcpBin ? process.execPath : bunPath;
 const childArgs = cachedMcpBin
   ? [cachedMcpBin, ...mcpArgs]
@@ -120,6 +126,9 @@ const child = spawn(childCommand, childArgs, {
   windowsHide: true,
 });
 
+log.write(
+  `[${new Date().toISOString()}] browserUrl configured=${configuredBrowserUrl ?? ""} resolved=${resolvedBrowserUrl}\n`,
+);
 log.write(`[${new Date().toISOString()}] spawn ${childCommand} ${childArgs.join(" ")}\n`);
 
 process.stdin.pipe(child.stdin);

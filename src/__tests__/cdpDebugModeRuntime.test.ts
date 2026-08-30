@@ -1,0 +1,46 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { describe, expect, it } from "vitest";
+
+const cwd = process.cwd();
+
+function read(relPath: string) {
+  return readFileSync(resolve(cwd, relPath), "utf8");
+}
+
+describe("runtime CDP debug mode", () => {
+  it("starts and stops the loopback CDP server with persisted debug mode", () => {
+    const command = read("src-tauri/src/commands/workspace.rs");
+    const runtime = read("src-tauri/src/cdp_debug.rs");
+
+    expect(command).toMatch(
+      /set_debug_mode[\s\S]*?set_debug_enabled\(value\)[\s\S]*?cdp_debug::reconcile\(app_handle, value\)/,
+    );
+    expect(runtime).toContain('TcpListener::bind(("127.0.0.1", port))');
+    expect(runtime).toContain("if !enabled {");
+    expect(runtime).toContain("stop_locked(&mut running).await;");
+    expect(runtime).toContain("task.abort();");
+  });
+
+  it("keeps the disabled path free of listeners, polling, and WebView2 startup flags", () => {
+    const runtime = read("src-tauri/src/cdp_debug.rs");
+    const app = read("src-tauri/src/lib.rs");
+
+    expect(runtime.indexOf("if !enabled {")).toBeLessThan(runtime.indexOf("bind_listener().await"));
+    expect(app).not.toContain("--remote-debugging-port");
+    expect(app).not.toContain("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
+    expect(app).toContain('if app.state::<Arc<AppConfig>>().debug_enabled() {');
+  });
+
+  it("exposes native WebView2 CDP calls and forwards runtime protocol events", () => {
+    const runtime = read("src-tauri/src/cdp_debug.rs");
+
+    expect(runtime).toContain("CallDevToolsProtocolMethod(");
+    expect(runtime).toContain("CallDevToolsProtocolMethodForSession(");
+    expect(runtime).toContain("GetDevToolsProtocolEventReceiver(");
+    expect(runtime).toContain('"Runtime.consoleAPICalled"');
+    expect(runtime).toContain('"Target.targetCreated"');
+    expect(runtime).toContain('matches!(path, "/json" | "/json/list")');
+    expect(runtime).toContain('path == "/json/version"');
+  });
+});

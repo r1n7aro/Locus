@@ -23,6 +23,7 @@ pub mod asset_db;
 mod async_tasks;
 mod auth;
 pub mod binary_cache;
+mod cdp_debug;
 mod cli_driver;
 pub mod code_tools;
 mod commands;
@@ -78,6 +79,7 @@ mod windows_resize_sync;
 #[cfg(target_os = "windows")]
 mod windows_window_frame;
 mod workspace;
+pub mod workspace_changes;
 pub mod workspace_definition_registry;
 pub mod workspace_service;
 pub mod workspace_tool_registry;
@@ -986,6 +988,9 @@ pub fn run() {
             app.manage(workspace_definitions);
             app.manage(tool_registry);
             app.manage(workspace_tool_registry);
+            app.manage(std::sync::Arc::new(
+                cdp_debug::CdpDebugServerHandle::default(),
+            ));
             app.manage(std::sync::Arc::new(mcp::server::McpServerHandle::default()));
             app.manage(std::sync::Arc::new(sdk::SdkServerHandle::default()));
             app.manage(raw_context_store);
@@ -1043,6 +1048,14 @@ pub fn run() {
             }
             main_window_builder.build()?;
             startup_for_setup.mark("main_window_build_done");
+            if app.state::<Arc<AppConfig>>().debug_enabled() {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = cdp_debug::reconcile(app_handle, true).await {
+                        eprintln!("[CdpDebug] startup failed: {error}");
+                    }
+                });
+            }
             if let Err(error) = install_main_tray(app) {
                 eprintln!("[Locus] warning: failed to install tray icon: {}", error);
             }
@@ -1399,6 +1412,9 @@ pub fn run() {
             commands::project_explorer_delete_preset,
             commands::project_explorer_list_mount,
             commands::project_explorer_preview_file,
+            commands::project_explorer_write_file,
+            commands::workspace_file_preview,
+            commands::workspace_file_write,
             commands::knowledge_list_scoped,
             commands::knowledge_list_page,
             commands::knowledge_list_page_scoped,
