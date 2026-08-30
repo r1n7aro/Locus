@@ -7,6 +7,7 @@ import {
   type LocusFileDropRef,
 } from "../services/unity";
 import type { AssetRefAttachment } from "../types";
+import type { WorkspaceRef } from "../services/project";
 
 // Crossing the threshold mid-click dispatches a native OS drag that outlives
 // the gesture, so both gates below must hold before a drag starts:
@@ -49,10 +50,13 @@ function scheduleDragPassthroughReset() {
   }, DRAG_PASSTHROUGH_RESET_MS);
 }
 
-function startUnityAssetDragWarmup(refs: AssetRefAttachment[]): Promise<boolean> | null {
+function startUnityAssetDragWarmup(
+  refs: AssetRefAttachment[],
+  workspaceRef?: WorkspaceRef | null,
+): Promise<boolean> | null {
   if (!shouldWarmupUnityDrag(refs)) return null;
 
-  return startUnityEmbedAssetDrag(refs)
+  return startUnityEmbedAssetDrag(refs, workspaceRef)
     .then(() => true)
     .catch((error) => {
       console.warn("[Locus] Failed to arm Unity asset drag", error);
@@ -60,11 +64,14 @@ function startUnityAssetDragWarmup(refs: AssetRefAttachment[]): Promise<boolean>
     });
 }
 
-async function beginUnityReferencePointerDrag(refs: AssetRefAttachment[]) {
-  const armPromise = startUnityAssetDragWarmup(refs);
+async function beginUnityReferencePointerDrag(
+  refs: AssetRefAttachment[],
+  workspaceRef?: WorkspaceRef | null,
+) {
+  const armPromise = startUnityAssetDragWarmup(refs, workspaceRef);
   if (!armPromise) return;
 
-  const passthroughPromise = setUnityEmbedDragPassthrough(true)
+  const passthroughPromise = setUnityEmbedDragPassthrough(true, workspaceRef)
     .then(() => true)
     .catch((error) => {
       console.warn("[Locus] Failed to enable Unity drag passthrough", error);
@@ -78,22 +85,25 @@ async function beginUnityReferencePointerDrag(refs: AssetRefAttachment[]) {
   }
 
   if (armed) {
-    void cancelUnityEmbedAssetDrag().catch((error) => {
+    void cancelUnityEmbedAssetDrag(workspaceRef).catch((error) => {
       console.warn("[Locus] Failed to cancel Unity reference drag", error);
     });
   }
-  void setUnityEmbedDragPassthrough(false);
+  void setUnityEmbedDragPassthrough(false, workspaceRef);
 }
 
-async function beginNativeAssetFileDrag(refs: AssetRefAttachment[]) {
+async function beginNativeAssetFileDrag(
+  refs: AssetRefAttachment[],
+  workspaceRef?: WorkspaceRef | null,
+) {
   const shouldResetPassthrough = isUnityEmbedWindow();
-  const armPromise = startUnityAssetDragWarmup(refs) ?? Promise.resolve(false);
+  const armPromise = startUnityAssetDragWarmup(refs, workspaceRef) ?? Promise.resolve(false);
   let armed = false;
   try {
     if (shouldResetPassthrough) {
-      await setUnityEmbedDragPassthrough(true);
+      await setUnityEmbedDragPassthrough(true, workspaceRef);
     }
-    const nativeDragPromise = startUnityNativeAssetFileDrag(refs);
+    const nativeDragPromise = startUnityNativeAssetFileDrag(refs, workspaceRef);
     const [armResult, nativeDragResult] = await Promise.allSettled([armPromise, nativeDragPromise]);
     armed = armResult.status === "fulfilled" && armResult.value;
     if (nativeDragResult.status === "rejected") {
@@ -103,28 +113,31 @@ async function beginNativeAssetFileDrag(refs: AssetRefAttachment[]) {
     console.warn("[Locus] Failed to start native asset file drag", error);
   } finally {
     if (armed) {
-      void cancelUnityEmbedAssetDrag().catch((error) => {
+      void cancelUnityEmbedAssetDrag(workspaceRef).catch((error) => {
         console.warn("[Locus] Failed to cancel Unity reference drag", error);
       });
     }
     if (shouldResetPassthrough) {
-      void setUnityEmbedDragPassthrough(false);
+      void setUnityEmbedDragPassthrough(false, workspaceRef);
     }
   }
 }
 
-async function beginNativeFileDrag(files: LocusFileDropRef[]) {
+async function beginNativeFileDrag(
+  files: LocusFileDropRef[],
+  workspaceRef?: WorkspaceRef | null,
+) {
   const shouldResetPassthrough = isUnityEmbedWindow();
   try {
     if (shouldResetPassthrough) {
-      await setUnityEmbedDragPassthrough(true);
+      await setUnityEmbedDragPassthrough(true, workspaceRef);
     }
-    await startLocusNativeFileDrag(files);
+    await startLocusNativeFileDrag(files, workspaceRef);
   } catch (error) {
     console.warn("[Locus] Failed to start native file drag", error);
   } finally {
     if (shouldResetPassthrough) {
-      void setUnityEmbedDragPassthrough(false);
+      void setUnityEmbedDragPassthrough(false, workspaceRef);
     }
   }
 }
@@ -298,4 +311,22 @@ export function armLocusFilePointerDrag(event: PointerEvent, files: LocusFileDro
     suppressHtmlDrag: true,
     onDragStart: () => beginNativeFileDrag(files),
   });
+}
+
+/** Transfer a semantic in-app drag to the existing Unity/OS drag bridge. */
+export function externalizeUnityReferenceDrag(
+  refs: AssetRefAttachment[],
+  workspaceRef?: WorkspaceRef | null,
+): Promise<void> {
+  return shouldStartNativeAssetFileDrag(refs)
+    ? beginNativeAssetFileDrag(refs, workspaceRef)
+    : beginUnityReferencePointerDrag(refs, workspaceRef);
+}
+
+/** Transfer a semantic in-app file drag to the existing native file bridge. */
+export function externalizeLocusFileDrag(
+  files: LocusFileDropRef[],
+  workspaceRef?: WorkspaceRef | null,
+): Promise<void> {
+  return beginNativeFileDrag(files, workspaceRef);
 }

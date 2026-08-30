@@ -109,7 +109,7 @@
     },
     {
       "path": "src/components/diff/UnityInspectorPane.vue",
-      "bytes": 23490
+      "bytes": 23527
     },
     {
       "path": "src/components/diff/UnityInspectorFieldTree.vue",
@@ -229,7 +229,7 @@
     },
     {
       "path": "src/components/unity-preview/index.ts",
-      "bytes": 325
+      "bytes": 411
     },
     {
       "path": "src/components/unity-preview/unityObjectPreview.ts",
@@ -245,7 +245,7 @@
     },
     {
       "path": "src/components/unity-preview/UnityObjectPreview.vue",
-      "bytes": 71451
+      "bytes": 72171
     },
     {
       "path": "src/components/ui/BaseButton.vue",
@@ -277,7 +277,7 @@
     },
     {
       "path": "src/composables/useUnityReferenceDragSource.ts",
-      "bytes": 10365
+      "bytes": 11403
     },
     {
       "path": "src/composables/resizeObserver.ts",
@@ -297,11 +297,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 267332
+      "bytes": 269935
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 260599
+      "bytes": 263099
     },
     {
       "path": "src/services/asset.ts",
@@ -365,7 +365,7 @@
     },
     {
       "path": "src/types.ts",
-      "bytes": 83995
+      "bytes": 84533
     }
   ]
 }

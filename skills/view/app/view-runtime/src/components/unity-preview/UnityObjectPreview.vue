@@ -75,14 +75,15 @@ function rememberUnityObjectPreviewExpandedState(stateKey: string | undefined, e
 function loadWorkspaceAssetPreviewCached(
   path: string,
   workspaceRef: WorkspaceRef,
+  focusLine?: number,
 ): ReturnType<typeof previewWorkspaceAsset> {
   const assetPath = normalizedPreviewCacheKey(path);
-  const key = scopedPreviewCacheKey(assetPath, workspaceRef);
+  const key = `${scopedPreviewCacheKey(assetPath, workspaceRef)}:line:${focusLine ?? "none"}`;
   const cached = workspacePreviewPayloadCache.get(key);
   if (cached?.payload) return Promise.resolve(cached.payload);
   if (cached?.promise) return cached.promise;
 
-  const promise = previewWorkspaceAsset(assetPath, undefined, workspaceRef)
+  const promise = previewWorkspaceAsset(assetPath, focusLine, workspaceRef)
     .then((payload) => {
       workspacePreviewPayloadCache.set(key, { payload });
       return payload;
@@ -231,20 +232,9 @@ import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 
 const workspaceContextStore = useWorkspaceContextStore();
 
-function requirePreviewWorkspaceRef(): WorkspaceRef {
-  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-  if (!workspaceRef) throw new Error("A focused workspace checkout is required.");
-  return workspaceRef;
-}
-
-const locusInspectorPropertyRuntime = createUnityPropertyRuntime({
-  read: (request) => readUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
-  write: (request) => writeUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
-  apply: (request) => applyUnitySerializedProperties(requirePreviewWorkspaceRef(), request),
-});
-
 const props = withDefaults(defineProps<{
   model: UnityObjectPreviewInput | UnityObjectPreviewModel;
+  workspaceRef?: WorkspaceRef | null;
   level?: UnityObjectPreviewLevel;
   loading?: boolean;
   error?: string;
@@ -262,6 +252,8 @@ const props = withDefaults(defineProps<{
   autoLoadPreview?: boolean;
   previewStateKey?: string;
   collapsible?: boolean;
+  showHeader?: boolean;
+  focusLine?: number | null;
 }>(), {
   level: "inline",
   loading: false,
@@ -280,6 +272,21 @@ const props = withDefaults(defineProps<{
   autoLoadPreview: true,
   previewStateKey: "",
   collapsible: true,
+  showHeader: true,
+  workspaceRef: null,
+  focusLine: null,
+});
+
+function requirePreviewWorkspaceRef(): WorkspaceRef {
+  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) throw new Error("A workspace checkout is required for this preview.");
+  return workspaceRef;
+}
+
+const locusInspectorPropertyRuntime = createUnityPropertyRuntime({
+  read: (request) => readUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
+  write: (request) => writeUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
+  apply: (request) => applyUnitySerializedProperties(requirePreviewWorkspaceRef(), request),
 });
 
 const emit = defineEmits<{
@@ -441,7 +448,9 @@ const canAutoLoadPreview = computed(() => (
   && !objectModel.value.previewPayload
   && !objectModel.value.inspector
   && objectModel.value.ref.kind === "asset"
-  && /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i.test(autoPreviewPath.value)
+  && !!autoPreviewPath.value
+  && !/^(?:[A-Za-z]:\/|\/\/|\/)/.test(autoPreviewPath.value)
+  && !autoPreviewPath.value.split("/").includes("..")
 ));
 const canAutoLoadThumbnail = computed(() => (
   props.autoLoadPreview
@@ -1243,8 +1252,8 @@ watch(
 );
 
 watch(
-  () => [canAutoLoadPreview.value, autoPreviewPath.value] as const,
-  async ([canLoad, path]) => {
+  () => [canAutoLoadPreview.value, autoPreviewPath.value, props.focusLine ?? null] as const,
+  async ([canLoad, path, focusLine]) => {
     const run = ++autoPreviewRun;
     autoPreviewError.value = "";
     autoPreviewPayload.value = null;
@@ -1260,6 +1269,7 @@ watch(
       const payload = await loadWorkspaceAssetPreviewCached(
         path,
         requirePreviewWorkspaceRef(),
+        focusLine ?? undefined,
       );
       if (run !== autoPreviewRun) return;
       autoPreviewPayload.value = payload;
@@ -1371,7 +1381,7 @@ watch(
 // the object shown here, refresh the live property tree in the background.
 let unlistenValueEditor: (() => void) | null = null;
 void listenUnityValueEditorCommitted((event) => {
-  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
   if (
     !workspaceRef
     || event.workspaceRef.checkoutId !== workspaceRef.checkoutId
@@ -1425,6 +1435,7 @@ onBeforeUnmount(() => {
   >
     <UnityObjectPreview
       :model="model"
+      :workspace-ref="workspaceRef"
       :level="level"
       :loading="loading"
       :error="error"
@@ -1440,6 +1451,7 @@ onBeforeUnmount(() => {
       :object-drawers="objectDrawers"
       :auto-load-preview="autoLoadPreview"
       :preview-state-key="previewStateKey"
+      :focus-line="focusLine"
       disable-object-drawer
       @select="emit('select', $event)"
       @preview="handleEditorPreview"
@@ -1475,7 +1487,7 @@ onBeforeUnmount(() => {
 
   <section v-else class="unity-object-preview" :class="previewClass" @click="handlePreviewRootClick">
     <div
-      v-if="level === 'inspector'"
+      v-if="level === 'inspector' && showHeader"
       class="unity-object-inspector-header"
       :class="{ 'no-fold': !collapsible }"
     >
@@ -1605,7 +1617,12 @@ onBeforeUnmount(() => {
 
     <div v-else-if="loadingState && !previewPayload" class="unity-object-preview-state">Loading preview...</div>
     <div v-else-if="errorState && !previewPayload" class="unity-object-preview-summary">
-      <UnityObjectIdentity :model="objectModel" mode="row" :draggable="false" />
+      <UnityObjectIdentity
+        v-if="showHeader || level !== 'inspector'"
+        :model="objectModel"
+        mode="row"
+        :draggable="false"
+      />
       <div
         class="unity-object-preview-error"
         :class="{ neutral: errorStateRequiresUnity }"
@@ -1627,7 +1644,12 @@ onBeforeUnmount(() => {
 
     <template v-else-if="binaryPreviewPayload && compactBinaryMeta">
       <div class="unity-object-preview-summary">
-        <UnityObjectIdentity :model="objectModel" mode="row" :draggable="false" />
+        <UnityObjectIdentity
+          v-if="showHeader || level !== 'inspector'"
+          :model="objectModel"
+          mode="row"
+          :draggable="false"
+        />
         <div class="unity-object-preview-meta">
           <span>{{ compactBinaryKindLabel }}</span>
           <span>{{ formatBytes(compactBinaryMeta.size) }}</span>
@@ -1664,6 +1686,7 @@ onBeforeUnmount(() => {
             :include-unchanged="includeUnchanged"
             :display-mode="displayMode"
             header-layout="unity"
+            :hide-header="!showHeader"
             hide-toolbar
           />
           <div
@@ -1702,6 +1725,7 @@ onBeforeUnmount(() => {
         :include-unchanged="includeUnchanged"
         :display-mode="displayMode"
         header-layout="unity"
+        :hide-header="!showHeader"
         hide-toolbar
       />
       <div v-else class="unity-object-preview-placeholder">
@@ -1720,6 +1744,7 @@ onBeforeUnmount(() => {
         :truncated="textPayload.truncated"
         :total-lines="textPayload.totalLines"
         :language="textPayload.language"
+        :focus-line="focusLine"
       />
       <div v-else class="unity-object-text-summary">
         <UnityObjectIdentity :model="objectModel" mode="row" :draggable="false" />
