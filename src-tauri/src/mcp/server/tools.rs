@@ -352,7 +352,7 @@ async fn run_unity_recompile(working_dir: &str) -> ToolResult {
     }
     match crate::code_tools::recompile_with_semantic_warnings(working_dir).await {
         Ok(msg) => ok(&msg),
-        Err(e) => err(&format!("Compilation failed:\n{e}")),
+        Err(e) => err(&e),
     }
 }
 
@@ -648,6 +648,16 @@ async fn execute_workspace_tool(
     tool_registry: Arc<ToolRegistry>,
     runtime_state: Arc<ToolRuntimeState>,
 ) -> ToolCallOutcome {
+    let requires_ready = crate::workspace_service::service::service_ready_required_for_tool(name);
+    let unity_owned = crate::workspace_service::service::owner_service_for_tool(name)
+        == Some(crate::workspace_service::ServiceKind::Unity);
+    if requires_ready && unity_owned {
+        if let Some(error) =
+            crate::unity_bridge::dialog::blocked_error(working_dir, "not_sent", None)
+        {
+            return outcome_from_tool_result(err(&error), None);
+        }
+    }
     let _service_lease = match resolve_owned_service_for_mcp_tool(
         execution.as_ref(),
         name,
@@ -657,10 +667,17 @@ async fn execute_workspace_tool(
     {
         Ok(binding) => binding,
         Err(error) => {
+            if requires_ready && unity_owned {
+                if let Some(dialog_error) =
+                    crate::unity_bridge::dialog::blocked_error(working_dir, "not_sent", None)
+                {
+                    return outcome_from_tool_result(err(&dialog_error), None);
+                }
+            }
             return outcome_from_tool_result(
                 err(&format!("Tool '{name}' service binding error: {error}")),
                 None,
-            )
+            );
         }
     };
     match name {

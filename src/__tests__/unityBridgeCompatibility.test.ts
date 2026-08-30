@@ -47,6 +47,13 @@ describe("unityBridgeCompatibility", () => {
     expect(compilationStarted).toContain('CompleteRecompileStartResponse();');
     expect(compilationStarted).toContain('SetCompileResult("pending");');
     expect(bridge).toContain('OkResponse(requestId, "recompile_started")');
+    expect(bridge).toContain('SetCompileResult("not_needed")');
+    expect(bridge).toContain("CompleteRecompileNotNeeded();");
+    expect(bridge).toContain(
+      "CompilationPipeline.assemblyCompilationNotRequired += OnAssemblyCompilationNotRequired",
+    );
+    expect(bridge).toContain("_compiledAssemblyCount++");
+    expect(bridge).toContain("bool rebuiltAssemblies = _compiledAssemblyCount > 0");
     expect(bridge).toContain('SetCompileResult("starting")');
     expect(bridge).toContain("Unity 没有开始编译。");
     expect(bridge).toContain("Unity 没有开始编译。未找到活动重编译请求。");
@@ -56,13 +63,38 @@ describe("unityBridgeCompatibility", () => {
       "SessionState.SetInt(SessionKey_RecompileTargetEpoch, targetEpoch)",
     );
     expect(targetPersisted).toBeGreaterThan(-1);
-    expect(targetPersisted).toBeLessThan(requestHandler.indexOf("ReleaseAllEditSessions();"));
-    expect(targetPersisted).toBeLessThan(requestHandler.indexOf("AssetDatabase.Refresh();"));
+    expect(targetPersisted).toBeLessThan(requestHandler.indexOf("ReleaseAllEditSessions(false);"));
+    expect(targetPersisted).toBeLessThan(
+      requestHandler.indexOf('FlushQueuedAssetImports(recompileRequest.syncMode == "full");'),
+    );
     expect(targetPersisted).toBeLessThan(
       requestHandler.indexOf("CompilationPipeline.RequestScriptCompilation();"),
     );
     expect(bridge).not.toContain("RecompileCheckDelayFrames");
     expect(bridge).not.toContain("_recompileCheckFrames");
+  });
+
+  it("batches changed assets into one import pass before compilation", () => {
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
+    const flush = bridge.slice(
+      bridge.indexOf("private static int FlushQueuedAssetImports"),
+      bridge.indexOf("private static string BeginEditSession"),
+    );
+    const requestHandler = bridge.slice(
+      bridge.indexOf('case "request_recompile":'),
+      bridge.indexOf('case "request_script_reload":'),
+    );
+
+    expect(flush).toContain("AssetDatabase.StartAssetEditing();");
+    expect(flush).toContain("AssetDatabase.StopAssetEditing();");
+    expect(flush).toContain("ImportAssetOptions.Default");
+    expect(flush).not.toContain("ImportAssetOptions.ForceUpdate");
+    expect(requestHandler).toContain("ReleaseAllEditSessions(false);");
+    expect(requestHandler).toContain("ParseRecompileRequest(changedPathsRaw)");
+    expect(requestHandler).toContain('FlushQueuedAssetImports(recompileRequest.syncMode == "full");');
+    expect(requestHandler).not.toContain("AssetDatabase.Refresh();");
+    expect(bridge).toContain('syncMode = "full"');
+    expect(bridge).toContain('mode != "none" && mode != "targeted" && mode != "full"');
   });
 
   it("rechecks persisted compile state after a bridge reconnect", () => {
@@ -76,6 +108,10 @@ describe("unityBridgeCompatibility", () => {
     expect(reconnectBranch).not.toContain("finish_recompile_success");
     expect(bridge).toContain('"starting" | "pending" => Ok(RecompilePollState::Waiting)');
     expect(bridge).toContain('"ok" => Ok(RecompilePollState::Completed)');
+    expect(bridge).toContain('"not_needed" => Ok(RecompilePollState::NotNeeded)');
+    expect(bridge).toContain('"request_script_reload"');
+    expect(bridge).toContain("request_script_reload_and_wait(project_path).await?");
+    expect(bridge).toContain("detection: unity_incremental_build_graph");
     expect(bridge).toContain("RECOMPILE_TOTAL_TIMEOUT");
     expect(bridge).toContain("RECOMPILE_START_CONFIRM_TIMEOUT: Duration = Duration::from_secs(90)");
     expect(bridge).toContain("RECOMPILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(300)");
@@ -85,7 +121,28 @@ describe("unityBridgeCompatibility", () => {
     expect(bridge).toContain("main_thread=");
     expect(bridge).toContain("RecompileStartAck::Unconfirmed");
     expect(bridge).toContain("recompile_timeout_reason(&state)");
+    expect(bridge).toContain("wait_for_existing_reload(project_path).await?");
+    expect(bridge).toContain('"already_converged"');
+    expect(bridge).toContain('"up_to_date"');
+    expect(bridge).toContain("status: compiled_bridge_recovering");
+    expect(bridge).toContain("detection: rebuilt_assembly_output");
     expect(bridge).not.toContain("Unity 最终状态：");
+  });
+
+  it("returns structured recompile state through every agent entry", () => {
+    const codeTools = read("src-tauri/src/code_tools.rs");
+    const builtins = read("src-tauri/src/tool/builtins/unity.rs");
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
+    const mcp = read("src-tauri/src/mcp/server/tools.rs");
+    const prompt = read("tools/unity_recompile.json");
+
+    expect(codeTools).toContain("format_recompile_error_for_agent");
+    expect(codeTools).toContain("Unity recompile status:");
+    expect(builtins).not.toContain('output: format!("Compilation failed:\\n{}", e)');
+    expect(agent).not.toContain('output: format!("Compilation failed:\\n{}", e)');
+    expect(mcp).not.toContain('err(&format!("Compilation failed:\\n{e}"))');
+    expect(prompt).toContain("`already_converged`");
+    expect(prompt).toContain("`up_to_date`");
   });
 
   it("samples Unity editor state only for confirmed bridge work or outbound updates", () => {

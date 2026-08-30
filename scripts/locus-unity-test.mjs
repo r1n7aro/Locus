@@ -106,13 +106,14 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite hot-reload-release --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite parallel-edit-refresh --install-plugin
+  bun run locus:test:unity -- --project F:\\Game --suite recompile-import --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
   bun run locus:test:unity -- --project F:\\Game --suite python-sdk --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite modal-dialog --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              workspace | workspace-switch | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | execute | python-sdk | modal-dialog | yaml-parity | unity-test | all
+  --suite <name>              workspace | workspace-switch | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | python-sdk | modal-dialog | yaml-parity | unity-test | all
                                hot-reload-release runs Release first, then switches to Debug at runtime and runs again
                                every CLI driver run enables Locus Debug mode inside its isolated config
   --workspace-project <path>  Additional Unity project for a single-process workspace suite; repeat as needed

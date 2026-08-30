@@ -1091,7 +1091,7 @@ pub(super) fn unity_recompile() -> ToolDef {
                         is_error: false,
                     },
                     Err(e) => ToolResult {
-                        output: format!("Compilation failed:\n{}", e),
+                        output: e,
                         is_error: true,
                     },
                 }

@@ -3770,6 +3770,87 @@ pub async fn unity_test_run(
     unity_test_run_controlled(project_path, request, Some(timeout), None, None).await
 }
 
+const UNITY_TEST_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnityTestPollWake {
+    Tick,
+    DialogChanged,
+    Cancelled,
+}
+
+fn unity_test_resume_run_id(request: &serde_json::Value) -> Result<Option<String>, String> {
+    let Some(value) = request.get("resume_run_id") else {
+        return Ok(None);
+    };
+    let run_id = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "resume_run_id must be a non-empty Unity Test run id".to_string())?;
+    Ok(Some(run_id.to_string()))
+}
+
+fn unity_test_modal_dialog_error(
+    project_path: &str,
+    snapshot: &UnityTestRunSnapshot,
+    source_error: &str,
+) -> String {
+    let base = dialog::blocked_error(
+        project_path,
+        "test_run_detached",
+        Some(snapshot.run_id.as_str()),
+    )
+    .unwrap_or_else(|| source_error.to_string());
+    let context = serde_json::json!({
+        "operation": "unity_test_run",
+        "runId": snapshot.run_id.as_str(),
+        "status": snapshot.status.as_str(),
+        "currentTest": snapshot.current_test.as_str(),
+        "completed": snapshot.passed + snapshot.failed + snapshot.skipped + snapshot.inconclusive,
+        "total": snapshot.total,
+        "resumeArguments": { "resume_run_id": snapshot.run_id.as_str() },
+    });
+    format!("{base}\nunity_test_context={context}")
+}
+
+async fn wait_for_unity_test_poll_wake(
+    dialog_events: &mut tokio::sync::watch::Receiver<u64>,
+    cancel_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> UnityTestPollWake {
+    let sleep = tokio::time::sleep(UNITY_TEST_STATUS_POLL_INTERVAL);
+    tokio::pin!(sleep);
+    match cancel_rx {
+        Some(cancel_rx) => {
+            tokio::select! {
+                biased;
+                changed = dialog_events.changed() => {
+                    if changed.is_ok() {
+                        UnityTestPollWake::DialogChanged
+                    } else {
+                        UnityTestPollWake::Tick
+                    }
+                }
+                _ = cancel_rx.changed() => UnityTestPollWake::Cancelled,
+                _ = &mut sleep => UnityTestPollWake::Tick,
+            }
+        }
+        None => {
+            tokio::select! {
+                biased;
+                changed = dialog_events.changed() => {
+                    if changed.is_ok() {
+                        UnityTestPollWake::DialogChanged
+                    } else {
+                        UnityTestPollWake::Tick
+                    }
+                }
+                _ = &mut sleep => UnityTestPollWake::Tick,
+            }
+        }
+    }
+}
+
 pub async fn unity_test_run_controlled(
     project_path: &str,
     request: &serde_json::Value,
@@ -3778,36 +3859,115 @@ pub async fn unity_test_run_controlled(
     progress: Option<crate::async_tasks::TaskProgressReporter>,
 ) -> Result<UnityTestRunSnapshot, String> {
     require_unity_test_tools_available(project_path)?;
-    require_unity_test_sources_converged(project_path).await?;
-    ensure_unity_test_start_status(project_path).await?;
+    let resume_run_id = unity_test_resume_run_id(request)?;
+    if resume_run_id.is_none() {
+        require_unity_test_sources_converged(project_path).await?;
+        ensure_unity_test_start_status(project_path).await?;
+    }
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let payload = serde_json::to_string(request)
-        .map_err(|error| format!("Failed to serialize Unity Test run request: {error}"))?;
-    let start = send_message_with_transient_retry(
-        project_path,
-        "unity_test_start",
-        &payload,
-        Duration::from_secs(30),
-        "start Unity Test run",
-    )
-    .await?;
-    if !start.ok {
-        return Err(start.error.unwrap_or_else(|| {
-            "Unity Test run could not start. Update the Locus Unity plugin and recompile the project."
-                .to_string()
-        }));
-    }
-
-    let mut snapshot: UnityTestRunSnapshot =
+    let mut snapshot: UnityTestRunSnapshot = if let Some(run_id) = resume_run_id {
+        let status_payload = serde_json::json!({ "run_id": run_id }).to_string();
+        let placeholder = UnityTestRunSnapshot {
+            run_id,
+            status: "unknown".to_string(),
+            ..Default::default()
+        };
+        let response = match send_message_with_timeout(
+            project_path,
+            "unity_test_status",
+            &status_payload,
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
+                return Err(unity_test_modal_dialog_error(
+                    project_path,
+                    &placeholder,
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if !response.ok {
+            return Err(response
+                .error
+                .unwrap_or_else(|| "Unity Test status query failed".to_string()));
+        }
+        serde_json::from_str(response.message.as_deref().unwrap_or_default())
+            .map_err(|error| format!("Unity Test status returned invalid JSON: {error}"))?
+    } else {
+        let mut start_request = request.clone();
+        let requested_run_id = uuid::Uuid::new_v4().simple().to_string();
+        let object = start_request
+            .as_object_mut()
+            .ok_or_else(|| "Unity Test run request must be an object".to_string())?;
+        object.remove("resume_run_id");
+        object.insert(
+            "run_id".to_string(),
+            serde_json::Value::String(requested_run_id.clone()),
+        );
+        let payload = serde_json::to_string(&start_request)
+            .map_err(|error| format!("Failed to serialize Unity Test run request: {error}"))?;
+        let start = match send_message_with_transient_retry(
+            project_path,
+            "unity_test_start",
+            &payload,
+            Duration::from_secs(30),
+            "start Unity Test run",
+        )
+        .await
+        {
+            Ok(start) => start,
+            Err(error)
+                if dialog::is_unity_modal_dialog_blocked_error(&error)
+                    && !error.contains("request_state=not_sent") =>
+            {
+                let placeholder = UnityTestRunSnapshot {
+                    run_id: requested_run_id,
+                    status: "starting".to_string(),
+                    ..Default::default()
+                };
+                return Err(unity_test_modal_dialog_error(
+                    project_path,
+                    &placeholder,
+                    &error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if !start.ok {
+            return Err(start.error.unwrap_or_else(|| {
+                "Unity Test run could not start. Update the Locus Unity plugin and recompile the project."
+                    .to_string()
+            }));
+        }
         serde_json::from_str(start.message.as_deref().unwrap_or_default())
-            .map_err(|error| format!("Unity Test start returned invalid JSON: {error}"))?;
+            .map_err(|error| format!("Unity Test start returned invalid JSON: {error}"))?
+    };
     if snapshot.run_id.trim().is_empty() {
-        return Err("Unity Test start did not return a run id".to_string());
+        return Err("Unity Test run did not return a run id".to_string());
     }
 
     let started = Instant::now();
     let status_payload = serde_json::json!({ "run_id": snapshot.run_id.clone() }).to_string();
+    // The WinEventHook publishes only on native window changes. Waiting on its
+    // watch revision adds no polling work during normal test execution and can
+    // interrupt the 250ms status cadence as soon as a modal dialog is observed.
+    let mut dialog_events = dialog::subscribe();
+    if let Some(error) = dialog::blocked_error(
+        project_path,
+        "test_run_detached",
+        Some(snapshot.run_id.as_str()),
+    ) {
+        return Err(unity_test_modal_dialog_error(
+            project_path,
+            &snapshot,
+            &error,
+        ));
+    }
     loop {
         match snapshot.status.as_str() {
             "passed" | "failed" | "error" | "cancelled" => return Ok(snapshot),
@@ -3826,6 +3986,20 @@ pub async fn unity_test_run_controlled(
                 }
             ));
         }
+        if dialog_events.has_changed().unwrap_or(false) {
+            let _ = dialog_events.borrow_and_update();
+            if let Some(error) = dialog::blocked_error(
+                project_path,
+                "test_run_detached",
+                Some(snapshot.run_id.as_str()),
+            ) {
+                return Err(unity_test_modal_dialog_error(
+                    project_path,
+                    &snapshot,
+                    &error,
+                ));
+            }
+        }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
             let timeout = timeout.unwrap_or_default();
             return Err(format!(
@@ -3840,20 +4014,41 @@ pub async fn unity_test_run_controlled(
             ));
         }
 
-        let sleep = tokio::time::sleep(Duration::from_millis(250));
-        if let Some(ref mut cancel_rx) = cancel_rx {
-            tokio::select! {
-                _ = sleep => {}
-                _ = cancel_rx.changed() => {
-                    let cancel_response = send_message_with_timeout(
+        match wait_for_unity_test_poll_wake(&mut dialog_events, cancel_rx.as_mut()).await {
+            UnityTestPollWake::DialogChanged => {
+                if let Some(error) = dialog::blocked_error(
+                    project_path,
+                    "test_run_detached",
+                    Some(snapshot.run_id.as_str()),
+                ) {
+                    return Err(unity_test_modal_dialog_error(
                         project_path,
-                        "unity_test_cancel",
-                        &status_payload,
-                        Duration::from_secs(5),
-                    ).await;
-                    if let Ok(response) = cancel_response {
+                        &snapshot,
+                        &error,
+                    ));
+                }
+            }
+            UnityTestPollWake::Cancelled => {
+                let cancel_response = send_message_with_timeout(
+                    project_path,
+                    "unity_test_cancel",
+                    &status_payload,
+                    Duration::from_secs(5),
+                )
+                .await;
+                match cancel_response {
+                    Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
+                        return Err(unity_test_modal_dialog_error(
+                            project_path,
+                            &snapshot,
+                            &error,
+                        ));
+                    }
+                    Ok(response) => {
                         if let Some(message) = response.message.as_deref() {
-                            if let Ok(cancelled) = serde_json::from_str::<UnityTestRunSnapshot>(message) {
+                            if let Ok(cancelled) =
+                                serde_json::from_str::<UnityTestRunSnapshot>(message)
+                            {
                                 if !cancelled.error.is_empty() {
                                     return Err(format!(
                                         "Unity Test cancellation unavailable: {}",
@@ -3863,33 +4058,46 @@ pub async fn unity_test_run_controlled(
                             }
                         }
                     }
-                    for _ in 0..120 {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        let Ok(response) = send_message_with_timeout(
-                            project_path,
-                            "unity_test_status",
-                            &status_payload,
-                            Duration::from_secs(5),
-                        ).await else {
-                            continue;
-                        };
-                        let Ok(cancelled) = serde_json::from_str::<UnityTestRunSnapshot>(
-                            response.message.as_deref().unwrap_or_default(),
-                        ) else {
-                            continue;
-                        };
-                        if matches!(cancelled.status.as_str(), "cancelled" | "error" | "passed" | "failed") {
-                            return Err(format!("Unity Test run {} cancelled", snapshot.run_id));
-                        }
-                    }
-                    return Err(format!(
-                        "Unity Test cancellation failed: run {} did not stop within 30s",
-                        snapshot.run_id
-                    ));
+                    Err(_) => {}
                 }
+                for _ in 0..120 {
+                    tokio::time::sleep(UNITY_TEST_STATUS_POLL_INTERVAL).await;
+                    let response = match send_message_with_timeout(
+                        project_path,
+                        "unity_test_status",
+                        &status_payload,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
+                            return Err(unity_test_modal_dialog_error(
+                                project_path,
+                                &snapshot,
+                                &error,
+                            ));
+                        }
+                        Err(_) => continue,
+                    };
+                    let Ok(cancelled) = serde_json::from_str::<UnityTestRunSnapshot>(
+                        response.message.as_deref().unwrap_or_default(),
+                    ) else {
+                        continue;
+                    };
+                    if matches!(
+                        cancelled.status.as_str(),
+                        "cancelled" | "error" | "passed" | "failed"
+                    ) {
+                        return Err(format!("Unity Test run {} cancelled", snapshot.run_id));
+                    }
+                }
+                return Err(format!(
+                    "Unity Test cancellation failed: run {} did not stop within 30s",
+                    snapshot.run_id
+                ));
             }
-        } else {
-            sleep.await;
+            UnityTestPollWake::Tick => {}
         }
         let response = match send_message_with_timeout(
             project_path,
@@ -3900,6 +4108,13 @@ pub async fn unity_test_run_controlled(
         .await
         {
             Ok(response) => response,
+            Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
+                return Err(unity_test_modal_dialog_error(
+                    project_path,
+                    &snapshot,
+                    &error,
+                ));
+            }
             Err(_) => {
                 // Play Mode transitions and tests that explicitly reload the
                 // domain briefly drop the managed executor. The persisted run
@@ -3981,6 +4196,12 @@ pub async fn import_assets(project_path: &str, asset_paths: &[String]) -> Result
     if asset_paths.is_empty() {
         return Ok("0 assets queued".to_string());
     }
+
+    crate::workspace_changes::record_known_paths(
+        Path::new(project_path),
+        asset_paths,
+        crate::workspace_changes::WorkspaceChangeSource::LocusWrite,
+    );
 
     let resp = send_message(project_path, "import_assets", &asset_paths.join("\n")).await?;
     if resp.ok {
@@ -5876,6 +6097,7 @@ enum RecompileStartAck {
 enum RecompilePollState {
     Waiting,
     Completed,
+    NotNeeded,
     Transient,
 }
 
@@ -5903,13 +6125,20 @@ fn classify_recompile_start_response(resp: &PipeResponse) -> Result<RecompileSta
 
 async fn request_recompile_and_wait_for_start(
     project_path: &str,
-    tracked_dirty_paths: &str,
+    asset_sync: &crate::workspace_changes::UnitySyncSnapshot,
 ) -> Result<RecompileStartAck, String> {
+    let request_payload = serde_json::json!({
+        "schema": 1,
+        "syncMode": asset_sync.mode.as_str(),
+        "paths": &asset_sync.paths,
+        "reason": &asset_sync.reason,
+    })
+    .to_string();
     let (acceptance_tx, mut acceptance_rx) = tokio::sync::oneshot::channel();
     let request = send_message_without_timeout_with_acceptance(
         project_path,
         "request_recompile",
-        tracked_dirty_paths,
+        &request_payload,
         acceptance_tx,
     );
     tokio::pin!(request);
@@ -5991,6 +6220,7 @@ fn classify_recompile_poll_response(resp: &PipeResponse) -> Result<RecompilePoll
         return match resp.message.as_deref().unwrap_or_default() {
             "starting" | "pending" => Ok(RecompilePollState::Waiting),
             "ok" => Ok(RecompilePollState::Completed),
+            "not_needed" => Ok(RecompilePollState::NotNeeded),
             other => Err(format!("Unexpected Unity compile result: {other}")),
         };
     }
@@ -6009,30 +6239,234 @@ fn classify_recompile_poll_response(resp: &PipeResponse) -> Result<RecompilePoll
 async fn finish_recompile_success(
     project_path: &str,
     unity_test_pending_seq: u64,
+    asset_sync: &crate::workspace_changes::UnitySyncSnapshot,
 ) -> Result<String, String> {
     crate::unity_type_index::invalidate_cached_type_index(project_path).await;
     crate::unity_hotreload::coordinator::on_recompile_converged(project_path).await;
-    wait_for_unity_bridge_ready_after_recompile(project_path).await?;
     crate::workspace::clear_unity_test_pending_sources_through(
         project_path,
         unity_test_pending_seq,
     );
+    if let Err(error) = wait_for_unity_bridge_ready_after_recompile(project_path).await {
+        let state = unity_semantic_state(project_path).await;
+        return Err(format!(
+            "Unity recompile status:\n- status: compiled_bridge_recovering\n- compilation: completed\n- detection: rebuilt_assembly_output\n- domain_reload: completed\n- bridge: not_ready\n- editor: {}\n- phase: {}\n- action: {}\n- detail: {}",
+            state.editor_mode.value,
+            state.phase,
+            state.safety.recommended_action,
+            error.replace(['\r', '\n'], " ")
+        ));
+    }
     if let Err(error) = refresh_unity_type_index_after_recompile(project_path).await {
         eprintln!(
             "[Locus] Unity type index refresh after recompile skipped: {}",
             error
         );
     }
-    Ok("Compilation succeeded, domain reload complete".to_string())
+    crate::workspace_changes::acknowledge_unity_sync(Path::new(project_path), asset_sync);
+    let state = unity_semantic_state(project_path).await;
+    Ok(format!(
+        "Unity recompile status:\n- status: compiled\n- compilation: completed\n- detection: rebuilt_assembly_output\n- asset_sync: {}\n- asset_sync_reason: {}\n- domain_reload: completed\n- bridge: ready\n- editor: {}\n- phase: {}\n- action: {}",
+        asset_sync.mode.as_str(),
+        asset_sync.reason,
+        state.editor_mode.value,
+        state.phase,
+        state.safety.recommended_action
+    ))
+}
+
+#[derive(Debug, Default)]
+struct ExistingReloadContext {
+    observed: bool,
+    compile_converged: bool,
+}
+
+fn semantic_state_is_reloading(state: &SemanticState) -> bool {
+    state.phase == "reloading"
+        || state.domain.phase == "reloading"
+        || state.channel.control_pipe == "reloading"
+}
+
+async fn wait_for_existing_reload(project_path: &str) -> Result<ExistingReloadContext, String> {
+    let state = unity_semantic_state(project_path).await;
+    if !semantic_state_is_reloading(&state) {
+        return Ok(ExistingReloadContext::default());
+    }
+
+    let before = fetch_reload_state(project_path).await;
+    if let Some((session_id, domain_generation, converged_serial)) = before.as_ref() {
+        crate::unity_hotreload::coordinator::observe_reload_state(
+            project_path,
+            session_id.clone(),
+            domain_generation.clone(),
+            *converged_serial,
+        )
+        .await;
+    }
+    eprintln!(
+        "[Locus] unity_recompile found an existing reload; waiting before deciding whether another compile is required: {}",
+        format_recompile_state_detail(&state)
+    );
+
+    wait_for_unity_bridge_ready(
+        project_path,
+        Duration::from_secs(180),
+        "before requesting another recompile; an existing reload was already in progress",
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Unity recompile status:\n- status: existing_reload_incomplete\n- compilation: not_requested\n- domain_reload: incomplete\n- bridge: not_ready\n- editor: {}\n- phase: {}\n- action: {}\n- detail: {}",
+            state.editor_mode.value,
+            state.phase,
+            state.safety.recommended_action,
+            error.replace(['\r', '\n'], " ")
+        )
+    })?;
+
+    let after = fetch_reload_state(project_path).await;
+    if let Some((session_id, domain_generation, converged_serial)) = after.as_ref() {
+        crate::unity_hotreload::coordinator::observe_reload_state(
+            project_path,
+            session_id.clone(),
+            domain_generation.clone(),
+            *converged_serial,
+        )
+        .await;
+    }
+    let compile_converged = match (before.as_ref(), after.as_ref()) {
+        (Some((before_session, _, before_serial)), Some((after_session, _, after_serial))) => {
+            before_session == after_session && after_serial > before_serial
+                || before_session != after_session && *after_serial > 0
+        }
+        _ => false,
+    };
+    Ok(ExistingReloadContext {
+        observed: true,
+        compile_converged,
+    })
+}
+
+async fn request_script_reload_and_wait(project_path: &str) -> Result<(), String> {
+    let (before_session, before_generation, _) = fetch_reload_state(project_path)
+        .await
+        .ok_or_else(|| {
+            "Unity recompile status:\n- status: reload_only_incomplete\n- compilation: not_needed\n- domain_reload: not_started\n- bridge: ready\n- action: retry_recompile\n- detail: Could not read the domain generation before requesting the reload-only convergence pass."
+                .to_string()
+        })?;
+
+    let response = send_message_with_timeout(
+        project_path,
+        "request_script_reload",
+        "",
+        RECOMPILE_POLL_TIMEOUT,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "Unity recompile status:\n- status: reload_only_incomplete\n- compilation: not_needed\n- domain_reload: not_started\n- bridge: ready\n- action: retry_recompile\n- detail: Failed to request the reload-only convergence pass: {}",
+            error.replace(['\r', '\n'], " ")
+        )
+    })?;
+    if !response.ok {
+        return Err(format!(
+            "Unity recompile status:\n- status: reload_only_incomplete\n- compilation: not_needed\n- domain_reload: not_started\n- bridge: ready\n- action: retry_recompile\n- detail: {}",
+            response
+                .error
+                .unwrap_or_else(|| "Unity rejected the reload-only convergence pass.".to_string())
+                .replace(['\r', '\n'], " ")
+        ));
+    }
+
+    let started_at = Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if let Some((session_id, domain_generation, _)) = fetch_reload_state(project_path).await {
+            if session_id != before_session || domain_generation != before_generation {
+                wait_for_unity_bridge_ready(
+                    project_path,
+                    Duration::from_secs(30),
+                    "after reload-only convergence",
+                )
+                .await
+                .map_err(|error| {
+                    format!(
+                        "Unity recompile status:\n- status: reload_only_bridge_recovering\n- compilation: not_needed\n- domain_reload: completed\n- bridge: not_ready\n- action: wait_reload\n- detail: {}",
+                        error.replace(['\r', '\n'], " ")
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+
+        if started_at.elapsed() >= Duration::from_secs(60) {
+            let state = unity_semantic_state(project_path).await;
+            return Err(format!(
+                "Unity recompile status:\n- status: reload_only_incomplete\n- compilation: not_needed\n- domain_reload: incomplete\n- bridge: {}\n- editor: {}\n- phase: {}\n- action: {}\n- detail: The reload-only convergence pass did not publish a new domain generation within 60 seconds.",
+                state.channel.control_pipe,
+                state.editor_mode.value,
+                state.phase,
+                state.safety.recommended_action
+            ));
+        }
+    }
+}
+
+async fn finish_recompile_not_needed(
+    project_path: &str,
+    existing_reload: &ExistingReloadContext,
+    unity_test_pending_seq: u64,
+    asset_sync: &crate::workspace_changes::UnitySyncSnapshot,
+) -> Result<String, String> {
+    let active_patches =
+        crate::unity_hotreload::coordinator::project_active_patches(project_path).await;
+    let reloaded_to_drop_patches = if active_patches > 0 {
+        request_script_reload_and_wait(project_path).await?;
+        crate::unity_hotreload::coordinator::on_recompile_converged(project_path).await;
+        true
+    } else {
+        crate::unity_hotreload::coordinator::on_recompile_not_needed(project_path).await;
+        false
+    };
+    crate::workspace::clear_unity_test_pending_sources_through(
+        project_path,
+        unity_test_pending_seq,
+    );
+    crate::workspace_changes::acknowledge_unity_sync(Path::new(project_path), asset_sync);
+    let state = unity_semantic_state(project_path).await;
+
+    let status = if reloaded_to_drop_patches {
+        "reloaded_without_compile"
+    } else if existing_reload.compile_converged {
+        "already_converged"
+    } else {
+        "up_to_date"
+    };
+    Ok(format!(
+        "Unity recompile status:\n- status: {status}\n- compilation: not_needed\n- detection: unity_incremental_build_graph\n- asset_sync: {}\n- asset_sync_reason: {}\n- domain_reload: {}\n- bridge: ready\n- editor: {}\n- phase: {}\n- action: none\n- detail: {}",
+        asset_sync.mode.as_str(),
+        asset_sync.reason,
+        if reloaded_to_drop_patches {
+            "completed_to_drop_live_patches"
+        } else if existing_reload.observed {
+            "existing_reload_completed"
+        } else {
+            "unchanged"
+        },
+        state.editor_mode.value,
+        state.phase,
+        if reloaded_to_drop_patches {
+            "Unity's incremental build found every assembly up to date; a reload-only pass removed live hot-patch detours."
+        } else if existing_reload.compile_converged {
+            "The compile already in progress converged the project; another recompile was unnecessary."
+        } else {
+            "Unity's incremental build graph found no assembly that requires recompilation."
+        }
+    ))
 }
 
 async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> {
-    if let Err(e) = end_edit_session(project_path, "").await {
-        eprintln!(
-            "[Locus] failed to end edit sessions before recompile (continuing): {}",
-            e
-        );
-    }
+    let existing_reload = wait_for_existing_reload(project_path).await?;
 
     // Hot-reload edits bypass the AssetDatabase entirely; forward every
     // tracked dirty path so the plugin imports created files (and refreshes
@@ -6046,13 +6480,23 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
     tracked_dirty_sources.extend(unity_test_pending_paths);
     tracked_dirty_sources.sort();
     tracked_dirty_sources.dedup();
-    let tracked_dirty_paths = relative_asset_paths(project_path, &tracked_dirty_sources).join("\n");
-
-    let mut disconnected = match request_recompile_and_wait_for_start(
-        project_path,
+    let tracked_dirty_paths = relative_asset_paths(project_path, &tracked_dirty_sources);
+    let asset_sync = crate::workspace_changes::snapshot_unity_sync(
+        Path::new(project_path),
         &tracked_dirty_paths,
-    )
-    .await?
+    );
+    eprintln!(
+        "[Locus] Unity asset sync decision: mode={}, paths={}, generation={}, through_seq={}, health={:?}, reason={}",
+        asset_sync.mode.as_str(),
+        asset_sync.paths.len(),
+        asset_sync.generation,
+        asset_sync.through_seq,
+        asset_sync.health,
+        asset_sync.reason,
+    );
+
+    let mut disconnected = match request_recompile_and_wait_for_start(project_path, &asset_sync)
+        .await?
     {
         RecompileStartAck::Started => false,
         RecompileStartAck::Unconfirmed => {
@@ -6098,7 +6542,21 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
             Ok(resp) => match classify_recompile_poll_response(&resp)? {
                 RecompilePollState::Waiting | RecompilePollState::Transient => continue,
                 RecompilePollState::Completed => {
-                    return finish_recompile_success(project_path, unity_test_pending_seq).await
+                    return finish_recompile_success(
+                        project_path,
+                        unity_test_pending_seq,
+                        &asset_sync,
+                    )
+                    .await
+                }
+                RecompilePollState::NotNeeded => {
+                    return finish_recompile_not_needed(
+                        project_path,
+                        &existing_reload,
+                        unity_test_pending_seq,
+                        &asset_sync,
+                    )
+                    .await
                 }
             },
             Err(error) => {
@@ -6623,9 +7081,11 @@ mod tests {
         is_transient_broker_error, native_background_hook_markers_present,
         parse_unity_hub_editor_locations, pipe_response_transient_broker_error,
         play_mode_target_status, read_project_unity_version, relative_asset_paths,
-        requested_run_states_editor_status, rewrite_run_states_output_for_size, PipeResponse,
-        RecompilePollState, RecompileStartAck, RecompileStartDiagnostics, UnityBackgroundHookState,
-        UnityBackgroundHookStatus, UnityConnectionStatus, UnityEditorProcessState, UnityLaunchMode,
+        requested_run_states_editor_status, rewrite_run_states_output_for_size,
+        unity_test_modal_dialog_error, unity_test_resume_run_id, wait_for_unity_test_poll_wake,
+        PipeResponse, RecompilePollState, RecompileStartAck, RecompileStartDiagnostics,
+        UnityBackgroundHookState, UnityBackgroundHookStatus, UnityConnectionStatus,
+        UnityEditorProcessState, UnityLaunchMode, UnityTestPollWake, UnityTestRunSnapshot,
         RECOMPILE_START_STATE_HISTORY_LIMIT, UNITY_EDITOR_STATUS_EDITING,
         UNITY_EDITOR_STATUS_PLAYING,
     };
@@ -6718,7 +7178,6 @@ mod tests {
             )),
             Ok(RecompileStartAck::Started)
         );
-
         let error =
             classify_recompile_start_response(&pipe_response(true, Some("request_queued"), None))
                 .expect_err("a queued request is not a started compilation");
@@ -6745,6 +7204,10 @@ mod tests {
         assert_eq!(
             classify_recompile_poll_response(&pipe_response(true, Some("ok"), None)),
             Ok(RecompilePollState::Completed)
+        );
+        assert_eq!(
+            classify_recompile_poll_response(&pipe_response(true, Some("not_needed"), None)),
+            Ok(RecompilePollState::NotNeeded)
         );
         assert_eq!(
             classify_recompile_poll_response(&pipe_response(
@@ -7010,6 +7473,51 @@ mod tests {
         assert!(error.contains("print_lines: 90000"));
         assert!(error.contains("result was not saved"));
         assert!(!project.path().join("Library").join("Locus").exists());
+    }
+
+    #[test]
+    fn unity_test_resume_run_id_requires_an_opaque_non_empty_id() {
+        assert_eq!(unity_test_resume_run_id(&json!({})).unwrap(), None);
+        assert_eq!(
+            unity_test_resume_run_id(&json!({ "resume_run_id": " run-1 " })).unwrap(),
+            Some("run-1".to_string())
+        );
+        assert!(unity_test_resume_run_id(&json!({ "resume_run_id": "" })).is_err());
+        assert!(unity_test_resume_run_id(&json!({ "resume_run_id": 1 })).is_err());
+    }
+
+    #[tokio::test]
+    async fn unity_test_poll_wait_is_interrupted_by_a_dialog_revision() {
+        let (dialog_tx, mut dialog_rx) = tokio::sync::watch::channel(0u64);
+        dialog_tx.send_replace(1);
+        let wake = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_unity_test_poll_wake(&mut dialog_rx, None),
+        )
+        .await
+        .expect("dialog revision should interrupt the 250ms status interval");
+        assert_eq!(wake, UnityTestPollWake::DialogChanged);
+    }
+
+    #[test]
+    fn unity_test_blocked_context_preserves_the_run_for_resumption() {
+        let snapshot = UnityTestRunSnapshot {
+            run_id: "run-1".to_string(),
+            status: "running".to_string(),
+            current_test: "Game.Tests.Blocked".to_string(),
+            total: 3,
+            passed: 1,
+            ..Default::default()
+        };
+        let error = unity_test_modal_dialog_error(
+            "Z:/missing-project",
+            &snapshot,
+            "code=unity_modal_dialog_blocked",
+        );
+        assert!(error.contains("code=unity_modal_dialog_blocked"));
+        assert!(error.contains(r#""runId":"run-1""#));
+        assert!(error.contains(r#""resumeArguments":{"resume_run_id":"run-1"}"#));
+        assert!(error.contains(r#""completed":1"#));
     }
 
     const UNITY_HUB_EDITORS_SAMPLE: &str = r#"{

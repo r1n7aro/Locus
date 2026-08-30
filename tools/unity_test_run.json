@@ -1,5 +1,5 @@
 {
-  "description": "Run tests through the connected project's official Unity Test Framework and wait for the structured result. Use this instead of unity_execute reflection or invoking NUnit methods directly. It supports NUnit lifecycle, UnityTest coroutines, Edit Mode, Play Mode, skips, parameterized cases, and domain reload recovery. After writing or hot-reloading C# tests, call unity_recompile before running; the new test tree becomes runnable after compilation and domain reload complete. The tool is present only when Unity Test tools are enabled for the workspace and com.unity.test-framework is installed. All parameters are optional. Omit assemblies, tests, groups, and categories when that filter is unused; do not send empty arrays.",
+  "description": "Run tests through the connected project's official Unity Test Framework and wait for the structured result. Use this instead of unity_execute reflection or invoking NUnit methods directly. It supports NUnit lifecycle, UnityTest coroutines, Edit Mode, Play Mode, skips, parameterized cases, domain reload recovery, and resuming a run that returned early because a Unity modal dialog blocked the main thread. After writing or hot-reloading C# tests, call unity_recompile before running; the new test tree becomes runnable after compilation and domain reload complete. When a blocked result supplies resumeArguments, resolve the captured dialog and call this tool with that resume_run_id; the original test run remains active. The tool is present only when Unity Test tools are enabled for the workspace and com.unity.test-framework is installed. All parameters are optional. Omit assemblies, tests, groups, and categories when that filter is unused; do not send empty arrays.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -39,6 +39,10 @@
         "enum": ["summary", "failures", "all"],
         "default": "failures",
         "description": "Result detail returned to the agent. failures includes failure messages and stack traces; all includes every leaf result."
+      },
+      "resume_run_id": {
+        "type": "string",
+        "description": "Continue waiting for an existing Unity Test run after a modal-dialog blocked result. Use only the opaque run id returned in resumeArguments; filters and mode are ignored because the original run is already active."
       }
     },
     "required": []

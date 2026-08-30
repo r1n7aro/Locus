@@ -52,6 +52,7 @@ pub enum CliDriverSuite {
     HotReload,
     HotReloadRelease,
     ParallelEditRefresh,
+    RecompileImport,
     Execute,
     PythonSdk,
     ModalDialog,
@@ -72,6 +73,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReload => "hot-reload",
             CliDriverSuite::HotReloadRelease => "hot-reload-release",
             CliDriverSuite::ParallelEditRefresh => "parallel-edit-refresh",
+            CliDriverSuite::RecompileImport => "recompile-import",
             CliDriverSuite::Execute => "execute",
             CliDriverSuite::PythonSdk => "python-sdk",
             CliDriverSuite::ModalDialog => "modal-dialog",
@@ -92,6 +94,7 @@ impl CliDriverSuite {
             CliDriverSuite::HotReload => Some("unity-hotreload-selftest"),
             CliDriverSuite::HotReloadRelease => Some("unity-hotreload-selftest"),
             CliDriverSuite::ParallelEditRefresh => None,
+            CliDriverSuite::RecompileImport => None,
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
             CliDriverSuite::PythonSdk => None,
@@ -620,6 +623,8 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         | "parallel_refresh" | "edit-refresh" | "edit_refresh" => {
             CliDriverSuite::ParallelEditRefresh
         }
+        "recompile-import" | "recompile_import" | "compile-import" | "compile_import"
+        | "asset-refresh" | "asset_refresh" => CliDriverSuite::RecompileImport,
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
         "python-sdk" | "python_sdk" | "sdk" | "sdk-editor" | "sdk_editor" => {
@@ -636,7 +641,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use workspace, workspace-switch, connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, execute, python-sdk, modal-dialog, yaml-parity, unity-test, or all.",
+            "Unknown --suite '{}'. Use workspace, workspace-switch, connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, recompile-import, execute, python-sdk, modal-dialog, yaml-parity, unity-test, or all.",
             value
         ))
         }
@@ -942,6 +947,28 @@ async fn run_driver(
                             &mut cancel_rx,
                         )
                         .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            CliDriverSuite::RecompileImport => {
+                let edit_mode_result = if config.force_edit_mode {
+                    ensure_edit_mode(
+                        &project,
+                        *suite,
+                        config.connect_timeout,
+                        config.poll_interval,
+                        &sink,
+                        &mut cancel_rx,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                match edit_mode_result {
+                    Ok(()) => {
+                        run_recompile_import_suite(&project, *suite, &config, &sink, &mut cancel_rx)
+                            .await
                     }
                     Err(error) => Err(error),
                 }
@@ -2329,7 +2356,9 @@ fn prepare_suite_environment(
     if config.suites.iter().any(|suite| {
         matches!(
             suite,
-            CliDriverSuite::NativeBridge | CliDriverSuite::ParallelEditRefresh
+            CliDriverSuite::NativeBridge
+                | CliDriverSuite::ParallelEditRefresh
+                | CliDriverSuite::RecompileImport
         )
     }) {
         unity_bridge::set_native_bridge_enabled(true);
@@ -4924,6 +4953,697 @@ async fn run_parallel_edit_refresh_suite(
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecompileImportObservation {
+    case_name: String,
+    converged_without_import: bool,
+    elapsed_ms: u128,
+    request_result: String,
+    last_probe: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecompilePipelineObservation {
+    baseline_elapsed_ms: u128,
+    baseline_result: String,
+    queued_paths: usize,
+    elapsed_ms: u128,
+    result: String,
+    probe: String,
+    asmdef_elapsed_ms: u128,
+    asmdef_result: String,
+    delete_elapsed_ms: u128,
+    delete_result: String,
+    no_op_elapsed_ms: u128,
+    no_op_result: String,
+}
+
+fn recompile_import_source(type_name: &str, answer: i32) -> String {
+    format!(
+        "public static class {type_name}\n{{\n    public static int Answer() => {answer};\n}}\n"
+    )
+}
+
+fn recompile_import_asmdef(name: &str) -> String {
+    serde_json::to_string_pretty(&json!({
+        "name": name,
+        "rootNamespace": "",
+        "references": [],
+        "includePlatforms": ["Editor"],
+        "excludePlatforms": [],
+        "allowUnsafeCode": false,
+        "overrideReferences": false,
+        "precompiledReferences": [],
+        "autoReferenced": false,
+        "defineConstraints": [],
+        "versionDefines": [],
+        "noEngineReferences": false,
+    }))
+    .unwrap_or_default()
+        + "\n"
+}
+
+fn recompile_import_type_probe(type_name: &str, marker: &str, predicate: &str) -> String {
+    format!(
+        r#"var t = System.AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetType("{type_name}")).FirstOrDefault(x => x != null); bool matched = {predicate}; print("{marker}:" + (matched ? "yes" : "no") + ":" + (t == null ? "missing" : t.Assembly.GetName().Name));"#
+    )
+}
+
+async fn observe_recompile_import_marker(
+    project: &str,
+    code: &str,
+    expected_marker: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(bool, u128, String), String> {
+    let started = Instant::now();
+    loop {
+        if run_cancelled(cancel_rx) {
+            return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+        }
+        let last_probe = match execute_capture(project, code).await {
+            Ok(output) if output.contains(expected_marker) => {
+                return Ok((true, started.elapsed().as_millis(), clip(&output, 240)))
+            }
+            Ok(output) => clip(&output, 240),
+            Err(error) => clip(&error, 240),
+        };
+        if started.elapsed() >= timeout {
+            return Ok((false, started.elapsed().as_millis(), last_probe));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(poll_interval.min(Duration::from_secs(1))) => {}
+            _ = cancel_rx.changed() => {
+                return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+        }
+    }
+}
+
+async fn request_script_compilation_only(project: &str) -> String {
+    match execute_capture(
+        project,
+        r#"UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation(); print("RIR_REQUEST:accepted");"#,
+    )
+    .await
+    {
+        Ok(output) => format!("ok:{}", clip(&output, 160)),
+        Err(error) => format!("error:{}", clip(&error, 160)),
+    }
+}
+
+async fn refresh_recompile_import_fixture(project: &str) -> String {
+    match execute_capture(
+        project,
+        r#"AssetDatabase.Refresh(); print("RIR_REFRESH:requested");"#,
+    )
+    .await
+    {
+        Ok(output) => format!("ok:{}", clip(&output, 160)),
+        Err(error) => format!("error:{}", clip(&error, 160)),
+    }
+}
+
+async fn cleanup_recompile_import_fixture(
+    project: &str,
+    fixture_asset_dir: &str,
+    fixture_dir: &Path,
+) -> Result<(), String> {
+    let cleanup_code = format!(
+        r#"AssetDatabase.DeleteAsset("{fixture_asset_dir}"); AssetDatabase.Refresh(); print("RIR_CLEANUP:requested");"#
+    );
+    let _ = execute_capture(project, &cleanup_code).await;
+
+    let project_assets = Path::new(project).join("Assets");
+    let safe_name = fixture_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("LocusRecompileImportSelfTest_"));
+    if !fixture_dir.starts_with(&project_assets) || !safe_name {
+        return Err(format!(
+            "refused unsafe recompile-import cleanup path: {}",
+            fixture_dir.display()
+        ));
+    }
+
+    match tokio::fs::remove_dir_all(fixture_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("fixture directory cleanup failed: {error}")),
+    }
+    let fixture_meta = fixture_dir.with_extension("meta");
+    match tokio::fs::remove_file(&fixture_meta).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("fixture meta cleanup failed: {error}")),
+    }
+    let _ = refresh_recompile_import_fixture(project).await;
+    Ok(())
+}
+
+/// Observe which externally-written script changes reach Unity's compilation
+/// graph through RequestScriptCompilation alone while auto refresh is held.
+/// This is intentionally a fact-finding suite: each case reports its observed
+/// convergence result, while infrastructure and cleanup failures still fail the
+/// suite. The result is used to keep Locus's import policy evidence-based across
+/// Unity versions.
+async fn run_recompile_import_suite(
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    sink.emit(
+        "suite_start",
+        json!({ "suite": suite.as_str(), "project": project }),
+    );
+    crate::csharp_compile::set_enabled(true).await;
+    crate::csharp_compile::warm_up_in_background();
+
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let short = &token[..8];
+    let fixture_asset_dir = format!("Assets/LocusRecompileImportSelfTest_{token}");
+    let fixture_dir = Path::new(project)
+        .join("Assets")
+        .join(format!("LocusRecompileImportSelfTest_{token}"));
+    let asmdef_path = fixture_dir.join("Locus.RecompileImport.asmdef");
+    let asm_a = format!("Locus.RecompileImport.A.{short}");
+    let asm_b = format!("Locus.RecompileImport.B.{short}");
+    let asmdef_a = recompile_import_asmdef(&asm_a);
+    let asmdef_b = recompile_import_asmdef(&asm_b);
+    let existing_type = format!("LocusRirExisting_{short}");
+    let new_type = format!("LocusRirNew_{short}");
+    let deleted_type = format!("LocusRirDeleted_{short}");
+    let assembly_type = format!("LocusRirAssembly_{short}");
+    let existing_path = fixture_dir.join("Existing.cs");
+    let new_path = fixture_dir.join("New.cs");
+    let deleted_path = fixture_dir.join("Deleted.cs");
+    let deleted_meta_path = deleted_path.with_extension("cs.meta");
+    let assembly_path = fixture_dir.join("Assembly.cs");
+    let existing_source_a = recompile_import_source(&existing_type, 1);
+    let existing_source_b = recompile_import_source(&existing_type, 2);
+    let deleted_source = recompile_import_source(&deleted_type, 1);
+    let assembly_source = recompile_import_source(&assembly_type, 1);
+
+    tokio::fs::create_dir_all(&fixture_dir)
+        .await
+        .map_err(|error| format!("failed to create recompile-import fixture: {error}"))?;
+    for (path, content) in [
+        (&asmdef_path, asmdef_a.as_str()),
+        (&existing_path, existing_source_a.as_str()),
+        (&deleted_path, deleted_source.as_str()),
+        (&assembly_path, assembly_source.as_str()),
+    ] {
+        tokio::fs::write(path, content)
+            .await
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    }
+
+    let cleanup_on_error = |error: String| async {
+        let _ = cleanup_recompile_import_fixture(project, &fixture_asset_dir, &fixture_dir).await;
+        error
+    };
+    let _ = refresh_recompile_import_fixture(project).await;
+    let baseline_probe = format!(
+        r#"var names = new[] {{ "{existing_type}", "{deleted_type}", "{assembly_type}" }}; bool present = names.All(name => System.AppDomain.CurrentDomain.GetAssemblies().Any(a => a.GetType(name) != null)); print("RIR_BASELINE:" + (present ? "yes" : "no"));"#
+    );
+    let (baseline_ready, _, baseline_last) = observe_recompile_import_marker(
+        project,
+        &baseline_probe,
+        "RIR_BASELINE:yes",
+        recompile_wait(config),
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !baseline_ready {
+        return Err(cleanup_on_error(format!(
+            "recompile-import baseline did not load: {baseline_last}"
+        ))
+        .await);
+    }
+    let deleted_meta = tokio::fs::read(&deleted_meta_path)
+        .await
+        .map_err(|error| format!("failed to read generated delete fixture meta: {error}"))?;
+
+    let environment = execute_capture(
+        project,
+        r#"print("RIR_ENV:directoryMonitoring=" + AssetDatabase.IsDirectoryMonitoringEnabled());"#,
+    )
+    .await
+    .unwrap_or_else(|error| format!("error:{error}"));
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": suite.as_str(),
+            "line": format!("INFO  recompile-import: {}", clip(&environment, 200)),
+            "passed": 0,
+            "failed": 0,
+        }),
+    );
+
+    let case_timeout = recompile_wait(config).min(Duration::from_secs(45));
+    let mut observations = Vec::new();
+
+    // Existing .cs content modification.
+    let owner = format!("rir-existing-{token}");
+    unity_bridge::begin_edit_session(project, &owner).await?;
+    tokio::fs::write(&existing_path, &existing_source_b)
+        .await
+        .map_err(|error| format!("failed to modify existing fixture: {error}"))?;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let request_result = request_script_compilation_only(project).await;
+    let existing_probe = recompile_import_type_probe(
+        &existing_type,
+        "RIR_EXISTING",
+        "t != null && (int)t.GetMethod(\"Answer\").Invoke(null, null) == 2",
+    );
+    let (converged, elapsed_ms, last_probe) = observe_recompile_import_marker(
+        project,
+        &existing_probe,
+        "RIR_EXISTING:yes",
+        case_timeout,
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !converged {
+        tokio::fs::write(&existing_path, &existing_source_a)
+            .await
+            .map_err(|error| format!("failed to restore existing fixture: {error}"))?;
+    }
+    let _ = end_edit_session_for_cleanup(project, &owner).await;
+    if !converged {
+        let _ = refresh_recompile_import_fixture(project).await;
+    }
+    observations.push(RecompileImportObservation {
+        case_name: "existing_cs".to_string(),
+        converged_without_import: converged,
+        elapsed_ms,
+        request_result,
+        last_probe,
+    });
+
+    // Brand-new .cs file with no .meta.
+    let owner = format!("rir-new-{token}");
+    unity_bridge::begin_edit_session(project, &owner).await?;
+    tokio::fs::write(&new_path, recompile_import_source(&new_type, 1))
+        .await
+        .map_err(|error| format!("failed to create new fixture: {error}"))?;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let request_result = request_script_compilation_only(project).await;
+    let new_probe = recompile_import_type_probe(&new_type, "RIR_NEW", "t != null");
+    let (converged, elapsed_ms, last_probe) = observe_recompile_import_marker(
+        project,
+        &new_probe,
+        "RIR_NEW:yes",
+        case_timeout,
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !converged {
+        let _ = tokio::fs::remove_file(&new_path).await;
+    }
+    let _ = end_edit_session_for_cleanup(project, &owner).await;
+    if !converged {
+        let _ = refresh_recompile_import_fixture(project).await;
+    }
+    observations.push(RecompileImportObservation {
+        case_name: "new_cs".to_string(),
+        converged_without_import: converged,
+        elapsed_ms,
+        request_result,
+        last_probe,
+    });
+
+    // Externally deleted .cs and its .meta.
+    let owner = format!("rir-delete-{token}");
+    unity_bridge::begin_edit_session(project, &owner).await?;
+    tokio::fs::remove_file(&deleted_path)
+        .await
+        .map_err(|error| format!("failed to delete fixture source: {error}"))?;
+    tokio::fs::remove_file(&deleted_meta_path)
+        .await
+        .map_err(|error| format!("failed to delete fixture meta: {error}"))?;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let request_result = request_script_compilation_only(project).await;
+    let deleted_probe = recompile_import_type_probe(&deleted_type, "RIR_DELETE", "t == null");
+    let (converged, elapsed_ms, last_probe) = observe_recompile_import_marker(
+        project,
+        &deleted_probe,
+        "RIR_DELETE:yes",
+        case_timeout,
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !converged {
+        tokio::fs::write(&deleted_path, &deleted_source)
+            .await
+            .map_err(|error| format!("failed to restore deleted fixture source: {error}"))?;
+        tokio::fs::write(&deleted_meta_path, &deleted_meta)
+            .await
+            .map_err(|error| format!("failed to restore deleted fixture meta: {error}"))?;
+    }
+    let _ = end_edit_session_for_cleanup(project, &owner).await;
+    if !converged {
+        let _ = refresh_recompile_import_fixture(project).await;
+    }
+    observations.push(RecompileImportObservation {
+        case_name: "deleted_cs".to_string(),
+        converged_without_import: converged,
+        elapsed_ms,
+        request_result,
+        last_probe,
+    });
+
+    // Assembly definition content modification.
+    let owner = format!("rir-asmdef-{token}");
+    unity_bridge::begin_edit_session(project, &owner).await?;
+    tokio::fs::write(&asmdef_path, &asmdef_b)
+        .await
+        .map_err(|error| format!("failed to modify asmdef fixture: {error}"))?;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let request_result = request_script_compilation_only(project).await;
+    let assembly_probe = recompile_import_type_probe(
+        &assembly_type,
+        "RIR_ASMDEF",
+        &format!("t != null && t.Assembly.GetName().Name == \"{asm_b}\""),
+    );
+    let (converged, elapsed_ms, last_probe) = observe_recompile_import_marker(
+        project,
+        &assembly_probe,
+        "RIR_ASMDEF:yes",
+        case_timeout,
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !converged {
+        tokio::fs::write(&asmdef_path, &asmdef_a)
+            .await
+            .map_err(|error| format!("failed to restore asmdef fixture: {error}"))?;
+    }
+    let _ = end_edit_session_for_cleanup(project, &owner).await;
+    if !converged {
+        let _ = refresh_recompile_import_fixture(project).await;
+    }
+    observations.push(RecompileImportObservation {
+        case_name: "asmdef".to_string(),
+        converged_without_import: converged,
+        elapsed_ms,
+        request_result,
+        last_probe,
+    });
+
+    // Establish the process-local journal baseline. A fresh Locus process is
+    // intentionally Unverified, so its first recompile must use one full
+    // refresh before later known paths qualify for targeted import.
+    let baseline_started = Instant::now();
+    let journal_baseline_result = unity_bridge::recompile_and_wait(project).await;
+    let baseline_elapsed_ms = baseline_started.elapsed().as_millis();
+    if let Err(error) = journal_baseline_result.as_ref() {
+        return Err(cleanup_on_error(format!(
+            "journal baseline recompile failed after {baseline_elapsed_ms}ms: {error}"
+        ))
+        .await);
+    }
+    if !journal_baseline_result
+        .as_ref()
+        .is_ok_and(|result| result.contains("- asset_sync: full"))
+    {
+        return Err(cleanup_on_error(format!(
+            "fresh journal baseline did not use full sync: {}",
+            describe_result(&journal_baseline_result, "- asset_sync: full")
+        ))
+        .await);
+    }
+
+    // Exercise Locus's real edit-session -> queued paths -> recompile path with
+    // enough files to expose accidental per-path Asset Pipeline refreshes.
+    let batch_owner = format!("rir-pipeline-{token}");
+    let batch_count = 64usize;
+    let mut batch_asset_paths = Vec::with_capacity(batch_count);
+    unity_bridge::begin_edit_session(project, &batch_owner).await?;
+    for index in 0..batch_count {
+        let type_name = format!("LocusRirPipeline_{short}_{index}");
+        let file_name = format!("Pipeline{index}.cs");
+        tokio::fs::write(
+            fixture_dir.join(&file_name),
+            recompile_import_source(&type_name, index as i32),
+        )
+        .await
+        .map_err(|error| format!("failed to write pipeline fixture {file_name}: {error}"))?;
+        batch_asset_paths.push(format!("{fixture_asset_dir}/{file_name}"));
+    }
+    unity_bridge::import_assets(project, &batch_asset_paths)
+        .await
+        .map_err(|error| format!("failed to queue pipeline fixture assets: {error}"))?;
+
+    let pipeline_started = Instant::now();
+    let pipeline_result = unity_bridge::recompile_and_wait(project).await;
+    let pipeline_elapsed_ms = pipeline_started.elapsed().as_millis();
+    if let Err(error) = pipeline_result.as_ref() {
+        let _ = end_edit_session_for_cleanup(project, &batch_owner).await;
+        return Err(cleanup_on_error(format!(
+            "real Locus recompile failed after {pipeline_elapsed_ms}ms: {error}"
+        ))
+        .await);
+    }
+    if !pipeline_result
+        .as_ref()
+        .is_ok_and(|result| result.contains("- asset_sync: targeted"))
+    {
+        return Err(cleanup_on_error(format!(
+            "known pipeline paths did not use targeted sync: {}",
+            describe_result(&pipeline_result, "- asset_sync: targeted")
+        ))
+        .await);
+    }
+    let pipeline_probe_code = format!(
+        r#"var first = System.AppDomain.CurrentDomain.GetAssemblies().Any(a => a.GetType("LocusRirPipeline_{short}_0") != null); var last = System.AppDomain.CurrentDomain.GetAssemblies().Any(a => a.GetType("LocusRirPipeline_{short}_63") != null); print("RIR_PIPELINE:" + (first && last ? "yes" : "no"));"#
+    );
+    let (pipeline_converged, _, pipeline_probe) = observe_recompile_import_marker(
+        project,
+        &pipeline_probe_code,
+        "RIR_PIPELINE:yes",
+        recompile_wait(config),
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !pipeline_converged {
+        return Err(cleanup_on_error(format!(
+            "real Locus recompile returned without loading all queued files: {pipeline_probe}"
+        ))
+        .await);
+    }
+
+    // Assembly graph edits remain eligible for the targeted path when the
+    // journal knows the exact existing asmdef that changed.
+    let asm_c = format!("Locus.RecompileImport.C.{short}");
+    let asmdef_c = recompile_import_asmdef(&asm_c);
+    let asmdef_owner = format!("rir-targeted-asmdef-{token}");
+    unity_bridge::begin_edit_session(project, &asmdef_owner).await?;
+    tokio::fs::write(&asmdef_path, &asmdef_c)
+        .await
+        .map_err(|error| format!("failed to write targeted asmdef fixture: {error}"))?;
+    let asmdef_asset_path = format!("{fixture_asset_dir}/Locus.RecompileImport.asmdef");
+    unity_bridge::import_assets(project, std::slice::from_ref(&asmdef_asset_path))
+        .await
+        .map_err(|error| format!("failed to queue targeted asmdef fixture: {error}"))?;
+    let asmdef_started = Instant::now();
+    let asmdef_result = unity_bridge::recompile_and_wait(project).await;
+    let asmdef_elapsed_ms = asmdef_started.elapsed().as_millis();
+    if let Err(error) = asmdef_result.as_ref() {
+        let _ = end_edit_session_for_cleanup(project, &asmdef_owner).await;
+        return Err(cleanup_on_error(format!(
+            "targeted asmdef recompile failed after {asmdef_elapsed_ms}ms: {error}"
+        ))
+        .await);
+    }
+    if !asmdef_result
+        .as_ref()
+        .is_ok_and(|result| result.contains("- asset_sync: targeted"))
+    {
+        return Err(cleanup_on_error(format!(
+            "known asmdef path did not use targeted sync: {}",
+            describe_result(&asmdef_result, "- asset_sync: targeted")
+        ))
+        .await);
+    }
+    let asmdef_probe = recompile_import_type_probe(
+        &assembly_type,
+        "RIR_TARGETED_ASMDEF",
+        &format!("t != null && t.Assembly.GetName().Name == \"{asm_c}\""),
+    );
+    let (asmdef_converged, _, asmdef_last_probe) = observe_recompile_import_marker(
+        project,
+        &asmdef_probe,
+        "RIR_TARGETED_ASMDEF:yes",
+        recompile_wait(config),
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !asmdef_converged {
+        return Err(cleanup_on_error(format!(
+            "targeted asmdef recompile returned before the assembly graph converged: {asmdef_last_probe}"
+        ))
+        .await);
+    }
+
+    // A known deletion fails closed to one full refresh, which removes the
+    // stale AssetDatabase row before Unity evaluates its incremental graph.
+    let delete_owner = format!("rir-delete-full-{token}");
+    unity_bridge::begin_edit_session(project, &delete_owner).await?;
+    tokio::fs::remove_file(&assembly_path)
+        .await
+        .map_err(|error| format!("failed to remove full-sync fixture source: {error}"))?;
+    match tokio::fs::remove_file(assembly_path.with_extension("cs.meta")).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(cleanup_on_error(format!(
+                "failed to remove full-sync fixture meta: {error}"
+            ))
+            .await)
+        }
+    }
+    let assembly_asset_path = format!("{fixture_asset_dir}/Assembly.cs");
+    unity_bridge::import_assets(project, std::slice::from_ref(&assembly_asset_path))
+        .await
+        .map_err(|error| format!("failed to queue deleted fixture path: {error}"))?;
+    let delete_started = Instant::now();
+    let delete_result = unity_bridge::recompile_and_wait(project).await;
+    let delete_elapsed_ms = delete_started.elapsed().as_millis();
+    if let Err(error) = delete_result.as_ref() {
+        let _ = end_edit_session_for_cleanup(project, &delete_owner).await;
+        return Err(cleanup_on_error(format!(
+            "delete full-sync recompile failed after {delete_elapsed_ms}ms: {error}"
+        ))
+        .await);
+    }
+    if !delete_result
+        .as_ref()
+        .is_ok_and(|result| result.contains("- asset_sync: full"))
+    {
+        return Err(cleanup_on_error(format!(
+            "deleted compile input did not fail closed to full sync: {}",
+            describe_result(&delete_result, "- asset_sync: full")
+        ))
+        .await);
+    }
+    let deleted_assembly_probe =
+        recompile_import_type_probe(&assembly_type, "RIR_DELETE_FULL", "t == null");
+    let (delete_converged, _, delete_last_probe) = observe_recompile_import_marker(
+        project,
+        &deleted_assembly_probe,
+        "RIR_DELETE_FULL:yes",
+        recompile_wait(config),
+        config.poll_interval,
+        cancel_rx,
+    )
+    .await?;
+    if !delete_converged {
+        return Err(cleanup_on_error(format!(
+            "delete full-sync recompile retained the removed type: {delete_last_probe}"
+        ))
+        .await);
+    }
+
+    let no_op_started = Instant::now();
+    let no_op_result = unity_bridge::recompile_and_wait(project).await;
+    let no_op_elapsed_ms = no_op_started.elapsed().as_millis();
+    if let Err(error) = no_op_result.as_ref() {
+        return Err(cleanup_on_error(format!(
+            "no-op Locus recompile failed after {no_op_elapsed_ms}ms: {error}"
+        ))
+        .await);
+    }
+    if !no_op_result
+        .as_ref()
+        .is_ok_and(|result| result.contains("- asset_sync: none"))
+    {
+        return Err(cleanup_on_error(format!(
+            "healthy no-op recompile did not skip asset synchronization: {}",
+            describe_result(&no_op_result, "- asset_sync: none")
+        ))
+        .await);
+    }
+    let pipeline_observation = RecompilePipelineObservation {
+        baseline_elapsed_ms,
+        baseline_result: journal_baseline_result.unwrap_or_default(),
+        queued_paths: batch_asset_paths.len(),
+        elapsed_ms: pipeline_elapsed_ms,
+        result: pipeline_result.unwrap_or_default(),
+        probe: pipeline_probe,
+        asmdef_elapsed_ms,
+        asmdef_result: asmdef_result.unwrap_or_default(),
+        delete_elapsed_ms,
+        delete_result: delete_result.unwrap_or_default(),
+        no_op_elapsed_ms,
+        no_op_result: no_op_result.unwrap_or_default(),
+    };
+
+    for observation in &observations {
+        sink.emit(
+            "suite_event",
+            json!({
+                "suite": suite.as_str(),
+                "line": format!(
+                    "OBSERVE recompile-import: {} converged_without_import={} elapsed={}ms request={} probe={}",
+                    observation.case_name,
+                    observation.converged_without_import,
+                    observation.elapsed_ms,
+                    clip(&observation.request_result, 100),
+                    clip(&observation.last_probe, 100),
+                ),
+                "passed": 0,
+                "failed": 0,
+            }),
+        );
+    }
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": suite.as_str(),
+            "line": format!(
+                "PASS  recompile-import: locus_pipeline baseline={}ms queued={} targeted={}ms asmdef={}ms delete_full={}ms no_op={}ms probe={}",
+                pipeline_observation.baseline_elapsed_ms,
+                pipeline_observation.queued_paths,
+                pipeline_observation.elapsed_ms,
+                pipeline_observation.asmdef_elapsed_ms,
+                pipeline_observation.delete_elapsed_ms,
+                pipeline_observation.no_op_elapsed_ms,
+                clip(&pipeline_observation.probe, 100),
+            ),
+            "passed": 1,
+            "failed": 0,
+        }),
+    );
+
+    cleanup_recompile_import_fixture(project, &fixture_asset_dir, &fixture_dir).await?;
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": suite.as_str(),
+            "passed": observations.len() + 1,
+            "failed": 0,
+            "environment": environment,
+            "observations": observations,
+            "pipelineObservation": pipeline_observation,
+            "fixtureCleaned": true,
+        }),
+    );
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 struct ProgressStats {
     total: u32,
@@ -6761,6 +7481,20 @@ mod tests {
             assert_eq!(
                 parsed.suites,
                 vec![CliDriverSuite::ParallelEditRefresh],
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_recompile_import_suite_aliases() {
+        for alias in ["recompile-import", "compile_import", "asset-refresh"] {
+            let parsed = parse(&["--locus-unity-test", "--suite", alias])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parsed.suites,
+                vec![CliDriverSuite::RecompileImport],
                 "alias {alias}"
             );
         }

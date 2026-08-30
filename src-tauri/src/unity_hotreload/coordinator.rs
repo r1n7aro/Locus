@@ -993,6 +993,21 @@ pub async fn on_recompile_converged(project_path: &str) {
     converge_tracked_edits(project_path, None).await;
 }
 
+/// Unity completed an incremental compilation request and reported every
+/// assembly as already up to date. With no live detours, the loaded domain is
+/// already disk truth, so tracked source/test bookkeeping can converge without
+/// pretending that a domain reload occurred.
+pub async fn on_recompile_not_needed(project_path: &str) {
+    let mut projects = projects().lock().await;
+    if let Some(state) = projects.get_mut(&project_key(project_path)) {
+        state.pending.clear();
+        state.cold_paths.clear();
+        state.convergence_pending = false;
+    }
+    drop(projects);
+    crate::csharp_compile::emit_status_in_background();
+}
+
 /// Shared convergence: clear tracked edits (all of them, or only those whose
 /// last write is at or below `pending_seq_bound`), reset the reload trackers,
 /// and run the domain-reload cleanup. The bound exists for OBSERVED

@@ -312,6 +312,17 @@ pub async fn recompile_with_semantic_warnings(workspace: &str) -> Result<String,
         crate::unity_bridge::recompile_and_wait(workspace),
     )
     .await
+    .map_err(format_recompile_error_for_agent)
+}
+
+fn format_recompile_error_for_agent(error: String) -> String {
+    if error.starts_with("Unity recompile status:") {
+        return error;
+    }
+    format!(
+        "Unity recompile status:\n- status: failed\n- compilation: failed_or_unconfirmed\n- detection: unavailable\n- domain_reload: unconfirmed\n- bridge: current_state_unknown\n- action: inspect_error\n- detail: {}",
+        error.replace(['\r', '\n'], " | ")
+    )
 }
 
 #[cfg(test)]
@@ -361,5 +372,20 @@ mod tests {
         assert!(output.contains("1 warning(s)"));
         assert!(output.contains("unavailable for 1 file(s)"));
         assert!(output.contains("omitted 2 file(s)"));
+    }
+
+    #[test]
+    fn recompile_errors_always_expose_agent_readable_state() {
+        let output = format_recompile_error_for_agent("compiler exploded\nCS1002".to_string());
+        assert!(output.starts_with("Unity recompile status:"));
+        assert!(output.contains("- status: failed"));
+        assert!(output.contains("- action: inspect_error"));
+        assert!(output.contains("compiler exploded | CS1002"));
+
+        let structured = "Unity recompile status:\n- status: compiled_bridge_recovering";
+        assert_eq!(
+            format_recompile_error_for_agent(structured.to_string()),
+            structured
+        );
     }
 }

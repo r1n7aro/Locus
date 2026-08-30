@@ -40,8 +40,8 @@ use crate::commands::{
 use crate::compact;
 use crate::llm::{anthropic, chat_completions, codex, openrouter, responses};
 use crate::session::models::{
-    AssistantRenderPart, ChatMessage, ImageData, MessageRole, PendingSessionInput, RenderOrderKey,
-    TodoItem, ToolCallInfo,
+    AssistantRenderPart, ChatMessage, Citation, ImageData, MessageRole, PendingSessionInput,
+    RenderOrderKey, TodoItem, ToolCallInfo,
 };
 use crate::session::store::{SessionPromptPrefixCache, SessionStore};
 use crate::tool::{ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult, ToolRuntimeState};
@@ -665,6 +665,7 @@ fn assistant_render_parts_for_response(
     thinking_text: &str,
     thinking_duration: Option<u32>,
     thinking_signature: Option<&str>,
+    citations: &[Citation],
     tool_calls: &[ToolCallInfo],
 ) -> Vec<AssistantRenderPart> {
     let mut parts = Vec::new();
@@ -685,6 +686,7 @@ fn assistant_render_parts_for_response(
             id: mark.id,
             order: render_order_key(run_id, mark.seq),
             content: text.to_string(),
+            citations: citations.to_vec(),
         });
     }
     for tool_call in tool_calls {
@@ -1106,6 +1108,7 @@ impl AgentKnowledgeEditArgs {
             old_string: self.old_string.clone(),
             new_string: self.new_string.clone(),
             replace_all: false,
+            expected_empty: false,
         }
     }
 
@@ -1124,6 +1127,7 @@ impl AgentKnowledgeEditArgs {
                 old_string,
                 new_string,
                 replace_all: false,
+                expected_empty: false,
             }],
             ..Default::default()
         };
@@ -8365,6 +8369,7 @@ impl AgentInstance {
                 .await?;
                 Ok(LlmCallResult {
                     text: resp.text,
+                    citations: resp.citations,
                     tool_calls: resp.tool_calls,
                     finish_reason: resp.finish_reason,
                     end_turn: resp.end_turn,
@@ -8405,6 +8410,7 @@ impl AgentInstance {
                 .await?;
                 Ok(LlmCallResult {
                     text: resp.text,
+                    citations: Vec::new(),
                     tool_calls: resp.tool_calls,
                     finish_reason: resp.finish_reason,
                     end_turn: None,
@@ -8496,6 +8502,7 @@ impl AgentInstance {
                 };
                 Ok(LlmCallResult {
                     text: resp.text,
+                    citations: resp.citations,
                     tool_calls: resp.tool_calls,
                     finish_reason: resp.finish_reason,
                     end_turn: resp.end_turn,
@@ -8589,6 +8596,7 @@ impl AgentInstance {
                         .await?;
                         Ok(LlmCallResult {
                             text: resp.text,
+                            citations: resp.citations,
                             tool_calls: resp.tool_calls,
                             finish_reason: resp.finish_reason,
                             end_turn: resp.end_turn,
@@ -8633,6 +8641,7 @@ impl AgentInstance {
                         .await?;
                         Ok(LlmCallResult {
                             text: resp.text,
+                            citations: resp.citations,
                             tool_calls: resp.tool_calls,
                             finish_reason: resp.finish_reason,
                             end_turn: resp.end_turn,
@@ -8681,6 +8690,7 @@ impl AgentInstance {
                         .await?;
                         Ok(LlmCallResult {
                             text: resp.text,
+                            citations: Vec::new(),
                             tool_calls: resp.tool_calls,
                             finish_reason: resp.finish_reason,
                             end_turn: None,
@@ -8892,6 +8902,7 @@ impl AgentInstance {
             };
             return Ok(LlmCallResult {
                 text: resp.text,
+                citations: resp.citations,
                 tool_calls: resp.tool_calls,
                 finish_reason: resp.finish_reason,
                 end_turn: resp.end_turn,
@@ -11556,6 +11567,7 @@ impl AgentInstance {
                 &response.thinking_text,
                 (response.thinking_duration_secs > 0).then_some(response.thinking_duration_secs),
                 (!response.thinking_signature.is_empty()).then_some(response.thinking_signature.as_str()),
+                &response.citations,
                 &ordered_tool_calls,
             );
 
@@ -12902,6 +12914,7 @@ impl AgentInstance {
                         .then_some(response.thinking_duration_secs),
                     (!response.thinking_signature.is_empty())
                         .then_some(response.thinking_signature.as_str()),
+                    &response.citations,
                     &finalized_tool_calls,
                 );
 
@@ -13111,7 +13124,7 @@ impl AgentInstance {
             final_content_order = response_content_order;
             final_thinking_order = response_thinking_order;
             final_persisted_message_id = None;
-            final_render_parts = None;
+            final_render_parts = Some(response_render_parts);
             break;
         }
 
@@ -13145,6 +13158,7 @@ impl AgentInstance {
                     thinking_opt.unwrap_or_default(),
                     thinking_dur,
                     thinking_sig,
+                    &[],
                     &[],
                 )
             });
@@ -15345,17 +15359,42 @@ impl AgentInstance {
                     is_error: true,
                 });
             };
-            let resolved =
-                if crate::workspace_service::service::service_ready_required_for_tool(&tc.name) {
-                    execution
-                        .resolve_service_ready(owner, UNITY_SERVICE_READY_TIMEOUT)
-                        .await
-                } else {
-                    execution.resolve_service(owner)
-                };
+            let requires_ready =
+                crate::workspace_service::service::service_ready_required_for_tool(&tc.name);
+            if requires_ready && owner == crate::workspace_service::ServiceKind::Unity {
+                if let Some(error) = crate::unity_bridge::dialog::blocked_error(
+                    &execution.root().to_string_lossy(),
+                    "not_sent",
+                    None,
+                ) {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: error,
+                        is_error: true,
+                    });
+                }
+            }
+            let resolved = if requires_ready {
+                execution
+                    .resolve_service_ready(owner, UNITY_SERVICE_READY_TIMEOUT)
+                    .await
+            } else {
+                execution.resolve_service(owner)
+            };
             match resolved {
                 Ok(binding) => Some(binding),
                 Err(error) => {
+                    if requires_ready && owner == crate::workspace_service::ServiceKind::Unity {
+                        if let Some(dialog_error) = crate::unity_bridge::dialog::blocked_error(
+                            &execution.root().to_string_lossy(),
+                            "not_sent",
+                            None,
+                        ) {
+                            return ExecutedToolResult::from_tool_result(ToolResult {
+                                output: dialog_error,
+                                is_error: true,
+                            });
+                        }
+                    }
                     let diagnostic = error
                         .diagnostic_json()
                         .map(|json| format!(" diagnostic={json}"))
@@ -18137,7 +18176,7 @@ impl AgentInstance {
                 is_error: false,
             },
             Err(e) => ToolResult {
-                output: format!("Compilation failed:\n{}", e),
+                output: e,
                 is_error: true,
             },
         }

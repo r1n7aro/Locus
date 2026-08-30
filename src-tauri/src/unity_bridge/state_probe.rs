@@ -1237,6 +1237,33 @@ fn domain_state_for_inputs(inputs: &FusionInputs) -> ObservedDomainState {
         }
     }
 
+    // A responding managed pipe proves that the new domain is loaded. Keep
+    // recompile_inflight as a fallback only for the pipe-disconnected reload
+    // window; otherwise the operation's own wait guard would permanently make
+    // its post-compile readiness probe observe a synthetic reload.
+    if inputs.pipe_connected {
+        return ObservedDomainState {
+            phase: "none".to_string(),
+            reload_sub_phase: None,
+            source: "pipe".to_string(),
+            confidence: "high".to_string(),
+        };
+    }
+
+    if inputs
+        .native_broker_status
+        .as_ref()
+        .map(|status| status.managed_state == "ready")
+        .unwrap_or(false)
+    {
+        return ObservedDomainState {
+            phase: "none".to_string(),
+            reload_sub_phase: None,
+            source: "native_broker".to_string(),
+            confidence: "high".to_string(),
+        };
+    }
+
     if inputs.recompile_inflight {
         return ObservedDomainState {
             phase: "reloading".to_string(),
@@ -1914,10 +1941,9 @@ async fn observe_project_once_with_native_broker_status(
             // alive and its main thread is busy, or we initiated a recompile.
             // Idle / edit / play (the pipe answers) NEVER escalates → no
             // suspension in the common case.
-            let reload_likely = recompile_inflight
-                || (!pipe_connected
-                    && process_alive
-                    && passive.as_ref().map(|s| s.cpu_active).unwrap_or(false));
+            let reload_likely = !pipe_connected
+                && (recompile_inflight
+                    || (process_alive && passive.as_ref().map(|s| s.cpu_active).unwrap_or(false)));
 
             if reload_likely {
                 let hint = module_hint.clone();
@@ -2852,6 +2878,45 @@ mod workspace_scope_tests {
     use super::*;
     use crate::workspace_service::event::WorkspaceEventScope;
     use crate::workspace_service::{CheckoutId, ProjectId, ServiceInstanceId};
+
+    fn connected_recompile_inputs(pipe_connected: bool) -> FusionInputs {
+        FusionInputs {
+            pipe_connected,
+            pipe_status: if pipe_connected {
+                "editing"
+            } else {
+                "disconnected"
+            }
+            .to_string(),
+            process_state: super::super::UnityEditorProcessState::Running,
+            editor_instance_present: true,
+            recompile_inflight: true,
+            recently_launched: false,
+            native: None,
+            native_broker_status: None,
+            pipe_latency_ms: Some(1),
+            pipe_error: None,
+            control_channel_state: if pipe_connected { "ready" } else { "reloading" }.to_string(),
+            process_id: Some(42),
+            process_created_at_ms: Some(1),
+            process_path: None,
+            last_known_editor_mode: None,
+            pending_editor_intent: None,
+            native_hook: NativeHookObservation::default(),
+            observer: None,
+        }
+    }
+
+    #[test]
+    fn connected_pipe_ends_recompile_reload_inference() {
+        let connected = domain_state_for_inputs(&connected_recompile_inputs(true));
+        assert_eq!(connected.phase, "none");
+        assert_eq!(connected.source, "pipe");
+
+        let disconnected = domain_state_for_inputs(&connected_recompile_inputs(false));
+        assert_eq!(disconnected.phase, "reloading");
+        assert_eq!(disconnected.source, "inference");
+    }
 
     fn scope(
         checkout: &str,

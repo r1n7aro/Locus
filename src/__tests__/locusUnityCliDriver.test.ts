@@ -67,6 +67,10 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("run_parallel_edit_refresh_suite");
     expect(driver).toContain("LocusParallelEditRefreshSelfTest_");
     expect(driver).toContain("activeOwnersAfterFirstEnd");
+    expect(driver).toContain("CliDriverSuite::RecompileImport");
+    expect(driver).toContain("run_recompile_import_suite");
+    expect(driver).toContain("LocusRecompileImportSelfTest_");
+    expect(driver).toContain("converged_without_import");
     expect(driver).toContain("CliDriverSuite::Execute");
     expect(driver).toContain("run_execute_suite");
     expect(driver).toContain("run_agent_unity_execute_probe");
@@ -170,6 +174,7 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain("probe_asset_guid(project, &fixture_asset_path)");
     expect(driver).toContain("completed asset stayed outside the AssetDatabase");
     expect(script).toContain("--suite parallel-edit-refresh --install-plugin");
+    expect(script).toContain("--suite recompile-import --install-plugin");
   });
 
   it("guards the Type Index suite against transient Unity reload windows", () => {

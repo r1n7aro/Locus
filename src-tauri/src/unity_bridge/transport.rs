@@ -517,13 +517,17 @@ mod windows_impl {
         }
         let requires_main_thread =
             super::super::dialog::message_requires_unity_main_thread(msg_type);
+        // Subscribe before the preflight snapshot. If a dialog is published
+        // between these two operations, the snapshot observes it; if it is
+        // published afterwards, the watch receiver retains the new revision.
+        // This closes the detection race without adding another window scan.
+        let mut dialog_events = super::super::dialog::subscribe();
         if requires_main_thread {
             if let Some(error) = super::super::dialog::blocked_error(project_path, "not_sent", None)
             {
                 return Err(error);
             }
         }
-        let mut dialog_events = super::super::dialog::subscribe();
         let trace_exit_play_mode = msg_type == "exit_play_mode";
         if trace_exit_play_mode {
             tracing::info!(log_module = "Locus", "exit_play_mode transport: connecting");

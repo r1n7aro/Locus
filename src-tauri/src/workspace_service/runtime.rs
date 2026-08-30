@@ -159,6 +159,7 @@ pub struct WorkspaceCoreServices {
     knowledge_index:
         Arc<std::sync::Mutex<Option<Arc<crate::knowledge_index::KnowledgeIndexState>>>>,
     asset_watcher: Arc<std::sync::Mutex<Option<crate::asset_db::watcher::AssetDbWatcher>>>,
+    workspace_changes: Arc<crate::workspace_changes::WorkspaceChangeHub>,
     knowledge_watcher: Arc<std::sync::Mutex<Option<crate::knowledge_watcher::KnowledgeFsWatcher>>>,
     background_watchers_lifecycle: Arc<std::sync::Mutex<()>>,
     knowledge_operations: WorkspaceKnowledgeOperationStates,
@@ -199,6 +200,7 @@ impl WorkspaceCoreServices {
             asset_db: Arc::new(std::sync::Mutex::new(asset_db)),
             knowledge_index: Arc::new(std::sync::Mutex::new(None)),
             asset_watcher: Arc::new(std::sync::Mutex::new(None)),
+            workspace_changes: crate::workspace_changes::hub_for_workspace(&identity.root),
             knowledge_watcher: Arc::new(std::sync::Mutex::new(None)),
             background_watchers_lifecycle: Arc::new(std::sync::Mutex::new(())),
             knowledge_operations: WorkspaceKnowledgeOperationStates::default(),
@@ -221,6 +223,20 @@ impl WorkspaceCoreServices {
 
     pub fn asset_db(&self) -> Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>> {
         Arc::clone(&self.asset_db)
+    }
+
+    pub fn workspace_changes(&self) -> Arc<crate::workspace_changes::WorkspaceChangeHub> {
+        Arc::clone(&self.workspace_changes)
+    }
+
+    pub fn asset_watcher_diagnostics(&self) -> (bool, u64, Option<String>) {
+        let Ok(watcher) = self.asset_watcher.lock() else {
+            return (false, 0, None);
+        };
+        match watcher.as_ref() {
+            Some(watcher) => (true, watcher.queue_len() as u64, watcher.current_file()),
+            None => (false, 0, None),
+        }
     }
 
     pub fn asset_last_scan_info(&self) -> &crate::commands::asset::LastScanInfoState {
@@ -347,6 +363,7 @@ impl WorkspaceCoreServices {
                     self.root.clone(),
                     Arc::clone(&self.asset_db),
                     watcher_tuning,
+                    Arc::clone(&self.workspace_changes),
                 )?);
             }
         }

@@ -894,7 +894,12 @@ mod platform {
             lines.push(format!("- {}: {}", choice.id, choice.label));
         }
         if let Some(request_id) = request_id {
-            lines.push(format!("request_id={request_id}"));
+            let id_label = if request_state == "test_run_detached" {
+                "run_id"
+            } else {
+                "request_id"
+            };
+            lines.push(format!("{id_label}={request_id}"));
         }
         lines.push("该恢复接口不使用 Unity 主线程。请根据弹窗语义选择一个 choice_id：".to_string());
         let project_json =
@@ -911,6 +916,13 @@ mod platform {
                     .unwrap_or_else(|_| "\"\"".to_string());
                 format!(
                     "原请求已发送；选择后使用 Python SDK 获取原执行结果，避免重复执行：\npython -c 'import asyncio,locus; print(asyncio.run(locus.wait_unity_execution(project={project_json}, execution_id={execution_json})))'"
+                )
+            }
+            "test_run_detached" => {
+                let run_json = serde_json::to_string(request_id.unwrap_or_default())
+                    .unwrap_or_else(|_| "\"\"".to_string());
+                format!(
+                    "原 Unity Test 运行仍然有效；选择后使用 unity_test_run 的 resume_run_id 继续等待原运行，避免启动重复测试：\n{{\"resume_run_id\":{run_json}}}"
                 )
             }
             _ => "原请求可能已经发送；选择后先查询原请求状态，避免直接重复执行。".to_string(),
@@ -1330,23 +1342,41 @@ mod platform {
                 project: r"F:\Project".to_string(),
                 title: "Scene changed".to_string(),
                 message: "Reload it?".to_string(),
-                choices: vec![UnityDialogChoice {
-                    id: "choice-0".to_string(),
-                    label: "Reload".to_string(),
-                }],
+                choices: vec![
+                    UnityDialogChoice {
+                        id: "choice-0".to_string(),
+                        label: "Save".to_string(),
+                    },
+                    UnityDialogChoice {
+                        id: "choice-1".to_string(),
+                        label: "Don't Save".to_string(),
+                    },
+                    UnityDialogChoice {
+                        id: "choice-2".to_string(),
+                        label: "Cancel".to_string(),
+                    },
+                ],
                 main_thread_blocked: true,
                 opened_at_ms: 1,
             };
             let error = format_blocked_error(&dialog, "not_sent", None);
             assert!(error.contains("code=unity_modal_dialog_blocked"));
             assert!(error.contains("Unity 主线程已被模态弹窗阻塞"));
-            assert!(error.contains("choice-0: Reload"));
+            assert!(error.contains("dialog_id=dialog-test"));
+            assert!(error.contains("choice-0: Save"));
+            assert!(error.contains("choice-1: Don't Save"));
+            assert!(error.contains("choice-2: Cancel"));
             assert!(error.contains("locus.choose_unity_dialog"));
             assert!(error.contains("可安全重试"));
 
             let detached = format_blocked_error(&dialog, "detached", Some("exec-test"));
             assert!(detached.contains("locus.wait_unity_execution"));
             assert!(detached.contains("exec-test"));
+
+            let test_run = format_blocked_error(&dialog, "test_run_detached", Some("test-run-1"));
+            assert!(test_run.contains("run_id=test-run-1"));
+            assert!(test_run.contains("resume_run_id"));
+            assert!(!test_run.contains("wait_unity_execution"));
         }
     }
 }
@@ -1368,7 +1398,8 @@ mod platform {
     }
 
     pub fn subscribe() -> watch::Receiver<u64> {
-        watch::channel(0).1
+        static SENDER: std::sync::OnceLock<watch::Sender<u64>> = std::sync::OnceLock::new();
+        SENDER.get_or_init(|| watch::channel(0).0).subscribe()
     }
 
     pub fn current_dialog(_project_path: &str) -> Option<UnityModalDialog> {
@@ -1419,8 +1450,12 @@ mod tests {
             "execute_loaded",
             "execute_code_wait",
             "request_recompile",
+            "request_script_reload",
             "set_editor_status",
             "run_states",
+            "unity_test_start",
+            "unity_test_status",
+            "unity_test_cancel",
             "capture_viewport",
             "read_yaml",
             "property_tree_write",

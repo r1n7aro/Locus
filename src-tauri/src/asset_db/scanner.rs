@@ -50,6 +50,13 @@ pub(crate) const P1_EXTENSIONS: &[&str] = &[
     "brush",
 ];
 
+/// Files that can alter Unity's C# compilation graph. The asset watcher keeps
+/// this small side list during its existing directory walk so the compile
+/// change journal can discover a missed create event without allocating a
+/// probe entry for every project file.
+pub(crate) const UNITY_COMPILE_INPUT_EXTENSIONS: &[&str] =
+    &["cs", "asmdef", "asmref", "rsp", "dll"];
+
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub rel_path: String,
@@ -75,6 +82,7 @@ pub(crate) struct EntryProbe {
 pub struct DirSnapshot {
     pub meta_files: Vec<FileEntry>,
     pub yaml_asset_files: Vec<FileEntry>,
+    pub(crate) compile_input_files: Vec<FileEntry>,
     pub dirs_scanned: u64,
     pub linked_asset_roots: Vec<LinkedAssetRoot>,
     /// rel_path → on-disk facts for every entry the walk visited. Empty when
@@ -109,6 +117,7 @@ pub fn scan_directory_with_cancel(project_root: &Path, cancel: &AtomicBool) -> D
 struct ScanPartial {
     meta_files: Vec<FileEntry>,
     yaml_asset_files: Vec<FileEntry>,
+    compile_input_files: Vec<FileEntry>,
     dirs_scanned: u64,
     linked_asset_roots: Vec<LinkedAssetRoot>,
     entry_probes: Vec<(String, EntryProbe)>,
@@ -118,6 +127,8 @@ impl ScanPartial {
     fn merge(mut self, mut other: ScanPartial) -> ScanPartial {
         self.meta_files.append(&mut other.meta_files);
         self.yaml_asset_files.append(&mut other.yaml_asset_files);
+        self.compile_input_files
+            .append(&mut other.compile_input_files);
         self.dirs_scanned += other.dirs_scanned;
         self.linked_asset_roots
             .append(&mut other.linked_asset_roots);
@@ -213,6 +224,7 @@ pub(crate) fn scan_directory_with_options(
     DirSnapshot {
         meta_files: combined.meta_files,
         yaml_asset_files: combined.yaml_asset_files,
+        compile_input_files: combined.compile_input_files,
         dirs_scanned: combined.dirs_scanned,
         linked_asset_roots: combined.linked_asset_roots,
         entry_probes: combined.entry_probes.into_iter().collect(),
@@ -343,7 +355,8 @@ fn classify_file(
     }
 
     let indexed = ext == "meta" || P1_EXTENSIONS.contains(&ext.as_str());
-    if !indexed {
+    let compile_input = UNITY_COMPILE_INPUT_EXTENSIONS.contains(&ext.as_str());
+    if !indexed && !compile_input {
         return;
     }
 
@@ -355,9 +368,13 @@ fn classify_file(
         size,
     };
 
+    if compile_input {
+        local.compile_input_files.push(file_entry.clone());
+    }
+
     if ext == "meta" {
         local.meta_files.push(file_entry);
-    } else {
+    } else if indexed {
         local.yaml_asset_files.push(file_entry);
     }
 }

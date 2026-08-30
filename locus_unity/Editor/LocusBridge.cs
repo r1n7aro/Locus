@@ -135,6 +135,13 @@ namespace Locus
         // thread. Count only continuously idle editor time and leave enough room
         // for Unity to publish CompilationPipeline.compilationStarted.
         private const double RecompileStartIdleTimeoutSeconds = 30.0;
+        // Unity's Bee build graph reports every output assembly through exactly
+        // one of assemblyCompilationFinished (rebuilt) or
+        // assemblyCompilationNotRequired (already up to date). These counters
+        // let compilationFinished distinguish a real compile from an
+        // incremental no-op without inferring from elapsed idle time.
+        private static int _compiledAssemblyCount;
+        private static int _upToDateAssemblyCount;
         private static readonly HashSet<string> _activeEditSessionOwners =
             new HashSet<string>(StringComparer.Ordinal);
         private static readonly HashSet<string> _pendingChangedAssetPaths =
@@ -466,11 +473,23 @@ namespace Locus
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             CompilationPipeline.compilationStarted += OnCompilationStarted;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
+#if UNITY_2022_1_OR_NEWER
+            CompilationPipeline.assemblyCompilationNotRequired += OnAssemblyCompilationNotRequired;
+#endif
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
             RestorePendingRecompileStartAfterReload();
             RegisterExtensionMessageHandler(
                 "yaml_preview_cache_selftest",
                 HandleYamlPreviewCacheSelfTest);
+        }
+
+        [Serializable]
+        private sealed class RecompileRequestPayload
+        {
+            public int schema;
+            public string syncMode;
+            public string[] paths;
+            public string reason;
         }
 
         private static void OnQuitting()
@@ -673,6 +692,20 @@ namespace Locus
                 completion.TrySetResult(OkResponse(requestId, "recompile_started"));
         }
 
+        private static void CompleteRecompileNotNeeded()
+        {
+            _recompileRequested = false;
+            _recompileStartWatchActive = false;
+            _recompileStartIdleSince = -1;
+            _domainReloadCheckFrames = -1;
+            SessionState.SetBool(SessionKey_RecompileInProgress, false);
+            SessionState.SetBool(SessionKey_RecompilePendingCompile, false);
+            SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
+            SetCompileResult("not_needed");
+            Debug.Log("[Locus] Unity incremental build completed with no rebuilt assemblies ("
+                + _upToDateAssemblyCount + " already up to date); no domain reload is required.");
+        }
+
         private static void FailRecompileStart(string detail)
         {
             const string summary = "Unity 没有开始编译。";
@@ -750,6 +783,9 @@ namespace Locus
 
         private static void OnCompilationStarted(object context)
         {
+            _compiledAssemblyCount = 0;
+            _upToDateAssemblyCount = 0;
+
             // Epoch for the request/finish pairing — see
             // SessionKey_CompileEpochStarted. SessionState survives the domain
             // reload between a pre-request compile and the requested one.
@@ -770,8 +806,16 @@ namespace Locus
             }
         }
 
+#if UNITY_2022_1_OR_NEWER
+        private static void OnAssemblyCompilationNotRequired(string assemblyPath)
+        {
+            _upToDateAssemblyCount++;
+        }
+#endif
+
         private static void OnAssemblyCompilationFinished(string assemblyPath, CompilerMessage[] messages)
         {
+            _compiledAssemblyCount++;
             // Collect errors for EVERY compilation, not just Locus-requested
             // ones, so OnCompilationFinished can tell a successful compile from
             // a failed one regardless of who triggered it (the convergence
@@ -838,7 +882,8 @@ namespace Locus
             // BOTH ways: a FAILED compile must clear a stale flag left by a prior
             // successful-but-not-yet-reloaded compile, otherwise a later bare
             // domain reload would consume it and falsely report convergence.
-            SessionState.SetBool(SessionKey_CompileAwaitingReload, succeeded);
+            bool rebuiltAssemblies = _compiledAssemblyCount > 0;
+            SessionState.SetBool(SessionKey_CompileAwaitingReload, succeeded && rebuiltAssemblies);
 
             // Completion attribution is epoch-gated the same way: a pre-request
             // compile's finish must not consume the request (its success/errors
@@ -866,6 +911,13 @@ namespace Locus
                 // Failed compilations do not trigger a domain reload, so clear the in-progress flag here.
                 SessionState.SetBool(SessionKey_RecompileInProgress, false);
                 _domainReloadCheckFrames = -1;
+            }
+            else if (!rebuiltAssemblies)
+            {
+                // Bee completed the requested incremental build and classified
+                // every assembly as already up to date. This is Unity's own
+                // dependency-graph verdict, so no assembly reload will follow.
+                CompleteRecompileNotNeeded();
             }
             else
             {
@@ -998,11 +1050,8 @@ namespace Locus
             }
         }
 
-        private static int FlushQueuedAssetImports()
+        private static int FlushQueuedAssetImports(bool forceFullRefresh = false)
         {
-            if (_pendingChangedAssetPaths.Count == 0)
-                return 0;
-
             string[] pendingPaths = new string[_pendingChangedAssetPaths.Count];
             _pendingChangedAssetPaths.CopyTo(pendingPaths);
             _pendingChangedAssetPaths.Clear();
@@ -1011,46 +1060,102 @@ namespace Locus
             Array.Sort(pendingPaths, StringComparer.Ordinal);
 
             int importedCount = 0;
-            bool needsRefresh = false;
-            foreach (string assetPath in pendingPaths)
+            bool needsFullRefresh = forceFullRefresh;
+            if (!needsFullRefresh)
             {
-                try
+                foreach (string assetPath in pendingPaths)
                 {
                     if (!File.Exists(assetPath) && !Directory.Exists(assetPath))
                     {
                         // Deleted on disk. ImportAsset cannot drop a stale
-                        // database entry; a Refresh pass below picks the
-                        // removal up (leaving it would fail the next compile
-                        // with a missing source file).
-                        needsRefresh = true;
-                        continue;
+                        // database entry, so one project refresh handles the
+                        // whole queued batch, including the removal.
+                        needsFullRefresh = true;
+                        break;
                     }
-                    AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
-                    importedCount++;
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError("[Locus] Failed to import changed asset before compile: " + assetPath + "\n" + ex);
                 }
             }
 
-            if (needsRefresh)
+            if (needsFullRefresh)
             {
                 try
                 {
-                    AssetDatabase.Refresh();
+                    // A compile request uses this path even when the explicit
+                    // queue is empty, so out-of-band package/file changes also
+                    // enter the AssetDatabase before dependency analysis.
+                    AssetDatabase.Refresh(ImportAssetOptions.Default);
+                    importedCount = pendingPaths.Length;
                 }
                 catch (Exception ex)
                 {
-                    Debug.LogError("[Locus] AssetDatabase.Refresh for deleted assets failed: " + ex);
+                    Debug.LogError("[Locus] AssetDatabase.Refresh for changed assets failed: " + ex);
+                    throw;
+                }
+            }
+            else if (pendingPaths.Length > 0)
+            {
+                // ImportAsset starts an import process per call unless asset
+                // editing is active. Queue every known path into one import
+                // batch and let Unity run dependency analysis once at the end.
+                AssetDatabase.StartAssetEditing();
+                try
+                {
+                    foreach (string assetPath in pendingPaths)
+                    {
+                        try
+                        {
+                            AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.Default);
+                            importedCount++;
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogError("[Locus] Failed to import changed asset before compile: " + assetPath + "\n" + ex);
+                            throw;
+                        }
+                    }
+                }
+                finally
+                {
+                    AssetDatabase.StopAssetEditing();
                 }
             }
 
-            if (importedCount > 0 || needsRefresh)
-                Debug.Log("[Locus] Flushed changed asset imports before compile: " + importedCount
-                    + (needsRefresh ? " (+refresh for deletions)" : ""));
+            if (importedCount > 0 || needsFullRefresh)
+                Debug.Log("[Locus] Flushed changed assets in one import pass: " + importedCount
+                    + (needsFullRefresh ? " (project refresh)" : " (targeted batch)"));
 
             return importedCount;
+        }
+
+        private static RecompileRequestPayload ParseRecompileRequest(string raw)
+        {
+            string trimmed = (raw ?? "").Trim();
+            if (trimmed.StartsWith("{", StringComparison.Ordinal))
+            {
+                RecompileRequestPayload parsed = JsonUtility.FromJson<RecompileRequestPayload>(trimmed);
+                if (parsed == null || parsed.schema != 1)
+                    throw new InvalidOperationException("Unsupported Locus recompile request schema.");
+
+                string mode = (parsed.syncMode ?? "").Trim().ToLowerInvariant();
+                if (mode != "none" && mode != "targeted" && mode != "full")
+                    throw new InvalidOperationException("Unsupported Locus asset sync mode: " + parsed.syncMode);
+                parsed.syncMode = mode;
+                if (parsed.paths == null)
+                    parsed.paths = new string[0];
+                return parsed;
+            }
+
+            // Legacy desktop versions send newline-delimited paths. Preserve
+            // their correctness contract with one full refresh.
+            return new RecompileRequestPayload
+            {
+                schema = 0,
+                syncMode = "full",
+                paths = trimmed.Length == 0
+                    ? new string[0]
+                    : trimmed.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries),
+                reason = "legacy_request"
+            };
         }
 
         private static string BeginEditSession(string owner)
@@ -1095,7 +1200,7 @@ namespace Locus
             return "active_edit_sessions:" + _activeEditSessionOwners.Count;
         }
 
-        private static void ReleaseAllEditSessions()
+        private static void ReleaseAllEditSessions(bool flushQueuedAssets = true)
         {
             if (_activeEditSessionOwners.Count == 0 && _autoRefreshSuppressionCount == 0)
                 return;
@@ -1107,8 +1212,8 @@ namespace Locus
                 _autoRefreshSuppressionCount--;
             }
 
-            int importedCount = FlushQueuedAssetImports();
-            Debug.Log($"[Locus] Released all edit sessions, imported={importedCount}.");
+            int importedCount = flushQueuedAssets ? FlushQueuedAssetImports() : 0;
+            Debug.Log($"[Locus] Released all edit sessions, imported={importedCount}, deferred={!flushQueuedAssets}.");
         }
 
         private static void PostToMainThread(Action action)
@@ -1151,7 +1256,7 @@ namespace Locus
                     _recompileStartWatchActive = false;
                     _recompileStartIdleSince = -1;
                 }
-                else if (EditorApplication.isCompiling)
+                else if (EditorApplication.isCompiling || EditorApplication.isUpdating)
                 {
                     _recompileStartIdleSince = -1;
                 }
@@ -1761,18 +1866,19 @@ namespace Locus
                                 SessionState.SetBool(SessionKey_RecompileInProgress, true);
                                 SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
 
-                                ReleaseAllEditSessions();
-                                if (changedPathsRaw.Length > 0)
-                                    QueueChangedAssets(changedPathsRaw.Split('\n'));
-                                FlushQueuedAssetImports();
-                                // Catch out-of-band file changes the AssetDatabase
-                                // never saw — chiefly a Locus plugin push, which
-                                // copies new/changed .cs straight into Packages
-                                // without going through ImportAsset. Without this a
-                                // newly added plugin file (no .meta yet) is absent
-                                // from the next compilation and any reference to it
-                                // fails to compile. Refresh imports them first.
-                                AssetDatabase.Refresh();
+                                RecompileRequestPayload recompileRequest =
+                                    ParseRecompileRequest(changedPathsRaw);
+
+                                // Merge the session queue and the request's
+                                // tracked paths before performing at most one
+                                // AssetDatabase synchronization pass.
+                                ReleaseAllEditSessions(false);
+                                QueueChangedAssets(recompileRequest.paths);
+                                FlushQueuedAssetImports(recompileRequest.syncMode == "full");
+                                Debug.Log("[Locus] Recompile asset sync: mode="
+                                    + recompileRequest.syncMode + ", paths="
+                                    + recompileRequest.paths.Length + ", reason="
+                                    + (recompileRequest.reason ?? ""));
 
                                 // Refresh/import may already have started the
                                 // target epoch. Request explicitly only while it
@@ -1790,6 +1896,28 @@ namespace Locus
                         });
 
                         return await startCompletion.Task.ConfigureAwait(false);
+                    }
+
+                    case "request_script_reload":
+                    {
+                        var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
+                        PostToMainThread(delegate
+                        {
+                            try
+                            {
+                                // Complete the broker response before crossing
+                                // the reload boundary. The next delay call then
+                                // tears down this domain and removes live detours
+                                // while keeping Unity's up-to-date assemblies.
+                                tcs.SetResult(OkResponse(reqId, "reload_requested"));
+                                EditorApplication.delayCall += EditorUtility.RequestScriptReload;
+                            }
+                            catch (Exception ex)
+                            {
+                                tcs.SetResult(ErrorResponse(reqId, ex.ToString()));
+                            }
+                        });
+                        return await tcs.Task.ConfigureAwait(false);
                     }
 
                     case "begin_edit_session":
@@ -1909,6 +2037,13 @@ namespace Locus
                                 if (string.Equals(result, "starting", StringComparison.Ordinal) ||
                                     string.Equals(result, "pending", StringComparison.Ordinal))
                                 {
+                                    tcs.SetResult(OkResponse(reqId, result));
+                                    return;
+                                }
+
+                                if (string.Equals(result, "not_needed", StringComparison.Ordinal))
+                                {
+                                    ClearCompileResult();
                                     tcs.SetResult(OkResponse(reqId, result));
                                     return;
                                 }

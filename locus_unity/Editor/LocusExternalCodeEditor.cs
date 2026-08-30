@@ -80,10 +80,6 @@ namespace Locus
 
         public bool OpenProject(string path, int line, int column)
         {
-            if (!string.IsNullOrEmpty(path)
-                && !path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
-                return false;
-
             string projectPath = ProjectRoot();
             string assetPath = NormalizeAssetPath(projectPath, path);
             if (!string.IsNullOrEmpty(assetPath)
@@ -147,7 +143,7 @@ namespace Locus
         public void OnGUI()
         {
             EditorGUILayout.LabelField(
-                "C# scripts open in the Locus asset preview.",
+                "Unity project files open in editable Locus workspace tabs.",
                 EditorStyles.wordWrappedLabel);
             if (GUILayout.Button("Regenerate project files", GUILayout.Width(190)))
                 LocusProjectFiles.SyncAll();

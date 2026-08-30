@@ -25,6 +25,7 @@ namespace Locus.UnityTesting
     internal sealed class UnityTestRunRequest : UnityTestFilterRequest
     {
         public string result_detail = "failures";
+        public string run_id;
     }
 
     [Serializable]
@@ -114,11 +115,17 @@ namespace Locus.UnityTesting
             Save(true);
         }
 
-        public void Begin(string editorSessionId, string modeValue, string resultDetail)
+        public void Begin(
+            string editorSessionId,
+            string modeValue,
+            string resultDetail,
+            string requestedRunId = null)
         {
             active = true;
             editor_session_id = editorSessionId;
-            run_id = Guid.NewGuid().ToString("N");
+            run_id = string.IsNullOrWhiteSpace(requestedRunId)
+                ? Guid.NewGuid().ToString("N")
+                : requestedRunId.Trim();
             unity_run_guid = "";
             status = "starting";
             mode = modeValue;
@@ -294,7 +301,7 @@ namespace Locus.UnityTesting
             if (state.active)
                 throw new InvalidOperationException("A Unity Test run is already active.");
 
-            state.Begin(EditorSessionId(), modeName, resultDetail);
+            state.Begin(EditorSessionId(), modeName, resultDetail, request.run_id);
             try
             {
                 Filter filter = BuildFilter(request, mode);

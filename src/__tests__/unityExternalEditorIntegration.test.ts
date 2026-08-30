@@ -18,18 +18,32 @@ describe("Locus Unity external editor integration", () => {
     expect(system).toContain('"set_unity_external_editor_default_enabled"');
   });
 
-  it("registers Locus with Unity and routes C# files to the asset preview", () => {
+  it("registers Locus with Unity and routes C# files to editable workbench tabs", () => {
     const editor = read("locus_unity/Editor/LocusExternalCodeEditor.cs");
     const bootstrap = read("src/composables/useAppBootstrap.ts");
-    const assetState = read("src/composables/useAssetState.ts");
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const fileEditor = read("src/components/workbench/WorkspaceFilePreview.vue");
+    const service = read("src/services/workspaceExplorer.ts");
+    const command = read("src-tauri/src/commands/workspace_explorer.rs");
 
     expect(editor).toContain("IExternalCodeEditor");
     expect(editor).toContain("CodeEditor.Register");
     expect(editor).toContain('OpenScriptEvent = "locus-open-script"');
     expect(editor).toContain('"--locus-open-script"');
+    expect(editor).not.toContain('path.EndsWith(".cs"');
     expect(bootstrap).toContain('"locus-open-script"');
-    expect(assetState).toContain("openAssetPath");
-    expect(assetState).toContain("previewFocusLine");
+    expect(bootstrap).toContain("stageExternalScriptOpen");
+    expect(bootstrap).toContain('setPage("development")');
+    expect(workbench).toContain("revealPendingExternalScriptOpen");
+    expect(workbench).toContain('kind: "workspaceFile"');
+    expect(workbench).toContain("revealPosition(");
+    expect(fileEditor).toContain("workspaceFilePreview(");
+    expect(fileEditor).toContain("workspaceFileWrite(");
+    expect(fileEditor).toContain("EditorView.scrollIntoView");
+    expect(service).toContain('"workspace_file_preview"');
+    expect(service).toContain('"workspace_file_write"');
+    expect(command).toContain("pub async fn workspace_file_preview(");
+    expect(command).toContain("pub async fn workspace_file_write(");
   });
 
   it("generates Unity project files through the Locus plugin", () => {

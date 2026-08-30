@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use notify::event::ModifyKind;
+use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -573,6 +573,131 @@ fn to_asset_rel_paths_and_reasons(
     results
 }
 
+fn asset_rel_paths_and_reasons_from_workspace_rels(
+    workspace_rels: &[String],
+) -> Vec<(String, QueueEnqueueReason)> {
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+    for rel in workspace_rels {
+        push_asset_rel_path_and_reason(rel.clone(), &mut results, &mut seen);
+    }
+    results
+}
+
+fn to_workspace_rel_paths(
+    project_root: &Path,
+    abs_path: &Path,
+    linked_roots: &[LinkedAssetRoot],
+) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Ok(rel) = abs_path.strip_prefix(project_root) {
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel_path_is_scannable(&rel) && seen.insert(rel.clone()) {
+            results.push(rel);
+        }
+    }
+    for rel in linked_asset_rel_paths_for_abs(abs_path, linked_roots) {
+        if rel_path_is_scannable(&rel) && seen.insert(rel.clone()) {
+            results.push(rel);
+        }
+    }
+    results
+}
+
+fn workspace_change_kind_for_event(
+    event: &notify::Event,
+    path_index: usize,
+) -> Option<crate::workspace_changes::WorkspaceChangeKind> {
+    use crate::workspace_changes::WorkspaceChangeKind;
+
+    match event.kind {
+        EventKind::Access(_) => None,
+        EventKind::Create(_) => Some(WorkspaceChangeKind::Upsert),
+        EventKind::Remove(_) => Some(WorkspaceChangeKind::Delete),
+        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => Some(WorkspaceChangeKind::Delete),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Some(WorkspaceChangeKind::Upsert),
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
+            if path_index == 0 {
+                Some(WorkspaceChangeKind::Delete)
+            } else {
+                Some(WorkspaceChangeKind::Upsert)
+            }
+        }
+        EventKind::Modify(_) | EventKind::Any | EventKind::Other => {
+            Some(WorkspaceChangeKind::Upsert)
+        }
+    }
+}
+
+fn event_has_unresolved_structure(event: &notify::Event) -> bool {
+    match event.kind {
+        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => true,
+        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => event.paths.len() < 2,
+        // Windows commonly reports a parent's name-change notification while
+        // files are created below it. Treating every extensionless Name(Any)
+        // path as a directory rename made normal batched script creation
+        // permanently degrade the journal. Concrete directory targets are
+        // detected with `path.is_dir()` in the receiver below; notify Rescan/
+        // error remains the authoritative lost-event signal.
+        EventKind::Modify(ModifyKind::Name(_)) => false,
+        EventKind::Remove(_) => event.paths.iter().any(|path| {
+            path.extension().is_none()
+                && !path
+                    .file_name()
+                    .is_some_and(|name| scanner::is_ignored_name(&name.to_string_lossy()))
+        }),
+        _ => false,
+    }
+}
+
+fn record_workspace_changes_for_event(
+    event: &notify::Event,
+    project_root: &Path,
+    linked_roots: &[LinkedAssetRoot],
+    change_hub: &crate::workspace_changes::WorkspaceChangeHub,
+) -> (Vec<Vec<String>>, usize) {
+    if event.need_rescan() {
+        eprintln!(
+            "[AssetDb Watcher] compile journal rescan: kind={:?}, paths={:?}",
+            event.kind, event.paths
+        );
+        change_hub.mark_rescan_required("notify_rescan");
+    }
+    if event_has_unresolved_structure(event) {
+        eprintln!(
+            "[AssetDb Watcher] compile journal structural gap: kind={:?}, paths={:?}",
+            event.kind, event.paths
+        );
+        change_hub.mark_structural_gap("directory_or_unpaired_rename");
+    }
+
+    let mut recorded = 0;
+    let mut rel_paths_by_event_path = Vec::with_capacity(event.paths.len());
+    for (path_index, path) in event.paths.iter().enumerate() {
+        let workspace_rels = to_workspace_rel_paths(project_root, path, linked_roots);
+        let mut observed_rels = Vec::with_capacity(workspace_rels.len());
+        if let Some(kind) = workspace_change_kind_for_event(event, path_index) {
+            for rel in workspace_rels {
+                let compile_input = crate::workspace_changes::is_unity_compile_input(&rel);
+                if let Some(observed) = change_hub.observe(
+                    &rel,
+                    kind,
+                    crate::workspace_changes::WorkspaceChangeSource::OsWatcher,
+                ) {
+                    if compile_input {
+                        recorded += 1;
+                    }
+                    observed_rels.push(observed.path);
+                }
+            }
+        }
+        rel_paths_by_event_path.push(observed_rels);
+    }
+    (rel_paths_by_event_path, recorded)
+}
+
 /// Directory creates and renames are the only events that move whole
 /// subtrees: on Windows, `ReadDirectoryChangesW` reports just the directory
 /// itself — none of the children fire events of their own — so without a
@@ -583,7 +708,8 @@ fn to_asset_rel_paths_and_reasons(
 fn is_structural_event(kind: &EventKind) -> bool {
     matches!(
         kind,
-        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
+        EventKind::Create(_)
+            | EventKind::Modify(ModifyKind::Name(RenameMode::To | RenameMode::Both))
     )
 }
 
@@ -1537,22 +1663,26 @@ fn event_receiver_loop(
     project_root: PathBuf,
     linked_roots: SharedLinkedAssetRoots,
     activity: Arc<RecentQueueActivityLog>,
+    change_hub: Arc<crate::workspace_changes::WorkspaceChangeHub>,
 ) {
     eprintln!("[AssetDb Watcher] event receiver thread started");
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Ok(event)) => {
+                let structure_already_unresolved = event_has_unresolved_structure(&event);
                 let linked_roots_snapshot = linked_roots
                     .read()
                     .map(|roots| roots.clone())
                     .unwrap_or_default();
+                let (workspace_rels_by_path, _) = record_workspace_changes_for_event(
+                    &event,
+                    &project_root,
+                    linked_roots_snapshot.as_slice(),
+                    &change_hub,
+                );
                 let structural = is_structural_event(&event.kind);
-                for path in &event.paths {
-                    let mapped = to_asset_rel_paths_and_reasons(
-                        &project_root,
-                        path,
-                        linked_roots_snapshot.as_slice(),
-                    );
+                for (path, workspace_rels) in event.paths.iter().zip(workspace_rels_by_path) {
+                    let mapped = asset_rel_paths_and_reasons_from_workspace_rels(&workspace_rels);
                     let mapped_any = !mapped.is_empty();
                     for (rel, reason) in mapped {
                         if enqueue_with_activity(&queue, &activity, rel.clone(), reason, None) {
@@ -1571,6 +1701,14 @@ fn event_receiver_loop(
                             linked_roots_snapshot.as_slice(),
                         )
                     {
+                        if !structure_already_unresolved {
+                            eprintln!(
+                                "[AssetDb Watcher] compile journal directory event: kind={:?}, path={}",
+                                event.kind,
+                                path.display()
+                            );
+                            change_hub.mark_structural_gap("directory_or_unpaired_rename");
+                        }
                         let discovered = enqueue_dir_subtree_metas(
                             path,
                             &project_root,
@@ -1590,13 +1728,43 @@ fn event_receiver_loop(
                 }
             }
             Ok(Err(e)) => {
+                change_hub.mark_watch_error("notify_watch_error");
                 eprintln!("[AssetDb Watcher] watch error: {}", e);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if !stop.load(Ordering::Relaxed) {
+                    change_hub.mark_watch_error("notify_channel_disconnected");
+                }
+                break;
+            }
         }
     }
     eprintln!("[AssetDb Watcher] event receiver thread stopped");
+}
+
+fn record_reconciled_compile_input(
+    change_hub: Option<&crate::workspace_changes::WorkspaceChangeHub>,
+    project_root: &Path,
+    path: &str,
+) {
+    let Some(change_hub) = change_hub else {
+        return;
+    };
+    if !crate::workspace_changes::is_unity_compile_input(path) {
+        return;
+    }
+    let absolute = project_root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let kind = if absolute.is_file() {
+        crate::workspace_changes::WorkspaceChangeKind::Upsert
+    } else {
+        crate::workspace_changes::WorkspaceChangeKind::Delete
+    };
+    change_hub.record(
+        path,
+        kind,
+        crate::workspace_changes::WorkspaceChangeSource::Reconcile,
+    );
 }
 
 fn mtime_scanner_loop(
@@ -1606,8 +1774,9 @@ fn mtime_scanner_loop(
     project_root: PathBuf,
     activity: Arc<RecentQueueActivityLog>,
     linked_watch_state: LinkedAssetWatchState,
+    change_hub: Arc<crate::workspace_changes::WorkspaceChangeHub>,
 ) {
-    mtime_scan_once_with_linked_watch(
+    mtime_scan_once_with_linked_watch_and_hub(
         &queue,
         &stop,
         &state,
@@ -1615,6 +1784,7 @@ fn mtime_scanner_loop(
         &activity,
         true,
         Some(&linked_watch_state),
+        Some(&change_hub),
     );
 
     let mut mtime_elapsed = Duration::ZERO;
@@ -1633,7 +1803,7 @@ fn mtime_scanner_loop(
             if discover_new_meta {
                 discovery_elapsed = Duration::ZERO;
             }
-            mtime_scan_once_with_linked_watch(
+            mtime_scan_once_with_linked_watch_and_hub(
                 &queue,
                 &stop,
                 &state,
@@ -1641,11 +1811,13 @@ fn mtime_scanner_loop(
                 &activity,
                 discover_new_meta,
                 Some(&linked_watch_state),
+                Some(&change_hub),
             );
         }
     }
 }
 
+#[cfg(test)]
 fn mtime_scan_once(
     queue: &DirtyQueue,
     stop: &AtomicBool,
@@ -1665,6 +1837,7 @@ fn mtime_scan_once(
     );
 }
 
+#[cfg(test)]
 fn mtime_scan_once_with_linked_watch(
     queue: &DirtyQueue,
     stop: &AtomicBool,
@@ -1673,6 +1846,28 @@ fn mtime_scan_once_with_linked_watch(
     activity: &RecentQueueActivityLog,
     discover_new_meta: bool,
     linked_watch_state: Option<&LinkedAssetWatchState>,
+) {
+    mtime_scan_once_with_linked_watch_and_hub(
+        queue,
+        stop,
+        state,
+        project_root,
+        activity,
+        discover_new_meta,
+        linked_watch_state,
+        None,
+    );
+}
+
+fn mtime_scan_once_with_linked_watch_and_hub(
+    queue: &DirtyQueue,
+    stop: &AtomicBool,
+    state: &Arc<Mutex<Option<AssetDb>>>,
+    project_root: &Path,
+    activity: &RecentQueueActivityLog,
+    discover_new_meta: bool,
+    linked_watch_state: Option<&LinkedAssetWatchState>,
+    change_hub: Option<&crate::workspace_changes::WorkspaceChangeHub>,
 ) {
     mtime_scan_once_with_options(
         queue,
@@ -1686,6 +1881,7 @@ fn mtime_scan_once_with_linked_watch(
         },
         linked_watch_state,
         None,
+        change_hub,
     );
 }
 
@@ -1698,6 +1894,7 @@ fn mtime_scan_once_with_options(
     options: MtimeScanOptions,
     linked_watch_state: Option<&LinkedAssetWatchState>,
     on_progress: ReconcileProgressCallback<'_>,
+    change_hub: Option<&crate::workspace_changes::WorkspaceChangeHub>,
 ) {
     if stop.load(Ordering::Relaxed) {
         return;
@@ -1734,6 +1931,24 @@ fn mtime_scan_once_with_options(
         return;
     }
 
+    let mut indexed_compile_inputs = HashSet::new();
+    if change_hub.is_some() {
+        indexed_compile_inputs.extend(
+            asset_records
+                .iter()
+                .map(|record| record.path.as_str())
+                .filter(|path| crate::workspace_changes::is_unity_compile_input(path))
+                .map(str::to_string),
+        );
+        indexed_compile_inputs.extend(
+            file_records
+                .iter()
+                .map(|record| record.path.as_str())
+                .filter(|path| crate::workspace_changes::is_unity_compile_input(path))
+                .map(str::to_string),
+        );
+    }
+
     let scan_total = (asset_records.len() + file_records.len()) as u64;
     let mut scan_completed = 0u64;
     emit_reconcile_progress(
@@ -1762,6 +1977,7 @@ fn mtime_scan_once_with_options(
             .filter(|record| asset_record_is_dirty(project_root, record, options.verify_hashes))
             .collect();
         for record in dirty {
+            record_reconciled_compile_input(change_hub, project_root, &record.path);
             enqueue_with_activity(
                 queue,
                 activity,
@@ -1808,6 +2024,7 @@ fn mtime_scan_once_with_options(
             .filter(|record| file_record_is_dirty(project_root, record, options.verify_hashes))
             .collect();
         for record in dirty {
+            record_reconciled_compile_input(change_hub, project_root, &record.path);
             let asset_path = record
                 .path
                 .strip_suffix(".meta")
@@ -1867,6 +2084,7 @@ fn mtime_scan_once_with_options(
             .unwrap_or(&entry.rel_path)
             .to_string();
         if !indexed_meta_paths.contains(&asset_path) {
+            record_reconciled_compile_input(change_hub, project_root, &asset_path);
             enqueue_with_activity(
                 queue,
                 activity,
@@ -1874,6 +2092,18 @@ fn mtime_scan_once_with_options(
                 QueueEnqueueReason::NewMetaDiscovered,
                 None,
             );
+        }
+    }
+
+    if let Some(change_hub) = change_hub {
+        for entry in &discover_snapshot.compile_input_files {
+            if !indexed_compile_inputs.contains(&entry.rel_path) {
+                change_hub.record(
+                    &entry.rel_path,
+                    crate::workspace_changes::WorkspaceChangeKind::Upsert,
+                    crate::workspace_changes::WorkspaceChangeSource::Reconcile,
+                );
+            }
         }
     }
 
@@ -2148,6 +2378,7 @@ fn reconcile_graph_state_with_options(
         options,
         None,
         on_progress,
+        None,
     );
     stats.queued = queue.len() as u64;
 
@@ -2291,6 +2522,7 @@ pub struct AssetDbWatcher {
     current_file: CurrentFileSlot,
     recent_activity: Arc<RecentQueueActivityLog>,
     tuning: Arc<WatcherTuning>,
+    change_hub: Arc<crate::workspace_changes::WorkspaceChangeHub>,
     os_watcher: Option<SharedOsWatcher>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -2300,6 +2532,7 @@ impl AssetDbWatcher {
         project_root: PathBuf,
         graph_state: Arc<Mutex<Option<AssetDb>>>,
         tuning: Arc<WatcherTuning>,
+        change_hub: Arc<crate::workspace_changes::WorkspaceChangeHub>,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let dirty_queue = Arc::new(DirtyQueue::new());
@@ -2347,10 +2580,19 @@ impl AssetDbWatcher {
         let root_ev = project_root.clone();
         let linked_roots_ev = linked_roots.clone();
         let activity_ev = recent_activity.clone();
+        let change_hub_ev = change_hub.clone();
         let event_thread = std::thread::Builder::new()
             .name("refgraph-events".into())
             .spawn(move || {
-                event_receiver_loop(rx, queue_ev, stop_ev, root_ev, linked_roots_ev, activity_ev);
+                event_receiver_loop(
+                    rx,
+                    queue_ev,
+                    stop_ev,
+                    root_ev,
+                    linked_roots_ev,
+                    activity_ev,
+                    change_hub_ev,
+                );
             })
             .map_err(|e| format!("Failed to spawn event thread: {}", e))?;
         threads.push(event_thread);
@@ -2399,6 +2641,7 @@ impl AssetDbWatcher {
         let root_mt = project_root.clone();
         let activity_mt = recent_activity.clone();
         let linked_watch_state_mt = linked_watch_state.clone();
+        let change_hub_mt = change_hub.clone();
         let mtime_thread = std::thread::Builder::new()
             .name("refgraph-mtime".into())
             .spawn(move || {
@@ -2409,11 +2652,13 @@ impl AssetDbWatcher {
                     root_mt,
                     activity_mt,
                     linked_watch_state_mt,
+                    change_hub_mt,
                 );
             })
             .map_err(|e| format!("Failed to spawn mtime scanner thread: {}", e))?;
         threads.push(mtime_thread);
 
+        change_hub.watcher_started();
         eprintln!("[AssetDb Watcher] started for {}", project_root.display());
 
         Ok(Self {
@@ -2422,6 +2667,7 @@ impl AssetDbWatcher {
             current_file,
             recent_activity,
             tuning,
+            change_hub,
             os_watcher: Some(os_watcher),
             threads,
         })
@@ -2435,6 +2681,7 @@ impl AssetDbWatcher {
         let was_stopped = self.stop.swap(true, Ordering::Relaxed);
         self.dirty_queue.condvar.notify_all();
         if !was_stopped {
+            self.change_hub.watcher_stopped();
             eprintln!("[AssetDb Watcher] stop signal sent");
         }
     }
@@ -3498,6 +3745,9 @@ mod tests {
         assert!(is_structural_event(&EventKind::Modify(ModifyKind::Name(
             RenameMode::To
         ))));
+        assert!(!is_structural_event(&EventKind::Modify(ModifyKind::Name(
+            RenameMode::Any
+        ))));
         assert!(!is_structural_event(&EventKind::Modify(ModifyKind::Data(
             DataChange::Any
         ))));
@@ -3505,5 +3755,170 @@ mod tests {
             ModifyKind::Metadata(MetadataKind::Any)
         )));
         assert!(!is_structural_event(&EventKind::Remove(RemoveKind::Any)));
+    }
+
+    #[test]
+    fn ambiguous_parent_name_event_does_not_degrade_journal_health() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets/Generated")).expect("create assets dir");
+        let hub = healthy_change_hub(&root);
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Any)))
+            .add_path(root.join("Assets/Generated"));
+
+        record_workspace_changes_for_event(&event, &root, &[], &hub);
+
+        let sync_file = root.join("Assets/~UnityDirMonSyncFile~deadbeef~");
+        let sync_remove =
+            notify::Event::new(EventKind::Remove(RemoveKind::Any)).add_path(sync_file);
+        record_workspace_changes_for_event(&sync_remove, &root, &[], &hub);
+
+        assert_eq!(
+            hub.status().health,
+            crate::workspace_changes::ChangeJournalHealth::Healthy
+        );
+    }
+
+    fn healthy_change_hub(root: &Path) -> Arc<crate::workspace_changes::WorkspaceChangeHub> {
+        let hub = crate::workspace_changes::hub_for_workspace(root);
+        hub.watcher_started();
+        let baseline = hub.unity_snapshot(root, &[]);
+        hub.acknowledge_unity_sync(root, &baseline);
+        hub
+    }
+
+    #[test]
+    fn workspace_change_hub_records_new_script_without_meta() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let script = root.join("Assets/NewScript.cs");
+        std::fs::write(&script, "public class NewScript {}").expect("write script");
+        assert!(!script.with_extension("cs.meta").exists());
+
+        let hub = healthy_change_hub(&root);
+        let event = notify::Event::new(EventKind::Create(CreateKind::File)).add_path(script);
+        let (_, recorded) = record_workspace_changes_for_event(&event, &root, &[], &hub);
+        assert_eq!(recorded, 1);
+        let snapshot = hub.unity_snapshot(&root, &[]);
+        assert_eq!(
+            snapshot.mode,
+            crate::workspace_changes::UnityAssetSyncMode::Targeted
+        );
+        assert_eq!(snapshot.paths, vec!["Assets/NewScript.cs"]);
+    }
+
+    #[test]
+    fn workspace_change_hub_tracks_every_compile_input_extension() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let hub = healthy_change_hub(&root);
+
+        for name in ["A.cs", "A.asmdef", "A.asmref", "csc.rsp", "A.dll"] {
+            let path = root.join("Assets").join(name);
+            std::fs::write(&path, "changed").expect("write compile input");
+            let event = notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path);
+            record_workspace_changes_for_event(&event, &root, &[], &hub);
+        }
+
+        let snapshot = hub.unity_snapshot(&root, &[]);
+        assert_eq!(
+            snapshot.mode,
+            crate::workspace_changes::UnityAssetSyncMode::Targeted
+        );
+        assert_eq!(snapshot.paths.len(), 5);
+    }
+
+    #[test]
+    fn notify_rescan_marks_workspace_change_hub_suspect() {
+        use notify::event::Flag;
+
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let hub = healthy_change_hub(&root);
+        let event = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        record_workspace_changes_for_event(&event, &root, &[], &hub);
+
+        let status = hub.status();
+        assert_eq!(
+            status.health,
+            crate::workspace_changes::ChangeJournalHealth::Suspect
+        );
+        assert_eq!(status.health_reason, "notify_rescan");
+        assert_eq!(status.rescan_count, 1);
+    }
+
+    #[test]
+    fn mtime_discovery_recovers_missed_new_script_event() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(root.join("Packages")).expect("create packages dir");
+        let state = Arc::new(Mutex::new(Some(scan_test_graph(&root))));
+        let hub = healthy_change_hub(&root);
+
+        std::fs::write(root.join("Assets/Missed.cs"), "class Missed {}")
+            .expect("write unobserved script");
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+        mtime_scan_once_with_linked_watch_and_hub(
+            &queue,
+            &stop,
+            &state,
+            &root,
+            &activity,
+            true,
+            None,
+            Some(&hub),
+        );
+
+        let snapshot = hub.unity_snapshot(&root, &[]);
+        assert_eq!(
+            snapshot.mode,
+            crate::workspace_changes::UnityAssetSyncMode::Targeted
+        );
+        assert_eq!(snapshot.paths, vec!["Assets/Missed.cs"]);
+    }
+
+    #[test]
+    fn mtime_reconcile_recovers_missed_script_delete_event() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        std::fs::create_dir_all(root.join("Packages")).expect("create packages dir");
+        write_asset(
+            &root,
+            "Assets/Removed.cs",
+            b"class Removed {}",
+            "77777777777777777777777777777777",
+        );
+        let state = Arc::new(Mutex::new(Some(scan_test_graph(&root))));
+        let hub = healthy_change_hub(&root);
+        std::fs::remove_file(root.join("Assets/Removed.cs")).expect("remove script");
+
+        let queue = DirtyQueue::new();
+        let stop = AtomicBool::new(false);
+        let activity = RecentQueueActivityLog::new();
+        mtime_scan_once_with_linked_watch_and_hub(
+            &queue,
+            &stop,
+            &state,
+            &root,
+            &activity,
+            false,
+            None,
+            Some(&hub),
+        );
+
+        let snapshot = hub.unity_snapshot(&root, &[]);
+        assert_eq!(
+            snapshot.mode,
+            crate::workspace_changes::UnityAssetSyncMode::Full
+        );
+        assert_eq!(snapshot.reason, "compile_input_deleted");
     }
 }

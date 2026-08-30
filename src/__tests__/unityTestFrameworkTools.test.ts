@@ -119,6 +119,27 @@ describe("Unity Test Framework tools", () => {
     expect(api).toContain("UnityTestMode Mode = UnityTestMode.EditAndPlay");
   });
 
+  it("returns modal-dialog blocks promptly and resumes the original test run", () => {
+    const bridge = read("src-tauri/src/unity_bridge/mod.rs");
+    const dialog = read("src-tauri/src/unity_bridge/dialog.rs");
+    const service = read("locus_unity/Editor/Testing/LocusUnityTestService.cs");
+    const runDefinition = JSON.parse(read("tools/unity_test_run.json"));
+
+    expect(runDefinition.parameters.properties.resume_run_id.type).toBe("string");
+    expect(runDefinition.description).toContain("original test run remains active");
+    expect(bridge).toContain("let mut dialog_events = dialog::subscribe()");
+    expect(bridge).toContain("wait_for_unity_test_poll_wake");
+    expect(bridge).toContain("dialog_events.has_changed()");
+    expect(bridge).toContain("Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error)");
+    expect(bridge).toContain("object.insert(");
+    expect(bridge).toContain('"run_id".to_string()');
+    expect(bridge).toContain('object.remove("resume_run_id")');
+    expect(dialog).toContain('"test_run_detached"');
+    expect(dialog).toContain("resume_run_id");
+    expect(service).toContain("public string run_id;");
+    expect(service).toContain("request.run_id");
+  });
+
   it("preserves the Unity suite path for tree output", () => {
     const service = read("locus_unity/Editor/Testing/LocusUnityTestService.cs");
     const formatter = read("src-tauri/src/tool/builtins/unity.rs");
