@@ -41,6 +41,7 @@
     "locus:test:chat-render": "bun run scripts/locus-chat-render-stress.ts",
     "locus:test:chat-render:verify": "bun run scripts/locus-chat-render-stress.ts --verify",
     "locus:test:chat-switch": "bun run scripts/locus-chat-switch-stress.ts",
+    "locus:test:markdown-editor": "bun run scripts/locus-markdown-editor-benchmark.ts",
     "locus:test:chat-live-tools": "bun run scripts/locus-chat-live-tool-stress.ts",
     "locus:test:unity": "bun run scripts/locus-unity-test.mjs",
     "locus:test:unity:workspace": "bun run scripts/locus-unity-test.mjs --suite workspace",
@@ -59,6 +60,17 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@codemirror/commands": "^6.11.0",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lang-markdown": "^6.5.2",
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/search": "^6.7.1",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.9",
+    "@lezer/highlight": "^1.2.3",
+    "@lezer/markdown": "^1.7.2",
+    "@replit/codemirror-lang-csharp": "^6.2.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-notification": "^2.3.3",
@@ -67,6 +79,7 @@
     "@types/turndown": "^5.0.6",
     "@vue/compiler-sfc": "^3.5.41",
     "ag-psd": "^31.0.2",
+    "diff-match-patch": "^1.0.5",
     "dompurify": "^3.4.13",
     "elkjs": "^0.12.0",
     "highlight.js": "^11.12.0",
@@ -78,17 +91,16 @@
     "three": "^0.185.1",
     "turndown": "^7.2.4",
     "turndown-plugin-gfm": "^1.0.2",
-    "vditor": "^3.11.3",
     "vue": "^3.5.41"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.4",
+    "@types/diff-match-patch": "^1.0.36",
     "@types/katex": "^0.16.8",
     "@vitejs/plugin-vue": "^6.0.8",
     "jsdom": "^30.0.1",
     "typescript": "~6.0.3",
     "vite": "^8.2.1",
-    "vite-plugin-static-copy": "^4.1.1",
     "vitest": "^4.1.10",
     "vue-tsc": "^3.3.10"
   }

@@ -48,11 +48,16 @@ describe("Markdown table styles", () => {
     expect(source).toMatch(/\.markdown-body mark\.markdown-search-mark-target\s*\{[\s\S]*background:[\s\S]*box-shadow:/);
   });
 
-  it("keeps editor table cells readable under the same theme constraints", () => {
-    const source = read("src/components/ui/BaseMarkdownEditor.vue");
+  it("keeps GFM tables editable on the persistent CodeMirror surface", () => {
+    const editor = read("src/components/ui/BaseMarkdownEditor.vue");
+    const extensions = read("src/components/ui/markdown-editor/codeMirrorMarkdownExtensions.ts");
 
-    expect(source).toMatch(/\.base-markdown-editor :deep\(\.vditor-reset table\)\s*\{[\s\S]*width:\s*max-content;[\s\S]*min-width:\s*100%;/);
-    expect(source).toMatch(/\.base-markdown-editor :deep\(\.vditor-reset th\),\s*[\s\S]*\.base-markdown-editor :deep\(\.vditor-reset td\)\s*\{[\s\S]*overflow-wrap:\s*anywhere;[\s\S]*border-right:[\s\S]*!important;[\s\S]*border-bottom:[\s\S]*!important;/);
-    expect(source).toMatch(/tbody tr:nth-child\(even\) td\)\s*\{[\s\S]*!important;/);
+    expect(extensions).toContain('import { GFM } from "@lezer/markdown"');
+    expect(extensions).toContain("markdown({");
+    expect(extensions).toContain("extensions: GFM");
+    expect(editor).toContain('ref="mountRef" class="base-markdown-editor-host"');
+    expect(editor).toContain(":deep(.cm-editor)");
+    expect(editor).not.toContain(["Vdi", "tor"].join(""));
+    expect(editor).not.toContain(["vdi", "tor-reset"].join(""));
   });
 });

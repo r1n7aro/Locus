@@ -1,30 +1,32 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import Vditor from "vditor";
-import "vditor/dist/index.css";
-import "vditor/dist/js/icons/ant.js";
-import { semanticCodeLanguageFromPath } from "../../composables/semanticCodeRendering";
-import MarkdownRenderer from "../MarkdownRenderer.vue";
-import SemanticCodeRenderer from "./SemanticCodeRenderer.vue";
+import { Compartment, EditorState, StateEffect, Transaction, type Extension } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
-  canSyncMarkdownEditorWhileFocused,
-  normalizeMarkdownEditorLineEndings,
-  shouldPreferMarkdownPlainTextPaste,
-} from "./markdownEditorFormatting";
+  markdownEditorBaseExtensions,
+  markdownEditorLanguageExtension,
+  markdownEditorLanguageFromPath,
+  markdownEditorModeExtension,
+  markdownEditorPlaceholderExtension,
+  markdownEditorReadOnlyExtension,
+} from "./markdown-editor/codeMirrorMarkdownExtensions";
 import {
-  applyMarkdownEditorPanelLayout,
-  createMarkdownEditorResizeSync,
-  MARKDOWN_EDITOR_PANEL_HEIGHT,
-  MARKDOWN_EDITOR_PANEL_MAX_WIDTH,
-} from "./markdownEditorLayout";
-import {
-  captureMarkdownEditorActivation,
-  focusMarkdownEditorAtActivation,
-  placeMarkdownEditorCaretAtActivation,
-  restoreMarkdownEditorActivationScroll,
-  type MarkdownEditorActivationSnapshot,
-} from "./markdownEditorActivation";
+  MarkdownEditorSessionCache,
+  type MarkdownEditorSessionStore,
+} from "./markdown-editor/markdownEditorSessionCache";
+import { createMinimalTextChange } from "./markdown-editor/markdownEditorTransactions";
+import type { MarkdownEditorDocumentChange } from "./markdown-editor/markdownEditorDocumentChange";
+import type { MarkdownImageResolver, MarkdownLivePreviewOptions } from "./markdown-editor/markdownComplexWidgets";
+import type { MarkdownReferenceToken } from "./markdown-editor/markdownComplexTokens";
+import { normalizeMarkdownEditorLineEndings } from "./markdownEditorFormatting";
 import type { MarkdownEditorViewMode } from "./markdownEditorViewMode";
+import { resolveMarkdownImage } from "../../services/markdownImage";
+import type { WorkspaceRef } from "../../services/project";
+
+const workspaceMarkdownImageResolver: MarkdownImageResolver = (source, context) => {
+  if (!context.workspaceRef) return null;
+  return resolveMarkdownImage(context.workspaceRef, source);
+};
 
 const props = withDefaults(defineProps<{
   modelValue: string;
@@ -33,461 +35,497 @@ const props = withDefaults(defineProps<{
   viewMode?: MarkdownEditorViewMode;
   contentPath?: string;
   contentKey?: string;
+  sessionCache?: MarkdownEditorSessionStore | null;
+  sessionPinned?: boolean;
+  workspaceRef?: WorkspaceRef | null;
+  active?: boolean;
   autoGrow?: boolean;
   minHeight?: number;
-  deferRenderedEditor?: boolean;
+  /**
+   * Emits immutable CodeMirror Text/ChangeSet payloads for local edits. This
+   * avoids allocating the whole document string on every transaction. The
+   * model is materialized at an explicit shortcut-save boundary.
+   */
+  transactionModel?: boolean;
 }>(), {
   disabled: false,
   placeholder: "",
   viewMode: "rendered",
   contentPath: "",
   contentKey: "",
+  sessionCache: null,
+  sessionPinned: false,
+  workspaceRef: null,
+  active: true,
   autoGrow: false,
   minHeight: 80,
-  deferRenderedEditor: false,
+  transactionModel: false,
 });
 
 const emit = defineEmits<{
   (e: "update:modelValue", value: string): void;
+  (e: "documentChange", value: MarkdownEditorDocumentChange): void;
   (e: "shortcutSave"): void;
+  (e: "referenceOpen", reference: MarkdownReferenceToken): void;
+  (e: "referencePointerDown", payload: {
+    reference: MarkdownReferenceToken;
+    event: PointerEvent;
+    element: HTMLElement;
+  }): void;
 }>();
 
 const mountRef = ref<HTMLDivElement | null>(null);
-const textareaRef = ref<HTMLTextAreaElement | null>(null);
-const editorReady = ref(false);
-const focused = ref(false);
-const renderedEditing = ref(false);
-const activationMinHeight = ref<number | null>(null);
-const syncing = ref(false);
-const pendingModelValue = ref<string | null>(null);
-const isNativeMode = computed(() => props.viewMode === "native");
-const isRenderedPreviewMode = computed(() =>
-  props.viewMode === "rendered"
-  && (props.disabled || (props.deferRenderedEditor && !renderedEditing.value))
-);
-const readonlyCodeLanguage = computed(() =>
-  isRenderedPreviewMode.value ? semanticCodeLanguageFromPath(props.contentPath) : null
-);
-const shouldUseVditor = computed(() => !isNativeMode.value && !isRenderedPreviewMode.value);
-let editor: Vditor | null = null;
-let themeObserver: MutationObserver | null = null;
-let layoutSync: { disconnect(): void } | null = null;
-let pasteInterceptorCleanup: (() => void) | null = null;
-let pendingRenderedActivation: MarkdownEditorActivationSnapshot | null = null;
-let activationRestoreFrame = 0;
+const languageCompartment = new Compartment();
+const modeCompartment = new Compartment();
+const readOnlyCompartment = new Compartment();
+const placeholderCompartment = new Compartment();
+const localSessionCache = new MarkdownEditorSessionCache();
 
-const VDITOR_ICON_SCRIPT_ID = "vditorIconScript";
-
-// Vditor falls back to a synchronous XMLHttpRequest whenever this marker is
-// absent. The icon sprite is bundled above, so keep a lightweight marker for
-// the whole app lifetime and restore it after Vditor.destroy() removes it.
-function ensureVditorIconMarker() {
-  if (typeof document === "undefined" || document.getElementById(VDITOR_ICON_SCRIPT_ID)) return;
-  const marker = document.createElement("script");
-  marker.id = VDITOR_ICON_SCRIPT_ID;
-  marker.type = "application/json";
-  marker.dataset.locusVditorIconMarker = "true";
-  document.head.appendChild(marker);
-}
-
-ensureVditorIconMarker();
-
-const editorCdnBase = computed(() => {
-  const base = import.meta.env.BASE_URL || "/";
-  return new URL(`${base}vendor/vditor`, window.location.origin).toString().replace(/\/$/, "");
-});
+let editorView: EditorView | null = null;
+let activeSessionKey = normalizeSessionKey(props.contentKey);
+let activeSessionCache = props.sessionCache ?? localSessionCache;
+let activeSessionPinned = props.sessionPinned;
+let applyingExternalModel = false;
+let composing = false;
+let pendingExternalModel: string | null = null;
+let compositionFlushToken = 0;
+let currentScrollTop = 0;
+let currentScrollLeft = 0;
+let removeScrollTracking: (() => void) | null = null;
+let activeScrollElement: HTMLElement | null = null;
 
 function normalizeMarkdown(value: string): string {
   return normalizeMarkdownEditorLineEndings(value);
 }
 
-function isSaveShortcut(event: KeyboardEvent) {
-  return (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s";
+function normalizeSessionKey(value: string): string {
+  return value.trim() || "__default__";
 }
 
-function isDarkTheme() {
-  return document.documentElement.dataset.theme === "dark";
+function currentLanguage() {
+  return markdownEditorLanguageFromPath(props.contentPath);
 }
 
-function currentEditorValue() {
-  return editor ? normalizeMarkdown(editor.getValue()) : normalizeMarkdown(props.modelValue);
+function handleReferenceOpen(reference: MarkdownReferenceToken): void {
+  emit("referenceOpen", reference);
 }
 
-function syncDisabledState() {
-  if (!editor) return;
-  if (props.disabled) {
-    editor.disabled();
-    return;
-  }
-  editor.enable();
+function handleReferencePointerDown(
+  reference: MarkdownReferenceToken,
+  event: PointerEvent,
+  element: HTMLElement,
+): void {
+  emit("referencePointerDown", { reference, event, element });
 }
 
-function syncSpellcheckState() {
-  const editable = mountRef.value?.querySelector<HTMLElement>(".vditor-ir .vditor-reset");
-  if (!editable) return;
-  editable.setAttribute("spellcheck", "false");
-}
-
-function installPasteInterceptor() {
-  pasteInterceptorCleanup?.();
-  pasteInterceptorCleanup = null;
-
-  const editable = mountRef.value?.querySelector<HTMLElement>(".vditor-ir .vditor-reset");
-  if (!editable) return;
-
-  const onPaste = (event: ClipboardEvent) => {
-    const html = event.clipboardData?.getData("text/html") ?? "";
-    const text = event.clipboardData?.getData("text/plain") ?? "";
-    if (!editor || props.disabled || !shouldPreferMarkdownPlainTextPaste(html, text)) {
-      return;
-    }
-
-    // Avoid Vditor wrapping prose copied from preformatted HTML in a fenced code block.
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation();
-    editor.insertMD(text);
-    emitMarkdown(editor.getValue());
+function currentLivePreviewOptions(): MarkdownLivePreviewOptions {
+  const workspaceRef = props.workspaceRef;
+  const options: MarkdownLivePreviewOptions = {
+    onReferenceOpen: handleReferenceOpen,
+    onReferencePointerDown: handleReferencePointerDown,
   };
-
-  editable.addEventListener("paste", onPaste, true);
-  pasteInterceptorCleanup = () => {
-    editable.removeEventListener("paste", onPaste, true);
+  if (!workspaceRef) return options;
+  return {
+    ...options,
+    imageResolver: workspaceMarkdownImageResolver,
+    imageContext: {
+      cacheKey: `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`,
+      contentPath: props.contentPath,
+      workspaceRef: {
+        checkoutId: workspaceRef.checkoutId,
+        expectedGeneration: workspaceRef.expectedGeneration,
+      },
+    },
   };
 }
 
-function applyTheme() {
-  if (!editor) return;
-  editor.setTheme(isDarkTheme() ? "dark" : "classic");
+function emitCurrentValue(): void {
+  if (!editorView) return;
+  emit("update:modelValue", normalizeMarkdown(editorView.state.doc.toString()));
 }
 
-function syncPanelLayout() {
-  applyMarkdownEditorPanelLayout(mountRef.value);
-}
-
-function cancelRenderedActivationRestore() {
-  if (activationRestoreFrame) {
-    window.cancelAnimationFrame(activationRestoreFrame);
-    activationRestoreFrame = 0;
-  }
-}
-
-function clearRenderedActivation() {
-  cancelRenderedActivationRestore();
-  pendingRenderedActivation = null;
-  activationMinHeight.value = null;
-}
-
-function completeRenderedActivation() {
-  const activation = pendingRenderedActivation;
-  const editable = mountRef.value?.querySelector<HTMLElement>(".vditor-ir .vditor-reset");
-  if (!activation || !editable) return;
-
-  cancelRenderedActivationRestore();
-  focusMarkdownEditorAtActivation(editable, activation);
-  activationRestoreFrame = window.requestAnimationFrame(() => {
-    activationRestoreFrame = 0;
-    activationMinHeight.value = null;
-    activationRestoreFrame = window.requestAnimationFrame(() => {
-      activationRestoreFrame = 0;
-      restoreMarkdownEditorActivationScroll(activation);
-      placeMarkdownEditorCaretAtActivation(editable, activation);
-      pendingRenderedActivation = null;
-    });
-  });
-}
-
-function destroyEditor() {
-  clearRenderedActivation();
-  pasteInterceptorCleanup?.();
-  pasteInterceptorCleanup = null;
-  layoutSync?.disconnect();
-  layoutSync = null;
-  editorReady.value = false;
-  focused.value = false;
-  syncing.value = false;
-  pendingModelValue.value = null;
-  editor?.destroy();
-  editor = null;
-  ensureVditorIconMarker();
-}
-
-function syncFromModel(nextValue: string, clearStack = false) {
-  if (!editor) return;
-  const normalizedNext = normalizeMarkdown(nextValue);
-  if (currentEditorValue() === normalizedNext) {
-    if (clearStack) editor.clearStack();
-    pendingModelValue.value = null;
-    return;
-  }
-  syncing.value = true;
-  editor.setValue(nextValue, clearStack);
-  syncing.value = false;
-  pendingModelValue.value = null;
-}
-
-function emitMarkdown(value?: string) {
-  if (syncing.value) return;
-  const nextValue = normalizeMarkdown(value ?? currentEditorValue());
-  emit("update:modelValue", nextValue);
-}
-
-function emitShortcutSave(value?: string) {
-  emitMarkdown(value);
+function emitShortcutSave(): void {
+  emitCurrentValue();
   emit("shortcutSave");
 }
 
-function handleEditorKeydown(event: KeyboardEvent) {
-  if (!isSaveShortcut(event)) return;
-  event.preventDefault();
-  emitShortcutSave();
+function flushPendingExternalModel(): void {
+  const pending = pendingExternalModel;
+  pendingExternalModel = null;
+  if (pending === null) return;
+  syncExternalModel(pending);
 }
 
-function handleNativeKeydown(event: KeyboardEvent) {
-  if (!isSaveShortcut(event)) return;
-  event.preventDefault();
-  emitShortcutSave(textareaRef.value?.value ?? props.modelValue);
+function resetCompositionState(flushPending: boolean): void {
+  compositionFlushToken += 1;
+  composing = false;
+  if (flushPending) flushPendingExternalModel();
+  else pendingExternalModel = null;
 }
 
-function handleNativeInput(event: Event) {
-  emitMarkdown((event.target as HTMLTextAreaElement | null)?.value ?? "");
-  syncNativeAutoGrowHeight();
+function handleCompositionStart(): boolean {
+  compositionFlushToken += 1;
+  composing = true;
+  return false;
 }
 
-function syncNativeAutoGrowHeight() {
-  if (!props.autoGrow || !isNativeMode.value) return;
-  void nextTick(() => {
-    const textarea = textareaRef.value;
-    if (!textarea) return;
-    textarea.style.height = "auto";
-    textarea.style.height = `${Math.max(props.minHeight, textarea.scrollHeight)}px`;
+function handleCompositionEnd(): boolean {
+  composing = false;
+  const flushToken = ++compositionFlushToken;
+  void Promise.resolve().then(() => {
+    if (composing || flushToken !== compositionFlushToken) return;
+    flushPendingExternalModel();
+  });
+  return false;
+}
+
+function editorExtensions(): Extension[] {
+  const language = currentLanguage();
+  return [
+    ...markdownEditorBaseExtensions(emitShortcutSave),
+    languageCompartment.of(markdownEditorLanguageExtension(language)),
+    modeCompartment.of(markdownEditorModeExtension(
+      props.viewMode,
+      language,
+      currentLivePreviewOptions(),
+    )),
+    readOnlyCompartment.of(markdownEditorReadOnlyExtension(props.disabled)),
+    placeholderCompartment.of(markdownEditorPlaceholderExtension(props.placeholder)),
+    EditorView.domEventHandlers({
+      compositionstart: handleCompositionStart,
+      compositionend: handleCompositionEnd,
+    }),
+    EditorView.updateListener.of((update) => {
+      if (!update.docChanged || applyingExternalModel) return;
+      if (props.transactionModel) {
+        emit("documentChange", {
+          doc: update.state.doc,
+          changes: update.changes,
+        });
+        return;
+      }
+      emit("update:modelValue", normalizeMarkdown(update.state.doc.toString()));
+    }),
+  ];
+}
+
+function createEditorState(value: string): EditorState {
+  return EditorState.create({
+    doc: normalizeMarkdown(value),
+    extensions: editorExtensions(),
   });
 }
 
-function mountEditor() {
-  const target = mountRef.value;
-  if (!target || editor) return;
+function configurationEffects() {
+  const language = currentLanguage();
+  return [
+    languageCompartment.reconfigure(markdownEditorLanguageExtension(language)),
+    modeCompartment.reconfigure(markdownEditorModeExtension(
+      props.viewMode,
+      language,
+      currentLivePreviewOptions(),
+    )),
+    readOnlyCompartment.reconfigure(markdownEditorReadOnlyExtension(props.disabled)),
+    placeholderCompartment.reconfigure(markdownEditorPlaceholderExtension(props.placeholder)),
+  ];
+}
 
-  ensureVditorIconMarker();
-  editor = new Vditor(target, {
-    value: props.modelValue,
-    height: MARKDOWN_EDITOR_PANEL_HEIGHT,
-    minHeight: 0,
-    mode: "ir",
-    lang: "zh_CN",
-    cdn: editorCdnBase.value,
-    toolbar: [],
-    cache: {
-      enable: false,
-    },
-    counter: {
-      enable: false,
-    },
-    outline: {
-      enable: false,
-      position: "right",
-    },
-    preview: {
-      mode: "editor",
-      maxWidth: MARKDOWN_EDITOR_PANEL_MAX_WIDTH,
-      hljs: {
-        enable: false,
-        lineNumber: false,
-      },
-      markdown: {
-        toc: false,
-      },
-    },
-    placeholder: props.placeholder,
-    icon: "ant",
-    theme: isDarkTheme() ? "dark" : "classic",
-    input(value) {
-      emitMarkdown(value);
-    },
-    focus() {
-      focused.value = true;
-    },
-    blur(value) {
-      focused.value = false;
-      emitMarkdown(value);
-      if (pendingModelValue.value !== null) {
-        if (canSyncMarkdownEditorWhileFocused(currentEditorValue(), pendingModelValue.value)) {
-          pendingModelValue.value = null;
-        } else {
-          syncFromModel(pendingModelValue.value);
-        }
-      }
-      if (props.deferRenderedEditor) {
-        renderedEditing.value = false;
-      }
-    },
-    keydown(event) {
-      handleEditorKeydown(event);
-    },
-    after() {
-      editorReady.value = true;
-      syncDisabledState();
-      syncSpellcheckState();
-      installPasteInterceptor();
-      applyTheme();
-      syncPanelLayout();
-      layoutSync?.disconnect();
-      layoutSync = createMarkdownEditorResizeSync(mountRef.value, syncPanelLayout);
-      if (renderedEditing.value) {
-        completeRenderedActivation();
-      }
+function stateWithFreshConfiguration(state: EditorState): EditorState {
+  return state.update({
+    effects: StateEffect.reconfigure.of(editorExtensions()),
+    annotations: Transaction.addToHistory.of(false),
+  }).state;
+}
+
+function stateWithExternalValue(state: EditorState, value: string): EditorState {
+  const normalized = normalizeMarkdown(value);
+  const change = createMinimalTextChange(state.doc.toString(), normalized);
+  if (!change) return state;
+  return state.update({
+    changes: change,
+    annotations: Transaction.addToHistory.of(false),
+  }).state;
+}
+
+function syncExternalModel(value: string): void {
+  const view = editorView;
+  if (!view) return;
+  const normalized = normalizeMarkdown(value);
+  const change = createMinimalTextChange(view.state.doc.toString(), normalized);
+  if (!change) return;
+
+  applyingExternalModel = true;
+  try {
+    view.dispatch({
+      changes: change,
+      annotations: Transaction.addToHistory.of(false),
+    });
+  } finally {
+    applyingExternalModel = false;
+  }
+}
+
+function syncOrQueueExternalModel(value: string): void {
+  const normalized = normalizeMarkdown(value);
+  if (composing && editorView) {
+    pendingExternalModel = normalized;
+    return;
+  }
+  compositionFlushToken += 1;
+  pendingExternalModel = null;
+  syncExternalModel(normalized);
+}
+
+function saveActiveSession(
+  modelValue = props.modelValue,
+  pinned = activeSessionPinned,
+): void {
+  const view = editorView;
+  if (!view) return;
+  activeSessionCache.set(activeSessionKey, {
+    state: view.state,
+    scrollTop: currentScrollTop,
+    scrollLeft: currentScrollLeft,
+    modelValue: normalizeMarkdown(modelValue),
+    pinned,
+  });
+}
+
+function isScrollableOverflow(element: HTMLElement): boolean {
+  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
+  if (!style) return false;
+  return /^(?:auto|scroll|overlay)$/.test(style.overflowY)
+    || /^(?:auto|scroll|overlay)$/.test(style.overflow);
+}
+
+function resolveScrollElement(view: EditorView): HTMLElement {
+  if (props.autoGrow) {
+    let ancestor = view.dom.parentElement;
+    while (ancestor) {
+      if (isScrollableOverflow(ancestor)) return ancestor;
+      ancestor = ancestor.parentElement;
+    }
+    const documentScroller = view.dom.ownerDocument.scrollingElement;
+    if (documentScroller instanceof HTMLElement) return documentScroller;
+  }
+  return view.scrollDOM;
+}
+
+function startScrollTracking(view: EditorView): void {
+  removeScrollTracking?.();
+  const scrollElement = resolveScrollElement(view);
+  activeScrollElement = scrollElement;
+  const handleScroll = () => {
+    currentScrollTop = scrollElement.scrollTop;
+    currentScrollLeft = scrollElement.scrollLeft;
+  };
+  scrollElement.addEventListener("scroll", handleScroll, { passive: true });
+  removeScrollTracking = () => {
+    scrollElement.removeEventListener("scroll", handleScroll);
+    if (activeScrollElement === scrollElement) activeScrollElement = null;
+    removeScrollTracking = null;
+  };
+}
+
+function restoreTrackedScroll(view: EditorView, top: number, left: number): void {
+  const scrollElement = activeScrollElement ?? resolveScrollElement(view);
+  scrollElement.scrollTop = top;
+  scrollElement.scrollLeft = left;
+}
+
+function stateWithSessionModel(
+  state: EditorState,
+  cachedModelValue: string | undefined,
+  nextModelValue: string,
+): EditorState {
+  if (
+    props.transactionModel
+    && cachedModelValue !== undefined
+    && normalizeMarkdown(cachedModelValue) === normalizeMarkdown(nextModelValue)
+  ) {
+    return state;
+  }
+  return stateWithExternalValue(state, nextModelValue);
+}
+
+function restoreSession(contentKey: string, nextModelValue: string, previousModelValue: string): void {
+  const view = editorView;
+  if (!view) {
+    activeSessionKey = normalizeSessionKey(contentKey);
+    return;
+  }
+
+  resetCompositionState(true);
+  saveActiveSession(previousModelValue, activeSessionPinned);
+  activeSessionKey = normalizeSessionKey(contentKey);
+  activeSessionCache = props.sessionCache ?? localSessionCache;
+  activeSessionPinned = props.sessionPinned;
+  activeSessionCache.setPinned(activeSessionKey, activeSessionPinned);
+  const cached = activeSessionCache.get(activeSessionKey);
+  // A newly created state already contains the current document and every
+  // compartment. Re-applying both here duplicates the most expensive work for
+  // large documents (full-text comparison plus language/plugin setup).
+  let nextState = createEditorState(nextModelValue);
+  if (cached) {
+    nextState = stateWithSessionModel(cached.state, cached.modelValue, nextModelValue);
+    nextState = stateWithFreshConfiguration(nextState);
+  }
+  view.setState(nextState);
+
+  const scrollTop = cached?.scrollTop ?? 0;
+  const scrollLeft = cached?.scrollLeft ?? 0;
+  currentScrollTop = scrollTop;
+  currentScrollLeft = scrollLeft;
+  const restoredKey = activeSessionKey;
+  view.requestMeasure({
+    read: () => null,
+    write() {
+      if (!editorView || activeSessionKey !== restoredKey) return;
+      restoreTrackedScroll(editorView, scrollTop, scrollLeft);
     },
   });
 }
+
+function mountEditor(): void {
+  const parent = mountRef.value;
+  if (!parent || editorView || !props.active) return;
+
+  activeSessionCache = props.sessionCache ?? localSessionCache;
+  activeSessionPinned = props.sessionPinned;
+  activeSessionCache.setPinned(activeSessionKey, activeSessionPinned);
+  const cached = activeSessionCache.get(activeSessionKey);
+  let state = createEditorState(props.modelValue);
+  if (cached) {
+    state = stateWithSessionModel(cached.state, cached.modelValue, props.modelValue);
+    state = stateWithFreshConfiguration(state);
+  }
+  editorView = new EditorView({ state, parent });
+  startScrollTracking(editorView);
+
+  const scrollTop = cached?.scrollTop ?? 0;
+  const scrollLeft = cached?.scrollLeft ?? 0;
+  currentScrollTop = scrollTop;
+  currentScrollLeft = scrollLeft;
+  const restoredKey = activeSessionKey;
+  editorView.requestMeasure({
+    read: () => null,
+    write() {
+      if (!editorView || activeSessionKey !== restoredKey) return;
+      restoreTrackedScroll(editorView, scrollTop, scrollLeft);
+    },
+  });
+}
+
+function suspendEditor(): void {
+  if (!editorView) return;
+  resetCompositionState(true);
+  saveActiveSession();
+  removeScrollTracking?.();
+  editorView.destroy();
+  editorView = null;
+}
+
+function reconfigureEditor(): void {
+  const view = editorView;
+  if (!view) return;
+  applyingExternalModel = true;
+  try {
+    view.dispatch({
+      effects: configurationEffects(),
+      annotations: Transaction.addToHistory.of(false),
+    });
+  } finally {
+    applyingExternalModel = false;
+  }
+  view.requestMeasure();
+}
+
+onMounted(() => {
+  mountEditor();
+});
 
 watch(
-  () => props.contentKey,
-  (nextKey, previousKey) => {
-    if (nextKey === previousKey) return;
-    clearRenderedActivation();
-    pendingModelValue.value = null;
-    if (!shouldUseVditor.value || !editorReady.value || !editor) return;
-    // A Vditor instance may stay mounted while the knowledge document changes.
-    // Resetting the stack prevents cross-document undo history and avoids
-    // retaining diff snapshots for every document visited in this panel.
-    syncFromModel(props.modelValue, true);
+  () => props.active,
+  (active) => {
+    if (!active) {
+      suspendEditor();
+      return;
+    }
+    activeSessionKey = normalizeSessionKey(props.contentKey);
+    activeSessionCache = props.sessionCache ?? localSessionCache;
+    activeSessionPinned = props.sessionPinned;
+    mountEditor();
   },
 );
 
 watch(
-  () => props.modelValue,
-  (nextValue) => {
-    syncNativeAutoGrowHeight();
-    if (!shouldUseVditor.value || !editorReady.value || !editor) return;
-    const currentValue = currentEditorValue();
-    if (canSyncMarkdownEditorWhileFocused(currentValue, nextValue)) {
-      pendingModelValue.value = null;
+  () => [props.contentKey, props.modelValue] as const,
+  ([nextKey, nextValue], [previousKey, previousValue]) => {
+    if (nextKey !== previousKey) {
+      restoreSession(nextKey, nextValue, previousValue);
       return;
     }
-    if (focused.value) {
-      pendingModelValue.value = nextValue;
-      return;
-    }
-    syncFromModel(nextValue);
+    if (nextValue !== previousValue) syncOrQueueExternalModel(nextValue);
   },
 );
 
 watch(
-  shouldUseVditor,
-  (nextValue) => {
-    if (!nextValue) {
-      destroyEditor();
+  () => [
+    props.viewMode,
+    props.disabled,
+    props.placeholder,
+    props.contentPath,
+    props.workspaceRef?.checkoutId,
+    props.workspaceRef?.expectedGeneration,
+  ] as const,
+  () => reconfigureEditor(),
+);
+
+watch(
+  () => props.sessionPinned,
+  (pinned) => {
+    activeSessionPinned = pinned;
+    if (editorView) {
+      saveActiveSession(props.modelValue, pinned);
       return;
     }
+    activeSessionCache.setPinned(activeSessionKey, pinned);
+  },
+);
+
+watch(
+  () => [props.autoGrow, props.minHeight] as const,
+  () => {
     void nextTick(() => {
-      mountEditor();
+      if (!editorView) return;
+      startScrollTracking(editorView);
+      editorView.requestMeasure();
     });
   },
 );
 
-watch(
-  () => [props.autoGrow, props.minHeight, props.viewMode],
-  () => {
-    if (props.viewMode !== "rendered") renderedEditing.value = false;
-    syncNativeAutoGrowHeight();
-  },
-);
-
-watch(
-  () => props.disabled,
-  () => {
-    if (!editorReady.value) return;
-    syncDisabledState();
-  },
-);
-
-watch(
-  () => props.placeholder,
-  (placeholder) => {
-    const editable = mountRef.value?.querySelector<HTMLElement>(".vditor-ir .vditor-reset");
-    if (!editable) return;
-    editable.setAttribute("placeholder", placeholder);
-  },
-);
-
-onMounted(() => {
-  themeObserver = new MutationObserver(() => applyTheme());
-  themeObserver.observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["data-theme"],
-  });
-  if (shouldUseVditor.value) mountEditor();
-  syncNativeAutoGrowHeight();
-  window.addEventListener("resize", syncNativeAutoGrowHeight);
-});
-
 onBeforeUnmount(() => {
-  window.removeEventListener("resize", syncNativeAutoGrowHeight);
-  themeObserver?.disconnect();
-  themeObserver = null;
-  destroyEditor();
+  suspendEditor();
+  localSessionCache.clear();
 });
 
-function activateRenderedEditor(event: MouseEvent | KeyboardEvent) {
-  if (props.disabled || !props.deferRenderedEditor || props.viewMode !== "rendered") return;
-  const source = event.currentTarget as HTMLElement | null;
-  if (!source) return;
-  const point = event instanceof MouseEvent
-    ? { x: event.clientX, y: event.clientY }
-    : null;
-  pendingRenderedActivation = captureMarkdownEditorActivation(source, point);
-  if (props.autoGrow) {
-    activationMinHeight.value = Math.ceil(pendingRenderedActivation.renderedHeight);
-  }
-  renderedEditing.value = true;
-  void nextTick(() => {
-    mountEditor();
-  });
-}
+defineExpose({
+  getEditorView: () => editorView,
+});
 </script>
 
 <template>
   <div
     class="base-markdown-editor"
-    :class="{ disabled, 'is-native': isNativeMode, 'auto-grow': autoGrow }"
-    :style="{
-      '--markdown-editor-min-height': `${minHeight}px`,
-      minHeight: activationMinHeight === null ? undefined : `${activationMinHeight}px`,
+    :class="{
+      disabled,
+      'auto-grow': autoGrow,
+      'is-rendered': viewMode === 'rendered',
+      'is-source': viewMode === 'native',
     }"
+    :style="{ '--markdown-editor-min-height': `${minHeight}px` }"
   >
-    <div v-if="isNativeMode" class="base-markdown-editor-native">
-      <textarea
-        ref="textareaRef"
-        class="base-markdown-editor-textarea"
-        :value="modelValue"
-        :disabled="disabled"
-        :placeholder="placeholder"
-        spellcheck="false"
-        @input="handleNativeInput"
-        @keydown="handleNativeKeydown"
-      />
-    </div>
-    <div
-      v-else-if="isRenderedPreviewMode"
-      class="base-markdown-editor-rendered"
-      :class="{ 'is-editable-preview': !disabled && deferRenderedEditor }"
-      :tabindex="!disabled && deferRenderedEditor ? 0 : undefined"
-      :role="!disabled && deferRenderedEditor ? 'textbox' : undefined"
-      :aria-readonly="!disabled && deferRenderedEditor ? 'false' : undefined"
-      @click="activateRenderedEditor"
-      @keydown.enter.prevent="activateRenderedEditor"
-    >
-      <SemanticCodeRenderer
-        v-if="readonlyCodeLanguage"
-        :content="modelValue"
-        :language="readonlyCodeLanguage"
-      />
-      <MarkdownRenderer v-else :content="modelValue" />
-      <span v-if="!modelValue.trim()" class="base-markdown-editor-rendered-placeholder">
-        {{ placeholder }}
-      </span>
-    </div>
-    <div v-else ref="mountRef" class="base-markdown-editor-host" />
+    <div ref="mountRef" class="base-markdown-editor-host" />
   </div>
 </template>
 
@@ -496,325 +534,137 @@ function activateRenderedEditor(event: MouseEvent | KeyboardEvent) {
   --markdown-document-font-size: 14px;
   --markdown-document-line-height: 1.68;
   --markdown-document-list-indent: 20px;
-  height: 100%;
-  min-height: 0;
-  min-width: 0;
   display: flex;
   flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   background: transparent;
 }
 
-.base-markdown-editor.disabled {
-  cursor: default;
-}
-
-.base-markdown-editor.auto-grow {
-  height: auto;
-  min-height: var(--markdown-editor-min-height);
-  flex: none;
-}
-
-.base-markdown-editor.auto-grow .base-markdown-editor-native,
-.base-markdown-editor.auto-grow .base-markdown-editor-host,
-.base-markdown-editor.auto-grow .base-markdown-editor-rendered {
-  flex: none;
-  height: auto;
-  min-height: var(--markdown-editor-min-height);
-  overflow: visible;
-}
-
-.base-markdown-editor.auto-grow .base-markdown-editor-textarea {
-  flex: none;
-  height: auto;
-  min-height: var(--markdown-editor-min-height);
-  overflow-y: hidden;
-  field-sizing: content;
-}
-
-.base-markdown-editor.auto-grow :deep(.vditor),
-.base-markdown-editor.auto-grow :deep(.vditor-content),
-.base-markdown-editor.auto-grow :deep(.vditor-ir),
-.base-markdown-editor.auto-grow :deep(.vditor-ir pre.vditor-reset) {
-  height: auto !important;
-  min-height: var(--markdown-editor-min-height);
-  overflow-y: visible;
-}
-
-.base-markdown-editor.auto-grow :deep(.vditor-content),
-.base-markdown-editor.auto-grow :deep(.vditor-ir) {
-  flex: none;
-  overflow: visible;
-}
-
-.base-markdown-editor-native {
-  flex: 1;
-  display: flex;
-  min-width: 0;
-  min-height: 0;
-}
-
 .base-markdown-editor-host {
-  flex: 1;
-  height: 100%;
-  min-height: 0;
-  min-width: 0;
-}
-
-.base-markdown-editor-rendered {
-  position: relative;
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  overflow: auto;
-  padding: 14px 14px 16px 16px;
-  overscroll-behavior: contain;
-}
-
-.base-markdown-editor-rendered.is-editable-preview {
-  cursor: text;
-  outline: none;
-}
-
-.base-markdown-editor-rendered.is-editable-preview:focus-visible {
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 42%, transparent);
-}
-
-.base-markdown-editor-rendered-placeholder {
-  color: var(--text-secondary);
-  opacity: 0.55;
-  font-size: 13px;
-  line-height: 1.65;
-  pointer-events: none;
-}
-
-.base-markdown-editor-rendered :deep(.markdown-body) {
-  min-height: 100%;
-  font-family: var(--font-prose);
-  font-size: var(--markdown-document-font-size);
-  line-height: var(--markdown-document-line-height);
-  text-rendering: optimizeLegibility;
-}
-
-.base-markdown-editor-textarea {
+  display: flex;
   flex: 1;
   width: 100%;
   min-width: 0;
   min-height: 0;
-  margin: 0;
-  padding: 14px 14px 16px 16px;
-  border: none;
-  outline: none;
-  resize: none;
-  overflow: auto;
-  background: transparent;
-  color: var(--text-color);
-  font-family: var(--font-mono-editor);
-  font-size: 13px;
-  line-height: 1.65;
-  white-space: pre;
-  tab-size: 2;
 }
 
-.base-markdown-editor-textarea::placeholder {
-  color: var(--text-secondary);
-  opacity: 0.55;
-}
-
-.base-markdown-editor-textarea:disabled {
-  opacity: 1;
-  cursor: default;
-}
-
-.base-markdown-editor :deep(.vditor) {
-  --border-color: color-mix(in srgb, var(--border-color) 88%, transparent);
-  --second-color: color-mix(in srgb, var(--text-secondary) 50%, transparent);
-  --panel-background-color: color-mix(in srgb, var(--panel-bg) 96%, var(--sidebar-bg) 4%);
-  --panel-shadow: 0 10px 24px color-mix(in srgb, var(--text-color) 14%, transparent);
-  --toolbar-background-color: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
-  --toolbar-icon-color: var(--text-secondary);
-  --toolbar-icon-hover-color: var(--text-color);
-  --textarea-background-color: transparent;
-  --textarea-text-color: var(--text-color);
-  --resize-icon-color: var(--text-secondary);
-  --resize-background-color: var(--border-color);
-  --resize-hover-icon-color: var(--text-color);
-  --resize-hover-background-color: color-mix(in srgb, var(--hover-bg) 84%, var(--panel-bg) 16%);
-  --count-background-color: color-mix(in srgb, var(--hover-bg) 72%, transparent);
-  --heading-border-color: color-mix(in srgb, var(--border-color) 84%, transparent);
-  --blockquote-color: var(--text-secondary);
-  --ir-heading-color: color-mix(in srgb, var(--accent-color) 74%, var(--text-color) 26%);
-  --ir-title-color: var(--text-secondary);
-  --ir-bi-color: color-mix(in srgb, var(--accent-color) 52%, var(--text-color) 48%);
-  --ir-link-color: color-mix(in srgb, var(--accent-color) 66%, var(--text-color) 34%);
-  --ir-bracket-color: color-mix(in srgb, var(--accent-color) 48%, var(--text-color) 52%);
-  --ir-paren-color: var(--text-secondary);
-  height: 100%;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  border: none;
-  background: transparent;
-  font-family: var(--font-prose);
-}
-
-.base-markdown-editor :deep(.vditor-toolbar) {
-  display: none;
-}
-
-.base-markdown-editor :deep(.vditor-content) {
+.base-markdown-editor :deep(.cm-editor) {
   flex: 1;
-  min-height: 0;
+  width: 100%;
   min-width: 0;
-  overflow: hidden;
-}
-
-.base-markdown-editor :deep(.vditor-ir) {
-  flex: 1;
-  min-height: 0;
-  padding: 0 !important;
-  overflow: hidden;
-}
-
-.base-markdown-editor :deep(.vditor-ir pre.vditor-reset) {
-  height: auto;
-  min-height: 100%;
-  margin: 0;
-  padding: 14px 14px 16px 16px !important;
-  overflow: auto;
+  min-height: var(--markdown-editor-min-height);
   background: transparent;
-  color: var(--text-color);
+}
+
+.base-markdown-editor :deep(.cm-scroller) {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
   font-family: var(--font-prose);
   font-size: var(--markdown-document-font-size);
   line-height: var(--markdown-document-line-height);
-  white-space: pre-wrap;
-  text-rendering: optimizeLegibility;
 }
 
-.base-markdown-editor :deep(.vditor-ir pre.vditor-reset:focus) {
-  background: transparent;
-  outline: none;
+.base-markdown-editor :deep(.cm-content) {
+  min-height: 100%;
+  padding: 14px 14px 16px 16px;
+  color: var(--text-color);
+  caret-color: var(--accent-color);
 }
 
-.base-markdown-editor :deep(.vditor-ir pre.vditor-reset[contenteditable="false"]) {
-  opacity: 1;
+.base-markdown-editor :deep(.cm-line) {
+  padding: 0;
+}
+
+.base-markdown-editor.disabled,
+.base-markdown-editor.disabled :deep(.cm-content) {
   cursor: default;
 }
 
-.base-markdown-editor :deep(.vditor-ir pre.vditor-reset:empty::before) {
-  color: var(--text-secondary);
-  opacity: 0.55;
+.base-markdown-editor :deep(.cm-editor.cm-source-mode .cm-scroller) {
+  font-family: var(--font-mono-editor);
+  font-size: 13px;
+  line-height: 1.65;
 }
 
-.base-markdown-editor :deep(.vditor-ir .vditor-reset > h1::before),
-.base-markdown-editor :deep(.vditor-ir .vditor-reset > h2::before),
-.base-markdown-editor :deep(.vditor-ir .vditor-reset > h3::before),
-.base-markdown-editor :deep(.vditor-ir .vditor-reset > h4::before),
-.base-markdown-editor :deep(.vditor-ir .vditor-reset > h5::before),
-.base-markdown-editor :deep(.vditor-ir .vditor-reset > h6::before),
-.base-markdown-editor :deep(.vditor-ir div[data-type="link-ref-defs-block"]::before),
-.base-markdown-editor :deep(.vditor-ir div[data-type="footnotes-block"]::before),
-.base-markdown-editor :deep(.vditor-ir .vditor-toc::before) {
-  content: none;
-  display: none;
+.base-markdown-editor.auto-grow {
+  flex: none;
+  height: auto;
+  min-height: var(--markdown-editor-min-height);
 }
 
-.base-markdown-editor :deep(.vditor-reset h1),
-.base-markdown-editor :deep(.vditor-reset h2),
-.base-markdown-editor :deep(.vditor-reset h3),
-.base-markdown-editor :deep(.vditor-reset h4),
-.base-markdown-editor :deep(.vditor-reset h5),
-.base-markdown-editor :deep(.vditor-reset h6) {
-  margin: 24px 0 10px;
+.base-markdown-editor.auto-grow .base-markdown-editor-host,
+.base-markdown-editor.auto-grow :deep(.cm-editor),
+.base-markdown-editor.auto-grow :deep(.cm-scroller) {
+  flex: none;
+  height: auto;
+  min-height: var(--markdown-editor-min-height);
+  overflow: visible;
+  overscroll-behavior: auto;
+}
+
+.base-markdown-editor.auto-grow :deep(.cm-content) {
+  min-height: var(--markdown-editor-min-height);
+}
+
+.base-markdown-editor :deep(.cm-live-heading) {
+  color: var(--text-color);
   font-weight: 600;
   line-height: 1.35;
-  letter-spacing: -0.01em;
-  color: var(--text-color);
+  padding-top: 14px;
+  padding-bottom: 6px;
 }
 
-.base-markdown-editor :deep(.vditor-reset h1:first-child),
-.base-markdown-editor :deep(.vditor-reset h2:first-child),
-.base-markdown-editor :deep(.vditor-reset h3:first-child),
-.base-markdown-editor :deep(.vditor-reset h4:first-child),
-.base-markdown-editor :deep(.vditor-reset h5:first-child),
-.base-markdown-editor :deep(.vditor-reset h6:first-child),
-.base-markdown-editor :deep(.vditor-reset p:first-child),
-.base-markdown-editor :deep(.vditor-reset ul:first-child),
-.base-markdown-editor :deep(.vditor-reset ol:first-child),
-.base-markdown-editor :deep(.vditor-reset blockquote:first-child),
-.base-markdown-editor :deep(.vditor-reset pre:first-child),
-.base-markdown-editor :deep(.vditor-reset table:first-child) {
-  margin-top: 0;
-}
-
-.base-markdown-editor :deep(.vditor-reset h1) {
+.base-markdown-editor :deep(.cm-live-heading-1) {
   font-size: 1.58em;
-  margin-bottom: 14px;
+  padding-bottom: 10px;
 }
 
-.base-markdown-editor :deep(.vditor-reset h2) {
+.base-markdown-editor :deep(.cm-live-heading-2) {
   font-size: 1.3em;
   padding-bottom: 8px;
   border-bottom: 1px solid color-mix(in srgb, var(--border-color) 84%, transparent);
 }
 
-.base-markdown-editor :deep(.vditor-reset h3) {
+.base-markdown-editor :deep(.cm-live-heading-3) {
   font-size: 1.12em;
 }
 
-.base-markdown-editor :deep(.vditor-reset h4),
-.base-markdown-editor :deep(.vditor-reset h5),
-.base-markdown-editor :deep(.vditor-reset h6) {
+.base-markdown-editor :deep(.cm-live-heading-4),
+.base-markdown-editor :deep(.cm-live-heading-5),
+.base-markdown-editor :deep(.cm-live-heading-6) {
   font-size: 1em;
   color: var(--text-secondary);
 }
 
-.base-markdown-editor :deep(.vditor-reset p),
-.base-markdown-editor :deep(.vditor-reset ul),
-.base-markdown-editor :deep(.vditor-reset ol),
-.base-markdown-editor :deep(.vditor-reset blockquote),
-.base-markdown-editor :deep(.vditor-reset hr),
-.base-markdown-editor :deep(.vditor-reset pre),
-.base-markdown-editor :deep(.vditor-reset table) {
-  margin: 0 0 12px;
-}
-
-.base-markdown-editor :deep(.vditor-reset ul),
-.base-markdown-editor :deep(.vditor-reset ol) {
-  padding-left: var(--markdown-document-list-indent);
-}
-
-.base-markdown-editor :deep(.vditor-reset li) {
-  margin: 4px 0;
-}
-
-.base-markdown-editor :deep(.vditor-reset li > ul),
-.base-markdown-editor :deep(.vditor-reset li > ol) {
-  margin-top: 6px;
-  margin-bottom: 6px;
-}
-
-.base-markdown-editor :deep(.vditor-reset > :last-child) {
-  margin-bottom: 0;
-}
-
-.base-markdown-editor :deep(.vditor-reset ul li::marker) {
-  color: color-mix(in srgb, var(--text-secondary) 72%, transparent);
-}
-
-.base-markdown-editor :deep(.vditor-reset ol li::marker) {
-  color: var(--text-secondary);
+.base-markdown-editor :deep(.cm-live-strong) {
   font-weight: 600;
 }
 
-.base-markdown-editor :deep(.vditor-reset blockquote) {
-  padding: 8px 12px;
-  border-left: 2px solid color-mix(in srgb, var(--accent-color) 38%, var(--border-color));
-  color: var(--text-secondary);
-  background: color-mix(in srgb, var(--sidebar-bg) 44%, transparent);
-  border-radius: 0 6px 6px 0;
+.base-markdown-editor :deep(.cm-live-emphasis) {
+  color: color-mix(in srgb, var(--text-color) 82%, var(--text-secondary) 18%);
+  font-style: italic;
 }
 
-.base-markdown-editor :deep(.vditor-reset a) {
+.base-markdown-editor :deep(.cm-live-strikethrough) {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--text-secondary) 78%, transparent);
+}
+
+.base-markdown-editor :deep(.cm-live-inline-code) {
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--sidebar-bg) 52%, transparent);
+  color: color-mix(in srgb, var(--text-color) 92%, var(--accent-color) 8%);
+  font-family: var(--font-mono-inline);
+  font-size: 0.92em;
+}
+
+.base-markdown-editor :deep(.cm-live-link) {
   color: var(--accent-color);
   text-decoration-line: underline;
   text-decoration-thickness: 1px;
@@ -822,91 +672,58 @@ function activateRenderedEditor(event: MouseEvent | KeyboardEvent) {
   text-decoration-color: color-mix(in srgb, var(--accent-color) 40%, transparent);
 }
 
-.base-markdown-editor :deep(.vditor-reset hr) {
-  border: none;
+.base-markdown-editor :deep(.cm-live-list-marker) {
+  display: inline-block;
+  min-width: var(--markdown-document-list-indent);
+  color: var(--text-secondary);
+  font-weight: 600;
+  text-align: center;
+  user-select: none;
+}
+
+.base-markdown-editor :deep(.cm-live-task-checkbox) {
+  width: 14px;
+  height: 14px;
+  margin: 0 6px 0 1px;
+  vertical-align: -2px;
+  accent-color: var(--accent-color);
+}
+
+.base-markdown-editor :deep(.cm-live-blockquote) {
+  padding-left: 12px;
+  border-left: 2px solid color-mix(in srgb, var(--accent-color) 38%, var(--border-color));
+  background: color-mix(in srgb, var(--sidebar-bg) 44%, transparent);
+  color: var(--text-secondary);
+}
+
+.base-markdown-editor :deep(.cm-live-horizontal-rule) {
+  display: inline-block;
+  width: 100%;
+  height: 0.8em;
   border-top: 1px solid var(--border-color);
   opacity: 0.8;
+  vertical-align: middle;
 }
 
-.base-markdown-editor :deep(.vditor-reset table) {
-  width: max-content;
-  min-width: 100%;
-  border-collapse: separate;
-  border-spacing: 0;
-  table-layout: auto;
-  font-size: 13px;
-  border: 1px solid color-mix(in srgb, var(--border-color) 88%, transparent);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--panel-bg) 90%, var(--sidebar-bg) 10%);
-}
-
-.base-markdown-editor :deep(.vditor-reset th),
-.base-markdown-editor :deep(.vditor-reset td) {
-  min-width: 120px;
-  padding: 7px 10px;
-  text-align: left;
-  vertical-align: top;
-  white-space: normal;
-  overflow-wrap: anywhere;
-  word-break: normal;
-  border-right: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent) !important;
-  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent) !important;
-  color: var(--text-color) !important;
-  background: color-mix(in srgb, var(--panel-bg) 94%, var(--sidebar-bg) 6%) !important;
-}
-
-.base-markdown-editor :deep(.vditor-reset th) {
-  background: color-mix(in srgb, var(--sidebar-bg) 68%, var(--panel-bg) 32%) !important;
-  font-weight: 600;
-  color: var(--text-secondary) !important;
-}
-
-.base-markdown-editor :deep(.vditor-reset tr:last-child td) {
-  border-bottom: none;
-}
-
-.base-markdown-editor :deep(.vditor-reset th:last-child),
-.base-markdown-editor :deep(.vditor-reset td:last-child) {
-  border-right: none;
-}
-
-.base-markdown-editor :deep(.vditor-reset tbody tr:nth-child(even) td) {
-  background: color-mix(in srgb, var(--panel-bg) 82%, var(--hover-bg) 18%) !important;
-}
-
-.base-markdown-editor :deep(.vditor-reset code:not(.hljs):not(.highlight-chroma)) {
-  font-family: var(--font-mono-inline);
-  font-size: 0.92em;
-  padding: 1px 6px;
-  border-radius: 4px;
-  border: 1px solid color-mix(in srgb, var(--border-color) 78%, transparent);
-  background: color-mix(in srgb, var(--sidebar-bg) 52%, transparent);
-  color: color-mix(in srgb, var(--text-color) 92%, var(--accent-color) 8%);
-}
-
-.base-markdown-editor :deep(.vditor-reset pre) {
-  border-radius: 8px;
-  border: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
+.base-markdown-editor :deep(.cm-live-fenced-code) {
+  padding: 0 12px;
+  border-right: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
+  border-left: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
   background: color-mix(in srgb, var(--sidebar-bg) 76%, transparent);
-  overflow-x: auto;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--panel-bg) 32%, transparent);
-}
-
-.base-markdown-editor :deep(.vditor-reset pre > code) {
-  display: block;
-  padding: 10px 12px;
-  background: transparent;
-  color: inherit;
   font-family: var(--font-mono-block);
   font-size: 13px;
   line-height: 1.55;
 }
 
-.base-markdown-editor :deep(.vditor-reset strong) {
-  font-weight: 600;
+.base-markdown-editor :deep(.cm-live-fenced-code-start) {
+  padding-top: 9px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
+  border-radius: 8px 8px 0 0;
 }
 
-.base-markdown-editor :deep(.vditor-reset em) {
-  color: color-mix(in srgb, var(--text-color) 82%, var(--text-secondary) 18%);
+.base-markdown-editor :deep(.cm-live-fenced-code-end) {
+  padding-bottom: 9px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
+  border-radius: 0 0 8px 8px;
 }
 </style>

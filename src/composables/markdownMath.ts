@@ -266,6 +266,17 @@ function renderKatexCached(latex: string, display: boolean): string {
   return html;
 }
 
+export async function renderMarkdownMathHtml(
+  latex: string,
+  display = false,
+): Promise<string> {
+  await ensureMathRendererLoaded();
+  if (!katexModule) {
+    return '<span class="md-math-error">' + escapeMathHtml(latex) + "</span>";
+  }
+  return renderKatexCached(latex, display);
+}
+
 /** Test-only visibility into the render cache. */
 export function mathRenderCacheSizeForTest(): number {
   return mathRenderCache.size;

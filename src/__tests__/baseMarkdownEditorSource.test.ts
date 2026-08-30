@@ -3,116 +3,127 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const cwd = process.cwd();
-
 const source = readFileSync(resolve(cwd, "src/components/ui/BaseMarkdownEditor.vue"), "utf8");
+const extensionsSource = readFileSync(
+  resolve(cwd, "src/components/ui/markdown-editor/codeMirrorMarkdownExtensions.ts"),
+  "utf8",
+);
+const livePreviewSource = readFileSync(
+  resolve(cwd, "src/components/ui/markdown-editor/markdownLivePreview.ts"),
+  "utf8",
+);
 
-describe("BaseMarkdownEditor source", () => {
-  it("wraps Vditor in Typora-like instant rendering mode", () => {
-    expect(source).toContain("import Vditor from \"vditor\"");
-    expect(source).toContain("mode: \"ir\"");
-    expect(source).toContain("height: MARKDOWN_EDITOR_PANEL_HEIGHT");
-    expect(source).toContain("maxWidth: MARKDOWN_EDITOR_PANEL_MAX_WIDTH");
-    expect(source).toContain("toolbar: []");
-    expect(source).toContain("cache: {");
-    expect(source).toContain("enable: false");
+describe("BaseMarkdownEditor CodeMirror source", () => {
+  it("mounts one persistent CodeMirror editing surface eagerly", () => {
+    expect(source).toContain('import { EditorView } from "@codemirror/view"');
+    expect(source).toContain("editorView = new EditorView({ state, parent })");
+    expect(source).toContain('ref="mountRef" class="base-markdown-editor-host"');
+    expect(source).not.toContain(["Vdi", "tor"].join(""));
+    expect(source).not.toMatch(/MarkdownRenderer|SemanticCodeRenderer/);
+    expect(source).not.toMatch(/<textarea|base-markdown-editor-textarea/);
+    expect(source).not.toContain("v-if=");
   });
 
-  it("supports a shared native markdown source view", () => {
-    expect(source).toContain("viewMode?: MarkdownEditorViewMode;");
-    expect(source).toContain("contentPath?: string;");
-    expect(source).toContain("contentKey?: string;");
-    expect(source).toContain("deferRenderedEditor?: boolean;");
-    expect(source).toContain("viewMode: \"rendered\"");
-    expect(source).toContain("contentPath: \"\"");
-    expect(source).toContain("const isNativeMode = computed(() => props.viewMode === \"native\")");
-    expect(source).toContain("const isRenderedPreviewMode = computed(() =>");
-    expect(source).toContain("const readonlyCodeLanguage = computed(() =>");
-    expect(source).toContain("const shouldUseVditor = computed(() => !isNativeMode.value && !isRenderedPreviewMode.value)");
-    expect(source).toContain("class=\"base-markdown-editor-textarea\"");
-    expect(source).toContain("font-family: var(--font-mono-editor);");
-    expect(source).toContain("function handleNativeInput(event: Event)");
-    expect(source).toContain("function handleNativeKeydown(event: KeyboardEvent)");
-    expect(source).toContain("spellcheck=\"false\"");
+  it("reconfigures mode, language, read-only, and placeholder through compartments", () => {
+    expect(source).toContain("const languageCompartment = new Compartment()");
+    expect(source).toContain("const modeCompartment = new Compartment()");
+    expect(source).toContain("const readOnlyCompartment = new Compartment()");
+    expect(source).toContain("const placeholderCompartment = new Compartment()");
+    expect(source).toContain("languageCompartment.reconfigure");
+    expect(source).toContain("modeCompartment.reconfigure");
+    expect(source).toContain("readOnlyCompartment.reconfigure");
+    expect(source).toContain("placeholderCompartment.reconfigure");
+    expect(extensionsSource).toContain('return "json"');
+    expect(extensionsSource).toContain('return "python"');
+    expect(extensionsSource).toContain("markdownLivePreview(livePreviewOptions)");
   });
 
-  it("keeps the save shortcut and theme sync inside the wrapper", () => {
-    expect(source).toContain("event.key.toLowerCase() === \"s\"");
-    expect(source).toContain("emit(\"shortcutSave\")");
-    expect(source).toContain("editor.setTheme(isDarkTheme() ? \"dark\" : \"classic\")");
-    expect(source).toContain("new MutationObserver(() => applyTheme())");
-    expect(source).toContain("createMarkdownEditorResizeSync(mountRef.value, syncPanelLayout)");
+  it("keeps rendered/native storage values as Live Preview/source modes", () => {
+    expect(source).toContain("viewMode?: MarkdownEditorViewMode");
+    expect(source).toContain('viewMode: "rendered"');
+    expect(source).toContain("'is-rendered': viewMode === 'rendered'");
+    expect(source).toContain("'is-source': viewMode === 'native'");
+    expect(extensionsSource).toContain('viewMode === "rendered" && language === "markdown"');
+    expect(extensionsSource).toContain('class: language === "markdown" ? "cm-source-mode"');
   });
 
-  it("intercepts prose pasted from preformatted html before Vditor auto-wraps it as code", () => {
-    expect(source).toContain("shouldPreferMarkdownPlainTextPaste");
-    expect(source).toContain("event.stopImmediatePropagation()");
-    expect(source).toContain("editor.insertMD(text)");
-    expect(source).toContain("editable.addEventListener(\"paste\", onPaste, true)");
+  it("preserves the editor input contract and save/paste behavior", () => {
+    expect(source).toContain('emit("update:modelValue"');
+    expect(source).toContain('emit("shortcutSave")');
+    expect(extensionsSource).toContain('key: "Mod-s"');
+    expect(extensionsSource).toContain("history()");
+    expect(extensionsSource).toContain("...historyKeymap");
+    expect(extensionsSource).toContain('spellcheck: "false"');
+    expect(extensionsSource).toContain("shouldPreferMarkdownPlainTextPaste");
+    expect(extensionsSource).toContain("event.stopImmediatePropagation()");
+    expect(extensionsSource).toContain("EditorView.lineWrapping");
   });
 
-  it("uses the editor surface as the only scroll container", () => {
+  it("applies external model values as minimal non-history changes", () => {
+    expect(source).toContain("createMinimalTextChange(view.state.doc.toString(), normalized)");
+    expect(source).toContain("Transaction.addToHistory.of(false)");
+    expect(source).toContain("view.dispatch({");
+    expect(source).not.toContain("setValue(");
+  });
+
+  it("restores document-local state, history, selection, and scroll from a bounded LRU", () => {
+    expect(source).toContain("sessionCache?: MarkdownEditorSessionStore | null");
+    expect(source).toContain("sessionPinned?: boolean");
+    expect(source).toContain("const localSessionCache = new MarkdownEditorSessionCache()");
+    expect(source).toContain("let activeSessionCache = props.sessionCache ?? localSessionCache");
+    expect(source).toContain("StateEffect.reconfigure.of(editorExtensions())");
+    expect(source).toContain("stateWithFreshConfiguration(state)");
+    expect(source).toContain("stateWithFreshConfiguration(nextState)");
+    expect(source).toContain("state: view.state");
+    expect(source).toContain("pinned,");
+    expect(source).toContain("scrollTop: currentScrollTop");
+    expect(source).toContain("scrollLeft: currentScrollLeft");
+    expect(source).toContain("function resolveScrollElement(view: EditorView): HTMLElement");
+    expect(source).toContain('scrollElement.addEventListener("scroll", handleScroll, { passive: true })');
+    expect(source).toContain("restoreTrackedScroll(editorView, scrollTop, scrollLeft)");
+    expect(source).toContain("view.setState(nextState)");
+    expect(source).toContain("localSessionCache.clear()");
+    expect(source).not.toContain("props.sessionCache?.clear()");
+  });
+
+  it("suspends hidden editors while retaining their session", () => {
+    expect(source).toContain("active?: boolean");
+    expect(source).toContain("active: true");
+    expect(source).toContain("function suspendEditor()");
+    expect(source).toContain("saveActiveSession()");
+    expect(source).toContain("editorView.destroy()");
+    expect(source).toContain("mountEditor();");
+  });
+
+  it("builds Live Preview from visible syntax-tree ranges", () => {
+    expect(livePreviewSource).toContain("syntaxTree(view.state)");
+    expect(livePreviewSource).toContain("view.visibleRanges");
+    expect(livePreviewSource).toContain('name === "StrongEmphasis"');
+    expect(livePreviewSource).toContain('name === "TaskMarker"');
+    expect(livePreviewSource).toContain('name === "Blockquote"');
+    expect(livePreviewSource).toContain('name === "HorizontalRule"');
+    expect(livePreviewSource).toContain('name === "FencedCode"');
+  });
+
+  it("uses one continuous CodeMirror layout for fixed and auto-grow editors", () => {
     expect(source).toMatch(/\.base-markdown-editor\s*\{[\s\S]*display:\s*flex;[\s\S]*min-height:\s*0;/);
-    expect(source).toMatch(/\.base-markdown-editor-native\s*\{[\s\S]*display:\s*flex;[\s\S]*min-height:\s*0;/);
-    expect(source).toMatch(/\.base-markdown-editor-rendered\s*\{[\s\S]*overflow:\s*auto;/);
-    expect(source).toMatch(/\.base-markdown-editor-textarea\s*\{[\s\S]*overflow:\s*auto;/);
-    expect(source).toMatch(/\.base-markdown-editor\s*:deep\(\.vditor-content\)\s*\{[\s\S]*overflow:\s*hidden;/);
-    expect(source).toMatch(/\.base-markdown-editor\s*:deep\(\.vditor-ir\)\s*\{[\s\S]*padding:\s*0 !important;[\s\S]*overflow:\s*hidden;/);
-    expect(source).toMatch(/\.base-markdown-editor\s*:deep\(\.vditor-ir pre\.vditor-reset\)\s*\{[\s\S]*height:\s*auto;[\s\S]*overflow:\s*auto;/);
-  });
-
-  it("keeps a compact left gutter for knowledge editing", () => {
-    expect(source).toContain("padding: 14px 14px 16px 16px !important;");
-    expect(source).toContain("padding-left: var(--markdown-document-list-indent);");
-    expect(source).toContain("content: none;");
-    expect(source).toContain("display: none;");
-  });
-
-  it("keeps preview and focused editor typography geometrically aligned", () => {
-    expect(source).toContain("--markdown-document-font-size: 14px;");
-    expect(source).toContain("--markdown-document-line-height: 1.68;");
-    expect(source).toContain("--markdown-document-list-indent: 20px;");
-    expect(source).toMatch(/\.base-markdown-editor-rendered :deep\(\.markdown-body\)[\s\S]*font-size:\s*var\(--markdown-document-font-size\);[\s\S]*line-height:\s*var\(--markdown-document-line-height\);/);
-    expect(source).toMatch(/\.vditor-ir pre\.vditor-reset\)[\s\S]*font-size:\s*var\(--markdown-document-font-size\);[\s\S]*line-height:\s*var\(--markdown-document-line-height\);/);
-    expect(source).toContain(".vditor-reset > :last-child");
-    expect(source).toContain(".vditor-reset ul li::marker");
-  });
-
-  it("uses a neutral cursor for disabled read-only content", () => {
-    expect(source).toMatch(/\.base-markdown-editor\.disabled\s*\{[\s\S]*cursor:\s*default;/);
-    expect(source).toMatch(/pre\.vditor-reset\[contenteditable="false"\]\)\s*\{[\s\S]*cursor:\s*default;/);
-    expect(source).toContain("import MarkdownRenderer from \"../MarkdownRenderer.vue\"");
-    expect(source).toContain("import SemanticCodeRenderer from \"./SemanticCodeRenderer.vue\"");
-    expect(source).toContain("semanticCodeLanguageFromPath(props.contentPath)");
-    expect(source).toContain("<SemanticCodeRenderer");
-    expect(source).toContain("<MarkdownRenderer v-else :content=\"modelValue\" />");
-    expect(source).not.toContain("cursor: wait;");
-  });
-
-  it("keeps Vditor resources warm and resets history between documents", () => {
-    expect(source).toContain('import "vditor/dist/js/icons/ant.js"');
-    expect(source).toContain('const VDITOR_ICON_SCRIPT_ID = "vditorIconScript"');
-    expect(source).toContain("ensureVditorIconMarker()");
-    expect(source).toContain("syncFromModel(props.modelValue, true)");
-    expect(source).toContain("deferRenderedEditor && !renderedEditing.value");
-  });
-
-  it("preserves the rendered scroll position and click caret while activating Vditor", () => {
-    expect(source).toContain("captureMarkdownEditorActivation");
-    expect(source).toContain("focusMarkdownEditorAtActivation");
-    expect(source).toContain("restoreMarkdownEditorActivationScroll");
-    expect(source).toContain("placeMarkdownEditorCaretAtActivation");
-    expect(source).toContain("activationMinHeight");
-    expect(source).toContain("completeRenderedActivation()");
-    expect(source).not.toContain("requestAnimationFrame(() => editor?.focus())");
-  });
-
-  it("supports document-flow auto growth without nested vertical scrolling", () => {
-    expect(source).toContain("autoGrow?: boolean;");
-    expect(source).toContain("minHeight?: number;");
-    expect(source).toContain("function syncNativeAutoGrowHeight()");
-    expect(source).toContain("'auto-grow': autoGrow");
+    expect(source).toMatch(/\.base-markdown-editor :deep\(\.cm-scroller\)\s*\{[\s\S]*overflow:\s*auto;/);
     expect(source).toMatch(/\.base-markdown-editor\.auto-grow[\s\S]*height:\s*auto;/);
-    expect(source).toMatch(/\.base-markdown-editor\.auto-grow :deep\(\.vditor\),[\s\S]*overflow-y:\s*visible;/);
-    expect(source).toContain("field-sizing: content;");
+    expect(source).toMatch(/\.base-markdown-editor\.auto-grow :deep\(\.cm-scroller\)[\s\S]*overflow:\s*visible;[\s\S]*overscroll-behavior:\s*auto;/);
+    expect(source).toContain("padding: 14px 14px 16px 16px;");
+    expect(source).toContain("min-height: var(--markdown-editor-min-height);");
+  });
+
+  it("uses a low-opacity drawn selection that keeps text legible", () => {
+    expect(extensionsSource).toContain('".cm-selectionBackground": {');
+    expect(extensionsSource).toContain('"&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground"');
+    expect(extensionsSource).toContain('background: "color-mix(in srgb, var(--accent-color) 18%, transparent)"');
+    expect(extensionsSource).not.toContain(".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection");
+  });
+
+  it("keeps the editor surface visually unchanged while focused", () => {
+    expect(source).not.toContain(".base-markdown-editor :deep(.cm-editor.cm-focused)");
+    expect(extensionsSource).toMatch(/"&\.cm-focused":\s*\{\s*outline:\s*"none"/);
+    expect(extensionsSource).not.toMatch(/"&\.cm-focused":\s*\{[^}]*boxShadow/);
   });
 });

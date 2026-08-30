@@ -1,27 +1,13 @@
 import path from "node:path";
 import { defineConfig, normalizePath } from "vite";
 import vue from "@vitejs/plugin-vue";
-import { viteStaticCopy } from "vite-plugin-static-copy";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
-  plugins: [
-    vue(),
-    viteStaticCopy({
-      targets: [
-        {
-          src: normalizePath(path.resolve(import.meta.dirname, "node_modules/vditor/dist/**/*")),
-          dest: "vendor/vditor",
-          rename: {
-            stripBase: 2,
-          },
-        },
-      ],
-    }),
-  ],
+  plugins: [vue()],
 
   resolve: {
     alias: [
@@ -56,6 +42,15 @@ export default defineConfig(async () => ({
           const normalizedId = normalizePath(id);
           if (normalizedId.includes("/node_modules/ag-psd/")) return "binary-preview";
           if (normalizedId.includes("/node_modules/three/")) return "three-preview";
+          if (
+            normalizedId.includes("/node_modules/@codemirror/")
+            || normalizedId.includes("/node_modules/@lezer/")
+            || normalizedId.includes("/node_modules/style-mod/")
+            || normalizedId.includes("/node_modules/w3c-keyname/")
+            || normalizedId.includes("/node_modules/crelt/")
+          ) {
+            return "markdown-editor";
+          }
           if (
             normalizedId.includes("/node_modules/vue/")
             || normalizedId.includes("/node_modules/@vue/")
