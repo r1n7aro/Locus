@@ -353,6 +353,14 @@ pub fn codex_auto_compact_token_limit(effective_context_window: u32) -> u32 {
     .min(u64::from(u32::MAX)) as u32
 }
 
+/// Derives the Codex 90% compaction threshold when the configured value is
+/// already the raw model context window, as it is for custom provider models.
+pub fn codex_auto_compact_token_limit_from_raw_window(context_window: u32) -> u32 {
+    (u64::from(context_window).saturating_mul(u64::from(CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT))
+        / 100)
+        .min(u64::from(u32::MAX)) as u32
+}
+
 pub fn should_codex_auto_compact(total_input_tokens: u32, auto_compact_limit: u32) -> bool {
     if auto_compact_limit == 0 {
         return false;
@@ -3289,6 +3297,11 @@ mod tests {
         assert_eq!(extended_limit, 334_800);
         assert!(!should_codex_auto_compact(334_799, extended_limit));
         assert!(should_codex_auto_compact(334_800, extended_limit));
+
+        let custom_limit = codex_auto_compact_token_limit_from_raw_window(272_000);
+        assert_eq!(custom_limit, 244_800);
+        assert!(!should_codex_auto_compact(244_799, custom_limit));
+        assert!(should_codex_auto_compact(244_800, custom_limit));
     }
 
     #[test]

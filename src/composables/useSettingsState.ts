@@ -75,7 +75,10 @@ import {
   DEFAULT_CATALOG_CONTEXT_LENGTH,
   DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS,
   DEFAULT_REASONING_EFFORTS,
+  defaultReplayReasoningContent,
   defaultReasoningParamFormat,
+  inferredReasoningReplayField,
+  isDeepSeekV4Model,
   modelRowIdFromApiModel,
   newCustomProvider,
 } from "../services/modelCatalog";
@@ -1384,6 +1387,8 @@ export function useSettingsState(emit: SettingsEmit) {
     model: CustomProviderModel,
     apiFormat: ApiFormat,
   ): CustomProviderModel {
+    const reasoningReplayField = inferredReasoningReplayField(model);
+    const replayRequired = isDeepSeekV4Model(model);
     return {
       ...model,
       id: model.id?.trim() ? model.id.trim() : modelRowIdFromApiModel(model.apiModel),
@@ -1391,13 +1396,18 @@ export function useSettingsState(emit: SettingsEmit) {
       contextLength: Number.isFinite(model.contextLength) && model.contextLength > 0
         ? model.contextLength
         : DEFAULT_CUSTOM_ENDPOINT_CONTEXT_LENGTH,
+      remoteCompactionMode: model.remoteCompactionMode === "codex_v2"
+        ? "codex_v2"
+        : "disabled",
       supportsToolLazyLoading: model.supportsToolLazyLoading === true,
       supportedReasoningEfforts: normalizeReasoningEfforts(model.supportedReasoningEfforts),
       reasoningParamFormat: model.reasoningParamFormat ?? defaultReasoningParamFormat(apiFormat),
-      replayReasoningContent: typeof model.replayReasoningContent === "boolean"
-        ? model.replayReasoningContent
-        : apiFormat === "openai_chat",
-      reasoningReplayField: model.reasoningReplayField ?? null,
+      replayReasoningContent: replayRequired
+        ? true
+        : typeof model.replayReasoningContent === "boolean"
+          ? model.replayReasoningContent
+          : defaultReplayReasoningContent(apiFormat, model),
+      reasoningReplayField,
       serverTools: normalizeServerTools(model.serverTools),
       supportsVision: model.supportsVision !== false,
     };
@@ -1431,6 +1441,7 @@ export function useSettingsState(emit: SettingsEmit) {
         apiModel: ep.apiModel,
         name: ep.apiModel,
         contextLength: ep.contextLength,
+        remoteCompactionMode: "disabled",
         supportsToolLazyLoading: ep.supportsToolLazyLoading === true,
         supportedReasoningEfforts: ep.supportedReasoningEfforts,
         reasoningParamFormat: ep.reasoningParamFormat ?? null,

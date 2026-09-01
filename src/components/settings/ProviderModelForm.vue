@@ -3,7 +3,10 @@ import { computed } from "vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import { t } from "../../i18n";
-import { defaultReasoningParamFormat } from "../../services/modelCatalog";
+import {
+  defaultReasoningParamFormat,
+  isDeepSeekV4Model,
+} from "../../services/modelCatalog";
 import type {
   ApiFormat,
   CustomProviderModel,
@@ -59,6 +62,11 @@ const REPLAY_FIELD_OPTIONS = [
 /** null means "derive on save"; show the derived value instead of a blank. */
 const effectiveReasoningFormat = computed<ReasoningParamFormat>(
   () => props.model.reasoningParamFormat ?? defaultReasoningParamFormat(props.apiFormat),
+);
+
+const reasoningReplayRequired = computed(() => isDeepSeekV4Model(props.model));
+const effectiveReasoningReplay = computed(
+  () => reasoningReplayRequired.value || props.model.replayReasoningContent === true,
 );
 
 const reasoningFormatOptions = computed(() => {
@@ -128,6 +136,21 @@ function updateReplayField(value: string) {
       />
     </div>
 
+    <template v-if="apiFormat === 'openai_responses'">
+      <span class="form-row-label form-row-label-top">{{ t("settings.custom.remoteCompaction") }}</span>
+      <div class="form-control">
+        <div class="form-option-row">
+          <BaseCheckbox
+            :disabled="saving"
+            :model-value="model.remoteCompactionMode === 'codex_v2'"
+            :aria-label="t('settings.custom.remoteCompaction')"
+            @update:model-value="model.remoteCompactionMode = $event ? 'codex_v2' : 'disabled'"
+          />
+          <span class="form-option-desc">{{ t("settings.custom.remoteCompactionDesc") }}</span>
+        </div>
+      </div>
+    </template>
+
     <span class="form-row-label">{{ t("settings.custom.imageUnderstanding") }}</span>
     <div class="form-control form-control-inline">
       <BaseCheckbox
@@ -170,17 +193,20 @@ function updateReplayField(value: string) {
       </div>
     </template>
 
-    <template v-if="apiFormat === 'openai_chat'">
+    <template v-if="apiFormat === 'openai_chat' || apiFormat === 'anthropic_messages'">
       <span class="form-row-label">{{ t("settings.custom.replayReasoningContent") }}</span>
-      <div class="form-control form-control-inline">
+      <div
+        class="form-control form-control-inline"
+        :title="reasoningReplayRequired ? t('settings.custom.replayReasoningRequired') : undefined"
+      >
         <BaseCheckbox
-          :model-value="model.replayReasoningContent === true"
-          :disabled="saving"
+          :model-value="effectiveReasoningReplay"
+          :disabled="saving || reasoningReplayRequired"
           :aria-label="t('settings.custom.replayReasoningContent')"
           @update:model-value="model.replayReasoningContent = $event"
         />
       </div>
-      <template v-if="model.replayReasoningContent === true">
+      <template v-if="apiFormat === 'openai_chat' && effectiveReasoningReplay">
         <span class="form-row-label">{{ t("settings.custom.replayField") }}</span>
         <div class="form-control">
           <BaseDropdown

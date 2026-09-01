@@ -112,6 +112,30 @@ describe("chat compact route", () => {
     expect(codex).toContain("validate_remote_compaction_v2_output(");
   });
 
+  it("routes opted-in custom Responses models through HTTP compact and replays provider output", () => {
+    const workspace = read("src-tauri/src/commands/workspace.rs");
+    const session = read("src-tauri/src/commands/session.rs");
+    const backend = read("src-tauri/src/agent/instance/backend.rs");
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
+    const codex = read("src-tauri/src/llm/codex.rs");
+    const responses = read("src-tauri/src/llm/responses.rs");
+
+    expect(workspace).toContain("pub enum RemoteCompactionMode");
+    expect(workspace).toContain("const CUSTOM_PROVIDERS_FILE_VERSION: u32 = 3;");
+    expect(session).toContain("remote_compaction_mode: model.remote_compaction_mode");
+    expect(backend).toContain("remote_compaction_mode: crate::commands::RemoteCompactionMode");
+    expect(agent).toContain("fn uses_codex_remote_compaction(&self) -> bool");
+    expect(agent).toContain("crate::commands::CodexTransportMode::Http");
+    expect(agent).toContain("codex::compact_conversation_history_v2(");
+    expect(agent).toContain("compact_messages_with_response_request(");
+    expect(codex).toContain('push(serde_json::json!({ "type": "compaction_trigger" }))');
+    expect(responses).toContain("append_codex_compaction_replay(");
+    expect(responses).toContain('body["prompt_cache_key"]');
+    expect(responses).not.toContain("x-codex-beta-features");
+    expect(responses).not.toContain('header("session-id"');
+    expect(responses).not.toContain('header("thread-id"');
+  });
+
   it("fails manual compact when visible fork history has no active prompt window", () => {
     const agentInstance = read("src-tauri/src/agent/instance/mod.rs");
 

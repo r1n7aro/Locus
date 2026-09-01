@@ -113,6 +113,7 @@ function providerModel(partial: Partial<CustomProviderModel> = {}): CustomProvid
     apiModel: "model",
     name: "model",
     contextLength: 256000,
+    remoteCompactionMode: "disabled",
     supportsToolLazyLoading: false,
     supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
     reasoningParamFormat: "openai_chat_reasoning_effort",
@@ -191,6 +192,7 @@ describe("custom provider persistence", () => {
     const draft = state.editingCustomProvider.value;
     expect(draft?.models).toHaveLength(1);
     expect(draft?.models[0].contextLength).toBe(256000);
+    expect(draft?.models[0].remoteCompactionMode).toBe("disabled");
     expect(draft?.models[0].supportsVision).toBe(true);
     expect(draft?.models[0].serverTools.webSearch).toBe(false);
     expect(draft?.models[0].supportedReasoningEfforts).toEqual([
@@ -290,6 +292,27 @@ describe("custom provider persistence", () => {
     ]);
   });
 
+  it("persists Codex V2 remote compaction on a Responses model", async () => {
+    const state = useSettingsState((() => undefined) as never);
+
+    state.startAddCustomProvider();
+    const draft = state.editingCustomProvider.value!;
+    draft.name = "CPA";
+    draft.endpoint = "http://192.168.0.2:8317/v1";
+    draft.apiFormat = "openai_responses";
+    draft.models[0].apiModel = "gpt-5.6-sol";
+    draft.models[0].remoteCompactionMode = "codex_v2";
+
+    await state.saveCustomProvider();
+
+    expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
+      expect.objectContaining({
+        apiFormat: "openai_responses",
+        models: [expect.objectContaining({ remoteCompactionMode: "codex_v2" })],
+      }),
+    ]);
+  });
+
   it("normalizes legacy OpenAI Chat models to replay reasoning content", async () => {
     const state = useSettingsState((() => undefined) as never);
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
@@ -324,6 +347,30 @@ describe("custom provider persistence", () => {
     expect(state.customProviders.value[0].models[0].replayReasoningContent).toBe(false);
   });
 
+  it("forces reasoning replay for an existing DeepSeek V4 Anthropic model", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
+        id: "deepseek",
+        name: "DeepSeek",
+        endpoint: "https://api.deepseek.com/anthropic/v1",
+        apiFormat: "anthropic_messages",
+        models: [providerModel({
+          apiModel: "deepseek-v4-pro",
+          catalogModelId: "deepseek-v4-pro",
+          reasoningParamFormat: "anthropic_thinking",
+          replayReasoningContent: false,
+          reasoningReplayField: null,
+        })],
+      }),
+    ]);
+
+    await state.loadCustomProviders();
+
+    expect(state.customProviders.value[0].models[0].replayReasoningContent).toBe(true);
+    expect(state.customProviders.value[0].models[0].reasoningReplayField).toBe("reasoning_content");
+  });
+
   it("normalizes legacy models to disabled server tools", async () => {
     const state = useSettingsState((() => undefined) as never);
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
@@ -337,6 +384,29 @@ describe("custom provider persistence", () => {
     await state.loadCustomProviders();
 
     expect(state.customProviders.value[0].models[0].serverTools).toEqual({ webSearch: false });
+  });
+
+  it("normalizes legacy remote compaction and preserves an enabled Codex compact mode", async () => {
+    const state = useSettingsState((() => undefined) as never);
+    modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
+      provider({
+        id: "legacy-compaction",
+        name: "Legacy compaction",
+        apiFormat: "openai_responses",
+        models: [providerModel({ remoteCompactionMode: undefined } as never)],
+      }),
+      provider({
+        id: "cpa",
+        name: "CPA",
+        apiFormat: "openai_responses",
+        models: [providerModel({ remoteCompactionMode: "codex_v2" })],
+      }),
+    ]);
+
+    await state.loadCustomProviders();
+
+    expect(state.customProviders.value[0].models[0].remoteCompactionMode).toBe("disabled");
+    expect(state.customProviders.value[1].models[0].remoteCompactionMode).toBe("codex_v2");
   });
 
   it("normalizes legacy models to enabled image understanding", async () => {

@@ -1141,6 +1141,7 @@ fn custom_backend_for_model(selected_model: &str) -> Result<LlmBackend, AppError
         endpoint: provider.endpoint,
         api_format: provider.api_format,
         context_length: model.context_length,
+        remote_compaction_mode: model.remote_compaction_mode,
         supports_tool_lazy_loading: model.supports_tool_lazy_loading,
         supported_reasoning_efforts: model.supported_reasoning_efforts,
         reasoning_param_format: model
@@ -3973,7 +3974,7 @@ mod workspace_definition_scope_tests {
                 .iter()
                 .find(|agent| agent.is_default)
                 .map(|agent| agent.id.as_str()),
-            Some("dev")
+            Some("unity")
         );
     }
 }

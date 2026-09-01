@@ -5,11 +5,13 @@ import {
   CATALOG_ANTHROPIC_BASES,
   FEATURED_CATALOG_PROVIDERS,
   addCatalogModelRow,
+  catalogModelToProviderModel,
   catalogProviderEndpoint,
   catalogProviderToCustomProvider,
   defaultReasoningParamFormat,
   isListableCatalogModel,
   isListableCatalogProvider,
+  isDeepSeekV4Model,
   isRedundantModelId,
   isTrustedCatalogProvider,
   newCustomProvider,
@@ -29,6 +31,15 @@ const catalogModel: ModelCatalogModel = {
   limit: { context: 128_000, output: 8_192 },
   reasoning: false,
   tool_call: true,
+};
+
+const deepSeekV4CatalogModel: ModelCatalogModel = {
+  name: "DeepSeek V4 Pro",
+  limit: { context: 1_000_000, output: 384_000 },
+  reasoning: true,
+  tool_call: true,
+  interleaved: { field: "reasoning_content" },
+  reasoning_options: [{ type: "effort", values: ["high", "max"] }],
 };
 
 function draftProvider(): CustomProvider {
@@ -87,6 +98,7 @@ describe("custom provider modal helpers", () => {
     expect(draft.models).toHaveLength(1);
     expect(draft.models[0].apiModel).toBe("");
     expect(draft.models[0].contextLength).toBe(256_000);
+    expect(draft.models[0].remoteCompactionMode).toBe("disabled");
     expect(draft.models[0].supportedReasoningEfforts).toEqual([
       "low",
       "medium",
@@ -100,6 +112,19 @@ describe("custom provider modal helpers", () => {
     expect(defaultReasoningParamFormat("openai_chat")).toBe("openai_chat_reasoning_effort");
     expect(defaultReasoningParamFormat("openai_responses")).toBe("openai_responses_reasoning_effort");
     expect(defaultReasoningParamFormat("anthropic_messages")).toBe("anthropic_thinking");
+  });
+
+  it("enables reasoning replay for DeepSeek V4 on the Anthropic-compatible route", () => {
+    const row = catalogModelToProviderModel(
+      "deepseek",
+      "deepseek-v4-pro",
+      deepSeekV4CatalogModel,
+      "anthropic_messages",
+    );
+
+    expect(isDeepSeekV4Model(row)).toBe(true);
+    expect(row.replayReasoningContent).toBe(true);
+    expect(row.reasoningReplayField).toBe("reasoning_content");
   });
 
   it("defaults catalog adds to the vendor's Anthropic endpoint when it has one", () => {
@@ -132,6 +157,24 @@ describe("custom provider modal helpers", () => {
 });
 
 describe("custom provider modal layout", () => {
+  it("shows reasoning replay for Chat and Anthropic models while keeping the replay field Chat-only", () => {
+    const source = read("src/components/settings/ProviderModelForm.vue");
+
+    expect(source).toContain("apiFormat === 'openai_chat' || apiFormat === 'anthropic_messages'");
+    expect(source).toContain("saving || reasoningReplayRequired");
+    expect(source).toContain("apiFormat === 'openai_chat' && effectiveReasoningReplay");
+  });
+
+  it("shows Codex remote compaction only for Responses models using the shared checkbox", () => {
+    const source = read("src/components/settings/ProviderModelForm.vue");
+
+    expect(source).toContain("<template v-if=\"apiFormat === 'openai_responses'\">");
+    expect(source).toContain("model.remoteCompactionMode === 'codex_v2'");
+    expect(source).toContain("model.remoteCompactionMode = $event ? 'codex_v2' : 'disabled'");
+    expect(source).toContain("BaseCheckbox");
+    expect(source).toContain('t("settings.custom.remoteCompactionDesc")');
+  });
+
   it("runs the add flow as a two-step wizard with in-dialog validation", () => {
     const source = read("src/components/settings/CustomProviderModal.vue");
 

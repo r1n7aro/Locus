@@ -14,6 +14,8 @@ import {
 import {
   catalogKeyPlaceholder,
   catalogProviderToCustomProvider,
+  defaultReplayReasoningContent,
+  inferredReasoningReplayField,
   newCustomProvider,
 } from "../../services/modelCatalog";
 import type {
@@ -157,9 +159,12 @@ const apiFormatOptions = computed(() => [
 
 function updateProviderApiFormat(value: string) {
   if (!provider.value) return;
-  provider.value.apiFormat = value as ApiFormat;
+  const apiFormat = value as ApiFormat;
+  provider.value.apiFormat = apiFormat;
   for (const model of provider.value.models) {
     model.reasoningParamFormat = null; // re-derive from the new format on save
+    model.reasoningReplayField = inferredReasoningReplayField(model);
+    model.replayReasoningContent = defaultReplayReasoningContent(apiFormat, model);
   }
 }
 

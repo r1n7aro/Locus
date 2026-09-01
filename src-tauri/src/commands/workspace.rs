@@ -812,7 +812,7 @@ pub async fn test_custom_endpoint(endpoint: CustomEndpoint) -> Result<String, Ap
     }
 }
 
-// ===== Custom providers (v2: one provider hosts many models) =====
+// ===== Custom providers (v3: model-level remote compaction capability) =====
 //
 // Stored in custom_providers.json; api keys stay in the keychain under the
 // legacy "endpoint/{provider_id}" name so migrated endpoints keep their
@@ -830,6 +830,17 @@ pub enum ReasoningReplayField {
     Reasoning,
 }
 
+/// Remote context-compaction protocol supported by one custom model route.
+/// Kept as an enum so later protocols can be added without replacing the
+/// persisted capability shape.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteCompactionMode {
+    #[default]
+    Disabled,
+    CodexV2,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomProviderModel {
@@ -839,6 +850,8 @@ pub struct CustomProviderModel {
     pub name: String,
     #[serde(default = "default_context_length")]
     pub context_length: u32,
+    #[serde(default)]
+    pub remote_compaction_mode: RemoteCompactionMode,
     /// Protocol-native lazy tool loading (`defer_loading`/`tool_reference`)
     /// for Anthropic-format endpoints; the endpoint must support it.
     #[serde(default)]
@@ -887,7 +900,7 @@ struct CustomProvidersFile {
     providers: Vec<CustomProvider>,
 }
 
-const CUSTOM_PROVIDERS_FILE_VERSION: u32 = 2;
+const CUSTOM_PROVIDERS_FILE_VERSION: u32 = 3;
 
 pub(crate) fn custom_providers_path() -> Result<std::path::PathBuf, String> {
     Ok(persistent_config_dir()?.join("custom_providers.json"))
@@ -918,6 +931,20 @@ pub(crate) fn model_row_id_from_api_model(api_model: &str) -> String {
 
 fn default_model_replay_reasoning_content(api_format: &ApiFormat) -> bool {
     *api_format == ApiFormat::OpenaiChat
+}
+
+fn is_deepseek_v4_model(model: &CustomProviderModel) -> bool {
+    [
+        model.api_model.as_str(),
+        model.catalog_model_id.as_deref().unwrap_or(""),
+    ]
+    .iter()
+    .any(|value| {
+        value
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("deepseek-v4-")
+    })
 }
 
 pub(crate) fn normalize_custom_provider_config(provider: &mut CustomProvider) {
@@ -957,7 +984,12 @@ pub(crate) fn normalize_custom_provider_config(provider: &mut CustomProvider) {
         if model.reasoning_param_format.is_none() {
             model.reasoning_param_format = Some(default_reasoning_param_format(&api_format));
         }
-        if model.replay_reasoning_content.is_none() {
+        if is_deepseek_v4_model(model) {
+            model.replay_reasoning_content = Some(true);
+            if model.reasoning_replay_field.is_none() {
+                model.reasoning_replay_field = Some(ReasoningReplayField::ReasoningContent);
+            }
+        } else if model.replay_reasoning_content.is_none() {
             model.replay_reasoning_content =
                 Some(default_model_replay_reasoning_content(&api_format));
         }
@@ -979,6 +1011,7 @@ fn migrate_endpoint_to_provider(mut endpoint: CustomEndpoint) -> CustomProvider 
             name: endpoint.api_model.clone(),
             api_model: endpoint.api_model,
             context_length: endpoint.context_length,
+            remote_compaction_mode: RemoteCompactionMode::Disabled,
             supports_tool_lazy_loading: endpoint.supports_tool_lazy_loading,
             supported_reasoning_efforts: endpoint.supported_reasoning_efforts,
             reasoning_param_format: endpoint.reasoning_param_format,
@@ -1058,6 +1091,23 @@ fn write_custom_providers_file(providers: &[CustomProvider]) -> Result<(), Strin
     std::fs::write(&path, json).map_err(|e| format!("Failed to save custom providers: {e}"))
 }
 
+fn migrate_custom_providers_file(file: &mut CustomProvidersFile) -> bool {
+    if file.version >= CUSTOM_PROVIDERS_FILE_VERSION {
+        return false;
+    }
+
+    // v2 had no remote-compaction capability. Persist the explicit disabled
+    // value so the migration is repeatable and does not depend on serde's
+    // in-memory default after the first successful load.
+    for provider in &mut file.providers {
+        for model in &mut provider.models {
+            model.remote_compaction_mode = RemoteCompactionMode::Disabled;
+        }
+    }
+    file.version = CUSTOM_PROVIDERS_FILE_VERSION;
+    true
+}
+
 /// Load providers (keys NOT filled in). Lazily migrates custom_endpoints.json
 /// on first read; the legacy file is left in place so downgrades still work.
 pub(crate) fn load_custom_providers() -> Result<Vec<CustomProvider>, String> {
@@ -1067,8 +1117,12 @@ pub(crate) fn load_custom_providers() -> Result<Vec<CustomProvider>, String> {
             .map_err(|e| format!("Failed to read custom providers: {e}"))?;
         let mut file: CustomProvidersFile = serde_json::from_str(&json)
             .map_err(|e| format!("Failed to parse custom providers: {e}"))?;
+        let migrated = migrate_custom_providers_file(&mut file);
         for provider in &mut file.providers {
             normalize_custom_provider_config(provider);
+        }
+        if migrated {
+            write_custom_providers_file(&file.providers)?;
         }
         return Ok(file.providers);
     }
@@ -1216,6 +1270,18 @@ pub async fn get_debug_mode(
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<bool, AppError> {
     Ok(config.debug_enabled())
+}
+
+#[tauri::command]
+pub fn debug_webview_bridge_heartbeat(
+    heartbeat: crate::cdp_debug::FrontendBridgeHeartbeat,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+    diagnostics: State<'_, Arc<crate::cdp_debug::CdpDebugServerHandle>>,
+) -> Result<(), AppError> {
+    if config.debug_enabled() {
+        diagnostics.record_frontend_heartbeat(heartbeat);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3015,15 +3081,16 @@ mod tests {
     use super::{
         collect_dir_entries, collect_dir_entries_with_hidden,
         default_provider_prefix_cache_ttl_seconds, is_stale_custom_model_ref,
-        migrate_endpoint_to_provider, normalize_custom_endpoint_config,
-        normalize_custom_provider_config, normalize_tool_permission_mode_request,
-        normalize_workspace_sub_path, resolve_workspace_dir_target,
-        rewrite_legacy_custom_model_ref, search_workspace_entries_in_dir,
-        search_workspace_entries_in_dir_with_hidden, unity_checkout_connection_status,
-        unity_connection_flags, valid_custom_model_refs, workspace_entry_stat_for_path,
-        workspace_search_score, ApiFormat, CodexModelConfig, CodexTransportMode, CustomEndpoint,
-        CustomProvider, CustomProviderModel, ModelDefaults, DEFAULT_CODEX_CONTEXT_WINDOW,
-        DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
+        migrate_custom_providers_file, migrate_endpoint_to_provider,
+        normalize_custom_endpoint_config, normalize_custom_provider_config,
+        normalize_tool_permission_mode_request, normalize_workspace_sub_path,
+        resolve_workspace_dir_target, rewrite_legacy_custom_model_ref,
+        search_workspace_entries_in_dir, search_workspace_entries_in_dir_with_hidden,
+        unity_checkout_connection_status, unity_connection_flags, valid_custom_model_refs,
+        workspace_entry_stat_for_path, workspace_search_score, ApiFormat, CodexModelConfig,
+        CodexTransportMode, CustomEndpoint, CustomProvider, CustomProviderModel,
+        CustomProvidersFile, ModelDefaults, RemoteCompactionMode, CUSTOM_PROVIDERS_FILE_VERSION,
+        DEFAULT_CODEX_CONTEXT_WINDOW, DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS,
     };
     use std::collections::HashSet;
     use std::path::Path;
@@ -3588,6 +3655,7 @@ mod tests {
         assert_eq!(model.id, "deepseek-chat");
         assert_eq!(model.api_model, "deepseek-chat");
         assert_eq!(model.context_length, 131_072);
+        assert_eq!(model.remote_compaction_mode, RemoteCompactionMode::Disabled);
         assert!(!model.supports_tool_lazy_loading);
         assert_eq!(
             model.supported_reasoning_efforts,
@@ -3603,6 +3671,69 @@ mod tests {
         let provider = migrate_endpoint_to_provider(legacy_endpoint("ep-2", "zai-org/GLM-5.2"));
         assert_eq!(provider.models[0].id, "zai-org-GLM-5.2");
         assert_eq!(provider.models[0].api_model, "zai-org/GLM-5.2");
+    }
+
+    #[test]
+    fn v2_custom_provider_file_migrates_remote_compaction_to_explicit_disabled() {
+        let mut file: CustomProvidersFile = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "providers": [{
+                "id": "cpa",
+                "name": "CPA",
+                "endpoint": "http://192.168.0.2:8317/v1",
+                "apiFormat": "openai_responses",
+                "models": [{
+                    "id": "gpt-5.6-sol",
+                    "apiModel": "gpt-5.6-sol",
+                    "name": "GPT-5.6 Sol",
+                    "contextLength": 272000
+                }]
+            }]
+        }))
+        .expect("parse v2 custom providers");
+
+        assert!(migrate_custom_providers_file(&mut file));
+        assert_eq!(file.version, CUSTOM_PROVIDERS_FILE_VERSION);
+        assert_eq!(
+            file.providers[0].models[0].remote_compaction_mode,
+            RemoteCompactionMode::Disabled
+        );
+        let persisted = serde_json::to_value(&file).expect("serialize migrated providers");
+        assert_eq!(
+            persisted["providers"][0]["models"][0]["remoteCompactionMode"],
+            serde_json::json!("disabled")
+        );
+        assert!(!migrate_custom_providers_file(&mut file));
+        assert_eq!(
+            serde_json::to_value(RemoteCompactionMode::CodexV2).expect("serialize Codex V2 mode"),
+            serde_json::json!("codex_v2")
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_provider_forces_reasoning_replay_and_infers_its_field() {
+        let mut provider: CustomProvider = serde_json::from_value(serde_json::json!({
+            "id": "deepseek",
+            "name": "DeepSeek",
+            "endpoint": "https://api.deepseek.com/anthropic/v1",
+            "apiFormat": "anthropic_messages",
+            "models": [{
+                "id": "deepseek-v4-pro",
+                "apiModel": "deepseek-v4-pro",
+                "name": "DeepSeek V4 Pro",
+                "replayReasoningContent": false
+            }]
+        }))
+        .expect("parse DeepSeek provider");
+
+        normalize_custom_provider_config(&mut provider);
+
+        let model = &provider.models[0];
+        assert_eq!(model.replay_reasoning_content, Some(true));
+        assert_eq!(
+            model.reasoning_replay_field,
+            Some(super::ReasoningReplayField::ReasoningContent)
+        );
     }
 
     fn provider_with_models(id: &str, model_ids: &[&str]) -> CustomProvider {
@@ -3621,6 +3752,7 @@ mod tests {
                     api_model: mid.to_string(),
                     name: mid.to_string(),
                     context_length: 128_000,
+                    remote_compaction_mode: RemoteCompactionMode::Disabled,
                     supports_tool_lazy_loading: false,
                     supported_reasoning_efforts: vec!["high".to_string()],
                     reasoning_param_format: None,

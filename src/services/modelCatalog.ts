@@ -27,12 +27,35 @@ export function defaultReasoningParamFormat(apiFormat: ApiFormat): ReasoningPara
   }
 }
 
+/** DeepSeek V4 requires its reasoning payload on every later tool-enabled turn. */
+export function isDeepSeekV4Model(
+  model: Pick<CustomProviderModel, "apiModel" | "catalogModelId">,
+): boolean {
+  return [model.apiModel, model.catalogModelId]
+    .some((value) => value?.trim().toLowerCase().startsWith("deepseek-v4-"));
+}
+
+export function inferredReasoningReplayField(
+  model: Pick<CustomProviderModel, "apiModel" | "catalogModelId" | "reasoningReplayField">,
+): ReasoningReplayField | null {
+  return model.reasoningReplayField ?? (isDeepSeekV4Model(model) ? "reasoning_content" : null);
+}
+
+export function defaultReplayReasoningContent(
+  apiFormat: ApiFormat,
+  model: Pick<CustomProviderModel, "apiModel" | "catalogModelId" | "reasoningReplayField">,
+): boolean {
+  if (apiFormat === "openai_responses") return false;
+  return apiFormat === "openai_chat" || isDeepSeekV4Model(model);
+}
+
 export function newCustomProviderModel(): CustomProviderModel {
   return {
     id: "",
     apiModel: "",
     name: "",
     contextLength: DEFAULT_CATALOG_CONTEXT_LENGTH,
+    remoteCompactionMode: "disabled",
     supportsToolLazyLoading: false,
     supportedReasoningEfforts: [...DEFAULT_REASONING_EFFORTS],
     reasoningParamFormat: null,
@@ -225,17 +248,24 @@ export function catalogModelToProviderModel(
   const reasoningParamFormat = catalogReasoningParamFormat(providerId, model, apiFormat);
   const replayField = catalogReplayField(model);
   const efforts = effortsFromCatalog(model);
+  const modelIdentity = {
+    apiModel: catalogModelId,
+    catalogModelId,
+    reasoningReplayField: replayField,
+  };
   return {
     id: modelRowIdFromApiModel(catalogModelId),
     apiModel: catalogModelId,
     name: model.name || catalogModelId,
     contextLength: model.limit.context > 0 ? model.limit.context : DEFAULT_CATALOG_CONTEXT_LENGTH,
+    remoteCompactionMode: "disabled",
     supportsToolLazyLoading: false,
     supportedReasoningEfforts: efforts,
     reasoningParamFormat,
-    replayReasoningContent:
-      apiFormat === "openai_chat" && replayField !== null ? true : undefined,
-    reasoningReplayField: replayField,
+    replayReasoningContent: replayField !== null || defaultReplayReasoningContent(apiFormat, modelIdentity)
+      ? true
+      : undefined,
+    reasoningReplayField: inferredReasoningReplayField(modelIdentity),
     serverTools: { webSearch: false },
     supportsVision: catalogModelSupportsVision(model),
     catalogModelId,

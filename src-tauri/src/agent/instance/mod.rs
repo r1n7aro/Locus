@@ -16,6 +16,7 @@ pub(crate) use backend::{
 
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
@@ -4316,6 +4317,10 @@ impl AgentInstance {
     /// silently hiding them.
     async fn resolve_configured_tool_names(&self) -> Vec<String> {
         let mut tools = self.def.tools.clone();
+        if crate::unity_editor_lock::is_enabled() {
+            push_unique_tool_name(&mut tools, "unity_lock");
+            push_unique_tool_name(&mut tools, "unity_release");
+        }
         for tool_name in self.tool_registry.skill_tool_names() {
             push_unique_tool_name(&mut tools, &tool_name);
         }
@@ -4376,6 +4381,15 @@ impl AgentInstance {
         }
 
         match name {
+            "unity_lock" | "unity_release" if !crate::unity_editor_lock::is_enabled() => {
+                Some("unity_multi_agent_editor_disabled")
+            }
+            "unity_lock" | "unity_release"
+                if !self.has_selected_working_dir()
+                    || !crate::unity_bridge::is_unity_project(&self.working_dir) =>
+            {
+                Some("requires_unity_workspace")
+            }
             "knowledge_query" | "create_skill_package" | "skill_list" => {
                 if !self.has_selected_working_dir() {
                     Some("requires_workspace")
@@ -4531,6 +4545,7 @@ impl AgentInstance {
     /// per agent.
     fn can_toggle_enabled_tool(&self, name: &str) -> bool {
         !Self::is_meta_tool(name)
+            && !matches!(name, "unity_lock" | "unity_release")
             && (self.tool_registry.is_built_in(name) || Self::is_mcp_wire_tool(name))
             && matches!(
                 self.default_tool_load_mode(name),
@@ -4601,6 +4616,7 @@ impl AgentInstance {
     fn can_configure_direct_load_tool(&self, name: &str) -> bool {
         !self.disables_tool_load_configuration()
             && !Self::is_meta_tool(name)
+            && !matches!(name, "unity_lock" | "unity_release")
             && (self.tool_registry.is_built_in(name) || Self::is_mcp_wire_tool(name))
             && matches!(
                 self.default_tool_load_mode(name),
@@ -4907,14 +4923,36 @@ impl AgentInstance {
         }
     }
 
+    fn uses_codex_remote_compaction(&self) -> bool {
+        match &self.backend {
+            LlmBackend::OpenAiCodex { .. } => true,
+            LlmBackend::Custom {
+                api_format: crate::commands::ApiFormat::OpenaiResponses,
+                remote_compaction_mode: crate::commands::RemoteCompactionMode::CodexV2,
+                ..
+            } => true,
+            _ => false,
+        }
+    }
+
     /// Context-window budgets for the active backend/model. Codex models use
     /// the same raw-window/effective-window distinction as codex-rs so their
     /// auto-compaction threshold can be resolved independently.
     fn context_limits(&self) -> RuntimeContextLimits {
         match &self.backend {
-            LlmBackend::Custom { context_length, .. } => RuntimeContextLimits {
+            LlmBackend::Custom {
+                context_length,
+                api_format,
+                remote_compaction_mode,
+                ..
+            } => RuntimeContextLimits {
                 effective_context_window: *context_length,
-                codex_auto_compact_token_limit: None,
+                codex_auto_compact_token_limit: (api_format
+                    == &crate::commands::ApiFormat::OpenaiResponses
+                    && *remote_compaction_mode == crate::commands::RemoteCompactionMode::CodexV2)
+                    .then(|| {
+                        compact::codex_auto_compact_token_limit_from_raw_window(*context_length)
+                    }),
             },
             LlmBackend::OpenAiCodex { .. } => {
                 let config = crate::commands::load_codex_model_config().unwrap_or_default();
@@ -5671,15 +5709,35 @@ impl AgentInstance {
                 )
             }
         };
-        // Model, reasoning effort, and Codex service tier all select a new
-        // remote prompt-cache route. Once any of them changes, preserving the
-        // locally synthesized prefix can no longer retain a server cache hit,
-        // so let the next turn rebuild the system prompt immediately.
+        // Model, reasoning effort, Codex service tier, and workspace prompt
+        // inputs all select a new prompt-prefix identity. Once any of them
+        // changes, rebuild the locally synthesized prefix on the next turn.
+        let extra_workdirs_prompt = if self.has_selected_working_dir() {
+            let injection_config = crate::commands::load_agent_injection_config_layers(
+                self.app_agent_dir.as_ref(),
+                &self.working_dir,
+                &self.def.id,
+            );
+            injection_config
+                .state("extra_workdirs")
+                .enabled
+                .then(|| crate::extra_workdirs::build_env_prompt_block(&self.working_dir))
+                .flatten()
+        } else {
+            None
+        };
+        let extra_workdirs_fingerprint = extra_workdirs_prompt.as_deref().map(|content| {
+            Sha256::digest(content.as_bytes())
+                .iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<String>()
+        });
         let cache_key = serde_json::json!({
             "provider": provider_key.as_str(),
             "model": self.effective_model.as_str(),
             "effort": self.effort.as_deref(),
             "fastMode": self.codex_fast_mode,
+            "extraWorkdirs": extra_workdirs_fingerprint,
         })
         .to_string();
         PromptPrefixCachePolicy {
@@ -8223,6 +8281,13 @@ impl AgentInstance {
             return;
         }
 
+        if crate::unity_editor_lock::release_for_session(&self.working_dir, &self.session_id) {
+            eprintln!(
+                "[Agent {}] released Unity Editor cooperative lock during run cleanup for {}",
+                self.id, self.session_id
+            );
+        }
+
         match crate::unity_bridge::end_edit_session(&self.working_dir, &self.session_id).await {
             Ok(_) => {}
             Err(e) => {
@@ -8525,6 +8590,7 @@ impl AgentInstance {
                 api_model,
                 endpoint,
                 api_format,
+                remote_compaction_mode,
                 supported_reasoning_efforts,
                 reasoning_param_format,
                 replay_reasoning_content,
@@ -8616,6 +8682,13 @@ impl AgentInstance {
                     }
                     ApiFormat::OpenaiResponses => {
                         let system_prompt = system_parts.join("\n\n");
+                        let response_request_metadata = if *remote_compaction_mode
+                            == crate::commands::RemoteCompactionMode::CodexV2
+                        {
+                            Some(store.get_response_request_metadata(&self.session_id)?)
+                        } else {
+                            None
+                        };
                         let reasoning_effort = matches!(
                             reasoning_param_format,
                             CustomReasoningParamFormat::OpenaiResponsesReasoningEffort
@@ -8634,6 +8707,7 @@ impl AgentInstance {
                             request_options.max_output_tokens,
                             self.debug,
                             Some(&self.session_id),
+                            response_request_metadata.as_ref(),
                             on_text_delta,
                             on_thinking_delta,
                             on_tool_call_start,
@@ -9091,10 +9165,9 @@ impl AgentInstance {
         context_tokens
     }
 
-    /// Default compaction path for the OpenAI Codex subscription backend,
-    /// aligned with codex-rs Remote Compaction V2: a streaming `POST /responses`
-    /// request ending in `compaction_trigger`. The canonical opaque output is
-    /// stored on the handoff message and replayed by later Codex requests.
+    /// Canonical Codex Remote Compaction V2 path. Subscription Codex keeps its
+    /// configured transport; opted-in custom Responses models force HTTP.
+    /// Both persist the opaque provider window for later replay.
     async fn execute_codex_remote_compact(
         &self,
         app_handle: &AppHandle,
@@ -9107,14 +9180,9 @@ impl AgentInstance {
         trigger: crate::commands::CompactTrigger,
         iteration: usize,
     ) -> Result<Option<u32>, String> {
-        let LlmBackend::OpenAiCodex {
-            auth,
-            transport,
-            base_url,
-        } = &self.backend
-        else {
+        if !self.uses_codex_remote_compaction() {
             return Ok(None);
-        };
+        }
 
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         if messages.len() < 2 {
@@ -9144,8 +9212,6 @@ impl AgentInstance {
         );
         let response_request_metadata = store.get_response_request_metadata(&self.session_id)?;
         let system_prompt = system_parts.join("\n\n");
-        let model_name = &self.effective_model;
-        let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
 
         emit_stream(
             app_handle,
@@ -9158,35 +9224,18 @@ impl AgentInstance {
             },
         );
 
-        let (access_token, account_id) = resolve_codex_request_auth(auth, false)
-            .await
-            .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
-        let compact_result = match codex::compact_conversation_history_v2(
-            &access_token,
-            account_id.as_deref(),
-            *transport,
-            base_url.as_deref(),
-            actual_model,
-            &system_prompt,
-            &prepared,
-            &api_tools,
-            self.effort.as_deref(),
-            self.codex_fast_mode,
-            Some(&self.session_id),
-            Some(&response_request_metadata),
-            self.debug,
-        )
-        .await
-        {
-            Ok(outcome) => Ok(outcome),
-            Err(error) if is_codex_unauthorized_error(&error.message) => {
-                eprintln!(
-                    "[OpenAI Codex] compact received unauthorized response, refreshing auth and retrying once"
-                );
-                let (access_token, account_id) = resolve_codex_request_auth(auth, true)
+        let compact_result = match &self.backend {
+            LlmBackend::OpenAiCodex {
+                auth,
+                transport,
+                base_url,
+            } => {
+                let model_name = &self.effective_model;
+                let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
+                let (access_token, account_id) = resolve_codex_request_auth(auth, false)
                     .await
-                    .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
-                codex::compact_conversation_history_v2(
+                    .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
+                match codex::compact_conversation_history_v2(
                     &access_token,
                     account_id.as_deref(),
                     *transport,
@@ -9202,8 +9251,61 @@ impl AgentInstance {
                     self.debug,
                 )
                 .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(error) if is_codex_unauthorized_error(&error.message) => {
+                        eprintln!(
+                            "[OpenAI Codex] compact received unauthorized response, refreshing auth and retrying once"
+                        );
+                        let (access_token, account_id) = resolve_codex_request_auth(auth, true)
+                            .await
+                            .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
+                        codex::compact_conversation_history_v2(
+                            &access_token,
+                            account_id.as_deref(),
+                            *transport,
+                            base_url.as_deref(),
+                            actual_model,
+                            &system_prompt,
+                            &prepared,
+                            &api_tools,
+                            self.effort.as_deref(),
+                            self.codex_fast_mode,
+                            Some(&self.session_id),
+                            Some(&response_request_metadata),
+                            self.debug,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
-            Err(error) => Err(error),
+            LlmBackend::Custom {
+                api_key,
+                api_model,
+                endpoint,
+                api_format: crate::commands::ApiFormat::OpenaiResponses,
+                remote_compaction_mode: crate::commands::RemoteCompactionMode::CodexV2,
+                ..
+            } => {
+                codex::compact_conversation_history_v2(
+                    api_key,
+                    None,
+                    crate::commands::CodexTransportMode::Http,
+                    Some(endpoint.as_str()),
+                    api_model,
+                    &system_prompt,
+                    &prepared,
+                    &api_tools,
+                    self.effort.as_deref(),
+                    false,
+                    Some(&self.session_id),
+                    Some(&response_request_metadata),
+                    self.debug,
+                )
+                .await
+            }
+            _ => return Ok(None),
         };
 
         let outcome = match compact_result {
@@ -9335,11 +9437,9 @@ impl AgentInstance {
         iteration: usize,
     ) -> Result<Option<u32>, String> {
         let trigger = compact_trigger(force_compact, attempt_kind);
-        // Codex subscription sessions require the canonical remote compaction
-        // window. A local checkpoint is a different protocol and cannot safely
-        // replace opaque Codex provider state, so any remote failure must stop
-        // the run with the original prompt left intact.
-        if matches!(self.backend, LlmBackend::OpenAiCodex { .. }) {
+        // Codex protocol routes require the canonical remote compaction window.
+        // Any remote failure stops the run with the original prompt left intact.
+        if self.uses_codex_remote_compaction() {
             return self
                 .execute_codex_remote_compact(
                     app_handle,
@@ -10268,6 +10368,11 @@ impl AgentInstance {
         }
     }
 
+    fn unity_test_cancellation_failed(output: &str) -> bool {
+        output.contains("Unity Test cancellation ")
+            && (output.contains("unavailable:") || output.contains("failed:"))
+    }
+
     pub fn persist_interrupted_assistant_snapshot(
         store: &SessionStore,
         session_id: &str,
@@ -10623,11 +10728,16 @@ impl AgentInstance {
                 status = crate::unity_bridge::query_unity_status(&self.working_dir) => Some(status),
                 _ = cancel_rx.changed() => None,
             };
-            let Some((_connected, status, active_scene)) = probed_status else {
+            let Some((_connected, pipe_status, active_scene)) = probed_status else {
                 self.emit_cancelled(app_handle, store, &run_id, None);
                 return Ok(String::new());
             };
-            let current_state = (status.to_string(), active_scene.clone());
+            let semantic = crate::unity_bridge::unity_semantic_state(&self.working_dir).await;
+            let status = match semantic.phase.as_str() {
+                "safe_mode" | "crashed" => semantic.phase.clone(),
+                _ => pipe_status.to_string(),
+            };
+            let current_state = (status.clone(), active_scene.clone());
 
             let mut state_map = session_unity_state().lock().await;
             let prev = state_map.get(&self.session_id);
@@ -10650,14 +10760,18 @@ impl AgentInstance {
             };
 
             if let Some(marker) = announcement_marker {
-                let status_text = crate::unity_bridge::format_editor_status_for_event(status);
-                let scene_info = active_scene
+                let status_text = crate::unity_bridge::format_editor_status_for_event(&status);
+                let mut context_info = active_scene
                     .as_deref()
                     .map(|s| format!(", Active Scene: {}", s))
                     .unwrap_or_default();
+                if let Some(log_path) = semantic.editor_log.path.as_deref() {
+                    context_info.push_str(", Editor Log: ");
+                    context_info.push_str(log_path);
+                }
                 actual_user_text = format!(
                     "{} Unity Editor Status: {}{}\n\n{}",
-                    marker, status_text, scene_info, user_text
+                    marker, status_text, context_info, user_text
                 );
             } else {
                 actual_user_text = user_text.to_string();
@@ -10965,7 +11079,7 @@ impl AgentInstance {
                 estimated_input_tokens,
                 compact::auto_compact_buffer(ctx_limit),
             );
-            let is_codex_backend = matches!(self.backend, LlmBackend::OpenAiCodex { .. });
+            let is_codex_backend = self.uses_codex_remote_compaction();
             let codex_auto_compact_token_limit = runtime_context_limits
                 .codex_auto_compact_token_limit
                 .unwrap_or_else(|| compact::codex_auto_compact_token_limit(ctx_limit));
@@ -13295,6 +13409,8 @@ impl AgentInstance {
                 | "list"
                 | "ask_user_question"
                 | "todowrite"
+                | "unity_lock"
+                | "unity_release"
                 | "unity_ref_search"
                 | "unity_asset_search"
                 | "unity_capture_viewport"
@@ -15094,8 +15210,7 @@ impl AgentInstance {
             };
 
             let cancellation_failed = tool_name == "unity_test_run"
-                && result.output.contains("Unity Test cancellation ")
-                && (result.output.contains("unavailable:") || result.output.contains("failed:"));
+                && Self::unity_test_cancellation_failed(&result.output);
             let was_cancelled = result.outcome == ToolRunOutcome::Interrupted
                 || (*cancel_rx.borrow() && !cancellation_failed);
 
@@ -15399,11 +15514,21 @@ impl AgentInstance {
                         .diagnostic_json()
                         .map(|json| format!(" diagnostic={json}"))
                         .unwrap_or_default();
+                    let output = format!(
+                        "Tool '{}' service binding error: {}{}",
+                        tc.name, error, diagnostic
+                    );
+                    let output = if owner == crate::workspace_service::ServiceKind::Unity {
+                        crate::unity_bridge::enrich_unity_tool_error(
+                            &execution.root().to_string_lossy(),
+                            &output,
+                        )
+                        .await
+                    } else {
+                        output
+                    };
                     return ExecutedToolResult::from_tool_result(ToolResult {
-                        output: format!(
-                            "Tool '{}' service binding error: {}{}",
-                            tc.name, error, diagnostic
-                        ),
+                        output,
                         is_error: true,
                     });
                 }
@@ -15654,11 +15779,20 @@ impl AgentInstance {
         // synchronous progress emit exhausted Tokio's 2 MiB worker stack.
         // Boxing here also prevents the Unity future from inflating this
         // preflight future's state and poll frame.
-        if tc.name == "unity_execute" {
-            return Box::pin(self.execute_unity_execute(app_handle, &tc.id, args, run_id)).await;
+        let mut result = if tc.name == "unity_execute" {
+            Box::pin(self.execute_unity_execute(app_handle, &tc.id, args, run_id)).await
+        } else {
+            Box::pin(self.execute_single_tool_dispatch(app_handle, store, tc, args, run_id)).await
+        };
+        if result.is_error
+            && crate::workspace_service::service::owner_service_for_tool(&tc.name)
+                == Some(crate::workspace_service::ServiceKind::Unity)
+        {
+            result.output =
+                crate::unity_bridge::enrich_unity_tool_error(&self.working_dir, &result.output)
+                    .await;
         }
-
-        Box::pin(self.execute_single_tool_dispatch(app_handle, store, tc, args, run_id)).await
+        result
     }
 
     async fn execute_single_tool_dispatch(
@@ -15884,13 +16018,26 @@ impl AgentInstance {
                     );
                 }));
             }
-            let mut result = self
-                .await_tool_result(Box::pin(self.tool_registry.execute_with_context(
+            let mut result = if tc.name == "unity_test_run" {
+                let tool_result = self
+                    .tool_registry
+                    .execute_with_context(&tc.name, args, tool_context)
+                    .await;
+                if self.is_cancel_requested()
+                    && !Self::unity_test_cancellation_failed(&tool_result.output)
+                {
+                    Self::interrupted_tool_result()
+                } else {
+                    ExecutedToolResult::from_tool_result(tool_result)
+                }
+            } else {
+                self.await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                     &tc.name,
                     args,
                     tool_context,
                 )))
-                .await;
+                .await
+            };
 
             if result.outcome == ToolRunOutcome::Done
                 && bash_git_knowledge_assessment
@@ -23224,6 +23371,36 @@ PrefabInstance:
         assert_ne!(changed_fast_mode.cache_key, initial.cache_key);
     }
 
+    #[test]
+    fn prompt_prefix_cache_identity_tracks_extra_workdir_prompt() {
+        let root = tempdir().expect("create root");
+        let workspace = root.path().join("workspace");
+        let attached = root.path().join("art-source");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&attached).expect("create attached directory");
+        let workspace = workspace.to_string_lossy().to_string();
+        let attached = attached.to_string_lossy().to_string();
+        let instance = test_agent_instance(workspace.clone());
+
+        let without_attachment = instance.prompt_prefix_cache_policy();
+        crate::extra_workdirs::save_entries(
+            &workspace,
+            &[crate::extra_workdirs::ExtraWorkdirEntry {
+                path: attached,
+                comment: "source art".to_string(),
+                read_only: true,
+            }],
+        )
+        .expect("save extra workdirs");
+        let with_attachment = instance.prompt_prefix_cache_policy();
+
+        assert_eq!(
+            with_attachment.provider_key,
+            without_attachment.provider_key
+        );
+        assert_ne!(with_attachment.cache_key, without_attachment.cache_key);
+    }
+
     #[tokio::test]
     async fn route_change_refreshes_the_cached_system_prompt() {
         let workspace = tempdir().expect("create workspace");
@@ -23382,6 +23559,7 @@ PrefabInstance:
             endpoint: "https://example.com/v1".to_string(),
             api_format: crate::commands::ApiFormat::OpenaiChat,
             context_length: 256_000,
+            remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
             supports_tool_lazy_loading: false,
             supported_reasoning_efforts: Vec::new(),
             reasoning_param_format:
@@ -23391,6 +23569,56 @@ PrefabInstance:
             server_tools: crate::commands::CustomEndpointServerTools::default(),
             supports_vision,
         }
+    }
+
+    #[test]
+    fn custom_responses_codex_v2_enables_remote_route_at_ninety_percent() {
+        let workspace = tempdir().expect("workspace");
+        let mut instance = test_agent_instance(workspace.path().to_string_lossy().to_string());
+        let backend =
+            |api_format, remote_compaction_mode| crate::agent::instance::LlmBackend::Custom {
+                api_key: "cpa-key".to_string(),
+                api_model: "gpt-5.6-sol".to_string(),
+                endpoint: "http://192.168.0.2:8317/v1".to_string(),
+                api_format,
+                context_length: 272_000,
+                remote_compaction_mode,
+                supports_tool_lazy_loading: false,
+                supported_reasoning_efforts: vec!["high".to_string()],
+                reasoning_param_format:
+                    crate::commands::CustomReasoningParamFormat::OpenaiResponsesReasoningEffort,
+                replay_reasoning_content: false,
+                reasoning_replay_field: None,
+                server_tools: Default::default(),
+                supports_vision: true,
+            };
+
+        instance.backend = backend(
+            crate::commands::ApiFormat::OpenaiResponses,
+            crate::commands::RemoteCompactionMode::CodexV2,
+        );
+        assert!(instance.uses_codex_remote_compaction());
+        assert_eq!(instance.context_limit(), 272_000);
+        assert_eq!(
+            instance.context_limits().codex_auto_compact_token_limit,
+            Some(244_800)
+        );
+
+        instance.backend = backend(
+            crate::commands::ApiFormat::OpenaiResponses,
+            crate::commands::RemoteCompactionMode::Disabled,
+        );
+        assert!(!instance.uses_codex_remote_compaction());
+        assert_eq!(
+            instance.context_limits().codex_auto_compact_token_limit,
+            None
+        );
+
+        instance.backend = backend(
+            crate::commands::ApiFormat::OpenaiChat,
+            crate::commands::RemoteCompactionMode::CodexV2,
+        );
+        assert!(!instance.uses_codex_remote_compaction());
     }
 
     fn noop_tool(name: &str) -> ToolDef {
@@ -23821,6 +24049,7 @@ PrefabInstance:
                 endpoint: "https://api.deepseek.com/anthropic/v1".to_string(),
                 api_format,
                 context_length: 256_000,
+                remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
                 supports_tool_lazy_loading: lazy,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -24324,6 +24553,7 @@ PrefabInstance:
                 endpoint: "https://example.com/v1".to_string(),
                 api_format: crate::commands::ApiFormat::OpenaiChat,
                 context_length: 256_000,
+                remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
                 supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -24426,6 +24656,7 @@ PrefabInstance:
                 endpoint: "https://example.com/v1".to_string(),
                 api_format: crate::commands::ApiFormat::OpenaiResponses,
                 context_length: 256_000,
+                remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
                 supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -24510,6 +24741,7 @@ PrefabInstance:
                 endpoint: "https://example.com/v1".to_string(),
                 api_format: crate::commands::ApiFormat::OpenaiResponses,
                 context_length: 256_000,
+                remote_compaction_mode: crate::commands::RemoteCompactionMode::Disabled,
                 supports_tool_lazy_loading: false,
                 supported_reasoning_efforts: Vec::new(),
                 reasoning_param_format:
@@ -28093,6 +28325,22 @@ Search, install, audit, and export a plugin.
         assert!(!AgentInstance::tool_context_requires_unity_probe(
             "grep",
             &serde_json::json!({ "filePath": "Assets/Scenes/Main.unity" }),
+        ));
+    }
+
+    #[test]
+    fn unity_test_interrupt_waits_for_cancellation_cleanup_failures() {
+        assert!(!AgentInstance::unity_test_cancellation_failed(
+            "Unity Test run run-1 stopped with status cancelled"
+        ));
+        assert!(!AgentInstance::unity_test_cancellation_failed(
+            "Unity Test cancellation queued for run run-1"
+        ));
+        assert!(AgentInstance::unity_test_cancellation_failed(
+            "Unity Test cancellation unavailable: cancellation API missing"
+        ));
+        assert!(AgentInstance::unity_test_cancellation_failed(
+            "Unity Test cancellation failed: run run-1 did not stop within 30s"
         ));
     }
 

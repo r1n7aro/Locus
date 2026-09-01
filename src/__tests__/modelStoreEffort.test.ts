@@ -277,6 +277,7 @@ describe("useModelStore OpenAI effort mapping", () => {
         apiModel: "gpt-5.1-codex-mini",
         name: "gpt-5.1-codex-mini",
         contextLength: 256000,
+        remoteCompactionMode: "disabled",
         supportsToolLazyLoading: false,
         supportedReasoningEfforts: ["medium", "high"],
         reasoningParamFormat: "openai_responses_reasoning_effort",
@@ -306,6 +307,7 @@ describe("useModelStore OpenAI effort mapping", () => {
         apiModel: "deepseek-v4-pro",
         name: "deepseek-v4-pro",
         contextLength: 256000,
+        remoteCompactionMode: "disabled",
         supportsToolLazyLoading: false,
         reasoningParamFormat: "openai_chat_reasoning_effort",
         replayReasoningContent: true,
@@ -336,6 +338,7 @@ describe("useModelStore OpenAI effort mapping", () => {
         apiModel: "deepseek-v4-pro",
         name: "deepseek-v4-pro",
         contextLength: 256000,
+        remoteCompactionMode: "disabled",
         supportsToolLazyLoading: false,
         supportedReasoningEfforts: ["low", "medium", "high", "max"],
         reasoningParamFormat: "openai_chat_reasoning_effort",
@@ -380,13 +383,13 @@ describe("useModelStore OpenAI effort mapping", () => {
     const authStore = useAuthStore();
     authStore.codexAuthenticated = true;
     modelServiceMocks.getAgentModelPreferences.mockResolvedValue({
-      dev: { modelId: "openai/gpt-5.6-terra", effort: "xhigh" },
+      unity: { modelId: "openai/gpt-5.6-terra", effort: "xhigh" },
       explorer: { modelId: "openai/gpt-5.6-luna", effort: "low" },
     });
     const modelStore = useModelStore();
     await modelStore.loadAgentModelPreferences();
 
-    modelStore.activateAgentPreference("dev", "medium", true);
+    modelStore.activateAgentPreference("unity", "medium", true);
     expect(modelStore.selectedModelId).toBe("openai/gpt-5.6-terra");
     expect(modelStore.effort).toBe("xhigh");
 

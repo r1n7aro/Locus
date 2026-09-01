@@ -23,6 +23,7 @@ pub async fn stream_chat<F, G, H>(
     max_output_tokens: Option<u32>,
     debug: bool,
     session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     on_text_delta: F,
     on_thinking_delta: G,
     on_tool_call_start: H,
@@ -38,7 +39,7 @@ where
             .connect_timeout(std::time::Duration::from_secs(30)),
     )?;
 
-    let body = build_request_body(
+    let body = build_request_body_with_metadata(
         model,
         system_prompt,
         history,
@@ -48,6 +49,7 @@ where
         max_output_tokens,
         session_id,
         supports_previous_response_id(base_url),
+        response_request_metadata,
     );
 
     let raw_request = serde_json::to_string_pretty(&body).unwrap_or_default();
@@ -236,7 +238,7 @@ where
     })
 }
 
-fn build_request_body(
+fn build_request_body_with_metadata(
     model: &str,
     system_prompt: &str,
     history: &[ChatMessage],
@@ -246,8 +248,13 @@ fn build_request_body(
     max_output_tokens: Option<u32>,
     session_id: Option<&str>,
     use_previous_response_id: bool,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
 ) -> serde_json::Value {
-    let request_input = build_request_input(history, use_previous_response_id);
+    let request_input = build_request_input_with_metadata(
+        history,
+        use_previous_response_id && response_request_metadata.is_none(),
+        response_request_metadata,
+    );
 
     let mut body = serde_json::json!({
         "model": model,
@@ -304,16 +311,49 @@ fn build_request_body(
     body
 }
 
+#[cfg(test)]
+fn build_request_body(
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking_level: Option<&str>,
+    explicit_reasoning_effort: Option<&str>,
+    max_output_tokens: Option<u32>,
+    session_id: Option<&str>,
+    use_previous_response_id: bool,
+) -> serde_json::Value {
+    build_request_body_with_metadata(
+        model,
+        system_prompt,
+        history,
+        tools,
+        thinking_level,
+        explicit_reasoning_effort,
+        max_output_tokens,
+        session_id,
+        use_previous_response_id,
+        None,
+    )
+}
+
 struct RequestInput {
     input: Vec<serde_json::Value>,
     previous_response_id: Option<String>,
 }
 
-fn build_request_input(history: &[ChatMessage], use_previous_response_id: bool) -> RequestInput {
+fn build_request_input_with_metadata(
+    history: &[ChatMessage],
+    use_previous_response_id: bool,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> RequestInput {
     if use_previous_response_id {
         if let Some((previous_response_id, start_index)) = find_previous_response_tail(history) {
             if start_index < history.len() {
-                let input = build_input_messages(&history[start_index..]);
+                let input = build_input_messages_with_metadata(
+                    &history[start_index..],
+                    response_request_metadata,
+                );
                 if !input.is_empty() {
                     return RequestInput {
                         input,
@@ -325,9 +365,14 @@ fn build_request_input(history: &[ChatMessage], use_previous_response_id: bool) 
     }
 
     RequestInput {
-        input: build_input_messages(history),
+        input: build_input_messages_with_metadata(history, response_request_metadata),
         previous_response_id: None,
     }
+}
+
+#[cfg(test)]
+fn build_request_input(history: &[ChatMessage], use_previous_response_id: bool) -> RequestInput {
+    build_request_input_with_metadata(history, use_previous_response_id, None)
 }
 
 fn supports_previous_response_id(base_url: &str) -> bool {
@@ -361,9 +406,19 @@ fn find_previous_response_tail(history: &[ChatMessage]) -> Option<(String, usize
         .map(|response_id| (response_id, index + 1))
 }
 
-fn build_input_messages(history: &[ChatMessage]) -> Vec<serde_json::Value> {
+fn build_input_messages_with_metadata(
+    history: &[ChatMessage],
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> Vec<serde_json::Value> {
     let mut input = Vec::new();
     for msg in history {
+        if super::codex::append_codex_compaction_replay(
+            &mut input,
+            &msg.id,
+            response_request_metadata,
+        ) {
+            continue;
+        }
         match msg.role {
             MessageRole::User => {
                 input.push(serde_json::json!({
@@ -410,6 +465,11 @@ fn build_input_messages(history: &[ChatMessage]) -> Vec<serde_json::Value> {
         }
     }
     input
+}
+
+#[cfg(test)]
+fn build_input_messages(history: &[ChatMessage]) -> Vec<serde_json::Value> {
+    build_input_messages_with_metadata(history, None)
 }
 
 fn build_tool_output_content(text: &str, images: Option<&[ImageData]>) -> serde_json::Value {
@@ -975,9 +1035,9 @@ struct InputTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_input_messages, build_request_body, build_request_input, collect_tool_calls,
-        drain_sse_buffer, is_retryable_response_status, process_sse_event_block, PendingToolCall,
-        ResponsesStreamState,
+        build_input_messages, build_request_body, build_request_body_with_metadata,
+        build_request_input, collect_tool_calls, drain_sse_buffer, is_retryable_response_status,
+        process_sse_event_block, PendingToolCall, ResponsesStreamState,
     };
     use crate::session::models::{
         ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo,
@@ -1504,6 +1564,58 @@ mod tests {
 
         assert!(request_input.previous_response_id.is_none());
         assert_eq!(request_input.input.len(), 3);
+    }
+
+    #[test]
+    fn custom_responses_replays_canonical_compaction_and_skips_readable_handoff() {
+        let handoff = assistant_message(
+            "handoff-1",
+            "## Context Handoff\n\nlocal readable fallback",
+            Some("resp_before_compact"),
+        );
+        let next_user = user_message_with_images("继续", vec![]);
+        let canonical_output = serde_json::json!([
+            {
+                "type": "compaction",
+                "encrypted_content": "opaque-blob"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "retained request" }]
+            }
+        ]);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "handoff-1".to_string(),
+            serde_json::json!({
+                "codex_compaction": {
+                    "output": canonical_output,
+                    "encrypted_content": "opaque-blob"
+                }
+            }),
+        );
+
+        let body = build_request_body_with_metadata(
+            "gpt-5.6-sol",
+            "You are Codex",
+            &[handoff, next_user],
+            &[],
+            Some("high"),
+            Some("high"),
+            None,
+            Some("session-1"),
+            true,
+            Some(&metadata),
+        );
+        let input = body["input"].as_array().expect("responses input");
+
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0], canonical_output[0]);
+        assert_eq!(input[1], canonical_output[1]);
+        assert_eq!(input[2]["role"], serde_json::json!("user"));
+        assert!(!body.to_string().contains("local readable fallback"));
     }
 
     #[test]

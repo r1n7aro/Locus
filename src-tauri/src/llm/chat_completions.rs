@@ -555,10 +555,19 @@ fn build_api_messages(
             MessageRole::Assistant => {
                 if should_flatten_deepseek_tool_round(msg, flavor, deepseek_thinking_enabled) {
                     let (content, consumed) = render_legacy_tool_round(history, i);
-                    messages.push(serde_json::json!({
+                    let mut replayed = serde_json::json!({
                         "role": "assistant",
                         "content": content,
-                    }));
+                    });
+                    if replay_reasoning_content {
+                        apply_reasoning_replay(
+                            &mut replayed,
+                            msg.thinking_content.as_deref(),
+                            flavor,
+                            reasoning_replay_field,
+                        );
+                    }
+                    messages.push(replayed);
                     i += consumed;
                     continue;
                 }
@@ -2055,6 +2064,28 @@ mod tests {
             Some(crate::commands::ReasoningReplayField::ReasoningDetails),
         );
         assert!(messages[0].get("reasoning_details").is_none());
+    }
+
+    #[test]
+    fn deepseek_flattened_legacy_tool_round_keeps_reasoning_replay_field() {
+        let mut assistant = assistant_message_with_tool_and_thinking();
+        assistant.thinking_content = None;
+
+        let messages = build_api_messages(
+            "",
+            &[assistant],
+            ChatCompletionsFlavor::DeepSeek,
+            true,
+            true,
+            Some(crate::commands::ReasoningReplayField::ReasoningContent),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["reasoning_content"], serde_json::json!(""));
+        assert!(messages[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("[Earlier tool call transcript]")));
+        assert!(messages[0].get("tool_calls").is_none());
     }
 
     #[test]

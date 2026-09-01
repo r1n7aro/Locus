@@ -358,6 +358,31 @@ fn codex_compaction_encrypted_content(metadata: &serde_json::Value) -> Option<&s
         .filter(|content| !content.is_empty())
 }
 
+/// Replays the canonical Codex compaction payload attached to a local handoff
+/// message. Returns true when the caller must skip the readable handoff text.
+pub(crate) fn append_codex_compaction_replay(
+    input: &mut Vec<serde_json::Value>,
+    message_id: &str,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> bool {
+    let Some(metadata) = response_request_metadata.and_then(|metadata| metadata.get(message_id))
+    else {
+        return false;
+    };
+    if let Some(output) = codex_compaction_output(metadata) {
+        input.extend(output.iter().cloned());
+        return true;
+    }
+    if let Some(encrypted_content) = codex_compaction_encrypted_content(metadata) {
+        input.push(serde_json::json!({
+            "type": "compaction",
+            "encrypted_content": encrypted_content,
+        }));
+        return true;
+    }
+    false
+}
+
 /// Reserved name tagging client `tool_search` rounds in session history.
 /// Matching assistant tool calls and their outputs replay as the typed
 /// `tool_search_call` / `tool_search_output` wire items instead of
@@ -428,23 +453,9 @@ fn build_input_with_metadata(
 
     let mut input = Vec::new();
     for msg in history {
-        if let Some(output) = response_request_metadata
-            .and_then(|metadata| metadata.get(&msg.id))
-            .and_then(codex_compaction_output)
-        {
-            input.extend(output.iter().cloned());
-            continue;
-        }
-        if let Some(encrypted_content) = response_request_metadata
-            .and_then(|metadata| metadata.get(&msg.id))
-            .and_then(codex_compaction_encrypted_content)
-        {
-            // The handoff text is a local fallback for non-Codex backends; the
-            // Codex API receives the original compaction item instead.
-            input.push(serde_json::json!({
-                "type": "compaction",
-                "encrypted_content": encrypted_content,
-            }));
+        if append_codex_compaction_replay(&mut input, &msg.id, response_request_metadata) {
+            // The handoff text is a local fallback for other backends; Codex
+            // protocol routes receive the original provider payload instead.
             continue;
         }
         match msg.role {
@@ -1010,6 +1021,7 @@ fn codex_compact_endpoint(base_url: Option<&str>) -> String {
 // one idle period between stream events (codex-rs uses idle timeout x4).
 const COMPACT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[derive(Debug)]
 pub struct CodexRemoteCompactOutcome {
     pub output: Vec<serde_json::Value>,
     pub encrypted_content: Option<String>,
@@ -4907,6 +4919,9 @@ mod tests {
         )
         .expect_err("extra output items must fail")
         .contains("exactly one compaction output item"));
+        assert!(validate_remote_compaction_v2_output(&[], true)
+            .expect_err("empty output must fail")
+            .contains("exactly one compaction output item"));
     }
 
     #[test]
@@ -5028,6 +5043,18 @@ mod tests {
         assert_eq!(outcome.encrypted_content, None);
         assert_eq!(outcome.raw_request, "request");
         assert_eq!(outcome.raw_response, response);
+    }
+
+    #[test]
+    fn compact_response_rejects_empty_canonical_output() {
+        let error = parse_compact_response(
+            "request".to_string(),
+            serde_json::json!({ "output": [] }).to_string(),
+        )
+        .expect_err("empty compact output must fail");
+
+        assert!(error.message.contains("empty canonical output window"));
+        assert_eq!(error.raw_request, "request");
     }
 
     #[test]
