@@ -194,7 +194,7 @@ describe("development workbench editor groups", () => {
     expect(workbench).toContain("!== lastRefreshedCheckoutServicesScopeKey");
     expect(workbench).toContain("binding.expectedGeneration !== context.workspaceGeneration");
     expect(workbench).toContain("const editorWorkspaceRefs = new Map<string, WorkspaceRef>()");
-    expect(workbench).toContain("cached?.expectedGeneration === expectedGeneration");
+    expect(workbench).toContain("cached && cached.expectedGeneration === expectedGeneration");
   });
 
   it("switches the complete editor-group state with the focused single workspace", () => {
