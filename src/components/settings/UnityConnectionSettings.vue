@@ -128,6 +128,12 @@ const unityTestToolsDescription = computed(() => {
   if (!status) return t("common.loading");
   if (!status.enabled) return t("settings.unityConnection.unityTestDisabled");
   if (!status.packageInstalled) return t("settings.unityConnection.unityTestPackageMissing");
+  if (!status.packageSupported) {
+    return t(
+      "settings.unityConnection.unityTestPackageUnsupported",
+      status.packageVersion ?? "unknown",
+    );
+  }
   return t("settings.unityConnection.unityTestReady");
 });
 

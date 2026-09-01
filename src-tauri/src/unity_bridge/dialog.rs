@@ -29,6 +29,8 @@ pub struct UnityDialogChoiceResult {
     pub choice_id: String,
     pub label: String,
     pub invoked: bool,
+    pub status: String,
+    pub message: String,
 }
 
 /// Native-broker messages that can remain usable while Unity's managed main
@@ -44,6 +46,7 @@ pub fn message_requires_unity_main_thread(message_type: &str) -> bool {
             | "execute_code_progress"
             | "get_reload_state"
             | "get_compile_result"
+            | "unity_test_cancel"
     )
 }
 
@@ -100,6 +103,8 @@ mod platform {
     };
 
     const HOOK_READY_TIMEOUT: Duration = Duration::from_secs(2);
+    const DIALOG_DISMISS_TIMEOUT: Duration = Duration::from_secs(5);
+    const DIALOG_DISMISS_POLL_INTERVAL: Duration = Duration::from_millis(25);
     const MAX_UIA_ELEMENTS: i32 = 512;
 
     #[derive(Debug)]
@@ -554,6 +559,12 @@ mod platform {
             process_window_event(&entry, event, automation.as_ref());
         }
 
+        // UI Automation is a COM object and must release all of its interface
+        // references while this worker's apartment is still initialized.
+        // Safe Mode opens a modal dialog during editor startup, which can stop
+        // this worker immediately after inspection; allowing `automation` to
+        // drop after `CoUninitialize` causes an access violation in IUnknown::Release.
+        drop(automation);
         if com_initialized {
             unsafe { CoUninitialize() };
         }
@@ -589,6 +600,16 @@ mod platform {
         }
         if main_hwnd == 0 {
             return;
+        }
+
+        // Unity 2022 presents "Enter Safe Mode?" before its main editor
+        // window exists. It is an ownerless top-level #32770 window, so model
+        // that startup recovery prompt as both the main and dialog window.
+        if is_ownerless_safe_mode_prompt(main_hwnd) {
+            if let Some(record) = inspect_dialog(entry, main_hwnd, main_hwnd, automation) {
+                publish_dialog(record);
+                return;
+            }
         }
 
         let mut candidates = Vec::new();
@@ -647,12 +668,15 @@ mod platform {
         dialog_hwnd: isize,
         automation: Option<&IUIAutomation>,
     ) -> Option<DialogRecord> {
+        let ownerless_safe_mode_prompt =
+            dialog_hwnd == main_hwnd && is_ownerless_safe_mode_prompt(dialog_hwnd);
         if dialog_hwnd == 0
-            || dialog_hwnd == main_hwnd
             || !window_matches_process(dialog_hwnd, entry.process_id)
             || !window_visible(dialog_hwnd)
-            || window_enabled(main_hwnd)
-            || !owner_chain_reaches(dialog_hwnd, main_hwnd)
+            || (!ownerless_safe_mode_prompt
+                && (dialog_hwnd == main_hwnd
+                    || window_enabled(main_hwnd)
+                    || !owner_chain_reaches(dialog_hwnd, main_hwnd)))
         {
             return None;
         }
@@ -844,21 +868,48 @@ mod platform {
     }
 
     fn record_still_valid(record: &DialogRecord) -> bool {
-        super::super::process::process_created_at_unix_ms(record.process_id)
-            == Some(record.process_created_at_ms)
+        let same_process = super::super::process::process_created_at_unix_ms(record.process_id)
+            == Some(record.process_created_at_ms);
+        let modal_relationship_valid = if record.main_hwnd == record.dialog_hwnd
+            && is_ownerless_safe_mode_prompt(record.dialog_hwnd)
+        {
+            true
+        } else {
+            !window_enabled(record.main_hwnd)
+                && owner_chain_reaches(record.dialog_hwnd, record.main_hwnd)
+        };
+        same_process
             && window_matches_process(record.main_hwnd, record.process_id)
             && window_matches_process(record.dialog_hwnd, record.process_id)
             && window_visible(record.dialog_hwnd)
-            && !window_enabled(record.main_hwnd)
-            && owner_chain_reaches(record.dialog_hwnd, record.main_hwnd)
+            && modal_relationship_valid
     }
 
     pub fn current_dialog(project_path: &str) -> Option<UnityModalDialog> {
         let key = project_key(project_path);
-        let record = {
+        let mut record = {
             let records = lock_unpoisoned(dialogs());
             records.get(&key).cloned()
-        }?;
+        };
+        // The Safe Mode startup prompt can appear after the hook's initial
+        // scan without producing a WinEvent on some Unity/Windows versions.
+        // A cache miss therefore performs one cheap synchronous Win32 scan.
+        if record.is_none() {
+            let entry = {
+                let entries = lock_unpoisoned(hooks());
+                entries.get(&key).cloned()
+            };
+            if let Some(entry) = entry {
+                let main_hwnd = find_unity_main_window(entry.process_id).unwrap_or(0);
+                if is_ownerless_safe_mode_prompt(main_hwnd) {
+                    record = inspect_dialog(&entry, main_hwnd, main_hwnd, None);
+                    if let Some(discovered) = record.clone() {
+                        publish_dialog(discovered);
+                    }
+                }
+            }
+        }
+        let record = record?;
         if record_still_valid(&record) {
             Some(record.public)
         } else {
@@ -894,20 +945,23 @@ mod platform {
             lines.push(format!("- {}: {}", choice.id, choice.label));
         }
         if let Some(request_id) = request_id {
-            let id_label = if request_state == "test_run_detached" {
+            let id_label = if request_state == "test_run_cancel_queued" {
                 "run_id"
             } else {
                 "request_id"
             };
             lines.push(format!("{id_label}={request_id}"));
         }
-        lines.push("该恢复接口不使用 Unity 主线程。请根据弹窗语义选择一个 choice_id：".to_string());
+        lines.push(
+            "该恢复接口不使用 Unity 主线程。请根据弹窗语义选择一个 choice_id，并通过内置 python 工具调用："
+                .to_string(),
+        );
         let project_json =
             serde_json::to_string(&dialog.project).unwrap_or_else(|_| "\"\"".to_string());
         let dialog_json =
             serde_json::to_string(&dialog.dialog_id).unwrap_or_else(|_| "\"\"".to_string());
         lines.push(format!(
-            "python -c 'import asyncio,locus; asyncio.run(locus.choose_unity_dialog(project={project_json}, dialog_id={dialog_json}, choice_id=\"choice-0\"))'"
+            "choice = await locus.choose_unity_dialog(project={project_json}, dialog_id={dialog_json}, choice_id=\"choice-0\")\nprint(choice)"
         ));
         lines.push(match request_state {
             "not_sent" => "选择后可安全重试原 Unity 操作。".to_string(),
@@ -915,16 +969,10 @@ mod platform {
                 let execution_json = serde_json::to_string(request_id.unwrap_or_default())
                     .unwrap_or_else(|_| "\"\"".to_string());
                 format!(
-                    "原请求已发送；选择后使用 Python SDK 获取原执行结果，避免重复执行：\npython -c 'import asyncio,locus; print(asyncio.run(locus.wait_unity_execution(project={project_json}, execution_id={execution_json})))'"
+                    "原请求已发送；选择完成后在同一次 python 工具调用中获取原执行结果，避免重复执行：\noutput = await locus.wait_unity_execution(project={project_json}, execution_id={execution_json})\nprint(output)"
                 )
             }
-            "test_run_detached" => {
-                let run_json = serde_json::to_string(request_id.unwrap_or_default())
-                    .unwrap_or_else(|_| "\"\"".to_string());
-                format!(
-                    "原 Unity Test 运行仍然有效；选择后使用 unity_test_run 的 resume_run_id 继续等待原运行，避免启动重复测试：\n{{\"resume_run_id\":{run_json}}}"
-                )
-            }
+            "test_run_cancel_queued" => "Unity Test 取消请求已提交；处理弹窗后 Unity 将执行取消。当前运行结束前不要重新启动测试。".to_string(),
             _ => "原请求可能已经发送；选择后先查询原请求状态，避免直接重复执行。".to_string(),
         });
         lines.join("\n")
@@ -943,14 +991,56 @@ mod platform {
         dialog_id: &str,
         choice_id: &str,
     ) -> Result<UnityDialogChoiceResult, String> {
+        // Subscribe before invoking the native button so a fast dialog-close
+        // event cannot race past the waiter.
+        let mut dialog_updates = subscribe();
         let project_path = project_path.to_string();
         let dialog_id = dialog_id.to_string();
         let choice_id = choice_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            choose_dialog_blocking(&project_path, &dialog_id, &choice_id)
+        let blocking_project_path = project_path.clone();
+        let blocking_dialog_id = dialog_id.clone();
+        let blocking_choice_id = choice_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            choose_dialog_blocking(
+                &blocking_project_path,
+                &blocking_dialog_id,
+                &blocking_choice_id,
+            )
         })
         .await
-        .map_err(|error| format!("Unity dialog choice task failed: {error}"))?
+        .map_err(|error| format!("Unity dialog choice task failed: {error}"))??;
+
+        wait_for_dialog_dismissal(&project_path, &dialog_id, &mut dialog_updates).await?;
+        Ok(result)
+    }
+
+    async fn wait_for_dialog_dismissal(
+        project_path: &str,
+        dialog_id: &str,
+        dialog_updates: &mut watch::Receiver<u64>,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + DIALOG_DISMISS_TIMEOUT;
+        loop {
+            let original_dialog_open = current_dialog(project_path)
+                .map(|dialog| dialog.dialog_id == dialog_id)
+                .unwrap_or(false);
+            if !original_dialog_open {
+                return Ok(());
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "Unity dialog choice was invoked, but dialog '{dialog_id}' remained open for {}ms",
+                    DIALOG_DISMISS_TIMEOUT.as_millis()
+                ));
+            }
+            let poll_interval = DIALOG_DISMISS_POLL_INTERVAL.min(deadline - now);
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                _ = dialog_updates.changed() => {}
+            }
+        }
     }
 
     fn choose_dialog_blocking(
@@ -961,11 +1051,21 @@ mod platform {
         let key = project_key(project_path);
         let (record, choice) = {
             let mut records = lock_unpoisoned(dialogs());
-            let record = records.get_mut(&key).ok_or_else(|| {
-                "No blocking Unity dialog is registered for this project".to_string()
-            })?;
+            let Some(record) = records.get_mut(&key) else {
+                return Ok(dialog_unavailable_result(
+                    dialog_id,
+                    choice_id,
+                    String::new(),
+                    None,
+                ));
+            };
             if record.public.dialog_id != dialog_id {
-                return Err("Unity dialog id is stale or belongs to another project".to_string());
+                return Ok(dialog_unavailable_result(
+                    dialog_id,
+                    choice_id,
+                    String::new(),
+                    Some(&record.public),
+                ));
             }
             if record.consumed {
                 return Err("Unity dialog choice is already being invoked".to_string());
@@ -982,6 +1082,19 @@ mod platform {
 
         let result = invoke_choice(&record, &choice);
         if let Err(error) = result {
+            let current = current_dialog(project_path);
+            if current
+                .as_ref()
+                .map(|dialog| dialog.dialog_id != dialog_id)
+                .unwrap_or(true)
+            {
+                return Ok(dialog_unavailable_result(
+                    dialog_id,
+                    choice_id,
+                    choice.public.label,
+                    current.as_ref(),
+                ));
+            }
             if let Some(current) = lock_unpoisoned(dialogs()).get_mut(&key) {
                 if current.public.dialog_id == dialog_id {
                     current.consumed = false;
@@ -995,7 +1108,39 @@ mod platform {
             choice_id: choice_id.to_string(),
             label: choice.public.label,
             invoked: true,
+            status: "invoked".to_string(),
+            message: "Unity dialog choice was invoked and the dialog closed.".to_string(),
         })
+    }
+
+    fn dialog_unavailable_result(
+        dialog_id: &str,
+        choice_id: &str,
+        label: String,
+        current_dialog: Option<&UnityModalDialog>,
+    ) -> UnityDialogChoiceResult {
+        let (status, message) = match current_dialog {
+            Some(current) => (
+                "dialog_changed",
+                format!(
+                    "The requested Unity dialog is no longer current; the current dialog id is '{}'.",
+                    current.dialog_id
+                ),
+            ),
+            None => (
+                "dialog_not_found",
+                "No blocking Unity dialog is currently open for this project; it may already have been handled manually."
+                    .to_string(),
+            ),
+        };
+        UnityDialogChoiceResult {
+            dialog_id: dialog_id.to_string(),
+            choice_id: choice_id.to_string(),
+            label,
+            invoked: false,
+            status: status.to_string(),
+            message,
+        }
     }
 
     fn invoke_choice(record: &DialogRecord, choice: &NativeChoice) -> Result<(), String> {
@@ -1010,13 +1155,23 @@ mod platform {
         let expected_labels = record
             .choices
             .iter()
-            .map(|candidate| candidate.public.label.as_str())
+            .map(|candidate| normalized_button_label(&candidate.public.label))
             .collect::<Vec<_>>();
         let current_win32_labels = current_choices
             .iter()
-            .map(|candidate| candidate.public.label.as_str())
+            .map(|candidate| normalized_button_label(&candidate.public.label))
             .collect::<Vec<_>>();
-        let (uia_invoked, uia_verified) = validate_and_invoke_choice_with_uia(record, choice)?;
+        let ownerless_safe_mode_prompt = record.main_hwnd == record.dialog_hwnd
+            && is_ownerless_safe_mode_prompt(record.dialog_hwnd);
+        // Startup Safe Mode records are discovered through Win32 because no
+        // Unity main window exists yet. Re-inspecting them through UIA changes
+        // text normalization and would create a different fingerprint, so use
+        // the already verified Win32 title/button identity for invocation.
+        let (uia_invoked, uia_verified) = if ownerless_safe_mode_prompt {
+            (false, false)
+        } else {
+            validate_and_invoke_choice_with_uia(record, choice)?
+        };
         if uia_invoked {
             return Ok(());
         }
@@ -1030,7 +1185,8 @@ mod platform {
         let win32_choice_still_matches = choice.native_hwnd != 0
             && current_choices.iter().any(|candidate| {
                 candidate.native_hwnd == choice.native_hwnd
-                    && candidate.public.label == choice.public.label
+                    && normalized_button_label(&candidate.public.label)
+                        == normalized_button_label(&choice.public.label)
             });
         if win32_choice_still_matches
             && window_matches_process(choice.native_hwnd, record.process_id)
@@ -1051,6 +1207,10 @@ mod platform {
         Err(format!(
             "Unity dialog choice changed before invocation (dialog class '{class_name}')"
         ))
+    }
+
+    fn normalized_button_label(label: &str) -> String {
+        label.replace('&', "").trim().to_string()
     }
 
     fn validate_and_invoke_choice_with_uia(
@@ -1235,6 +1395,11 @@ mod platform {
             .map(|(_, hwnd)| hwnd)
     }
 
+    pub fn main_window_title(process_id: u32) -> Option<String> {
+        let title = window_text(find_unity_main_window(process_id)?);
+        (!title.is_empty()).then_some(title)
+    }
+
     fn hwnd(value: isize) -> HWND {
         HWND(value as *mut c_void)
     }
@@ -1282,6 +1447,22 @@ mod platform {
 
     fn window_enabled(value: isize) -> bool {
         value != 0 && unsafe { IsWindowEnabled(hwnd(value)) }.as_bool()
+    }
+
+    fn is_ownerless_safe_mode_prompt(value: isize) -> bool {
+        if value == 0 || !window_visible(value) || window_class(value) != "#32770" {
+            return false;
+        }
+        let ownerless = unsafe { GetWindow(hwnd(value), GW_OWNER) }
+            .map(|owner| owner.0.is_null())
+            // The windows crate maps a NULL GetWindow result to Err even
+            // though NULL is the documented "no owner" result.
+            .unwrap_or(true);
+        if !ownerless {
+            return false;
+        }
+        let title = window_text(value).to_ascii_lowercase();
+        title.contains("enter safe mode") || title.contains("进入安全模式")
     }
 
     fn window_text(value: isize) -> String {
@@ -1367,16 +1548,37 @@ mod platform {
             assert!(error.contains("choice-1: Don't Save"));
             assert!(error.contains("choice-2: Cancel"));
             assert!(error.contains("locus.choose_unity_dialog"));
+            assert!(error.contains("内置 python 工具"));
+            assert!(error.contains("choice = await locus.choose_unity_dialog"));
+            assert!(!error.contains("python -c"));
+            assert!(!error.contains("asyncio.run"));
             assert!(error.contains("可安全重试"));
 
             let detached = format_blocked_error(&dialog, "detached", Some("exec-test"));
             assert!(detached.contains("locus.wait_unity_execution"));
+            assert!(detached.contains("output = await locus.wait_unity_execution"));
             assert!(detached.contains("exec-test"));
 
-            let test_run = format_blocked_error(&dialog, "test_run_detached", Some("test-run-1"));
+            let test_run =
+                format_blocked_error(&dialog, "test_run_cancel_queued", Some("test-run-1"));
             assert!(test_run.contains("run_id=test-run-1"));
-            assert!(test_run.contains("resume_run_id"));
+            assert!(test_run.contains("取消请求已提交"));
             assert!(!test_run.contains("wait_unity_execution"));
+        }
+
+        #[test]
+        fn missing_dialog_returns_a_normal_not_found_result() {
+            let project = r"F:\__locus_missing_dialog_test__";
+            lock_unpoisoned(dialogs()).remove(&project_key(project));
+
+            let result = choose_dialog_blocking(project, "dialog-closed", "choice-2")
+                .expect("a manually handled dialog should return a normal result");
+
+            assert!(!result.invoked);
+            assert_eq!(result.status, "dialog_not_found");
+            assert!(result.message.contains("handled manually"));
+            assert_eq!(result.dialog_id, "dialog-closed");
+            assert_eq!(result.choice_id, "choice-2");
         }
     }
 }
@@ -1421,11 +1623,15 @@ mod platform {
     ) -> Result<UnityDialogChoiceResult, String> {
         Err("Unity modal dialog recovery is currently supported on Windows".to_string())
     }
+
+    pub fn main_window_title(_process_id: u32) -> Option<String> {
+        None
+    }
 }
 
 pub use platform::{
-    blocked_error, choose_dialog, current_dialog, ensure_project_observed, subscribe,
-    sync_project_process,
+    blocked_error, choose_dialog, current_dialog, ensure_project_observed, main_window_title,
+    subscribe, sync_project_process,
 };
 
 #[cfg(test)]
@@ -1442,6 +1648,7 @@ mod tests {
             "execute_code_progress",
             "get_reload_state",
             "get_compile_result",
+            "unity_test_cancel",
         ] {
             assert!(!message_requires_unity_main_thread(message), "{message}");
         }
@@ -1455,7 +1662,6 @@ mod tests {
             "run_states",
             "unity_test_start",
             "unity_test_status",
-            "unity_test_cancel",
             "capture_viewport",
             "read_yaml",
             "property_tree_write",

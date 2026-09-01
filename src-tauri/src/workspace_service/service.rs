@@ -1069,7 +1069,6 @@ pub fn service_ready_required_for_tool(name: &str) -> bool {
             | "unity_execute"
             | "unity_run_states"
             | "unity_capture_viewport"
-            | "unity_get_console_log"
             | "unity_test_list"
             | "unity_test_run"
             | "unity_recompile"

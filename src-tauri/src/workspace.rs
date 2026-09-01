@@ -22,8 +22,12 @@ pub struct WorkspaceConfig {
 pub struct UnityTestToolsWorkspaceStatus {
     pub enabled: bool,
     pub package_installed: bool,
+    pub package_version: Option<String>,
+    pub package_supported: bool,
     pub available: bool,
 }
+
+pub const UNITY_TEST_FRAMEWORK_MIN_VERSION: &str = "1.4.0";
 
 pub fn workspace_config_path(dir: &str) -> std::path::PathBuf {
     Path::new(dir).join("Locus").join("config.json")
@@ -57,32 +61,62 @@ fn read_json_object(path: &Path) -> Option<serde_json::Map<String, serde_json::V
         .cloned()
 }
 
-pub fn unity_test_framework_package_installed(dir: &str) -> bool {
+fn unity_test_framework_package_info(dir: &str) -> (bool, Option<String>) {
     let packages = Path::new(dir).join("Packages");
+    let mut installed = false;
     for file_name in ["packages-lock.json", "manifest.json"] {
         let Some(root) = read_json_object(&packages.join(file_name)) else {
             continue;
         };
-        if root
+        let Some(dependency) = root
             .get("dependencies")
             .and_then(serde_json::Value::as_object)
-            .is_some_and(|dependencies| dependencies.contains_key("com.unity.test-framework"))
-        {
-            return true;
+            .and_then(|dependencies| dependencies.get("com.unity.test-framework"))
+        else {
+            continue;
+        };
+        installed = true;
+        let version = dependency
+            .as_str()
+            .or_else(|| {
+                dependency
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(version) = version {
+            if semver::Version::parse(version.trim_start_matches('v')).is_ok() {
+                return (true, Some(version.to_string()));
+            }
         }
     }
-    false
+    (installed, None)
+}
+
+fn unity_test_framework_package_supported(version: Option<&str>) -> bool {
+    let Some(version) =
+        version.and_then(|value| semver::Version::parse(value.trim_start_matches('v')).ok())
+    else {
+        return false;
+    };
+    let minimum = semver::Version::parse(UNITY_TEST_FRAMEWORK_MIN_VERSION)
+        .expect("Unity Test Framework minimum version must be valid semver");
+    version >= minimum
 }
 
 pub fn unity_test_tools_workspace_status(dir: &str) -> UnityTestToolsWorkspaceStatus {
     let enabled = read_workspace_config(dir)
         .map(|config| config.unity_test_tools_enabled)
         .unwrap_or(false);
-    let package_installed = unity_test_framework_package_installed(dir);
+    let (package_installed, package_version) = unity_test_framework_package_info(dir);
+    let package_supported = unity_test_framework_package_supported(package_version.as_deref());
     UnityTestToolsWorkspaceStatus {
         enabled,
         package_installed,
-        available: enabled && package_installed,
+        package_version,
+        package_supported,
+        available: enabled && package_installed && package_supported,
     }
 }
 
@@ -337,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn unity_test_tools_require_both_workspace_setting_and_installed_package() {
+    fn unity_test_tools_require_workspace_setting_and_supported_package() {
         let dir = tempfile::tempdir().unwrap();
         let locus_dir = dir.path().join("Locus");
         let packages_dir = dir.path().join("Packages");
@@ -352,6 +386,7 @@ mod tests {
         let missing = unity_test_tools_workspace_status(&dir.path().to_string_lossy());
         assert!(missing.enabled);
         assert!(!missing.package_installed);
+        assert!(!missing.package_supported);
         assert!(!missing.available);
 
         fs::write(
@@ -360,7 +395,20 @@ mod tests {
         )
         .unwrap();
         let installed = unity_test_tools_workspace_status(&dir.path().to_string_lossy());
+        assert_eq!(installed.package_version.as_deref(), Some("1.7.0"));
+        assert!(installed.package_supported);
         assert!(installed.available);
+
+        fs::write(
+            packages_dir.join("packages-lock.json"),
+            r#"{"dependencies":{"com.unity.test-framework":{"version":"1.3.9"}}}"#,
+        )
+        .unwrap();
+        let unsupported = unity_test_tools_workspace_status(&dir.path().to_string_lossy());
+        assert!(unsupported.package_installed);
+        assert_eq!(unsupported.package_version.as_deref(), Some("1.3.9"));
+        assert!(!unsupported.package_supported);
+        assert!(!unsupported.available);
     }
 
     #[test]
@@ -379,7 +427,7 @@ mod tests {
         .unwrap();
         fs::write(
             packages_dir.join("manifest.json"),
-            r#"{"dependencies":{"com.unity.test-framework":"1.1.33"}}"#,
+            r#"{"dependencies":{"com.unity.test-framework":"1.4.0"}}"#,
         )
         .unwrap();
 

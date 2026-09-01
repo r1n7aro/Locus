@@ -65,13 +65,27 @@ describe("Unity Console log tool", () => {
   });
 
   it("exposes the tool to Unity and the Locus MCP surface", () => {
-    const dev = JSON.parse(read("agent/dev/config.json"));
+    const dev = JSON.parse(read("agent/unity/config.json"));
     const mcpTools = read("src-tauri/src/mcp/server/tools.rs");
     const registry = read("src-tauri/src/tool/builtins/mod.rs");
 
     expect(dev.tools).toContain("unity_get_console_log");
     expect(mcpTools).toContain('"unity_get_console_log"');
     expect(registry).toContain("registry.register_builtin(unity::unity_get_console_log())");
+  });
+
+  it("falls back to Editor.log when the managed Unity bridge is unavailable", () => {
+    const builtin = read("src-tauri/src/tool/builtins/unity.rs");
+    const service = read("src-tauri/src/workspace_service/service.rs");
+    const editorLog = read("src-tauri/src/unity_bridge/editor_log.rs");
+
+    expect(builtin).toContain("read_editor_log_console_entries");
+    expect(builtin).toContain("Unity Editor log fallback:");
+    expect(editorLog).toContain("Safe Mode: Only loading a subset of assemblies");
+    expect(editorLog).toContain('join("Logs").join("Editor.log")');
+    expect(service).not.toMatch(
+      /service_ready_required_for_tool[\s\S]*?\| \"unity_get_console_log\"/,
+    );
   });
 
   it("avoids eager status probes for MCP tools and ordinary file reads", () => {

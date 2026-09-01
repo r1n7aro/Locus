@@ -30,6 +30,8 @@ pub mod tools {
     pub const GREP: &str = include_str!("../../tools/grep.json");
     pub const WEB_FETCH: &str = include_str!("../../tools/web_fetch.json");
     pub const TODOWRITE: &str = include_str!("../../tools/todowrite.json");
+    pub const UNITY_LOCK: &str = include_str!("../../tools/unity_lock.json");
+    pub const UNITY_RELEASE: &str = include_str!("../../tools/unity_release.json");
     pub const UNITY_SET_PLAY_MODE: &str = include_str!("../../tools/unity_set_play_mode.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
@@ -99,6 +101,8 @@ pub mod tools {
         ("grep", GREP),
         ("web_fetch", WEB_FETCH),
         ("todowrite", TODOWRITE),
+        ("unity_lock", UNITY_LOCK),
+        ("unity_release", UNITY_RELEASE),
         ("unity_set_play_mode", UNITY_SET_PLAY_MODE),
         ("unity_execute", UNITY_EXECUTE),
         ("unity_run_states", UNITY_RUN_STATES),

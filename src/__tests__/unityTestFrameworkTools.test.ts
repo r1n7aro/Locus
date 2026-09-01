@@ -43,7 +43,7 @@ describe("Unity Test Framework tools", () => {
     expect(executeDefinition.description).toContain("UnityTestApi.Start");
     expect(executeDefinition.description).toContain("Status(runId)");
     expect(executeDefinition.description).toContain("com.unity.test-framework");
-    expect(read("agent/dev/rule/tool_usage_strategy.md")).toContain(
+    expect(read("agent/unity/rule/tool_usage_strategy.md")).toContain(
       "UnityTestApi.ListAsync",
     );
   });
@@ -61,7 +61,7 @@ describe("Unity Test Framework tools", () => {
     expect(asmdef.versionDefines).toContainEqual(
       expect.objectContaining({
         name: "com.unity.test-framework",
-        expression: "1.1.0",
+        expression: "1.4.0",
         define: "LOCUS_HAS_UNITY_TEST_FRAMEWORK",
       }),
     );
@@ -72,12 +72,15 @@ describe("Unity Test Framework tools", () => {
     const workspace = read("src-tauri/src/workspace.rs");
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const mcp = read("src-tauri/src/mcp/server/tools.rs");
+    const settings = read("src/components/settings/UnityConnectionSettings.vue");
 
-    expect(workspace).toContain("enabled && package_installed");
-    expect(workspace).toContain('contains_key("com.unity.test-framework")');
+    expect(workspace).toContain("enabled && package_installed && package_supported");
+    expect(workspace).toContain("UNITY_TEST_FRAMEWORK_MIN_VERSION");
     expect(agent).toContain('"unity_test_list" | "unity_test_run"');
     expect(agent).toContain("unity_test_tools_available(&self.working_dir)");
     expect(mcp).toContain("unity_test_tools_workspace_status(working_dir)");
+    expect(settings).toContain("status.packageSupported");
+    expect(settings).toContain("unityTestPackageUnsupported");
   });
 
   it("holds discovery and execution until edited tests converge through a domain reload", () => {
@@ -119,25 +122,79 @@ describe("Unity Test Framework tools", () => {
     expect(api).toContain("UnityTestMode Mode = UnityTestMode.EditAndPlay");
   });
 
-  it("returns modal-dialog blocks promptly and resumes the original test run", () => {
+  it("saves every dirty persisted scene before starting Unity tests", () => {
+    const service = read("locus_unity/Editor/Testing/LocusUnityTestService.cs");
+
+    expect(service).toContain("SaveDirtyScenesBeforeRun();");
+    expect(service).toContain("EditorSceneManager.sceneCount");
+    expect(service).toContain("EditorSceneManager.GetSceneAt(index)");
+    expect(service).toContain("scene.isDirty");
+    expect(service).toContain("EditorSceneManager.IsPreviewScene(scene)");
+    expect(service).toContain("!EditorSceneManager.SaveScene(scene) || scene.isDirty");
+    expect(service).toContain("Save the untitled scene before starting Unity Tests");
+    expect(service).not.toContain("SaveCurrentModifiedScenesIfUserWantsTo");
+    expect(service.indexOf("SaveDirtyScenesBeforeRun();")).toBeLessThan(
+      service.indexOf("state.Begin("),
+    );
+  });
+
+  it("cancels the active Unity test whenever tool waiting is interrupted", () => {
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
     const bridge = read("src-tauri/src/unity_bridge/mod.rs");
     const dialog = read("src-tauri/src/unity_bridge/dialog.rs");
     const service = read("locus_unity/Editor/Testing/LocusUnityTestService.cs");
+    const liveness = read("locus_unity/Editor/Testing/UnityTestRunLiveness.cs");
+    const testingAssembly = JSON.parse(
+      read("locus_unity/Editor/Testing/Locus.UnityTesting.Editor.asmdef"),
+    );
     const runDefinition = JSON.parse(read("tools/unity_test_run.json"));
 
-    expect(runDefinition.parameters.properties.resume_run_id.type).toBe("string");
-    expect(runDefinition.description).toContain("original test run remains active");
+    expect(runDefinition.parameters.properties.resume_run_id).toBeUndefined();
+    expect(runDefinition.description).toContain("cancels the active Unity Test run");
+    expect(agent).toContain('if tc.name == "unity_test_run"');
+    expect(agent).toContain("unity_test_cancellation_failed");
     expect(bridge).toContain("let mut dialog_events = dialog::subscribe()");
     expect(bridge).toContain("wait_for_unity_test_poll_wake");
     expect(bridge).toContain("dialog_events.has_changed()");
+    expect(bridge).toContain("dispatch_unity_test_cancel");
+    expect(bridge).toContain("cancel_unity_test_run");
+    expect(bridge).toContain("unity_test_abort_error");
     expect(bridge).toContain("Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error)");
     expect(bridge).toContain("object.insert(");
     expect(bridge).toContain('"run_id".to_string()');
-    expect(bridge).toContain('object.remove("resume_run_id")');
-    expect(dialog).toContain('"test_run_detached"');
-    expect(dialog).toContain("resume_run_id");
+    expect(dialog).toContain('"test_run_cancel_queued"');
+    expect(dialog).toContain("取消请求已提交");
+    expect(dialog).not.toContain("resume_run_id");
     expect(service).toContain("public string run_id;");
     expect(service).toContain("request.run_id");
+    expect(service).toContain("state.cancellation_requested = true;");
+    expect(service).toContain("ReconcileCancellation");
+    expect(service).toContain("TryCancelActiveRun");
+    expect(service).toContain("TryFinishCancellationFromUtfState");
+    expect(service).toContain("FinishCancelledLocally");
+    expect(service).toContain("CancellationObservationTimeoutSeconds");
+    expect(service).toContain("ReportCancellationObservationError");
+    expect(service).not.toContain("CancellationAcceptanceTimeoutSeconds");
+    expect(service).not.toContain("CancellationSettleTimeoutSeconds");
+    expect(liveness).toContain('GetMethod(\n            "IsRunning"');
+    expect(liveness).toContain('GetProperty(\n            "m_testJobDataHolder"');
+    expect(liveness).toContain('GetField("TestRuns"');
+    expect(liveness).toContain('GetField("guid"');
+    expect(liveness).toContain('GetField("isRunning"');
+    expect(service).toContain(
+      "It does not mean that the cancellation API is absent.",
+    );
+    expect(service).toContain(
+      "Unity Test cancellation requires com.unity.test-framework 1.4.0 or newer.",
+    );
+    expect(service).not.toContain(
+      "The installed Unity Test Framework does not expose test cancellation.",
+    );
+    expect(testingAssembly.versionDefines).toContainEqual({
+      name: "com.unity.test-framework",
+      expression: "1.4.0",
+      define: "LOCUS_HAS_UNITY_TEST_CANCEL",
+    });
   });
 
   it("preserves the Unity suite path for tree output", () => {

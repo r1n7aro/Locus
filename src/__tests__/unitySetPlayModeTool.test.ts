@@ -30,7 +30,7 @@ describe("Unity Play Mode tool", () => {
   });
 
   it("offers the tool to agents that can execute Unity code", () => {
-    const dev = JSON.parse(read("agent/dev/config.json"));
+    const dev = JSON.parse(read("agent/unity/config.json"));
     const wiki = JSON.parse(read("agent/wiki/config.json"));
 
     for (const agent of [dev, wiki]) {

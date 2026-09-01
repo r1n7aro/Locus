@@ -54,6 +54,7 @@ namespace Locus
         private static volatile bool _isPlaying;
         private static volatile bool _isPaused;
         private static volatile string _activeScenePath = "";
+        private static volatile string _additionalOpenScenePathsStatus = "";
         private static int _editorUpdateEventSequence;
         private static double _lastEditorUpdateEventAt = -1.0;
         private static int _lastEditorUpdateSelectionInstanceId = int.MinValue;
@@ -1335,6 +1336,17 @@ namespace Locus
             _isPlaying = EditorApplication.isPlaying;
             _isPaused = EditorApplication.isPaused;
             _activeScenePath = EditorSceneManager.GetActiveScene().path ?? "";
+
+            var additionalScenePaths = new List<string>();
+            for (int i = 0; i < EditorSceneManager.sceneCount; i++)
+            {
+                string path = EditorSceneManager.GetSceneAt(i).path ?? "";
+                if (string.IsNullOrEmpty(path)
+                    || string.Equals(path, _activeScenePath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                additionalScenePaths.Add(path);
+            }
+            _additionalOpenScenePathsStatus = string.Join("|", additionalScenePaths.ToArray());
         }
 
         private static void MaybeSendEditorUpdateEvent()
@@ -2283,6 +2295,13 @@ namespace Locus
             string scenePath = _activeScenePath;
             if (!string.IsNullOrEmpty(scenePath))
                 status += "|" + scenePath;
+            string additionalScenePaths = _additionalOpenScenePathsStatus;
+            if (!string.IsNullOrEmpty(additionalScenePaths))
+            {
+                if (string.IsNullOrEmpty(scenePath))
+                    status += "|";
+                status += "|" + additionalScenePaths;
+            }
             return status;
         }
     }

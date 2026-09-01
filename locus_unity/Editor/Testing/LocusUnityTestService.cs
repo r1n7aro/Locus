@@ -5,8 +5,10 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Locus;
 using UnityEditor;
+using UnityEditor.SceneManagement;
 using UnityEditor.TestTools.TestRunner.Api;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace Locus.UnityTesting
 {
@@ -98,6 +100,8 @@ namespace Locus.UnityTesting
         public string current_test;
         public string result_detail;
         public bool cancellation_requested;
+        public bool cancellation_accepted;
+        public long cancellation_requested_at_ticks;
         public string error;
         public long started_at_ticks;
         public long finished_at_ticks;
@@ -132,6 +136,8 @@ namespace Locus.UnityTesting
             current_test = "";
             result_detail = resultDetail;
             cancellation_requested = false;
+            cancellation_accepted = false;
+            cancellation_requested_at_ticks = 0;
             error = "";
             started_at_ticks = DateTime.UtcNow.Ticks;
             finished_at_ticks = 0;
@@ -240,8 +246,13 @@ namespace Locus.UnityTesting
     internal static class LocusUnityTestService
     {
         private const string EditorSessionStateKey = "Locus_UnityTestEditorSessionId";
+        private const double CancellationRetryIntervalSeconds = 0.1d;
+        private const double CancellationObservationTimeoutSeconds = 25d;
+        private const string CancellationObservationErrorPrefix =
+            "Locus could not verify Unity Test cancellation";
         private static readonly TestRunnerApi Api;
         private static readonly LocusUnityTestCallbacks Callbacks;
+        private static double nextCancellationRetryAt;
 
         static LocusUnityTestService()
         {
@@ -251,6 +262,7 @@ namespace Locus.UnityTesting
             Api.RegisterCallbacks(Callbacks, 1000);
 
             RecoverEditorSession();
+            EditorApplication.update += ReconcileCancellation;
             LocusBridge.RegisterExtensionMessageHandler("unity_test_list", HandleListAsync);
             LocusBridge.RegisterExtensionMessageHandler("unity_test_start", HandleStartAsync);
             LocusBridge.RegisterExtensionMessageHandler("unity_test_status", HandleStatusAsync);
@@ -301,6 +313,7 @@ namespace Locus.UnityTesting
             if (state.active)
                 throw new InvalidOperationException("A Unity Test run is already active.");
 
+            SaveDirtyScenesBeforeRun();
             state.Begin(EditorSessionId(), modeName, resultDetail, request.run_id);
             try
             {
@@ -317,6 +330,34 @@ namespace Locus.UnityTesting
                 state.finished_at_ticks = DateTime.UtcNow.Ticks;
                 state.Persist();
                 throw;
+            }
+        }
+
+        private static void SaveDirtyScenesBeforeRun()
+        {
+            List<Scene> dirtyScenes = new List<Scene>();
+            for (int index = 0; index < EditorSceneManager.sceneCount; index++)
+            {
+                Scene scene = EditorSceneManager.GetSceneAt(index);
+                if (!scene.IsValid() || !scene.isLoaded || !scene.isDirty ||
+                    EditorSceneManager.IsPreviewScene(scene))
+                    continue;
+                if (string.IsNullOrEmpty(scene.path))
+                {
+                    throw new InvalidOperationException(
+                        "Save the untitled scene before starting Unity Tests: " + scene.name);
+                }
+                dirtyScenes.Add(scene);
+            }
+
+            foreach (Scene scene in dirtyScenes)
+            {
+                if (!EditorSceneManager.SaveScene(scene) || scene.isDirty)
+                {
+                    throw new InvalidOperationException(
+                        "Failed to save the dirty scene before starting Unity Tests: " +
+                        scene.path);
+                }
             }
         }
 
@@ -352,29 +393,144 @@ namespace Locus.UnityTesting
             if (!state.active)
                 return Snapshot(state);
 
-            string previousStatus = state.status;
+            state.cancellation_requested = true;
+            if (state.cancellation_requested_at_ticks <= 0)
+                state.cancellation_requested_at_ticks = DateTime.UtcNow.Ticks;
             state.status = "cancelling";
+            state.error = "";
             state.Persist();
-            bool accepted = false;
 #if LOCUS_HAS_UNITY_TEST_CANCEL
-            accepted = TestRunnerApi.CancelTestRun(state.unity_run_guid);
+            TryCancelActiveRun(state);
+            TryFinishCancellationFromUtfState(state);
+#else
+            FinishWithCancellationError(
+                state,
+                "Unity Test cancellation requires com.unity.test-framework 1.4.0 or newer.");
 #endif
-            if (!accepted && string.Equals(state.mode, "play", StringComparison.OrdinalIgnoreCase))
-            {
-                EditorApplication.isPlaying = false;
-                accepted = true;
-            }
-            if (!accepted)
-            {
-                state.status = previousStatus;
-                state.error = "The installed Unity Test Framework does not expose test cancellation.";
-            }
-            else
-            {
-                state.cancellation_requested = true;
-            }
-            state.Persist();
             return Snapshot(state);
+        }
+
+#if LOCUS_HAS_UNITY_TEST_CANCEL
+        private static void ReconcileCancellation()
+        {
+            LocusUnityTestRunState state = LocusUnityTestRunState.instance;
+            if (!state.active || !state.cancellation_requested)
+                return;
+
+            UnityTestRunLiveness liveness = UnityTestRunLivenessProbe.Query(
+                state.unity_run_guid);
+            if (liveness == UnityTestRunLiveness.NotRunning)
+            {
+                FinishCancelledLocally(state);
+                return;
+            }
+            if (liveness == UnityTestRunLiveness.Running &&
+                !string.IsNullOrEmpty(state.error) &&
+                state.error.StartsWith(CancellationObservationErrorPrefix, StringComparison.Ordinal))
+            {
+                state.error = "";
+                state.Persist();
+            }
+
+            if (liveness == UnityTestRunLiveness.Unknown &&
+                CancellationElapsedSeconds(state) >= CancellationObservationTimeoutSeconds)
+                ReportCancellationObservationError(state);
+
+            if (state.cancellation_accepted ||
+                EditorApplication.timeSinceStartup < nextCancellationRetryAt)
+                return;
+
+            nextCancellationRetryAt =
+                EditorApplication.timeSinceStartup + CancellationRetryIntervalSeconds;
+            TryCancelActiveRun(state);
+        }
+
+        private static void TryCancelActiveRun(LocusUnityTestRunState state)
+        {
+            if (!state.active || !state.cancellation_requested || state.cancellation_accepted)
+                return;
+
+            // UTF returns false when the run has not reached Running yet, the
+            // guid is no longer registered, or cancellation is already in
+            // progress. It does not mean that the cancellation API is absent.
+            bool accepted = !string.IsNullOrEmpty(state.unity_run_guid) &&
+                TestRunnerApi.CancelTestRun(state.unity_run_guid);
+            if (accepted)
+            {
+                state.cancellation_accepted = true;
+                state.status = "cancelling";
+                state.error = "";
+                state.Persist();
+                return;
+            }
+
+            if (string.Equals(state.mode, "play", StringComparison.OrdinalIgnoreCase) &&
+                EditorApplication.isPlaying)
+                EditorApplication.isPlaying = false;
+        }
+
+        private static bool TryFinishCancellationFromUtfState(LocusUnityTestRunState state)
+        {
+            if (!state.active || !state.cancellation_requested)
+                return false;
+            if (UnityTestRunLivenessProbe.Query(state.unity_run_guid) !=
+                UnityTestRunLiveness.NotRunning)
+                return false;
+
+            FinishCancelledLocally(state);
+            return true;
+        }
+#else
+        private static void ReconcileCancellation()
+        {
+        }
+#endif
+
+        private static double CancellationElapsedSeconds(LocusUnityTestRunState state)
+        {
+            if (state.cancellation_requested_at_ticks <= 0)
+                return 0d;
+            return Math.Max(
+                0d,
+                TimeSpan.FromTicks(DateTime.UtcNow.Ticks - state.cancellation_requested_at_ticks)
+                    .TotalSeconds);
+        }
+
+        private static void FinishCancelledLocally(LocusUnityTestRunState state)
+        {
+            state.active = false;
+            state.status = "cancelled";
+            state.current_test = "";
+            state.error = "";
+            state.finished_at_ticks = DateTime.UtcNow.Ticks;
+            state.duration_ms = Math.Max(
+                state.duration_ms,
+                TimeSpan.FromTicks(state.finished_at_ticks - state.started_at_ticks).Ticks / 10000L);
+            state.Persist();
+        }
+
+        private static void ReportCancellationObservationError(LocusUnityTestRunState state)
+        {
+            string error = CancellationObservationErrorPrefix +
+                " for run " + state.unity_run_guid +
+                ". The run remains active in Locus until UTF liveness can be observed.";
+            if (string.Equals(state.error, error, StringComparison.Ordinal))
+                return;
+            state.status = "cancelling";
+            state.error = error;
+            state.Persist();
+        }
+
+        private static void FinishWithCancellationError(
+            LocusUnityTestRunState state,
+            string error)
+        {
+            state.active = false;
+            state.status = "error";
+            state.current_test = "";
+            state.error = error;
+            state.finished_at_ticks = DateTime.UtcNow.Ticks;
+            state.Persist();
         }
 
         private static Task<string> HandleListAsync(string json)

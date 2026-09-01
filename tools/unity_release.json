@@ -1,0 +1,8 @@
+{
+  "description": "Release the cooperative lock for shared Unity Editor state after the current critical section is complete. Call this promptly after the state-sensitive operation and its verification finish so the next waiting Agent can proceed. Releasing an already-free lock succeeds. An Agent cannot release a lock owned by another Agent. Agent run completion and cancellation also clean up locks owned by that run's session.",
+  "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  }
+}

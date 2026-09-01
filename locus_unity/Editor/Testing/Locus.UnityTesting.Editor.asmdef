@@ -20,12 +20,12 @@
     "versionDefines": [
         {
             "name": "com.unity.test-framework",
-            "expression": "1.1.0",
+            "expression": "1.4.0",
             "define": "LOCUS_HAS_UNITY_TEST_FRAMEWORK"
         },
         {
             "name": "com.unity.test-framework",
-            "expression": "2.0.0",
+            "expression": "1.4.0",
             "define": "LOCUS_HAS_UNITY_TEST_CANCEL"
         }
     ],

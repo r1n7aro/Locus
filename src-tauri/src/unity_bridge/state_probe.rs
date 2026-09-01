@@ -217,6 +217,8 @@ pub enum SemanticPhase {
     Unresponsive,
     /// Domain reload in progress (the pipe-dead window).
     Reloading,
+    /// Unity Safe Mode: compiler errors are present and project/package managed code is disabled.
+    SafeMode,
     /// Connected, edit mode, idle.
     Editing,
     /// Play mode running.
@@ -235,6 +237,7 @@ impl SemanticPhase {
             SemanticPhase::Starting => "starting",
             SemanticPhase::Unresponsive => "unresponsive",
             SemanticPhase::Reloading => "reloading",
+            SemanticPhase::SafeMode => "safe_mode",
             SemanticPhase::Editing => "editing",
             SemanticPhase::Playing => "playing",
             SemanticPhase::Paused => "paused",
@@ -271,6 +274,7 @@ pub struct SemanticState {
     pub main_thread: ObservedMainThreadState,
     pub safety: ObservedSafetyState,
     pub state_plane: ObservedStatePlane,
+    pub editor_log: super::ObservedEditorLogState,
 }
 
 impl SemanticState {
@@ -336,6 +340,7 @@ impl SemanticState {
                 history_samples: 0,
                 last_observed_at_ms: None,
             },
+            editor_log: super::ObservedEditorLogState::default(),
         }
     }
 }
@@ -1833,7 +1838,7 @@ async fn observe_project_once_with_native_broker_status(
             control_channel_state = "ready".to_string();
             pipe_connected = true;
             let message = resp.message.unwrap_or_default();
-            let (status, _) = super::parse_unity_status_message(&message);
+            let (status, _, _) = super::parse_unity_status_message(&message);
             pipe_status = status.to_string();
             note_pipe_editor_status(
                 project_path,
@@ -1991,7 +1996,50 @@ async fn observe_project_once_with_native_broker_status(
         native_hook,
         observer,
     };
-    let state = fuse(&inputs);
+    let mut state = fuse(&inputs);
+    let allow_log_safe_mode_fallback = process_alive
+        && !pipe_connected
+        && !inputs
+            .native_broker_status
+            .as_ref()
+            .is_some_and(|status| status.managed_state == "ready");
+    state.editor_log = super::editor_log::observe(
+        project_path,
+        process_id,
+        process_created_at_ms,
+        allow_log_safe_mode_fallback,
+    );
+    if process_alive && state.editor_log.safe_mode {
+        state.phase = SemanticPhase::SafeMode.as_str().to_string();
+        state.reload_phase = None;
+        state.source = state
+            .editor_log
+            .safe_mode_source
+            .clone()
+            .unwrap_or_else(|| "editor_log".to_string());
+        state.confidence = if state.source == "window_title" {
+            "high"
+        } else {
+            "medium"
+        }
+        .to_string();
+        state.transient = false;
+        state.detail = Some(
+            "Unity Safe Mode is active; fix script compilation errors with file tools before using Unity APIs"
+                .to_string(),
+        );
+        state.domain.phase = "compilation_failed".to_string();
+        state.domain.reload_sub_phase = None;
+        state.domain.source = state.source.clone();
+        state.domain.confidence = state.confidence.clone();
+        state.editor_mode.value = "unknown".to_string();
+        state.editor_mode.source = state.source.clone();
+        state.editor_mode.confidence = state.confidence.clone();
+        state.editor_mode.detail = Some("project/package managed code is disabled".to_string());
+        state.safety.can_call_unity_api = false;
+        state.safety.can_modify_assets_safely = false;
+        state.safety.recommended_action = "fix_compile_errors".to_string();
+    }
     note_fused(project_path, &state, process_id);
     state
 }

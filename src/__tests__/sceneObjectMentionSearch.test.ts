@@ -9,7 +9,7 @@ function read(relPath: string) {
 }
 
 describe("scene object mention search", () => {
-  it("searches the cached on-disk scene hierarchy and validates only on selection", () => {
+  it("searches cached hierarchies for every open scene and validates only on selection", () => {
     const input = read("src/components/chat/RichChatInput.vue");
     const assetService = read("src/services/asset.ts");
     const unityService = read("src/services/unity.ts");
@@ -22,7 +22,8 @@ describe("scene object mention search", () => {
     const popup = read("src/components/chat/MentionPopup.vue");
 
     expect(input).toContain("searchWorkspaceSceneObjects");
-    expect(input).toContain("projectStore.unityConnectionStatus?.scenePath");
+    expect(input).toContain("status?.scenePaths");
+    expect(input).toContain("Promise.allSettled(scenePaths.map");
     expect(input).toContain("await validateUnitySceneObject(workspaceRef, target.scenePath, target.objectPath)");
     expect(input).toContain('entryKind: "sceneObject"');
     expect(input).toContain("meta: relPath");
@@ -40,6 +41,8 @@ describe("scene object mention search", () => {
     expect(workspaceCommands).toContain("pub async fn validate_unity_scene_object");
     expect(rustBridge).toContain('send_message(project_path, "validate_scene_object"');
     expect(unityBridge).toContain('case "validate_scene_object"');
+    expect(unityBridge).toContain("EditorSceneManager.sceneCount");
+    expect(unityBridge).toContain("_additionalOpenScenePathsStatus");
     expect(unityTypes).toContain("ResolveSceneObject(scenePath, objectPath);");
     expect(popup).toContain(':title="entry.meta || entry.parentPath"');
     expect(rustBridge).not.toContain('send_message(project_path, "search_scene_objects"');

@@ -1,0 +1,26 @@
+{
+  "description": "Acquire the cooperative lock for shared Unity Editor state before entering an Editor-state critical section. Use it when an operation changes or depends on transient shared state such as Play/Pause/Edit Mode, compilation or domain reload, the active scene or Prefab Stage, Selection, focused Editor windows, or any state that must remain stable across multiple tool calls. Hold the lock only for that critical section and always finish with `unity_release`.\n\nThe decision is based on shared Editor-state interference, not on `unity_execute.readonly`. A mutating `unity_execute` may run without this lock when it targets explicit objects or paths, does not depend on transient Editor state, and remains deterministic while another Agent uses the Editor. Read-only queries and safe background work are additional lock-free cases. This is a cooperative protocol: Unity tools remain callable without the lock.\n\n`mode: \"wait\"` waits in FIFO order until acquisition, cancellation, or timeout. `mode: \"try\"` first reclaims a holder whose session is no longer running, then returns immediately with `status=busy` when an active session still owns the lock so other asynchronous work can continue. A busy result is an expected, non-error outcome and reports the complete holder session and reason. Try mode respects existing waiters and does not jump the queue. Repeated acquisition by the current owner is idempotent.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "reason": {
+        "type": "string",
+        "description": "Short description of the Editor-state critical section, shown to Agents waiting for the lock."
+      },
+      "mode": {
+        "type": "string",
+        "enum": ["wait", "try"],
+        "default": "wait",
+        "description": "Acquisition behavior. `wait` queues until the lock is acquired; `try` returns immediately when an active session owns the lock or another session is already queued."
+      },
+      "timeout_seconds": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 900,
+        "default": 300,
+        "description": "Maximum time to wait for the cooperative lock. Defaults to 300 seconds."
+      }
+    },
+    "required": ["reason"]
+  }
+}

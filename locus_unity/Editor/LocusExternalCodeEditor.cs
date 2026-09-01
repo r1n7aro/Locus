@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -17,6 +18,23 @@ namespace Locus
         private const string PreviousEditorPathKey = "Locus.ExternalEditor.PreviousPath";
         private const string ManagedDefaultKey = "Locus.ExternalEditor.ManagedDefault";
         private const string OpenScriptEvent = "locus-open-script";
+
+        private static readonly HashSet<string> LocusSourceExtensions =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ".asmdef", ".asmref", ".cginc", ".compute", ".cs", ".css",
+                ".glsl", ".glslinc", ".gradle", ".hlsl", ".hlsli", ".html",
+                ".java", ".js", ".json", ".kt", ".kts", ".log", ".lua",
+                ".md", ".mjs", ".properties", ".py", ".raytrace", ".rsp",
+                ".shader", ".sh", ".template", ".toml", ".ts", ".tsx",
+                ".txt", ".uxml", ".uss", ".vue", ".xml", ".yaml", ".yml",
+            };
+
+        private static readonly HashSet<string> LocusSourceFileNames =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ".editorconfig", ".gitattributes", ".gitignore", "LICENSE", "README",
+            };
 
         [Serializable]
         private sealed class ConfigureRequest
@@ -87,6 +105,12 @@ namespace Locus
                 && !assetPath.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase)
                 && !assetPath.StartsWith("ProjectSettings/", StringComparison.OrdinalIgnoreCase))
                 return false;
+            // CodeEditor receives every asset-open attempt. Give Unity-native editors
+            // first ownership, then claim only source formats Locus can edit as text.
+            if (ShouldUseUnityDefaultOpen(assetPath))
+                return false;
+            if (!ShouldOpenInLocus(assetPath))
+                return false;
             var payload = new OpenScriptPayload
             {
                 projectPath = projectPath,
@@ -143,7 +167,7 @@ namespace Locus
         public void OnGUI()
         {
             EditorGUILayout.LabelField(
-                "Unity project files open in editable Locus workspace tabs.",
+                "Unity source files open in editable Locus workspace tabs.",
                 EditorStyles.wordWrappedLabel);
             if (GUILayout.Button("Regenerate project files", GUILayout.Width(190)))
                 LocusProjectFiles.SyncAll();
@@ -200,6 +224,51 @@ namespace Locus
             if (fullPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                 return fullPath.Substring(prefix.Length).Replace('\\', '/');
             return fullPath.Replace('\\', '/');
+        }
+
+        private static bool ShouldUseUnityDefaultOpen(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return false;
+            if (path.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)
+                || path.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            UnityEngine.Object asset = AssetDatabase.LoadMainAssetAtPath(path);
+#if UNITY_6000_5_OR_NEWER
+            return asset != null && AssetDatabase.CanOpenAssetInEditor(asset.GetEntityId());
+#else
+            return asset != null && AssetDatabase.CanOpenAssetInEditor(asset.GetInstanceID());
+#endif
+        }
+
+        private static bool ShouldOpenInLocus(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return true;
+
+            string extension = Path.GetExtension(path);
+            if (LocusSourceExtensions.Contains(extension))
+                return true;
+
+            string fileName = Path.GetFileName(path);
+            if (LocusSourceFileNames.Contains(fileName))
+                return true;
+
+            string[] userExtensions = EditorSettings.projectGenerationUserExtensions;
+            if (userExtensions == null)
+                return false;
+            foreach (string userExtension in userExtensions)
+            {
+                if (string.IsNullOrWhiteSpace(userExtension))
+                    continue;
+                string normalized = userExtension.StartsWith(".", StringComparison.Ordinal)
+                    ? userExtension
+                    : "." + userExtension;
+                if (string.Equals(extension, normalized, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
         }
 
         private static bool PathsEqual(string left, string right)

@@ -241,6 +241,7 @@ export interface UnityConnectionStatus {
   editorStatus: string;
   controlChannelState: "ready" | "busy" | "timeout" | "disconnected" | "error" | "not_checked" | string;
   scenePath?: string | null;
+  scenePaths?: string[];
   editorProcessState: UnityEditorProcessState;
   editorProcessId?: number | null;
   editorProcessPath?: string | null;
@@ -297,7 +298,7 @@ export interface UnityObservedMainThreadState {
 export interface UnityObservedSafetyState {
   canCallUnityApi: boolean;
   canModifyAssetsSafely: boolean;
-  recommendedAction: "proceed" | "wait_reload" | "avoid_unity_api" | "diagnose_hang" | "reconnect_control_pipe" | "resolve_dialog" | string;
+  recommendedAction: "proceed" | "wait_reload" | "avoid_unity_api" | "diagnose_hang" | "reconnect_control_pipe" | "resolve_dialog" | "fix_compile_errors" | string;
 }
 
 export interface UnityObservedStatePlane {
@@ -307,6 +308,14 @@ export interface UnityObservedStatePlane {
   nativeHook: string;
   historySamples: number;
   lastObservedAtMs?: number | null;
+}
+
+export interface UnityObservedEditorLogState {
+  path?: string | null;
+  source: "command_line" | "project" | "platform_default" | "unavailable" | string;
+  safeMode: boolean;
+  safeModeSource?: "window_title" | "editor_log" | string | null;
+  modifiedAtMs?: number | null;
 }
 
 export interface UnitySemanticState {
@@ -324,6 +333,7 @@ export interface UnitySemanticState {
   mainThread: UnityObservedMainThreadState;
   safety: UnityObservedSafetyState;
   statePlane: UnityObservedStatePlane;
+  editorLog: UnityObservedEditorLogState;
 }
 
 export interface UnityNativeBrokerStatus {
@@ -631,6 +641,8 @@ export type ReasoningReplayField =
   | "reasoning_details"
   | "reasoning";
 
+export type RemoteCompactionMode = "disabled" | "codex_v2";
+
 export interface CustomEndpointServerTools {
   webSearch: boolean;
 }
@@ -658,6 +670,7 @@ export interface CustomProviderModel {
   apiModel: string;
   name: string;
   contextLength: number;
+  remoteCompactionMode: RemoteCompactionMode;
   /** Protocol-native lazy tool loading (defer_loading/tool_reference); Anthropic format only. */
   supportsToolLazyLoading: boolean;
   supportedReasoningEfforts: EffortLevel[];

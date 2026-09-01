@@ -303,6 +303,26 @@ fn format_unity_console_logs(
     Ok(output)
 }
 
+fn format_editor_log_fallback(
+    read: crate::unity_bridge::EditorLogRead,
+    requested_levels: &[String],
+    bridge_error: &str,
+) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "entries": read.entries,
+        "matchedCount": read.matched_count,
+        "uniqueCount": read.unique_count,
+        "truncated": read.truncated,
+    });
+    let console = format_unity_console_logs(&payload, requested_levels)?;
+    Ok(format!(
+        "Unity Editor log fallback:\n- path: {}\n- bridge: {}\n{}",
+        read.path,
+        crate::tool::output::flat_text(bridge_error),
+        console
+    ))
+}
+
 fn requested_console_levels(args: &serde_json::Value) -> Vec<String> {
     let mut requested = Vec::new();
     if let Some(level) = args.get("level").and_then(serde_json::Value::as_str) {
@@ -408,6 +428,201 @@ pub(super) fn unity_test_run() -> ToolDef {
                     }
                     Err(output) => ToolResult {
                         output,
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+// ─── unity_lock / unity_release ─────────────────────────────────────────────
+
+fn unity_cooperative_lock_context(
+    ctx: &crate::tool::ToolExecutionContext,
+    tool_name: &str,
+) -> Result<(String, String, tauri::AppHandle), ToolResult> {
+    let project_path = ctx
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ToolResult {
+            output: format!(
+                "Tool '{tool_name}' requires a selected Unity project working directory."
+            ),
+            is_error: true,
+        })?;
+    if !crate::unity_bridge::is_unity_project(&project_path) {
+        return Err(ToolResult {
+            output: format!("Tool '{tool_name}' requires a Unity project workspace."),
+            is_error: true,
+        });
+    }
+    let session_id = ctx
+        .process_owner
+        .as_ref()
+        .and_then(|owner| owner.session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ToolResult {
+            output: format!("Tool '{tool_name}' requires an Agent session identity."),
+            is_error: true,
+        })?;
+    let app = ctx.app_handle.clone().ok_or_else(|| ToolResult {
+        output: format!("Tool '{tool_name}' requires the Locus application runtime."),
+        is_error: true,
+    })?;
+    Ok((project_path, session_id, app))
+}
+
+pub(super) fn unity_lock() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_LOCK);
+    ToolDef {
+        name: "unity_lock".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        // Advisory process state only; Unity tools remain independently callable.
+        mutates_workspace: false,
+        execute: make_exec(|args, ctx| {
+            Box::pin(async move {
+                let reason = match args
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(reason) => reason.chars().take(240).collect::<String>(),
+                    None => {
+                        return ToolResult {
+                            output: "Missing required parameter: reason".to_string(),
+                            is_error: true,
+                        };
+                    }
+                };
+                let timeout_seconds = match args.get("timeout_seconds") {
+                    None => 300,
+                    Some(value) => match value.as_u64() {
+                        Some(value @ 1..=900) => value,
+                        _ => {
+                            return ToolResult {
+                                output: "Parameter 'timeout_seconds' must be an integer from 1 to 900."
+                                    .to_string(),
+                                is_error: true,
+                            };
+                        }
+                    },
+                };
+                let mode = match args
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("wait")
+                    .trim()
+                {
+                    "wait" => crate::unity_editor_lock::UnityEditorLockAcquireMode::Wait,
+                    "try" => crate::unity_editor_lock::UnityEditorLockAcquireMode::Try,
+                    value => {
+                        return ToolResult {
+                            output: format!(
+                                "Invalid unity_lock mode {value:?}. Use 'wait' or 'try'."
+                            ),
+                            is_error: true,
+                        };
+                    }
+                };
+                let (project_path, session_id, app) =
+                    match unity_cooperative_lock_context(&ctx, "unity_lock") {
+                        Ok(context) => context,
+                        Err(result) => return result,
+                    };
+
+                match crate::unity_editor_lock::acquire(
+                    &app,
+                    &project_path,
+                    &session_id,
+                    &reason,
+                    mode,
+                    Duration::from_secs(timeout_seconds),
+                    ctx.cancel_rx.clone(),
+                    ctx.progress.clone(),
+                )
+                .await
+                {
+                    Ok(outcome) => ToolResult {
+                        output: format!(
+                            "Unity Editor cooperative lock: status={} session={} waited_ms={} reason={}",
+                            if outcome.already_owned {
+                                "already_owned"
+                            } else {
+                                "acquired"
+                            },
+                            session_id,
+                            outcome.waited_ms,
+                            serde_json::to_string(&reason)
+                                .unwrap_or_else(|_| "\"<invalid>\"".to_string())
+                        ),
+                        is_error: false,
+                    },
+                    Err(error @ crate::unity_editor_lock::UnityEditorLockAcquireError::Busy {
+                        ..
+                    }) => ToolResult {
+                        output: error.message(),
+                        is_error: false,
+                    },
+                    Err(error) => ToolResult {
+                        output: error.message(),
+                        is_error: true,
+                    },
+                }
+            })
+        }),
+    }
+}
+
+pub(super) fn unity_release() -> ToolDef {
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::UNITY_RELEASE);
+    ToolDef {
+        name: "unity_release".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute: make_exec(|_args, ctx| {
+            Box::pin(async move {
+                if !crate::unity_editor_lock::is_enabled() {
+                    return ToolResult {
+                        output: "Unity Editor cooperative locking is disabled in Settings > Experimental."
+                            .to_string(),
+                        is_error: true,
+                    };
+                }
+                let (project_path, session_id, _app) =
+                    match unity_cooperative_lock_context(&ctx, "unity_release") {
+                        Ok(context) => context,
+                        Err(result) => return result,
+                    };
+                match crate::unity_editor_lock::release(&project_path, &session_id) {
+                    Ok(crate::unity_editor_lock::UnityEditorLockReleaseOutcome::Released) => {
+                        ToolResult {
+                            output: format!(
+                                "Unity Editor cooperative lock: status=released session={session_id}"
+                            ),
+                            is_error: false,
+                        }
+                    }
+                    Ok(crate::unity_editor_lock::UnityEditorLockReleaseOutcome::AlreadyFree) => {
+                        ToolResult {
+                            output: "Unity Editor cooperative lock: status=already_free"
+                                .to_string(),
+                            is_error: false,
+                        }
+                    }
+                    Err(holder) => ToolResult {
+                        output: format!(
+                            "Unity Editor cooperative lock is owned by another Agent: {}.",
+                            crate::unity_editor_lock::holder_summary(&holder)
+                        ),
                         is_error: true,
                     },
                 }
@@ -841,9 +1056,34 @@ pub(super) fn unity_get_console_log() -> ToolDef {
                 {
                     Ok(response) => response,
                     Err(error) => {
-                        return ToolResult {
-                            output: error,
-                            is_error: true,
+                        let requested_levels = requested_console_levels(&args);
+                        let limit = args
+                            .get("limit")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(50) as usize;
+                        let process = crate::unity_bridge::query_current_project_editor_process(
+                            &project_path,
+                        )
+                        .await;
+                        return match crate::unity_bridge::read_editor_log_console_entries(
+                            &project_path,
+                            process.process_id,
+                            &requested_levels,
+                            limit,
+                        )
+                        .and_then(|read| {
+                            format_editor_log_fallback(read, &requested_levels, &error)
+                        }) {
+                            Ok(output) => ToolResult {
+                                output,
+                                is_error: false,
+                            },
+                            Err(fallback_error) => ToolResult {
+                                output: format!(
+                                    "{error}\nUnity Editor log fallback failed: {fallback_error}"
+                                ),
+                                is_error: true,
+                            },
                         };
                     }
                 };

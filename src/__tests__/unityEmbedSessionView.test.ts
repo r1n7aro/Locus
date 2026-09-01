@@ -391,6 +391,15 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("public DroppedAssetRef[] assetRefs;");
     expect(unityWindow).toContain('[MenuItem("Assets/Send to Locus", false, 0)');
     expect(unityWindow).toContain('[MenuItem("GameObject/Send to Locus", false, 0)');
+    expect(unityWindow).toContain("public enum SendToLocusMode");
+    expect(unityWindow).toContain("public sealed class LocusFileAttachment");
+    expect(unityWindow).toContain("FocusedSession");
+    expect(unityWindow).toContain("NewSession");
+    expect(unityWindow).toContain("public static bool SendToLocus(");
+    expect(unityWindow).toContain("SendToLocusMode mode = SendToLocusMode.FocusedSession");
+    expect(unityWindow).toContain("IReadOnlyList<LocusFileAttachment> attachments");
+    expect(unityWindow).toContain('type = "fileDrop"');
+    expect(unityWindow).toContain('return "newSession";');
     expect(unityWindow).not.toContain("InitializeConsoleIntegration");
     expect(unityWindow).not.toContain("locus-console-send-button");
     expect(unityWindow).not.toContain('text = "Send to Locus"');
@@ -425,7 +434,11 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain('source = "unity"');
     expect(unityWindow).toContain('message.type == "open" || message.type == "update"');
     expect(command).toContain("asset_refs: Option<Vec<UnityEmbedAssetRef>>");
+    expect(command).toContain("files: Option<Vec<LocusFileDropRef>>");
+    expect(command).toContain("send_mode: Option<String>");
+    expect(command).toContain('Some("newSession") => Some("newSession".to_string())');
     expect(command).toContain('"assetDrop" =>');
+    expect(command).toContain('"fileDrop" =>');
     expect(command).toContain('"assetDrag" =>');
     expect(command).toContain('"consoleText" =>');
     expect(command).toContain("text_entries: Option<Vec<UnityEmbedTextDropEntry>>");
@@ -436,6 +449,7 @@ describe("Unity embedded session view", () => {
     expect(service).toContain("getUnityConsoleText");
     expect(service).toContain("get_unity_console_text");
     expect(service).toContain("subscribeUnityEmbedAssetDrop");
+    expect(service).toContain('sendMode?: "focusedSession" | "newSession"');
     expect(service).toContain("subscribeUnityEmbedTextDrop");
     expect(service).toContain("subscribeLocusFileDrop");
     expect(service).toContain("subscribeUnityEmbedAssetDragState");
@@ -459,6 +473,10 @@ describe("Unity embedded session view", () => {
     expect(input).toContain("consoleTextAttachments = ref<ConsoleTextAttachment[]>([])");
     expect(input).toContain("localFileAttachments = ref<LocalFileAttachment[]>([])");
     expect(input).toContain("subscribeUnityEmbedAssetDrop((payload)");
+    expect(input).toContain('sendMode === "newSession"');
+    expect(input).toContain("chatStore.newChat();");
+    expect(input).toContain("chatStore.newChat();\n    await nextTick();\n    resetDraft();");
+    expect(input).toContain("async function handleLocusFileDrop(payload: LocusFileDropPayload)");
     expect(input).toContain("subscribeUnityEmbedTextDrop((payload)");
     expect(input).toContain("subscribeLocusFileDrop((payload)");
     expect(input).toContain("checkUnityConnectionStatus");
@@ -522,6 +540,21 @@ describe("Unity embedded session view", () => {
     expect(unityTypes).toContain("TryOpenPropertyEditor");
     expect(unityTypes).toContain("LocusLockedAssetInspectorWindow");
     expect(unityTypes).not.toContain("Selection.activeObject = obj");
+  });
+
+  it("routes Send to Locus payloads to the restored main window with workspace scope", () => {
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+    const app = read("src-tauri/src/lib.rs");
+    const service = read("src/services/unity.ts");
+
+    expect(command).toContain("crate::reveal_main_window(app_handle);");
+    expect(command).toContain("MAIN_WINDOW_LABEL");
+    expect(command).toContain("workspace_ref: Some(binding.workspace_ref.clone())");
+    expect(app).toContain("pub(crate) fn reveal_main_window");
+    expect(app).toContain("window.unminimize()");
+    expect(app).toContain("window.show()");
+    expect(app).toContain("window.set_focus()");
+    expect(service).toContain("workspaceRef?: WorkspaceRef;");
   });
 
   it("offers reference context-menu actions for assets and knowledge documents", () => {
@@ -618,10 +651,11 @@ describe("Unity embedded session view", () => {
     expect(unityTypes).toContain("OpenLockedObjectInspector(target)");
   });
 
-  it("queues Locus refs for Unity native IMGUI drag start", () => {
+  it("routes Locus refs through internal drag before native externalization", () => {
     const markdownInject = read("src/composables/markdownInject.ts");
     const markdownRenderer = read("src/components/MarkdownRenderer.vue");
     const assetChip = read("src/components/AssetChip.vue");
+    const referenceDrag = read("src/components/workbench/workbenchReferenceDrag.ts");
     const dragSource = read("src/composables/useUnityReferenceDragSource.ts");
     const service = read("src/services/unity.ts");
     const command = read("src-tauri/src/commands/unity_embed.rs");
@@ -631,19 +665,17 @@ describe("Unity embedded session view", () => {
     const editorWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
     const unityTypes = read("locus_unity/Editor/LocusBridge.Types.cs");
 
-    expect(markdownInject).toContain('draggable="true"');
-    expect(markdownRenderer).toContain("function handleMarkdownDragStart(event: DragEvent)");
+    expect(markdownInject).not.toContain('draggable="true"');
     expect(markdownRenderer).toContain("function handleMarkdownPointerDown(event: PointerEvent)");
-    expect(markdownRenderer).toContain("function localFileFromMarkdownDragTarget(target: Element)");
-    expect(markdownRenderer).toContain("startUnityReferenceHtmlDrag(event, [ref])");
-    expect(markdownRenderer).toContain("armUnityReferencePointerDrag(event, [ref])");
-    expect(markdownRenderer).toContain("startLocusFileHtmlDrag(event, [file])");
-    expect(markdownRenderer).toContain("armLocusFilePointerDrag(event, [file])");
-    expect(assetChip).toContain(':draggable="!!unityDragRef"');
+    expect(markdownRenderer).toContain("startWorkbenchReferenceInternalDrag");
+    expect(markdownRenderer).not.toContain("@dragstart");
+    expect(markdownRenderer).not.toContain("armUnityReferencePointerDrag");
+    expect(assetChip).toContain("startWorkbenchReferenceInternalDrag");
     expect(assetChip).toContain('@pointerdown="handlePointerDown"');
-    expect(assetChip).toContain('@dragstart="handleDragStart"');
     expect(assetChip).toContain('@pointerdown.stop.prevent');
-    expect(assetChip).toContain('@dragstart.stop.prevent');
+    expect(assetChip).not.toContain("@dragstart");
+    expect(referenceDrag).toContain("externalizeUnityReferenceDrag");
+    expect(referenceDrag).toContain("externalizeLocusFileDrag");
     expect(dragSource).toContain("POINTER_DRAG_THRESHOLD_PX");
     expect(dragSource).toContain("NATIVE_FILE_DRAG_RESTORE_MS");
     expect(dragSource).toContain("UNITY_ASSET_REF_ROOT_RE");

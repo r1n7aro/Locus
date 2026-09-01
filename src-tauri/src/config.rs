@@ -275,12 +275,8 @@ fn default_async_tasks_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
 }
 
-fn default_view_windows_above_main() -> Arc<AtomicBool> {
+fn default_unity_multi_agent_editor_enabled() -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(false))
-}
-
-fn default_view_open_in_existing_window() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
 }
 
 fn default_unity_background_hook_enabled() -> Arc<AtomicBool> {
@@ -552,6 +548,14 @@ pub struct AppConfig {
     /// Experimental background execution for selected long-running tools.
     #[serde(default = "default_async_tasks_enabled", with = "serde_atomic_bool")]
     pub async_tasks_enabled: Arc<AtomicBool>,
+    /// Experimental cooperative lock protocol for multiple Agent sessions
+    /// sharing one Unity Editor. The lock is advisory and never gates Unity
+    /// tool execution in the harness.
+    #[serde(
+        default = "default_unity_multi_agent_editor_enabled",
+        with = "serde_atomic_bool"
+    )]
+    pub unity_multi_agent_editor_enabled: Arc<AtomicBool>,
     #[serde(default = "default_close_behavior", with = "serde_close_behavior")]
     pub close_behavior: Arc<Mutex<AppCloseBehavior>>,
     #[serde(
@@ -585,16 +589,6 @@ pub struct AppConfig {
         with = "serde_string_mutex"
     )]
     pub default_skill_package_namespace: Arc<Mutex<String>>,
-    #[serde(
-        default = "default_view_windows_above_main",
-        with = "serde_atomic_bool"
-    )]
-    pub view_windows_above_main: Arc<AtomicBool>,
-    #[serde(
-        default = "default_view_open_in_existing_window",
-        with = "serde_atomic_bool"
-    )]
-    pub view_open_in_existing_window: Arc<AtomicBool>,
     #[serde(
         default = "default_unity_background_hook_enabled",
         with = "serde_atomic_bool"
@@ -761,14 +755,13 @@ impl AppConfig {
             session_undo_enabled: default_session_undo_enabled(),
             file_tool_workspace_boundary: default_debug_flag(),
             async_tasks_enabled: default_async_tasks_enabled(),
+            unity_multi_agent_editor_enabled: default_unity_multi_agent_editor_enabled(),
             close_behavior: default_close_behavior(),
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
             dynamic_tool_loading_native_migrated: true,
             workspace_service_ttl_hour_migrated: true,
             anthropic_native_lazy_enabled: default_anthropic_native_lazy_enabled(),
             default_skill_package_namespace: default_skill_package_namespace(),
-            view_windows_above_main: default_view_windows_above_main(),
-            view_open_in_existing_window: default_view_open_in_existing_window(),
             unity_background_hook_enabled: default_unity_background_hook_enabled(),
             unity_embed_enabled: default_unity_embed_enabled(),
             unity_state_probe_enabled: default_unity_state_probe_enabled(),
@@ -979,6 +972,24 @@ impl AppConfig {
         self.persist()
     }
 
+    pub fn unity_multi_agent_editor_enabled(&self) -> bool {
+        self.unity_multi_agent_editor_enabled
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn set_unity_multi_agent_editor_enabled(&self, value: bool) -> Result<(), String> {
+        let previous = self.unity_multi_agent_editor_enabled();
+        self.unity_multi_agent_editor_enabled
+            .store(value, Ordering::Relaxed);
+        if let Err(error) = self.persist() {
+            self.unity_multi_agent_editor_enabled
+                .store(previous, Ordering::Relaxed);
+            return Err(error);
+        }
+        crate::unity_editor_lock::set_enabled(value);
+        Ok(())
+    }
+
     pub fn close_behavior(&self) -> AppCloseBehavior {
         self.close_behavior
             .lock()
@@ -1034,25 +1045,6 @@ impl AppConfig {
             .default_skill_package_namespace
             .lock()
             .map_err(|e| format!("default skill package namespace lock poisoned: {}", e))? = value;
-        self.persist()
-    }
-
-    pub fn view_windows_above_main_enabled(&self) -> bool {
-        self.view_windows_above_main.load(Ordering::Relaxed)
-    }
-
-    pub fn set_view_windows_above_main_enabled(&self, value: bool) -> Result<(), String> {
-        self.view_windows_above_main.store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn view_open_in_existing_window_enabled(&self) -> bool {
-        self.view_open_in_existing_window.load(Ordering::Relaxed)
-    }
-
-    pub fn set_view_open_in_existing_window_enabled(&self, value: bool) -> Result<(), String> {
-        self.view_open_in_existing_window
-            .store(value, Ordering::Relaxed);
         self.persist()
     }
 
@@ -1657,6 +1649,31 @@ mod tests {
     }
 
     #[test]
+    fn unity_multi_agent_editor_defaults_to_disabled_and_persists_opt_in() {
+        let _gate = crate::unity_editor_lock::test_gate();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"{
+  "model": "legacy-model",
+  "debug": false
+}"#,
+        )
+        .expect("legacy config");
+
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(!config.unity_multi_agent_editor_enabled());
+
+        config
+            .set_unity_multi_agent_editor_enabled(true)
+            .expect("persist Unity multi-Agent Editor opt-in");
+        let reloaded = AppConfig::load_from_path(&config_path);
+        assert!(reloaded.unity_multi_agent_editor_enabled());
+        crate::unity_editor_lock::set_enabled(false);
+    }
+
+    #[test]
     fn default_skill_package_namespace_defaults_to_empty() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
@@ -1672,42 +1689,6 @@ mod tests {
         let config = AppConfig::load_from_path(&config_path);
 
         assert_eq!(config.default_skill_package_namespace(), "");
-    }
-
-    #[test]
-    fn view_windows_above_main_defaults_to_disabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert!(!config.view_windows_above_main_enabled());
-    }
-
-    #[test]
-    fn view_open_in_existing_window_defaults_to_enabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert!(config.view_open_in_existing_window_enabled());
     }
 
     #[test]
@@ -1985,34 +1966,6 @@ mod tests {
 
         let reloaded = AppConfig::load_from_path(&config_path);
         assert_eq!(reloaded.default_skill_package_namespace(), "studio.tools");
-    }
-
-    #[test]
-    fn view_windows_above_main_persists_enabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_view_windows_above_main_enabled(true)
-            .expect("persist view window z-order setting");
-
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(reloaded.view_windows_above_main_enabled());
-    }
-
-    #[test]
-    fn view_open_in_existing_window_persists_disabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_view_open_in_existing_window_enabled(false)
-            .expect("persist view tab opening setting");
-
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(!reloaded.view_open_in_existing_window_enabled());
     }
 
     #[test]

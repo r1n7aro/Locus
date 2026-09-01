@@ -488,10 +488,11 @@ describe("unityObjectPreview", () => {
     expect(numberField).toContain('emit("preview", parsed)');
     expect(numberField).toContain("constrainUnityNumberValue");
     expect(numberField).toContain("usesRange");
-    expect(identity).toContain("armUnityReferencePointerDrag");
+    expect(identity).toContain("startWorkbenchReferenceInternalDrag");
+    expect(identity).not.toContain("@dragstart");
     expect(identity).toContain("resolveRefGraphGuid");
     expect(identity).toContain("resolveRefGraphPath");
-    expect(identity).toContain("unityObjectPreviewAssetRef");
+    expect(identity).toContain("data-unity-ref-path");
   });
 
   it("keeps disk previews visible when the live property tree fails (#114)", () => {
@@ -522,7 +523,7 @@ describe("unityObjectPreview", () => {
     expect(renderer).toContain("[data-md-unity-object-preview='true']");
     expect(renderer).toContain("data-md-unity-passive");
     expect(renderer).toContain("host.removeAttribute(\"draggable\")");
-    expect(renderer).toContain("isInsidePassiveMarkdownUnityPreview");
+    expect(renderer).toContain("startWorkbenchReferenceInternalDrag");
     expect(renderer).toContain("draggable: false");
     expect(renderer).toContain("autoLoadPreview: true");
     expect(renderer).toContain("unityPreviewStateScope?: string | null");
@@ -530,7 +531,7 @@ describe("unityObjectPreview", () => {
     expect(renderer).toContain("previewStateKey: markdownUnityObjectPreviewStateKey(host, index, model, level)");
     expect(renderer).toContain("host.replaceChildren();");
     expect(renderer).toContain(".md-unity-object-ref[data-md-unity-level=\"row\"]");
-    expect(renderer).toContain("target.closest(\".md-unity-asset-ref, .md-file-ref[data-asset-path]\")");
+    expect(renderer).not.toContain("@dragstart");
   });
 
   it("remembers markdown inspector expansion by preview state key", () => {

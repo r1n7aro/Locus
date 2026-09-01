@@ -15,6 +15,32 @@ using Microsoft.Win32;
 
 namespace Locus
 {
+    public enum SendToLocusMode
+    {
+        FocusedSession,
+        NewSession
+    }
+
+    public sealed class LocusFileAttachment
+    {
+        public string Path { get; }
+        public string Name { get; }
+        public string TypeLabel { get; }
+        public string Source { get; }
+
+        public LocusFileAttachment(
+            string path,
+            string name = "",
+            string typeLabel = "",
+            string source = "")
+        {
+            Path = path ?? "";
+            Name = name ?? "";
+            TypeLabel = typeLabel ?? "";
+            Source = source ?? "";
+        }
+    }
+
     public sealed class LocusEditorWindow : EditorWindow
     {
         private const bool OverlaySyncEnabled = true;
@@ -120,6 +146,8 @@ namespace Locus
             public long parentHwnd;
             public string reason;
             public DroppedAssetRef[] assetRefs;
+            public LocusFileDropRef[] files;
+            public string sendMode;
             // Set to "reloading" while the managed domain reloads so the Tauri
             // server retains the overlay (the native client keeps the pipe up).
             public string managedOverlayState;
@@ -143,6 +171,16 @@ namespace Locus
             public string kind;
             public string name;
             public string typeLabel;
+            public string source;
+        }
+
+        [Serializable]
+        private sealed class LocusFileDropRef
+        {
+            public string path;
+            public string name;
+            public string typeLabel;
+            public bool isDir;
             public string source;
         }
 
@@ -316,15 +354,57 @@ namespace Locus
 
         private static void SendSelectedRefsToLocus()
         {
+            SendToLocus(SendToLocusMode.FocusedSession);
+        }
+
+        /// <summary>
+        /// Sends the current Unity selection to Locus as asset or scene-object
+        /// references. FocusedSession appends to the active composer;
+        /// NewSession opens a fresh session draft before attaching the refs.
+        /// </summary>
+        public static bool SendToLocus(
+            SendToLocusMode mode = SendToLocusMode.FocusedSession)
+        {
+            string sendMode = SerializeSendToLocusMode(mode);
             DroppedAssetRef[] assetRefs = BuildSelectedAssetRefs();
             if (assetRefs.Length == 0)
-                return;
+                return false;
 
-            string json = JsonUtility.ToJson(new EmbedControlMessage
+            return QueueSendToLocusMessage(new EmbedControlMessage
             {
                 type = "assetDrop",
-                assetRefs = assetRefs
+                assetRefs = assetRefs,
+                sendMode = sendMode
             });
+        }
+
+        /// <summary>
+        /// Sends explicit local files or folders to Locus. Invalid or missing
+        /// paths are ignored; returns false when no attachment can be sent.
+        /// </summary>
+        public static bool SendToLocus(
+            IReadOnlyList<LocusFileAttachment> attachments,
+            SendToLocusMode mode = SendToLocusMode.FocusedSession)
+        {
+            if (attachments == null)
+                throw new ArgumentNullException(nameof(attachments));
+
+            string sendMode = SerializeSendToLocusMode(mode);
+            LocusFileDropRef[] files = BuildLocalFileDropRefs(attachments);
+            if (files.Length == 0)
+                return false;
+
+            return QueueSendToLocusMessage(new EmbedControlMessage
+            {
+                type = "fileDrop",
+                files = files,
+                sendMode = sendMode
+            });
+        }
+
+        private static bool QueueSendToLocusMessage(EmbedControlMessage message)
+        {
+            string json = JsonUtility.ToJson(message);
             string pipeName = GetControlPipeName();
 
             Task.Run(() =>
@@ -337,6 +417,20 @@ namespace Locus
                 {
                 }
             });
+            return true;
+        }
+
+        private static string SerializeSendToLocusMode(SendToLocusMode mode)
+        {
+            switch (mode)
+            {
+                case SendToLocusMode.FocusedSession:
+                    return "focusedSession";
+                case SendToLocusMode.NewSession:
+                    return "newSession";
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported Send to Locus mode.");
+            }
         }
 
         private static void EnsureLifecycleHooks()
@@ -1268,6 +1362,55 @@ namespace Locus
                 return;
 
             throw new IOException("Native overlay client is unavailable.");
+        }
+
+        private static LocusFileDropRef[] BuildLocalFileDropRefs(
+            IReadOnlyList<LocusFileAttachment> attachments)
+        {
+            List<LocusFileDropRef> files = new List<LocusFileDropRef>(attachments.Count);
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int index = 0; index < attachments.Count; index++)
+            {
+                LocusFileAttachment attachment = attachments[index];
+                string rawPath = attachment == null ? "" : attachment.Path.Trim();
+                if (string.IsNullOrEmpty(rawPath))
+                    continue;
+
+                string fullPath;
+                try
+                {
+                    fullPath = Path.GetFullPath(rawPath);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                bool isDir = Directory.Exists(fullPath);
+                if (!isDir && !File.Exists(fullPath))
+                    continue;
+                if (!seen.Add(fullPath))
+                    continue;
+
+                string trimmedPath = fullPath.TrimEnd(
+                    Path.DirectorySeparatorChar,
+                    Path.AltDirectorySeparatorChar);
+                string name = attachment.Name.Trim();
+                if (string.IsNullOrEmpty(name))
+                    name = Path.GetFileName(trimmedPath);
+
+                files.Add(new LocusFileDropRef
+                {
+                    path = fullPath,
+                    name = name,
+                    typeLabel = attachment.TypeLabel.Trim(),
+                    isDir = isDir,
+                    source = string.IsNullOrWhiteSpace(attachment.Source)
+                        ? "unity"
+                        : attachment.Source.Trim()
+                });
+            }
+            return files.ToArray();
         }
 
         private static void WritePipeLineOnce(string pipeName, string json)

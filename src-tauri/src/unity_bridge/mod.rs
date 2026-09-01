@@ -1,6 +1,7 @@
 mod background_hook;
 mod capture;
 pub(crate) mod dialog;
+mod editor_log;
 mod flavor;
 mod focus;
 mod native_selftest;
@@ -28,11 +29,16 @@ use flavor::EditorFlavor;
 
 pub use background_hook::{UnityBackgroundHookState, UnityBackgroundHookStatus};
 pub use capture::{capture_viewport, UnityViewportCapture};
+pub use editor_log::{
+    read_console_entries as read_editor_log_console_entries, resolve_editor_log_path,
+    EditorLogEntry, EditorLogRead, ObservedEditorLogState,
+};
 pub use plugin::{
     check_plugin_install_plan, check_plugin_status, emit_plugin_status_scoped,
     find_plugin_source_dir, install_or_update_plugin, install_or_update_plugin_with_force_close,
     plugin_install_root, plugin_skills_root, PluginInstallPlan, PluginStatus,
 };
+pub(crate) use process::UnityProcessIdentityLiveness;
 pub use process::{
     close_current_project_unity_processes, force_close_current_project_unity_processes,
     query_current_project_editor_process, UnityEditorProcessInfo, UnityEditorProcessState,
@@ -154,6 +160,50 @@ pub async fn unity_semantic_state(project_path: &str) -> SemanticState {
         });
     }
     state
+}
+
+pub async fn enrich_unity_tool_error(project_path: &str, original: &str) -> String {
+    const MARKER: &str = "[Unity editor diagnostics]";
+    if original.contains(MARKER) || project_path.trim().is_empty() {
+        return original.to_string();
+    }
+
+    let state = unity_semantic_state(project_path).await;
+    if !matches!(state.phase.as_str(), "safe_mode" | "crashed") {
+        return original.to_string();
+    }
+
+    let log_path = state
+        .editor_log
+        .path
+        .clone()
+        .or_else(|| {
+            editor_log::resolve_editor_log_path(project_path, state.process.pid)
+                .map(|(path, _)| path.display().to_string())
+        })
+        .unwrap_or_else(|| "unavailable".to_string());
+    let action = if state.phase == "safe_mode" {
+        "Inspect the compiler errors below or call unity_get_console_log with level='error', fix the referenced source files with file tools, then wait for Unity to exit Safe Mode automatically."
+    } else {
+        "Inspect the Editor log around the crash before restarting Unity; identify the native exception, managed stack, or last executing tool operation that caused the exit."
+    };
+    let recent_errors = editor_log::recent_error_lines(project_path, state.process.pid, 8);
+    let mut output = format!(
+        "{}\n\n{}\n- state: {}\n- editor_log: {}\n- action: {}",
+        original.trim_end(),
+        MARKER,
+        state.phase,
+        log_path,
+        action
+    );
+    if !recent_errors.is_empty() {
+        output.push_str("\n- recent_errors:");
+        for error in recent_errors {
+            output.push_str("\n  - ");
+            output.push_str(&crate::tool::output::flat_text(&error));
+        }
+    }
+    output
 }
 
 pub async fn run_state_probe_selftest(
@@ -1074,6 +1124,7 @@ pub struct UnityConnectionStatus {
     pub control_channel_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scene_path: Option<String>,
+    pub scene_paths: Vec<String>,
     pub editor_process_state: UnityEditorProcessState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor_process_id: Option<u32>,
@@ -1714,11 +1765,23 @@ pub async fn launch_project_with_mode_and_options(
         .ok_or_else(|| "Current Unity project is missing ProjectVersion.txt".to_string())?;
     let editor_path = resolve_unity_editor_executable(&project_version)?;
     let project_path = normalized_project_path_for_launch(project_path);
+    let editor_log_path = project_path.join("Logs").join("Editor.log");
+    if let Some(parent) = editor_log_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create Unity Editor log directory '{}': {}",
+                parent.display(),
+                error
+            )
+        })?;
+    }
 
     let mut command = std::process::Command::new(&editor_path);
     command
         .arg("-projectPath")
         .arg(&project_path)
+        .arg("-logFile")
+        .arg(&editor_log_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1783,6 +1846,45 @@ pub async fn launch_project_with_mode_and_options(
         process_id,
         mode,
     })
+}
+
+pub(crate) fn launched_unity_process_created_at_ms(process_id: u32) -> Option<u64> {
+    process::process_created_at_unix_ms(process_id)
+}
+
+pub(crate) fn launched_unity_process_liveness(
+    process_id: u32,
+    expected_created_at_ms: Option<u64>,
+) -> Result<UnityProcessIdentityLiveness, String> {
+    process::query_process_identity_liveness(process_id, expected_created_at_ms)
+}
+
+pub(crate) async fn reaffirm_launched_unity_editor_process(
+    project_path: &str,
+    editor_path: &str,
+    process_id: u32,
+    expected_created_at_ms: Option<u64>,
+) -> Result<UnityProcessIdentityLiveness, String> {
+    let liveness = launched_unity_process_liveness(process_id, expected_created_at_ms)?;
+    if liveness == UnityProcessIdentityLiveness::Alive {
+        // Repair any late old-generation disconnect probe that raced with the
+        // launch. Clearing the semantic cache prevents its derived `crashed`
+        // state from surviving after the expected process was proven alive.
+        process::cache_project_editor_process(
+            project_path,
+            UnityEditorProcessInfo {
+                state: UnityEditorProcessState::Running,
+                process_id: Some(process_id),
+                executable_path: Some(editor_path.to_string()),
+                project_path: Some(project_path.to_string()),
+                checked_at_ms: unix_now_ms(),
+                last_error: None,
+            },
+        )
+        .await;
+        state_probe::clear_project_observer_state(project_path);
+    }
+    Ok(liveness)
 }
 
 // ── Public API (cross-platform, routes through transport) ────────────
@@ -1870,6 +1972,12 @@ pub fn format_editor_status_for_prompt(status: &str) -> &'static str {
 }
 
 pub fn format_editor_status_for_event(status: &str) -> &'static str {
+    if status.eq_ignore_ascii_case("safe_mode") {
+        return "`safe_mode` (fix script compilation errors with file tools; Unity APIs are unavailable)";
+    }
+    if status.eq_ignore_ascii_case("crashed") {
+        return "`crashed` (Unity exited abnormally; inspect the Editor log before restarting)";
+    }
     match normalize_editor_status(status) {
         UNITY_EDITOR_STATUS_DISCONNECTED => "`disconnected`",
         UNITY_EDITOR_STATUS_PLAYING => "`playing`",
@@ -1885,15 +1993,27 @@ fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn parse_unity_status_message(message: &str) -> (&'static str, Option<String>) {
-    let (status_part, scene_part) = match message.split_once('|') {
-        Some((status, scene)) => (status, Some(scene.trim().to_string())),
-        None => (message, None),
-    };
-    (
-        normalize_editor_status(status_part),
-        scene_part.filter(|scene| !scene.is_empty()),
-    )
+fn parse_unity_status_message(message: &str) -> (&'static str, Option<String>, Vec<String>) {
+    let mut parts = message.split('|');
+    let status = normalize_editor_status(parts.next().unwrap_or_default());
+    let scene_path = parts
+        .next()
+        .map(str::trim)
+        .filter(|scene| !scene.is_empty())
+        .map(ToOwned::to_owned);
+    let mut scene_paths = Vec::new();
+    if let Some(active_scene_path) = scene_path.as_ref() {
+        scene_paths.push(active_scene_path.clone());
+    }
+    for scene_path in parts.map(str::trim).filter(|scene| !scene.is_empty()) {
+        if !scene_paths
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(scene_path))
+        {
+            scene_paths.push(scene_path.to_string());
+        }
+    }
+    (status, scene_path, scene_paths)
 }
 
 fn apply_unity_process_info(
@@ -2246,7 +2366,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
         Ok(Some((resp, latency_ms))) if resp.ok => {
             let process_hint = process_hint_from_response(&resp, project_path, checked_at_ms);
             let message = resp.message.unwrap_or_default();
-            let (editor_status, scene_path) = parse_unity_status_message(&message);
+            let (editor_status, scene_path, scene_paths) = parse_unity_status_message(&message);
             state_probe::note_pipe_editor_status(
                 project_path,
                 editor_status,
@@ -2258,6 +2378,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 editor_status: editor_status.to_string(),
                 control_channel_state: "ready".to_string(),
                 scene_path,
+                scene_paths,
                 editor_process_state: UnityEditorProcessState::Running,
                 editor_process_id: None,
                 editor_process_path: None,
@@ -2300,6 +2421,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 editor_status: UNITY_EDITOR_STATUS_DISCONNECTED.to_string(),
                 control_channel_state,
                 scene_path: None,
+                scene_paths: Vec::new(),
                 editor_process_state: UnityEditorProcessState::Unknown,
                 editor_process_id: None,
                 editor_process_path: None,
@@ -2338,8 +2460,8 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 .await
                 .filter(|status| status.native_alive)
                 .map(|status| parse_unity_status_message(&status.editor_status));
-            let (editor_status, scene_path) =
-                native_editor_state.unwrap_or((UNITY_EDITOR_STATUS_DISCONNECTED, None));
+            let (editor_status, scene_path, scene_paths) =
+                native_editor_state.unwrap_or((UNITY_EDITOR_STATUS_DISCONNECTED, None, Vec::new()));
             let mut status = UnityConnectionStatus {
                 // `Ok(None)` is returned only after get_or_connect succeeded and
                 // the existing connection's writer lock was observed busy. It
@@ -2349,6 +2471,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                 editor_status: editor_status.to_string(),
                 control_channel_state: "busy".to_string(),
                 scene_path,
+                scene_paths,
                 editor_process_state: UnityEditorProcessState::Unknown,
                 editor_process_id: None,
                 editor_process_path: None,
@@ -2393,6 +2516,7 @@ pub async fn query_unity_connection_status(project_path: &str) -> UnityConnectio
                     "disconnected".to_string()
                 },
                 scene_path: None,
+                scene_paths: Vec::new(),
                 editor_process_state: UnityEditorProcessState::Unknown,
                 editor_process_id: None,
                 editor_process_path: None,
@@ -2723,7 +2847,7 @@ pub async fn query_unity_status_with_timeout(
     match query_unity_status_response_waiting_with_timeout(project_path, timeout).await {
         Ok((resp, _)) if resp.ok => {
             let msg = resp.message.unwrap_or_default();
-            let (status, scene_part) = parse_unity_status_message(&msg);
+            let (status, scene_part, _scene_paths) = parse_unity_status_message(&msg);
             state_probe::note_pipe_editor_status(
                 project_path,
                 status,
@@ -3663,6 +3787,13 @@ fn require_unity_test_tools_available(project_path: &str) -> Result<(), String> 
                 .to_string(),
         );
     }
+    if !status.package_supported {
+        return Err(format!(
+            "Unity Test tools require com.unity.test-framework {} or newer so interrupted runs can be cancelled (found {}).",
+            crate::workspace::UNITY_TEST_FRAMEWORK_MIN_VERSION,
+            status.package_version.as_deref().unwrap_or("unknown version")
+        ));
+    }
     Ok(())
 }
 
@@ -3771,6 +3902,9 @@ pub async fn unity_test_run(
 }
 
 const UNITY_TEST_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const UNITY_TEST_CANCEL_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+const UNITY_TEST_CANCEL_RESPONSE_GRACE: Duration = Duration::from_secs(1);
+const UNITY_TEST_CANCEL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnityTestPollWake {
@@ -3779,39 +3913,253 @@ enum UnityTestPollWake {
     Cancelled,
 }
 
-fn unity_test_resume_run_id(request: &serde_json::Value) -> Result<Option<String>, String> {
-    let Some(value) = request.get("resume_run_id") else {
-        return Ok(None);
-    };
-    let run_id = value
-        .as_str()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "resume_run_id must be a non-empty Unity Test run id".to_string())?;
-    Ok(Some(run_id.to_string()))
+fn unity_test_start_request(
+    request: &serde_json::Value,
+    requested_run_id: &str,
+) -> Result<serde_json::Value, String> {
+    let mut start_request = request.clone();
+    let object = start_request
+        .as_object_mut()
+        .ok_or_else(|| "Unity Test run request must be an object".to_string())?;
+    object.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(requested_run_id.to_string()),
+    );
+    Ok(start_request)
 }
 
-fn unity_test_modal_dialog_error(
+fn unity_test_run_is_terminal(status: &str) -> bool {
+    matches!(status, "cancelled" | "error" | "passed" | "failed")
+}
+
+fn unity_test_cancel_error(snapshot: &UnityTestRunSnapshot) -> Option<&str> {
+    let error = snapshot.error.trim();
+    if error.is_empty() {
+        return None;
+    }
+    if error.starts_with("Unity Test cancellation requires com.unity.test-framework")
+        || !unity_test_run_is_terminal(&snapshot.status)
+    {
+        return Some(error);
+    }
+    None
+}
+
+fn unity_test_cancel_snapshot(
+    response: &PipeResponse,
+) -> Result<Option<UnityTestRunSnapshot>, String> {
+    if !response.ok {
+        return Err(format!(
+            "failed: {}",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("Unity rejected the cancellation request")
+        ));
+    }
+    let Some(message) = response
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+    else {
+        return Ok(None);
+    };
+    let snapshot: UnityTestRunSnapshot = serde_json::from_str(message)
+        .map_err(|error| format!("failed: Unity Test cancel returned invalid JSON: {error}"))?;
+    if let Some(error) = unity_test_cancel_error(&snapshot) {
+        return Err(format!("unavailable: {error}"));
+    }
+    Ok(Some(snapshot))
+}
+
+fn unity_test_cancel_dispatch_response(
+    response: PipeResponse,
+) -> Result<Option<PipeResponse>, String> {
+    if let Some(error) = transient_broker_error_from_response(&response) {
+        Err(error.to_string())
+    } else {
+        Ok(Some(response))
+    }
+}
+
+fn unity_test_cancel_dispatch_error(error: String) -> String {
+    if is_transient_broker_error(&error) {
+        error
+    } else {
+        format!("failed: {error}")
+    }
+}
+
+async fn dispatch_unity_test_cancel(
+    project_path: &str,
+    status_payload: &str,
+) -> Result<Option<PipeResponse>, String> {
+    let (acceptance_tx, acceptance_rx) = tokio::sync::oneshot::channel();
+    let project_path = project_path.to_string();
+    let status_payload = status_payload.to_string();
+    let response_task = tokio::spawn(async move {
+        send_message_without_timeout_with_acceptance(
+            &project_path,
+            "unity_test_cancel",
+            &status_payload,
+            acceptance_tx,
+        )
+        .await
+    });
+
+    match tokio::time::timeout(UNITY_TEST_CANCEL_ACCEPT_TIMEOUT, acceptance_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return response_task
+                .await
+                .map_err(|error| format!("failed: cancellation task failed: {error}"))?
+                .map_err(unity_test_cancel_dispatch_error)
+                .and_then(unity_test_cancel_dispatch_response);
+        }
+        Err(_) => {
+            return Err(
+                "failed: Unity native broker did not accept the cancellation request within 5s"
+                    .to_string(),
+            );
+        }
+    }
+
+    match tokio::time::timeout(UNITY_TEST_CANCEL_RESPONSE_GRACE, response_task).await {
+        Ok(Ok(response)) => response
+            .map_err(unity_test_cancel_dispatch_error)
+            .and_then(unity_test_cancel_dispatch_response),
+        Ok(Err(error)) => Err(format!("failed: cancellation task failed: {error}")),
+        Err(_) => Ok(None),
+    }
+}
+
+fn unity_test_cancel_queued_dialog(
+    project_path: &str,
+    snapshot: &UnityTestRunSnapshot,
+) -> Option<String> {
+    dialog::blocked_error(
+        project_path,
+        "test_run_cancel_queued",
+        Some(snapshot.run_id.as_str()),
+    )
+    .map(|blocked| {
+        format!(
+            "Unity Test cancellation queued for run {}.\n{}",
+            snapshot.run_id, blocked
+        )
+    })
+}
+
+async fn cancel_unity_test_run(
+    project_path: &str,
+    snapshot: &UnityTestRunSnapshot,
+) -> Result<String, String> {
+    let status_payload = serde_json::json!({ "run_id": snapshot.run_id }).to_string();
+    let mut dispatch_attempt = 1;
+    let cancel_response = loop {
+        match dispatch_unity_test_cancel(project_path, &status_payload).await {
+            Err(error)
+                if is_transient_broker_error(&error)
+                    && dispatch_attempt < SHORT_MESSAGE_TRANSIENT_RETRY_ATTEMPTS =>
+            {
+                wait_before_transient_retry(
+                    project_path,
+                    "cancel Unity Test run",
+                    &error,
+                    dispatch_attempt,
+                )
+                .await
+                .map_err(|wait_error| format!("failed: {wait_error}"))?;
+                dispatch_attempt += 1;
+            }
+            result => break result?,
+        }
+    };
+    if let Some(response) = cancel_response {
+        if let Some(cancelled) = unity_test_cancel_snapshot(&response)? {
+            if unity_test_run_is_terminal(&cancelled.status) {
+                return Ok(format!(
+                    "Unity Test run {} stopped with status {}",
+                    snapshot.run_id, cancelled.status
+                ));
+            }
+        }
+    }
+
+    if let Some(queued) = unity_test_cancel_queued_dialog(project_path, snapshot) {
+        return Ok(queued);
+    }
+
+    let cancel_started = Instant::now();
+    while cancel_started.elapsed() < UNITY_TEST_CANCEL_CONFIRM_TIMEOUT {
+        tokio::time::sleep(UNITY_TEST_STATUS_POLL_INTERVAL).await;
+        let remaining = UNITY_TEST_CANCEL_CONFIRM_TIMEOUT.saturating_sub(cancel_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        let response = match send_message_with_timeout(
+            project_path,
+            "unity_test_status",
+            &status_payload,
+            remaining.min(Duration::from_secs(5)),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
+                return Ok(unity_test_cancel_queued_dialog(project_path, snapshot)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Unity Test cancellation queued for run {}. Resolve the Unity modal dialog so cancellation can complete.",
+                            snapshot.run_id
+                        )
+                    }));
+            }
+            Err(_) => continue,
+        };
+        if pipe_response_transient_broker_error(&response) {
+            continue;
+        }
+        if !response.ok {
+            continue;
+        }
+        let Ok(cancelled) = serde_json::from_str::<UnityTestRunSnapshot>(
+            response.message.as_deref().unwrap_or_default(),
+        ) else {
+            continue;
+        };
+        if let Some(error) = unity_test_cancel_error(&cancelled) {
+            return Err(format!("unavailable: {error}"));
+        }
+        if unity_test_run_is_terminal(&cancelled.status) {
+            return Ok(format!(
+                "Unity Test run {} stopped with status {}",
+                snapshot.run_id, cancelled.status
+            ));
+        }
+    }
+
+    Err(format!(
+        "failed: run {} did not stop within 30s",
+        snapshot.run_id
+    ))
+}
+
+async fn unity_test_abort_error(
     project_path: &str,
     snapshot: &UnityTestRunSnapshot,
     source_error: &str,
 ) -> String {
-    let base = dialog::blocked_error(
-        project_path,
-        "test_run_detached",
-        Some(snapshot.run_id.as_str()),
-    )
-    .unwrap_or_else(|| source_error.to_string());
-    let context = serde_json::json!({
-        "operation": "unity_test_run",
-        "runId": snapshot.run_id.as_str(),
-        "status": snapshot.status.as_str(),
-        "currentTest": snapshot.current_test.as_str(),
-        "completed": snapshot.passed + snapshot.failed + snapshot.skipped + snapshot.inconclusive,
-        "total": snapshot.total,
-        "resumeArguments": { "resume_run_id": snapshot.run_id.as_str() },
-    });
-    format!("{base}\nunity_test_context={context}")
+    match cancel_unity_test_run(project_path, snapshot).await {
+        Ok(report) if dialog::is_unity_modal_dialog_blocked_error(&report) => report,
+        Ok(report) => format!("{}\n{}", source_error.trim_end(), report),
+        Err(error) => format!(
+            "{}\nUnity Test cancellation {}",
+            source_error.trim_end(),
+            error
+        ),
+    }
 }
 
 async fn wait_for_unity_test_poll_wake(
@@ -3859,97 +4207,80 @@ pub async fn unity_test_run_controlled(
     progress: Option<crate::async_tasks::TaskProgressReporter>,
 ) -> Result<UnityTestRunSnapshot, String> {
     require_unity_test_tools_available(project_path)?;
-    let resume_run_id = unity_test_resume_run_id(request)?;
-    if resume_run_id.is_none() {
-        require_unity_test_sources_converged(project_path).await?;
-        ensure_unity_test_start_status(project_path).await?;
+    require_unity_test_sources_converged(project_path).await?;
+    ensure_unity_test_start_status(project_path).await?;
+    if cancel_rx
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return Err("Unity Test run cancelled before start".to_string());
     }
+
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let mut snapshot: UnityTestRunSnapshot = if let Some(run_id) = resume_run_id {
-        let status_payload = serde_json::json!({ "run_id": run_id }).to_string();
-        let placeholder = UnityTestRunSnapshot {
-            run_id,
-            status: "unknown".to_string(),
-            ..Default::default()
-        };
-        let response = match send_message_with_timeout(
-            project_path,
-            "unity_test_status",
-            &status_payload,
-            Duration::from_secs(5),
-        )
-        .await
+    if cancel_rx
+        .as_ref()
+        .is_some_and(|receiver| *receiver.borrow())
+    {
+        return Err("Unity Test run cancelled before start".to_string());
+    }
+
+    let requested_run_id = uuid::Uuid::new_v4().simple().to_string();
+    let start_request = unity_test_start_request(request, &requested_run_id)?;
+    let payload = serde_json::to_string(&start_request)
+        .map_err(|error| format!("Failed to serialize Unity Test run request: {error}"))?;
+    let start = match send_message_with_transient_retry(
+        project_path,
+        "unity_test_start",
+        &payload,
+        Duration::from_secs(30),
+        "start Unity Test run",
+    )
+    .await
+    {
+        Ok(start) => start,
+        Err(error)
+            if dialog::is_unity_modal_dialog_blocked_error(&error)
+                && !error.contains("request_state=not_sent") =>
         {
-            Ok(response) => response,
-            Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
-                return Err(unity_test_modal_dialog_error(
-                    project_path,
-                    &placeholder,
-                    &error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        if !response.ok {
-            return Err(response
-                .error
-                .unwrap_or_else(|| "Unity Test status query failed".to_string()));
+            let placeholder = UnityTestRunSnapshot {
+                run_id: requested_run_id.clone(),
+                status: "starting".to_string(),
+                ..Default::default()
+            };
+            return Err(unity_test_abort_error(project_path, &placeholder, &error).await);
         }
-        serde_json::from_str(response.message.as_deref().unwrap_or_default())
-            .map_err(|error| format!("Unity Test status returned invalid JSON: {error}"))?
-    } else {
-        let mut start_request = request.clone();
-        let requested_run_id = uuid::Uuid::new_v4().simple().to_string();
-        let object = start_request
-            .as_object_mut()
-            .ok_or_else(|| "Unity Test run request must be an object".to_string())?;
-        object.remove("resume_run_id");
-        object.insert(
-            "run_id".to_string(),
-            serde_json::Value::String(requested_run_id.clone()),
-        );
-        let payload = serde_json::to_string(&start_request)
-            .map_err(|error| format!("Failed to serialize Unity Test run request: {error}"))?;
-        let start = match send_message_with_transient_retry(
-            project_path,
-            "unity_test_start",
-            &payload,
-            Duration::from_secs(30),
-            "start Unity Test run",
-        )
-        .await
-        {
-            Ok(start) => start,
-            Err(error)
-                if dialog::is_unity_modal_dialog_blocked_error(&error)
-                    && !error.contains("request_state=not_sent") =>
-            {
+        Err(error) => return Err(error),
+    };
+    if !start.ok {
+        return Err(start.error.unwrap_or_else(|| {
+            "Unity Test run could not start. Update the Locus Unity plugin and recompile the project."
+                .to_string()
+        }));
+    }
+
+    let mut snapshot: UnityTestRunSnapshot =
+        match serde_json::from_str(start.message.as_deref().unwrap_or_default()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
                 let placeholder = UnityTestRunSnapshot {
-                    run_id: requested_run_id,
+                    run_id: requested_run_id.clone(),
                     status: "starting".to_string(),
                     ..Default::default()
                 };
-                return Err(unity_test_modal_dialog_error(
-                    project_path,
-                    &placeholder,
-                    &error,
-                ));
+                let source = format!("Unity Test start returned invalid JSON: {error}");
+                return Err(unity_test_abort_error(project_path, &placeholder, &source).await);
             }
-            Err(error) => return Err(error),
         };
-        if !start.ok {
-            return Err(start.error.unwrap_or_else(|| {
-                "Unity Test run could not start. Update the Locus Unity plugin and recompile the project."
-                    .to_string()
-            }));
-        }
-        serde_json::from_str(start.message.as_deref().unwrap_or_default())
-            .map_err(|error| format!("Unity Test start returned invalid JSON: {error}"))?
-    };
     if snapshot.run_id.trim().is_empty() {
-        return Err("Unity Test run did not return a run id".to_string());
-    }
+        snapshot.run_id = requested_run_id;
+        return Err(unity_test_abort_error(
+            project_path,
+            &snapshot,
+            "Unity Test run did not return a run id",
+        )
+        .await);
+    };
 
     let started = Instant::now();
     let status_payload = serde_json::json!({ "run_id": snapshot.run_id.clone() }).to_string();
@@ -3957,21 +4288,27 @@ pub async fn unity_test_run_controlled(
     // watch revision adds no polling work during normal test execution and can
     // interrupt the 250ms status cadence as soon as a modal dialog is observed.
     let mut dialog_events = dialog::subscribe();
-    if let Some(error) = dialog::blocked_error(
-        project_path,
-        "test_run_detached",
-        Some(snapshot.run_id.as_str()),
-    ) {
-        return Err(unity_test_modal_dialog_error(
+    if dialog::current_dialog(project_path).is_some() {
+        return Err(unity_test_abort_error(
             project_path,
             &snapshot,
-            &error,
-        ));
+            "Unity Test run was interrupted by a Unity modal dialog",
+        )
+        .await);
     }
+
     loop {
-        match snapshot.status.as_str() {
-            "passed" | "failed" | "error" | "cancelled" => return Ok(snapshot),
-            _ => {}
+        if unity_test_run_is_terminal(&snapshot.status) {
+            return Ok(snapshot);
+        }
+        if cancel_rx
+            .as_ref()
+            .is_some_and(|receiver| *receiver.borrow())
+        {
+            return match cancel_unity_test_run(project_path, &snapshot).await {
+                Ok(report) => Err(report),
+                Err(error) => Err(format!("Unity Test cancellation {error}")),
+            };
         }
         if let Some(report) = progress.as_ref() {
             report(format!(
@@ -3988,21 +4325,18 @@ pub async fn unity_test_run_controlled(
         }
         if dialog_events.has_changed().unwrap_or(false) {
             let _ = dialog_events.borrow_and_update();
-            if let Some(error) = dialog::blocked_error(
-                project_path,
-                "test_run_detached",
-                Some(snapshot.run_id.as_str()),
-            ) {
-                return Err(unity_test_modal_dialog_error(
+            if dialog::current_dialog(project_path).is_some() {
+                return Err(unity_test_abort_error(
                     project_path,
                     &snapshot,
-                    &error,
-                ));
+                    "Unity Test run was interrupted by a Unity modal dialog",
+                )
+                .await);
             }
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
             let timeout = timeout.unwrap_or_default();
-            return Err(format!(
+            let source = format!(
                 "Unity Test run {} timed out after {}s (current test: {})",
                 snapshot.run_id,
                 timeout.as_secs(),
@@ -4011,91 +4345,26 @@ pub async fn unity_test_run_controlled(
                 } else {
                     snapshot.current_test.as_str()
                 }
-            ));
+            );
+            return Err(unity_test_abort_error(project_path, &snapshot, &source).await);
         }
 
         match wait_for_unity_test_poll_wake(&mut dialog_events, cancel_rx.as_mut()).await {
             UnityTestPollWake::DialogChanged => {
-                if let Some(error) = dialog::blocked_error(
-                    project_path,
-                    "test_run_detached",
-                    Some(snapshot.run_id.as_str()),
-                ) {
-                    return Err(unity_test_modal_dialog_error(
+                if dialog::current_dialog(project_path).is_some() {
+                    return Err(unity_test_abort_error(
                         project_path,
                         &snapshot,
-                        &error,
-                    ));
+                        "Unity Test run was interrupted by a Unity modal dialog",
+                    )
+                    .await);
                 }
             }
             UnityTestPollWake::Cancelled => {
-                let cancel_response = send_message_with_timeout(
-                    project_path,
-                    "unity_test_cancel",
-                    &status_payload,
-                    Duration::from_secs(5),
-                )
-                .await;
-                match cancel_response {
-                    Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
-                        return Err(unity_test_modal_dialog_error(
-                            project_path,
-                            &snapshot,
-                            &error,
-                        ));
-                    }
-                    Ok(response) => {
-                        if let Some(message) = response.message.as_deref() {
-                            if let Ok(cancelled) =
-                                serde_json::from_str::<UnityTestRunSnapshot>(message)
-                            {
-                                if !cancelled.error.is_empty() {
-                                    return Err(format!(
-                                        "Unity Test cancellation unavailable: {}",
-                                        cancelled.error
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {}
-                }
-                for _ in 0..120 {
-                    tokio::time::sleep(UNITY_TEST_STATUS_POLL_INTERVAL).await;
-                    let response = match send_message_with_timeout(
-                        project_path,
-                        "unity_test_status",
-                        &status_payload,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
-                            return Err(unity_test_modal_dialog_error(
-                                project_path,
-                                &snapshot,
-                                &error,
-                            ));
-                        }
-                        Err(_) => continue,
-                    };
-                    let Ok(cancelled) = serde_json::from_str::<UnityTestRunSnapshot>(
-                        response.message.as_deref().unwrap_or_default(),
-                    ) else {
-                        continue;
-                    };
-                    if matches!(
-                        cancelled.status.as_str(),
-                        "cancelled" | "error" | "passed" | "failed"
-                    ) {
-                        return Err(format!("Unity Test run {} cancelled", snapshot.run_id));
-                    }
-                }
-                return Err(format!(
-                    "Unity Test cancellation failed: run {} did not stop within 30s",
-                    snapshot.run_id
-                ));
+                return match cancel_unity_test_run(project_path, &snapshot).await {
+                    Ok(report) => Err(report),
+                    Err(error) => Err(format!("Unity Test cancellation {error}")),
+                };
             }
             UnityTestPollWake::Tick => {}
         }
@@ -4109,11 +4378,7 @@ pub async fn unity_test_run_controlled(
         {
             Ok(response) => response,
             Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
-                return Err(unity_test_modal_dialog_error(
-                    project_path,
-                    &snapshot,
-                    &error,
-                ));
+                return Err(unity_test_abort_error(project_path, &snapshot, &error).await);
             }
             Err(_) => {
                 // Play Mode transitions and tests that explicitly reload the
@@ -4126,12 +4391,18 @@ pub async fn unity_test_run_controlled(
             continue;
         }
         if !response.ok {
-            return Err(response
+            let source = response
                 .error
-                .unwrap_or_else(|| "Unity Test status query failed".to_string()));
+                .unwrap_or_else(|| "Unity Test status query failed".to_string());
+            return Err(unity_test_abort_error(project_path, &snapshot, &source).await);
         }
-        snapshot = serde_json::from_str(response.message.as_deref().unwrap_or_default())
-            .map_err(|error| format!("Unity Test status returned invalid JSON: {error}"))?;
+        snapshot = match serde_json::from_str(response.message.as_deref().unwrap_or_default()) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let source = format!("Unity Test status returned invalid JSON: {error}");
+                return Err(unity_test_abort_error(project_path, &snapshot, &source).await);
+            }
+        };
     }
 }
 
@@ -6966,17 +7237,17 @@ pub async fn start_unity_monitor(
             // keeps the process alive, so the liveness refresh distinguishes
             // the two and the normal recompile flow is unaffected.
             if disconnected_transition {
-                if let Some(process_info) = process::refresh_known_project_editor_process_liveness(
+                if let Some(refresh) = process::refresh_known_project_editor_process_liveness(
                     &project_path,
                     last_detected_editor_process.clone(),
                 )
                 .await
                 {
-                    let process_not_running =
-                        matches!(process_info.state, UnityEditorProcessState::NotRunning);
-                    apply_unity_process_info(&mut status, process_info);
+                    let observed_process_not_running =
+                        matches!(refresh.observed.state, UnityEditorProcessState::NotRunning);
+                    apply_unity_process_info(&mut status, refresh.effective);
                     sync_unity_launch_mode_for_status(&mut status).await;
-                    if process_not_running {
+                    if observed_process_not_running {
                         sync_background_hook_for_status(&mut status, &project_path).await;
                         // The editor is gone: reset its dead detour state but KEEP
                         // the tracked edits — they are still not in any running
@@ -7079,13 +7350,14 @@ mod tests {
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
         classify_recompile_poll_response, classify_recompile_start_response,
         is_transient_broker_error, native_background_hook_markers_present,
-        parse_unity_hub_editor_locations, pipe_response_transient_broker_error,
-        play_mode_target_status, read_project_unity_version, relative_asset_paths,
-        requested_run_states_editor_status, rewrite_run_states_output_for_size,
-        unity_test_modal_dialog_error, unity_test_resume_run_id, wait_for_unity_test_poll_wake,
-        PipeResponse, RecompilePollState, RecompileStartAck, RecompileStartDiagnostics,
-        UnityBackgroundHookState, UnityBackgroundHookStatus, UnityConnectionStatus,
-        UnityEditorProcessState, UnityLaunchMode, UnityTestPollWake, UnityTestRunSnapshot,
+        parse_unity_hub_editor_locations, parse_unity_status_message,
+        pipe_response_transient_broker_error, play_mode_target_status, read_project_unity_version,
+        relative_asset_paths, requested_run_states_editor_status,
+        rewrite_run_states_output_for_size, unity_test_cancel_dispatch_response,
+        unity_test_cancel_snapshot, unity_test_run_is_terminal, unity_test_start_request,
+        wait_for_unity_test_poll_wake, PipeResponse, RecompilePollState, RecompileStartAck,
+        RecompileStartDiagnostics, UnityBackgroundHookState, UnityBackgroundHookStatus,
+        UnityConnectionStatus, UnityEditorProcessState, UnityLaunchMode, UnityTestPollWake,
         RECOMPILE_START_STATE_HISTORY_LIMIT, UNITY_EDITOR_STATUS_EDITING,
         UNITY_EDITOR_STATUS_PLAYING,
     };
@@ -7115,6 +7387,7 @@ mod tests {
             editor_status: super::UNITY_EDITOR_STATUS_PLAYING.to_string(),
             control_channel_state: "ready".to_string(),
             scene_path: Some("Assets/Scenes/Main.unity".to_string()),
+            scene_paths: vec!["Assets/Scenes/Main.unity".to_string()],
             editor_process_state: UnityEditorProcessState::Running,
             editor_process_id: Some(42),
             editor_process_path: Some("C:/Unity/Unity.exe".to_string()),
@@ -7140,6 +7413,26 @@ mod tests {
             },
             checked_at_ms,
         }
+    }
+
+    #[test]
+    fn unity_status_message_includes_all_open_scene_paths() {
+        let (status, active_scene_path, scene_paths) = parse_unity_status_message(
+            "editing|Assets/Scenes/Main.unity|Assets/Scenes/World_SubScene.unity|Assets/Scenes/Main.unity",
+        );
+
+        assert_eq!(status, UNITY_EDITOR_STATUS_EDITING);
+        assert_eq!(
+            active_scene_path.as_deref(),
+            Some("Assets/Scenes/Main.unity")
+        );
+        assert_eq!(
+            scene_paths,
+            vec![
+                "Assets/Scenes/Main.unity".to_string(),
+                "Assets/Scenes/World_SubScene.unity".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -7476,14 +7769,92 @@ mod tests {
     }
 
     #[test]
-    fn unity_test_resume_run_id_requires_an_opaque_non_empty_id() {
-        assert_eq!(unity_test_resume_run_id(&json!({})).unwrap(), None);
-        assert_eq!(
-            unity_test_resume_run_id(&json!({ "resume_run_id": " run-1 " })).unwrap(),
-            Some("run-1".to_string())
-        );
-        assert!(unity_test_resume_run_id(&json!({ "resume_run_id": "" })).is_err());
-        assert!(unity_test_resume_run_id(&json!({ "resume_run_id": 1 })).is_err());
+    fn unity_test_start_request_has_single_start_semantics() {
+        let request = json!({
+            "assemblies": ["SampleGame.Replay.Tests"],
+            "async": "sync",
+            "categories": [],
+            "groups": ["CameraRuntimeTests"],
+            "mode": "edit",
+            "result_detail": "failures",
+            "run_id": "caller-value",
+            "tests": [],
+            "timeout_ms": 600000
+        });
+
+        let start_request = unity_test_start_request(&request, "new-run-id").unwrap();
+        assert_eq!(start_request["run_id"], "new-run-id");
+        assert_eq!(start_request["groups"], json!(["CameraRuntimeTests"]));
+    }
+
+    #[test]
+    fn unity_test_cancel_snapshot_surfaces_compile_time_unavailable_cancellation() {
+        let response = PipeResponse {
+            ok: true,
+            error: None,
+            message: Some(
+                json!({
+                    "run_id": "run-1",
+                    "status": "error",
+                    "error": "Unity Test cancellation requires com.unity.test-framework 1.4.0 or newer."
+                })
+                .to_string(),
+            ),
+            process_id: None,
+            process_path: None,
+        };
+
+        let error = unity_test_cancel_snapshot(&response).unwrap_err();
+        assert!(error.starts_with("unavailable:"));
+        assert!(error.contains("requires com.unity.test-framework 1.4.0"));
+    }
+
+    #[test]
+    fn unity_test_cancel_snapshot_accepts_pending_utf_reconciliation() {
+        let response = PipeResponse {
+            ok: true,
+            error: None,
+            message: Some(
+                json!({
+                    "run_id": "run-1",
+                    "status": "cancelling",
+                    "error": ""
+                })
+                .to_string(),
+            ),
+            process_id: None,
+            process_path: None,
+        };
+
+        let snapshot = unity_test_cancel_snapshot(&response)
+            .unwrap()
+            .expect("pending cancellation snapshot");
+        assert_eq!(snapshot.status, "cancelling");
+        assert!(snapshot.error.is_empty());
+    }
+
+    #[test]
+    fn unity_test_cancel_dispatch_retries_transient_broker_states() {
+        let response = PipeResponse {
+            ok: false,
+            error: Some("managed_reloading".to_string()),
+            message: None,
+            process_id: None,
+            process_path: None,
+        };
+
+        let error = unity_test_cancel_dispatch_response(response).unwrap_err();
+        assert!(error.contains("managed_reloading"));
+        assert!(is_transient_broker_error(&error));
+    }
+
+    #[test]
+    fn unity_test_terminal_statuses_cover_cancel_and_completion() {
+        for status in ["cancelled", "error", "passed", "failed"] {
+            assert!(unity_test_run_is_terminal(status), "{status}");
+        }
+        assert!(!unity_test_run_is_terminal("running"));
+        assert!(!unity_test_run_is_terminal("cancelling"));
     }
 
     #[tokio::test]
@@ -7497,27 +7868,6 @@ mod tests {
         .await
         .expect("dialog revision should interrupt the 250ms status interval");
         assert_eq!(wake, UnityTestPollWake::DialogChanged);
-    }
-
-    #[test]
-    fn unity_test_blocked_context_preserves_the_run_for_resumption() {
-        let snapshot = UnityTestRunSnapshot {
-            run_id: "run-1".to_string(),
-            status: "running".to_string(),
-            current_test: "Game.Tests.Blocked".to_string(),
-            total: 3,
-            passed: 1,
-            ..Default::default()
-        };
-        let error = unity_test_modal_dialog_error(
-            "Z:/missing-project",
-            &snapshot,
-            "code=unity_modal_dialog_blocked",
-        );
-        assert!(error.contains("code=unity_modal_dialog_blocked"));
-        assert!(error.contains(r#""runId":"run-1""#));
-        assert!(error.contains(r#""resumeArguments":{"resume_run_id":"run-1"}"#));
-        assert!(error.contains(r#""completed":1"#));
     }
 
     const UNITY_HUB_EDITORS_SAMPLE: &str = r#"{

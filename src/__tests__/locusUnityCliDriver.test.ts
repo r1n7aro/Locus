@@ -39,6 +39,7 @@ describe("Locus Unity CLI driver", () => {
   it("runs through the Rust backend without a WebView/CDP dependency", () => {
     const lib = read("src-tauri/src/lib.rs");
     const driver = read("src-tauri/src/cli_driver.rs");
+    const script = read("scripts/locus-unity-test.mjs");
 
     expect(lib).toContain("cli_driver::CliDriverConfig::from_env_args()");
     expect(lib).toContain("cli_driver::spawn(app.handle().clone(), cli_driver_config)");
@@ -87,6 +88,12 @@ describe("Locus Unity CLI driver", () => {
     expect(driver).toContain('tools=["python"]');
     expect(driver).toContain("[[mock:python-tool]]");
     expect(driver).toContain('mode="headless"');
+    expect(driver).toContain("CliDriverSuite::SafeMode");
+    expect(driver).toContain("run_safe_mode_recovery_suite");
+    expect(driver).toContain('"S1 external state probe"');
+    expect(driver).toContain('"S2 out-of-process log"');
+    expect(driver).toContain('"S4 tool-time crash diagnostic"');
+    expect(script).toContain("--suite safe-mode --install-plugin");
     expect(driver).toContain('"P6 headless lifecycle"');
     expect(driver).toContain('"P7 headless close"');
     expect(driver).toContain("unity_bridge::unity_run_states");

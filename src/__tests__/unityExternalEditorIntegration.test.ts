@@ -18,8 +18,12 @@ describe("Locus Unity external editor integration", () => {
     expect(system).toContain('"set_unity_external_editor_default_enabled"');
   });
 
-  it("registers Locus with Unity and routes C# files to editable workbench tabs", () => {
+  it("registers Locus with Unity and routes source files to editable workbench tabs", () => {
     const editor = read("locus_unity/Editor/LocusExternalCodeEditor.cs");
+    const sourceExtensions = editor.slice(
+      editor.indexOf("LocusSourceExtensions"),
+      editor.indexOf("LocusSourceFileNames"),
+    );
     const bootstrap = read("src/composables/useAppBootstrap.ts");
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const fileEditor = read("src/components/workbench/WorkspaceFilePreview.vue");
@@ -30,7 +34,14 @@ describe("Locus Unity external editor integration", () => {
     expect(editor).toContain("CodeEditor.Register");
     expect(editor).toContain('OpenScriptEvent = "locus-open-script"');
     expect(editor).toContain('"--locus-open-script"');
-    expect(editor).not.toContain('path.EndsWith(".cs"');
+    expect(editor).toContain('".asmdef"');
+    expect(editor).toContain('".cs"');
+    expect(editor).toContain('".shader"');
+    expect(editor).toContain("EditorSettings.projectGenerationUserExtensions");
+    expect(editor).toMatch(/if \(!ShouldOpenInLocus\(assetPath\)\)\s+return false;/);
+    expect(sourceExtensions).not.toContain('".asset"');
+    expect(sourceExtensions).not.toContain('".fbx"');
+    expect(sourceExtensions).not.toContain('".png"');
     expect(bootstrap).toContain('"locus-open-script"');
     expect(bootstrap).toContain("stageExternalScriptOpen");
     expect(bootstrap).toContain('setPage("development")');
@@ -44,6 +55,25 @@ describe("Locus Unity external editor integration", () => {
     expect(service).toContain('"workspace_file_write"');
     expect(command).toContain("pub async fn workspace_file_preview(");
     expect(command).toContain("pub async fn workspace_file_write(");
+  });
+
+  it("leaves Unity-native assets to their default double-click behavior", () => {
+    const editor = read("locus_unity/Editor/LocusExternalCodeEditor.cs");
+    const unityFallback = editor.indexOf("if (ShouldUseUnityDefaultOpen(assetPath))");
+    const sourceBoundary = editor.indexOf("if (!ShouldOpenInLocus(assetPath))");
+    const locusDispatch = editor.indexOf("if (LocusBridge.HasConnectedDesktopClient())");
+
+    expect(editor).toContain('path.EndsWith(".unity", StringComparison.OrdinalIgnoreCase)');
+    expect(editor).toContain('path.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase)');
+    expect(editor).toContain("AssetDatabase.LoadMainAssetAtPath(path)");
+    expect(editor).toContain("#if UNITY_6000_5_OR_NEWER");
+    expect(editor).toContain("AssetDatabase.CanOpenAssetInEditor(asset.GetEntityId())");
+    expect(editor).toContain("AssetDatabase.CanOpenAssetInEditor(asset.GetInstanceID())");
+    expect(editor).toMatch(/if \(ShouldUseUnityDefaultOpen\(assetPath\)\)\s+return false;/);
+    expect(unityFallback).toBeGreaterThan(-1);
+    expect(unityFallback).toBeLessThan(locusDispatch);
+    expect(sourceBoundary).toBeGreaterThan(unityFallback);
+    expect(sourceBoundary).toBeLessThan(locusDispatch);
   });
 
   it("generates Unity project files through the Locus plugin", () => {

@@ -5,7 +5,8 @@ use tokio::sync::Mutex;
 
 use super::{strip_extended_path_prefix, unix_now_ms};
 
-const UNITY_PROCESS_PROBE_CACHE_TTL_MS: u64 = 15_000;
+const UNITY_RUNNING_PROCESS_PROBE_CACHE_TTL_MS: u64 = 15_000;
+const UNITY_NON_RUNNING_PROCESS_PROBE_CACHE_TTL_MS: u64 = 250;
 const UNITY_PROCESS_PROBE_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +34,21 @@ pub struct UnityProjectProcessCloseResult {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct UnityProcessLivenessRefresh {
+    /// Liveness of the exact process generation supplied by the caller.
+    pub observed: UnityEditorProcessInfo,
+    /// Process generation that remains authoritative for the project cache.
+    pub effective: UnityEditorProcessInfo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnityProcessIdentityLiveness {
+    Alive,
+    Exited,
+    Replaced,
+}
+
+#[derive(Debug, Clone)]
 struct Win32UnityProcess {
     process_id: u32,
     executable_path: Option<String>,
@@ -53,6 +69,48 @@ struct EditorInstanceManifest {
 fn unity_process_probe_cache() -> &'static Mutex<HashMap<String, UnityEditorProcessInfo>> {
     static CACHE: OnceLock<Mutex<HashMap<String, UnityEditorProcessInfo>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn process_probe_cache_ttl_ms(info: &UnityEditorProcessInfo) -> u64 {
+    match info.state {
+        UnityEditorProcessState::Running => UNITY_RUNNING_PROCESS_PROBE_CACHE_TTL_MS,
+        UnityEditorProcessState::NotRunning | UnityEditorProcessState::Unknown => {
+            UNITY_NON_RUNNING_PROCESS_PROBE_CACHE_TTL_MS
+        }
+    }
+}
+
+fn cached_process_supersedes_candidate(
+    cached: &UnityEditorProcessInfo,
+    candidate: &UnityEditorProcessInfo,
+) -> bool {
+    cached.checked_at_ms > candidate.checked_at_ms
+        || (cached.checked_at_ms == candidate.checked_at_ms
+            && cached.state == UnityEditorProcessState::Running
+            && candidate.state != UnityEditorProcessState::Running)
+}
+
+fn cached_process_is_different_generation(
+    cached: &UnityEditorProcessInfo,
+    observed_process_id: u32,
+) -> bool {
+    cached
+        .process_id
+        .is_some_and(|cached_process_id| cached_process_id != observed_process_id)
+}
+
+fn write_process_cache_if_fresh(
+    cache: &mut HashMap<String, UnityEditorProcessInfo>,
+    key: String,
+    candidate: UnityEditorProcessInfo,
+) -> UnityEditorProcessInfo {
+    if let Some(cached) = cache.get(&key) {
+        if cached_process_supersedes_candidate(cached, &candidate) {
+            return cached.clone();
+        }
+    }
+    cache.insert(key, candidate.clone());
+    candidate
 }
 
 impl UnityEditorProcessInfo {
@@ -137,7 +195,7 @@ async fn close_current_project_unity_processes_inner(
 pub(super) async fn refresh_known_project_editor_process_liveness(
     project_path: &str,
     known_process: Option<UnityEditorProcessInfo>,
-) -> Option<UnityEditorProcessInfo> {
+) -> Option<UnityProcessLivenessRefresh> {
     let key = process_cache_key(project_path);
     let cached = {
         let cache = unity_process_probe_cache().lock().await;
@@ -163,8 +221,22 @@ pub(super) async fn refresh_known_project_editor_process_liveness(
     };
 
     let mut cache = unity_process_probe_cache().lock().await;
-    cache.insert(key, refreshed.clone());
-    Some(refreshed)
+    let effective = match cache.get(&key) {
+        // A disconnect transition can finish after a replacement editor was
+        // launched. The old PID still needs its exit bookkeeping, while its
+        // liveness result must never overwrite the new project generation.
+        Some(current) if cached_process_is_different_generation(current, process_id) => {
+            current.clone()
+        }
+        _ => {
+            cache.insert(key, refreshed.clone());
+            refreshed.clone()
+        }
+    };
+    Some(UnityProcessLivenessRefresh {
+        observed: refreshed,
+        effective,
+    })
 }
 
 #[cfg(windows)]
@@ -175,6 +247,44 @@ fn is_process_alive(process_id: u32) -> Result<bool, String> {
 #[cfg(not(windows))]
 fn is_process_alive(_process_id: u32) -> Result<bool, String> {
     Err("Unity process liveness detection is only supported on Windows".to_string())
+}
+
+fn classify_process_identity_liveness(
+    alive: bool,
+    actual_created_at_ms: Option<u64>,
+    expected_created_at_ms: Option<u64>,
+) -> UnityProcessIdentityLiveness {
+    if !alive {
+        return UnityProcessIdentityLiveness::Exited;
+    }
+    if matches!(
+        (actual_created_at_ms, expected_created_at_ms),
+        (Some(actual), Some(expected)) if actual != expected
+    ) {
+        return UnityProcessIdentityLiveness::Replaced;
+    }
+    UnityProcessIdentityLiveness::Alive
+}
+
+#[cfg(windows)]
+pub(crate) fn query_process_identity_liveness(
+    process_id: u32,
+    expected_created_at_ms: Option<u64>,
+) -> Result<UnityProcessIdentityLiveness, String> {
+    let facts = probe_native::query_process_facts(process_id)?;
+    Ok(classify_process_identity_liveness(
+        facts.alive,
+        facts.created_at_unix_ms,
+        expected_created_at_ms,
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn query_process_identity_liveness(
+    _process_id: u32,
+    _expected_created_at_ms: Option<u64>,
+) -> Result<UnityProcessIdentityLiveness, String> {
+    Err("Unity process identity detection is only supported on Windows".to_string())
 }
 
 fn normalize_project_identity(path: &str) -> Option<String> {
@@ -220,7 +330,7 @@ pub async fn query_current_project_editor_process(project_path: &str) -> UnityEd
     {
         let cache = unity_process_probe_cache().lock().await;
         if let Some(cached) = cache.get(&key) {
-            if now.saturating_sub(cached.checked_at_ms) <= UNITY_PROCESS_PROBE_CACHE_TTL_MS {
+            if now.saturating_sub(cached.checked_at_ms) <= process_probe_cache_ttl_ms(cached) {
                 return cached.clone();
             }
         }
@@ -250,8 +360,7 @@ pub async fn query_current_project_editor_process(project_path: &str) -> UnityEd
     };
 
     let mut cache = unity_process_probe_cache().lock().await;
-    cache.insert(key, probe.clone());
-    probe
+    write_process_cache_if_fresh(&mut cache, key, probe)
 }
 
 /// Process creation time (ms since the Unix epoch) for `process_id`, used to
@@ -295,6 +404,34 @@ pub(super) async fn query_unity_editor_launch_mode(
     .flatten()
 }
 
+#[cfg(windows)]
+pub(crate) fn explicit_editor_log_path(process_id: u32) -> Option<std::path::PathBuf> {
+    let command_line = probe_native::read_process_command_line(process_id).ok()?;
+    let args = split_windows_command_line(&command_line);
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = args[index].trim();
+        if argument.eq_ignore_ascii_case("-logFile") {
+            let value = args.get(index + 1)?.trim();
+            return (!value.is_empty() && value != "-").then(|| std::path::PathBuf::from(value));
+        }
+        if let Some((name, value)) = argument.split_once('=') {
+            if name.eq_ignore_ascii_case("-logFile") {
+                let value = value.trim();
+                return (!value.is_empty() && value != "-")
+                    .then(|| std::path::PathBuf::from(value));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn explicit_editor_log_path(_process_id: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
 #[cfg(not(windows))]
 pub(super) async fn query_unity_editor_launch_mode(
     _process_id: Option<u32>,
@@ -316,7 +453,7 @@ pub(super) async fn cache_project_editor_process(
 ) {
     let key = process_cache_key(project_path);
     let mut cache = unity_process_probe_cache().lock().await;
-    cache.insert(key, process_info);
+    write_process_cache_if_fresh(&mut cache, key, process_info);
 }
 
 #[cfg(windows)]
@@ -1150,9 +1287,100 @@ fn split_windows_command_line(command_line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        launch_mode_from_args, normalize_project_identity, project_path_from_args,
-        split_windows_command_line, unity_process_args_are_worker,
+        cached_process_is_different_generation, cached_process_supersedes_candidate,
+        classify_process_identity_liveness, launch_mode_from_args, normalize_project_identity,
+        process_probe_cache_ttl_ms, project_path_from_args, split_windows_command_line,
+        unity_process_args_are_worker, UnityEditorProcessInfo, UnityEditorProcessState,
+        UnityProcessIdentityLiveness, UNITY_NON_RUNNING_PROCESS_PROBE_CACHE_TTL_MS,
+        UNITY_RUNNING_PROCESS_PROBE_CACHE_TTL_MS,
     };
+
+    fn process_info(
+        state: UnityEditorProcessState,
+        process_id: Option<u32>,
+        checked_at_ms: u64,
+    ) -> UnityEditorProcessInfo {
+        UnityEditorProcessInfo {
+            state,
+            process_id,
+            executable_path: None,
+            project_path: Some(r"F:\Projects\Game".to_string()),
+            checked_at_ms,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn non_running_process_cache_recovers_quickly() {
+        let running = process_info(UnityEditorProcessState::Running, Some(42), 100);
+        let not_running = process_info(UnityEditorProcessState::NotRunning, None, 100);
+        let unknown = process_info(UnityEditorProcessState::Unknown, None, 100);
+
+        assert_eq!(
+            process_probe_cache_ttl_ms(&running),
+            UNITY_RUNNING_PROCESS_PROBE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            process_probe_cache_ttl_ms(&not_running),
+            UNITY_NON_RUNNING_PROCESS_PROBE_CACHE_TTL_MS
+        );
+        assert_eq!(
+            process_probe_cache_ttl_ms(&unknown),
+            UNITY_NON_RUNNING_PROCESS_PROBE_CACHE_TTL_MS
+        );
+    }
+
+    #[test]
+    fn newer_running_cache_rejects_late_absent_probe() {
+        let cached = process_info(UnityEditorProcessState::Running, Some(5252), 200);
+        let stale_absent = process_info(UnityEditorProcessState::NotRunning, None, 100);
+        let equal_time_absent = process_info(UnityEditorProcessState::NotRunning, None, 200);
+        let newer_running = process_info(UnityEditorProcessState::Running, Some(6262), 300);
+
+        assert!(cached_process_supersedes_candidate(&cached, &stale_absent));
+        assert!(cached_process_supersedes_candidate(
+            &cached,
+            &equal_time_absent
+        ));
+        assert!(!cached_process_supersedes_candidate(
+            &cached,
+            &newer_running
+        ));
+    }
+
+    #[test]
+    fn old_pid_liveness_cannot_replace_new_project_generation() {
+        let new_generation = process_info(UnityEditorProcessState::Running, Some(5252), 200);
+
+        assert!(cached_process_is_different_generation(
+            &new_generation,
+            4242
+        ));
+        assert!(!cached_process_is_different_generation(
+            &new_generation,
+            5252
+        ));
+    }
+
+    #[test]
+    fn process_identity_requires_pid_creation_generation_match() {
+        assert_eq!(
+            classify_process_identity_liveness(false, None, Some(100)),
+            UnityProcessIdentityLiveness::Exited
+        );
+        assert_eq!(
+            classify_process_identity_liveness(true, Some(100), Some(100)),
+            UnityProcessIdentityLiveness::Alive
+        );
+        assert_eq!(
+            classify_process_identity_liveness(true, Some(101), Some(100)),
+            UnityProcessIdentityLiveness::Replaced
+        );
+        assert_eq!(
+            classify_process_identity_liveness(true, None, Some(100)),
+            UnityProcessIdentityLiveness::Alive
+        );
+    }
 
     #[test]
     fn parses_unity_hub_project_path_argument_case_insensitively() {

@@ -10,9 +10,9 @@ function read(relPath: string) {
 
 describe("Unity property display rule", () => {
   it("keeps Unity property display independently configurable", () => {
-    const referenceRule = read("agent/dev/rule/unity_reference_protocol.md");
-    const propertyRule = read("agent/dev/rule/unity_property_display.md");
-    const config = JSON.parse(read("agent/dev/rule_config.json"));
+    const referenceRule = read("agent/unity/rule/unity_reference_protocol.md");
+    const propertyRule = read("agent/unity/rule/unity_property_display.md");
+    const config = JSON.parse(read("agent/unity/rule_config.json"));
 
     expect(config["unity_reference_protocol.md"]).toMatchObject({
       enabled: true,

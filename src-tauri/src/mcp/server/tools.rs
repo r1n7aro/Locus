@@ -117,6 +117,19 @@ fn tool_available(name: &str, working_dir: Option<&str>) -> (bool, Option<String
                     Some("Unity Test Framework is not installed in this project".to_string()),
                 );
             }
+            if !status.package_supported {
+                return (
+                    false,
+                    Some(format!(
+                        "Unity Test tools require com.unity.test-framework {} or newer (found {})",
+                        crate::workspace::UNITY_TEST_FRAMEWORK_MIN_VERSION,
+                        status
+                            .package_version
+                            .as_deref()
+                            .unwrap_or("unknown version")
+                    )),
+                );
+            }
             (true, None)
         }
         _ => (true, None),
@@ -674,13 +687,16 @@ async fn execute_workspace_tool(
                     return outcome_from_tool_result(err(&dialog_error), None);
                 }
             }
-            return outcome_from_tool_result(
-                err(&format!("Tool '{name}' service binding error: {error}")),
-                None,
-            );
+            let output = format!("Tool '{name}' service binding error: {error}");
+            let output = if unity_owned {
+                crate::unity_bridge::enrich_unity_tool_error(working_dir, &output).await
+            } else {
+                output
+            };
+            return outcome_from_tool_result(err(&output), None);
         }
     };
-    match name {
+    let mut outcome = match name {
         "unity_execute" => {
             outcome_from_tool_result(run_unity_execute(working_dir, arguments).await, None)
         }
@@ -796,7 +812,12 @@ async fn execute_workspace_tool(
                 .await;
             outcome_from_tool_result(result, None)
         }
+    };
+    if unity_owned && outcome.is_error {
+        outcome.output =
+            crate::unity_bridge::enrich_unity_tool_error(working_dir, &outcome.output).await;
     }
+    outcome
 }
 
 async fn resolve_owned_service_for_mcp_tool(

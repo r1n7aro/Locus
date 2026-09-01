@@ -149,6 +149,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "ask_user_question",
     "exit_plan_mode",
     // Unity editor actions.
+    "unity_lock",
     "unity_set_play_mode",
     "unity_execute",
     "unity_recompile",
@@ -156,6 +157,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "unity_get_console_log",
     "unity_test_list",
     "unity_test_run",
+    "unity_release",
     // Unity project search & inspection.
     "unity_asset_search",
     "unity_ref_search",

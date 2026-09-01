@@ -37,6 +37,8 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(misc::todowrite());
 
     registry.register_builtin(filesystem::list());
+    registry.register_builtin(unity::unity_lock());
+    registry.register_builtin(unity::unity_release());
     registry.register_builtin(unity::unity_set_play_mode());
     registry.register_builtin(unity::unity_execute());
     registry.register_builtin(unity::unity_run_states());

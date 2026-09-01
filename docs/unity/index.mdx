@@ -41,6 +41,33 @@ Locus 升级后，若项目中的插件版本落后，Unity 状态指示会显�
 
 配套的两个菜单项用于把编辑器中的内容发给 Locus：选中资产后使用 `Assets > Send to Locus`，选中场景对象后使用 `GameObject > Send to Locus`，所选内容会作为引用出现在 Locus 输入框中。
 
+编辑器扩展也可以调用公开接口，并指定引用进入焦点会话或新会话：
+
+```csharp
+using Locus;
+
+LocusEditorWindow.SendToLocus(SendToLocusMode.FocusedSession);
+LocusEditorWindow.SendToLocus(SendToLocusMode.NewSession);
+```
+
+省略参数时使用 `FocusedSession`。`NewSession` 会切换到一个新会话草稿后附加当前 Unity 选择；当前已存在的会话保持不变。
+
+本地文件和文件夹使用 `LocusFileAttachment` 显式传入：
+
+```csharp
+LocusEditorWindow.SendToLocus(
+    new[]
+    {
+        new LocusFileAttachment(
+            replayPath,
+            typeLabel: "Replay",
+            source: "replay-timeline")
+    },
+    SendToLocusMode.NewSession);
+```
+
+路径必须在调用时存在。无效路径会被忽略；全部路径无效时接口返回 `false`。
+
 ## 团结引擎（Tuanjie）
 
 Locus 自动识别团结引擎（Unity 中国版）编辑器：启动发现、进程检测与连接流程与 Unity 完全一致，无需任何额外配置。

@@ -33,12 +33,57 @@ describe("Unity modal dialog readiness barrier", () => {
 
   it("formats every captured choice in the original blocked-tool message", () => {
     const dialog = read("src-tauri/src/unity_bridge/dialog.rs");
+    const formatStart = dialog.indexOf("fn format_blocked_error(");
+    const formatEnd = dialog.indexOf("fn display_or_empty(", formatStart);
+    const format = dialog.slice(formatStart, formatEnd);
 
-    expect(dialog).toContain('lines.push(format!("- {}: {}", choice.id, choice.label))');
+    expect(format).toContain('lines.push(format!("- {}: {}", choice.id, choice.label))');
     expect(dialog).toContain("choice-0: Save");
     expect(dialog).toContain("choice-1: Don't Save");
     expect(dialog).toContain("choice-2: Cancel");
-    expect(dialog).toContain("locus.choose_unity_dialog");
+    expect(format).toContain("locus.choose_unity_dialog");
+    expect(format).toContain("内置 python 工具");
+    expect(format).toContain("choice = await locus.choose_unity_dialog");
+    expect(format).toContain("output = await locus.wait_unity_execution");
+    expect(format).not.toContain("python -c");
+  });
+
+  it("waits for the selected dialog to close before returning to Python", () => {
+    const dialog = read("src-tauri/src/unity_bridge/dialog.rs");
+    const choose = dialog.indexOf("pub async fn choose_dialog(");
+    const subscribe = dialog.indexOf("let mut dialog_updates = subscribe();", choose);
+    const invoke = dialog.indexOf("tokio::task::spawn_blocking", subscribe);
+    const wait = dialog.indexOf("wait_for_dialog_dismissal(", invoke);
+
+    expect(choose).toBeGreaterThan(0);
+    expect(subscribe).toBeGreaterThan(choose);
+    expect(invoke).toBeGreaterThan(subscribe);
+    expect(wait).toBeGreaterThan(invoke);
+  });
+
+  it("returns a normal result when the user already handled the dialog", () => {
+    const dialog = read("src-tauri/src/unity_bridge/dialog.rs");
+    const choose = dialog.indexOf("fn choose_dialog_blocking(");
+    const unavailable = dialog.indexOf("fn dialog_unavailable_result(", choose);
+    const implementation = dialog.slice(choose, unavailable);
+
+    expect(implementation).toContain("let Some(record) = records.get_mut(&key) else");
+    expect(implementation).toContain("return Ok(dialog_unavailable_result(");
+    expect(dialog).toContain('"dialog_not_found"');
+    expect(dialog).toContain("it may already have been handled manually");
+  });
+
+  it("covers immediate detached-execution recovery in the Unity integration suite", () => {
+    const driver = read("src-tauri/src/cli_driver.rs");
+    const resolver = driver.indexOf("async fn resolve_modal_dialog_through_python_sdk(");
+    const choose = driver.indexOf("await locus.choose_unity_dialog(", resolver);
+    const wait = driver.indexOf("await locus.wait_unity_execution(", choose);
+    const recoveredOutput = driver.indexOf('"executionOutput": execution_output', wait);
+
+    expect(resolver).toBeGreaterThan(0);
+    expect(choose).toBeGreaterThan(resolver);
+    expect(wait).toBeGreaterThan(choose);
+    expect(recoveredOutput).toBeGreaterThan(wait);
   });
 
   it("subscribes before the transport preflight without adding another window scan", () => {

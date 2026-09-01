@@ -403,6 +403,23 @@ pub fn set_async_tasks_enabled(
 }
 
 #[tauri::command]
+pub fn get_unity_multi_agent_editor_enabled(
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<bool, crate::error::AppError> {
+    Ok(config.unity_multi_agent_editor_enabled())
+}
+
+#[tauri::command]
+pub fn set_unity_multi_agent_editor_enabled(
+    value: bool,
+    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+) -> Result<(), crate::error::AppError> {
+    config
+        .set_unity_multi_agent_editor_enabled(value)
+        .map_err(crate::error::AppError::from)
+}
+
+#[tauri::command]
 pub fn get_unity_background_hook_enabled(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<bool, crate::error::AppError> {
@@ -885,40 +902,6 @@ pub async fn unity_integration_test_run(
 pub fn unity_integration_test_cancel() -> Result<(), crate::error::AppError> {
     crate::cli_driver::cancel_ui();
     Ok(())
-}
-
-#[tauri::command]
-pub fn get_view_windows_above_main(
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-) -> Result<bool, crate::error::AppError> {
-    Ok(config.view_windows_above_main_enabled())
-}
-
-#[tauri::command]
-pub fn set_view_windows_above_main(
-    value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-) -> Result<(), crate::error::AppError> {
-    config
-        .set_view_windows_above_main_enabled(value)
-        .map_err(crate::error::AppError::from)
-}
-
-#[tauri::command]
-pub fn get_view_open_in_existing_window(
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-) -> Result<bool, crate::error::AppError> {
-    Ok(config.view_open_in_existing_window_enabled())
-}
-
-#[tauri::command]
-pub fn set_view_open_in_existing_window(
-    value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-) -> Result<(), crate::error::AppError> {
-    config
-        .set_view_open_in_existing_window_enabled(value)
-        .map_err(crate::error::AppError::from)
 }
 
 #[cfg(windows)]

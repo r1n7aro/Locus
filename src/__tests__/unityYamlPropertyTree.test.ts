@@ -245,7 +245,7 @@ describe("Unity YAML Property Tree", () => {
     expect(prompt).not.toContain("UNITY_YAML_LIST");
     const bridge = read("locus_unity/Editor/LocusBridge.cs");
     expect(bridge).not.toContain('case "list_yaml"');
-    const devConfig = JSON.parse(read("agent/dev/config.json"));
+    const devConfig = JSON.parse(read("agent/unity/config.json"));
     expect(devConfig.tools).not.toContain("unity_yaml_list");
     const compact = read("src-tauri/src/compact.rs");
     expect(compact).toContain(

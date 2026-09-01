@@ -83,6 +83,14 @@ export function setAsyncTasksEnabled(value: boolean): Promise<void> {
   return ipcInvoke<void>("set_async_tasks_enabled", { value });
 }
 
+export function getUnityMultiAgentEditorEnabled(): Promise<boolean> {
+  return ipcInvoke<boolean>("get_unity_multi_agent_editor_enabled");
+}
+
+export function setUnityMultiAgentEditorEnabled(value: boolean): Promise<void> {
+  return ipcInvoke<void>("set_unity_multi_agent_editor_enabled", { value });
+}
+
 export function getToolFailureLogEnabled(): Promise<boolean> {
   return ipcInvoke<boolean>("get_tool_failure_log_enabled");
 }
@@ -165,22 +173,6 @@ export function setUnityExternalEditorDefaultEnabled(
 
 export function takeExternalScriptOpenRequest(): Promise<ExternalScriptOpenRequest | null> {
   return ipcInvoke<ExternalScriptOpenRequest | null>("take_external_script_open_request");
-}
-
-export function getViewWindowsAboveMain(): Promise<boolean> {
-  return ipcInvoke<boolean>("get_view_windows_above_main");
-}
-
-export function setViewWindowsAboveMain(value: boolean): Promise<void> {
-  return ipcInvoke<void>("set_view_windows_above_main", { value });
-}
-
-export function getViewOpenInExistingWindow(): Promise<boolean> {
-  return ipcInvoke<boolean>("get_view_open_in_existing_window");
-}
-
-export function setViewOpenInExistingWindow(value: boolean): Promise<void> {
-  return ipcInvoke<void>("set_view_open_in_existing_window", { value });
 }
 
 export function getProxyStatus(): Promise<ProxyStatus> {

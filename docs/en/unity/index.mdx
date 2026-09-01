@@ -41,6 +41,33 @@ Quick actions:
 
 Two companion menu items send editor content to Locus: with an asset selected, use `Assets > Send to Locus`; with a scene object selected, use `GameObject > Send to Locus`. The selection appears in the Locus composer as a reference.
 
+Editor extensions can also call the public API and choose whether the references go to the focused session or a new session:
+
+```csharp
+using Locus;
+
+LocusEditorWindow.SendToLocus(SendToLocusMode.FocusedSession);
+LocusEditorWindow.SendToLocus(SendToLocusMode.NewSession);
+```
+
+Omitting the argument uses `FocusedSession`. `NewSession` switches to a new session draft, attaches the current Unity selection there, and leaves the existing session unchanged.
+
+Pass local files and folders explicitly with `LocusFileAttachment`:
+
+```csharp
+LocusEditorWindow.SendToLocus(
+    new[]
+    {
+        new LocusFileAttachment(
+            replayPath,
+            typeLabel: "Replay",
+            source: "replay-timeline")
+    },
+    SendToLocusMode.NewSession);
+```
+
+Paths must exist when the API is called. Invalid paths are ignored, and the API returns `false` when none remain.
+
 ## Tuanjie engine
 
 Locus recognizes the Tuanjie engine (the Chinese edition of Unity) automatically: launch discovery, process detection, and the connection flow are identical to Unity, with no extra configuration.

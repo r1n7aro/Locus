@@ -56,6 +56,7 @@ pub enum CliDriverSuite {
     Execute,
     PythonSdk,
     ModalDialog,
+    SafeMode,
     YamlParity,
     UnityTest,
 }
@@ -77,6 +78,7 @@ impl CliDriverSuite {
             CliDriverSuite::Execute => "execute",
             CliDriverSuite::PythonSdk => "python-sdk",
             CliDriverSuite::ModalDialog => "modal-dialog",
+            CliDriverSuite::SafeMode => "safe-mode",
             CliDriverSuite::YamlParity => "yaml-parity",
             CliDriverSuite::UnityTest => "unity-test",
         }
@@ -99,6 +101,7 @@ impl CliDriverSuite {
             CliDriverSuite::Execute => None,
             CliDriverSuite::PythonSdk => None,
             CliDriverSuite::ModalDialog => None,
+            CliDriverSuite::SafeMode => None,
             CliDriverSuite::YamlParity => None,
             CliDriverSuite::UnityTest => None,
         }
@@ -633,6 +636,9 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         "modal-dialog" | "modal_dialog" | "dialog" | "unity-dialog" | "unity_dialog" => {
             CliDriverSuite::ModalDialog
         }
+        "safe-mode" | "safe_mode" | "safe-mode-recovery" | "editor-recovery" => {
+            CliDriverSuite::SafeMode
+        }
         "yaml-parity" | "yaml_parity" | "yaml-diff" | "yaml_diff" => {
             CliDriverSuite::YamlParity
         }
@@ -641,7 +647,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use workspace, workspace-switch, connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, recompile-import, execute, python-sdk, modal-dialog, yaml-parity, unity-test, or all.",
+            "Unknown --suite '{}'. Use workspace, workspace-switch, connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, recompile-import, execute, python-sdk, modal-dialog, safe-mode, yaml-parity, unity-test, or all.",
             value
         ))
         }
@@ -1034,6 +1040,17 @@ async fn run_driver(
                     }
                     Err(error) => Err(error),
                 }
+            }
+            CliDriverSuite::SafeMode => {
+                run_safe_mode_recovery_suite(
+                    &app_handle,
+                    &project,
+                    *suite,
+                    &config,
+                    &sink,
+                    &mut cancel_rx,
+                )
+                .await
             }
             CliDriverSuite::YamlParity => {
                 let edit_mode_result = if config.force_edit_mode {
@@ -1700,7 +1717,7 @@ async fn create_workspace_driver_session(
         format!("Workspace driver target {index}"),
         None,
         Some("chat".to_string()),
-        Some("dev".to_string()),
+        Some(crate::agent::definition::DEFAULT_AGENT_ID.to_string()),
         crate::workspace_service::WorkspaceRef::for_runtime(runtime),
         app_handle.state(),
         app_handle.state(),
@@ -1945,7 +1962,7 @@ async fn launch_workspace_mock_chat_with_prompt(
         prompt,
         Some(false),
         None,
-        Some("dev".to_string()),
+        Some(crate::agent::definition::DEFAULT_AGENT_ID.to_string()),
         None,
         Some("mock/tool".to_string()),
         None,
@@ -2255,6 +2272,16 @@ async fn run_unity_test_suite(
     }
     if !workspace_status.package_installed {
         return Err("com.unity.test-framework is not installed in this project".to_string());
+    }
+    if !workspace_status.package_supported {
+        return Err(format!(
+            "Unity Test suite requires com.unity.test-framework {} or newer (found {})",
+            crate::workspace::UNITY_TEST_FRAMEWORK_MIN_VERSION,
+            workspace_status
+                .package_version
+                .as_deref()
+                .unwrap_or("unknown version")
+        ));
     }
 
     let recompile = unity_bridge::recompile_and_wait(project).await?;
@@ -5764,6 +5791,7 @@ async fn run_python_sdk_script(
 async fn resolve_modal_dialog_through_python_sdk(
     app_handle: &AppHandle,
     project: &str,
+    execution_id: &str,
 ) -> Result<String, String> {
     let script = r#"import asyncio, json, locus, sys
 async def main():
@@ -5787,11 +5815,16 @@ async def main():
         dialog_id=dialog.dialog_id,
         choice_id=choice.id,
     )
+    execution_output = await locus.wait_unity_execution(
+        project=dialog.project,
+        execution_id=sys.argv[2],
+    )
     print(json.dumps({
         "title": dialog.title,
         "message": dialog.message,
         "choice": choice.label,
         "invoked": result.invoked,
+        "executionOutput": execution_output.strip(),
         "ready": status.ready,
         "mainThreadBlocked": status.main_thread_blocked,
         "recoverable": status.blocking_dialog_recoverable,
@@ -5802,7 +5835,7 @@ asyncio.run(main())"#;
         app_handle,
         project,
         script,
-        &[],
+        &[execution_id.to_string()],
         Duration::from_secs(15),
         "Python SDK dialog resolver",
     )
@@ -6128,6 +6161,412 @@ asyncio.run(main())"#;
 /// Opens a real Unity Editor modal dialog from an active `unity_execute`,
 /// proves that a second main-thread request fails fast, and resolves the dialog
 /// through the public Python SDK while Unity's managed main thread is blocked.
+async fn run_safe_mode_recovery_suite(
+    _app_handle: &AppHandle,
+    project: &str,
+    suite: CliDriverSuite,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    const FIXTURE_ASSET: &str = "Assets/LocusSafeModeDriverProbe.cs";
+    const FIXTURE_META: &str = "Assets/LocusSafeModeDriverProbe.cs.meta";
+    const BAD_SOURCE: &str = "internal static class LocusSafeModeDriverProbe { private static LocusSafeModeDriverMissingType Value; }\n";
+    const GOOD_SOURCE: &str =
+        "internal static class LocusSafeModeDriverProbe { internal const int Value = 42; }\n";
+
+    sink.emit(
+        "suite_start",
+        json!({ "suite": suite.as_str(), "project": project }),
+    );
+    let fixture = Path::new(project).join(FIXTURE_ASSET.replace('/', "\\"));
+    let fixture_meta = Path::new(project).join(FIXTURE_META.replace('/', "\\"));
+    if fixture.exists() || fixture_meta.exists() {
+        return Err(format!(
+            "safe-mode suite fixture already exists: {}",
+            fixture.display()
+        ));
+    }
+
+    let mut run = ExecuteSuiteRun::new(suite, sink);
+    let outcome: Result<(), String> = async {
+        std::fs::write(&fixture, BAD_SOURCE)
+            .map_err(|error| format!("failed to write Safe Mode fixture: {error}"))?;
+        // Auto Refresh can be disabled in the test project's editor preferences.
+        // Queue the script explicitly, but treat a response timeout as expected:
+        // ImportAsset can synchronously enter compilation before the managed
+        // request posts its response. Editor.log is the authoritative result.
+        let _ = unity_bridge::import_assets(project, &[FIXTURE_ASSET.to_string()]).await;
+        let compile_started = Instant::now();
+        loop {
+            let process = unity_bridge::query_current_project_editor_process(project).await;
+            let observed = unity_bridge::read_editor_log_console_entries(
+                project,
+                process.process_id,
+                &["error".to_string()],
+                100,
+            )
+            .map(|read| {
+                read.entries.iter().any(|entry| {
+                    entry.message.contains("LocusSafeModeDriverMissingType")
+                        || entry.message.contains("CS0246")
+                })
+            })
+            .unwrap_or(false);
+            if observed {
+                break;
+            }
+            if compile_started.elapsed() >= config.connect_timeout {
+                return Err(format!(
+                    "fixture compiler error did not appear in Editor.log within {}ms",
+                    config.connect_timeout.as_millis()
+                ));
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(config.poll_interval) => {}
+                _ = cancel_rx.changed() => {
+                    return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+                }
+            }
+        }
+        run.pass(
+            "S0 compiler fixture",
+            "observed the deterministic compiler error out of process before restart",
+        );
+
+        unity_bridge::close_current_project_unity_processes(project, Duration::from_secs(45))
+            .await?;
+        // Unity can require a short interval after a forced close to release
+        // its project lock and crash-recovery handles. Launching immediately
+        // may create a short-lived editor process that exits before showing
+        // the Safe Mode recovery prompt.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        unity_bridge::launch_project_with_mode(project, unity_bridge::UnityLaunchMode::Interactive)
+            .await?;
+
+        let safe_started = Instant::now();
+        let mut safe_state = None;
+        let mut selected_dialog = false;
+        while safe_started.elapsed() < config.suite_timeout {
+            if run_cancelled(cancel_rx) {
+                return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+            }
+            if !selected_dialog {
+                if let Some(dialog) = unity_bridge::dialog::current_dialog(project) {
+                    let dialog_text =
+                        format!("{} {}", dialog.title, dialog.message).to_ascii_lowercase();
+                    if dialog_text.contains("safe mode") || dialog_text.contains("安全模式") {
+                        if let Some(choice) = dialog
+                            .choices
+                            .iter()
+                            .find(|choice| {
+                                let label = choice.label.to_ascii_lowercase();
+                                label.contains("safe mode") || label.contains("安全模式")
+                            })
+                            .or_else(|| dialog.choices.first())
+                        {
+                            unity_bridge::dialog::choose_dialog(
+                                project,
+                                &dialog.dialog_id,
+                                &choice.id,
+                            )
+                            .await?;
+                            selected_dialog = true;
+                        }
+                    }
+                }
+            }
+            let semantic = unity_bridge::unity_semantic_state(project).await;
+            let safe_mode_prompt_open = semantic
+                .process
+                .pid
+                .and_then(unity_bridge::dialog::main_window_title)
+                .map(|title| {
+                    let normalized = title.to_ascii_lowercase();
+                    normalized.contains("enter safe mode") || normalized.contains("进入安全模式")
+                })
+                .unwrap_or(false);
+            // The recovery prompt itself contains "Safe Mode" in its title.
+            // Keep driving the modal choice until Unity replaces that prompt
+            // with the real project window carrying the SAFE MODE marker.
+            if semantic.phase == "safe_mode" && !safe_mode_prompt_open {
+                safe_state = Some(semantic);
+                break;
+            }
+            if semantic.process.state == "not_running"
+                && safe_started.elapsed() >= Duration::from_secs(30)
+            {
+                return Err("Unity exited before entering Safe Mode".to_string());
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(config.poll_interval) => {}
+                _ = cancel_rx.changed() => {
+                    return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
+                }
+            }
+        }
+        let safe_state = safe_state.ok_or_else(|| {
+            format!(
+                "Unity did not enter Safe Mode within {}ms",
+                config.suite_timeout.as_millis()
+            )
+        })?;
+        if safe_state.safety.can_call_unity_api
+            || safe_state.safety.recommended_action != "fix_compile_errors"
+        {
+            return Err(format!(
+                "Safe Mode capability contract is incorrect: canCallUnityApi={} action={}",
+                safe_state.safety.can_call_unity_api, safe_state.safety.recommended_action
+            ));
+        }
+        run.pass(
+            "S1 external state probe",
+            format!(
+                "phase={} source={} editorLog={}",
+                safe_state.phase,
+                safe_state.source,
+                safe_state
+                    .editor_log
+                    .path
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            ),
+        );
+
+        let log_read = unity_bridge::read_editor_log_console_entries(
+            project,
+            safe_state.process.pid,
+            &["error".to_string()],
+            50,
+        )?;
+        if !log_read.entries.iter().any(|entry| {
+            entry.message.contains("LocusSafeModeDriverMissingType")
+                || entry.message.contains("CS0246")
+        }) {
+            return Err(format!(
+                "Editor log fallback did not expose the fixture compiler error: {}",
+                log_read.path
+            ));
+        }
+        run.pass(
+            "S2 out-of-process log",
+            format!("read compiler diagnostics from {}", log_read.path),
+        );
+
+        std::fs::write(&fixture, GOOD_SOURCE)
+            .map_err(|error| format!("failed to repair Safe Mode fixture: {error}"))?;
+        let first_recovery = wait_for_semantic_ready(
+            project,
+            suite,
+            "safe_mode_repair",
+            SemanticReadyRequirement::UnityApi,
+            Duration::from_secs(30),
+            config.poll_interval,
+            sink,
+            cancel_rx,
+        )
+        .await;
+        let (recovered, recovery_strategy) = match first_recovery {
+            Ok(recovered) => (recovered, "automatic_refresh"),
+            Err(error) => {
+                if error == UNITY_INTEGRATION_TEST_CANCELLED {
+                    return Err(error);
+                }
+                let state = unity_bridge::unity_semantic_state(project).await;
+                if state.phase != "safe_mode" {
+                    return Err(format!(
+                        "Safe Mode repair did not recover and the editor left the expected state: {error}; phase={}",
+                        state.phase
+                    ));
+                }
+                // External file changes are not auto-refreshed while an older
+                // Unity Safe Mode window remains in the background. Restarting
+                // is the deterministic out-of-process recovery path: startup
+                // recompiles the repaired source before the managed bridge is
+                // required.
+                unity_bridge::close_current_project_unity_processes(
+                    project,
+                    Duration::from_secs(45),
+                )
+                .await?;
+                tokio::time::sleep(Duration::from_millis(2_500)).await;
+                unity_bridge::launch_project_with_mode(
+                    project,
+                    unity_bridge::UnityLaunchMode::Interactive,
+                )
+                .await?;
+                let recovered = wait_for_semantic_ready(
+                    project,
+                    suite,
+                    "safe_mode_repair_restart",
+                    SemanticReadyRequirement::UnityApi,
+                    config.suite_timeout,
+                    config.poll_interval,
+                    sink,
+                    cancel_rx,
+                )
+                .await?;
+                (recovered, "editor_restart")
+            }
+        };
+        if recovered.phase == "safe_mode" {
+            return Err("Unity remained in Safe Mode after compiler repair".to_string());
+        }
+        run.pass(
+            "S3 Safe Mode repair recovery",
+            format!(
+                "recovered to phase={} after file repair via {}",
+                recovered.phase, recovery_strategy
+            ),
+        );
+
+        std::fs::remove_file(&fixture)
+            .map_err(|error| format!("failed to remove Safe Mode fixture: {error}"))?;
+        if fixture_meta.exists() {
+            std::fs::remove_file(&fixture_meta)
+                .map_err(|error| format!("failed to remove Safe Mode fixture meta: {error}"))?;
+        }
+        let _ = unity_bridge::import_assets(
+            project,
+            &[FIXTURE_ASSET.to_string(), FIXTURE_META.to_string()],
+        )
+        .await;
+        wait_for_semantic_ready(
+            project,
+            suite,
+            "safe_mode_fixture_cleanup",
+            SemanticReadyRequirement::UnityApi,
+            config.suite_timeout,
+            config.poll_interval,
+            sink,
+            cancel_rx,
+        )
+        .await?;
+
+        let crash_project = project.to_string();
+        let execution = tokio::spawn(async move {
+            unity_bridge::unity_execute_code_with_non_public_access(
+                &crash_project,
+                r#"await ctx.WaitSeconds(120); print("SAFE_MODE_DRIVER_SHOULD_NOT_FINISH");"#,
+                false,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        unity_bridge::force_close_current_project_unity_processes(project, Duration::from_secs(20))
+            .await?;
+        let execution_result = tokio::time::timeout(Duration::from_secs(30), execution)
+            .await
+            .map_err(|_| {
+                "Unity execution did not terminate after the editor was killed".to_string()
+            })?
+            .map_err(|error| format!("Unity execution task join failed: {error}"))?;
+        let execution_error = match execution_result {
+            Ok(output) => {
+                return Err(format!(
+                    "Unity execution unexpectedly succeeded after the editor exited: {}",
+                    clip(&output, 240)
+                ));
+            }
+            Err(error) => error,
+        };
+
+        let crash_started = Instant::now();
+        let crash_state = loop {
+            let state = unity_bridge::unity_semantic_state(project).await;
+            if state.phase == "crashed" {
+                break state;
+            }
+            if crash_started.elapsed() >= Duration::from_secs(20) {
+                return Err(format!(
+                    "state probe did not report crash after forced exit: phase={} process={}",
+                    state.phase, state.process.state
+                ));
+            }
+            tokio::time::sleep(config.poll_interval).await;
+        };
+        let enriched = unity_bridge::enrich_unity_tool_error(project, &execution_error).await;
+        let expected_log = crash_state.editor_log.path.as_deref().unwrap_or("");
+        if !enriched.contains("state: crashed")
+            || !enriched.contains("editor_log:")
+            || (!expected_log.is_empty() && !enriched.contains(expected_log))
+            || !enriched.contains("Inspect the Editor log")
+        {
+            return Err(format!(
+                "crash diagnostic was incomplete: {}",
+                clip(&enriched, 600)
+            ));
+        }
+        run.pass(
+            "S4 tool-time crash diagnostic",
+            format!(
+                "failed execution reported crash and Editor log {}",
+                expected_log
+            ),
+        );
+
+        unity_bridge::launch_project_with_mode(project, unity_bridge::UnityLaunchMode::Interactive)
+            .await?;
+        wait_for_semantic_ready(
+            project,
+            suite,
+            "post_crash_restart",
+            SemanticReadyRequirement::UnityApi,
+            config.suite_timeout,
+            config.poll_interval,
+            sink,
+            cancel_rx,
+        )
+        .await?;
+        run.pass(
+            "S5 post-crash recovery",
+            "Unity restarted and the bridge became ready",
+        );
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = &outcome {
+        run.fail("safe-mode recovery", error);
+        let _ = unity_bridge::force_close_current_project_unity_processes(
+            project,
+            Duration::from_secs(20),
+        )
+        .await;
+        let _ = std::fs::remove_file(&fixture);
+        let _ = std::fs::remove_file(&fixture_meta);
+        if unity_bridge::launch_project_with_mode(
+            project,
+            unity_bridge::UnityLaunchMode::Interactive,
+        )
+        .await
+        .is_ok()
+        {
+            let _ = wait_for_semantic_ready(
+                project,
+                suite,
+                "failure_cleanup",
+                SemanticReadyRequirement::UnityApi,
+                config.suite_timeout,
+                config.poll_interval,
+                sink,
+                cancel_rx,
+            )
+            .await;
+        }
+    }
+
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": suite.as_str(),
+            "passed": run.passed,
+            "failed": run.failed,
+        }),
+    );
+    outcome
+}
+
 async fn run_modal_dialog_suite(
     app_handle: &AppHandle,
     project: &str,
@@ -6246,15 +6685,24 @@ print("MODAL_PROBE:" + (accepted ? "continued" : "cancelled"));"#
         .await
         .map_err(|_| "The active unity_execute did not detach after dialog detection".to_string())?
         .map_err(|error| format!("unity_execute task join failed: {error}"))?;
+    let detached_execution_id = execute_result.as_ref().err().and_then(|error| {
+        error
+            .lines()
+            .find_map(|line| line.strip_prefix("request_id="))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    });
     match execute_result {
         Err(error)
             if crate::unity_bridge::dialog::is_unity_modal_dialog_blocked_error(&error)
                 && (error.contains("request_state=detached")
-                    || error.contains("request_state=unknown")) =>
+                    || error.contains("request_state=unknown"))
+                && detached_execution_id.is_some() =>
         {
             run.pass(
                 "D3 active request detach",
-                "unity_execute returned dialog content without waiting for its normal timeout",
+                "unity_execute returned dialog content and a resumable execution id without waiting for its normal timeout",
             );
         }
         Err(error) => run.fail(
@@ -6267,29 +6715,35 @@ print("MODAL_PROBE:" + (accepted ? "continued" : "cancelled"));"#
         ),
     }
 
-    let python_result = resolve_modal_dialog_through_python_sdk(app_handle, project).await;
+    let python_result = match detached_execution_id.as_deref() {
+        Some(execution_id) => {
+            resolve_modal_dialog_through_python_sdk(app_handle, project, execution_id).await
+        }
+        None => Err("The detached unity_execute error did not include request_id".to_string()),
+    };
     match &python_result {
         Ok(output)
             if output.contains("Locus Native Dialog Probe")
                 && output.contains("Cancel Probe")
                 && output.contains("\"invoked\": true")
+                && output.contains("\"executionOutput\": \"MODAL_PROBE:cancelled\"")
                 && output.contains("\"ready\": false")
                 && output.contains("\"mainThreadBlocked\": true")
                 && output.contains("\"recoverable\": true")
                 && output.contains("\"blockingReason\": \"modal_dialog\"") =>
         {
             run.pass(
-                "D4 Python SDK choice",
-                "status exposed the blocked main thread and SDK invoked Cancel Probe",
+                "D4 Python SDK choice and wait",
+                "SDK closed Cancel Probe and immediately recovered the original Unity execution",
             );
         }
         Ok(output) => run.fail(
-            "D4 Python SDK choice",
+            "D4 Python SDK choice and wait",
             format!("unexpected SDK output: {}", clip(output, 300)),
         ),
         Err(error) => {
             run.fail(
-                "D4 Python SDK choice",
+                "D4 Python SDK choice and wait",
                 format!("SDK error: {}", clip(error, 300)),
             );
             if let Some(current) = crate::unity_bridge::dialog::current_dialog(project) {
