@@ -67,6 +67,9 @@ const props = withDefaults(defineProps<{
   selectedDocumentId: null,
   selectedDocumentTarget: null,
 });
+const emit = defineEmits<{
+  (event: "dirtyChange", dirty: boolean): void;
+}>();
 const editorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
 const notificationStore = useNotificationStore();
 
@@ -833,6 +836,7 @@ onUnmounted(() => {
             @save-section="handleSaveSection"
             @update-meta="handleUpdateMeta"
             @reference-open="handleEditorReferenceOpen"
+            @dirty-change="emit('dirtyChange', $event)"
           />
 
           <KnowledgeDirectoryPreview

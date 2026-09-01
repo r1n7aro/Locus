@@ -19,11 +19,11 @@ describe("workspace knowledge document layout", () => {
     expect(knowledgeView).toContain(':active="props.active"');
   });
 
-  it("hides the redundant document header inside a workspace tab", () => {
+  it("removes the redundant document header in every host", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
     expect(preview).toContain("embedded?: boolean;");
-    expect(preview).toContain('<div v-if="!props.embedded" class="preview-header">');
+    expect(preview).not.toContain('class="preview-header"');
   });
 
   it("lets the continuous document scroller receive wheels from auto-grow editors", () => {

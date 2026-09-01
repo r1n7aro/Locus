@@ -9,12 +9,13 @@ function read(relPath: string) {
 }
 
 describe("KnowledgePreview continuous document layout", () => {
-  it("keeps the path and view mode in a compact workspace header", () => {
+  it("opens directly on the rendered document without a redundant header", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
-    expect(preview).toContain('class="preview-path">{{ documentDisplayPath }}</span>');
-    expect(preview).toContain('class="preview-view-segmented"');
-    expect(preview).toContain("useMarkdownEditorViewMode");
+    expect(preview).not.toContain('class="preview-header"');
+    expect(preview).not.toContain('class="preview-path"');
+    expect(preview).not.toContain('class="preview-view-segmented"');
+    expect(preview).toContain('const editorViewMode = "rendered" as const;');
     expect(preview).not.toContain('class="preview-pane-header"');
   });
 
@@ -79,14 +80,16 @@ describe("KnowledgePreview continuous document layout", () => {
     expect(preview).not.toContain("knowledge.preview.rulesInheritedHint");
   });
 
-  it("keeps storage details off ordinary documents while retaining file size", () => {
+  it("keeps storage details off ordinary documents while retaining file size and modification time", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
 
     expect(preview).toContain("const showExtendedDocumentProperties = computed(() => (");
     expect(preview).toContain('props.document?.type === "skill" || props.document?.type === "reference"');
     expect(preview).toContain('<template v-if="showExtendedDocumentProperties">');
     expect(preview).toContain('<div v-if="documentFileMetadata" class="document-property-row">');
-    expect(preview).toContain('<template v-if="showExtendedDocumentProperties && documentFileMetadata">');
+    expect(preview).toContain('documentFileMetadata.value?.modifiedAt ?? props.document?.modifiedAt');
+    expect(preview).toContain('{{ t("knowledge.meta.modifiedAt") }}');
+    expect(preview).not.toContain('showLastCommit');
   });
 
   it("keeps skill-only properties and Unity package actions in the same property list", () => {

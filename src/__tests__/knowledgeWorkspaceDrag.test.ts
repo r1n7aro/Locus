@@ -8,7 +8,7 @@ import {
 } from "../components/knowledge/knowledgeWorkspaceDrag";
 
 describe("knowledge internal drag payload", () => {
-  it("connects opened document and directory headers to the pointer drag controller", () => {
+  it("connects the opened directory header to the pointer drag controller", () => {
     const documentPreview = readFileSync(
       new URL("../components/knowledge/KnowledgePreview.vue", import.meta.url),
       "utf8",
@@ -18,8 +18,7 @@ describe("knowledge internal drag payload", () => {
       "utf8",
     );
 
-    expect(documentPreview).toContain("startKnowledgeInternalDrag(internalDrag, event");
-    expect(documentPreview).toContain('@pointerdown="onDocumentDragPointerDown"');
+    expect(documentPreview).not.toContain('@pointerdown="onDocumentDragPointerDown"');
     expect(documentPreview).not.toContain("@dragstart");
     expect(directoryPreview).toContain("startKnowledgeInternalDrag(internalDrag, event");
     expect(directoryPreview).toContain('@pointerdown="onDirectoryDragPointerDown"');

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import type { Text } from "@codemirror/state";
-import { computed, onUnmounted, ref, watch } from "vue";
+import type { EditorView } from "@codemirror/view";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import type {
   KnowledgeDocument,
   KnowledgeDocumentEditOperation,
@@ -66,11 +67,6 @@ import {
   getKnowledgeEditMode,
   isKnowledgeEditModeLocked,
 } from "./knowledgeEditMode";
-import BaseSegmented from "../ui/BaseSegmented.vue";
-import {
-  useMarkdownEditorViewMode,
-  type MarkdownEditorViewMode,
-} from "../ui/markdownEditorViewMode";
 import {
   KnowledgeEditorWorkspaceSessionStore,
   knowledgeDocumentEditorSessionKey,
@@ -78,29 +74,20 @@ import {
   type KnowledgeEditorDraftValues,
   type KnowledgeSectionConflicts,
 } from "./knowledgeEditorWorkspaceSession";
-import {
-  buildKnowledgeDocumentWorkspaceDragPayload,
-  startKnowledgeInternalDrag,
-} from "./knowledgeWorkspaceDrag";
 import { useInternalDragController } from "../../composables/useInternalDrag";
 import type { WorkspaceRef } from "../../services/project";
 import {
-  claimWorkbenchReferencePointerEvent,
-  workbenchReferenceFromElement,
-  workbenchReferenceInternalDragSource,
-  type WorkbenchReferenceDragData,
+  startWorkbenchReferenceInternalDrag,
 } from "../workbench/workbenchReferenceDrag";
+import {
+  extractKnowledgeDocumentOutline,
+  type KnowledgeDocumentOutlineItem,
+} from "./knowledgeDocumentOutline";
 
 const AUTO_SAVE_DELAY_MS = 700;
-const MEMORY_PREVIEW_PATH_PREFIX = "unity-project-understanding";
-const BUILTIN_MEMORY_PREVIEW_PATHS = new Set([
-  "project-mistake-note.md",
-  "user-preference.md",
-]);
 const notificationStore = useNotificationStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const { skillItems, loadSkills } = useSkills();
-const { markdownEditorViewMode, setMarkdownEditorViewMode } = useMarkdownEditorViewMode();
 type InjectModeSelection = KnowledgeInjectMode | "inherit_parent";
 
 const props = withDefaults(defineProps<{
@@ -126,11 +113,16 @@ const emit = defineEmits<{
   (e: "saveSection", section: KnowledgeDocumentSection, value: string): void;
   (e: "updateMeta", patch: KnowledgeDocumentPatch): void;
   (e: "referenceOpen", reference: MarkdownReferenceToken): void;
+  (e: "dirtyChange", dirty: boolean): void;
 }>();
 
 const summaryDraft = ref("");
 const rulesDraft = ref("");
 const bodyDraft = ref("");
+const documentScrollerRef = ref<HTMLElement | null>(null);
+const bodyEditorRef = ref<{ getEditorView: () => EditorView | null } | null>(null);
+const activeOutlineId = ref("");
+const outlineViewportHeight = ref(0);
 const sectionTextBuffers = new Map<KnowledgeDocumentSection, Text>();
 const baseSectionTexts = new Map<KnowledgeDocumentSection, Text>();
 const fileNameDraft = ref("");
@@ -153,24 +145,14 @@ const skillUnityStatusLoading = ref(false);
 const skillUnityActionPending = ref(false);
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let skillUnityStatusRequestId = 0;
+let outlineUpdateFrame = 0;
+let outlineRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let outlineResizeObserver: ResizeObserver | null = null;
 
 const localEditorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
 const editorWorkspaceSessions = props.sessionStore ?? localEditorWorkspaceSessions;
 const editorSessions = editorWorkspaceSessions.documents;
 const markdownEditorSessions = editorWorkspaceSessions.markdownEditors;
-
-function formatDocumentDisplayPath(document: KnowledgeDocument | null | undefined): string {
-  if (!document) return "";
-  const path = document.path.trim().replace(/\\/g, "/").replace(/^\/+/, "");
-  if (
-    document.type === "memory"
-    && !path.includes("/")
-    && BUILTIN_MEMORY_PREVIEW_PATHS.has(path)
-  ) {
-    return `${MEMORY_PREVIEW_PATH_PREFIX}/${path}`;
-  }
-  return path;
-}
 
 function packageIdForSkillDocument(document: KnowledgeDocument | null | undefined): string {
   if (!document || document.type !== "skill") return "";
@@ -199,19 +181,11 @@ const activeDocumentSessionKey = computed(() =>
 // CodeMirror state follows the same stable document identity as the draft
 // session, so a path rename keeps selection and undo history.
 const documentContentKey = computed(() => activeDocumentSessionKey.value);
-const documentDisplayPath = computed(() => formatDocumentDisplayPath(props.document));
 const documentTitle = computed(() => currentDocumentFileStem.value || t("knowledge.preview.untitled"));
 const titleMeasureText = computed(() => fileNameDraft.value || " ");
 const typeLabel = computed(() => labelForType(props.document?.type));
 const scopeLabel = computed(() => labelForStoredScope(props.document));
 const injectMode = computed(() => props.document?.effectiveInjectMode ?? "none");
-
-function onDocumentDragPointerDown(event: PointerEvent): void {
-  if (!props.document) return;
-  startKnowledgeInternalDrag(internalDrag, event, {
-    payload: buildKnowledgeDocumentWorkspaceDragPayload(props.document),
-  });
-}
 
 function onEditorReferenceOpen(reference: MarkdownReferenceToken): void {
   emit("referenceOpen", reference);
@@ -225,21 +199,13 @@ function onEditorReferencePointerDown(payload: {
   const { event, element } = payload;
   const workspaceRef = props.workspaceRef;
   if (!workspaceRef || event.button !== 0 || event.isPrimary === false) return;
-  const entry = workbenchReferenceFromElement(element);
   const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
-  if (!entry || !checkout?.projectId || !checkout.root) return;
-
-  const data: WorkbenchReferenceDragData = {
-    version: 1,
-    origin: {
-      projectId: checkout.projectId,
-      workspaceRef: { ...workspaceRef },
-      workspaceRoot: checkout.root,
-    },
-    entries: [entry],
-  };
-  if (!internalDrag.start(event, workbenchReferenceInternalDragSource(data, element))) return;
-  claimWorkbenchReferencePointerEvent(event);
+  if (!checkout?.projectId || !checkout.root) return;
+  startWorkbenchReferenceInternalDrag(internalDrag, event, {
+    projectId: checkout.projectId,
+    workspaceRef: { ...workspaceRef },
+    workspaceRoot: checkout.root,
+  }, element);
 }
 // Skill documents show the effective auto-channel mode: a surface without the
 // auto side reads as "none" regardless of the stored injectMode.
@@ -367,22 +333,14 @@ const fileDetailLabel = computed(() => (
     .filter((value) => value && value !== "—" && value !== "— tokens")
     .join(" · ") || "—"
 ));
-const modifiedAtLabel = computed(() =>
-  formatDateTime(documentFileMetadata.value?.modifiedAt),
-);
-const lastCommitLabel = computed(() => {
-  const author = documentFileMetadata.value?.lastCommitAuthor?.trim();
-  const committedAt = formatDateTime(documentFileMetadata.value?.lastCommitAt);
-  if (author && committedAt !== "—") return `${author} · ${committedAt}`;
-  if (author) return author;
-  if (committedAt !== "—") return committedAt;
-  return "";
-});
-const showLastCommit = computed(() => !!lastCommitLabel.value);
+const modifiedAtLabel = computed(() => formatDateTime(
+  documentFileMetadata.value?.modifiedAt ?? props.document?.modifiedAt,
+));
 
 const hasUnsavedSectionChanges = computed(() => dirtySections.value.size > 0);
 const currentDocumentFileStem = computed(() => extractDocumentFileStem(props.document?.path));
 const hasUnsavedChanges = computed(() => hasUnsavedSectionChanges.value || fileNameDirty.value);
+watch(hasUnsavedChanges, (dirty) => emit("dirtyChange", dirty), { immediate: true });
 const conflictCount = computed(() =>
   Object.values(sectionConflicts.value).reduce((total, conflicts) => total + conflicts.length, 0)
   + saveBlockedSections.value.size,
@@ -409,14 +367,7 @@ const footerWarning = computed(() =>
   hasBlockingConflicts.value
   || (hasUnsavedChanges.value && !autoSaveQueued.value && !autoSaveInFlight.value),
 );
-const editorViewOptions = computed(() => [
-  { value: "rendered", label: t("knowledge.editor.view.rendered") },
-  { value: "native", label: t("knowledge.editor.view.native") },
-]);
-const editorViewMode = computed<MarkdownEditorViewMode>({
-  get: () => markdownEditorViewMode.value,
-  set: (value) => setMarkdownEditorViewMode(value),
-});
+const editorViewMode = "rendered" as const;
 const fallbackSkillName = computed(() => inferSkillName(props.document));
 const isSkillDocument = computed(() => props.document?.type === "skill");
 const skillEnabled = computed(() => (
@@ -663,6 +614,9 @@ watch(skillPackageId, () => {
 onUnmounted(() => {
   captureEditorSession(activeDocumentSessionKey.value);
   clearAutoSaveTimer();
+  if (outlineUpdateFrame) cancelAnimationFrame(outlineUpdateFrame);
+  if (outlineRefreshTimer !== null) clearTimeout(outlineRefreshTimer);
+  outlineResizeObserver?.disconnect();
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
 });
 
@@ -1058,6 +1012,131 @@ function sectionValue(section: KnowledgeDocumentSection): string {
   if (section === "maintenanceRules") return rulesDraft.value;
   return bodyDraft.value;
 }
+
+const documentOutlineSource = computed(() => {
+  // Transaction-backed editor changes live in sectionTextBuffers. markDirty
+  // replaces this Set on every transaction and gives the computed a reactive
+  // invalidation point without copying the full document into another ref.
+  void dirtySections.value;
+  return sectionValue("body");
+});
+const documentOutlineItems = ref<KnowledgeDocumentOutlineItem[]>([]);
+const documentOutlineBaseLevel = computed(() =>
+  documentOutlineItems.value.reduce(
+    (lowest, item) => Math.min(lowest, item.level),
+    6,
+  )
+);
+const documentOutlineMaxHeight = computed(() => (
+  outlineViewportHeight.value > 0
+    ? `${Math.max(160, outlineViewportHeight.value - 48)}px`
+    : undefined
+));
+
+function outlineItemPadding(item: KnowledgeDocumentOutlineItem): string {
+  const depth = Math.max(0, item.level - documentOutlineBaseLevel.value);
+  return `${8 + Math.min(depth, 4) * 12}px`;
+}
+
+function outlineItemScreenTop(
+  view: EditorView,
+  item: KnowledgeDocumentOutlineItem,
+): number {
+  const position = Math.min(view.state.doc.length, Math.max(0, item.from));
+  return view.documentTop + view.lineBlockAt(position).top;
+}
+
+function updateDocumentOutlineActive(): void {
+  outlineUpdateFrame = 0;
+  const items = documentOutlineItems.value;
+  if (!items.length) {
+    activeOutlineId.value = "";
+    return;
+  }
+
+  const scroller = documentScrollerRef.value;
+  const view = bodyEditorRef.value?.getEditorView();
+  if (!scroller || !view) {
+    activeOutlineId.value = items[0]?.id ?? "";
+    return;
+  }
+
+  if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2) {
+    activeOutlineId.value = items[items.length - 1]?.id ?? "";
+    return;
+  }
+
+  const activationLine = scroller.getBoundingClientRect().top + 48;
+  let activeItem = items[0];
+  for (const item of items) {
+    if (outlineItemScreenTop(view, item) > activationLine) break;
+    activeItem = item;
+  }
+  activeOutlineId.value = activeItem?.id ?? "";
+}
+
+function scheduleDocumentOutlineActiveUpdate(): void {
+  if (outlineUpdateFrame) return;
+  outlineUpdateFrame = requestAnimationFrame(updateDocumentOutlineActive);
+}
+
+function scrollToDocumentOutlineItem(item: KnowledgeDocumentOutlineItem): void {
+  const scroller = documentScrollerRef.value;
+  const view = bodyEditorRef.value?.getEditorView();
+  if (!scroller || !view) return;
+
+  const targetTop = scroller.scrollTop
+    + outlineItemScreenTop(view, item)
+    - scroller.getBoundingClientRect().top
+    - 28;
+  activeOutlineId.value = item.id;
+  scroller.scrollTo({
+    top: Math.max(0, targetTop),
+    behavior: "smooth",
+  });
+}
+
+function observeDocumentScroller(scroller: HTMLElement | null): void {
+  outlineResizeObserver?.disconnect();
+  outlineResizeObserver = null;
+  outlineViewportHeight.value = scroller?.clientHeight ?? 0;
+  if (!scroller || typeof ResizeObserver === "undefined") return;
+  outlineResizeObserver = new ResizeObserver(() => {
+    outlineViewportHeight.value = scroller.clientHeight;
+    scheduleDocumentOutlineActiveUpdate();
+  });
+  outlineResizeObserver.observe(scroller);
+}
+
+watch(documentScrollerRef, observeDocumentScroller, { flush: "post" });
+
+function applyDocumentOutlineSource(source: string): void {
+  outlineRefreshTimer = null;
+  documentOutlineItems.value = extractKnowledgeDocumentOutline(source);
+  if (!documentOutlineItems.value.some((item) => item.id === activeOutlineId.value)) {
+    activeOutlineId.value = documentOutlineItems.value[0]?.id ?? "";
+  }
+  void nextTick(scheduleDocumentOutlineActiveUpdate);
+}
+
+watch(
+  () => [activeDocumentSessionKey.value, documentOutlineSource.value] as const,
+  ([documentKey, source], previous) => {
+    if (outlineRefreshTimer !== null) clearTimeout(outlineRefreshTimer);
+    const documentChanged = !previous || previous[0] !== documentKey;
+    if (documentChanged) {
+      applyDocumentOutlineSource(source);
+      return;
+    }
+    outlineRefreshTimer = setTimeout(() => applyDocumentOutlineSource(source), 120);
+  },
+  { flush: "post", immediate: true },
+);
+watch(
+  () => [activeDocumentSessionKey.value, props.active] as const,
+  () => void nextTick(scheduleDocumentOutlineActiveUpdate),
+  { flush: "post" },
+);
 
 function onSectionInput(section: KnowledgeDocumentSection, value: string) {
   sectionTextBuffers.delete(section);
@@ -1490,31 +1569,41 @@ function labelForProvider(provider?: string | null): string {
   <div class="preview-panel">
     <div class="preview-shell">
       <div class="preview-main-column">
-        <div v-if="!props.embedded" class="preview-header">
-          <div
-            class="preview-header-main"
-            :class="{ 'drag-enabled': !!document }"
-            @pointerdown="onDocumentDragPointerDown"
-          >
-            <span v-if="documentDisplayPath" class="preview-path">{{ documentDisplayPath }}</span>
-          </div>
-          <div class="preview-header-actions">
-            <BaseSegmented
-              v-if="document"
-              v-model="editorViewMode"
-              class="preview-view-segmented"
-              size="sm"
-              :options="editorViewOptions"
-              :aria-label="t('knowledge.editor.viewMode')"
-            />
-            <span v-if="isReadOnly" class="preview-status-tag">{{ t("knowledge.meta.readOnly") }}</span>
-          </div>
-        </div>
-
-        <div class="preview-main">
+        <div
+          ref="documentScrollerRef"
+          class="preview-main"
+          @scroll.passive="scheduleDocumentOutlineActiveUpdate"
+        >
           <div v-if="loading && !document" class="preview-empty">{{ t("common.loading") }}</div>
           <div v-else-if="!document" class="preview-empty">{{ t("knowledge.empty.title") }}</div>
-          <article v-else class="document-page">
+          <div
+            v-else
+            class="document-workspace"
+            :class="{ 'has-outline': documentOutlineItems.length > 0 }"
+          >
+            <aside
+              v-if="documentOutlineItems.length"
+              class="document-outline"
+              :style="{ maxHeight: documentOutlineMaxHeight }"
+            >
+              <nav class="document-outline-nav" :aria-label="t('knowledge.preview.outline')">
+                <button
+                  v-for="item in documentOutlineItems"
+                  :key="item.id"
+                  type="button"
+                  class="document-outline-item"
+                  :class="{ active: activeOutlineId === item.id }"
+                  :style="{ paddingInlineStart: outlineItemPadding(item) }"
+                  :title="item.text"
+                  :aria-current="activeOutlineId === item.id ? 'location' : undefined"
+                  @click="scrollToDocumentOutlineItem(item)"
+                >
+                  <span>{{ item.text }}</span>
+                </button>
+              </nav>
+            </aside>
+
+            <article class="document-page">
             <header class="document-heading">
               <span
                 v-if="!isReadOnly && !isPackageDocument"
@@ -1678,14 +1767,10 @@ function labelForProvider(provider?: string | null): string {
                 <span class="document-property-label">{{ t("knowledge.meta.fileSize") }}</span>
                 <span class="document-property-value">{{ fileDetailLabel }}</span>
               </div>
-              <template v-if="showExtendedDocumentProperties && documentFileMetadata">
-                <div class="document-property-row">
-                  <span class="document-property-label">{{ t("knowledge.meta.modifiedAt") }}</span>
-                  <span class="document-property-value document-property-value-wrap">
-                    {{ modifiedAtLabel }}<template v-if="showLastCommit"> · {{ lastCommitLabel }}</template>
-                  </span>
-                </div>
-              </template>
+              <div class="document-property-row">
+                <span class="document-property-label">{{ t("knowledge.meta.modifiedAt") }}</span>
+                <span class="document-property-value">{{ modifiedAtLabel }}</span>
+              </div>
             </section>
 
             <section
@@ -1788,6 +1873,7 @@ function labelForProvider(provider?: string | null): string {
                   </div>
                 </div>
                 <BaseMarkdownEditor
+                  ref="bodyEditorRef"
                   :model-value="bodyDraft"
                   :active="active"
                   :session-cache="markdownEditorSessions"
@@ -1812,7 +1898,8 @@ function labelForProvider(provider?: string | null): string {
             <div v-if="footerLabel" class="editor-footnote" :class="{ 'is-warning': footerWarning }">
               {{ footerLabel }}
             </div>
-          </article>
+            </article>
+          </div>
         </div>
       </div>
 
@@ -1832,59 +1919,6 @@ function labelForProvider(provider?: string | null): string {
 
 .preview-panel.is-resizing {
   user-select: none;
-}
-
-.preview-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border-color);
-  flex-shrink: 0;
-}
-
-.preview-header-main {
-  min-width: 0;
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.preview-header-main.drag-enabled {
-  cursor: grab;
-  touch-action: none;
-}
-
-.preview-header-main.drag-enabled:active {
-  cursor: grabbing;
-}
-
-.preview-header-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-.preview-view-segmented {
-  flex-shrink: 0;
-}
-
-.preview-status-tag {
-  display: inline-flex;
-  align-items: center;
-  min-height: 20px;
-  padding: 0 8px;
-  border-radius: var(--radius-badge);
-  border: 1px solid color-mix(in srgb, var(--accent-border) 70%, var(--border-color) 30%);
-  background: color-mix(in srgb, var(--accent-soft) 72%, var(--panel-bg) 28%);
-  color: var(--accent-color);
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1;
-  flex-shrink: 0;
 }
 
 .preview-title {
@@ -1950,18 +1984,6 @@ function labelForProvider(provider?: string | null): string {
 .preview-title-input::placeholder {
   color: var(--text-secondary);
   opacity: 0.72;
-}
-
-.preview-path {
-  font-size: 11px;
-  color: var(--text-secondary);
-  opacity: 0.46;
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-mono-identifier);
 }
 
 .preview-shell {
@@ -2588,8 +2610,72 @@ function labelForProvider(provider?: string | null): string {
 .preview-main {
   display: block;
   overflow: auto;
+  container-type: inline-size;
+  container-name: knowledge-document;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text-secondary) 34%, transparent) transparent;
+}
+
+.document-workspace {
+  width: 100%;
+  min-height: 100%;
+}
+
+.document-outline {
+  display: none;
+  min-width: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-secondary) 28%, transparent) transparent;
+}
+
+.document-outline-nav {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.document-outline-item {
+  display: block;
+  width: 100%;
+  min-height: 27px;
+  padding-top: 4px;
+  padding-right: 8px;
+  padding-bottom: 4px;
+  border: 0;
+  border-left: 1px solid transparent;
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.document-outline-item > span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-outline-item:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.document-outline-item:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
+}
+
+.document-outline-item.active {
+  border-left-color: color-mix(in srgb, var(--accent-color) 70%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-color) 7%, transparent);
+  color: var(--text-color);
 }
 
 .document-page {
@@ -2855,6 +2941,30 @@ function labelForProvider(provider?: string | null): string {
   position: fixed;
   right: 16px;
   bottom: 10px;
+}
+
+@container knowledge-document (min-width: 1120px) {
+  .document-workspace.has-outline {
+    display: grid;
+    grid-template-columns: 210px minmax(0, 920px);
+    column-gap: 20px;
+    align-items: start;
+    justify-content: center;
+    box-sizing: border-box;
+    padding-inline: 24px;
+  }
+
+  .document-workspace.has-outline .document-outline {
+    position: sticky;
+    top: 24px;
+    display: block;
+    align-self: start;
+  }
+
+  .document-workspace.has-outline .document-page {
+    width: 100%;
+    margin-inline: 0;
+  }
 }
 
 @media (max-width: 860px) {

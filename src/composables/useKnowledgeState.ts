@@ -2615,6 +2615,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
     return true;
   }
 
+  function selectedDocumentMatches(
+    target: KnowledgeDocumentSummary | KnowledgeDocument,
+  ): boolean {
+    return selectedDocument.value?.type === target.type
+      && selectedDocument.value.path === target.path;
+  }
+
   function scheduleAdjacentDocumentPrefetch(
     document: KnowledgeDocument,
     request: WorkspaceRequestSnapshot,
@@ -2725,7 +2732,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
         refTarget,
       )
       : null;
-    if (cached && commitSelectedDocument(cached, request, seq)) {
+    if (cached) {
+      if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) return false;
+      // Keep an already visible same-target snapshot in place while the
+      // filesystem revalidation runs. A cache entry from another render cycle
+      // must never roll the preview backwards.
+      if (!selectedDocumentMatches(refTarget)
+        && !commitSelectedDocument(cached, request, seq)) return false;
       void readDocumentContent(refTarget, request, { force: true })
         .then((fresh) => {
           if (commitSelectedDocument(fresh, request, seq)) {
@@ -4842,30 +4855,28 @@ export function useKnowledgeState(props: KnowledgeProps) {
   );
 
   watch(
-    () => [
-      props.workingDir,
-      props.workspaceRef?.checkoutId ?? "",
-      props.workspaceRef?.expectedGeneration ?? null,
+    [
+      () => props.workingDir,
+      () => props.workspaceRef?.checkoutId ?? "",
+      () => props.workspaceRef?.expectedGeneration ?? null,
     ] as const,
     ([workingDir, checkoutId, expectedGeneration], previous) => {
       const [previousWorkingDir, previousCheckoutId, previousExpectedGeneration] = previous;
       const nextWorkspaceKey = normalizeWorkspacePath(workingDir);
+      const previousWorkspaceKey = normalizeWorkspacePath(
+        previousWorkingDir ?? "",
+      );
+      const scopeChanged = nextWorkspaceKey !== previousWorkspaceKey
+        || checkoutId !== previousCheckoutId
+        || expectedGeneration !== previousExpectedGeneration;
+      if (!scopeChanged) return;
       if (!nextWorkspaceKey) {
         resetWorkspaceState();
         return;
       }
-      const previousWorkspaceKey = normalizeWorkspacePath(
-        previousWorkingDir ?? "",
-      );
-      if (
-        nextWorkspaceKey !== previousWorkspaceKey
-        || checkoutId !== previousCheckoutId
-        || expectedGeneration !== previousExpectedGeneration
-      ) {
-        const preservedActiveType = activeType.value;
-        resetWorkspaceState();
-        activeType.value = preservedActiveType;
-      }
+      const preservedActiveType = activeType.value;
+      resetWorkspaceState();
+      activeType.value = preservedActiveType;
       if (!props.embedded) {
         void refreshKnowledgeData({ force: true, includeOverview: false });
         void refreshRetrievalRuntimeStatus();

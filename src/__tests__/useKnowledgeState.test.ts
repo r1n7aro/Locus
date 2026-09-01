@@ -6,7 +6,10 @@ import {
   useKnowledgeState as useKnowledgeStateImpl,
   type ExplorerNode,
 } from "../composables/useKnowledgeState";
-import { clearKnowledgeDocumentCacheForTests } from "../composables/knowledgeDocumentCache";
+import {
+  cacheKnowledgeDocument,
+  clearKnowledgeDocumentCacheForTests,
+} from "../composables/knowledgeDocumentCache";
 import { clearKnowledgeCatalogCacheForTests } from "../composables/knowledgeCatalogCache";
 import { resetKnowledgeWorkspaceEventHubForTests } from "../services/knowledgeWorkspaceEventHub";
 import type {
@@ -279,6 +282,10 @@ function findSpecialRoot(
 
 type KnowledgeStateProps = {
   workingDir: string;
+  workspaceRef?: {
+    checkoutId: string;
+    expectedGeneration?: number | null;
+  };
   selectedModelId: string;
   modelDefaults: any;
   embedded?: boolean;
@@ -1054,6 +1061,74 @@ describe("useKnowledgeState", () => {
       "repo-b.md",
     ]);
     expect(knowledgeMocks.knowledgeList).toHaveBeenCalledTimes(8);
+  });
+
+  it("does not refresh knowledge when the workspace ref identity changes within the same scope", async () => {
+    const props = reactive<KnowledgeStateProps>({
+      workingDir: "F:/repo",
+      workspaceRef: { ...TEST_WORKSPACE_REF },
+      selectedModelId: "",
+      modelDefaults: {} as any,
+    });
+    const mounted = mountKnowledgeState(props);
+    await flushPromises(12);
+
+    knowledgeMocks.knowledgeList.mockClear();
+    knowledgeMocks.knowledgeListDirectories.mockClear();
+    knowledgeMocks.knowledgeGetEmbeddingStatus.mockClear();
+    knowledgeMocks.knowledgeGetLexicalRebuildStatus.mockClear();
+    props.workspaceRef = { ...TEST_WORKSPACE_REF };
+    await nextTick();
+    await flushPromises(12);
+
+    expect(knowledgeMocks.knowledgeList).not.toHaveBeenCalled();
+    expect(knowledgeMocks.knowledgeListDirectories).not.toHaveBeenCalled();
+    expect(knowledgeMocks.knowledgeGetEmbeddingStatus).not.toHaveBeenCalled();
+    expect(knowledgeMocks.knowledgeGetLexicalRebuildStatus).not.toHaveBeenCalled();
+    mounted.unmount();
+  });
+
+  it("keeps the visible document while a same-document cache hit revalidates", async () => {
+    const props = reactive<KnowledgeStateProps>({
+      workingDir: "F:/repo",
+      workspaceRef: { ...TEST_WORKSPACE_REF },
+      selectedModelId: "",
+      modelDefaults: {} as any,
+      embedded: true,
+      active: true,
+    });
+    const mounted = mountKnowledgeState(props);
+    await mounted.state.refreshKnowledgeData();
+    const summary = mounted.state.documents.value[0]!;
+    await mounted.state.selectDocument(summary);
+    const current = mounted.state.selectedDocument.value!;
+    expect(current.body).toBe("正文");
+
+    cacheKnowledgeDocument("F:/repo", TEST_WORKSPACE_REF, {
+      ...current,
+      body: "旧缓存正文",
+      modifiedAt: current.modifiedAt - 1,
+    });
+    let resolveRead!: (value: unknown) => void;
+    knowledgeMocks.knowledgeRead.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveRead = resolve;
+    }));
+
+    await mounted.state.selectDocument(summary);
+    expect(mounted.state.selectedDocument.value?.body).toBe("正文");
+
+    resolveRead({
+      kind: "document",
+      document: {
+        ...current,
+        body: "重校验后的正文",
+        modifiedAt: current.modifiedAt + 1,
+      },
+    });
+    await flushPromises(12);
+
+    expect(mounted.state.selectedDocument.value?.body).toBe("重校验后的正文");
+    mounted.unmount();
   });
 
   it("resets documents and selection when the checkout generation changes", async () => {
