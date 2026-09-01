@@ -892,7 +892,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 38;
+    const SCHEMA_VERSION: i32 = 39;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1407,7 +1407,17 @@ impl SessionStore {
             )?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 38, "add a new migration block above");
+        if current < 39 {
+            Self::migrate(conn, 39, "rename the built-in dev Agent to unity", |conn| {
+                conn.execute(
+                    "UPDATE sessions SET agent_id = 'unity' WHERE agent_id = 'dev'",
+                    [],
+                )?;
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 39, "add a new migration block above");
         Ok(())
     }
 
@@ -8892,7 +8902,7 @@ mod tests {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
         let session_id = store
-            .create_session("plan test", None, None, "chat", Some("dev"))
+            .create_session("plan test", None, None, "chat", Some("unity"))
             .expect("create session");
 
         let initial = store
@@ -9343,6 +9353,52 @@ mod tests {
     }
 
     #[test]
+    fn v38_database_migrates_dev_agent_id_and_exports_unity() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v38 db");
+        SessionStore::create_latest_schema(&conn).expect("create latest schema fixture");
+        conn.execute_batch(
+            "INSERT INTO sessions (
+                id, title, session_type, agent_id, created_at, updated_at
+             ) VALUES ('session-dev-agent', 'Legacy Agent id', 'chat', 'dev', 100, 100);
+             PRAGMA user_version = 38;",
+        )
+        .expect("create v38 Agent id fixture");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v38 store");
+        let detail = store
+            .load_session("session-dev-agent")
+            .expect("load migrated Agent session");
+        assert_eq!(detail.agent_id.as_deref(), Some("unity"));
+
+        let output = dir.path().join("agent-id-context.yaml");
+        crate::session::context_export::export_session_context_yaml(
+            &store,
+            "session-dev-agent",
+            "F:/workspace",
+            None,
+            None,
+            &output,
+        )
+        .expect("export migrated Agent session");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(output).expect("read migrated Agent export"))
+                .expect("parse migrated Agent export");
+        assert_eq!(
+            yaml["sessions"][0]["metadata"]["agentId"].as_str(),
+            Some("unity")
+        );
+
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(version, SessionStore::SCHEMA_VERSION);
+    }
+
+    #[test]
     fn checkout_services_and_scoped_runs_are_isolated_across_worktrees() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
@@ -9409,7 +9465,7 @@ mod tests {
                 Some("project-shared"),
                 Some("checkout-main"),
                 "chat",
-                Some("dev"),
+                Some("unity"),
             )
             .expect("create main session");
         let worktree_session = store
@@ -9419,7 +9475,7 @@ mod tests {
                 Some("project-shared"),
                 Some("checkout-worktree"),
                 "chat",
-                Some("dev"),
+                Some("unity"),
             )
             .expect("create worktree session");
         let project_sessions = store
@@ -11305,7 +11361,7 @@ mod tests {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
         let session_id = store
-            .create_session("Source", None, Some("workspace-1"), "chat", Some("dev"))
+            .create_session("Source", None, Some("workspace-1"), "chat", Some("unity"))
             .expect("create session");
 
         store
@@ -11390,7 +11446,7 @@ mod tests {
         assert_ne!(fork_id, session_id);
         let detail = store.load_session(&fork_id).expect("load forked session");
         assert_eq!(detail.title, "Forked");
-        assert_eq!(detail.agent_id.as_deref(), Some("dev"));
+        assert_eq!(detail.agent_id.as_deref(), Some("unity"));
         assert_eq!(detail.session_type, "chat");
         assert_eq!(detail.parent_session_id, None);
         assert_eq!(detail.latest_completed_run_id.as_deref(), Some("run-1"));
@@ -11443,7 +11499,7 @@ mod tests {
                 None,
                 Some("workspace"),
                 "chat",
-                Some("dev"),
+                Some("unity"),
             )
             .expect("create session");
         store

@@ -36,7 +36,7 @@ describe("rankSearchResults", () => {
 describe("useCommandRegistry", () => {
   it("registers /console-error as an executable action command", () => {
     const skills = ref<SkillManifest[]>([]);
-    const agentId = ref("dev");
+    const agentId = ref("unity");
     const { filteredCommands, findExactAvailableCommand } = useCommandRegistry(skills, agentId);
 
     expect(findExactAvailableCommand("/console-error")).toMatchObject({
@@ -65,7 +65,7 @@ describe("useCommandRegistry", () => {
         commandTrigger: "/custom-skill",
       },
     ]);
-    const agentId = ref("dev");
+    const agentId = ref("unity");
     const { filteredCommands } = useCommandRegistry(skills, agentId);
 
     const results = filteredCommands("/skill");
@@ -89,7 +89,7 @@ describe("useCommandRegistry", () => {
         commandTrigger: "/custom-skill",
       },
     ]);
-    const agentId = ref("dev");
+    const agentId = ref("unity");
     const { filteredCommands } = useCommandRegistry(skills, agentId);
 
     expect(filteredCommands("/").map((command) => command.name)).toContain("/custom-skill");

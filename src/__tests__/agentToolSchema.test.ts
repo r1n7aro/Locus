@@ -154,7 +154,7 @@ describe("parseAgentToolDefinition", () => {
     const raw = readFileSync(resolve(cwd, "tools/edit.json"), "utf8");
     const definition = JSON.parse(raw);
     const devToolUsageRule = readFileSync(
-      resolve(cwd, "agent/dev/rule/tool_usage_strategy.md"),
+      resolve(cwd, "agent/unity/rule/tool_usage_strategy.md"),
       "utf8",
     );
     const tool = parseAgentToolDefinition({

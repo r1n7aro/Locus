@@ -22,7 +22,7 @@ tools:
 Command arguments: `<agent-id>` identifies the Agent to create or edit. Use a short lowercase id containing letters, digits, hyphens, or underscores. Ask for the id and purpose only when they are missing.
 
 1. Call `agent_reload` before editing. Use its `userAgentRoot` exactly; this directory is owned by the user and remains untouched by Locus updates.
-2. Inspect `<userAgentRoot>/<agent-id>/` when it exists. Preserve useful files and confirm the requested changes. Reject ids already owned by another Agent unless the user explicitly asked to edit that Agent. Keep `dev`, `explorer`, `doc`, `wiki`, `git`, `knowledge`, and `runtime_debugger` reserved.
+2. Inspect `<userAgentRoot>/<agent-id>/` when it exists. Preserve useful files and confirm the requested changes. Reject ids already owned by another Agent unless the user explicitly asked to edit that Agent. Keep `unity`, `dev`, `explorer`, `doc`, `wiki`, `git`, `knowledge`, and `runtime_debugger` reserved.
 3. Create `<userAgentRoot>/<agent-id>/config.json` and `system.md`. Add `env.md`, `rule/`, `rule_config.json`, `injection_config.json`, or `tools/` only when the workflow needs them.
 4. Write `config.json` with this schema:
 
@@ -39,7 +39,7 @@ Command arguments: `<agent-id>` identifies the Agent to create or edit. Use a sh
 ```
 
    - Choose only tools required by the workflow. Use real Locus tool names already visible in the current tool surface.
-   - Keep `default` false so Unity remains the default Agent.
+   - Keep `default` false so the built-in `unity` Agent remains the default Agent.
    - Use `default_effort` from `none`, `low`, `medium`, `high`, `xhigh`, or `max`.
    - Use `model_recommendation` as `small` or `large`. The model selector remembers the exact model and reasoning effort chosen for each Agent.
 5. Write `system.md` as the Agent's focused role, execution rules, validation requirements, and output contract. Keep general Locus behavior out of the file and avoid copying Unity wholesale.

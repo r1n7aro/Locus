@@ -16,6 +16,8 @@ The Unity Editor status and active scene are announced in the conversation: the 
 ### Unity Editor Status Schema
 
 * `disconnected`: do not attempt `unity_execute`. Fall back to file-level reading, searching, and editing, and explain the limitation.
+* `safe_mode`: project/package managed code is disabled. Read `Editor.log` through `unity_get_console_log`, fix compiler errors with file tools, and re-probe status. If the editor does not consume the external file change promptly, restart it out of process and wait for `ready` before using Unity API tools.
+* `crashed`: inspect the Editor log path included in the status or failed tool result before deciding whether to restart Unity.
 * `editing`: the Editor is in Edit Mode. You may use `unity_execute` for Editor API operations.
 * `playing`: the Editor is in Play Mode and the game is running. Do not use `unity_execute` to modify assets or scenes; those changes will be lost after exiting. Clearly remind the user.
 * `playing_paused`: the Editor is in Play Mode and paused. Apply the same asset and scene modification restriction as `playing`.

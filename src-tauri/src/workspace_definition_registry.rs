@@ -326,7 +326,7 @@ mod tests {
     use super::{load_agent_registry, AgentRegistryLoader, WorkspaceDefinitionRegistry};
 
     fn write_workspace_agent(root: &Path, prompt: &str) {
-        let agent_dir = root.join("Locus").join("agent").join("dev");
+        let agent_dir = root.join("Locus").join("agent").join("unity");
         fs::create_dir_all(&agent_dir).expect("workspace Agent directory");
         fs::write(
             agent_dir.join("config.json"),
@@ -343,8 +343,8 @@ mod tests {
 
     fn prompt(registry: &AgentDefRegistry) -> &str {
         &registry
-            .get("dev")
-            .expect("workspace dev Agent")
+            .get("unity")
+            .expect("workspace Unity Agent")
             .system_prompt
     }
 

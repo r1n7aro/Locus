@@ -20,7 +20,7 @@ const commands: CommandDef[] = [
     description: "plan",
     commandKind: "intent",
     commandType: "plan",
-    agentOnly: "dev",
+    agentOnly: "unity",
   },
   {
     name: "/unity-editor-tooling",
@@ -140,7 +140,7 @@ describe("parseInlineIntentCommands", () => {
     const result = parseInlineIntentCommands(
       "请先 /plan 用 /unity-editor-tooling 修复 Inspector",
       commands,
-      "dev",
+      "unity",
     );
 
     expect(result.blockedCommand).toBeNull();
@@ -155,7 +155,7 @@ describe("parseInlineIntentCommands", () => {
     ]);
   });
 
-  it("blocks /plan outside dev sessions", () => {
+  it("blocks /plan outside Unity sessions", () => {
     const result = parseInlineIntentCommands("请先 /plan 看一下", commands, "designer");
 
     expect(result.blockedCommand?.name).toBe("/plan");

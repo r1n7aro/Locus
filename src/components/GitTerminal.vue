@@ -389,7 +389,7 @@ async function submit() {
       workspaceRef,
       sessionId: sessionId.value,
       text: text,
-      agentId: "dev",
+      agentId: "unity",
       model: props.selectedModelId || null,
       sessionType: "git",
     });

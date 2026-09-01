@@ -996,7 +996,7 @@ mod tests {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("create store");
         let session_id = store
-            .create_session("Legacy", None, Some("workspace"), "chat", Some("dev"))
+            .create_session("Legacy", None, Some("workspace"), "chat", Some("unity"))
             .expect("create session");
         store
             .add_message(&session_id, MessageRole::User, "Review this")
@@ -1032,7 +1032,7 @@ mod tests {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("create store");
         let session_id = store
-            .create_session("Cache model switch", None, None, "chat", Some("dev"))
+            .create_session("Cache model switch", None, None, "chat", Some("unity"))
             .expect("create session");
         store
             .add_message(&session_id, MessageRole::User, "first model")
@@ -1097,7 +1097,7 @@ mod tests {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("create store");
         let session_id = store
-            .create_session("Checkpoint", None, None, "chat", Some("dev"))
+            .create_session("Checkpoint", None, None, "chat", Some("unity"))
             .expect("create session");
         let user_id = store
             .add_message(&session_id, MessageRole::User, "旧需求")
@@ -1147,7 +1147,7 @@ mod tests {
         {
             let store = SessionStore::new(dir.path()).expect("create store");
             session_id = store
-                .create_session("Captured", None, None, "chat", Some("dev"))
+                .create_session("Captured", None, None, "chat", Some("unity"))
                 .expect("create session");
             store
                 .record_context_attempt(
@@ -1188,7 +1188,7 @@ mod tests {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("create store");
         let session_id = store
-            .create_session("Running", None, None, "chat", Some("dev"))
+            .create_session("Running", None, None, "chat", Some("unity"))
             .expect("create session");
         store
             .add_message(&session_id, MessageRole::User, "before snapshot")

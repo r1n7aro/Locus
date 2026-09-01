@@ -4138,6 +4138,19 @@ pub struct AgentToolLoadConfig {
     pub enabled: HashMap<String, bool>,
 }
 
+fn workspace_agent_layer_dirs(working_dir: &str, agent_id: &str) -> Vec<std::path::PathBuf> {
+    let agent_id = canonical_agent_id(agent_id);
+    let root = std::path::Path::new(working_dir)
+        .join("Locus")
+        .join("agent");
+    let mut dirs = Vec::new();
+    if agent_id == crate::agent::definition::DEFAULT_AGENT_ID {
+        dirs.push(root.join(crate::agent::definition::LEGACY_UNITY_AGENT_ID));
+    }
+    dirs.push(root.join(agent_id));
+    dirs
+}
+
 fn tool_load_config_path(working_dir: &str, agent_id: &str) -> std::path::PathBuf {
     let agent_id = canonical_agent_id(agent_id);
     std::path::Path::new(working_dir)
@@ -4148,11 +4161,16 @@ fn tool_load_config_path(working_dir: &str, agent_id: &str) -> std::path::PathBu
 }
 
 pub fn load_tool_load_config(working_dir: &str, agent_id: &str) -> AgentToolLoadConfig {
-    let path = tool_load_config_path(working_dir, agent_id);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => AgentToolLoadConfig::default(),
+    let mut merged = AgentToolLoadConfig::default();
+    for layer_dir in workspace_agent_layer_dirs(working_dir, agent_id) {
+        let Ok(content) = std::fs::read_to_string(layer_dir.join("tool_load_config.json")) else {
+            continue;
+        };
+        let layer: AgentToolLoadConfig = serde_json::from_str(&content).unwrap_or_default();
+        merged.direct_load.extend(layer.direct_load);
+        merged.enabled.extend(layer.enabled);
     }
+    merged
 }
 
 fn save_tool_load_config(
@@ -4440,7 +4458,13 @@ fn load_workspace_injection_config(working_dir: &str, agent_id: &str) -> AgentIn
     if working_dir.trim().is_empty() {
         return AgentInjectionConfig::new();
     }
-    load_injection_config_file(&injection_config_path(working_dir, agent_id))
+    let mut merged = AgentInjectionConfig::new();
+    for layer_dir in workspace_agent_layer_dirs(working_dir, agent_id) {
+        merged.extend(load_injection_config_file(
+            &layer_dir.join("injection_config.json"),
+        ));
+    }
+    merged
 }
 
 fn save_workspace_injection_config(
@@ -4591,11 +4615,15 @@ fn rule_config_path(working_dir: &str, agent_id: &str) -> std::path::PathBuf {
 }
 
 pub fn load_rule_config(working_dir: &str, agent_id: &str) -> AgentRuleConfig {
-    let path = rule_config_path(working_dir, agent_id);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
-        Err(_) => AgentRuleConfig::new(),
+    let mut merged = AgentRuleConfig::new();
+    for layer_dir in workspace_agent_layer_dirs(working_dir, agent_id) {
+        let Ok(content) = std::fs::read_to_string(layer_dir.join("rule_config.json")) else {
+            continue;
+        };
+        let layer: AgentRuleConfig = serde_json::from_str(&content).unwrap_or_default();
+        merged.extend(layer);
     }
+    merged
 }
 
 fn save_rule_config(
@@ -4650,7 +4678,8 @@ pub fn merged_rule_config_for_agent(
 }
 
 fn hide_from_static_rule_list(agent_id: &str, file_name: &str) -> bool {
-    agent_id == "dev" && matches!(file_name, "知识库使用.md" | "知识维护.md")
+    agent_id == crate::agent::definition::DEFAULT_AGENT_ID
+        && matches!(file_name, "知识库使用.md" | "知识维护.md")
 }
 
 fn rule_config_or_default(
@@ -4814,7 +4843,16 @@ pub fn collect_agent_rule_files(
 
     if !working_dir.trim().is_empty() {
         if create_project_dir {
-            let project_dir = rules_dir(working_dir, &agent_id)?;
+            rules_dir(working_dir, &agent_id)?;
+        }
+        for layer_dir in workspace_agent_layer_dirs(working_dir, &agent_id)
+            .into_iter()
+            .rev()
+        {
+            let project_dir = layer_dir.join("rule");
+            if !project_dir.is_dir() {
+                continue;
+            }
             scan_static_rules_dir(
                 &agent_id,
                 &project_dir,
@@ -4823,33 +4861,13 @@ pub fn collect_agent_rule_files(
                 &mut seen_static_names,
                 &mut items,
             );
-        } else {
-            let project_dir = std::path::Path::new(working_dir)
-                .join("Locus")
-                .join("agent")
-                .join(&agent_id)
-                .join("rule");
-            if project_dir.is_dir() {
-                scan_static_rules_dir(
-                    &agent_id,
-                    &project_dir,
-                    "project",
-                    &configs,
-                    &mut seen_static_names,
-                    &mut items,
-                );
-            }
         }
     }
 
     scan_plugin_rule_sources(working_dir, &configs, &mut items);
 
     if let Some(app_dir) = app_agent_dir {
-        for (index, layer_dir) in app_agent_layer_dirs(app_dir, &agent_id)
-            .into_iter()
-            .enumerate()
-            .rev()
-        {
+        for layer_dir in app_agent_layer_dirs(app_dir, &agent_id).into_iter().rev() {
             let app_rules = layer_dir.join("rule");
             if !app_rules.is_dir() {
                 continue;
@@ -4857,7 +4875,11 @@ pub fn collect_agent_rule_files(
             scan_static_rules_dir(
                 &agent_id,
                 &app_rules,
-                if index == 0 { "app" } else { "user" },
+                if layer_dir.starts_with(crate::agent::definition::user_agent_dir(app_dir)) {
+                    "user"
+                } else {
+                    "app"
+                },
                 &configs,
                 &mut seen_static_names,
                 &mut items,
@@ -5348,7 +5370,7 @@ mod tests {
         );
 
         let listed =
-            collect_agent_rule_files(&None, &working_dir, "dev", false).expect("collect rules");
+            collect_agent_rule_files(&None, &working_dir, "unity", false).expect("collect rules");
         let plugin_rule = listed
             .iter()
             .find(|item| item.plugin_id.as_deref() == Some("com.example.rules"))
@@ -5370,10 +5392,10 @@ mod tests {
                 order: 3,
             },
         );
-        save_rule_config(&working_dir, "dev", &config).expect("save rule config");
+        save_rule_config(&working_dir, "unity", &config).expect("save rule config");
 
         let ordered =
-            collect_agent_rule_files(&None, &working_dir, "dev", false).expect("collect ordered");
+            collect_agent_rule_files(&None, &working_dir, "unity", false).expect("collect ordered");
         let plugin_rule = ordered
             .iter()
             .find(|item| item.plugin_id.as_deref() == Some("com.example.rules"))

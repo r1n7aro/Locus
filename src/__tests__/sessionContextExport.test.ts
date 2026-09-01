@@ -9,7 +9,7 @@ describe("structured session context export", () => {
   it("uses schema v38 with citation persistence and prior context migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 38;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 39;");
     expect(store).toContain('36,\n                "persist project contexts, shared sessions, and scoped runs"');
     expect(store).toContain('37,\n                "backfill unambiguous legacy session checkout bindings"');
     expect(store).toContain('38,\n                "persist explicit citation arrays on assistant text render parts"');

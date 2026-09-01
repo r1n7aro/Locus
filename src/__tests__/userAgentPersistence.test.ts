@@ -68,28 +68,29 @@ describe("persistent user Agents", () => {
 
   it("removes retired built-in Agent definitions and aliases them to Unity", () => {
     const definitions = read("src-tauri/src/agent/definition.rs");
-    const dev = JSON.parse(read("agent/dev/config.json"));
+    const unity = JSON.parse(read("agent/unity/config.json"));
 
-    expect(dev.name).toBe("Unity");
-    for (const id of ["git", "knowledge", "runtime_debugger"]) {
+    expect(unity.name).toBe("Unity");
+    for (const id of ["dev", "git", "knowledge", "runtime_debugger"]) {
       expect(existsSync(resolve(root, "agent", id, "config.json"))).toBe(false);
       expect(definitions).toContain(`\"${id}\"`);
     }
-    expect(definitions).toContain("=> DEFAULT_AGENT_ID");
+    expect(definitions).toContain('pub const DEFAULT_AGENT_ID: &str = "unity"');
+    expect(definitions).toContain('pub const LEGACY_UNITY_AGENT_ID: &str = "dev"');
   });
 
   it("routes former specialized entry points through Unity", () => {
     const gitTerminal = read("src/components/GitTerminal.vue");
     const knowledgeChat = read("src/components/knowledge/KnowledgeChatPane.vue");
 
-    expect(gitTerminal).toContain('agentId: "dev"');
+    expect(gitTerminal).toContain('agentId: "unity"');
     expect(gitTerminal).not.toContain('agentId: "git"');
     expect(knowledgeChat).toContain("agent.isDefault");
     expect(knowledgeChat).not.toContain('agent.id === "knowledge"');
   });
 
   it("ships project-typed built-ins and a minimal Simple Agent", () => {
-    const unity = JSON.parse(read("agent/dev/config.json"));
+    const unity = JSON.parse(read("agent/unity/config.json"));
     const simple = JSON.parse(read("agent/simple/config.json"));
     const definitions = read("src-tauri/src/agent/definition.rs");
     const sessionCommands = read("src-tauri/src/commands/session.rs");

@@ -30,11 +30,11 @@ describe("subagent tool name", () => {
   });
 
   it("ships built-in agents and plan guidance with the new name", () => {
-    const dev = JSON.parse(read("agent/dev/config.json")) as { tools: string[] };
+    const unity = JSON.parse(read("agent/unity/config.json")) as { tools: string[] };
     const planReminder = read("prompt/plan-reminder.md");
 
-    expect(dev.tools).toContain("subagent");
-    expect(dev.tools).not.toContain("task");
+    expect(unity.tools).toContain("subagent");
+    expect(unity.tools).not.toContain("task");
     expect(planReminder).toContain("with the subagent tool");
   });
 });

@@ -36,25 +36,25 @@ describe("Agent workspace scope", () => {
   it("forwards the active checkout through effective Agent preview IPC", async () => {
     await listWorkspaceAgents(workspaceRef);
     await listWorkspaceSubagentDefs(workspaceRef);
-    await getWorkspaceAgentSystemPrompt(workspaceRef, "dev");
-    await getWorkspaceAgentEnvTemplate(workspaceRef, "dev");
-    await getWorkspaceAgentRenderedEnvPrompt(workspaceRef, "dev", "openai/gpt-5.6");
-    await getWorkspaceAgentSystemPromptStats(workspaceRef, "dev", "openai/gpt-5.6");
-    await listWorkspaceAgentInjectedItems(workspaceRef, "dev", null, "openai/gpt-5.6");
-    await listRules(workspaceRef, "dev");
-    await readRule(workspaceRef, "dev", "workflow.md");
+    await getWorkspaceAgentSystemPrompt(workspaceRef, "unity");
+    await getWorkspaceAgentEnvTemplate(workspaceRef, "unity");
+    await getWorkspaceAgentRenderedEnvPrompt(workspaceRef, "unity", "openai/gpt-5.6");
+    await getWorkspaceAgentSystemPromptStats(workspaceRef, "unity", "openai/gpt-5.6");
+    await listWorkspaceAgentInjectedItems(workspaceRef, "unity", null, "openai/gpt-5.6");
+    await listRules(workspaceRef, "unity");
+    await readRule(workspaceRef, "unity", "workflow.md");
 
     for (const call of mockedInvoke.mock.calls) {
       expect(call[1]).toMatchObject({ workspaceRef });
     }
     expect(mockedInvoke).toHaveBeenCalledWith("get_workspace_agent_rendered_env_prompt", {
       workspaceRef,
-      agentId: "dev",
+      agentId: "unity",
       selectedModel: "openai/gpt-5.6",
     });
     expect(mockedInvoke).toHaveBeenCalledWith("get_workspace_agent_system_prompt_stats", {
       workspaceRef,
-      agentId: "dev",
+      agentId: "unity",
       selectedModel: "openai/gpt-5.6",
     });
   });

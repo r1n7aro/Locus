@@ -16,7 +16,7 @@ describe("Agent store legacy aliases", () => {
     setActivePinia(createPinia());
     agentServiceMocks.listAgents.mockResolvedValue([
       {
-        id: "dev",
+        id: "unity",
         name: "Unity",
         description: "Unity development",
         projectTypes: ["unity"],
@@ -32,9 +32,9 @@ describe("Agent store legacy aliases", () => {
     const store = useAgentStore();
     await store.loadAgents();
 
-    for (const id of ["git", "knowledge", "runtime_debugger", "doc", "wiki"]) {
+    for (const id of ["dev", "git", "knowledge", "runtime_debugger", "doc", "wiki"]) {
       store.selectAgent(id);
-      expect(store.selectedAgentId).toBe("dev");
+      expect(store.selectedAgentId).toBe("unity");
     }
   });
 
@@ -49,7 +49,7 @@ describe("Agent store legacy aliases", () => {
         source: "app",
       },
       {
-        id: "dev",
+        id: "unity",
         name: "Unity",
         description: "Unity development",
         projectTypes: ["unity"],
@@ -63,9 +63,9 @@ describe("Agent store legacy aliases", () => {
     await store.loadWorkspaceAgents({ checkoutId: "checkout-generic" });
     expect(store.selectedAgentId).toBe("simple");
 
-    store.selectAgent("dev");
+    store.selectAgent("unity");
     await store.loadWorkspaceAgents({ checkoutId: "checkout-generic" });
-    expect(store.selectedAgentId).toBe("dev");
+    expect(store.selectedAgentId).toBe("unity");
 
     await store.loadWorkspaceAgents({ checkoutId: "checkout-other" });
     expect(store.selectedAgentId).toBe("simple");

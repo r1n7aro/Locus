@@ -72,7 +72,7 @@ export function useCommandRegistry(
         description: t("chat.command.planDesc"),
         commandKind: "intent",
         commandType: "plan",
-        agentOnly: "dev",
+        agentOnly: "unity",
       },
     ];
 

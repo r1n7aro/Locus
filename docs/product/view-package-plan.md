@@ -490,7 +490,7 @@ View 相关 agent tool 仅由 Skill 加载。默认 agent 上下文保持轻量�
 加载规则：
 
 - View tools 注册为 `ToolLoadMode::Skill`。
-- 默认 dev agent 工具列表不直接暴露 View tools。
+- 默认 Unity Agent 工具列表不直接暴露 View tools。
 - 内置 `/view` 或 `/create-view` Skill 负责加载工具。
 - Skill 负责选择模板、创建目录、调用 reload、运行校验。
 - 文件编辑继续使用常规文件工具，范围限定在 `packageRoot`。

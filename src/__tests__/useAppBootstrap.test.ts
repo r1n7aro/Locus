@@ -261,7 +261,7 @@ describe("useAppBootstrap onboarding completion", () => {
     chatStoreMock.activeSessionId = "session-1";
     agentStoreMock.selectedAgentId = "qa";
     agentStoreMock.agents = [
-      { id: "dev", defaultEffort: "medium" },
+      { id: "unity", defaultEffort: "medium" },
       { id: "qa", defaultEffort: "low" },
     ];
 
@@ -275,10 +275,10 @@ describe("useAppBootstrap onboarding completion", () => {
     modelStoreMock.restoreDefaultEffort.mockClear();
 
     chatStoreMock.activeSessionId = null;
-    agentStoreMock.selectedAgentId = "dev";
+    agentStoreMock.selectedAgentId = "unity";
     await nextTick();
 
-    expect(modelStoreMock.activateAgentPreference).toHaveBeenLastCalledWith("dev", "medium", true);
+    expect(modelStoreMock.activateAgentPreference).toHaveBeenLastCalledWith("unity", "medium", true);
     expect(modelStoreMock.restoreDefaultEffort).not.toHaveBeenCalled();
     expect(modelStoreMock.applyContextEffort).not.toHaveBeenCalled();
     expect(modelStoreMock.effort).toBe("medium");
@@ -288,9 +288,9 @@ describe("useAppBootstrap onboarding completion", () => {
     modelStoreMock.defaultEffort = "high";
     modelStoreMock.hasUserDefaultEffort = true;
     chatStoreMock.activeSessionId = "session-1";
-    agentStoreMock.selectedAgentId = "dev";
+    agentStoreMock.selectedAgentId = "unity";
     agentStoreMock.agents = [
-      { id: "dev", defaultEffort: "medium" },
+      { id: "unity", defaultEffort: "medium" },
     ];
 
     const useAppBootstrap = await loadUseAppBootstrap();

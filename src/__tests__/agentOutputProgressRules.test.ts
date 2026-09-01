@@ -10,8 +10,8 @@ function read(relPath: string) {
 
 describe("Dev agent work-in-progress output rules", () => {
   it("keeps the progress-update contract enabled in the runtime prompt", () => {
-    const rules = read("agent/dev/rule/output_principles.md");
-    const config = JSON.parse(read("agent/dev/rule_config.json"));
+    const rules = read("agent/unity/rule/output_principles.md");
+    const config = JSON.parse(read("agent/unity/rule_config.json"));
 
     expect(config["output_principles.md"]).toMatchObject({ enabled: true });
     expect(rules).toContain("Work-in-progress updates:");
