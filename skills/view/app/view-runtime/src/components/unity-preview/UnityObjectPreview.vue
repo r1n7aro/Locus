@@ -1464,6 +1464,7 @@ onBeforeUnmount(() => {
   <UnityObjectIdentity
     v-else-if="level === 'inline' || level === 'row'"
     :model="objectModel"
+    :workspace-ref="workspaceRef"
     :mode="level === 'row' ? 'row' : 'inline'"
     :selected="selected"
     :disabled="disabled"
@@ -1503,6 +1504,7 @@ onBeforeUnmount(() => {
       </button>
       <UnityObjectIdentity
         :model="objectModel"
+        :workspace-ref="workspaceRef"
         mode="row"
         :draggable="objectModel.capabilities.drag"
         :highlightable="objectModel.capabilities.drag"
@@ -1552,6 +1554,7 @@ onBeforeUnmount(() => {
         <div class="unity-object-thumbnail-header">
           <UnityObjectIdentity
             :model="objectModel"
+            :workspace-ref="workspaceRef"
             mode="row"
             :draggable="objectModel.capabilities.drag"
             :highlightable="objectModel.capabilities.drag"
@@ -1587,6 +1590,7 @@ onBeforeUnmount(() => {
         <div class="unity-object-thumbnail-header">
           <UnityObjectIdentity
             :model="objectModel"
+            :workspace-ref="workspaceRef"
             mode="row"
             :draggable="objectModel.capabilities.drag"
             :highlightable="objectModel.capabilities.drag"
@@ -1607,6 +1611,7 @@ onBeforeUnmount(() => {
       <div v-else class="unity-object-thumbnail-row-fallback">
         <UnityObjectIdentity
           :model="objectModel"
+          :workspace-ref="workspaceRef"
           mode="row"
           :draggable="objectModel.capabilities.drag"
           :highlightable="objectModel.capabilities.drag"
@@ -1620,6 +1625,7 @@ onBeforeUnmount(() => {
       <UnityObjectIdentity
         v-if="showHeader || level !== 'inspector'"
         :model="objectModel"
+        :workspace-ref="workspaceRef"
         mode="row"
         :draggable="false"
       />
@@ -1647,6 +1653,7 @@ onBeforeUnmount(() => {
         <UnityObjectIdentity
           v-if="showHeader || level !== 'inspector'"
           :model="objectModel"
+          :workspace-ref="workspaceRef"
           mode="row"
           :draggable="false"
         />
@@ -1700,7 +1707,7 @@ onBeforeUnmount(() => {
         </div>
       </div>
       <div v-else class="unity-object-preview-summary">
-        <UnityObjectIdentity :model="objectModel" mode="row" :draggable="false" />
+        <UnityObjectIdentity :model="objectModel" :workspace-ref="workspaceRef" mode="row" :draggable="false" />
         <div class="unity-object-preview-meta">
           <span v-for="item in structuredSummaryMeta" :key="item">{{ item }}</span>
         </div>
@@ -1731,6 +1738,7 @@ onBeforeUnmount(() => {
       <div v-else class="unity-object-preview-placeholder">
         <UnityObjectIdentity
           :model="objectModel"
+          :workspace-ref="workspaceRef"
           mode="row"
           :draggable="false"
         />
@@ -1747,7 +1755,7 @@ onBeforeUnmount(() => {
         :focus-line="focusLine"
       />
       <div v-else class="unity-object-text-summary">
-        <UnityObjectIdentity :model="objectModel" mode="row" :draggable="false" />
+        <UnityObjectIdentity :model="objectModel" :workspace-ref="workspaceRef" mode="row" :draggable="false" />
         <pre class="unity-object-text-lines"><span
           v-for="(line, index) in compactTextLines"
           :key="index"
@@ -1763,7 +1771,7 @@ onBeforeUnmount(() => {
 
     <template v-else-if="binaryInfoPayload">
       <div class="unity-object-preview-summary">
-        <UnityObjectIdentity :model="objectModel" mode="row" :draggable="false" />
+        <UnityObjectIdentity :model="objectModel" :workspace-ref="workspaceRef" mode="row" :draggable="false" />
         <div class="unity-object-preview-meta">
           <span>{{ binaryInfoPayload.meta.ext || "file" }}</span>
           <span>{{ formatBytes(binaryInfoPayload.meta.size) }}</span>
@@ -1780,6 +1788,7 @@ onBeforeUnmount(() => {
     <div v-else class="unity-object-preview-summary">
       <UnityObjectIdentity
         :model="objectModel"
+        :workspace-ref="workspaceRef"
         mode="row"
         :draggable="false"
       />

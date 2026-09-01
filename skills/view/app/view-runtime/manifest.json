@@ -241,11 +241,11 @@
     },
     {
       "path": "src/components/unity-preview/UnityObjectIdentity.vue",
-      "bytes": 9086
+      "bytes": 9373
     },
     {
       "path": "src/components/unity-preview/UnityObjectPreview.vue",
-      "bytes": 72171
+      "bytes": 72590
     },
     {
       "path": "src/components/ui/BaseButton.vue",
@@ -297,15 +297,15 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 269935
+      "bytes": 271412
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 263099
+      "bytes": 264444
     },
     {
       "path": "src/services/asset.ts",
-      "bytes": 5393
+      "bytes": 6147
     },
     {
       "path": "src/services/diff.ts",
@@ -317,11 +317,11 @@
     },
     {
       "path": "src/services/view.ts",
-      "bytes": 22522
+      "bytes": 22352
     },
     {
       "path": "src/services/unity.ts",
-      "bytes": 19686
+      "bytes": 24012
     },
     {
       "path": "src/services/unitySerializedProperty.ts",
@@ -361,11 +361,11 @@
     },
     {
       "path": "src/services/locusRuntime.ts",
-      "bytes": 1816
+      "bytes": 3721
     },
     {
       "path": "src/types.ts",
-      "bytes": 84533
+      "bytes": 85300
     }
   ]
 }
