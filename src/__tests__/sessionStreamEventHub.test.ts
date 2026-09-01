@@ -101,4 +101,34 @@ describe("session stream event hub", () => {
     unsubscribeSecond();
   });
 
+  it("buffers events received after a bound consumer unmounts", () => {
+    const sessionId = "bound-remount-gap-session";
+    const state = {};
+    const listener = vi.fn();
+    const unsubscribe = subscribeSessionStreamEventConsumer(
+      (dispatch) => dispatch.event.sessionId === sessionId ? state : null,
+      listener,
+    );
+    bindSessionStreamEventConsumer(sessionId);
+    publishSessionStreamEvent({
+      event: { type: "runStart", sessionId, runId: "bound-remount-gap-run" },
+      source: { kind: "legacy" },
+    });
+    unsubscribe();
+
+    const terminal: StreamEvent = {
+      type: "done",
+      sessionId,
+      runId: "bound-remount-gap-run",
+      messageId: "bound-remount-gap-assistant",
+      fullText: "finished while unmounted",
+    };
+    publishSessionStreamEvent({ event: terminal, source: { kind: "legacy" } });
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(bindSessionStreamEventConsumer(sessionId).map(({ event }) => event)).toEqual([
+      terminal,
+    ]);
+  });
+
 });

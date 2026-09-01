@@ -44,6 +44,8 @@ describe("chat undo chooser", () => {
     expect(chatView).toContain("rollbackTargetForMessage");
     expect(chatView).toContain("props.messages.slice(messageIndex + 1)");
     expect(chatView).toContain("userMessage: null");
+    expect(chatView).toContain("await props.undoConversation(targetMessageId)");
+    expect(chatView).toContain("await props.undoFilesAndConversation(targetMessageId, targetId, acceptDirty)");
     expect(chatView).toContain("chatStore.rollbackToMessage(targetMessageId");
     expect(chatView).toContain("chatStore.forkSessionFromMessage(messageId)");
     expect(chatView).toContain("const messageContextCanFork = computed");

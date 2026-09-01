@@ -31,9 +31,12 @@ const MAX_PENDING_SESSION_COUNT = 64;
 const MAX_PENDING_EVENTS_PER_SESSION = 512;
 const MAX_BOUND_SESSION_COUNT = 2048;
 
-function rememberPendingDispatch(dispatch: SessionStreamEventDispatch): void {
+function rememberPendingDispatch(
+  dispatch: SessionStreamEventDispatch,
+  options: { includeBound?: boolean } = {},
+): void {
   const sessionId = dispatch.event.sessionId.trim();
-  if (!sessionId || boundSessionIds.has(sessionId)) return;
+  if (!sessionId || (!options.includeBound && boundSessionIds.has(sessionId))) return;
   const pending = pendingEventsBySessionId.get(sessionId) ?? [];
   pending.push(dispatch);
   if (pending.length > MAX_PENDING_EVENTS_PER_SESSION) {
@@ -65,6 +68,13 @@ export function publishSessionStreamEvent(dispatch: SessionStreamEventDispatch):
     if (!consumer || deliveredConsumers.has(consumer)) continue;
     deliveredConsumers.add(consumer);
     subscription.listener(dispatch);
+  }
+  // A durable session stays marked as bound for the frontend lifetime, while
+  // its editor can briefly have no reducer during pane/window reparenting.
+  // Preserve events received in that gap so the next mount can catch up.
+  const sessionId = dispatch.event.sessionId.trim();
+  if (deliveredConsumers.size === 0 && boundSessionIds.has(sessionId)) {
+    rememberPendingDispatch(dispatch, { includeBound: true });
   }
 }
 

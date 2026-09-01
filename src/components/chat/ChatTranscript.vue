@@ -2924,6 +2924,7 @@ function openImage(src: string) {
                     :key="`${assetRef.kind}:${assetRef.path}`"
                     :path="assetRef.path"
                     :kind="assetRef.kind"
+                    :workspace-ref="workspaceRef"
                     context-menu-mode="inherit"
                   />
                 </div>
@@ -2998,6 +2999,7 @@ function openImage(src: string) {
                       v-if="segment.type === 'asset' || segment.type === 'knowledge'"
                       :path="segment.value"
                       :kind="segment.type === 'knowledge' ? 'knowledge' : undefined"
+                      :workspace-ref="workspaceRef"
                       context-menu-mode="inherit"
                     />
                     <template v-else>{{ segment.value }}</template>

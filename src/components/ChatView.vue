@@ -20,6 +20,7 @@ import SessionCompactPicker from "./chat/SessionCompactPicker.vue";
 import ChatTranscript from "./chat/ChatTranscript.vue";
 import ChatTurnNavigationRail from "./chat/ChatTurnNavigationRail.vue";
 import ChatStatusIndicators from "./chat/ChatStatusIndicators.vue";
+import QueuedFollowUpImages from "./chat/QueuedFollowUpImages.vue";
 import RichChatInput from "./chat/RichChatInput.vue";
 import TokenUsageBar from "./chat/TokenUsageBar.vue";
 import SessionContextUsageWindow from "./SessionContextUsageWindow.vue";
@@ -97,6 +98,7 @@ import {
   writeChatMessageClipboard,
   type UserMessageDraft,
 } from "../composables/chatMessageDraft";
+import { emptyComposerIntent } from "../composables/chatInputIntents";
 import { isMessageFromActiveStream } from "../composables/chatMessageFork";
 import { selectionTextAtPoint } from "../composables/chatSelectionContext";
 import { logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
@@ -107,17 +109,17 @@ import {
 } from "../services/layoutDiagnostics";
 import { useInternalDragController } from "../composables/useInternalDrag";
 import {
-  claimWorkbenchReferencePointerEvent,
-  workbenchReferenceFromElement,
-  workbenchReferenceInternalDragSource,
-  type WorkbenchReferenceDragData,
+  startWorkbenchReferenceInternalDrag,
 } from "./workbench/workbenchReferenceDrag";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
+type NewChatShortcutAction = "keepCurrent" | "replaceCurrent" | "newTab";
+type NewChatRequestSource = "control" | "shortcut";
 
 interface ScopedQueuedFollowUp {
   displayText: string;
+  images?: ImageAttachment[];
   canInsert: boolean;
   isInserting: boolean;
 }
@@ -297,6 +299,14 @@ const props = defineProps<{
   referenceDropActive?: boolean;
   managedNativeDrops?: boolean;
   shortcutActive?: boolean;
+  newChatShortcutAction?: NewChatShortcutAction;
+  checkUndoDirty?: (assistantMessageId: string) => Promise<ChangedFile[]>;
+  undoConversation?: (targetMessageId: string | null) => Promise<boolean>;
+  undoFilesAndConversation?: (
+    targetMessageId: string | null,
+    assistantMessageId: string,
+    acceptDirty: boolean,
+  ) => Promise<boolean>;
 }>();
 
 const chatContentStyle = computed(() => ({
@@ -336,7 +346,7 @@ const emit = defineEmits<{
   updateComposerValue: [value: string];
   openThinking: [content: string];
   selectSession: [id: string];
-  newChat: [];
+  newChat: [request: { source: NewChatRequestSource }];
   renameSession: [id: string, title: string];
   archiveSession: [id: string];
   deleteSession: [id: string];
@@ -1067,30 +1077,20 @@ async function openInlineDiffInWindow() {
 }
 
 function handleContentPointerDown(event: PointerEvent) {
-  if (!props.scopedSession || event.button !== 0 || event.isPrimary === false) return;
-  if (!(event.target instanceof Element)) return;
-  const entry = workbenchReferenceFromElement(event.target);
+  if (event.button !== 0 || event.isPrimary === false) return;
   const workspaceRef = props.workspaceRef;
-  if (!entry || !workspaceRef) return;
+  if (!workspaceRef) return;
   const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
   const projectId = props.projectId?.trim() || checkout?.projectId || "";
   const workspaceRoot = props.workingDir?.trim() || checkout?.root || "";
   if (!projectId || !workspaceRoot) return;
 
-  const data: WorkbenchReferenceDragData = {
-    version: 1,
-    origin: {
-      projectId,
-      workspaceRef: { ...workspaceRef },
-      workspaceRoot,
-    },
-    entries: [entry],
-  };
-  const captureElement = event.target.closest<HTMLElement>(
-    ".asset-chip, .md-file-ref, .md-workspace-ref, .md-asset-chip, .unity-object-identity",
-  ) ?? undefined;
-  if (!internalDrag.start(event, workbenchReferenceInternalDragSource(data, captureElement))) return;
-  claimWorkbenchReferencePointerEvent(event);
+  const started = startWorkbenchReferenceInternalDrag(internalDrag, event, {
+    projectId,
+    workspaceRef: { ...workspaceRef },
+    workspaceRoot,
+  });
+  if (!started) return;
   closeAssetRefContextMenu();
   closeMessageContextMenu();
 }
@@ -1424,7 +1424,8 @@ function refreshUndoChooserDirtyState() {
   undoChooserDirtyChecked.value = false;
   const targetId = currentUndoTarget.value?.fileUndoTarget;
   if (!targetId) return;
-  void chatStore.checkUndoDirty(targetId).then(
+  const checkDirty = props.checkUndoDirty ?? chatStore.checkUndoDirty;
+  void checkDirty(targetId).then(
     (files) => {
       if (currentUndoTarget.value?.fileUndoTarget !== targetId) return;
       undoChooserDirtyFiles.value = files;
@@ -1507,11 +1508,13 @@ async function undoConversationOnly() {
   const turn = currentUndoTarget.value;
   if (!turn || !canUndoConversation.value || undoChooserBusy.value) return;
   undoAction.value = "conversation";
-  chatChangesStore.closeInlineDiff();
+  if (!props.scopedSession) chatChangesStore.closeInlineDiff();
   try {
-    const undone = targetMessageId
-      ? await chatStore.rollbackToMessage(targetMessageId, { includeFiles: false })
-      : await chatStore.undoLatestConversationTurn();
+    const undone = props.undoConversation
+      ? await props.undoConversation(targetMessageId)
+      : targetMessageId
+        ? await chatStore.rollbackToMessage(targetMessageId, { includeFiles: false })
+        : await chatStore.undoLatestConversationTurn();
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
@@ -1528,18 +1531,20 @@ async function undoFilesAndConversation() {
   const targetId = turn?.fileUndoTarget;
   if (!targetId || !canUndoFilesAndConversation.value || undoChooserBusy.value) return;
   undoAction.value = "files";
-  chatChangesStore.closeInlineDiff();
+  if (!props.scopedSession) chatChangesStore.closeInlineDiff();
   // The chooser showed the dirty file list (or verified it empty); if the
   // preflight never completed, leave acceptDirty off so the backend re-checks.
   const acceptDirty = undoChooserDirtyChecked.value;
   try {
-    const undone = targetMessageId
-      ? await chatStore.rollbackToMessage(targetMessageId, {
-          includeFiles: true,
-          fileUndoTarget: targetId,
-          acceptDirty,
-        })
-      : await chatStore.performUndo(targetId, { acceptDirty });
+    const undone = props.undoFilesAndConversation
+      ? await props.undoFilesAndConversation(targetMessageId, targetId, acceptDirty)
+      : targetMessageId
+        ? await chatStore.rollbackToMessage(targetMessageId, {
+            includeFiles: true,
+            fileUndoTarget: targetId,
+            acceptDirty,
+          })
+        : await chatStore.performUndo(targetId, { acceptDirty });
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
@@ -1552,12 +1557,22 @@ async function undoFilesAndConversation() {
   }
 }
 
-async function handleNewChatRequest() {
-  if (props.activeSessionId === null) {
-    composerPanelRef.value?.resetDraft();
-    inputText.value = "";
+async function handleNewChatRequest(source: NewChatRequestSource = "control") {
+  const shortcutAction = source === "shortcut"
+    ? props.newChatShortcutAction ?? "replaceCurrent"
+    : "replaceCurrent";
+  if (shortcutAction === "keepCurrent") {
+    await focusComposerInput();
+    return;
   }
-  emit("newChat");
+  if (shortcutAction !== "newTab") {
+    if (props.activeSessionId === null) {
+      composerPanelRef.value?.resetDraft();
+      inputText.value = "";
+    }
+  }
+  emit("newChat", { source });
+  if (shortcutAction === "newTab") return;
   await nextTick();
   await focusComposerInput();
 }
@@ -1584,9 +1599,32 @@ async function applyDraftPrefill(draft: UserMessageDraft) {
   await focusComposerInput();
 }
 
+async function appendComposerDraft(draft: UserMessageDraft) {
+  if (composerPanelRef.value) {
+    await composerPanelRef.value.appendDraft(draft);
+    return;
+  }
+  inputText.value += draft.text;
+  await focusComposerInput();
+}
+
+function exportComposerDraft(): UserMessageDraft {
+  return composerPanelRef.value?.exportDraft() ?? {
+    text: inputText.value,
+    images: [],
+    assetRefs: [],
+    localFiles: [],
+    consoleTexts: [],
+    intent: emptyComposerIntent(),
+  };
+}
+
 defineExpose({
   applyDraftPrefill,
+  appendComposerDraft,
   applyExternalComposerPrefill,
+  exportComposerDraft,
+  focusComposerInput,
   isComposerDraftEmpty,
 });
 
@@ -2956,7 +2994,7 @@ function onGlobalChatKeydown(e: KeyboardEvent) {
 
   if (!e.repeat && matchesShortcut(e, shortcutState.newChat)) {
     e.preventDefault();
-    handleNewChatRequest();
+    handleNewChatRequest("shortcut");
     return;
   }
 }
@@ -3214,6 +3252,7 @@ onUnmounted(() => {
         <span class="queued-follow-up-label">
           {{ activeQueuedFollowUp?.isInserting ? t('chat.input.queuedFollowUpInserting') : t('chat.input.queuedFollowUp') }}
         </span>
+        <QueuedFollowUpImages :images="activeQueuedFollowUp?.images" />
         <span class="queued-follow-up-text ui-select-text">{{ activeQueuedFollowUp?.displayText }}</span>
         <BaseButton
           v-if="activeQueuedFollowUp?.canInsert"
@@ -3389,6 +3428,7 @@ onUnmounted(() => {
           :resume-label="t('chat.input.resume')"
           :compact="inputControlsCollapsed"
           :asset-ref-sync-key="composerAssetRefSyncKey"
+          :workspace-ref="workspaceRef"
           :reference-drop-available="referenceDropAvailable"
           :reference-drop-active="referenceDropActive"
           :managed-native-drops="managedNativeDrops"

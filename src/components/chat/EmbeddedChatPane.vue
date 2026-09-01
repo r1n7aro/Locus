@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, useSlots, watch } from
 import type {
   ChatComposerSendPayload,
   ChatMessage,
+  ImageAttachment,
   PendingQuestion,
   PendingToolConfirm,
   SkillManifest,
@@ -14,6 +15,7 @@ import ToolConfirmCard from "./ToolConfirmCard.vue";
 import ToolConfirmBatchCard from "./ToolConfirmBatchCard.vue";
 import ChatTranscript from "./ChatTranscript.vue";
 import RichChatInput from "./RichChatInput.vue";
+import QueuedFollowUpImages from "./QueuedFollowUpImages.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import type { UserMessageDraft } from "../../composables/chatMessageDraft";
 import { forwardWheelToElement } from "../../composables/chatWheelPassthrough";
@@ -73,7 +75,12 @@ const props = withDefaults(defineProps<{
   activeToolCalls: ToolCallDisplay[];
   pendingQuestion?: PendingQuestion | null;
   pendingToolConfirms?: PendingToolConfirm[];
-  queuedFollowUp?: { displayText: string; canInsert?: boolean; isInserting?: boolean } | null;
+  queuedFollowUp?: {
+    displayText: string;
+    images?: ImageAttachment[];
+    canInsert?: boolean;
+    isInserting?: boolean;
+  } | null;
   toolConfirmLayoutKey?: string | null;
   inputValue: string;
   placeholder?: string;
@@ -701,6 +708,7 @@ onUnmounted(() => {
           <span class="embedded-queued-label">
             {{ queuedFollowUp.isInserting ? t('chat.input.queuedFollowUpInserting') : t('chat.input.queuedFollowUp') }}
           </span>
+          <QueuedFollowUpImages :images="queuedFollowUp.images" />
           <span class="embedded-queued-text ui-select-text">{{ queuedFollowUp.displayText }}</span>
           <BaseButton
             v-if="queuedFollowUp.canInsert"

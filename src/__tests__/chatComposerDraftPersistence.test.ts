@@ -70,4 +70,22 @@ describe("chat composer draft persistence", () => {
     expect(richInput).toContain("parentPath: parentPathFor(refPath),");
     expect(richInput).toContain("meta: refPath,");
   });
+
+  it("waits for the controlled value to clear before replacing a complete draft", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+
+    expect(richInput).toMatch(
+      /async function applyDraftPrefill[\s\S]*resetDraft\(\);[\s\S]*await nextTick\(\);[\s\S]*await applyUserMessageDraft\(draft\);/,
+    );
+  });
+
+  it("appends dropped references without clearing the existing composer draft", () => {
+    const richInput = read("src/components/chat/RichChatInput.vue");
+    const appendDraftStart = richInput.indexOf("async function appendDraft(");
+    const appendDraftEnd = richInput.indexOf("\nfunction exportDraft", appendDraftStart);
+    const appendDraft = richInput.slice(appendDraftStart, appendDraftEnd);
+
+    expect(appendDraft).toContain("await applyUserMessageDraft(draft);");
+    expect(appendDraft).not.toContain("resetDraft();");
+  });
 });

@@ -46,7 +46,6 @@ const undoServiceMocks = vi.hoisted(() => ({
 
 const displaySettingsState = vi.hoisted(() => ({
   showWelcomeSubtitle: true,
-  showViewsTab: true,
   showPluginsTab: true,
   showAgentTab: true,
   showAgentSelector: false,
@@ -238,7 +237,6 @@ describe("chat session panel state", () => {
 
     displaySettingsState.todoAutoOpen = true;
     displaySettingsState.showWelcomeSubtitle = true;
-    displaySettingsState.showViewsTab = true;
     displaySettingsState.showPluginsTab = true;
     displaySettingsState.showAgentTab = true;
     displaySettingsState.showAgentSelector = false;
@@ -2855,6 +2853,10 @@ describe("chat session panel state", () => {
         },
       },
     );
+
+    expect(chatStore.activeQueuedFollowUp?.images).toEqual([
+      { data: "image-data", mimeType: "image/png" },
+    ]);
 
     const restored = await chatStore.reEditActiveQueuedFollowUp();
 

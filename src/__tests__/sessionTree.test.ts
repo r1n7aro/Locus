@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildSessionTree,
+  isAnimatedSessionTreeStatus,
   sessionTreeStatusForSession,
 } from "../components/chat/sessionTree";
 import type { SessionSummary } from "../types";
@@ -102,6 +103,13 @@ describe("buildSessionTree", () => {
     });
 
     expect(sessionTreeStatusForSession(session, new Set([session.id]))).toBe("running");
+  });
+
+  it("animates the active execution phases used by session titles", () => {
+    expect(isAnimatedSessionTreeStatus("running")).toBe(true);
+    expect(isAnimatedSessionTreeStatus("finishing")).toBe(true);
+    expect(isAnimatedSessionTreeStatus("waiting_input")).toBe(false);
+    expect(isAnimatedSessionTreeStatus(null)).toBe(false);
   });
 
   it("keeps legacy docgen sessions readable", () => {

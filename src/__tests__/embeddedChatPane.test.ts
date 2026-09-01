@@ -47,7 +47,7 @@ describe("EmbeddedChatPane contract", () => {
     expect(embeddedSession).toContain("buildToolResultMessages(sourceToolCalls)");
     expect(embeddedSession).toContain("function replaceMessageById");
     expect(embeddedSession).toContain("state.messages = replaceMessageById(state.messages, mutation.message)");
-    expect(embeddedSession).toContain("async function reloadSessionMessagesAfterError");
+    expect(embeddedSession).toContain("async function reloadSessionState");
     expect(embeddedSession).toContain("sessionService.loadSession(sessionId)");
     expect(embeddedSession).toContain("hydrateChatMessagesIntent(detail.messages)");
     expect(embeddedSession).toContain("subscribeSessionStreamEventConsumer");
@@ -58,7 +58,10 @@ describe("EmbeddedChatPane contract", () => {
     expect(embeddedSession).toContain("async function reEditQueuedFollowUp()");
     expect(pane).toContain("<AskUserCard");
     expect(pane).toContain("<ToolConfirmCard");
-    expect(pane).toContain('queuedFollowUp?: { displayText: string; canInsert?: boolean; isInserting?: boolean } | null;');
+    expect(pane).toContain("images?: ImageAttachment[];");
+    expect(pane).toContain('<QueuedFollowUpImages :images="queuedFollowUp.images" />');
+    expect(chatView).toContain('<QueuedFollowUpImages :images="activeQueuedFollowUp?.images" />');
+    expect(embeddedSession).toContain("images: inputs.flatMap((input) => input.images ?? []),");
     expect(pane).toContain('@click="emit(\'insertQueuedFollowUp\')"');
     expect(pane).toContain('@click="emit(\'reEditQueuedFollowUp\')"');
     expect(pane).toContain('@click="emit(\'deleteQueuedFollowUp\')"');

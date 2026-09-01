@@ -13,6 +13,7 @@ import {
   listDirEntriesPage,
   searchWorkspaceEntries,
   type DirEntry,
+  type WorkspaceRef,
 } from "../../services/project";
 import { useChatStore } from "../../stores/chat";
 import { useNotificationStore } from "../../stores/notification";
@@ -67,7 +68,9 @@ import {
   subscribeUnityEmbedAssetDrop,
   subscribeUnityEmbedTextDrop,
   type LocusFileDragStatePayload,
+  type LocusFileDropPayload,
   type LocusFileDropRef,
+  type UnityEmbedAssetDropPayload,
   type UnityEmbedTextDropEntry,
   validateUnitySceneObject,
 } from "../../services/unity";
@@ -170,6 +173,7 @@ const props = withDefaults(defineProps<{
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   managedNativeDrops?: boolean;
+  workspaceRef?: WorkspaceRef | null;
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -484,6 +488,23 @@ function mapSceneObjectSearchResult(result: WorkspaceSceneObjectSearchResult): M
   };
 }
 
+function searchableUnityScenePaths(): string[] {
+  if (!projectStore.unityConnected) return [];
+  const status = projectStore.unityConnectionStatus;
+  const candidates = [status?.scenePath, ...(status?.scenePaths ?? [])];
+  const seen = new Set<string>();
+  const scenePaths: string[] = [];
+  for (const candidate of candidates) {
+    const scenePath = candidate?.trim().replace(/\\/g, "/");
+    if (!scenePath || !scenePath.toLowerCase().endsWith(".unity")) continue;
+    const key = scenePath.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    scenePaths.push(scenePath);
+  }
+  return scenePaths;
+}
+
 const rankedMentionSearchResults = computed(() =>
   rankMentionSearchResults(mentionSearchResults.value, mentionQuery.value),
 );
@@ -738,17 +759,23 @@ async function searchAssets(query: string) {
     ];
   }
 
-  async function searchSceneObjectsFromDisk() {
-    const scenePath = projectStore.unityConnectionStatus?.scenePath?.trim();
-    if (!projectStore.unityConnected || !scenePath) return;
-    const results = await searchWorkspaceSceneObjects(
-      scenePath,
-      query,
-      MAX_SCENE_OBJECT_MENTION_RESULTS,
-      workspaceRef!,
-    );
+  async function searchOpenSceneObjectsFromDisk() {
+    const scenePaths = searchableUnityScenePaths();
+    if (scenePaths.length === 0) return;
+    const searches = await Promise.allSettled(scenePaths.map((scenePath) => (
+      searchWorkspaceSceneObjects(
+        scenePath,
+        query,
+        MAX_SCENE_OBJECT_MENTION_RESULTS,
+        workspaceRef!,
+      )
+    )));
     if (!requestIsCurrent()) return;
-    sceneObjectResults = results.map(mapSceneObjectSearchResult);
+    sceneObjectResults = searches.flatMap((search) => (
+      search.status === "fulfilled"
+        ? search.value.map(mapSceneObjectSearchResult)
+        : []
+    ));
     publishResults();
   }
 
@@ -785,7 +812,7 @@ async function searchAssets(query: string) {
       assetSearchPromise,
       folderSearchPromise,
       knowledgeSearchPromise,
-      searchSceneObjectsFromDisk(),
+      searchOpenSceneObjectsFromDisk(),
     ]);
     if (!requestIsCurrent()) return;
 
@@ -1386,6 +1413,36 @@ function addAssetRefs(
   }
 }
 
+async function prepareSendToLocusTarget(sendMode?: "focusedSession" | "newSession") {
+  const opensNewSession = sendMode === "newSession";
+  if (opensNewSession) {
+    chatStore.newChat();
+    await nextTick();
+    resetDraft();
+    await nextTick();
+  }
+  return opensNewSession;
+}
+
+async function handleUnityEmbedAssetDrop(payload: UnityEmbedAssetDropPayload) {
+  const opensNewSession = await prepareSendToLocusTarget(payload.sendMode);
+  if (opensNewSession) {
+    addAssetRefs(payload.refs ?? [], { respectRecentRemoval: false });
+    return;
+  }
+  addAssetRefs(payload.refs ?? [], { respectRecentRemoval: true });
+}
+
+async function handleLocusFileDrop(payload: LocusFileDropPayload) {
+  await prepareSendToLocusTarget(payload.sendMode);
+  const composer = composerRef.value?.getTextarea()?.closest<HTMLElement>(".chat-composer");
+  const bounds = composer?.getBoundingClientRect();
+  const hasPosition = Number.isFinite(payload.x) && Number.isFinite(payload.y);
+  const insideComposer = !hasPosition || !!bounds && payload.x! >= bounds.left
+    && payload.x! <= bounds.right && payload.y! >= bounds.top && payload.y! <= bounds.bottom;
+  if (insideComposer) addLocalFileAttachments(payload.files ?? []);
+}
+
 function removeAssetRef(index: number) {
   const next = [...assetRefAttachments.value];
   const removed = next.splice(index, 1);
@@ -1752,7 +1809,26 @@ async function applyPrefill(text: string) {
 
 async function applyDraftPrefill(draft: UserMessageDraft) {
   resetDraft();
+  // resetDraft emits the controlled model update. Wait until the parent has
+  // passed the empty value back before applying the replacement draft, or its
+  // text would be appended to the previous controlled value.
+  await nextTick();
   await applyUserMessageDraft(draft);
+}
+
+async function appendDraft(draft: UserMessageDraft) {
+  await applyUserMessageDraft(draft);
+}
+
+function exportDraft(): UserMessageDraft {
+  return {
+    text: props.modelValue,
+    images: imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType })),
+    assetRefs: assetRefAttachments.value.map((item) => ({ ...item })),
+    localFiles: localFileAttachments.value.map((item) => ({ ...item })),
+    consoleTexts: consoleTextAttachments.value.map((item) => ({ ...item })),
+    intent: JSON.parse(JSON.stringify(composerIntent.value)) as ComposerIntentState,
+  };
 }
 
 function appendDraftText(text: string) {
@@ -2449,7 +2525,9 @@ onMounted(() => {
   window.addEventListener("blur", handleWindowLocalFileDragBlur);
   if (!props.managedNativeDrops) {
     subscribeUnityEmbedAssetDrop((payload) => {
-      addAssetRefs(payload.refs ?? [], { respectRecentRemoval: true });
+      void handleUnityEmbedAssetDrop(payload).catch((error) => {
+        console.warn("[Locus] Unity asset drop handling failed:", error);
+      });
     })
       .then((release) => {
         if (unityAssetDropSubscriptionDisposed) {
@@ -2477,12 +2555,9 @@ onMounted(() => {
     });
   if (!props.managedNativeDrops) {
     subscribeLocusFileDrop((payload) => {
-      const composer = composerRef.value?.getTextarea()?.closest<HTMLElement>(".chat-composer");
-      const bounds = composer?.getBoundingClientRect();
-      const hasPosition = Number.isFinite(payload.x) && Number.isFinite(payload.y);
-      const insideComposer = !hasPosition || !!bounds && payload.x! >= bounds.left
-        && payload.x! <= bounds.right && payload.y! >= bounds.top && payload.y! <= bounds.bottom;
-      if (insideComposer) addLocalFileAttachments(payload.files ?? []);
+      void handleLocusFileDrop(payload).catch((error) => {
+        console.warn("[Locus] local file drop handling failed:", error);
+      });
     })
       .then((release) => {
         if (locusFileDropSubscriptionDisposed) {
@@ -2548,6 +2623,8 @@ defineExpose({
   resetDraft,
   applyPrefill,
   applyDraftPrefill,
+  appendDraft,
+  exportDraft,
   isDraftEmpty,
 });
 </script>
@@ -2610,6 +2687,7 @@ defineExpose({
               <AssetChip
                 :path="assetRef.path"
                 :kind="assetRef.kind"
+                :workspace-ref="workspaceRef"
                 removable
                 @remove="removeAssetRef(index)"
               />
@@ -2915,6 +2993,7 @@ defineExpose({
               :key="`${assetRef.kind}:${assetRef.path}`"
               :path="assetRef.path"
               :kind="assetRef.kind"
+              :workspace-ref="workspaceRef"
               removable
               @remove="removeAssetRef(index)"
             />

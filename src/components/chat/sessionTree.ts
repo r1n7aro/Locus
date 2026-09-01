@@ -9,6 +9,12 @@ export type SessionTreeStatus =
   | "cancelling"
   | "error";
 
+export function isAnimatedSessionTreeStatus(
+  status: SessionTreeStatus | null | undefined,
+): boolean {
+  return status === "running" || status === "finishing";
+}
+
 export interface SessionTreeFolderNode {
   kind: "folder";
   key: string;

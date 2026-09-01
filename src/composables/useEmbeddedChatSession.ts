@@ -11,6 +11,7 @@ import {
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import * as sessionService from "../services/session";
+import * as undoService from "../services/undo";
 import { isToolCollapseTraceEnabled, logToolCollapseTrace, previewTraceText } from "../services/toolCollapseTrace";
 import { StreamingTextChunks } from "./streamingTextChunks";
 import { useThrottledStreamingText } from "./streamingRenderThrottle";
@@ -79,6 +80,7 @@ interface EmbeddedChatState extends StreamState {
   sessionEffort: EffortLevel | null;
   sessionFastMode: boolean | null;
   pendingRun: boolean;
+  isCancelling: boolean;
   pendingInputs: PendingSessionInput[];
   acceptedPendingInputIds: Set<string>;
   deferredUserMessagesByRun: Map<string, ChatMessage[]>;
@@ -143,6 +145,7 @@ function createState(key: string): EmbeddedChatState {
     sessionEffort: null,
     sessionFastMode: null,
     pendingRun: false,
+    isCancelling: false,
     pendingInputs: [],
     acceptedPendingInputIds: new Set<string>(),
     deferredUserMessagesByRun: new Map<string, ChatMessage[]>(),
@@ -532,6 +535,7 @@ function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDe
     state.currentRunId = null;
     state.isStreaming = false;
     state.pendingRun = false;
+    state.isCancelling = false;
     state.pendingQuestion = null;
     state.pendingToolConfirms = [];
     state.isCompacting = false;
@@ -543,6 +547,7 @@ function applySessionRuntimeSnapshot(state: EmbeddedChatState, detail: SessionDe
   state.currentRunId = runtime.activeRun.runId;
   state.isStreaming = true;
   state.pendingRun = false;
+  state.isCancelling = runtime.activeRun.status === "cancelling";
   state.rawStreamText = runtime.streamingText ?? "";
   state.streamingText = runtime.streamingText ?? "";
   state.streamingThinking = runtime.streamingThinking ?? "";
@@ -862,9 +867,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const normalizedSessionId = sessionId.trim();
     if (!normalizedSessionId) return;
     if (state.sessionId === normalizedSessionId && state.messages.length > 0) {
-      // The shared state is already authoritative. Mark the transport binding
-      // and drop any pre-bind buffer that the state has already materialized.
-      bindSessionStreamEventConsumer(normalizedSessionId);
+      // The transcript is shared across pane reparenting, while stream events
+      // may have arrived during the short interval with no mounted reducer.
+      replayBufferedSessionEvents(normalizedSessionId);
       return;
     }
     const epoch = (sessionHydrationEpochs.get(state.key) ?? 0) + 1;
@@ -878,9 +883,10 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     sessionStates.set(normalizedSessionId, state);
     let hydrated = false;
     try {
-      const [detail, usage] = await Promise.all([
+      const [detail, usage, undoEntries] = await Promise.all([
         sessionService.loadSession(normalizedSessionId),
         sessionService.getSessionUsage(normalizedSessionId).catch(() => null),
+        undoService.undoList(normalizedSessionId).catch(() => []),
       ]);
       if (
         sessionHydrationEpochs.get(state.key) !== epoch
@@ -892,6 +898,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.sessionModelId = detail.lastModelId ?? null;
       state.sessionEffort = detail.lastEffort ?? null;
       state.sessionFastMode = detail.lastFastMode ?? null;
+      state.undoableMessageIds = new Set(
+        undoEntries.map((entry) => entry.assistantMessageId),
+      );
       if (usage) state.tokenUsage = usage;
       applySessionRuntimeSnapshot(state, detail);
       hydrated = true;
@@ -916,15 +925,23 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     return sessionStates.get(event.sessionId) ?? null;
   }
 
-  async function reloadSessionMessagesAfterError(state: EmbeddedChatState, sessionId: string) {
+  async function reloadSessionState(state: EmbeddedChatState, sessionId: string): Promise<boolean> {
     try {
-      const detail = await sessionService.loadSession(sessionId);
-      if (state.sessionId !== sessionId) return;
+      const [detail, undoEntries] = await Promise.all([
+        sessionService.loadSession(sessionId),
+        undoService.undoList(sessionId).catch(() => []),
+      ]);
+      if (state.sessionId !== sessionId) return false;
       state.messages = hydrateChatMessagesIntent(detail.messages);
       state.pendingInputs = visiblePendingInputs(detail.pendingInputs ?? []);
+      state.undoableMessageIds = new Set(
+        undoEntries.map((entry) => entry.assistantMessageId),
+      );
       applySessionRuntimeSnapshot(state, detail);
+      return true;
     } catch (error) {
-      console.warn("[embedded-chat] loadSession after stream error failed:", error);
+      console.warn("[embedded-chat] failed to refresh session state:", error);
+      return false;
     }
   }
 
@@ -946,14 +963,26 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       })),
     });
 
-    if (state.currentRunId && event.runId !== state.currentRunId) return;
-    if (!state.currentRunId) state.currentRunId = event.runId;
-
     if (event.type === "runStart") {
+      if (state.currentRunId && state.currentRunId !== event.runId) {
+        state.deferredUserMessagesByRun.delete(state.currentRunId);
+        state.submittedUserMessagesByRun.delete(state.currentRunId);
+        state.streamSequence = 0;
+        state.pendingQuestion = null;
+        state.pendingToolConfirms = [];
+        state.isCompacting = false;
+        resetRoundState(state);
+      }
+      state.currentRunId = event.runId;
       state.isStreaming = true;
+      state.pendingRun = false;
+      state.isCancelling = false;
       state.error = null;
       return;
     }
+
+    if (state.currentRunId && event.runId !== state.currentRunId) return;
+    if (!state.currentRunId) state.currentRunId = event.runId;
 
     if (event.type === "pendingInputQueued") {
       if (state.acceptedPendingInputIds.has(event.input.id)) return;
@@ -1009,8 +1038,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.error = normalizeAppError(event.error).message;
       state.currentRunId = null;
       state.pendingRun = false;
+      state.isCancelling = false;
       state.submittedUserMessagesByRun.delete(event.runId);
-      void reloadSessionMessagesAfterError(state, event.sessionId);
+      void reloadSessionState(state, event.sessionId);
       return;
     }
 
@@ -1046,6 +1076,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       }
       state.currentRunId = null;
       state.pendingRun = false;
+      state.isCancelling = false;
       state.submittedUserMessagesByRun.delete(event.runId);
       if (event.type === "cancelled" && event.removedUserMessage && submittedUserMessage) {
         restoreEmbeddedSubmittedDraft(submittedUserMessage);
@@ -1213,6 +1244,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     resetRoundState(state);
     state.isStreaming = true;
     state.pendingRun = true;
+    state.isCancelling = false;
 
     const knowledgeFocus = toValue(options.knowledgeFocus) ?? null;
 
@@ -1375,15 +1407,82 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
 
   async function cancel() {
     const state = activeState.value;
-    if (!state.isStreaming) return;
     if (state.pendingRun && !state.currentRunId) {
       state.cancelPendingLaunch = true;
     }
     if (!state.sessionId) return;
+    const targetSessionId = state.sessionId;
+    state.isCancelling = true;
     try {
-      await sessionService.cancelChat(state.sessionId);
+      await sessionService.cancelChat(targetSessionId);
+      await reloadSessionState(state, targetSessionId);
     } catch (error) {
       state.error = normalizeAppError(error).message;
+    } finally {
+      state.isCancelling = false;
+    }
+  }
+
+  async function checkUndoDirty(assistantMessageId: string) {
+    const state = activeState.value;
+    if (!state.sessionId || !assistantMessageId) return [];
+    return undoService.undoCheckDirty(state.sessionId, assistantMessageId);
+  }
+
+  async function rollbackConversation(targetMessageId: string | null): Promise<boolean> {
+    const state = activeState.value;
+    const targetSessionId = state.sessionId;
+    if (!targetSessionId || state.isStreaming) return false;
+    state.error = null;
+    try {
+      const detail = targetMessageId
+        ? await sessionService.rollbackSessionToMessage(targetSessionId, targetMessageId)
+        : await sessionService.undoLatestConversationTurn(targetSessionId);
+      if (state.sessionId !== targetSessionId) return false;
+      state.messages = hydrateChatMessagesIntent(detail.messages);
+      state.pendingInputs = visiblePendingInputs(detail.pendingInputs ?? []);
+      state.undoableMessageIds = new Set(
+        (await undoService.undoList(targetSessionId).catch(() => []))
+          .map((entry) => entry.assistantMessageId),
+      );
+      applySessionRuntimeSnapshot(state, detail);
+      return true;
+    } catch (error) {
+      state.error = normalizeAppError(error).message;
+      return false;
+    }
+  }
+
+  async function rollbackFilesAndConversation(
+    targetMessageId: string | null,
+    assistantMessageId: string,
+    acceptDirty: boolean,
+  ): Promise<boolean> {
+    const state = activeState.value;
+    const targetSessionId = state.sessionId;
+    if (!targetSessionId || !assistantMessageId || state.isStreaming) return false;
+    state.error = null;
+    try {
+      if (targetMessageId) {
+        await undoService.undoPerformToMessage(
+          targetSessionId,
+          assistantMessageId,
+          targetMessageId,
+          false,
+          acceptDirty,
+        );
+      } else {
+        await undoService.undoPerform(
+          targetSessionId,
+          assistantMessageId,
+          false,
+          acceptDirty,
+        );
+      }
+      return reloadSessionState(state, targetSessionId);
+    } catch (error) {
+      state.error = normalizeAppError(error).message;
+      return false;
     }
   }
 
@@ -1502,6 +1601,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const liveRenderParts = computed(() => activeState.value.liveRenderParts);
   const livePartStreams = computed(() => activeState.value.livePartStreams);
   const isStreaming = computed(() => activeState.value.isStreaming);
+  const isCancelling = computed(() => activeState.value.isCancelling);
   const isCompacting = computed(() => activeState.value.isCompacting);
   const isThinking = computed(() => activeState.value.isThinking);
   const hasThinking = computed(() => (
@@ -1521,6 +1621,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       inputs,
       canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
       isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
+      images: inputs.flatMap((input) => input.images ?? []),
       displayText: inputs
         .map((input) => input.displayText || input.text)
         .filter((text) => text.trim().length > 0)
@@ -1570,6 +1671,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     liveRenderParts,
     livePartStreams,
     isStreaming,
+    isCancelling,
     isCompacting,
     isThinking,
     hasThinking,
@@ -1593,6 +1695,9 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     deleteQueuedFollowUp,
     reEditQueuedFollowUp,
     cancel,
+    checkUndoDirty,
+    rollbackConversation,
+    rollbackFilesAndConversation,
     resetSession,
     setExecutionSelection,
     answerQuestion,

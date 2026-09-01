@@ -486,12 +486,14 @@ export const useChatStore = defineStore("chat", () => {
       .map((input) => input.displayText || input.text)
       .filter((text) => text.trim().length > 0)
       .join("\n");
+    const images = inputs.flatMap((input) => input.images ?? []);
     return {
       inputs,
       displayText,
+      images,
       canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
       isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
-      imageCount: inputs.reduce((total, input) => total + (input.images?.length ?? 0), 0),
+      imageCount: images.length,
       assetRefCount: inputs.reduce((total, input) => total + (input.assetRefs?.length ?? 0), 0),
     };
   });
