@@ -23,6 +23,30 @@ for message in session.messages:
     print(message.role, message.content)
 ```
 
+List only sessions that currently have an active run:
+
+```python
+for summary in await locus.list_running_sessions():
+    print(summary.id, summary.title, summary.runtime_status)
+```
+
+Insert a message into another running session's next model iteration:
+
+```python
+target = next(
+    session
+    for session in await locus.list_running_sessions()
+    if not session.is_current
+)
+delivery = await target.send_message("Please verify the failing test before you finish.")
+print(delivery.target_session_id, delivery.target_run_id)
+```
+
+Locus derives the source session from the current Python tool invocation. The
+received user-role message includes the source session title and ID. The target
+must still be running and accepting inserted input. This call changes another
+session, so use `readonly=false` in the Python tool.
+
 Observe or control a run:
 
 ```python

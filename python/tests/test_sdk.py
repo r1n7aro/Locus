@@ -5,6 +5,7 @@ import json
 import unittest
 import urllib.request
 from typing import Literal
+from unittest.mock import patch
 
 import locus
 from locus._models import Run
@@ -26,7 +27,11 @@ class _FakeClient:
 
 class _SdkSurfaceClient(locus.Client):
     def __init__(self) -> None:
-        super().__init__(base_url="http://127.0.0.1/sdk", token="test-token")
+        super().__init__(
+            base_url="http://127.0.0.1/sdk",
+            token="test-token",
+            current_session_id="session-source",
+        )
         self.calls: list[tuple[str, dict[str, object]]] = []
 
     async def rpc(self, method: str, params=None, *, timeout=None):
@@ -194,6 +199,8 @@ class _SdkSurfaceClient(locus.Client):
                 "choiceId": values["choiceId"],
                 "label": "Reload",
                 "invoked": True,
+                "status": "invoked",
+                "message": "Unity dialog choice was invoked and the dialog closed.",
             }
         if method == "unity.execution.wait":
             return "MODAL_PROBE:cancelled"
@@ -206,6 +213,7 @@ class _SdkSurfaceClient(locus.Client):
                     "sessionType": "chat",
                     "parentSessionId": None,
                     "updatedAt": 10,
+                    "runtimeStatus": "running" if values.get("runningOnly") else None,
                 }
             ]
         if method == "sessions.get":
@@ -226,6 +234,16 @@ class _SdkSurfaceClient(locus.Client):
                 ],
                 "pendingInputs": [],
                 "runtime": None,
+            }
+        if method == "sessions.send":
+            return {
+                "pendingInputId": "pending-1",
+                "sourceSessionId": values["sourceSessionId"],
+                "sourceSessionTitle": "Source workflow",
+                "targetSessionId": values["sessionId"],
+                "targetSessionTitle": "Workflow",
+                "targetRunId": "run-target",
+                "delivery": "immediate",
             }
         if method == "agents.prompt":
             return {"runId": "run-2", "sessionId": values["sessionId"]}
@@ -272,6 +290,15 @@ class _RunEventClient:
 
 
 class ToolSchemaTests(unittest.TestCase):
+    def test_client_reads_current_session_from_python_tool_environment(self) -> None:
+        with patch.dict("os.environ", {"LOCUS_SESSION_ID": "session-current"}):
+            client = locus.Client(
+                base_url="http://127.0.0.1/sdk",
+                token="test-token",
+            )
+
+        self.assertEqual(client.current_session_id, "session-current")
+
     def test_decorator_builds_object_schema_from_annotations(self) -> None:
         @locus.tool(description="Select a build.")
         def select_build(platform: Literal["windows", "mac"], retries: int = 2) -> dict:
@@ -438,6 +465,47 @@ class SdkCoverageTests(unittest.IsolatedAsyncioTestCase):
         prompt_call = next(call for call in client.calls if call[0] == "agents.prompt")
         self.assertEqual(prompt_call[1]["sessionId"], "session-1")
 
+    async def test_lists_running_sessions_and_inserts_a_sourced_message(self) -> None:
+        client = _SdkSurfaceClient()
+
+        sessions = await client.list_running_sessions()
+        delivery = await sessions[0].send_message("Please verify the result")
+
+        self.assertTrue(sessions[0].is_running)
+        self.assertFalse(sessions[0].is_current)
+        self.assertEqual(delivery.pending_input_id, "pending-1")
+        self.assertEqual(delivery.source_session_id, "session-source")
+        self.assertEqual(delivery.target_session_id, "session-1")
+        self.assertEqual(delivery.target_run_id, "run-target")
+        self.assertEqual(delivery.delivery, "immediate")
+        self.assertIn(
+            (
+                "sessions.list",
+                {"archived": False, "runningOnly": True, "limit": None},
+            ),
+            client.calls,
+        )
+        self.assertIn(
+            (
+                "sessions.send",
+                {
+                    "sessionId": "session-1",
+                    "sourceSessionId": "session-source",
+                    "message": "Please verify the result",
+                },
+            ),
+            client.calls,
+        )
+
+    async def test_session_send_requires_a_source_session(self) -> None:
+        client = locus.Client(
+            base_url="http://127.0.0.1/sdk",
+            token="test-token",
+        )
+
+        with self.assertRaises(locus.LocusUnavailableError):
+            await client.send_session_message("session-1", "hello")
+
     async def test_reads_and_resolves_unity_dialog_without_tool_schema(self) -> None:
         client = _SdkSurfaceClient()
 
@@ -457,6 +525,7 @@ class SdkCoverageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(dialog.main_thread_blocked)
         self.assertEqual(dialog.choices[1].label, "Keep Changes")
         self.assertTrue(result.invoked)
+        self.assertEqual(result.status, "invoked")
         self.assertEqual(output, "MODAL_PROBE:cancelled")
         self.assertIn(
             ("unity.dialog.get", {"project": r"F:\Project"}),
@@ -480,6 +549,22 @@ class SdkCoverageTests(unittest.IsolatedAsyncioTestCase):
             ),
             client.calls,
         )
+
+    async def test_parses_manually_closed_dialog_as_a_normal_result(self) -> None:
+        result = locus.UnityDialogChoiceResult.from_payload(
+            {
+                "dialogId": "dialog-closed",
+                "choiceId": "choice-2",
+                "label": "",
+                "invoked": False,
+                "status": "dialog_not_found",
+                "message": "No blocking Unity dialog is currently open.",
+            }
+        )
+
+        self.assertFalse(result.invoked)
+        self.assertEqual(result.status, "dialog_not_found")
+        self.assertIn("No blocking Unity dialog", result.message)
 
     async def test_queries_and_ensures_unity_editor_lifecycle(self) -> None:
         client = _SdkSurfaceClient()

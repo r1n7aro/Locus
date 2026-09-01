@@ -129,7 +129,7 @@ if dialog is not None:
     )
 ```
 
-选择接口只接受当前快照返回的不透明 id，并在执行前重新验证 Unity PID、owner 窗口、弹窗指纹与按钮集合。窗口已经关闭或内容发生变化时会返回 stale 错误。
+选择接口只接受当前快照返回的不透明 id，并在执行前重新验证 Unity PID、owner 窗口、弹窗指纹与按钮集合。按钮调用后，接口会等待原弹窗关闭或被新弹窗替换再返回，后续 Unity 调用不会与原弹窗关闭过程发生竞态。用户已经手动处理弹窗时，接口正常返回 `invoked=False`、`status="dialog_not_found"`；出现新弹窗时返回 `status="dialog_changed"`。未知 choice、重复并发选择和系统调用失败仍会返回错误。
 
 ## 自定义 workflow
 

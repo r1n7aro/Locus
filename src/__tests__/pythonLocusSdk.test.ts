@@ -72,6 +72,7 @@ describe("Locus Python API", () => {
       '"unity.editor.restart"',
       '"sessions.list"',
       '"sessions.get"',
+      '"sessions.send"',
       '"sessions.events"',
     ]) {
       expect(bridge).toContain(method);
@@ -79,6 +80,8 @@ describe("Locus Python API", () => {
     expect(api).toContain("async def list_models(");
     expect(api).toContain("async def call_tool(");
     expect(api).toContain("async def get_session(");
+    expect(api).toContain("async def list_running_sessions(");
+    expect(api).toContain("async def send_session_message(");
     expect(api).toContain("async def get_unity_editor_status(");
     expect(api).toContain("async def ensure_unity_editor(");
     expect(api).toContain("async def restart_unity_editor(");
@@ -92,6 +95,7 @@ describe("Locus Python API", () => {
     expect(models).toContain("blocking_dialog: UnityModalDialog | None");
     expect(models).toContain("class UnityEditorEnsureResult:");
     expect(models).toContain("class UnityEditorRestartResult:");
+    expect(models).toContain("class SessionMessageDelivery:");
     expect(models).toContain("async def event_stream(");
     expect(models).toContain("def raise_for_error(self)");
     expect(example).toContain("await asyncio.gather(");
@@ -102,17 +106,23 @@ describe("Locus Python API", () => {
     const builtins = read("src-tauri/src/tool/builtins/mod.rs");
     const pythonTool = read("src-tauri/src/tool/builtins/python.rs");
     const prompt = read("tools/python.json");
-    const devAgent = read("agent/dev/config.json");
+    const unityAgent = read("agent/unity/config.json");
+    const unityPrompt = read("agent/unity/tools/python.json");
     const simpleAgent = read("agent/simple/config.json");
 
     expect(builtins).toContain("registry.register_builtin(python::python())");
-    expect(devAgent).toContain('"python"');
+    expect(unityAgent).toContain('"python"');
     expect(simpleAgent).toContain('"python"');
-    expect(prompt).toContain("get_unity_editor_status");
-    expect(prompt).toContain("restart_unity_editor");
+    expect(prompt).not.toContain("get_unity_editor_status");
+    expect(prompt).not.toContain("restart_unity_editor");
+    expect(unityPrompt).toContain("get_unity_editor_status");
+    expect(unityPrompt).toContain("restart_unity_editor");
+    expect(unityPrompt).toContain("status.safe_mode");
+    expect(unityPrompt).toContain("status.editor_log_path");
     expect(prompt).toContain('"help"');
     expect(pythonTool).toContain("workspace_ref = locus.WorkspaceRef");
     expect(pythonTool).toContain("HELP_CALLBACKS");
     expect(pythonTool).toContain("python_process_env");
+    expect(pythonTool).toContain('command.env("LOCUS_SESSION_ID"');
   });
 });

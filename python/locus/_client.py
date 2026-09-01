@@ -56,10 +56,14 @@ class Client:
         *,
         base_url: str | None = None,
         token: str | None = None,
+        current_session_id: str | None = None,
         request_timeout: float = 35.0,
     ) -> None:
         self.base_url = (base_url or os.environ.get("LOCUS_SDK_URL", "")).strip()
         self.token = (token or os.environ.get("LOCUS_SDK_TOKEN", "")).strip()
+        self.current_session_id = (
+            current_session_id or os.environ.get("LOCUS_SESSION_ID", "")
+        ).strip() or None
         self.request_timeout = request_timeout
 
     def _require_connection(self) -> None:
@@ -304,7 +308,11 @@ class Client:
         dialog_id: str,
         choice_id: str,
     ) -> "UnityDialogChoiceResult":
-        """Invoke one choice returned by :meth:`get_unity_dialog`."""
+        """Invoke one choice returned by :meth:`get_unity_dialog`.
+
+        If the dialog was already handled manually, this returns a result with
+        ``invoked=False`` and ``status="dialog_not_found"`` instead of raising.
+        """
         from ._models import UnityDialogChoiceResult
 
         project = project.strip()
@@ -353,20 +361,64 @@ class Client:
         self,
         *,
         archived: bool = False,
+        running_only: bool = False,
         limit: int | None = None,
     ) -> list["SessionSummary"]:
         from ._models import SessionSummary
 
         if limit is not None and limit <= 0:
             raise ValueError("limit must be positive")
-        rows = await self.rpc("sessions.list", {"archived": archived, "limit": limit})
+        rows = await self.rpc(
+            "sessions.list",
+            {"archived": archived, "runningOnly": running_only, "limit": limit},
+        )
         return [SessionSummary.from_payload(row, self) for row in rows]
+
+    async def list_running_sessions(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list["SessionSummary"]:
+        """Return sessions that currently own an active Locus run."""
+        return await self.list_sessions(running_only=True, limit=limit)
 
     async def get_session(self, session_id: str) -> "Session":
         from ._models import Session
 
         payload = await self.rpc("sessions.get", {"sessionId": session_id})
         return Session.from_payload(payload, self)
+
+    async def send_session_message(
+        self,
+        session_id: str,
+        message: str,
+        *,
+        source_session_id: str | None = None,
+    ) -> "SessionMessageDelivery":
+        """Insert a source-labelled user message into another active session."""
+        from ._models import SessionMessageDelivery
+
+        session_id = session_id.strip()
+        message = message.strip()
+        source_session_id = (source_session_id or self.current_session_id or "").strip()
+        if not session_id:
+            raise ValueError("session_id cannot be empty")
+        if not message:
+            raise ValueError("message cannot be empty")
+        if not source_session_id:
+            raise LocusUnavailableError(
+                "The sending Locus session is unavailable. Run this call from the "
+                "Python tool inside an active session or pass source_session_id explicitly."
+            )
+        payload = await self.rpc(
+            "sessions.send",
+            {
+                "sessionId": session_id,
+                "sourceSessionId": source_session_id,
+                "message": message,
+            },
+        )
+        return SessionMessageDelivery.from_payload(payload)
 
     def define_agent(
         self,
@@ -456,6 +508,7 @@ if TYPE_CHECKING:
         ModelInfo,
         Run,
         Session,
+        SessionMessageDelivery,
         SessionSummary,
         ToolCallResult,
         ToolInfo,

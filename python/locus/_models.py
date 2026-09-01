@@ -123,6 +123,8 @@ class UnityEditorStatus:
     editor_path: str | None
     launch_mode: str | None
     headless: bool
+    safe_mode: bool
+    editor_log_path: str | None
     semantic_phase: str
     main_thread_blocked: bool
     blocking_reason: str | None
@@ -175,6 +177,8 @@ class UnityEditorStatus:
             editor_path=payload.get("editorPath"),
             launch_mode=payload.get("launchMode"),
             headless=bool(payload.get("headless")),
+            safe_mode=bool(payload.get("safeMode")),
+            editor_log_path=payload.get("editorLogPath"),
             semantic_phase=payload.get("semanticPhase", "unknown"),
             main_thread_blocked=bool(payload.get("mainThreadBlocked")),
             blocking_reason=payload.get("blockingReason"),
@@ -282,14 +286,19 @@ class UnityDialogChoiceResult:
     choice_id: str
     label: str
     invoked: bool
+    status: str = "invoked"
+    message: str = ""
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "UnityDialogChoiceResult":
+        invoked = bool(payload.get("invoked"))
         return cls(
             dialog_id=payload["dialogId"],
             choice_id=payload["choiceId"],
             label=payload.get("label", ""),
-            invoked=bool(payload.get("invoked")),
+            invoked=invoked,
+            status=payload.get("status", "invoked" if invoked else "dialog_not_found"),
+            message=payload.get("message", ""),
         )
 
 
@@ -576,6 +585,51 @@ class SessionSummary:
             raise RuntimeError("SessionSummary is not attached to a Locus client")
         return await self.client.get_session(self.id)
 
+    @property
+    def is_running(self) -> bool:
+        return self.runtime_status is not None
+
+    @property
+    def is_current(self) -> bool:
+        return self.client is not None and self.client.current_session_id == self.id
+
+    async def send_message(
+        self,
+        message: str,
+        *,
+        source_session_id: str | None = None,
+    ) -> "SessionMessageDelivery":
+        if self.client is None:
+            raise RuntimeError("SessionSummary is not attached to a Locus client")
+        return await self.client.send_session_message(
+            self.id,
+            message,
+            source_session_id=source_session_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class SessionMessageDelivery:
+    pending_input_id: str
+    source_session_id: str
+    source_session_title: str
+    target_session_id: str
+    target_session_title: str
+    target_run_id: str
+    delivery: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "SessionMessageDelivery":
+        return cls(
+            pending_input_id=payload["pendingInputId"],
+            source_session_id=payload["sourceSessionId"],
+            source_session_title=payload.get("sourceSessionTitle", ""),
+            target_session_id=payload["targetSessionId"],
+            target_session_title=payload.get("targetSessionTitle", ""),
+            target_run_id=payload["targetRunId"],
+            delivery=payload.get("delivery", "immediate"),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RunEvent:
@@ -644,6 +698,18 @@ class Session:
             {"sessionId": self.id, "afterSeq": after_seq, "limit": limit},
         )
         return [RunEvent.from_payload(event) for event in payload]
+
+    async def send_message(
+        self,
+        message: str,
+        *,
+        source_session_id: str | None = None,
+    ) -> SessionMessageDelivery:
+        return await self.client.send_session_message(
+            self.id,
+            message,
+            source_session_id=source_session_id,
+        )
 
     async def prompt(
         self,

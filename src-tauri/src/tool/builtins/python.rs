@@ -202,13 +202,17 @@ pub(super) fn python() -> ToolDef {
                     OsString::from(execution.workspace_generation.to_string()),
                 );
 
-                if let Some(report) = ctx.progress.as_ref() {
-                    report("Python workflow running".to_string());
-                }
                 let owner = ctx.process_owner.clone().unwrap_or_else(|| ProcessOwner {
                     working_dir: Some(project.clone()),
                     ..Default::default()
                 });
+                if let Some(session_id) = owner.session_id.as_deref() {
+                    command.env("LOCUS_SESSION_ID", OsString::from(session_id));
+                }
+
+                if let Some(report) = ctx.progress.as_ref() {
+                    report("Python workflow running".to_string());
+                }
                 let execution = run_captured_command_with_input(
                     command,
                     Some(source.into_bytes()),

@@ -9,6 +9,8 @@ print({
     "pid": status.process_id,
     "connected": status.connected,
     "ready": status.ready,
+    "safe_mode": status.safe_mode,
+    "editor_log": status.editor_log_path,
     "main_thread_blocked": status.main_thread_blocked,
     "dialog_recoverable": status.blocking_dialog_recoverable,
     "dialog": status.blocking_dialog,
@@ -39,6 +41,8 @@ print(restarted.closed_process_ids, restarted.forced_process_ids)
 
 `ready` becomes false while a modal dialog blocks the main thread, even when the status channel still responds. `blocking_reason`, `blocking_dialog`, `blocking_dialog_recoverable`, `main_thread`, and `safety` describe observable state and available capabilities. The model chooses whether to resolve a dialog, wait, or restart the editor.
 
+`safe_mode` is detected outside the Unity managed domain. In Safe Mode, call `unity_get_console_log` with `level="error"`, repair the referenced source files with file tools, and poll status. If Unity does not consume the external file change promptly, call `restart_unity_editor(...)` and wait for `ready`. After an abnormal exit, inspect `editor_log_path` before restarting Unity.
+
 Resolve a native Unity modal dialog while the managed main thread is blocked:
 
 ```python
@@ -52,5 +56,7 @@ if dialog:
     )
     print(result)
 ```
+
+`choose_unity_dialog(...)` returns after the selected dialog has closed or been replaced, so the next Unity call cannot race with the original modal window. If the user already handled the dialog, the call returns `invoked=False` with `status="dialog_not_found"`; this is a normal result and does not raise an RPC error.
 
 For a detached `unity_execute` result, pass its execution id to `await locus.wait_unity_execution(...)`.

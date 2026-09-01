@@ -25,6 +25,7 @@ from ._models import (
     RunStatus,
     Session,
     SessionMessage,
+    SessionMessageDelivery,
     SessionSummary,
     ToolCallImage,
     ToolCallResult,
@@ -56,6 +57,7 @@ __all__ = [
     "RunStatus",
     "Session",
     "SessionMessage",
+    "SessionMessageDelivery",
     "SessionSummary",
     "ToolCallImage",
     "ToolCallResult",
@@ -81,12 +83,14 @@ __all__ = [
     "get_workspace",
     "list_agents",
     "list_models",
+    "list_running_sessions",
     "list_sessions",
     "list_tools",
     "prompt",
     "choose_unity_dialog",
     "ensure_unity_editor",
     "restart_unity_editor",
+    "send_session_message",
     "wait_unity_execution",
     "tool",
 ]
@@ -209,13 +213,37 @@ async def wait_unity_execution(
 async def list_sessions(
     *,
     archived: bool = False,
+    running_only: bool = False,
     limit: int | None = None,
 ) -> list[SessionSummary]:
-    return await _client().list_sessions(archived=archived, limit=limit)
+    return await _client().list_sessions(
+        archived=archived,
+        running_only=running_only,
+        limit=limit,
+    )
+
+
+async def list_running_sessions(*, limit: int | None = None) -> list[SessionSummary]:
+    """Return sessions that currently own an active Locus run."""
+    return await _client().list_running_sessions(limit=limit)
 
 
 async def get_session(session_id: str) -> Session:
     return await _client().get_session(session_id)
+
+
+async def send_session_message(
+    session_id: str,
+    message: str,
+    *,
+    source_session_id: str | None = None,
+) -> SessionMessageDelivery:
+    """Insert a source-labelled user message into another active session."""
+    return await _client().send_session_message(
+        session_id,
+        message,
+        source_session_id=source_session_id,
+    )
 
 
 async def get_agent(agent_id: str) -> Agent:

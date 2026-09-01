@@ -22,7 +22,9 @@ use tauri::{AppHandle, Manager};
 use tokio::net::TcpListener;
 
 use crate::agent::definition::{canonical_agent_id, AgentDef};
-use crate::session::models::{MessageRole, SessionEventRecord, SessionRunSummary};
+use crate::session::models::{
+    MessageRole, SessionEventRecord, SessionRunSummary, SessionRuntimeStatus, SessionSummary,
+};
 use crate::session::store::SessionStore;
 use crate::tool::{
     ToolDef, ToolExecuteFn, ToolExecutionContext, ToolLoadMode, ToolRegistry, ToolResult,
@@ -426,6 +428,8 @@ struct ListSessionsParams {
     #[serde(default)]
     archived: bool,
     #[serde(default)]
+    running_only: bool,
+    #[serde(default)]
     limit: Option<u32>,
     #[serde(default)]
     workspace_ref: Option<crate::workspace_service::WorkspaceRef>,
@@ -497,6 +501,45 @@ enum UnityEnsureTarget {
     Ready,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnityLaunchWaitState {
+    Satisfied,
+    Waiting,
+    Exited,
+}
+
+fn unity_launch_wait_state(
+    target_satisfied: bool,
+    status_process_id: Option<u32>,
+    launch_process_id: u32,
+    launch_liveness: Option<crate::unity_bridge::UnityProcessIdentityLiveness>,
+) -> UnityLaunchWaitState {
+    if matches!(
+        launch_liveness,
+        Some(
+            crate::unity_bridge::UnityProcessIdentityLiveness::Exited
+                | crate::unity_bridge::UnityProcessIdentityLiveness::Replaced
+        )
+    ) {
+        return UnityLaunchWaitState::Exited;
+    }
+    if target_satisfied
+        && status_process_id == Some(launch_process_id)
+        && launch_liveness == Some(crate::unity_bridge::UnityProcessIdentityLiveness::Alive)
+    {
+        return UnityLaunchWaitState::Satisfied;
+    }
+    UnityLaunchWaitState::Waiting
+}
+
+fn sdk_semantic_status_matches_launch(
+    status: &SdkUnityEditorStatus,
+    launch_process_id: u32,
+) -> bool {
+    status.process_id == Some(launch_process_id)
+        && status.semantic.process.pid == Some(launch_process_id)
+}
+
 impl UnityEnsureTarget {
     fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim).filter(|value| !value.is_empty()) {
@@ -534,6 +577,9 @@ struct SdkUnityEditorStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     launch_mode: Option<crate::unity_bridge::UnityLaunchMode>,
     headless: bool,
+    safe_mode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor_log_path: Option<String>,
     semantic_phase: String,
     main_thread_blocked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -590,6 +636,26 @@ struct SdkRestartUnityEditorResult {
 #[serde(rename_all = "camelCase")]
 struct SessionParams {
     session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendSessionMessageParams {
+    session_id: String,
+    source_session_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SdkSessionMessageDelivery {
+    pending_input_id: String,
+    source_session_id: String,
+    source_session_title: String,
+    target_session_id: String,
+    target_session_title: String,
+    target_run_id: String,
+    delivery: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1618,7 +1684,10 @@ async fn sdk_unity_editor_status(
             semantic.main_thread.state.as_str(),
             "blocked" | "hung" | "stalled"
         );
-    let blocking_reason = if blocking_dialog.is_some() {
+    let safe_mode = semantic.phase == "safe_mode" || semantic.editor_log.safe_mode;
+    let blocking_reason = if safe_mode {
+        Some("safe_mode".to_string())
+    } else if blocking_dialog.is_some() {
         Some("modal_dialog".to_string())
     } else if matches!(semantic.main_thread.state.as_str(), "hung" | "stalled") {
         Some(semantic.main_thread.state.clone())
@@ -1647,6 +1716,8 @@ async fn sdk_unity_editor_status(
             .or_else(|| semantic.process.path.clone()),
         launch_mode: connection.launch_mode,
         headless: connection.headless,
+        safe_mode,
+        editor_log_path: semantic.editor_log.path.clone(),
         semantic_phase: semantic.phase.clone(),
         main_thread_blocked,
         blocking_reason,
@@ -1659,6 +1730,14 @@ async fn sdk_unity_editor_status(
         connection,
         semantic,
     }
+}
+
+fn unity_safe_mode_wait_error(status: &SdkUnityEditorStatus, target: UnityEnsureTarget) -> String {
+    let log = status.editor_log_path.as_deref().unwrap_or("unavailable");
+    format!(
+        "Unity Editor entered Safe Mode before reaching '{}': project={}, editorLog={}. Read the Editor log or call unity_get_console_log with level='error', fix the compiler errors with file tools, then wait for Unity to exit Safe Mode automatically.",
+        target.as_str(), status.project_path, log
+    )
 }
 
 async fn get_unity_editor_status(
@@ -1750,6 +1829,9 @@ async fn ensure_unity_editor(
         })
         .map_err(|error| error.to_string());
     }
+    if initial_status.safe_mode && target == UnityEnsureTarget::Ready {
+        return Err(unity_safe_mode_wait_error(&initial_status, target));
+    }
 
     let launch = match initial_status.process_state {
         crate::unity_bridge::UnityEditorProcessState::Running => None,
@@ -1774,10 +1856,71 @@ async fn ensure_unity_editor(
         }
     };
     let launched = launch.is_some();
+    let launch_created_at_ms = launch.as_ref().and_then(|launch| {
+        crate::unity_bridge::launched_unity_process_created_at_ms(launch.process_id)
+    });
+    let mut launch_liveness_probe_error: Option<String> = None;
 
     loop {
         let status = sdk_unity_editor_status(&runtime).await;
-        if status.satisfies(target) {
+        let mut launch_liveness = None;
+        if let Some(expected_launch) = launch.as_ref() {
+            if status.process_id != Some(expected_launch.process_id) {
+                match crate::unity_bridge::reaffirm_launched_unity_editor_process(
+                    &expected_launch.project_path,
+                    &expected_launch.editor_path,
+                    expected_launch.process_id,
+                    launch_created_at_ms,
+                )
+                .await
+                {
+                    Ok(liveness) => {
+                        launch_liveness_probe_error = None;
+                        launch_liveness = Some(liveness);
+                    }
+                    Err(error) => launch_liveness_probe_error = Some(error),
+                }
+            } else if status.satisfies(target) {
+                match crate::unity_bridge::launched_unity_process_liveness(
+                    expected_launch.process_id,
+                    launch_created_at_ms,
+                ) {
+                    Ok(liveness) => {
+                        launch_liveness_probe_error = None;
+                        launch_liveness = Some(liveness);
+                    }
+                    Err(error) => launch_liveness_probe_error = Some(error),
+                }
+            }
+            match unity_launch_wait_state(
+                status.satisfies(target),
+                status.process_id,
+                expected_launch.process_id,
+                launch_liveness,
+            ) {
+                UnityLaunchWaitState::Satisfied => {
+                    return serde_json::to_value(SdkEnsureUnityEditorResult {
+                        launched,
+                        wait_until: target.as_str().to_string(),
+                        waited_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX))
+                            as u64,
+                        launch,
+                        status,
+                    })
+                    .map_err(|error| error.to_string());
+                }
+                UnityLaunchWaitState::Exited => {
+                    return Err(format!(
+                        "Unity Editor process {} exited before reaching '{}': phase={}, project={}",
+                        expected_launch.process_id,
+                        target.as_str(),
+                        status.semantic_phase,
+                        status.project_path
+                    ));
+                }
+                UnityLaunchWaitState::Waiting => {}
+            }
+        } else if status.satisfies(target) {
             return serde_json::to_value(SdkEnsureUnityEditorResult {
                 launched,
                 wait_until: target.as_str().to_string(),
@@ -1787,11 +1930,19 @@ async fn ensure_unity_editor(
             })
             .map_err(|error| error.to_string());
         }
+        let safe_mode_is_authoritative = launch.as_ref().map_or(true, |expected_launch| {
+            sdk_semantic_status_matches_launch(&status, expected_launch.process_id)
+        });
+        if status.safe_mode && target == UnityEnsureTarget::Ready && safe_mode_is_authoritative {
+            return Err(unity_safe_mode_wait_error(&status, target));
+        }
 
-        if matches!(
-            status.process_state,
-            crate::unity_bridge::UnityEditorProcessState::NotRunning
-        ) {
+        if launch.is_none()
+            && matches!(
+                status.process_state,
+                crate::unity_bridge::UnityEditorProcessState::NotRunning
+            )
+        {
             return Err(format!(
                 "Unity Editor exited before reaching '{}': phase={}, project={}",
                 target.as_str(),
@@ -1802,13 +1953,14 @@ async fn ensure_unity_editor(
 
         if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
             return Err(format!(
-                "Timed out after {}ms waiting for Unity Editor to reach '{}': process={:?}, phase={}, channel={}, project={}",
+                "Timed out after {}ms waiting for Unity Editor to reach '{}': process={:?}, phase={}, channel={}, project={}, launchProbe={}",
                 timeout_ms,
                 target.as_str(),
                 status.process_state,
                 status.semantic_phase,
                 status.semantic.channel.control_pipe,
-                status.project_path
+                status.project_path,
+                launch_liveness_probe_error.as_deref().unwrap_or("ok")
             ));
         }
 
@@ -1873,42 +2025,86 @@ async fn restart_unity_editor(
     let launch = crate::unity_bridge::launch_project_with_mode(&project_path, launch_mode)
         .await
         .map_err(|error| format!("unity.editor.restart failed to launch Unity: {error}"))?;
+    let launch_created_at_ms =
+        crate::unity_bridge::launched_unity_process_created_at_ms(launch.process_id);
+    let mut launch_liveness_probe_error: Option<String> = None;
 
     loop {
         let status = sdk_unity_editor_status(&runtime).await;
-        if status.satisfies(target) {
-            return serde_json::to_value(SdkRestartUnityEditorResult {
-                closed_process_ids: close.process_ids,
-                forced_process_ids: close.forced_process_ids,
-                wait_until: target.as_str().to_string(),
-                waited_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-                launch,
-                status,
-            })
-            .map_err(|error| error.to_string());
+        let mut launch_liveness = None;
+        if status.process_id != Some(launch.process_id) {
+            match crate::unity_bridge::reaffirm_launched_unity_editor_process(
+                &launch.project_path,
+                &launch.editor_path,
+                launch.process_id,
+                launch_created_at_ms,
+            )
+            .await
+            {
+                Ok(liveness) => {
+                    launch_liveness_probe_error = None;
+                    launch_liveness = Some(liveness);
+                }
+                Err(error) => launch_liveness_probe_error = Some(error),
+            }
+        } else if status.satisfies(target) {
+            match crate::unity_bridge::launched_unity_process_liveness(
+                launch.process_id,
+                launch_created_at_ms,
+            ) {
+                Ok(liveness) => {
+                    launch_liveness_probe_error = None;
+                    launch_liveness = Some(liveness);
+                }
+                Err(error) => launch_liveness_probe_error = Some(error),
+            }
         }
-
-        if matches!(
-            status.process_state,
-            crate::unity_bridge::UnityEditorProcessState::NotRunning
+        match unity_launch_wait_state(
+            status.satisfies(target),
+            status.process_id,
+            launch.process_id,
+            launch_liveness,
         ) {
-            return Err(format!(
-                "Restarted Unity Editor exited before reaching '{}': phase={}, project={}",
-                target.as_str(),
-                status.semantic_phase,
-                status.project_path
-            ));
+            UnityLaunchWaitState::Satisfied => {
+                return serde_json::to_value(SdkRestartUnityEditorResult {
+                    closed_process_ids: close.process_ids,
+                    forced_process_ids: close.forced_process_ids,
+                    wait_until: target.as_str().to_string(),
+                    waited_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    launch,
+                    status,
+                })
+                .map_err(|error| error.to_string());
+            }
+            UnityLaunchWaitState::Exited => {
+                return Err(format!(
+                    "Restarted Unity Editor process {} exited before reaching '{}': phase={}, project={}",
+                    launch.process_id,
+                    target.as_str(),
+                    status.semantic_phase,
+                    status.project_path
+                ));
+            }
+            UnityLaunchWaitState::Waiting => {}
+        }
+        if status.safe_mode
+            && target == UnityEnsureTarget::Ready
+            && sdk_semantic_status_matches_launch(&status, launch.process_id)
+        {
+            return Err(unity_safe_mode_wait_error(&status, target));
         }
 
         if started_at.elapsed() >= Duration::from_millis(timeout_ms) {
             return Err(format!(
-                "Timed out after {}ms waiting for restarted Unity Editor to reach '{}': process={:?}, phase={}, channel={}, project={}",
+                "Timed out after {}ms waiting for restarted Unity Editor to reach '{}': process={:?}, phase={}, channel={}, project={}, launchPid={}, launchProbe={}",
                 timeout_ms,
                 target.as_str(),
                 status.process_state,
                 status.semantic_phase,
                 status.semantic.channel.control_pipe,
-                status.project_path
+                status.project_path,
+                launch.process_id,
+                launch_liveness_probe_error.as_deref().unwrap_or("ok")
             ));
         }
 
@@ -1953,6 +2149,43 @@ async fn wait_unity_execution(
     Ok(Value::String(output))
 }
 
+fn sdk_runtime_status(status: &str) -> SessionRuntimeStatus {
+    match status {
+        "queued" => SessionRuntimeStatus::Queued,
+        "starting" => SessionRuntimeStatus::Starting,
+        "waiting_input" => SessionRuntimeStatus::WaitingInput,
+        "finishing" => SessionRuntimeStatus::Finishing,
+        "cancelling" => SessionRuntimeStatus::Cancelling,
+        "error" => SessionRuntimeStatus::Error,
+        _ => SessionRuntimeStatus::Running,
+    }
+}
+
+async fn populate_sdk_session_runtime_statuses(
+    app: &AppHandle,
+    sessions: &mut [SessionSummary],
+) -> Result<(), String> {
+    let active_tasks = app.state::<ActiveTasks>();
+    let active_runs = active_tasks
+        .lock()
+        .await
+        .iter()
+        .map(|(session_id, task)| (session_id.clone(), task.run_id.clone()))
+        .collect::<HashMap<_, _>>();
+    let store = app.state::<Arc<SessionStore>>();
+
+    for session in sessions {
+        session.runtime_status = match active_runs.get(&session.id) {
+            Some(run_id) => store
+                .run_by_id(run_id)?
+                .map(|run| sdk_runtime_status(&run.status))
+                .or(Some(SessionRuntimeStatus::Running)),
+            None => None,
+        };
+    }
+    Ok(())
+}
+
 async fn list_sdk_sessions(app: &AppHandle, params: ListSessionsParams) -> Result<Value, String> {
     let store = app.state::<Arc<SessionStore>>();
     let mut sessions = match params.workspace_ref.as_ref() {
@@ -1967,10 +2200,124 @@ async fn list_sdk_sessions(app: &AppHandle, params: ListSessionsParams) -> Resul
         None if params.archived => store.list_archived_sessions(None)?,
         None => store.list_sessions(None)?,
     };
+    populate_sdk_session_runtime_statuses(app, &mut sessions).await?;
+    if params.running_only {
+        sessions.retain(|session| session.runtime_status.is_some());
+    }
     if let Some(limit) = params.limit {
         sessions.truncate(limit.clamp(1, 1_000) as usize);
     }
     serde_json::to_value(sessions).map_err(|error| error.to_string())
+}
+
+fn single_line_session_title(title: &str) -> String {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = if title.is_empty() {
+        "未命名会话".to_string()
+    } else {
+        title
+    };
+    title.chars().take(160).collect()
+}
+
+fn cross_session_message(
+    source_session_id: &str,
+    source_session_title: &str,
+    message: &str,
+) -> String {
+    format!(
+        "[来自 Locus session：{}（{}）]\n\n{}",
+        single_line_session_title(source_session_title),
+        source_session_id,
+        message.trim()
+    )
+}
+
+async fn send_sdk_session_message(
+    app: &AppHandle,
+    params: SendSessionMessageParams,
+) -> Result<Value, String> {
+    let target_session_id = params.session_id.trim();
+    let source_session_id = params.source_session_id.trim();
+    let message = params.message.trim();
+    if target_session_id.is_empty() {
+        return Err("sessionId cannot be empty".to_string());
+    }
+    if source_session_id.is_empty() {
+        return Err(
+            "sourceSessionId is required; call this API from a running Locus session".to_string(),
+        );
+    }
+    if target_session_id == source_session_id {
+        return Err("A session cannot send a message to itself".to_string());
+    }
+    if message.is_empty() {
+        return Err("message cannot be empty".to_string());
+    }
+
+    let store = app.state::<Arc<SessionStore>>();
+    let source_session_title = store
+        .get_session_title(source_session_id)?
+        .ok_or_else(|| format!("Source session not found: {source_session_id}"))?;
+    let target_session_title = store
+        .get_session_title(target_session_id)?
+        .ok_or_else(|| format!("Target session not found: {target_session_id}"))?;
+
+    {
+        let active_tasks = app.state::<ActiveTasks>();
+        let tasks = active_tasks.lock().await;
+        if !tasks.contains_key(source_session_id) {
+            return Err(format!(
+                "Source session '{source_session_id}' is no longer running"
+            ));
+        }
+    }
+
+    let text = cross_session_message(source_session_id, &source_session_title, message);
+    let target_run_id = {
+        let active_tasks = app.state::<ActiveTasks>();
+        let run_id = active_tasks
+            .lock()
+            .await
+            .get(target_session_id)
+            .map(|task| task.run_id.clone())
+            .ok_or_else(|| format!("Target session '{target_session_id}' is not running"))?;
+        run_id
+    };
+    let pending = crate::commands::queue_chat_input(
+        target_session_id.to_string(),
+        target_run_id,
+        format!(
+            "sdk-session-message:{}:{}",
+            source_session_id,
+            uuid::Uuid::new_v4()
+        ),
+        text.clone(),
+        Some(text),
+        None,
+        None,
+        Some("build".to_string()),
+        None,
+        None,
+        Some("immediate".to_string()),
+        app.clone(),
+        app.state::<Arc<SessionStore>>(),
+        app.state::<crate::PendingInputQueueHandle>(),
+        app.state::<ActiveTasks>(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+
+    serde_json::to_value(SdkSessionMessageDelivery {
+        pending_input_id: pending.id,
+        source_session_id: source_session_id.to_string(),
+        source_session_title,
+        target_session_id: target_session_id.to_string(),
+        target_session_title,
+        target_run_id: pending.run_id.clone(),
+        delivery: pending.delivery,
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn get_sdk_session(app: &AppHandle, params: SessionParams) -> Result<Value, String> {
@@ -2404,6 +2751,7 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
         "unity.execution.wait" => wait_unity_execution(app, parse_params(params)?).await,
         "sessions.list" => list_sdk_sessions(app, parse_params(params)?).await,
         "sessions.get" => get_sdk_session(app, parse_params(params)?),
+        "sessions.send" => send_sdk_session_message(app, parse_params(params)?).await,
         "sessions.events" => list_sdk_session_events(app, parse_params(params)?),
         "runs.get" => {
             let params: RunParams = parse_params(params)?;
@@ -2549,9 +2897,12 @@ pub async fn start(app: AppHandle) -> Result<SocketAddr, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        host_allowed, is_agent_only_tool, token_matches, validate_agent_id, ListModelsParams,
-        UnityEnsureTarget, CODEX_FALLBACK_MODELS, STATIC_MODELS,
+        cross_session_message, host_allowed, is_agent_only_tool, sdk_runtime_status, token_matches,
+        unity_launch_wait_state, validate_agent_id, ListModelsParams, ListSessionsParams,
+        UnityEnsureTarget, UnityLaunchWaitState, CODEX_FALLBACK_MODELS, STATIC_MODELS,
     };
+    use crate::session::models::SessionRuntimeStatus;
+    use crate::unity_bridge::UnityProcessIdentityLiveness;
 
     #[test]
     fn validates_runtime_agent_ids() {
@@ -2589,6 +2940,29 @@ mod tests {
     }
 
     #[test]
+    fn running_session_filter_defaults_off_and_accepts_camel_case() {
+        let default_params: ListSessionsParams =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!default_params.running_only);
+
+        let filtered: ListSessionsParams =
+            serde_json::from_value(serde_json::json!({ "runningOnly": true })).unwrap();
+        assert!(filtered.running_only);
+    }
+
+    #[test]
+    fn cross_session_messages_carry_source_title_and_id() {
+        assert_eq!(
+            cross_session_message("session-source", " Source\n workflow ", " check this "),
+            "[来自 Locus session：Source workflow（session-source）]\n\ncheck this"
+        );
+        assert_eq!(
+            sdk_runtime_status("waiting_input"),
+            SessionRuntimeStatus::WaitingInput
+        );
+    }
+
+    #[test]
     fn unity_ensure_target_defaults_to_ready_and_rejects_unknown_values() {
         assert_eq!(
             UnityEnsureTarget::parse(None).unwrap(),
@@ -2603,6 +2977,71 @@ mod tests {
             UnityEnsureTarget::Connected
         );
         assert!(UnityEnsureTarget::parse(Some("running")).is_err());
+    }
+
+    #[test]
+    fn launched_editor_waits_through_old_generation_crash_observation() {
+        assert_eq!(
+            unity_launch_wait_state(false, None, 5252, Some(UnityProcessIdentityLiveness::Alive),),
+            UnityLaunchWaitState::Waiting
+        );
+        assert_eq!(
+            unity_launch_wait_state(
+                true,
+                Some(4242),
+                5252,
+                Some(UnityProcessIdentityLiveness::Alive),
+            ),
+            UnityLaunchWaitState::Waiting
+        );
+        assert_eq!(
+            unity_launch_wait_state(
+                true,
+                Some(5252),
+                5252,
+                Some(UnityProcessIdentityLiveness::Alive),
+            ),
+            UnityLaunchWaitState::Satisfied
+        );
+        assert_eq!(
+            unity_launch_wait_state(true, Some(5252), 5252, None),
+            UnityLaunchWaitState::Waiting
+        );
+    }
+
+    #[test]
+    fn launched_editor_exit_requires_identity_confirmation() {
+        assert_eq!(
+            unity_launch_wait_state(
+                false,
+                None,
+                5252,
+                Some(UnityProcessIdentityLiveness::Exited),
+            ),
+            UnityLaunchWaitState::Exited
+        );
+        assert_eq!(
+            unity_launch_wait_state(
+                true,
+                Some(5252),
+                5252,
+                Some(UnityProcessIdentityLiveness::Exited),
+            ),
+            UnityLaunchWaitState::Exited
+        );
+        assert_eq!(
+            unity_launch_wait_state(
+                false,
+                None,
+                5252,
+                Some(UnityProcessIdentityLiveness::Replaced),
+            ),
+            UnityLaunchWaitState::Exited
+        );
+        assert_eq!(
+            unity_launch_wait_state(false, None, 5252, None),
+            UnityLaunchWaitState::Waiting
+        );
     }
 
     #[test]
