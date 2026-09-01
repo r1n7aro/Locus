@@ -238,15 +238,23 @@ const errorDetail = computed(() =>
 }
 
 .tool-call-name {
-  font-weight: 600;
-  font-family: var(--font-mono-identifier);
-  color: var(--text-color);
-  font-size: 12px;
+  font-weight: 400;
+  font-family: var(--font-ui-label);
+  color: var(--text-secondary);
+  font-size: 13px;
   flex-shrink: 0;
+}
+
+.exit-plan-tool-block.is-expanded .tool-call-name {
+  color: var(--text-color);
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .tool-call-summary {
   color: var(--text-secondary);
+  font-family: var(--font-mono-identifier);
   font-size: 11px;
   white-space: nowrap;
   overflow: hidden;

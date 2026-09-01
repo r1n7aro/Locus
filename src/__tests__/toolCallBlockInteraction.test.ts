@@ -74,4 +74,45 @@ describe("tool call block interactions", () => {
     expect(noteRule).not.toContain("var(--status-good-bg)");
     expect(noteRule).not.toContain("var(--status-good-border)");
   });
+
+  it("uses proportional collapsed labels and monospace expanded tool names", () => {
+    const toolBlockFiles = [
+      ["src/components/ToolCallBlock.vue", ".tool-call-block.is-expanded .tool-call-name"],
+      ["src/components/tool-block-overrides/UnityExecuteToolBlock.vue", ".unity-tool-call-block.is-expanded .tool-call-name"],
+      ["src/components/tool-block-overrides/UnityRunStatesToolBlock.vue", ".unity-tool-call-block.is-expanded .tool-call-name"],
+      ["src/components/tool-block-overrides/KnowledgeQueryToolBlock.vue", ".knowledge-query-tool-block.is-expanded .tool-call-name"],
+      ["src/components/tool-block-overrides/ExitPlanModeToolBlock.vue", ".exit-plan-tool-block.is-expanded .tool-call-name"],
+    ];
+
+    for (const [relPath, expandedSelector] of toolBlockFiles) {
+      const source = read(relPath);
+      const nameRule = source.match(/\.tool-call-name\s*\{([^}]+)\}/)?.[1] ?? "";
+      const summaryRule = source.match(/\.tool-call-summary\s*\{([^}]+)\}/)?.[1] ?? "";
+      const normalizedSource = source.replaceAll("\r\n", "\n");
+
+      expect(nameRule).toContain("font-weight: 400;");
+      expect(nameRule).toContain("font-family: var(--font-ui-label);");
+      expect(nameRule).toContain("font-size: 13px;");
+      expect(nameRule).toContain("color: var(--text-secondary);");
+      expect(summaryRule).toContain("font-family: var(--font-mono-identifier);");
+      expect(summaryRule).toContain("color: var(--text-secondary);");
+      expect(normalizedSource).toContain(
+        `${expandedSelector} {\n  color: var(--text-color);\n  font-family: var(--font-mono-identifier);\n  font-size: 12px;\n  font-weight: 600;\n}`,
+      );
+    }
+
+    const collection = read("src/components/ToolCallCollection.vue");
+    const batchTitleRule = collection.match(/\.tool-call-batch-title\s*\{([^}]+)\}/)?.[1] ?? "";
+
+    expect(batchTitleRule).toContain("font-weight: 400;");
+    expect(batchTitleRule).toContain("font-family: var(--font-ui-label);");
+    expect(batchTitleRule).toContain("font-size: 13px;");
+    expect(batchTitleRule).toContain("color: var(--text-secondary);");
+    expect(collection).toMatch(
+      /\.tool-call-batch-summary\.open \.tool-call-batch-title\s*\{\s*color: var\(--text-color\);/,
+    );
+    expect(collection).toMatch(
+      /\.tool-call-collection\.is-expanded :deep\(\.tool-call-name\),\s*\.tool-call-collection:not\(\.is-collapsible\) :deep\(\.tool-call-name\)\s*\{\s*color: var\(--text-color\);\s*font-family: var\(--font-mono-identifier\);\s*font-size: 12px;\s*font-weight: 600;/,
+    );
+  });
 });

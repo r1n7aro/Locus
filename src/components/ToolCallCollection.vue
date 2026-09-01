@@ -527,9 +527,22 @@ watch(
 .tool-call-batch-title {
   min-width: 0;
   line-height: 1.45;
+  font-family: var(--font-ui-label);
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.tool-call-batch-summary.open .tool-call-batch-title {
+  color: var(--text-color);
+}
+
+.tool-call-collection.is-expanded :deep(.tool-call-name),
+.tool-call-collection:not(.is-collapsible) :deep(.tool-call-name) {
+  color: var(--text-color);
+  font-family: var(--font-mono-identifier);
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-color);
 }
 
 .tool-call-batch-meta {

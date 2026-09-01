@@ -13,6 +13,7 @@ const legacyFontTokenRe = new RegExp(`var\\(${legacyFontToken}\\s*,`);
 const allowedFontFamilies = new Set([
   "inherit",
   "var(--font-ui)",
+  "var(--font-ui-label)",
   "var(--font-prose)",
   "var(--font-mono-inline)",
   "var(--font-mono-identifier)",
@@ -42,6 +43,12 @@ function collectTextFiles(dir: string): string[] {
 }
 
 describe("typography tokens", () => {
+  it("defines a proportional UI label token", () => {
+    const typography = readFileSync(typographyFile, "utf8");
+
+    expect(typography).toContain("--font-ui-label: var(--font-stack-sans);");
+  });
+
   it("uses only semantic font tokens outside typography.css", () => {
     const violations: string[] = [];
 

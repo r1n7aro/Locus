@@ -12,6 +12,7 @@
     "Noto Sans CJK SC", "Source Han Sans SC", monospace;
 
   --font-ui: var(--font-stack-mono);
+  --font-ui-label: var(--font-stack-sans);
   --font-prose: var(--font-stack-mono);
   --font-mono-inline: var(--font-stack-mono);
   --font-mono-identifier: var(--font-stack-mono);
