@@ -25,12 +25,7 @@ import { prepareMarkdownCitations } from "../composables/markdownCitations";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
 import { loadCachedMarkdownPathStatuses } from "../composables/markdownPathStatusCache";
-import {
-  armLocusFilePointerDrag,
-  armUnityReferencePointerDrag,
-  startLocusFileHtmlDrag,
-  startUnityReferenceHtmlDrag,
-} from "../composables/useUnityReferenceDragSource";
+import { useInternalDragController } from "../composables/useInternalDrag";
 import { resolveMarkdownImage } from "../services/markdownImage";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
@@ -41,11 +36,10 @@ import { t } from "../i18n";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
 import UnityPropertyFenceBlock from "./unity/UnityPropertyFenceBlock.vue";
-import type { LocusFileDropRef } from "../services/unity";
-import type { AssetRefAttachment, Citation } from "../types";
+import type { Citation } from "../types";
 import type { WorkspaceRef } from "../services/project";
 import type { UnityObjectPreviewInput, UnityObjectPreviewLevel } from "./unity-preview";
-import { isWorkbenchReferencePointerEventClaimed } from "./workbench/workbenchReferenceDrag";
+import { startWorkbenchReferenceInternalDrag } from "./workbench/workbenchReferenceDrag";
 
 const props = defineProps<{
   content: string;
@@ -65,6 +59,7 @@ const rootRef = ref<HTMLElement | null>(null);
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
+const internalDrag = useInternalDragController();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
 const inlinePathStatuses = ref<Map<string, MarkdownPathStatus>>(new Map());
 const appContext = getCurrentInstance()?.appContext ?? null;
@@ -273,10 +268,6 @@ function markdownUnityLevelForHost(host: HTMLElement): UnityObjectPreviewLevel {
 
 function isPassiveMarkdownUnityPreviewLevel(level: UnityObjectPreviewLevel): boolean {
   return level !== "inline";
-}
-
-function isInsidePassiveMarkdownUnityPreview(target: Element): boolean {
-  return !!target.closest("[data-md-unity-passive='true']");
 }
 
 function markdownUnityObjectModelFromHost(host: HTMLElement): UnityObjectPreviewInput | null {
@@ -679,90 +670,17 @@ function normalizeUnityRefDatasetPath(value?: string): string {
   return (value ?? "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
 }
 
-function unityRefFromMarkdownDragTarget(target: Element): AssetRefAttachment | null {
-  if (isInsidePassiveMarkdownUnityPreview(target)) return null;
-
-  const sceneRef = target.closest(".md-unity-scene-object-ref") as HTMLElement | null;
-  if (sceneRef) {
-    const scenePath = normalizeUnityRefDatasetPath(sceneRef.dataset.scenePath);
-    const objectPath = normalizeUnityRefDatasetPath(sceneRef.dataset.sceneObjectPath);
-    if (scenePath && objectPath) {
-      return {
-        kind: "sceneObject",
-        path: `${scenePath}/${objectPath}`,
-        source: "manual",
-      };
-    }
-  }
-
-  const assetRef = target.closest(".md-unity-asset-ref, .md-file-ref[data-asset-path]") as HTMLElement | null;
-  if (assetRef) {
-    const assetPath = normalizeUnityRefDatasetPath(assetRef.dataset.assetPath || assetRef.dataset.filePath);
-    if (/^(Assets|Packages)\//i.test(assetPath)) {
-      return {
-        kind: "asset",
-        path: assetPath,
-        source: "manual",
-      };
-    }
-  }
-
-  return null;
-}
-
-function localFileFromMarkdownDragTarget(target: Element): LocusFileDropRef | null {
-  if (isInsidePassiveMarkdownUnityPreview(target)) return null;
-
-  const workspaceRef = target.closest(".md-workspace-ref[data-workspace-path]") as HTMLElement | null;
-  if (workspaceRef) {
-    const path = normalizeUnityRefDatasetPath(workspaceRef.dataset.workspacePath);
-    if (path) {
-      return {
-        path,
-        isDir: workspaceRef.dataset.entryKind === "folder",
-        source: "locus",
-      };
-    }
-  }
-
-  const fileRef = target.closest(".md-file-ref[data-file-path]") as HTMLElement | null;
-  if (!fileRef || fileRef.classList.contains("md-knowledge-ref")) return null;
-  if (fileRef.classList.contains("md-unity-asset-ref") || fileRef.classList.contains("md-unity-scene-object-ref")) {
-    return null;
-  }
-
-  const path = normalizeUnityRefDatasetPath(fileRef.dataset.filePath);
-  if (!path) return null;
-  return {
-    path,
-    isDir: fileRef.dataset.entryKind === "folder",
-    source: "locus",
-  };
-}
-
-function handleMarkdownDragStart(event: DragEvent) {
-  if (!(event.target instanceof Element)) return;
-  const ref = unityRefFromMarkdownDragTarget(event.target);
-  if (ref) {
-    startUnityReferenceHtmlDrag(event, [ref]);
-    return;
-  }
-  const file = localFileFromMarkdownDragTarget(event.target);
-  if (!file) return;
-  startLocusFileHtmlDrag(event, [file]);
-}
-
 function handleMarkdownPointerDown(event: PointerEvent) {
-  if (isWorkbenchReferencePointerEventClaimed(event)) return;
-  if (!(event.target instanceof Element)) return;
-  const ref = unityRefFromMarkdownDragTarget(event.target);
-  if (ref) {
-    armUnityReferencePointerDrag(event, [ref]);
-    return;
-  }
-  const file = localFileFromMarkdownDragTarget(event.target);
-  if (!file) return;
-  armLocusFilePointerDrag(event, [file]);
+  if (event.button !== 0 || event.isPrimary === false) return;
+  const workspaceRef = props.workspaceRef;
+  if (!workspaceRef) return;
+  const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
+  if (!checkout?.projectId || !checkout.root) return;
+  startWorkbenchReferenceInternalDrag(internalDrag, event, {
+    projectId: checkout.projectId,
+    workspaceRef: { ...workspaceRef },
+    workspaceRoot: checkout.root,
+  });
 }
 </script>
 
@@ -773,7 +691,6 @@ function handleMarkdownPointerDown(event: PointerEvent) {
     @click="handleMarkdownContentActivation"
     @auxclick="handleMarkdownContentActivation"
     @pointerdown="handleMarkdownPointerDown"
-    @dragstart="handleMarkdownDragStart"
     v-html="renderedHtml"
   />
 </template>

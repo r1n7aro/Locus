@@ -455,11 +455,6 @@ export const VIEW_HOST_PATH = "/view-host";
 export const VIEW_CONTENT_PATH = "/view-content";
 export type ViewWorkspaceRef = WorkspaceRef & { expectedGeneration: number };
 
-export function isViewHostWindowLocation(): boolean {
-  return window.location.pathname === VIEW_HOST_PATH
-    || new URLSearchParams(window.location.search).get("viewHost") === "1";
-}
-
 export function isViewContentWindowLocation(): boolean {
   return window.location.pathname === VIEW_CONTENT_PATH
     || new URLSearchParams(window.location.search).get("viewContent") === "1";
@@ -493,8 +488,8 @@ export function isExactViewWorkspaceBinding(
 }
 
 export function isViewHostPoolWindowLocation(): boolean {
-  return isViewHostWindowLocation()
-    && new URLSearchParams(window.location.search).get("pool") === "1";
+  const params = new URLSearchParams(window.location.search);
+  return params.get("viewHost") === "1" && params.get("pool") === "1";
 }
 
 export function viewTemplates(): Promise<ViewTemplateSummary[]> {

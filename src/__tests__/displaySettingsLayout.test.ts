@@ -82,7 +82,6 @@ describe("display settings transcript alignment", () => {
 
     for (const field of [
       "showWelcomeSubtitle",
-      "showViewsTab",
       "showPluginsTab",
       "showAgentTab",
     ]) {
@@ -104,7 +103,6 @@ describe("display settings transcript alignment", () => {
     expect(displayPanel).toContain(":model-value=\"display.showAgentSelector\"");
     expect(displayPanel).toContain("@update:model-value=\"setDisplay('showAgentSelector', $event)\"");
     expect(displayPanel).toContain("const topNavigationToggles = [");
-    expect(displayPanel).toContain('{ key: "showViewsTab", labelKey: "settings.display.showViewsTab" }');
     expect(displayPanel).toContain('{ key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" }');
     expect(displayPanel).toContain('{ key: "showAgentTab", labelKey: "settings.display.showAgentTab" }');
     expect(displayPanel).toContain(":model-value=\"display[item.key]\"");
@@ -119,7 +117,7 @@ describe("display settings transcript alignment", () => {
     expect(app).toContain("const { state: displaySettings } = useDisplaySettings();");
     const topTabsSection = app.slice(app.indexOf("const topTabs ="), app.indexOf("const visibleTopTabs ="));
     expect(topTabsSection).toContain('{ id: "development", labelKey: "app.tab.development", visible: true }');
-    expect(topTabsSection).toContain('{ id: "views", labelKey: "app.tab.views", visible: displaySettings.showViewsTab }');
+    expect(topTabsSection).not.toContain('{ id: "views"');
     expect(topTabsSection).toContain('{ id: "settings", labelKey: "app.tab.settings", visible: true }');
     expect(topTabsSection).toContain('{ id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab }');
     expect(topTabsSection).toContain('{ id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab }');
@@ -139,14 +137,12 @@ describe("display settings transcript alignment", () => {
     expect(zh).toContain('"settings.display.mainChromeTitle": "主界面"');
     expect(zh).toContain('"settings.display.showWelcomeSubtitle": "显示上方子标题"');
     expect(zh).toContain('"settings.display.showKnowledgeFolder": "显示 {0}"');
-    expect(zh).toContain('"settings.display.showViewsTab": "显示视图"');
     expect(zh).toContain('"settings.display.showPluginsTab": "显示插件"');
     expect(zh).toContain('"settings.display.showAgentTab": "显示 Agent"');
     expect(zh).toContain('"settings.display.showAgentSelector": "显示 Agent 选择器"');
     expect(en).toContain('"settings.display.mainChromeTitle": "Main Interface"');
     expect(en).toContain('"settings.display.showWelcomeSubtitle": "Show top subtitle"');
     expect(en).toContain('"settings.display.showKnowledgeFolder": "Show {0}"');
-    expect(en).toContain('"settings.display.showViewsTab": "Show Views"');
     expect(en).toContain('"settings.display.showPluginsTab": "Show Plugins"');
     expect(en).toContain('"settings.display.showAgentTab": "Show Agent"');
     expect(en).toContain('"settings.display.showAgentSelector": "Show Agent selector"');

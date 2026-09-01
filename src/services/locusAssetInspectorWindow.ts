@@ -1,8 +1,11 @@
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { WorkspaceRef } from "./project";
-import { viewOpenInspectorTab } from "./view";
+import { emitTo } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isWorkbenchWindowLabel } from "./workbenchWindow";
 
 export const LOCUS_ASSET_INSPECTOR_WINDOW_TITLE = "Locus Inspector";
+export const WORKBENCH_INSPECTOR_OPEN_EVENT = "workbench-inspector-open";
 
 /**
  * Inspector targets live inside the View host tab system. A tab id encodes the
@@ -17,6 +20,12 @@ export interface LocusAssetInspectorWindowPayload {
   assetPath?: string;
   scenePath?: string;
   objectPath?: string;
+}
+
+export interface WorkbenchInspectorOpenPayload {
+  targetLabel: string;
+  workspaceRef: WorkspaceRef;
+  inspector: LocusAssetInspectorWindowPayload;
 }
 
 function trimOrEmpty(value: string | null | undefined): string {
@@ -119,11 +128,7 @@ export function locusAssetInspectorTabTitle(
   return segments[segments.length - 1] || LOCUS_ASSET_INSPECTOR_WINDOW_TITLE;
 }
 
-/**
- * Opens the target as an inspector tab in the View host window system. The
- * backend focuses an existing tab for the same target, prefers adding a tab
- * to an already-open host window, and only then creates a new window.
- */
+/** Opens the target as a standard Workbench asset or scene-object tab. */
 export async function openLocusAssetInspectorWindow(
   workspaceRef: WorkspaceRef,
   payload: LocusAssetInspectorWindowPayload,
@@ -133,6 +138,12 @@ export async function openLocusAssetInspectorWindow(
   const nextPayload = normalizeLocusAssetInspectorPayload(payload);
   if (!isValidLocusAssetInspectorPayload(nextPayload)) return false;
 
-  await viewOpenInspectorTab(workspaceRef, { tabId: buildLocusAssetInspectorTabId(nextPayload) });
+  const currentLabel = getCurrentWindow().label;
+  const targetLabel = isWorkbenchWindowLabel(currentLabel) ? currentLabel : "main";
+  await emitTo<WorkbenchInspectorOpenPayload>(targetLabel, WORKBENCH_INSPECTOR_OPEN_EVENT, {
+    targetLabel,
+    workspaceRef,
+    inspector: nextPayload,
+  });
   return true;
 }

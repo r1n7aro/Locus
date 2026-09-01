@@ -51,13 +51,20 @@ describe("extra workdirs (additional working directories)", () => {
     expect(instance).toContain('title: "Additional Working Directories".to_string()');
     // Sorts directly behind the env.md entry in the injected panel.
     expect(instance).toContain('"extra_workdirs" => (0, usize::MAX)');
+    expect(instance).toContain('injection_config.state("extra_workdirs").enabled');
+    expect(instance).toContain('"extraWorkdirs": extra_workdirs_fingerprint');
+    expect(instance).toContain("prompt_prefix_cache_identity_tracks_extra_workdir_prompt");
   });
 
-  it("offers checkout-scoped configuration from Collaboration checkout nodes", () => {
+  it("keeps current-checkout configuration and attachment status in the workspace selector", () => {
     const app = read("src/App.vue");
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const windowService = read("src/services/extraWorkdirsWindow.ts");
 
+    expect(workbench).toContain("configureCurrentWorkspaceExtraWorkdirs");
+    expect(workbench).toContain("workspaceContextStore.focusedWorkspaceRef");
+    expect(workbench).toContain('class="development-workspace-extra-list"');
+    expect(workbench).toContain("extraWorkdirsFor(path)");
     expect(workbench).toContain("configureCheckoutExtraWorkdirs");
     expect(workbench).toContain('t("app.dir.configureExtraWorkdirs")');
     expect(workbench).toContain("workspaceRef:");

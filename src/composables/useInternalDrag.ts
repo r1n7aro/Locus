@@ -56,6 +56,8 @@ export interface InternalDropDecision<I = unknown> {
   key: string;
   operation: InternalDragOperation;
   intent: I;
+  /** Let a resolved drop surface replace the shared floating preview. */
+  previewMode?: InternalDragPreviewMode;
 }
 
 export interface InternalDropResolveContext<T = unknown> {
@@ -92,6 +94,18 @@ export function internalDragFloatingTransform(
   return `translate3d(${point.x - anchor.x}px, ${point.y - anchor.y}px, 0)`;
 }
 
+export function internalDragPointReachedViewportEdge(
+  point: InternalDragPoint,
+  viewport: { width: number; height: number },
+): boolean {
+  const rightEdge = Math.max(0, viewport.width - 1);
+  const bottomEdge = Math.max(0, viewport.height - 1);
+  return point.x <= 0
+    || point.y <= 0
+    || point.x >= rightEdge
+    || point.y >= bottomEdge;
+}
+
 interface ActiveTarget {
   registration: InternalDropTargetRegistration;
   decision: InternalDropDecision;
@@ -106,6 +120,7 @@ interface PendingPointer {
 export interface InternalDragController {
   phase: Ref<InternalDragPhase>;
   source: ShallowRef<InternalDragSource | null>;
+  ownerDocument: ShallowRef<Document>;
   point: Ref<InternalDragPoint>;
   previewAnchor: Ref<InternalDragPoint>;
   activeTarget: ShallowRef<{
@@ -142,9 +157,11 @@ function sameDecision(left: ActiveTarget | null, right: ActiveTarget | null): bo
     && left?.decision.operation === right?.decision.operation;
 }
 
-export function createInternalDragController(): InternalDragController {
+export function createInternalDragController(defaultWindow: Window = window): InternalDragController {
+  const defaultDocument = defaultWindow.document;
   const phase = ref<InternalDragPhase>("idle");
   const source = shallowRef<InternalDragSource | null>(null);
+  const ownerDocument = shallowRef<Document>(defaultDocument);
   const point = ref<InternalDragPoint>({ x: 0, y: 0 });
   const previewAnchor = ref<InternalDragPoint>({ x: 10, y: 17 });
   const activeTarget = shallowRef<{
@@ -164,6 +181,7 @@ export function createInternalDragController(): InternalDragController {
   let autoScrollElement: HTMLElement | null = null;
   let autoScrollVelocity = 0;
   let releaseHtmlDragSuppression: (() => void) | null = null;
+  let ownerWindow = defaultWindow;
 
   const dragging = computed(() => phase.value === "dragging");
 
@@ -208,7 +226,7 @@ export function createInternalDragController(): InternalDragController {
     if (!activeSource || phase.value !== "dragging") {
       return { target: null, mode: "floating" };
     }
-    if (!(hit instanceof Element)) return { target: null, mode: "floating" };
+    if (hit?.nodeType !== 1) return { target: null, mode: "floating" };
     const candidates = candidateTargets(hit, activeSource);
     let mode: InternalDragPreviewMode = "floating";
     for (const candidate of candidates) {
@@ -234,7 +252,10 @@ export function createInternalDragController(): InternalDragController {
       if (!decision) continue;
       const allowed = activeSource.allowedOperations ?? ["move", "copy"];
       if (!allowed.includes(decision.operation)) continue;
-      return { target: { registration: candidate.registration, decision }, mode };
+      return {
+        target: { registration: candidate.registration, decision },
+        mode: decision.previewMode ?? mode,
+      };
     }
     return { target: null, mode };
   }
@@ -246,8 +267,8 @@ export function createInternalDragController(): InternalDragController {
   }
 
   function hitAtPoint(): Element | null {
-    const hit = document.elementFromPoint(point.value.x, point.value.y);
-    return hit instanceof Element ? hit : null;
+    const hit = ownerDocument.value.elementFromPoint(point.value.x, point.value.y);
+    return hit?.nodeType === 1 ? hit as Element : null;
   }
 
   function eventPoint(event: PointerEvent): InternalDragPoint {
@@ -274,17 +295,16 @@ export function createInternalDragController(): InternalDragController {
     if (
       allowExternalize
       && activeSource?.externalize
-      && (
-        nextPoint.x < 0
-        || nextPoint.y < 0
-        || nextPoint.x > window.innerWidth
-        || nextPoint.y > window.innerHeight
-      )
+      && internalDragPointReachedViewportEdge(nextPoint, {
+        width: ownerWindow.innerWidth,
+        height: ownerWindow.innerHeight,
+      })
     ) {
-      finish("externalize", false);
-      void Promise.resolve(activeSource.externalize()).catch((error) => {
+      const externalize = activeSource.externalize;
+      void Promise.resolve(externalize()).catch((error) => {
         console.error("[internal-drag] externalization failed", error);
       });
+      finish("externalize", false);
       return;
     }
     const hit = hitAtPoint();
@@ -293,9 +313,9 @@ export function createInternalDragController(): InternalDragController {
   }
 
   function scrollableAncestor(hit: Element | null): HTMLElement | null {
-    let current = hit instanceof HTMLElement ? hit : hit?.parentElement ?? null;
-    while (current && current !== document.body) {
-      const style = window.getComputedStyle(current);
+    let current = hit?.nodeType === 1 ? hit as HTMLElement : hit?.parentElement ?? null;
+    while (current && current !== ownerDocument.value.body) {
+      const style = ownerWindow.getComputedStyle(current);
       if (
         current.scrollHeight > current.clientHeight
         && (style.overflowY === "auto" || style.overflowY === "scroll")
@@ -306,7 +326,7 @@ export function createInternalDragController(): InternalDragController {
   }
 
   function stopAutoScroll(): void {
-    window.cancelAnimationFrame(autoScrollFrame);
+    ownerWindow.cancelAnimationFrame(autoScrollFrame);
     autoScrollFrame = 0;
     autoScrollElement = null;
     autoScrollVelocity = 0;
@@ -322,7 +342,7 @@ export function createInternalDragController(): InternalDragController {
       return;
     }
     resolveCurrentState();
-    autoScrollFrame = window.requestAnimationFrame(runAutoScroll);
+    autoScrollFrame = ownerWindow.requestAnimationFrame(runAutoScroll);
   }
 
   function updateAutoScroll(hit: Element | null): void {
@@ -345,14 +365,14 @@ export function createInternalDragController(): InternalDragController {
     }
     autoScrollElement = scrollable;
     autoScrollVelocity = velocity;
-    if (!autoScrollFrame) autoScrollFrame = window.requestAnimationFrame(runAutoScroll);
+    if (!autoScrollFrame) autoScrollFrame = ownerWindow.requestAnimationFrame(runAutoScroll);
   }
 
   function activate(): void {
     if (!source.value || !pendingPointer || phase.value !== "pending") return;
     phase.value = "dragging";
     releaseSelectionLock = acquireSelectionLock();
-    document.body.classList.add(INTERNAL_DRAG_BODY_CLASS);
+    ownerDocument.value.body.classList.add(INTERNAL_DRAG_BODY_CLASS);
     source.value.onActivated?.();
   }
 
@@ -388,7 +408,7 @@ export function createInternalDragController(): InternalDragController {
     emitVisualPoint(eventPoint(event));
   }
 
-  function suppressNextClick(): void {
+  function suppressNextClick(clickWindow = ownerWindow): void {
     releaseClickSuppression?.();
     const suppress = (event: MouseEvent) => {
       event.preventDefault();
@@ -396,26 +416,26 @@ export function createInternalDragController(): InternalDragController {
       clear();
     };
     const clear = () => {
-      window.removeEventListener("click", suppress, true);
-      window.clearTimeout(suppressClickTimer);
+      clickWindow.removeEventListener("click", suppress, true);
+      clickWindow.clearTimeout(suppressClickTimer);
       suppressClickTimer = 0;
       releaseClickSuppression = null;
     };
     releaseClickSuppression = clear;
-    window.addEventListener("click", suppress, true);
-    suppressClickTimer = window.setTimeout(clear, 160);
+    clickWindow.addEventListener("click", suppress, true);
+    suppressClickTimer = clickWindow.setTimeout(clear, 160);
   }
 
   function removePointerListeners(): void {
-    window.removeEventListener("pointermove", onPointerMove, true);
-    window.removeEventListener("pointerrawupdate", onPointerRawUpdate, true);
-    window.removeEventListener("pointerup", onPointerUp, true);
-    window.removeEventListener("pointercancel", onPointerCancel, true);
-    window.removeEventListener("mouseup", onMouseUp, true);
-    window.removeEventListener("dragstart", onNativeDragStart, true);
-    window.removeEventListener("dragend", onNativeDragEnd, true);
-    window.removeEventListener("keydown", onKeydown, true);
-    window.removeEventListener("blur", onWindowBlur);
+    ownerWindow.removeEventListener("pointermove", onPointerMove, true);
+    ownerWindow.removeEventListener("pointerrawupdate", onPointerRawUpdate, true);
+    ownerWindow.removeEventListener("pointerup", onPointerUp, true);
+    ownerWindow.removeEventListener("pointercancel", onPointerCancel, true);
+    ownerWindow.removeEventListener("mouseup", onMouseUp, true);
+    ownerWindow.removeEventListener("dragstart", onNativeDragStart, true);
+    ownerWindow.removeEventListener("dragend", onNativeDragEnd, true);
+    ownerWindow.removeEventListener("keydown", onKeydown, true);
+    ownerWindow.removeEventListener("blur", onWindowBlur);
     pendingPointer?.captureElement.removeEventListener("lostpointercapture", onLostPointerCapture);
   }
 
@@ -425,7 +445,7 @@ export function createInternalDragController(): InternalDragController {
     clearTarget();
     releaseSelectionLock?.();
     releaseSelectionLock = null;
-    document.body.classList.remove(INTERNAL_DRAG_BODY_CLASS);
+    ownerDocument.value.body.classList.remove(INTERNAL_DRAG_BODY_CLASS);
     const capture = pendingPointer;
     pendingPointer = null;
     if (capture?.captureElement.hasPointerCapture?.(capture.pointerId)) {
@@ -437,6 +457,7 @@ export function createInternalDragController(): InternalDragController {
     previewMode.value = "floating";
     previewAnchor.value = { x: 10, y: 17 };
     source.value = null;
+    ownerWindow = defaultWindow;
   }
 
   function finish(reason: InternalDragFinishReason, dropped: boolean): void {
@@ -445,12 +466,13 @@ export function createInternalDragController(): InternalDragController {
     const completedSource = source.value;
     const completedTarget = dropped ? resolvedTarget : null;
     const completedPoint = point.value;
-    const hit = document.elementFromPoint(completedPoint.x, completedPoint.y);
+    const completedOwnerWindow = ownerWindow;
+    const hit = ownerDocument.value.elementFromPoint(completedPoint.x, completedPoint.y);
     const wasDragging = phase.value === "dragging";
     resetState();
-    if (wasDragging) suppressNextClick();
+    if (wasDragging) suppressNextClick(completedOwnerWindow);
     completedSource?.onFinished?.({ dropped: !!completedTarget, reason });
-    if (completedTarget && completedSource && hit instanceof Element) {
+    if (completedTarget && completedSource && hit?.nodeType === 1) {
       void Promise.resolve(completedTarget.registration.drop({
         source: completedSource,
         point: completedPoint,
@@ -535,14 +557,18 @@ export function createInternalDragController(): InternalDragController {
   function start<T>(event: PointerEvent, nextSource: InternalDragSource<T>): boolean {
     if (event.button !== 0 || event.isPrimary === false) return false;
     if (phase.value !== "idle") finish("replaced", false);
+    const currentTarget = event.currentTarget as Node | null;
+    const target = event.target as Node | null;
     const captureElement = nextSource.captureElement
-      ?? (event.currentTarget instanceof HTMLElement
-      ? event.currentTarget
-      : event.target instanceof HTMLElement
-        ? event.target
-        : null);
+      ?? (currentTarget?.nodeType === 1
+        ? currentTarget as HTMLElement
+        : target?.nodeType === 1
+          ? target as HTMLElement
+          : null);
     if (!captureElement) return false;
 
+    ownerDocument.value = captureElement.ownerDocument;
+    ownerWindow = captureElement.ownerDocument.defaultView ?? defaultWindow;
     releaseHtmlDragSuppression = suppressHtmlDrag(captureElement);
     source.value = nextSource as InternalDragSource;
     point.value = { x: event.clientX, y: event.clientY };
@@ -563,15 +589,15 @@ export function createInternalDragController(): InternalDragController {
       // Window-level listeners still keep the in-document drag session alive.
     }
     captureElement.addEventListener("lostpointercapture", onLostPointerCapture);
-    window.addEventListener("pointermove", onPointerMove, { capture: true, passive: false });
-    window.addEventListener("pointerrawupdate", onPointerRawUpdate, { capture: true, passive: true });
-    window.addEventListener("pointerup", onPointerUp, true);
-    window.addEventListener("pointercancel", onPointerCancel, true);
-    window.addEventListener("mouseup", onMouseUp, true);
-    window.addEventListener("dragstart", onNativeDragStart, true);
-    window.addEventListener("dragend", onNativeDragEnd, true);
-    window.addEventListener("keydown", onKeydown, true);
-    window.addEventListener("blur", onWindowBlur);
+    ownerWindow.addEventListener("pointermove", onPointerMove, { capture: true, passive: false });
+    ownerWindow.addEventListener("pointerrawupdate", onPointerRawUpdate, { capture: true, passive: true });
+    ownerWindow.addEventListener("pointerup", onPointerUp, true);
+    ownerWindow.addEventListener("pointercancel", onPointerCancel, true);
+    ownerWindow.addEventListener("mouseup", onMouseUp, true);
+    ownerWindow.addEventListener("dragstart", onNativeDragStart, true);
+    ownerWindow.addEventListener("dragend", onNativeDragEnd, true);
+    ownerWindow.addEventListener("keydown", onKeydown, true);
+    ownerWindow.addEventListener("blur", onWindowBlur);
     return true;
   }
 
@@ -608,6 +634,7 @@ export function createInternalDragController(): InternalDragController {
   return {
     phase,
     source,
+    ownerDocument,
     point,
     previewAnchor,
     activeTarget,
@@ -622,7 +649,12 @@ export function createInternalDragController(): InternalDragController {
   };
 }
 
-const fallbackInternalDragController = createInternalDragController();
+let fallbackInternalDragController: InternalDragController | null = null;
+
+function getFallbackInternalDragController(): InternalDragController {
+  fallbackInternalDragController ??= createInternalDragController();
+  return fallbackInternalDragController;
+}
 
 export function provideInternalDragController(): InternalDragController {
   const controller = createInternalDragController();
@@ -631,7 +663,7 @@ export function provideInternalDragController(): InternalDragController {
 }
 
 export function useInternalDragController(): InternalDragController {
-  return inject(internalDragKey, fallbackInternalDragController);
+  return inject(internalDragKey, null) ?? getFallbackInternalDragController();
 }
 
 export function useInternalDropTarget<T, I>(

@@ -213,6 +213,82 @@ describe("workbench store", () => {
     expect(state.focusedPaneId).toBe(rightPane);
   });
 
+  it("activates a background tab without moving editor-group focus", () => {
+    const store = useWorkbenchStore();
+    const state = store.ensureWindow("main");
+    const first = store.openEditor("main", sessionEditor("session-a", { preview: false }));
+    store.openEditor("main", sessionEditor("session-b", { preview: false }));
+    const rightPane = store.splitPane("main", "main", "right", sessionEditor("session-c"))!;
+
+    expect(state.focusedPaneId).toBe(rightPane);
+    expect(state.groups.main!.activeEditorId).not.toBe(first.editorId);
+
+    store.activateEditor("main", "main", first.editorId, { focusPane: false });
+
+    expect(state.groups.main!.activeEditorId).toBe(first.editorId);
+    expect(state.focusedPaneId).toBe(rightPane);
+  });
+
+  it("replaces the focused editor at its exact tab position", () => {
+    const store = useWorkbenchStore();
+    const state = store.ensureWindow("main");
+    const first = store.openEditor("main", sessionEditor("session-a", { preview: false }));
+    const second = store.openEditor("main", sessionEditor("session-b", { preview: false }));
+    store.activateEditor("main", "main", first.editorId);
+    const replacement = sessionEditor("session-c", { preview: false });
+
+    expect(store.replaceEditor("main", "main", first.editorId, replacement)).toEqual(replacement);
+    expect(state.groups.main!.tabs.map((editor) => editor.editorId)).toEqual([
+      replacement.editorId,
+      second.editorId,
+    ]);
+    expect(state.groups.main!.activeEditorId).toBe(replacement.editorId);
+  });
+
+  it("accepts transferred editors into auxiliary windows and reports deduplication", () => {
+    const store = useWorkbenchStore();
+    const source = sessionEditor("session-a", { preview: false });
+    const target = store.ensureWindow("workbench-a");
+    const paneId = target.focusedPaneId;
+
+    const first = store.acceptTransferredEditor(
+      "workbench-a",
+      source,
+      paneId,
+      { direction: "center", index: 0 },
+    );
+    expect(first).toEqual({ paneId, editorId: source.editorId, inserted: true });
+    expect(target.groups[paneId]!.tabs[0]!.pinned).toBe(true);
+
+    const duplicate = store.acceptTransferredEditor(
+      "workbench-a",
+      sessionEditor("session-a", { preview: false }),
+      paneId,
+      { direction: "center" },
+    );
+    expect(duplicate).toEqual({ paneId, editorId: source.editorId, inserted: false });
+    expect(target.groups[paneId]!.tabs).toHaveLength(1);
+
+    const explicitDuplicate = store.acceptTransferredEditor(
+      "workbench-a",
+      sessionEditor("session-a", { preview: false }),
+      paneId,
+      { direction: "center", allowDuplicate: true },
+    );
+    expect(explicitDuplicate?.inserted).toBe(true);
+    expect(target.groups[paneId]!.tabs).toHaveLength(2);
+
+    const split = store.acceptTransferredEditor(
+      "workbench-a",
+      sessionEditor("session-b", { preview: false }),
+      paneId,
+      { direction: "right" },
+    );
+    expect(split?.inserted).toBe(true);
+    expect(split?.paneId).not.toBe(paneId);
+    expect(target.layout.kind).toBe("split");
+  });
+
   it("reorders within a group using tab-half insertion positions", () => {
     const store = useWorkbenchStore();
     const state = store.ensureWindow("main");

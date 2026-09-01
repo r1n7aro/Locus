@@ -15,6 +15,7 @@ const props = withDefaults(defineProps<{
   zIndex?: number;
   role?: string;
   ariaLabel?: string;
+  showBackdrop?: boolean;
 }>(), {
   minWidth: 156,
   maxWidth: "calc(100vw - 16px)",
@@ -23,6 +24,7 @@ const props = withDefaults(defineProps<{
   zIndex: 9999,
   role: "menu",
   ariaLabel: "",
+  showBackdrop: true,
 });
 
 const emit = defineEmits<{
@@ -111,6 +113,7 @@ onUnmounted(() => {
   <Teleport to="body">
     <Transition name="base-context-menu-fade" appear>
       <div
+        v-if="showBackdrop"
         class="base-context-menu-backdrop"
         :style="backdropStyle"
         @click="close"
@@ -129,6 +132,20 @@ onUnmounted(() => {
         >
           <slot />
         </div>
+      </div>
+      <div
+        v-else
+        ref="menuRef"
+        v-bind="menuAttrs"
+        :class="menuClass"
+        :style="menuStyle"
+        :role="role"
+        :aria-label="ariaLabel || undefined"
+        tabindex="-1"
+        @click.stop
+        @contextmenu.prevent.stop
+      >
+        <slot />
       </div>
     </Transition>
   </Teleport>

@@ -2,7 +2,6 @@
 import { computed, ref, watch } from "vue";
 import {
   normalizeUnityObjectPreviewModel,
-  unityObjectPreviewAssetRef,
   type UnityObjectPreviewInput,
   type UnityObjectPreviewModel,
 } from "./unityObjectPreview";
@@ -13,11 +12,12 @@ import {
 } from "../icons/unityAssetIcons";
 import LucideIcon from "../icons/LucideIcon.vue";
 import {
-  armUnityReferencePointerDrag,
-  startUnityReferenceHtmlDrag,
-} from "../../composables/useUnityReferenceDragSource";
+  useInternalDragController,
+} from "../../composables/useInternalDrag";
 import { resolveRefGraphGuid, resolveRefGraphPath } from "../../services/refGraph";
+import type { WorkspaceRef } from "../../services/project";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+import { startWorkbenchReferenceInternalDrag } from "../workbench/workbenchReferenceDrag";
 
 const props = withDefaults(defineProps<{
   model: UnityObjectPreviewInput | UnityObjectPreviewModel;
@@ -29,6 +29,7 @@ const props = withDefaults(defineProps<{
   disabled?: boolean;
   showPath?: boolean;
   showEditState?: boolean;
+  workspaceRef?: WorkspaceRef | null;
 }>(), {
   mode: "inline",
   selected: false,
@@ -44,6 +45,7 @@ const emit = defineEmits<{
   select: [model: UnityObjectPreviewModel];
 }>();
 const workspaceContextStore = useWorkspaceContextStore();
+const internalDrag = useInternalDragController();
 
 const objectModel = computed(() => normalizeUnityObjectPreviewModel(props.model));
 const resolvedGuid = ref("");
@@ -81,7 +83,6 @@ const displayModel = computed<UnityObjectPreviewModel>(() => {
 });
 const iconNode = computed(() => unityAssetIconNodeForKind(displayModel.value.iconKind));
 const iconClass = computed(() => unityAssetIconClassForKind(displayModel.value.iconKind));
-const dragRef = computed(() => props.draggable ? unityObjectPreviewAssetRef(displayModel.value) : null);
 const rootTag = computed(() => props.interactive ? "button" : "div");
 const titleText = computed(() => {
   const parts = [
@@ -151,14 +152,17 @@ function handleSelect() {
   emit("select", displayModel.value);
 }
 
-function handleDragStart(event: DragEvent) {
-  if (!dragRef.value) return;
-  startUnityReferenceHtmlDrag(event, [dragRef.value]);
-}
-
 function handlePointerDown(event: PointerEvent) {
-  if (!dragRef.value) return;
-  armUnityReferencePointerDrag(event, [dragRef.value]);
+  if (!props.draggable || event.button !== 0 || event.isPrimary === false) return;
+  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
+  const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
+  if (!checkout?.projectId || !checkout.root) return;
+  startWorkbenchReferenceInternalDrag(internalDrag, event, {
+    projectId: checkout.projectId,
+    workspaceRef: { ...workspaceRef },
+    workspaceRoot: checkout.root,
+  }, event.currentTarget as Element);
 }
 </script>
 
@@ -180,13 +184,11 @@ function handlePointerDown(event: PointerEvent) {
     :disabled="interactive ? disabled : undefined"
     :aria-disabled="disabled || undefined"
     :title="titleText || undefined"
-    :draggable="!!dragRef"
     :data-unity-ref-kind="displayModel.ref.kind"
     :data-unity-ref-path="displayModel.ref.path"
     :data-unity-guid="displayModel.ref.guid || undefined"
     @click="handleSelect"
     @pointerdown="handlePointerDown"
-    @dragstart="handleDragStart"
   >
     <LucideIcon
       class="unity-object-identity-icon"

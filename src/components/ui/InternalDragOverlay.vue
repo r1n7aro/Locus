@@ -10,6 +10,7 @@ import {
 const drag = useInternalDragController();
 let overlayElement: HTMLElement | null = null;
 
+const overlayTarget = computed(() => drag.ownerDocument.value.body);
 const preview = computed(() => drag.source.value?.preview ?? null);
 const icon = computed(() => {
   if (preview.value?.icon) return preview.value.icon;
@@ -48,7 +49,7 @@ onBeforeUnmount(unsubscribeVisualPoint);
 </script>
 
 <template>
-  <Teleport to="body">
+  <Teleport :to="overlayTarget">
     <div
       v-if="drag.dragging.value && drag.previewMode.value !== 'inline' && preview"
       :ref="bindOverlayElement"

@@ -36,14 +36,14 @@ describe("Locus asset inspector integration", () => {
     expect(openInspectorIndex).toBeGreaterThan(selectInUnityIndex);
     expect(chat.slice(selectInUnityIndex, openInspectorIndex)).toContain('class="asset-ref-ctx-sep"');
 
-    // The standalone inspector window is gone; inspector targets open as tabs
-    // inside the View host window system.
+    // Inspector targets use the same Workbench tab group as every other editor.
     expect(app).not.toContain("LocusAssetInspectorWindow");
     expect(app).not.toContain("isLocusAssetInspectorWindowLocation");
     expect(service).toContain('LOCUS_ASSET_INSPECTOR_TAB_ID_PREFIX = "locus-inspector:"');
     expect(service).toContain("buildLocusAssetInspectorTabId");
     expect(service).toContain("parseLocusAssetInspectorTabId");
-    expect(service).toContain("viewOpenInspectorTab(workspaceRef, { tabId: buildLocusAssetInspectorTabId(nextPayload) })");
+    expect(service).toContain("WORKBENCH_INSPECTOR_OPEN_EVENT");
+    expect(service).toContain("emitTo<WorkbenchInspectorOpenPayload>");
     expect(service).toContain("scenePath");
     expect(service).toContain("objectPath");
 
@@ -68,53 +68,34 @@ describe("Locus asset inspector integration", () => {
     expect(tauriCapability).toContain('"core:window:allow-close"');
     expect(tauriCapability).toContain('"core:window:allow-destroy"');
     expect(zh).toContain('"common.openInLocusInspector": "在 Locus Inspector 中打开"');
-    expect(zh).toContain('"common.openInLocusInspectorWindow": "在独立 Inspector 窗口中打开"');
+    expect(zh).toContain('"common.openInLocusInspectorWindow": "在工作台标签页中打开"');
     expect(zh).toContain('"asset.inspector.source.disk": "磁盘"');
     expect(zh).toContain('"asset.inspector.source.live": "Live"');
     expect(en).toContain('"common.openInLocusInspector": "Open in Locus Inspector"');
-    expect(en).toContain('"common.openInLocusInspectorWindow": "Open in standalone Inspector window"');
+    expect(en).toContain('"common.openInLocusInspectorWindow": "Open in Workbench tab"');
     expect(en).toContain('"asset.inspector.source.disk": "Disk"');
     expect(en).toContain('"asset.inspector.source.live": "Live"');
   });
 
-  it("hosts inspector tabs inside the View host window system", () => {
-    const host = read("src/components/ViewHostWindow.vue");
+  it("hosts inspector targets inside Workbench editor groups", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const baseTabs = read("src/components/ui/BaseTabStrip.vue");
-    const viewService = read("src/services/view.ts");
-    const commands = read("src-tauri/src/commands/view.rs");
-    const runtime = read("src-tauri/src/view.rs");
-    const app = read("src-tauri/src/lib.rs");
+    const editor = read("src/components/workbench/WorkbenchAssetEditor.vue");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
-    // Host window renders inspector tabs inline next to View tabs.
-    expect(host).toContain("import LocusAssetInspectorPane from \"./LocusAssetInspectorPane.vue\"");
-    expect(host).toContain("isLocusAssetInspectorTabId");
-    expect(host).toContain("inspectorPaneRecords");
-    expect(host).toContain("<LocusAssetInspectorPane");
-    expect(host).toContain(':workspace-ref="viewWorkspaceRef"');
-    expect(host).toContain("activeTabIsInspector");
-    expect(host).toContain("inspectorTabFromId");
-
-    // Every tab can be closed in place; the last tab closes the window.
-    expect(host).toContain("async function closeTab(tabId: string)");
-    expect(host).toContain('@close="closeTab($event)"');
+    expect(workbench).toContain("WORKBENCH_INSPECTOR_OPEN_EVENT");
+    expect(workbench).toContain("openInspectorInWorkbench(event.payload)");
+    expect(workbench).toContain('kind: "sceneObject"');
+    expect(workbench).toContain('kind: "asset"');
+    expect(workbench).toContain("<WorkbenchAssetEditor");
+    expect(editor).toContain("WorkspaceAssetPreview");
+    expect(editor).toContain(':show-header="false"');
     expect(baseTabs).toContain('@click.stop="emit(\'close\', tab.id)"');
     expect(baseTabs).toContain("handleAuxClick");
     expect(baseTabs).toContain("t('common.close')");
     expect(zh).toContain('"view.host.closeTab"');
     expect(en).toContain('"view.host.closeTab"');
-
-    // Inspector opens route through the shared host/tab registry.
-    expect(viewService).toContain('ipcInvoke<ViewRunResult>("view_open_inspector_tab"');
-    expect(commands).toContain("pub async fn view_open_inspector_tab");
-    expect(app).toContain("commands::view_open_inspector_tab");
-    expect(runtime).toContain('LOCUS_INSPECTOR_TAB_ID_PREFIX: &str = "locus-inspector:"');
-    expect(runtime).toContain("fn normalize_view_tab_id");
-    expect(runtime).toContain("pub async fn open_inspector_tab_window");
-    expect(runtime).toContain("fn detach_inspector_tab_window");
-    expect(runtime).toContain("fn encode_view_host_tab_id");
-    expect(runtime).toContain("reusable_view_host_window_label_scoped(");
   });
 
   it("hosts an embedded floating inspector panel in the main window", () => {

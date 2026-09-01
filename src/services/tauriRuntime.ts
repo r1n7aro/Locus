@@ -1,4 +1,8 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  LogicalPosition,
+  LogicalSize,
+  getCurrentWindow,
+} from "@tauri-apps/api/window";
 
 type TauriInternals = {
   metadata?: {
@@ -50,6 +54,42 @@ export async function showCurrentTauriWindow(): Promise<void> {
   await window.setFocus().catch(() => {
     /* Focusing can fail when the OS denies foreground activation. */
   });
+}
+
+export async function setCurrentTauriWindowBounds(bounds: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}): Promise<void> {
+  if (!hasTauriWindowRuntime()) return;
+  const currentWindow = getCurrentWindow();
+  await currentWindow.unminimize().catch(() => undefined);
+  await Promise.all([
+    currentWindow.setPosition(new LogicalPosition(bounds.x, bounds.y)),
+    currentWindow.setSize(new LogicalSize(bounds.width, bounds.height)),
+  ]);
+  await currentWindow.show();
+  await currentWindow.setFocus().catch(() => undefined);
+}
+
+export async function getCurrentTauriWindowPhysicalBounds(): Promise<{
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}> {
+  const currentWindow = getCurrentWindow();
+  const [position, size] = await Promise.all([
+    currentWindow.outerPosition(),
+    currentWindow.outerSize(),
+  ]);
+  return {
+    x: position.x,
+    y: position.y,
+    width: size.width,
+    height: size.height,
+  };
 }
 
 export function startCurrentWindowDragging(): void {

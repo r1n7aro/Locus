@@ -40,7 +40,6 @@ function createDisplayState(): DisplaySettings {
     fileExplorerHiddenDirectories: [".git", "node_modules"],
     unityFileExplorerHiddenDirectories: ["Library", "Temp"],
     showWelcomeSubtitle: true,
-    showViewsTab: true,
     showPluginsTab: true,
     showAgentTab: true,
     showAgentSelector: false,

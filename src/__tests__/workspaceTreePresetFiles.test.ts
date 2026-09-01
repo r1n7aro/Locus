@@ -24,6 +24,35 @@ describe("workspace tree presets and mounted files", () => {
     expect(workbench).toMatch(/\.development-explorer-actions\s*\{[^}]*margin-left:\s*auto/s);
   });
 
+  it("controls every system node from a visibility submenu", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const displaySettings = read("src/composables/useDisplaySettings.ts");
+    const zh = read("src/language/zh.json");
+    const en = read("src/language/en.json");
+
+    for (const resourceId of [
+      "NEW_SESSION_SYSTEM_RESOURCE_ID",
+      "COLLABORATION_SYSTEM_RESOURCE_ID",
+      "KNOWLEDGE_SYSTEM_RESOURCE_ID",
+      "ASSETS_SYSTEM_RESOURCE_ID",
+      "VIEWS_SYSTEM_RESOURCE_ID",
+    ]) {
+      expect(workbench).toContain(`resourceId: ${resourceId}`);
+    }
+    expect(workbench).toContain("const specialNodeVisibilityItems = computed");
+    expect(workbench).toContain("candidate.resourceKind === SYSTEM_RESOURCE_KIND");
+    expect(workbench).toContain(':show-backdrop="false"');
+    expect(workbench).toContain('role="menuitemcheckbox"');
+    expect(workbench).toContain("toggleSpecialNodeVisibility(item.node)");
+    expect(workbench).toContain('kind: "setNodeHidden"');
+    expect(workbench).toContain("if (node.hidden) return false;");
+    expect(workbench).not.toContain("showHiddenNodes");
+    expect(displaySettings).toContain('workspaceDisplayMode: "single",');
+    expect(displaySettings).toContain('parsed.workspaceDisplayMode === "multi" ? "multi" : "single"');
+    expect(zh).toContain('"development.specialNodeVisibility": "节点显隐"');
+    expect(en).toContain('"development.specialNodeVisibility": "Node visibility"');
+  });
+
   it("mounts knowledge folders and local files with scoped previews", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const command = read("src-tauri/src/commands/workspace_explorer.rs");
@@ -55,6 +84,21 @@ describe("workspace tree presets and mounted files", () => {
     expect(directoryPreview).toContain("explorerStore.loadMount");
   });
 
+  it("keeps session, file, and asset placement on the shared internal drag protocol", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const tabs = read("src/components/workbench/WorkbenchEditorTabs.vue");
+    const assetView = read("src/components/AssetView.vue");
+    const controller = read("src/composables/useInternalDrag.ts");
+
+    expect(tabs).toContain("WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE");
+    expect(tabs).not.toContain("native-drag");
+    expect(workbench).toContain("WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE");
+    expect(workbench).toContain('id: `development-workbench:${WORKBENCH_WINDOW_ID}`');
+    expect(workbench).toContain("treeEditorDescriptor((sourceData as WorkspaceLayoutInternalDragData).item)");
+    expect(assetView).toContain("workbenchReferenceInternalDragSource");
+    expect(controller).toContain("captureElement.ownerDocument");
+  });
+
   it("edits mounted source files while keeping Unity assets on Locus Inspector", () => {
     const command = read("src-tauri/src/commands/workspace_explorer.rs");
     const service = read("src/services/workspaceExplorer.ts");
@@ -77,6 +121,8 @@ describe("workspace tree presets and mounted files", () => {
     expect(workbench).toContain("saveAndCloseDirtyEditor");
     expect(fileEditor).toContain("preview?.kind === 'unity'");
     expect(fileEditor).toContain("<WorkspaceAssetPreview");
+    expect(fileEditor).toContain(':show-header="false"');
+    expect(fileEditor).not.toContain('class="workspace-file-preview-header"');
     expect(sharedAssetPreview).toContain("UnityObjectPreview");
     expect(sharedAssetPreview).toContain("edit: props.writable");
   });
@@ -140,6 +186,21 @@ describe("workspace tree presets and mounted files", () => {
     expect(command).toContain("LocusFileDropPayload { files, x, y }");
     expect(richInput).toContain("insideComposer");
     expect(richInput).toContain("getBoundingClientRect()");
+  });
+
+  it("opens native drops as tabs only when every item is a non-Unity text file", () => {
+    const command = read("src-tauri/src/commands/unity_embed.rs");
+    const service = read("src/services/unity.ts");
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+
+    expect(command).toContain("fn locus_file_drop_tab_eligible(");
+    expect(command).toContain("unity_file_drop_asset_ref(workspace_path, path).is_none()");
+    expect(command).toContain("locus_file_drop_path_is_text(path)");
+    expect(service).toContain("tabEligible: boolean;");
+    expect(workbench).toContain("const locusFileWorkspaceTabEligible = ref(false);");
+    expect(workbench).toContain("const nativeFileCanOpenEditor = locusFileWorkspaceDragActive.value");
+    expect(workbench).toContain("if (tabStrip && nativeFileCanOpenEditor)");
+    expect(workbench).toContain("if (editorGroup && nativeFileCanOpenEditor)");
   });
 
   it("turns the new-session row into a reference drop zone", () => {

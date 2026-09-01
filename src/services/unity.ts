@@ -1,12 +1,13 @@
 import { ipcInvoke } from "./ipc";
-import { getLocusRuntime } from "./locusRuntime";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 import type {
   AssetRefAttachment,
   PluginStatus,
+  UnityConnectionStatus,
   UnityLaunchMode,
   UnityPluginInstallPlan,
 } from "../types";
-import type { WorkspaceRef } from "./project";
+import { WORKSPACE_EVENT_NAME, type RoutedWorkspaceEvent, type WorkspaceRef } from "./project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 export type UnityServiceReadinessPhase =
@@ -90,6 +91,33 @@ export function launchUnityProject(workspaceRef: WorkspaceRef): Promise<UnityLau
 
 export function closeHeadlessUnityProject(workspaceRef: WorkspaceRef): Promise<void> {
   return ipcInvoke<void>("close_headless_unity_project", { workspaceRef });
+}
+
+export interface WorkspaceUnityStatusHandlers {
+  onConnection?: (connected: boolean) => void;
+  onConnectionDetail?: (status: UnityConnectionStatus) => void;
+  onPluginStatus?: (status: PluginStatus) => void;
+}
+
+export function subscribeWorkspaceUnityStatus(
+  workspaceRef: WorkspaceRef,
+  handlers: WorkspaceUnityStatusHandlers,
+): Promise<RuntimeUnsubscribe> {
+  const scopedRef = { ...workspaceRef };
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent>(WORKSPACE_EVENT_NAME, (event) => {
+    if (event.checkoutId !== scopedRef.checkoutId) return;
+    if (
+      scopedRef.expectedGeneration != null
+      && event.workspaceGeneration !== scopedRef.expectedGeneration
+    ) return;
+    if (event.eventName === "unity-connection-status") {
+      handlers.onConnection?.(event.payload as boolean);
+    } else if (event.eventName === "unity-connection-status-detail") {
+      handlers.onConnectionDetail?.(event.payload as UnityConnectionStatus);
+    } else if (event.eventName === "unity-plugin-status") {
+      handlers.onPluginStatus?.(event.payload as PluginStatus);
+    }
+  });
 }
 
 export interface SelectUnityAssetOptions {
@@ -198,6 +226,8 @@ export function setUnityEmbedEnabled(value: boolean, workspaceRef?: WorkspaceRef
 export interface UnityTestToolsWorkspaceStatus {
   enabled: boolean;
   packageInstalled: boolean;
+  packageVersion: string | null;
+  packageSupported: boolean;
   available: boolean;
 }
 
@@ -336,11 +366,93 @@ export function startLocusNativeFileDrag(
   });
 }
 
-export function startLocusDragPreview(label: string): Promise<void> {
+export interface LocusDragPreviewAnchor {
+  x: number;
+  y: number;
+}
+
+interface LocusDragPreviewColor {
+  red: number;
+  green: number;
+  blue: number;
+}
+
+interface LocusDragPreviewAppearance {
+  width: number;
+  height: number;
+  pointerOffsetX: number;
+  pointerOffsetY: number;
+  scaleFactor: number;
+  backgroundColor: LocusDragPreviewColor;
+  borderColor: LocusDragPreviewColor;
+  textColor: LocusDragPreviewColor;
+  iconColor: LocusDragPreviewColor;
+}
+
+function clampDragPreviewColor(value: string | undefined, scale = 1): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.min(255, Math.max(0, Math.round(numeric * scale)));
+}
+
+function computedDragPreviewColor(value: string, fallback: LocusDragPreviewColor): LocusDragPreviewColor {
+  const rgb = value.match(/rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+  if (rgb) {
+    return {
+      red: clampDragPreviewColor(rgb[1]),
+      green: clampDragPreviewColor(rgb[2]),
+      blue: clampDragPreviewColor(rgb[3]),
+    };
+  }
+  const srgb = value.match(/color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/i);
+  if (srgb) {
+    return {
+      red: clampDragPreviewColor(srgb[1], 255),
+      green: clampDragPreviewColor(srgb[2], 255),
+      blue: clampDragPreviewColor(srgb[3], 255),
+    };
+  }
+  return fallback;
+}
+
+function currentDragPreviewAppearance(
+  anchor: LocusDragPreviewAnchor,
+  sourceDocument?: Document,
+): LocusDragPreviewAppearance | null {
+  if (typeof document === "undefined" || typeof window === "undefined") return null;
+  const previewDocument = sourceDocument ?? document;
+  const sourceWindow = previewDocument.defaultView ?? window;
+  const preview = previewDocument.querySelector<HTMLElement>("[data-internal-drag-preview]");
+  if (!preview) return null;
+  const bounds = preview.getBoundingClientRect();
+  const style = sourceWindow.getComputedStyle(preview);
+  const icon = preview.querySelector<HTMLElement>(".internal-drag-overlay-icon");
+  const iconStyle = icon ? sourceWindow.getComputedStyle(icon) : style;
+  return {
+    width: Math.max(1, bounds.width),
+    height: Math.max(1, bounds.height),
+    pointerOffsetX: Math.min(bounds.width, Math.max(0, anchor.x)),
+    pointerOffsetY: Math.min(bounds.height, Math.max(0, anchor.y)),
+    scaleFactor: Math.min(4, Math.max(0.5, sourceWindow.devicePixelRatio || 1)),
+    backgroundColor: computedDragPreviewColor(style.backgroundColor, { red: 31, green: 36, blue: 44 }),
+    borderColor: computedDragPreviewColor(style.borderColor, { red: 74, green: 84, blue: 98 }),
+    textColor: computedDragPreviewColor(style.color, { red: 238, green: 242, blue: 248 }),
+    iconColor: computedDragPreviewColor(iconStyle.color, { red: 168, green: 178, blue: 190 }),
+  };
+}
+
+export function startLocusDragPreview(
+  label: string,
+  anchor?: LocusDragPreviewAnchor | null,
+  sourceDocument?: Document,
+): Promise<void> {
   const runtime = getLocusRuntime();
   const normalized = label.trim();
   if (runtime.kind !== "tauri" || !normalized) return Promise.resolve();
-  return runtime.invoke("locus_start_drag_preview", { label: normalized });
+  return runtime.invoke("locus_start_drag_preview", {
+    label: normalized,
+    preview: anchor ? currentDragPreviewAppearance(anchor, sourceDocument) : null,
+  });
 }
 
 export function stopLocusDragPreview(): Promise<void> {
@@ -351,6 +463,8 @@ export function stopLocusDragPreview(): Promise<void> {
 
 export interface UnityEmbedAssetDropPayload {
   refs: AssetRefAttachment[];
+  sendMode?: "focusedSession" | "newSession";
+  workspaceRef?: WorkspaceRef;
 }
 
 export interface UnityEmbedTextDropEntry {
@@ -403,12 +517,15 @@ export interface LocusFileDropPayload {
   files: LocusFileDropRef[];
   x?: number;
   y?: number;
+  sendMode?: "focusedSession" | "newSession";
+  workspaceRef?: WorkspaceRef;
 }
 
 export interface LocusFileDragStatePayload {
   phase: "enter" | "over" | "drop" | "leave";
   active: boolean;
   fileCount: number;
+  tabEligible: boolean;
   x: number;
   y: number;
 }

@@ -53,13 +53,18 @@ import {
 } from "./services/extraWorkdirsWindow";
 import { prepareSubWindowPool } from "./services/subWindow";
 import {
+  prepareSharedWorkbenchWindowPool,
+  restoreSharedWorkbenchWindows,
+  sharedWorkbenchWindowHosts,
+} from "./services/sharedWorkbenchWindow";
+import {
   isAppWorkspacePageId,
   isCheckoutWorkspacePageId,
   isWorkspacePageWindowLocation,
   openWorkspacePageWindow,
   WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
 } from "./services/workspacePageWindow";
-import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
+import { isViewContentWindowLocation } from "./services/view";
 import {
   canStartWindowDragFromTarget,
   getCurrentTauriWindowLabel,
@@ -85,7 +90,6 @@ const isWorkspacePageWindow = isWorkspacePageWindowLocation();
 const isPlanViewWindow = isPlanViewWindowLocation();
 const isUnityValueEditorWindow = isUnityValueEditorWindowLocation();
 const isExtraWorkdirsWindow = isExtraWorkdirsWindowLocation();
-const isViewHostWindow = isViewHostWindowLocation();
 const isViewContentWindow = isViewContentWindowLocation();
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
@@ -100,7 +104,6 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isPlanViewWindow
   || isUnityValueEditorWindow
   || isExtraWorkdirsWindow
-  || isViewHostWindow
   || isViewContentWindow;
 
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
@@ -119,6 +122,7 @@ const UnityEmbeddedSessionView = defineAsyncComponent(() => import("./components
 const UnityEmbedTestView = defineAsyncComponent(() => import("./components/UnityEmbedTestView.vue"));
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
+const WorkbenchWindow = defineAsyncComponent(() => import("./components/WorkbenchWindow.vue"));
 const LocusAssetInspectorPanel = defineAsyncComponent(() => import("./components/LocusAssetInspectorPanel.vue"));
 const showPluginEntry = true;
 
@@ -237,10 +241,6 @@ function createLazyViewState(
   };
 }
 
-const viewPackageView = createLazyViewState(
-  () => import("./components/ViewPackageView.vue"),
-  "loadViewPackageView",
-);
 const pluginView = createLazyViewState(
   () => import("./components/PluginView.vue"),
   "loadPluginView",
@@ -253,10 +253,6 @@ const settingsView = createLazyViewState(
   () => import("./components/SettingsView.vue"),
   "loadSettingsView",
 );
-
-const viewPackageViewComponent = viewPackageView.component;
-const viewPackageViewLoading = viewPackageView.loading;
-const viewPackageViewError = viewPackageView.error;
 
 const pluginViewComponent = pluginView.component;
 const pluginViewLoading = pluginView.loading;
@@ -280,7 +276,6 @@ interface TopTabItem {
 
 const topTabs = computed<TopTabItem[]>(() => [
   { id: "development", labelKey: "app.tab.development", visible: true },
-  { id: "views", labelKey: "app.tab.views", visible: displaySettings.showViewsTab },
   { id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab },
   { id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab },
   { id: "settings", labelKey: "app.tab.settings", visible: true },
@@ -345,19 +340,10 @@ function openTopTabContextMenu(event: MouseEvent, tab: TopTabItem) {
   topTabContextMenu.value = { x: event.clientX, y: event.clientY, tab };
 }
 
-watch(() => uiStore.activePage, (tab) => {
-  if (tab === "views") void viewPackageView.ensureLoaded();
-}, { immediate: true });
-
 // 离开设置页时做一次兜底刷新（顶栏切 Tab 不走 setTab 之外的逻辑，原 closeSettings 的副作用迁移到这里）。
 watch(() => uiStore.activePage, (tab, prev) => {
   if (prev === "settings" && tab !== "settings") void refreshAfterSettings();
 });
-
-watch(() => uiStore.viewMounted, (mounted) => {
-  if (!mounted) return;
-  void viewPackageView.ensureLoaded();
-}, { immediate: true });
 
 watch(() => [uiStore.pluginsMounted, displaySettings.showPluginsTab] as const, ([mounted]) => {
   if (!showPluginEntry || !displaySettings.showPluginsTab || !mounted) return;
@@ -687,13 +673,17 @@ onMounted(async () => {
   // Development is already interactive. Preload the remaining process-level pages.
   preloadTabsInBackground([
     settingsView.ensureLoaded,
-    viewPackageView.ensureLoaded,
     pluginView.ensureLoaded,
     agentView.ensureLoaded,
   ]);
   markStartupPhase("main_preload_tabs_scheduled");
   void bootstrapDeferred();
   markStartupPhase("main_bootstrap_deferred_scheduled");
+  void restoreSharedWorkbenchWindows()
+    .then(() => prepareSharedWorkbenchWindowPool())
+    .catch((error) => {
+      console.warn("[workbench-window] restore or pool warmup failed", error);
+    });
   void appUpdateStore.checkForUpdates({ silent: true });
   markStartupPhase("main_update_check_scheduled");
   startKnowledgeRuntimeStartupPolling();
@@ -754,7 +744,6 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
   <UnityValueEditorWindow v-else-if="isUnityValueEditorWindow" />
   <ExtraWorkdirsConfigWindow v-else-if="isExtraWorkdirsWindow" />
   <ViewHostWindow v-else-if="isViewContentWindow" embedded />
-  <ViewHostWindow v-else-if="isViewHostWindow" />
   <div v-else-if="!authStore.authChecked" class="app-startup-state">
     <span>{{ t("common.loading") }}</span>
   </div>
@@ -832,21 +821,6 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
       <TopBannerHost />
       <div class="tab-content">
         <DevelopmentWorkbench v-show="uiStore.activePage === 'development'" />
-
-        <component
-          :is="viewPackageViewComponent"
-          v-if="uiStore.viewMounted && viewPackageViewComponent"
-          v-show="uiStore.activePage === 'views'"
-          :working-dir="focusedWorkspaceRoot"
-          :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
-        />
-        <div
-          v-else-if="uiStore.viewMounted && uiStore.activePage === 'views'"
-          class="tab-loading-state"
-          :class="{ 'is-loading': viewPackageViewLoading, 'is-error': !!viewPackageViewError }"
-        >
-          {{ viewPackageViewError || t("common.loading") }}
-        </div>
 
         <component
           :is="pluginViewComponent"
@@ -977,4 +951,11 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
   <FileDiffOverlay v-if="diffOverlay.visible.value" />
   <LocusAssetInspectorPanel v-if="!isStandaloneWindow && locusAssetInspectorPanel.state.open" />
   <InternalDragOverlay />
+  <Teleport
+    v-for="host in sharedWorkbenchWindowHosts"
+    :key="host.label"
+    :to="host.container"
+  >
+    <WorkbenchWindow :shared-host="host" />
+  </Teleport>
 </template>

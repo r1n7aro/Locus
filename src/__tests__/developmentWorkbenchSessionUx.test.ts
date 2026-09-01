@@ -72,6 +72,25 @@ describe("development workbench session experience", () => {
     expect(chatWorkspace).toContain("reviewSessionContext,");
   });
 
+  it("creates sibling folders from session menus and groups the actions", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const menuStart = workbench.indexOf(
+      '<template v-else-if="contextMenu.item.meta.kind === \'session\'">',
+    );
+    const menuEnd = workbench.indexOf("\n      <template v-else>", menuStart);
+    const sessionMenu = workbench.slice(menuStart, menuEnd);
+
+    expect(menuStart).toBeGreaterThan(0);
+    expect(menuEnd).toBeGreaterThan(menuStart);
+    expect(sessionMenu).toContain('@click="beginCreateFolder"');
+    expect(sessionMenu).toContain('t("development.newFolder")');
+    expect(sessionMenu).toMatch(
+      /contextOpenSessionInUnity[\s\S]*?base-context-menu-separator[\s\S]*?beginCreateFolder[\s\S]*?base-context-menu-separator[\s\S]*?exportContextSession[\s\S]*?reviewContextSession[\s\S]*?base-context-menu-separator[\s\S]*?archiveContextSession/,
+    );
+    expect(workbench).toContain('const parentNodeId = item.meta.kind === "folder"');
+    expect(workbench).toContain(': item.meta.explorerNode?.parentNodeId ?? null;');
+  });
+
   it("renames sessions in place inside the workspace tree", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 

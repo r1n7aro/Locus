@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createInternalDragController,
   internalDragFloatingTransform,
+  internalDragPointReachedViewportEdge,
 } from "../composables/useInternalDrag";
 
 function pointerButtons(type: string): number {
@@ -51,6 +52,15 @@ describe("internal drag controller", () => {
       { x: 1399.5, y: 0.5 },
       { x: 98.5, y: 15.25 },
     )).toBe("translate3d(1301px, -14.75px, 0)");
+  });
+
+  it("treats WebView-clamped boundary coordinates as a viewport exit", () => {
+    const viewport = { width: 1200, height: 800 };
+    expect(internalDragPointReachedViewportEdge({ x: 0, y: 300 }, viewport)).toBe(true);
+    expect(internalDragPointReachedViewportEdge({ x: 1199, y: 300 }, viewport)).toBe(true);
+    expect(internalDragPointReachedViewportEdge({ x: 400, y: 0 }, viewport)).toBe(true);
+    expect(internalDragPointReachedViewportEdge({ x: 400, y: 799 }, viewport)).toBe(true);
+    expect(internalDragPointReachedViewportEdge({ x: 1, y: 1 }, viewport)).toBe(false);
   });
 
   it("tracks every pointer position and commits one accepted target", () => {
@@ -387,6 +397,52 @@ describe("internal drag controller", () => {
     controller.dispose();
   });
 
+  it("lets an accepted drop surface replace the shared floating preview", () => {
+    const controller = createInternalDragController();
+    const root = document.createElement("div");
+    const sourceElement = document.createElement("button");
+    const targetElement = document.createElement("div");
+    root.append(sourceElement, targetElement);
+    document.body.append(root);
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      value: vi.fn(() => targetElement),
+    });
+    let replaceFloatingPreview = true;
+    controller.registerTarget({
+      id: "composer",
+      root: () => root,
+      accepts: () => true,
+      resolve: () => ({
+        key: "composer:session",
+        operation: "copy",
+        intent: { kind: "composer" },
+        previewMode: replaceFloatingPreview ? "inline" : undefined,
+      }),
+      previewMode: "floating",
+      drop: vi.fn(),
+    });
+    sourceElement.addEventListener("pointerdown", (event) => {
+      controller.start(event as PointerEvent, {
+        id: "source",
+        payload: { type: "test/reference", data: null },
+        preview: { label: "Reference" },
+        allowedOperations: ["copy"],
+      });
+    });
+
+    sourceElement.dispatchEvent(pointerEvent("pointerdown", 5, 5));
+    window.dispatchEvent(pointerEvent("pointermove", 25, 25));
+    expect(controller.activeTarget.value?.decision.key).toBe("composer:session");
+    expect(controller.previewMode.value).toBe("inline");
+
+    replaceFloatingPreview = false;
+    window.dispatchEvent(pointerEvent("pointermove", 35, 35));
+    expect(controller.previewMode.value).toBe("floating");
+    window.dispatchEvent(pointerEvent("pointercancel", 35, 35));
+    controller.dispose();
+  });
+
   it("streams visual coordinates synchronously and avoids repeated target updates", () => {
     const controller = createInternalDragController();
     const root = document.createElement("div");
@@ -466,6 +522,47 @@ describe("internal drag controller", () => {
     controller.dispose();
   });
 
+  it("binds pointer listeners and hit testing to the source element document", () => {
+    const controller = createInternalDragController();
+    const frame = document.createElement("iframe");
+    document.body.append(frame);
+    const frameWindow = frame.contentWindow!;
+    const frameDocument = frame.contentDocument!;
+    const root = frameDocument.createElement("div");
+    const sourceElement = frameDocument.createElement("button");
+    const targetElement = frameDocument.createElement("div");
+    root.append(sourceElement, targetElement);
+    frameDocument.body.append(root);
+    Object.defineProperty(frameDocument, "elementFromPoint", {
+      configurable: true,
+      value: vi.fn(() => targetElement),
+    });
+    const drop = vi.fn();
+    controller.registerTarget({
+      id: "child-window-target",
+      root: () => root,
+      accepts: () => true,
+      resolve: () => ({ key: "child", operation: "move", intent: null }),
+      drop,
+    });
+    sourceElement.addEventListener("pointerdown", (event) => {
+      controller.start(event as PointerEvent, {
+        id: "child-window-source",
+        payload: { type: "test/item", data: null },
+        preview: { label: "Child source" },
+      });
+    });
+
+    sourceElement.dispatchEvent(pointerEvent("pointerdown", 10, 10));
+    frameWindow.dispatchEvent(pointerEvent("pointermove", 40, 40));
+    expect(controller.ownerDocument.value).toBe(frameDocument);
+    expect(controller.dragging.value).toBe(true);
+    expect(controller.activeTarget.value?.decision.key).toBe("child");
+    frameWindow.dispatchEvent(pointerEvent("pointerup", 40, 40));
+    expect(drop).toHaveBeenCalledOnce();
+    controller.dispose();
+  });
+
   it("externalizes a semantic drag after the captured pointer leaves the viewport", async () => {
     const controller = createInternalDragController();
     const sourceElement = document.createElement("button");
@@ -492,7 +589,7 @@ describe("internal drag controller", () => {
     window.dispatchEvent(pointerEvent("pointermove", 30, 30));
     expect(controller.dragging.value).toBe(true);
 
-    window.dispatchEvent(pointerEvent("pointermove", -1, 30));
+    window.dispatchEvent(pointerEvent("pointermove", 0, 30));
     await Promise.resolve();
     expect(controller.phase.value).toBe("idle");
     expect(sourceElement.getAttribute("draggable")).toBe("true");

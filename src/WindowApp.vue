@@ -40,7 +40,8 @@ import { isKnowledgeMarkdownPreviewWindowLocation } from "./services/knowledgeMa
 import { isToolFilePreviewWindowLocation } from "./services/toolFilePreviewWindow";
 import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWindow";
 import { isExtraWorkdirsWindowLocation } from "./services/extraWorkdirsWindow";
-import { isViewContentWindowLocation, isViewHostWindowLocation } from "./services/view";
+import { isViewContentWindowLocation } from "./services/view";
+import { isWorkbenchWindowLocation } from "./services/workbenchWindow";
 import SubWindowLoading from "./components/SubWindowLoading.vue";
 import InternalDragOverlay from "./components/ui/InternalDragOverlay.vue";
 import { provideInternalDragController } from "./composables/useInternalDrag";
@@ -67,6 +68,12 @@ interface WindowKindEntry {
 }
 
 const WINDOW_KINDS: WindowKindEntry[] = [
+  {
+    kind: "workbench-window",
+    matches: isWorkbenchWindowLocation,
+    component: asyncWindowComponent(() => import("./components/WorkbenchWindow.vue")),
+    selfRevealing: true,
+  },
   {
     kind: "knowledge-download",
     matches: isKnowledgeDownloadWindowLocation,
@@ -147,12 +154,6 @@ const WINDOW_KINDS: WindowKindEntry[] = [
     matches: isViewContentWindowLocation,
     component: asyncWindowComponent(() => import("./components/ViewHostWindow.vue")),
     props: { embedded: true },
-    selfRevealing: true,
-  },
-  {
-    kind: "view-host",
-    matches: isViewHostWindowLocation,
-    component: asyncWindowComponent(() => import("./components/ViewHostWindow.vue")),
     selfRevealing: true,
   },
 ];

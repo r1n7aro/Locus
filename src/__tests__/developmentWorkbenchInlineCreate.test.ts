@@ -17,7 +17,7 @@ describe("development workbench inline create", () => {
     expect(workbench).toContain('class="development-inline-create-row"');
     expect(workbench).toContain('@keydown.enter.prevent="submitInlineCreate"');
     expect(workbench).toContain('@keydown.esc.prevent.stop="cancelInlineCreate"');
-    expect(workbench).toContain('document.addEventListener("pointerdown", handleInlineCreatePointerDown, true)');
+    expect(workbench).toContain('ownerDocument.addEventListener("pointerdown", handleInlineCreatePointerDown, true)');
     expect(workbench).not.toContain('mode: "create",\n    projectId: item.meta.projectId');
   });
 

@@ -1,16 +1,17 @@
 import { ref, type Ref } from "vue";
-import { emitTo, type UnlistenFn } from "@tauri-apps/api/event";
+import { invokeLocusRuntime } from "../services/locusRuntime";
+import { emit, emitTo, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
-  cursorPosition,
   Window as TauriWindow,
   type Window as TauriWindowHandle,
 } from "@tauri-apps/api/window";
-import type { InternalDragFinishResult } from "./useInternalDrag";
-import { startLocusDragPreview, stopLocusDragPreview } from "../services/unity";
+import { currentWorkbenchCursorPosition } from "../services/workbenchWindow";
 
 export const WINDOW_TAB_DROP_TARGET_EVENT = "locus-window-tab-drop-target";
+export const WINDOW_TAB_NATIVE_MIME = "application/x-locus-window-tab";
 
-const WINDOW_TAB_DRAG_FRAME_MS = 16;
+const WINDOW_TAB_DRAG_STATE_EVENT = "locus-window-tab-drag-state";
+const NATIVE_DRAG_POINT_EVENT = "shared-workbench:drag-point";
 
 export interface WindowTabScreenPoint {
   x: number;
@@ -31,6 +32,8 @@ export interface WindowTabDropTargetPayload {
   active: boolean;
 }
 
+interface WindowTabDragStatePayload extends WindowTabDropTargetPayload {}
+
 export interface WindowTabDragOptions {
   family: string;
   appWindow: TauriWindowHandle | null;
@@ -44,230 +47,227 @@ export interface WindowTabDragController {
   draggingTabId: Ref<string>;
   dropTargetLabel: Ref<string>;
   externalDropActive: Ref<boolean>;
-  begin: (item: WindowTabDragItem) => void;
-  finish: (tabId: string, result: InternalDragFinishResult) => Promise<void>;
+  begin: (item: WindowTabDragItem, event: DragEvent) => void;
+  markDropped: () => void;
+  finish: (tabId: string, event: DragEvent) => Promise<void>;
   startListening: () => Promise<void>;
   dispose: () => void;
 }
 
-/**
- * Bridges the app-level pointer drag controller to native window coordinates.
- * The shared layer decides where a gesture ends; each tab supplies its own
- * transfer and detach implementation.
- */
+interface NativeWindowBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scale: number;
+}
+
 export function useWindowTabDrag(options: WindowTabDragOptions): WindowTabDragController {
   const draggingTabId = ref("");
   const dropTargetLabel = ref("");
   const externalDropActive = ref(false);
   let activeItem: WindowTabDragItem | null = null;
-  let frameTimer: ReturnType<typeof setTimeout> | null = null;
-  let unlistenDropTarget: UnlistenFn | null = null;
-  let lastEmittedTargetLabel = "";
+  let localDropCommitted = false;
   let externalSourceLabel = "";
-  let nativePreviewActive = false;
+  let targetStateEmitted = false;
+  let nativeBounds: NativeWindowBounds | null = null;
   let disposed = false;
+  const releases: UnlistenFn[] = [];
 
-  function emitTargetState(targetLabel: string, active: boolean): void {
-    if (!options.windowLabel || !targetLabel || targetLabel === options.windowLabel) return;
-    void emitTo<WindowTabDropTargetPayload>(targetLabel, WINDOW_TAB_DROP_TARGET_EVENT, {
-      family: options.family,
-      sourceLabel: options.windowLabel,
-      active,
-    }).catch((error) => {
-      console.warn("[window-tab-drag] failed to update drop target", error);
-    });
+  async function refreshNativeBounds(): Promise<void> {
+    if (!options.appWindow) return;
+    const [position, size, scale] = await Promise.all([
+      options.appWindow.outerPosition(),
+      options.appWindow.outerSize(),
+      options.appWindow.scaleFactor(),
+    ]);
+    nativeBounds = {
+      x: position.x,
+      y: position.y,
+      width: size.width,
+      height: size.height,
+      scale,
+    };
   }
 
-  function setDropTargetLabel(nextLabel: string): void {
-    const normalized = nextLabel || "";
-    if (normalized === dropTargetLabel.value) return;
-    if (lastEmittedTargetLabel) emitTargetState(lastEmittedTargetLabel, false);
-    dropTargetLabel.value = normalized;
-    lastEmittedTargetLabel = normalized;
-    if (normalized) emitTargetState(normalized, true);
+  function pointInsideTabBand(point: WindowTabScreenPoint): boolean {
+    const bounds = nativeBounds;
+    if (!bounds) return false;
+    const bandHeight = (options.tabBandHeight ?? 40) * bounds.scale;
+    return point.x >= bounds.x
+      && point.x <= bounds.x + bounds.width
+      && point.y >= bounds.y
+      && point.y <= Math.min(bounds.y + bounds.height, bounds.y + bandHeight);
   }
 
-  async function findDropTargetAt(point: WindowTabScreenPoint): Promise<string> {
-    if (!options.windowLabel) return "";
-    let windows: TauriWindowHandle[] = [];
-    try {
-      windows = await TauriWindow.getAll();
-    } catch {
-      return "";
-    }
-    const tabBandHeight = options.tabBandHeight ?? 40;
-    for (const candidate of windows) {
-      if (
-        candidate.label === options.windowLabel
-        || !options.acceptsWindowLabel(candidate.label)
-      ) continue;
-      try {
-        const [position, size] = await Promise.all([
-          candidate.outerPosition(),
-          candidate.outerSize(),
-        ]);
-        const withinX = point.x >= position.x && point.x <= position.x + size.width;
-        const withinY = point.y >= position.y && point.y <= position.y + size.height;
-        const withinTabBand = point.y >= position.y
-          && point.y <= position.y + tabBandHeight;
-        if (withinX && withinY && withinTabBand) return candidate.label;
-      } catch {
-        // A window can disappear between enumeration and geometry lookup.
-      }
-    }
-    return "";
+  function emitTargetState(active: boolean): void {
+    if (!externalSourceLabel || targetStateEmitted === active) return;
+    targetStateEmitted = active;
+    externalDropActive.value = active;
+    void emitTo<WindowTabDropTargetPayload>(
+      externalSourceLabel,
+      WINDOW_TAB_DROP_TARGET_EVENT,
+      {
+        family: options.family,
+        sourceLabel: options.windowLabel,
+        active,
+      },
+    ).catch(() => undefined);
   }
 
-  async function isCurrentTabBandAt(point: WindowTabScreenPoint): Promise<boolean> {
-    if (!options.appWindow) return false;
-    try {
-      const [position, size] = await Promise.all([
-        options.appWindow.outerPosition(),
-        options.appWindow.outerSize(),
-      ]);
-      const tabBandHeight = options.tabBandHeight ?? 40;
-      return point.x >= position.x
-        && point.x <= position.x + size.width
-        && point.y >= position.y
-        && point.y <= position.y + Math.min(tabBandHeight, size.height);
-    } catch {
-      return false;
-    }
+  function clearExternalSource(sourceLabel = externalSourceLabel): void {
+    if (sourceLabel && externalSourceLabel !== sourceLabel) return;
+    emitTargetState(false);
+    externalSourceLabel = "";
+    targetStateEmitted = false;
+    externalDropActive.value = false;
   }
 
-  async function isCurrentWindowAt(point: WindowTabScreenPoint): Promise<boolean> {
-    if (!options.appWindow) return false;
-    try {
-      const [position, size] = await Promise.all([
-        options.appWindow.outerPosition(),
-        options.appWindow.outerSize(),
-      ]);
-      return point.x >= position.x
-        && point.x <= position.x + size.width
-        && point.y >= position.y
-        && point.y <= position.y + size.height;
-    } catch {
-      return false;
-    }
-  }
-
-  function startNativePreview(label: string): void {
-    if (nativePreviewActive) return;
-    nativePreviewActive = true;
-    void startLocusDragPreview(label).catch((error) => {
-      nativePreviewActive = false;
-      console.warn("[window-tab-drag] failed to start native preview", error);
-    });
-  }
-
-  function stopNativePreview(): void {
-    if (!nativePreviewActive) return;
-    nativePreviewActive = false;
-    void stopLocusDragPreview().catch((error) => {
-      console.warn("[window-tab-drag] failed to stop native preview", error);
-    });
-  }
-
-  function scheduleFrame(): void {
-    if (disposed || !activeItem || frameTimer !== null) return;
-    frameTimer = setTimeout(() => {
-      frameTimer = null;
-      void updateFrame();
-    }, WINDOW_TAB_DRAG_FRAME_MS);
-  }
-
-  async function updateFrame(): Promise<void> {
-    const item = activeItem;
-    if (!item || disposed) return;
-    try {
-      const cursor = await cursorPosition();
-      const insideCurrentWindow = await isCurrentWindowAt(cursor);
-      if (activeItem !== item || disposed) return;
-      if (insideCurrentWindow) stopNativePreview();
-      else startNativePreview(item.title);
-      const nextTargetLabel = await findDropTargetAt(cursor);
-      if (activeItem === item && !disposed) setDropTargetLabel(nextTargetLabel);
-    } catch (error) {
-      console.warn("[window-tab-drag] failed to inspect native windows", error);
-    }
-    scheduleFrame();
-  }
-
-  function begin(item: WindowTabDragItem): void {
-    if (!options.appWindow || disposed) return;
-    activeItem = item;
-    draggingTabId.value = item.id;
-    void Promise.resolve(options.prepare?.()).catch((error) => {
-      console.warn("[window-tab-drag] failed to prepare detached host", error);
-    });
-    scheduleFrame();
-  }
-
-  async function finish(tabId: string, result: InternalDragFinishResult): Promise<void> {
-    const item = activeItem;
-    if (!item || item.id !== tabId) return;
-    activeItem = null;
-    draggingTabId.value = "";
-    if (frameTimer !== null) clearTimeout(frameTimer);
-    frameTimer = null;
-    stopNativePreview();
-
-    let targetLabel = dropTargetLabel.value;
-    setDropTargetLabel("");
-    if (result.dropped || result.reason !== "drop") return;
-
-    let releasePoint: WindowTabScreenPoint;
-    try {
-      releasePoint = await cursorPosition();
-      targetLabel = await findDropTargetAt(releasePoint) || targetLabel;
-    } catch {
-      return;
-    }
-    if (targetLabel) {
-      await item.transfer(targetLabel);
-      return;
-    }
-    if (await isCurrentTabBandAt(releasePoint)) return;
-    if (item.canDetach()) await item.detach(releasePoint);
-  }
-
-  function applyExternalDropTarget(payload: WindowTabDropTargetPayload): void {
+  function applyDragState(payload: WindowTabDragStatePayload): void {
     if (
       payload.family !== options.family
       || !payload.sourceLabel
       || payload.sourceLabel === options.windowLabel
     ) return;
-    if (payload.active) {
-      externalSourceLabel = payload.sourceLabel;
-      externalDropActive.value = true;
+    if (!payload.active) {
+      clearExternalSource(payload.sourceLabel);
       return;
     }
-    if (!externalSourceLabel || externalSourceLabel === payload.sourceLabel) {
-      externalSourceLabel = "";
-      externalDropActive.value = false;
+    if (externalSourceLabel && externalSourceLabel !== payload.sourceLabel) clearExternalSource();
+    externalSourceLabel = payload.sourceLabel;
+  }
+
+  function applyNativePoint(point: WindowTabScreenPoint): void {
+    if (!externalSourceLabel) return;
+    emitTargetState(pointInsideTabBand(point));
+  }
+
+  function applyDropTarget(payload: WindowTabDropTargetPayload): void {
+    if (
+      payload.family !== options.family
+      || !payload.sourceLabel
+      || !options.acceptsWindowLabel(payload.sourceLabel)
+      || payload.sourceLabel === options.windowLabel
+    ) return;
+    dropTargetLabel.value = payload.active ? payload.sourceLabel : "";
+  }
+
+  async function windowAtPoint(point: WindowTabScreenPoint): Promise<string> {
+    const windows = await TauriWindow.getAll().catch(() => []);
+    for (const candidate of windows) {
+      if (!options.acceptsWindowLabel(candidate.label)) continue;
+      try {
+        const [visible, minimized, position, size] = await Promise.all([
+          candidate.isVisible(),
+          candidate.isMinimized(),
+          candidate.outerPosition(),
+          candidate.outerSize(),
+        ]);
+        if (!visible || minimized) continue;
+        if (
+          point.x >= position.x
+          && point.x <= position.x + size.width
+          && point.y >= position.y
+          && point.y <= position.y + size.height
+        ) return candidate.label;
+      } catch {
+        // The window can close while the release point is being resolved.
+      }
     }
+    return "";
+  }
+
+  function publishDragState(active: boolean): void {
+    void emit<WindowTabDragStatePayload>(WINDOW_TAB_DRAG_STATE_EVENT, {
+      family: options.family,
+      sourceLabel: options.windowLabel,
+      active,
+    }).catch(() => undefined);
+  }
+
+  function begin(item: WindowTabDragItem, event: DragEvent): void {
+    if (!options.appWindow || disposed || !event.dataTransfer) return;
+    activeItem = item;
+    localDropCommitted = false;
+    draggingTabId.value = item.id;
+    dropTargetLabel.value = "";
+    event.dataTransfer.setData(WINDOW_TAB_NATIVE_MIME, JSON.stringify({
+      family: options.family,
+      sourceLabel: options.windowLabel,
+      tabId: item.id,
+    }));
+    void Promise.resolve(options.prepare?.()).catch((error) => {
+      console.warn("[window-tab-drag] failed to prepare detached host", error);
+    });
+    void invokeLocusRuntime("start_shared_workbench_drag_tracking").catch(() => undefined);
+    publishDragState(true);
+  }
+
+  function markDropped(): void {
+    localDropCommitted = true;
+    dropTargetLabel.value = "";
+  }
+
+  async function finish(tabId: string, _event: DragEvent): Promise<void> {
+    const item = activeItem;
+    if (!item || item.id !== tabId) return;
+    const targetLabel = dropTargetLabel.value;
+    activeItem = null;
+    draggingTabId.value = "";
+    dropTargetLabel.value = "";
+    void invokeLocusRuntime("stop_shared_workbench_drag_tracking").catch(() => undefined);
+    publishDragState(false);
+    const dropped = localDropCommitted;
+    localDropCommitted = false;
+    if (dropped) return;
+
+    const point = await currentWorkbenchCursorPosition().catch(() => null);
+    if (!point) {
+      return;
+    }
+    const releaseWindowLabel = await windowAtPoint(point);
+    if (
+      targetLabel
+      && targetLabel !== options.windowLabel
+      && (!releaseWindowLabel || releaseWindowLabel === targetLabel)
+    ) {
+      await item.transfer(targetLabel);
+      return;
+    }
+    if (releaseWindowLabel) return;
+    if (item.canDetach()) await item.detach(point);
   }
 
   async function startListening(): Promise<void> {
-    if (!options.appWindow || unlistenDropTarget || disposed) return;
-    unlistenDropTarget = await options.appWindow.listen<WindowTabDropTargetPayload>(
-      WINDOW_TAB_DROP_TARGET_EVENT,
-      (event) => applyExternalDropTarget(event.payload),
+    if (!options.appWindow || releases.length > 0 || disposed) return;
+    await refreshNativeBounds();
+    releases.push(
+      await listen<WindowTabDragStatePayload>(WINDOW_TAB_DRAG_STATE_EVENT, (event) => {
+        applyDragState(event.payload);
+      }),
+      await listen<WindowTabScreenPoint>(NATIVE_DRAG_POINT_EVENT, (event) => {
+        applyNativePoint(event.payload);
+      }),
+      await options.appWindow.listen<WindowTabDropTargetPayload>(
+        WINDOW_TAB_DROP_TARGET_EVENT,
+        (event) => applyDropTarget(event.payload),
+      ),
+      await options.appWindow.onMoved(() => void refreshNativeBounds()),
+      await options.appWindow.onResized(() => void refreshNativeBounds()),
     );
   }
 
   function dispose(): void {
     disposed = true;
+    if (activeItem) {
+      void invokeLocusRuntime("stop_shared_workbench_drag_tracking").catch(() => undefined);
+      publishDragState(false);
+    }
     activeItem = null;
     draggingTabId.value = "";
-    if (frameTimer !== null) clearTimeout(frameTimer);
-    frameTimer = null;
-    stopNativePreview();
-    setDropTargetLabel("");
-    externalSourceLabel = "";
-    externalDropActive.value = false;
-    unlistenDropTarget?.();
-    unlistenDropTarget = null;
+    dropTargetLabel.value = "";
+    clearExternalSource();
+    for (const release of releases.splice(0)) release();
   }
 
   return {
@@ -275,6 +275,7 @@ export function useWindowTabDrag(options: WindowTabDragOptions): WindowTabDragCo
     dropTargetLabel,
     externalDropActive,
     begin,
+    markDropped,
     finish,
     startListening,
     dispose,

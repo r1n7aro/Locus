@@ -23,7 +23,10 @@ import {
   useInternalDragController,
   type InternalDropTargetRegistration,
 } from "../composables/useInternalDrag";
-import { useWindowTabDrag } from "../composables/useWindowTabDrag";
+import {
+  useWindowTabDrag,
+  WINDOW_TAB_NATIVE_MIME,
+} from "../composables/useWindowTabDrag";
 import { t } from "../i18n";
 import { searchWorkspaceAssets } from "../services/asset";
 import {
@@ -131,7 +134,7 @@ import type {
 } from "../types";
 import { createViewRuntimeComponent } from "./view/viewRuntime";
 import BaseTabStrip, {
-  type BaseTabDragFinishedPayload,
+  type BaseTabNativeDragPayload,
   type BaseTabStripItem,
 } from "./ui/BaseTabStrip.vue";
 import {
@@ -182,16 +185,16 @@ interface ViewHostTabsMergeDonePayload {
   activeViewId: string;
 }
 
-interface ViewHostTabsSelectPayload {
-  viewId: string;
-  targetLabel?: string;
-  allowPoolClaim?: boolean;
-}
-
 interface ViewHostTabDragData {
   hostLabel: string;
   tabId: string;
   title: string;
+}
+
+interface ViewHostTabsSelectPayload {
+  viewId: string;
+  targetLabel?: string;
+  allowPoolClaim?: boolean;
 }
 
 interface ViewHostTabDropIntent {
@@ -1098,36 +1101,55 @@ async function detachTab(tabId: string, point: { x: number; y: number }) {
   }
 }
 
-function viewTabDragData(tab: BaseTabStripItem): ViewHostTabDragData {
-  return {
-    hostLabel: currentWindowLabel,
-    tabId: tab.id,
-    title: tab.title,
-  };
-}
-
-function viewTabDragSourceId(tab: BaseTabStripItem): string {
-  return `view-host-tab:${currentWindowLabel}:${tab.id}`;
-}
-
 function canDragViewTab(): boolean {
   return !props.embedded && !!appWindow;
 }
 
-function handleViewTabDragActivated(tab: BaseTabStripItem): void {
+function handleViewTabNativeDragStart(payload: BaseTabNativeDragPayload): void {
+  const tab = payload.tab;
   windowTabDrag.begin({
     id: tab.id,
     title: tab.title,
     canDetach: () => tabs.value.length > 1 && tabs.value.some((item) => item.id === tab.id),
     transfer: (targetLabel) => mergeTabIntoWindow(tab.id, targetLabel),
     detach: (point) => detachTab(tab.id, point),
+  }, payload.event);
+}
+
+function handleViewTabNativeDragEnd(payload: BaseTabNativeDragPayload): void {
+  viewTabDropIndex.value = -1;
+  void windowTabDrag.finish(payload.tab.id, payload.event).catch((dragError) => {
+    console.error("[view-host] Failed to finish tab drag", dragError);
   });
 }
 
-function handleViewTabDragFinished(payload: BaseTabDragFinishedPayload): void {
-  void windowTabDrag.finish(payload.tab.id, payload.result).catch((dragError) => {
-    console.error("[view-host] Failed to finish tab drag", dragError);
-  });
+function handleViewTabNativeDragOver(event: DragEvent): void {
+  if (!windowTabDrag.draggingTabId.value) return;
+  if (!Array.from(event.dataTransfer?.types ?? []).includes(WINDOW_TAB_NATIVE_MIME)) return;
+  const strip = viewHostTabsRoot.value?.querySelector<HTMLElement>("[data-locus-tab-strip]");
+  if (!strip) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  const bounds = [...strip.querySelectorAll<HTMLElement>("[data-locus-tab-id]")]
+    .map((tab) => tab.getBoundingClientRect());
+  viewTabDropIndex.value = tabInsertionIndexAtPoint(event.clientX, bounds);
+}
+
+function handleViewTabNativeDragLeave(event: DragEvent): void {
+  const current = event.currentTarget as HTMLElement | null;
+  const related = event.relatedTarget as Node | null;
+  if (current && related && current.contains(related)) return;
+  viewTabDropIndex.value = -1;
+}
+
+function handleViewTabNativeDrop(event: DragEvent): void {
+  const tabId = windowTabDrag.draggingTabId.value;
+  if (!tabId || viewTabDropIndex.value < 0) return;
+  event.preventDefault();
+  const insertionIndex = viewTabDropIndex.value;
+  viewTabDropIndex.value = -1;
+  windowTabDrag.markDropped();
+  void reorderViewTab(tabId, insertionIndex);
 }
 
 async function reorderViewTab(tabId: string, insertionIndex: number): Promise<void> {
@@ -2759,6 +2781,9 @@ onUnmounted(() => {
         class="view-host-tabs-region"
         data-tauri-drag-region
         @dblclick.stop="toggleMaximizeWindow"
+        @dragover="handleViewTabNativeDragOver"
+        @dragleave="handleViewTabNativeDragLeave"
+        @drop="handleViewTabNativeDrop"
       >
         <BaseTabStrip
           v-if="tabs.length > 0"
@@ -2766,18 +2791,15 @@ onUnmounted(() => {
           :tabs="tabItems"
           :active-id="activeViewId"
           :label="t('view.host.title')"
-          :drag-type="VIEW_HOST_TAB_INTERNAL_DRAG_TYPE"
-          :drag-data="viewTabDragData"
-          :drag-source-id="viewTabDragSourceId"
           :can-drag="canDragViewTab"
           :drop-active="viewTabDropIndex >= 0"
           :drop-index="viewTabDropIndex"
-          :cancel-drag-on-window-blur="false"
+          native-drag
           activate-on-pointer-down
           @activate="setActiveViewTab($event)"
           @close="closeTab($event)"
-          @drag-activated="handleViewTabDragActivated"
-          @drag-finished="handleViewTabDragFinished"
+          @native-drag-start="handleViewTabNativeDragStart"
+          @native-drag-end="handleViewTabNativeDragEnd"
         />
         <span v-else class="view-host-title-main">{{ windowTitle }}</span>
       </div>

@@ -188,12 +188,13 @@ describe("workspacePageWindow", () => {
     expect(capabilities).toContain('"workspace-page-*"');
   });
 
-  it("keeps Development and View in the primary navigation with Plugin in app scope", () => {
+  it("keeps View inside Development and out of the primary navigation", () => {
     const app = read("src/App.vue");
+    const developmentWorkbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const topTabs = app.slice(app.indexOf("const topTabs"), app.indexOf("const visibleTopTabs"));
 
     expect(topTabs).toContain('{ id: "development"');
-    expect(topTabs).toContain('{ id: "views"');
+    expect(topTabs).not.toContain('{ id: "views"');
     expect(topTabs).toContain('{ id: "plugins"');
     expect(topTabs).toContain('{ id: "agent"');
     expect(topTabs).not.toContain('{ id: "knowledge"');
@@ -201,6 +202,8 @@ describe("workspacePageWindow", () => {
     expect(app).not.toContain("const projectTabs");
     expect(app).not.toContain('class="project-tab-context"');
     expect(app).toContain("DevelopmentWorkbench");
+    expect(developmentWorkbench).toContain('editor.resource.section === \'views\'');
+    expect(developmentWorkbench).toContain("<ViewPackageView");
     expect(app).toContain("openTopTabInWindow");
     expect(app).toContain('return tab.id !== "development"');
     expect(app).toMatch(

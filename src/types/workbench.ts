@@ -222,3 +222,47 @@ export interface WorkbenchEditorDragData {
   paneId: string;
   editorId: string;
 }
+
+export interface WorkbenchWindowDropIntent {
+  windowId: string;
+  paneId: string;
+  direction: WorkbenchDropDirection;
+  index?: number;
+}
+
+export type WorkbenchEditorTransferSnapshot =
+  | {
+      kind: "session";
+      composerDraft?: unknown;
+    }
+  | {
+      kind: "workspaceFile";
+      text: string;
+      contentHash: string;
+      originalLineEnding: "\n" | "\r\n" | "\r";
+      selection?: { anchor: number; head: number } | null;
+      scrollTop?: number | null;
+    }
+  | {
+      kind: "resource";
+    };
+
+export interface WorkbenchEditorTransferRecord {
+  version: 1;
+  token: string;
+  sourceWindowId: string;
+  sourcePaneId: string;
+  sourceEditorId: string;
+  editor: WorkbenchEditorInput;
+  snapshot?: WorkbenchEditorTransferSnapshot | null;
+  target?: WorkbenchWindowDropIntent | null;
+  allowDuplicate?: boolean;
+  createdAt: number;
+  dragStartedAt: number;
+}
+
+export interface WorkbenchTransferAcceptResult {
+  paneId: string;
+  editorId: string;
+  inserted: boolean;
+}

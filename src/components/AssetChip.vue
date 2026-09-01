@@ -8,29 +8,29 @@ import {
   classifyUnitySceneObjectError,
   openFileExternal,
 } from "../services/unity";
-import {
-  armUnityReferencePointerDrag,
-  startUnityReferenceHtmlDrag,
-} from "../composables/useUnityReferenceDragSource";
+import { useInternalDragController } from "../composables/useInternalDrag";
 import { normalizeAppError } from "../services/errors";
 import { useKnowledgeDocumentOpen } from "../composables/useKnowledgeDocumentOpen";
 import { t } from "../i18n";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
-import type { AssetRefAttachment, AssetRefKind, KnowledgeDocumentType } from "../types";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
+import type { WorkspaceRef } from "../services/project";
+import type { AssetRefKind, KnowledgeDocumentType } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
 import {
   unityAssetIconClassForKind,
   unityAssetIconKindForPath,
   unityAssetIconNodeForKind,
 } from "./icons/unityAssetIcons";
-import { isWorkbenchReferencePointerEventClaimed } from "./workbench/workbenchReferenceDrag";
+import { startWorkbenchReferenceInternalDrag } from "./workbench/workbenchReferenceDrag";
 
 const props = defineProps<{
   path: string;
   kind?: AssetRefKind;
   removable?: boolean;
   contextMenuMode?: "copyPath" | "inherit";
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -39,6 +39,8 @@ const emit = defineEmits<{
 
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
+const workspaceContextStore = useWorkspaceContextStore();
+const internalDrag = useInternalDragController();
 const { openDocument: openKnowledgeDocument } = useKnowledgeDocumentOpen();
 const KNOWLEDGE_REF_ROOT_RE = /^(design|plan|memory|skill|reference)\/.+\.md$/i;
 
@@ -89,25 +91,6 @@ const iconKind = computed(() =>
 
 const iconNode = computed(() => unityAssetIconNodeForKind(iconKind.value));
 const unitySelectableAsset = computed(() => /^(Assets|Packages)\//i.test(normalizedPath.value));
-const unityDragRef = computed<AssetRefAttachment | null>(() => {
-  if (sceneObjectRef.value) {
-    return {
-      kind: "sceneObject",
-      path: `${sceneObjectRef.value.scenePath}/${sceneObjectRef.value.objectPath}`,
-      name: displayName.value,
-      source: "manual",
-    };
-  }
-  if (effectiveKind.value === "asset" && unitySelectableAsset.value) {
-    return {
-      kind: "asset",
-      path: normalizedPath.value,
-      name: displayName.value,
-      source: "manual",
-    };
-  }
-  return null;
-});
 
 async function handleClick(e: MouseEvent) {
   try {
@@ -189,17 +172,17 @@ async function handleContextMenu(event: MouseEvent) {
   }
 }
 
-function handleDragStart(event: DragEvent) {
-  const ref = unityDragRef.value;
-  if (!ref) return;
-  startUnityReferenceHtmlDrag(event, [ref]);
-}
-
 function handlePointerDown(event: PointerEvent) {
-  if (isWorkbenchReferencePointerEventClaimed(event)) return;
-  const ref = unityDragRef.value;
-  if (!ref) return;
-  armUnityReferencePointerDrag(event, [ref]);
+  if (event.button !== 0 || event.isPrimary === false) return;
+  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceRef) return;
+  const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
+  if (!checkout?.projectId || !checkout.root) return;
+  startWorkbenchReferenceInternalDrag(internalDrag, event, {
+    projectId: checkout.projectId,
+    workspaceRef: { ...workspaceRef },
+    workspaceRoot: checkout.root,
+  }, event.currentTarget as Element);
 }
 </script>
 
@@ -214,11 +197,9 @@ function handlePointerDown(event: PointerEvent) {
     :data-asset-path="effectiveKind === 'asset' ? normalizedPath : undefined"
     :data-scene-path="sceneObjectRef?.scenePath"
     :data-scene-object-path="sceneObjectRef?.objectPath"
-    :draggable="!!unityDragRef"
     @click.stop="handleClick"
     @contextmenu="handleContextMenu"
     @pointerdown="handlePointerDown"
-    @dragstart="handleDragStart"
   >
     <LucideIcon
       class="asset-chip-icon"
@@ -230,9 +211,7 @@ function handlePointerDown(event: PointerEvent) {
       v-if="removable"
       type="button"
       class="asset-chip-remove"
-      draggable="false"
       @pointerdown.stop.prevent
-      @dragstart.stop.prevent
       @click.stop="emit('remove')"
     >&times;</button>
   </span>

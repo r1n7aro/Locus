@@ -27,5 +27,6 @@ const previewPath = computed(() => {
     :path="previewPath"
     :title="editor.title"
     :auto-load-preview="true"
+    :show-header="false"
   />
 </template>

@@ -14,15 +14,7 @@ import {
   type WorkspaceDisplayMode,
   type WorkspaceSectionVisibilityKind,
 } from "../../composables/useDisplaySettings";
-import { normalizeAppError } from "../../services/errors";
 import { ipcInvoke } from "../../services/ipc";
-import {
-  getViewOpenInExistingWindow,
-  getViewWindowsAboveMain,
-  setViewOpenInExistingWindow,
-  setViewWindowsAboveMain,
-} from "../../services/system";
-import { useNotificationStore } from "../../stores/notification";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
@@ -30,13 +22,6 @@ import BaseCheckbox from "../ui/BaseCheckbox.vue";
 
 const { mainPreference, unityEmbedPreference, setThemePreference } = useTheme();
 const { state: display, set: setDisplay, setFont } = useDisplaySettings();
-const notificationStore = useNotificationStore();
-const viewOpenInExistingWindow = ref(true);
-const viewOpenInExistingWindowReady = ref(false);
-const viewOpenInExistingWindowBusy = ref(false);
-const viewWindowsAboveMain = ref(false);
-const viewWindowsAboveMainReady = ref(false);
-const viewWindowsAboveMainBusy = ref(false);
 
 const options: { value: ThemePreference; labelKey: string }[] = [
   { value: "system", labelKey: "settings.display.themeSystem" },
@@ -164,7 +149,6 @@ const unityEmbedAssetRefClickActionOptions = computed(() => [
 ]);
 
 const topNavigationToggles = [
-  { key: "showViewsTab", labelKey: "settings.display.showViewsTab" },
   { key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" },
   { key: "showAgentTab", labelKey: "settings.display.showAgentTab" },
 ] as const;
@@ -189,78 +173,11 @@ const fontOptions = computed<DropdownOption[]>(() => [
 ]);
 
 onMounted(async () => {
-  void refreshViewOpenInExistingWindow();
-  void refreshViewWindowsAboveMain();
   try {
     systemFonts.value = await ipcInvoke<string[]>("get_system_fonts");
   } catch { /* fallback: empty list, user can still type */ }
 });
 
-async function refreshViewOpenInExistingWindow() {
-  try {
-    viewOpenInExistingWindow.value = await getViewOpenInExistingWindow();
-  } catch (e) {
-    const err = normalizeAppError(e);
-    notificationStore.addNotice("error", err.message, {
-      code: err.code,
-      operation: "loadViewOpenInExistingWindow",
-    });
-  } finally {
-    viewOpenInExistingWindowReady.value = true;
-  }
-}
-
-async function refreshViewWindowsAboveMain() {
-  try {
-    viewWindowsAboveMain.value = await getViewWindowsAboveMain();
-  } catch (e) {
-    const err = normalizeAppError(e);
-    notificationStore.addNotice("error", err.message, {
-      code: err.code,
-      operation: "loadViewWindowsAboveMain",
-    });
-  } finally {
-    viewWindowsAboveMainReady.value = true;
-  }
-}
-
-async function updateViewOpenInExistingWindow(value: boolean) {
-  if (!viewOpenInExistingWindowReady.value || viewOpenInExistingWindowBusy.value) return;
-  const previous = viewOpenInExistingWindow.value;
-  viewOpenInExistingWindow.value = value;
-  viewOpenInExistingWindowBusy.value = true;
-  try {
-    await setViewOpenInExistingWindow(value);
-  } catch (e) {
-    viewOpenInExistingWindow.value = previous;
-    const err = normalizeAppError(e);
-    notificationStore.addNotice("error", err.message, {
-      code: err.code,
-      operation: "saveViewOpenInExistingWindow",
-    });
-  } finally {
-    viewOpenInExistingWindowBusy.value = false;
-  }
-}
-
-async function updateViewWindowsAboveMain(value: boolean) {
-  if (!viewWindowsAboveMainReady.value || viewWindowsAboveMainBusy.value) return;
-  const previous = viewWindowsAboveMain.value;
-  viewWindowsAboveMain.value = value;
-  viewWindowsAboveMainBusy.value = true;
-  try {
-    await setViewWindowsAboveMain(value);
-  } catch (e) {
-    viewWindowsAboveMain.value = previous;
-    const err = normalizeAppError(e);
-    notificationStore.addNotice("error", err.message, {
-      code: err.code,
-      operation: "saveViewWindowsAboveMain",
-    });
-  } finally {
-    viewWindowsAboveMainBusy.value = false;
-  }
-}
 </script>
 
 <template>
@@ -502,25 +419,6 @@ async function updateViewWindowsAboveMain(value: boolean) {
       <span>{{ t("settings.display.showViewLogBar") }}</span>
     </div>
 
-    <div class="toggle-row" :class="{ disabled: !viewOpenInExistingWindowReady || viewOpenInExistingWindowBusy }">
-      <BaseSwitch
-        :model-value="viewOpenInExistingWindow"
-        :disabled="!viewOpenInExistingWindowReady || viewOpenInExistingWindowBusy"
-        :aria-label="t('settings.display.viewOpenInExistingWindow')"
-        @update:model-value="updateViewOpenInExistingWindow"
-      />
-      <span>{{ t("settings.display.viewOpenInExistingWindow") }}</span>
-    </div>
-
-    <div class="toggle-row" :class="{ disabled: !viewWindowsAboveMainReady || viewWindowsAboveMainBusy }">
-      <BaseSwitch
-        :model-value="viewWindowsAboveMain"
-        :disabled="!viewWindowsAboveMainReady || viewWindowsAboveMainBusy"
-        :aria-label="t('settings.display.viewWindowsAboveMain')"
-        @update:model-value="updateViewWindowsAboveMain"
-      />
-      <span>{{ t("settings.display.viewWindowsAboveMain") }}</span>
-    </div>
   </div>
 
   <div class="settings-section">

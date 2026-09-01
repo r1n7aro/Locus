@@ -59,12 +59,14 @@ mod runtime_data_lock;
 mod runtime_paths;
 mod sdk;
 mod session;
+mod shared_workbench_window;
 mod skill_runtime_context;
 mod sqlite_maint;
 mod tool;
 pub mod unity_bridge;
 pub mod unity_csharp;
 mod unity_docs;
+pub mod unity_editor_lock;
 pub mod unity_hotreload;
 mod unity_project_config;
 pub mod unity_serialized_property;
@@ -187,13 +189,16 @@ fn set_main_tray_visible(app_handle: &tauri::AppHandle, visible: bool) -> bool {
     true
 }
 
-fn reveal_main_window(app_handle: &tauri::AppHandle) {
+pub(crate) fn reveal_main_window(app_handle: &tauri::AppHandle) {
     if let Some(window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
+        if let Err(error) = window.unminimize() {
+            eprintln!("[Locus] failed to restore main window: {}", error);
+        }
         if let Err(error) = window.show() {
-            eprintln!("[Locus] failed to show main window from tray: {}", error);
+            eprintln!("[Locus] failed to show main window: {}", error);
         }
         if let Err(error) = window.set_focus() {
-            eprintln!("[Locus] failed to focus main window from tray: {}", error);
+            eprintln!("[Locus] failed to focus main window: {}", error);
         }
     }
     let _ = set_main_tray_visible(app_handle, false);
@@ -533,6 +538,16 @@ pub fn run() {
             startup_for_setup.mark("setup_storage_ready");
 
             let mut loaded_config = AppConfig::load(&data_dir);
+            // CLI integration drivers exercise the bridge and process state
+            // directly. Unity embed windows retain native HWNDs across editor
+            // restarts and can panic the desktop event loop while a driver is
+            // intentionally killing/relaunching Unity, so keep embed disabled
+            // for this isolated test runtime.
+            if cli_driver_for_setup.is_some() {
+                loaded_config
+                    .unity_embed_enabled
+                    .store(false, Ordering::Relaxed);
+            }
             debug_flag_for_setup.store(loaded_config.debug_enabled(), Ordering::Relaxed);
             loaded_config.debug = debug_flag_for_setup.clone();
             let config = Arc::new(loaded_config);
@@ -558,6 +573,7 @@ pub fn run() {
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             unity_bridge::initialize_state_probe(config.unity_state_probe_enabled());
             unity_bridge::initialize_native_bridge(config.unity_native_bridge_enabled());
+            unity_editor_lock::initialize(config.unity_multi_agent_editor_enabled());
             unity_bridge::initialize_external_editor_default(
                 config.unity_external_editor_default_enabled(),
             );
@@ -1041,11 +1057,26 @@ pub fn run() {
             startup_for_setup.mark("main_window_build_start");
             let mut main_window_builder =
                 tauri::WebviewWindowBuilder::from_config(app.handle(), main_window_config)?;
+            let app_handle_for_shared_workbench = app.handle().clone();
+            main_window_builder = main_window_builder.on_new_window(move |url, features| {
+                shared_workbench_window::handle_new_window(
+                    &app_handle_for_shared_workbench,
+                    url,
+                    features,
+                )
+            });
             if skip_onboarding_for_setup {
                 main_window_builder = main_window_builder.initialization_script(
                     "try { localStorage.setItem('locus-onboarding-completed', '1'); } catch (_) {}",
                 );
             }
+            let debug_initialization_script = if app.state::<Arc<AppConfig>>().debug_enabled() {
+                "window.__LOCUS_DEBUG_ENABLED__ = true; try { localStorage.setItem('locus:webview-bridge:debug-enabled:v1', '1'); } catch (_) {}"
+            } else {
+                "window.__LOCUS_DEBUG_ENABLED__ = false; try { localStorage.removeItem('locus:webview-bridge:debug-enabled:v1'); } catch (_) {}"
+            };
+            main_window_builder =
+                main_window_builder.initialization_script(debug_initialization_script);
             main_window_builder.build()?;
             startup_for_setup.mark("main_window_build_done");
             if app.state::<Arc<AppConfig>>().debug_enabled() {
@@ -1529,6 +1560,7 @@ pub fn run() {
             commands::undo_check_conflicts,
             commands::undo_check_dirty,
             commands::get_debug_mode,
+            commands::debug_webview_bridge_heartbeat,
             commands::set_debug_mode,
             commands::get_tool_failure_log_enabled,
             commands::set_tool_failure_log_enabled,
@@ -1562,6 +1594,8 @@ pub fn run() {
             commands::set_anthropic_native_lazy_enabled,
             commands::get_async_tasks_enabled,
             commands::set_async_tasks_enabled,
+            commands::get_unity_multi_agent_editor_enabled,
+            commands::set_unity_multi_agent_editor_enabled,
             commands::get_unity_background_hook_enabled,
             commands::set_unity_background_hook_enabled,
             commands::get_unity_background_hook_status,
@@ -1597,10 +1631,6 @@ pub fn run() {
             commands::unity_hot_reload_set_play_mode_reload,
             commands::code_analysis_tools_get_config,
             commands::code_analysis_tools_set_config,
-            commands::get_view_windows_above_main,
-            commands::set_view_windows_above_main,
-            commands::get_view_open_in_existing_window,
-            commands::set_view_open_in_existing_window,
             commands::get_proxy_status,
             commands::save_proxy_config,
             commands::get_python_runtime_state,
@@ -1624,6 +1654,8 @@ pub fn run() {
             commands::unity_embed_activate_for_input,
             commands::unity_embed_set_drag_passthrough,
             commands::unity_embed_focus_debug_snapshot,
+            shared_workbench_window::start_shared_workbench_drag_tracking,
+            shared_workbench_window::stop_shared_workbench_drag_tracking,
             commands::unity_embed_commit_asset_drop,
             commands::unity_embed_start_asset_drag,
             commands::unity_embed_cancel_asset_drag,
@@ -1646,15 +1678,10 @@ pub fn run() {
             commands::view_run,
             commands::view_run_in_unity,
             commands::view_set_tab_host,
-            commands::view_detach_tab,
-            commands::view_open_inspector_tab,
-            commands::view_host_pool_prepare,
-            commands::view_host_pool_ready,
             commands::sub_window_open,
             commands::sub_window_pool_prepare,
             commands::sub_window_pool_ready,
             commands::sub_window_claimed_query,
-            commands::view_host_revealed,
             commands::view_content_mount,
             commands::view_content_hide,
             commands::view_content_destroy,

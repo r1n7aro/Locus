@@ -1,6 +1,8 @@
 import { ipcInvoke } from "./ipc";
-import type { WorkspaceRef } from "./project";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
+import { WORKSPACE_EVENT_NAME, type RoutedWorkspaceEvent, type WorkspaceRef } from "./project";
 import type {
+  AssetDbScanEvent,
   AssetDbLightStatus,
   AssetDbOverview,
   AssetRiskKind,
@@ -39,6 +41,25 @@ export function assetDbScanStart(
   workspaceRef: WorkspaceRef,
 ): Promise<RefGraphScanStartResult> {
   return ipcInvoke<RefGraphScanStartResult>("ref_graph_scan_start", { workspaceRef });
+}
+
+export function subscribeAssetDbScan(
+  workspaceRef: WorkspaceRef,
+  handler: (event: AssetDbScanEvent) => void,
+): Promise<RuntimeUnsubscribe> {
+  const scopedRef = { ...workspaceRef };
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<AssetDbScanEvent>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "ref-graph-scan") return;
+      if (event.checkoutId !== scopedRef.checkoutId) return;
+      if (
+        scopedRef.expectedGeneration != null
+        && event.workspaceGeneration !== scopedRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
+  );
 }
 
 /**

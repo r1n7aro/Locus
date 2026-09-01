@@ -16,12 +16,25 @@ export interface BaseTabStripItem {
   dirty?: boolean;
   preview?: boolean;
   unavailable?: boolean;
+  running?: boolean;
   closeable?: boolean;
 }
 
 export interface BaseTabDragFinishedPayload {
   tab: BaseTabStripItem;
   result: InternalDragFinishResult;
+}
+
+export interface BaseTabNativeDragPayload {
+  tab: BaseTabStripItem;
+  event: DragEvent;
+  shell: HTMLElement;
+  anchor: { x: number; y: number };
+}
+
+export interface BaseTabContextMenuPayload {
+  tab: BaseTabStripItem;
+  event: MouseEvent;
 }
 
 const props = withDefaults(defineProps<{
@@ -31,6 +44,7 @@ const props = withDefaults(defineProps<{
   dragType?: string | null;
   dragData?: ((tab: BaseTabStripItem) => unknown) | null;
   dragSourceId?: ((tab: BaseTabStripItem) => string) | null;
+  dragExternalize?: ((tab: BaseTabStripItem) => void | Promise<void>) | null;
   canDrag?: ((tab: BaseTabStripItem) => boolean) | null;
   allowedOperations?: readonly InternalDragOperation[];
   activateOnPointerDown?: boolean;
@@ -40,10 +54,12 @@ const props = withDefaults(defineProps<{
   dropActive?: boolean;
   dropIndex?: number;
   tabIdAttribute?: string;
+  nativeDrag?: boolean;
 }>(), {
   dragType: null,
   dragData: null,
   dragSourceId: null,
+  dragExternalize: null,
   canDrag: null,
   allowedOperations: () => ["move"],
   activateOnPointerDown: false,
@@ -53,6 +69,7 @@ const props = withDefaults(defineProps<{
   dropActive: false,
   dropIndex: -1,
   tabIdAttribute: "data-locus-tab-id",
+  nativeDrag: false,
 });
 
 const emit = defineEmits<{
@@ -61,6 +78,9 @@ const emit = defineEmits<{
   (event: "pin", tabId: string): void;
   (event: "drag-activated", tab: BaseTabStripItem): void;
   (event: "drag-finished", payload: BaseTabDragFinishedPayload): void;
+  (event: "native-drag-start", payload: BaseTabNativeDragPayload): void;
+  (event: "native-drag-end", payload: BaseTabNativeDragPayload): void;
+  (event: "tab-contextmenu", payload: BaseTabContextMenuPayload): void;
 }>();
 
 const internalDrag = useInternalDragController();
@@ -76,7 +96,7 @@ function tabDomAttributes(tab: BaseTabStripItem): Record<string, string> {
 }
 
 function beginTabDrag(event: PointerEvent, tab: BaseTabStripItem): void {
-  if (!props.dragType || event.detail > 1 || props.canDrag?.(tab) === false) return;
+  if (props.nativeDrag || !props.dragType || event.detail > 1 || props.canDrag?.(tab) === false) return;
   if (props.activateOnPointerDown && props.activeId !== tab.id) emit("activate", tab.id);
   internalDrag.start(event, {
     id: props.dragSourceId?.(tab) ?? `${props.dragType}:${tab.id}`,
@@ -91,9 +111,48 @@ function beginTabDrag(event: PointerEvent, tab: BaseTabStripItem): void {
     },
     allowedOperations: props.allowedOperations,
     cancelOnWindowBlur: props.cancelDragOnWindowBlur,
+    externalize: props.dragExternalize ? () => props.dragExternalize?.(tab) : undefined,
     onActivated: () => emit("drag-activated", tab),
     onFinished: (result) => emit("drag-finished", { tab, result }),
   });
+}
+
+function nativeDragPayload(event: DragEvent, tab: BaseTabStripItem): BaseTabNativeDragPayload | null {
+  const currentTarget = event.currentTarget as Node | null;
+  const shell = currentTarget?.nodeType === 1 ? currentTarget as HTMLElement : null;
+  if (!shell) return null;
+  const bounds = shell.getBoundingClientRect();
+  return {
+    tab,
+    event,
+    shell,
+    anchor: {
+      x: Math.max(0, Math.min(bounds.width, event.clientX - bounds.left)),
+      y: Math.max(0, Math.min(bounds.height, event.clientY - bounds.top)),
+    },
+  };
+}
+
+function beginNativeTabDrag(event: DragEvent, tab: BaseTabStripItem): void {
+  if (!props.nativeDrag || props.canDrag?.(tab) === false || !event.dataTransfer) {
+    event.preventDefault();
+    return;
+  }
+  const payload = nativeDragPayload(event, tab);
+  if (!payload) {
+    event.preventDefault();
+    return;
+  }
+  if (props.activateOnPointerDown && props.activeId !== tab.id) emit("activate", tab.id);
+  event.dataTransfer.effectAllowed = "copyMove";
+  event.dataTransfer.setData("text/plain", tab.title);
+  event.dataTransfer.setDragImage(payload.shell, payload.anchor.x, payload.anchor.y);
+  emit("native-drag-start", payload);
+}
+
+function finishNativeTabDrag(event: DragEvent, tab: BaseTabStripItem): void {
+  const payload = nativeDragPayload(event, tab);
+  if (payload) emit("native-drag-end", payload);
 }
 
 function handleDoubleClick(event: MouseEvent, tab: BaseTabStripItem): void {
@@ -108,6 +167,12 @@ function handleAuxClick(event: MouseEvent, tab: BaseTabStripItem): void {
   emit("close", tab.id);
 }
 
+function openTabContextMenu(event: MouseEvent, tab: BaseTabStripItem): void {
+  event.preventDefault();
+  event.stopPropagation();
+  emit("tab-contextmenu", { tab, event });
+}
+
 function onTabKeydown(event: KeyboardEvent, index: number): void {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
   event.preventDefault();
@@ -117,7 +182,11 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
   if (!next) return;
   emit("activate", next.id);
   requestAnimationFrame(() => {
-    document.querySelector<HTMLElement>(
+    const currentTarget = event.currentTarget as Node | null;
+    const ownerDocument = currentTarget?.nodeType === 1
+      ? (currentTarget as HTMLElement).ownerDocument
+      : document;
+    ownerDocument.querySelector<HTMLElement>(
       `[data-locus-tab-id="${CSS.escape(next.id)}"]`,
     )?.focus();
   });
@@ -141,9 +210,14 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
         dirty: tab.dirty,
         preview: tab.preview,
         unavailable: tab.unavailable,
+        running: tab.running,
         'drop-before': activeDropIndex() === index,
       }"
       data-locus-tab-shell
+      :draggable="nativeDrag && canDrag?.(tab) !== false"
+      @dragstart="beginNativeTabDrag($event, tab)"
+      @dragend="finishNativeTabDrag($event, tab)"
+      @contextmenu="openTabContextMenu($event, tab)"
     >
       <button
         v-bind="tabDomAttributes(tab)"
@@ -160,7 +234,9 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
         @keydown="onTabKeydown($event, index)"
         @pointerdown="beginTabDrag($event, tab)"
       >
-        <LucideIcon v-if="tab.icon" :icon="tab.icon" :size="12" :stroke-width="2" />
+        <span v-if="tab.icon" class="base-tab-icon" aria-hidden="true">
+          <LucideIcon :icon="tab.icon" :size="12" :stroke-width="2" />
+        </span>
         <span class="base-tab-title">{{ tab.title }}</span>
         <span v-if="tab.dirty" class="base-tab-dirty" aria-hidden="true" />
       </button>
@@ -171,6 +247,8 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
         :title="t('common.close')"
         :aria-label="t('common.close')"
         @pointerdown.stop
+        draggable="false"
+        @dragstart.stop.prevent
         @click.stop="emit('close', tab.id)"
       >
         <LucideIcon :icon="X" :size="12" :stroke-width="2" />
@@ -279,6 +357,41 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.base-tab-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+  color: inherit;
+}
+
+.base-tab-shell.running .base-tab-icon {
+  color: var(--accent-color);
+  animation: base-tab-icon-breathe 1.8s ease-in-out infinite;
+}
+
+@keyframes base-tab-icon-breathe {
+  0%,
+  100% {
+    opacity: 0.58;
+    filter: drop-shadow(0 0 0 transparent);
+  }
+  50% {
+    opacity: 1;
+    filter: drop-shadow(0 0 2px color-mix(in srgb, var(--accent-color) 72%, transparent));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .base-tab-shell.running .base-tab-icon {
+    animation: none;
+    opacity: 1;
+    filter: none;
+  }
 }
 
 .base-tab-dirty {

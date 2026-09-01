@@ -494,7 +494,7 @@ fn mime_for_extension(extension: &str) -> &'static str {
     }
 }
 
-fn is_text_extension(extension: &str) -> bool {
+pub(super) fn is_text_extension(extension: &str) -> bool {
     matches!(
         extension,
         "txt"

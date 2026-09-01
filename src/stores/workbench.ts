@@ -6,6 +6,7 @@ import type {
   WorkbenchEditorInput,
   WorkbenchResourceRef,
   WorkbenchSplitNode,
+  WorkbenchTransferAcceptResult,
   WorkbenchWindowState,
 } from "../types/workbench";
 
@@ -591,14 +592,19 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     return true;
   }
 
-  function activateEditor(windowId: string, paneId: string, editorId: string): boolean {
+  function activateEditor(
+    windowId: string,
+    paneId: string,
+    editorId: string,
+    options: { focusPane?: boolean } = {},
+  ): boolean {
     const state = ensureWindow(windowId);
     const target = state.groups[paneId];
     const editor = target?.tabs.find((candidate) => candidate.editorId === editorId);
     if (!target || !editor) return false;
     target.activeEditorId = editorId;
     target.focusedCheckoutId = editor.checkoutBinding?.checkoutId ?? target.focusedCheckoutId ?? null;
-    state.focusedPaneId = paneId;
+    if (options.focusPane !== false) state.focusedPaneId = paneId;
     persist(windowId);
     return true;
   }
@@ -612,6 +618,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
       preview?: boolean;
       index?: number;
       replacePreview?: boolean;
+      allowDuplicate?: boolean;
     } = {},
   ): WorkbenchEditorInput {
     const state = ensureWindow(windowId);
@@ -620,9 +627,11 @@ export const useWorkbenchStore = defineStore("workbench", () => {
       : state.focusedPaneId;
     const target = state.groups[paneId]!;
     const resourceKey = workbenchResourceKey(input.resource);
-    const existing = target.tabs.find(
-      (editor) => workbenchResourceKey(editor.resource) === resourceKey,
-    );
+    const existing = options.allowDuplicate
+      ? undefined
+      : target.tabs.find(
+          (editor) => workbenchResourceKey(editor.resource) === resourceKey,
+        );
     if (existing) {
       const existingDirty = existing.dirty;
       Object.assign(existing, {
@@ -654,6 +663,30 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     target.tabs.splice(index, 0, editor);
     target.activeEditorId = editor.editorId;
     target.focusedCheckoutId = editor.checkoutBinding?.checkoutId ?? target.focusedCheckoutId ?? null;
+    state.focusedPaneId = paneId;
+    persist(windowId);
+    return editor;
+  }
+
+  function replaceEditor(
+    windowId: string,
+    paneId: string,
+    editorId: string,
+    input: WorkbenchEditorInput,
+  ): WorkbenchEditorInput | null {
+    const state = ensureWindow(windowId);
+    const target = state.groups[paneId];
+    const index = target?.tabs.findIndex((editor) => editor.editorId === editorId) ?? -1;
+    if (!target || index < 0) return null;
+    const editor: WorkbenchEditorInput = {
+      ...input,
+      resource: cloneResource(input.resource),
+      capabilities: { ...input.capabilities },
+      checkoutBinding: input.checkoutBinding ? { ...input.checkoutBinding } : null,
+    };
+    target.tabs.splice(index, 1, editor);
+    target.activeEditorId = editor.editorId;
+    target.focusedCheckoutId = editor.checkoutBinding?.checkoutId ?? null;
     state.focusedPaneId = paneId;
     persist(windowId);
     return editor;
@@ -812,6 +845,75 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     return destinationPaneId;
   }
 
+  function acceptTransferredEditor(
+    windowId: string,
+    input: WorkbenchEditorInput,
+    targetPaneId: string,
+    options: {
+      index?: number;
+      direction?: WorkbenchDropDirection;
+      allowDuplicate?: boolean;
+    } = {},
+  ): WorkbenchTransferAcceptResult | null {
+    const state = ensureWindow(windowId);
+    const target = state.groups[targetPaneId];
+    if (!target) return null;
+    const direction = options.direction ?? "center";
+    if (direction === "center") {
+      const resourceKey = workbenchResourceKey(input.resource);
+      const existing = options.allowDuplicate
+        ? undefined
+        : target.tabs.find(
+            (editor) => workbenchResourceKey(editor.resource) === resourceKey,
+          );
+      const editor = openEditor(windowId, {
+        ...input,
+        resource: cloneResource(input.resource),
+        capabilities: { ...input.capabilities },
+        checkoutBinding: input.checkoutBinding ? { ...input.checkoutBinding } : null,
+        preview: false,
+        pinned: true,
+      }, {
+        paneId: targetPaneId,
+        preview: false,
+        pinned: true,
+        index: options.index,
+        replacePreview: false,
+        allowDuplicate: options.allowDuplicate,
+      });
+      return {
+        paneId: targetPaneId,
+        editorId: editor.editorId,
+        inserted: !existing,
+      };
+    }
+
+    const editor: WorkbenchEditorInput = {
+      ...input,
+      resource: cloneResource(input.resource),
+      capabilities: { ...input.capabilities },
+      checkoutBinding: input.checkoutBinding ? { ...input.checkoutBinding } : null,
+      preview: false,
+      pinned: true,
+    };
+    const paneId = splitPane(windowId, targetPaneId, direction, editor);
+    return paneId ? { paneId, editorId: editor.editorId, inserted: true } : null;
+  }
+
+  function hasEditors(windowId: string): boolean {
+    return Object.values(ensureWindow(windowId).groups)
+      .some((candidate) => candidate.tabs.length > 0);
+  }
+
+  function deleteWindow(windowId: string, options: { removeStorage?: boolean } = {}): void {
+    delete windows.value[windowId];
+    const scope = workspaceScope(windowId);
+    delete workspaceScopes.value[windowId];
+    if (options.removeStorage !== true || typeof window === "undefined") return;
+    window.localStorage.removeItem(storageKey(windowId, scope));
+    window.localStorage.removeItem(storageKey(windowId));
+  }
+
   function updateSplitRatio(
     windowId: string,
     splitId: string,
@@ -856,12 +958,16 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     focusPane,
     activateEditor,
     openEditor,
+    replaceEditor,
     pinEditor,
     updateEditor,
     splitPane,
     closePane,
     closeEditor,
     moveEditor,
+    acceptTransferredEditor,
+    hasEditors,
+    deleteWindow,
     updateSplitRatio,
     setSidebarWidth,
   };

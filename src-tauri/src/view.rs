@@ -33,6 +33,7 @@ const VIEW_HOST_ROUTE: &str = "/window.html?viewHost=1";
 const VIEW_CONTENT_ROUTE: &str = "/window.html?viewContent=1";
 const VIEW_HOST_TABS_MERGE_EVENT: &str = "view-host-tabs-merge";
 const VIEW_HOST_TABS_SELECT_EVENT: &str = "view-host-tabs-select";
+const VIEW_WORKBENCH_OPEN_EVENT: &str = "view-workbench-open";
 const VIEW_FRONTEND_LOG_REL_PATH: &str = ".locus/logs/frontend.log";
 const VIEW_FRONTEND_LOG_MAX_CHARS: usize = 16_384;
 const VIEW_PACKAGE_ARCHIVE_MAX_ENTRIES: usize = 20_000;
@@ -4210,7 +4211,8 @@ fn sanitize_view_host_label(label: &str) -> Result<String, String> {
         && !normalized.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX);
     let is_unity_embed_view_host = normalized.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX)
         && normalized.len() > UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX.len();
-    if !is_locus_view_host && !is_unity_embed_view_host {
+    let is_workbench_host = normalized == MAIN_WINDOW_LABEL || normalized.starts_with("workbench-");
+    if !is_locus_view_host && !is_unity_embed_view_host && !is_workbench_host {
         return Err(format!("Invalid View host window label: {}", label));
     }
     Ok(normalized.to_string())
@@ -4282,7 +4284,7 @@ pub fn set_view_tab_host_scoped_sync(
     scope_key: &str,
 ) -> Result<(), String> {
     let host_label = sanitize_view_host_label(&request.host_label)?;
-    {
+    if !host_label.eq(MAIN_WINDOW_LABEL) && !host_label.starts_with("workbench-") {
         let mut scopes = view_host_scopes()
             .lock()
             .map_err(|_| "View host scope registry is unavailable".to_string())?;
@@ -5321,110 +5323,42 @@ pub fn destroy_view_content_window_scoped(
     Ok(())
 }
 
-pub async fn open_view_window(
+pub async fn open_view_in_workbench(
     app_handle: &AppHandle,
     working_dir: &str,
     view_id: &str,
-    view_windows_above_main: bool,
-    view_open_in_existing_window: bool,
 ) -> Result<ViewRunResult, String> {
     let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
     let scope_key = view_workspace_scope_key(&workspace_ref);
     let detail = read_view_sync(working_dir, view_id)?;
-    let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
+    let _unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
     let id = detail.summary.id.clone();
-    let label = scoped_view_window_label(&workspace_ref, &id);
     let host_url = view_host_url_for_tab_id_scoped(&id, &workspace_ref);
-
-    if let Some(host_label) = registered_view_host_label_scoped(&scope_key, &id) {
-        if app_handle.get_webview_window(&host_label).is_some() {
-            let target_host_url = view_host_url_for_label_scoped(&id, &host_label, &workspace_ref);
-            return focus_view_host_window(
-                app_handle,
-                working_dir,
-                &id,
-                &host_label,
-                &target_host_url,
-                &detail.summary.package_root,
-                unity_status.as_ref(),
-                "registered-host",
-                false,
-                &scope_key,
-            );
-        }
-        clear_registered_view_host_scoped(&scope_key, &id);
-    }
-
-    if let Some(window) = app_handle.get_webview_window(&label) {
-        emit_view_host_tab_select(app_handle, &label, &id, false);
-        focus_view_host_window_with_unity_owner_guard(
-            app_handle,
-            working_dir,
-            &window,
-            &label,
-            unity_status.as_ref(),
-        )?;
-    } else if app_handle
-        .get_webview_window(&format!(
-            "{}{}-{id}",
-            UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX,
-            view_scope_token(&workspace_ref)
-        ))
-        .is_some()
-    {
-        let unity_label = format!(
-            "{}{}-{id}",
-            UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX,
-            view_scope_token(&workspace_ref)
-        );
-        let unity_host_url = view_host_url_for_label_scoped(&id, &unity_label, &workspace_ref);
-        return focus_view_host_window(
-            app_handle,
-            working_dir,
-            &id,
-            &unity_label,
-            &unity_host_url,
-            &detail.summary.package_root,
-            unity_status.as_ref(),
-            "existing-unity-embed-host",
-            true,
-            &scope_key,
-        );
-    } else {
-        if view_open_in_existing_window {
-            if let Some(target_label) =
-                reusable_view_host_window_label_scoped(app_handle, &scope_key, &label)
-            {
-                let target_host_url =
-                    view_host_url_for_label_scoped(&id, &target_label, &workspace_ref);
-                return merge_view_tab_into_host_window(
-                    app_handle,
-                    working_dir,
-                    &id,
-                    &target_label,
-                    &target_host_url,
-                    &detail.summary.package_root,
-                    unity_status.as_ref(),
-                    &scope_key,
-                );
-            }
-        }
-        build_view_window(
-            app_handle,
-            &label,
-            &host_url,
-            &format!("{} - Locus View", detail.summary.name),
-            None,
-            view_windows_above_main,
-        )?;
-        track_view_host_unity_owner(working_dir, &label, unity_status.as_ref());
-    }
+    let windows = app_handle.webview_windows();
+    let label = windows
+        .iter()
+        .find_map(|(label, window)| {
+            let is_workbench = label == MAIN_WINDOW_LABEL || label.starts_with("workbench-");
+            (is_workbench && window.is_focused().unwrap_or(false)).then(|| label.clone())
+        })
+        .or_else(|| {
+            windows
+                .contains_key(MAIN_WINDOW_LABEL)
+                .then(|| MAIN_WINDOW_LABEL.to_string())
+        })
+        .or_else(|| {
+            windows
+                .keys()
+                .find(|label| label.starts_with("workbench-"))
+                .cloned()
+        })
+        .ok_or_else(|| "Workbench window is unavailable.".to_string())?;
 
     if let Err(error) = set_view_tab_host_scoped_sync(
         ViewSetTabHostRequest {
             host_label: label.clone(),
             view_ids: vec![id.clone()],
-            keep_existing_for_host: false,
+            keep_existing_for_host: true,
         },
         &scope_key,
     ) {
@@ -5440,6 +5374,27 @@ pub async fn open_view_window(
             id, error
         );
     }
+
+    let window = app_handle
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("Workbench window is unavailable: {label}"))?;
+    app_handle
+        .emit_to(
+            &label,
+            VIEW_WORKBENCH_OPEN_EVENT,
+            serde_json::json!({
+                "viewId": id.clone(),
+                "title": detail.summary.name.clone(),
+                "targetLabel": label.clone(),
+                "workspaceRef": {
+                    "checkoutId": workspace_ref.checkout_id.clone(),
+                    "expectedGeneration": workspace_ref.expected_generation.unwrap_or_default(),
+                },
+            }),
+        )
+        .map_err(|error| format!("Failed to open View in Workbench: {error}"))?;
+    let _ = window.show();
+    let _ = window.set_focus();
 
     Ok(ViewRunResult {
         id,
@@ -5678,7 +5633,7 @@ pub async fn detach_view_tab_window(
 }
 
 /// Opens (or reveals) a Locus inspector tab inside the View host window
-/// system. Mirrors `open_view_window`: an already-hosted tab is focused in
+/// system. An already-hosted Inspector tab is focused in
 /// place, otherwise the tab merges into a reusable host window when allowed,
 /// and only then a fresh host window (or pool window) is created.
 pub async fn open_inspector_tab_window(
@@ -7453,10 +7408,18 @@ mod tests {
     }
 
     #[test]
-    fn view_host_label_accepts_unity_embed_view_hosts() {
+    fn view_host_label_accepts_unity_embed_and_workbench_hosts() {
         assert_eq!(
             super::sanitize_view_host_label("unity-embed-view-attack-config-table").as_deref(),
             Ok("unity-embed-view-attack-config-table")
+        );
+        assert_eq!(
+            super::sanitize_view_host_label("main").as_deref(),
+            Ok("main")
+        );
+        assert_eq!(
+            super::sanitize_view_host_label("workbench-shared-editor").as_deref(),
+            Ok("workbench-shared-editor")
         );
         assert!(super::sanitize_view_host_label("view-content-attack-config-table").is_err());
     }

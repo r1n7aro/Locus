@@ -2,7 +2,6 @@
 import type { Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { computed, nextTick, ref, watch } from "vue";
-import { Save } from "lucide";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
 import { previewWorkspaceAsset } from "../../services/asset";
@@ -15,10 +14,9 @@ import {
 } from "../../services/workspaceExplorer";
 import type { AssetPreviewPayload } from "../../types";
 import type { ProjectExplorerFilePreview } from "../../types/workbench";
+import type { WorkbenchEditorTransferSnapshot } from "../../types/workbench";
 import WorkspaceAssetPreview from "../asset/WorkspaceAssetPreview.vue";
 import AssetTextViewer from "../asset/AssetTextViewer.vue";
-import LucideIcon from "../icons/LucideIcon.vue";
-import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 
@@ -41,7 +39,6 @@ const sourceText = ref("");
 const editorDocument = ref<Text | null>(null);
 const dirty = ref(false);
 const saving = ref(false);
-const saveStatus = ref<"idle" | "saved">("idle");
 const originalLineEnding = ref<"\n" | "\r\n" | "\r">("\n");
 const sourceEditor = ref<InstanceType<typeof BaseMarkdownEditor> | null>(null);
 const pendingPosition = ref<{ line: number; column: number } | null>(null);
@@ -56,14 +53,6 @@ const editorContentKey = computed(() => [
   props.path,
   preview.value?.contentHash ?? "unloaded",
 ].join(":"));
-const editorStatus = computed(() => {
-  if (saving.value) return t("development.editor.saving");
-  if (error.value && preview.value) return error.value;
-  if (dirty.value) return t("development.editor.unsaved");
-  if (saveStatus.value === "saved") return t("development.editor.saved");
-  return "";
-});
-
 const language = computed(() => {
   const extension = preview.value?.extension ?? "";
   return ({
@@ -97,7 +86,6 @@ async function loadPreview(): Promise<void> {
   sourceText.value = "";
   editorDocument.value = null;
   setDirty(false);
-  saveStatus.value = "idle";
   try {
     const next = props.workspaceRef
       ? await workspaceFilePreview(props.path, props.workspaceRef)
@@ -168,7 +156,6 @@ function setDirty(value: boolean): void {
 
 function onEditorDocumentChange(change: MarkdownEditorDocumentChange): void {
   editorDocument.value = change.doc;
-  saveStatus.value = "idle";
   setDirty(change.doc.toString() !== normalizedSourceText.value);
 }
 
@@ -208,7 +195,6 @@ async function saveFile(): Promise<boolean> {
     preview.value = next;
     sourceText.value = next.text ?? "";
     editorDocument.value = null;
-    saveStatus.value = "saved";
     setDirty(false);
     return true;
   } catch (cause) {
@@ -217,6 +203,49 @@ async function saveFile(): Promise<boolean> {
   } finally {
     saving.value = false;
   }
+}
+
+function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
+  const view = sourceEditor.value?.getEditorView();
+  return {
+    kind: "workspaceFile",
+    text: serializedEditorText(),
+    contentHash: preview.value?.contentHash ?? "",
+    originalLineEnding: originalLineEnding.value,
+    selection: view ? {
+      anchor: view.state.selection.main.anchor,
+      head: view.state.selection.main.head,
+    } : null,
+    scrollTop: view?.scrollDOM.scrollTop ?? null,
+  };
+}
+
+async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> {
+  if (snapshot.kind !== "workspaceFile") return false;
+  const deadline = Date.now() + 4_000;
+  while (!sourceEditor.value?.getEditorView() && Date.now() < deadline) {
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 16));
+  }
+  const view = sourceEditor.value?.getEditorView();
+  if (!view || preview.value?.kind !== "text" || !preview.value.editable) return false;
+  if (snapshot.contentHash && preview.value.contentHash !== snapshot.contentHash) {
+    error.value = t("development.editor.transferConflict");
+    return false;
+  }
+  originalLineEnding.value = snapshot.originalLineEnding;
+  const normalized = snapshot.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const selection = snapshot.selection
+    ? {
+        anchor: Math.min(normalized.length, Math.max(0, snapshot.selection.anchor)),
+        head: Math.min(normalized.length, Math.max(0, snapshot.selection.head)),
+      }
+    : undefined;
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: normalized },
+    selection,
+  });
+  if (snapshot.scrollTop != null) view.scrollDOM.scrollTop = snapshot.scrollTop;
+  return true;
 }
 
 watch(
@@ -233,7 +262,7 @@ watch(() => props.active, (active) => {
   if (active) void applyPendingPosition();
 });
 
-defineExpose({ saveFile, revealPosition });
+defineExpose({ saveFile, revealPosition, exportTransferSnapshot, applyTransferSnapshot });
 </script>
 
 <template>
@@ -255,29 +284,11 @@ defineExpose({ saveFile, revealPosition });
       :loading="loading"
       :error="error"
       :auto-load-preview="false"
+      :show-header="false"
     />
 
     <template v-else-if="preview">
-      <header class="workspace-file-preview-header">
-        <span class="workspace-file-preview-title">{{ preview.name }}</span>
-        <span class="workspace-file-preview-path" :title="preview.path">{{ preview.path }}</span>
-        <span
-          v-if="editorStatus"
-          class="workspace-file-preview-status"
-          :class="{ error: !!error && !!preview }"
-          :title="editorStatus"
-        >{{ editorStatus }}</span>
-        <BaseButton
-          v-if="preview.kind === 'text' && preview.editable"
-          class="workspace-file-preview-save"
-          :disabled="!dirty || saving"
-          :title="t('common.save')"
-          @click="saveFile"
-        >
-          <LucideIcon :icon="Save" :size="12" :stroke-width="2" />
-          {{ t("common.save") }}
-        </BaseButton>
-      </header>
+      <div v-if="error" class="workspace-file-preview-inline-error">{{ error }}</div>
       <div class="workspace-file-preview-body">
         <BaseMarkdownEditor
           v-if="preview.kind === 'text' && preview.editable"
@@ -347,47 +358,15 @@ defineExpose({ saveFile, revealPosition });
   color: var(--status-error-fg, var(--text-color));
 }
 
-.workspace-file-preview-header {
-  min-height: 38px;
-  padding: 0 12px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
+.workspace-file-preview-inline-error {
+  flex-shrink: 0;
+  padding: 7px 10px;
   border-bottom: 1px solid var(--border-color);
-}
-
-.workspace-file-preview-title {
-  flex-shrink: 0;
-  font-size: 12px;
-  font-weight: 600;
-}
-
-.workspace-file-preview-path {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text-secondary);
-  font-family: var(--font-mono-identifier);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workspace-file-preview-status {
-  max-width: min(260px, 30%);
-  overflow: hidden;
-  color: var(--text-secondary);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workspace-file-preview-status.error {
   color: var(--status-error-fg, var(--text-color));
-}
-
-.workspace-file-preview-save {
-  flex-shrink: 0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .workspace-file-preview-body {

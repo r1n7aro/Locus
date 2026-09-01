@@ -6,31 +6,29 @@ use crate::error::AppError;
 use crate::view::{
     append_view_frontend_log_sync, call_view_script, compile_view_script,
     complete_view_automation_request, create_view_folder_sync, create_view_sync_with_scope,
-    delete_view_entry_sync, destroy_view_content_window_scoped, detach_view_tab_window,
-    emit_view_reload_for_scope, emit_view_tree_changed_for_scope, ensure_view_host_pool_window,
-    export_view_package_sync, hide_view_content_window_scoped, import_view_package_sync,
-    list_view_tree_sync, list_views_sync, mark_view_host_pool_ready, mark_view_host_revealed,
-    mount_view_content_window, move_view_entry_sync, open_inspector_tab_window,
-    open_view_frontend_log_sync, open_view_unity_embed_window, open_view_window,
-    parse_view_create_request, read_view_frontend_log_sync, read_view_sync, reload_view_sync,
-    rename_view_entry_sync, set_view_tab_host_scoped_sync, supported_view_templates,
-    view_fs_access as view_fs_access_impl, view_fs_append_file as view_fs_append_file_impl,
-    view_fs_copy_file as view_fs_copy_file_impl, view_fs_lstat as view_fs_lstat_impl,
-    view_fs_mkdir as view_fs_mkdir_impl, view_fs_read_file as view_fs_read_file_impl,
-    view_fs_readdir as view_fs_readdir_impl, view_fs_rename as view_fs_rename_impl,
-    view_fs_rm as view_fs_rm_impl, view_fs_stat as view_fs_stat_impl,
-    view_fs_unlink as view_fs_unlink_impl, view_fs_write_file as view_fs_write_file_impl,
-    view_storage_get_sync, view_storage_remove_sync, view_storage_set_sync, ViewAutomationStore,
-    ViewCallScriptRequest, ViewCallScriptResult, ViewCompileScriptRequest, ViewCompileScriptResult,
-    ViewContentMountRequest, ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewDetachTabRequest,
-    ViewExportPackageRequest, ViewFolderSummary, ViewFrontendLogEntry, ViewFrontendLogReadRequest,
-    ViewFrontendLogRequest, ViewFsCopyFileRequest, ViewFsMkdirRequest, ViewFsPathRequest,
-    ViewFsReadFileRequest, ViewFsReadFileResult, ViewFsReaddirRequest, ViewFsReaddirResult,
-    ViewFsRenameRequest, ViewFsRmRequest, ViewFsStatResult, ViewFsWriteFileRequest,
-    ViewImportPackageRequest, ViewMoveEntryRequest, ViewOpenInspectorTabRequest, ViewPackageDetail,
-    ViewPackageImportResult, ViewPackageSummary, ViewRenameEntryRequest, ViewRunResult,
-    ViewSetTabHostRequest, ViewStorageGetRequest, ViewStorageRemoveRequest, ViewStorageSetRequest,
-    ViewTemplateSummary, ViewTreeSnapshot,
+    delete_view_entry_sync, destroy_view_content_window_scoped, emit_view_reload_for_scope,
+    emit_view_tree_changed_for_scope, export_view_package_sync, hide_view_content_window_scoped,
+    import_view_package_sync, list_view_tree_sync, list_views_sync, mount_view_content_window,
+    move_view_entry_sync, open_view_frontend_log_sync, open_view_in_workbench,
+    open_view_unity_embed_window, parse_view_create_request, read_view_frontend_log_sync,
+    read_view_sync, reload_view_sync, rename_view_entry_sync, set_view_tab_host_scoped_sync,
+    supported_view_templates, view_fs_access as view_fs_access_impl,
+    view_fs_append_file as view_fs_append_file_impl, view_fs_copy_file as view_fs_copy_file_impl,
+    view_fs_lstat as view_fs_lstat_impl, view_fs_mkdir as view_fs_mkdir_impl,
+    view_fs_read_file as view_fs_read_file_impl, view_fs_readdir as view_fs_readdir_impl,
+    view_fs_rename as view_fs_rename_impl, view_fs_rm as view_fs_rm_impl,
+    view_fs_stat as view_fs_stat_impl, view_fs_unlink as view_fs_unlink_impl,
+    view_fs_write_file as view_fs_write_file_impl, view_storage_get_sync, view_storage_remove_sync,
+    view_storage_set_sync, ViewAutomationStore, ViewCallScriptRequest, ViewCallScriptResult,
+    ViewCompileScriptRequest, ViewCompileScriptResult, ViewContentMountRequest,
+    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewExportPackageRequest, ViewFolderSummary,
+    ViewFrontendLogEntry, ViewFrontendLogReadRequest, ViewFrontendLogRequest,
+    ViewFsCopyFileRequest, ViewFsMkdirRequest, ViewFsPathRequest, ViewFsReadFileRequest,
+    ViewFsReadFileResult, ViewFsReaddirRequest, ViewFsReaddirResult, ViewFsRenameRequest,
+    ViewFsRmRequest, ViewFsStatResult, ViewFsWriteFileRequest, ViewImportPackageRequest,
+    ViewMoveEntryRequest, ViewPackageDetail, ViewPackageImportResult, ViewPackageSummary,
+    ViewRenameEntryRequest, ViewRunResult, ViewSetTabHostRequest, ViewStorageGetRequest,
+    ViewStorageRemoveRequest, ViewStorageSetRequest, ViewTemplateSummary, ViewTreeSnapshot,
 };
 use crate::workspace_service::{
     ProjectRegistry as InnerProjectRegistry, ResolvedWorkspaceScope, WorkspaceRef,
@@ -253,7 +251,6 @@ pub async fn view_run(
     view_id: String,
     workspace_ref: WorkspaceRef,
     registry: State<'_, ProjectRegistry>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
     app_handle: AppHandle,
 ) -> Result<ViewRunResult, AppError> {
     let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
@@ -266,15 +263,9 @@ pub async fn view_run(
     .await?;
     super::ensure_unity_embed_control_server(app_handle.clone(), runtime);
     let working_dir = view_scope_root(&scope);
-    open_view_window(
-        &app_handle,
-        &working_dir,
-        &view_id,
-        config.view_windows_above_main_enabled(),
-        config.view_open_in_existing_window_enabled(),
-    )
-    .await
-    .map_err(Into::into)
+    open_view_in_workbench(&app_handle, &working_dir, &view_id)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -304,84 +295,6 @@ pub async fn view_set_tab_host(
         workspace_ref.expected_generation.unwrap_or_default()
     );
     set_view_tab_host_scoped_sync(request, &scope_key).map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_open_inspector_tab(
-    request: ViewOpenInspectorTabRequest,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
-    app_handle: AppHandle,
-) -> Result<ViewRunResult, AppError> {
-    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    let working_dir = view_scope_root(&scope);
-    open_inspector_tab_window(
-        &app_handle,
-        &working_dir,
-        &request.tab_id,
-        config.view_windows_above_main_enabled(),
-        config.view_open_in_existing_window_enabled(),
-    )
-    .await
-    .map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_detach_tab(
-    request: ViewDetachTabRequest,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
-    app_handle: AppHandle,
-) -> Result<ViewRunResult, AppError> {
-    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    let working_dir = view_scope_root(&scope);
-    detach_view_tab_window(
-        &app_handle,
-        &working_dir,
-        request,
-        config.view_windows_above_main_enabled(),
-    )
-    .await
-    .map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_host_pool_prepare(
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
-    app_handle: AppHandle,
-) -> Result<ViewRunResult, AppError> {
-    let _scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    ensure_view_host_pool_window(&app_handle, config.view_windows_above_main_enabled())
-        .map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_host_pool_ready(
-    host_label: String,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let _scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    mark_view_host_pool_ready(&app_handle, &host_label).map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_host_revealed(
-    host_label: String,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    let working_dir = view_scope_root(&scope);
-    mark_view_host_revealed(&app_handle, &working_dir, &host_label)
-        .await
-        .map_err(Into::into)
 }
 
 #[tauri::command]

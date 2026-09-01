@@ -15,8 +15,10 @@ describe("internal drag architecture", () => {
     expect(controller).toContain('type InternalDragPhase = "idle" | "pending" | "dragging"');
     expect(controller).toContain("setPointerCapture");
     expect(controller).toContain("elementFromPoint");
+    expect(controller).toContain("captureElement.ownerDocument");
     expect(controller).toContain("requestAnimationFrame(runAutoScroll)");
     expect(overlay).toContain("data-internal-drag-preview");
+    expect(overlay).toContain(':to="overlayTarget"');
   });
 
   it("keeps every in-document reorder and placement source off native HTML drag", () => {
@@ -28,6 +30,10 @@ describe("internal drag architecture", () => {
       "src/components/knowledge/KnowledgeDirectoryPreview.vue",
       "src/components/chat/SessionPanel.vue",
       "src/components/ViewPackageView.vue",
+      "src/components/MarkdownRenderer.vue",
+      "src/components/AssetChip.vue",
+      "src/components/unity-preview/UnityObjectIdentity.vue",
+      "src/components/workbench/WorkbenchEditorTabs.vue",
     ];
 
     for (const path of internalSurfaces) {
@@ -37,13 +43,22 @@ describe("internal drag architecture", () => {
     }
   });
 
-  it("retains native drag only at the cross-runtime Unity and file bridge", () => {
+  it("externalizes references through the shared semantic drag source", () => {
     const assetChip = read("src/components/AssetChip.vue");
+    const markdownRenderer = read("src/components/MarkdownRenderer.vue");
+    const unityIdentity = read("src/components/unity-preview/UnityObjectIdentity.vue");
+    const referenceDrag = read("src/components/workbench/workbenchReferenceDrag.ts");
     const bridge = read("src/composables/useUnityReferenceDragSource.ts");
 
-    expect(assetChip).toContain('@dragstart="handleDragStart"');
-    expect(bridge).toContain("startUnityReferenceHtmlDrag");
-    expect(bridge).toContain("startLocusFileHtmlDrag");
+    for (const source of [assetChip, markdownRenderer, unityIdentity]) {
+      expect(source).toContain("startWorkbenchReferenceInternalDrag");
+      expect(source).not.toContain("startUnityReferenceHtmlDrag");
+      expect(source).not.toContain("armUnityReferencePointerDrag");
+    }
+    expect(referenceDrag).toContain("externalizeUnityReferenceDrag");
+    expect(referenceDrag).toContain("externalizeLocusFileDrag");
+    expect(bridge).toContain("externalizeUnityReferenceDrag");
+    expect(bridge).toContain("externalizeLocusFileDrag");
   });
 
   it("keeps sortable lists floating while reserving only a layout gap", () => {

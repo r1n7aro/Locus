@@ -1,7 +1,10 @@
 import { File, FileText, Folder, Package } from "lucide";
 import type { KnowledgeDocumentType } from "../../types";
 import type { WorkspaceRef } from "../../services/project";
-import type { InternalDragSource } from "../../composables/useInternalDrag";
+import type {
+  InternalDragController,
+  InternalDragSource,
+} from "../../composables/useInternalDrag";
 import {
   externalizeLocusFileDrag,
   externalizeUnityReferenceDrag,
@@ -10,6 +13,18 @@ import type { LocusFileDropRef } from "../../services/unity";
 import type { AssetRefAttachment } from "../../types";
 
 export const WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE = "locus/workbench-reference";
+export const WORKBENCH_REFERENCE_DRAG_SELECTOR = [
+  ".unity-object-identity[data-unity-ref-kind][data-unity-ref-path]",
+  ".cm-live-reference[data-reference-kind]",
+  ".md-knowledge-ref[data-knowledge-path]",
+  ".md-unity-scene-object-ref",
+  ".md-unity-asset-ref",
+  ".md-file-ref[data-asset-path]",
+  ".md-asset-chip",
+  ".md-workspace-ref[data-workspace-path]",
+  ".md-file-ref[data-file-path]",
+  ".asset-chip[data-ref-kind]",
+].join(", ");
 
 export interface WorkbenchReferenceDragOrigin {
   projectId: string;
@@ -116,8 +131,14 @@ function sceneObjectEntryFromPath(
 }
 
 function entryName(element: HTMLElement, path: string): string {
-  return element.querySelector<HTMLElement>(".asset-chip-name, .md-ref-label")?.textContent?.trim()
+  return element.querySelector<HTMLElement>(
+    ".asset-chip-name, .md-ref-label, .cm-live-reference-label, .unity-object-identity-title",
+  )?.textContent?.trim()
     || basename(path);
+}
+
+export function workbenchReferenceDragElementFromElement(target: Element): HTMLElement | null {
+  return target.closest<HTMLElement>(WORKBENCH_REFERENCE_DRAG_SELECTOR);
 }
 
 /**
@@ -128,8 +149,11 @@ export function workbenchReferenceFromElement(
   target: Element,
 ): WorkbenchReferenceDragEntry | null {
   const livePreviewReference = target.closest(".cm-live-reference[data-reference-kind]");
+  const referenceSurface = workbenchReferenceDragElementFromElement(target);
+  const interactiveControl = target.closest("button, input, textarea, select");
   if (
-    target.closest(".asset-chip-remove, button, input, textarea, select")
+    target.closest(".asset-chip-remove")
+    || (interactiveControl && interactiveControl !== referenceSurface)
     || (!livePreviewReference && target.closest("[contenteditable='true']"))
   ) {
     return null;
@@ -229,6 +253,43 @@ export function claimWorkbenchReferencePointerEvent(event: PointerEvent): void {
 
 export function isWorkbenchReferencePointerEventClaimed(event: PointerEvent): boolean {
   return claimedPointerEvents.has(event);
+}
+
+function pointerEventElement(
+  event: PointerEvent,
+  target?: Element,
+): Element | null {
+  if (target) return target;
+  const eventTarget = event.target as Partial<Element> | null;
+  return eventTarget && typeof eventTarget.closest === "function"
+    ? eventTarget as Element
+    : null;
+}
+
+export function startWorkbenchReferenceInternalDrag(
+  controller: Pick<InternalDragController, "start">,
+  event: PointerEvent,
+  origin: WorkbenchReferenceDragOrigin,
+  target?: Element,
+): boolean {
+  if (event.button !== 0 || event.isPrimary === false) return false;
+  if (isWorkbenchReferencePointerEventClaimed(event)) return false;
+  const element = pointerEventElement(event, target);
+  if (!element) return false;
+  const entry = workbenchReferenceFromElement(element);
+  const captureElement = workbenchReferenceDragElementFromElement(element);
+  if (!entry || !captureElement) return false;
+
+  const data: WorkbenchReferenceDragData = {
+    version: 1,
+    origin,
+    entries: [entry],
+  };
+  if (!controller.start(event, workbenchReferenceInternalDragSource(data, captureElement))) {
+    return false;
+  }
+  claimWorkbenchReferencePointerEvent(event);
+  return true;
 }
 
 function entryLabel(entry: WorkbenchReferenceDragEntry): string {

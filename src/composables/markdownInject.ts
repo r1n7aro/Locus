@@ -338,7 +338,7 @@ function renderLocalFileRef(
   const icon = isDir
     ? renderRefIcon("folder", "md-workspace-ref-icon")
     : renderRefIcon();
-  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${resolvedEntryKind}" draggable="true"`, icon);
+  return renderFileRef(cleanPath, line, classes, ` data-entry-kind="${resolvedEntryKind}"`, icon);
 }
 
 function renderUnityAssetRef(
@@ -366,7 +366,7 @@ function renderUnityAssetRef(
     normalizedPath,
     line,
     refClasses,
-    `${preview.attrs} data-asset-path="${escaped}" data-asset-kind="${kind}" data-entry-kind="${entryKind}" draggable="true"`,
+    `${preview.attrs} data-asset-path="${escaped}" data-asset-kind="${kind}" data-entry-kind="${entryKind}"`,
     renderUnityAssetIcon(kind),
   );
 }
@@ -476,7 +476,7 @@ function renderWorkspaceMention(
     ? renderRefIcon("folder", "md-workspace-ref-icon")
     : renderLucideRefIcon("file", "md-workspace-ref-icon md-workspace-file-icon");
 
-  return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} draggable="true" title="${title}" aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${escapeAttr(name)}${isDir ? "/" : ""}</span>`;
+  return `<span class="${classes} ui-select-text" data-workspace-path="${escapedPath}" data-entry-kind="${isDir ? "folder" : "file"}"${fileAttr} title="${title}" aria-label="${title}">${icon}<span class="md-workspace-ref-prefix">@</span>${escapeAttr(name)}${isDir ? "/" : ""}</span>`;
 }
 
 interface SceneObjectRefParts {
@@ -507,7 +507,7 @@ function renderUnitySceneObjectRef(
   const escapedLabel = escapeAttr(displaySceneObjectRef(ref.objectPath));
   const icon = renderRefIcon("gameobject", "md-unity-gameobject-icon");
   const preview = unityObjectPreviewAttrs("sceneObject", options);
-  return `<span class="md-file-ref md-unity-scene-object-ref ${preview.classes} ui-select-text"${preview.attrs} data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" draggable="true" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
+  return `<span class="md-file-ref md-unity-scene-object-ref ${preview.classes} ui-select-text"${preview.attrs} data-file-path="${escapedFullPath}" data-scene-path="${escapedScenePath}" data-scene-object-path="${escapedObjectPath}" title="${escapedFullPath}" aria-label="${escapedFullPath}">${icon}<span class="md-ref-label">${escapedLabel}</span></span>`;
 }
 
 function isSceneObjectRefTerminator(ch: string): boolean {

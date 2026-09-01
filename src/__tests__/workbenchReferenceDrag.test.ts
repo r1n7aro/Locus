@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from "vitest";
+import type { InternalDragController } from "../composables/useInternalDrag";
 import {
   WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE,
   claimWorkbenchReferencePointerEvent,
   isWorkbenchReferencePointerEventClaimed,
+  startWorkbenchReferenceInternalDrag,
   workbenchReferenceFromElement,
   workbenchReferenceInternalDragSource,
   type WorkbenchReferenceDragData,
@@ -64,6 +66,49 @@ describe("workbench conversation reference drag", () => {
       type: "design",
       path: "design/editor.md",
     });
+  });
+
+  it("accepts an interactive Unity identity button as a semantic drag surface", () => {
+    const target = targetFromHtml(
+      '<button class="unity-object-identity" data-unity-ref-kind="asset" data-unity-ref-path="Assets/Prefabs/Hero.prefab"><span class="unity-object-identity-title">Hero</span></button>',
+      ".unity-object-identity-title",
+    );
+    expect(workbenchReferenceFromElement(target)).toEqual({
+      kind: "asset",
+      path: "Assets/Prefabs/Hero.prefab",
+      name: "Hero",
+    });
+  });
+
+  it("starts a canonical internal drag from a nested markdown reference label", () => {
+    const target = targetFromHtml(
+      '<span class="md-file-ref" data-file-path="src/gameplay/state.ts" data-entry-kind="file"><span class="md-ref-label">state.ts</span></span>',
+      ".md-ref-label",
+    );
+    const event = new MouseEvent("pointerdown", { button: 0 }) as PointerEvent;
+    Object.defineProperty(event, "target", { configurable: true, value: target });
+    const calls: unknown[][] = [];
+    const start = ((...args: unknown[]) => {
+      calls.push(args);
+      return true;
+    }) as InternalDragController["start"];
+    const controller = { start } as Pick<InternalDragController, "start">;
+
+    expect(startWorkbenchReferenceInternalDrag(controller, event, {
+      projectId: "project-a",
+      workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 7 },
+      workspaceRoot: "F:/Game",
+    })).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.[1]).toMatchObject({
+      payload: {
+        type: WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE,
+        data: {
+          entries: [{ kind: "file", path: "src/gameplay/state.ts", isDir: false }],
+        },
+      },
+    });
+    expect(isWorkbenchReferencePointerEventClaimed(event)).toBe(true);
   });
 
   it("publishes a copy-only semantic source and claims the captured gesture", () => {

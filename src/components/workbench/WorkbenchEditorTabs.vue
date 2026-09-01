@@ -1,10 +1,23 @@
 <script setup lang="ts">
-import { computed } from "vue";
-import { BookOpen, File, Folder, GitBranch, MessageSquare } from "lucide";
+import { computed, ref } from "vue";
+import { BookOpen, File, Folder, GitBranch, MessageSquare, PanelsTopLeft } from "lucide";
 import { t } from "../../i18n";
+import {
+  isAnimatedSessionTreeStatus,
+  sessionTreeStatusForSession,
+} from "../chat/sessionTree";
+import { useChatStore } from "../../stores/chat";
 import { shouldShowWorkbenchTabStrip } from "../../stores/workbench";
 import type { WorkbenchEditorGroup, WorkbenchEditorInput } from "../../types/workbench";
-import BaseTabStrip, { type BaseTabStripItem } from "../ui/BaseTabStrip.vue";
+import BaseContextMenu from "../ui/BaseContextMenu.vue";
+import BaseTabStrip, {
+  type BaseTabContextMenuPayload,
+  type BaseTabStripItem,
+} from "../ui/BaseTabStrip.vue";
+import {
+  workbenchTabCloseIds,
+  type WorkbenchTabCloseScope,
+} from "./workbenchTabClose";
 import {
   WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE,
   type WorkbenchEditorTabInternalDragData,
@@ -21,10 +34,26 @@ const props = defineProps<{
 const emit = defineEmits<{
   (event: "activate", editorId: string): void;
   (event: "close", editorId: string): void;
+  (event: "close-many", editorIds: string[]): void;
   (event: "pin", editorId: string): void;
+  (event: "drag-externalize", tab: BaseTabStripItem): void;
 }>();
 
 const visible = computed(() => shouldShowWorkbenchTabStrip(props.group, props.showSingleTab));
+const chatStore = useChatStore();
+const tabContextMenu = ref<{ x: number; y: number; editorId: string } | null>(null);
+
+const runningSessionIds = computed(() => {
+  const ids = new Set(chatStore.streamingSessionIds);
+  for (const session of chatStore.sessions) {
+    if (isAnimatedSessionTreeStatus(
+      sessionTreeStatusForSession(session, chatStore.streamingSessionIds),
+    )) {
+      ids.add(session.id);
+    }
+  }
+  return ids;
+});
 
 function editorIcon(editor: WorkbenchEditorInput) {
   switch (editor.resource.kind) {
@@ -40,6 +69,8 @@ function editorIcon(editor: WorkbenchEditorInput) {
     case "folder":
     case "localDirectory":
       return Folder;
+    case "view":
+      return PanelsTopLeft;
     case "section":
       if (editor.resource.section === "knowledge") return BookOpen;
       if (editor.resource.section === "collab") return GitBranch;
@@ -56,6 +87,8 @@ const tabItems = computed<BaseTabStripItem[]>(() => props.group.tabs.map((editor
   dirty: editor.dirty,
   preview: editor.preview && !editor.pinned,
   unavailable: editor.availability === "unavailable",
+  running: editor.resource.kind === "session"
+    && runningSessionIds.value.has(editor.resource.sessionId),
   closeable: true,
 })));
 
@@ -71,27 +104,86 @@ function editorDragData(tab: BaseTabStripItem): WorkbenchEditorTabInternalDragDa
 function editorDragSourceId(tab: BaseTabStripItem): string {
   return `workbench-editor:${props.windowId}:${props.group.paneId}:${tab.id}`;
 }
+
+function openTabContextMenu(payload: BaseTabContextMenuPayload): void {
+  tabContextMenu.value = {
+    x: payload.event.clientX,
+    y: payload.event.clientY,
+    editorId: payload.tab.id,
+  };
+}
+
+function closeIds(scope: WorkbenchTabCloseScope): string[] {
+  const editorId = tabContextMenu.value?.editorId;
+  if (!editorId) return [];
+  return workbenchTabCloseIds(
+    props.group.tabs.map((editor) => editor.editorId),
+    editorId,
+    scope,
+  );
+}
+
+function closeFromContextMenu(scope: WorkbenchTabCloseScope): void {
+  const editorIds = closeIds(scope);
+  tabContextMenu.value = null;
+  if (editorIds.length > 0) emit("close-many", editorIds);
+}
+
 </script>
 
 <template>
-  <BaseTabStrip
-    v-if="visible"
-    class="workbench-editor-tabs"
-    :data-workbench-pane-id="group.paneId"
-    :tabs="tabItems"
-    :active-id="group.activeEditorId"
-    :label="t('workbench.tabs')"
-    :drag-type="WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE"
-    :drag-data="editorDragData"
-    :drag-source-id="editorDragSourceId"
-    :drop-active="dropActive"
-    :drop-index="dropIndex"
-    tab-id-attribute="data-workbench-tab-id"
-    pin-on-double-click
-    @activate="emit('activate', $event)"
-    @close="emit('close', $event)"
-    @pin="emit('pin', $event)"
-  />
+  <template v-if="visible">
+    <BaseTabStrip
+      class="workbench-editor-tabs"
+      :data-workbench-pane-id="group.paneId"
+      :tabs="tabItems"
+      :active-id="group.activeEditorId"
+      :label="t('workbench.tabs')"
+      :drag-type="WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE"
+      :drag-data="editorDragData"
+      :drag-source-id="editorDragSourceId"
+      :drag-externalize="(tab) => emit('drag-externalize', tab)"
+      :cancel-drag-on-window-blur="false"
+      :drop-active="dropActive"
+      :drop-index="dropIndex"
+      tab-id-attribute="data-workbench-tab-id"
+      pin-on-double-click
+      @activate="emit('activate', $event)"
+      @close="emit('close', $event)"
+      @pin="emit('pin', $event)"
+      @tab-contextmenu="openTabContextMenu"
+    />
+    <BaseContextMenu
+      v-if="tabContextMenu"
+      :x="tabContextMenu.x"
+      :y="tabContextMenu.y"
+      :min-width="156"
+      :aria-label="t('workbench.tabs.menu')"
+      @close="tabContextMenu = null"
+    >
+      <button type="button" @click="closeFromContextMenu('current')">
+        {{ t("common.close") }}
+      </button>
+      <div class="base-context-menu-separator" role="separator" />
+      <button
+        type="button"
+        :disabled="closeIds('left').length === 0"
+        @click="closeFromContextMenu('left')"
+      >
+        {{ t("workbench.tabs.closeLeft") }}
+      </button>
+      <button
+        type="button"
+        :disabled="closeIds('right').length === 0"
+        @click="closeFromContextMenu('right')"
+      >
+        {{ t("workbench.tabs.closeRight") }}
+      </button>
+      <button type="button" @click="closeFromContextMenu('all')">
+        {{ t("workbench.tabs.closeAll") }}
+      </button>
+    </BaseContextMenu>
+  </template>
 </template>
 
 <style scoped>

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ const TRANSIENT_CLOSE_DESTROY_DELAY: Duration = Duration::from_secs(30);
 const UNITY_EMBED_QUIESCE_TIMEOUT: Duration = Duration::from_secs(5);
 const ASSET_DRAG_CACHE_TTL: Duration = Duration::from_secs(3);
 const ASSET_DRAG_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(35);
+const FILE_DROP_TEXT_PROBE_BYTES: u64 = 8 * 1024;
 
 #[derive(Debug, Default)]
 struct UnityEmbedQuiesceState {
@@ -118,6 +120,10 @@ struct UnityEmbedControlMessage {
     #[serde(default)]
     asset_refs: Option<Vec<UnityEmbedAssetRef>>,
     #[serde(default)]
+    files: Option<Vec<LocusFileDropRef>>,
+    #[serde(default)]
+    send_mode: Option<String>,
+    #[serde(default)]
     text: Option<String>,
     #[serde(default)]
     text_entries: Option<Vec<UnityEmbedTextDropEntry>>,
@@ -172,6 +178,20 @@ struct UnityEmbedAssetRef {
 #[serde(rename_all = "camelCase")]
 struct UnityEmbedAssetDropPayload {
     refs: Vec<UnityEmbedAssetRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    send_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_ref: Option<WorkspaceRef>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UnityEmbedFileDropPayload {
+    files: Vec<LocusFileDropRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    send_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_ref: Option<WorkspaceRef>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -229,6 +249,14 @@ struct LocusFileDropPayload {
     y: f64,
 }
 
+fn normalize_send_to_locus_mode(value: Option<&str>) -> Option<String> {
+    match value.map(str::trim) {
+        Some("newSession") => Some("newSession".to_string()),
+        Some("focusedSession") => Some("focusedSession".to_string()),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocusNativeFileDragRequest {
@@ -241,6 +269,7 @@ struct LocusFileDragStatePayload {
     phase: String,
     active: bool,
     file_count: usize,
+    tab_eligible: bool,
     x: f64,
     y: f64,
 }
@@ -1033,12 +1062,24 @@ fn control_snapshot_for_scope(workspace_ref: &WorkspaceRef) -> UnityEmbedControl
     UnityEmbedControlSnapshot::default()
 }
 
-fn strip_extended_path_prefix(path: &str) -> &str {
-    path.strip_prefix(r"\\?\").unwrap_or(path)
+fn strip_extended_path_prefix(path: &str) -> String {
+    let Some(suffix) = path.strip_prefix(r"\\?\") else {
+        return path.to_string();
+    };
+
+    if suffix
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("UNC\\"))
+    {
+        return format!(r"\\{}", &suffix[4..]);
+    }
+
+    suffix.to_string()
 }
 
 fn normalize_pipe_project_path(path: &str) -> String {
-    let trimmed = strip_extended_path_prefix(path).trim();
+    let path_without_extended_prefix = strip_extended_path_prefix(path);
+    let trimmed = path_without_extended_prefix.trim();
     if trimmed.is_empty() {
         return String::new();
     }
@@ -1071,10 +1112,22 @@ fn workspace_path_for_window(app_handle: &AppHandle, label: &str) -> String {
     let Some(registry) = app_handle.try_state::<Arc<ProjectRegistry>>() else {
         return String::new();
     };
-    registry
+    if let Some(root) = registry
         .runtimes()
         .into_iter()
         .find(|runtime| is_unity_embed_window_for_scope(label, &WorkspaceRef::for_runtime(runtime)))
+        .map(|runtime| runtime.root().to_string_lossy().to_string())
+    {
+        return root;
+    }
+    let Some(contexts) = app_handle.try_state::<Arc<WindowContextRegistry>>() else {
+        return String::new();
+    };
+    contexts
+        .active_pane(label)
+        .ok()
+        .flatten()
+        .and_then(|context| registry.runtime(&context.focused_checkout_id))
         .map(|runtime| runtime.root().to_string_lossy().to_string())
         .unwrap_or_default()
 }
@@ -1256,7 +1309,11 @@ fn emit_locus_asset_drop_to(
         app_handle,
         label,
         ASSET_DROP_EVENT,
-        UnityEmbedAssetDropPayload { refs },
+        UnityEmbedAssetDropPayload {
+            refs,
+            send_mode: None,
+            workspace_ref: None,
+        },
     )
 }
 
@@ -1269,7 +1326,11 @@ fn emit_locus_asset_drop_to_chat_windows(
         return Ok(());
     }
 
-    let payload = UnityEmbedAssetDropPayload { refs };
+    let payload = UnityEmbedAssetDropPayload {
+        refs,
+        send_mode: None,
+        workspace_ref: None,
+    };
     for label in locus_frontend_drop_window_labels_for_scope(app_handle, workspace_ref) {
         emit_to_existing_window(app_handle, &label, ASSET_DROP_EVENT, payload.clone())?;
     }
@@ -1554,7 +1615,10 @@ pub async fn unity_embed_start_asset_drag(
     // call fails (e.g. Unity disconnected) and the command errors out.
     crate::unity_bridge::start_asset_drag(&cwd, &payload).await?;
     #[cfg(target_os = "windows")]
-    windows_impl::start_reference_drag_preview(unity_ref_drag_preview_label(&refs, refs.len()));
+    windows_impl::start_reference_drag_preview(
+        unity_ref_drag_preview_label(&refs, refs.len()),
+        None,
+    );
     Ok("ok".to_string())
 }
 
@@ -1639,10 +1703,35 @@ pub async fn locus_start_native_file_drag(
     dispatch_native_file_drag(app_handle, paths, preview_label, None).await
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocusDragPreviewColor {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocusDragPreviewAppearance {
+    width: f64,
+    height: f64,
+    pointer_offset_x: f64,
+    pointer_offset_y: f64,
+    scale_factor: f64,
+    background_color: LocusDragPreviewColor,
+    border_color: LocusDragPreviewColor,
+    text_color: LocusDragPreviewColor,
+    icon_color: LocusDragPreviewColor,
+}
+
 #[tauri::command]
-pub async fn locus_start_drag_preview(label: String) -> Result<(), AppError> {
+pub async fn locus_start_drag_preview(
+    label: String,
+    preview: Option<LocusDragPreviewAppearance>,
+) -> Result<(), AppError> {
     #[cfg(target_os = "windows")]
-    windows_impl::start_reference_drag_preview(label);
+    windows_impl::start_reference_drag_preview(label, preview);
 
     Ok(())
 }
@@ -1663,7 +1752,7 @@ async fn dispatch_native_file_drag(
 ) -> Result<String, AppError> {
     #[cfg(target_os = "windows")]
     {
-        windows_impl::start_reference_drag_preview(preview_label.clone());
+        windows_impl::start_reference_drag_preview(preview_label.clone(), None);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         app_handle
@@ -2030,6 +2119,41 @@ fn locus_file_drop_ref(path: &Path) -> Option<LocusFileDropRef> {
     })
 }
 
+fn locus_file_drop_path_is_text(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if super::workspace_explorer::is_text_extension(&extension) {
+        return true;
+    }
+
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(FILE_DROP_TEXT_PROBE_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return false;
+    }
+    !bytes.contains(&0) && std::str::from_utf8(&bytes).is_ok()
+}
+
+fn locus_file_drop_tab_eligible(workspace_path: &str, paths: &[PathBuf]) -> bool {
+    !paths.is_empty()
+        && paths.iter().all(|path| {
+            unity_file_drop_asset_ref(workspace_path, path).is_none()
+                && locus_file_drop_path_is_text(path)
+        })
+}
+
 fn emit_locus_file_drop_to(
     app_handle: &AppHandle,
     label: &str,
@@ -2053,11 +2177,13 @@ fn emit_locus_file_drag_state_to(
     label: &str,
     event: &tauri::DragDropEvent,
 ) -> Result<(), String> {
+    let workspace_path = workspace_path_for_window(app_handle, label);
     let payload = match event {
         tauri::DragDropEvent::Enter { paths, position } => LocusFileDragStatePayload {
             phase: "enter".to_string(),
             active: true,
             file_count: paths.len(),
+            tab_eligible: locus_file_drop_tab_eligible(&workspace_path, paths),
             x: position.x,
             y: position.y,
         },
@@ -2065,6 +2191,7 @@ fn emit_locus_file_drag_state_to(
             phase: "over".to_string(),
             active: true,
             file_count: 0,
+            tab_eligible: false,
             x: position.x,
             y: position.y,
         },
@@ -2072,6 +2199,7 @@ fn emit_locus_file_drag_state_to(
             phase: "drop".to_string(),
             active: false,
             file_count: paths.len(),
+            tab_eligible: locus_file_drop_tab_eligible(&workspace_path, paths),
             x: position.x,
             y: position.y,
         },
@@ -2079,6 +2207,7 @@ fn emit_locus_file_drag_state_to(
             phase: "leave".to_string(),
             active: false,
             file_count: 0,
+            tab_eligible: false,
             x: 0.0,
             y: 0.0,
         },
@@ -2916,7 +3045,11 @@ fn apply_control_message_on_main(
     if should_ignore_stale_control_message(&label, &msg) {
         return Ok(());
     }
-    if msg.kind != "assetDrop" && msg.kind != "assetDrag" && msg.kind != "consoleText" {
+    if msg.kind != "assetDrop"
+        && msg.kind != "assetDrag"
+        && msg.kind != "fileDrop"
+        && msg.kind != "consoleText"
+    {
         record_control_message(&binding, &msg);
     }
     match msg.kind.as_str() {
@@ -2959,11 +3092,50 @@ fn apply_control_message_on_main(
                 windows_impl::stop_reference_drag_preview();
                 return Ok(());
             }
-            emit_locus_asset_drop_to(app_handle, &label, refs)?;
+            let send_mode = normalize_send_to_locus_mode(msg.send_mode.as_deref());
+            let target_label = if send_mode.is_some() {
+                crate::reveal_main_window(app_handle);
+                MAIN_WINDOW_LABEL
+            } else {
+                label.as_str()
+            };
+            emit_to_existing_window(
+                app_handle,
+                target_label,
+                ASSET_DROP_EVENT,
+                UnityEmbedAssetDropPayload {
+                    refs,
+                    send_mode,
+                    workspace_ref: Some(binding.workspace_ref.clone()),
+                },
+            )?;
             cache_unity_embed_asset_drag_refs(&binding.workspace_ref, Vec::new());
             #[cfg(target_os = "windows")]
             windows_impl::stop_reference_drag_preview();
             emit_unity_embed_asset_drag_state(app_handle, &binding.workspace_ref, Vec::new())
+        }
+        "fileDrop" => {
+            let files = msg.files.unwrap_or_default();
+            if files.is_empty() {
+                return Ok(());
+            }
+            let send_mode = normalize_send_to_locus_mode(msg.send_mode.as_deref());
+            let target_label = if send_mode.is_some() {
+                crate::reveal_main_window(app_handle);
+                MAIN_WINDOW_LABEL
+            } else {
+                label.as_str()
+            };
+            emit_to_existing_window(
+                app_handle,
+                target_label,
+                FILE_DROP_EVENT,
+                UnityEmbedFileDropPayload {
+                    files,
+                    send_mode,
+                    workspace_ref: Some(binding.workspace_ref.clone()),
+                },
+            )
         }
         "assetDrag" => {
             let refs = msg.asset_refs.unwrap_or_default();
@@ -3319,7 +3491,10 @@ mod windows_impl {
         STATE.get_or_init(|| Mutex::new(None))
     }
 
-    pub(super) fn start_reference_drag_preview(preview_label: String) {
+    pub(super) fn start_reference_drag_preview(
+        preview_label: String,
+        appearance: Option<LocusDragPreviewAppearance>,
+    ) {
         stop_reference_drag_preview();
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -3328,7 +3503,9 @@ mod windows_impl {
         }
 
         std::thread::spawn(move || {
-            if let Err(error) = unsafe { run_reference_drag_preview(preview_label, stop) } {
+            if let Err(error) =
+                unsafe { run_reference_drag_preview(preview_label, appearance, stop) }
+            {
                 eprintln!("[Locus] native reference drag preview failed: {error}");
             }
         });
@@ -3344,9 +3521,21 @@ mod windows_impl {
 
     unsafe fn run_reference_drag_preview(
         preview_label: String,
+        appearance: Option<LocusDragPreviewAppearance>,
         stop: Arc<AtomicBool>,
     ) -> Result<(), String> {
-        let image = create_native_file_drag_image(&preview_label)?;
+        let image = create_native_file_drag_image(&preview_label, appearance.as_ref())?;
+        let pointer_anchor = appearance.as_ref().map(|preview| {
+            let scale = preview.scale_factor.clamp(0.5, 4.0);
+            POINT {
+                x: (preview.pointer_offset_x * scale)
+                    .round()
+                    .clamp(0.0, image.width as f64) as i32,
+                y: (preview.pointer_offset_y * scale)
+                    .round()
+                    .clamp(0.0, image.height as f64) as i32,
+            }
+        });
         let screen_dc = GetDC(None);
         if screen_dc.0.is_null() {
             return Err("GetDC failed".to_string());
@@ -3419,9 +3608,16 @@ mod windows_impl {
                 break;
             }
 
-            let dst = POINT {
-                x: cursor.x + REFERENCE_DRAG_PREVIEW_OFFSET_X,
-                y: cursor.y + REFERENCE_DRAG_PREVIEW_OFFSET_Y,
+            let dst = if let Some(anchor) = &pointer_anchor {
+                POINT {
+                    x: cursor.x - anchor.x,
+                    y: cursor.y - anchor.y,
+                }
+            } else {
+                POINT {
+                    x: cursor.x + REFERENCE_DRAG_PREVIEW_OFFSET_X,
+                    y: cursor.y + REFERENCE_DRAG_PREVIEW_OFFSET_Y,
+                }
             };
             if let Err(error) = UpdateLayeredWindow(
                 hwnd,
@@ -3546,7 +3742,7 @@ mod windows_impl {
         data_object: &IDataObject,
         preview_label: &str,
     ) -> Result<NativeDragImage, String> {
-        let drag_image = create_native_file_drag_image(preview_label)?;
+        let drag_image = create_native_file_drag_image(preview_label, None)?;
         let helper: IDragSourceHelper =
             CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER).map_err(
                 |error| format!("CoCreateInstance(CLSID_DragDropHelper) failed: {error}"),
@@ -3568,12 +3764,27 @@ mod windows_impl {
 
     unsafe fn create_native_file_drag_image(
         preview_label: &str,
+        appearance: Option<&LocusDragPreviewAppearance>,
     ) -> Result<NativeDragImage, String> {
-        const HEIGHT: i32 = 24;
+        const DEFAULT_HEIGHT: i32 = 24;
         const MIN_WIDTH: i32 = 52;
         const MAX_WIDTH: i32 = 340;
-        const TEXT_LEFT: i32 = 24;
-        const TEXT_RIGHT_PADDING: i32 = 7;
+        const DEFAULT_TEXT_LEFT: i32 = 24;
+        const DEFAULT_TEXT_RIGHT_PADDING: i32 = 7;
+
+        let scale = appearance
+            .map(|preview| preview.scale_factor.clamp(0.5, 4.0))
+            .unwrap_or(1.0);
+        let height = appearance
+            .map(|preview| (preview.height * scale).round() as i32)
+            .unwrap_or(DEFAULT_HEIGHT)
+            .clamp(DEFAULT_HEIGHT, 240);
+        let text_left = appearance
+            .map(|_| (30.0 * scale).round() as i32)
+            .unwrap_or(DEFAULT_TEXT_LEFT);
+        let text_right_padding = appearance
+            .map(|_| (9.0 * scale).round() as i32)
+            .unwrap_or(DEFAULT_TEXT_RIGHT_PADDING);
 
         let label = sanitize_drag_image_label(preview_label);
         let mut text = label.encode_utf16().collect::<Vec<u16>>();
@@ -3592,9 +3803,15 @@ mod windows_impl {
             return Err("CreateCompatibleDC failed".to_string());
         }
 
-        let font_name = wide_null("Cascadia Mono");
+        let font_name = wide_null(if appearance.is_some() {
+            "Segoe UI"
+        } else {
+            "Cascadia Mono"
+        });
         let created_font = CreateFontW(
-            -12,
+            appearance
+                .map(|_| -((12.0 * scale).round() as i32).max(9))
+                .unwrap_or(-12),
             0,
             0,
             0,
@@ -3627,9 +3844,19 @@ mod windows_impl {
         } else {
             estimate_drag_label_width(&label)
         };
-        let width = (TEXT_LEFT + measured_width + TEXT_RIGHT_PADDING).clamp(MIN_WIDTH, MAX_WIDTH);
+        let width = appearance
+            .map(|preview| (preview.width * scale).round() as i32)
+            .unwrap_or(text_left + measured_width + text_right_padding)
+            .clamp(
+                MIN_WIDTH,
+                if appearance.is_some() {
+                    1360
+                } else {
+                    MAX_WIDTH
+                },
+            );
 
-        let bitmap = CreateCompatibleBitmap(screen_dc, width, HEIGHT);
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
         if bitmap.0.is_null() {
             if !old_font.0.is_null() {
                 let _ = SelectObject(mem_dc, old_font);
@@ -3643,7 +3870,16 @@ mod windows_impl {
         }
 
         let old_bitmap = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
-        draw_native_file_drag_image(mem_dc, width, HEIGHT, &mut text);
+        draw_native_file_drag_image(
+            mem_dc,
+            width,
+            height,
+            text_left,
+            text_right_padding,
+            scale,
+            &mut text,
+            appearance,
+        );
 
         if !old_bitmap.0.is_null() {
             let _ = SelectObject(mem_dc, old_bitmap);
@@ -3660,11 +3896,20 @@ mod windows_impl {
         Ok(NativeDragImage {
             bitmap,
             width,
-            height: HEIGHT,
+            height,
         })
     }
 
-    unsafe fn draw_native_file_drag_image(hdc: HDC, width: i32, height: i32, text: &mut [u16]) {
+    unsafe fn draw_native_file_drag_image(
+        hdc: HDC,
+        width: i32,
+        height: i32,
+        text_left: i32,
+        text_right_padding: i32,
+        scale: f64,
+        text: &mut [u16],
+        appearance: Option<&LocusDragPreviewAppearance>,
+    ) {
         let transparent = drag_image_transparent_color();
         let transparent_brush = CreateSolidBrush(transparent);
         if !transparent_brush.0.is_null() {
@@ -3678,8 +3923,18 @@ mod windows_impl {
             let _ = DeleteObject(HGDIOBJ(transparent_brush.0));
         }
 
-        let body_brush = CreateSolidBrush(rgb_color(31, 36, 44));
-        let border_pen = CreatePen(PS_SOLID, 1, rgb_color(74, 84, 98));
+        let body_brush = CreateSolidBrush(
+            appearance
+                .map(|preview| drag_preview_color(preview.background_color))
+                .unwrap_or_else(|| rgb_color(31, 36, 44)),
+        );
+        let border_pen = CreatePen(
+            PS_SOLID,
+            1,
+            appearance
+                .map(|preview| drag_preview_color(preview.border_color))
+                .unwrap_or_else(|| rgb_color(74, 84, 98)),
+        );
         let old_brush = if !body_brush.0.is_null() {
             SelectObject(hdc, HGDIOBJ(body_brush.0))
         } else {
@@ -3690,7 +3945,11 @@ mod windows_impl {
         } else {
             HGDIOBJ::default()
         };
-        let _ = RoundRect(hdc, 0, 0, width, height, 6, 6);
+        let corner = appearance
+            .map(|_| (6.0 * scale).round() as i32)
+            .unwrap_or(6)
+            .max(2);
+        let _ = RoundRect(hdc, 0, 0, width, height, corner, corner);
         if !old_brush.0.is_null() {
             let _ = SelectObject(hdc, old_brush);
         }
@@ -3704,14 +3963,24 @@ mod windows_impl {
             let _ = DeleteObject(HGDIOBJ(border_pen.0));
         }
 
-        draw_drag_reference_icon(hdc, drag_icon_tone_for_label_text(text));
+        draw_drag_reference_icon(
+            hdc,
+            drag_icon_tone_for_label_text(text),
+            appearance.map(|preview| drag_preview_color(preview.icon_color)),
+            scale,
+        );
 
         let _ = SetBkMode(hdc, TRANSPARENT);
-        let _ = SetTextColor(hdc, rgb_color(238, 242, 248));
+        let _ = SetTextColor(
+            hdc,
+            appearance
+                .map(|preview| drag_preview_color(preview.text_color))
+                .unwrap_or_else(|| rgb_color(238, 242, 248)),
+        );
         let mut text_rect = RECT {
-            left: 24,
+            left: text_left,
             top: 0,
-            right: width - 6,
+            right: width - text_right_padding,
             bottom: height,
         };
         let _ = DrawTextW(
@@ -3753,12 +4022,17 @@ mod windows_impl {
         DragIconTone::Neutral
     }
 
-    unsafe fn draw_drag_reference_icon(hdc: HDC, tone: DragIconTone) {
-        let color = match tone {
+    unsafe fn draw_drag_reference_icon(
+        hdc: HDC,
+        tone: DragIconTone,
+        color_override: Option<COLORREF>,
+        scale: f64,
+    ) {
+        let color = color_override.unwrap_or_else(|| match tone {
             DragIconTone::Primary => rgb_color(116, 154, 222),
             DragIconTone::Resource => rgb_color(121, 205, 154),
             DragIconTone::Neutral => rgb_color(168, 178, 190),
-        };
+        });
         let pen = CreatePen(PS_SOLID, 1, color);
         if pen.0.is_null() {
             return;
@@ -3766,8 +4040,8 @@ mod windows_impl {
 
         let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
         match tone {
-            DragIconTone::Resource => draw_drag_sparkle_icon(hdc),
-            _ => draw_drag_file_icon(hdc),
+            DragIconTone::Resource => draw_drag_sparkle_icon(hdc, scale),
+            _ => draw_drag_file_icon(hdc, scale),
         }
         if !old_pen.0.is_null() {
             let _ = SelectObject(hdc, old_pen);
@@ -3775,28 +4049,29 @@ mod windows_impl {
         let _ = DeleteObject(HGDIOBJ(pen.0));
     }
 
-    unsafe fn draw_drag_file_icon(hdc: HDC) {
-        draw_drag_icon_line(hdc, 7, 5, 14, 5);
-        draw_drag_icon_line(hdc, 14, 5, 18, 9);
-        draw_drag_icon_line(hdc, 18, 9, 18, 18);
-        draw_drag_icon_line(hdc, 18, 18, 7, 18);
-        draw_drag_icon_line(hdc, 7, 18, 7, 5);
-        draw_drag_icon_line(hdc, 14, 5, 14, 9);
-        draw_drag_icon_line(hdc, 14, 9, 18, 9);
+    unsafe fn draw_drag_file_icon(hdc: HDC, scale: f64) {
+        draw_drag_icon_line(hdc, 7, 5, 14, 5, scale);
+        draw_drag_icon_line(hdc, 14, 5, 18, 9, scale);
+        draw_drag_icon_line(hdc, 18, 9, 18, 18, scale);
+        draw_drag_icon_line(hdc, 18, 18, 7, 18, scale);
+        draw_drag_icon_line(hdc, 7, 18, 7, 5, scale);
+        draw_drag_icon_line(hdc, 14, 5, 14, 9, scale);
+        draw_drag_icon_line(hdc, 14, 9, 18, 9, scale);
     }
 
-    unsafe fn draw_drag_sparkle_icon(hdc: HDC) {
-        draw_drag_icon_line(hdc, 11, 4, 11, 16);
-        draw_drag_icon_line(hdc, 5, 10, 17, 10);
-        draw_drag_icon_line(hdc, 7, 6, 15, 14);
-        draw_drag_icon_line(hdc, 15, 6, 7, 14);
-        draw_drag_icon_line(hdc, 18, 4, 18, 8);
-        draw_drag_icon_line(hdc, 16, 6, 20, 6);
+    unsafe fn draw_drag_sparkle_icon(hdc: HDC, scale: f64) {
+        draw_drag_icon_line(hdc, 11, 4, 11, 16, scale);
+        draw_drag_icon_line(hdc, 5, 10, 17, 10, scale);
+        draw_drag_icon_line(hdc, 7, 6, 15, 14, scale);
+        draw_drag_icon_line(hdc, 15, 6, 7, 14, scale);
+        draw_drag_icon_line(hdc, 18, 4, 18, 8, scale);
+        draw_drag_icon_line(hdc, 16, 6, 20, 6, scale);
     }
 
-    unsafe fn draw_drag_icon_line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32) {
-        let _ = MoveToEx(hdc, x1, y1, None);
-        let _ = LineTo(hdc, x2, y2);
+    unsafe fn draw_drag_icon_line(hdc: HDC, x1: i32, y1: i32, x2: i32, y2: i32, scale: f64) {
+        let scaled = |value: i32| (value as f64 * scale).round() as i32;
+        let _ = MoveToEx(hdc, scaled(x1), scaled(y1), None);
+        let _ = LineTo(hdc, scaled(x2), scaled(y2));
     }
 
     fn sanitize_drag_image_label(value: &str) -> String {
@@ -3822,6 +4097,10 @@ mod windows_impl {
 
     fn drag_image_transparent_color() -> COLORREF {
         rgb_color(255, 0, 255)
+    }
+
+    fn drag_preview_color(color: LocusDragPreviewColor) -> COLORREF {
+        rgb_color(color.red, color.green, color.blue)
     }
 
     fn rgb_color(red: u8, green: u8, blue: u8) -> COLORREF {
@@ -6173,11 +6452,13 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        control_pipe_name_for_project_path, locus_file_drop_refs, native_asset_file_drag_paths,
-        native_locus_file_drag_paths, normalize_pipe_project_path, unity_embed_host_url_for_scope,
-        unity_embed_scope_key, unity_embed_window_label_for_scope, unity_file_drop_asset_refs,
+        control_pipe_name_for_project_path, locus_file_drop_refs, locus_file_drop_tab_eligible,
+        native_asset_file_drag_paths, native_locus_file_drag_paths, normalize_pipe_project_path,
+        normalize_send_to_locus_mode, unity_embed_host_url_for_scope, unity_embed_scope_key,
+        unity_embed_window_label_for_scope, unity_file_drop_asset_refs,
         unity_ref_drag_preview_label, unity_relative_drop_path, workspace_ref_for_window_context,
-        LocusFileDropRef, UnityEmbedAssetRef,
+        LocusFileDropRef, UnityEmbedAssetDropPayload, UnityEmbedAssetRef, UnityEmbedControlMessage,
+        UnityEmbedFileDropPayload,
     };
     use crate::workspace_service::identity::ProjectIdResolver;
     use crate::workspace_service::{
@@ -6187,6 +6468,37 @@ mod tests {
 
     fn checkout_ref(id: &str, generation: u64) -> WorkspaceRef {
         WorkspaceRef::new(CheckoutId::new(id).expect("checkout id"), Some(generation))
+    }
+
+    #[test]
+    fn send_to_locus_mode_and_file_attachments_round_trip_as_camel_case() {
+        let message: UnityEmbedControlMessage =
+            serde_json::from_str(r#"{"type":"assetDrop","sendMode":"newSession","assetRefs":[]}"#)
+                .expect("control message");
+        assert_eq!(message.send_mode.as_deref(), Some("newSession"));
+
+        let payload = UnityEmbedAssetDropPayload {
+            refs: Vec::new(),
+            send_mode: message.send_mode,
+            workspace_ref: Some(checkout_ref("checkout-send", 9)),
+        };
+        let serialized = serde_json::to_value(payload).expect("asset drop payload");
+        assert_eq!(serialized["sendMode"], "newSession");
+        assert_eq!(serialized["workspaceRef"]["checkoutId"], "checkout-send");
+        assert_eq!(serialized["workspaceRef"]["expectedGeneration"], 9);
+
+        let message: UnityEmbedControlMessage = serde_json::from_str(
+            r#"{"type":"fileDrop","sendMode":"newSession","files":[{"path":"C:/tmp/replay.dereplay","name":"replay.dereplay","typeLabel":"SampleGame Replay","isDir":false,"source":"replay-timeline"}]}"#,
+        )
+        .expect("file control message");
+        let payload = UnityEmbedFileDropPayload {
+            files: message.files.expect("file attachments"),
+            send_mode: normalize_send_to_locus_mode(message.send_mode.as_deref()),
+            workspace_ref: None,
+        };
+        let serialized = serde_json::to_value(payload).expect("file drop payload");
+        assert_eq!(serialized["sendMode"], "newSession");
+        assert_eq!(serialized["files"][0]["typeLabel"], "SampleGame Replay");
     }
 
     #[test]
@@ -6356,6 +6668,23 @@ mod tests {
     }
 
     #[test]
+    fn file_drop_preserves_extended_unc_path_as_absolute_local_ref() {
+        let refs = locus_file_drop_refs(
+            "R:/Fixture/UnityProject",
+            &[PathBuf::from(
+                r"\\?\UNC\fixture-nas\art-share\Characters\Captain\captain.fbx",
+            )],
+        );
+
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].path,
+            "//fixture-nas/art-share/Characters/Captain/captain.fbx"
+        );
+        assert_eq!(refs[0].source, "local");
+    }
+
+    #[test]
     fn file_drop_keeps_asset_paths_as_unity_refs() {
         let refs = locus_file_drop_refs(
             "F:/Game/Project",
@@ -6363,6 +6692,36 @@ mod tests {
         );
 
         assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn file_drop_tabs_accept_only_non_unity_text_files() {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let readme = project.path().join("README.md");
+        let extensionless = project.path().join("LICENSE");
+        let binary = project.path().join("archive.bin");
+        let unity_script = project.path().join("Assets/Scripts/Player.cs");
+        fs::create_dir_all(unity_script.parent().expect("Unity script parent"))
+            .expect("create Unity script parent");
+        fs::write(&readme, "# Project\n").expect("write markdown");
+        fs::write(&extensionless, "license text\n").expect("write extensionless text");
+        fs::write(&binary, b"binary\0payload").expect("write binary");
+        fs::write(&unity_script, "class Player {}\n").expect("write Unity script");
+        let workspace_path = project.path().to_string_lossy();
+
+        assert!(locus_file_drop_tab_eligible(
+            &workspace_path,
+            &[readme.clone(), extensionless],
+        ));
+        assert!(!locus_file_drop_tab_eligible(
+            &workspace_path,
+            &[readme.clone(), binary],
+        ));
+        assert!(!locus_file_drop_tab_eligible(
+            &workspace_path,
+            &[unity_script],
+        ));
+        assert!(!locus_file_drop_tab_eligible(&workspace_path, &[]));
     }
 
     #[test]

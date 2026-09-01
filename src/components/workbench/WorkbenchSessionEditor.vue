@@ -2,13 +2,14 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
 import { useSkills } from "../../composables/useSkills";
+import { useWorkspaceAssetDbStatus } from "../../composables/useWorkspaceAssetDbStatus";
+import { useWorkspaceUnityStatus } from "../../composables/useWorkspaceUnityStatus";
 import type { WorkspaceRef } from "../../services/project";
 import { useAgentStore } from "../../stores/agent";
 import { useAuthStore } from "../../stores/auth";
 import { useChatStore } from "../../stores/chat";
 import { useModelStore } from "../../stores/model";
 import { useNotificationStore } from "../../stores/notification";
-import { useProjectStore } from "../../stores/project";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import type {
   AssetRefAttachment,
@@ -26,11 +27,15 @@ const props = defineProps<{
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   shortcutActive?: boolean;
+  newChatShortcutAction?: "keepCurrent" | "replaceCurrent" | "newTab";
 }>();
 
 const emit = defineEmits<{
   (event: "session-created", payload: { editorId: string; sessionId: string }): void;
-  (event: "new-session-requested", payload: { editorId: string }): void;
+  (event: "new-session-requested", payload: {
+    editorId: string;
+    source: "control" | "shortcut";
+  }): void;
   (event: "composer-draft-change", payload: { editorId: string; hasDraft: boolean }): void;
 }>();
 
@@ -39,7 +44,6 @@ const authStore = useAuthStore();
 const chatStore = useChatStore();
 const modelStore = useModelStore();
 const notificationStore = useNotificationStore();
-const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const { skillItems } = useSkills();
 const chatViewRef = ref<InstanceType<typeof ChatView> | null>(null);
@@ -77,10 +81,44 @@ const checkout = computed(() => (
 ));
 const workingDir = computed(() => checkout.value?.root ?? "");
 const projectServices = computed(() => checkout.value?.runtime?.detectedServices ?? []);
-const usesFocusedProjectStatus = computed(() => (
-  !!props.workspaceRef
-  && workspaceContextStore.focusedWorkspaceRef?.checkoutId === props.workspaceRef.checkoutId
+const isUnityWorkspace = computed(() => (
+  projectServices.value.some((serviceId) => serviceId.trim().toLowerCase() === "unity")
 ));
+const {
+  scanPhase: workspaceScanPhase,
+  lastScanStats: workspaceLastScanStats,
+  startScan: startWorkspaceAssetScan,
+} = useWorkspaceAssetDbStatus({
+  workspaceRef: computed(() => props.workspaceRef),
+  enabled: isUnityWorkspace,
+  onScanError(error) {
+    notificationStore.addNotice("error", error.message, {
+      code: error.code,
+      operation: "ref_graph_scan_start",
+      skipConsoleLog: true,
+    });
+  },
+});
+const {
+  connected: workspaceUnityConnected,
+  connectionStatus: workspaceUnityConnectionStatus,
+  pluginStatus: workspaceUnityPluginStatus,
+  pluginInstalling: workspaceUnityPluginInstalling,
+  launching: workspaceUnityLaunching,
+  launchState: workspaceUnityLaunchState,
+  launch: launchWorkspaceUnity,
+  installPlugin: installWorkspaceUnityPlugin,
+} = useWorkspaceUnityStatus({
+  workspaceRef: computed(() => props.workspaceRef),
+  enabled: isUnityWorkspace,
+  onError(error, operation) {
+    notificationStore.addNotice("error", error.message, {
+      code: error.code,
+      operation,
+      skipConsoleLog: true,
+    });
+  },
+});
 
 const {
   inputText,
@@ -93,6 +131,7 @@ const {
   liveRenderParts,
   livePartStreams,
   isStreaming,
+  isCancelling,
   isCompacting,
   isThinking,
   hasThinking,
@@ -115,6 +154,9 @@ const {
   deleteQueuedFollowUp,
   reEditQueuedFollowUp,
   cancel,
+  checkUndoDirty,
+  rollbackConversation,
+  rollbackFilesAndConversation,
   resetSession,
   answerQuestion,
   answerToolConfirm,
@@ -222,6 +264,27 @@ async function applyDraftPrefill(
   await chatViewRef.value?.applyDraftPrefill(draft);
 }
 
+async function appendComposerDraft(
+  draft: Parameters<NonNullable<InstanceType<typeof ChatView>["appendComposerDraft"]>>[0],
+): Promise<void> {
+  await chatViewRef.value?.appendComposerDraft(draft);
+}
+
+function exportTransferSnapshot() {
+  return {
+    kind: "session" as const,
+    composerDraft: chatViewRef.value?.exportComposerDraft() ?? null,
+  };
+}
+
+function exportComposerDraft() {
+  return chatViewRef.value?.exportComposerDraft() ?? null;
+}
+
+async function focusComposerInput(): Promise<void> {
+  await chatViewRef.value?.focusComposerInput();
+}
+
 function handleSelectAgent(agentId: string): void {
   const agent = agentStore.agents.find((item) => item.id === agentId);
   const fallbackEffort = modelStore.hasUserDefaultEffort
@@ -239,12 +302,23 @@ function handleSelectModel(modelId: string): void {
   }
 }
 
-function handleNewSessionRequest(): void {
-  resetSession();
-  emit("new-session-requested", { editorId: props.editor.editorId });
+function handleNewSessionRequest(request: { source: "control" | "shortcut" }): void {
+  if (request.source !== "shortcut" || props.newChatShortcutAction !== "newTab") {
+    resetSession();
+  }
+  emit("new-session-requested", {
+    editorId: props.editor.editorId,
+    source: request.source,
+  });
 }
 
-defineExpose({ applyDraftPrefill });
+defineExpose({
+  applyDraftPrefill,
+  appendComposerDraft,
+  exportComposerDraft,
+  exportTransferSnapshot,
+  focusComposerInput,
+});
 </script>
 
 <template>
@@ -259,7 +333,7 @@ defineExpose({ applyDraftPrefill });
     :has-streaming-text="streamingText.length > 0"
     :streaming-text-order="streamingTextOrder"
     :is-streaming="isStreaming"
-    :is-cancelling="false"
+    :is-cancelling="isCancelling"
     :can-resume-interrupted="false"
     :is-compacting="isCompacting"
     :is-thinking="isThinking"
@@ -289,24 +363,28 @@ defineExpose({ applyDraftPrefill });
     :sessions="chatStore.sessions"
     :active-session-id="sessionId"
     :pending-session-id="null"
-    :unity-connected="usesFocusedProjectStatus ? projectStore.unityConnected : false"
-    :unity-plugin-status="usesFocusedProjectStatus ? projectStore.pluginToast : null"
-    :unity-plugin-installing="usesFocusedProjectStatus ? projectStore.pluginInstalling : false"
-    :unity-launching="usesFocusedProjectStatus ? projectStore.unityLaunching : false"
-    :unity-launch-state="usesFocusedProjectStatus ? projectStore.unityLaunchState : 'idle'"
-    :unity-connection-status="usesFocusedProjectStatus ? projectStore.unityConnectionStatus : null"
+    :unity-connected="workspaceUnityConnected"
+    :unity-plugin-status="workspaceUnityPluginStatus"
+    :unity-plugin-installing="workspaceUnityPluginInstalling"
+    :unity-launching="workspaceUnityLaunching"
+    :unity-launch-state="workspaceUnityLaunchState"
+    :unity-connection-status="workspaceUnityConnectionStatus"
     :workspace-ref="workspaceRef"
     :project-id="editor.resource.projectId"
     :reference-drop-available="referenceDropAvailable"
     :reference-drop-active="referenceDropActive"
     :shortcut-active="shortcutActive"
+    :new-chat-shortcut-action="newChatShortcutAction"
     :project-services="projectServices"
     :working-dir="workingDir"
-    :scan-phase="usesFocusedProjectStatus ? projectStore.scanPhase : null"
-    :last-scan-stats="usesFocusedProjectStatus ? projectStore.lastScanStats : null"
+    :scan-phase="workspaceScanPhase"
+    :last-scan-stats="workspaceLastScanStats"
     :skills="skillItems"
     :streaming-session-ids="streamingSessionIds"
     :undoable-message-ids="undoableMessageIds"
+    :check-undo-dirty="checkUndoDirty"
+    :undo-conversation="rollbackConversation"
+    :undo-files-and-conversation="rollbackFilesAndConversation"
     :show-session-navigation="false"
     :session-panel-storage-scope="sessionKey"
     @send="handleSend"
@@ -325,9 +403,9 @@ defineExpose({ applyDraftPrefill });
     @ignore-knowledge-proposal="ignoreKnowledgeProposal"
     @update-composer-value="inputText = $event"
     @new-chat="handleNewSessionRequest"
-    @start-scan="projectStore.startScan"
-    @install-plugin="projectStore.installPlugin"
-    @launch-unity-project="projectStore.launchUnityProject"
+    @start-scan="startWorkspaceAssetScan"
+    @install-plugin="installWorkspaceUnityPlugin"
+    @launch-unity-project="launchWorkspaceUnity"
   />
 </template>
 

@@ -1,15 +1,23 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const viewServiceMocks = vi.hoisted(() => ({
-  viewOpenInspectorTabMock: vi.fn(),
+const eventMocks = vi.hoisted(() => ({
+  emitToMock: vi.fn(),
 }));
 
 const tauriRuntimeMocks = vi.hoisted(() => ({
   hasTauriWindowRuntimeMock: vi.fn(),
 }));
 
-vi.mock("../services/view", () => ({
-  viewOpenInspectorTab: viewServiceMocks.viewOpenInspectorTabMock,
+vi.mock("@tauri-apps/api/event", () => ({
+  emitTo: eventMocks.emitToMock,
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ label: "main" }),
+}));
+
+vi.mock("../services/workbenchWindow", () => ({
+  isWorkbenchWindowLabel: (label: string) => label === "main" || label.startsWith("workbench-"),
 }));
 
 vi.mock("../services/tauriRuntime", () => ({
@@ -18,6 +26,7 @@ vi.mock("../services/tauriRuntime", () => ({
 
 import {
   LOCUS_ASSET_INSPECTOR_TAB_ID_PREFIX,
+  WORKBENCH_INSPECTOR_OPEN_EVENT,
   buildLocusAssetInspectorTabId,
   isLocusAssetInspectorTabId,
   locusAssetInspectorTabTitle,
@@ -33,13 +42,8 @@ describe("locusAssetInspectorWindow", () => {
   const objectPath = "BardHare/DialogueShot/cm[1]";
 
   beforeEach(() => {
-    viewServiceMocks.viewOpenInspectorTabMock.mockReset();
-    viewServiceMocks.viewOpenInspectorTabMock.mockResolvedValue({
-      id: "",
-      windowLabel: "view-inspector-abc123",
-      hostUrl: "/view-host?id=...",
-      packageRoot: "",
-    });
+    eventMocks.emitToMock.mockReset();
+    eventMocks.emitToMock.mockResolvedValue(undefined);
     tauriRuntimeMocks.hasTauriWindowRuntimeMock.mockReset();
     tauriRuntimeMocks.hasTauriWindowRuntimeMock.mockReturnValue(true);
   });
@@ -98,17 +102,19 @@ describe("locusAssetInspectorWindow", () => {
     expect(parseLocusAssetInspectorTabId("not-an-inspector-tab")).toBeNull();
   });
 
-  it("opens inspector tabs through the View host tab system", async () => {
+  it("opens asset inspectors through the Workbench tab group", async () => {
     const opened = await openLocusAssetInspectorWindow(workspaceRef, { assetPath });
 
     expect(opened).toBe(true);
-    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledTimes(1);
-    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith(workspaceRef, {
-      tabId: buildLocusAssetInspectorTabId({ assetPath }),
+    expect(eventMocks.emitToMock).toHaveBeenCalledTimes(1);
+    expect(eventMocks.emitToMock).toHaveBeenCalledWith("main", WORKBENCH_INSPECTOR_OPEN_EVENT, {
+      targetLabel: "main",
+      workspaceRef,
+      inspector: { assetPath },
     });
   });
 
-  it("opens scene object targets through the View host tab system", async () => {
+  it("opens scene object inspectors through the Workbench tab group", async () => {
     const opened = await openLocusAssetInspectorWindow(workspaceRef, {
       kind: "sceneObject",
       scenePath,
@@ -116,8 +122,10 @@ describe("locusAssetInspectorWindow", () => {
     });
 
     expect(opened).toBe(true);
-    expect(viewServiceMocks.viewOpenInspectorTabMock).toHaveBeenCalledWith(workspaceRef, {
-      tabId: buildLocusAssetInspectorTabId({ kind: "sceneObject", scenePath, objectPath }),
+    expect(eventMocks.emitToMock).toHaveBeenCalledWith("main", WORKBENCH_INSPECTOR_OPEN_EVENT, {
+      targetLabel: "main",
+      workspaceRef,
+      inspector: { kind: "sceneObject", scenePath, objectPath },
     });
   });
 
@@ -125,7 +133,7 @@ describe("locusAssetInspectorWindow", () => {
     const opened = await openLocusAssetInspectorWindow(workspaceRef, { assetPath: "   " });
 
     expect(opened).toBe(false);
-    expect(viewServiceMocks.viewOpenInspectorTabMock).not.toHaveBeenCalled();
+    expect(eventMocks.emitToMock).not.toHaveBeenCalled();
   });
 
   it("does nothing without a Tauri window runtime", async () => {
@@ -134,6 +142,6 @@ describe("locusAssetInspectorWindow", () => {
     const opened = await openLocusAssetInspectorWindow(workspaceRef, { assetPath });
 
     expect(opened).toBe(false);
-    expect(viewServiceMocks.viewOpenInspectorTabMock).not.toHaveBeenCalled();
+    expect(eventMocks.emitToMock).not.toHaveBeenCalled();
   });
 });

@@ -7,7 +7,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import type { UserMessageDraft } from "../composables/chatMessageDraft";
 
-export type AppPage = "development" | "views" | "plugins" | "agent" | "settings";
+export type AppPage = "development" | "plugins" | "agent" | "settings";
 export type LegacyAppTab =
   | "project"
   | "chat"
@@ -23,7 +23,7 @@ export type LegacyAppTab =
 const ACTIVE_PAGE_STORAGE_KEY = "locus:activePage:v1";
 
 export function migrateAppPage(value: unknown): AppPage {
-  if (value === "views" || value === "plugins" || value === "agent" || value === "settings") {
+  if (value === "plugins" || value === "agent" || value === "settings") {
     return value;
   }
   return "development";
@@ -87,7 +87,6 @@ export const useUiStore = defineStore("ui", () => {
     column: number;
   } | null>(null);
 
-  const viewMounted = ref(false);
   const pluginsMounted = ref(false);
   const agentMounted = ref(false);
   const settingsMounted = ref(false);
@@ -250,7 +249,6 @@ export const useUiStore = defineStore("ui", () => {
 
   function setPage(page: AppPage) {
     activePage.value = page;
-    if (page === "views") viewMounted.value = true;
     if (page === "plugins") pluginsMounted.value = true;
     if (page === "agent") agentMounted.value = true;
     if (page === "settings") settingsMounted.value = true;
@@ -393,7 +391,6 @@ export const useUiStore = defineStore("ui", () => {
     pendingKnowledgeSelection,
     pendingAssetOpen,
     pendingExternalScriptOpen,
-    viewMounted,
     pluginsMounted,
     agentMounted,
     settingsMounted,

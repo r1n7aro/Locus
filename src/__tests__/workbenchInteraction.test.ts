@@ -57,7 +57,10 @@ describe("development workbench editor groups", () => {
     expect(composerTarget).toBeLessThan(tabTarget);
     expect(composerTarget).toBeLessThan(groupTarget);
     expect(workbench).toContain('intent: { kind: "composer", paneId, editorId: editor.editorId }');
-    expect(workbench).toContain("sessionEditorRefs.get(intent.editorId)?.applyDraftPrefill(draft)");
+    expect(workbench.slice(composerTarget, tabTarget)).toContain('previewMode: "inline"');
+    expect(workbench).toContain("sessionEditorRefs.get(intent.editorId)?.appendComposerDraft(draft)");
+    expect(sessionEditor).toContain("chatViewRef.value?.appendComposerDraft(draft)");
+    expect(chatView).toContain("composerPanelRef.value.appendDraft(draft)");
     expect(workbench).toContain("function composerAcceptsCurrentDrag(");
     expect(workbench).toContain(":reference-drop-available=\"composerAcceptsCurrentDrag(paneId, editor)\"");
     expect(workbench).toContain(':reference-drop-active="');
@@ -101,8 +104,8 @@ describe("development workbench editor groups", () => {
 
     expect(store).toContain("group.tabs.length >= 2");
     expect(store).toContain("showSingleTab && group.tabs.length === 1");
-    expect(workbench).toContain(":show-single-tab=\"workbenchWindow.layout.kind === 'split'\"");
-    expect(workbench).toContain(":show-single-tabs=\"workbenchWindow.layout.kind === 'split'\"");
+    expect(workbench).toContain(":show-single-tab=\"props.auxiliary || workbenchWindow.layout.kind === 'split'\"");
+    expect(workbench).toContain(":show-single-tabs=\"props.auxiliary || workbenchWindow.layout.kind === 'split'\"");
     expect(read("src/components/workbench/WorkbenchSplitHost.vue")).toContain(
       "props.showSingleTabs && count === 1",
     );
@@ -110,14 +113,88 @@ describe("development workbench editor groups", () => {
     expect(store).toContain("workbenchResourceKey(editor.resource) === resourceKey");
     expect(tabs).toContain('v-if="visible"');
     expect(tabs).toContain("editor.preview && !editor.pinned");
+    expect(tabs).toContain("runningSessionIds");
+    expect(tabs).toContain('running: editor.resource.kind === "session"');
     expect(tabs).toContain("<BaseTabStrip");
     expect(tabs).toContain("pin-on-double-click");
     expect(tabs).toContain('tab-id-attribute="data-workbench-tab-id"');
+    expect(tabs).toContain("<BaseContextMenu");
+    expect(tabs).toContain("@tab-contextmenu=\"openTabContextMenu\"");
+    expect(tabs).toContain("closeFromContextMenu('left')");
+    expect(tabs).toContain("closeFromContextMenu('right')");
+    expect(tabs).toContain("closeFromContextMenu('all')");
+    expect(workbench).toContain('@close-many="closeWorkbenchEditors(paneId, $event)"');
     expect(baseTabs).toContain('@dblclick="handleDoubleClick($event, tab)"');
     expect(baseTabs).toContain("handleAuxClick");
+    expect(baseTabs).toContain('@contextmenu="openTabContextMenu($event, tab)"');
     expect(baseTabs).toContain("activeDropIndex() === index");
     expect(baseTabs).toContain("base-tab-drop-end");
+    expect(baseTabs).toContain("running: tab.running");
+    expect(baseTabs).toContain('class="base-tab-icon"');
+    expect(baseTabs).toContain("base-tab-icon-breathe 1.8s ease-in-out infinite");
+    expect(baseTabs).not.toContain("base-tab-title-scan");
     expect(baseTabs).toContain("font-style: italic");
+  });
+
+  it("locates workspace-tree resources across the current window and reserves duplication for drag placement", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const activateStart = workbench.indexOf("async function activateItem(");
+    const activateEnd = workbench.indexOf("\nfunction toggleItem", activateStart);
+    const activateFlow = workbench.slice(activateStart, activateEnd);
+    const dropStart = workbench.indexOf("async function commitWorkbenchInternalDrop(");
+    const dropEnd = workbench.indexOf("\nconst workbenchInternalDropTarget", dropStart);
+    const dropFlow = workbench.slice(dropStart, dropEnd);
+
+    expect(workbench).toContain("function matchingWorkbenchEditors(");
+    expect(workbench).toContain("Object.values(workbenchWindow.value.groups).flatMap");
+    expect(workbench).toContain("if (matches.length === 0) return openWorkbenchResource(descriptor, options);");
+    expect(workbench).toContain("flashWorkspaceTreeEditorTabs(matches.map((match) => match.editor))");
+    expect(workbench).toContain("focusPane: alreadyForeground");
+    expect(workbench).toContain("{ activate: focusPane }");
+    expect(workbench).toContain("workspace-tree-attention-a");
+    expect(workbench).toContain("workspace-tree-tab-attention-a 420ms ease-out");
+    expect(workbench).toContain("outline: 1px solid transparent");
+    expect(workbench).toContain("outline-offset: -1px");
+    expect(workbench).toContain("outline-color: var(--accent-color)");
+    expect(workbench).toContain("box-shadow: inset 0 0 0 1px var(--accent-color)");
+    expect(workbench).not.toContain("18%, 62% { box-shadow");
+    expect(activateFlow).toContain("openWorkbenchResourceFromWorkspaceTree(");
+    expect(activateFlow).not.toContain("openWorkbenchResource(");
+    expect(dropFlow).toContain("await openWorkbenchResource(descriptor, {");
+    expect(dropFlow).toContain("allowDuplicate: descriptor.resource.kind === \"session\"");
+  });
+
+  it("routes session clicks through explicit activate, reuse, and new-tab decisions", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const navigation = read("src/components/workbench/workbenchSessionNavigation.ts");
+
+    expect(navigation).toContain('export type WorkbenchSessionNavigationMode = "activate" | "reuse" | "newTab"');
+    expect(navigation).toContain("context.splitLayout");
+    expect(navigation).toContain("context.focusedGroupTabCount > 1");
+    expect(workbench).toContain("if ((event?.detail ?? 1) > 1) return;");
+    expect(workbench).not.toContain("systemDoubleClickIntervalMs");
+    expect(workbench).not.toContain("workspaceSessionClickTimers");
+    expect(workbench).not.toContain("ImmediateWorkspaceSessionReuseClick");
+    expect(workbench).toContain('if (mode === "activate")');
+    expect(workbench).toContain("refreshServices: false");
+    expect(workbench).toContain("if (!context) return null;");
+    expect(workbench).toContain("workbenchStore.replaceEditor(");
+    expect(workbench).toContain("preserveReplacedWorkspaceSessionDraft(current);");
+    expect(workbench).toContain("restoreReplacedWorkspaceSessionDraft(descriptor.resource, editor.editorId)");
+    expect(workbench).toContain('allowDuplicate: descriptor.resource.kind === "newSession"');
+    expect(workbench).toContain("activateWorkspaceSessionItem(item, event);");
+  });
+
+  it("keeps same-checkout tab activation local to the workbench pane", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+
+    expect(workbench).toContain("lastRefreshedCheckoutServicesScopeKey");
+    expect(workbench).toContain("pendingCheckoutServicesRefreshes");
+    expect(workbench).toContain("workspaceRefScopeKey(workspaceContextStore.focusedWorkspaceRef)");
+    expect(workbench).toContain("!== lastRefreshedCheckoutServicesScopeKey");
+    expect(workbench).toContain("binding.expectedGeneration !== context.workspaceGeneration");
+    expect(workbench).toContain("const editorWorkspaceRefs = new Map<string, WorkspaceRef>()");
+    expect(workbench).toContain("cached?.expectedGeneration === expectedGeneration");
   });
 
   it("switches the complete editor-group state with the focused single workspace", () => {
@@ -174,6 +251,9 @@ describe("development workbench editor groups", () => {
     expect(sessionEditor).toContain('@update-composer-value="inputText = $event"');
     expect(sessionEditor).toContain("initialSessionId: requestedSessionId");
     expect(sessionEditor).toContain("sessionKey");
+    expect(sessionEditor).toContain(':undo-conversation="rollbackConversation"');
+    expect(sessionEditor).toContain(':undo-files-and-conversation="rollbackFilesAndConversation"');
+    expect(sessionEditor).toContain(':check-undo-dirty="checkUndoDirty"');
     expect(embeddedSession).toContain("hydrateExistingSession");
     expect(embeddedSession).toContain("sessionStates");
     expect(embeddedSession).toContain("bindSessionStreamEventConsumer");
@@ -186,17 +266,44 @@ describe("development workbench editor groups", () => {
     const sessionEditor = read("src/components/workbench/WorkbenchSessionEditor.vue");
     const chatView = read("src/components/ChatView.vue");
 
-    expect(sessionEditor).toContain("function handleNewSessionRequest(): void");
+    expect(sessionEditor).toContain('request.source !== "shortcut" || props.newChatShortcutAction !== "newTab"');
     expect(sessionEditor).toContain("resetSession();");
-    expect(sessionEditor).toContain('emit("new-session-requested", { editorId: props.editor.editorId });');
+    expect(sessionEditor).toContain('emit("new-session-requested", {');
     expect(sessionEditor).toContain('@new-chat="handleNewSessionRequest"');
     expect(sessionEditor).not.toContain('@new-chat="resetSession"');
 
-    expect(workbench).toContain("function handleWorkbenchNewSessionRequested(");
+    expect(workbench).toContain("async function handleWorkbenchNewSessionRequested(");
+    expect(workbench).toContain('if (action === "keepCurrent") return;');
+    expect(workbench).toContain('if (action === "newTab")');
+    expect(workbench).toContain("sessionEditorRefs.get(newEditor.editorId)?.focusComposerInput()");
+    expect(workbench).toContain("allowDuplicate: true");
     expect(workbench).toContain('kind: "newSession" as const');
     expect(workbench).toContain('title: t("chat.session.newSession")');
     expect(workbench).toContain('@new-session-requested="handleWorkbenchNewSessionRequested(paneId, $event)"');
     expect(workbench).toContain(':shortcut-active="focused && group.activeEditorId === editor.editorId"');
+    expect(workbench).toContain(':new-chat-shortcut-action="newSessionShortcutAction(group, editor)"');
     expect(chatView).toContain("if (props.shortcutActive === false) return;");
+    expect(chatView).toContain('handleNewChatRequest("shortcut")');
+    expect(chatView).toContain("focusComposerInput,");
+    expect(sessionEditor).toContain("async function focusComposerInput(): Promise<void>");
+  });
+
+  it("opens Send to Locus API attachments in the main workbench session surface", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const sessionEditor = read("src/components/workbench/WorkbenchSessionEditor.vue");
+
+    expect(workbench).toContain("if (payload.sendMode)");
+    expect(workbench).toContain("handleSendToLocusDraft(");
+    expect(workbench).toContain('if (WORKBENCH_WINDOW_ID !== "main") return;');
+    expect(workbench).toContain('uiStore.setPage("development");');
+    expect(workbench).toContain("sendToLocusCheckout(workspaceRef)");
+    expect(workbench).toContain("createNewSessionWithAttachmentsForCheckout(checkout, draft)");
+    expect(workbench).toContain("attachmentDraft({ localFiles: payload.files })");
+    expect(workbench).toContain("attachmentDraft({ assetRefs: payload.refs })");
+    expect(workbench).toContain("mergeAttachmentDrafts(");
+    expect(sessionEditor).toContain("function exportComposerDraft()");
+    expect(sessionEditor).toContain("defineExpose({");
+    expect(sessionEditor).toContain("appendComposerDraft,");
+    expect(sessionEditor).toContain("exportComposerDraft,");
   });
 });

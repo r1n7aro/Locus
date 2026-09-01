@@ -86,8 +86,6 @@ export interface DisplaySettings {
   fileExplorerHiddenDirectories: string[];
   /** Additional directory names hidden when the workspace is a Unity project. */
   unityFileExplorerHiddenDirectories: string[];
-  /** Show Views tab in the top navigation */
-  showViewsTab: boolean;
   /** Show Plugins tab in the top navigation */
   showPluginsTab: boolean;
   /** Show Agent tab in the top navigation */
@@ -204,7 +202,6 @@ const defaults: DisplaySettings = {
   knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
   fileExplorerHiddenDirectories: [...DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES],
   unityFileExplorerHiddenDirectories: [...DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES],
-  showViewsTab: true,
   showPluginsTab: true,
   showAgentTab: true,
   showAgentSelector: true,
