@@ -97,7 +97,7 @@ describe("ConsoleSettings layout", () => {
     expect(source).toContain('t("settings.console.export")');
     expect(service).toContain("export function formatDebugConsoleEntriesForLogExport");
     expect(service).toContain("export async function saveDebugConsoleLogExport");
-    expect(service).toContain('invoke<string>("save_log_export"');
+    expect(service).toContain('invokeLocusRuntime<string>("save_log_export"');
     expect(rustCommand).toContain("pub async fn save_log_export");
     expect(rustCommand).toContain("path.set_extension(\"log\")");
     expect(rustCommand).toContain("std::fs::write(&path, content.as_bytes())");

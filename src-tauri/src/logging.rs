@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use chrono::Utc;
 use tauri::{AppHandle, Emitter};
@@ -62,8 +63,11 @@ macro_rules! eprintln {
     }};
 }
 
-pub(crate) const APP_LOG_EVENT: &str = "app-log";
+pub(crate) const APP_LOG_BATCH_EVENT: &str = "app-log-batch";
 pub(crate) const DEFAULT_LOG_CAPACITY: usize = 2_000;
+const FRONTEND_EVENT_MAX_PENDING: usize = 2_048;
+const FRONTEND_EVENT_MAX_BATCH: usize = 128;
+const FRONTEND_EVENT_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +81,50 @@ pub struct AppLogEntry {
     pub message: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppLogBatchEvent {
+    entries: Vec<AppLogEntry>,
+    dropped_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct FrontendEventQueue {
+    pending: VecDeque<AppLogEntry>,
+    dropped_count: u64,
+    flush_scheduled: bool,
+}
+
+impl FrontendEventQueue {
+    fn push(&mut self, entry: AppLogEntry) -> bool {
+        if self.pending.len() >= FRONTEND_EVENT_MAX_PENDING {
+            self.pending.pop_front();
+            self.dropped_count = self.dropped_count.saturating_add(1);
+        }
+        self.pending.push_back(entry);
+        if self.flush_scheduled {
+            false
+        } else {
+            self.flush_scheduled = true;
+            true
+        }
+    }
+
+    fn take_batch(&mut self) -> Option<AppLogBatchEvent> {
+        if self.pending.is_empty() {
+            self.flush_scheduled = false;
+            return None;
+        }
+        let take_count = self.pending.len().min(FRONTEND_EVENT_MAX_BATCH);
+        let entries = self.pending.drain(..take_count).collect();
+        let dropped_count = std::mem::take(&mut self.dropped_count);
+        Some(AppLogBatchEvent {
+            entries,
+            dropped_count,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct AppLogStore {
     capacity: usize,
@@ -84,6 +132,8 @@ pub struct AppLogStore {
     entries: Mutex<VecDeque<AppLogEntry>>,
     app_handle: Mutex<Option<AppHandle>>,
     file_sink: OnceLock<Arc<crate::file_log::FileLogSink>>,
+    self_weak: OnceLock<Weak<AppLogStore>>,
+    frontend_events: Mutex<FrontendEventQueue>,
 }
 
 impl AppLogStore {
@@ -94,10 +144,13 @@ impl AppLogStore {
             entries: Mutex::new(VecDeque::with_capacity(capacity.min(64))),
             app_handle: Mutex::new(None),
             file_sink: OnceLock::new(),
+            self_weak: OnceLock::new(),
+            frontend_events: Mutex::new(FrontendEventQueue::default()),
         }
     }
 
-    pub fn attach_app_handle(&self, app_handle: AppHandle) {
+    pub fn attach_app_handle(self: &Arc<Self>, app_handle: AppHandle) {
+        let _ = self.self_weak.set(Arc::downgrade(self));
         if let Ok(mut slot) = self.app_handle.lock() {
             *slot = Some(app_handle);
         }
@@ -157,9 +210,55 @@ impl AppLogStore {
             entries.push_back(entry.clone());
         }
 
-        if let Ok(handle_guard) = self.app_handle.lock() {
-            if let Some(handle) = handle_guard.as_ref() {
-                let _ = handle.emit(APP_LOG_EVENT, entry);
+        self.enqueue_frontend_event(entry);
+    }
+
+    fn enqueue_frontend_event(&self, entry: AppLogEntry) {
+        let has_app_handle = self
+            .app_handle
+            .lock()
+            .map(|handle| handle.is_some())
+            .unwrap_or(false);
+        if !has_app_handle {
+            return;
+        }
+        let should_schedule = self
+            .frontend_events
+            .lock()
+            .map(|mut queue| queue.push(entry))
+            .unwrap_or(false);
+        if !should_schedule {
+            return;
+        }
+        let Some(store) = self.self_weak.get().and_then(Weak::upgrade) else {
+            if let Ok(mut queue) = self.frontend_events.lock() {
+                queue.flush_scheduled = false;
+            }
+            return;
+        };
+        tauri::async_runtime::spawn(async move {
+            store.flush_frontend_event_loop().await;
+        });
+    }
+
+    async fn flush_frontend_event_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(FRONTEND_EVENT_FLUSH_INTERVAL).await;
+            let batch = self
+                .frontend_events
+                .lock()
+                .ok()
+                .and_then(|mut queue| queue.take_batch());
+            let Some(batch) = batch else {
+                return;
+            };
+            let app_handle = self
+                .app_handle
+                .lock()
+                .ok()
+                .and_then(|handle| handle.clone());
+            if let Some(app_handle) = app_handle {
+                let _ = app_handle.emit(APP_LOG_BATCH_EVENT, batch);
             }
         }
     }
@@ -211,14 +310,14 @@ pub fn prepare_print(
 
 fn allow_level(level: &Level, target: &str, debug_flag: &std::sync::atomic::AtomicBool) -> bool {
     if debug_flag.load(Ordering::Relaxed) {
-        !is_third_party_trace(level, target)
+        !is_third_party_verbose(level, target)
     } else {
         !matches!(*level, Level::DEBUG | Level::TRACE)
     }
 }
 
-fn is_third_party_trace(level: &Level, target: &str) -> bool {
-    matches!(*level, Level::TRACE) && !is_app_target(target)
+fn is_third_party_verbose(level: &Level, target: &str) -> bool {
+    matches!(*level, Level::DEBUG | Level::TRACE) && !is_app_target(target)
 }
 
 fn is_app_target(target: &str) -> bool {
@@ -393,6 +492,7 @@ where
 mod tests {
     use super::{
         allow_level, classify_print_level, extract_bracket_prefix, normalize_module_and_message,
+        AppLogEntry, FrontendEventQueue, FRONTEND_EVENT_MAX_BATCH, FRONTEND_EVENT_MAX_PENDING,
     };
     use std::sync::atomic::AtomicBool;
     use tracing::Level;
@@ -464,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_mode_filters_third_party_trace() {
+    fn debug_mode_filters_third_party_debug_and_trace() {
         let debug_flag = AtomicBool::new(true);
 
         assert!(!allow_level(
@@ -477,10 +577,51 @@ mod tests {
             "locus_lib::knowledge_index",
             &debug_flag
         ));
-        assert!(allow_level(
+        assert!(!allow_level(
             &Level::DEBUG,
             "tokenizers::tokenizer",
             &debug_flag
         ));
+        assert!(allow_level(
+            &Level::DEBUG,
+            "locus_lib::knowledge_index",
+            &debug_flag
+        ));
+        assert!(allow_level(&Level::INFO, "ignore::walk", &debug_flag));
+    }
+
+    #[test]
+    fn frontend_event_queue_batches_and_bounds_log_bursts() {
+        let mut queue = FrontendEventQueue::default();
+        for index in 0..(FRONTEND_EVENT_MAX_PENDING + 100) {
+            let scheduled = queue.push(AppLogEntry {
+                id: format!("backend-{index}"),
+                timestamp_ms: index as i64,
+                level: "debug".to_string(),
+                source: "backend".to_string(),
+                module: "logging-test".to_string(),
+                target: "locus_lib::logging".to_string(),
+                message: format!("entry {index}"),
+            });
+            assert_eq!(scheduled, index == 0);
+        }
+
+        assert_eq!(queue.pending.len(), FRONTEND_EVENT_MAX_PENDING);
+        let first = queue.take_batch().expect("first batch");
+        assert_eq!(first.entries.len(), FRONTEND_EVENT_MAX_BATCH);
+        assert_eq!(first.dropped_count, 100);
+        assert_eq!(first.entries[0].id, "backend-100");
+
+        while queue.take_batch().is_some() {}
+        assert!(!queue.flush_scheduled);
+        assert!(queue.push(AppLogEntry {
+            id: "backend-next".to_string(),
+            timestamp_ms: 0,
+            level: "info".to_string(),
+            source: "backend".to_string(),
+            module: "logging-test".to_string(),
+            target: "locus_lib::logging".to_string(),
+            message: "next".to_string(),
+        }));
     }
 }

@@ -1,10 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { DebugConsoleEntry, DebugConsoleLevel } from "../types";
+import { invokeLocusRuntime } from "./locusRuntime";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 const MAX_ENTRIES = 2_000;
-const BACKEND_EVENT_NAME = "app-log";
+const BACKEND_EVENT_NAME = "app-log-batch";
+const DISPLAY_FLUSH_DELAY_MS = 16;
+const DISPLAY_MAX_PENDING = 4_096;
 const FORWARD_FLUSH_DELAY_MS = 400;
 const FORWARD_MAX_BATCH = 128;
 const FORWARD_MAX_PENDING = 1_000;
@@ -26,6 +28,12 @@ let consoleInstalled = false;
 let backendReady = false;
 let backendUnlisten: UnlistenFn | null = null;
 let nextFrontendId = 1;
+let nextDroppedMarkerId = 1;
+
+interface BackendLogBatchEvent {
+  entries: DebugConsoleEntry[];
+  droppedCount: number;
+}
 
 type ConsoleMethod = keyof typeof originalConsole;
 
@@ -81,7 +89,7 @@ export async function saveDebugConsoleLogExport(
   logEntries: readonly DebugConsoleEntry[],
 ): Promise<string> {
   const content = formatDebugConsoleEntriesForLogExport(logEntries);
-  return invoke<string>("save_log_export", { filePath, content });
+  return invokeLocusRuntime<string>("save_log_export", { filePath, content });
 }
 
 export interface ForwardedLogLine {
@@ -138,7 +146,7 @@ async function flushForwardQueue() {
   const droppedCount = forwardDropped;
   forwardDropped = 0;
   try {
-    await invoke("append_frontend_logs", {
+    await invokeLocusRuntime("append_frontend_logs", {
       entries: buildForwardPayload(batch),
       droppedCount,
     });
@@ -163,6 +171,63 @@ function pushEntries(batch: DebugConsoleEntry[]) {
   entries.sort((left, right) => left.timestampMs - right.timestampMs);
   trimEntries();
   notify();
+}
+
+const displayQueue: DebugConsoleEntry[] = [];
+let displayFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let displayDropped = 0;
+
+function clearDisplayFlushTimer() {
+  if (displayFlushTimer === null) return;
+  clearTimeout(displayFlushTimer);
+  displayFlushTimer = null;
+}
+
+export function buildLiveLogDroppedEntry(
+  droppedCount: number,
+  timestampMs = Date.now(),
+  markerId = nextDroppedMarkerId++,
+): DebugConsoleEntry {
+  return {
+    id: `backend-live-dropped-${markerId}`,
+    timestampMs,
+    level: "warn",
+    source: "backend",
+    module: "logging",
+    target: "logging",
+    message: `Live console dropped ${droppedCount} entries during a log burst. Refresh to load the latest backend snapshot.`,
+  };
+}
+
+function flushDisplayQueue() {
+  clearDisplayFlushTimer();
+  if (displayQueue.length === 0 && displayDropped === 0) return;
+  const batch = displayQueue.splice(0, displayQueue.length);
+  const droppedCount = displayDropped;
+  displayDropped = 0;
+  if (droppedCount > 0) {
+    batch.push(buildLiveLogDroppedEntry(droppedCount));
+  }
+  pushEntries(batch);
+}
+
+function scheduleDisplayFlush() {
+  if (displayFlushTimer !== null) return;
+  displayFlushTimer = setTimeout(flushDisplayQueue, DISPLAY_FLUSH_DELAY_MS);
+}
+
+function queueDisplayEntries(batch: readonly DebugConsoleEntry[], droppedCount = 0) {
+  if (Number.isFinite(droppedCount)) {
+    displayDropped += Math.max(0, Math.trunc(droppedCount));
+  }
+  for (const entry of batch) {
+    if (displayQueue.length >= DISPLAY_MAX_PENDING) {
+      displayQueue.shift();
+      displayDropped += 1;
+    }
+    displayQueue.push(entry);
+  }
+  scheduleDisplayFlush();
 }
 
 function parseBracketPrefix(input: string): { module: string; message: string } | null {
@@ -276,7 +341,7 @@ function captureConsole(method: ConsoleMethod, args: unknown[]) {
     target: normalized.module,
     message: normalized.message,
   };
-  pushEntries([entry]);
+  queueDisplayEntries([entry]);
   queueForwardToFile(entry);
 }
 
@@ -300,15 +365,17 @@ function installConsoleCapture() {
 }
 
 async function fetchBackendSnapshot() {
-  const snapshot = await invoke<DebugConsoleEntry[]>("get_log_entries", { limit: MAX_ENTRIES });
+  const snapshot = await invokeLocusRuntime<DebugConsoleEntry[]>("get_log_entries", {
+    limit: MAX_ENTRIES,
+  });
   pushEntries(snapshot);
 }
 
 async function ensureBackendBridge() {
   if (!hasTauriWindowRuntime()) return;
   if (!backendReady) {
-    backendUnlisten = await listen<DebugConsoleEntry>(BACKEND_EVENT_NAME, (event) => {
-      pushEntries([event.payload]);
+    backendUnlisten = await listen<BackendLogBatchEvent>(BACKEND_EVENT_NAME, (event) => {
+      queueDisplayEntries(event.payload.entries, event.payload.droppedCount);
     });
     backendReady = true;
     await fetchBackendSnapshot();
@@ -332,13 +399,17 @@ export async function refreshDebugConsole() {
 }
 
 export async function clearDebugConsole() {
+  clearDisplayFlushTimer();
+  displayQueue.splice(0, displayQueue.length);
+  displayDropped = 0;
   entries.splice(0, entries.length);
   entryIds.clear();
   notify();
-  await invoke("clear_log_entries");
+  await invokeLocusRuntime("clear_log_entries");
 }
 
 export function getDebugConsoleSnapshot(): DebugConsoleEntry[] {
+  flushDisplayQueue();
   return entries.slice();
 }
 
@@ -353,6 +424,9 @@ export function teardownDebugConsole() {
   backendUnlisten?.();
   backendUnlisten = null;
   backendReady = false;
+  clearDisplayFlushTimer();
+  displayQueue.splice(0, displayQueue.length);
+  displayDropped = 0;
   if (forwardTimer !== null) {
     clearTimeout(forwardTimer);
     forwardTimer = null;
@@ -360,5 +434,5 @@ export function teardownDebugConsole() {
 }
 
 export async function revealLogFile(): Promise<string> {
-  return invoke<string>("reveal_log_file");
+  return invokeLocusRuntime<string>("reveal_log_file");
 }

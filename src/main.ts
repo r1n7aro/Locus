@@ -15,6 +15,7 @@ import {
 import { getDebugMode } from "./services/permissions";
 import { bootstrapPluginInspectorDrawers } from "./services/inspectorDrawerExtensions";
 import { markStartupPhase, scheduleStartupPaintReport } from "./services/startupPerf";
+import { initWebviewBridgeDiagnostics } from "./services/webviewBridgeDiagnostics";
 
 const debugConsoleReady = initDebugConsole();
 markStartupPhase("frontend_main_enter", { href: window.location.href });
@@ -25,6 +26,13 @@ installTauriDevtoolsHotkeys(getDebugMode);
 markStartupPhase("frontend_devtools_hotkeys_ready");
 installTauriWindowDragFallback();
 markStartupPhase("frontend_window_drag_fallback_ready");
+try {
+  initWebviewBridgeDiagnostics();
+  markStartupPhase("frontend_webview_bridge_diagnostics_ready");
+} catch (error) {
+  markStartupPhase("frontend_webview_bridge_diagnostics_error");
+  console.warn("[startup] WebView bridge diagnostics unavailable", error);
+}
 
 const app = createApp(App);
 markStartupPhase("frontend_vue_app_created");

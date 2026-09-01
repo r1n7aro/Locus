@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildForwardPayload,
+  buildLiveLogDroppedEntry,
   formatDebugConsoleEntriesForLogExport,
 } from "../services/debugConsole";
 import type { DebugConsoleEntry } from "../types";
@@ -74,5 +75,19 @@ describe("debug console file forwarding", () => {
       10,
     );
     expect(payload[0]?.message).toBe(`${"x".repeat(10)} …(truncated)`);
+  });
+});
+
+describe("debug console live log backpressure", () => {
+  it("creates a stable warning when a live batch drops entries", () => {
+    expect(buildLiveLogDroppedEntry(42, 1750000000000, 7)).toEqual({
+      id: "backend-live-dropped-7",
+      timestampMs: 1750000000000,
+      level: "warn",
+      source: "backend",
+      module: "logging",
+      target: "logging",
+      message: "Live console dropped 42 entries during a log burst. Refresh to load the latest backend snapshot.",
+    });
   });
 });

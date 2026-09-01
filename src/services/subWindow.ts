@@ -1,5 +1,5 @@
-import { invoke } from "@tauri-apps/api/core";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { invokeLocusRuntime } from "./locusRuntime";
 import { currentThemeBackgroundColor } from "../composables/useTheme";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
@@ -54,7 +54,7 @@ export async function openSubWindow(
   descriptor: SubWindowDescriptor,
   query: string,
 ): Promise<SubWindowOpenResult> {
-  const result = await invoke<{ label: string; existing: boolean; pooled: boolean }>(
+  const result = await invokeLocusRuntime<{ label: string; existing: boolean; pooled: boolean }>(
     "sub_window_open",
     {
       request: {
@@ -81,14 +81,14 @@ export async function openSubWindow(
 /** Pre-warm the shared pool window; cheap no-op when one already waits. */
 export async function prepareSubWindowPool(): Promise<void> {
   if (!hasTauriWindowRuntime()) return;
-  await invoke("sub_window_pool_prepare", {
+  await invokeLocusRuntime("sub_window_pool_prepare", {
     backgroundColor: currentThemeBackgroundColor(),
   });
 }
 
 /** Called by the pool window itself once its assign listener is live. */
 export async function markSubWindowPoolReady(label: string): Promise<void> {
-  await invoke("sub_window_pool_ready", { label });
+  await invokeLocusRuntime("sub_window_pool_ready", { label });
 }
 
 /** Latest open-request query recorded for a live window kind. Window
@@ -96,5 +96,5 @@ export async function markSubWindowPoolReady(label: string): Promise<void> {
  *  pick up a payload that was emitted (existing-window re-open) before the
  *  listener was live. */
 export async function getSubWindowClaimedQuery(kind: string): Promise<string | null> {
-  return (await invoke<string | null>("sub_window_claimed_query", { kind })) ?? null;
+  return (await invokeLocusRuntime<string | null>("sub_window_claimed_query", { kind })) ?? null;
 }

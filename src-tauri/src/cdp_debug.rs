@@ -1,6 +1,55 @@
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingInvokeSnapshot {
+    pub command: String,
+    pub age_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendLifecycleEvent {
+    pub event: String,
+    pub timestamp_ms: u64,
+    pub session_id: String,
+    pub href: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendBridgeStallSnapshot {
+    pub id: String,
+    pub detected_at_ms: u64,
+    pub reason: String,
+    pub heartbeat: Box<FrontendBridgeHeartbeat>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontendBridgeHeartbeat {
+    pub sequence: u64,
+    pub sent_at_ms: u64,
+    pub session_id: String,
+    pub href: String,
+    pub ready_state: String,
+    pub visibility_state: String,
+    pub navigation_type: Option<String>,
+    pub performance_now_ms: f64,
+    pub event_loop_lag_ms: f64,
+    pub callback_count: Option<u64>,
+    #[serde(default)]
+    pub pending_invokes: Vec<PendingInvokeSnapshot>,
+    #[serde(default)]
+    pub lifecycle: Vec<FrontendLifecycleEvent>,
+    pub recovered_stall: Option<Box<FrontendBridgeStallSnapshot>>,
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
+    use super::FrontendBridgeHeartbeat;
+    use std::collections::HashSet;
     use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -26,10 +75,15 @@ mod imp {
 
     const MAIN_WINDOW_LABEL: &str = "main";
     const MAIN_TARGET_ID: &str = "main";
-    const MAIN_TARGET_SESSION_ID: &str = "locus-main-session";
+    const MAIN_TARGET_SESSION_PREFIX: &str = "locus-main-session";
     const DEBUG_PORT_START: u16 = 19_222;
     const DEBUG_PORT_ATTEMPTS: u16 = 25;
     const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+    const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+    const BRIDGE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+    const BRIDGE_STALLED_PROBE_BACKOFF_MS: u64 = 60_000;
+    const BRIDGE_HEARTBEAT_STALE_MS: u64 = 15_000;
+    const BRIDGE_STARTUP_GRACE_MS: u64 = 20_000;
     const EVENT_QUEUE_CAPACITY: usize = 2_048;
     const CDP_EVENT_NAMES: &[&str] = &[
         "Accessibility.loadComplete",
@@ -228,23 +282,148 @@ mod imp {
 
     type HttpBody = Full<Bytes>;
 
-    #[derive(Default)]
     pub struct CdpDebugServerHandle {
         inner: tokio::sync::Mutex<RunningState>,
+        bridge: BridgeDiagnosticState,
+    }
+
+    impl Default for CdpDebugServerHandle {
+        fn default() -> Self {
+            Self {
+                inner: tokio::sync::Mutex::new(RunningState::default()),
+                bridge: BridgeDiagnosticState::default(),
+            }
+        }
+    }
+
+    impl CdpDebugServerHandle {
+        pub fn record_frontend_heartbeat(&self, heartbeat: FrontendBridgeHeartbeat) {
+            if !self.bridge.enabled.load(Ordering::Relaxed) {
+                return;
+            }
+            let now = unix_time_millis();
+            self.bridge
+                .last_frontend_heartbeat_ms
+                .store(now, Ordering::Relaxed);
+            if let Some(recovered) = heartbeat.recovered_stall.as_ref() {
+                let is_new = self
+                    .bridge
+                    .last_recovered_stall_id
+                    .lock()
+                    .map(|mut last_id| {
+                        if last_id.as_deref() == Some(recovered.id.as_str()) {
+                            false
+                        } else {
+                            *last_id = Some(recovered.id.clone());
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if is_new {
+                    let snapshot = bounded_json(recovered.as_ref(), 24_000);
+                    eprintln!(
+                        "[WebViewBridge][warning] recovered frontend stall snapshot={snapshot}"
+                    );
+                }
+            }
+            if let Ok(mut slot) = self.bridge.last_frontend_snapshot.lock() {
+                *slot = Some(heartbeat);
+            }
+        }
     }
 
     #[derive(Default)]
     struct RunningState {
         task: Option<JoinHandle<()>>,
+        diagnostic_task: Option<JoinHandle<()>>,
         connection_tasks: Option<Arc<Mutex<Vec<JoinHandle<()>>>>>,
         shutdown: Option<watch::Sender<bool>>,
         port: Option<u16>,
+        native_subscriptions: Option<NativeDiagnosticSubscriptions>,
+    }
+
+    #[derive(Default)]
+    struct BridgeDiagnosticState {
+        enabled: AtomicBool,
+        started_at_ms: AtomicU64,
+        last_frontend_heartbeat_ms: AtomicU64,
+        last_frontend_snapshot: Mutex<Option<FrontendBridgeHeartbeat>>,
+        last_recovered_stall_id: Mutex<Option<String>>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct NativeDiagnosticSubscriptions {
+        navigation_starting: i64,
+        navigation_completed: i64,
+        process_failed: i64,
     }
 
     #[derive(Debug, Clone)]
     struct EventSubscription {
         name: String,
         token: i64,
+    }
+
+    #[derive(Debug, Clone)]
+    struct NativeCdpEvent {
+        method: String,
+        params: Value,
+        session_id: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct BrowserConnectionState {
+        next_session_sequence: u64,
+        sessions: Vec<String>,
+        session_lookup: HashSet<String>,
+        auto_attach_session_id: Option<String>,
+    }
+
+    impl BrowserConnectionState {
+        fn attach(&mut self) -> String {
+            self.next_session_sequence = self.next_session_sequence.saturating_add(1);
+            let session_id = format!(
+                "{MAIN_TARGET_SESSION_PREFIX}-{}",
+                self.next_session_sequence
+            );
+            self.sessions.push(session_id.clone());
+            self.session_lookup.insert(session_id.clone());
+            session_id
+        }
+
+        fn ensure_auto_attach(&mut self) -> (String, bool) {
+            if let Some(session_id) = self.auto_attach_session_id.as_ref() {
+                return (session_id.clone(), false);
+            }
+            let session_id = self.attach();
+            self.auto_attach_session_id = Some(session_id.clone());
+            (session_id, true)
+        }
+
+        fn disable_auto_attach(&mut self) -> Option<String> {
+            let session_id = self.auto_attach_session_id.take()?;
+            self.detach(&session_id);
+            Some(session_id)
+        }
+
+        fn detach(&mut self, session_id: &str) -> bool {
+            if !self.session_lookup.remove(session_id) {
+                return false;
+            }
+            self.sessions.retain(|value| value != session_id);
+            if self.auto_attach_session_id.as_deref() == Some(session_id) {
+                self.auto_attach_session_id = None;
+            }
+            true
+        }
+
+        fn contains(&self, session_id: &str) -> bool {
+            self.session_lookup.contains(session_id)
+        }
+
+        fn is_attached(&self) -> bool {
+            !self.sessions.is_empty()
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +437,7 @@ mod imp {
         let mut running = handle.inner.lock().await;
 
         if !enabled {
-            stop_locked(&mut running).await;
+            stop_locked(&app, &handle, &mut running).await;
             return Ok(None);
         }
         if running.task.is_some() {
@@ -267,22 +446,56 @@ mod imp {
 
         let (listener, port) = bind_listener().await?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let native_subscriptions = subscribe_native_diagnostics(&app).await?;
         let connection_tasks = Arc::new(Mutex::new(Vec::new()));
         let server_app = app.clone();
         let server_connections = Arc::clone(&connection_tasks);
+        let server_shutdown = shutdown_rx.clone();
         let task = tokio::spawn(async move {
-            serve(listener, port, server_app, shutdown_rx, server_connections).await;
+            serve(
+                listener,
+                port,
+                server_app,
+                server_shutdown,
+                server_connections,
+            )
+            .await;
+        });
+        handle.bridge.enabled.store(true, Ordering::Relaxed);
+        handle
+            .bridge
+            .started_at_ms
+            .store(unix_time_millis(), Ordering::Relaxed);
+        handle
+            .bridge
+            .last_frontend_heartbeat_ms
+            .store(0, Ordering::Relaxed);
+        if let Ok(mut snapshot) = handle.bridge.last_frontend_snapshot.lock() {
+            *snapshot = None;
+        }
+        let diagnostic_app = app.clone();
+        let diagnostic_handle = Arc::clone(&handle);
+        let diagnostic_task = tokio::spawn(async move {
+            monitor_bridge_health(diagnostic_app, diagnostic_handle, shutdown_rx).await;
         });
 
         running.task = Some(task);
+        running.diagnostic_task = Some(diagnostic_task);
         running.connection_tasks = Some(connection_tasks);
         running.shutdown = Some(shutdown_tx);
         running.port = Some(port);
+        running.native_subscriptions = Some(native_subscriptions);
         eprintln!("[CdpDebug] listening on http://127.0.0.1:{port}");
+        eprintln!("[WebViewBridge] debug diagnostics enabled");
         Ok(Some(port))
     }
 
-    async fn stop_locked(running: &mut RunningState) {
+    async fn stop_locked(
+        app: &AppHandle,
+        handle: &CdpDebugServerHandle,
+        running: &mut RunningState,
+    ) {
+        handle.bridge.enabled.store(false, Ordering::Relaxed);
         if let Some(shutdown) = running.shutdown.take() {
             let _ = shutdown.send(true);
         }
@@ -298,9 +511,391 @@ mod imp {
             task.abort();
             let _ = task.await;
         }
+        if let Some(task) = running.diagnostic_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(subscriptions) = running.native_subscriptions.take() {
+            unsubscribe_native_diagnostics(app, subscriptions).await;
+        }
         if let Some(port) = running.port.take() {
             eprintln!("[CdpDebug] stopped listening on 127.0.0.1:{port}");
         }
+        eprintln!("[WebViewBridge] debug diagnostics disabled");
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BridgeHealth {
+        Healthy,
+        RendererToHostStalled,
+        HostToRendererStalled,
+        BidirectionalStalled,
+    }
+
+    fn classify_bridge_health(
+        frontend_heartbeat_stalled: bool,
+        cdp_probe_stalled: bool,
+    ) -> BridgeHealth {
+        match (frontend_heartbeat_stalled, cdp_probe_stalled) {
+            (false, false) => BridgeHealth::Healthy,
+            (true, false) => BridgeHealth::RendererToHostStalled,
+            (false, true) => BridgeHealth::HostToRendererStalled,
+            (true, true) => BridgeHealth::BidirectionalStalled,
+        }
+    }
+
+    async fn monitor_bridge_health(
+        app: AppHandle,
+        handle: Arc<CdpDebugServerHandle>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let mut interval = tokio::time::interval(BRIDGE_PROBE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Avoid probing during the first renderer bootstrap turn.
+        interval.tick().await;
+        let mut last_health = BridgeHealth::Healthy;
+        let mut heartbeat_miss_streak = 0u32;
+        let mut cdp_failure_streak = 0u32;
+        let mut next_cdp_probe_at_ms = 0u64;
+        let mut last_cdp_error: Option<String> = None;
+        let mut last_cdp_snapshot: Option<Value> = None;
+
+        loop {
+            tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+                _ = interval.tick() => {
+                    if !handle.bridge.enabled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now = unix_time_millis();
+                    let started_at = handle.bridge.started_at_ms.load(Ordering::Relaxed);
+                    let last_heartbeat = handle
+                        .bridge
+                        .last_frontend_heartbeat_ms
+                        .load(Ordering::Relaxed);
+                    let startup_grace_elapsed = now.saturating_sub(started_at)
+                        >= BRIDGE_STARTUP_GRACE_MS;
+                    let heartbeat_age_ms = if last_heartbeat == 0 {
+                        None
+                    } else {
+                        Some(now.saturating_sub(last_heartbeat))
+                    };
+                    let heartbeat_overdue = startup_grace_elapsed
+                        && heartbeat_age_ms
+                            .map(|age| age >= BRIDGE_HEARTBEAT_STALE_MS)
+                            .unwrap_or(true);
+                    heartbeat_miss_streak = if heartbeat_overdue {
+                        heartbeat_miss_streak.saturating_add(1)
+                    } else {
+                        0
+                    };
+
+                    if now >= next_cdp_probe_at_ms {
+                        match probe_renderer_state(&app).await {
+                            Ok(snapshot) => {
+                                cdp_failure_streak = 0;
+                                last_cdp_error = None;
+                                last_cdp_snapshot = Some(snapshot);
+                                next_cdp_probe_at_ms = 0;
+                            }
+                            Err(error) => {
+                                cdp_failure_streak = cdp_failure_streak.saturating_add(1);
+                                last_cdp_error = Some(error);
+                                if cdp_failure_streak >= 2 {
+                                    next_cdp_probe_at_ms = now
+                                        .saturating_add(BRIDGE_STALLED_PROBE_BACKOFF_MS);
+                                }
+                            }
+                        }
+                    }
+
+                    let heartbeat_stalled = heartbeat_miss_streak >= 2
+                        || (heartbeat_overdue && cdp_failure_streak > 0);
+                    let cdp_stalled = cdp_failure_streak >= 2
+                        || (heartbeat_overdue && cdp_failure_streak > 0);
+                    let health = classify_bridge_health(heartbeat_stalled, cdp_stalled);
+                    if health == last_health {
+                        continue;
+                    }
+
+                    if health == BridgeHealth::Healthy {
+                        eprintln!(
+                            "[WebViewBridge] bridge recovered previous_state={last_health:?} heartbeat_age_ms={:?}",
+                            heartbeat_age_ms
+                        );
+                    } else {
+                        let frontend_snapshot = handle
+                            .bridge
+                            .last_frontend_snapshot
+                            .lock()
+                            .ok()
+                            .and_then(|snapshot| snapshot.clone())
+                            .map(|snapshot| bounded_json(&snapshot, 24_000))
+                            .unwrap_or_else(|| "null".to_string());
+                        let cdp_snapshot = last_cdp_snapshot
+                            .as_ref()
+                            .map(|snapshot| bounded_json(snapshot, 12_000))
+                            .unwrap_or_else(|| "null".to_string());
+                        let cdp_error = last_cdp_error.as_deref().unwrap_or("none");
+                        eprintln!(
+                            "[WebViewBridge][warning] bridge stall detected state={health:?} heartbeat_age_ms={:?} heartbeat_miss_streak={} cdp_failure_streak={} cdp_error={} frontend_snapshot={} cdp_snapshot={}",
+                            heartbeat_age_ms,
+                            heartbeat_miss_streak,
+                            cdp_failure_streak,
+                            cdp_error,
+                            frontend_snapshot,
+                            cdp_snapshot,
+                        );
+                    }
+                    last_health = health;
+                }
+            }
+        }
+    }
+
+    async fn probe_renderer_state(app: &AppHandle) -> Result<Value, String> {
+        let expression = r#"(() => ({
+            timestampMs: Date.now(),
+            href: location.href,
+            readyState: document.readyState,
+            visibilityState: document.visibilityState,
+            callbackCount: window.__TAURI_INTERNALS__?.callbacks?.size ?? null,
+            performanceNowMs: performance.now()
+        }))()"#;
+        call_devtools_method_with_timeout(
+            app,
+            None,
+            "Runtime.evaluate".to_string(),
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": false,
+            }),
+            BRIDGE_PROBE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn subscribe_native_diagnostics(
+        app: &AppHandle,
+    ) -> Result<NativeDiagnosticSubscriptions, String> {
+        use webview2_com::{
+            take_pwstr,
+            Microsoft::Web::WebView2::Win32::{
+                ICoreWebView2, ICoreWebView2ProcessFailedEventArgs2,
+                ICoreWebView2ProcessFailedEventArgs3,
+            },
+            NavigationCompletedEventHandler, NavigationStartingEventHandler,
+            ProcessFailedEventHandler,
+        };
+        use windows_core::{Interface, BOOL, PWSTR};
+
+        let window = app
+            .get_webview_window(MAIN_WINDOW_LABEL)
+            .ok_or_else(|| "The main WebView2 window is unavailable".to_string())?;
+        let (result_tx, result_rx) = oneshot::channel();
+        window
+            .with_webview(move |webview| {
+                let result = (|| -> Result<NativeDiagnosticSubscriptions, String> {
+                    let core: ICoreWebView2 = unsafe { webview.controller().CoreWebView2() }
+                        .map_err(|error| format!("Failed to access WebView2 core: {error}"))?;
+
+                    let navigation_starting = NavigationStartingEventHandler::create(Box::new(
+                        move |sender, args| {
+                            let Some(args) = args else { return Ok(()) };
+                            let mut raw_uri = PWSTR::null();
+                            let mut navigation_id = 0u64;
+                            let mut user_initiated = BOOL(0);
+                            let mut redirected = BOOL(0);
+                            let _ = unsafe { args.Uri(&mut raw_uri) };
+                            let _ = unsafe { args.NavigationId(&mut navigation_id) };
+                            let _ = unsafe { args.IsUserInitiated(&mut user_initiated) };
+                            let _ = unsafe { args.IsRedirected(&mut redirected) };
+                            let uri = take_pwstr(raw_uri);
+                            let mut browser_pid = 0u32;
+                            if let Some(sender) = sender {
+                                let _ = unsafe { sender.BrowserProcessId(&mut browser_pid) };
+                            }
+                            eprintln!(
+                                "[WebViewBridge] navigation starting id={} user_initiated={} redirected={} browser_pid={} uri={}",
+                                navigation_id,
+                                user_initiated.as_bool(),
+                                redirected.as_bool(),
+                                browser_pid,
+                                bounded_text(&uri, 2_000),
+                            );
+                            Ok(())
+                        },
+                    ));
+                    let mut navigation_starting_token = 0i64;
+                    unsafe {
+                        core.add_NavigationStarting(
+                            &navigation_starting,
+                            &mut navigation_starting_token,
+                        )
+                    }
+                    .map_err(|error| {
+                        format!("Failed to subscribe NavigationStarting: {error}")
+                    })?;
+
+                    let navigation_completed = NavigationCompletedEventHandler::create(Box::new(
+                        move |sender, args| {
+                            let Some(args) = args else { return Ok(()) };
+                            let mut navigation_id = 0u64;
+                            let mut success = BOOL(0);
+                            let mut web_error = Default::default();
+                            let _ = unsafe { args.NavigationId(&mut navigation_id) };
+                            let _ = unsafe { args.IsSuccess(&mut success) };
+                            let _ = unsafe { args.WebErrorStatus(&mut web_error) };
+                            let mut raw_uri = PWSTR::null();
+                            if let Some(sender) = sender {
+                                let _ = unsafe { sender.Source(&mut raw_uri) };
+                            }
+                            let uri = take_pwstr(raw_uri);
+                            eprintln!(
+                                "[WebViewBridge] navigation completed id={} success={} web_error={} uri={}",
+                                navigation_id,
+                                success.as_bool(),
+                                web_error.0,
+                                bounded_text(&uri, 2_000),
+                            );
+                            Ok(())
+                        },
+                    ));
+                    let mut navigation_completed_token = 0i64;
+                    unsafe {
+                        core.add_NavigationCompleted(
+                            &navigation_completed,
+                            &mut navigation_completed_token,
+                        )
+                    }
+                    .map_err(|error| {
+                        format!("Failed to subscribe NavigationCompleted: {error}")
+                    })?;
+
+                    let process_failed = ProcessFailedEventHandler::create(Box::new(
+                        move |sender, args| {
+                            let Some(args) = args else { return Ok(()) };
+                            let mut kind = Default::default();
+                            let _ = unsafe { args.ProcessFailedKind(&mut kind) };
+                            let mut browser_pid = 0u32;
+                            if let Some(sender) = sender {
+                                let _ = unsafe { sender.BrowserProcessId(&mut browser_pid) };
+                            }
+                            let mut reason_value = None;
+                            let mut exit_code = None;
+                            let mut description = String::new();
+                            let mut failure_module = String::new();
+                            if let Ok(args2) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+                                let mut reason = Default::default();
+                                let mut raw_description = PWSTR::null();
+                                let mut raw_exit_code = 0i32;
+                                if unsafe { args2.Reason(&mut reason) }.is_ok() {
+                                    reason_value = Some(reason.0);
+                                }
+                                if unsafe { args2.ExitCode(&mut raw_exit_code) }.is_ok() {
+                                    exit_code = Some(raw_exit_code);
+                                }
+                                if unsafe { args2.ProcessDescription(&mut raw_description) }.is_ok()
+                                {
+                                    description = take_pwstr(raw_description);
+                                }
+                            }
+                            if let Ok(args3) = args.cast::<ICoreWebView2ProcessFailedEventArgs3>() {
+                                let mut raw_module = PWSTR::null();
+                                if unsafe { args3.FailureSourceModulePath(&mut raw_module) }.is_ok() {
+                                    failure_module = take_pwstr(raw_module);
+                                }
+                            }
+                            eprintln!(
+                                "[WebViewBridge][warning] WebView2 process failed kind={} reason={:?} exit_code={:?} browser_pid={} description={} failure_module={}",
+                                kind.0,
+                                reason_value,
+                                exit_code,
+                                browser_pid,
+                                bounded_text(&description, 4_000),
+                                bounded_text(&failure_module, 2_000),
+                            );
+                            Ok(())
+                        },
+                    ));
+                    let mut process_failed_token = 0i64;
+                    unsafe { core.add_ProcessFailed(&process_failed, &mut process_failed_token) }
+                        .map_err(|error| format!("Failed to subscribe ProcessFailed: {error}"))?;
+
+                    Ok(NativeDiagnosticSubscriptions {
+                        navigation_starting: navigation_starting_token,
+                        navigation_completed: navigation_completed_token,
+                        process_failed: process_failed_token,
+                    })
+                })();
+                let _ = result_tx.send(result);
+            })
+            .map_err(|error| format!("Failed to access the main WebView2: {error}"))?;
+
+        tokio::time::timeout(Duration::from_secs(3), result_rx)
+            .await
+            .map_err(|_| "WebView2 diagnostic subscription timed out".to_string())?
+            .map_err(|_| "WebView2 diagnostic subscription channel closed".to_string())?
+    }
+
+    async fn unsubscribe_native_diagnostics(
+        app: &AppHandle,
+        subscriptions: NativeDiagnosticSubscriptions,
+    ) {
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
+
+        let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+            return;
+        };
+        let (done_tx, done_rx) = oneshot::channel();
+        if window
+            .with_webview(move |webview| {
+                if let Ok(core) =
+                    unsafe { webview.controller().CoreWebView2() }.map(|core: ICoreWebView2| core)
+                {
+                    let _ = unsafe {
+                        core.remove_NavigationStarting(subscriptions.navigation_starting)
+                    };
+                    let _ = unsafe {
+                        core.remove_NavigationCompleted(subscriptions.navigation_completed)
+                    };
+                    let _ = unsafe { core.remove_ProcessFailed(subscriptions.process_failed) };
+                }
+                let _ = done_tx.send(());
+            })
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
+        }
+    }
+
+    fn unix_time_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
+    }
+
+    fn bounded_text(value: &str, max_chars: usize) -> String {
+        let mut chars = value.chars();
+        let bounded = chars.by_ref().take(max_chars).collect::<String>();
+        if chars.next().is_some() {
+            format!("{bounded} …(truncated)")
+        } else {
+            bounded
+        }
+    }
+
+    fn bounded_json<T: serde::Serialize>(value: &T, max_chars: usize) -> String {
+        let serialized = serde_json::to_string(value)
+            .unwrap_or_else(|error| format!("{{\"serializationError\":\"{error}\"}}"));
+        bounded_text(&serialized, max_chars)
     }
 
     async fn bind_listener() -> Result<(TcpListener, u16), String> {
@@ -556,15 +1151,14 @@ mod imp {
     ) {
         let (event_tx, mut event_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let _event_tx_guard = event_tx.clone();
-        let default_session_id =
-            (mode == ConnectionMode::Browser).then_some(MAIN_TARGET_SESSION_ID.to_string());
-        let subscriptions = match subscribe_to_events(&app, event_tx, default_session_id).await {
+        let subscriptions = match subscribe_to_events(&app, event_tx).await {
             Ok(subscriptions) => subscriptions,
             Err(error) => {
                 eprintln!("[CdpDebug] failed to subscribe to CDP events: {error}");
                 Vec::new()
             }
         };
+        let mut browser_state = BrowserConnectionState::default();
         let (mut outgoing, mut incoming) = websocket.split();
 
         'connection: loop {
@@ -577,14 +1171,21 @@ mod imp {
                 }
                 event = event_rx.recv() => {
                     let Some(event) = event else { break };
-                    if outgoing.send(Message::text(event)).await.is_err() {
-                        break;
+                    for message in event_messages(event, mode, &browser_state) {
+                        if outgoing.send(Message::text(message)).await.is_err() {
+                            break 'connection;
+                        }
                     }
                 }
                 message = incoming.next() => {
                     match message {
                         Some(Ok(Message::Text(text))) => {
-                            for response in dispatch_messages(&app, text.as_ref(), mode).await {
+                            for response in dispatch_messages(
+                                &app,
+                                text.as_ref(),
+                                mode,
+                                &mut browser_state,
+                            ).await {
                                 if outgoing.send(Message::text(response)).await.is_err() {
                                     break 'connection;
                                 }
@@ -600,7 +1201,44 @@ mod imp {
         unsubscribe_from_events(&app, subscriptions).await;
     }
 
-    async fn dispatch_messages(app: &AppHandle, raw: &str, mode: ConnectionMode) -> Vec<String> {
+    fn event_messages(
+        event: NativeCdpEvent,
+        mode: ConnectionMode,
+        browser_state: &BrowserConnectionState,
+    ) -> Vec<String> {
+        let message = |session_id: Option<&str>| {
+            let mut value = json!({
+                "method": event.method.clone(),
+                "params": event.params.clone(),
+            });
+            if let Some(session_id) = session_id {
+                value["sessionId"] = Value::String(session_id.to_string());
+            }
+            value.to_string()
+        };
+
+        match mode {
+            ConnectionMode::Page => vec![message(event.session_id.as_deref())],
+            ConnectionMode::Browser if event.method.starts_with("Target.") => {
+                vec![message(event.session_id.as_deref())]
+            }
+            ConnectionMode::Browser => match event.session_id.as_deref() {
+                Some(session_id) => vec![message(Some(session_id))],
+                None => browser_state
+                    .sessions
+                    .iter()
+                    .map(|session_id| message(Some(session_id)))
+                    .collect(),
+            },
+        }
+    }
+
+    async fn dispatch_messages(
+        app: &AppHandle,
+        raw: &str,
+        mode: ConnectionMode,
+        browser_state: &mut BrowserConnectionState,
+    ) -> Vec<String> {
         let request: Value = match serde_json::from_str(raw) {
             Ok(value) => value,
             Err(error) => {
@@ -632,9 +1270,14 @@ mod imp {
             .map(str::to_string);
 
         if mode == ConnectionMode::Browser {
-            if let Some(messages) =
-                synthetic_browser_messages(app, &id, &method, &params, session_id.as_deref())
-            {
+            if let Some(messages) = synthetic_browser_messages(
+                app,
+                &id,
+                &method,
+                &params,
+                session_id.as_deref(),
+                browser_state,
+            ) {
                 return messages
                     .into_iter()
                     .map(|message| message.to_string())
@@ -643,7 +1286,19 @@ mod imp {
         }
 
         let call_session_id = match (mode, session_id.as_deref()) {
-            (ConnectionMode::Browser, Some(MAIN_TARGET_SESSION_ID)) => None,
+            (ConnectionMode::Browser, Some(session_id)) if browser_state.contains(session_id) => {
+                None
+            }
+            (ConnectionMode::Browser, Some(session_id)) => {
+                return vec![json!({
+                    "id": id,
+                    "error": {
+                        "code": -32001,
+                        "message": format!("Unknown Locus target session: {session_id}"),
+                    }
+                })
+                .to_string()]
+            }
             _ => session_id.clone(),
         };
 
@@ -651,7 +1306,9 @@ mod imp {
         // browser client attaches so it receives the existing execution
         // contexts just like a fresh native CDP target session would.
         if mode == ConnectionMode::Browser
-            && session_id.as_deref() == Some(MAIN_TARGET_SESSION_ID)
+            && session_id
+                .as_deref()
+                .is_some_and(|session_id| browser_state.contains(session_id))
             && method == "Runtime.enable"
         {
             let _ = call_devtools_method(app, None, "Runtime.disable".to_string(), json!({})).await;
@@ -681,6 +1338,7 @@ mod imp {
         method: &str,
         params: &Value,
         session_id: Option<&str>,
+        browser_state: &mut BrowserConnectionState,
     ) -> Option<Vec<Value>> {
         let with_session = |mut response: Value| {
             if let Some(session_id) = session_id {
@@ -689,6 +1347,22 @@ mod imp {
             response
         };
         let response = |result: Value| with_session(json!({ "id": id, "result": result }));
+        let error = |code: i64, message: String| {
+            with_session(json!({
+                "id": id,
+                "error": { "code": code, "message": message },
+            }))
+        };
+        let attached_message = |session_id: &str| {
+            json!({
+                "method": "Target.attachedToTarget",
+                "params": {
+                    "sessionId": session_id,
+                    "targetInfo": main_target_info(app, true),
+                    "waitingForDebugger": false,
+                }
+            })
+        };
         match method {
             "Browser.getVersion" => Some(vec![response(json!({
                 "protocolVersion": "1.3",
@@ -699,10 +1373,10 @@ mod imp {
             }))]),
             "Target.getBrowserContexts" => Some(vec![response(json!({ "browserContextIds": [] }))]),
             "Target.getTargets" => Some(vec![response(json!({
-                "targetInfos": [main_target_info(app, true)]
+                "targetInfos": [main_target_info(app, browser_state.is_attached())]
             }))]),
             "Target.getTargetInfo" => Some(vec![response(json!({
-                "targetInfo": main_target_info(app, true)
+                "targetInfo": main_target_info(app, browser_state.is_attached())
             }))]),
             "Target.setDiscoverTargets" => {
                 let mut messages = Vec::new();
@@ -713,7 +1387,9 @@ mod imp {
                 {
                     messages.push(json!({
                         "method": "Target.targetCreated",
-                        "params": { "targetInfo": main_target_info(app, false) }
+                        "params": {
+                            "targetInfo": main_target_info(app, browser_state.is_attached())
+                        }
                     }));
                 }
                 messages.push(response(json!({})));
@@ -721,36 +1397,68 @@ mod imp {
             }
             "Target.setAutoAttach" => {
                 let mut messages = Vec::new();
-                if session_id.is_none()
-                    && params
+                if session_id.is_none() {
+                    let enabled = params
                         .get("autoAttach")
                         .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                {
-                    messages.push(json!({
-                        "method": "Target.attachedToTarget",
-                        "params": {
-                            "sessionId": MAIN_TARGET_SESSION_ID,
-                            "targetInfo": main_target_info(app, true),
-                            "waitingForDebugger": false,
+                        .unwrap_or(false);
+                    if enabled {
+                        let (auto_session_id, created) = browser_state.ensure_auto_attach();
+                        if created {
+                            messages.push(attached_message(&auto_session_id));
                         }
-                    }));
+                    } else if let Some(detached_session_id) = browser_state.disable_auto_attach() {
+                        messages.push(json!({
+                            "method": "Target.detachedFromTarget",
+                            "params": {
+                                "sessionId": detached_session_id,
+                                "targetId": MAIN_TARGET_ID,
+                            }
+                        }));
+                    }
                 }
                 messages.push(response(json!({})));
                 Some(messages)
             }
-            "Target.attachToTarget" => Some(vec![
-                json!({
-                    "method": "Target.attachedToTarget",
-                    "params": {
-                        "sessionId": MAIN_TARGET_SESSION_ID,
-                        "targetInfo": main_target_info(app, true),
-                        "waitingForDebugger": false,
-                    }
-                }),
-                response(json!({ "sessionId": MAIN_TARGET_SESSION_ID })),
-            ]),
-            "Target.detachFromTarget" => Some(vec![response(json!({}))]),
+            "Target.attachToTarget" => {
+                let target_id = params
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if target_id != MAIN_TARGET_ID {
+                    return Some(vec![error(
+                        -32602,
+                        format!("Unknown Locus target: {target_id}"),
+                    )]);
+                }
+                let attached_session_id = browser_state.attach();
+                Some(vec![
+                    attached_message(&attached_session_id),
+                    response(json!({ "sessionId": attached_session_id })),
+                ])
+            }
+            "Target.detachFromTarget" => {
+                let detached_session_id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !browser_state.detach(detached_session_id) {
+                    return Some(vec![error(
+                        -32602,
+                        format!("Unknown Locus target session: {detached_session_id}"),
+                    )]);
+                }
+                Some(vec![
+                    json!({
+                        "method": "Target.detachedFromTarget",
+                        "params": {
+                            "sessionId": detached_session_id,
+                            "targetId": MAIN_TARGET_ID,
+                        }
+                    }),
+                    response(json!({})),
+                ])
+            }
             _ => None,
         }
     }
@@ -760,6 +1468,16 @@ mod imp {
         session_id: Option<String>,
         method: String,
         params: Value,
+    ) -> Result<Value, String> {
+        call_devtools_method_with_timeout(app, session_id, method, params, CDP_CALL_TIMEOUT).await
+    }
+
+    async fn call_devtools_method_with_timeout(
+        app: &AppHandle,
+        session_id: Option<String>,
+        method: String,
+        params: Value,
+        timeout: Duration,
     ) -> Result<Value, String> {
         use webview2_com::{
             CallDevToolsProtocolMethodCompletedHandler, CoTaskMemPWSTR,
@@ -838,7 +1556,7 @@ mod imp {
             })
             .map_err(|error| format!("Failed to access the main WebView2: {error}"))?;
 
-        let raw = tokio::time::timeout(CDP_CALL_TIMEOUT, response_rx)
+        let raw = tokio::time::timeout(timeout, response_rx)
             .await
             .map_err(|_| "WebView2 CDP call timed out".to_string())?
             .map_err(|_| "WebView2 CDP response channel closed".to_string())??;
@@ -848,8 +1566,7 @@ mod imp {
 
     async fn subscribe_to_events(
         app: &AppHandle,
-        event_tx: mpsc::Sender<String>,
-        default_session_id: Option<String>,
+        event_tx: mpsc::Sender<NativeCdpEvent>,
     ) -> Result<Vec<EventSubscription>, String> {
         use webview2_com::{
             take_pwstr, CoTaskMemPWSTR, DevToolsProtocolEventReceivedEventHandler,
@@ -881,7 +1598,6 @@ mod imp {
                         };
                         let callback_name = event_name.clone();
                         let callback_tx = event_tx.clone();
-                        let callback_default_session_id = default_session_id.clone();
                         let handler = DevToolsProtocolEventReceivedEventHandler::create(Box::new(
                             move |_sender, args| {
                                 let Some(args) = args else { return Ok(()) };
@@ -901,18 +1617,11 @@ mod imp {
                                         let session = take_pwstr(raw_session);
                                         (!session.is_empty()).then_some(session)
                                     });
-                                let mut event = json!({
-                                    "method": callback_name,
-                                    "params": params,
+                                let _ = callback_tx.try_send(NativeCdpEvent {
+                                    method: callback_name.clone(),
+                                    params,
+                                    session_id,
                                 });
-                                if let Some(session_id) = session_id {
-                                    event["sessionId"] = Value::String(session_id);
-                                } else if !callback_name.starts_with("Target.") {
-                                    if let Some(session_id) = callback_default_session_id.as_ref() {
-                                        event["sessionId"] = Value::String(session_id.clone());
-                                    }
-                                }
-                                let _ = callback_tx.try_send(event.to_string());
                                 Ok(())
                             },
                         ));
@@ -994,7 +1703,12 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{host_allowed, version_descriptor, CDP_EVENT_NAMES};
+        use super::{
+            classify_bridge_health, event_messages, host_allowed, version_descriptor, BridgeHealth,
+            BrowserConnectionState, ConnectionMode, NativeCdpEvent, CDP_EVENT_NAMES,
+        };
+        use serde_json::{json, Value};
+        use std::collections::HashSet;
 
         #[test]
         fn accepts_loopback_hosts_only() {
@@ -1020,15 +1734,75 @@ mod imp {
                 "ws://127.0.0.1:19222/devtools/browser/locus"
             );
         }
+
+        #[test]
+        fn classifies_each_bridge_direction_independently() {
+            assert_eq!(classify_bridge_health(false, false), BridgeHealth::Healthy);
+            assert_eq!(
+                classify_bridge_health(true, false),
+                BridgeHealth::RendererToHostStalled
+            );
+            assert_eq!(
+                classify_bridge_health(false, true),
+                BridgeHealth::HostToRendererStalled
+            );
+            assert_eq!(
+                classify_bridge_health(true, true),
+                BridgeHealth::BidirectionalStalled
+            );
+        }
+
+        #[test]
+        fn creates_unique_browser_sessions_and_detaches_them_independently() {
+            let mut state = BrowserConnectionState::default();
+            let (auto_session, created) = state.ensure_auto_attach();
+            let manual_session = state.attach();
+
+            assert!(created);
+            assert_ne!(auto_session, manual_session);
+            assert!(state.contains(&auto_session));
+            assert!(state.contains(&manual_session));
+            assert!(state.detach(&manual_session));
+            assert!(state.contains(&auto_session));
+            assert!(!state.contains(&manual_session));
+        }
+
+        #[test]
+        fn fans_native_page_events_out_to_every_synthetic_browser_session() {
+            let mut state = BrowserConnectionState::default();
+            let first = state.attach();
+            let second = state.attach();
+            let messages = event_messages(
+                NativeCdpEvent {
+                    method: "Runtime.consoleAPICalled".to_string(),
+                    params: json!({ "type": "log" }),
+                    session_id: None,
+                },
+                ConnectionMode::Browser,
+                &state,
+            );
+            let sessions = messages
+                .iter()
+                .map(|message| serde_json::from_str::<Value>(message).unwrap())
+                .filter_map(|message| message["sessionId"].as_str().map(str::to_string))
+                .collect::<HashSet<_>>();
+
+            assert_eq!(sessions, HashSet::from([first, second]));
+        }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
+    use super::FrontendBridgeHeartbeat;
     use tauri::AppHandle;
 
     #[derive(Default)]
     pub struct CdpDebugServerHandle;
+
+    impl CdpDebugServerHandle {
+        pub fn record_frontend_heartbeat(&self, _heartbeat: FrontendBridgeHeartbeat) {}
+    }
 
     pub async fn reconcile(_app: AppHandle, _enabled: bool) -> Result<Option<u16>, String> {
         Ok(None)

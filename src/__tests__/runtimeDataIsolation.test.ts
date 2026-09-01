@@ -107,6 +107,17 @@ describe("runtime data isolation", () => {
     expect(wrapper).not.toMatch(/[A-Za-z]:\\\\Users\\\\[^<]/);
   });
 
+  it("terminates the DevTools MCP child when its parent transport closes", () => {
+    const wrapper = read("scripts/chrome-devtools-mcp-wrapper.mjs");
+
+    expect(wrapper).toContain('process.stdin.once("end"');
+    expect(wrapper).toContain('process.stdin.once("close"');
+    expect(wrapper).toContain('process.once("disconnect"');
+    expect(wrapper).toContain('process.stdout.on("error"');
+    expect(wrapper).toContain("child.stdin.end()");
+    expect(wrapper).toContain("child.kill()");
+  });
+
   it("locks the resolved data directory before opening the session store", () => {
     const lib = read("src-tauri/src/lib.rs");
     const lock = read("src-tauri/src/runtime_data_lock.rs");

@@ -126,13 +126,54 @@ const child = spawn(childCommand, childArgs, {
   windowsHide: true,
 });
 
+let shutdownReason = null;
+let forceKillTimer = null;
+
+function shutdownChild(reason) {
+  if (shutdownReason || child.exitCode !== null) {
+    return;
+  }
+  shutdownReason = reason;
+  log.write(`[${new Date().toISOString()}] shutdown reason=${reason}\n`);
+  process.stdin.unpipe(child.stdin);
+  if (!child.stdin.destroyed && !child.stdin.writableEnded) {
+    child.stdin.end();
+  }
+  forceKillTimer = setTimeout(() => {
+    if (child.exitCode === null && !child.killed) {
+      log.write(`[${new Date().toISOString()}] force terminate child after stdin closed\n`);
+      child.kill();
+    }
+  }, 1_000);
+}
+
 log.write(
   `[${new Date().toISOString()}] browserUrl configured=${configuredBrowserUrl ?? ""} resolved=${resolvedBrowserUrl}\n`,
 );
 log.write(`[${new Date().toISOString()}] spawn ${childCommand} ${childArgs.join(" ")}\n`);
 
-process.stdin.pipe(child.stdin);
+process.stdin.pipe(child.stdin, { end: false });
 child.stdout.pipe(process.stdout);
+process.stdin.once("end", () => shutdownChild("stdin-end"));
+process.stdin.once("close", () => shutdownChild("stdin-close"));
+process.once("disconnect", () => shutdownChild("parent-disconnect"));
+process.once("SIGINT", () => shutdownChild("SIGINT"));
+process.once("SIGTERM", () => shutdownChild("SIGTERM"));
+
+child.stdin.on("error", (error) => {
+  if (error?.code !== "EPIPE") {
+    log.write(`[${new Date().toISOString()}] child stdin error: ${error.stack || error.message}\n`);
+  }
+});
+
+process.stdout.on("error", (error) => {
+  if (error?.code === "EPIPE") {
+    shutdownChild("stdout-closed");
+    return;
+  }
+  log.write(`[${new Date().toISOString()}] stdout error: ${error.stack || error.message}\n`);
+});
+
 child.stderr.on("data", (chunk) => {
   log.write(chunk);
 });
@@ -143,10 +184,18 @@ child.on("error", (error) => {
 });
 
 child.on("exit", (code, signal) => {
+  if (forceKillTimer) {
+    clearTimeout(forceKillTimer);
+    forceKillTimer = null;
+  }
   log.write(`[${new Date().toISOString()}] exit code=${code ?? ""} signal=${signal ?? ""}\n`);
-  process.exit(code ?? (signal ? 1 : 0));
+  const exitCode = code ?? (signal && !shutdownReason ? 1 : 0);
+  log.end(() => process.exit(exitCode));
 });
 
 process.on("exit", () => {
+  if (child.exitCode === null && !child.killed) {
+    child.kill();
+  }
   log.end();
 });

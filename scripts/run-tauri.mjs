@@ -16,6 +16,7 @@ const WEBVIEW2_ARGS_KEY = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 const REMOTE_DEBUG_FLAG = "--remote-debugging-port=";
 const LOCUS_WEBVIEW2_DEBUG_START_PORT = 19222;
 const LOCUS_WEBVIEW2_DEBUG_PORT_ATTEMPTS = 25;
+const LOCUS_WEBVIEW2_DEBUG_PORT_ENV_KEY = "LOCUS_WEBVIEW2_DEBUG_PORT";
 const CODEX_MCP_SERVER_NAME = "locus_webview2_devtools";
 const LEGACY_CODEX_MCP_SERVER_NAMES = ["locus-webview2-devtools"];
 const CODEX_CLI_ENV_KEY = "LOCUS_CODEX_CLI";
@@ -313,6 +314,10 @@ function canListenOnPort(port) {
 }
 
 async function findAvailableDebugPort() {
+  const requestedPort = Number.parseInt(process.env[LOCUS_WEBVIEW2_DEBUG_PORT_ENV_KEY] ?? "", 10);
+  if (Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65_535) {
+    return await canListenOnPort(requestedPort) ? requestedPort : null;
+  }
   for (let offset = 0; offset < LOCUS_WEBVIEW2_DEBUG_PORT_ATTEMPTS; offset += 1) {
     const port = LOCUS_WEBVIEW2_DEBUG_START_PORT + offset;
 
@@ -770,9 +775,10 @@ if (shouldExposeWebView2DebugPort) {
   }
 
   if (debugPort !== LOCUS_WEBVIEW2_DEBUG_START_PORT) {
-    console.log(
-      `[locus] WebView2 debug port ${LOCUS_WEBVIEW2_DEBUG_START_PORT} is in use; using ${debugPort}.`,
-    );
+    const requestedDebugPort = process.env[LOCUS_WEBVIEW2_DEBUG_PORT_ENV_KEY];
+    console.log(requestedDebugPort
+      ? `[locus] Using requested WebView2 debug port ${debugPort}.`
+      : `[locus] WebView2 debug port ${LOCUS_WEBVIEW2_DEBUG_START_PORT} is in use; using ${debugPort}.`);
   }
 
   ensureCodexDevtoolsMcp(debugPort);

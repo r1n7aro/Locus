@@ -18,7 +18,7 @@ describe("runtime CDP debug mode", () => {
     );
     expect(runtime).toContain('TcpListener::bind(("127.0.0.1", port))');
     expect(runtime).toContain("if !enabled {");
-    expect(runtime).toContain("stop_locked(&mut running).await;");
+    expect(runtime).toContain("stop_locked(&app, &handle, &mut running).await;");
     expect(runtime).toContain("task.abort();");
   });
 
@@ -42,5 +42,16 @@ describe("runtime CDP debug mode", () => {
     expect(runtime).toContain('"Target.targetCreated"');
     expect(runtime).toContain('matches!(path, "/json" | "/json/list")');
     expect(runtime).toContain('path == "/json/version"');
+  });
+
+  it("assigns a distinct synthetic session to every browser-level attachment", () => {
+    const runtime = read("src-tauri/src/cdp_debug.rs");
+
+    expect(runtime).toContain("struct BrowserConnectionState");
+    expect(runtime).toContain("self.next_session_sequence.saturating_add(1)");
+    expect(runtime).toContain("browser_state.attach()");
+    expect(runtime).toContain("browser_state.contains(session_id)");
+    expect(runtime).toMatch(/browser_state\s*\.sessions/);
+    expect(runtime).not.toContain('const MAIN_TARGET_SESSION_ID: &str');
   });
 });
