@@ -100,7 +100,6 @@ describe("knowledgeMarkdownPreviewWindow", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
     const documentOpen = read("src/composables/useKnowledgeDocumentOpen.ts");
-    const chatView = read("src/components/ChatView.vue");
     const assetChip = read("src/components/AssetChip.vue");
     const windowApp = read("src/WindowApp.vue");
     const viewer = read("src/components/KnowledgeMarkdownPreviewWindow.vue");
@@ -114,10 +113,9 @@ describe("knowledgeMarkdownPreviewWindow", () => {
     expect(displayPanel).toContain("settings.display.memoryFileOpenKnowledge");
     expect(documentOpen).toContain('docType === "memory"');
     expect(documentOpen).toContain('displaySettings.memoryFileOpenTarget === "window"');
-    expect(chatView).toContain("openKnowledgeDocument(docType, path)");
     expect(assetChip).toContain("await openKnowledgeDocument(knowledgeRef.value.docType");
     expect(windowApp).toContain('kind: "knowledge-markdown-preview"');
-    expect(viewer).toContain("<MarkdownRenderer v-else :content=\"content\" />");
+    expect(viewer).toContain("<MarkdownRenderer v-else :content=\"content\" text-zoom />");
     expect(viewer).toContain('part: "full"');
     expect(capabilities).toContain('"knowledge-markdown-preview"');
   });

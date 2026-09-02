@@ -26,8 +26,12 @@ vi.mock("../components/ui/BaseMarkdownEditor.vue", async () => {
   const { defineComponent, h: render } = await import("vue");
   return {
     default: defineComponent({
+      props: {
+        contentPath: { type: String, default: "" },
+        viewMode: { type: String, default: "rendered" },
+      },
       emits: ["documentChange", "shortcutSave"],
-      setup(_, { emit, expose }) {
+      setup(props, { emit, expose }) {
         const editorView = {
           state: { doc: Text.of(["line one", "line two"]) },
           dispatch: workspaceExplorerMocks.editorDispatch,
@@ -36,8 +40,12 @@ vi.mock("../components/ui/BaseMarkdownEditor.vue", async () => {
         expose({ getEditorView: () => editorView });
         return () => render("button", {
           class: "workspace-file-editor-test-change",
+          "data-content-path": props.contentPath,
+          "data-view-mode": props.viewMode,
           onClick: () => emit("documentChange", {
-            doc: Text.of(["export const value = 2;", ""]),
+            doc: Text.of(props.contentPath.toLowerCase().endsWith(".md")
+              ? ["# Edited", ""]
+              : ["export const value = 2;", ""]),
           }),
         }, "change");
       },
@@ -61,6 +69,17 @@ function textPreview(text: string, contentHash: string): ProjectExplorerFilePrev
   };
 }
 
+function markdownPreview(text: string, contentHash: string): ProjectExplorerFilePreview {
+  return {
+    ...textPreview(text, contentHash),
+    path: "F:\\Game\\Docs\\combat.md",
+    name: "combat.md",
+    extension: "md",
+    mimeType: "text/markdown",
+    totalLines: text.split(/\r\n|\r|\n/).length,
+  };
+}
+
 async function flush(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
@@ -78,6 +97,73 @@ afterEach(() => {
 });
 
 describe("workspace file editor", () => {
+  it("uses the knowledge editor's rendered CodeMirror mode for ordinary Markdown", async () => {
+    workspaceExplorerMocks.preview.mockResolvedValue(markdownPreview(
+      "# Combat rules\n\nKeep the loop readable.\n",
+      "markdown-hash-before",
+    ));
+    workspaceExplorerMocks.write.mockResolvedValue(markdownPreview(
+      "# Edited\n",
+      "markdown-hash-after",
+    ));
+    const dirtyChanges: boolean[] = [];
+    const editorRef = ref<{ saveFile(): Promise<boolean> } | null>(null);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup() {
+        return () => h(WorkspaceFilePreview, {
+          ref: editorRef,
+          projectId: "project-a",
+          path: "F:\\Game\\Docs\\combat.md",
+          onDirtyChange: (dirty: boolean) => dirtyChanges.push(dirty),
+        });
+      },
+    });
+    app.mount(host);
+    await flush();
+
+    const editor = host.querySelector<HTMLElement>(".workspace-file-editor-test-change");
+    expect(editor?.dataset.contentPath).toBe("F:\\Game\\Docs\\combat.md");
+    expect(editor?.dataset.viewMode).toBe("rendered");
+    expect(host.querySelector(".document-properties")).toBeNull();
+    editor?.click();
+    await nextTick();
+    expect(dirtyChanges[dirtyChanges.length - 1]).toBe(true);
+    await expect(editorRef.value?.saveFile()).resolves.toBe(true);
+    expect(workspaceExplorerMocks.write).toHaveBeenCalledWith(
+      "project-a",
+      "F:\\Game\\Docs\\combat.md",
+      "# Edited\n",
+      "markdown-hash-before",
+    );
+    app.unmount();
+  });
+
+  it("keeps source files in native CodeMirror mode", async () => {
+    workspaceExplorerMocks.preview.mockResolvedValue(textPreview(
+      "export const value = 1;\n",
+      "source-hash",
+    ));
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup() {
+        return () => h(WorkspaceFilePreview, {
+          projectId: "project-a",
+          path: "F:\\Game\\src\\value.ts",
+        });
+      },
+    });
+    app.mount(host);
+    await flush();
+
+    expect(
+      host.querySelector<HTMLElement>(".workspace-file-editor-test-change")?.dataset.viewMode,
+    ).toBe("native");
+    app.unmount();
+  });
+
   it("tracks dirty state and saves with the loaded hash while preserving CRLF", async () => {
     workspaceExplorerMocks.preview.mockResolvedValue(textPreview(
       "export const value = 1;\r\n",

@@ -26,6 +26,7 @@ import { normalizeMarkdownForRender } from "../composables/markdownRender";
 import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
 import { loadCachedMarkdownPathStatuses } from "../composables/markdownPathStatusCache";
 import { useInternalDragController } from "../composables/useInternalDrag";
+import { useTextViewerZoom } from "../composables/useTextViewerZoom";
 import { resolveMarkdownImage } from "../services/markdownImage";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
@@ -41,7 +42,7 @@ import type { WorkspaceRef } from "../services/project";
 import type { UnityObjectPreviewInput, UnityObjectPreviewLevel } from "./unity-preview";
 import { startWorkbenchReferenceInternalDrag } from "./workbench/workbenchReferenceDrag";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   content: string;
   citations?: Citation[];
   cursor?: boolean;
@@ -49,7 +50,10 @@ const props = defineProps<{
   highlightTerms?: string[];
   unityPreviewStateScope?: string | null;
   workspaceRef?: WorkspaceRef | null;
-}>();
+  textZoom?: boolean;
+}>(), {
+  textZoom: false,
+});
 
 const emit = defineEmits<{
   (e: "openImage", src: string): void;
@@ -60,6 +64,7 @@ const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const internalDrag = useInternalDragController();
+const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
 const inlinePathStatuses = ref<Map<string, MarkdownPathStatus>>(new Map());
 const appContext = getCurrentInstance()?.appContext ?? null;
@@ -682,15 +687,22 @@ function handleMarkdownPointerDown(event: PointerEvent) {
     workspaceRoot: checkout.root,
   });
 }
+
+function handleMarkdownWheel(event: WheelEvent) {
+  if (!props.textZoom) return;
+  handleTextViewerZoomWheel(event);
+}
 </script>
 
 <template>
   <div
     ref="rootRef"
     class="markdown-body ui-select-text"
+    :style="textZoom ? textViewerZoomStyle : undefined"
     @click="handleMarkdownContentActivation"
     @auxclick="handleMarkdownContentActivation"
     @pointerdown="handleMarkdownPointerDown"
+    @wheel="handleMarkdownWheel"
     v-html="renderedHtml"
   />
 </template>
@@ -698,7 +710,7 @@ function handleMarkdownPointerDown(event: PointerEvent) {
 <style>
 .markdown-body {
   font-family: var(--font-prose);
-  font-size: 14px;
+  font-size: calc(14px * var(--text-viewer-font-scale, 1));
   line-height: 1.68;
   word-break: break-word;
   color: var(--text-color);
@@ -830,7 +842,7 @@ function handleMarkdownPointerDown(event: PointerEvent) {
   border-collapse: separate;
   border-spacing: 0;
   table-layout: auto;
-  font-size: 13px;
+  font-size: 0.9286em;
   background: transparent;
 }
 
@@ -891,7 +903,7 @@ function handleMarkdownPointerDown(event: PointerEvent) {
   font-family: var(--font-mono-block);
   padding: 10px 0;
   background: transparent;
-  font-size: 13px;
+  font-size: 0.9286em;
   line-height: 1.55;
   white-space: pre;
   overflow-x: auto;
@@ -918,7 +930,7 @@ function handleMarkdownPointerDown(event: PointerEvent) {
   color: color-mix(in srgb, var(--text-secondary) 78%, transparent);
   user-select: none;
   opacity: 0.5;
-  font-size: 11px;
+  font-size: 0.8462em;
   border-right: 1px solid color-mix(in srgb, var(--border-color) 72%, transparent);
 }
 

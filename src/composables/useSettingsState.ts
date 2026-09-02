@@ -1,5 +1,6 @@
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { clearWarmup, getWarmup, setWarmup } from "./warmupCache";
+import { resetTextViewerZoomScale } from "./useTextViewerZoom";
 import { resetAllConfig } from "../services/project";
 import {
   getProviders,
@@ -381,6 +382,7 @@ export function useSettingsState(emit: SettingsEmit) {
       localStorage.removeItem("locus:collabLeftColWidth");
       localStorage.removeItem("locus:collabTerminalHeight");
     } catch { /* ignore */ }
+    resetTextViewerZoomScale();
     setThemePreference("main", "dark");
     setThemePreference("unityEmbed", "dark");
     try {

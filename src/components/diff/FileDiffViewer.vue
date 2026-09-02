@@ -5,6 +5,7 @@ import { diffSemanticTarget, diffTextForLarge, invalidateDiffCache, parseDiffReq
 import { gitExecute } from "../../services/git";
 import { t } from "../../i18n";
 import { useResizablePanel } from "../../composables/useResizablePanel";
+import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
 import { highlightDiffHunk } from "./fileDiffText";
 import type {
   FileDiffPayload,
@@ -65,6 +66,7 @@ const emit = defineEmits<{
 
 const lfsPulling = ref(false);
 const lfsPullError = ref<string | null>(null);
+const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 
 async function pullLfsObject() {
   const workspaceRef = captureWorkspaceRef();
@@ -874,7 +876,9 @@ onUnmounted(() => {
         ref="textScrollEl"
         class="diff-text"
         :class="[textDisplayMode, { 'has-change-nav': showChangeNavigator }]"
+        :style="textViewerZoomStyle"
         @scroll="onTextScroll"
+        @wheel="handleTextViewerZoomWheel"
       >
         <!-- Loading indicator while preparing large text -->
         <div v-if="!textReady" class="diff-loading">Loading…</div>
@@ -1332,6 +1336,11 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  font-size: calc(13px * var(--text-viewer-font-scale, 1));
+}
+
+.diff-viewer.compact .diff-text {
+  font-size: calc(11px * var(--text-viewer-font-scale, 1));
 }
 
 .diff-text.has-change-nav {

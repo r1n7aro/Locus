@@ -22,6 +22,7 @@ import { normalizeMarkdownEditorLineEndings } from "./markdownEditorFormatting";
 import type { MarkdownEditorViewMode } from "./markdownEditorViewMode";
 import { resolveMarkdownImage } from "../../services/markdownImage";
 import type { WorkspaceRef } from "../../services/project";
+import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
 
 const workspaceMarkdownImageResolver: MarkdownImageResolver = (source, context) => {
   if (!context.workspaceRef) return null;
@@ -80,6 +81,11 @@ const modeCompartment = new Compartment();
 const readOnlyCompartment = new Compartment();
 const placeholderCompartment = new Compartment();
 const localSessionCache = new MarkdownEditorSessionCache();
+const {
+  textViewerZoomScale,
+  textViewerZoomStyle,
+  handleTextViewerZoomWheel,
+} = useTextViewerZoom();
 
 let editorView: EditorView | null = null;
 let activeSessionKey = normalizeSessionKey(props.contentKey);
@@ -440,6 +446,10 @@ function reconfigureEditor(): void {
   view.requestMeasure();
 }
 
+function handleEditorWheel(event: WheelEvent): void {
+  handleTextViewerZoomWheel(event);
+}
+
 onMounted(() => {
   mountEditor();
 });
@@ -504,6 +514,10 @@ watch(
   },
 );
 
+watch(textViewerZoomScale, () => {
+  void nextTick(() => editorView?.requestMeasure());
+});
+
 onBeforeUnmount(() => {
   suspendEditor();
   localSessionCache.clear();
@@ -523,7 +537,11 @@ defineExpose({
       'is-rendered': viewMode === 'rendered',
       'is-source': viewMode === 'native',
     }"
-    :style="{ '--markdown-editor-min-height': `${minHeight}px` }"
+    :style="{
+      '--markdown-editor-min-height': `${minHeight}px`,
+      ...textViewerZoomStyle,
+    }"
+    @wheel="handleEditorWheel"
   >
     <div ref="mountRef" class="base-markdown-editor-host" />
   </div>
@@ -531,11 +549,16 @@ defineExpose({
 
 <style scoped>
 .base-markdown-editor {
-  --markdown-document-font-size: 14px;
+  --markdown-document-font-size: calc(14px * var(--text-viewer-font-scale, 1));
+  --markdown-source-font-size: calc(13px * var(--text-viewer-font-scale, 1));
   --markdown-document-line-height: 1.68;
   --markdown-document-list-indent: 20px;
+  --markdown-document-padding-left: 16px;
+  --markdown-document-padding-right: 14px;
   display: flex;
+  flex: 1 1 0;
   flex-direction: column;
+  width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
@@ -555,6 +578,7 @@ defineExpose({
   width: 100%;
   min-width: 0;
   min-height: var(--markdown-editor-min-height);
+  font-size: var(--markdown-document-font-size);
   background: transparent;
 }
 
@@ -564,19 +588,20 @@ defineExpose({
   overflow: auto;
   overscroll-behavior: contain;
   font-family: var(--font-prose);
-  font-size: var(--markdown-document-font-size);
+  font-size: inherit;
   line-height: var(--markdown-document-line-height);
 }
 
 .base-markdown-editor :deep(.cm-content) {
   min-height: 100%;
-  padding: 14px 14px 16px 16px;
+  padding: 14px 0 16px;
   color: var(--text-color);
   caret-color: var(--accent-color);
 }
 
 .base-markdown-editor :deep(.cm-line) {
-  padding: 0;
+  /* CodeMirror derives full-line selection bounds from .cm-line padding. */
+  padding: 0 var(--markdown-document-padding-right) 0 var(--markdown-document-padding-left);
 }
 
 .base-markdown-editor.disabled,
@@ -584,9 +609,13 @@ defineExpose({
   cursor: default;
 }
 
+.base-markdown-editor :deep(.cm-editor.cm-source-mode) {
+  font-size: var(--markdown-source-font-size);
+}
+
 .base-markdown-editor :deep(.cm-editor.cm-source-mode .cm-scroller) {
   font-family: var(--font-mono-editor);
-  font-size: 13px;
+  font-size: inherit;
   line-height: 1.65;
 }
 
@@ -690,6 +719,9 @@ defineExpose({
 }
 
 .base-markdown-editor :deep(.cm-live-blockquote) {
+  margin-right: var(--markdown-document-padding-right);
+  margin-left: var(--markdown-document-padding-left);
+  padding-right: 0;
   padding-left: 12px;
   border-left: 2px solid color-mix(in srgb, var(--accent-color) 38%, var(--border-color));
   background: color-mix(in srgb, var(--sidebar-bg) 44%, transparent);
@@ -706,6 +738,8 @@ defineExpose({
 }
 
 .base-markdown-editor :deep(.cm-live-fenced-code) {
+  margin-right: var(--markdown-document-padding-right);
+  margin-left: var(--markdown-document-padding-left);
   padding: 0 12px;
   border-right: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);
   border-left: 1px solid color-mix(in srgb, var(--border-color) 86%, transparent);

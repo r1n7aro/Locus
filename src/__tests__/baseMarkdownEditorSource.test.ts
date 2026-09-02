@@ -106,11 +106,10 @@ describe("BaseMarkdownEditor CodeMirror source", () => {
   });
 
   it("uses one continuous CodeMirror layout for fixed and auto-grow editors", () => {
-    expect(source).toMatch(/\.base-markdown-editor\s*\{[\s\S]*display:\s*flex;[\s\S]*min-height:\s*0;/);
+    expect(source).toMatch(/\.base-markdown-editor\s*\{[\s\S]*display:\s*flex;[\s\S]*flex:\s*1 1 0;[\s\S]*width:\s*100%;[\s\S]*min-height:\s*0;/);
     expect(source).toMatch(/\.base-markdown-editor :deep\(\.cm-scroller\)\s*\{[\s\S]*overflow:\s*auto;/);
     expect(source).toMatch(/\.base-markdown-editor\.auto-grow[\s\S]*height:\s*auto;/);
     expect(source).toMatch(/\.base-markdown-editor\.auto-grow :deep\(\.cm-scroller\)[\s\S]*overflow:\s*visible;[\s\S]*overscroll-behavior:\s*auto;/);
-    expect(source).toContain("padding: 14px 14px 16px 16px;");
     expect(source).toContain("min-height: var(--markdown-editor-min-height);");
   });
 

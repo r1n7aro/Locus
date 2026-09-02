@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
+import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
 import { t } from "../../i18n";
 import hljs from "../../hljs";
 
@@ -14,6 +15,7 @@ const props = defineProps<{
 }>();
 
 const bodyRef = ref<HTMLElement | null>(null);
+const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 const lines = computed(() => props.snippet.split("\n"));
 const shownLines = computed(() => lines.value.length);
 const languageClass = computed(() => (props.language ? `language-${props.language}` : null));
@@ -62,8 +64,11 @@ function escapeHtml(source: string): string {
 </script>
 
 <template>
-  <div class="atv-root">
-    <div ref="bodyRef" class="atv-body">
+  <div
+    class="atv-root"
+    :style="textViewerZoomStyle"
+  >
+    <div ref="bodyRef" class="atv-body" @wheel="handleTextViewerZoomWheel">
       <pre class="atv-pre hljs" :class="languageClass"><code><span
         v-for="(line, i) in highlightedLines"
         :key="i"
@@ -99,7 +104,7 @@ function escapeHtml(source: string): string {
   margin: 0;
   padding: 8px 0;
   font-family: var(--font-mono-editor);
-  font-size: 12px;
+  font-size: calc(12px * var(--text-viewer-font-scale, 1));
   line-height: 1.5;
   color: var(--text-color);
   background: var(--panel-bg);

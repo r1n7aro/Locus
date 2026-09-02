@@ -146,7 +146,7 @@ describe("toolFilePreviewWindow", () => {
 
     expect(viewer).toContain('import MarkdownRenderer from "./MarkdownRenderer.vue";');
     expect(viewer).toContain('preview.value.language === "markdown"');
-    expect(viewer).toContain('<MarkdownRenderer :content="preview.snippet || \'\'" />');
+    expect(viewer).toContain('<MarkdownRenderer :content="preview.snippet || \'\'" text-zoom />');
     expect(viewer).toContain('<AssetTextViewer');
   });
 });

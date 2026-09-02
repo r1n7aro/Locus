@@ -163,7 +163,7 @@ onUnmounted(() => {
         {{ t("tool.filePreview.empty") }}
       </div>
       <div v-else-if="isMarkdownPreview" class="tool-file-preview-markdown">
-        <MarkdownRenderer :content="preview.snippet || ''" />
+        <MarkdownRenderer :content="preview.snippet || ''" text-zoom />
       </div>
       <AssetTextViewer
         v-else-if="preview.kind === 'text' && preview.snippet !== undefined"
@@ -280,7 +280,7 @@ onUnmounted(() => {
 .tool-file-preview-markdown :deep(.markdown-body) {
   max-width: 860px;
   margin: 0 auto;
-  font-size: 13px;
+  font-size: calc(13px * var(--text-viewer-font-scale, 1));
   line-height: 1.7;
 }
 

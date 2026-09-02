@@ -241,7 +241,7 @@ watch(
             </div>
           </div>
           <div class="injection-detail-body">
-            <MarkdownRenderer :content="selectedItem.content" />
+            <MarkdownRenderer :content="selectedItem.content" text-zoom />
           </div>
         </div>
       </section>

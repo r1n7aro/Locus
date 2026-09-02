@@ -902,6 +902,8 @@ const markdownComplexWidgetTheme = EditorView.theme({
     display: "none",
   },
   ".cm-live-table-line": {
+    marginRight: "var(--markdown-document-padding-right)",
+    marginLeft: "var(--markdown-document-padding-left)",
     padding: "0",
   },
   ".cm-live-table-row": {

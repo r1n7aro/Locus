@@ -19,6 +19,7 @@ import WorkspaceAssetPreview from "../asset/WorkspaceAssetPreview.vue";
 import AssetTextViewer from "../asset/AssetTextViewer.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
+import type { MarkdownEditorViewMode } from "../ui/markdownEditorViewMode";
 
 const props = defineProps<{
   projectId?: string;
@@ -69,6 +70,11 @@ const language = computed(() => {
     ps1: "powershell",
   } as Record<string, string>)[extension] ?? extension;
 });
+const editorViewMode = computed<MarkdownEditorViewMode>(() => (
+  preview.value?.extension === "md" || preview.value?.extension === "markdown"
+    ? "rendered"
+    : "native"
+));
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -298,7 +304,7 @@ defineExpose({ saveFile, revealPosition, exportTransferSnapshot, applyTransferSn
           :content-path="preview.path"
           :workspace-ref="workspaceRef"
           :active="active !== false"
-          view-mode="native"
+          :view-mode="editorViewMode"
           transaction-model
           @document-change="onEditorDocumentChange"
           @shortcut-save="saveFile"

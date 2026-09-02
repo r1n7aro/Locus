@@ -133,7 +133,7 @@ onUnmounted(() => {
       <div v-else-if="!content.trim()" class="markdown-preview-state">
         {{ t("knowledge.markdownPreview.empty") }}
       </div>
-      <MarkdownRenderer v-else :content="content" />
+      <MarkdownRenderer v-else :content="content" text-zoom />
     </section>
   </main>
 </template>
@@ -221,7 +221,7 @@ onUnmounted(() => {
 .markdown-preview-body :deep(.markdown-body) {
   max-width: 860px;
   margin: 0 auto;
-  font-size: 13px;
+  font-size: calc(13px * var(--text-viewer-font-scale, 1));
   line-height: 1.7;
 }
 

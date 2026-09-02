@@ -2773,7 +2773,7 @@ function copyBranchName() {
 :deep(.merge-block-code) {
   margin: 0;
   padding: 8px;
-  font-size: 12px;
+  font-size: calc(12px * var(--text-viewer-font-scale, 1));
   font-family: var(--font-mono-block);
   line-height: 1.5;
   color: var(--text-color);
@@ -2807,7 +2807,7 @@ function copyBranchName() {
   border: none;
   background: var(--bg-color);
   color: var(--text-color);
-  font-size: 12px;
+  font-size: calc(12px * var(--text-viewer-font-scale, 1));
   font-family: var(--font-mono-editor);
   line-height: 1.5;
   resize: vertical;

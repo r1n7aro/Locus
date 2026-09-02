@@ -4,6 +4,7 @@ import type { MergeFileInfo, FileDiffPayload } from "../../types";
 import { diffSingleFile } from "../../services/diff";
 import { gitMergeApply } from "../../services/git";
 import { normalizeAppError } from "../../services/errors";
+import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
 import { t } from "../../i18n";
 import { humanizeMergeSideLabel, sharedBaseLabel } from "./mergeUi";
 import type { WorkspaceRef } from "../../services/project";
@@ -39,6 +40,7 @@ const emit = defineEmits<{
 const resolvedText = ref(props.mergeInfo.workspaceText ?? "");
 const saving = ref(false);
 const error = ref<string | null>(null);
+const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 
 const blockResolutions = ref<Map<number, "left" | "right" | "base">>(new Map());
 
@@ -201,10 +203,20 @@ function diffStatsText(diff: FileDiffPayload | null): string {
   if (!diff) return "";
   return `+${diff.stats.additions} -${diff.stats.deletions}`;
 }
+
+function handleMergeTextWheel(event: WheelEvent): void {
+  if (!(event.target instanceof Element)) return;
+  if (!event.target.closest(".merge-block-code, .merge-editor-textarea")) return;
+  handleTextViewerZoomWheel(event);
+}
 </script>
 
 <template>
-  <div class="merge-text-view">
+  <div
+    class="merge-text-view"
+    :style="textViewerZoomStyle"
+    @wheel="handleMergeTextWheel"
+  >
     <div v-if="error" class="merge-action-error">{{ error }}</div>
 
     <div v-if="isManuallyEdited" class="merge-manual-edit-banner">

@@ -147,7 +147,7 @@ onUnmounted(() => {
       <div v-if="error" class="plan-view-error">{{ error }}</div>
       <div v-else-if="loading && !content" class="plan-view-loading">{{ t("common.loading") }}</div>
       <div v-else class="plan-view-markdown">
-        <MarkdownRenderer :content="content" />
+        <MarkdownRenderer :content="content" text-zoom />
       </div>
     </div>
 
@@ -253,7 +253,7 @@ onUnmounted(() => {
 }
 
 .plan-view-markdown :deep(.markdown-body) {
-  font-size: 13px;
+  font-size: calc(13px * var(--text-viewer-font-scale, 1));
   line-height: 1.7;
   max-width: 860px;
   margin: 0 auto;
