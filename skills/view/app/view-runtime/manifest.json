@@ -89,7 +89,7 @@
     },
     {
       "path": "src/components/asset/AssetTextViewer.vue",
-      "bytes": 3981
+      "bytes": 4250
     },
     {
       "path": "src/components/diff/BinaryPreviewHost.vue",
@@ -297,11 +297,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 271412
+      "bytes": 271470
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 264444
+      "bytes": 264507
     },
     {
       "path": "src/services/asset.ts",
@@ -321,7 +321,7 @@
     },
     {
       "path": "src/services/unity.ts",
-      "bytes": 24012
+      "bytes": 24040
     },
     {
       "path": "src/services/unitySerializedProperty.ts",

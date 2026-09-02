@@ -475,6 +475,7 @@ export interface UnityEmbedTextDropEntry {
 }
 
 export interface UnityEmbedTextDropPayload {
+  workspaceRef: WorkspaceRef;
   text: string;
   entries?: UnityEmbedTextDropEntry[];
   title?: string;
