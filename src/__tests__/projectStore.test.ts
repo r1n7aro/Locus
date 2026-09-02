@@ -241,4 +241,45 @@ describe("project store asset scan state", () => {
     expect(store.lastScanStats?.nodesAdded).toBe(2);
     expect(store.scanPhase).toBeNull();
   });
+
+  it("reloads the plugin notice after the focused workspace scope changes", async () => {
+    const store = useProjectStore();
+    unityServiceMocks.checkUnityPlugin.mockResolvedValue({ status: "outdated" });
+
+    focusTestWorkspace("checkout-b", 9, "F:/project-b");
+
+    await vi.waitFor(() => {
+      expect(store.pluginToast).toBe("outdated");
+    });
+    expect(unityServiceMocks.checkUnityPlugin).toHaveBeenCalledWith({
+      checkoutId: "checkout-b",
+      expectedGeneration: 9,
+    });
+  });
+
+  it("keeps an event-driven plugin notice when an older check finishes later", async () => {
+    const store = useProjectStore();
+    let resolveStatus!: (value: { status: "upToDate" }) => void;
+    const pendingStatus = new Promise<{ status: "upToDate" }>((resolve) => {
+      resolveStatus = resolve;
+    });
+    unityServiceMocks.checkUnityPlugin.mockReturnValueOnce(pendingStatus);
+
+    const request = store.checkUnityPlugin();
+    store.handlePluginStatus({ status: "outdated" });
+    resolveStatus({ status: "upToDate" });
+    await request;
+
+    expect(store.pluginToast).toBe("outdated");
+  });
+
+  it("keeps the current plugin notice when a refresh fails", async () => {
+    const store = useProjectStore();
+    unityServiceMocks.checkUnityPlugin.mockRejectedValueOnce(new Error("temporary failure"));
+    store.handlePluginStatus({ status: "outdated" });
+
+    await store.checkUnityPlugin();
+
+    expect(store.pluginToast).toBe("outdated");
+  });
 });

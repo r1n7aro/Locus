@@ -43,9 +43,11 @@ export const useProjectStore = defineStore("project", () => {
   const unityLaunching = computed(() => unityLaunchState.value === "starting");
   let scanInFlight = false;
   let assetStatusRequestSeq = 0;
+  let pluginStatusRevision = 0;
   let unityLaunchPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   let unityLaunchWaitStartedAt = 0;
   const unityConnectionChecksInFlight = new Map<string, Promise<void>>();
+  const pluginStatusChecksInFlight = new Map<string, Promise<void>>();
 
   function requireWorkspaceRef(): projectService.WorkspaceRef {
     const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
@@ -89,6 +91,12 @@ export const useProjectStore = defineStore("project", () => {
     } else {
       notificationStore.clearByOperation(PLUGIN_STATUS_NOTICE_OPERATION);
     }
+  }
+
+  function applyPluginStatus(status: PluginStatus | null) {
+    pluginStatusRevision += 1;
+    const notice = status?.status;
+    setPluginToast(notice === "missing" || notice === "outdated" ? notice : null);
   }
 
   function clearUnityOnlyNotices() {
@@ -377,20 +385,36 @@ export const useProjectStore = defineStore("project", () => {
 
   async function checkUnityPlugin() {
     if (!isUnityProject.value) {
-      setPluginToast(null);
+      applyPluginStatus(null);
       return;
     }
     const workspaceRef = requireWorkspaceRef();
-    try {
-      const ps = await unityService.checkUnityPlugin(workspaceRef);
-      if (isFocusedWorkspaceRef(workspaceRef)) {
-        setPluginToast((ps.status === "missing" || ps.status === "outdated") ? ps.status : null);
+    const requestKey = workspaceRefKey(workspaceRef);
+    const existing = pluginStatusChecksInFlight.get(requestKey);
+    if (existing) return existing;
+    const requestRevision = pluginStatusRevision;
+    const request = (async () => {
+      try {
+        const status = await unityService.checkUnityPlugin(workspaceRef);
+        if (
+          requestRevision === pluginStatusRevision
+          && isFocusedWorkspaceRef(workspaceRef)
+        ) {
+          applyPluginStatus(status);
+        }
+      } catch (error) {
+        if (isFocusedWorkspaceRef(workspaceRef)) {
+          console.warn("check_unity_plugin failed:", error);
+        }
       }
-    } catch {
-      if (isFocusedWorkspaceRef(workspaceRef)) {
-        setPluginToast(null);
+    })();
+    pluginStatusChecksInFlight.set(requestKey, request);
+    void request.then(() => {
+      if (pluginStatusChecksInFlight.get(requestKey) === request) {
+        pluginStatusChecksInFlight.delete(requestKey);
       }
-    }
+    });
+    return request;
   }
 
   async function installPlugin() {
@@ -510,7 +534,8 @@ export const useProjectStore = defineStore("project", () => {
     scanInFlight = false;
     assetStatusRequestSeq += 1;
     unityConnectionChecksInFlight.clear();
-    setPluginToast(null);
+    pluginStatusChecksInFlight.clear();
+    applyPluginStatus(null);
     pluginInstalling.value = false;
     resetUnityLaunchState();
   }
@@ -523,7 +548,8 @@ export const useProjectStore = defineStore("project", () => {
     lastScanStats.value = null;
     scanInFlight = false;
     unityConnectionChecksInFlight.clear();
-    setPluginToast(null);
+    pluginStatusChecksInFlight.clear();
+    applyPluginStatus(null);
     clearUnityOnlyNotices();
     pluginInstalling.value = false;
     if (workingDir.value) void checkCurrentExtraWorkdirs();
@@ -534,8 +560,9 @@ export const useProjectStore = defineStore("project", () => {
       const scope = workspaceContextStore.focusedWorkspaceRef;
       return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
     },
-    (_nextScope, previousScope) => {
+    (nextScope, previousScope) => {
       if (previousScope !== undefined) resetFocusedWorkspaceState();
+      if (nextScope && isUnityProject.value) void checkUnityPlugin();
     },
     { flush: "sync" },
   );
@@ -571,12 +598,7 @@ export const useProjectStore = defineStore("project", () => {
 
   function handlePluginStatus(status: PluginStatus) {
     if (!isUnityProject.value) return;
-    const s = status.status;
-    if (s === "missing" || s === "outdated") {
-      setPluginToast(s);
-    } else {
-      setPluginToast(null);
-    }
+    applyPluginStatus(status);
   }
 
   return {
