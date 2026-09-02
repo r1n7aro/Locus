@@ -1229,7 +1229,14 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       intentMeta: userIntent,
     };
     const submittedUserMessage: EmbeddedSubmittedUserMessage = {
-      draft: buildUserMessageDraft(pendingUserMessage),
+      // The optimistic transcript uses displayText, which intentionally
+      // reduces local-file attachments to their names. Build the recoverable
+      // draft from the full request so an interrupted run restores attachment
+      // objects and absolute paths.
+      draft: buildUserMessageDraft({
+        ...pendingUserMessage,
+        content: request.text,
+      }),
       ownerKey: toValue(options.sessionKey),
     };
     state.cancelPendingLaunch = false;

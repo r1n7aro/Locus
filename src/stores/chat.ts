@@ -632,7 +632,7 @@ export const useChatStore = defineStore("chat", () => {
 
   function failedUserMessageFromPayload(
     id: string,
-    displayText: string,
+    text: string,
     images: ImageAttachment[],
     assetRefs: AssetRefAttachment[],
     userIntent: UserIntentMeta | null | undefined,
@@ -640,7 +640,7 @@ export const useChatStore = defineStore("chat", () => {
     return {
       id,
       role: "user",
-      content: displayText,
+      content: text,
       createdAt: Date.now() / 1000,
       images: images.length > 0 ? images : undefined,
       assetRefs: assetRefs.length > 0 ? assetRefs : undefined,
@@ -2701,7 +2701,7 @@ export const useChatStore = defineStore("chat", () => {
       });
       restoreDraftFromFailedUserMessage(failedUserMessageFromPayload(
         mergeGroupId,
-        displayText,
+        text,
         images,
         assetRefs,
         userIntent,
@@ -2837,7 +2837,11 @@ export const useChatStore = defineStore("chat", () => {
     const pendingUserMessage: ChatMessage = {
       id: pendingMessageId,
       role: "user",
-      content: displayText,
+      // Keep the full composer payload on the optimistic message. Structured
+      // attachment blocks are hidden by the transcript renderer, and they are
+      // required to rebuild real attachments if the run is interrupted before
+      // the backend persists the user message.
+      content: text,
       createdAt: Date.now() / 1000,
       images: images.length > 0 ? images : undefined,
       assetRefs: assetRefs.length > 0 ? assetRefs : undefined,

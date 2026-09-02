@@ -624,6 +624,14 @@ describe("embedded chat session distribution", () => {
 
   it("returns a backend-revoked prompt to its composer", async () => {
     mocks.chat.mockResolvedValueOnce({ sessionId: "revoked-session", runId: "revoked-run" });
+    const promptText = [
+      "revoked prompt",
+      "",
+      "<locus-local-files>",
+      "These are local paths supplied by drag and drop.",
+      "- file: `E:/cache/revoked-reference.psd`; type: psd",
+      "</locus-local-files>",
+    ].join("\n");
 
     let session!: ReturnType<typeof useEmbeddedChatSession>;
     const Root = defineComponent({
@@ -632,7 +640,10 @@ describe("embedded chat session distribution", () => {
           sessionKey: "revoked-draft-pane",
           workspaceRef: { checkoutId: "checkout-revoked", expectedGeneration: 10 },
           selectedModelId: "model-a",
-          buildRequest: (input: string) => ({ text: input, displayText: input }),
+          buildRequest: (input: string) => ({
+            text: promptText,
+            displayText: `${input}\n\nrevoked-reference.psd`,
+          }),
         });
         return () => h("div");
       },
@@ -678,6 +689,13 @@ describe("embedded chat session distribution", () => {
 
     expect(session.messages.value).toEqual([]);
     expect(session.restoredComposerDraft.value?.text).toBe("revoked prompt");
+    expect(session.restoredComposerDraft.value?.localFiles).toEqual([
+      expect.objectContaining({
+        path: "E:/cache/revoked-reference.psd",
+        isDir: false,
+        typeLabel: "psd",
+      }),
+    ]);
     app.unmount();
   });
 

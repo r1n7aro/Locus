@@ -2446,14 +2446,22 @@ describe("chat session panel state", () => {
     const chatStore = useChatStore();
     const uiStore = useUiStore();
     sessionServiceMocks.chat.mockRejectedValueOnce(new Error("missing token"));
+    const promptText = [
+      "visible text",
+      "",
+      "<locus-local-files>",
+      "These are local paths supplied by drag and drop.",
+      "- file: `E:/cache/Foo Notes.txt`; type: txt",
+      "</locus-local-files>",
+    ].join("\n");
 
     await chatStore.sendMessage(
-      "prompt text",
+      promptText,
       [{ data: "data:image/png;base64,abc", mimeType: "image/png" }],
       [{ kind: "asset", path: "Assets/Foo.prefab" }],
       {
         mode: "plan",
-        displayText: "visible text",
+        displayText: "visible text\n\nFoo Notes.txt",
         userIntent: {
           kind: "user_intent_v1",
           mode: "plan",
@@ -2466,6 +2474,11 @@ describe("chat session panel state", () => {
     expect(draft?.text).toBe("visible text");
     expect(draft?.images).toHaveLength(1);
     expect(draft?.assetRefs[0]).toMatchObject({ kind: "asset", path: "Assets/Foo.prefab" });
+    expect(draft?.localFiles).toEqual([expect.objectContaining({
+      path: "E:/cache/Foo Notes.txt",
+      isDir: false,
+      typeLabel: "txt",
+    })]);
     expect(draft?.intent.mode).toBe("plan");
     expect(draft?.intent.skills).toEqual([{ dirName: "view", source: "project", name: "View" }]);
     expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
@@ -2503,6 +2516,14 @@ describe("chat session panel state", () => {
     const chatStore = useChatStore();
     const uiStore = useUiStore();
     sessionServiceMocks.chat.mockResolvedValueOnce({ sessionId: "s1", runId: "run-cancel-early" });
+    const promptText = [
+      "cancelled before persistence",
+      "",
+      "<locus-local-files>",
+      "These are local paths supplied by drag and drop.",
+      "- file: `E:/cache/interrupted-input.psd`; type: psd",
+      "</locus-local-files>",
+    ].join("\n");
     sessionServiceMocks.listSessions.mockResolvedValue([
       {
         id: "s1",
@@ -2514,8 +2535,10 @@ describe("chat session panel state", () => {
       },
     ]);
 
-    await chatStore.sendMessage("cancelled before persistence");
-    expect(chatStore.messages[0]?.content).toBe("cancelled before persistence");
+    await chatStore.sendMessage(promptText, [], [], {
+      displayText: "cancelled before persistence\n\ninterrupted-input.psd",
+    });
+    expect(chatStore.messages[0]?.content).toBe(promptText);
 
     chatStore.handleStreamEvent({
       runId: "run-cancel-early",
@@ -2526,6 +2549,13 @@ describe("chat session panel state", () => {
     await vi.waitFor(() => {
       expect(uiStore.pendingChatPrefill?.draft?.text).toBe("cancelled before persistence");
     });
+    expect(uiStore.pendingChatPrefill?.draft?.localFiles).toEqual([
+      expect.objectContaining({
+        path: "E:/cache/interrupted-input.psd",
+        isDir: false,
+        typeLabel: "psd",
+      }),
+    ]);
     expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
     expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
     expect(chatStore.messages).toEqual([]);
@@ -2943,7 +2973,7 @@ describe("chat session panel state", () => {
     );
 
     expect(chatStore.activeQueuedFollowUp).toBeNull();
-    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("queued visible");
+    expect(uiStore.pendingChatPrefill?.draft?.text).toBe("queued prompt");
     expect(uiStore.pendingChatPrefill?.sessionId).toBe("s1");
     expect(uiStore.pendingChatPrefill?.requireEmptyComposer).toBe(true);
     expect(uiStore.pendingChatPrefill?.draft?.assetRefs[0]).toMatchObject({
