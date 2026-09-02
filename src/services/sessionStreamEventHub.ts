@@ -1,5 +1,6 @@
-import type { StreamEvent } from "../types";
+import type { AsyncTaskUpdatedEvent, StreamEvent } from "../types";
 import type { RoutedWorkspaceEvent, WorkspaceRef } from "./project";
+import type { SessionExecutionStateChanged } from "./sessionExecutionState";
 
 export type SessionStreamEventSource =
   | { kind: "legacy" }
@@ -30,6 +31,28 @@ const pendingEventsBySessionId = new Map<string, SessionStreamEventDispatch[]>()
 const MAX_PENDING_SESSION_COUNT = 64;
 const MAX_PENDING_EVENTS_PER_SESSION = 512;
 const MAX_BOUND_SESSION_COUNT = 2048;
+
+export type SessionAsyncTaskUpdateListener = (update: AsyncTaskUpdatedEvent) => void;
+
+interface SessionAsyncTaskUpdateConsumerSubscription {
+  resolveConsumer: (update: AsyncTaskUpdatedEvent) => object | null;
+  listener: SessionAsyncTaskUpdateListener;
+}
+
+const asyncTaskUpdateListeners = new Set<SessionAsyncTaskUpdateListener>();
+const asyncTaskUpdateConsumerSubscriptions = new Set<SessionAsyncTaskUpdateConsumerSubscription>();
+const boundAsyncTaskSessionIds = new Map<string, true>();
+const pendingAsyncTaskUpdatesBySessionId = new Map<string, AsyncTaskUpdatedEvent[]>();
+const MAX_PENDING_ASYNC_TASK_UPDATES_PER_SESSION = 128;
+
+export type SessionExecutionStateListener = (update: SessionExecutionStateChanged) => void;
+
+interface SessionExecutionStateConsumerSubscription {
+  resolveConsumer: (update: SessionExecutionStateChanged) => object | null;
+  listener: SessionExecutionStateListener;
+}
+
+const executionStateConsumerSubscriptions = new Set<SessionExecutionStateConsumerSubscription>();
 
 function rememberPendingDispatch(
   dispatch: SessionStreamEventDispatch,
@@ -81,6 +104,107 @@ export function publishSessionStreamEvent(dispatch: SessionStreamEventDispatch):
 export function subscribeSessionStreamEvents(listener: SessionStreamEventListener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+function rememberPendingAsyncTaskUpdate(
+  update: AsyncTaskUpdatedEvent,
+  options: { includeBound?: boolean } = {},
+): void {
+  const sessionId = update.sessionId.trim();
+  if (!sessionId || (!options.includeBound && boundAsyncTaskSessionIds.has(sessionId))) return;
+  const pending = pendingAsyncTaskUpdatesBySessionId.get(sessionId) ?? [];
+  pending.push(update);
+  if (pending.length > MAX_PENDING_ASYNC_TASK_UPDATES_PER_SESSION) {
+    pending.splice(0, pending.length - MAX_PENDING_ASYNC_TASK_UPDATES_PER_SESSION);
+  }
+  pendingAsyncTaskUpdatesBySessionId.delete(sessionId);
+  pendingAsyncTaskUpdatesBySessionId.set(sessionId, pending);
+  if (pendingAsyncTaskUpdatesBySessionId.size > MAX_PENDING_SESSION_COUNT) {
+    const oldestSessionId = pendingAsyncTaskUpdatesBySessionId.keys().next().value as string | undefined;
+    if (oldestSessionId && oldestSessionId !== sessionId) {
+      pendingAsyncTaskUpdatesBySessionId.delete(oldestSessionId);
+    }
+  }
+}
+
+/**
+ * Fans out background task lifecycle updates to every mounted representation
+ * of the owning session. The app bootstrap remains the sole Tauri listener;
+ * scoped editors consume updates through this hub instead of the active
+ * legacy-chat projection.
+ */
+export function publishSessionAsyncTaskUpdate(update: AsyncTaskUpdatedEvent): void {
+  rememberPendingAsyncTaskUpdate(update);
+  for (const listener of [...asyncTaskUpdateListeners]) listener(update);
+  const deliveredConsumers = new Set<object>();
+  for (const subscription of [...asyncTaskUpdateConsumerSubscriptions]) {
+    const consumer = subscription.resolveConsumer(update);
+    if (!consumer || deliveredConsumers.has(consumer)) continue;
+    deliveredConsumers.add(consumer);
+    subscription.listener(update);
+  }
+  const sessionId = update.sessionId.trim();
+  if (deliveredConsumers.size === 0 && boundAsyncTaskSessionIds.has(sessionId)) {
+    rememberPendingAsyncTaskUpdate(update, { includeBound: true });
+  }
+}
+
+export function subscribeSessionAsyncTaskUpdates(
+  listener: SessionAsyncTaskUpdateListener,
+): () => void {
+  asyncTaskUpdateListeners.add(listener);
+  return () => asyncTaskUpdateListeners.delete(listener);
+}
+
+export function subscribeSessionAsyncTaskUpdateConsumer(
+  resolveConsumer: SessionAsyncTaskUpdateConsumerSubscription["resolveConsumer"],
+  listener: SessionAsyncTaskUpdateListener,
+): () => void {
+  const subscription = { resolveConsumer, listener };
+  asyncTaskUpdateConsumerSubscriptions.add(subscription);
+  return () => asyncTaskUpdateConsumerSubscriptions.delete(subscription);
+}
+
+/**
+ * Marks a durable session as owned by a reducer and returns task updates that
+ * arrived while its editor was mounting or being reparented.
+ */
+export function bindSessionAsyncTaskUpdateConsumer(
+  sessionId: string,
+): AsyncTaskUpdatedEvent[] {
+  const normalizedSessionId = sessionId.trim();
+  if (!normalizedSessionId) return [];
+  boundAsyncTaskSessionIds.delete(normalizedSessionId);
+  boundAsyncTaskSessionIds.set(normalizedSessionId, true);
+  if (boundAsyncTaskSessionIds.size > MAX_BOUND_SESSION_COUNT) {
+    const oldestSessionId = boundAsyncTaskSessionIds.keys().next().value as string | undefined;
+    if (oldestSessionId && oldestSessionId !== normalizedSessionId) {
+      boundAsyncTaskSessionIds.delete(oldestSessionId);
+    }
+  }
+  const pending = pendingAsyncTaskUpdatesBySessionId.get(normalizedSessionId) ?? [];
+  pendingAsyncTaskUpdatesBySessionId.delete(normalizedSessionId);
+  return pending;
+}
+
+/** Publishes persisted model/effort changes to every mounted pane for that session. */
+export function publishSessionExecutionState(update: SessionExecutionStateChanged): void {
+  const deliveredConsumers = new Set<object>();
+  for (const subscription of [...executionStateConsumerSubscriptions]) {
+    const consumer = subscription.resolveConsumer(update);
+    if (!consumer || deliveredConsumers.has(consumer)) continue;
+    deliveredConsumers.add(consumer);
+    subscription.listener(update);
+  }
+}
+
+export function subscribeSessionExecutionStateConsumer(
+  resolveConsumer: SessionExecutionStateConsumerSubscription["resolveConsumer"],
+  listener: SessionExecutionStateListener,
+): () => void {
+  const subscription = { resolveConsumer, listener };
+  executionStateConsumerSubscriptions.add(subscription);
+  return () => executionStateConsumerSubscriptions.delete(subscription);
 }
 
 /**

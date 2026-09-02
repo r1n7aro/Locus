@@ -71,6 +71,8 @@ import {
   type RoutedWorkspaceEvent,
 } from "../services/project";
 import {
+  publishSessionAsyncTaskUpdate,
+  publishSessionExecutionState,
   publishSessionStreamEvent,
   workspaceStreamEventSource,
 } from "../services/sessionStreamEventHub";
@@ -663,6 +665,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
           payload.effort,
           payload.fastMode,
         );
+        publishSessionExecutionState(payload);
       },
     );
     unlistenUnity = null;
@@ -678,7 +681,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     });
     unlistenAsyncTaskUpdated = await runtime.subscribe<AsyncTaskUpdatedEvent>(
       "async-task-updated",
-      (payload) => chatStore.applyAsyncTaskUpdate(payload),
+      (payload) => {
+        chatStore.applyAsyncTaskUpdate(payload);
+        publishSessionAsyncTaskUpdate(payload);
+      },
     );
     unlistenKnowledgeChanged = await runtime.subscribe<RoutedWorkspaceEvent>(
       WORKSPACE_EVENT_NAME,

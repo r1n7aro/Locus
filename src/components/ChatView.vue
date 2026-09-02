@@ -12,7 +12,7 @@ import {
   showInFolder,
 } from "../services/unity";
 // undoPreview removed — undo UI moved to ChatChangesPanel
-import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, ManagedLocalFileAttachment, SkillManifest, UserIntentMeta, SessionContextExportRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType } from "../types";
+import type { ChatComposerSendPayload, ChatMessage, AgentInfo, TokenUsage, ModelOption, PendingQuestion, PendingToolConfirm, EffortLevel, SessionSummary, AssetDbScanEvent, ScanStats, ImageAttachment, AssetRefAttachment, ManagedLocalFileAttachment, SkillManifest, UserIntentMeta, SessionContextExportRequest, CodexTransportMode, AssistantRenderPart, UnityConnectionStatus, KnowledgeDocumentType, SessionTurnPreview } from "../types";
 import type { ChangedFile, ToolCallDisplay } from "../types";
 import ModelEffortSelector from "./ModelEffortSelector.vue";
 import SessionPanel from "./chat/SessionPanel.vue";
@@ -37,8 +37,14 @@ import type { WorkspaceRef } from "../services/project";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { broadcastPlanApprovalResolved, openPlanViewWindow } from "../services/planViewWindow";
 import { openContextCompactionWindow } from "../services/contextCompactionWindow";
-import type { LocusAssetInspectorWindowPayload } from "../services/locusAssetInspectorWindow";
-import { openLocusAssetInspector } from "../composables/useLocusAssetInspectorPanel";
+import {
+  openLocusAssetInspectorWindow,
+  type LocusAssetInspectorWindowPayload,
+} from "../services/locusAssetInspectorWindow";
+import {
+  canFitEmbeddedLocusAssetInspectorPanel,
+  openLocusAssetInspectorPanel,
+} from "../composables/useLocusAssetInspectorPanel";
 import { normalizeAppError } from "../services/errors";
 import { knowledgeRevealTarget } from "../services/knowledge";
 import { t } from "../i18n";
@@ -135,8 +141,8 @@ const { state: shortcutState } = useKeyboardShortcuts();
 const { state: chatInputSettings } = useChatInputSettings();
 const { state: displaySettings } = useDisplaySettings();
 const {
-  openDocument: openKnowledgeDocument,
-  openInKnowledge: openKnowledgeDocumentInKnowledge,
+  openDocument: openLegacyKnowledgeDocument,
+  openInKnowledge: openLegacyKnowledgeDocumentInKnowledge,
 } = useKnowledgeDocumentOpen();
 const { state: knowledgeAccessState, setMode: setKnowledgeAccessMode } = useKnowledgeAccessMode();
 
@@ -144,6 +150,7 @@ const planModeActive = computed(() => (
   props.scopedSession ? !!props.planModeActive : chatStore.activeSessionPlanMode
 ));
 const isViewingSubagent = computed(() => {
+  if (props.scopedSession) return !!props.isViewingSubagent;
   if (!props.activeSessionId) return false;
   const session = props.sessions.find(s => s.id === props.activeSessionId);
   return !!session?.parentSessionId;
@@ -198,15 +205,25 @@ function toggleInputControlsCollapsed() {
   }, INPUT_CONTROLS_SWITCH_VISIBLE_MS);
 }
 
-const showInlineDiff = computed(() =>
-  !props.scopedSession
-  && (
-    !!chatChangesStore.inlineDiffPayload
-    || chatChangesStore.inlineDiffLoading
-    || !!chatChangesStore.inlineDiffError
-  ),
-);
-const hasPanelToggleRow = computed(() => !props.scopedSession && chatChangesStore.hasAnyChanges);
+const changesSessionState = computed(() => (
+  chatChangesStore.sessionState(props.activeSessionId)
+));
+const inlineDiffState = computed(() => (
+  chatChangesStore.inlineDiffStateForSession(props.activeSessionId)
+));
+const inlineDiffPayload = computed(() => inlineDiffState.value?.payload ?? null);
+const inlineDiffLoading = computed(() => inlineDiffState.value?.loading ?? false);
+const inlineDiffError = computed(() => inlineDiffState.value?.error ?? null);
+const inlineDiffRequestKey = computed(() => inlineDiffState.value?.requestKey ?? null);
+const currentChangesPanelVisible = computed(() => (
+  changesSessionState.value?.panelVisible ?? false
+));
+const showInlineDiff = computed(() => (
+  !!inlineDiffPayload.value || inlineDiffLoading.value || !!inlineDiffError.value
+));
+const hasPanelToggleRow = computed(() => (
+  chatChangesStore.hasChangesForSession(props.activeSessionId)
+));
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
 const chatDiffTabOptions = computed(() => [
@@ -214,16 +231,14 @@ const chatDiffTabOptions = computed(() => [
   { value: "text", label: t("diff.tabs.text") },
 ]);
 
-watch(() => chatChangesStore.inlineDiffLoading, (loading) => {
-  if (loading) diffProgress.reset(chatChangesStore.inlineDiffRequestKey);
-});
-
 async function onChatDiffLfsPulled() {
-  const payload = chatChangesStore.inlineDiffPayload;
+  const payload = inlineDiffPayload.value;
   if (!payload) return;
   try {
     const updated = await refetchDiffByKey(payload.key);
-    if (updated) chatChangesStore.inlineDiffPayload = updated;
+    if (updated && inlineDiffState.value?.payload?.key === payload.key) {
+      inlineDiffState.value.payload = updated;
+    }
   } catch (e) {
     console.error("[ChatView] refetch after LFS pull failed:", e);
   }
@@ -290,11 +305,14 @@ const props = defineProps<{
   contentStartInset?: number;
   /** Uses pane-owned session state while preserving the standard Chat surface. */
   scopedSession?: boolean;
+  isViewingSubagent?: boolean;
   sessionSurfaceKey?: string;
   queuedFollowUp?: ScopedQueuedFollowUp | null;
   compactQueued?: boolean;
   planModeActive?: boolean;
+  currentRunId?: string | null;
   composerValue?: string;
+  composerDraftStateKey?: string;
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   managedNativeDrops?: boolean;
@@ -307,7 +325,32 @@ const props = defineProps<{
     assistantMessageId: string,
     acceptDirty: boolean,
   ) => Promise<boolean>;
+  restoreComposerDraft?: (draft: UserMessageDraft) => void | Promise<void>;
+  forkFromMessage?: (messageId: string) => void | Promise<unknown>;
+  exitPlanMode?: () => void | Promise<unknown>;
+  sessionHistoryLoading?: boolean;
+  sessionHistoryHasMore?: boolean;
+  loadOlderHistory?: () => Promise<boolean>;
+  sessionUserMessageIds?: string[];
+  loadSessionTurnPreview?: (messageId: string) => Promise<SessionTurnPreview | null>;
+  loadSessionHistoryThroughMessage?: (messageId: string) => Promise<boolean>;
 }>();
+
+const turnNavigationUserMessageIds = computed(() => (
+  props.scopedSession ? props.sessionUserMessageIds ?? [] : chatStore.sessionUserMessageIds
+));
+const turnNavigationLoadPreview = computed(() => (
+  props.scopedSession ? props.loadSessionTurnPreview : chatStore.loadSessionTurnPreview
+));
+const turnNavigationLoadTurn = computed(() => (
+  props.scopedSession
+    ? props.loadSessionHistoryThroughMessage
+    : chatStore.loadSessionHistoryThroughMessage
+));
+
+watch(inlineDiffLoading, (loading) => {
+  if (loading) diffProgress.reset(inlineDiffRequestKey.value);
+});
 
 const chatContentStyle = computed(() => ({
   paddingLeft: `${Math.max(0, props.contentStartInset ?? 0)}px`,
@@ -345,6 +388,9 @@ const emit = defineEmits<{
   ignoreKnowledgeProposal: [proposalId: string];
   updateComposerValue: [value: string];
   openThinking: [content: string];
+  requestPlanMode: [active: boolean];
+  openKnowledgeDocument: [request: { docType: KnowledgeDocumentType; path: string; workspaceRef: WorkspaceRef }];
+  openKnowledgeDocumentInKnowledge: [request: { docType: KnowledgeDocumentType; path: string; workspaceRef: WorkspaceRef }];
   selectSession: [id: string];
   newChat: [request: { source: NewChatRequestSource }];
   renameSession: [id: string, title: string];
@@ -403,6 +449,35 @@ function closeLightbox() {
   lightboxSrc.value = "";
 }
 
+/**
+ * Resource actions belong to the Chat surface that rendered the reference.
+ * Scoped surfaces never inherit the globally focused checkout: a missing
+ * workspace binding disables the action instead of targeting another pane.
+ */
+function resourceWorkspaceRef(): WorkspaceRef | null {
+  if (props.workspaceRef) return props.workspaceRef;
+  if (props.scopedSession) return null;
+  return projectStore.requireWorkspaceRef();
+}
+
+const resourceActionsAvailable = computed(() => (
+  !props.scopedSession || !!props.workspaceRef
+));
+
+async function openLocusAssetInspector(
+  payload: LocusAssetInspectorWindowPayload,
+  mode: "embedded" | "window" | "auto" = "auto",
+): Promise<boolean> {
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return false;
+  const preferEmbedded = mode === "embedded"
+    || (mode === "auto" && canFitEmbeddedLocusAssetInspectorPanel());
+  if (preferEmbedded && openLocusAssetInspectorPanel(payload, workspaceRef)) {
+    return true;
+  }
+  return openLocusAssetInspectorWindow(workspaceRef, payload);
+}
+
 type AssetRefContextMenuTarget =
   | {
       kind: "asset";
@@ -457,7 +532,7 @@ function isUnityAssetPath(filePath: string) {
 }
 
 function shouldSelectUnityAsset(filePath: string) {
-  return isUnityAssetPath(filePath) && props.unityConnected;
+  return resourceActionsAvailable.value && isUnityAssetPath(filePath) && props.unityConnected;
 }
 
 function shouldOpenUnityAssetInspector(e: MouseEvent, filePath: string) {
@@ -468,7 +543,8 @@ function shouldOpenUnityAssetInspector(e: MouseEvent, filePath: string) {
 }
 
 function shouldUseUnitySceneObjectRef(scenePath: string, objectPath: string) {
-  return /\.unity$/i.test(scenePath.replace(/\\/g, "/"))
+  return resourceActionsAvailable.value
+    && /\.unity$/i.test(scenePath.replace(/\\/g, "/"))
     && objectPath.trim().length > 0
     && props.unityConnected;
 }
@@ -494,10 +570,13 @@ const assetRefContextIsKnowledge = computed(() =>
 
 const assetRefContextCanOpenInEditor = computed(() => {
   const target = assetRefCtxMenu.value?.target;
-  return !!target && !(target.kind === "knowledge" || (target.kind === "file" && target.entryKind === "folder"));
+  return resourceActionsAvailable.value
+    && !!target
+    && !(target.kind === "knowledge" || (target.kind === "file" && target.entryKind === "folder"));
 });
 
 const assetRefContextCanOpenLocusInspector = computed(() => {
+  if (!resourceActionsAvailable.value) return false;
   const target = assetRefCtxMenu.value?.target;
   if (!target) return false;
   if (target.kind === "sceneObject") {
@@ -830,7 +909,14 @@ function isInsidePassiveMarkdownUnityPreview(target: Element): boolean {
 }
 
 function handleKnowledgeRefClick(docType: KnowledgeDocumentType, path: string) {
-  void openKnowledgeDocument(docType, path).catch((error) => {
+  if (props.scopedSession) {
+    const workspaceRef = resourceWorkspaceRef();
+    if (workspaceRef) {
+      emit("openKnowledgeDocument", { docType, path, workspaceRef });
+    }
+    return;
+  }
+  void openLegacyKnowledgeDocument(docType, path).catch((error) => {
     const err = normalizeAppError(error);
     notificationStore.addNotice("warning", t("chat.knowledgeRef.openFailed", err.message), {
       code: err.code,
@@ -841,14 +927,18 @@ function handleKnowledgeRefClick(docType: KnowledgeDocumentType, path: string) {
 }
 
 function handleUnityAssetInspectorClick(filePath: string) {
-  openUnityAssetInspector(projectStore.requireWorkspaceRef(), filePath).catch((e: unknown) => {
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return;
+  openUnityAssetInspector(workspaceRef, filePath).catch((e: unknown) => {
     console.warn("openUnityAssetInspector failed:", e);
     handleFileRefClick(filePath);
   });
 }
 
 function handleUnitySceneObjectInspectorClick(scenePath: string, objectPath: string) {
-  openUnitySceneObjectInspector(projectStore.requireWorkspaceRef(), scenePath, objectPath).catch((e: unknown) => {
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return;
+  openUnitySceneObjectInspector(workspaceRef, scenePath, objectPath).catch((e: unknown) => {
     console.warn("openUnitySceneObjectInspector failed:", e);
     notifyUnitySceneObjectError(e, scenePath, objectPath);
   });
@@ -860,7 +950,9 @@ function handleUnitySceneObjectClick(scenePath: string, objectPath: string) {
 
 function selectUnitySceneObjectRef(scenePath: string, objectPath: string) {
   if (!shouldUseUnitySceneObjectRef(scenePath, objectPath)) return;
-  selectUnitySceneObject(projectStore.requireWorkspaceRef(), scenePath, objectPath).catch((e: unknown) => {
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return;
+  selectUnitySceneObject(workspaceRef, scenePath, objectPath).catch((e: unknown) => {
     console.warn("selectUnitySceneObject failed:", e);
     notifyUnitySceneObjectError(e, scenePath, objectPath);
   });
@@ -885,7 +977,9 @@ function handleFileRefClick(filePath: string) {
     runAssetRefClickAction({ kind: "asset", assetPath: filePath, entryKind: "file" });
     return;
   }
-  openFileExternal(filePath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return;
+  openFileExternal(filePath, workspaceRef).catch((e: unknown) => console.warn("openFileExternal failed:", e));
 }
 
 function handleFolderRefClick(folderPath: string) {
@@ -893,7 +987,9 @@ function handleFolderRefClick(folderPath: string) {
     runAssetRefClickAction({ kind: "asset", assetPath: folderPath, entryKind: "folder" });
     return;
   }
-  showInFolder(folderPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return;
+  showInFolder(folderPath, workspaceRef).catch((e: unknown) => console.warn("showInFolder failed:", e));
 }
 
 type AssetRefClickTarget =
@@ -908,27 +1004,29 @@ function assetRefInspectorPayload(target: AssetRefClickTarget): LocusAssetInspec
 
 /** Pre-inspector click behavior, also the fallback when the inspector cannot open. */
 function legacyAssetRefClick(target: AssetRefClickTarget) {
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return;
   if (target.kind === "sceneObject") {
     selectUnitySceneObjectRef(target.scenePath, target.objectPath);
     return;
   }
   if (target.entryKind === "folder") {
     if (shouldSelectUnityAsset(target.assetPath)) {
-      selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+      selectUnityAsset(workspaceRef, target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
       return;
     }
-    showInFolder(target.assetPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
+    showInFolder(target.assetPath, workspaceRef).catch((e: unknown) => console.warn("showInFolder failed:", e));
     return;
   }
   if (canOpenInEditor(target.assetPath)) {
-    openFileExternal(target.assetPath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
+    openFileExternal(target.assetPath, workspaceRef).catch((e: unknown) => console.warn("openFileExternal failed:", e));
     return;
   }
   if (shouldSelectUnityAsset(target.assetPath)) {
-    selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
+    selectUnityAsset(workspaceRef, target.assetPath).catch((e: unknown) => console.warn("selectUnityAsset failed:", e));
     return;
   }
-  openFileExternal(target.assetPath).catch((e: unknown) => console.warn("openFileExternal failed:", e));
+  openFileExternal(target.assetPath, workspaceRef).catch((e: unknown) => console.warn("openFileExternal failed:", e));
 }
 
 function openAssetRefInUnityInspector(target: AssetRefClickTarget) {
@@ -936,7 +1034,9 @@ function openAssetRefInUnityInspector(target: AssetRefClickTarget) {
     handleUnitySceneObjectInspectorClick(target.scenePath, target.objectPath);
     return;
   }
-  openUnityAssetInspector(projectStore.requireWorkspaceRef(), target.assetPath).catch((e: unknown) => {
+  const workspaceRef = resourceWorkspaceRef();
+  if (!workspaceRef) return;
+  openUnityAssetInspector(workspaceRef, target.assetPath).catch((e: unknown) => {
     console.warn("openUnityAssetInspector failed:", e);
     // Fall back to the pre-inspector behavior instead of handleFileRefClick,
     // which would re-enter runAssetRefClickAction and loop on repeat failure.
@@ -954,7 +1054,9 @@ function runAssetRefClickAction(target: AssetRefClickTarget) {
   }
   if (action === "fileBrowser") {
     const revealPath = target.kind === "sceneObject" ? target.scenePath : target.assetPath;
-    showInFolder(revealPath).catch((e: unknown) => console.warn("showInFolder failed:", e));
+    const workspaceRef = resourceWorkspaceRef();
+    if (!workspaceRef) return;
+    showInFolder(revealPath, workspaceRef).catch((e: unknown) => console.warn("showInFolder failed:", e));
     return;
   }
   if (
@@ -1024,7 +1126,9 @@ async function doAssetRefOpenInEditor() {
   if (!target || !assetRefContextCanOpenInEditor.value) return;
   closeAssetRefContextMenu();
   try {
-    await openFileExternal(target.filePath);
+    const workspaceRef = resourceWorkspaceRef();
+    if (!workspaceRef) return;
+    await openFileExternal(target.filePath, workspaceRef);
   } catch (error) {
     console.warn("openFileExternal failed:", error);
     notifyAssetRefContextMenuError(error, "assetRefOpenInEditor", "Failed to open file");
@@ -1043,14 +1147,18 @@ async function doAssetRefOpenInLocusInspector(mode: "embedded" | "window" = "emb
         objectPath: target.objectPath,
       }, mode);
       if (!opened) {
-        await openUnitySceneObjectInspector(projectStore.requireWorkspaceRef(), target.scenePath, target.objectPath);
+        const workspaceRef = resourceWorkspaceRef();
+        if (!workspaceRef) return;
+        await openUnitySceneObjectInspector(workspaceRef, target.scenePath, target.objectPath);
       }
       return;
     }
     if (target.kind !== "asset") return;
     const opened = await openLocusAssetInspector({ assetPath: target.assetPath }, mode);
     if (!opened) {
-      await openFileExternal(target.filePath);
+      const workspaceRef = resourceWorkspaceRef();
+      if (!workspaceRef) return;
+      await openFileExternal(target.filePath, workspaceRef);
     }
   } catch (error) {
     console.warn("openLocusAssetInspector failed:", error);
@@ -1063,7 +1171,7 @@ function doAssetRefOpenInLocusInspectorWindow() {
 }
 
 async function openInlineDiffInWindow() {
-  const payload = chatChangesStore.inlineDiffPayload;
+  const payload = inlineDiffPayload.value;
   if (!payload) return;
   try {
     await openChatDiffReviewWindow({ payload });
@@ -1074,6 +1182,15 @@ async function openInlineDiffInWindow() {
       operation: "openChatDiffReviewWindow",
     });
   }
+}
+
+function openInlineDiffFileExternal() {
+  const payload = inlineDiffPayload.value;
+  const workspaceRef = resourceWorkspaceRef();
+  if (!payload || !workspaceRef) return;
+  void openFileExternal(payload.filePath, workspaceRef).catch((error: unknown) => {
+    console.warn("openFileExternal failed:", error);
+  });
 }
 
 function handleContentPointerDown(event: PointerEvent) {
@@ -1115,14 +1232,18 @@ async function doAssetRefShowInFolder() {
   closeAssetRefContextMenu();
   try {
     if (target.kind === "knowledge") {
+      const workspaceRef = resourceWorkspaceRef();
+      if (!workspaceRef) return;
       await knowledgeRevealTarget({
         kind: "document",
         docType: target.docType,
         path: target.path,
-      }, projectStore.requireWorkspaceRef());
+      }, workspaceRef);
       return;
     }
-    await showInFolder(target.filePath);
+    const workspaceRef = resourceWorkspaceRef();
+    if (!workspaceRef) return;
+    await showInFolder(target.filePath, workspaceRef);
   } catch (error) {
     console.warn("showInFolder failed:", error);
     notifyAssetRefContextMenuError(error, "assetRefShowInFolder", "Failed to show file in folder");
@@ -1133,7 +1254,18 @@ function doAssetRefOpenInKnowledge() {
   const target = assetRefCtxMenu.value?.target;
   if (!target || target.kind !== "knowledge") return;
   closeAssetRefContextMenu();
-  openKnowledgeDocumentInKnowledge(target.docType, target.path);
+  if (props.scopedSession) {
+    const workspaceRef = resourceWorkspaceRef();
+    if (workspaceRef) {
+      emit("openKnowledgeDocumentInKnowledge", {
+        docType: target.docType,
+        path: target.path,
+        workspaceRef,
+      });
+    }
+    return;
+  }
+  openLegacyKnowledgeDocumentInKnowledge(target.docType, target.path);
 }
 
 async function doAssetRefSelectInUnity() {
@@ -1142,12 +1274,14 @@ async function doAssetRefSelectInUnity() {
   closeAssetRefContextMenu();
 
   try {
+    const workspaceRef = resourceWorkspaceRef();
+    if (!workspaceRef) return;
     if (target.kind === "sceneObject") {
-      await selectUnitySceneObject(projectStore.requireWorkspaceRef(), target.scenePath, target.objectPath);
+      await selectUnitySceneObject(workspaceRef, target.scenePath, target.objectPath);
       return;
     }
     if (target.kind !== "asset") return;
-    await selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath);
+    await selectUnityAsset(workspaceRef, target.assetPath);
   } catch (error) {
     console.warn("selectUnityAsset failed:", error);
     if (target.kind === "sceneObject") {
@@ -1175,13 +1309,18 @@ const messageContextCanAct = computed(() =>
   && messageContextMessage.value.role !== "tool",
 );
 
+const effectiveCurrentRunId = computed(() => (
+  props.scopedSession ? props.currentRunId ?? null : chatStore.currentRunId
+));
+
 const messageContextCanFork = computed(() =>
   !!props.activeSessionId
   && !!messageContextMessage.value
   && messageContextMessage.value.role !== "tool"
+  && (!props.scopedSession || !!props.forkFromMessage)
   && !isMessageFromActiveStream(
     messageContextMessage.value,
-    chatStore.currentRunId,
+    effectiveCurrentRunId.value,
     props.isStreaming,
   ),
 );
@@ -1214,7 +1353,11 @@ const messageContextShouldShowReEdit = computed(() => {
 const messageContextCanReEdit = computed(() =>
   !!props.activeSessionId
   && !props.isStreaming
-  && messageContextShouldShowReEdit.value,
+  && messageContextShouldShowReEdit.value
+  && (
+    !props.scopedSession
+    || (!!props.undoConversation && !!props.restoreComposerDraft)
+  ),
 );
 
 async function doMessageCopy() {
@@ -1262,10 +1405,14 @@ async function doMessageReEdit() {
   if (!message || !messageContextCanReEdit.value) return;
   const draft = buildUserMessageDraft(message);
   closeMessageContextMenu();
-  chatChangesStore.closeInlineDiff();
-  const undone = await chatStore.undoLatestConversationTurn();
+  chatChangesStore.closeInlineDiffForSession(props.activeSessionId);
+  const undo = props.scopedSession
+    ? props.undoConversation
+    : () => chatStore.undoLatestConversationTurn();
+  if (!undo) return;
+  const undone = await undo(null);
   if (undone) {
-    uiStore.stageChatDraftPrefill(draft);
+    await restoreUserMessageDraft(draft);
   }
 }
 
@@ -1280,6 +1427,10 @@ async function doMessageFork() {
   const messageId = messageCtxMenu.value?.messageId ?? null;
   if (!messageId || !messageContextCanFork.value) return;
   closeMessageContextMenu();
+  if (props.scopedSession) {
+    await props.forkFromMessage?.(messageId);
+    return;
+  }
   await chatStore.forkSessionFromMessage(messageId);
 }
 
@@ -1358,10 +1509,21 @@ const currentUndoTarget = computed(() => {
 });
 
 const canUndoConversation = computed(() =>
-  !!props.activeSessionId && !!currentUndoTarget.value && !props.isStreaming,
+  !!props.activeSessionId
+  && !!currentUndoTarget.value
+  && !props.isStreaming
+  && (
+    !props.scopedSession
+    || (
+      !!props.undoConversation
+      && (!currentUndoTarget.value.userMessage || !!props.restoreComposerDraft)
+    )
+  ),
 );
 const canUndoFilesAndConversation = computed(() =>
-  canUndoConversation.value && !!currentUndoTarget.value?.fileUndoTarget,
+  canUndoConversation.value
+  && !!currentUndoTarget.value?.fileUndoTarget
+  && (!props.scopedSession || !!props.undoFilesAndConversation),
 );
 const undoChoices = computed<UndoChoice[]>(() => {
   if (!canUndoConversation.value) return [];
@@ -1424,7 +1586,10 @@ function refreshUndoChooserDirtyState() {
   undoChooserDirtyChecked.value = false;
   const targetId = currentUndoTarget.value?.fileUndoTarget;
   if (!targetId) return;
-  const checkDirty = props.checkUndoDirty ?? chatStore.checkUndoDirty;
+  const checkDirty = props.scopedSession
+    ? props.checkUndoDirty
+    : props.checkUndoDirty ?? chatStore.checkUndoDirty;
+  if (!checkDirty) return;
   void checkDirty(targetId).then(
     (files) => {
       if (currentUndoTarget.value?.fileUndoTarget !== targetId) return;
@@ -1454,9 +1619,17 @@ function closeUndoChooser() {
   undoChooserDirtyChecked.value = false;
 }
 
-function restoreUndoMessage(message: ChatMessage | null) {
+async function restoreUserMessageDraft(draft: UserMessageDraft) {
+  if (props.scopedSession) {
+    await props.restoreComposerDraft?.(draft);
+    return;
+  }
+  uiStore.stageChatDraftPrefill(draft);
+}
+
+async function restoreUndoMessage(message: ChatMessage | null) {
   if (!message) return;
-  uiStore.stageChatDraftPrefill(buildUserMessageDraft(message));
+  await restoreUserMessageDraft(buildUserMessageDraft(message));
 }
 
 function moveUndoChoice(delta: number) {
@@ -1508,17 +1681,22 @@ async function undoConversationOnly() {
   const turn = currentUndoTarget.value;
   if (!turn || !canUndoConversation.value || undoChooserBusy.value) return;
   undoAction.value = "conversation";
-  if (!props.scopedSession) chatChangesStore.closeInlineDiff();
+  chatChangesStore.closeInlineDiffForSession(props.activeSessionId);
   try {
-    const undone = props.undoConversation
-      ? await props.undoConversation(targetMessageId)
-      : targetMessageId
-        ? await chatStore.rollbackToMessage(targetMessageId, { includeFiles: false })
-        : await chatStore.undoLatestConversationTurn();
+    const undo = props.scopedSession
+      ? props.undoConversation
+      : props.undoConversation
+        ?? (
+          targetMessageId
+            ? (messageId: string | null) => chatStore.rollbackToMessage(messageId!, { includeFiles: false })
+            : () => chatStore.undoLatestConversationTurn()
+        );
+    if (!undo) return;
+    const undone = await undo(targetMessageId);
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
-      restoreUndoMessage(turn.userMessage);
+      await restoreUndoMessage(turn.userMessage);
     }
   } finally {
     undoAction.value = null;
@@ -1531,26 +1709,35 @@ async function undoFilesAndConversation() {
   const targetId = turn?.fileUndoTarget;
   if (!targetId || !canUndoFilesAndConversation.value || undoChooserBusy.value) return;
   undoAction.value = "files";
-  if (!props.scopedSession) chatChangesStore.closeInlineDiff();
+  chatChangesStore.closeInlineDiffForSession(props.activeSessionId);
   // The chooser showed the dirty file list (or verified it empty); if the
   // preflight never completed, leave acceptDirty off so the backend re-checks.
   const acceptDirty = undoChooserDirtyChecked.value;
   try {
-    const undone = props.undoFilesAndConversation
-      ? await props.undoFilesAndConversation(targetMessageId, targetId, acceptDirty)
-      : targetMessageId
-        ? await chatStore.rollbackToMessage(targetMessageId, {
-            includeFiles: true,
-            fileUndoTarget: targetId,
-            acceptDirty,
-          })
-        : await chatStore.performUndo(targetId, { acceptDirty });
+    const undo = props.scopedSession
+      ? props.undoFilesAndConversation
+      : props.undoFilesAndConversation
+        ?? (
+          targetMessageId
+            ? (messageId: string | null, fileUndoTarget: string, accept: boolean) => (
+                chatStore.rollbackToMessage(messageId!, {
+                  includeFiles: true,
+                  fileUndoTarget,
+                  acceptDirty: accept,
+                })
+              )
+            : (_messageId: string | null, fileUndoTarget: string, accept: boolean) => (
+                chatStore.performUndo(fileUndoTarget, { acceptDirty: accept })
+              )
+        );
+    if (!undo) return;
+    const undone = await undo(targetMessageId, targetId, acceptDirty);
     if (undone) {
       undoChooserVisible.value = false;
       undoTargetMessageId.value = null;
       undoChooserDirtyFiles.value = [];
       undoChooserDirtyChecked.value = false;
-      restoreUndoMessage(turn.userMessage);
+      await restoreUndoMessage(turn.userMessage);
     }
   } finally {
     undoAction.value = null;
@@ -1748,6 +1935,24 @@ const SESSION_RESTORE_MAX_SETTLE_FRAMES = 12;
 const SESSION_RESTORE_REQUIRED_STABLE_FRAMES = 2;
 const sessionRestoreLayoutStabilizing = ref(false);
 const sessionRestoreViewportGuarding = ref(false);
+const scopedSessionScrollStates = new Map<string, SessionScrollState>();
+
+function scopedScrollStateKey(sessionId: string) {
+  return props.sessionSurfaceKey?.trim() || sessionId;
+}
+
+function getSessionScrollState(sessionId: string): SessionScrollState | null {
+  if (!props.scopedSession) return chatStore.getSessionScrollState(sessionId);
+  return scopedSessionScrollStates.get(scopedScrollStateKey(sessionId)) ?? null;
+}
+
+function rememberSessionScrollState(sessionId: string, state: SessionScrollState) {
+  if (!props.scopedSession) {
+    chatStore.rememberSessionScrollState(sessionId, state);
+    return;
+  }
+  scopedSessionScrollStates.set(scopedScrollStateKey(sessionId), state);
+}
 
 function clearStreamingTextFlushTimer() {
   if (!streamingTextFlushTimer) return;
@@ -1770,7 +1975,7 @@ function beginSessionRestoreLayoutStabilization() {
 function finishSessionRestoreLayoutStabilization(
   finalRestore?: {
     targetSessionId: string;
-    state: ReturnType<typeof chatStore.getSessionScrollState>;
+    state: SessionScrollState | null;
   },
 ) {
   clearSessionRestoreLayoutTimer();
@@ -1944,7 +2149,7 @@ function captureCurrentSessionScrollState(el: HTMLElement): ReturnType<typeof ca
 function rememberScrollForSession(sessionId: string | null = props.activeSessionId) {
   const el = getMessagesElement();
   if (!sessionId || !el) return;
-  chatStore.rememberSessionScrollState(sessionId, captureCurrentSessionScrollState(el));
+  rememberSessionScrollState(sessionId, captureCurrentSessionScrollState(el));
 }
 
 function runProgrammaticScrollUpdate(
@@ -1958,7 +2163,7 @@ function runProgrammaticScrollUpdate(
   update(el);
 
   if (sessionId) {
-    chatStore.rememberSessionScrollState(sessionId, captureCurrentSessionScrollState(el));
+    rememberSessionScrollState(sessionId, captureCurrentSessionScrollState(el));
   }
 
   requestAnimationFrame(() => {
@@ -2036,7 +2241,7 @@ function restoreToolViewportAnchor() {
     },
   });
   if (restored && props.activeSessionId) {
-    chatStore.rememberSessionScrollState(props.activeSessionId, captureCurrentSessionScrollState(el));
+    rememberSessionScrollState(props.activeSessionId, captureCurrentSessionScrollState(el));
   }
 
   requestViewportFrame(() => {
@@ -2115,7 +2320,7 @@ function setMessagesScrollTop(scrollTop: number, sessionId: string | null = prop
 }
 
 function restoreMessagesScrollState(
-  state: ReturnType<typeof chatStore.getSessionScrollState>,
+  state: SessionScrollState | null,
   sessionId: string | null = props.activeSessionId,
 ) {
   const el = getMessagesElement();
@@ -2160,7 +2365,7 @@ function scrollToBottomNow(force = false) {
   if (!el) return;
 
   const metrics = readMessageMetrics(el);
-  const remembered = props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null;
+  const remembered = props.activeSessionId ? getSessionScrollState(props.activeSessionId) : null;
   if (!shouldAutoScrollToBottom({ force, metrics, remembered })) {
     return;
   }
@@ -2182,7 +2387,7 @@ const preserveScrollAnchorScheduler = createCoalescedScrollScheduler(() => {
     }
 
     const sessionId = props.activeSessionId;
-    const remembered = sessionId ? chatStore.getSessionScrollState(sessionId) : null;
+    const remembered = sessionId ? getSessionScrollState(sessionId) : null;
     if (!remembered || remembered.mode === "bottom") return;
     restoreMessagesScrollState(remembered, sessionId);
   });
@@ -2268,7 +2473,7 @@ function reconcileViewport(forceBottom = false) {
   const el = getMessagesElement();
   if (!el) return;
 
-  const remembered = props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null;
+  const remembered = props.activeSessionId ? getSessionScrollState(props.activeSessionId) : null;
   if (shouldAutoScrollToBottom({ force: forceBottom, metrics: readMessageMetrics(el), remembered })) {
     scrollToBottom(forceBottom);
     return;
@@ -2284,7 +2489,7 @@ function reconcileStreamingLayoutNow() {
   const el = getMessagesElement();
   if (!el) return;
   const remembered = props.activeSessionId
-    ? chatStore.getSessionScrollState(props.activeSessionId)
+    ? getSessionScrollState(props.activeSessionId)
     : null;
   if (!shouldAutoScrollToBottom({ metrics: readMessageMetrics(el), remembered })) return;
 
@@ -2297,7 +2502,7 @@ function settleStreamEndScroll() {
   if (!el) return;
 
   const metrics = readMessageMetrics(el);
-  const remembered = props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null;
+  const remembered = props.activeSessionId ? getSessionScrollState(props.activeSessionId) : null;
   const followBottom = shouldAutoScrollToBottom({ metrics, remembered });
   pendingStreamEndViewport = {
     sessionId: props.activeSessionId,
@@ -2316,7 +2521,7 @@ function finishPendingSessionRestore(targetSessionId: string) {
 
 function scheduleSessionRestoreFollowup(
   targetSessionId: string,
-  state: ReturnType<typeof chatStore.getSessionScrollState>,
+  state: SessionScrollState | null,
 ) {
   cancelSessionRestoreFrame();
   sessionRestoreFrame = requestViewportFrame(() => {
@@ -2349,7 +2554,7 @@ function restorePendingSessionScroll(options: { defer?: boolean } = {}) {
       return;
     }
 
-    const remembered = resolvePendingSessionRestoreState(chatStore.getSessionScrollState(targetSessionId));
+    const remembered = resolvePendingSessionRestoreState(getSessionScrollState(targetSessionId));
     restoreMessagesScrollState(remembered, targetSessionId);
     finishPendingSessionRestore(targetSessionId);
     scheduleSessionRestoreFollowup(targetSessionId, remembered);
@@ -2366,10 +2571,20 @@ function restorePendingSessionScroll(options: { defer?: boolean } = {}) {
 let olderHistoryRestoreRunning = false;
 
 async function loadOlderHistoryAtTop(el: HTMLElement) {
+  const historyLoading = props.scopedSession
+    ? !!props.sessionHistoryLoading
+    : chatStore.sessionHistoryLoading;
+  const historyHasMore = props.scopedSession
+    ? !!props.sessionHistoryHasMore
+    : chatStore.sessionHistoryHasMore;
+  const loadOlder = props.scopedSession
+    ? props.loadOlderHistory
+    : () => chatStore.loadOlderSessionHistory();
   if (
     olderHistoryRestoreRunning
-    || chatStore.sessionHistoryLoading
-    || !chatStore.sessionHistoryHasMore
+    || historyLoading
+    || !historyHasMore
+    || !loadOlder
     || el.scrollTop > 160
   ) {
     return;
@@ -2379,7 +2594,7 @@ async function loadOlderHistoryAtTop(el: HTMLElement) {
   const anchor = captureScrollAnchor(el);
   const previousScrollHeight = el.scrollHeight;
   try {
-    const loaded = await chatStore.loadOlderSessionHistory();
+    const loaded = await loadOlder();
     if (!loaded || props.activeSessionId !== sessionId) return;
     await nextTick();
     if (!anchor) {
@@ -2445,7 +2660,7 @@ function handleTurnNavigationRevealState(active: boolean, messageId: string) {
       `[data-scroll-anchor-id="${CSS.escape(messageId)}"]`,
     );
     if (el && anchor) {
-      chatStore.rememberSessionScrollState(props.activeSessionId, {
+      rememberSessionScrollState(props.activeSessionId, {
         mode: "anchor",
         anchorId: messageId,
         offsetTop: anchor.getBoundingClientRect().top - el.getBoundingClientRect().top,
@@ -2489,11 +2704,11 @@ function onMessagesScroll() {
   if (!userScrollIntent.isRecent()) {
     const el = getMessagesElement();
     if (props.activeSessionId && el && isNearBottom(readMessageMetrics(el))) {
-      chatStore.rememberSessionScrollState(props.activeSessionId, { mode: "bottom" });
+      rememberSessionScrollState(props.activeSessionId, { mode: "bottom" });
     }
     recordLayoutDiagnostic("chat.sessionScroll.nonUserScrollIgnored", {
       sessionId: props.activeSessionId ?? null,
-      state: props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null,
+      state: props.activeSessionId ? getSessionScrollState(props.activeSessionId) : null,
       metrics: readSessionScrollMetrics(),
     });
     return;
@@ -2502,7 +2717,7 @@ function onMessagesScroll() {
   preserveMessagesViewportForUserScroll();
   recordLayoutDiagnostic("chat.sessionScroll.userScrollCaptured", {
     sessionId: props.activeSessionId ?? null,
-    state: props.activeSessionId ? chatStore.getSessionScrollState(props.activeSessionId) : null,
+    state: props.activeSessionId ? getSessionScrollState(props.activeSessionId) : null,
     metrics: readSessionScrollMetrics(),
   });
 }
@@ -2789,15 +3004,38 @@ watch(
   { immediate: true },
 );
 
-function handleExitPlanMode() {
+async function handleRequestPlanMode(active: boolean) {
+  if (props.scopedSession) {
+    emit("requestPlanMode", active);
+    return;
+  }
   if (!props.activeSessionId) return;
-  void chatStore.setSessionPlanMode(props.activeSessionId, false).catch((e) => {
+  try {
+    await chatStore.setSessionPlanMode(props.activeSessionId, active);
+  } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", t("chat.plan.exitFailed"), {
       code: err.code,
       operation: "plan-mode-exit",
     });
-  });
+  }
+}
+
+async function handleExitPlanMode() {
+  if (props.scopedSession) {
+    if (!props.exitPlanMode) return;
+    try {
+      await props.exitPlanMode();
+    } catch (e) {
+      const err = normalizeAppError(e);
+      notificationStore.addNotice("error", t("chat.plan.exitFailed"), {
+        code: err.code,
+        operation: "plan-mode-exit",
+      });
+    }
+    return;
+  }
+  await handleRequestPlanMode(false);
 }
 
 function handleComposerSend(payload: ChatComposerSendPayload) {
@@ -2947,13 +3185,13 @@ function clearCancelShortcutConfirmation() {
 }
 
 function onGlobalChatKeydown(e: KeyboardEvent) {
-  if (uiStore.activeTab !== "chat") return;
+  if (!props.scopedSession && uiStore.activeTab !== "chat") return;
   if (props.shortcutActive === false) return;
 
   if (e.key === "Escape" && showInlineDiff.value) {
     e.preventDefault();
     clearCancelShortcutConfirmation();
-    chatChangesStore.closeInlineDiff();
+    chatChangesStore.closeInlineDiffForSession(props.activeSessionId);
     return;
   }
 
@@ -3061,16 +3299,16 @@ onUnmounted(() => {
 
     <!-- Inline diff panel — covers entire chat layout (session panel + chat area) -->
     <div v-if="showInlineDiff" class="diff-inline-panel">
-      <template v-if="chatChangesStore.inlineDiffPayload">
+      <template v-if="inlineDiffPayload">
         <div class="diff-inline-header">
-          <span class="diff-inline-status" :class="'status-' + (chatChangesStore.inlineDiffPayload.status ?? '').toLowerCase()">
-            {{ chatChangesStore.inlineDiffPayload.status }}
+          <span class="diff-inline-status" :class="'status-' + (inlineDiffPayload.status ?? '').toLowerCase()">
+            {{ inlineDiffPayload.status }}
           </span>
-          <span v-if="chatChangesStore.inlineDiffPayload.oldPath" class="diff-inline-path" :title="chatChangesStore.inlineDiffPayload.oldPath + ' → ' + chatChangesStore.inlineDiffPayload.filePath">
-            {{ chatChangesStore.inlineDiffPayload.oldPath }} → {{ chatChangesStore.inlineDiffPayload.filePath }}
+          <span v-if="inlineDiffPayload.oldPath" class="diff-inline-path" :title="inlineDiffPayload.oldPath + ' → ' + inlineDiffPayload.filePath">
+            {{ inlineDiffPayload.oldPath }} → {{ inlineDiffPayload.filePath }}
           </span>
-          <span v-else class="diff-inline-path" :title="chatChangesStore.inlineDiffPayload.filePath">
-            {{ chatChangesStore.inlineDiffPayload.filePath }}
+          <span v-else class="diff-inline-path" :title="inlineDiffPayload.filePath">
+            {{ inlineDiffPayload.filePath }}
           </span>
           <BaseSegmented
             v-if="chatDiffViewerRef?.hasSemanticAndText"
@@ -3081,8 +3319,8 @@ onUnmounted(() => {
             @update:model-value="chatDiffViewerRef.activeTab = $event as 'semantic' | 'text'"
           />
           <span class="diff-inline-stats">
-            <span class="stat-add">+{{ chatChangesStore.inlineDiffPayload.stats.additions }}</span>
-            <span class="stat-del">-{{ chatChangesStore.inlineDiffPayload.stats.deletions }}</span>
+            <span class="stat-add">+{{ inlineDiffPayload.stats.additions }}</span>
+            <span class="stat-del">-{{ inlineDiffPayload.stats.deletions }}</span>
           </span>
           <span class="diff-inline-actions">
             <BaseButton
@@ -3094,27 +3332,33 @@ onUnmounted(() => {
               {{ t('chat.changes.openReviewWindow') }}
             </BaseButton>
             <BaseButton
-              v-if="!chatChangesStore.inlineDiffPayload!.isBinary && canOpenInEditor(chatChangesStore.inlineDiffPayload!.filePath)"
+              v-if="!inlineDiffPayload.isBinary && canOpenInEditor(inlineDiffPayload.filePath)"
               class="diff-inline-action-btn ui-select-none"
               :title="t('common.openInEditor')"
-              @click="openFileExternal(chatChangesStore.inlineDiffPayload!.filePath)"
+              @click="openInlineDiffFileExternal"
             >
               <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
               {{ t('common.openInEditor') }}
             </BaseButton>
           </span>
-          <button class="diff-close-btn ui-select-none" @click="chatChangesStore.closeInlineDiff()">&times;</button>
+          <button
+            class="diff-close-btn ui-select-none"
+            type="button"
+            :title="t('common.close')"
+            :aria-label="t('common.close')"
+            @click="chatChangesStore.closeInlineDiffForSession(activeSessionId)"
+          >&times;</button>
         </div>
         <div class="diff-inline-body">
           <FileDiffViewer
             ref="chatDiffViewerRef"
-            :payload="chatChangesStore.inlineDiffPayload"
+            :payload="inlineDiffPayload"
             :hide-builtin-tabs="true"
             @lfs-pulled="onChatDiffLfsPulled"
           />
         </div>
       </template>
-      <div v-else-if="chatChangesStore.inlineDiffLoading" class="diff-inline-loading">
+      <div v-else-if="inlineDiffLoading" class="diff-inline-loading">
         <div class="diff-progress-info">
           <span class="diff-progress-text">{{ diffProgress.phaseLabel }}</span>
           <div class="diff-progress-bar">
@@ -3122,7 +3366,7 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
-      <div v-else-if="chatChangesStore.inlineDiffError" class="diff-inline-error">{{ chatChangesStore.inlineDiffError }}</div>
+      <div v-else-if="inlineDiffError" class="diff-inline-error">{{ inlineDiffError }}</div>
     </div>
 
     <SessionPanel
@@ -3224,13 +3468,13 @@ onUnmounted(() => {
         >
         </ChatTranscript>
         <ChatTurnNavigationRail
-          v-if="displaySettings.showTurnNavigationRail && !scopedSession"
+          v-if="displaySettings.showTurnNavigationRail"
           :messages="messages"
           :session-id="activeSessionId"
-          :user-message-ids="chatStore.sessionUserMessageIds"
+          :user-message-ids="turnNavigationUserMessageIds"
           :scroll-element="transcriptScrollElement"
-          :load-preview="chatStore.loadSessionTurnPreview"
-          :load-turn="chatStore.loadSessionHistoryThroughMessage"
+          :load-preview="turnNavigationLoadPreview"
+          :load-turn="turnNavigationLoadTurn"
           @navigate="markMessagesUserScrollIntent"
           @reveal-state="handleTurnNavigationRevealState"
         />
@@ -3317,7 +3561,7 @@ onUnmounted(() => {
         <button
           class="plan-status-exit ui-select-none"
           type="button"
-          :disabled="props.isStreaming"
+          :disabled="props.isStreaming || (scopedSession && !exitPlanMode)"
           :title="t('chat.plan.exit')"
           @click="handleExitPlanMode"
         >
@@ -3400,12 +3644,12 @@ onUnmounted(() => {
             <button
               v-if="!isViewingSubagent && hasPanelToggleRow"
               class="changes-toggle-btn ui-select-none"
-              :class="{ 'is-active': chatChangesStore.currentPanelVisible }"
+              :class="{ 'is-active': currentChangesPanelVisible }"
               type="button"
               :disabled="isStreaming"
-              :aria-pressed="chatChangesStore.currentPanelVisible"
+              :aria-pressed="currentChangesPanelVisible"
               :aria-label="t('chat.changes.toggle')"
-              @click="chatChangesStore.togglePanel()"
+              @click="chatChangesStore.togglePanelForSession(activeSessionId)"
             >
               <LucideIcon :icon="FileDiff" :size="14" />
               <span class="changes-toggle-label">{{ t('chat.changes.toggle') }}</span>
@@ -3428,7 +3672,10 @@ onUnmounted(() => {
           :resume-label="t('chat.input.resume')"
           :compact="inputControlsCollapsed"
           :asset-ref-sync-key="composerAssetRefSyncKey"
+          :draft-state-key="composerDraftStateKey"
           :workspace-ref="workspaceRef"
+          :workspace-root="workingDir"
+          :plan-mode-active="planModeActive"
           :reference-drop-available="referenceDropAvailable"
           :reference-drop-active="referenceDropActive"
           :managed-native-drops="managedNativeDrops"
@@ -3438,6 +3685,8 @@ onUnmounted(() => {
           @undo="openUndoChooser"
           @export-context="emit('exportSessionContext', { sessionId: activeSessionId || '' })"
           @review-context="emit('reviewSessionContext', { sessionId: activeSessionId || '' })"
+          @request-plan-mode="handleRequestPlanMode"
+          @request-new-session="handleNewChatRequest"
           @remove-managed-local-file="emit('removeManagedComposerFile', $event)"
           @clear="handleNewChatRequest"
           @cancel="emit('cancel')"
@@ -3633,6 +3882,7 @@ onUnmounted(() => {
             v-if="assetRefContextIsKnowledge"
             type="button"
             class="asset-ref-ctx-item"
+            :disabled="!resourceActionsAvailable"
             @click="doAssetRefOpenInKnowledge"
           >
             <LucideIcon :icon="BookOpen" :size="13" />
@@ -3647,7 +3897,12 @@ onUnmounted(() => {
             <LucideIcon :icon="ExternalLink" :size="13" />
             {{ t("common.openInEditor") }}
           </button>
-          <button type="button" class="asset-ref-ctx-item" @click="doAssetRefShowInFolder">
+          <button
+            type="button"
+            class="asset-ref-ctx-item"
+            :disabled="!resourceActionsAvailable"
+            @click="doAssetRefShowInFolder"
+          >
             <LucideIcon :icon="FolderOpen" :size="13" />
             {{ t("common.openInFileExplorer") }}
           </button>

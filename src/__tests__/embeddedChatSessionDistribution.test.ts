@@ -1,21 +1,49 @@
 // @vitest-environment jsdom
 import { createApp, defineComponent, h } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { publishSessionStreamEvent } from "../services/sessionStreamEventHub";
+import {
+  publishSessionAsyncTaskUpdate,
+  publishSessionExecutionState,
+  publishSessionStreamEvent,
+} from "../services/sessionStreamEventHub";
 import { useEmbeddedChatSession } from "../composables/useEmbeddedChatSession";
 
 const mocks = vi.hoisted(() => ({
   loadSession: vi.fn(),
+  loadSessionView: vi.fn(),
+  loadSessionMessagePage: vi.fn(),
+  loadSessionTurnPreview: vi.fn(),
   getSessionUsage: vi.fn(),
+  getTodos: vi.fn(),
+  getSessionResumeAvailable: vi.fn(),
+  getSessionPlanState: vi.fn(),
+  setSessionPlanMode: vi.fn(),
+  forkSession: vi.fn(),
+  forkSessionFromMessage: vi.fn(),
   rollbackSessionToMessage: vi.fn(),
   undoLatestConversationTurn: vi.fn(),
   undoList: vi.fn(),
+  undoCheckConflicts: vi.fn(),
   undoCheckDirty: vi.fn(),
   undoPerform: vi.fn(),
   undoPerformToMessage: vi.fn(),
   chat: vi.fn(),
+  queueSessionCompact: vi.fn(),
   cancelChat: vi.fn(),
   tauriListen: vi.fn().mockResolvedValue(vi.fn()),
+  modelDefaults: {
+    planModel: "",
+    subagentModels: {},
+    subagentEfforts: {},
+    subagentFastModes: {},
+  },
+  availableModels: [{
+    id: "model-a",
+    name: "Model A",
+    provider: "openrouter",
+    contextWindow: 128_000,
+    supportedEfforts: ["none", "low", "medium", "high"],
+  }],
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -27,26 +55,34 @@ vi.mock("../services/session", async (importOriginal) => {
   return {
     ...actual,
     loadSession: mocks.loadSession,
+    loadSessionView: mocks.loadSessionView,
+    loadSessionMessagePage: mocks.loadSessionMessagePage,
+    loadSessionTurnPreview: mocks.loadSessionTurnPreview,
     getSessionUsage: mocks.getSessionUsage,
+    getTodos: mocks.getTodos,
+    getSessionResumeAvailable: mocks.getSessionResumeAvailable,
+    getSessionPlanState: mocks.getSessionPlanState,
+    setSessionPlanMode: mocks.setSessionPlanMode,
+    forkSession: mocks.forkSession,
+    forkSessionFromMessage: mocks.forkSessionFromMessage,
     rollbackSessionToMessage: mocks.rollbackSessionToMessage,
     undoLatestConversationTurn: mocks.undoLatestConversationTurn,
     chat: mocks.chat,
+    queueSessionCompact: mocks.queueSessionCompact,
     cancelChat: mocks.cancelChat,
   };
 });
 
 vi.mock("../stores/model", () => ({
   useModelStore: () => ({
-    modelDefaults: {
-      subagentModels: {},
-      subagentEfforts: {},
-      subagentFastModes: {},
-    },
+    modelDefaults: mocks.modelDefaults,
+    availableModels: mocks.availableModels,
   }),
 }));
 
 vi.mock("../services/undo", () => ({
   undoList: mocks.undoList,
+  undoCheckConflicts: mocks.undoCheckConflicts,
   undoCheckDirty: mocks.undoCheckDirty,
   undoPerform: mocks.undoPerform,
   undoPerformToMessage: mocks.undoPerformToMessage,
@@ -54,25 +90,235 @@ vi.mock("../services/undo", () => ({
 
 describe("embedded chat session distribution", () => {
   beforeEach(() => {
+    mocks.loadSessionView.mockImplementation(async (sessionId: string) => {
+      const session = await mocks.loadSession(sessionId);
+      return {
+        session,
+        userMessageIds: session.messages
+          .filter((message: { role: string }) => message.role === "user")
+          .map((message: { id: string }) => message.id),
+        oldestMessageRowId: null,
+        hasMoreHistory: false,
+      };
+    });
+    mocks.getSessionUsage.mockResolvedValue(null);
+    mocks.getTodos.mockResolvedValue({ items: [], latestRunId: null });
+    mocks.getSessionResumeAvailable.mockResolvedValue(false);
+    mocks.getSessionPlanState.mockResolvedValue({
+      active: false,
+      planFilePath: "",
+      planFileExists: false,
+    });
     mocks.undoList.mockResolvedValue([]);
+    mocks.undoCheckConflicts.mockResolvedValue([]);
     mocks.undoCheckDirty.mockResolvedValue([]);
     mocks.undoPerform.mockResolvedValue(undefined);
     mocks.undoPerformToMessage.mockResolvedValue(undefined);
+    mocks.modelDefaults.planModel = "";
+    mocks.availableModels.splice(0, mocks.availableModels.length, {
+      id: "model-a",
+      name: "Model A",
+      provider: "openrouter",
+      contextWindow: 128_000,
+      supportedEfforts: ["none", "low", "medium", "high"],
+    });
   });
 
   afterEach(() => {
     vi.useRealTimers();
     mocks.loadSession.mockReset();
+    mocks.loadSessionView.mockReset();
+    mocks.loadSessionMessagePage.mockReset();
+    mocks.loadSessionTurnPreview.mockReset();
     mocks.getSessionUsage.mockReset();
+    mocks.getTodos.mockReset();
+    mocks.getSessionResumeAvailable.mockReset();
+    mocks.getSessionPlanState.mockReset();
+    mocks.setSessionPlanMode.mockReset();
+    mocks.forkSession.mockReset();
+    mocks.forkSessionFromMessage.mockReset();
     mocks.rollbackSessionToMessage.mockReset();
     mocks.undoLatestConversationTurn.mockReset();
     mocks.undoList.mockReset();
+    mocks.undoCheckConflicts.mockReset();
     mocks.undoCheckDirty.mockReset();
     mocks.undoPerform.mockReset();
     mocks.undoPerformToMessage.mockReset();
     mocks.chat.mockReset();
+    mocks.queueSessionCompact.mockReset();
     mocks.cancelChat.mockReset();
     mocks.tauriListen.mockClear();
+  });
+
+  it("starts manual compaction for an idle workbench session without adding a user message", async () => {
+    const sessionId = "idle-workbench-compact-session";
+    const existingMessage = {
+      id: "user-before-compact",
+      role: "user" as const,
+      content: "Keep this message",
+      createdAt: 1,
+    };
+    mocks.loadSession.mockResolvedValue({
+      id: sessionId,
+      title: "Idle compact",
+      sessionType: "chat",
+      parentSessionId: null,
+      createdAt: 1,
+      updatedAt: 1,
+      messages: [existingMessage],
+      pendingInputs: [],
+    });
+    mocks.getSessionUsage.mockResolvedValue(null);
+    mocks.chat.mockResolvedValue({ sessionId, runId: "manual-compact-run" });
+
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "idle-workbench-compact-pane",
+          initialSessionId: sessionId,
+          workspaceRef: { checkoutId: "checkout-compact", expectedGeneration: 3 },
+          selectedModelId: "model-a",
+          selectedAgentId: "unity",
+          effort: "high",
+          effortSupported: true,
+          fastMode: true,
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(session.messages.value).toHaveLength(1));
+
+    await expect(session.compact()).resolves.toBe(true);
+
+    expect(mocks.chat).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId,
+      text: "",
+      mode: "compact",
+      images: null,
+      assetRefs: null,
+      userIntent: null,
+    }));
+    expect(session.messages.value).toEqual([existingMessage]);
+    expect(session.isStreaming.value).toBe(true);
+
+    app.unmount();
+  });
+
+  it("queues manual compaction behind the active workbench run", async () => {
+    const sessionId = "running-workbench-compact-session";
+    const runId = "running-workbench-run";
+    mocks.loadSession.mockResolvedValue({
+      id: sessionId,
+      title: "Running compact",
+      sessionType: "chat",
+      parentSessionId: null,
+      createdAt: 1,
+      updatedAt: 1,
+      messages: [],
+      pendingInputs: [],
+      runtime: {
+        activeRun: {
+          runId,
+          sessionId,
+          status: "running",
+          startedAt: 1,
+          updatedAt: 1,
+        },
+        activeToolCalls: [],
+        pendingToolConfirms: [],
+        isCompacting: false,
+        compactQueued: false,
+      },
+    });
+    mocks.getSessionUsage.mockResolvedValue(null);
+    mocks.queueSessionCompact.mockResolvedValue(true);
+
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "running-workbench-compact-pane",
+          initialSessionId: sessionId,
+          workspaceRef: { checkoutId: "checkout-running-compact", expectedGeneration: 5 },
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(session.isStreaming.value).toBe(true));
+
+    await expect(session.compact()).resolves.toBe(true);
+
+    expect(mocks.queueSessionCompact).toHaveBeenCalledWith(sessionId, runId);
+    expect(mocks.chat).not.toHaveBeenCalled();
+    expect(session.compactQueued.value).toBe(true);
+
+    publishSessionStreamEvent({
+      event: {
+        type: "compactStart",
+        sessionId,
+        runId,
+        contextTokens: 100,
+        contextLimit: 1_000,
+      },
+      source: {
+        kind: "workspace",
+        projectId: "project-running-compact",
+        checkoutId: "checkout-running-compact",
+        workspaceGeneration: 5,
+        streamRevision: 1,
+      },
+    });
+    expect(session.compactQueued.value).toBe(false);
+    expect(session.isCompacting.value).toBe(true);
+
+    app.unmount();
+  });
+
+  it("queues manual compaction requested while a workbench run is still launching", async () => {
+    const sessionId = "launching-workbench-compact-session";
+    const runId = "launching-workbench-run";
+    let resolveLaunch!: (value: { sessionId: string; runId: string }) => void;
+    mocks.chat.mockReturnValue(new Promise((resolve) => {
+      resolveLaunch = resolve;
+    }));
+    mocks.queueSessionCompact.mockResolvedValue(true);
+
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "launching-workbench-compact-pane",
+          workspaceRef: { checkoutId: "checkout-launching-compact", expectedGeneration: 8 },
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+
+    const sendPromise = session.send({ text: "Start the run" });
+    await vi.waitFor(() => expect(session.isStreaming.value).toBe(true));
+    await expect(session.compact()).resolves.toBe(true);
+    expect(mocks.queueSessionCompact).not.toHaveBeenCalled();
+
+    resolveLaunch({ sessionId, runId });
+    await sendPromise;
+    await vi.waitFor(() => {
+      expect(mocks.queueSessionCompact).toHaveBeenCalledWith(sessionId, runId);
+    });
+    expect(session.compactQueued.value).toBe(true);
+
+    app.unmount();
   });
 
   it("refreshes the pane after conversation rollback when file undo is unavailable", async () => {
@@ -99,7 +345,9 @@ describe("embedded chat session distribution", () => {
       messages,
       pendingInputs: [],
     });
-    mocks.loadSession.mockResolvedValue(detail([targetMessage, laterMessage]));
+    mocks.loadSession
+      .mockResolvedValueOnce(detail([targetMessage, laterMessage]))
+      .mockResolvedValue(detail([targetMessage]));
     mocks.getSessionUsage.mockResolvedValue(null);
     mocks.undoList.mockResolvedValue([]);
     mocks.rollbackSessionToMessage.mockResolvedValue(detail([targetMessage]));
@@ -125,6 +373,17 @@ describe("embedded chat session distribution", () => {
     await expect(session.rollbackConversation("assistant-target")).resolves.toBe(true);
     expect(mocks.rollbackSessionToMessage).toHaveBeenCalledWith(sessionId, "assistant-target");
     expect(session.messages.value.map((message) => message.id)).toEqual(["assistant-target"]);
+
+    await expect(session.performUndo("assistant-target", {
+      force: true,
+      acceptDirty: true,
+    })).resolves.toBe(true);
+    expect(mocks.undoPerform).toHaveBeenCalledWith(
+      sessionId,
+      "assistant-target",
+      true,
+      true,
+    );
 
     app.unmount();
   });
@@ -777,6 +1036,396 @@ describe("embedded chat session distribution", () => {
     expect(second.sessionId.value).toBe("session-second");
     expect(first.streamingText.value).toBe("first response");
     expect(second.streamingText.value).toBe("second response");
+    app.unmount();
+  });
+
+  it("hydrates pane-owned Plan, Resume, Todo and Undo state and accepts synthetic Plan events", async () => {
+    const sessionId = "scoped-auxiliary-state-session";
+    const workspaceRef = { checkoutId: "checkout-auxiliary", expectedGeneration: 12 };
+    mocks.loadSession.mockResolvedValue({
+      id: sessionId,
+      title: "Auxiliary state",
+      sessionType: "chat",
+      parentSessionId: "parent-session",
+      latestCompletedRunId: "completed-run",
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [],
+      pendingInputs: [],
+    });
+    mocks.getTodos.mockResolvedValue({
+      latestRunId: "completed-run",
+      items: [{ content: "Verify pane state", status: "in_progress", priority: "high" }],
+    });
+    mocks.getSessionResumeAvailable.mockResolvedValue(true);
+    mocks.getSessionPlanState.mockResolvedValue({
+      active: true,
+      planFilePath: "plan/scoped.md",
+      planFileExists: true,
+    });
+    mocks.setSessionPlanMode.mockResolvedValue({
+      active: true,
+      planFilePath: "plan/new.md",
+      planFileExists: true,
+    });
+
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "scoped-auxiliary-state-pane",
+          initialSessionId: sessionId,
+          workspaceRef,
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(mocks.loadSessionView).toHaveBeenCalledWith(sessionId, expect.any(Number)));
+    await vi.waitFor(() => expect(session.errorMessage.value).toBeNull());
+    await vi.waitFor(() => expect(session.parentSessionId.value).toBe("parent-session"));
+
+    expect(session.parentSessionId.value).toBe("parent-session");
+    expect(session.planModeActive.value).toBe(true);
+    expect(session.canResumeInterrupted.value).toBe(true);
+    expect(session.visibleTodos.value).toEqual([
+      { content: "Verify pane state", status: "in_progress", priority: "high" },
+    ]);
+
+    const source = {
+      kind: "workspace" as const,
+      projectId: "project-auxiliary",
+      checkoutId: workspaceRef.checkoutId,
+      workspaceGeneration: workspaceRef.expectedGeneration,
+      streamRevision: 1,
+    };
+    publishSessionStreamEvent({
+      event: { type: "runStart", sessionId, runId: "active-pane-run" },
+      source,
+    });
+    publishSessionStreamEvent({
+      event: {
+        type: "planModeChanged",
+        sessionId,
+        runId: "synthetic-plan-command",
+        active: false,
+        planFilePath: null,
+      },
+      source: { ...source, streamRevision: 2 },
+    });
+    expect(session.planModeActive.value).toBe(false);
+
+    publishSessionStreamEvent({
+      event: {
+        type: "undoAvailable",
+        sessionId,
+        runId: "active-pane-run",
+        assistantMessageId: "assistant-undoable",
+      },
+      source: { ...source, streamRevision: 3 },
+    });
+    expect(session.undoableMessageIds.value.has("assistant-undoable")).toBe(true);
+
+    publishSessionStreamEvent({
+      event: {
+        type: "toolCallStart",
+        sessionId,
+        runId: "active-pane-run",
+        toolCallId: "todo-write",
+        toolName: "todowrite",
+        arguments: JSON.stringify({
+          todos: [{ content: "Streamed todo", status: "pending", priority: "medium" }],
+        }),
+      },
+      source: { ...source, streamRevision: 4 },
+    });
+    publishSessionStreamEvent({
+      event: {
+        type: "toolCallDone",
+        sessionId,
+        runId: "active-pane-run",
+        toolCallId: "todo-write",
+        toolName: "todowrite",
+        output: "Todos updated",
+        outcome: "done",
+      },
+      source: { ...source, streamRevision: 5 },
+    });
+    expect(session.currentTodos.value).toEqual([
+      { content: "Streamed todo", status: "pending", priority: "medium" },
+    ]);
+    publishSessionStreamEvent({
+      event: {
+        type: "done",
+        sessionId,
+        runId: "active-pane-run",
+        messageId: "assistant-finished",
+        fullText: "Finished",
+      },
+      source: { ...source, streamRevision: 6 },
+    });
+
+    await expect(session.setPlanMode(true)).resolves.toBe(true);
+    expect(mocks.setSessionPlanMode).toHaveBeenCalledWith(sessionId, true, workspaceRef);
+    expect(session.planModeActive.value).toBe(true);
+    publishSessionExecutionState({
+      sessionId,
+      modelId: "runtime-model",
+      effort: "low",
+      fastMode: true,
+    });
+    expect(session.sessionModelId.value).toBe("runtime-model");
+    expect(session.sessionEffort.value).toBe("low");
+    expect(session.sessionFastMode.value).toBe(true);
+    app.unmount();
+  });
+
+  it("uses the configured Plan model and constrains pane Fast mode by the effective model", async () => {
+    mocks.modelDefaults.planModel = "plan-model";
+    mocks.availableModels.splice(
+      0,
+      mocks.availableModels.length,
+      {
+        id: "model-a",
+        name: "Model A",
+        provider: "openai_codex",
+        contextWindow: 128_000,
+        supportedEfforts: ["high"],
+      },
+      {
+        id: "plan-model",
+        name: "Plan Model",
+        provider: "openrouter",
+        contextWindow: 128_000,
+        supportedEfforts: ["high"],
+      },
+    );
+    mocks.chat.mockResolvedValue({ sessionId: "plan-model-session", runId: "plan-model-run" });
+
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "plan-model-pane",
+          workspaceRef: { checkoutId: "checkout-plan-model", expectedGeneration: 21 },
+          selectedModelId: "model-a",
+          selectedAgentId: "unity-agent",
+          effort: "high",
+          effortSupported: true,
+          fastMode: true,
+          knowledgeMode: "read_only",
+          knowledgeFocus: { docType: "design", path: "Design/combat.md" },
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+
+    await session.send({ text: "Create a plan", mode: "plan" });
+
+    expect(mocks.chat).toHaveBeenCalledWith(expect.objectContaining({
+      workspaceRef: { checkoutId: "checkout-plan-model", expectedGeneration: 21 },
+      model: "plan-model",
+      effort: "high",
+      fastMode: false,
+      knowledgeMode: "read_only",
+      knowledgeDocType: "design",
+      knowledgeDocPath: "Design/combat.md",
+      mode: "plan",
+    }));
+    expect(session.sessionModelId.value).toBe("plan-model");
+    expect(session.sessionFastMode.value).toBe(false);
+    expect(session.planModeActive.value).toBe(true);
+    app.unmount();
+  });
+
+  it("resumes an interrupted pane through the shared hidden-run path", async () => {
+    const sessionId = "scoped-resume-session";
+    const trailingAssistant = {
+      id: "assistant-interrupted",
+      role: "assistant" as const,
+      content: "",
+      createdAt: 1,
+      toolCalls: [{
+        id: "tool-interrupted",
+        name: "read",
+        arguments: "{}",
+      }],
+    };
+    mocks.loadSession.mockResolvedValue({
+      id: sessionId,
+      title: "Resume",
+      sessionType: "chat",
+      parentSessionId: null,
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [trailingAssistant],
+      pendingInputs: [],
+    });
+    mocks.getSessionResumeAvailable.mockResolvedValue(true);
+    mocks.chat.mockResolvedValue({ sessionId, runId: "resumed-run" });
+
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "scoped-resume-pane",
+          initialSessionId: sessionId,
+          workspaceRef: { checkoutId: "checkout-resume", expectedGeneration: 4 },
+          selectedModelId: "model-a",
+          knowledgeMode: "disabled",
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(session.canResumeInterrupted.value).toBe(true));
+
+    await expect(session.resumeInterrupted()).resolves.toBe(true);
+
+    expect(mocks.chat).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId,
+      workspaceRef: { checkoutId: "checkout-resume", expectedGeneration: 4 },
+      text: "",
+      resume: true,
+      mode: "build",
+      knowledgeMode: "disabled",
+    }));
+    expect(session.messages.value.filter((message) => message.role === "user")).toEqual([]);
+    expect(session.messages.value).toContainEqual(expect.objectContaining({
+      id: "synthetic_tool_result:assistant-interrupted:tool-interrupted",
+      role: "tool",
+      toolCallId: "tool-interrupted",
+    }));
+    expect(session.canResumeInterrupted.value).toBe(false);
+    expect(session.isStreaming.value).toBe(true);
+    app.unmount();
+  });
+
+  it("loads paged history and turn previews for the pane session only", async () => {
+    const sessionId = "scoped-history-session";
+    mocks.loadSessionView.mockResolvedValueOnce({
+      session: {
+        id: sessionId,
+        title: "History",
+        sessionType: "chat",
+        parentSessionId: null,
+        createdAt: 1,
+        updatedAt: 2,
+        messages: [{ id: "message-new", role: "assistant", content: "new", createdAt: 2 }],
+        pendingInputs: [],
+      },
+      userMessageIds: ["message-old"],
+      oldestMessageRowId: 20,
+      hasMoreHistory: true,
+    });
+    mocks.loadSessionMessagePage.mockResolvedValueOnce({
+      messages: [{ id: "message-old", role: "user", content: "old", createdAt: 1 }],
+      oldestMessageRowId: 10,
+      hasMoreHistory: false,
+    });
+    mocks.loadSessionTurnPreview.mockResolvedValueOnce({
+      messageId: "message-old",
+      prompt: "old",
+      response: "new",
+    });
+
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: "scoped-history-pane",
+          initialSessionId: sessionId,
+          workspaceRef: { checkoutId: "checkout-history", expectedGeneration: 7 },
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(session.sessionHistoryHasMore.value).toBe(true));
+
+    await expect(session.loadSessionTurnPreview("message-old")).resolves.toEqual({
+      messageId: "message-old",
+      prompt: "old",
+      response: "new",
+    });
+    await expect(session.loadSessionHistoryThroughMessage("message-old")).resolves.toBe(true);
+
+    expect(mocks.loadSessionTurnPreview).toHaveBeenCalledWith(sessionId, "message-old");
+    expect(mocks.loadSessionMessagePage).toHaveBeenCalledWith(sessionId, 20, expect.any(Number));
+    expect(session.messages.value.map((message) => message.id)).toEqual([
+      "message-old",
+      "message-new",
+    ]);
+    expect(session.sessionHistoryHasMore.value).toBe(false);
+    expect(session.sessionUserMessageIds.value).toEqual(["message-old"]);
+    app.unmount();
+  });
+
+  it("applies one async task update to shared durable state observed by two panes", async () => {
+    const sessionId = "shared-async-task-session";
+    mocks.loadSession.mockResolvedValue({
+      id: sessionId,
+      title: "Async task",
+      sessionType: "chat",
+      parentSessionId: null,
+      createdAt: 1,
+      updatedAt: 2,
+      messages: [{
+        id: "assistant-async",
+        role: "assistant",
+        content: "",
+        createdAt: 1,
+        toolCalls: [{ id: "tool-async", name: "background_task", arguments: "{}" }],
+      }],
+      pendingInputs: [],
+    });
+
+    let first!: ReturnType<typeof useEmbeddedChatSession>;
+    let second!: ReturnType<typeof useEmbeddedChatSession>;
+    const Root = defineComponent({
+      setup() {
+        const common = {
+          initialSessionId: sessionId,
+          workspaceRef: { checkoutId: "checkout-async", expectedGeneration: 2 },
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        };
+        first = useEmbeddedChatSession({ ...common, sessionKey: "async-pane-a" });
+        second = useEmbeddedChatSession({ ...common, sessionKey: "async-pane-b" });
+        return () => h("div");
+      },
+    });
+    const app = createApp(Root);
+    app.mount(document.createElement("div"));
+    await vi.waitFor(() => expect(first.messages.value).toHaveLength(1));
+
+    publishSessionAsyncTaskUpdate({
+      sessionId,
+      assistantMessageId: "assistant-async",
+      toolCallId: "tool-async",
+      taskId: "task-async",
+      toolName: "background_task",
+      status: "completed",
+      output: "Async result",
+    });
+
+    expect(first.messages.value).toBe(second.messages.value);
+    expect(first.messages.value[0]?.toolCalls?.[0]).toEqual(expect.objectContaining({
+      id: "tool-async",
+      outcome: "done",
+      recordedOutput: "Async result",
+    }));
     app.unmount();
   });
 });

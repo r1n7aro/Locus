@@ -32,6 +32,20 @@ describe("chat composer draft persistence", () => {
     expect(workbench).toContain("workbenchStore.pinEditor(WORKBENCH_WINDOW_ID, paneId, payload.editorId);");
   });
 
+  it("keeps complete workbench composer drafts across editor-group remounts", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const sessionEditor = read("src/components/workbench/WorkbenchSessionEditor.vue");
+    const chatView = read("src/components/ChatView.vue");
+    const richInput = read("src/components/chat/RichChatInput.vue");
+
+    expect(sessionEditor).toContain(':composer-draft-state-key="sessionKey"');
+    expect(chatView).toContain(':draft-state-key="composerDraftStateKey"');
+    expect(richInput).toContain("readSharedComposerDraft(props.draftStateKey)");
+    expect(richInput).toContain("writeSharedComposerDraft(props.draftStateKey, exportDraft())");
+    expect(richInput).toContain("updateSharedComposerDraftText(props.draftStateKey, text)");
+    expect(workbench).toContain("clearSharedComposerDraft(`workbench:${editorId}`)");
+  });
+
   it("syncs asset reference drafts between chat windows by session", () => {
     const chatView = read("src/components/ChatView.vue");
     const richInput = read("src/components/chat/RichChatInput.vue");

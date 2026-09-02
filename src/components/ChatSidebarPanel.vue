@@ -5,12 +5,26 @@ import { useChatChangesStore } from "../stores/chatChanges";
 import { acquireSelectionLock } from "../composables/useSelectionLock";
 import ChatChangesPanel from "./ChatChangesPanel.vue";
 import type { WorkspaceRef } from "../services/project";
+import type { ChangedFile, ChatMessage, UndoConflictInfo } from "../types";
+import type { UserMessageDraft } from "../composables/chatMessageDraft";
 
 const props = withDefaults(defineProps<{
   layout?: "side" | "bottom";
   maxSideWidth?: number;
   storageScope?: string;
   workspaceRef?: WorkspaceRef | null;
+  scopedSession?: boolean;
+  sessionId?: string | null;
+  messages?: ChatMessage[];
+  isStreaming?: boolean;
+  unityConnected?: boolean;
+  checkUndoConflicts?: (assistantMessageId: string) => Promise<UndoConflictInfo[]>;
+  checkUndoDirty?: (assistantMessageId: string) => Promise<ChangedFile[]>;
+  performUndo?: (
+    targetMessageId: string,
+    options: { force: boolean; acceptDirty: boolean },
+  ) => Promise<boolean>;
+  restoreComposerDraft?: (draft: UserMessageDraft) => void | Promise<void>;
 }>(), {
   layout: "side",
   storageScope: "",
@@ -83,7 +97,32 @@ function clampSidebarHeight(next: number) {
 }
 
 function closeSidebar() {
-  changesStore.closePanel();
+  if (props.scopedSession) changesStore.closePanelForSession(props.sessionId);
+  else changesStore.closePanel();
+}
+
+function onSidebarResizeKeydown(event: KeyboardEvent) {
+  const step = event.shiftKey ? 24 : 8;
+  if (props.layout === "bottom") {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    sidebarHeight.value = clampSidebarHeight(
+      sidebarHeight.value + (event.key === "ArrowUp" ? step : -step),
+    );
+    try {
+      localStorage.setItem(sidebarHeightStorageKey.value, String(Math.round(sidebarHeight.value)));
+    } catch {}
+    return;
+  }
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  event.preventDefault();
+  sidebarWidth.value = clampSidebarWidth(
+    sidebarWidth.value + (event.key === "ArrowLeft" ? step : -step),
+    effectiveMaxSideWidth.value,
+  );
+  try {
+    localStorage.setItem(sidebarWidthStorageKey.value, String(Math.round(sidebarWidth.value)));
+  } catch {}
 }
 
 function onSidebarResizeMouseDown(event: MouseEvent) {
@@ -169,20 +208,46 @@ onUnmounted(() => {
       { 'dragging-sidebar': isDraggingSidebar },
     ]"
   >
-    <div class="chat-sidebar-resize-handle" @mousedown="onSidebarResizeMouseDown"></div>
+    <div
+      class="chat-sidebar-resize-handle"
+      role="separator"
+      :aria-orientation="layout === 'bottom' ? 'horizontal' : 'vertical'"
+      :aria-label="t('chat.changes.resizePanel')"
+      :aria-valuemin="layout === 'bottom' ? MIN_SIDEBAR_HEIGHT : MIN_SIDEBAR_WIDTH"
+      :aria-valuemax="layout === 'bottom' ? MAX_SIDEBAR_HEIGHT : effectiveMaxSideWidth"
+      :aria-valuenow="layout === 'bottom' ? Math.round(sidebarHeight) : Math.round(effectiveSidebarWidth)"
+      tabindex="0"
+      @mousedown="onSidebarResizeMouseDown"
+      @keydown="onSidebarResizeKeydown"
+    ></div>
 
     <aside
       class="chat-sidebar-panel changes-only"
       :style="sidebarStyle"
     >
-      <button class="chat-sidebar-close" :title="t('common.close')" @click="closeSidebar">&times;</button>
+      <button
+        class="chat-sidebar-close"
+        type="button"
+        :title="t('common.close')"
+        :aria-label="t('common.close')"
+        @click="closeSidebar"
+      >&times;</button>
 
       <ChatChangesPanel
         class="chat-sidebar-section chat-sidebar-section-changes"
         embedded
         :show-close="false"
         :workspace-ref="workspaceRef"
-        @close="changesStore.closePanel()"
+        :scoped-session="scopedSession"
+        :session-id="sessionId"
+        :messages="messages"
+        :is-streaming="isStreaming"
+        :unity-connected="unityConnected"
+        :check-undo-conflicts="checkUndoConflicts"
+        :check-undo-dirty="checkUndoDirty"
+        :perform-undo="performUndo"
+        :restore-composer-draft="restoreComposerDraft"
+        @close="closeSidebar"
       />
     </aside>
   </div>
@@ -218,8 +283,14 @@ onUnmounted(() => {
 }
 
 .chat-sidebar-resize-handle:hover,
+.chat-sidebar-resize-handle:focus-visible,
 .chat-sidebar-shell.dragging-sidebar .chat-sidebar-resize-handle {
   background: var(--text-secondary);
+}
+
+.chat-sidebar-resize-handle:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
 }
 
 .chat-sidebar-panel {

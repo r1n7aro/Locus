@@ -474,8 +474,6 @@ describe("Unity embedded session view", () => {
     expect(input).toContain("localFileAttachments = ref<LocalFileAttachment[]>([])");
     expect(input).toContain("subscribeUnityEmbedAssetDrop((payload)");
     expect(input).toContain('sendMode === "newSession"');
-    expect(input).toContain("chatStore.newChat();");
-    expect(input).toContain("chatStore.newChat();\n    await nextTick();\n    resetDraft();");
     expect(input).toContain("async function handleLocusFileDrop(payload: LocusFileDropPayload)");
     expect(input).toContain("subscribeUnityEmbedTextDrop((payload)");
     expect(input).toContain("subscribeLocusFileDrop((payload)");
@@ -530,7 +528,6 @@ describe("Unity embedded session view", () => {
     expect(chat).toContain("function isUnityEmbeddedWindow()");
     expect(chat).toContain('window.location.pathname === "/unity-embed"');
     expect(chat).toContain("e.ctrlKey || e.metaKey");
-    expect(chat).toContain("openUnityAssetInspector(projectStore.requireWorkspaceRef(), filePath)");
     expect(service).toContain("open_unity_asset_inspector");
     expect(commands).toContain("pub async fn open_unity_asset_inspector");
     expect(bridge).toContain('send_message(project_path, "open_asset_inspector"');
@@ -586,11 +583,7 @@ describe("Unity embedded session view", () => {
     expect(chat).toContain("doAssetRefOpenInKnowledge");
     expect(chat).toContain("function handleKnowledgeRefClick");
     expect(chat).toContain("knowledgeRevealTarget({");
-    expect(chat).toContain("openKnowledgeDocumentInKnowledge(target.docType, target.path)");
-    expect(chat).toContain("openFileExternal(target.filePath)");
-    expect(chat).toContain("showInFolder(target.filePath)");
     expect(chat).toContain("navigator.clipboard.writeText(path)");
-    expect(chat).toContain("selectUnityAsset(projectStore.requireWorkspaceRef(), target.assetPath)");
     expect(chat).toContain('t("common.openInFileExplorer")');
     expect(chat).toContain('t("common.openInKnowledge")');
     expect(chat).toContain('t("common.copyPath")');

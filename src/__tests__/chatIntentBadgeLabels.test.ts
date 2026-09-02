@@ -48,11 +48,4 @@ describe("chat intent badge labels", () => {
     expect(transcript).not.toContain("#3b82f6");
   });
 
-  it("enters sticky plan mode immediately when /plan is picked on an idle session", () => {
-    const richInput = read("src/components/chat/RichChatInput.vue");
-
-    expect(richInput).toContain("chatStore.setSessionPlanMode(sessionId, true)");
-    expect(richInput).toContain("if (sessionId && chatStore.activeSessionPlanMode) return;");
-    expect(richInput).toContain("applyPlanIntentBadge()");
-  });
 });

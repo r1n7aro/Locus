@@ -56,6 +56,11 @@ import {
   useDisplaySettings,
   type KnowledgeFolderKind,
 } from "../../composables/useDisplaySettings";
+import { useSkills } from "../../composables/useSkills";
+import {
+  buildContextReviewDraft,
+  contextReviewAttachmentName,
+} from "../../composables/sessionContextReview";
 import { normalizeAppError } from "../../services/errors";
 import {
   WORKBENCH_INSPECTOR_OPEN_EVENT,
@@ -108,6 +113,7 @@ import type {
 } from "../../types/workbench";
 import type { AssetRefAttachment, KnowledgeDocumentType, SessionSummary } from "../../types";
 import type { UserMessageDraft } from "../../composables/chatMessageDraft";
+import { clearSharedComposerDraft } from "../../composables/chatComposerDraftMemory";
 import { emptyComposerIntent } from "../../composables/chatInputIntents";
 import CollabView from "../CollabView.vue";
 import AssetView from "../AssetView.vue";
@@ -375,6 +381,7 @@ const agentStore = useAgentStore();
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const uiStore = useUiStore();
+const { skillItems } = useSkills();
 const { state: displaySettings, set: setDisplaySetting } = useDisplaySettings();
 
 const WORKBENCH_WINDOW_ID = props.windowId;
@@ -1695,6 +1702,10 @@ async function closeWorkbenchEditor(
   const wasActive = groupBefore?.activeEditorId === editorId;
   const paneCountBefore = Object.keys(workbenchWindow.value.groups).length;
   if (!workbenchStore.closeEditor(WORKBENCH_WINDOW_ID, paneId, editorId)) return;
+  if (
+    closingEditor?.resource.kind === "session"
+    || closingEditor?.resource.kind === "newSession"
+  ) clearSharedComposerDraft(`workbench:${editorId}`);
   const paneRemoved = paneCountBefore > Object.keys(workbenchWindow.value.groups).length;
   const focusedPaneId = workbenchWindow.value.focusedPaneId;
 
@@ -2696,6 +2707,212 @@ async function handleWorkbenchSessionCreated(
     paneId,
   );
   await explorerStore.refreshProjectSessions(editor.resource.projectId);
+}
+
+async function handleWorkbenchSessionForked(
+  paneId: string,
+  payload: {
+    editorId: string;
+    sourceSessionId: string;
+    forkedSessionId: string;
+  },
+): Promise<void> {
+  const sourceEditor = workbenchWindow.value.groups[paneId]?.tabs.find(
+    (candidate) => candidate.editorId === payload.editorId,
+  );
+  if (!sourceEditor || sourceEditor.resource.kind !== "session") return;
+  if (sourceEditor.resource.sessionId !== payload.sourceSessionId) return;
+  const projectId = sourceEditor.resource.projectId;
+  try {
+    await explorerStore.refreshProjectSessions(projectId);
+    const forkedSession = explorerStore.resources[projectId]?.sessions.find(
+      (session) => session.id === payload.forkedSessionId,
+    );
+    await openWorkbenchResource({
+      resource: {
+        kind: "session",
+        projectId,
+        sessionId: payload.forkedSessionId,
+      },
+      title: forkedSession?.title || t("chat.session.forkTitle", sourceEditor.title),
+      checkoutId: forkedSession?.executionTarget?.checkoutId
+        ?? forkedSession?.defaultCheckoutId
+        ?? sourceEditor.checkoutBinding?.checkoutId
+        ?? undefined,
+    }, {
+      paneId,
+      preview: false,
+      pinned: true,
+      replacePreview: false,
+      allowDuplicate: true,
+    });
+    notificationStore.addNotice("success", t("chat.session.forked"), {
+      operation: "forkSession",
+    });
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    notificationStore.addNotice("error", t("chat.session.forkFailed", normalized.message), {
+      code: normalized.code,
+      operation: "forkSession",
+      skipConsoleLog: true,
+    });
+  }
+}
+
+async function handleWorkbenchSessionExport(
+  paneId: string,
+  payload: { editorId: string; request: { sessionId: string } },
+): Promise<void> {
+  const editor = workbenchWindow.value.groups[paneId]?.tabs.find(
+    (candidate) => candidate.editorId === payload.editorId,
+  );
+  if (!editor || editor.resource.kind !== "session") return;
+  if (editor.resource.sessionId !== payload.request.sessionId) return;
+  await exportSessionContextToFile(payload.request.sessionId, editor.title);
+}
+
+async function reviewSessionInWorkbench(
+  paneId: string,
+  source: {
+    projectId: string;
+    checkoutId?: string | null;
+    sessionId: string;
+    title: string;
+  },
+): Promise<void> {
+  const sourceSessionId = source.sessionId;
+  const sourceTitle = source.title || sourceSessionId.slice(0, 8);
+
+  try {
+    const result = await exportSessionContext(sourceSessionId, null);
+    const loadingName = sessionContextExportFileName(sourceSessionId, sourceTitle);
+    const draft = buildContextReviewDraft(skillItems.value, t("chat.contextReviewPrompt"));
+    draft.localFiles.push({
+      name: contextReviewAttachmentName(result.filePath, loadingName),
+      typeLabel: "YAML",
+      path: result.filePath,
+      isDir: false,
+      source: "context-review",
+    });
+    const reviewEditor = await openWorkbenchResource({
+      resource: {
+        kind: "newSession",
+        projectId: source.projectId,
+      },
+      title: t("chat.contextReviewTitle", sourceTitle),
+      checkoutId: source.checkoutId ?? undefined,
+    }, {
+      paneId,
+      preview: false,
+      pinned: true,
+      replacePreview: false,
+      allowDuplicate: true,
+    });
+    await nextTick();
+    const reviewSessionEditor = sessionEditorRefs.get(reviewEditor.editorId);
+    if (!reviewSessionEditor) throw new Error("Workbench session editor did not mount.");
+    await reviewSessionEditor.applyDraftPrefill(draft);
+    await reviewSessionEditor.focusComposerInput();
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    notificationStore.addNotice("error", t("chat.contextReviewFailed", normalized.message), {
+      code: normalized.code,
+      operation: "reviewSessionContext",
+      skipConsoleLog: true,
+    });
+  }
+}
+
+async function handleWorkbenchSessionReview(
+  paneId: string,
+  payload: { editorId: string; request: { sessionId: string } },
+): Promise<void> {
+  const sourceEditor = workbenchWindow.value.groups[paneId]?.tabs.find(
+    (candidate) => candidate.editorId === payload.editorId,
+  );
+  if (!sourceEditor || sourceEditor.resource.kind !== "session") return;
+  if (sourceEditor.resource.sessionId !== payload.request.sessionId) return;
+  const sourceSessionId = payload.request.sessionId;
+  const sourceTitle = explorerStore.resources[sourceEditor.resource.projectId]?.sessions.find(
+    (session) => session.id === sourceSessionId,
+  )?.title || sourceEditor.title;
+  await reviewSessionInWorkbench(paneId, {
+    projectId: sourceEditor.resource.projectId,
+    checkoutId: sourceEditor.checkoutBinding?.checkoutId,
+    sessionId: sourceSessionId,
+    title: sourceTitle,
+  });
+}
+
+function normalizeKnowledgeReferencePath(path: string, docType: KnowledgeDocumentType): string {
+  const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const prefix = `${docType}/`;
+  return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : normalized;
+}
+
+async function handleWorkbenchKnowledgeDocument(
+  paneId: string,
+  payload: {
+    editorId: string;
+    target: "editor" | "knowledge";
+    request: { docType: KnowledgeDocumentType; path: string; workspaceRef: WorkspaceRef };
+  },
+): Promise<void> {
+  const sourceEditor = workbenchWindow.value.groups[paneId]?.tabs.find(
+    (candidate) => candidate.editorId === payload.editorId,
+  );
+  if (!sourceEditor) return;
+  const sourceWorkspaceRef = editorWorkspaceRef(sourceEditor);
+  if (
+    !sourceWorkspaceRef
+    || sourceWorkspaceRef.checkoutId !== payload.request.workspaceRef.checkoutId
+    || (
+      payload.request.workspaceRef.expectedGeneration != null
+      && sourceWorkspaceRef.expectedGeneration !== payload.request.workspaceRef.expectedGeneration
+    )
+  ) return;
+  const projectId = sourceEditor.resource.projectId;
+  try {
+    const targetPath = normalizeKnowledgeReferencePath(
+      payload.request.path,
+      payload.request.docType,
+    );
+    let document = explorerStore.resources[projectId]?.knowledge.find((candidate) => (
+      candidate.type === payload.request.docType
+      && normalizeKnowledgeReferencePath(candidate.path, candidate.type) === targetPath
+    ));
+    if (!document) {
+      await explorerStore.loadProject(projectId, true);
+      document = explorerStore.resources[projectId]?.knowledge.find((candidate) => (
+        candidate.type === payload.request.docType
+        && normalizeKnowledgeReferencePath(candidate.path, candidate.type) === targetPath
+      ));
+    }
+    if (!document) {
+      notificationStore.addNotice("warning", t("workbench.unavailable.knowledge"), {
+        operation: "openKnowledgeDocument",
+        replaceOperation: true,
+      });
+      return;
+    }
+    await openWorkbenchResource({
+      resource: { kind: "knowledge", projectId, documentId: document.id },
+      title: knowledgeDocumentName(document),
+      checkoutId: payload.request.workspaceRef.checkoutId,
+    }, {
+      paneId,
+      preview: payload.target === "editor",
+      pinned: payload.target === "knowledge",
+    });
+  } catch (error) {
+    const normalized = normalizeAppError(error);
+    notificationStore.addNotice("error", normalized.message, {
+      code: normalized.code,
+      operation: "openKnowledgeDocument",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    });
+  }
 }
 
 function newSessionShortcutAction(
@@ -4362,17 +4579,14 @@ async function commitSessionDeleteDialog(): Promise<void> {
   sessionDeleteDialog.value = null;
 }
 
-async function exportContextSession(): Promise<void> {
-  const entry = contextSessionEntry();
-  contextMenu.value = null;
-  if (!entry) return;
+async function exportSessionContextToFile(sessionId: string, title: string): Promise<void> {
   try {
     const filePath = await save({
-      defaultPath: sessionContextExportFileName(entry.session.id, entry.session.title || "untitled"),
+      defaultPath: sessionContextExportFileName(sessionId, title || "untitled"),
       filters: [{ name: "YAML", extensions: ["yaml", "yml"] }],
     });
     if (!filePath) return;
-    const result = await exportSessionContext(entry.session.id, filePath);
+    const result = await exportSessionContext(sessionId, filePath);
     notificationStore.addNotice("success", t("chat.contextExported", result.filePath), {
       operation: "exportSessionContext",
       replaceOperation: true,
@@ -4387,6 +4601,13 @@ async function exportContextSession(): Promise<void> {
   }
 }
 
+async function exportContextSession(): Promise<void> {
+  const entry = contextSessionEntry();
+  contextMenu.value = null;
+  if (!entry) return;
+  await exportSessionContextToFile(entry.session.id, entry.session.title || "untitled");
+}
+
 async function reviewContextSession(): Promise<void> {
   const entry = contextSessionEntry();
   contextMenu.value = null;
@@ -4396,15 +4617,12 @@ async function reviewContextSession(): Promise<void> {
       ?? entry.session.defaultCheckoutId;
     const checkout = await ensureProjectCheckout(entry.project, preferredCheckoutId);
     if (!checkout) return;
-    await openWorkbenchResource({
-      resource: {
-        kind: "session",
-        projectId: entry.project.projectId,
-        sessionId: entry.session.id,
-      },
-      title: entry.session.title || t("chat.session.newSession"),
+    await reviewSessionInWorkbench(workbenchWindow.value.focusedPaneId, {
+      projectId: entry.project.projectId,
       checkoutId: checkout.checkoutId,
-    }, { preview: false, pinned: true });
+      sessionId: entry.session.id,
+      title: entry.session.title,
+    });
   } catch (error) {
     const normalized = normalizeAppError(error);
     notificationStore.addNotice("error", normalized.message, {
@@ -6945,8 +7163,12 @@ watch(
                   "
                   :shortcut-active="focused && group.activeEditorId === editor.editorId"
                   :new-chat-shortcut-action="newSessionShortcutAction(group, editor)"
-                  @session-created="handleWorkbenchSessionCreated(paneId, $event)"
-                  @new-session-requested="handleWorkbenchNewSessionRequested(paneId, $event)"
+                   @session-created="handleWorkbenchSessionCreated(paneId, $event)"
+                   @session-forked="handleWorkbenchSessionForked(paneId, $event)"
+                   @export-session-context="handleWorkbenchSessionExport(paneId, $event)"
+                   @review-session-context="handleWorkbenchSessionReview(paneId, $event)"
+                   @open-knowledge-document="handleWorkbenchKnowledgeDocument(paneId, $event)"
+                   @new-session-requested="handleWorkbenchNewSessionRequested(paneId, $event)"
                   @composer-draft-change="handleWorkbenchComposerDraftChange(paneId, $event)"
                 />
                 <KnowledgeView

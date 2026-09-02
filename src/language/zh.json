@@ -896,6 +896,7 @@
   "chat.undo.noFileUndo": "当前轮次没有可撤回的文件修改",
   "chat.undo.dirtyWarning": "该轮结束后这些文件又有新的修改，撤回时会一并回退：",
   "chat.changes.title": "文件修改",
+  "chat.changes.resizePanel": "调整文件修改面板大小",
   "chat.changes.toggle": "文件修改",
   "chat.changes.modeCurrent": "当前轮次",
   "chat.changes.modeAll": "全部修改",

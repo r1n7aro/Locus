@@ -12,7 +12,6 @@ describe("chat pending panel wheel passthrough", () => {
   it("forwards wheel input from question and approval cards back to the transcript scroller", () => {
     const helper = read("src/composables/chatWheelPassthrough.ts");
     const chatView = read("src/components/ChatView.vue");
-    const embeddedPane = read("src/components/chat/EmbeddedChatPane.vue");
 
     expect(helper).toContain("export function forwardWheelToElement");
     expect(helper).toContain("findScrollableAncestorWithin");
@@ -22,8 +21,5 @@ describe("chat pending panel wheel passthrough", () => {
     expect(chatView).toContain('@wheel="handleBottomPanelWheel"');
     expect(chatView).toContain("forwardWheelToElement(event, getMessagesElement())");
 
-    expect(embeddedPane).toContain('class="embedded-chat-panels"');
-    expect(embeddedPane).toContain('@wheel="handleBottomPanelWheel"');
-    expect(embeddedPane).toContain("forwardWheelToElement(event, getTranscriptElement())");
   });
 });

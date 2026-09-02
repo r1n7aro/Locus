@@ -58,20 +58,6 @@ describe("development workbench session experience", () => {
     expect(workbench).toContain("for (const target of dialog.targets)");
   });
 
-  it("restores the primary session actions from the legacy session tree", () => {
-    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    const chatWorkspace = read("src/components/ChatWorkspaceView.vue");
-
-    expect(workbench).toContain("contextOpenSessionWindow");
-    expect(workbench).toContain("contextOpenSessionInUnity");
-    expect(workbench).toContain("exportContextSession");
-    expect(workbench).toContain("reviewContextSession");
-    expect(workbench).toContain("archiveContextSession");
-    expect(workbench).toContain("beginDeleteSession");
-    expect(chatWorkspace).toContain("defineExpose({");
-    expect(chatWorkspace).toContain("reviewSessionContext,");
-  });
-
   it("creates sibling folders from session menus and groups the actions", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const menuStart = workbench.indexOf(

@@ -42,7 +42,8 @@ describe("chat changes file context menu", () => {
     expect(panel).toContain('class="changes-ctx-item danger"');
     expect(panel).toContain(':disabled="isRevertingFile"');
     const menuBlock = panel.slice(panel.indexOf('class="changes-ctx-menu"'));
-    expect(menuBlock).toContain('<template v-if="!chatStore.isStreaming">');
+    expect(menuBlock).toContain('<template v-if="!activeIsStreaming">');
+    expect(menuBlock).not.toContain('<template v-if="!chatStore.isStreaming">');
   });
 
   it("keeps the menu labels translated in both locales", () => {

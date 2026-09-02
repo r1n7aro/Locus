@@ -15,9 +15,7 @@ import {
   type DirEntry,
   type WorkspaceRef,
 } from "../../services/project";
-import { useChatStore } from "../../stores/chat";
 import { useNotificationStore } from "../../stores/notification";
-import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import type {
   AssetRefAttachment,
   ChatComposerSendPayload,
@@ -49,6 +47,11 @@ import {
   readUserMessageDraftFromClipboardData,
   type UserMessageDraft,
 } from "../../composables/chatMessageDraft";
+import {
+  readSharedComposerDraft,
+  updateSharedComposerDraftText,
+  writeSharedComposerDraft,
+} from "../../composables/chatComposerDraftMemory";
 import { rankSearchResults } from "../../composables/searchMatcher";
 import { useCommandRegistry } from "../../composables/useCommandRegistry";
 import { normalizeAppError } from "../../services/errors";
@@ -78,7 +81,6 @@ import {
   getCachedFileToolWorkspaceBoundary,
   getFileToolWorkspaceBoundary,
 } from "../../services/permissions";
-import { useProjectStore } from "../../stores/project";
 import AssetChip from "../AssetChip.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import MentionPopup from "./MentionPopup.vue";
@@ -174,6 +176,9 @@ const props = withDefaults(defineProps<{
   referenceDropActive?: boolean;
   managedNativeDrops?: boolean;
   workspaceRef?: WorkspaceRef | null;
+  workspaceRoot?: string;
+  planModeActive?: boolean;
+  draftStateKey?: string;
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -196,6 +201,9 @@ const props = withDefaults(defineProps<{
   referenceDropAvailable: false,
   referenceDropActive: false,
   managedNativeDrops: false,
+  workspaceRoot: "",
+  planModeActive: false,
+  draftStateKey: "",
 });
 
 const emit = defineEmits<{
@@ -209,19 +217,19 @@ const emit = defineEmits<{
   (e: "undo"): void;
   (e: "exportContext"): void;
   (e: "reviewContext"): void;
+  (e: "requestPlanMode", active: boolean): void;
+  (e: "requestNewSession"): void;
   (e: "removeManagedLocalFile", fileId: string): void;
 }>();
 
 const composerRef = ref<InstanceType<typeof ChatComposer> | null>(null);
-const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
-const projectStore = useProjectStore();
-const workspaceContextStore = useWorkspaceContextStore();
 const slots = useSlots();
 const { state: chatInputSettings } = useChatInputSettings();
+const restoredSharedDraft = readSharedComposerDraft(props.draftStateKey);
 
-function captureWorkspaceRef() {
-  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+function captureWorkspaceRef(): WorkspaceRef | null {
+  const workspaceRef = props.workspaceRef;
   return workspaceRef
     ? {
         checkoutId: workspaceRef.checkoutId,
@@ -230,10 +238,24 @@ function captureWorkspaceRef() {
     : null;
 }
 
-function isCurrentWorkspaceRef(workspaceRef: ReturnType<typeof captureWorkspaceRef>) {
-  const current = workspaceContextStore.focusedWorkspaceRef;
+function isCurrentWorkspaceRef(workspaceRef: WorkspaceRef | null) {
+  const current = props.workspaceRef;
   return (workspaceRef?.checkoutId ?? null) === (current?.checkoutId ?? null)
     && (workspaceRef?.expectedGeneration ?? null) === (current?.expectedGeneration ?? null);
+}
+
+function payloadTargetsCurrentWorkspace(workspaceRef?: WorkspaceRef | null) {
+  if (!workspaceRef) return true;
+  const current = props.workspaceRef;
+  if (!current || workspaceRef.checkoutId !== current.checkoutId) return false;
+  return workspaceRef.expectedGeneration == null
+    || workspaceRef.expectedGeneration === current.expectedGeneration;
+}
+
+function payloadMatchesCurrentWorkspace(workspaceRef?: WorkspaceRef | null) {
+  const current = props.workspaceRef;
+  if (!workspaceRef || !current || workspaceRef.checkoutId !== current.checkoutId) return false;
+  return (workspaceRef.expectedGeneration ?? null) === (current.expectedGeneration ?? null);
 }
 
 const skillsRef = computed(() => props.skills);
@@ -256,7 +278,23 @@ const localFileAttachments = ref<LocalFileAttachment[]>([]);
 const localFileDragActive = ref(false);
 const showLocalFileDetails = ref(false);
 const previewImageIndex = ref<number | null>(null);
-const composerIntent = ref<ComposerIntentState>(emptyComposerIntent());
+const composerIntent = ref<ComposerIntentState>(restoredSharedDraft ? {
+  mode: restoredSharedDraft.intent.mode,
+  skills: restoredSharedDraft.intent.skills.map((skill) => ({ ...skill })),
+} : emptyComposerIntent());
+if (restoredSharedDraft) {
+  imageAttachments.value = restoredSharedDraft.images.map((image) => ({ ...image }));
+  assetRefAttachments.value = restoredSharedDraft.assetRefs.map((assetRef) => ({ ...assetRef }));
+  consoleTextAttachments.value = restoredSharedDraft.consoleTexts.map((entry, index) => ({
+    ...entry,
+    id: `restored-console-${index}`,
+    createdAt: Date.now(),
+  }));
+  localFileAttachments.value = restoredSharedDraft.localFiles.map((file, index) => ({
+    ...file,
+    id: `restored-file-${index}`,
+  }));
+}
 const activeOperator = ref<ActiveOperator | null>(null);
 const dismissedOperatorKey = ref<string | null>(null);
 const escapedMentionAnchor = ref<number | null>(null);
@@ -303,6 +341,7 @@ let localFileDragStateClearTimer = 0;
 let assetRefSyncChannel: BroadcastChannel | null = null;
 let assetRefSyncSeq = 0;
 let lastAssetRefSyncKey = "";
+let unityConsoleRequestSeq = 0;
 const assetRefSyncSourceId = `rich-chat-input-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 const hasTopAttachments = computed(() =>
   imageAttachments.value.length > 0
@@ -488,9 +527,12 @@ function mapSceneObjectSearchResult(result: WorkspaceSceneObjectSearchResult): M
   };
 }
 
-function searchableUnityScenePaths(): string[] {
-  if (!projectStore.unityConnected) return [];
-  const status = projectStore.unityConnectionStatus;
+function searchableUnityScenePaths(status: {
+  connected: boolean;
+  scenePath?: string | null;
+  scenePaths?: string[] | null;
+}): string[] {
+  if (!status.connected) return [];
   const candidates = [status?.scenePath, ...(status?.scenePaths ?? [])];
   const seen = new Set<string>();
   const scenePaths: string[] = [];
@@ -760,7 +802,9 @@ async function searchAssets(query: string) {
   }
 
   async function searchOpenSceneObjectsFromDisk() {
-    const scenePaths = searchableUnityScenePaths();
+    const status = await checkUnityConnectionStatus(workspaceRef!);
+    if (!requestIsCurrent()) return;
+    const scenePaths = searchableUnityScenePaths(status);
     if (scenePaths.length === 0) return;
     const searches = await Promise.allSettled(scenePaths.map((scenePath) => (
       searchWorkspaceSceneObjects(
@@ -1022,20 +1066,11 @@ function applyPlanIntentBadge() {
 
 function applyIntentCommand(command: CommandDef) {
   if (command.commandType === "plan") {
-    // Symmetric with the sticky bar's exit button: picking /plan on an idle
-    // session enters sticky plan mode immediately (the status bar is the
-    // feedback). The pending badge remains only for the cases where the
-    // sticky state cannot flip yet — no session or a run in flight.
-    const sessionId = chatStore.activeSessionId;
-    if (sessionId && chatStore.activeSessionPlanMode) return;
-    if (sessionId && !props.isStreaming) {
-      chatStore.setSessionPlanMode(sessionId, true).catch((e) => {
-        notificationStore.addNotice("error", normalizeAppError(e).message, { operation: "planMode" });
-        applyPlanIntentBadge();
-      });
-      return;
-    }
+    if (props.planModeActive) return;
+    // Keep the per-message intent until the session controller confirms sticky
+    // plan mode. This also covers new sessions and rejected controller requests.
     applyPlanIntentBadge();
+    if (!props.isStreaming) emit("requestPlanMode", true);
     return;
   }
 
@@ -1118,6 +1153,7 @@ async function selectMentionEntry(entry: MentionDisplayEntry) {
     try {
       await validateUnitySceneObject(workspaceRef, target.scenePath, target.objectPath);
     } catch (error) {
+      if (!isCurrentWorkspaceRef(workspaceRef)) return;
       mentionSearchResults.value = mentionSearchResults.value.filter(
         (result) => result.relPath !== entry.relPath,
       );
@@ -1132,7 +1168,8 @@ async function selectMentionEntry(entry: MentionDisplayEntry) {
     }
 
     if (
-      props.modelValue !== expectedText
+      !isCurrentWorkspaceRef(workspaceRef)
+      || props.modelValue !== expectedText
       || mentionAnchor.value !== expectedAnchor
       || mentionTokenEnd.value !== expectedTokenEnd
     ) return;
@@ -1416,7 +1453,7 @@ function addAssetRefs(
 async function prepareSendToLocusTarget(sendMode?: "focusedSession" | "newSession") {
   const opensNewSession = sendMode === "newSession";
   if (opensNewSession) {
-    chatStore.newChat();
+    emit("requestNewSession");
     await nextTick();
     resetDraft();
     await nextTick();
@@ -1425,6 +1462,7 @@ async function prepareSendToLocusTarget(sendMode?: "focusedSession" | "newSessio
 }
 
 async function handleUnityEmbedAssetDrop(payload: UnityEmbedAssetDropPayload) {
+  if (!payloadTargetsCurrentWorkspace(payload.workspaceRef)) return;
   const opensNewSession = await prepareSendToLocusTarget(payload.sendMode);
   if (opensNewSession) {
     addAssetRefs(payload.refs ?? [], { respectRecentRemoval: false });
@@ -1434,6 +1472,7 @@ async function handleUnityEmbedAssetDrop(payload: UnityEmbedAssetDropPayload) {
 }
 
 async function handleLocusFileDrop(payload: LocusFileDropPayload) {
+  if (!payloadTargetsCurrentWorkspace(payload.workspaceRef)) return;
   await prepareSendToLocusTarget(payload.sendMode);
   const composer = composerRef.value?.getTextarea()?.closest<HTMLElement>(".chat-composer");
   const bounds = composer?.getBoundingClientRect();
@@ -1580,8 +1619,11 @@ function isPathInsideWorkspace(path: string, workspacePath: string) {
   return lowerPath === lowerWorkspace || lowerPath.startsWith(`${lowerWorkspace}/`);
 }
 
-function isExternalLocalFile(file: Pick<LocalFileAttachment, "path">) {
-  return !isPathInsideWorkspace(file.path, projectStore.workingDir);
+function isExternalLocalFile(
+  file: Pick<LocalFileAttachment, "path">,
+  workspaceRoot: string,
+) {
+  return !isPathInsideWorkspace(file.path, workspaceRoot);
 }
 
 function showLocalFileBoundaryWarning() {
@@ -1593,10 +1635,18 @@ function showLocalFileBoundaryWarning() {
 }
 
 async function warnIfFileBoundaryBlocksExternalFiles(files: LocalFileAttachment[]) {
-  if (!files.some(isExternalLocalFile)) return;
+  const workspaceRef = captureWorkspaceRef();
+  const workspaceRoot = normalizeBoundaryPath(props.workspaceRoot);
+  if (!workspaceRef || !workspaceRoot) return;
+  if (!files.some((file) => isExternalLocalFile(file, workspaceRoot))) return;
+
+  function requestIsCurrent() {
+    return isCurrentWorkspaceRef(workspaceRef)
+      && normalizeBoundaryPath(props.workspaceRoot) === workspaceRoot;
+  }
 
   const cachedBoundary = getCachedFileToolWorkspaceBoundary();
-  if (cachedBoundary === true) {
+  if (cachedBoundary === true && requestIsCurrent()) {
     showLocalFileBoundaryWarning();
     return;
   }
@@ -1604,7 +1654,7 @@ async function warnIfFileBoundaryBlocksExternalFiles(files: LocalFileAttachment[
 
   try {
     const boundaryEnabled = await getFileToolWorkspaceBoundary();
-    if (boundaryEnabled) {
+    if (boundaryEnabled && requestIsCurrent()) {
       showLocalFileBoundaryWarning();
     }
   } catch {
@@ -1831,6 +1881,10 @@ function exportDraft(): UserMessageDraft {
   };
 }
 
+function persistSharedComposerDraft(): void {
+  writeSharedComposerDraft(props.draftStateKey, exportDraft());
+}
+
 function appendDraftText(text: string) {
   if (!text) {
     return props.modelValue.length;
@@ -1900,10 +1954,15 @@ async function attachUnityConsoleFromCommand(filter: "all" | "error" = "all") {
   const workspaceRef = captureWorkspaceRef();
   if (!workspaceRef) return;
 
+  const requestSeq = ++unityConsoleRequestSeq;
+  const requestIsCurrent = () => (
+    requestSeq === unityConsoleRequestSeq && isCurrentWorkspaceRef(workspaceRef)
+  );
   const operation = filter === "error" ? "unityConsoleErrorCommand" : "unityConsoleCommand";
   unityConsoleCommandPending.value = true;
   try {
     const status = await checkUnityConnectionStatus(workspaceRef);
+    if (!requestIsCurrent()) return;
     if (!status.connected) {
       notificationStore.addNotice("error", t("chat.command.unityConsoleDisconnected"), {
         operation,
@@ -1913,6 +1972,7 @@ async function attachUnityConsoleFromCommand(filter: "all" | "error" = "all") {
     }
 
     const consolePayload = await getUnityConsoleText(workspaceRef);
+    if (!requestIsCurrent()) return;
     const payload = filter === "error"
       ? filterUnityConsoleErrorPayload(consolePayload)
       : consolePayload;
@@ -1931,6 +1991,7 @@ async function attachUnityConsoleFromCommand(filter: "all" | "error" = "all") {
     clearActionCommandInput();
     addConsoleTextAttachment(payload);
   } catch (error) {
+    if (!requestIsCurrent()) return;
     const normalized = normalizeAppError(error);
     notificationStore.addNotice("error", t("chat.command.unityConsoleFailed", normalized.message), {
       code: normalized.code,
@@ -1938,7 +1999,9 @@ async function attachUnityConsoleFromCommand(filter: "all" | "error" = "all") {
       replaceOperation: true,
     });
   } finally {
-    unityConsoleCommandPending.value = false;
+    if (requestSeq === unityConsoleRequestSeq) {
+      unityConsoleCommandPending.value = false;
+    }
   }
 }
 
@@ -2456,9 +2519,47 @@ function removeSkillBadge(skill: SkillIntentItem) {
   };
 }
 
+watch(
+  () => `${props.workspaceRef?.checkoutId ?? ""}:${props.workspaceRef?.expectedGeneration ?? ""}`,
+  () => {
+    closeMentionPopup();
+    mentionEntries.value = [];
+    mentionEntriesPath.value = null;
+    mentionSearchResults.value = [];
+    mentionSearchSettledQuery.value = "";
+    lastSearchQuery = "";
+    unityConsoleRequestSeq += 1;
+    unityConsoleCommandPending.value = false;
+  },
+);
+
+watch(() => props.planModeActive, (active) => {
+  if (active && composerIntent.value.mode === "plan") {
+    removePlanBadge();
+  }
+});
+
 watch(() => props.modelValue, () => {
   nextTick(syncOperatorState);
 });
+
+watch(
+  () => props.modelValue,
+  (text) => updateSharedComposerDraftText(props.draftStateKey, text),
+  { flush: "sync", immediate: true },
+);
+
+watch(
+  [
+    imageAttachments,
+    assetRefAttachments,
+    consoleTextAttachments,
+    localFileAttachments,
+    composerIntent,
+  ],
+  persistSharedComposerDraft,
+  { deep: true, flush: "sync" },
+);
 
 watch(
   () => [showCommandPopup.value, commandHighlightIndex.value, filteredCommands.value.length],
@@ -2503,7 +2604,14 @@ watch(
     const next = nextKey.trim();
     lastAssetRefSyncKey = next;
     if (!next) return;
-    assetRefAttachments.value = cloneAssetRefs(assetRefDrafts.get(next) ?? []);
+    const remembered = assetRefDrafts.get(next);
+    if (remembered) {
+      assetRefAttachments.value = cloneAssetRefs(remembered);
+    } else if (previousKey === undefined) {
+      rememberAssetRefDraft(assetRefAttachments.value, next);
+    } else {
+      assetRefAttachments.value = [];
+    }
   },
   { immediate: true },
 );
@@ -2541,6 +2649,7 @@ onMounted(() => {
       });
   }
   subscribeUnityEmbedTextDrop((payload) => {
+    if (!payloadMatchesCurrentWorkspace(payload.workspaceRef)) return;
     addConsoleTextAttachment(payload);
   })
     .then((release) => {
@@ -2637,15 +2746,21 @@ defineExpose({
           v-if="showCommandPopup && filteredCommands.length > 0"
           ref="commandPopupRef"
           class="command-popup"
+          role="listbox"
         >
-          <div
+          <button
             v-for="(command, index) in filteredCommands"
             :key="command.name"
+            type="button"
             class="command-item"
             :class="{ highlighted: index === commandHighlightIndex }"
             :ref="(el) => setCommandItemRef(index, el)"
+            role="option"
+            :aria-selected="index === commandHighlightIndex"
             @mouseenter="commandHighlightIndex = index"
-            @mousedown.prevent="executeCommandFromPopup(command)"
+            @focus="commandHighlightIndex = index"
+            @mousedown.prevent
+            @click="executeCommandFromPopup(command)"
           >
             <div class="command-main">
               <div class="command-header">
@@ -2655,7 +2770,7 @@ defineExpose({
               </div>
               <span class="command-desc">{{ command.description }}</span>
             </div>
-          </div>
+          </button>
         </div>
       </Transition>
 
@@ -3150,9 +3265,14 @@ defineExpose({
 
 .command-item {
   display: flex;
+  width: 100%;
   align-items: flex-start;
   gap: 10px;
   padding: 8px 12px;
+  color: var(--text-color);
+  font: inherit;
+  text-align: left;
+  background: transparent;
   border: 1px solid transparent;
   border-radius: 7px;
   cursor: pointer;
@@ -3568,6 +3688,7 @@ defineExpose({
 .asset-ref-group-button:focus-visible,
 .local-file-group-button:focus-visible,
 .console-text-group-button:focus-visible,
+.command-item:focus-visible,
 .asset-ref-group-remove:focus-visible,
 .local-file-chip-remove:focus-visible,
 .asset-ref-details-close:focus-visible {

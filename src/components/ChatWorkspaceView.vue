@@ -15,10 +15,8 @@ import type {
   AssetRefAttachment,
   ManagedLocalFileAttachment,
   SessionContextExportRequest,
-  SkillIntentItem,
   UserIntentMeta,
 } from "../types";
-import type { UserMessageDraft } from "../composables/chatMessageDraft";
 import { useAgentStore } from "../stores/agent";
 import { useAuthStore } from "../stores/auth";
 import { useChatStore } from "../stores/chat";
@@ -38,6 +36,10 @@ import ThinkingPanel from "./ThinkingPanel.vue";
 import ChatSidebarPanel from "./ChatSidebarPanel.vue";
 import { resolveChatContentBalanceInset } from "./chat/chatSidebarBalance";
 import { sessionContextExportFileName } from "../composables/sessionContextExport";
+import {
+  buildContextReviewDraft,
+  contextReviewAttachmentName,
+} from "../composables/sessionContextReview";
 
 type ChatLayoutMode = "auto" | "horizontal" | "vertical";
 type ResolvedChatLayoutMode = "horizontal" | "vertical";
@@ -450,30 +452,6 @@ function resolveContextSessionId(request?: string | SessionContextExportRequest)
   return (typeof request === "string" ? request : request?.sessionId || chatStore.activeSessionId)?.trim() ?? "";
 }
 
-function reviewContextSkillIntent(): UserIntentMeta {
-  const manifest = skillItems.value.find((skill) =>
-    skill.dirName === "review-context" && skill.source === "project"
-  ) ?? skillItems.value.find((skill) =>
-    skill.dirName === "review-context" && skill.source === "app"
-  );
-  const skill: SkillIntentItem = manifest
-    ? {
-        dirName: manifest.dirName,
-        source: manifest.source,
-        name: manifest.name,
-      }
-    : {
-        dirName: "review-context",
-        source: "app",
-        name: "Review Context",
-      };
-  return {
-    kind: "user_intent_v1",
-    mode: "build",
-    skills: [skill],
-  };
-}
-
 const activeContextReviewFiles = computed(() => {
   const sessionId = chatStore.activeSessionId;
   if (!sessionId) return [];
@@ -493,25 +471,6 @@ function removeContextReviewFile(sessionId: string, fileId?: string) {
   const next = new Map(contextReviewFiles.value);
   next.delete(sessionId);
   contextReviewFiles.value = next;
-}
-
-function contextReviewDraft(): UserMessageDraft {
-  const intent = reviewContextSkillIntent();
-  return {
-    text: t("chat.contextReviewPrompt"),
-    images: [],
-    assetRefs: [],
-    localFiles: [],
-    consoleTexts: [],
-    intent: {
-      mode: intent.mode,
-      skills: intent.skills,
-    },
-  };
-}
-
-function contextReviewFileName(filePath: string, fallback: string) {
-  return filePath.replace(/\\/g, "/").split("/").filter(Boolean).pop() || fallback;
 }
 
 async function sendWorkspaceMessage(
@@ -588,9 +547,12 @@ async function reviewSessionContext(request?: string | SessionContextExportReque
     await chatStore.selectSession(reviewSessionId, {
       persist: props.persistSessionSelection,
     });
-    uiStore.stageChatDraftPrefill(contextReviewDraft(), {
+    uiStore.stageChatDraftPrefill(
+      buildContextReviewDraft(skillItems.value, t("chat.contextReviewPrompt")),
+      {
       sessionId: reviewSessionId,
-    });
+      },
+    );
     void chatStore.refreshSessions();
 
     try {
@@ -599,7 +561,7 @@ async function reviewSessionContext(request?: string | SessionContextExportReque
       if (!current || current.id !== fileId) return;
       setContextReviewFile(reviewSessionId, {
         ...current,
-        name: contextReviewFileName(result.filePath, loadingName),
+        name: contextReviewAttachmentName(result.filePath, loadingName),
         path: result.filePath,
         status: "ready",
       });

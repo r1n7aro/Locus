@@ -3,7 +3,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { useChatStore } from "../stores/chat";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useUiStore } from "../stores/ui";
-import type { TodoItem, TodoSnapshot } from "../types";
+import type { FileDiffPayload, TodoItem, TodoSnapshot } from "../types";
 
 const sessionServiceMocks = vi.hoisted(() => ({
   applyKnowledgeProposal: vi.fn(),
@@ -1075,6 +1075,46 @@ describe("chat session panel state", () => {
     undoData.s2 = [makeUndoEntry("s2", "src/brand-new.ts")];
     await changesStore.refresh("s2");
     expect(changesStore.currentPanelVisible).toBe(true);
+  });
+
+  it("isolates explicit panel and inline diff state from the globally active session", async () => {
+    const chatStore = useChatStore();
+    const changesStore = useChatChangesStore();
+    await chatStore.selectSession("s1");
+    await changesStore.refresh("s1", { allowAutoOpen: false });
+    await changesStore.refresh("s2", { allowAutoOpen: false });
+    const firstDiff: FileDiffPayload = {
+      key: "diff-s1",
+      filePath: "src/one.ts",
+      status: "M",
+      isBinary: false,
+      isLarge: false,
+      contentState: { type: "normal" },
+      stats: { additions: 1, deletions: 0, changedHunks: 1 },
+      previewSummary: [],
+    };
+    const secondDiff: FileDiffPayload = {
+      ...firstDiff,
+      key: "diff-s2",
+      filePath: "src/two.ts",
+    };
+
+    changesStore.togglePanelForSession("s2");
+    changesStore.setModeForSession("s2", "all");
+    changesStore.openInlineDiffForSession("s1", firstDiff, "assistant-s1");
+    changesStore.openInlineDiffForSession("s2", secondDiff, "assistant-s2");
+
+    expect(changesStore.currentPanelVisible).toBe(false);
+    expect(changesStore.sessionState("s2")).toMatchObject({
+      panelVisible: true,
+      mode: "all",
+    });
+    expect(changesStore.inlineDiffStateForSession("s1")?.payload?.key).toBe("diff-s1");
+    expect(changesStore.inlineDiffStateForSession("s2")?.payload?.key).toBe("diff-s2");
+
+    changesStore.closeInlineDiffForSession("s2");
+    expect(changesStore.inlineDiffStateForSession("s1")?.payload?.key).toBe("diff-s1");
+    expect(changesStore.inlineDiffStateForSession("s2")).toBeNull();
   });
 
   it("auto-opens file changes again when a later round adds new changes", async () => {

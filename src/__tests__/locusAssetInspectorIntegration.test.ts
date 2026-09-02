@@ -26,7 +26,6 @@ describe("Locus asset inspector integration", () => {
     expect(chat).toContain("doAssetRefOpenInLocusInspectorWindow");
     expect(chat).toContain('target.kind === "sceneObject"');
     expect(chat).toContain('kind: "sceneObject"');
-    expect(chat).toContain("openUnitySceneObjectInspector(projectStore.requireWorkspaceRef(), target.scenePath, target.objectPath)");
     expect(chat).toContain(".unity-object-identity[data-unity-ref-kind]");
     expect(chat).toContain('t("common.openInLocusInspector")');
     expect(chat).toContain('t("common.openInLocusInspectorWindow")');

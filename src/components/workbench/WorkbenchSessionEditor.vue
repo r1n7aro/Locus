@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
+import { t } from "../../i18n";
 import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
 import { useSkills } from "../../composables/useSkills";
+import { useKnowledgeAccessMode } from "../../composables/useKnowledgeAccessMode";
 import { useWorkspaceAssetDbStatus } from "../../composables/useWorkspaceAssetDbStatus";
 import { useWorkspaceUnityStatus } from "../../composables/useWorkspaceUnityStatus";
 import type { WorkspaceRef } from "../../services/project";
+import { saveSessionExecutionState } from "../../services/session";
+import { broadcastSessionExecutionState } from "../../services/sessionExecutionState";
 import { useAgentStore } from "../../stores/agent";
 import { useAuthStore } from "../../stores/auth";
-import { useChatStore } from "../../stores/chat";
+import { useChatChangesStore } from "../../stores/chatChanges";
 import { useModelStore } from "../../stores/model";
 import { useNotificationStore } from "../../stores/notification";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
@@ -16,10 +20,14 @@ import type {
   ChatComposerSendPayload,
   EffortLevel,
   ImageAttachment,
+  KnowledgeDocumentType,
+  SessionContextExportRequest,
   UserIntentMeta,
 } from "../../types";
 import type { WorkbenchEditorInput } from "../../types/workbench";
 import ChatView from "../ChatView.vue";
+import ChatSidebarPanel from "../ChatSidebarPanel.vue";
+import ThinkingPanel from "../ThinkingPanel.vue";
 
 const props = defineProps<{
   editor: WorkbenchEditorInput;
@@ -37,15 +45,34 @@ const emit = defineEmits<{
     source: "control" | "shortcut";
   }): void;
   (event: "composer-draft-change", payload: { editorId: string; hasDraft: boolean }): void;
+  (event: "session-forked", payload: {
+    editorId: string;
+    sourceSessionId: string;
+    forkedSessionId: string;
+  }): void;
+  (event: "export-session-context", payload: {
+    editorId: string;
+    request: SessionContextExportRequest;
+  }): void;
+  (event: "review-session-context", payload: {
+    editorId: string;
+    request: SessionContextExportRequest;
+  }): void;
+  (event: "open-knowledge-document", payload: {
+    editorId: string;
+    target: "editor" | "knowledge";
+    request: { docType: KnowledgeDocumentType; path: string; workspaceRef: WorkspaceRef };
+  }): void;
 }>();
 
 const agentStore = useAgentStore();
 const authStore = useAuthStore();
-const chatStore = useChatStore();
+const chatChangesStore = useChatChangesStore();
 const modelStore = useModelStore();
 const notificationStore = useNotificationStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const { skillItems } = useSkills();
+const { state: knowledgeAccessState } = useKnowledgeAccessMode();
 const chatViewRef = ref<InstanceType<typeof ChatView> | null>(null);
 
 const requestedSessionId = computed(() => (
@@ -126,6 +153,7 @@ const {
   clearRestoredComposerDraft,
   messages,
   streamingText,
+  thinkingStream,
   streamingTextOrder,
   thinkingOrder,
   liveRenderParts,
@@ -133,6 +161,7 @@ const {
   isStreaming,
   isCancelling,
   isCompacting,
+  compactQueued,
   isThinking,
   hasThinking,
   thinkingDuration,
@@ -144,17 +173,37 @@ const {
   queuedFollowUp,
   errorMessage,
   sessionId,
+  currentRunId,
   sessionAgentId,
   sessionModelId,
   sessionEffort,
   sessionFastMode,
+  parentSessionId,
+  latestCompletedRunId,
+  planModeActive,
+  canResumeInterrupted,
+  sessionHistoryHasMore,
+  sessionHistoryLoading,
+  sessionUserMessageIds,
   setExecutionSelection,
   sendComposerPayload,
+  compact,
+  resumeInterrupted,
   insertQueuedFollowUp,
   deleteQueuedFollowUp,
   reEditQueuedFollowUp,
   cancel,
+  setPlanMode,
+  exitPlanMode,
+  loadOlderHistory,
+  loadSessionHistoryThroughMessage,
+  loadSessionTurnPreview,
+  restoreComposerDraft,
+  forkFromMessage,
+  forkSession,
+  checkUndoConflicts,
   checkUndoDirty,
+  performUndo,
   rollbackConversation,
   rollbackFilesAndConversation,
   resetSession,
@@ -176,6 +225,7 @@ const {
   effort: editorEffort,
   effortSupported: editorEffortSupported,
   fastMode: editorFastMode,
+  knowledgeMode: computed(() => knowledgeAccessState.mode),
   buildRequest(input) {
     return { text: input, displayText: input };
   },
@@ -202,6 +252,32 @@ watch(
 const streamingSessionIds = computed(() => (
   sessionId.value && isStreaming.value ? new Set([sessionId.value]) : new Set<string>()
 ));
+const changesPanelVisible = computed(() => (
+  chatChangesStore.sessionState(sessionId.value)?.panelVisible ?? false
+));
+const showThinkingPanel = ref(false);
+const thinkingPanelContent = ref("");
+
+watch(sessionId, (nextSessionId) => {
+  if (!nextSessionId) return;
+  chatChangesStore.setActiveRunId(nextSessionId, currentRunId.value);
+  chatChangesStore.setLatestCompletedRunId(nextSessionId, latestCompletedRunId.value);
+  void chatChangesStore.refresh(nextSessionId, { allowAutoOpen: false });
+}, { immediate: true });
+
+watch([sessionId, currentRunId] as const, ([targetSessionId, runId]) => {
+  chatChangesStore.setActiveRunId(targetSessionId, runId);
+});
+
+watch([sessionId, latestCompletedRunId] as const, ([targetSessionId, runId]) => {
+  chatChangesStore.setLatestCompletedRunId(targetSessionId, runId);
+});
+
+watch(isStreaming, (streaming, wasStreaming) => {
+  if (!streaming && wasStreaming && sessionId.value) {
+    void chatChangesStore.refresh(sessionId.value);
+  }
+});
 
 watch(sessionId, (nextSessionId) => {
   if (!nextSessionId || requestedSessionId.value === nextSessionId) return;
@@ -221,10 +297,36 @@ watch(
     if (agentId && agentStore.agents.some((agent) => agent.id === agentId)) editorAgentId.value = agentId;
     if (modelId && modelStore.availableModels.some((model) => model.id === modelId)) editorModelId.value = modelId;
     if (effort && editorEfforts.value.includes(effort)) editorEffort.value = effort;
-    if (fastMode != null) editorFastMode.value = fastMode;
+    if (fastMode != null) editorFastMode.value = editorFastModeAvailable.value && fastMode;
   },
   { immediate: true },
 );
+
+watch(editorFastModeAvailable, (available) => {
+  if (!available) editorFastMode.value = false;
+}, { immediate: true });
+
+let executionStateSaveQueue = Promise.resolve();
+
+function persistExecutionSelection(): void {
+  const targetSessionId = sessionId.value;
+  if (!targetSessionId) return;
+  const modelId = editorModelId.value;
+  const effort = editorEffort.value;
+  const fastMode = editorFastModeAvailable.value && editorFastMode.value;
+  void broadcastSessionExecutionState({
+    sessionId: targetSessionId,
+    modelId,
+    effort,
+    fastMode,
+  });
+  executionStateSaveQueue = executionStateSaveQueue
+    .catch(() => undefined)
+    .then(() => saveSessionExecutionState(targetSessionId, modelId, effort, fastMode))
+    .catch((error: unknown) => {
+      console.warn("save_session_execution_state failed:", error);
+    });
+}
 
 watch(
   [selectedAgentId, editorModelId, editorEffort, editorFastMode] as const,
@@ -300,6 +402,76 @@ function handleSelectModel(modelId: string): void {
   if (editorEfforts.value.length > 0 && !editorEfforts.value.includes(editorEffort.value)) {
     editorEffort.value = editorEfforts.value[0]!;
   }
+  if (!editorFastModeAvailable.value) editorFastMode.value = false;
+  persistExecutionSelection();
+}
+
+function handleSelectEffort(effort: EffortLevel): void {
+  if (!editorEfforts.value.includes(effort)) return;
+  editorEffort.value = effort;
+  persistExecutionSelection();
+}
+
+function handleSelectFastMode(enabled: boolean): void {
+  editorFastMode.value = editorFastModeAvailable.value && enabled;
+  persistExecutionSelection();
+}
+
+function handleOpenThinking(content: string): void {
+  thinkingPanelContent.value = content;
+  showThinkingPanel.value = true;
+}
+
+function closeThinkingPanel(): void {
+  showThinkingPanel.value = false;
+}
+
+async function handleForkFromMessage(messageId: string): Promise<void> {
+  const sourceSessionId = sessionId.value;
+  if (!sourceSessionId) return;
+  const forkedSessionId = await forkFromMessage(
+    messageId,
+    t("chat.session.forkTitle", props.editor.title),
+  );
+  if (!forkedSessionId) return;
+  emit("session-forked", {
+    editorId: props.editor.editorId,
+    sourceSessionId,
+    forkedSessionId,
+  });
+}
+
+async function handleForkSession(): Promise<void> {
+  const sourceSessionId = sessionId.value;
+  if (!sourceSessionId) return;
+  const forkedSessionId = await forkSession(t("chat.session.forkTitle", props.editor.title));
+  if (!forkedSessionId) return;
+  emit("session-forked", {
+    editorId: props.editor.editorId,
+    sourceSessionId,
+    forkedSessionId,
+  });
+}
+
+function handleExportSessionContext(request: SessionContextExportRequest): void {
+  if (!request.sessionId.trim()) return;
+  emit("export-session-context", { editorId: props.editor.editorId, request });
+}
+
+function handleReviewSessionContext(request: SessionContextExportRequest): void {
+  if (!request.sessionId.trim()) return;
+  emit("review-session-context", { editorId: props.editor.editorId, request });
+}
+
+function handleOpenKnowledgeDocument(
+  target: "editor" | "knowledge",
+  request: { docType: KnowledgeDocumentType; path: string; workspaceRef: WorkspaceRef },
+): void {
+  emit("open-knowledge-document", {
+    editorId: props.editor.editorId,
+    target,
+    request,
+  });
 }
 
 function handleNewSessionRequest(request: { source: "control" | "shortcut" }): void {
@@ -322,11 +494,12 @@ defineExpose({
 </script>
 
 <template>
-  <ChatView
-    ref="chatViewRef"
-    class="workbench-session-editor"
-    scoped-session
-    managed-native-drops
+  <div class="workbench-session-shell">
+    <ChatView
+      ref="chatViewRef"
+      class="workbench-session-editor"
+      scoped-session
+      managed-native-drops
     :session-surface-key="sessionKey"
     :messages="messages"
     :streaming-text="streamingText"
@@ -334,8 +507,9 @@ defineExpose({
     :streaming-text-order="streamingTextOrder"
     :is-streaming="isStreaming"
     :is-cancelling="isCancelling"
-    :can-resume-interrupted="false"
+    :can-resume-interrupted="canResumeInterrupted"
     :is-compacting="isCompacting"
+    :compact-queued="compactQueued"
     :is-thinking="isThinking"
     :has-thinking="hasThinking"
     :thinking-order="thinkingOrder"
@@ -352,7 +526,7 @@ defineExpose({
     :effort="editorEffort"
     :effort-supported="editorEffortSupported"
     :effort-levels="editorEfforts"
-    :fast-mode-enabled="editorFastMode"
+    :fast-mode-enabled="editorFastModeAvailable && editorFastMode"
     :fast-mode-available="editorFastModeAvailable"
     :token-usage="tokenUsage"
     :codex-connected="authStore.codexAuthenticated"
@@ -360,8 +534,10 @@ defineExpose({
     :pending-tool-confirms="pendingToolConfirms"
     :queued-follow-up="queuedFollowUp"
     :composer-value="inputText"
-    :sessions="chatStore.sessions"
+    :sessions="[]"
     :active-session-id="sessionId"
+    :current-run-id="currentRunId"
+    :is-viewing-subagent="!!parentSessionId"
     :pending-session-id="null"
     :unity-connected="workspaceUnityConnected"
     :unity-plugin-status="workspaceUnityPluginStatus"
@@ -385,14 +561,28 @@ defineExpose({
     :check-undo-dirty="checkUndoDirty"
     :undo-conversation="rollbackConversation"
     :undo-files-and-conversation="rollbackFilesAndConversation"
+    :restore-composer-draft="restoreComposerDraft"
+    :fork-from-message="handleForkFromMessage"
+    :exit-plan-mode="exitPlanMode"
+    :plan-mode-active="planModeActive"
+    :session-history-loading="sessionHistoryLoading"
+    :session-history-has-more="sessionHistoryHasMore"
+    :load-older-history="loadOlderHistory"
+    :session-user-message-ids="sessionUserMessageIds"
+    :load-session-turn-preview="loadSessionTurnPreview"
+    :load-session-history-through-message="loadSessionHistoryThroughMessage"
     :show-session-navigation="false"
     :session-panel-storage-scope="sessionKey"
+    :composer-draft-state-key="sessionKey"
     @send="handleSend"
+    @compact="compact"
+    @fork="handleForkSession"
     @cancel="cancel"
+    @resume="resumeInterrupted"
     @select-agent="handleSelectAgent"
     @select-model="handleSelectModel"
-    @select-effort="editorEffort = $event"
-    @select-fast-mode="editorFastMode = $event"
+    @select-effort="handleSelectEffort"
+    @select-fast-mode="handleSelectFastMode"
     @answer-question="answerQuestion"
     @answer-tool-confirm="answerToolConfirm"
     @answer-all-tool-confirms="answerAllToolConfirms"
@@ -402,17 +592,53 @@ defineExpose({
     @apply-knowledge-proposal="applyKnowledgeProposal"
     @ignore-knowledge-proposal="ignoreKnowledgeProposal"
     @update-composer-value="inputText = $event"
+    @request-plan-mode="setPlanMode"
+    @export-session-context="handleExportSessionContext"
+    @review-session-context="handleReviewSessionContext"
+    @open-thinking="handleOpenThinking"
+    @open-knowledge-document="handleOpenKnowledgeDocument('editor', $event)"
+    @open-knowledge-document-in-knowledge="handleOpenKnowledgeDocument('knowledge', $event)"
     @new-chat="handleNewSessionRequest"
     @start-scan="startWorkspaceAssetScan"
     @install-plugin="installWorkspaceUnityPlugin"
     @launch-unity-project="launchWorkspaceUnity"
-  />
+    />
+    <ThinkingPanel
+      v-if="showThinkingPanel"
+      :text="thinkingPanelContent"
+      :stream="thinkingPanelContent ? null : thinkingStream"
+      :is-thinking="isThinking && !thinkingPanelContent"
+      @close="closeThinkingPanel"
+    />
+    <ChatSidebarPanel
+      v-if="changesPanelVisible"
+      scoped-session
+      :storage-scope="sessionKey"
+      :workspace-ref="workspaceRef"
+      :session-id="sessionId"
+      :messages="messages"
+      :is-streaming="isStreaming"
+      :unity-connected="workspaceUnityConnected"
+      :check-undo-conflicts="checkUndoConflicts"
+      :check-undo-dirty="checkUndoDirty"
+      :perform-undo="performUndo"
+      :restore-composer-draft="restoreComposerDraft"
+    />
+  </div>
 </template>
 
 <style scoped>
-.workbench-session-editor {
+.workbench-session-shell {
+  display: flex;
   width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench-session-editor {
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
 }

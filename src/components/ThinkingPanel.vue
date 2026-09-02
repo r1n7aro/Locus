@@ -87,7 +87,13 @@ onBeforeUnmount(() => {
         <span v-if="isThinking" class="thinking-dot" />
         {{ t("thinking.panel.title") }}
       </span>
-      <button class="close-btn" @click="emit('close')" :title="t('thinking.panel.close')">&times;</button>
+      <button
+        class="close-btn"
+        type="button"
+        @click="emit('close')"
+        :title="t('thinking.panel.close')"
+        :aria-label="t('thinking.panel.close')"
+      >&times;</button>
     </div>
     <div ref="contentRef" class="thinking-content">
       <pre v-if="text" class="thinking-text">{{ text }}</pre>
@@ -137,7 +143,7 @@ onBeforeUnmount(() => {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #3b82f6;
+  background: var(--accent-color);
   animation: pulse 1.2s ease-in-out infinite;
   flex-shrink: 0;
 }

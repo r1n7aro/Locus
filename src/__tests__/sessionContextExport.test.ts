@@ -90,9 +90,8 @@ describe("structured session context export", () => {
     expect(chatStore).toContain("detail.lastFastMode ?? modelStore.defaultCodexFastMode");
   });
 
-  it("exposes the review workflow as a selected builtin skill", () => {
+  it("ships the context review workflow as a builtin skill", () => {
     const skill = read("knowledge/skill/review-context.md");
-    const workspace = read("src/components/ChatWorkspaceView.vue");
     const zh = JSON.parse(read("src/language/zh.json"));
     const en = JSON.parse(read("src/language/en.json"));
 
@@ -111,10 +110,6 @@ describe("structured session context export", () => {
     expect(skill).toContain("## Instructions");
     expect(skill).toContain("### Evaluate compaction continuity");
     expect(skill).toContain("Tool-result audit");
-    expect(workspace).toContain("function reviewContextSkillIntent(): UserIntentMeta");
-    expect(workspace).toContain('dirName: "review-context"');
-    expect(workspace).toContain("uiStore.stageChatDraftPrefill(contextReviewDraft()");
-    expect(workspace).toContain("skills: intent.skills");
     expect(zh["chat.contextReviewPrompt"]).toBe("请review这个context");
     expect(en["chat.contextReviewPrompt"]).toBe("Please review this context");
     expect(zh["chat.contextReviewPrompt"]).not.toContain("完整分析轨迹");
@@ -149,37 +144,4 @@ describe("structured session context export", () => {
     expect(claude).toContain("record_captured_attempt");
   });
 
-  it("wires export and isolated review through built-in commands and the session menu", () => {
-    const service = read("src/services/session.ts");
-    const registry = read("src/composables/useCommandRegistry.ts");
-    const input = read("src/components/chat/RichChatInput.vue");
-    const workspace = read("src/components/ChatWorkspaceView.vue");
-    const panel = read("src/components/chat/SessionPanel.vue");
-    const reviewWorkflow = workspace.slice(
-      workspace.indexOf("async function reviewSessionContext"),
-      workspace.indexOf("onMounted("),
-    );
-
-    expect(service).toContain('ipcInvoke<ContextExportResult>("export_session_context"');
-    expect(registry).toContain('name: "/export-context"');
-    expect(registry).toContain('name: "/review-context"');
-    expect(input).toContain('emit("exportContext")');
-    expect(input).toContain('emit("reviewContext")');
-    expect(workspace).toContain("await createSession({");
-    expect(workspace).toContain("await chatStore.selectSession(reviewSessionId");
-    expect(workspace).toContain('"chat.contextReviewPrompt"');
-    expect(reviewWorkflow).toContain("chatStore.newChat({ persistSelection: props.persistSessionSelection })");
-    expect(reviewWorkflow).toContain("uiStore.stageChatDraftPrefill(contextReviewDraft()");
-    expect(reviewWorkflow).toContain('status: "loading"');
-    expect(reviewWorkflow).toContain('status: "ready"');
-    expect(reviewWorkflow).not.toContain("chatStore.sendMessage(");
-    expect(reviewWorkflow.indexOf("chatStore.selectSession(reviewSessionId"))
-      .toBeLessThan(reviewWorkflow.indexOf("await exportContext(sid, null)"));
-    expect(input).toContain("managedLocalFiles");
-    expect(input).toContain("hasBlockingManagedLocalFile");
-    expect(input).toContain('t("chat.fileRefs.exporting")');
-    expect(panel).toContain("chat.exportContext");
-    expect(panel).toContain("chat.reviewContext");
-    expect(workspace).not.toContain("includeSystemPrompt");
-  });
 });

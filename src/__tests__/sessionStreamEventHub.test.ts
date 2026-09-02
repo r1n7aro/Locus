@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 import type { StreamEvent } from "../types";
 import {
+  bindSessionAsyncTaskUpdateConsumer,
   bindSessionStreamEventConsumer,
+  publishSessionAsyncTaskUpdate,
+  publishSessionExecutionState,
   publishSessionStreamEvent,
   sessionStreamSourceMatchesWorkspace,
+  subscribeSessionAsyncTaskUpdateConsumer,
+  subscribeSessionExecutionStateConsumer,
   subscribeSessionStreamEventConsumer,
   subscribeSessionStreamEvents,
   workspaceStreamEventSource,
@@ -129,6 +134,72 @@ describe("session stream event hub", () => {
     expect(bindSessionStreamEventConsumer(sessionId).map(({ event }) => event)).toEqual([
       terminal,
     ]);
+  });
+
+  it("delivers one async task update to a shared reducer mounted in multiple panes", () => {
+    const sharedState = {};
+    const first = vi.fn();
+    const second = vi.fn();
+    const unsubscribeFirst = subscribeSessionAsyncTaskUpdateConsumer(() => sharedState, first);
+    const unsubscribeSecond = subscribeSessionAsyncTaskUpdateConsumer(() => sharedState, second);
+    const update = {
+      sessionId: "async-shared-session",
+      assistantMessageId: "assistant-1",
+      toolCallId: "tool-1",
+      taskId: "task-1",
+      toolName: "bash",
+      status: "running" as const,
+      output: "line 1",
+    };
+
+    publishSessionAsyncTaskUpdate(update);
+
+    expect(first).toHaveBeenCalledOnce();
+    expect(first).toHaveBeenCalledWith(update);
+    expect(second).not.toHaveBeenCalled();
+    unsubscribeFirst();
+    unsubscribeSecond();
+  });
+
+  it("replays async task updates received before a durable reducer binds", () => {
+    const update = {
+      sessionId: "async-pending-session",
+      assistantMessageId: "assistant-2",
+      toolCallId: "tool-2",
+      taskId: "task-2",
+      toolName: "bash",
+      status: "completed" as const,
+      output: "done",
+    };
+
+    publishSessionAsyncTaskUpdate(update);
+
+    expect(bindSessionAsyncTaskUpdateConsumer(update.sessionId)).toEqual([update]);
+    expect(bindSessionAsyncTaskUpdateConsumer(update.sessionId)).toEqual([]);
+  });
+
+  it("deduplicates execution-state updates for a session shared by multiple panes", () => {
+    const sharedState = {};
+    const first = vi.fn();
+    const second = vi.fn();
+    const resolve = (update: { sessionId: string }) => (
+      update.sessionId === "execution-session" ? sharedState : null
+    );
+    const unsubscribeFirst = subscribeSessionExecutionStateConsumer(resolve, first);
+    const unsubscribeSecond = subscribeSessionExecutionStateConsumer(resolve, second);
+    const update = {
+      sessionId: "execution-session",
+      modelId: "gpt-scoped",
+      effort: "high" as const,
+      fastMode: true,
+    };
+
+    publishSessionExecutionState(update);
+
+    expect(first).toHaveBeenCalledWith(update);
+    expect(second).not.toHaveBeenCalled();
+    unsubscribeFirst();
+    unsubscribeSecond();
   });
 
 });

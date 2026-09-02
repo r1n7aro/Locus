@@ -221,6 +221,7 @@ struct UnityEmbedTextDropEntry {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UnityEmbedTextDropPayload {
+    workspace_ref: WorkspaceRef,
     text: String,
     entries: Vec<UnityEmbedTextDropEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1354,6 +1355,7 @@ fn emit_unity_embed_text_drop(
     source: Option<String>,
 ) -> Result<(), String> {
     let payload = UnityEmbedTextDropPayload {
+        workspace_ref: workspace_ref.clone(),
         text,
         entries,
         title,

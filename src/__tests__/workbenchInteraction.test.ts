@@ -231,36 +231,6 @@ describe("development workbench editor groups", () => {
     );
   });
 
-  it("keeps every active group editor mounted and isolates session stream state", () => {
-    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    const sessionEditor = read("src/components/workbench/WorkbenchSessionEditor.vue");
-    const chatView = read("src/components/ChatView.vue");
-    const embeddedSession = read("src/composables/useEmbeddedChatSession.ts");
-
-    expect(workbench).toContain('v-for="editor in group.tabs"');
-    expect(workbench).toContain('v-show="group.activeEditorId === editor.editorId"');
-    expect(sessionEditor).toContain("<ChatView");
-    expect(sessionEditor).toContain("scoped-session");
-    expect(sessionEditor).not.toContain("<EmbeddedChatPane");
-    expect(sessionEditor).not.toContain(":deep(.chat");
-    expect(chatView).toContain("<ChatTranscript");
-    expect(chatView).toContain("<ChatStatusIndicators");
-    expect(chatView).toContain("<RichChatInput");
-    expect(chatView).toContain(':session-key="sessionSurfaceKey"');
-    expect(sessionEditor).toContain(':composer-value="inputText"');
-    expect(sessionEditor).toContain('@update-composer-value="inputText = $event"');
-    expect(sessionEditor).toContain("initialSessionId: requestedSessionId");
-    expect(sessionEditor).toContain("sessionKey");
-    expect(sessionEditor).toContain(':undo-conversation="rollbackConversation"');
-    expect(sessionEditor).toContain(':undo-files-and-conversation="rollbackFilesAndConversation"');
-    expect(sessionEditor).toContain(':check-undo-dirty="checkUndoDirty"');
-    expect(embeddedSession).toContain("hydrateExistingSession");
-    expect(embeddedSession).toContain("sessionStates");
-    expect(embeddedSession).toContain("bindSessionStreamEventConsumer");
-    expect(embeddedSession).not.toContain("sessionIdToKey");
-    expect(workbench).toContain("setActiveSessionInPane(");
-  });
-
   it("turns the focused session tab into a clean new-session editor", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const sessionEditor = read("src/components/workbench/WorkbenchSessionEditor.vue");

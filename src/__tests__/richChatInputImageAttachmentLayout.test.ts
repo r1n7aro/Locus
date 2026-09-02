@@ -13,7 +13,6 @@ describe("RichChatInput image attachment layout", () => {
     const source = read("src/components/chat/RichChatInput.vue");
     const composer = read("src/components/chat/ChatComposer.vue");
     const chatView = read("src/components/ChatView.vue");
-    const embeddedPane = read("src/components/chat/EmbeddedChatPane.vue");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
@@ -52,8 +51,6 @@ describe("RichChatInput image attachment layout", () => {
     expect(chatView).not.toContain("composerHasImageAttachments");
     expect(chatView).not.toContain("has-composer-attachments");
     expect(chatView).not.toContain(":deep(.chat-composer-overlay)");
-    expect(embeddedPane).not.toContain("composerHasImageAttachments");
-    expect(embeddedPane).not.toContain("has-composer-attachments");
     expect(zh).toContain('"chat.paste.previewImage": "预览图片"');
     expect(en).toContain('"chat.paste.previewImage": "Preview image"');
   });

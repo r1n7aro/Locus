@@ -1,8 +1,6 @@
-import { computed, ref, triggerRef, watch } from "vue";
+import { computed, ref, triggerRef } from "vue";
 import { defineStore } from "pinia";
 import { useChatStore } from "./chat";
-import { useProjectStore } from "./project";
-import { useWorkspaceContextStore } from "./workspaceContext";
 import * as undoService from "../services/undo";
 import {
   buildRounds,
@@ -39,6 +37,14 @@ export interface ChatChangesSessionState {
   lastArrivalEntryKey: string | null;
 }
 
+export interface ChatChangesInlineDiffState {
+  payload: FileDiffPayload | null;
+  loading: boolean;
+  error: string | null;
+  requestKey: string | null;
+  assistantMessageId: string | null;
+}
+
 function emptySessionState(): ChatChangesSessionState {
   return {
     panelVisible: false,
@@ -51,6 +57,16 @@ function emptySessionState(): ChatChangesSessionState {
     loading: false,
     error: null,
     lastArrivalEntryKey: null,
+  };
+}
+
+function emptyInlineDiffState(): ChatChangesInlineDiffState {
+  return {
+    payload: null,
+    loading: false,
+    error: null,
+    requestKey: null,
+    assistantMessageId: null,
   };
 }
 
@@ -74,10 +90,9 @@ function logChatChangesDebug(message: string, detail?: Record<string, unknown>) 
 
 export const useChatChangesStore = defineStore("chatChanges", () => {
   const sessions = ref(new Map<string, ChatChangesSessionState>());
+  const inlineDiffSessions = ref(new Map<string, ChatChangesInlineDiffState>());
 
   const chatStore = useChatStore();
-  const projectStore = useProjectStore();
-  const workspaceContextStore = useWorkspaceContextStore();
 
   // ── Helpers ──
 
@@ -103,16 +118,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
   const currentMode = computed(() => currentState()?.mode ?? "current");
 
   /** All rounds belonging to the latest conversation turn (same runId when available). */
-  const latestTurnRounds = computed(() => {
-    const s = currentState();
-    if (!s || s.rounds.length === 0) return [];
-    const currentRunId = s.activeRunId ?? s.latestCompletedRunId;
-    if (currentRunId) {
-      return s.rounds.filter((r) => r.runId === currentRunId);
-    }
-    const latestKey = roundTurnKey(s.rounds[s.rounds.length - 1]);
-    return s.rounds.filter((r) => roundTurnKey(r) === latestKey);
-  });
+  const latestTurnRounds = computed(() => latestTurnRoundsForSession(currentSessionId()));
 
   /**
    * Net-merged file list for the latest conversation turn.
@@ -124,76 +130,170 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
    * collapse.
    */
   const latestTurnFiles = computed<ChatMergedFileItem[]>(() =>
-    mergeRoundFiles(latestTurnRounds.value),
+    latestTurnFilesForSession(currentSessionId()),
   );
 
-  const currentFiles = computed(() => {
-    const s = currentState();
-    if (!s) return [];
-    if (s.mode === "current") {
-      return latestTurnFiles.value;
-    }
-    return s.mergedFiles;
-  });
+  const currentFiles = computed(() => filesForSession(currentSessionId()));
 
-  const currentFileCount = computed(() => {
-    const s = currentState();
-    if (!s) return 0;
-    if (s.mode === "current") {
-      return latestTurnFiles.value.length;
-    }
-    return s.mergedFiles.length;
-  });
+  const currentFileCount = computed(() => filesForSession(currentSessionId()).length);
 
   // Whether any changes exist in any mode (used for button visibility — avoids hiding when one mode is empty)
-  const hasAnyChanges = computed(() => {
-    const s = currentState();
-    if (!s) return false;
-    return latestTurnFiles.value.length > 0 || s.mergedFiles.length > 0;
-  });
+  const hasAnyChanges = computed(() => hasChangesForSession(currentSessionId()));
 
   const currentRounds = computed(() => currentState()?.rounds ?? []);
   const currentLoading = computed(() => currentState()?.loading ?? false);
   const currentError = computed(() => currentState()?.error ?? null);
 
-  // ── Inline diff state (app-level, not per-session) ──
+  // ── Inline diff state ──
 
-  const inlineDiffPayload = ref<FileDiffPayload | null>(null);
-  const inlineDiffLoading = ref(false);
-  const inlineDiffError = ref<string | null>(null);
-  const inlineDiffRequestKey = ref<string | null>(null);
+  function getInlineDiffState(sessionId: string): ChatChangesInlineDiffState {
+    let state = inlineDiffSessions.value.get(sessionId);
+    if (!state) {
+      state = emptyInlineDiffState();
+      inlineDiffSessions.value.set(sessionId, state);
+    }
+    return state;
+  }
+
+  function inlineDiffStateForSession(
+    sessionId: string | null | undefined,
+  ): ChatChangesInlineDiffState | null {
+    const normalizedSessionId = sessionId?.trim();
+    if (!normalizedSessionId) return null;
+    return inlineDiffSessions.value.get(normalizedSessionId) ?? null;
+  }
+
+  function updateInlineDiffState(
+    sessionId: string | null | undefined,
+    update: (state: ChatChangesInlineDiffState) => void,
+  ): void {
+    const normalizedSessionId = sessionId?.trim();
+    if (!normalizedSessionId) return;
+    update(getInlineDiffState(normalizedSessionId));
+    triggerRef(inlineDiffSessions);
+  }
+
+  const inlineDiffPayload = computed<FileDiffPayload | null>({
+    get: () => inlineDiffStateForSession(currentSessionId())?.payload ?? null,
+    set: (payload) => updateInlineDiffState(currentSessionId(), (state) => {
+      state.payload = payload;
+    }),
+  });
+  const inlineDiffLoading = computed(() => (
+    inlineDiffStateForSession(currentSessionId())?.loading ?? false
+  ));
+  const inlineDiffError = computed(() => (
+    inlineDiffStateForSession(currentSessionId())?.error ?? null
+  ));
+  const inlineDiffRequestKey = computed(() => (
+    inlineDiffStateForSession(currentSessionId())?.requestKey ?? null
+  ));
   /** assistantMessageId for the file currently shown in inline diff (used for Undo) */
-  const inlineDiffAssistantMsgId = ref<string | null>(null);
+  const inlineDiffAssistantMsgId = computed(() => (
+    inlineDiffStateForSession(currentSessionId())?.assistantMessageId ?? null
+  ));
+
+  function openInlineDiffForSession(
+    sessionId: string | null | undefined,
+    payload: FileDiffPayload,
+    assistantMessageId: string,
+  ): void {
+    updateInlineDiffState(sessionId, (state) => {
+      state.payload = payload;
+      state.assistantMessageId = assistantMessageId;
+      state.loading = false;
+      state.error = null;
+      state.requestKey = null;
+    });
+  }
+
+  function closeInlineDiffForSession(sessionId: string | null | undefined): void {
+    const normalizedSessionId = sessionId?.trim();
+    if (!normalizedSessionId) return;
+    if (inlineDiffSessions.value.delete(normalizedSessionId)) triggerRef(inlineDiffSessions);
+  }
 
   function openInlineDiff(payload: FileDiffPayload, assistantMessageId: string) {
-    inlineDiffPayload.value = payload;
-    inlineDiffAssistantMsgId.value = assistantMessageId;
-    inlineDiffLoading.value = false;
-    inlineDiffError.value = null;
-    inlineDiffRequestKey.value = null;
+    openInlineDiffForSession(currentSessionId(), payload, assistantMessageId);
   }
 
   function closeInlineDiff() {
-    inlineDiffPayload.value = null;
-    inlineDiffLoading.value = false;
-    inlineDiffError.value = null;
-    inlineDiffAssistantMsgId.value = null;
-    inlineDiffRequestKey.value = null;
+    closeInlineDiffForSession(currentSessionId());
+  }
+
+  function sessionState(sessionId: string | null | undefined): ChatChangesSessionState | null {
+    const normalizedSessionId = sessionId?.trim();
+    if (!normalizedSessionId) return null;
+    return sessions.value.get(normalizedSessionId) ?? null;
+  }
+
+  function currentSessionId(): string | null {
+    return chatStore.activeSessionId?.trim() || null;
+  }
+
+  function latestTurnRoundsForSession(
+    sessionId: string | null | undefined,
+  ): ChatChangeRound[] {
+    const state = sessionState(sessionId);
+    if (!state || state.rounds.length === 0) return [];
+    const currentRunId = state.activeRunId ?? state.latestCompletedRunId;
+    if (currentRunId) return state.rounds.filter((round) => round.runId === currentRunId);
+    const latestKey = roundTurnKey(state.rounds[state.rounds.length - 1]!);
+    return state.rounds.filter((round) => roundTurnKey(round) === latestKey);
+  }
+
+  function latestTurnFilesForSession(
+    sessionId: string | null | undefined,
+  ): ChatMergedFileItem[] {
+    return mergeRoundFiles(latestTurnRoundsForSession(sessionId));
+  }
+
+  function filesForSession(sessionId: string | null | undefined): ChatMergedFileItem[] {
+    const state = sessionState(sessionId);
+    if (!state) return [];
+    return state.mode === "current"
+      ? latestTurnFilesForSession(sessionId)
+      : state.mergedFiles;
+  }
+
+  function hasChangesForSession(sessionId: string | null | undefined): boolean {
+    const state = sessionState(sessionId);
+    if (!state) return false;
+    return latestTurnFilesForSession(sessionId).length > 0 || state.mergedFiles.length > 0;
+  }
+
+  function setInlineDiffLoadingForSession(
+    sessionId: string | null | undefined,
+    loading: boolean,
+    requestKey: string | null = null,
+  ): void {
+    updateInlineDiffState(sessionId, (state) => {
+      state.loading = loading;
+      state.requestKey = loading ? requestKey : null;
+      if (loading) {
+        state.error = null;
+        state.payload = null;
+      }
+    });
   }
 
   function setInlineDiffLoading(loading: boolean, requestKey: string | null = null) {
-    inlineDiffLoading.value = loading;
-    inlineDiffRequestKey.value = loading ? requestKey : null;
-    if (loading) {
-      inlineDiffError.value = null;
-      inlineDiffPayload.value = null;
-    }
+    setInlineDiffLoadingForSession(currentSessionId(), loading, requestKey);
+  }
+
+  function setInlineDiffErrorForSession(
+    sessionId: string | null | undefined,
+    error: string,
+  ): void {
+    updateInlineDiffState(sessionId, (state) => {
+      state.error = error;
+      state.loading = false;
+      state.requestKey = null;
+    });
   }
 
   function setInlineDiffError(error: string) {
-    inlineDiffError.value = error;
-    inlineDiffLoading.value = false;
-    inlineDiffRequestKey.value = null;
+    setInlineDiffErrorForSession(currentSessionId(), error);
   }
 
   // ── Actions ──
@@ -268,16 +368,20 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     await loadChanges(sessionId, options);
   }
 
-  function togglePanel() {
-    const sid = chatStore.activeSessionId;
+  function togglePanelForSession(sessionId: string | null | undefined): void {
+    const sid = sessionId?.trim();
     if (!sid) return;
     const s = getState(sid);
     s.panelVisible = !s.panelVisible;
     triggerRef(sessions);
   }
 
-  function closePanel() {
-    const sid = chatStore.activeSessionId;
+  function togglePanel() {
+    togglePanelForSession(currentSessionId());
+  }
+
+  function closePanelForSession(sessionId: string | null | undefined): void {
+    const sid = sessionId?.trim();
     if (!sid) return;
     const s = getState(sid);
     if (s.panelVisible) {
@@ -286,11 +390,22 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     }
   }
 
-  function setMode(mode: "current" | "all") {
-    const sid = chatStore.activeSessionId;
+  function closePanel() {
+    closePanelForSession(currentSessionId());
+  }
+
+  function setModeForSession(
+    sessionId: string | null | undefined,
+    mode: "current" | "all",
+  ): void {
+    const sid = sessionId?.trim();
     if (!sid) return;
     getState(sid).mode = mode;
     triggerRef(sessions);
+  }
+
+  function setMode(mode: "current" | "all") {
+    setModeForSession(currentSessionId(), mode);
   }
 
   function setLatestCompletedRunId(sessionId: string | null, runId: string | null | undefined) {
@@ -313,21 +428,10 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
   function clear(sessionId: string | null) {
     if (!sessionId) return;
     sessions.value.delete(sessionId);
-    closeInlineDiff();
+    inlineDiffSessions.value.delete(sessionId);
     triggerRef(sessions);
+    triggerRef(inlineDiffSessions);
   }
-
-  // ── Watchers ──
-
-  // Clear all session states when working directory changes
-  watch(
-    () => projectStore.workingDir,
-    () => {
-      sessions.value.clear();
-      closeInlineDiff();
-      triggerRef(sessions);
-    },
-  );
 
   /**
    * A single file was reverted to its pre-round state (possibly from another
@@ -344,15 +448,17 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     }
     invalidateDiffCacheForFiles(paths);
 
-    const inline = inlineDiffPayload.value;
+    const inline = inlineDiffStateForSession(event.sessionId)?.payload ?? null;
     if (
       inline &&
       (paths.includes(inline.filePath) || (!!inline.oldPath && paths.includes(inline.oldPath)))
     ) {
       void refetchDiffByKey(inline.key)
         .then((updated) => {
-          if (updated && inlineDiffPayload.value?.key === inline.key) {
-            inlineDiffPayload.value = updated;
+          if (updated && inlineDiffStateForSession(event.sessionId)?.payload?.key === inline.key) {
+            updateInlineDiffState(event.sessionId, (state) => {
+              state.payload = updated;
+            });
           }
         })
         .catch((e) => {
@@ -360,7 +466,9 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
         });
     }
 
-    void loadChanges(event.sessionId, { allowAutoOpen: false });
+    if (sessions.value.has(event.sessionId) || chatStore.activeSessionId === event.sessionId) {
+      void loadChanges(event.sessionId, { allowAutoOpen: false });
+    }
   }
 
   void getLocusRuntime()
@@ -368,12 +476,6 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
       WORKSPACE_EVENT_NAME,
       (event) => {
         if (event.eventName !== "undo-file-reverted") return;
-        const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-        if (!workspaceRef || event.checkoutId !== workspaceRef.checkoutId) return;
-        if (
-          workspaceRef.expectedGeneration != null
-          && event.workspaceGeneration !== workspaceRef.expectedGeneration
-        ) return;
         handleUndoFileReverted(event.payload);
       },
     )
@@ -384,6 +486,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
   return {
     // State
     sessions,
+    inlineDiffSessions,
     // Computed
     currentPanelVisible,
     currentMode,
@@ -395,22 +498,35 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
     currentRounds,
     currentLoading,
     currentError,
+    sessionState,
+    latestTurnRoundsForSession,
+    latestTurnFilesForSession,
+    filesForSession,
+    hasChangesForSession,
     // Inline diff
     inlineDiffPayload,
     inlineDiffLoading,
     inlineDiffError,
     inlineDiffRequestKey,
     inlineDiffAssistantMsgId,
+    inlineDiffStateForSession,
     openInlineDiff,
+    openInlineDiffForSession,
     closeInlineDiff,
+    closeInlineDiffForSession,
     setInlineDiffLoading,
+    setInlineDiffLoadingForSession,
     setInlineDiffError,
+    setInlineDiffErrorForSession,
     // Actions
     loadChanges,
     refresh,
     togglePanel,
+    togglePanelForSession,
     closePanel,
+    closePanelForSession,
     setMode,
+    setModeForSession,
     setActiveRunId,
     setLatestCompletedRunId,
     clear,

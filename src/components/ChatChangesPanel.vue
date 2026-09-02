@@ -17,7 +17,13 @@ import { useNotificationStore } from "../stores/notification";
 import FileDiffPopover from "./diff/FileDiffPopover.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
-import type { ChangedFile, GitFileChange, FileDiffPayload, UndoConflictInfo } from "../types";
+import type {
+  ChangedFile,
+  ChatMessage,
+  GitFileChange,
+  FileDiffPayload,
+  UndoConflictInfo,
+} from "../types";
 import type { ChatMergedFileItem } from "../services/chatChanges";
 import { buildUserMessageDraft } from "../composables/chatMessageDraft";
 import { useHideMeta, isMetaFile, canOpenInEditor } from "../composables/useHideMeta";
@@ -36,6 +42,18 @@ const props = defineProps<{
   embedded?: boolean;
   showClose?: boolean;
   workspaceRef?: WorkspaceRef | null;
+  scopedSession?: boolean;
+  sessionId?: string | null;
+  messages?: ChatMessage[];
+  isStreaming?: boolean;
+  unityConnected?: boolean;
+  checkUndoConflicts?: (assistantMessageId: string) => Promise<UndoConflictInfo[]>;
+  checkUndoDirty?: (assistantMessageId: string) => Promise<ChangedFile[]>;
+  performUndo?: (
+    targetMessageId: string,
+    options: { force: boolean; acceptDirty: boolean },
+  ) => Promise<boolean>;
+  restoreComposerDraft?: (draft: ReturnType<typeof buildUserMessageDraft>) => void | Promise<void>;
 }>();
 
 const chatStore = useChatStore();
@@ -43,16 +61,38 @@ const changesStore = useChatChangesStore();
 const uiStore = useUiStore();
 const { state: displaySettings } = useDisplaySettings();
 
-const mode = computed(() => changesStore.currentMode);
+const activeSessionId = computed(() => (
+  props.scopedSession
+    ? props.sessionId?.trim() || null
+    : chatStore.activeSessionId
+));
+const activeMessages = computed(() => (
+  props.scopedSession ? props.messages ?? [] : chatStore.messages
+));
+const activeIsStreaming = computed(() => (
+  props.scopedSession ? !!props.isStreaming : chatStore.isStreaming
+));
+const activeUnityConnected = computed(() => (
+  props.scopedSession ? !!props.unityConnected : projectStore.unityConnected
+));
+const sessionState = computed(() => changesStore.sessionState(activeSessionId.value));
+const mode = computed(() => sessionState.value?.mode ?? "current");
+const latestTurnRounds = computed(() => (
+  changesStore.latestTurnRoundsForSession(activeSessionId.value)
+));
+const latestTurnFiles = computed(() => (
+  changesStore.latestTurnFilesForSession(activeSessionId.value)
+));
+const currentFiles = computed(() => changesStore.filesForSession(activeSessionId.value));
 const fileViewMode = ref<StagingViewMode>(readStoredChatChangesViewMode());
 const collapsedFolders = ref(new Set<string>());
 
 // Close any stale diff UI when session changes and invalidate in-flight click requests.
 let clickSeq = 0;
-watch(() => chatStore.activeSessionId, () => {
+watch(activeSessionId, (_sessionId, previousSessionId) => {
   clickSeq++;
   collapsedFolders.value = new Set();
-  changesStore.closeInlineDiff();
+  changesStore.closeInlineDiffForSession(previousSessionId);
 });
 
 // ── Hover preview state ──
@@ -121,11 +161,11 @@ type DisplayTreeFile = GitFileChange & {
 };
 
 const currentModeItems = computed<DisplayItem[]>(() => {
-  const turnRounds = changesStore.latestTurnRounds;
+  const turnRounds = latestTurnRounds.value;
   if (turnRounds.length === 0) return [];
   // Use the first round's assistantMessageId so diff/undo span the whole current run.
   const msgId = turnRounds[0].assistantMessageId;
-  return (changesStore.latestTurnFiles as ChatMergedFileItem[]).map((item) => ({
+  return (latestTurnFiles.value as ChatMergedFileItem[]).map((item) => ({
     key: `cur-${item.id}`,
     fileChange: {
       path: item.finalPath,
@@ -138,7 +178,7 @@ const currentModeItems = computed<DisplayItem[]>(() => {
 });
 
 const allModeItems = computed<DisplayItem[]>(() => {
-  return (changesStore.currentFiles as ChatMergedFileItem[]).map((item) => ({
+  return (currentFiles.value as ChatMergedFileItem[]).map((item) => ({
     key: `all-${item.id}`,
     fileChange: {
       path: item.finalPath,
@@ -211,7 +251,7 @@ function buildRequest(item: DisplayItem, detail: "preview" | "full") {
     source: "chatCheckpoint" as const,
     filePath: item.fileChange.path,
     oldPath: item.fileChange.oldPath,
-    sessionId: chatStore.activeSessionId ?? undefined,
+    sessionId: activeSessionId.value ?? undefined,
     assistantMessageId: item.assistantMessageId,
     detail,
   };
@@ -323,7 +363,7 @@ async function onItemClick(item: DisplayItem) {
         workspaceRef: props.workspaceRef,
       });
       if (opened) {
-        changesStore.closeInlineDiff();
+        changesStore.closeInlineDiffForSession(activeSessionId.value);
         return;
       }
     } catch (e) {
@@ -336,18 +376,23 @@ async function onItemClick(item: DisplayItem) {
     }
   }
   const seq = ++clickSeq;
-  changesStore.setInlineDiffLoading(
+  changesStore.setInlineDiffLoadingForSession(
+    activeSessionId.value,
     true,
     computeRequestKey(request, props.workspaceRef),
   );
   try {
     const payload = await diffSingleFile(request, props.workspaceRef);
     if (seq !== clickSeq) return; // stale — newer click or session switch
-    changesStore.openInlineDiff(payload, item.assistantMessageId);
+    changesStore.openInlineDiffForSession(
+      activeSessionId.value,
+      payload,
+      item.assistantMessageId,
+    );
   } catch (e) {
     if (seq !== clickSeq) return;
     const err = normalizeAppError(e);
-    changesStore.setInlineDiffError(err.message);
+    changesStore.setInlineDiffErrorForSession(activeSessionId.value, err.message);
     console.error("[ChatChangesPanel] failed to fetch full diff:", e);
   }
 }
@@ -367,17 +412,17 @@ const undoDirtyChecked = ref(false);
 const undoTargetId = computed(() => {
   if (mode.value === "current") {
     // Earliest assistantMessageId in the latest run so undo covers the whole run.
-    const turns = changesStore.latestTurnRounds;
+    const turns = latestTurnRounds.value;
     return turns.length > 0 ? turns[0].assistantMessageId : null;
   }
   // "all" mode: earliest round's assistantMessageId to undo everything
-  const rounds = changesStore.currentRounds;
+  const rounds = sessionState.value?.rounds ?? [];
   return rounds.length > 0 ? rounds[0].assistantMessageId : null;
 });
 
 const undoRestoreDraft = computed(() => {
   if (mode.value !== "current" || !undoTargetId.value) return null;
-  const message = findUndoRestoreUserMessage(chatStore.messages, undoTargetId.value);
+  const message = findUndoRestoreUserMessage(activeMessages.value, undoTargetId.value);
   return message ? buildUserMessageDraft(message) : null;
 });
 
@@ -398,13 +443,20 @@ function conflictFilesLabel(conflict: UndoConflictInfo): string {
 
 async function onUndoClick() {
   if (!undoTargetId.value || undoButtonBusy.value) return;
+  const checkConflicts = props.scopedSession
+    ? props.checkUndoConflicts
+    : chatStore.checkUndoConflicts;
+  const checkDirty = props.scopedSession
+    ? props.checkUndoDirty
+    : chatStore.checkUndoDirty;
+  if (!checkConflicts || !checkDirty) return;
   checkingUndoConflicts.value = true;
   try {
     const [conflicts, dirty] = await Promise.all([
-      chatStore.checkUndoConflicts(undoTargetId.value),
+      checkConflicts(undoTargetId.value),
       // Dirty preflight is advisory: on failure proceed without it and let
       // undo_perform re-check on the backend.
-      chatStore.checkUndoDirty(undoTargetId.value).then(
+      checkDirty(undoTargetId.value).then(
         (files) => ({ files, checked: true }),
         (e) => {
           console.warn("[ChatChangesPanel] undo_check_dirty failed:", e);
@@ -438,12 +490,15 @@ async function confirmUndo(force = false) {
   // The dirty list was shown to the user (or verified empty) in this dialog;
   // only skip the backend re-check when the preflight actually completed.
   const acceptDirty = force || undoDirtyChecked.value;
+  const performUndo = props.scopedSession ? props.performUndo : chatStore.performUndo;
+  if (!performUndo) return;
   isUndoing.value = true;
-  changesStore.closeInlineDiff();
+  changesStore.closeInlineDiffForSession(activeSessionId.value);
   try {
-    const undone = await chatStore.performUndo(targetId, { force, acceptDirty });
+    const undone = await performUndo(targetId, { force, acceptDirty });
     if (undone && restoreDraft) {
-      uiStore.stageChatDraftPrefill(restoreDraft);
+      if (props.scopedSession) await props.restoreComposerDraft?.(restoreDraft);
+      else uiStore.stageChatDraftPrefill(restoreDraft);
     }
   } finally {
     isUndoing.value = false;
@@ -466,12 +521,16 @@ function cancelUndo() {
 
 function onSelectInUnity(ev: MouseEvent, path: string) {
   ev.stopPropagation();
-  selectUnityAsset(projectStore.requireWorkspaceRef(), path);
+  const workspaceRef = props.workspaceRef
+    ?? (props.scopedSession ? null : projectStore.requireWorkspaceRef());
+  if (workspaceRef) void selectUnityAsset(workspaceRef, path);
 }
 
 function onOpenInEditor(ev: MouseEvent, path: string) {
   ev.stopPropagation();
-  openFileExternal(path);
+  const workspaceRef = props.workspaceRef
+    ?? (props.scopedSession ? null : projectStore.requireWorkspaceRef());
+  if (workspaceRef) void openFileExternal(path, workspaceRef);
 }
 
 // ── Per-file revert with confirmation ──
@@ -508,7 +567,7 @@ function cancelRevertFile() {
 
 async function confirmRevertFile(force = false) {
   const item = revertTarget.value;
-  const sessionId = chatStore.activeSessionId;
+  const sessionId = activeSessionId.value;
   if (!item || !sessionId || isRevertingFile.value) return;
   isRevertingFile.value = true;
   try {
@@ -601,12 +660,13 @@ function ctxRevertFile(ev: MouseEvent) {
   <aside class="changes-panel" :class="{ embedded: props.embedded }">
     <div class="panel-header">
       <span class="panel-title">{{ t("chat.changes.title") }}</span>
-      <div class="mode-tabs">
+      <div class="mode-tabs" role="group" :aria-label="t('chat.changes.title')">
         <button
           type="button"
           class="mode-tab"
           :class="{ active: mode === 'current' }"
-          @click="changesStore.setMode('current')"
+          :aria-pressed="mode === 'current'"
+          @click="changesStore.setModeForSession(activeSessionId, 'current')"
         >
           {{ t("chat.changes.modeCurrent") }}
         </button>
@@ -614,7 +674,8 @@ function ctxRevertFile(ev: MouseEvent) {
           type="button"
           class="mode-tab"
           :class="{ active: mode === 'all' }"
-          @click="changesStore.setMode('all')"
+          :aria-pressed="mode === 'all'"
+          @click="changesStore.setModeForSession(activeSessionId, 'all')"
         >
           {{ t("chat.changes.modeAll") }}
         </button>
@@ -642,12 +703,19 @@ function ctxRevertFile(ev: MouseEvent) {
           @click="hideMeta = !hideMeta"
           :title="t('common.hideMeta')"
         >.meta</button>
-        <button v-if="props.showClose ?? true" type="button" class="close-btn" @click="emit('close')" :title="t('common.close')">&times;</button>
+        <button
+          v-if="props.showClose ?? true"
+          type="button"
+          class="close-btn"
+          @click="emit('close')"
+          :title="t('common.close')"
+          :aria-label="t('common.close')"
+        >&times;</button>
       </div>
     </div>
     <div class="file-list" :class="{ 'changes-tree-list': fileViewMode === 'tree' }">
-      <div v-if="changesStore.currentLoading" class="empty-hint">{{ t("chat.changes.loading") }}</div>
-      <div v-else-if="changesStore.currentError" class="empty-hint error">{{ changesStore.currentError }}</div>
+      <div v-if="sessionState?.loading" class="empty-hint">{{ t("chat.changes.loading") }}</div>
+      <div v-else-if="sessionState?.error" class="empty-hint error">{{ sessionState.error }}</div>
       <div v-else-if="displayItems.length === 0" class="empty-hint">{{ t("chat.changes.empty") }}</div>
       <template v-else-if="fileViewMode === 'tree'">
         <div
@@ -710,7 +778,7 @@ function ctxRevertFile(ev: MouseEvent) {
             </button>
             <span class="file-actions">
               <button
-                v-if="projectStore.unityConnected"
+                v-if="activeUnityConnected"
                 type="button"
                 class="file-action-btn"
                 :title="t('common.selectInUnity')"
@@ -728,7 +796,7 @@ function ctxRevertFile(ev: MouseEvent) {
                 <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
               </button>
               <button
-                v-if="!chatStore.isStreaming"
+                v-if="!activeIsStreaming"
                 type="button"
                 class="file-action-btn"
                 :disabled="isRevertingFile"
@@ -764,7 +832,7 @@ function ctxRevertFile(ev: MouseEvent) {
           </button>
           <span class="file-actions">
             <button
-              v-if="projectStore.unityConnected"
+              v-if="activeUnityConnected"
               type="button"
               class="file-action-btn"
               :title="t('common.selectInUnity')"
@@ -782,7 +850,7 @@ function ctxRevertFile(ev: MouseEvent) {
               <svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><path d="M8 1C4.1 1 1 4.1 1 8s3.1 7 7 7 7-3.1 7-7-3.1-7-7-7zm0 12.5c-3 0-5.5-2.5-5.5-5.5S5 2.5 8 2.5s5.5 2.5 5.5 5.5-2.5 5.5-5.5 5.5zM6 5l6 3-6 3V5z"/></svg>
             </button>
             <button
-              v-if="!chatStore.isStreaming"
+              v-if="!activeIsStreaming"
               type="button"
               class="file-action-btn"
               :disabled="isRevertingFile"
@@ -810,7 +878,7 @@ function ctxRevertFile(ev: MouseEvent) {
         {{ t("chat.changes.viewDiff") }}
       </button>
       <button
-        v-if="projectStore.unityConnected"
+        v-if="activeUnityConnected"
         type="button"
         class="changes-ctx-item"
         @click="ctxSelectInUnity($event)"
@@ -827,7 +895,7 @@ function ctxRevertFile(ev: MouseEvent) {
         <LucideIcon :icon="ExternalLink" :size="13" />
         {{ t("common.openInEditor") }}
       </button>
-      <template v-if="!chatStore.isStreaming">
+      <template v-if="!activeIsStreaming">
         <div class="ctx-sep" aria-hidden="true"></div>
         <button
           type="button"
@@ -842,7 +910,7 @@ function ctxRevertFile(ev: MouseEvent) {
     </BaseContextMenu>
 
     <!-- Undo footer -->
-    <div v-if="displayItems.length > 0 && !chatStore.isStreaming" class="panel-footer">
+    <div v-if="displayItems.length > 0 && !activeIsStreaming" class="panel-footer">
       <button type="button" class="undo-btn" :disabled="undoButtonBusy" @click="onUndoClick">
         {{ undoButtonLabel }}
       </button>

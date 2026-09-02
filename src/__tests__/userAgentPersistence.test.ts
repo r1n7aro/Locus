@@ -79,14 +79,11 @@ describe("persistent user Agents", () => {
     expect(definitions).toContain('pub const LEGACY_UNITY_AGENT_ID: &str = "dev"');
   });
 
-  it("routes former specialized entry points through Unity", () => {
+  it("routes the retired Git entry point through Unity", () => {
     const gitTerminal = read("src/components/GitTerminal.vue");
-    const knowledgeChat = read("src/components/knowledge/KnowledgeChatPane.vue");
 
     expect(gitTerminal).toContain('agentId: "unity"');
     expect(gitTerminal).not.toContain('agentId: "git"');
-    expect(knowledgeChat).toContain("agent.isDefault");
-    expect(knowledgeChat).not.toContain('agent.id === "knowledge"');
   });
 
   it("ships project-typed built-ins and a minimal Simple Agent", () => {

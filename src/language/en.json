@@ -896,6 +896,7 @@
   "chat.undo.noFileUndo": "No file changes are available for this turn",
   "chat.undo.dirtyWarning": "These files were modified again after this turn; undoing rolls those extra changes back too:",
   "chat.changes.title": "File Changes",
+  "chat.changes.resizePanel": "Resize file changes panel",
   "chat.changes.toggle": "File changes",
   "chat.changes.modeCurrent": "Current Round",
   "chat.changes.modeAll": "All Changes",

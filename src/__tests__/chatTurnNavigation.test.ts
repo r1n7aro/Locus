@@ -99,12 +99,11 @@ describe("chat turn navigation", () => {
     });
   });
 
-  it("integrates a default-on setting and preserves the Codex rail interactions", () => {
+  it("keeps a default-on setting and preserves the rail interactions", () => {
     const rail = readFileSync(
       resolve(process.cwd(), "src/components/chat/ChatTurnNavigationRail.vue"),
       "utf8",
     );
-    const chatView = readFileSync(resolve(process.cwd(), "src/components/ChatView.vue"), "utf8");
     const display = readFileSync(
       resolve(process.cwd(), "src/composables/useDisplaySettings.ts"),
       "utf8",
@@ -116,13 +115,6 @@ describe("chat turn navigation", () => {
 
     expect(display).toContain("showTurnNavigationRail: true");
     expect(displayView).toContain("display.showTurnNavigationRail");
-    expect(chatView).toContain('v-if="displaySettings.showTurnNavigationRail && !scopedSession"');
-    expect(chatView).toContain(":scroll-element=\"transcriptScrollElement\"");
-    expect(chatView).toContain(":user-message-ids=\"chatStore.sessionUserMessageIds\"");
-    expect(chatView).toContain(":load-preview=\"chatStore.loadSessionTurnPreview\"");
-    expect(chatView).toContain(":load-turn=\"chatStore.loadSessionHistoryThroughMessage\"");
-    expect(chatView).toContain('@reveal-state="handleTurnNavigationRevealState"');
-    expect(chatView).toContain("if (turnNavigationRevealActive.value) return;");
     expect(rail).toContain("visibleItems.value.length > 0");
     expect(rail).toContain("buildChatTurnNavigationItems(props.messages, props.userMessageIds)");
     expect(rail).toContain("ensurePreviewLoaded(item)");
