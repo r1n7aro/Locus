@@ -1,8 +1,8 @@
 ---
 title: "Latest Version"
-description: "Locus v0.8.0 (2026-09-02)"
+description: "Locus v0.8.1 (2026-09-02)"
 sidebarTitle: "Latest Version"
-version: "0.8.0"
+version: "0.8.1"
 releasedAt: "2026-09-02"
 channel: "stable"
 updateTitle: "Update available"
@@ -11,11 +11,29 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.8.1 (Added)
+
+- **Text zoom and Markdown editing.** Ctrl+wheel text zoom is available in Markdown editors and previews, text viewers, diffs, and merge views. Workspace Markdown files now open in rendered CodeMirror mode.
+
+### v0.8.1 (Fixed)
+
+- Restored missing Workbench session editor capabilities, including compaction, interrupted-run resume, Plan mode, full-session and message-level forks, history navigation, context export and review, and pane-owned Thinking and Changes panels.
+- Scoped session panes preserve drafts, execution settings, todos, background-task updates, undo and diff state, scroll history, and session actions across editor remounts.
+- File, Knowledge, Unity, and native-drop actions remain bound to their originating workspace and session.
+- Knowledge document outlines align with the document body and available viewport.
+- Restored system resources return to the beginning of the workspace root.
+- ONNX Runtime preparation resumes partial downloads and validates package and runtime integrity.
+- Improved keyboard access for Changes panel resizing, undo selection, command lists, and close controls.
+
+### v0.8.1 (Removed)
+
+- No user-facing workflows or compatibility paths were removed.
 
 ### v0.8.0 (Added)
 

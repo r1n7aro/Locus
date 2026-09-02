@@ -1,12 +1,12 @@
 {
-  "version": "0.8.0",
+  "version": "0.8.1",
   "releasedAt": "2026-09-02",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,33 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.8.0 (2026-09-02)",
+      "summary": "Locus v0.8.1 (2026-09-02)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.1（新增）",
+          "items": [
+            "**文本缩放与 Markdown 编辑。** Markdown 编辑器与预览、文本查看器、Diff 和 Merge 支持 Ctrl+滚轮缩放；工作区 Markdown 文件默认使用 CodeMirror 渲染态编辑。"
+          ]
+        },
+        {
+          "title": "v0.8.1（修复）",
+          "items": [
+            "修复工作台会话编辑器的功能缺失，恢复上下文压缩、中断续跑、Plan 模式、整会话与指定消息分叉、历史导航、上下文导出与审查，以及归属当前分屏的思考和文件修改面板。",
+            "分屏会话在编辑器重新挂载后继续保留草稿、执行配置、Todo、后台任务状态、撤回与 Diff 状态、滚动历史和会话操作。",
+            "文件、知识、Unity 和原生拖放操作始终绑定其来源工作区与会话。",
+            "知识文档大纲会对齐正文起点，并按可用视口计算高度。",
+            "重新显示的系统资源会回到工作区根节点首位。",
+            "ONNX Runtime 准备流程支持断点续传，并校验下载包与运行时文件完整性。",
+            "文件修改面板缩放、撤回选择、命令列表和关闭控件补齐键盘操作能力。"
+          ]
+        },
+        {
+          "title": "v0.8.1（移除）",
+          "items": [
+            "本版本没有移除面向用户的工作流或兼容路径。"
+          ]
+        },
         {
           "title": "v0.8.0（新增）",
           "items": [
@@ -403,11 +427,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -417,9 +441,33 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.8.0 (2026-09-02)",
+      "summary": "Locus v0.8.1 (2026-09-02)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.1 (Added)",
+          "items": [
+            "**Text zoom and Markdown editing.** Ctrl+wheel text zoom is available in Markdown editors and previews, text viewers, diffs, and merge views. Workspace Markdown files now open in rendered CodeMirror mode."
+          ]
+        },
+        {
+          "title": "v0.8.1 (Fixed)",
+          "items": [
+            "Restored missing Workbench session editor capabilities, including compaction, interrupted-run resume, Plan mode, full-session and message-level forks, history navigation, context export and review, and pane-owned Thinking and Changes panels.",
+            "Scoped session panes preserve drafts, execution settings, todos, background-task updates, undo and diff state, scroll history, and session actions across editor remounts.",
+            "File, Knowledge, Unity, and native-drop actions remain bound to their originating workspace and session.",
+            "Knowledge document outlines align with the document body and available viewport.",
+            "Restored system resources return to the beginning of the workspace root.",
+            "ONNX Runtime preparation resumes partial downloads and validates package and runtime integrity.",
+            "Improved keyboard access for Changes panel resizing, undo selection, command lists, and close controls."
+          ]
+        },
+        {
+          "title": "v0.8.1 (Removed)",
+          "items": [
+            "No user-facing workflows or compatibility paths were removed."
+          ]
+        },
         {
           "title": "v0.8.0 (Added)",
           "items": [
@@ -791,11 +839,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
