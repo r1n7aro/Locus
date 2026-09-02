@@ -2,7 +2,7 @@
   "name": "locus",
   "private": true,
   "license": "GPL-3.0-or-later",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "releaseChannel": "stable",
   "type": "module",
   "scripts": {

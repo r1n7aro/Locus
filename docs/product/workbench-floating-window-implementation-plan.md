@@ -173,11 +173,11 @@ Tab 拖动迁移为 HTML 标准 DnD。Chromium 直接从真实 Tab DOM 生成系
 
 ### 调研依据
 
-- VS Code 普通 Editor Tab 在 `dragstart` 中直接执行 `dataTransfer.setDragImage(tab, 0, 0)`；多选和 shrink sizing 才回退到专用文本拖拽块。Locus 采用同一 DOM 快照机制，并把热点从 VS Code 的 `(0, 0)` 改为真实点击偏移。来源：<https://github.com/microsoft/vscode/blob/main/src/vs/workbench/browser/parts/editor/multiEditorTabsControl.ts#L1111-L1142>。
-- VS Code 在 `dragend` 后读取原生屏幕光标位置，确认释放点位于现有窗口之外，再创建 `AuxiliaryEditorPart` 并移动 Editor。来源：<https://github.com/microsoft/vscode/blob/main/src/vs/workbench/browser/parts/editor/editorTabsControl.ts#L455-L502>。
-- VS Code 的辅助窗口使用 `window.open('about:blank', ..., 'popup=yes,...')`，克隆主窗口 stylesheet、根节点属性与主题状态，并持续同步后续样式变化。来源：<https://github.com/microsoft/vscode/blob/main/src/vs/workbench/services/auxiliaryWindow/browser/auxiliaryWindowService.ts#L303-L370>、<https://github.com/microsoft/vscode/blob/main/src/vs/workbench/services/auxiliaryWindow/browser/auxiliaryWindowService.ts#L412-L497>。
-- HTML Living Standard 定义 `setDragImage(element, x, y)`：浏览器从 element 生成拖拽位图，并把 `x/y` 作为位图热点坐标。来源：<https://html.spec.whatwg.org/multipage/dnd.html#dom-datatransfer-setdragimage>。
-- WebView2 允许宿主把同 environment、同 profile、未导航的目标 WebView 设置为 `NewWindow`；目标顶层 window 会作为真实 `WindowProxy` 返回给 opener。来源：<https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2newwindowrequestedeventargs?view=webview2-1.0.3719.77>。
+- VS Code 普通 Editor Tab 在 `dragstart` 中直接执行 `dataTransfer.setDragImage(tab, 0, 0)`；多选和 shrink sizing 才回退到专用文本拖拽块。Locus 采用同一 DOM 快照机制，并把热点从 VS Code 的 `(0, 0)` 改为真实点击偏移。来源：[multiEditorTabsControl.ts](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/browser/parts/editor/multiEditorTabsControl.ts#L1111-L1142)。
+- VS Code 在 `dragend` 后读取原生屏幕光标位置，确认释放点位于现有窗口之外，再创建 `AuxiliaryEditorPart` 并移动 Editor。来源：[editorTabsControl.ts](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/browser/parts/editor/editorTabsControl.ts#L455-L502)。
+- VS Code 的辅助窗口使用 `window.open('about:blank', ..., 'popup=yes,...')`，克隆主窗口 stylesheet、根节点属性与主题状态，并持续同步后续样式变化。来源：[auxiliaryWindowService.ts（窗口创建）](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/services/auxiliaryWindow/browser/auxiliaryWindowService.ts#L303-L370)、[auxiliaryWindowService.ts（样式同步）](https://github.com/microsoft/vscode/blob/main/src/vs/workbench/services/auxiliaryWindow/browser/auxiliaryWindowService.ts#L412-L497)。
+- HTML Living Standard 定义 `setDragImage(element, x, y)`：浏览器从 element 生成拖拽位图，并把 `x/y` 作为位图热点坐标。来源：[HTML Drag and Drop](https://html.spec.whatwg.org/multipage/dnd.html#dom-datatransfer-setdragimage)。
+- WebView2 允许宿主把同 environment、同 profile、未导航的目标 WebView 设置为 `NewWindow`；目标顶层 window 会作为真实 `WindowProxy` 返回给 opener。来源：[ICoreWebView2NewWindowRequestedEventArgs](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2newwindowrequestedeventargs?view=webview2-1.0.3719.77)。
 - Locus 当前使用 Tauri `2.11.5` / Wry `0.55.1`。`WebviewWindowBuilder::on_new_window`、`window_features(features)` 和 `NewWindowResponse::Create` 已封装 WebView2 `NewWindowRequested`、opener environment 与 `SetNewWindow`，无需维护自定义 WebView2 COM 窗口宿主。
 
 ### 已完成的运行模型证明

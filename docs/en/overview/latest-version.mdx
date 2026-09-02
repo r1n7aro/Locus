@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.7.4 (2026-08-18)"
+description: "Locus v0.8.0 (2026-09-02)"
 sidebarTitle: "Latest Version"
-version: "0.7.4"
-releasedAt: "2026-08-18"
+version: "0.8.0"
+releasedAt: "2026-09-02"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,42 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.8.0 (Added)
+
+- **Concurrent multi-workspace operation.** Multiple projects and Git worktrees can run in one Locus instance, with parallel sessions, Unity connections, Knowledge indexes, asset databases, and workspace services. Each workspace keeps an independent execution context, runtime state, and resource cache.
+- **VS Code-style split workbench.** Sessions, files, Knowledge documents, Unity assets, and Views open as editor tabs. Tabs can be reordered, split in four directions, moved between panes, or detached into native windows. Window layouts, tabs, drafts, scroll positions, and unsaved content can be restored.
+- **Development workspace tree.** Sessions, Knowledge, collaboration, and files now share one workspace tree, with single- and multi-workspace layouts, saved presets, virtual folders, mounted directories, and per-node visibility controls.
+- **Persistent Markdown editing.** Knowledge documents now use CodeMirror 6 for Live Preview and source editing, preserving selections, undo history, scroll position, drafts, and unsaved changes across document switches and split panes.
+- **Expanded Knowledge workflows.** Added `Plan` as a fifth knowledge type, writable project Skill packages under `Locus/skills`, automatic Skill refresh, document outline navigation, cached loading, and conflict-aware collaborative editing.
+- **Workspace and Unity mentions.** Chat `@` search now covers workspace files and folders as well as live Unity scene objects, with ranked results and explicit object references.
+- **Richer Unity inspection.** `unity_yaml_read` can display selected hierarchy metadata, including active state, Prefab source, world transforms, RectTransform bounds, tags, layers, and components. SubScene reads can follow the authoring Scene hierarchy, and adjustable serialized fields can render as inline property controls.
+- **Unity coordination and incremental synchronization.** A workspace change journal selects targeted imports, full refreshes, or no-op recompiles from verified file events. Experimental `unity_lock` and `unity_release` coordinate multiple Agents sharing one Editor.
+- **Runtime and provider controls.** Sub-agent defaults now include model, reasoning effort, and response speed. Custom Responses providers can enable Codex V2 remote compaction, with normalized reasoning replay for supported DeepSeek V4 routes.
+- **Session SDK and diagnostics.** The Python SDK can list running sessions and send sourced input to another active run. Debug mode adds DevTools control, CDP port discovery, WebView bridge diagnostics, and bounded log batching.
+
+### v0.8.0 (Fixed)
+
+- Strengthened isolation for session events, Unity services, MCP, C# analysis, asset databases, Knowledge, diff/merge state, Views, and caches across workspaces.
+- Preserved streaming sessions, input drafts, pending confirmations, queued attachments, image previews, and unsaved files while moving tabs, transferring windows, or remounting editors.
+- Failed or timed-out window transfers now leave the tab and editor state safely in the source window.
+- Manual context compaction can queue behind an active run and executes before queued follow-up input. Child Agent sessions remain independently controllable.
+- Responses API citations now persist through session storage and context export. Incremental UTF-8 decoding preserves multibyte characters split across streaming chunks.
+- Streaming Markdown, syntax highlighting, collapsed tool interaction, and tool file previews remain stable while content grows or finishes streaming.
+- Interrupted or failed sub-agents return persisted partial output. Deferred tool schemas load by exact wire name, and image tools validate model vision support before execution.
+- Unity recovery now exposes Safe Mode and Editor log paths, waits for modal-dialog transitions, and cancels interrupted Unity Test runs through the Test Framework lifecycle.
+- Collapsed tool rows use concise UI labels, while expanded rows retain exact monospace tool identifiers.
+
+### v0.8.0 (Removed)
+
+- Removed the legacy Project entry and second-level workspace bar; the Development workbench and workspace tree now provide the unified navigation model.
+- Removed the Vditor-backed Markdown editor and its legacy rendering and compatibility paths after the CodeMirror migration.
+- Removed the manual `skill_reload` tool; Locus now refreshes Skill manifests automatically after file changes.
 
 ### v0.7.4 (Added)
 

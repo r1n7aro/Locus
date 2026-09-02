@@ -1,12 +1,12 @@
 {
-  "version": "0.7.4",
-  "releasedAt": "2026-08-18",
+  "version": "0.8.0",
+  "releasedAt": "2026-09-02",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,46 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.7.4 (2026-08-18)",
+      "summary": "Locus v0.8.0 (2026-09-02)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.0（新增）",
+          "items": [
+            "**多工作区同时运行。** 可在同一 Locus 实例中打开多个项目与 Git worktree，并行运行会话、Unity、知识索引、资产数据库及工作区服务。每个工作区保持独立的执行上下文、运行状态与资源缓存。",
+            "**VS Code 式分屏工作台。** 会话、文件、知识文档、Unity 资产和 View 统一以编辑器标签打开；标签可拖动排序、四向分屏、跨分屏移动或拖出原生窗口。窗口、分屏、标签、草稿、滚动位置及未保存内容支持恢复。",
+            "**开发工作区树。** 会话、知识、协作与文件统一进入一棵工作区树，支持单工作区与多工作区显示、树预设、虚拟文件夹、目录挂载及节点显隐。",
+            "**持久化 Markdown 编辑。** 知识文档迁移到 CodeMirror 6，实时预览与源码模式共享同一编辑器；文档切换和分屏期间保留选区、撤销历史、滚动位置、草稿与未保存修改。",
+            "**知识工作流扩展。** 新增第五类知识 `Plan`；项目可在 `Locus/skills` 下维护可写 Skill Package；文件变化后自动刷新 Skill；同时加入文档大纲、正文缓存和冲突感知的协同编辑。",
+            "**工作区与 Unity 引用搜索。** Chat 的 `@` 搜索覆盖工作区文件、文件夹及实时 Unity 场景对象，并提供排序后的结果和明确对象引用。",
+            "**更完整的 Unity 检查。** `unity_yaml_read` 可选择显示激活状态、Prefab 来源、世界变换、RectTransform 范围、Tag、Layer 和组件等层级字段；SubScene 可继续读取其 Authoring Scene；可调序列化字段可渲染为内联属性控件。",
+            "**Unity 协作与增量同步。** Workspace Change Journal 根据可验证的文件事件选择定向导入、全量刷新或跳过重编译；实验性 `unity_lock` 与 `unity_release` 可协调多个 Agent 共用一个 Editor。",
+            "**运行时与供应商控制。** 子 Agent 默认值扩展为模型、思考强度和响应速度；自定义 Responses 供应商可启用 Codex V2 远程压缩；支持的 DeepSeek V4 路由会规范化推理内容回放。",
+            "**会话 SDK 与诊断。** Python SDK 可列出运行中的会话，并向另一个活动运行发送带来源信息的输入。调试模式加入 DevTools 控制、CDP 端口发现、WebView Bridge 诊断和有界日志批处理。"
+          ]
+        },
+        {
+          "title": "v0.8.0（修复）",
+          "items": [
+            "加强多工作区之间的会话事件、Unity 服务、MCP、C# 分析、资产数据库、知识、Diff/Merge、View 和缓存隔离。",
+            "标签移动、窗口交接及编辑器重新挂载期间，会保留流式会话、输入草稿、待确认操作、排队附件、图片预览和未保存文件。",
+            "目标窗口创建失败或交接超时时，标签及编辑状态会安全保留在原窗口。",
+            "手动上下文压缩可在当前运行后排队，并优先于后续排队输入执行；子 Agent 会话可独立控制。",
+            "Responses API 的引用会写入会话存储及上下文导出；增量 UTF-8 解码会保留跨流式分块的多字节字符。",
+            "流式 Markdown、语法高亮、折叠工具交互和工具文件预览在内容增长及流结束时保持稳定。",
+            "中断或失败的子 Agent 会返回已经持久化的部分输出；延迟工具按精确 wire name 加载；图片工具会在执行前检查模型的图像理解能力。",
+            "Unity 恢复流程会显示 Safe Mode 与 Editor 日志路径，等待弹窗状态切换，并通过 Test Framework 生命周期取消中断的 Unity Test。",
+            "折叠工具调用使用简洁界面标签，展开后继续显示精确的等宽工具标识符。"
+          ]
+        },
+        {
+          "title": "v0.8.0（移除）",
+          "items": [
+            "移除旧一级“项目”入口与第二层工作区栏，统一由“开发”工作台和工作区树承载。",
+            "CodeMirror 迁移完成后，移除 Vditor 编辑器及其旧渲染和兼容路径。",
+            "移除手动 `skill_reload` 工具，Skill 文件变化后由 Locus 自动刷新清单。"
+          ]
+        },
         {
           "title": "v0.7.4（新增）",
           "items": [
@@ -364,11 +401,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -378,9 +415,46 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.7.4 (2026-08-18)",
+      "summary": "Locus v0.8.0 (2026-09-02)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.0 (Added)",
+          "items": [
+            "**Concurrent multi-workspace operation.** Multiple projects and Git worktrees can run in one Locus instance, with parallel sessions, Unity connections, Knowledge indexes, asset databases, and workspace services. Each workspace keeps an independent execution context, runtime state, and resource cache.",
+            "**VS Code-style split workbench.** Sessions, files, Knowledge documents, Unity assets, and Views open as editor tabs. Tabs can be reordered, split in four directions, moved between panes, or detached into native windows. Window layouts, tabs, drafts, scroll positions, and unsaved content can be restored.",
+            "**Development workspace tree.** Sessions, Knowledge, collaboration, and files now share one workspace tree, with single- and multi-workspace layouts, saved presets, virtual folders, mounted directories, and per-node visibility controls.",
+            "**Persistent Markdown editing.** Knowledge documents now use CodeMirror 6 for Live Preview and source editing, preserving selections, undo history, scroll position, drafts, and unsaved changes across document switches and split panes.",
+            "**Expanded Knowledge workflows.** Added `Plan` as a fifth knowledge type, writable project Skill packages under `Locus/skills`, automatic Skill refresh, document outline navigation, cached loading, and conflict-aware collaborative editing.",
+            "**Workspace and Unity mentions.** Chat `@` search now covers workspace files and folders as well as live Unity scene objects, with ranked results and explicit object references.",
+            "**Richer Unity inspection.** `unity_yaml_read` can display selected hierarchy metadata, including active state, Prefab source, world transforms, RectTransform bounds, tags, layers, and components. SubScene reads can follow the authoring Scene hierarchy, and adjustable serialized fields can render as inline property controls.",
+            "**Unity coordination and incremental synchronization.** A workspace change journal selects targeted imports, full refreshes, or no-op recompiles from verified file events. Experimental `unity_lock` and `unity_release` coordinate multiple Agents sharing one Editor.",
+            "**Runtime and provider controls.** Sub-agent defaults now include model, reasoning effort, and response speed. Custom Responses providers can enable Codex V2 remote compaction, with normalized reasoning replay for supported DeepSeek V4 routes.",
+            "**Session SDK and diagnostics.** The Python SDK can list running sessions and send sourced input to another active run. Debug mode adds DevTools control, CDP port discovery, WebView bridge diagnostics, and bounded log batching."
+          ]
+        },
+        {
+          "title": "v0.8.0 (Fixed)",
+          "items": [
+            "Strengthened isolation for session events, Unity services, MCP, C# analysis, asset databases, Knowledge, diff/merge state, Views, and caches across workspaces.",
+            "Preserved streaming sessions, input drafts, pending confirmations, queued attachments, image previews, and unsaved files while moving tabs, transferring windows, or remounting editors.",
+            "Failed or timed-out window transfers now leave the tab and editor state safely in the source window.",
+            "Manual context compaction can queue behind an active run and executes before queued follow-up input. Child Agent sessions remain independently controllable.",
+            "Responses API citations now persist through session storage and context export. Incremental UTF-8 decoding preserves multibyte characters split across streaming chunks.",
+            "Streaming Markdown, syntax highlighting, collapsed tool interaction, and tool file previews remain stable while content grows or finishes streaming.",
+            "Interrupted or failed sub-agents return persisted partial output. Deferred tool schemas load by exact wire name, and image tools validate model vision support before execution.",
+            "Unity recovery now exposes Safe Mode and Editor log paths, waits for modal-dialog transitions, and cancels interrupted Unity Test runs through the Test Framework lifecycle.",
+            "Collapsed tool rows use concise UI labels, while expanded rows retain exact monospace tool identifiers."
+          ]
+        },
+        {
+          "title": "v0.8.0 (Removed)",
+          "items": [
+            "Removed the legacy Project entry and second-level workspace bar; the Development workbench and workspace tree now provide the unified navigation model.",
+            "Removed the Vditor-backed Markdown editor and its legacy rendering and compatibility paths after the CodeMirror migration.",
+            "Removed the manual `skill_reload` tool; Locus now refreshes Skill manifests automatically after file changes."
+          ]
+        },
         {
           "title": "v0.7.4 (Added)",
           "items": [
@@ -713,11 +787,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.7.4/locus_0.7.4_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.0/locus_0.8.0_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
