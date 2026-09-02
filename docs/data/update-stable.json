@@ -51,7 +51,9 @@
           "title": "v0.8.0（修复）",
           "items": [
             "加强多工作区之间的会话事件、Unity 服务、MCP、C# 分析、资产数据库、知识、Diff/Merge、View 和缓存隔离。",
+            "切换工作区作用域后会刷新 Unity 插件的安装或更新提示；较晚完成的状态检查与临时失败不会覆盖较新的事件状态。",
             "标签移动、窗口交接及编辑器重新挂载期间，会保留流式会话、输入草稿、待确认操作、排队附件、图片预览和未保存文件。",
+            "发送失败、取消或被后端撤回的乐观消息会把完整本地文件附件与绝对路径恢复到输入框。",
             "目标窗口创建失败或交接超时时，标签及编辑状态会安全保留在原窗口。",
             "手动上下文压缩可在当前运行后排队，并优先于后续排队输入执行；子 Agent 会话可独立控制。",
             "Responses API 的引用会写入会话存储及上下文导出；增量 UTF-8 解码会保留跨流式分块的多字节字符。",
@@ -437,7 +439,9 @@
           "title": "v0.8.0 (Fixed)",
           "items": [
             "Strengthened isolation for session events, Unity services, MCP, C# analysis, asset databases, Knowledge, diff/merge state, Views, and caches across workspaces.",
+            "Switching workspace scopes now refreshes the Unity plugin install or update notice. Late status checks and transient failures no longer overwrite newer event-driven notices.",
             "Preserved streaming sessions, input drafts, pending confirmations, queued attachments, image previews, and unsaved files while moving tabs, transferring windows, or remounting editors.",
+            "Failed, cancelled, or backend-revoked optimistic sends now restore complete local-file attachments and absolute paths to the composer.",
             "Failed or timed-out window transfers now leave the tab and editor state safely in the source window.",
             "Manual context compaction can queue behind an active run and executes before queued follow-up input. Child Agent sessions remain independently controllable.",
             "Responses API citations now persist through session storage and context export. Incremental UTF-8 decoding preserves multibyte characters split across streaming chunks.",

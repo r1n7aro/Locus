@@ -33,7 +33,9 @@ changelogUrl: "/en/overview/latest-version"
 ### v0.8.0 (Fixed)
 
 - Strengthened isolation for session events, Unity services, MCP, C# analysis, asset databases, Knowledge, diff/merge state, Views, and caches across workspaces.
+- Switching workspace scopes now refreshes the Unity plugin install or update notice. Late status checks and transient failures no longer overwrite newer event-driven notices.
 - Preserved streaming sessions, input drafts, pending confirmations, queued attachments, image previews, and unsaved files while moving tabs, transferring windows, or remounting editors.
+- Failed, cancelled, or backend-revoked optimistic sends now restore complete local-file attachments and absolute paths to the composer.
 - Failed or timed-out window transfers now leave the tab and editor state safely in the source window.
 - Manual context compaction can queue behind an active run and executes before queued follow-up input. Child Agent sessions remain independently controllable.
 - Responses API citations now persist through session storage and context export. Incremental UTF-8 decoding preserves multibyte characters split across streaming chunks.
