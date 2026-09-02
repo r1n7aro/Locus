@@ -26,6 +26,7 @@ describe("workspace tree presets and mounted files", () => {
 
   it("controls every system node from a visibility submenu", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const tree = read("src-tauri/src/workspace_tree.rs");
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
@@ -46,6 +47,7 @@ describe("workspace tree presets and mounted files", () => {
     expect(workbench).toContain("toggleSpecialNodeVisibility(item.node)");
     expect(workbench).toContain('kind: "setNodeHidden"');
     expect(workbench).toContain("if (node.hidden) return false;");
+    expect(tree).toMatch(/SetNodeHidden \{ node_id, hidden \}[\s\S]*if !\*hidden \{[\s\S]*move_node\(nodes, node_id, None, 0\)\?/);
     expect(workbench).not.toContain("showHiddenNodes");
     expect(displaySettings).toContain('workspaceDisplayMode: "single",');
     expect(displaySettings).toContain('parsed.workspaceDisplayMode === "multi" ? "multi" : "single"');

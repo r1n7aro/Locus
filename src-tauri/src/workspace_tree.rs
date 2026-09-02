@@ -750,16 +750,19 @@ fn apply_operation(
             *position,
         ),
         ProjectExplorerOperation::SetNodeHidden { node_id, hidden } => {
-            let node = nodes
-                .iter_mut()
-                .find(|node| node.node_id == *node_id)
+            let node_index = nodes
+                .iter()
+                .position(|node| node.node_id == *node_id)
                 .ok_or_else(|| format!("Workspace tree node does not exist: {node_id}"))?;
-            if node.resource_kind.as_deref() != Some("system") {
+            if nodes[node_index].resource_kind.as_deref() != Some("system") {
                 return Err(format!(
                     "Only Locus system resources can be hidden: '{node_id}'"
                 ));
             }
-            node.hidden = *hidden;
+            if !*hidden {
+                move_node(nodes, node_id, None, 0)?;
+            }
+            nodes[node_index].hidden = *hidden;
             Ok(())
         }
         ProjectExplorerOperation::RemoveNode { node_id } => {
@@ -1100,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn system_resources_can_toggle_hidden_state() {
+    fn shown_system_resources_return_to_the_workspace_root_head() {
         let temp = tempfile::tempdir().unwrap();
         let initial = snapshot(temp.path(), "project-a").unwrap();
         let placed = apply_operations(
@@ -1108,29 +1111,76 @@ mod tests {
             "project-a",
             initial.revision,
             "place-collaboration",
-            &[ProjectExplorerOperation::PlaceResource {
-                resource_kind: "system".to_string(),
-                resource_id: "collaboration".to_string(),
-                source_kind: None,
-                parent_node_id: None,
-                position: 0,
-            }],
+            &[
+                ProjectExplorerOperation::PlaceResource {
+                    resource_kind: "session".to_string(),
+                    resource_id: "session-a".to_string(),
+                    source_kind: None,
+                    parent_node_id: None,
+                    position: 0,
+                },
+                ProjectExplorerOperation::PlaceResource {
+                    resource_kind: "system".to_string(),
+                    resource_id: "collaboration".to_string(),
+                    source_kind: None,
+                    parent_node_id: None,
+                    position: 1,
+                },
+            ],
         )
         .unwrap();
-        let node_id = placed.snapshot.nodes[0].node_id.clone();
+        let node_id = placed
+            .snapshot
+            .nodes
+            .iter()
+            .find(|node| node.resource_id.as_deref() == Some("collaboration"))
+            .map(|node| node.node_id.clone())
+            .unwrap();
         let hidden = apply_operations(
             temp.path(),
             "project-a",
             placed.snapshot.revision,
             "hide-collaboration",
             &[ProjectExplorerOperation::SetNodeHidden {
-                node_id,
+                node_id: node_id.clone(),
                 hidden: true,
             }],
         )
         .unwrap();
 
-        assert!(hidden.snapshot.nodes[0].hidden);
+        assert!(
+            hidden
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.node_id == node_id)
+                .unwrap()
+                .hidden
+        );
+
+        let shown = apply_operations(
+            temp.path(),
+            "project-a",
+            hidden.snapshot.revision,
+            "show-collaboration",
+            &[ProjectExplorerOperation::SetNodeHidden {
+                node_id: node_id.clone(),
+                hidden: false,
+            }],
+        )
+        .unwrap();
+        let mut roots = shown
+            .snapshot
+            .nodes
+            .iter()
+            .filter(|node| node.parent_node_id.is_none())
+            .collect::<Vec<_>>();
+        roots.sort_by_key(|node| node.position);
+
+        assert_eq!(roots[0].node_id, node_id);
+        assert!(!roots[0].hidden);
+        assert_eq!(roots[0].position, 0);
+        assert_eq!(roots[1].resource_id.as_deref(), Some("session-a"));
     }
 
     #[test]
