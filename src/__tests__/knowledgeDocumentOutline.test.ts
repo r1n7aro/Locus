@@ -49,10 +49,15 @@ describe("knowledge document outline", () => {
 
     expect(preview).toContain('class="document-workspace"');
     expect(preview).toContain('class="document-outline"');
+    expect(preview).toContain('marginTop: documentOutlineMarginTop');
+    expect(preview).toContain('ref="documentBodyRef"');
     expect(preview).toContain('@click="scrollToDocumentOutlineItem(item)"');
     expect(preview).toContain('@scroll.passive="scheduleDocumentOutlineActiveUpdate"');
     expect(preview).toMatch(/@container knowledge-document \(min-width: 1120px\)/);
-    expect(preview).toMatch(/\.document-workspace\.has-outline \.document-outline\s*\{[\s\S]*position:\s*sticky;[\s\S]*top:\s*24px;/);
+    expect(preview).toMatch(/\.document-workspace\.has-outline \.document-outline\s*\{[\s\S]*position:\s*sticky;[\s\S]*top:\s*40px;/);
+    expect(preview).toMatch(/\.document-outline\s*\{[\s\S]*overflow:\s*auto;[\s\S]*scrollbar-width:\s*none;/);
+    expect(preview).toMatch(/\.document-outline::\-webkit-scrollbar\s*\{[\s\S]*display:\s*none;/);
+    expect(preview).toContain("bodyRect.top - pageRect.top - DOCUMENT_OUTLINE_BODY_LEAD");
     expect(preview).toMatch(/\.document-outline-item\s*\{[\s\S]*border:\s*0;[\s\S]*background:\s*transparent;/);
   });
 });

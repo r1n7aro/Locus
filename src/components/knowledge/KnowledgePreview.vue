@@ -116,13 +116,21 @@ const emit = defineEmits<{
   (e: "dirtyChange", dirty: boolean): void;
 }>();
 
+const DOCUMENT_OUTLINE_STICKY_TOP = 40;
+const DOCUMENT_OUTLINE_BODY_LEAD = 16;
+const DOCUMENT_OUTLINE_BOTTOM_GUTTER = 24;
+
 const summaryDraft = ref("");
 const rulesDraft = ref("");
 const bodyDraft = ref("");
 const documentScrollerRef = ref<HTMLElement | null>(null);
+const documentPageRef = ref<HTMLElement | null>(null);
+const documentBodyRef = ref<HTMLElement | null>(null);
 const bodyEditorRef = ref<{ getEditorView: () => EditorView | null } | null>(null);
 const activeOutlineId = ref("");
 const outlineViewportHeight = ref(0);
+const outlineViewportTop = ref(DOCUMENT_OUTLINE_STICKY_TOP);
+const outlineStartOffset = ref(DOCUMENT_OUTLINE_STICKY_TOP);
 const sectionTextBuffers = new Map<KnowledgeDocumentSection, Text>();
 const baseSectionTexts = new Map<KnowledgeDocumentSection, Text>();
 const fileNameDraft = ref("");
@@ -1027,9 +1035,15 @@ const documentOutlineBaseLevel = computed(() =>
     6,
   )
 );
+const documentOutlineMarginTop = computed(() => `${outlineStartOffset.value}px`);
 const documentOutlineMaxHeight = computed(() => (
   outlineViewportHeight.value > 0
-    ? `${Math.max(160, outlineViewportHeight.value - 48)}px`
+    ? `${Math.max(
+        160,
+        outlineViewportHeight.value
+          - outlineViewportTop.value
+          - DOCUMENT_OUTLINE_BOTTOM_GUTTER,
+      )}px`
     : undefined
 ));
 
@@ -1048,6 +1062,7 @@ function outlineItemScreenTop(
 
 function updateDocumentOutlineActive(): void {
   outlineUpdateFrame = 0;
+  updateDocumentOutlineLayout();
   const items = documentOutlineItems.value;
   if (!items.length) {
     activeOutlineId.value = "";
@@ -1096,19 +1111,52 @@ function scrollToDocumentOutlineItem(item: KnowledgeDocumentOutlineItem): void {
   });
 }
 
-function observeDocumentScroller(scroller: HTMLElement | null): void {
+function updateDocumentOutlineLayout(): void {
+  const scroller = documentScrollerRef.value;
+  const page = documentPageRef.value;
+  const body = documentBodyRef.value;
+  outlineViewportHeight.value = scroller?.clientHeight ?? 0;
+  if (!scroller || !page || !body) {
+    outlineViewportTop.value = DOCUMENT_OUTLINE_STICKY_TOP;
+    outlineStartOffset.value = DOCUMENT_OUTLINE_STICKY_TOP;
+    return;
+  }
+
+  const scrollerRect = scroller.getBoundingClientRect();
+  const pageRect = page.getBoundingClientRect();
+  const bodyRect = body.getBoundingClientRect();
+  outlineStartOffset.value = Math.max(
+    DOCUMENT_OUTLINE_STICKY_TOP,
+    Math.round(bodyRect.top - pageRect.top - DOCUMENT_OUTLINE_BODY_LEAD),
+  );
+  outlineViewportTop.value = Math.max(
+    DOCUMENT_OUTLINE_STICKY_TOP,
+    Math.round(bodyRect.top - scrollerRect.top - DOCUMENT_OUTLINE_BODY_LEAD),
+  );
+}
+
+function observeDocumentOutlineLayout(
+  scroller: HTMLElement | null,
+  page: HTMLElement | null,
+  body: HTMLElement | null,
+): void {
   outlineResizeObserver?.disconnect();
   outlineResizeObserver = null;
-  outlineViewportHeight.value = scroller?.clientHeight ?? 0;
+  updateDocumentOutlineLayout();
   if (!scroller || typeof ResizeObserver === "undefined") return;
   outlineResizeObserver = new ResizeObserver(() => {
-    outlineViewportHeight.value = scroller.clientHeight;
     scheduleDocumentOutlineActiveUpdate();
   });
   outlineResizeObserver.observe(scroller);
+  if (page) outlineResizeObserver.observe(page);
+  if (body) outlineResizeObserver.observe(body);
 }
 
-watch(documentScrollerRef, observeDocumentScroller, { flush: "post" });
+watch(
+  [documentScrollerRef, documentPageRef, documentBodyRef],
+  ([scroller, page, body]) => observeDocumentOutlineLayout(scroller, page, body),
+  { flush: "post" },
+);
 
 function applyDocumentOutlineSource(source: string): void {
   outlineRefreshTimer = null;
@@ -1584,7 +1632,10 @@ function labelForProvider(provider?: string | null): string {
             <aside
               v-if="documentOutlineItems.length"
               class="document-outline"
-              :style="{ maxHeight: documentOutlineMaxHeight }"
+              :style="{
+                marginTop: documentOutlineMarginTop,
+                maxHeight: documentOutlineMaxHeight,
+              }"
             >
               <nav class="document-outline-nav" :aria-label="t('knowledge.preview.outline')">
                 <button
@@ -1603,7 +1654,7 @@ function labelForProvider(provider?: string | null): string {
               </nav>
             </aside>
 
-            <article class="document-page">
+            <article ref="documentPageRef" class="document-page">
             <header class="document-heading">
               <span
                 v-if="!isReadOnly && !isPackageDocument"
@@ -1863,7 +1914,11 @@ function labelForProvider(provider?: string | null): string {
               {{ t("knowledge.meta.rulesRequiredHint") }}
             </div>
 
-            <section class="document-body" :class="{ 'is-search-match': isSearchMatchSection('body'), 'is-loading': loading }">
+            <section
+              ref="documentBodyRef"
+              class="document-body"
+              :class="{ 'is-search-match': isSearchMatchSection('body'), 'is-loading': loading }"
+            >
                 <div v-if="searchSnippetVisible('body')" class="preview-search-hit preview-search-hit-body">
                   <div class="preview-search-hit-text">
                     <template v-for="(segment, index) in searchSnippetSegments('body')" :key="`body-${index}`">
@@ -2625,8 +2680,12 @@ function labelForProvider(provider?: string | null): string {
   display: none;
   min-width: 0;
   overflow: auto;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--text-secondary) 28%, transparent) transparent;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.document-outline::-webkit-scrollbar {
+  display: none;
 }
 
 .document-outline-nav {
@@ -2956,7 +3015,7 @@ function labelForProvider(provider?: string | null): string {
 
   .document-workspace.has-outline .document-outline {
     position: sticky;
-    top: 24px;
+    top: 40px;
     display: block;
     align-self: start;
   }
