@@ -40,7 +40,13 @@ describe("Agent workspace scope", () => {
     await getWorkspaceAgentEnvTemplate(workspaceRef, "unity");
     await getWorkspaceAgentRenderedEnvPrompt(workspaceRef, "unity", "openai/gpt-5.6");
     await getWorkspaceAgentSystemPromptStats(workspaceRef, "unity", "openai/gpt-5.6");
-    await listWorkspaceAgentInjectedItems(workspaceRef, "unity", null, "openai/gpt-5.6");
+    await listWorkspaceAgentInjectedItems(
+      workspaceRef,
+      "unity",
+      null,
+      "openai/gpt-5.6-sol",
+      { explorer: "openai/gpt-5.6-luna" },
+    );
     await listRules(workspaceRef, "unity");
     await readRule(workspaceRef, "unity", "workflow.md");
 
@@ -57,6 +63,13 @@ describe("Agent workspace scope", () => {
       agentId: "unity",
       selectedModel: "openai/gpt-5.6",
     });
+    expect(mockedInvoke).toHaveBeenCalledWith("list_workspace_agent_injected_items", {
+      workspaceRef,
+      agentId: "unity",
+      knowledgeMode: null,
+      selectedModel: "openai/gpt-5.6-sol",
+      subagentModels: { explorer: "openai/gpt-5.6-luna" },
+    });
   });
 
   it("keeps app Agent rules available without an active checkout", async () => {
@@ -70,13 +83,16 @@ describe("Agent workspace scope", () => {
     });
   });
 
-  it("binds the main and detached Agent views to their focused checkout", () => {
+  it("binds the main Agent view and its detached window to the same workspace", () => {
     const root = process.cwd();
     const app = readFileSync(resolve(root, "src/App.vue"), "utf8");
     const view = readFileSync(resolve(root, "src/components/AgentView.vue"), "utf8");
     const detached = readFileSync(resolve(root, "src/components/WorkspacePageWindow.vue"), "utf8");
 
-    expect(app).toContain(':workspace-ref="workspaceContextStore.focusedWorkspaceRef"');
+    expect(app).toContain(':workspace-ref="agentWorkspaceRef"');
+    expect(app).toContain(':working-dir="agentWorkingDir"');
+    expect(app).toContain('tab.id === "agent" ? agentWorkspaceRuntime.value');
+    expect(app).toContain("const runtime = topTabWorkspaceRuntime(tab);");
     expect(app).toContain(':agent-list="[...agentStore.agents, ...agentStore.subagents]"');
     expect(view).toContain("listWorkspaceAgents(workspaceRef)");
     expect(view).toContain("listWorkspaceAgentInjectedItems(");

@@ -76,11 +76,13 @@ export function listAgentInjectedItems(
   agentId: string,
   knowledgeMode?: KnowledgeAccessMode | null,
   selectedModel?: string | null,
+  subagentModels?: Record<string, string> | null,
 ): Promise<InjectedPromptItem[]> {
   return ipcInvoke<InjectedPromptItem[]>("list_agent_injected_items", {
     agentId,
     knowledgeMode: knowledgeMode ?? null,
     selectedModel: selectedModel ?? null,
+    subagentModels: subagentModels ?? null,
   });
 }
 
@@ -89,12 +91,14 @@ export function listWorkspaceAgentInjectedItems(
   agentId: string,
   knowledgeMode?: KnowledgeAccessMode | null,
   selectedModel?: string | null,
+  subagentModels?: Record<string, string> | null,
 ): Promise<InjectedPromptItem[]> {
   return ipcInvoke<InjectedPromptItem[]>("list_workspace_agent_injected_items", {
     workspaceRef,
     agentId,
     knowledgeMode: knowledgeMode ?? null,
     selectedModel: selectedModel ?? null,
+    subagentModels: subagentModels ?? null,
   });
 }
 
