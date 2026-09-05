@@ -31,6 +31,18 @@ describe("unityBridgeCompatibility", () => {
     expect(transport).toContain(".filter(|value| !value.is_empty())");
   });
 
+  it("correlates concurrent responses by request id", () => {
+    const transport = read("src-tauri/src/unity_bridge/transport.rs");
+    const nativeBridge = read("locus_unity/Editor/LocusBridge.Native.cs");
+
+    expect(transport).toContain("static REQUEST_SEQ: AtomicU64");
+    expect(transport).toContain('format!("req-{}", REQUEST_SEQ.fetch_add(1, Ordering::Relaxed))');
+    expect(transport).toContain("pending.insert(request_id.clone(), tx);");
+    expect(transport).toContain("pending.remove(&reply_to)");
+    expect(nativeBridge).toContain("response.reply_to = id;");
+    expect(transport).toContain("out_of_order_responses_are_dispatched_by_reply_to");
+  });
+
   it("acknowledges recompile only after Unity starts the requested epoch", () => {
     const bridge = read("locus_unity/Editor/LocusBridge.cs");
     const requestHandler = bridge.slice(
@@ -47,6 +59,8 @@ describe("unityBridgeCompatibility", () => {
     expect(compilationStarted).toContain('CompleteRecompileStartResponse();');
     expect(compilationStarted).toContain('SetCompileResult("pending");');
     expect(bridge).toContain('OkResponse(requestId, "recompile_started")');
+    expect(bridge).toContain("SessionKey_RecompileOperationId");
+    expect(bridge).toContain('"recompile_result_operation_mismatch"');
     expect(bridge).toContain('SetCompileResult("not_needed")');
     expect(bridge).toContain("CompleteRecompileNotNeeded();");
     expect(bridge).toContain(
@@ -72,6 +86,23 @@ describe("unityBridgeCompatibility", () => {
     );
     expect(bridge).not.toContain("RecompileCheckDelayFrames");
     expect(bridge).not.toContain("_recompileCheckFrames");
+  });
+
+  it("only uses the no-compilation-required event on Unity 2022.2 or newer", () => {
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
+
+    expect(bridge).toMatch(
+      /#if UNITY_2022_2_OR_NEWER\r?\n\s+CompilationPipeline\.assemblyCompilationNotRequired \+= OnAssemblyCompilationNotRequired;/,
+    );
+    expect(bridge).toMatch(
+      /#if UNITY_2022_2_OR_NEWER\r?\n\s+private static void OnAssemblyCompilationNotRequired\(string assemblyPath\)/,
+    );
+    expect(bridge).not.toMatch(
+      /#if UNITY_2022_1_OR_NEWER\r?\n\s+CompilationPipeline\.assemblyCompilationNotRequired/,
+    );
+    expect(bridge).not.toMatch(
+      /#if UNITY_2022_1_OR_NEWER\r?\n\s+private static void OnAssemblyCompilationNotRequired/,
+    );
   });
 
   it("batches changed assets into one import pass before compilation", () => {
@@ -116,6 +147,8 @@ describe("unityBridgeCompatibility", () => {
     expect(bridge).toContain("RECOMPILE_START_CONFIRM_TIMEOUT: Duration = Duration::from_secs(90)");
     expect(bridge).toContain("RECOMPILE_TOTAL_TIMEOUT: Duration = Duration::from_secs(300)");
     expect(bridge).toContain("send_message_without_timeout_with_acceptance(");
+    expect(bridge).toContain('"operationId": operation_id');
+    expect(bridge).toContain('"get_compile_result",\n            &operation_id');
     expect(bridge).toContain("state_probe::semantic_state_for_project(project_path).await");
     expect(bridge).toContain("Native Broker 已接收请求");
     expect(bridge).toContain("main_thread=");
@@ -127,6 +160,39 @@ describe("unityBridgeCompatibility", () => {
     expect(bridge).toContain("status: compiled_bridge_recovering");
     expect(bridge).toContain("detection: rebuilt_assembly_output");
     expect(bridge).not.toContain("Unity 最终状态：");
+  });
+
+  it("keeps terminal compile results readable after a late main-thread response", () => {
+    const unityBridge = read("locus_unity/Editor/LocusBridge.cs");
+    const nativeBridge = read("locus_unity/Editor/LocusBridge.Native.cs");
+    const rustBridge = read("src-tauri/src/unity_bridge/mod.rs");
+    const requestHandler = unityBridge.slice(
+      unityBridge.indexOf('case "request_recompile":'),
+      unityBridge.indexOf('case "request_script_reload":'),
+    );
+    const resultHandler = unityBridge.slice(
+      unityBridge.indexOf('case "get_compile_result":'),
+      unityBridge.indexOf('case "select_asset":'),
+    );
+    const pollTimeoutBranch = rustBridge.slice(
+      rustBridge.indexOf('if is_recompile_poll_response_timeout(&error)'),
+      rustBridge.indexOf('disconnected = true;', rustBridge.indexOf('if is_recompile_poll_response_timeout(&error)')),
+    );
+
+    expect(requestHandler).toContain("ClearCompileResult();");
+    expect(requestHandler.indexOf("ClearCompileResult();")).toBeLessThan(
+      requestHandler.indexOf('SetCompileResult("starting");'),
+    );
+    expect(resultHandler).not.toContain("ClearCompileResult();");
+    expect(resultHandler).toContain("Keep terminal results as a durable last-value register");
+    expect(resultHandler).toContain("requestedOperationId");
+    expect(resultHandler).toContain("activeOperationId");
+    expect(resultHandler).toContain('"recompile_result_operation_mismatch"');
+    expect(nativeBridge).toContain("recompile_result_idempotent_v1");
+    expect(nativeBridge).toContain("recompile_operation_id_v1");
+    expect(rustBridge).toContain("fn is_recompile_poll_response_timeout");
+    expect(pollTimeoutBranch).toContain("continue;");
+    expect(pollTimeoutBranch).not.toContain("transport::disconnect");
   });
 
   it("returns structured recompile state through every agent entry", () => {

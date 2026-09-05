@@ -33,6 +33,7 @@ pub use editor_log::{
     read_console_entries as read_editor_log_console_entries, resolve_editor_log_path,
     EditorLogEntry, EditorLogRead, ObservedEditorLogState,
 };
+pub(crate) use focus::restore_foreground;
 pub use plugin::{
     check_plugin_install_plan, check_plugin_status, emit_plugin_status_scoped,
     find_plugin_source_dir, install_or_update_plugin, install_or_update_plugin_with_force_close,
@@ -6397,12 +6398,16 @@ fn classify_recompile_start_response(resp: &PipeResponse) -> Result<RecompileSta
 async fn request_recompile_and_wait_for_start(
     project_path: &str,
     asset_sync: &crate::workspace_changes::UnitySyncSnapshot,
+    operation_id: &str,
 ) -> Result<RecompileStartAck, String> {
     let request_payload = serde_json::json!({
         "schema": 1,
         "syncMode": asset_sync.mode.as_str(),
         "paths": &asset_sync.paths,
         "reason": &asset_sync.reason,
+        // Optional in schema 1: older plugins ignore this field, while current
+        // plugins use it to reject a stale result from another recompile.
+        "operationId": operation_id,
     })
     .to_string();
     let (acceptance_tx, mut acceptance_rx) = tokio::sync::oneshot::channel();
@@ -6500,11 +6505,18 @@ fn classify_recompile_poll_response(resp: &PipeResponse) -> Result<RecompilePoll
         .error
         .clone()
         .unwrap_or_else(|| "Compilation failed (unknown error)".to_string());
-    if is_transient_broker_error(&error) {
+    if is_transient_broker_error(&error) || error.trim() == "recompile_result_operation_mismatch" {
         Ok(RecompilePollState::Transient)
     } else {
         Err(error)
     }
+}
+
+fn is_recompile_poll_response_timeout(error: &str) -> bool {
+    matches!(
+        error,
+        "Unity response timed out" | "Unity request timed out"
+    )
 }
 
 async fn finish_recompile_success(
@@ -6738,6 +6750,7 @@ async fn finish_recompile_not_needed(
 
 async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> {
     let existing_reload = wait_for_existing_reload(project_path).await?;
+    let operation_id = format!("recompile-{}", uuid::Uuid::new_v4().simple());
 
     // Hot-reload edits bypass the AssetDatabase entirely; forward every
     // tracked dirty path so the plugin imports created files (and refreshes
@@ -6766,8 +6779,12 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
         asset_sync.reason,
     );
 
-    let mut disconnected = match request_recompile_and_wait_for_start(project_path, &asset_sync)
-        .await?
+    let mut disconnected = match request_recompile_and_wait_for_start(
+        project_path,
+        &asset_sync,
+        &operation_id,
+    )
+    .await?
     {
         RecompileStartAck::Started => false,
         RecompileStartAck::Unconfirmed => {
@@ -6805,7 +6822,7 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
         match send_message_with_timeout(
             project_path,
             "get_compile_result",
-            "",
+            &operation_id,
             RECOMPILE_POLL_TIMEOUT,
         )
         .await
@@ -6831,6 +6848,16 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
                 }
             },
             Err(error) => {
+                if is_recompile_poll_response_timeout(&error) {
+                    // The native broker accepted the request and may still execute the
+                    // queued main-thread read after this local response deadline. The
+                    // Unity-side result register is idempotent, so keep the healthy pipe
+                    // and retry without turning a busy main thread into a reconnect loop.
+                    eprintln!(
+                        "[Locus] Unity compile-result response timed out; keeping the native bridge and retrying the persisted result"
+                    );
+                    continue;
+                }
                 disconnected = true;
                 transport::disconnect(project_path).await;
                 eprintln!(
@@ -7349,10 +7376,10 @@ mod tests {
     use super::{
         cache_unity_connection_status, cached_running_connection_status_for_transient_failure,
         classify_recompile_poll_response, classify_recompile_start_response,
-        is_transient_broker_error, native_background_hook_markers_present,
-        parse_unity_hub_editor_locations, parse_unity_status_message,
-        pipe_response_transient_broker_error, play_mode_target_status, read_project_unity_version,
-        relative_asset_paths, requested_run_states_editor_status,
+        is_recompile_poll_response_timeout, is_transient_broker_error,
+        native_background_hook_markers_present, parse_unity_hub_editor_locations,
+        parse_unity_status_message, pipe_response_transient_broker_error, play_mode_target_status,
+        read_project_unity_version, relative_asset_paths, requested_run_states_editor_status,
         rewrite_run_states_output_for_size, unity_test_cancel_dispatch_response,
         unity_test_cancel_snapshot, unity_test_run_is_terminal, unity_test_start_request,
         wait_for_unity_test_poll_wake, PipeResponse, RecompilePollState, RecompileStartAck,
@@ -7510,6 +7537,14 @@ mod tests {
             )),
             Ok(RecompilePollState::Transient)
         );
+        assert_eq!(
+            classify_recompile_poll_response(&pipe_response(
+                false,
+                None,
+                Some("recompile_result_operation_mismatch"),
+            )),
+            Ok(RecompilePollState::Transient)
+        );
 
         let error = classify_recompile_poll_response(&pipe_response(
             false,
@@ -7518,6 +7553,19 @@ mod tests {
         ))
         .expect_err("no compilation is terminal");
         assert!(error.contains("没有开始编译"), "{error}");
+    }
+
+    #[test]
+    fn recompile_poll_response_timeout_keeps_the_idempotent_result_path() {
+        assert!(is_recompile_poll_response_timeout(
+            "Unity response timed out"
+        ));
+        assert!(is_recompile_poll_response_timeout(
+            "Unity request timed out"
+        ));
+        assert!(!is_recompile_poll_response_timeout(
+            "Unity pipe connection closed"
+        ));
     }
 
     #[test]

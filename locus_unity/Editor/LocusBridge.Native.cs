@@ -47,7 +47,7 @@ namespace Locus
         // Capabilities the managed executor advertises (mirrors the managed
         // executor features the broker can route through this domain).
         private const string ManagedCapabilities =
-            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1";
+            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1,recompile_result_idempotent_v1,recompile_operation_id_v1";
 
         private static volatile bool _nativeBridgeActive;
         private static long _nativeGeneration;

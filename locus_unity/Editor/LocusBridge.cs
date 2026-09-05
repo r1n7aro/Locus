@@ -91,6 +91,7 @@ namespace Locus
 
         private const string SessionKey_RecompileInProgress = "Locus_RecompileInProgress";
         private const string SessionKey_RecompileResult = "Locus_RecompileResult";
+        private const string SessionKey_RecompileOperationId = "Locus_RecompileOperationId";
         // Convergence signalling read by the desktop via get_reload_state.
         // CompileAwaitingReload: set by OnCompilationFinished on a SUCCESSFUL
         // compile (any initiator), consumed by OnAfterAssemblyReload in the next
@@ -474,7 +475,7 @@ namespace Locus
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
             CompilationPipeline.compilationStarted += OnCompilationStarted;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
-#if UNITY_2022_1_OR_NEWER
+#if UNITY_2022_2_OR_NEWER
             CompilationPipeline.assemblyCompilationNotRequired += OnAssemblyCompilationNotRequired;
 #endif
             CompilationPipeline.assemblyCompilationFinished += OnAssemblyCompilationFinished;
@@ -491,6 +492,7 @@ namespace Locus
             public string syncMode;
             public string[] paths;
             public string reason;
+            public string operationId;
         }
 
         private static void OnQuitting()
@@ -807,7 +809,7 @@ namespace Locus
             }
         }
 
-#if UNITY_2022_1_OR_NEWER
+#if UNITY_2022_2_OR_NEWER
         private static void OnAssemblyCompilationNotRequired(string assemblyPath)
         {
             _upToDateAssemblyCount++;
@@ -1444,6 +1446,14 @@ namespace Locus
             NativeEmitEvent(eventType, message);
         }
 
+        internal static bool TrySendEventToRust(string eventType, string message)
+        {
+            if (!HasConnectedDesktopClient())
+                return false;
+            NativeEmitEvent(eventType, message);
+            return true;
+        }
+
         // ───────────────── Response helpers ─────────────────
 
         private static PipeEnvelope OkResponse(string replyTo, string message)
@@ -1664,7 +1674,7 @@ namespace Locus
                     case "bridge_capabilities":
                         return OkResponse(
                             reqId,
-                            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1");
+                            ManagedCapabilities);
 
                     case "status":
                         return HandleStatus(reqId);
@@ -1857,7 +1867,12 @@ namespace Locus
                                     return;
                                 }
 
+                                RecompileRequestPayload recompileRequest =
+                                    ParseRecompileRequest(changedPathsRaw);
                                 lock (_recompileErrorsLock) { _recompileErrors.Clear(); }
+                                SessionState.SetString(
+                                    SessionKey_RecompileOperationId,
+                                    (recompileRequest.operationId ?? "").Trim());
                                 ClearCompileResult();
                                 SetCompileResult("starting");
                                 _recompileRequested = true;
@@ -1877,9 +1892,6 @@ namespace Locus
                                 SessionState.SetBool(SessionKey_RecompilePendingCompile, true);
                                 SessionState.SetBool(SessionKey_RecompileInProgress, true);
                                 SessionState.SetBool(SessionKey_CompileAwaitingReload, false);
-
-                                RecompileRequestPayload recompileRequest =
-                                    ParseRecompileRequest(changedPathsRaw);
 
                                 // Merge the session queue and the request's
                                 // tracked paths before performing at most one
@@ -2026,11 +2038,27 @@ namespace Locus
 
                     case "get_compile_result":
                     {
+                        string requestedOperationId = (msg.message ?? "").Trim();
                         var tcs = LocusAsync.CreateTcs<PipeEnvelope>();
                         PostToMainThread(delegate
                         {
                             try
                             {
+                                string activeOperationId = SessionState.GetString(
+                                    SessionKey_RecompileOperationId,
+                                    "");
+                                if (!string.IsNullOrEmpty(requestedOperationId) &&
+                                    !string.Equals(
+                                        requestedOperationId,
+                                        activeOperationId,
+                                        StringComparison.Ordinal))
+                                {
+                                    tcs.SetResult(ErrorResponse(
+                                        reqId,
+                                        "recompile_result_operation_mismatch"));
+                                    return;
+                                }
+
                                 string result = GetCompileResult();
                                 if (string.IsNullOrEmpty(result))
                                 {
@@ -2053,15 +2081,12 @@ namespace Locus
                                     return;
                                 }
 
-                                if (string.Equals(result, "not_needed", StringComparison.Ordinal))
-                                {
-                                    ClearCompileResult();
-                                    tcs.SetResult(OkResponse(reqId, result));
-                                    return;
-                                }
-
-                                ClearCompileResult();
-
+                                // Keep terminal results as a durable last-value register. A desktop
+                                // response timeout removes only its local pending request; the work
+                                // already queued here can still run later on Unity's main thread. If
+                                // a read cleared the value, that late response would consume the only
+                                // completion proof before the desktop could receive it. The next
+                                // request_recompile clears this register before publishing "starting".
                                 if (result.StartsWith("error:", StringComparison.Ordinal))
                                     tcs.SetResult(ErrorResponse(reqId, result.Substring("error:".Length)));
                                 else
