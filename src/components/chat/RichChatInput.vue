@@ -219,6 +219,7 @@ const emit = defineEmits<{
   (e: "reviewContext"): void;
   (e: "requestPlanMode", active: boolean): void;
   (e: "requestNewSession"): void;
+  (e: "focus"): void;
   (e: "removeManagedLocalFile", fileId: string): void;
 }>();
 
@@ -1450,30 +1451,17 @@ function addAssetRefs(
   }
 }
 
-async function prepareSendToLocusTarget(sendMode?: "focusedSession" | "newSession") {
-  const opensNewSession = sendMode === "newSession";
-  if (opensNewSession) {
-    emit("requestNewSession");
-    await nextTick();
-    resetDraft();
-    await nextTick();
-  }
-  return opensNewSession;
+function handleComposerFocus() {
+  handleTextareaInteraction();
+  emit("focus");
 }
 
 async function handleUnityEmbedAssetDrop(payload: UnityEmbedAssetDropPayload) {
   if (!payloadTargetsCurrentWorkspace(payload.workspaceRef)) return;
-  const opensNewSession = await prepareSendToLocusTarget(payload.sendMode);
-  if (opensNewSession) {
-    addAssetRefs(payload.refs ?? [], { respectRecentRemoval: false });
-    return;
-  }
   addAssetRefs(payload.refs ?? [], { respectRecentRemoval: true });
 }
 
 async function handleLocusFileDrop(payload: LocusFileDropPayload) {
-  if (!payloadTargetsCurrentWorkspace(payload.workspaceRef)) return;
-  await prepareSendToLocusTarget(payload.sendMode);
   const composer = composerRef.value?.getTextarea()?.closest<HTMLElement>(".chat-composer");
   const bounds = composer?.getBoundingClientRect();
   const hasPosition = Number.isFinite(payload.x) && Number.isFinite(payload.y);
@@ -2969,7 +2957,7 @@ defineExpose({
       @click="handleTextareaInteraction"
       @keyup="handleTextareaKeyup"
       @mouseup="handleTextareaInteraction"
-      @focus="handleTextareaInteraction"
+      @focus="handleComposerFocus"
       @send="handleSend"
       @cancel="emit('cancel')"
       @resume="emit('resume')"

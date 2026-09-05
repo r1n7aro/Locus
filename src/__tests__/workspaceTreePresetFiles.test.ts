@@ -37,6 +37,7 @@ describe("workspace tree presets and mounted files", () => {
       "KNOWLEDGE_SYSTEM_RESOURCE_ID",
       "ASSETS_SYSTEM_RESOURCE_ID",
       "VIEWS_SYSTEM_RESOURCE_ID",
+      "ARCHIVED_SYSTEM_RESOURCE_ID",
     ]) {
       expect(workbench).toContain(`resourceId: ${resourceId}`);
     }
@@ -115,6 +116,8 @@ describe("workspace tree presets and mounted files", () => {
     expect(command).toContain("workspace.explorer_file_uses_unity_inspector");
     expect(service).toContain('"project_explorer_write_file"');
     expect(fileEditor).toContain("<BaseMarkdownEditor");
+    expect(workbench).toContain("isWorkbenchMarkdownPath(editor.resource.path)");
+    expect(workbench).toContain("editor.resource.kind === 'workspaceFile' || (editor.resource.kind === 'asset'");
     expect(fileEditor).toContain("projectExplorerWriteFile(");
     expect(fileEditor).toContain("workspaceFileWrite(");
     expect(fileEditor).toContain('@shortcut-save="saveFile"');
@@ -156,8 +159,10 @@ describe("workspace tree presets and mounted files", () => {
     expect(store).toContain('resourceId: NEW_SESSION_SYSTEM_RESOURCE_ID');
     expect(store).toContain('resourceId: KNOWLEDGE_SYSTEM_RESOURCE_ID');
     expect(store).toContain('resourceId: COLLABORATION_SYSTEM_RESOURCE_ID');
+    expect(store).toContain('resourceId: ARCHIVED_SYSTEM_RESOURCE_ID');
     expect(workbench).toContain('node.resourceId === KNOWLEDGE_SYSTEM_RESOURCE_ID');
     expect(workbench).toContain('node.resourceId === COLLABORATION_SYSTEM_RESOURCE_ID');
+    expect(workbench).toContain('node.resourceId === ARCHIVED_SYSTEM_RESOURCE_ID');
     expect(workbench).toContain("dragEnabled: true");
     expect(workbench).toContain("position: snapshot.nodes.filter((node) => !node.parentNodeId).length");
     expect(workbench).toContain("await moveExplorerNodeToIntent((sourceData as WorkspaceLayoutInternalDragData).item, intent.layout)");

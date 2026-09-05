@@ -44,6 +44,7 @@ static UI_RUN_CANCEL: Mutex<Option<watch::Sender<bool>>> = Mutex::new(None);
 pub enum CliDriverSuite {
     Workspace,
     WorkspaceSwitch,
+    SessionUndo,
     Connect,
     Sidecar,
     TypeIndex,
@@ -66,6 +67,7 @@ impl CliDriverSuite {
         match self {
             CliDriverSuite::Workspace => "workspace",
             CliDriverSuite::WorkspaceSwitch => "workspace-switch",
+            CliDriverSuite::SessionUndo => "session-undo",
             CliDriverSuite::Connect => "connect",
             CliDriverSuite::Sidecar => "sidecar",
             CliDriverSuite::TypeIndex => "type-index",
@@ -88,6 +90,7 @@ impl CliDriverSuite {
         match self {
             CliDriverSuite::Workspace => None,
             CliDriverSuite::WorkspaceSwitch => None,
+            CliDriverSuite::SessionUndo => None,
             CliDriverSuite::Connect => None,
             CliDriverSuite::Sidecar => None,
             CliDriverSuite::TypeIndex => None,
@@ -309,6 +312,10 @@ impl UnityIntegrationTestRunRequest {
 }
 
 impl CliDriverConfig {
+    pub fn requires_frontend(&self) -> bool {
+        self.suites.contains(&CliDriverSuite::SessionUndo)
+    }
+
     pub fn from_env_args() -> Option<Result<Self, String>> {
         Self::parse(std::env::args().skip(1).collect())
     }
@@ -612,6 +619,9 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         "workspace-switch" | "workspace_switch" | "cross-project" | "cross_project" => {
             CliDriverSuite::WorkspaceSwitch
         }
+        "session-undo" | "session_undo" | "undo" | "file-undo" | "file_undo" => {
+            CliDriverSuite::SessionUndo
+        }
         "sidecar" | "compile-server" | "compile_server" => CliDriverSuite::Sidecar,
         "type-index" | "type_index" | "typeindex" | "schema" | "serialized-schema"
         | "serialized_schema" => CliDriverSuite::TypeIndex,
@@ -647,7 +657,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         }
         _ => {
             return Err(format!(
-            "Unknown --suite '{}'. Use workspace, workspace-switch, connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, recompile-import, execute, python-sdk, modal-dialog, safe-mode, yaml-parity, unity-test, or all.",
+            "Unknown --suite '{}'. Use workspace, workspace-switch, session-undo, connect, sidecar, type-index, state-probe, native-bridge, hot-reload, hot-reload-release, parallel-edit-refresh, recompile-import, execute, python-sdk, modal-dialog, safe-mode, yaml-parity, unity-test, or all.",
             value
         ))
         }
@@ -781,6 +791,19 @@ async fn run_driver(
         return Ok(());
     }
 
+    if config.suites.contains(&CliDriverSuite::SessionUndo) {
+        if config.suites.len() != 1 {
+            return Err(
+                "The session-undo suite must run alone because it owns its fixture and undo stack"
+                    .to_string(),
+            );
+        }
+        let project = resolve_project_path(config.project_path.as_deref(), &app_handle).await?;
+        run_session_undo_suite(&app_handle, &project, &config, &sink).await?;
+        sink.emit("finished", json!({ "ok": true }));
+        return Ok(());
+    }
+
     let project = resolve_project_path(config.project_path.as_deref(), &app_handle).await?;
     set_workspace_for_driver(&app_handle, &project).await?;
     prepare_suite_environment(&project, &config, &sink)?;
@@ -819,6 +842,10 @@ async fn run_driver(
             ),
             CliDriverSuite::WorkspaceSwitch => Err(
                 "The workspace-switch suite must be dispatched before single-project suites"
+                    .to_string(),
+            ),
+            CliDriverSuite::SessionUndo => Err(
+                "The session-undo suite must be dispatched before Unity connection setup"
                     .to_string(),
             ),
             CliDriverSuite::Connect => {
@@ -1368,6 +1395,426 @@ async fn run_workspace_suite(
         }),
     );
     drop(probe_contexts);
+    Ok(())
+}
+
+const SESSION_UNDO_FIXTURE_RELATIVE_PATH: &str = ".locus-session-undo-driver-probe.txt";
+const SESSION_UNDO_FIXTURE_CONTENT: &str = "LOCUS_SESSION_UNDO_DRIVER_PROBE\n";
+
+async fn probe_session_undo_frontend(
+    app_handle: &AppHandle,
+    project_id: &str,
+    checkout_id: &str,
+    workspace_generation: u64,
+    session_id: &str,
+    phase: &str,
+) -> Result<Value, String> {
+    let config = json!({
+        "projectId": project_id,
+        "checkoutId": checkout_id,
+        "workspaceGeneration": workspace_generation,
+        "sessionId": session_id,
+        "fixture": SESSION_UNDO_FIXTURE_RELATIVE_PATH,
+        "phase": phase,
+    });
+    let expression = r#"(() => {
+      const config = __LOCUS_SESSION_UNDO_CONFIG__;
+      const visible = (element) => {
+        if (!(element instanceof HTMLElement)) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      const pending = (stage, detail = null) => ({
+        ready: false,
+        phase: config.phase,
+        stage,
+        detail,
+      });
+      const app = document.querySelector('#app')?.__vue_app__;
+      if (!app) return pending('vue-app');
+      const pinia = app.config?.globalProperties?.$pinia
+        ?? Reflect.ownKeys(app._context.provides)
+          .map((key) => app._context.provides[key])
+          .find((value) => value?._s instanceof Map && value._s.has('ui'));
+      if (!pinia) return pending('pinia');
+      const ui = pinia._s.get('ui');
+      const workbench = pinia._s.get('workbench');
+
+      {
+        const workspaceContext = pinia._s.get('workspaceContext');
+        if (!ui || !workspaceContext || !workbench) {
+          return pending('workbench-stores', [...pinia._s.keys()]);
+        }
+        ui.setPage('development');
+        if (!workspaceContext.checkoutsById?.[config.checkoutId]) {
+          return pending('workspace-checkout', Object.keys(workspaceContext.checkoutsById ?? {}));
+        }
+        workbench.switchWorkspaceScope('main', config.checkoutId);
+        const editorId = 'cli-session-undo-' + config.sessionId;
+        workbench.openEditor('main', {
+          editorId,
+          resource: {
+            kind: 'session',
+            projectId: config.projectId,
+            sessionId: config.sessionId,
+          },
+          title: 'Workspace driver target 0',
+          icon: null,
+          preview: false,
+          pinned: true,
+          dirty: false,
+          capabilities: { split: true, detach: true, duplicate: true },
+          checkoutBinding: {
+            checkoutId: config.checkoutId,
+            expectedGeneration: config.workspaceGeneration,
+          },
+          sourcePath: null,
+          availability: 'available',
+          unavailableReason: null,
+        }, {
+          preview: false,
+          pinned: true,
+          replacePreview: true,
+        });
+      }
+
+      const shell = [...document.querySelectorAll('.workbench-session-shell')].find((candidate) => (
+        candidate.dataset.sessionId === config.sessionId && visible(candidate)
+      ));
+      if (!shell) return pending('session-editor', {
+        activePage: ui?.activePage ?? null,
+        workbenchScope: workbench?.workspaceScope?.('main') ?? null,
+        windowIds: Object.keys(workbench?.windows ?? {}),
+        activeEditor: workbench?.activeEditor?.('main') ?? null,
+        domEditorIds: [...document.querySelectorAll('[data-editor-id]')]
+          .map((element) => element.dataset.editorId),
+        sessionShellIds: [...document.querySelectorAll('.workbench-session-shell')]
+          .map((element) => element.dataset.sessionId ?? null),
+      });
+      const toggle = [...shell.querySelectorAll('.changes-toggle-btn')].find(visible);
+      if (!toggle) return pending('changes-button');
+      if (toggle.disabled) throw new Error('Changes button is disabled after the session became idle.');
+
+      let panel = [...shell.querySelectorAll('.chat-sidebar-panel')].find(visible) ?? null;
+      if (!panel) {
+        toggle.click();
+        return pending('opening-changes-panel');
+      }
+
+      const fixtureSelector = '.changes-file-main[title="' + config.fixture + '"]';
+      let fixture = panel.querySelector(fixtureSelector);
+      if (config.phase === 'empty' && fixture) {
+        throw new Error('The isolated fixture was already present before the mock write.');
+      }
+      if (config.phase === 'written') {
+        if (!fixture) return pending('written-fixture');
+      }
+      if (config.phase === 'undo' && fixture) {
+        const confirm = [...panel.querySelectorAll('.confirm-ok')].find(visible);
+        if (confirm) {
+          if (!confirm.disabled) confirm.click();
+          return pending('undo-performing');
+        }
+        const undoButton = [...panel.querySelectorAll('.undo-btn')].find(visible);
+        if (!undoButton) return pending('undo-button');
+        if (!undoButton.disabled) undoButton.click();
+        return pending('undo-preflight');
+      }
+
+      return {
+        ready: true,
+        phase: config.phase,
+        sessionId: config.sessionId,
+        editorId: 'cli-session-undo-' + config.sessionId,
+        buttonVisible: visible(toggle),
+        buttonEnabled: !toggle.disabled,
+        panelVisible: visible(panel),
+        fixtureVisible: Boolean(fixture && visible(fixture)),
+        emptyHintVisible: Boolean([...panel.querySelectorAll('.empty-hint')].find(visible)),
+      };
+    })()"#
+        .replace("__LOCUS_SESSION_UNDO_CONFIG__", &config.to_string());
+
+    let probe_started = Instant::now();
+    let mut last_report = Value::Null;
+    let report = loop {
+        match crate::cdp_debug::evaluate_main_webview(
+            app_handle,
+            &expression,
+            Duration::from_secs(5),
+        )
+        .await
+        {
+            Ok(report) if report.get("ready").and_then(Value::as_bool) == Some(true) => {
+                break report;
+            }
+            Ok(report) if probe_started.elapsed() < Duration::from_secs(60) => {
+                last_report = report;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(report) => {
+                return Err(format!(
+                    "Session undo frontend {phase} probe timed out: {report}"
+                ));
+            }
+            Err(error)
+                if (error.contains("main WebView2 window is unavailable")
+                    || error.contains("0x80070057")
+                    || error.contains("CDP call timed out"))
+                    && probe_started.elapsed() < Duration::from_secs(60) =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Session undo frontend {phase} probe failed: {error}; last state: {last_report}"
+                ));
+            }
+        }
+    };
+    if report.get("buttonVisible").and_then(Value::as_bool) != Some(true)
+        || report.get("buttonEnabled").and_then(Value::as_bool) != Some(true)
+        || report.get("panelVisible").and_then(Value::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "Session undo frontend {phase} probe returned an invalid control state: {report}"
+        ));
+    }
+    Ok(report)
+}
+
+async fn run_session_undo_suite(
+    app_handle: &AppHandle,
+    project: &str,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+) -> Result<(), String> {
+    sink.emit(
+        "suite_start",
+        json!({
+            "suite": CliDriverSuite::SessionUndo.as_str(),
+            "project": project,
+            "fixture": SESSION_UNDO_FIXTURE_RELATIVE_PATH,
+        }),
+    );
+
+    let fixture_path = Path::new(project).join(SESSION_UNDO_FIXTURE_RELATIVE_PATH);
+    if fixture_path.exists() {
+        return Err(format!(
+            "Session undo fixture already exists and was left untouched: {}",
+            fixture_path.display()
+        ));
+    }
+
+    let result =
+        run_session_undo_suite_inner(app_handle, project, config, sink, &fixture_path).await;
+    if fixture_path.exists() {
+        if let Err(cleanup_error) = std::fs::remove_file(&fixture_path) {
+            let primary_error = result
+                .err()
+                .unwrap_or_else(|| "Session undo left its fixture on disk".to_string());
+            return Err(format!(
+                "{primary_error}; fixture cleanup also failed for {}: {cleanup_error}",
+                fixture_path.display()
+            ));
+        }
+    }
+    result
+}
+
+async fn run_session_undo_suite_inner(
+    app_handle: &AppHandle,
+    project: &str,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    fixture_path: &Path,
+) -> Result<(), String> {
+    let app_config = app_handle.state::<Arc<crate::config::AppConfig>>();
+    app_config.set_session_undo_enabled(true)?;
+    if !app_config.session_undo_enabled() {
+        return Err(
+            "Session undo remained disabled after enabling the isolated config".to_string(),
+        );
+    }
+
+    open_and_focus_workspace_for_driver(app_handle, project).await?;
+    let registry = app_handle
+        .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+        .inner()
+        .clone();
+    let runtime = registry
+        .runtime_for_root(Path::new(project))
+        .ok_or_else(|| format!("Workspace runtime was not registered for {project}"))?;
+    let mut scoped_events = registry.event_router().subscribe();
+    let session_id = create_workspace_driver_session(app_handle, 0, runtime.as_ref()).await?;
+    let target = WorkspaceSuiteTarget {
+        index: 0,
+        project: project.to_string(),
+        runtime,
+        session_id,
+        plugin_outcome: PluginPrepareOutcome::UpToDate,
+    };
+    let project_id = target.runtime.project_id().to_string();
+    let undo_manager = app_handle
+        .state::<crate::UndoManagerHandle>()
+        .inner()
+        .clone();
+    let initial_entries = undo_manager.list_entries(&target.session_id).await;
+    if !initial_entries.is_empty() {
+        return Err(format!(
+            "Expected an empty undo stack before the mock write, observed {} entries",
+            initial_entries.len()
+        ));
+    }
+    let checkout_id = target.runtime.checkout_id().to_string();
+    let workspace_generation = target.runtime.generation();
+    let frontend_empty = probe_session_undo_frontend(
+        app_handle,
+        &project_id,
+        &checkout_id,
+        workspace_generation,
+        &target.session_id,
+        "empty",
+    )
+    .await?;
+    let launch = launch_workspace_mock_chat_with_prompt(
+        app_handle,
+        &target,
+        format!(
+            "{} Write the isolated session undo fixture.",
+            crate::agent::instance::MOCK_SESSION_UNDO_FILE_SCENARIO
+        ),
+    )
+    .await?;
+    let run_result =
+        wait_for_workspace_mock_chat(app_handle, &launch, &target, config.suite_timeout).await?;
+
+    let written = std::fs::read_to_string(fixture_path)
+        .map_err(|error| format!("Mock write did not create the fixture: {error}"))?;
+    if written != SESSION_UNDO_FIXTURE_CONTENT {
+        return Err(format!(
+            "Mock write fixture content mismatch: expected {:?}, observed {:?}",
+            SESSION_UNDO_FIXTURE_CONTENT, written
+        ));
+    }
+
+    let entries = undo_manager.list_entries(&target.session_id).await;
+    if entries.len() != 1 {
+        return Err(format!(
+            "Expected one undo entry after the mock write, observed {}",
+            entries.len()
+        ));
+    }
+    let entry = entries[0].clone();
+    if !entry
+        .changed_files
+        .iter()
+        .any(|file| file.path.replace('\\', "/") == SESSION_UNDO_FIXTURE_RELATIVE_PATH)
+    {
+        return Err(format!(
+            "Undo entry did not contain fixture {}: {:?}",
+            SESSION_UNDO_FIXTURE_RELATIVE_PATH, entry.changed_files
+        ));
+    }
+
+    let mut saw_undo_available = false;
+    while let Ok(event) = scoped_events.try_recv() {
+        if event.event_name != "stream-event" {
+            continue;
+        }
+        let Ok(envelope) =
+            serde_json::from_value::<crate::commands::StreamEventEnvelope>(event.envelope.payload)
+        else {
+            continue;
+        };
+        if envelope.run_id == launch.run_id
+            && matches!(
+                envelope.event,
+                crate::commands::StreamEvent::UndoAvailable {
+                    ref session_id,
+                    ref assistant_message_id,
+                } if session_id == &target.session_id
+                    && assistant_message_id == &entry.assistant_message_id
+            )
+        {
+            saw_undo_available = true;
+            break;
+        }
+    }
+    if !saw_undo_available {
+        return Err(
+            "The mock write recorded undo state without a scoped UndoAvailable event".to_string(),
+        );
+    }
+
+    let frontend_written = probe_session_undo_frontend(
+        app_handle,
+        &project_id,
+        &checkout_id,
+        workspace_generation,
+        &target.session_id,
+        "written",
+    )
+    .await?;
+
+    let frontend_reverted = probe_session_undo_frontend(
+        app_handle,
+        &project_id,
+        &checkout_id,
+        workspace_generation,
+        &target.session_id,
+        "undo",
+    )
+    .await?;
+    if fixture_path.exists() {
+        return Err(format!(
+            "Session undo left the fixture on disk: {}",
+            fixture_path.display()
+        ));
+    }
+    let remaining_entries = undo_manager.list_entries(&target.session_id).await;
+    if !remaining_entries.is_empty() {
+        return Err(format!(
+            "Session undo left {} active undo entries",
+            remaining_entries.len()
+        ));
+    }
+    sink.emit(
+        "suite_event",
+        json!({
+            "suite": CliDriverSuite::SessionUndo.as_str(),
+            "line": format!(
+                "PASS  session-undo: mock write recorded {}, emitted UndoAvailable, and restored the fixture",
+                SESSION_UNDO_FIXTURE_RELATIVE_PATH
+            ),
+            "passed": 7,
+            "failed": 0,
+        }),
+    );
+    sink.emit(
+        "suite_result",
+        json!({
+            "suite": CliDriverSuite::SessionUndo.as_str(),
+            "passed": 7,
+            "failed": 0,
+            "sessionUndoEnabled": true,
+            "fixtureRestored": true,
+            "undoAvailable": true,
+            "sessionId": target.session_id,
+            "runId": launch.run_id,
+            "assistantMessageId": entry.assistant_message_id,
+            "frontend": {
+                "empty": frontend_empty,
+                "written": frontend_written,
+                "reverted": frontend_reverted,
+            },
+            "run": run_result,
+        }),
+    );
     Ok(())
 }
 
@@ -7921,6 +8368,20 @@ mod tests {
             assert_eq!(
                 parsed.suites,
                 vec![CliDriverSuite::Execute],
+                "alias {alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_session_undo_suite_aliases() {
+        for alias in ["session-undo", "session_undo", "undo", "file-undo"] {
+            let parsed = parse(&["--locus-unity-test", "--suite", alias])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parsed.suites,
+                vec![CliDriverSuite::SessionUndo],
                 "alias {alias}"
             );
         }

@@ -5,7 +5,6 @@ import { LogicalPosition, LogicalSize, getCurrentWindow } from "@tauri-apps/api/
 import { t } from "../i18n";
 import { useAppBootstrap } from "../composables/useAppBootstrap";
 import { provideDiffOverlay } from "../composables/useDiffOverlay";
-import { setLocusAssetInspectorPanelHostAvailable } from "../composables/useLocusAssetInspectorPanel";
 import {
   WORKBENCH_WINDOW_POOL_CLAIM_EVENT,
   getWorkbenchAuxWindowRecord,
@@ -69,7 +68,6 @@ const { bootstrapCritical, registerListeners, cleanup } = useAppBootstrap({
   handleExternalScriptOpen: false,
 });
 const diffOverlay = provideDiffOverlay();
-if (!props.sharedHost) setLocusAssetInspectorPanelHostAvailable(false);
 
 function handleTitlebarPointerDown(event: PointerEvent): void {
   if (event.button !== 0 || event.detail > 1) return;

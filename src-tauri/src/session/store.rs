@@ -892,7 +892,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 39;
+    const SCHEMA_VERSION: i32 = 40;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1417,7 +1417,20 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 39, "add a new migration block above");
+        if current < 40 {
+            Self::migrate(conn, 40, "persist workspace tree visibility", |conn| {
+                if !Self::table_has_column(conn, "workspace_projects", "is_visible")? {
+                    conn.execute_batch(
+                        "ALTER TABLE workspace_projects
+                         ADD COLUMN is_visible INTEGER NOT NULL DEFAULT 1
+                         CHECK(is_visible IN (0, 1));",
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+
+        debug_assert_eq!(Self::SCHEMA_VERSION, 40, "add a new migration block above");
         Ok(())
     }
 
@@ -1806,7 +1819,8 @@ impl SessionStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS workspace_projects (
                 project_id TEXT PRIMARY KEY,
-                last_opened_at INTEGER NOT NULL
+                last_opened_at INTEGER NOT NULL,
+                is_visible INTEGER NOT NULL DEFAULT 1 CHECK(is_visible IN (0, 1))
             );
 
             CREATE TABLE IF NOT EXISTS workspace_checkouts (
@@ -1839,7 +1853,8 @@ impl SessionStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS workspace_projects (
                 project_id TEXT PRIMARY KEY,
-                last_opened_at INTEGER NOT NULL
+                last_opened_at INTEGER NOT NULL,
+                is_visible INTEGER NOT NULL DEFAULT 1 CHECK(is_visible IN (0, 1))
             );
             INSERT INTO workspace_projects (project_id, last_opened_at)
             SELECT project_id, MAX(last_opened_at)
@@ -2554,6 +2569,52 @@ impl SessionStore {
             .map_err(|e| format!("Failed to read workspace checkout: {}", e))
     }
 
+    pub fn list_visible_workspace_checkouts(&self) -> Result<Vec<WorkspaceCheckoutRecord>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.checkout_id, c.project_id, c.root_path,
+                        c.normalized_root, c.last_opened_at
+                 FROM workspace_checkouts c
+                 JOIN workspace_projects p ON p.project_id = c.project_id
+                 WHERE p.is_visible = 1
+                 ORDER BY c.last_opened_at DESC, c.checkout_id ASC",
+            )
+            .map_err(|e| format!("Failed to prepare visible workspace checkout query: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(WorkspaceCheckoutRecord {
+                    checkout_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    root_path: row.get(2)?,
+                    normalized_root: row.get(3)?,
+                    last_opened_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query visible workspace checkouts: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read visible workspace checkout: {}", e))
+    }
+
+    pub fn set_workspace_project_visible(
+        &self,
+        project_id: &str,
+        visible: bool,
+    ) -> Result<bool, String> {
+        let project_id = project_id.trim();
+        if project_id.is_empty() {
+            return Err("Workspace project id is required".to_string());
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let changed = conn
+            .execute(
+                "UPDATE workspace_projects SET is_visible = ?2 WHERE project_id = ?1",
+                params![project_id, if visible { 1 } else { 0 }],
+            )
+            .map_err(|e| format!("Failed to update workspace project visibility: {}", e))?;
+        Ok(changed > 0)
+    }
+
     fn ensure_project_explorer_layout_with_conn(
         conn: &Connection,
         project_id: &str,
@@ -2698,22 +2759,42 @@ impl SessionStore {
         conn: &Connection,
         project_id: &str,
         parent_node_id: Option<&str>,
+        node_kind: &str,
+        resource_kind: Option<&str>,
+        allow_session_parent: bool,
     ) -> Result<(), String> {
         let Some(parent_node_id) = parent_node_id else {
             return Ok(());
         };
         let parent = conn
             .query_row(
-                "SELECT project_id, node_kind
+                "SELECT project_id, node_kind, resource_kind
                  FROM project_explorer_nodes WHERE node_id = ?1",
                 params![parent_node_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| format!("Failed to inspect explorer parent: {error}"))?
             .ok_or_else(|| format!("Project explorer parent does not exist: {parent_node_id}"))?;
-        if parent.0 != project_id || parent.1 != "folder" {
-            return Err("Project explorer parent must be a folder in the same project".to_string());
+        let accepts_node = parent.1 == "folder"
+            || (allow_session_parent
+                && parent.1 == "resource"
+                && parent.2.as_deref() == Some("session")
+                && node_kind == "resource"
+                && resource_kind == Some("session"));
+        if parent.0 != project_id || !accepts_node {
+            return Err(if allow_session_parent {
+                "Project explorer parent must be a folder, or a session for session children in the same project"
+                    .to_string()
+            } else {
+                "Project explorer parent must be a folder in the same project".to_string()
+            });
         }
         Ok(())
     }
@@ -2724,11 +2805,11 @@ impl SessionStore {
         node_id: &str,
         parent_node_id: Option<&str>,
         position: i64,
+        allow_session_parent: bool,
     ) -> Result<(), String> {
-        Self::validate_project_explorer_parent(conn, project_id, parent_node_id)?;
-        let (node_project, node_kind, old_parent) = conn
+        let (node_project, node_kind, node_resource_kind, old_parent) = conn
             .query_row(
-                "SELECT project_id, node_kind, parent_node_id
+                "SELECT project_id, node_kind, resource_kind, parent_node_id
                  FROM project_explorer_nodes WHERE node_id = ?1",
                 params![node_id],
                 |row| {
@@ -2736,6 +2817,7 @@ impl SessionStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
@@ -2745,32 +2827,36 @@ impl SessionStore {
         if node_project != project_id {
             return Err("Project explorer nodes cannot move across projects".to_string());
         }
-        if node_kind == "folder" {
-            if parent_node_id == Some(node_id) {
-                return Err("Project explorer folder cannot contain itself".to_string());
-            }
-            if let Some(parent_node_id) = parent_node_id {
-                let is_descendant = conn
-                    .query_row(
-                        "WITH RECURSIVE descendants(node_id) AS (
-                            SELECT node_id FROM project_explorer_nodes
-                            WHERE parent_node_id = ?1
-                            UNION ALL
-                            SELECT child.node_id FROM project_explorer_nodes child
-                            JOIN descendants parent ON child.parent_node_id = parent.node_id
-                         )
-                         SELECT 1 FROM descendants WHERE node_id = ?2 LIMIT 1",
-                        params![node_id, parent_node_id],
-                        |_| Ok(()),
-                    )
-                    .optional()
-                    .map_err(|error| format!("Failed to validate explorer cycle: {error}"))?
-                    .is_some();
-                if is_descendant {
-                    return Err(
-                        "Project explorer folder cannot move into its descendant".to_string()
-                    );
-                }
+        Self::validate_project_explorer_parent(
+            conn,
+            project_id,
+            parent_node_id,
+            &node_kind,
+            node_resource_kind.as_deref(),
+            allow_session_parent,
+        )?;
+        if parent_node_id == Some(node_id) {
+            return Err("Project explorer node cannot contain itself".to_string());
+        }
+        if let Some(parent_node_id) = parent_node_id {
+            let is_descendant = conn
+                .query_row(
+                    "WITH RECURSIVE descendants(node_id) AS (
+                        SELECT node_id FROM project_explorer_nodes
+                        WHERE parent_node_id = ?1
+                        UNION ALL
+                        SELECT child.node_id FROM project_explorer_nodes child
+                        JOIN descendants parent ON child.parent_node_id = parent.node_id
+                     )
+                     SELECT 1 FROM descendants WHERE node_id = ?2 LIMIT 1",
+                    params![node_id, parent_node_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| format!("Failed to validate explorer cycle: {error}"))?
+                .is_some();
+            if is_descendant {
+                return Err("Project explorer node cannot move into its descendant".to_string());
             }
         }
         conn.execute(
@@ -2808,6 +2894,9 @@ impl SessionStore {
                     conn,
                     project_id,
                     parent_node_id.as_deref(),
+                    "folder",
+                    None,
+                    false,
                 )?;
                 let name = name.trim();
                 if name.is_empty() {
@@ -2840,6 +2929,7 @@ impl SessionStore {
                     &node_id,
                     parent_node_id.as_deref(),
                     *position,
+                    false,
                 )
             }
             ProjectExplorerOperation::RenameFolder { node_id, name } => {
@@ -2914,8 +3004,10 @@ impl SessionStore {
                 node_id,
                 parent_node_id.as_deref(),
                 *position,
+                false,
             ),
             ProjectExplorerOperation::PlaceResource {
+                node_id,
                 resource_kind,
                 resource_id,
                 source_kind: _,
@@ -2944,26 +3036,42 @@ impl SessionStore {
                     )
                     .optional()
                     .map_err(|error| format!("Failed to inspect resource placement: {error}"))?;
-                let node_id = existing.unwrap_or_else(|| {
-                    format!("resource:{resource_kind}:{}", Uuid::new_v4())
-                });
-                if !conn
+                let node_id = existing
+                    .or_else(|| {
+                        node_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| format!("resource:{resource_kind}:{}", Uuid::new_v4()));
+                let existing_node = conn
                     .query_row(
-                        "SELECT 1 FROM project_explorer_nodes WHERE node_id = ?1",
-                        params![node_id],
-                        |_| Ok(()),
+                        "SELECT resource_kind, resource_id FROM project_explorer_nodes WHERE node_id = ?1",
+                        params![&node_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                            ))
+                        },
                     )
                     .optional()
-                    .map_err(|error| format!("Failed to inspect explorer node: {error}"))?
-                    .is_some()
-                {
+                    .map_err(|error| format!("Failed to inspect explorer node: {error}"))?;
+                if let Some((existing_kind, existing_id)) = existing_node.as_ref() {
+                    if existing_kind.as_deref() != Some(resource_kind)
+                        || existing_id.as_deref() != Some(resource_id)
+                    {
+                        return Err(format!("Project explorer node already exists: {node_id}"));
+                    }
+                } else {
                     conn.execute(
                         "INSERT INTO project_explorer_nodes (
                             node_id, project_id, node_kind, parent_node_id,
                             resource_kind, resource_id, position, created_at, updated_at
                          ) VALUES (?1, ?2, 'resource', ?3, ?4, ?5, ?6, ?7, ?7)",
                         params![
-                            node_id,
+                            &node_id,
                             project_id,
                             parent_node_id,
                             resource_kind,
@@ -2980,6 +3088,7 @@ impl SessionStore {
                     &node_id,
                     parent_node_id.as_deref(),
                     *position,
+                    true,
                 )
             }
             ProjectExplorerOperation::RemoveResourcePlacement {
@@ -9399,6 +9508,61 @@ mod tests {
     }
 
     #[test]
+    fn v39_database_adds_visible_workspace_projects() {
+        let dir = tempdir().expect("create temp dir");
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).expect("create v39 db");
+        SessionStore::create_latest_schema(&conn).expect("create latest schema fixture");
+        conn.execute_batch(
+            "INSERT INTO workspace_projects (project_id, last_opened_at)
+             VALUES ('project-visible', 100);
+             ALTER TABLE workspace_projects DROP COLUMN is_visible;
+             PRAGMA user_version = 39;",
+        )
+        .expect("create v39 workspace visibility fixture");
+        drop(conn);
+
+        let store = SessionStore::new(dir.path()).expect("migrate v39 store");
+        let conn = Connection::open(&db_path).expect("reopen migrated db");
+        let visible: i64 = conn
+            .query_row(
+                "SELECT is_visible FROM workspace_projects WHERE project_id = 'project-visible'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read migrated workspace visibility");
+        assert_eq!(visible, 1);
+        assert_eq!(store.list_visible_workspace_checkouts().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn workspace_project_visibility_preserves_checkout_history() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        store
+            .upsert_workspace_checkout(&WorkspaceCheckoutRecord {
+                checkout_id: "checkout-visible".to_string(),
+                project_id: "project-visible".to_string(),
+                root_path: "F:\\Project".to_string(),
+                normalized_root: "f:/project".to_string(),
+                last_opened_at: 100,
+            })
+            .expect("persist checkout");
+
+        assert_eq!(store.list_visible_workspace_checkouts().unwrap().len(), 1);
+        assert!(store
+            .set_workspace_project_visible("project-visible", false)
+            .unwrap());
+        assert!(store.list_visible_workspace_checkouts().unwrap().is_empty());
+        assert_eq!(store.list_workspace_checkouts(None).unwrap().len(), 1);
+
+        assert!(store
+            .set_workspace_project_visible("project-visible", true)
+            .unwrap());
+        assert_eq!(store.list_visible_workspace_checkouts().unwrap().len(), 1);
+    }
+
+    #[test]
     fn checkout_services_and_scoped_runs_are_isolated_across_worktrees() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
@@ -9641,6 +9805,7 @@ mod tests {
                         position: 0,
                     },
                     ProjectExplorerOperation::PlaceResource {
+                        node_id: None,
                         resource_kind: "session".to_string(),
                         resource_id: "session-a".to_string(),
                         source_kind: None,
@@ -9648,6 +9813,7 @@ mod tests {
                         position: 1,
                     },
                     ProjectExplorerOperation::PlaceResource {
+                        node_id: None,
                         resource_kind: "knowledge".to_string(),
                         resource_id: "knowledge-a".to_string(),
                         source_kind: None,

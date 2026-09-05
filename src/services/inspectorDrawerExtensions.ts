@@ -21,8 +21,8 @@ import {
  * property / object drawers into the plugin libraries of the CURRENT window.
  *
  * Every Locus window shares the same SPA entry, so bootstrapping this from
- * main.ts covers chat, the Locus Inspector window, view hosts, and diff
- * review windows alike. Packages are compiled with the same TS/SFC compiler
+ * main.ts covers Workbench, View content, and diff review windows alike.
+ * Packages are compiled with the same TS/SFC compiler
  * the View runtime uses, but execute against a deliberately small runtime —
  * no fs, session, or llm surface.
  */

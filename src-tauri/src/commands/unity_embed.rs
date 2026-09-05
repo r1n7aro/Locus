@@ -120,10 +120,6 @@ struct UnityEmbedControlMessage {
     #[serde(default)]
     asset_refs: Option<Vec<UnityEmbedAssetRef>>,
     #[serde(default)]
-    files: Option<Vec<LocusFileDropRef>>,
-    #[serde(default)]
-    send_mode: Option<String>,
-    #[serde(default)]
     text: Option<String>,
     #[serde(default)]
     text_entries: Option<Vec<UnityEmbedTextDropEntry>>,
@@ -178,18 +174,6 @@ struct UnityEmbedAssetRef {
 #[serde(rename_all = "camelCase")]
 struct UnityEmbedAssetDropPayload {
     refs: Vec<UnityEmbedAssetRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    send_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workspace_ref: Option<WorkspaceRef>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UnityEmbedFileDropPayload {
-    files: Vec<LocusFileDropRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    send_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspace_ref: Option<WorkspaceRef>,
 }
@@ -248,14 +232,6 @@ struct LocusFileDropPayload {
     files: Vec<LocusFileDropRef>,
     x: f64,
     y: f64,
-}
-
-fn normalize_send_to_locus_mode(value: Option<&str>) -> Option<String> {
-    match value.map(str::trim) {
-        Some("newSession") => Some("newSession".to_string()),
-        Some("focusedSession") => Some("focusedSession".to_string()),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -334,6 +310,24 @@ impl UnityEmbedCheckoutBinding {
     fn host_url(&self, window_id: &str, target_kind: &str, target_id: &str) -> String {
         unity_embed_host_url_for_scope(&self.workspace_ref, window_id, target_kind, target_id)
     }
+}
+
+fn current_workspace_ref_for_binding(
+    app_handle: &AppHandle,
+    binding: &UnityEmbedCheckoutBinding,
+) -> Result<WorkspaceRef, String> {
+    let registry = app_handle
+        .try_state::<Arc<ProjectRegistry>>()
+        .ok_or_else(|| "workspace registry is unavailable".to_string())?;
+    let runtime = registry
+        .runtime(&binding.workspace_ref.checkout_id)
+        .ok_or_else(|| {
+            format!(
+                "Unity embed checkout '{}' is no longer registered",
+                binding.workspace_ref.checkout_id
+            )
+        })?;
+    Ok(WorkspaceRef::for_runtime(&runtime))
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1312,7 +1306,6 @@ fn emit_locus_asset_drop_to(
         ASSET_DROP_EVENT,
         UnityEmbedAssetDropPayload {
             refs,
-            send_mode: None,
             workspace_ref: None,
         },
     )
@@ -1329,7 +1322,6 @@ fn emit_locus_asset_drop_to_chat_windows(
 
     let payload = UnityEmbedAssetDropPayload {
         refs,
-        send_mode: None,
         workspace_ref: None,
     };
     for label in locus_frontend_drop_window_labels_for_scope(app_handle, workspace_ref) {
@@ -3047,11 +3039,7 @@ fn apply_control_message_on_main(
     if should_ignore_stale_control_message(&label, &msg) {
         return Ok(());
     }
-    if msg.kind != "assetDrop"
-        && msg.kind != "assetDrag"
-        && msg.kind != "fileDrop"
-        && msg.kind != "consoleText"
-    {
+    if msg.kind != "assetDrop" && msg.kind != "assetDrag" && msg.kind != "consoleText" {
         record_control_message(&binding, &msg);
     }
     match msg.kind.as_str() {
@@ -3094,50 +3082,20 @@ fn apply_control_message_on_main(
                 windows_impl::stop_reference_drag_preview();
                 return Ok(());
             }
-            let send_mode = normalize_send_to_locus_mode(msg.send_mode.as_deref());
-            let target_label = if send_mode.is_some() {
-                crate::reveal_main_window(app_handle);
-                MAIN_WINDOW_LABEL
-            } else {
-                label.as_str()
-            };
+            let workspace_ref = current_workspace_ref_for_binding(app_handle, &binding)?;
             emit_to_existing_window(
                 app_handle,
-                target_label,
+                label.as_str(),
                 ASSET_DROP_EVENT,
                 UnityEmbedAssetDropPayload {
                     refs,
-                    send_mode,
-                    workspace_ref: Some(binding.workspace_ref.clone()),
+                    workspace_ref: Some(workspace_ref.clone()),
                 },
             )?;
-            cache_unity_embed_asset_drag_refs(&binding.workspace_ref, Vec::new());
+            cache_unity_embed_asset_drag_refs(&workspace_ref, Vec::new());
             #[cfg(target_os = "windows")]
             windows_impl::stop_reference_drag_preview();
-            emit_unity_embed_asset_drag_state(app_handle, &binding.workspace_ref, Vec::new())
-        }
-        "fileDrop" => {
-            let files = msg.files.unwrap_or_default();
-            if files.is_empty() {
-                return Ok(());
-            }
-            let send_mode = normalize_send_to_locus_mode(msg.send_mode.as_deref());
-            let target_label = if send_mode.is_some() {
-                crate::reveal_main_window(app_handle);
-                MAIN_WINDOW_LABEL
-            } else {
-                label.as_str()
-            };
-            emit_to_existing_window(
-                app_handle,
-                target_label,
-                FILE_DROP_EVENT,
-                UnityEmbedFileDropPayload {
-                    files,
-                    send_mode,
-                    workspace_ref: Some(binding.workspace_ref.clone()),
-                },
-            )
+            emit_unity_embed_asset_drag_state(app_handle, &workspace_ref, Vec::new())
         }
         "assetDrag" => {
             let refs = msg.asset_refs.unwrap_or_default();
@@ -3145,9 +3103,10 @@ fn apply_control_message_on_main(
                 #[cfg(target_os = "windows")]
                 windows_impl::stop_reference_drag_preview();
             }
-            cache_unity_embed_asset_drag_refs(&binding.workspace_ref, refs.clone());
-            ensure_unity_embed_asset_drag_release_monitor(app_handle, &binding.workspace_ref);
-            emit_unity_embed_asset_drag_state(app_handle, &binding.workspace_ref, refs)
+            let workspace_ref = current_workspace_ref_for_binding(app_handle, &binding)?;
+            cache_unity_embed_asset_drag_refs(&workspace_ref, refs.clone());
+            ensure_unity_embed_asset_drag_release_monitor(app_handle, &workspace_ref);
+            emit_unity_embed_asset_drag_state(app_handle, &workspace_ref, refs)
         }
         "consoleText" => {
             let text = msg.text.unwrap_or_default();
@@ -3166,14 +3125,8 @@ fn apply_control_message_on_main(
             if text.trim().is_empty() && entries.is_empty() {
                 return Ok(());
             }
-            emit_unity_embed_text_drop(
-                app_handle,
-                &binding.workspace_ref,
-                text,
-                entries,
-                title,
-                source,
-            )
+            let workspace_ref = current_workspace_ref_for_binding(app_handle, &binding)?;
+            emit_unity_embed_text_drop(app_handle, &workspace_ref, text, entries, title, source)
         }
         other => Err(format!("Unknown Unity embed control message: {other}")),
     }
@@ -3315,6 +3268,7 @@ mod windows_impl {
         io::{AsyncBufReadExt, BufReader},
         net::windows::named_pipe::{NamedPipeServer, ServerOptions},
         sync::Notify,
+        task::JoinSet,
     };
     use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC;
     use windows::core::{
@@ -5510,6 +5464,7 @@ mod windows_impl {
     ) -> io::Result<()> {
         let pipe_name = binding.pipe_name.clone();
         let mut server = create_server(&pipe_name)?;
+        let mut clients = JoinSet::new();
         eprintln!("[Locus] Unity embed control pipe listening: {pipe_name}");
 
         loop {
@@ -5519,13 +5474,14 @@ mod windows_impl {
             let app_for_client = app_handle.clone();
             let binding_for_client = binding.clone();
 
-            tauri::async_runtime::spawn(async move {
+            clients.spawn(async move {
                 if let Err(error) =
                     handle_client(app_for_client, connected, binding_for_client).await
                 {
                     eprintln!("[Locus] Unity embed control client error: {error}");
                 }
             });
+            while clients.try_join_next().is_some() {}
         }
     }
 
@@ -6456,11 +6412,9 @@ mod tests {
     use super::{
         control_pipe_name_for_project_path, locus_file_drop_refs, locus_file_drop_tab_eligible,
         native_asset_file_drag_paths, native_locus_file_drag_paths, normalize_pipe_project_path,
-        normalize_send_to_locus_mode, unity_embed_host_url_for_scope, unity_embed_scope_key,
-        unity_embed_window_label_for_scope, unity_file_drop_asset_refs,
-        unity_ref_drag_preview_label, unity_relative_drop_path, workspace_ref_for_window_context,
-        LocusFileDropRef, UnityEmbedAssetDropPayload, UnityEmbedAssetRef, UnityEmbedControlMessage,
-        UnityEmbedFileDropPayload,
+        unity_embed_host_url_for_scope, unity_embed_scope_key, unity_embed_window_label_for_scope,
+        unity_file_drop_asset_refs, unity_ref_drag_preview_label, unity_relative_drop_path,
+        workspace_ref_for_window_context, LocusFileDropRef, UnityEmbedAssetRef,
     };
     use crate::workspace_service::identity::ProjectIdResolver;
     use crate::workspace_service::{
@@ -6470,37 +6424,6 @@ mod tests {
 
     fn checkout_ref(id: &str, generation: u64) -> WorkspaceRef {
         WorkspaceRef::new(CheckoutId::new(id).expect("checkout id"), Some(generation))
-    }
-
-    #[test]
-    fn send_to_locus_mode_and_file_attachments_round_trip_as_camel_case() {
-        let message: UnityEmbedControlMessage =
-            serde_json::from_str(r#"{"type":"assetDrop","sendMode":"newSession","assetRefs":[]}"#)
-                .expect("control message");
-        assert_eq!(message.send_mode.as_deref(), Some("newSession"));
-
-        let payload = UnityEmbedAssetDropPayload {
-            refs: Vec::new(),
-            send_mode: message.send_mode,
-            workspace_ref: Some(checkout_ref("checkout-send", 9)),
-        };
-        let serialized = serde_json::to_value(payload).expect("asset drop payload");
-        assert_eq!(serialized["sendMode"], "newSession");
-        assert_eq!(serialized["workspaceRef"]["checkoutId"], "checkout-send");
-        assert_eq!(serialized["workspaceRef"]["expectedGeneration"], 9);
-
-        let message: UnityEmbedControlMessage = serde_json::from_str(
-            r#"{"type":"fileDrop","sendMode":"newSession","files":[{"path":"C:/tmp/replay.dereplay","name":"replay.dereplay","typeLabel":"DustEcho Replay","isDir":false,"source":"replay-timeline"}]}"#,
-        )
-        .expect("file control message");
-        let payload = UnityEmbedFileDropPayload {
-            files: message.files.expect("file attachments"),
-            send_mode: normalize_send_to_locus_mode(message.send_mode.as_deref()),
-            workspace_ref: None,
-        };
-        let serialized = serde_json::to_value(payload).expect("file drop payload");
-        assert_eq!(serialized["sendMode"], "newSession");
-        assert_eq!(serialized["files"][0]["typeLabel"], "DustEcho Replay");
     }
 
     #[test]

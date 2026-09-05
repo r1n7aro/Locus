@@ -73,8 +73,7 @@ const mocks = vi.hoisted(() => {
     legacyOpenKnowledgeDocument: vi.fn(async () => undefined),
     legacyOpenKnowledgeDocumentInKnowledge: vi.fn(),
     knowledgeRevealTarget: vi.fn(async () => undefined),
-    openLocusAssetInspectorPanel: vi.fn(() => true),
-    openLocusAssetInspectorWindow: vi.fn(async () => true),
+    openLocusAssetInspectorWorkbenchTab: vi.fn(async () => true),
     displaySettings: {
       showTurnNavigationRail: false,
       showWelcomeSubtitle: false,
@@ -83,6 +82,12 @@ const mocks = vi.hoisted(() => {
       assetRefClickAction: "fileBrowser",
       unityEmbedAssetRefClickAction: "fileBrowser",
     },
+    sessionUndoSettings: {
+      enabled: true,
+      ready: true,
+      busy: false,
+    },
+    loadSessionUndoSettings: vi.fn(async () => true),
   };
 });
 
@@ -107,12 +112,8 @@ vi.mock("../services/unity", () => ({
 vi.mock("../services/knowledge", () => ({
   knowledgeRevealTarget: mocks.knowledgeRevealTarget,
 }));
-vi.mock("../services/locusAssetInspectorWindow", () => ({
-  openLocusAssetInspectorWindow: mocks.openLocusAssetInspectorWindow,
-}));
-vi.mock("../composables/useLocusAssetInspectorPanel", () => ({
-  canFitEmbeddedLocusAssetInspectorPanel: () => true,
-  openLocusAssetInspectorPanel: mocks.openLocusAssetInspectorPanel,
+vi.mock("../services/locusAssetInspector", () => ({
+  openLocusAssetInspectorWorkbenchTab: mocks.openLocusAssetInspectorWorkbenchTab,
 }));
 vi.mock("../composables/useKnowledgeDocumentOpen", () => ({
   useKnowledgeDocumentOpen: () => ({
@@ -126,6 +127,13 @@ vi.mock("../composables/useKnowledgeAccessMode", () => ({
 vi.mock("../composables/useDisplaySettings", () => ({
   useDisplaySettings: () => ({
     state: mocks.displaySettings,
+  }),
+}));
+vi.mock("../composables/useSessionUndoSettings", () => ({
+  useSessionUndoSettings: () => ({
+    state: mocks.sessionUndoSettings,
+    load: mocks.loadSessionUndoSettings,
+    setEnabled: vi.fn(),
   }),
 }));
 vi.mock("../composables/useChatInputSettings", () => ({
@@ -334,6 +342,9 @@ beforeEach(() => {
   mocks.chatChangesStore.sessionState.mockReturnValue(null);
   mocks.chatChangesStore.inlineDiffStateForSession.mockReturnValue(null);
   mocks.chatChangesStore.hasChangesForSession.mockReturnValue(false);
+  mocks.sessionUndoSettings.enabled = true;
+  mocks.sessionUndoSettings.ready = true;
+  mocks.sessionUndoSettings.busy = false;
   mocks.displaySettings.showTurnNavigationRail = false;
   mocks.chatStore.sessionHistoryLoading = false;
   mocks.chatStore.sessionHistoryHasMore = true;
@@ -559,6 +570,7 @@ describe("ChatView scoped access boundary", () => {
   });
 
   it("binds the Changes control to the pane session and keeps it keyboard-readable", async () => {
+    mocks.sessionUndoSettings.enabled = false;
     mocks.chatChangesStore.sessionState.mockReturnValue({ panelVisible: false });
     mocks.chatChangesStore.hasChangesForSession.mockImplementation(
       (sessionId: string | null) => sessionId === "pane-session",
@@ -577,6 +589,23 @@ describe("ChatView scoped access boundary", () => {
     expect(mocks.chatChangesStore.hasChangesForSession).toHaveBeenCalledWith("pane-session");
     expect(mocks.chatChangesStore.togglePanelForSession).toHaveBeenCalledWith("pane-session");
     expect(mocks.chatChangesStore.togglePanel).not.toHaveBeenCalled();
+  });
+
+  it("shows the Changes control before the first change when file tracking is enabled", async () => {
+    mocks.chatChangesStore.hasChangesForSession.mockReturnValue(false);
+    const host = mountChat();
+    await flushUi();
+
+    expect(host.querySelector(".changes-toggle-btn")).not.toBeNull();
+  });
+
+  it("hides the empty Changes control when file tracking is disabled", async () => {
+    mocks.sessionUndoSettings.enabled = false;
+    mocks.chatChangesStore.hasChangesForSession.mockReturnValue(false);
+    const host = mountChat();
+    await flushUi();
+
+    expect(host.querySelector(".changes-toggle-btn")).toBeNull();
   });
 
   it("uses the pane workspace for file, Unity, Inspector, and knowledge actions", async () => {
@@ -620,9 +649,9 @@ describe("ChatView scoped access boundary", () => {
     await flushUi();
     contextMenuButton("common.openInLocusInspector")?.click();
     await flushUi();
-    expect(mocks.openLocusAssetInspectorPanel).toHaveBeenCalledWith(
-      { assetPath: "Assets/Scripts/Scoped.cs" },
+    expect(mocks.openLocusAssetInspectorWorkbenchTab).toHaveBeenCalledWith(
       paneWorkspaceRef,
+      { assetPath: "Assets/Scripts/Scoped.cs" },
     );
 
     host.querySelector<HTMLSpanElement>(".test-knowledge-ref")?.click();

@@ -11,7 +11,7 @@ pub use backend::resolve_openrouter_model;
 pub use backend::{LlmBackend, MockModelProfile, RawContextStore, RawRound};
 pub(crate) use backend::{
     MOCK_AGENT_UNITY_EXECUTE_SCENARIO, MOCK_AGENT_UNITY_YAML_READ_SCENARIO,
-    MOCK_WORKSPACE_SWITCH_HOLD_SCENARIO,
+    MOCK_SESSION_UNDO_FILE_SCENARIO, MOCK_WORKSPACE_SWITCH_HOLD_SCENARIO,
 };
 
 use futures::StreamExt;

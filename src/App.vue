@@ -42,10 +42,6 @@ import { isReferenceExternalImportWindowLocation } from "./services/referenceExt
 import { isCollabSearchWindowLocation } from "./services/collabSearchWindow";
 import { isChatDiffReviewWindowLocation } from "./services/chatDiffReviewWindow";
 import { isPlanViewWindowLocation } from "./services/planViewWindow";
-import {
-  setLocusAssetInspectorPanelHostAvailable,
-  useLocusAssetInspectorPanel,
-} from "./composables/useLocusAssetInspectorPanel";
 import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWindow";
 import {
   isExtraWorkdirsWindowLocation,
@@ -73,11 +69,13 @@ import {
 } from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
 import { reloadPluginInspectorDrawers } from "./services/inspectorDrawerExtensions";
+import { currentUnityEmbedWorkspaceRef } from "./services/unity";
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
 const isUnityEmbedWindow = !isUnityEmbedTestWindow && window.location.pathname === "/unity-embed";
 const unityEmbedParams = new URLSearchParams(window.location.search);
 const unityEmbedTarget = unityEmbedParams.get("target") || "session";
 const unityEmbedTargetId = unityEmbedParams.get("id") || "";
+const unityEmbedWindowId = getCurrentTauriWindowLabel() || "unity-embed";
 const isUnityEmbedViewWindow = isUnityEmbedWindow && unityEmbedTarget === "view";
 const isKnowledgeDownloadWindow = isKnowledgeDownloadWindowLocation();
 const isKnowledgeLexicalProgressWindow = isKnowledgeLexicalProgressWindowLocation();
@@ -123,7 +121,6 @@ const UnityEmbedTestView = defineAsyncComponent(() => import("./components/Unity
 const OnboardingView = defineAsyncComponent(() => import("./components/OnboardingView.vue"));
 const FileDiffOverlay = defineAsyncComponent(() => import("./components/diff/FileDiffOverlay.vue"));
 const WorkbenchWindow = defineAsyncComponent(() => import("./components/WorkbenchWindow.vue"));
-const LocusAssetInspectorPanel = defineAsyncComponent(() => import("./components/LocusAssetInspectorPanel.vue"));
 const showPluginEntry = true;
 
 initTheme(isUnityEmbedWindow ? "unityEmbed" : "main");
@@ -155,10 +152,6 @@ let workspacePageResetOnboardingUnlisten: UnlistenFn | null = null;
 const diffOverlay = provideDiffOverlay();
 const internalDragController = provideInternalDragController();
 onUnmounted(() => internalDragController.dispose());
-// The floating Locus inspector panel lives in the main window only; standalone
-// windows fall back to the dedicated inspector window.
-const locusAssetInspectorPanel = useLocusAssetInspectorPanel();
-setLocusAssetInspectorPanelHostAvailable(!isStandaloneWindow);
 const {
   bootstrapCritical,
   bootstrapDeferred,
@@ -184,6 +177,36 @@ async function handleOnboardingCompleted() {
       projectStore.loadAssetDbStatus(),
     ]);
     void reloadPluginInspectorDrawers();
+  }
+}
+
+async function bindUnityEmbedWorkspace() {
+  const workspaceRef = currentUnityEmbedWorkspaceRef();
+  if (!workspaceRef) {
+    throw new Error("The Unity embed URL is missing its checkout workspace scope.");
+  }
+
+  await workspaceContextStore.initialize(unityEmbedWindowId, "main");
+  const restoredRef = workspaceContextStore.focusedWorkspaceRef;
+  if (
+    !restoredRef
+    || restoredRef.checkoutId !== workspaceRef.checkoutId
+    || restoredRef.expectedGeneration !== workspaceRef.expectedGeneration
+  ) {
+    const context = await workspaceContextStore.focusWorkspaceRef(workspaceRef);
+    if (!context) {
+      throw new Error("The Unity embed workspace focus request was superseded.");
+    }
+  }
+
+  const focusedRef = workspaceContextStore.focusedWorkspaceRef;
+  if (
+    !focusedRef
+    || focusedRef.checkoutId !== workspaceRef.checkoutId
+    || focusedRef.expectedGeneration !== workspaceRef.expectedGeneration
+    || !workspaceContextStore.focusedRoot
+  ) {
+    throw new Error("The Unity embed window could not restore its workspace scope.");
   }
 }
 const {
@@ -616,6 +639,9 @@ onMounted(async () => {
 
   if (isUnityEmbedWindow) {
     try {
+      markStartupPhase("unity_embed_workspace_bind_start");
+      await bindUnityEmbedWorkspace();
+      markStartupPhase("unity_embed_workspace_bind_done");
       markStartupPhase("unity_embed_bootstrap_critical_start");
       await bootstrapCritical();
       markStartupPhase("unity_embed_bootstrap_critical_done");
@@ -730,6 +756,7 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
     :bootstrapped="unityEmbedBootstrapped"
     :bootstrap-error="unityEmbedBootstrapError"
     :initial-session-id="unityEmbedTargetId"
+    :window-id="unityEmbedWindowId"
   />
   <UnityEmbedTestView v-else-if="isUnityEmbedTestWindow" />
   <KnowledgeDownloadProgressWindow v-else-if="isKnowledgeDownloadWindow" />
@@ -856,6 +883,7 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
           :is="settingsViewComponent"
           v-if="uiStore.settingsMounted && settingsViewComponent"
           v-show="uiStore.activePage === 'settings'"
+          :active="uiStore.activePage === 'settings'"
           :all-models="modelStore.availableModels"
           :agents="agentStore.appAgents"
           :subagents="agentStore.appSubagents"
@@ -949,7 +977,6 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
     </div>
   </Transition>
   <FileDiffOverlay v-if="diffOverlay.visible.value" />
-  <LocusAssetInspectorPanel v-if="!isStandaloneWindow && locusAssetInspectorPanel.state.open" />
   <InternalDragOverlay />
   <Teleport
     v-for="host in sharedWorkbenchWindowHosts"

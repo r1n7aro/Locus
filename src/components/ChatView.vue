@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { AppWindow, BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FolderOpen, GitFork, PanelTopOpen, PencilLine, Undo2 } from "lucide";
+import { BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FolderOpen, GitFork, PanelTopOpen, PencilLine, Undo2 } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -38,13 +38,9 @@ import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { broadcastPlanApprovalResolved, openPlanViewWindow } from "../services/planViewWindow";
 import { openContextCompactionWindow } from "../services/contextCompactionWindow";
 import {
-  openLocusAssetInspectorWindow,
-  type LocusAssetInspectorWindowPayload,
-} from "../services/locusAssetInspectorWindow";
-import {
-  canFitEmbeddedLocusAssetInspectorPanel,
-  openLocusAssetInspectorPanel,
-} from "../composables/useLocusAssetInspectorPanel";
+  openLocusAssetInspectorWorkbenchTab,
+  type LocusAssetInspectorTarget,
+} from "../services/locusAssetInspector";
 import { normalizeAppError } from "../services/errors";
 import { knowledgeRevealTarget } from "../services/knowledge";
 import { t } from "../i18n";
@@ -96,6 +92,7 @@ import {
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { useSessionUndoSettings } from "../composables/useSessionUndoSettings";
 import { useKnowledgeDocumentOpen } from "../composables/useKnowledgeDocumentOpen";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import {
@@ -131,6 +128,13 @@ interface ScopedQueuedFollowUp {
 }
 
 const chatChangesStore = useChatChangesStore();
+const {
+  state: sessionUndoSettings,
+  load: loadSessionUndoSettings,
+} = useSessionUndoSettings();
+void loadSessionUndoSettings().catch((error: unknown) => {
+  console.warn("[session-undo] failed to load setting for Chat Changes:", error);
+});
 const chatStore = useChatStore();
 const uiStore = useUiStore();
 const notificationStore = useNotificationStore();
@@ -222,7 +226,11 @@ const showInlineDiff = computed(() => (
   !!inlineDiffPayload.value || inlineDiffLoading.value || !!inlineDiffError.value
 ));
 const hasPanelToggleRow = computed(() => (
-  chatChangesStore.hasChangesForSession(props.activeSessionId)
+  Boolean(props.activeSessionId?.trim())
+  && (
+    sessionUndoSettings.enabled
+    || chatChangesStore.hasChangesForSession(props.activeSessionId)
+  )
 ));
 
 const chatDiffViewerRef = ref<InstanceType<typeof FileDiffViewer> | null>(null);
@@ -400,6 +408,7 @@ const emit = defineEmits<{
   installPlugin: [];
   launchUnityProject: [];
   layoutModeChange: [mode: ResolvedChatLayoutMode];
+  composerFocus: [];
 }>();
 
 const lightboxSrc = ref("");
@@ -465,17 +474,11 @@ const resourceActionsAvailable = computed(() => (
 ));
 
 async function openLocusAssetInspector(
-  payload: LocusAssetInspectorWindowPayload,
-  mode: "embedded" | "window" | "auto" = "auto",
+  target: LocusAssetInspectorTarget,
 ): Promise<boolean> {
   const workspaceRef = resourceWorkspaceRef();
   if (!workspaceRef) return false;
-  const preferEmbedded = mode === "embedded"
-    || (mode === "auto" && canFitEmbeddedLocusAssetInspectorPanel());
-  if (preferEmbedded && openLocusAssetInspectorPanel(payload, workspaceRef)) {
-    return true;
-  }
-  return openLocusAssetInspectorWindow(workspaceRef, payload);
+  return openLocusAssetInspectorWorkbenchTab(workspaceRef, target);
 }
 
 type AssetRefContextMenuTarget =
@@ -996,7 +999,7 @@ type AssetRefClickTarget =
   | { kind: "asset"; assetPath: string; entryKind: "file" | "folder" }
   | { kind: "sceneObject"; scenePath: string; objectPath: string };
 
-function assetRefInspectorPayload(target: AssetRefClickTarget): LocusAssetInspectorWindowPayload {
+function assetRefInspectorPayload(target: AssetRefClickTarget): LocusAssetInspectorTarget {
   return target.kind === "sceneObject"
     ? { kind: "sceneObject", scenePath: target.scenePath, objectPath: target.objectPath }
     : { assetPath: target.assetPath };
@@ -1059,19 +1062,8 @@ function runAssetRefClickAction(target: AssetRefClickTarget) {
     showInFolder(revealPath, workspaceRef).catch((e: unknown) => console.warn("showInFolder failed:", e));
     return;
   }
-  if (
-    action === "locusInspectorAuto"
-    || action === "locusInspectorEmbedded"
-    || action === "locusInspectorWindow"
-  ) {
-    openLocusAssetInspector(
-      assetRefInspectorPayload(target),
-      action === "locusInspectorWindow"
-        ? "window"
-        : action === "locusInspectorEmbedded"
-          ? "embedded"
-          : "auto",
-    )
+  if (action === "locusInspector") {
+    openLocusAssetInspector(assetRefInspectorPayload(target))
       .then((opened) => {
         if (!opened) legacyAssetRefClick(target);
       })
@@ -1135,7 +1127,7 @@ async function doAssetRefOpenInEditor() {
   }
 }
 
-async function doAssetRefOpenInLocusInspector(mode: "embedded" | "window" = "embedded") {
+async function doAssetRefOpenInLocusInspector() {
   const target = assetRefCtxMenu.value?.target;
   if (!target || !assetRefContextCanOpenLocusInspector.value) return;
   closeAssetRefContextMenu();
@@ -1145,7 +1137,7 @@ async function doAssetRefOpenInLocusInspector(mode: "embedded" | "window" = "emb
         kind: "sceneObject",
         scenePath: target.scenePath,
         objectPath: target.objectPath,
-      }, mode);
+      });
       if (!opened) {
         const workspaceRef = resourceWorkspaceRef();
         if (!workspaceRef) return;
@@ -1154,7 +1146,7 @@ async function doAssetRefOpenInLocusInspector(mode: "embedded" | "window" = "emb
       return;
     }
     if (target.kind !== "asset") return;
-    const opened = await openLocusAssetInspector({ assetPath: target.assetPath }, mode);
+    const opened = await openLocusAssetInspector({ assetPath: target.assetPath });
     if (!opened) {
       const workspaceRef = resourceWorkspaceRef();
       if (!workspaceRef) return;
@@ -1164,10 +1156,6 @@ async function doAssetRefOpenInLocusInspector(mode: "embedded" | "window" = "emb
     console.warn("openLocusAssetInspector failed:", error);
     notifyAssetRefContextMenuError(error, "assetRefOpenLocusInspector", t("asset.inspector.openFailed"));
   }
-}
-
-function doAssetRefOpenInLocusInspectorWindow() {
-  return doAssetRefOpenInLocusInspector("window");
 }
 
 async function openInlineDiffInWindow() {
@@ -3687,6 +3675,7 @@ onUnmounted(() => {
           @review-context="emit('reviewSessionContext', { sessionId: activeSessionId || '' })"
           @request-plan-mode="handleRequestPlanMode"
           @request-new-session="handleNewChatRequest"
+          @focus="emit('composerFocus')"
           @remove-managed-local-file="emit('removeManagedComposerFile', $event)"
           @clear="handleNewChatRequest"
           @cancel="emit('cancel')"
@@ -3927,18 +3916,10 @@ onUnmounted(() => {
               <button
                 type="button"
                 class="asset-ref-ctx-item"
-                @click="doAssetRefOpenInLocusInspector()"
+                @click="doAssetRefOpenInLocusInspector"
               >
                 <LucideIcon :icon="PanelTopOpen" :size="13" />
                 {{ t("common.openInLocusInspector") }}
-              </button>
-              <button
-                type="button"
-                class="asset-ref-ctx-item"
-                @click="doAssetRefOpenInLocusInspectorWindow"
-              >
-                <LucideIcon :icon="AppWindow" :size="13" />
-                {{ t("common.openInLocusInspectorWindow") }}
               </button>
             </template>
           </template>

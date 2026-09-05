@@ -141,6 +141,10 @@ export function openWorkspace(path: string): Promise<WorkspaceRuntimeDescriptor>
   return ipcInvoke<WorkspaceRuntimeDescriptor>("open_workspace", { path });
 }
 
+export function removeWorkspace(projectId: string): Promise<boolean> {
+  return ipcInvoke<boolean>("remove_workspace", { projectId });
+}
+
 export function startWorkspaceUnityService(
   workspaceRef: WorkspaceRef,
 ): Promise<ServiceBindingSnapshot> {

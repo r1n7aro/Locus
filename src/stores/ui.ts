@@ -57,7 +57,7 @@ export const useUiStore = defineStore("ui", () => {
     get: () => activePage.value === "development" ? "chat" : activePage.value,
     set: (value) => { activePage.value = migrateAppPage(value); },
   });
-  const settingsCategoryHint = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about" | "experimental" | null>(null);
+  const settingsCategoryHint = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "console" | "about" | "experimental" | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
   const isWindowResizing = ref(false);

@@ -59,7 +59,7 @@ export type ProjectExplorerOperation =
   | { kind: "renameFolder"; nodeId: string; name: string }
   | { kind: "deleteFolder"; nodeId: string }
   | { kind: "moveNode"; nodeId: string; parentNodeId?: string | null; position: number }
-  | { kind: "placeResource"; resourceKind: "session" | "knowledge" | "system"; resourceId: string; sourceKind?: "knowledge" | string | null; parentNodeId?: string | null; position: number }
+  | { kind: "placeResource"; nodeId?: string | null; resourceKind: "session" | "knowledge" | "system"; resourceId: string; sourceKind?: "knowledge" | string | null; parentNodeId?: string | null; position: number }
   | { kind: "removeResourcePlacement"; resourceKind: "knowledge"; resourceId: string }
   | { kind: "mountPath"; nodeId?: string | null; parentNodeId?: string | null; path: string; sourceKind?: "local" | "knowledge" | null; name?: string | null; position: number }
   | { kind: "setNodeHidden"; nodeId: string; hidden: boolean }
@@ -101,6 +101,13 @@ export type ProjectExplorerFilePreviewKind =
   | "binary"
   | "unity";
 
+export interface ProjectExplorerFileRevision {
+  exists: boolean;
+  size: number;
+  modifiedAtNanos: string;
+  key: string;
+}
+
 export interface ProjectExplorerFilePreview {
   path: string;
   name: string;
@@ -117,10 +124,12 @@ export interface ProjectExplorerFilePreview {
   checkoutId?: string;
   workspaceGeneration?: number;
   workspaceRelativePath?: string;
+  revision: ProjectExplorerFileRevision;
 }
 
 export type WorkspaceSectionKind =
   | "sessions"
+  | "archived"
   | "knowledge"
   | "collab"
   | "assets"

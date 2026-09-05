@@ -575,6 +575,21 @@ WorkbenchWindowState[windowId]
 
 Explorer selection 和 active editor 分开保存。折叠、右键或拖动树节点不会意外切换正在执行的编辑器。
 
+### 单工作区 checkout 持久化事务
+
+单工作区的持久化身份固定为 `windowId + checkoutId`。每个 scoped layout 只保存该 checkout 的 EditorInput、活动 EditorGroup 与 `focusedCheckoutId`；切换期间由显式目标 checkout 驱动状态，不从正在恢复的 pane context 反向推导目标 scope。
+
+已确认的故障链路：workspace 切换先改变 pane context，scope watcher 恢复目标布局后又从旧 pane context 推导出上一个 checkout；过期同步任务继续创建 EditorInput，`openEditor` 随后按照已经变化的 scope 写入，形成 `存储 key = A / editor checkout = B`。外部 View、Locus Inspector、跨窗口 tab transfer 与跨 checkout 引用拖入也可以在 editor 写入早于 scope 路由时触发同类问题。
+
+修复要求：
+
+- 使用显式 single-workspace scope 作为切换事务的唯一目标；`scope → layout → pane context → active editor` 完成前，旧事务不能继续写 editor。
+- 每次异步返回后、每次 `openEditor / replaceEditor / splitPane / updateEditor / acceptTransferredEditor` 前检查目标 scope 与事务 epoch。
+- 外部 View、Inspector、跨窗口 transfer 和引用拖入先切换或路由到来源 checkout 的 scoped layout，再写入 EditorInput。
+- store 写入层强制 `tab.checkoutBinding.checkoutId === scopeId`，同时约束 `group.focusedCheckoutId`；违规写入保留现场错误并停止覆盖持久化数据。
+- 启动时扫描历史 scoped layout，按 EditorInput 的 durable checkout binding 重新归位错槽数据；正确槽优先保留，错槽中的可恢复标签合并到真实 checkout，空槽恢复为空布局。
+- 回归测试覆盖首次打开空 workspace、A→B→C 反向完成、错槽迁移、混合 checkout 拒写、外部 View/Inspector、跨窗口 transfer 和重启恢复。
+
 ## 前端组件结构
 
 建议新增：

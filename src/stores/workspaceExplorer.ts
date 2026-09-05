@@ -3,6 +3,10 @@ import { defineStore } from "pinia";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { normalizeAppError } from "../services/errors";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+} from "../services/project";
 import { listProjectSessions } from "../services/session";
 import {
   projectCollaborationSnapshot,
@@ -22,6 +26,7 @@ import type {
   ProjectExplorerResources,
   ProjectExplorerSnapshot,
 } from "../types/workbench";
+import type { KnowledgeChangedEvent } from "../types";
 
 const SYSTEM_RESOURCE_KIND = "system" as const;
 const NEW_SESSION_SYSTEM_RESOURCE_ID = "newSession";
@@ -29,6 +34,7 @@ const KNOWLEDGE_SYSTEM_RESOURCE_ID = "knowledge";
 const COLLABORATION_SYSTEM_RESOURCE_ID = "collaboration";
 const ASSETS_SYSTEM_RESOURCE_ID = "assets";
 const VIEWS_SYSTEM_RESOURCE_ID = "views";
+const ARCHIVED_SYSTEM_RESOURCE_ID = "archived";
 
 function emptyResources(): ProjectExplorerResources {
   return { sessions: [], knowledge: [], collaboration: null };
@@ -43,9 +49,15 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
   const errors = reactive<Record<string, string>>({});
   const requestEpochs = new Map<string, number>();
   const sessionRequestEpochs = new Map<string, number>();
+  const knowledgeRequestEpochs = new Map<string, number>();
+  const knowledgeCatalogLoaded = new Set<string>();
+  const queuedKnowledgeRefreshes = new Set<string>();
+  const activeKnowledgeRefreshes = new Map<string, Promise<void>>();
   const pendingOperationIds = new Set<string>();
   let explorerUnlisten: UnlistenFn | null = null;
   let explorerListenerStarting = false;
+  let knowledgeUnlisten: UnlistenFn | null = null;
+  let knowledgeListenerStarting = false;
   const selectedNodeKey = ref<string | null>(null);
   const expandedNodeKeys = ref<Set<string>>(new Set());
 
@@ -69,7 +81,35 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     return sessionRequestEpochs.get(projectId) === epoch;
   }
 
+  function nextKnowledgeEpoch(projectId: string): number {
+    const epoch = (knowledgeRequestEpochs.get(projectId) ?? 0) + 1;
+    knowledgeRequestEpochs.set(projectId, epoch);
+    return epoch;
+  }
+
+  function isCurrentKnowledgeRequest(projectId: string, epoch: number): boolean {
+    return knowledgeRequestEpochs.get(projectId) === epoch;
+  }
+
+  function ensureKnowledgeListener(): void {
+    if (knowledgeUnlisten || knowledgeListenerStarting) return;
+    knowledgeListenerStarting = true;
+    void listen<RoutedWorkspaceEvent<KnowledgeChangedEvent>>(
+      WORKSPACE_EVENT_NAME,
+      ({ payload: event }) => {
+        if (event.eventName !== "knowledge-changed") return;
+        if (!snapshots[event.projectId] || !resources[event.projectId]) return;
+        scheduleProjectKnowledgeRefresh(event.projectId);
+      },
+    ).then((unlisten) => {
+      knowledgeUnlisten = unlisten;
+    }).catch(() => {
+      knowledgeListenerStarting = false;
+    });
+  }
+
   function ensureExplorerListener(): void {
+    ensureKnowledgeListener();
     if (explorerUnlisten || explorerListenerStarting) return;
     explorerListenerStarting = true;
     void listen<{
@@ -97,6 +137,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     if (!force && snapshots[projectId] && resources[projectId]) return;
     const epoch = nextEpoch(projectId);
     const sessionEpoch = nextSessionEpoch(projectId);
+    const knowledgeEpoch = nextKnowledgeEpoch(projectId);
     loading[projectId] = true;
     delete errors[projectId];
     try {
@@ -119,11 +160,20 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
           && isCurrentSessionRequest(projectId, sessionEpoch)
           ? sessionsResult.value
           : previous.sessions,
-        knowledge: knowledgeResult.status === "fulfilled" ? knowledgeResult.value : previous.knowledge,
+        knowledge: knowledgeResult.status === "fulfilled"
+          && isCurrentKnowledgeRequest(projectId, knowledgeEpoch)
+          ? knowledgeResult.value
+          : previous.knowledge,
         collaboration: collaborationResult.status === "fulfilled"
           ? collaborationResult.value
           : previous.collaboration,
       };
+      if (
+        knowledgeResult.status === "fulfilled"
+        && isCurrentKnowledgeRequest(projectId, knowledgeEpoch)
+      ) {
+        knowledgeCatalogLoaded.add(projectId);
+      }
       await placeMissingResources(projectId, epoch);
       const partialFailure = [sessionsResult, knowledgeResult, collaborationResult]
         .find((result) => result.status === "rejected");
@@ -155,6 +205,101 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     const layoutEpoch = requestEpochs.get(projectId);
     if (layoutEpoch == null || !snapshots[projectId]) return;
     await placeMissingResources(projectId, layoutEpoch);
+  }
+
+  function newlyCreatedPlanDesignDocuments(
+    previous: ProjectExplorerResources["knowledge"],
+    next: ProjectExplorerResources["knowledge"],
+  ): ProjectExplorerResources["knowledge"] {
+    const previousIds = new Set(previous.map((document) => document.id));
+    return next
+      .filter((document) => (
+        (document.type === "plan" || document.type === "design")
+        && document.storageSource !== "app"
+        && !previousIds.has(document.id)
+      ))
+      .sort((left, right) => (
+        right.modifiedAt - left.modifiedAt
+        || left.path.localeCompare(right.path, undefined, { sensitivity: "base", numeric: true })
+      ));
+  }
+
+  async function placeKnowledgeDocumentsBelowSpecialNode(
+    projectId: string,
+    documents: ProjectExplorerResources["knowledge"],
+  ): Promise<void> {
+    const snapshot = snapshots[projectId];
+    if (!snapshot || documents.length === 0) return;
+    const knowledgeNode = snapshot.nodes.find((node) => (
+      node.resourceKind === SYSTEM_RESOURCE_KIND
+      && node.resourceId === KNOWLEDGE_SYSTEM_RESOURCE_ID
+    ));
+    if (!knowledgeNode) return;
+
+    const placedDocumentIds = new Set(snapshot.nodes.flatMap((node) => (
+      node.resourceKind === "knowledge" && node.resourceId ? [node.resourceId] : []
+    )));
+    const documentsToPlace = documents.filter((document) => !placedDocumentIds.has(document.id));
+    if (documentsToPlace.length === 0) return;
+
+    const parentNodeId = knowledgeNode.parentNodeId ?? null;
+    const siblings = snapshot.nodes
+      .filter((node) => (node.parentNodeId ?? null) === parentNodeId)
+      .sort((left, right) => left.position - right.position || left.nodeId.localeCompare(right.nodeId));
+    const knowledgePosition = siblings.findIndex((node) => node.nodeId === knowledgeNode.nodeId);
+    if (knowledgePosition < 0) return;
+
+    await applyOperations(projectId, documentsToPlace.map((document, index) => ({
+      kind: "placeResource" as const,
+      resourceKind: "knowledge" as const,
+      resourceId: document.id,
+      sourceKind: "knowledge",
+      parentNodeId: parentNodeId ?? undefined,
+      position: knowledgePosition + 1 + index,
+    })));
+  }
+
+  async function refreshProjectKnowledge(projectId: string): Promise<void> {
+    const previousResources = resources[projectId];
+    if (!projectId || !previousResources || !snapshots[projectId]) return;
+    const hadLoadedCatalog = knowledgeCatalogLoaded.has(projectId);
+    const epoch = nextKnowledgeEpoch(projectId);
+    const nextKnowledge = await projectKnowledgeList(projectId);
+    if (!isCurrentKnowledgeRequest(projectId, epoch)) return;
+
+    const addedDocuments = hadLoadedCatalog
+      ? newlyCreatedPlanDesignDocuments(previousResources.knowledge, nextKnowledge)
+      : [];
+    resources[projectId] = {
+      ...previousResources,
+      knowledge: nextKnowledge,
+    };
+    knowledgeCatalogLoaded.add(projectId);
+
+    if (
+      displaySettings.autoPlaceNewPlanDesignKnowledgeDocuments
+      && addedDocuments.length > 0
+    ) {
+      await placeKnowledgeDocumentsBelowSpecialNode(projectId, addedDocuments);
+    }
+  }
+
+  function scheduleProjectKnowledgeRefresh(projectId: string): void {
+    queuedKnowledgeRefreshes.add(projectId);
+    if (activeKnowledgeRefreshes.has(projectId)) return;
+    const task = (async () => {
+      while (queuedKnowledgeRefreshes.delete(projectId)) {
+        await refreshProjectKnowledge(projectId);
+      }
+    })().catch((error) => {
+      errors[projectId] = normalizeAppError(error).message;
+    }).finally(() => {
+      if (activeKnowledgeRefreshes.get(projectId) === task) {
+        activeKnowledgeRefreshes.delete(projectId);
+      }
+      if (queuedKnowledgeRefreshes.has(projectId)) scheduleProjectKnowledgeRefresh(projectId);
+    });
+    activeKnowledgeRefreshes.set(projectId, task);
   }
 
   async function placeMissingResources(
@@ -246,23 +391,68 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     let nextSessionPosition = firstFollowingSessionPosition >= 0
       ? firstFollowingSessionPosition
       : Math.max(0, newSessionPosition + 1);
-    for (const session of projectResources.sessions) {
-      if (session.sessionType === "folder" || placed.has(`session:${session.id}`)) continue;
+    const sessionsById = new Map(
+      projectResources.sessions
+        .filter((session) => session.sessionType !== "folder")
+        .map((session) => [session.id, session]),
+    );
+    const sessionPlacementById = new Map<string, PlacementNode>(
+      snapshot.nodes.flatMap((node) => (
+        node.resourceKind === "session" && node.resourceId ? [[node.resourceId, node] as const] : []
+      )),
+    );
+    const pendingSessions = new Map(
+      [...sessionsById.values()]
+        .filter((session) => !placed.has(`session:${session.id}`))
+        .map((session) => [session.id, session]),
+    );
+    const plannedNodeIds = new Map(
+      [...pendingSessions.keys()].map((sessionId) => [
+        sessionId,
+        `resource:session:${crypto.randomUUID()}`,
+      ]),
+    );
+    const placeSession = (sessionId: string, parentNodeId: string | null): void => {
+      const session = pendingSessions.get(sessionId);
+      const nodeId = plannedNodeIds.get(sessionId);
+      if (!session || !nodeId) return;
+      const position = parentNodeId === sessionParentNodeId
+        ? nextSessionPosition++
+        : siblingsByParent.get(parentNodeId)?.length ?? 0;
       operations.push({
         kind: "placeResource",
+        nodeId,
         resourceKind: "session",
         resourceId: session.id,
-        parentNodeId: sessionParentNodeId ?? undefined,
-        position: nextSessionPosition,
+        parentNodeId: parentNodeId ?? undefined,
+        position,
       });
-      insertPlacementNode(sessionParentNodeId, nextSessionPosition, {
-        nodeId: `pending:session:${session.id}`,
-        parentNodeId: sessionParentNodeId,
+      const placement: PlacementNode = {
+        nodeId,
+        parentNodeId,
         resourceKind: "session",
         resourceId: session.id,
-        position: nextSessionPosition,
-      });
-      nextSessionPosition += 1;
+        position,
+      };
+      insertPlacementNode(parentNodeId, position, placement);
+      sessionPlacementById.set(session.id, placement);
+      pendingSessions.delete(session.id);
+    };
+    while (pendingSessions.size > 0) {
+      let placedInPass = 0;
+      for (const session of [...pendingSessions.values()]) {
+        const parentSessionId = session.parentSessionId ?? null;
+        const parentPlacement = parentSessionId
+          ? sessionPlacementById.get(parentSessionId)
+          : undefined;
+        if (parentSessionId && pendingSessions.has(parentSessionId) && !parentPlacement) continue;
+        placeSession(session.id, parentPlacement?.nodeId ?? sessionParentNodeId);
+        placedInPass += 1;
+      }
+      if (placedInPass > 0) continue;
+      const cyclicSession = pendingSessions.values().next().value;
+      if (!cyclicSession) break;
+      placeSession(cyclicSession.id, sessionParentNodeId);
     }
     if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${COLLABORATION_SYSTEM_RESOURCE_ID}`)) {
       const position = siblingsByParent.get(null)?.length ?? 0;
@@ -300,6 +490,21 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
         kind: "placeResource",
         resourceKind: SYSTEM_RESOURCE_KIND,
         resourceId: VIEWS_SYSTEM_RESOURCE_ID,
+        position,
+      });
+      insertPlacementNode(null, position, {
+        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${VIEWS_SYSTEM_RESOURCE_ID}`,
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId: VIEWS_SYSTEM_RESOURCE_ID,
+        position,
+      });
+    }
+    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${ARCHIVED_SYSTEM_RESOURCE_ID}`)) {
+      const position = siblingsByParent.get(null)?.length ?? 0;
+      operations.push({
+        kind: "placeResource",
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId: ARCHIVED_SYSTEM_RESOURCE_ID,
         position,
       });
     }
@@ -443,6 +648,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     expandedNodeKeys,
     loadProject,
     refreshProjectSessions,
+    refreshProjectKnowledge,
     applyOperations,
     loadMount,
     mountListing,

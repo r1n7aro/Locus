@@ -680,6 +680,32 @@ mod imp {
         .await
     }
 
+    pub(crate) async fn evaluate_main_webview(
+        app: &AppHandle,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let response = call_devtools_method_with_timeout(
+            app,
+            None,
+            "Runtime.evaluate".to_string(),
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true,
+            }),
+            timeout,
+        )
+        .await?;
+        if let Some(exception) = response.get("exceptionDetails") {
+            return Err(format!("WebView evaluation failed: {exception}"));
+        }
+        response
+            .pointer("/result/value")
+            .cloned()
+            .ok_or_else(|| format!("WebView evaluation returned no value: {response}"))
+    }
+
     async fn subscribe_native_diagnostics(
         app: &AppHandle,
     ) -> Result<NativeDiagnosticSubscriptions, String> {
@@ -1795,6 +1821,8 @@ mod imp {
 #[cfg(not(target_os = "windows"))]
 mod imp {
     use super::FrontendBridgeHeartbeat;
+    use serde_json::Value;
+    use std::time::Duration;
     use tauri::AppHandle;
 
     #[derive(Default)]
@@ -1807,6 +1835,15 @@ mod imp {
     pub async fn reconcile(_app: AppHandle, _enabled: bool) -> Result<Option<u16>, String> {
         Ok(None)
     }
+
+    pub(crate) async fn evaluate_main_webview(
+        _app: &AppHandle,
+        _expression: &str,
+        _timeout: Duration,
+    ) -> Result<Value, String> {
+        Err("WebView evaluation is only available on Windows".to_string())
+    }
 }
 
+pub(crate) use imp::evaluate_main_webview;
 pub use imp::{reconcile, CdpDebugServerHandle};

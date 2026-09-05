@@ -98,6 +98,17 @@ describe("development workbench session experience", () => {
     expect(workbench).toContain("const parentNodeId = targetNode.parentNodeId ?? null;");
   });
 
+  it("renders session children while keeping manual drops folder-based", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+
+    expect(workbench).toContain('candidate.parentNodeId === node.nodeId');
+    expect(workbench).toContain('candidate.resourceKind === "session"');
+    expect(workbench).toContain('target.meta.kind === "folder" && ratio >= 0.25 && ratio <= 0.75');
+    expect(workbench).toContain('if (parentNode.nodeKind !== "folder") return false;');
+    expect(workbench).not.toContain('allowSessionParent');
+    expect(workbench).toContain('if (item.treeRow?.expandable) toggleItem(item);');
+  });
+
   it("reveals an accessible archive action when a session row is hovered", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 

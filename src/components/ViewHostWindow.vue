@@ -17,7 +17,7 @@ import {
   type Window as TauriWindowHandle,
 } from "@tauri-apps/api/window";
 import { emitTo, type UnlistenFn } from "@tauri-apps/api/event";
-import { PanelsTopLeft, ScanSearch } from "lucide";
+import { PanelsTopLeft } from "lucide";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import {
   useInternalDragController,
@@ -29,13 +29,6 @@ import {
 } from "../composables/useWindowTabDrag";
 import { t } from "../i18n";
 import { searchWorkspaceAssets } from "../services/asset";
-import {
-  isLocusAssetInspectorTabId,
-  locusAssetInspectorTabTitle,
-  parseLocusAssetInspectorTabId,
-  type LocusAssetInspectorWindowPayload,
-} from "../services/locusAssetInspectorWindow";
-import LocusAssetInspectorPane from "./LocusAssetInspectorPane.vue";
 import { normalizeAppError } from "../services/errors";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
 import { getLastEffort, getLastModel, getModelDefaults } from "../services/model";
@@ -238,19 +231,8 @@ if (hasTauriWindowRuntime()) {
   }
 }
 
-function inspectorTabFromId(tabId: string): ViewHostTab {
-  const payload = parseLocusAssetInspectorTabId(tabId);
-  return {
-    id: tabId,
-    title: payload ? locusAssetInspectorTabTitle(payload) : t("asset.inspector.windowTitle"),
-    packageRoot: "",
-  };
-}
-
 function initialHostTab(tabId: string): ViewHostTab {
-  return isLocusAssetInspectorTabId(tabId)
-    ? inspectorTabFromId(tabId)
-    : { id: tabId, title: tabId, packageRoot: "" };
+  return { id: tabId, title: tabId, packageRoot: "" };
 }
 
 const initialViewId = viewHostIdFromLocation();
@@ -312,7 +294,7 @@ const tabs = ref<ViewHostTab[]>(initialViewId
   ? [initialHostTab(initialViewId)]
   : []);
 const runtimeRecords = ref<ViewRuntimeRecord[]>(
-  initialViewId && !isLocusAssetInspectorTabId(initialViewId)
+  initialViewId
     ? [{
         viewId: initialViewId,
         detail: null,
@@ -447,26 +429,12 @@ const latestFrontendLog = computed(() => activeRuntimeRecord.value?.latestFronte
 const usePersistentViewContentPool = computed(() => !props.embedded && !!appWindow);
 const manifest = computed(() => detail.value?.manifest ?? null);
 const activeTab = computed(() => tabs.value.find((tab) => tab.id === activeViewId.value) ?? null);
-const activeTabIsInspector = computed(() => isLocusAssetInspectorTabId(activeViewId.value));
 const tabItems = computed<BaseTabStripItem[]>(() => tabs.value.map((tab) => ({
   id: tab.id,
   title: tab.title,
-  icon: isLocusAssetInspectorTabId(tab.id) ? ScanSearch : PanelsTopLeft,
+  icon: PanelsTopLeft,
   closeable: true,
 })));
-
-interface InspectorPaneRecord {
-  tabId: string;
-  payload: LocusAssetInspectorWindowPayload;
-}
-
-// Inspector tabs render inline in the host window (same app bundle), unlike
-// View tabs whose content lives in pooled child webviews.
-const inspectorPaneRecords = computed<InspectorPaneRecord[]>(() =>
-  tabs.value
-    .filter((tab) => isLocusAssetInspectorTabId(tab.id))
-    .map((tab) => ({ tabId: tab.id, payload: parseLocusAssetInspectorTabId(tab.id) }))
-    .filter((record): record is InspectorPaneRecord => !!record.payload));
 const windowTitle = computed(() =>
   manifest.value?.name || detail.value?.summary.name || activeTab.value?.title || activeViewId.value || t("view.host.title"),
 );
@@ -615,23 +583,11 @@ async function closeWindow() {
   window.close();
 }
 
-function handleHostWindowKeydown(event: KeyboardEvent) {
-  if (event.key !== "Escape" || event.defaultPrevented) return;
-  const active = activeViewId.value;
-  if (!active || !isLocusAssetInspectorTabId(active)) return;
-  const target = event.target as HTMLElement | null;
-  // ESC inside form controls means "cancel the edit", not "close the tab".
-  if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
-  event.preventDefault();
-  void closeTab(active);
-}
-
 // Keep the native (taskbar) title in sync with the active tab; the in-app
 // titlebar only shows tabs.
-watch([windowTitle, activeTabIsInspector], ([title, inspectorActive]) => {
+watch(windowTitle, (title) => {
   if (props.embedded || !appWindow || tabs.value.length === 0) return;
-  const suffix = inspectorActive ? "Locus Inspector" : "Locus View";
-  void appWindow.setTitle(`${title} - ${suffix}`).catch(() => undefined);
+  void appWindow.setTitle(`${title} - Locus View`).catch(() => undefined);
 });
 
 function installViewConsoleLogCapture(activeViewId: string) {
@@ -721,7 +677,7 @@ function formatErrorEvent(event: ErrorEvent) {
 
 async function refreshLatestFrontendLog() {
   const viewId = activeViewId.value;
-  if (!viewId || isLocusAssetInspectorTabId(viewId)) return;
+  if (!viewId) return;
   const record = ensureRuntimeRecord(viewId);
   try {
     const entries = await viewReadFrontendLog(requireViewWorkspaceRef(), { viewId, limit: 1 });
@@ -792,11 +748,7 @@ function removeTab(tabId: string, options: { releaseContent?: boolean } = {}): V
   });
   tabs.value = nextTabs;
   removeRuntimeRecord(tabId);
-  if (
-    usePersistentViewContentPool.value
-    && options.releaseContent !== false
-    && !isLocusAssetInspectorTabId(tabId)
-  ) {
+  if (usePersistentViewContentPool.value && options.releaseContent !== false) {
     viewHostContentLog("hide-from-remove-tab", { tabId });
     void viewContentHide(requireViewWorkspaceRef(), tabId);
   }
@@ -819,7 +771,6 @@ function removeTab(tabId: string, options: { releaseContent?: boolean } = {}): V
 }
 
 async function resolveViewTab(id: string): Promise<ViewHostTab> {
-  if (isLocusAssetInspectorTabId(id)) return inspectorTabFromId(id);
   if (detail.value?.manifest.id === id) return tabFromDetail(detail.value);
   const existing = tabs.value.find((tab) => tab.id === id);
   try {
@@ -863,8 +814,7 @@ async function registerCurrentTabHost() {
 
 function refreshConsoleLogCapture() {
   restoreConsoleLogCapture?.();
-  // Inspector tabs have no View package to receive frontend logs.
-  restoreConsoleLogCapture = activeViewId.value && !isLocusAssetInspectorTabId(activeViewId.value)
+  restoreConsoleLogCapture = activeViewId.value
     ? installViewConsoleLogCapture(activeViewId.value)
     : null;
 }
@@ -876,18 +826,16 @@ async function setActiveViewTab(viewId: string, options: { loadNow?: boolean } =
   if (!tabs.value.some((tab) => tab.id === normalized)) {
     upsertTab(await resolveViewTab(normalized));
   }
-  const isInspectorTab = isLocusAssetInspectorTabId(normalized);
-  const record = isInspectorTab ? null : ensureRuntimeRecord(normalized);
+  const record = ensureRuntimeRecord(normalized);
   const changed = activeViewId.value !== normalized;
   viewHostContentLog("set-active", {
     viewId: normalized,
     previousActiveViewId,
     changed,
     loadNow: !!options.loadNow,
-    inspectorTab: isInspectorTab,
-    recordHasDetail: !!record?.detail,
-    recordHasComponent: !!record?.component,
-    recordStale: record?.stale ?? false,
+    recordHasDetail: !!record.detail,
+    recordHasComponent: !!record.component,
+    recordStale: record.stale,
   });
   if (changed) {
     activeViewId.value = normalized;
@@ -896,11 +844,6 @@ async function setActiveViewTab(viewId: string, options: { loadNow?: boolean } =
   }
   void refreshLatestFrontendLog();
   await registerCurrentTabHost();
-  if (!record) {
-    // Inspector panes render inline; loading only hides stale View content.
-    if (options.loadNow || changed) await loadView(normalized);
-    return;
-  }
   if (options.loadNow) {
     const inFlightLoad = record.loadPromise;
     if (inFlightLoad) await inFlightLoad.catch(() => undefined);
@@ -2218,15 +2161,6 @@ async function mountViewContentFromPool(
     record.error = t("view.host.missingId");
     return;
   }
-  if (isLocusAssetInspectorTabId(viewId)) {
-    // Inspector panes render inline; just make sure no pooled View content
-    // webview keeps covering the host body while the pane is active.
-    if (!options.updateGeometryOnly && viewId === activeViewId.value) {
-      await hidePersistentViewContentTabs(tabs.value.map((tab) => tab.id));
-    }
-    return;
-  }
-
   const record = ensureRuntimeRecord(viewId);
   if (!options.updateGeometryOnly) {
     viewHostContentLog("mount-request", {
@@ -2395,9 +2329,7 @@ function scheduleViewContentSync(delay = VIEW_CONTENT_SYNC_FRAME_MS) {
 }
 
 async function hidePersistentViewContentTabs(viewIds: string[]) {
-  // Inspector tabs never own pooled content webviews.
-  const normalized = normalizeTabIds(viewIds)
-    .filter((viewId) => !isLocusAssetInspectorTabId(viewId));
+  const normalized = normalizeTabIds(viewIds);
   if (normalized.length > 0) {
     viewHostContentLog("hide-batch", { viewIds: normalized.join(",") });
   }
@@ -2420,9 +2352,6 @@ async function loadView(
     record.error = t("view.host.missingId");
     return;
   }
-  // Inspector panes render inline without a View runtime.
-  if (isLocusAssetInspectorTabId(viewId)) return;
-
   const record = ensureRuntimeRecord(viewId);
   if (record.loadPromise) {
     record.reloadQueued = true;
@@ -2627,7 +2556,6 @@ onMounted(async () => {
   viewHostContentLog("host-mounted", { initialViewId });
   void syncMaximizedState();
   void syncAlwaysOnTopState();
-  if (!props.embedded) window.addEventListener("keydown", handleHostWindowKeydown);
   refreshConsoleLogCapture();
   void refreshLatestFrontendLog();
   installViewContentPoolObservers();
@@ -2722,7 +2650,6 @@ onUnmounted(() => {
   windowTabDrag.dispose();
   unregisterViewTabDropTarget?.();
   unregisterViewTabDropTarget = null;
-  window.removeEventListener("keydown", handleHostWindowKeydown);
   if (reloadTimer) clearTimeout(reloadTimer);
   reloadTimer = null;
   if (embeddedLogbarSyncTimer) clearTimeout(embeddedLogbarSyncTimer);
@@ -2862,7 +2789,7 @@ onUnmounted(() => {
     <section ref="viewHostBodyRef" class="view-host-body">
       <div
         class="view-runtime-cache"
-        :class="{ 'is-suspended': !!error || (loading && !detail) || activeTabIsInspector }"
+        :class="{ 'is-suspended': !!error || (loading && !detail) }"
       >
         <div
           v-for="record in visibleRuntimeRecords"
@@ -2874,17 +2801,6 @@ onUnmounted(() => {
         >
           <component v-if="record.component" :is="record.component" />
         </div>
-      </div>
-      <div
-        v-for="record in inspectorPaneRecords"
-        v-show="record.tabId === activeViewId"
-        :key="record.tabId"
-        class="view-inspector-frame"
-      >
-        <LocusAssetInspectorPane
-          :payload="record.payload"
-          :workspace-ref="viewWorkspaceRef"
-        />
       </div>
       <div v-if="error" class="view-host-state view-host-state-error">{{ error }}</div>
       <div v-else-if="loading && !detail" class="view-host-state">{{ t("common.loading") }}</div>
@@ -3184,12 +3100,4 @@ onUnmounted(() => {
   pointer-events: none;
 }
 
-.view-inspector-frame {
-  flex: 1;
-  min-width: 0;
-  min-height: 0;
-  display: flex;
-  overflow: hidden;
-  background: var(--panel-bg);
-}
 </style>

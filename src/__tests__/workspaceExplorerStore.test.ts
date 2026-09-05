@@ -22,6 +22,8 @@ const sessionMocks = vi.hoisted(() => ({
   listProjectSessions: vi.fn(),
 }));
 
+const eventListeners = new Map<string, (event: { payload: unknown }) => void>();
+
 vi.mock("@tauri-apps/api/event", () => eventMocks);
 vi.mock("../services/workspaceExplorer", () => ({
   ...explorerMocks,
@@ -51,7 +53,14 @@ describe("workspace explorer store", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
-    eventMocks.listen.mockResolvedValue(vi.fn());
+    eventListeners.clear();
+    eventMocks.listen.mockImplementation((
+      eventName: string,
+      handler: (event: { payload: unknown }) => void,
+    ) => {
+      eventListeners.set(eventName, handler);
+      return Promise.resolve(vi.fn());
+    });
     explorerMocks.projectExplorerSnapshot.mockResolvedValue(snapshot());
     explorerMocks.projectCollaborationSnapshot.mockResolvedValue({
       projectId: "project-a",
@@ -138,6 +147,43 @@ describe("workspace explorer store", () => {
       resourceId: "session-a",
     }));
     expect(store.errors["project-a"]).toBe("knowledge unavailable");
+  });
+
+  it("places subagent sessions beneath their parent session", async () => {
+    sessionMocks.listProjectSessions.mockResolvedValueOnce([{
+      id: "subagent-a",
+      title: "Inspect code",
+      sessionType: "chat",
+      parentSessionId: "session-a",
+      updatedAt: 2,
+      projectId: "project-a",
+      defaultCheckoutId: "checkout-a",
+    }, {
+      id: "session-a",
+      title: "Session A",
+      sessionType: "chat",
+      parentSessionId: null,
+      updatedAt: 1,
+      projectId: "project-a",
+      defaultCheckoutId: "checkout-a",
+    }]);
+    const store = useWorkspaceExplorerStore();
+
+    await store.loadProject("project-a");
+
+    const operations = (
+      explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]
+    ) as ProjectExplorerOperation[];
+    const sessionPlacements = operations.filter(
+      (operation): operation is Extract<ProjectExplorerOperation, { kind: "placeResource" }> => (
+        operation.kind === "placeResource" && operation.resourceKind === "session"
+      ),
+    );
+    expect(sessionPlacements.map((operation) => operation.resourceId))
+      .toEqual(["session-a", "subagent-a"]);
+    expect(sessionPlacements[0]?.nodeId).toEqual(expect.any(String));
+    expect(sessionPlacements[1]?.parentNodeId).toBe(sessionPlacements[0]?.nodeId);
+    expect(sessionPlacements[1]?.position).toBe(0);
   });
 
   it("places a newly created session before the first following session", async () => {
@@ -263,6 +309,7 @@ describe("workspace explorer store", () => {
       (operation: { resourceKind?: string }) => operation.resourceKind === "session",
     )).toEqual([{
       kind: "placeResource",
+      nodeId: expect.any(String),
       resourceKind: "session",
       resourceId: "session-b",
       parentNodeId: undefined,
@@ -342,11 +389,118 @@ describe("workspace explorer store", () => {
       (operation: { resourceKind?: string }) => operation.resourceKind === "session",
     )).toEqual([{
       kind: "placeResource",
+      nodeId: expect.any(String),
       resourceKind: "session",
       resourceId: "session-b",
       parentNodeId: "folder:chat",
       position: 2,
     }]);
+  });
+
+  it("places a newly created Plan document directly below the Knowledge node", async () => {
+    const store = useWorkspaceExplorerStore();
+    store.displaySettings.autoPlaceNewPlanDesignKnowledgeDocuments = true;
+    await store.loadProject("project-a");
+    store.snapshots["project-a"] = {
+      ...snapshot(1),
+      nodes: [{
+        nodeId: "folder:project-notes",
+        projectId: "project-a",
+        nodeKind: "folder",
+        folderName: "Project Notes",
+        hidden: false,
+        position: 0,
+      }, {
+        nodeId: "system:knowledge",
+        projectId: "project-a",
+        nodeKind: "resource",
+        parentNodeId: "folder:project-notes",
+        resourceKind: "system",
+        resourceId: "knowledge",
+        hidden: false,
+        position: 0,
+      }, {
+        nodeId: "folder:existing",
+        projectId: "project-a",
+        nodeKind: "folder",
+        parentNodeId: "folder:project-notes",
+        folderName: "Existing",
+        hidden: false,
+        position: 1,
+      }],
+    };
+    const existing = store.resources["project-a"].knowledge[0]!;
+    const plan = {
+      ...existing,
+      id: "plan-rollout",
+      type: "plan" as const,
+      path: "rollout.md",
+      title: "Rollout",
+      modifiedAt: 3,
+    };
+    explorerMocks.projectKnowledgeList.mockResolvedValueOnce([existing, plan]);
+    explorerMocks.projectExplorerApplyOperations.mockClear();
+
+    eventListeners.get("locus://workspace-event")?.({
+      payload: {
+        eventName: "knowledge-changed",
+        streamRevision: 2,
+        projectId: "project-a",
+        checkoutId: "checkout-a",
+        workspaceGeneration: 1,
+        payload: {
+          workingDir: "F:/Project",
+          source: "agent_knowledge_tool",
+          changedAt: 2,
+        },
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(explorerMocks.projectExplorerApplyOperations).toHaveBeenCalledTimes(1);
+    });
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([{
+      kind: "placeResource",
+      resourceKind: "knowledge",
+      resourceId: "plan-rollout",
+      sourceKind: "knowledge",
+      parentNodeId: "folder:project-notes",
+      position: 1,
+    }]);
+    expect(store.resources["project-a"].knowledge).toContainEqual(plan);
+  });
+
+  it("keeps new Plan and Design documents out of the tree when auto-placement is disabled", async () => {
+    const store = useWorkspaceExplorerStore();
+    await store.loadProject("project-a");
+    store.snapshots["project-a"] = {
+      ...snapshot(1),
+      nodes: [{
+        nodeId: "system:knowledge",
+        projectId: "project-a",
+        nodeKind: "resource",
+        resourceKind: "system",
+        resourceId: "knowledge",
+        hidden: false,
+        position: 0,
+      }],
+    };
+    const existing = store.resources["project-a"].knowledge[0]!;
+    explorerMocks.projectKnowledgeList.mockResolvedValueOnce([{
+      ...existing,
+      id: "design-input",
+      type: "design",
+      path: "input.md",
+      title: "Input",
+      modifiedAt: 4,
+    }]);
+    explorerMocks.projectExplorerApplyOperations.mockClear();
+    store.displaySettings.autoPlaceNewPlanDesignKnowledgeDocuments = false;
+
+    await store.refreshProjectKnowledge("project-a");
+
+    expect(explorerMocks.projectExplorerApplyOperations).not.toHaveBeenCalled();
+    store.displaySettings.autoPlaceNewPlanDesignKnowledgeDocuments = true;
   });
 
   it("leaves legacy knowledge placements untouched", async () => {

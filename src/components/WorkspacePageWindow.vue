@@ -6,7 +6,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { t } from "../i18n";
 import { provideDiffOverlay } from "../composables/useDiffOverlay";
 import { useWorkspacePageBootstrap } from "../composables/useWorkspacePageBootstrap";
-import { setLocusAssetInspectorPanelHostAvailable } from "../composables/useLocusAssetInspectorPanel";
 import { normalizeAppError } from "../services/errors";
 import {
   getWorkspacePageWindowPayload,
@@ -54,7 +53,6 @@ const {
   cleanup,
 } = useWorkspacePageBootstrap();
 const diffOverlay = provideDiffOverlay();
-setLocusAssetInspectorPanelHostAvailable(false);
 
 const pageComponent = computed<Component | null>(() =>
   page.value ? PAGE_COMPONENTS[page.value] : null,

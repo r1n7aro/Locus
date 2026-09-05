@@ -12,7 +12,6 @@ import {
   getCloseBehavior,
   getLlmRetryMaxAttempts,
   getPythonRuntimeState,
-  getSessionUndoEnabled,
   getSubagentMaxConcurrent,
   getSubagentMaxDepth,
   getToolFailureLogEnabled,
@@ -21,7 +20,6 @@ import {
   savePythonRuntimeSelection,
   setCloseBehavior,
   setLlmRetryMaxAttempts,
-  setSessionUndoEnabled,
   setSubagentMaxConcurrent,
   setSubagentMaxDepth,
   setToolFailureLogEnabled,
@@ -51,6 +49,7 @@ import { normalizeAppError } from "../../services/errors";
 import { toggleTauriDevtools } from "../../services/tauriRuntime";
 import { useNotificationStore } from "../../stores/notification";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+import { useSessionUndoSettings } from "../../composables/useSessionUndoSettings";
 
 defineProps<{
   locale: string;
@@ -66,6 +65,11 @@ const emit = defineEmits<{
 
 const notificationStore = useNotificationStore();
 const workspaceContextStore = useWorkspaceContextStore();
+const {
+  state: sessionUndoSettings,
+  load: loadSessionUndoSettings,
+  setEnabled: setSessionUndoEnabled,
+} = useSessionUndoSettings();
 const initialDebugMode = getCachedDebugMode();
 const debugEnabled = ref(initialDebugMode ?? false);
 const debugReady = ref(initialDebugMode !== null);
@@ -74,9 +78,6 @@ const devtoolsBusy = ref(false);
 const toolFailureLogEnabled = ref(false);
 const toolFailureLogReady = ref(false);
 const toolFailureLogBusy = ref(false);
-const sessionUndoEnabled = ref(true);
-const sessionUndoReady = ref(false);
-const sessionUndoBusy = ref(false);
 const closeBehavior = ref<AppCloseBehavior>("exit");
 const closeBehaviorReady = ref(false);
 const closeBehaviorBusy = ref(false);
@@ -142,8 +143,8 @@ const toolFailureLogStatusLabel = computed(() => {
 });
 
 const sessionUndoStatusLabel = computed(() => {
-  if (!sessionUndoReady.value) return t("common.loading");
-  return sessionUndoEnabled.value ? t("common.enabled") : t("common.disabled");
+  if (!sessionUndoSettings.ready) return t("common.loading");
+  return sessionUndoSettings.enabled ? t("common.enabled") : t("common.disabled");
 });
 
 const llmRetryStatusLabel = computed(() => {
@@ -322,35 +323,26 @@ async function toggleToolFailureLog() {
 
 async function refreshSessionUndoEnabled() {
   try {
-    sessionUndoEnabled.value = await getSessionUndoEnabled();
+    await loadSessionUndoSettings(true);
   } catch (e) {
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "loadSessionUndo",
     });
-  } finally {
-    sessionUndoReady.value = true;
   }
 }
 
-async function toggleSessionUndo() {
-  if (!sessionUndoReady.value || sessionUndoBusy.value) return;
-  const previous = sessionUndoEnabled.value;
-  const next = !previous;
-  sessionUndoEnabled.value = next;
-  sessionUndoBusy.value = true;
+async function toggleSessionUndo(next: boolean) {
+  if (!sessionUndoSettings.ready || sessionUndoSettings.busy) return;
   try {
     await setSessionUndoEnabled(next);
   } catch (e) {
-    sessionUndoEnabled.value = previous;
     const err = normalizeAppError(e);
     notificationStore.addNotice("error", err.message, {
       code: err.code,
       operation: "toggleSessionUndo",
     });
-  } finally {
-    sessionUndoBusy.value = false;
   }
 }
 
@@ -1152,11 +1144,11 @@ async function selectPythonRuntime(selectedId: string) {
   <div class="settings-section">
     <div class="section-label">{{ t("settings.general.sessionUndo") }}</div>
     <p class="section-desc">{{ t("settings.general.sessionUndoDesc") }}</p>
-    <label class="debug-toggle" :aria-busy="!sessionUndoReady">
+    <label class="debug-toggle" :aria-busy="!sessionUndoSettings.ready">
       <BaseSwitch
-        v-if="sessionUndoReady"
-        :model-value="sessionUndoEnabled"
-        :disabled="sessionUndoBusy"
+        v-if="sessionUndoSettings.ready"
+        :model-value="sessionUndoSettings.enabled"
+        :disabled="sessionUndoSettings.busy"
         :aria-label="t('settings.general.sessionUndo')"
         @update:model-value="toggleSessionUndo"
       />

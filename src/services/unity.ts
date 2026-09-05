@@ -463,7 +463,6 @@ export function stopLocusDragPreview(): Promise<void> {
 
 export interface UnityEmbedAssetDropPayload {
   refs: AssetRefAttachment[];
-  sendMode?: "focusedSession" | "newSession";
   workspaceRef?: WorkspaceRef;
 }
 
@@ -518,8 +517,15 @@ export interface LocusFileDropPayload {
   files: LocusFileDropRef[];
   x?: number;
   y?: number;
-  sendMode?: "focusedSession" | "newSession";
-  workspaceRef?: WorkspaceRef;
+}
+
+export interface UnitySendToLocusPayload {
+  assetRefs?: AssetRefAttachment[];
+  files?: LocusFileDropRef[];
+}
+
+export interface UnitySendToLocusEventPayload extends UnitySendToLocusPayload {
+  workspaceRef: WorkspaceRef;
 }
 
 export interface LocusFileDragStatePayload {
@@ -534,6 +540,24 @@ export interface LocusFileDragStatePayload {
 export interface UnityEmbedAssetDragStatePayload {
   hasRefs: boolean;
   refs: AssetRefAttachment[];
+}
+
+export function subscribeUnitySendToLocus(
+  handler: (payload: UnitySendToLocusEventPayload) => void,
+): Promise<RuntimeUnsubscribe> {
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<UnitySendToLocusPayload>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== "unity-send-to-locus") return;
+      handler({
+        ...event.payload,
+        workspaceRef: {
+          checkoutId: event.checkoutId,
+          expectedGeneration: event.workspaceGeneration,
+        },
+      });
+    },
+  );
 }
 
 export function subscribeUnityEmbedAssetDrop(
@@ -639,7 +663,7 @@ export function sendUnityLog(workspaceRef: WorkspaceRef, message: string): Promi
   return ipcInvoke("send_unity_log", { workspaceRef, message });
 }
 
-function focusedWorkspaceRef(): WorkspaceRef {
+export function focusedWorkspaceRef(): WorkspaceRef {
   const workspaceRef = useWorkspaceContextStore().focusedWorkspaceRef;
   if (!workspaceRef) throw new Error("A focused checkout is required");
   return workspaceRef;

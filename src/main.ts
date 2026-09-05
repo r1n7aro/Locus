@@ -42,7 +42,7 @@ app.mount("#app");
 markStartupPhase("frontend_vue_mount_called");
 scheduleStartupPaintReport();
 // Plugin inspector drawers register per window; every Locus window shares
-// this entry, so chat, inspector, view-host, and diff windows all load them.
+// this entry, so Workbench, View content, and diff windows all load them.
 bootstrapPluginInspectorDrawers();
 
 async function syncSystemLocale() {

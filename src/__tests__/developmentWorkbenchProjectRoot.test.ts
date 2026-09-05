@@ -27,6 +27,14 @@ describe("Development workbench project roots", () => {
     expect(projectBranch).not.toContain("selectedNodeKey");
   });
 
+  it("offers a persistent delete action from project root context menus", () => {
+    expect(workbench).toContain('@click="removeContextWorkspace"');
+    expect(workbench).toContain('t("development.deleteWorkspace")');
+    expect(workbench).toContain('t("development.deleteWorkspaceConfirm", projectLabel(project))');
+    expect(workbench).toContain("workspaceContextBaseStore.removeProject(project.projectId)");
+    expect(workbench).toContain("projectStore.loadRecentDirs()");
+  });
+
   it("uses the Unity mark for projects with the Unity service detected", () => {
     expect(workbench).toContain("projectIconForServices(project?.detectedServices ?? [])");
     expect(workbench).toContain("if (projectIcon) return projectIcon;");

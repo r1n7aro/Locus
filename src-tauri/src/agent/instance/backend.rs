@@ -736,6 +736,7 @@ pub(crate) const MOCK_WORKSPACE_SWITCH_HOLD_SCENARIO: &str = "[[mock:workspace-s
 pub(crate) const MOCK_PYTHON_TOOL_SCENARIO: &str = "[[mock:python-tool]]";
 pub(crate) const MOCK_AGENT_UNITY_EXECUTE_SCENARIO: &str = "[[mock:agent-unity-execute]]";
 pub(crate) const MOCK_AGENT_UNITY_YAML_READ_SCENARIO: &str = "[[mock:agent-unity-yaml-read]]";
+pub(crate) const MOCK_SESSION_UNDO_FILE_SCENARIO: &str = "[[mock:session-undo-file]]";
 const MOCK_WORKSPACE_SWITCH_HOLD_DELAY_MS: u64 = 8_000;
 
 fn api_tool_name(tool: &serde_json::Value) -> Option<&str> {
@@ -898,6 +899,29 @@ fn build_mock_response_plan(
                         "description": "Probe the injected Locus SDK and Unity lifecycle state",
                         "readonly": true,
                         "timeout": 30_000
+                    })
+                    .to_string(),
+                    order: None,
+                    server_tool: None,
+                    server_tool_output: None,
+                    outcome: None,
+                    recorded_output: None,
+                    nested_tool_calls: None,
+                })
+            } else if user_text.contains(MOCK_SESSION_UNDO_FILE_SCENARIO)
+                && tool_is_exposed(api_tools, "write")
+            {
+                Some(ToolCallInfo {
+                    id: format!(
+                        "mock-session-undo-file-{}",
+                        latest_user
+                            .map(|message| message.id.as_str())
+                            .unwrap_or("turn")
+                    ),
+                    name: "write".to_string(),
+                    arguments: serde_json::json!({
+                        "filePath": ".locus-session-undo-driver-probe.txt",
+                        "content": "LOCUS_SESSION_UNDO_DRIVER_PROBE\n"
                     })
                     .to_string(),
                     order: None,

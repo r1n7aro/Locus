@@ -1,25 +1,27 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, watch } from "vue";
+import { onMounted, onUnmounted } from "vue";
 import { t } from "../i18n";
 import {
   activateUnityEmbedForInput,
+  currentUnityEmbedWorkspaceRef,
   getUnityEmbedFocusDebugSnapshot,
   setUnityEmbedMouseActivationSuppressed,
   type UnityEmbedFocusDebugSnapshot,
 } from "../services/unity";
-import { useChatStore } from "../stores/chat";
 import { useUnityAssetDropTarget } from "../composables/useUnityAssetDropTarget";
-import ChatWorkspaceView from "./ChatWorkspaceView.vue";
+import DevelopmentWorkbench from "./workbench/DevelopmentWorkbench.vue";
 import TopBannerHost from "./TopBannerHost.vue";
 
 const props = withDefaults(defineProps<{
   bootstrapped?: boolean;
   bootstrapError?: string | null;
   initialSessionId?: string;
+  windowId?: string;
 }>(), {
   bootstrapped: false,
   bootstrapError: null,
   initialSessionId: "",
+  windowId: "unity-embed",
 });
 
 const ACTIVATION_ALLOWED_SELECTOR = [
@@ -43,29 +45,17 @@ const {
   handleUnityAssetDrop,
 } = useUnityAssetDropTarget();
 
-const chatStore = useChatStore();
+const initialWorkspaceRef = currentUnityEmbedWorkspaceRef();
 let lastActivationSuppressed: boolean | null = null;
 let activationErrorLogged = false;
 let inputActivationErrorLogged = false;
 let focusOutFrame = 0;
 let focusDebugSequence = 0;
-let initialSessionApplied = false;
 // True while the native foreground handshake (activateUnityEmbedForInput) is in
 // flight; blur-driven re-suppression is skipped during it so it cannot fight the
 // handshake. Paired with windowBlurTimer (the deferred-suppress timer).
 let activationInFlight = false;
 let windowBlurTimer = 0;
-
-async function applyInitialSession() {
-  const sessionId = props.initialSessionId.trim();
-  if (initialSessionApplied || !props.bootstrapped || !sessionId) return;
-  initialSessionApplied = true;
-  try {
-    await chatStore.selectSession(sessionId, { persist: false });
-  } catch (error) {
-    console.warn("[Locus] failed to select embedded Unity session:", error);
-  }
-}
 
 function focusDebugEnabled(): boolean {
   try {
@@ -286,13 +276,6 @@ onUnmounted(() => {
   applyMouseActivationSuppressed(true);
 });
 
-watch(
-  () => [props.bootstrapped, props.initialSessionId] as const,
-  () => {
-    void applyInitialSession();
-  },
-  { immediate: true },
-);
 </script>
 
 <template>
@@ -314,12 +297,12 @@ watch(
     <div v-else-if="!bootstrapped" class="unity-session-state">
       {{ t("common.loading") }}
     </div>
-    <ChatWorkspaceView
+    <DevelopmentWorkbench
       v-else
       class="unity-session-workspace"
-      active
-      layout-mode="auto"
-      session-panel-storage-scope="unity"
+      :window-id="windowId"
+      :initial-session-id="initialSessionId"
+      :fixed-workspace-ref="initialWorkspaceRef"
     />
   </main>
 </template>
