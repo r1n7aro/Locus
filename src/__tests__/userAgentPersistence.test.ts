@@ -66,7 +66,7 @@ describe("persistent user Agents", () => {
     expect(agentView).toContain("modelStore.selectedModelId");
   });
 
-  it("removes retired built-in Agent definitions and aliases them to Unity", () => {
+  it("removes dev and keeps the remaining retired built-in aliases", () => {
     const definitions = read("src-tauri/src/agent/definition.rs");
     const unity = JSON.parse(read("agent/unity/config.json"));
 
@@ -76,7 +76,8 @@ describe("persistent user Agents", () => {
       expect(definitions).toContain(`\"${id}\"`);
     }
     expect(definitions).toContain('pub const DEFAULT_AGENT_ID: &str = "unity"');
-    expect(definitions).toContain('pub const LEGACY_UNITY_AGENT_ID: &str = "dev"');
+    expect(definitions).not.toContain("LEGACY_UNITY_AGENT_ID");
+    expect(read("src-tauri/nsis/installer.nsi")).toContain('RMDir /r "$INSTDIR\\agent\\dev"');
   });
 
   it("routes the retired Git entry point through Unity", () => {

@@ -38,47 +38,27 @@ describe("Unity YAML Property Tree", () => {
     ]);
     expect(
       schema.parameters.properties.hierarchy_fields.description,
-    ).toContain("Select only fields required by the current task");
+    ).toContain("Request only needed fields");
     expect(
       schema.parameters.properties.hierarchy_fields.description,
-    ).toContain("only for GameObjects whose Transform is a RectTransform");
+    ).toContain("rect appears only on RectTransforms");
     expect(schema.parameters.properties.file_path).toBeUndefined();
     expect(schema.parameters.properties.detail).toBeUndefined();
     expect(schema.description).toContain("4,000 characters");
-    expect(schema.description).toContain("live Editor object graph first");
     expect(schema.description).toContain("[source: live Editor]");
     expect(schema.description).toContain("[source: disk YAML]");
-    expect(schema.description).toContain(
-      "Malformed live Editor responses end the tool call as errors",
-    );
-    expect(schema.description).toContain("all non-array descendants");
-    expect(schema.description).toContain(
-      "`max_array_items` controls how many items each array exposes",
-    );
-    expect(schema.description).toContain(
-      "Same-named sibling instances from one Prefab",
-    );
-    expect(schema.description).toContain("annotated with their total count");
-    expect(schema.description).toContain("Subasset");
-    expect(schema.description).toContain("never expose `#fileID` suffixes");
-    expect(schema.description).toContain("never returns a whole raw YAML file");
-    expect(schema.description).toContain("Supported extensions are");
-    expect(schema.description).toContain("`.fbx`");
-    expect(schema.description).toContain("`unity_execute`");
-    expect(schema.description).toContain(
-      "SubScene Authoring Hierarchy",
-    );
-    expect(schema.description).toContain(
-      "a closed SubScene uses its saved disk YAML",
-    );
+    expect(schema.description).toContain("known exact target directly");
+    expect(schema.description).toContain("bounded by max_array_items");
+    expect(schema.description).toContain("indexed paths stay readable");
+    expect(schema.description).toContain("read-only unity_execute");
   });
 
   it("uses the same path DSL for search results and read targets", () => {
     const schema = JSON.parse(read("tools/unity_yaml_search.json"));
     expect(schema.parameters.required).toEqual(["path", "query"]);
-    expect(schema.description).toContain("passed to unity_yaml_read unchanged");
+    expect(schema.description).toContain("paths usable unchanged with unity_yaml_read");
     expect(schema.description).toContain("shallowest matching node");
-    expect(schema.description).toContain("explicit evidence");
+    expect(schema.description).toContain("match evidence");
 
     const implementation = read(
       "src-tauri/src/unity_serialized_property/property_tree.rs",

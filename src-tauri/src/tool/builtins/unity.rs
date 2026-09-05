@@ -1267,7 +1267,7 @@ pub(super) fn unity_recompile() -> ToolDef {
                     None => {
                         return ToolResult {
                             output: format!(
-                                "Missing required parameter: editor_status. You must pass the current Unity Editor status ({}) exactly as shown in the Environment section.",
+                                "Missing required parameter: editor_status. Pass the latest Unity Editor status ({}) from the session announcement or a newer tool result.",
                                 crate::unity_bridge::UNITY_EDITOR_STATUS_SCHEMA
                             ),
                             is_error: true,

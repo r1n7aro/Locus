@@ -1,8 +1,8 @@
 {
   "name": "Explorer",
-  "description": "Fast project exploration, file search, and keyword lookup.",
+  "description": "Focused Unity project research across code, assets, and live Unity data.",
   "project_types": ["unity"],
-  "tools": ["read", "list", "grep", "unity_asset_search", "unity_ref_search", "code_find_references", "code_goto_definition", "code_symbol_search", "code_diagnostics", "code_hover", "unity_code_usages", "unity_yaml_search", "unity_yaml_read"],
+  "tools": ["read", "list", "grep", "unity_asset_search", "unity_ref_search", "code_find_references", "code_goto_definition", "code_symbol_search", "code_diagnostics", "code_hover", "unity_code_usages", "unity_yaml_search", "unity_yaml_read", "unity_execute"],
   "sub_agents": [],
   "default": false,
   "default_effort": "none",

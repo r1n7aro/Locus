@@ -1,5 +1,5 @@
 {
-  "description": "Creates a new file on the local filesystem and writes the provided content.\n\nUsage:\n- This tool only creates new files. It will reject any path that already exists.\n- Use the edit tool for any change to an existing file.\n- Parent directories will be created automatically if they don't exist.\n- In a registered writable knowledge directory, provide Markdown body content only. Locus generates the required frontmatter, updates the knowledge index, and reports every generated field plus the final content start line.",
+  "description": "Create a new file, creating parent directories as needed. Existing paths are rejected; use edit to change an existing file.\n\nIn a registered writable knowledge directory, provide Markdown body content only. Locus generates frontmatter, updates the index, and reports every generated field plus the final content start line.",
   "parameters": {
     "type": "object",
     "properties": {

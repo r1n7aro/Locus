@@ -51,7 +51,7 @@ describe("Unity Console log tool", () => {
     expect(executeContext).toContain("BuildConsoleLogResult(level, limit)");
     expect(executeContext).toContain("BuildConsoleLogResult(null, levels, limit)");
     expect(executeDefinition.description).toContain(
-      'ctx.GetConsoleLog(new[] { "warn", "error" }, 50)',
+      "ctx.GetConsoleLog(levels, limit)",
     );
     expect(builtin).toContain('name: "unity_get_console_log".to_string()');
     expect(builtin).toContain('"unity_get_console_log"');

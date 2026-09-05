@@ -153,10 +153,6 @@ describe("parseAgentToolDefinition", () => {
   it("exposes one atomic same-file edit batch with original-snapshot semantics", () => {
     const raw = readFileSync(resolve(cwd, "tools/edit.json"), "utf8");
     const definition = JSON.parse(raw);
-    const devToolUsageRule = readFileSync(
-      resolve(cwd, "agent/unity/rule/tool_usage_strategy.md"),
-      "utf8",
-    );
     const tool = parseAgentToolDefinition({
       name: "edit",
       ...definition,
@@ -179,9 +175,6 @@ describe("parseAgentToolDefinition", () => {
     expect(definition.description).toContain("matched against the original file content");
     expect(definition.description).toContain("Array order does not make edits sequential");
     expect(definition.description).toContain("entire call fails without changing the file");
-    expect(devToolUsageRule).toContain("call's `edits` array");
-    expect(devToolUsageRule).toContain("matched against the same original file");
-    expect(devToolUsageRule).toContain("Array order does not create dependencies");
   });
 
   it("documents automatic knowledge frontmatter in write", () => {

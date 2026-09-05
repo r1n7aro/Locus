@@ -1,5 +1,5 @@
 {
-  "description": "Trigger Unity script recompilation and wait for it to complete. Unity's auto domain reload is disabled by default — after modifying .cs files you MUST call this once to apply your code changes, always before relying on them in unity_execute. The result reports a stable `status` (`compiled`, `already_converged`, `up_to_date`, `reloaded_without_compile`, `compiled_bridge_recovering`, `existing_reload_incomplete`, `reload_only_incomplete`, `reload_only_bridge_recovering`, or `failed`) together with the relevant compilation, detection, domain reload, bridge, editor, phase, and recommended action fields, so treat those fields as authoritative before choosing the next Unity tool. `already_converged` means a compile already in progress applied the changes; `up_to_date` means Unity's incremental build graph found every assembly current; `reloaded_without_compile` means assemblies were current and a domain reload removed live hot-patch detours.\n\n{optional_capability_guidance}\n\nThis tool brings the Unity Editor to the foreground and may take 10-60 seconds depending on project size. Do NOT call it while `editor_status` is `playing` or `playing_paused`.",
+  "description": "Apply pending project C# changes through compilation and domain reload, and wait for the result. Use for changes requiring a full compile, refreshed test discovery, serialization/Inspector changes, or convergence after a burst of hot edits. Already-applied runtime changes can be observed before convergence. Requires the connected Editor to be in Edit Mode.\n\n{optional_capability_guidance}\n\nThe result's status, compilation/reload/bridge state, phase, and recommended action determine the next step. `already_converged` means an in-progress compile applied the changes; `up_to_date` means assemblies were current; `reloaded_without_compile` also clears live hot-patch detours. Recovery or incomplete statuses require following their reported action. This brings the Editor forward and may take 10-60 seconds. Plan mode blocks this state-changing operation.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,7 +10,7 @@
       "editor_status": {
         "type": "string",
         "enum": ["disconnected", "editing", "playing", "playing_paused"],
-        "description": "The canonical Unity Editor status from the Environment section's `Unity Editor Status`. Allowed values: `disconnected`, `editing`, `playing`, `playing_paused`. You MUST read the current status and pass it exactly. `unity_recompile` only runs when the actual status is `editing`."
+        "description": "Latest canonical Unity Editor status from the session announcement or a newer tool result. Pass disconnected, editing, playing, or playing_paused exactly; execution requires the actual state to be editing."
       }
     },
     "required": ["project_path", "editor_status"]

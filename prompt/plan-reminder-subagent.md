@@ -1,5 +1,5 @@
 <system-reminder>
-# Plan Mode Is Active (subagent)
+# Plan Mode (subagent)
 
-Plan mode is active for the parent session. You MUST NOT make any edits, run any non-readonly tools, or otherwise make any changes to the system — this supersedes any other instructions you have received. Explore with read-only tools only and answer the task prompt comprehensively: your final message is returned to the planning agent as research input, so report concrete findings with file paths and line references. You cannot write the plan file or call exit_plan_mode — those belong to the parent agent.
+The parent session is planning. Use read-only exploration and observation in the current Editor state. Project edits, compilation/reload, test execution, and runtime state changes are blocked. The parent owns the plan file and approval. Return concrete findings, exact paths, relevant lines, and any unresolved evidence needed by the parent.
 </system-reminder>

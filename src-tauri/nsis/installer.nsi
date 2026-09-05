@@ -721,6 +721,17 @@ Section Install
   ; Locus: $INSTDIR\user-agents is user-owned. The installer never removes or copies it,
   ; so custom Agent definitions survive both automatic and manual updates.
   Call LocusDetectSystemGit
+  ; Retired bundled Unity rules were merged into the remaining rule files.
+  ; Keep user-agents and project overlays intact during upgrades.
+  Delete "$INSTDIR\agent\unity\rule\collaborative_design_principles.md"
+  Delete "$INSTDIR\agent\unity\rule\code_change_principles.md"
+  Delete "$INSTDIR\agent\unity\rule\knowledge_usage.md"
+  Delete "$INSTDIR\agent\unity\rule\risk_control.md"
+  Delete "$INSTDIR\agent\unity\rule\tool_usage_strategy.md"
+  Delete "$INSTDIR\agent\unity\rule\unity_asset_search_strategy.md"
+  Delete "$INSTDIR\agent\unity\rule\unity_file_modification_strategy.md"
+  ; The removed dev Agent is installer-owned and must not survive an upgrade.
+  RMDir /r "$INSTDIR\agent\dev"
   ; Locus: replace optional bundled Python and Git resources.
   RMDir /r "$INSTDIR\managed-python"
   RMDir /r "$INSTDIR\managed-git"

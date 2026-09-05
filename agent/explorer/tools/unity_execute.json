@@ -1,0 +1,15 @@
+{
+  "parameters": {
+    "properties": {
+      "code": {
+        "description": "A bounded, observation-only C# method body for Unity research. Read known assets, importer settings, loaded objects, or stored fields without changing project or Editor state. Return concise evidence with print, printJson on materialized results, or ctx.PropertyTree with explicit limits."
+      },
+      "readonly": {
+        "description": "Explorer must always pass true. This is a declaration, not a C# sandbox: the code must leave Unity objects, assets, scenes, project settings, Editor state, and filesystem content unchanged. Read-only calls skip workspace mutation locking and undo snapshots."
+      },
+      "request_editor_status": {
+        "description": "Use the current Unity Editor state already supplied in context. Do not add a status-check step or request a state change."
+      }
+    }
+  }
+}

@@ -116,7 +116,7 @@ describe("knowledgeQueryProgress", () => {
     const agentSource = read("src-tauri/src/agent/instance/mod.rs");
 
     expect(agentSource).toContain("prompt_relative_physical_path(&resolved.physical_path");
-    expect(agentSource).toContain("`Structure` lists registered physical directories directly");
+    expect(agentSource).toContain("`Structure` lists physical directories: workspace-relative inside the checkout");
     expect(agentSource).toContain('render_scope("Project", project_roots)');
     expect(agentSource).toContain('render_scope("App", app_roots)');
     expect(agentSource).toContain("KnowledgeSourceKind::AppSkillPackage => source");

@@ -4,24 +4,27 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_AGENT_ID: &str = "unity";
-pub const LEGACY_UNITY_AGENT_ID: &str = "dev";
 pub const USER_AGENTS_DIR_NAME: &str = "user-agents";
 pub const GENERIC_PROJECT_TYPE: &str = "generic";
 pub const UNITY_PROJECT_TYPE: &str = "unity";
 
 pub fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
-        LEGACY_UNITY_AGENT_ID | "doc" | "wiki" | "git" | "knowledge" | "runtime_debugger" => {
+        "doc" | "wiki" | "git" | "knowledge" | "runtime_debugger" => {
             DEFAULT_AGENT_ID
         }
         _ => agent_id,
     }
 }
 
+pub fn is_removed_agent_id(agent_id: &str) -> bool {
+    agent_id == "dev"
+}
+
 pub fn is_hidden_legacy_agent_id(agent_id: &str) -> bool {
     matches!(
         agent_id,
-        LEGACY_UNITY_AGENT_ID | "doc" | "wiki" | "git" | "knowledge" | "runtime_debugger"
+        "dev" | "doc" | "wiki" | "git" | "knowledge" | "runtime_debugger"
     )
 }
 
@@ -33,18 +36,12 @@ pub fn user_agent_dir(app_agent_dir: &Path) -> PathBuf {
 }
 
 pub fn app_agent_layer_dirs(app_agent_dir: &Path, agent_id: &str) -> Vec<PathBuf> {
+    if is_removed_agent_id(agent_id) {
+        return Vec::new();
+    }
     let agent_id = canonical_agent_id(agent_id);
     let user_dir = user_agent_dir(app_agent_dir);
-    let mut dirs = Vec::new();
-    if agent_id == DEFAULT_AGENT_ID {
-        dirs.push(app_agent_dir.join(LEGACY_UNITY_AGENT_ID));
-    }
-    dirs.push(app_agent_dir.join(agent_id));
-    if agent_id == DEFAULT_AGENT_ID {
-        dirs.push(user_dir.join(LEGACY_UNITY_AGENT_ID));
-    }
-    dirs.push(user_dir.join(agent_id));
-    dirs
+    vec![app_agent_dir.join(agent_id), user_dir.join(agent_id)]
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -92,14 +89,6 @@ pub struct AgentDefRegistry {
 }
 
 impl AgentDefRegistry {
-    fn source_agent_id(agent_id: &str) -> &str {
-        if agent_id == LEGACY_UNITY_AGENT_ID {
-            DEFAULT_AGENT_ID
-        } else {
-            agent_id
-        }
-    }
-
     ///
     pub fn load(app_agent_dir: Option<&Path>, project_agent_dir: Option<&Path>) -> Self {
         Self::load_with_plugins(app_agent_dir, project_agent_dir, &[])
@@ -175,7 +164,10 @@ impl AgentDefRegistry {
             let Some(raw_id) = id else {
                 continue;
             };
-            let id = Self::source_agent_id(&raw_id).to_string();
+            if is_removed_agent_id(&raw_id) {
+                continue;
+            }
+            let id = raw_id;
             match Self::load_agent_from_dir(&dir, &id) {
                 Ok(mut def) => {
                     def.source =
@@ -218,10 +210,10 @@ impl AgentDefRegistry {
                 Some(name) => name.to_string(),
                 None => continue,
             };
-            if raw_id == LEGACY_UNITY_AGENT_ID && dir.join(DEFAULT_AGENT_ID).is_dir() {
+            if is_removed_agent_id(&raw_id) {
                 continue;
             }
-            let id = Self::source_agent_id(&raw_id).to_string();
+            let id = raw_id;
             match Self::load_agent_from_dir(&path, &id) {
                 Ok(mut def) => {
                     def.source = "app".to_string();
@@ -265,10 +257,10 @@ impl AgentDefRegistry {
                 Some(name) => name.to_string(),
                 None => continue,
             };
-            if raw_id == LEGACY_UNITY_AGENT_ID && dir.join(DEFAULT_AGENT_ID).is_dir() {
+            if is_removed_agent_id(&raw_id) {
                 continue;
             }
-            let id = Self::source_agent_id(&raw_id).to_string();
+            let id = raw_id;
 
             if let Some(existing) = defs.get_mut(&id) {
                 Self::merge_project_overlay(existing, &path);
@@ -320,10 +312,10 @@ impl AgentDefRegistry {
             else {
                 continue;
             };
-            if raw_id == LEGACY_UNITY_AGENT_ID && dir.join(DEFAULT_AGENT_ID).is_dir() {
+            if is_removed_agent_id(&raw_id) {
                 continue;
             }
-            let id = Self::source_agent_id(&raw_id).to_string();
+            let id = raw_id;
 
             if let Some(existing) = defs.get_mut(&id) {
                 Self::merge_project_overlay(existing, &path);
@@ -965,6 +957,42 @@ mod tests {
     }
 
     #[test]
+    fn explorer_inspection_override_preserves_shared_execution_schema() {
+        let agents = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
+        let explorer = agents.get("explorer").expect("Explorer should load");
+        let unity = agents.get("unity").expect("Unity Agent should load");
+        let tools = crate::tool::ToolRegistry::with_builtins();
+
+        assert!(explorer.tools.iter().any(|tool| tool == "unity_execute"));
+        assert!(!explorer.tools.iter().any(|tool| tool == "unity_get_console_log"));
+
+        let base = tools
+            .resolve_api_tool("unity_execute")
+            .expect("Unity execution tool");
+        let mut inspection = base.clone();
+        assert!(explorer.apply_tool_description_override("unity_execute", &mut inspection));
+        assert_eq!(
+            inspection["function"]["description"],
+            base["function"]["description"]
+        );
+        for name in ["code", "readonly", "request_editor_status"] {
+            assert_ne!(
+                inspection["function"]["parameters"]["properties"][name]["description"],
+                base["function"]["parameters"]["properties"][name]["description"],
+                "Explorer should specialize the {name} guidance"
+            );
+        }
+        let mut unchanged = base.clone();
+        assert!(!unity.apply_tool_description_override("unity_execute", &mut unchanged));
+        assert_eq!(unchanged, base);
+
+        let mut executable_schema = base;
+        remove_description_fields(&mut executable_schema);
+        remove_description_fields(&mut inspection);
+        assert_eq!(inspection, executable_schema);
+    }
+
+    #[test]
     fn unity_agent_exposes_view_property_tools() {
         let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
         let agent = registry
@@ -1001,7 +1029,7 @@ mod tests {
     #[test]
     fn retired_builtin_agent_ids_resolve_to_unity() {
         let registry = AgentDefRegistry::load(Some(repo_agent_dir().as_path()), None);
-        for legacy_id in ["dev", "git", "knowledge", "runtime_debugger", "doc", "wiki"] {
+        for legacy_id in ["git", "knowledge", "runtime_debugger", "doc", "wiki"] {
             assert_eq!(canonical_agent_id(legacy_id), DEFAULT_AGENT_ID);
             assert_eq!(
                 registry.get(legacy_id).map(|def| def.id.as_str()),
@@ -1011,31 +1039,68 @@ mod tests {
     }
 
     #[test]
-    fn legacy_dev_agent_directory_loads_as_unity() {
+    fn removed_dev_agent_directories_are_not_registered_or_merged() {
         let root = tempfile::tempdir().expect("temp root");
         let bundled_root = root.path().join("agent");
-        let legacy = bundled_root.join("dev");
-        fs::create_dir_all(&legacy).expect("legacy Agent dir");
-        fs::write(
-            legacy.join("config.json"),
-            r#"{"name":"Unity","description":"Legacy Unity Agent","tools":["read"],"default":true}"#,
-        )
-        .expect("legacy config");
-        fs::write(legacy.join("system.md"), "Legacy Unity prompt").expect("legacy prompt");
+        let project_root = root.path().join("workspace/Locus/agent");
+        for agent_root in [&bundled_root, &user_agent_dir(&bundled_root), &project_root] {
+            let legacy = agent_root.join("dev");
+            fs::create_dir_all(&legacy).expect("legacy Agent dir");
+            fs::write(
+                legacy.join("config.json"),
+                r#"{"name":"Legacy","tools":["write"],"default":true}"#,
+            )
+            .expect("legacy config");
+            fs::write(legacy.join("system.md"), "Legacy prompt").expect("legacy prompt");
+        }
 
-        let registry = AgentDefRegistry::load(Some(&bundled_root), None);
+        let registry = AgentDefRegistry::load(Some(&bundled_root), Some(&project_root));
+        assert!(registry.list_ids().is_empty());
+        assert!(registry.default_def().is_none());
+        assert_eq!(canonical_agent_id("dev"), "dev");
+        assert!(registry.get("dev").is_none());
+
+        let unity = bundled_root.join("unity");
+        fs::create_dir_all(&unity).expect("Unity Agent dir");
+        fs::write(
+            unity.join("config.json"),
+            r#"{"name":"Unity","tools":["read"],"default":true}"#,
+        )
+        .expect("Unity config");
+        fs::write(unity.join("system.md"), "Current Unity prompt").expect("Unity prompt");
+        let registry = AgentDefRegistry::load(Some(&bundled_root), Some(&project_root));
+        assert_eq!(registry.list_ids(), vec!["unity"]);
         assert_eq!(registry.default_id(), "unity");
-        assert_eq!(
-            registry.get("dev").map(|agent| agent.id.as_str()),
-            Some("unity")
-        );
+        assert!(registry.get("dev").is_none());
         assert_eq!(
             registry
                 .get("unity")
                 .map(|agent| agent.system_prompt.as_str()),
-            Some("Legacy Unity prompt")
+            Some("Current Unity prompt")
         );
-        assert!(registry.list_ids().into_iter().all(|id| id != "dev"));
+    }
+
+    #[test]
+    fn removed_dev_agent_plugin_definition_is_not_registered() {
+        let root = tempfile::tempdir().expect("temp root");
+        fs::write(
+            root.path().join("config.json"),
+            r#"{"name":"Legacy","tools":["read"],"default":true}"#,
+        )
+        .expect("plugin Agent config");
+        let source = crate::plugin::PluginComponentSource {
+            plugin_id: "test-plugin".to_string(),
+            plugin_name: "Test Plugin".to_string(),
+            plugin_version: "1.0.0".to_string(),
+            scope: crate::plugin::PluginInstallScope::App,
+            id: Some("dev".to_string()),
+            root: root.path().to_path_buf(),
+            rel_path: "agent".to_string(),
+        };
+        let registry = AgentDefRegistry::load_with_plugins(None, None, &[source]);
+        assert!(registry.list_ids().is_empty());
+        assert!(registry.get("dev").is_none());
+        assert!(registry.get("unity").is_none());
     }
 
     #[test]
