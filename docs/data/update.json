@@ -1,12 +1,12 @@
 {
-  "version": "0.8.1",
-  "releasedAt": "2026-09-02",
+  "version": "0.8.2",
+  "releasedAt": "2026-09-05",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,41 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.8.1 (2026-09-02)",
+      "summary": "Locus v0.8.2 (2026-09-05)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.2（新增）",
+          "items": [
+            "ChatGPT 订阅模型新增 GPT-6 Astra，支持思考强度与 Fast 模式；配置的上下文窗口现适用于全部订阅模型。",
+            "模型选择器新增会话级 Multi-Agent 控制，选择状态会随会话重载、分屏、独立窗口和会话分叉保留。",
+            "Python SDK 支持任务列表、查询、等待与取消，父子及同级 Agent 间消息通信，以及在原会话内续跑失败或取消的子 Agent。任务支持短名称和完整输出日志。升级后默认启用后台执行，可在实验性设置中关闭。",
+            "Explorer 可通过有界、只读的 C# 查询调查实时 Unity 数据，并结合代码与资产搜索返回结果。",
+            "归档会话与 Unity Inspector 内容统一在工作台编辑器标签中打开；Unity 选中对象和文件附件会发送到对应工作区最近聚焦的输入框。"
+          ]
+        },
+        {
+          "title": "v0.8.2（修复）",
+          "items": [
+            "对齐 Codex 订阅的 Responses 协议，支持工具命名空间、WebSocket 预热、HTTP 回退及请求压缩。会话重新打开或重连后保留原始响应项与加密推理内容；失败或不完整的响应会在执行工具前停止。",
+            "修正远程压缩对文本和图片的保留预算，并统一前后端对订阅模型上下文配置的应用。",
+            "子 Agent 使用自身配置的模型、提供方、凭据、思考强度和速度设置，修复模型名称已切换但请求仍走父 Agent 提供方的问题。",
+            "后台结果和 Agent 消息在投递前持久化，重试不会重复通知，前台轮次结束也不会覆盖后台结果。会话迁移保留旧上下文导出能力，历史缺失字段显式写为 empty。",
+            "Agent 页面、工作台编辑器、会话操作和独立窗口保持绑定所选工作区；磁盘文件变化后重新校验预览，同时保留未保存的编辑。",
+            "修复大量日志下控制台虚拟列表的行高测量、滚动和窗口缩放，并补充运行时卡顿与桥接诊断。",
+            "Unity 重编译结果在重试后仍可读取，并与发起操作正确关联。Plan 模式禁止重编译、测试执行和 Editor 状态变更，同时保留只读调查。",
+            "收敛 Unity 操作规则，明确已验证的编辑目标、Prefab 实例范围、通过 Unity API 修改结构化资产，以及沿用任务中已有授权。"
+          ]
+        },
+        {
+          "title": "v0.8.2（移除）",
+          "items": [
+            "移除独立的 get_task_status 和 cancel_task 工具，任务控制统一使用 Python SDK 内置接口。",
+            "Inspector 与归档会话工作流迁入工作台后，移除旧独立 Inspector 界面和设置中的归档会话页。",
+            "移除已合并的内置 Unity 规则文件；升级安装时清理旧内置副本，保留用户 Agent 定义与项目覆盖规则。",
+            "移除旧 dev Agent 兼容路径，其定义、规则和模型偏好不再加载或合并到 Unity；升级安装时清理内置 agent/dev 目录。"
+          ]
+        },
         {
           "title": "v0.8.1（新增）",
           "items": [
@@ -427,11 +459,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -441,9 +473,41 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.8.1 (2026-09-02)",
+      "summary": "Locus v0.8.2 (2026-09-05)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.2 (Added)",
+          "items": [
+            "Added GPT-6 Astra to ChatGPT subscription models, with reasoning effort and Fast mode controls. The configured context window now applies to all subscription models.",
+            "Added a per-session Multi-Agent control in the model selector. The selection is preserved across reloads, split panes, detached windows, and session forks.",
+            "The Python SDK can list, query, wait for, and cancel tasks; send messages between parent, child, and sibling Agents; and resume failed or cancelled subagents in their existing conversations. Tasks support short names and full output logs. Background execution is enabled by default on upgrade and can be disabled in Experimental settings.",
+            "Explorer can inspect live Unity data through bounded, read-only C# queries, alongside code and asset searches.",
+            "Archived sessions and Unity Inspector content now open in Workbench editor tabs. Unity selections and file attachments are sent to the most recently focused composer in the matching workspace."
+          ]
+        },
+        {
+          "title": "v0.8.2 (Fixed)",
+          "items": [
+            "Aligned Codex subscription requests with the current Responses protocol, including tool namespaces, WebSocket prewarming, HTTP fallback, and compressed HTTP requests. Reopened and reconnected conversations preserve canonical response items and encrypted reasoning; failed or incomplete responses stop before tool execution.",
+            "Corrected remote-compaction retention budgets for text and images, and applied configured subscription context limits consistently in the frontend and backend.",
+            "Subagents now use their configured model, provider, credentials, reasoning effort, and speed settings instead of inheriting the parent provider route.",
+            "Background results and Agent messages are persisted before delivery, retry without duplicate notifications, and survive foreground-round finalization. Session migrations preserve older context exports and explicitly mark missing historical fields as empty.",
+            "Kept Agent pages, Workbench editors, session controls, and detached windows bound to the selected workspace. File previews revalidate after disk changes while preserving unsaved edits.",
+            "Fixed virtual console row measurement, scrolling, and resizing with large log histories. Added runtime stall and bridge diagnostics.",
+            "Unity recompilation results remain available across retries and are matched to the originating operation. Plan mode now blocks recompilation, test execution, and Editor state changes while allowing read-only inspection.",
+            "Consolidated Unity guidance around verified edit targets, Prefab instance scope, structured asset edits through Unity APIs, and the existing authorization for the task."
+          ]
+        },
+        {
+          "title": "v0.8.2 (Removed)",
+          "items": [
+            "Removed the standalone get_task_status and cancel_task tools; task controls are built into the Python SDK.",
+            "Removed the separate legacy Inspector surface and archived-session Settings page after moving these workflows into the Workbench.",
+            "Removed superseded bundled Unity rule files. Upgrades clean up the retired bundled copies while preserving user Agent definitions and project overrides.",
+            "Removed the retired dev Agent compatibility path. Its definitions, rules, and model preferences are no longer loaded or merged into Unity; upgrades remove the bundled agent/dev directory."
+          ]
+        },
         {
           "title": "v0.8.1 (Added)",
           "items": [
@@ -839,11 +903,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

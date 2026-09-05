@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.8.1 (2026-09-02)"
+description: "Locus v0.8.2 (2026-09-05)"
 sidebarTitle: "当前版本"
-version: "0.8.1"
-releasedAt: "2026-09-02"
+version: "0.8.2"
+releasedAt: "2026-09-05"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,37 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.8.2（新增）
+
+- ChatGPT 订阅模型新增 GPT-6 Astra，支持思考强度与 Fast 模式；配置的上下文窗口现适用于全部订阅模型。
+- 模型选择器新增会话级 Multi-Agent 控制，选择状态会随会话重载、分屏、独立窗口和会话分叉保留。
+- Python SDK 支持任务列表、查询、等待与取消，父子及同级 Agent 间消息通信，以及在原会话内续跑失败或取消的子 Agent。任务支持短名称和完整输出日志。升级后默认启用后台执行，可在实验性设置中关闭。
+- Explorer 可通过有界、只读的 C# 查询调查实时 Unity 数据，并结合代码与资产搜索返回结果。
+- 归档会话与 Unity Inspector 内容统一在工作台编辑器标签中打开；Unity 选中对象和文件附件会发送到对应工作区最近聚焦的输入框。
+
+### v0.8.2（修复）
+
+- 对齐 Codex 订阅的 Responses 协议，支持工具命名空间、WebSocket 预热、HTTP 回退及请求压缩。会话重新打开或重连后保留原始响应项与加密推理内容；失败或不完整的响应会在执行工具前停止。
+- 修正远程压缩对文本和图片的保留预算，并统一前后端对订阅模型上下文配置的应用。
+- 子 Agent 使用自身配置的模型、提供方、凭据、思考强度和速度设置，修复模型名称已切换但请求仍走父 Agent 提供方的问题。
+- 后台结果和 Agent 消息在投递前持久化，重试不会重复通知，前台轮次结束也不会覆盖后台结果。会话迁移保留旧上下文导出能力，历史缺失字段显式写为 empty。
+- Agent 页面、工作台编辑器、会话操作和独立窗口保持绑定所选工作区；磁盘文件变化后重新校验预览，同时保留未保存的编辑。
+- 修复大量日志下控制台虚拟列表的行高测量、滚动和窗口缩放，并补充运行时卡顿与桥接诊断。
+- Unity 重编译结果在重试后仍可读取，并与发起操作正确关联。Plan 模式禁止重编译、测试执行和 Editor 状态变更，同时保留只读调查。
+- 收敛 Unity 操作规则，明确已验证的编辑目标、Prefab 实例范围、通过 Unity API 修改结构化资产，以及沿用任务中已有授权。
+
+### v0.8.2（移除）
+
+- 移除独立的 get_task_status 和 cancel_task 工具，任务控制统一使用 Python SDK 内置接口。
+- Inspector 与归档会话工作流迁入工作台后，移除旧独立 Inspector 界面和设置中的归档会话页。
+- 移除已合并的内置 Unity 规则文件；升级安装时清理旧内置副本，保留用户 Agent 定义与项目覆盖规则。
+- 移除旧 dev Agent 兼容路径，其定义、规则和模型偏好不再加载或合并到 Unity；升级安装时清理内置 agent/dev 目录。
 
 ### v0.8.1（新增）
 

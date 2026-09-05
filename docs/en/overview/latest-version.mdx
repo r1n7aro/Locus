@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.8.1 (2026-09-02)"
+description: "Locus v0.8.2 (2026-09-05)"
 sidebarTitle: "Latest Version"
-version: "0.8.1"
-releasedAt: "2026-09-02"
+version: "0.8.2"
+releasedAt: "2026-09-05"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,37 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.1/locus_0.8.1_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.8.2 (Added)
+
+- Added GPT-6 Astra to ChatGPT subscription models, with reasoning effort and Fast mode controls. The configured context window now applies to all subscription models.
+- Added a per-session Multi-Agent control in the model selector. The selection is preserved across reloads, split panes, detached windows, and session forks.
+- The Python SDK can list, query, wait for, and cancel tasks; send messages between parent, child, and sibling Agents; and resume failed or cancelled subagents in their existing conversations. Tasks support short names and full output logs. Background execution is enabled by default on upgrade and can be disabled in Experimental settings.
+- Explorer can inspect live Unity data through bounded, read-only C# queries, alongside code and asset searches.
+- Archived sessions and Unity Inspector content now open in Workbench editor tabs. Unity selections and file attachments are sent to the most recently focused composer in the matching workspace.
+
+### v0.8.2 (Fixed)
+
+- Aligned Codex subscription requests with the current Responses protocol, including tool namespaces, WebSocket prewarming, HTTP fallback, and compressed HTTP requests. Reopened and reconnected conversations preserve canonical response items and encrypted reasoning; failed or incomplete responses stop before tool execution.
+- Corrected remote-compaction retention budgets for text and images, and applied configured subscription context limits consistently in the frontend and backend.
+- Subagents now use their configured model, provider, credentials, reasoning effort, and speed settings instead of inheriting the parent provider route.
+- Background results and Agent messages are persisted before delivery, retry without duplicate notifications, and survive foreground-round finalization. Session migrations preserve older context exports and explicitly mark missing historical fields as empty.
+- Kept Agent pages, Workbench editors, session controls, and detached windows bound to the selected workspace. File previews revalidate after disk changes while preserving unsaved edits.
+- Fixed virtual console row measurement, scrolling, and resizing with large log histories. Added runtime stall and bridge diagnostics.
+- Unity recompilation results remain available across retries and are matched to the originating operation. Plan mode now blocks recompilation, test execution, and Editor state changes while allowing read-only inspection.
+- Consolidated Unity guidance around verified edit targets, Prefab instance scope, structured asset edits through Unity APIs, and the existing authorization for the task.
+
+### v0.8.2 (Removed)
+
+- Removed the standalone get_task_status and cancel_task tools; task controls are built into the Python SDK.
+- Removed the separate legacy Inspector surface and archived-session Settings page after moving these workflows into the Workbench.
+- Removed superseded bundled Unity rule files. Upgrades clean up the retired bundled copies while preserving user Agent definitions and project overrides.
+- Removed the retired dev Agent compatibility path. Its definitions, rules, and model preferences are no longer loaded or merged into Unity; upgrades remove the bundled agent/dev directory.
 
 ### v0.8.1 (Added)
 
