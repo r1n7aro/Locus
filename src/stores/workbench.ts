@@ -15,6 +15,23 @@ export const WORKBENCH_MIN_SPLIT_RATIO = 0.18;
 export const WORKBENCH_MAX_SPLIT_RATIO = 0.82;
 const WORKBENCH_STORAGE_PREFIX = "locus:workbench-window:";
 
+export function isWorkbenchMarkdownPath(path: string): boolean {
+  return /\.(?:md|markdown)$/i.test(path.trim());
+}
+
+export function normalizeWorkbenchResource(
+  resource: WorkbenchResourceRef,
+): WorkbenchResourceRef {
+  if (resource.kind === "asset" && isWorkbenchMarkdownPath(resource.path)) {
+    return {
+      kind: "workspaceFile",
+      projectId: resource.projectId,
+      path: resource.path,
+    };
+  }
+  return resource;
+}
+
 function nextStableId(prefix: string): string {
   const uuid = globalThis.crypto?.randomUUID?.();
   if (uuid) return `${prefix}-${uuid}`;
@@ -22,6 +39,7 @@ function nextStableId(prefix: string): string {
 }
 
 export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
+  resource = normalizeWorkbenchResource(resource);
   switch (resource.kind) {
     case "project": return `project:${resource.projectId}`;
     case "newSession": return `new-session:${resource.projectId}`;
@@ -63,7 +81,7 @@ export function createWorkbenchEditorInput(
 ): WorkbenchEditorInput {
   return {
     editorId: options.editorId ?? nextStableId("editor"),
-    resource,
+    resource: normalizeWorkbenchResource(resource),
     title,
     icon: options.icon ?? null,
     preview: options.preview ?? true,
@@ -185,7 +203,7 @@ function createWindowState(windowId: string): WorkbenchWindowState {
 }
 
 function cloneResource(resource: WorkbenchResourceRef): WorkbenchResourceRef {
-  return { ...resource } as WorkbenchResourceRef;
+  return { ...normalizeWorkbenchResource(resource) } as WorkbenchResourceRef;
 }
 
 function isRestorableResource(value: unknown): value is WorkbenchResourceRef {
@@ -199,7 +217,7 @@ function isRestorableResource(value: unknown): value is WorkbenchResourceRef {
     case "collaboration":
       return true;
     case "checkout": return typeof resource.checkoutId === "string";
-    case "section": return ["sessions", "knowledge", "collab", "assets", "views"].includes(
+    case "section": return ["sessions", "archived", "knowledge", "collab", "assets", "views"].includes(
       String(resource.section),
     );
     case "folder": return typeof resource.nodeId === "string";
@@ -258,11 +276,11 @@ function normalizeRestoredResource(resource: WorkbenchResourceRef): WorkbenchRes
       projectId: legacy.projectId,
       path: legacy.path,
     };
-    case "asset": return {
+    case "asset": return normalizeWorkbenchResource({
       kind: "asset",
       projectId: legacy.projectId,
       path: legacy.path,
-    };
+    });
     case "sceneObject": return {
       kind: "sceneObject",
       projectId: legacy.projectId,
@@ -441,8 +459,157 @@ function windowBelongsToWorkspaceScope(
   state: WorkbenchWindowState,
   workspaceScopeId: string,
 ): boolean {
-  const tabs = Object.values(state.groups).flatMap((group) => group.tabs);
-  return tabs.every((editor) => editor.checkoutBinding?.checkoutId === workspaceScopeId);
+  return Object.values(state.groups).every((group) => (
+    (group.focusedCheckoutId === null || group.focusedCheckoutId === workspaceScopeId)
+    && group.tabs.every((editor) => editor.checkoutBinding?.checkoutId === workspaceScopeId)
+  ));
+}
+
+interface StoredWorkspaceCandidate {
+  sourceScopeId: string;
+  state: WorkbenchWindowState;
+  tabCount: number;
+}
+
+function scopedStoragePrefix(windowId: string): string {
+  return `${storageKey(windowId)}:workspace:`;
+}
+
+function workspaceScopeFromStorageKey(windowId: string, key: string): string | null {
+  const prefix = scopedStoragePrefix(windowId);
+  if (!key.startsWith(prefix)) return null;
+  try {
+    return normalizeWorkspaceScopeId(decodeURIComponent(key.slice(prefix.length)));
+  } catch {
+    return null;
+  }
+}
+
+function workspaceTabCount(state: WorkbenchWindowState): number {
+  return Object.values(state.groups).reduce((count, group) => count + group.tabs.length, 0);
+}
+
+function projectWindowToWorkspaceScope(
+  source: WorkbenchWindowState,
+  workspaceScopeId: string,
+): WorkbenchWindowState {
+  const state = serializableWindow(source);
+  for (const group of Object.values(state.groups)) {
+    group.tabs = group.tabs.filter(
+      (editor) => editor.checkoutBinding?.checkoutId === workspaceScopeId,
+    );
+    if (!group.tabs.some((editor) => editor.editorId === group.activeEditorId)) {
+      group.activeEditorId = group.tabs[0]?.editorId ?? null;
+    }
+    const activeEditor = group.tabs.find((editor) => editor.editorId === group.activeEditorId);
+    group.focusedCheckoutId = activeEditor ? workspaceScopeId : null;
+  }
+  if (state.groups[state.focusedPaneId]?.tabs.length === 0) {
+    state.focusedPaneId = Object.values(state.groups).find((group) => group.tabs.length > 0)?.paneId
+      ?? state.focusedPaneId;
+  }
+  return state;
+}
+
+function mergeWorkspaceCandidates(
+  windowId: string,
+  workspaceScopeId: string,
+  candidates: StoredWorkspaceCandidate[],
+): WorkbenchWindowState {
+  const ordered = [...candidates].sort((left, right) => {
+    const leftScore = (left.tabCount > 0 ? 1_000_000 : 0)
+      + (left.sourceScopeId === workspaceScopeId ? 100_000 : 0)
+      + left.tabCount;
+    const rightScore = (right.tabCount > 0 ? 1_000_000 : 0)
+      + (right.sourceScopeId === workspaceScopeId ? 100_000 : 0)
+      + right.tabCount;
+    return rightScore - leftScore;
+  });
+  const primary = ordered.shift()?.state ?? createWindowState(windowId);
+  const targetGroup = primary.groups[primary.focusedPaneId]
+    ?? Object.values(primary.groups)[0];
+  if (!targetGroup) return createWindowState(windowId);
+
+  const knownEditorIds = new Set(
+    Object.values(primary.groups).flatMap((group) => group.tabs.map((editor) => editor.editorId)),
+  );
+  for (const candidate of ordered) {
+    for (const editor of Object.values(candidate.state.groups).flatMap((group) => group.tabs)) {
+      if (knownEditorIds.has(editor.editorId)) continue;
+      knownEditorIds.add(editor.editorId);
+      targetGroup.tabs.push(serializableEditor(editor));
+    }
+  }
+  if (!targetGroup.activeEditorId && targetGroup.tabs[0]) {
+    targetGroup.activeEditorId = targetGroup.tabs[0].editorId;
+  }
+  for (const group of Object.values(primary.groups)) {
+    const activeEditor = group.tabs.find((editor) => editor.editorId === group.activeEditorId);
+    group.focusedCheckoutId = activeEditor ? workspaceScopeId : null;
+  }
+  return primary;
+}
+
+/**
+ * Repairs historical per-workspace layout slots that were written under the
+ * wrong checkout key. Editors are routed by their durable checkout binding;
+ * an existing correctly keyed layout remains the primary layout and displaced
+ * editors are merged into it.
+ */
+function repairStoredWorkspaceScopes(windowId: string): void {
+  if (typeof window === "undefined") return;
+  const prefix = scopedStoragePrefix(windowId);
+  const entries: Array<{ scopeId: string; state: WorkbenchWindowState }> = [];
+  for (let index = 0; index < window.localStorage.length; index += 1) {
+    const key = window.localStorage.key(index);
+    if (!key?.startsWith(prefix)) continue;
+    const scopeId = workspaceScopeFromStorageKey(windowId, key);
+    if (!scopeId) continue;
+    try {
+      const parsed: unknown = JSON.parse(window.localStorage.getItem(key) ?? "null");
+      if (!isRestorableWindow(parsed, windowId)) continue;
+      entries.push({ scopeId, state: normalizeRestoredWindow(parsed) });
+    } catch {
+      // Invalid entries remain isolated from valid workspace layouts.
+    }
+  }
+  if (entries.length === 0) return;
+
+  const candidates = new Map<string, StoredWorkspaceCandidate[]>();
+  const sourceScopes = new Set(entries.map((entry) => entry.scopeId));
+  let repairRequired = false;
+  for (const entry of entries) {
+    const checkoutIds = new Set<string>([entry.scopeId]);
+    for (const group of Object.values(entry.state.groups)) {
+      for (const editor of group.tabs) {
+        const checkoutId = editor.checkoutBinding?.checkoutId;
+        if (checkoutId) checkoutIds.add(checkoutId);
+      }
+    }
+    if (!windowBelongsToWorkspaceScope(entry.state, entry.scopeId)) repairRequired = true;
+    for (const checkoutId of checkoutIds) {
+      const state = projectWindowToWorkspaceScope(entry.state, checkoutId);
+      const list = candidates.get(checkoutId) ?? [];
+      list.push({
+        sourceScopeId: entry.scopeId,
+        state,
+        tabCount: workspaceTabCount(state),
+      });
+      candidates.set(checkoutId, list);
+    }
+  }
+  if (!repairRequired) return;
+
+  const destinationScopes = new Set([...sourceScopes, ...candidates.keys()]);
+  for (const scopeId of destinationScopes) {
+    const repaired = mergeWorkspaceCandidates(
+      windowId,
+      scopeId,
+      candidates.get(scopeId) ?? [],
+    );
+    window.localStorage.setItem(storageKey(windowId, scopeId), JSON.stringify(repaired));
+  }
+  console.warn(`[workbench] repaired checkout-scoped layouts for window ${windowId}`);
 }
 
 export function replaceWorkbenchPane(
@@ -489,6 +656,7 @@ export function removeWorkbenchPane(
 export const useWorkbenchStore = defineStore("workbench", () => {
   const windows = ref<Record<string, WorkbenchWindowState>>({});
   const workspaceScopes = ref<Record<string, string | null>>({});
+  const repairedStorageWindows = new Set<string>();
 
   const mainWindow = computed(() => windows.value.main ?? null);
 
@@ -502,9 +670,18 @@ export const useWorkbenchStore = defineStore("workbench", () => {
   ): WorkbenchWindowState | null {
     if (typeof window === "undefined") return null;
     try {
+      if (workspaceScopeId && !repairedStorageWindows.has(windowId)) {
+        repairStoredWorkspaceScopes(windowId);
+        repairedStorageWindows.add(windowId);
+      }
       const raw = window.localStorage.getItem(storageKey(windowId, workspaceScopeId));
       const parsed: unknown = raw ? JSON.parse(raw) : null;
-      if (isRestorableWindow(parsed, windowId)) return normalizeRestoredWindow(parsed);
+      if (isRestorableWindow(parsed, windowId)) {
+        const restored = normalizeRestoredWindow(parsed);
+        if (!workspaceScopeId || windowBelongsToWorkspaceScope(restored, workspaceScopeId)) {
+          return restored;
+        }
+      }
 
       // The unscoped key predates per-workspace layouts. Adopt it once when all
       // of its tabs already belong to the workspace being activated.
@@ -525,9 +702,16 @@ export const useWorkbenchStore = defineStore("workbench", () => {
   function persist(windowId: string): void {
     const state = windows.value[windowId];
     if (!state || typeof window === "undefined") return;
+    const scopeId = workspaceScope(windowId);
+    if (scopeId && !windowBelongsToWorkspaceScope(state, scopeId)) {
+      console.error(
+        `[workbench] refused to persist a layout outside checkout scope ${scopeId}`,
+      );
+      return;
+    }
     try {
       window.localStorage.setItem(
-        storageKey(windowId, workspaceScope(windowId)),
+        storageKey(windowId, scopeId),
         JSON.stringify(serializableWindow(state)),
       );
     } catch (error) {
@@ -542,6 +726,20 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     const state = restored ?? createWindowState(windowId);
     windows.value[windowId] = state;
     return state;
+  }
+
+  function requireEditorWorkspaceScope(
+    windowId: string,
+    editor: WorkbenchEditorInput,
+    operation: string,
+  ): void {
+    const scopeId = workspaceScope(windowId);
+    if (!scopeId) return;
+    const checkoutId = normalizeWorkspaceScopeId(editor.checkoutBinding?.checkoutId);
+    if (checkoutId === scopeId) return;
+    throw new Error(
+      `[workbench] ${operation} requires checkout ${scopeId}; received ${checkoutId ?? "empty"}`,
+    );
   }
 
   function switchWorkspaceScope(
@@ -602,6 +800,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     const target = state.groups[paneId];
     const editor = target?.tabs.find((candidate) => candidate.editorId === editorId);
     if (!target || !editor) return false;
+    requireEditorWorkspaceScope(windowId, editor, "activateEditor");
     target.activeEditorId = editorId;
     target.focusedCheckoutId = editor.checkoutBinding?.checkoutId ?? target.focusedCheckoutId ?? null;
     if (options.focusPane !== false) state.focusedPaneId = paneId;
@@ -622,6 +821,11 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     } = {},
   ): WorkbenchEditorInput {
     const state = ensureWindow(windowId);
+    input = {
+      ...input,
+      resource: cloneResource(input.resource),
+    };
+    requireEditorWorkspaceScope(windowId, input, "openEditor");
     const paneId = options.paneId && state.groups[options.paneId]
       ? options.paneId
       : state.focusedPaneId;
@@ -684,6 +888,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
       capabilities: { ...input.capabilities },
       checkoutBinding: input.checkoutBinding ? { ...input.checkoutBinding } : null,
     };
+    requireEditorWorkspaceScope(windowId, editor, "replaceEditor");
     target.tabs.splice(index, 1, editor);
     target.activeEditorId = editor.editorId;
     target.focusedCheckoutId = editor.checkoutBinding?.checkoutId ?? null;
@@ -709,6 +914,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
   ): WorkbenchEditorInput | null {
     const editor = group(windowId, paneId)?.tabs.find((candidate) => candidate.editorId === editorId);
     if (!editor) return null;
+    requireEditorWorkspaceScope(windowId, { ...editor, ...patch, editorId }, "updateEditor");
     Object.assign(editor, patch, { editorId });
     persist(windowId);
     return editor;
@@ -722,6 +928,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
   ): string | null {
     const state = ensureWindow(windowId);
     if (!state.groups[paneId]) return null;
+    if (editor) requireEditorWorkspaceScope(windowId, editor, "splitPane");
     const newPaneId = nextStableId("pane");
     const before = direction === "left" || direction === "top";
     const orientation = direction === "left" || direction === "right"
@@ -808,6 +1015,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     const target = state.groups[targetPaneId];
     const sourceEditor = source?.tabs.find((editor) => editor.editorId === editorId);
     if (!source || !target || !sourceEditor) return null;
+    requireEditorWorkspaceScope(windowId, sourceEditor, "moveEditor");
     const direction = options.direction ?? "center";
     if (sourcePaneId === targetPaneId && direction === "center") {
       const from = source.tabs.findIndex((editor) => editor.editorId === editorId);
@@ -855,6 +1063,7 @@ export const useWorkbenchStore = defineStore("workbench", () => {
       allowDuplicate?: boolean;
     } = {},
   ): WorkbenchTransferAcceptResult | null {
+    requireEditorWorkspaceScope(windowId, input, "acceptTransferredEditor");
     const state = ensureWindow(windowId);
     const target = state.groups[targetPaneId];
     if (!target) return null;

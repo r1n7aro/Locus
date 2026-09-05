@@ -1,8 +1,18 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
+import {
+  subscribeUnitySendToLocus,
+  type UnitySendToLocusEventPayload,
+} from "../services/unity";
+import {
+  clearLastFocusedComposer,
+  readLastFocusedComposer,
+  writeLastFocusedComposer,
+} from "../services/unitySendToLocusFocus";
 import {
   createSession,
   exportSessionContext as exportContext,
@@ -27,6 +37,8 @@ import { useProjectStore } from "../stores/project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import { useUiStore } from "../stores/ui";
 import { useSkills } from "../composables/useSkills";
+import type { UserMessageDraft } from "../composables/chatMessageDraft";
+import { emptyComposerIntent } from "../composables/chatInputIntents";
 import {
   createAnimationFrameResizeObserver,
   type ResizeObserverHandle,
@@ -71,6 +83,14 @@ const workspaceContextStore = useWorkspaceContextStore();
 const uiStore = useUiStore();
 const { skillItems, loadSkills } = useSkills();
 const contextReviewFiles = ref(new Map<string, ManagedLocalFileAttachment>());
+const chatViewRef = ref<InstanceType<typeof ChatView> | null>(null);
+let releaseUnitySendToLocus: (() => void) | null = null;
+let chatWindowId = "main";
+try {
+  chatWindowId = getCurrentWindow().label;
+} catch {
+  // Browser-only tests use the main-window identity.
+}
 
 const workspaceRef = ref<HTMLElement | null>(null);
 const workspaceWidth = ref(0);
@@ -591,6 +611,46 @@ async function reviewSessionContext(request?: string | SessionContextExportReque
   }
 }
 
+async function handleUnitySendToLocus(payload: UnitySendToLocusEventPayload): Promise<void> {
+  const focusTarget = readLastFocusedComposer();
+  if (
+    focusTarget?.surface !== "chatWorkspace"
+    || focusTarget.windowId !== chatWindowId
+  ) return;
+
+  const currentWorkspace = workspaceContextStore.focusedWorkspaceRef;
+  if (
+    !currentWorkspace
+    || currentWorkspace.checkoutId !== payload.workspaceRef.checkoutId
+    || (
+      payload.workspaceRef.expectedGeneration != null
+      && currentWorkspace.expectedGeneration != null
+      && currentWorkspace.expectedGeneration !== payload.workspaceRef.expectedGeneration
+    )
+  ) return;
+
+  const draft: UserMessageDraft = {
+    text: "",
+    images: [],
+    assetRefs: payload.assetRefs ?? [],
+    localFiles: (payload.files ?? []).map((file) => ({ ...file })),
+    consoleTexts: [],
+    intent: emptyComposerIntent(),
+  };
+  if (draft.assetRefs.length === 0 && draft.localFiles.length === 0) return;
+  await chatViewRef.value?.appendComposerDraft(draft);
+}
+
+function handleComposerFocus(): void {
+  const currentWorkspace = workspaceContextStore.focusedWorkspaceRef;
+  if (!currentWorkspace) return;
+  writeLastFocusedComposer({
+    surface: "chatWorkspace",
+    windowId: chatWindowId,
+    checkoutId: currentWorkspace.checkoutId,
+  });
+}
+
 defineExpose({
   exportSessionContext,
   reviewSessionContext,
@@ -598,6 +658,13 @@ defineExpose({
 
 onMounted(() => {
   nextTick(connectWorkspaceResizeObserver);
+  void subscribeUnitySendToLocus((payload) => {
+    void handleUnitySendToLocus(payload);
+  }).then((release) => {
+    releaseUnitySendToLocus = release;
+  }).catch((error) => {
+    console.warn("[ChatWorkspaceView] Send to Locus subscription failed", error);
+  });
 });
 
 watch(
@@ -614,6 +681,9 @@ watch(
 onUnmounted(() => {
   disconnectWorkspaceResizeObserver();
   disconnectAssistantSidebarResizeObserver();
+  releaseUnitySendToLocus?.();
+  releaseUnitySendToLocus = null;
+  clearLastFocusedComposer({ surface: "chatWorkspace", windowId: chatWindowId });
 });
 </script>
 
@@ -627,6 +697,7 @@ onUnmounted(() => {
     }"
   >
     <ChatView
+      ref="chatViewRef"
       v-show="active"
       :layout-mode="layoutMode"
       :default-session-panel-collapsed="defaultSessionPanelCollapsed"
@@ -707,6 +778,7 @@ onUnmounted(() => {
       @install-plugin="projectStore.installPlugin"
       @launch-unity-project="projectStore.launchUnityProject"
       @layout-mode-change="handleLayoutModeChange"
+      @composer-focus="handleComposerFocus"
     />
     <ThinkingPanel
       v-if="active && chatStore.showThinkingPanel"

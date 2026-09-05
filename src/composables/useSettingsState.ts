@@ -433,7 +433,7 @@ export function useSettingsState(emit: SettingsEmit) {
   }
 
   // ── Navigation ───────────────────────────────────────────────────────
-  const activeCategory = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "archived" | "console" | "about" | "experimental">("general");
+  const activeCategory = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "console" | "about" | "experimental">("general");
 
   // ── Provider / API key state ─────────────────────────────────────────
   const providers = ref<ProviderStatus[]>([]);

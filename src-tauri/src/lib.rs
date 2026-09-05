@@ -197,6 +197,10 @@ pub(crate) fn reveal_main_window(app_handle: &tauri::AppHandle) {
         if let Err(error) = window.show() {
             eprintln!("[Locus] failed to show main window: {}", error);
         }
+        #[cfg(target_os = "windows")]
+        if let Ok(hwnd) = window.hwnd() {
+            unity_bridge::restore_foreground(hwnd.0 as isize);
+        }
         if let Err(error) = window.set_focus() {
             eprintln!("[Locus] failed to focus main window: {}", error);
         }
@@ -1041,10 +1045,12 @@ pub fn run() {
             }
 
             if let Some(cli_driver_config) = cli_driver_for_setup.clone() {
-                cli_driver::spawn(app.handle().clone(), cli_driver_config);
-                startup_for_setup.mark("setup_cli_driver_scheduled");
-                startup_for_setup.mark("setup_done");
-                return Ok(());
+                if !cli_driver_config.requires_frontend() {
+                    cli_driver::spawn(app.handle().clone(), cli_driver_config);
+                    startup_for_setup.mark("setup_cli_driver_scheduled");
+                    startup_for_setup.mark("setup_done");
+                    return Ok(());
+                }
             }
 
             let main_window_config = app
@@ -1065,7 +1071,11 @@ pub fn run() {
                     features,
                 )
             });
-            if skip_onboarding_for_setup {
+            if skip_onboarding_for_setup
+                || cli_driver_for_setup
+                    .as_ref()
+                    .is_some_and(cli_driver::CliDriverConfig::requires_frontend)
+            {
                 main_window_builder = main_window_builder.initialization_script(
                     "try { localStorage.setItem('locus-onboarding-completed', '1'); } catch (_) {}",
                 );
@@ -1079,6 +1089,12 @@ pub fn run() {
                 main_window_builder.initialization_script(debug_initialization_script);
             main_window_builder.build()?;
             startup_for_setup.mark("main_window_build_done");
+            if let Some(cli_driver_config) = cli_driver_for_setup.clone() {
+                cli_driver::spawn(app.handle().clone(), cli_driver_config);
+                startup_for_setup.mark("setup_cli_driver_scheduled");
+                startup_for_setup.mark("setup_done");
+                return Ok(());
+            }
             if app.state::<Arc<AppConfig>>().debug_enabled() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -1274,6 +1290,7 @@ pub fn run() {
             commands::list_workspace_runtimes,
             commands::list_project_contexts,
             commands::open_workspace,
+            commands::remove_workspace,
             commands::focus_workspace,
             commands::set_active_session,
             commands::detach_workspace_pane,
@@ -1443,8 +1460,10 @@ pub fn run() {
             commands::project_explorer_delete_preset,
             commands::project_explorer_list_mount,
             commands::project_explorer_preview_file,
+            commands::project_explorer_file_revision,
             commands::project_explorer_write_file,
             commands::workspace_file_preview,
+            commands::workspace_file_revision,
             commands::workspace_file_write,
             commands::knowledge_list_scoped,
             commands::knowledge_list_page,

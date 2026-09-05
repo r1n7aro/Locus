@@ -15,12 +15,6 @@ using Microsoft.Win32;
 
 namespace Locus
 {
-    public enum SendToLocusMode
-    {
-        FocusedSession,
-        NewSession
-    }
-
     public sealed class LocusFileAttachment
     {
         public string Path { get; }
@@ -44,6 +38,7 @@ namespace Locus
     public sealed class LocusEditorWindow : EditorWindow
     {
         private const bool OverlaySyncEnabled = true;
+        private const string SendToLocusEvent = "unity-send-to-locus";
         private const string PipeNamePrefix = "locus_tauri_unity_embed_";
         private const string FullPipeNamePrefix = @"\\.\pipe\";
         private const double SyncIntervalSeconds = 0.12d;
@@ -146,11 +141,16 @@ namespace Locus
             public long parentHwnd;
             public string reason;
             public DroppedAssetRef[] assetRefs;
-            public LocusFileDropRef[] files;
-            public string sendMode;
             // Set to "reloading" while the managed domain reloads so the Tauri
             // server retains the overlay (the native client keeps the pipe up).
             public string managedOverlayState;
+        }
+
+        [Serializable]
+        private sealed class SendToLocusMessage
+        {
+            public DroppedAssetRef[] assetRefs;
+            public LocusFileDropRef[] files;
         }
 
         [Serializable]
@@ -354,83 +354,48 @@ namespace Locus
 
         private static void SendSelectedRefsToLocus()
         {
-            SendToLocus(SendToLocusMode.FocusedSession);
+            SendToLocus();
         }
 
         /// <summary>
-        /// Sends the current Unity selection to Locus as asset or scene-object
-        /// references. FocusedSession appends to the active composer;
-        /// NewSession opens a fresh session draft before attaching the refs.
+        /// Sends the current Unity selection to the most recently focused Locus composer.
         /// </summary>
-        public static bool SendToLocus(
-            SendToLocusMode mode = SendToLocusMode.FocusedSession)
+        public static bool SendToLocus()
         {
-            string sendMode = SerializeSendToLocusMode(mode);
             DroppedAssetRef[] assetRefs = BuildSelectedAssetRefs();
             if (assetRefs.Length == 0)
                 return false;
 
-            return QueueSendToLocusMessage(new EmbedControlMessage
+            return SendToLocus(new SendToLocusMessage
             {
-                type = "assetDrop",
-                assetRefs = assetRefs,
-                sendMode = sendMode
+                assetRefs = assetRefs
             });
         }
 
         /// <summary>
-        /// Sends explicit local files or folders to Locus. Invalid or missing
-        /// paths are ignored; returns false when no attachment can be sent.
+        /// Sends explicit local files or folders to the most recently focused Locus composer.
+        /// Invalid or missing paths are ignored; returns false when no attachment can be sent.
         /// </summary>
-        public static bool SendToLocus(
-            IReadOnlyList<LocusFileAttachment> attachments,
-            SendToLocusMode mode = SendToLocusMode.FocusedSession)
+        public static bool SendToLocus(IReadOnlyList<LocusFileAttachment> attachments)
         {
             if (attachments == null)
                 throw new ArgumentNullException(nameof(attachments));
 
-            string sendMode = SerializeSendToLocusMode(mode);
             LocusFileDropRef[] files = BuildLocalFileDropRefs(attachments);
             if (files.Length == 0)
                 return false;
 
-            return QueueSendToLocusMessage(new EmbedControlMessage
+            return SendToLocus(new SendToLocusMessage
             {
-                type = "fileDrop",
-                files = files,
-                sendMode = sendMode
+                files = files
             });
         }
 
-        private static bool QueueSendToLocusMessage(EmbedControlMessage message)
+        private static bool SendToLocus(SendToLocusMessage message)
         {
-            string json = JsonUtility.ToJson(message);
-            string pipeName = GetControlPipeName();
-
-            Task.Run(() =>
-            {
-                try
-                {
-                    WritePipeLineOnce(pipeName, json);
-                }
-                catch
-                {
-                }
-            });
-            return true;
-        }
-
-        private static string SerializeSendToLocusMode(SendToLocusMode mode)
-        {
-            switch (mode)
-            {
-                case SendToLocusMode.FocusedSession:
-                    return "focusedSession";
-                case SendToLocusMode.NewSession:
-                    return "newSession";
-                default:
-                    throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported Send to Locus mode.");
-            }
+            return LocusBridge.TrySendEventToRust(
+                SendToLocusEvent,
+                JsonUtility.ToJson(message));
         }
 
         private static void EnsureLifecycleHooks()

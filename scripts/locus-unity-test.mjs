@@ -97,6 +97,7 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite connect
   bun run locus:test:unity -- --project F:\\Game --workspace-project F:\\GameCopy --workspace-project F:\\GameWorktree --suite workspace --install-plugin
   bun run locus:test:unity -- --project F:\\GameA --workspace-project F:\\GameB --suite workspace-switch --install-plugin
+  bun run locus:test:unity -- --project F:\\Game --suite session-undo
   bun run locus:test:unity -- --project F:\\Game --suite type-index --type-index-sample all
   bun run locus:test:unity -- --project F:\\Game --suite state-probe --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite native-bridge --prepare-native --install-plugin
@@ -114,7 +115,7 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              workspace | workspace-switch | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | python-sdk | modal-dialog | safe-mode | yaml-parity | unity-test | all
+  --suite <name>              workspace | workspace-switch | session-undo | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | python-sdk | modal-dialog | safe-mode | yaml-parity | unity-test | all
                                hot-reload-release runs Release first, then switches to Debug at runtime and runs again
                                every CLI driver run enables Locus Debug mode inside its isolated config
   --workspace-project <path>  Additional Unity project for a single-process workspace suite; repeat as needed

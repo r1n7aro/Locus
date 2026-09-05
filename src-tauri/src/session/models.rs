@@ -288,6 +288,8 @@ pub enum ProjectExplorerOperation {
         position: i64,
     },
     PlaceResource {
+        #[serde(default)]
+        node_id: Option<String>,
         resource_kind: String,
         resource_id: String,
         #[serde(default)]
@@ -336,6 +338,7 @@ mod project_explorer_operation_tests {
     fn deserializes_camel_case_frontend_fields() {
         let operation = serde_json::from_value::<ProjectExplorerOperation>(serde_json::json!({
             "kind": "placeResource",
+            "nodeId": "knowledge-node",
             "resourceKind": "knowledge",
             "resourceId": "memory-a",
             "parentNodeId": "knowledge-type:project-a:memory",
@@ -346,6 +349,7 @@ mod project_explorer_operation_tests {
         assert_eq!(
             operation,
             ProjectExplorerOperation::PlaceResource {
+                node_id: Some("knowledge-node".to_string()),
                 resource_kind: "knowledge".to_string(),
                 resource_id: "memory-a".to_string(),
                 source_kind: None,

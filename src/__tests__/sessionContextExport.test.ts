@@ -6,13 +6,14 @@ function read(path: string): string {
 }
 
 describe("structured session context export", () => {
-  it("uses schema v38 with citation persistence and prior context migrations", () => {
+  it("uses schema v40 with workspace visibility and prior context migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 39;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 40;");
     expect(store).toContain('36,\n                "persist project contexts, shared sessions, and scoped runs"');
     expect(store).toContain('37,\n                "backfill unambiguous legacy session checkout bindings"');
     expect(store).toContain('38,\n                "persist explicit citation arrays on assistant text render parts"');
+    expect(store).toContain('Self::migrate(conn, 40, "persist workspace tree visibility"');
     expect(store).toContain("v36_database_backfills_only_unambiguous_legacy_session_checkouts");
     expect(store).toContain("v37_database_migrates_text_render_parts_with_explicit_empty_citations");
     expect(store).toContain("default_checkout_id TEXT REFERENCES workspace_checkouts(checkout_id)");

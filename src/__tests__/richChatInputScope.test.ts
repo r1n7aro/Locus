@@ -395,30 +395,19 @@ describe("RichChatInput scoped controller", () => {
     expect(mounted.host.querySelector(".console-text-group")).not.toBeNull();
   });
 
-  it("accepts native drops only for its checkout and evaluates file boundaries against its root", async () => {
+  it("accepts native file drops without creating sessions and evaluates file boundaries", async () => {
     const mounted = await mountInput({ managedNativeDrops: false });
     expect(mocks.fileDropHandler).not.toBeNull();
 
     mocks.fileDropHandler!({
-      workspaceRef: CHECKOUT_B,
-      sendMode: "newSession",
-      files: [{ path: "D:/elsewhere/ignored.txt", isDir: false }],
-    });
-    await flushAsync();
-    expect(mounted.requestNewSession).not.toHaveBeenCalled();
-    expect(mounted.host.querySelector(".local-file-chip")).toBeNull();
-
-    mocks.fileDropHandler!({
-      workspaceRef: CHECKOUT_A,
-      sendMode: "newSession",
       files: [{ path: "C:/projects/a/inside.txt", isDir: false }],
     });
     await flushAsync();
-    expect(mounted.requestNewSession).toHaveBeenCalledOnce();
+    expect(mounted.requestNewSession).not.toHaveBeenCalled();
+    expect(mounted.host.querySelector(".local-file-chip")).not.toBeNull();
     expect(mocks.getFileToolWorkspaceBoundary).not.toHaveBeenCalled();
 
     mocks.fileDropHandler!({
-      workspaceRef: CHECKOUT_A,
       files: [{ path: "C:/outside/external.txt", isDir: false }],
     });
     await flushAsync();

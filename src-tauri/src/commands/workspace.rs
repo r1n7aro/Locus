@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::error::AppError;
 use crate::keychain;
@@ -13,6 +13,13 @@ use crate::workspace_service::service::{
 use crate::workspace_service::{AgentExecutionContext, ProjectRegistry, WorkspaceRef};
 
 const ENDPOINT_TEST_HTML_RESPONSE_CODE: &str = "endpoint_test.html_response";
+pub const SESSION_UNDO_ENABLED_CHANGED_EVENT: &str = "session-undo-enabled-changed";
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionUndoEnabledChangedEvent {
+    enabled: bool,
+}
 
 /// Returns a stable app config directory inside the OS config root.
 /// On Windows this resolves under `%APPDATA%\\locus`, which keeps model config
@@ -80,6 +87,21 @@ const MAX_RECENT_DIRS: usize = 8;
 
 pub fn save_recent_dir_pub(data_dir: &std::path::Path, dir: &str) {
     save_recent_dir(data_dir, dir);
+}
+
+pub fn remove_recent_dirs_pub(
+    data_dir: &std::path::Path,
+    removed_paths: &[String],
+) -> Result<Vec<String>, AppError> {
+    let removed_paths = removed_paths
+        .iter()
+        .map(|path| path.trim())
+        .filter(|path| !path.is_empty())
+        .collect::<HashSet<_>>();
+    let mut dirs = read_recent_dirs(data_dir);
+    dirs.retain(|dir| !removed_paths.contains(dir.trim()));
+    write_recent_dirs(data_dir, &dirs)?;
+    Ok(existing_recent_dirs(dirs))
 }
 
 fn recent_dirs_file(data_dir: &std::path::Path) -> std::path::PathBuf {
@@ -1334,11 +1356,18 @@ pub async fn get_session_undo_enabled(
 #[tauri::command]
 pub async fn set_session_undo_enabled(
     value: bool,
+    app_handle: AppHandle,
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<(), AppError> {
     config
         .set_session_undo_enabled(value)
         .map_err(AppError::from)?;
+    if let Err(error) = app_handle.emit(
+        SESSION_UNDO_ENABLED_CHANGED_EVENT,
+        SessionUndoEnabledChangedEvent { enabled: value },
+    ) {
+        eprintln!("[Locus] failed to publish session undo setting: {error}");
+    }
     Ok(())
 }
 

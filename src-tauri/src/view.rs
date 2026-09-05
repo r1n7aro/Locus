@@ -42,10 +42,6 @@ const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
 const VIEW_HOST_POOL_LABEL_PREFIX: &str = "view-pool-";
 const VIEW_HOST_POOL_ROUTE: &str = "/window.html?viewHost=1&pool=1";
 const VIEW_CONTENT_WINDOW_LABEL_PREFIX: &str = "view-content-";
-const VIEW_INSPECTOR_WINDOW_LABEL_PREFIX: &str = "view-inspector-";
-pub const LOCUS_INSPECTOR_TAB_ID_PREFIX: &str = "locus-inspector:";
-const LOCUS_INSPECTOR_TAB_ID_MAX_LEN: usize = 2048;
-const LOCUS_INSPECTOR_WINDOW_TITLE: &str = "Locus Inspector";
 const UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX: &str = "unity-embed-view-";
 const VIEW_CONTENT_DESTROY_DELAY: Duration = Duration::from_secs(30);
 const VIEW_TREE_METADATA_REL_PATH: &str = ".locus/view-tree.json";
@@ -509,12 +505,6 @@ pub struct ViewDetachTabRequest {
     pub x: Option<f64>,
     #[serde(default)]
     pub y: Option<f64>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewOpenInspectorTabRequest {
-    pub tab_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1159,35 +1149,8 @@ pub fn normalize_view_id(id: &str) -> Result<String, String> {
     Ok(normalized.to_string())
 }
 
-/// Tab ids carried by the View host tab system are either View package ids or
-/// Locus inspector targets encoded as `locus-inspector:<url params>`.
-pub fn is_inspector_tab_id(id: &str) -> bool {
-    id.trim().starts_with(LOCUS_INSPECTOR_TAB_ID_PREFIX)
-}
-
-pub fn normalize_inspector_tab_id(id: &str) -> Result<String, String> {
-    let normalized = id.trim();
-    let Some(payload) = normalized.strip_prefix(LOCUS_INSPECTOR_TAB_ID_PREFIX) else {
-        return Err("Invalid inspector tab id: missing locus-inspector prefix.".to_string());
-    };
-    if payload.is_empty() {
-        return Err("Invalid inspector tab id: empty target payload.".to_string());
-    }
-    if normalized.len() > LOCUS_INSPECTOR_TAB_ID_MAX_LEN {
-        return Err("Invalid inspector tab id: target payload is too long.".to_string());
-    }
-    if !normalized.chars().all(|ch| ch.is_ascii_graphic()) {
-        return Err("Invalid inspector tab id: target payload must be URL-encoded.".to_string());
-    }
-    Ok(normalized.to_string())
-}
-
 pub fn normalize_view_tab_id(id: &str) -> Result<String, String> {
-    if is_inspector_tab_id(id) {
-        normalize_inspector_tab_id(id)
-    } else {
-        normalize_view_id(id)
-    }
+    normalize_view_id(id)
 }
 
 pub fn normalize_package_rel_path(value: &str) -> Result<String, String> {
@@ -4506,7 +4469,7 @@ fn view_host_url_for_tab_id_scoped(
 }
 
 fn view_host_url_for_label(view_id: &str, label: &str) -> String {
-    if label.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX) && !is_inspector_tab_id(view_id) {
+    if label.starts_with(UNITY_EMBED_VIEW_WINDOW_LABEL_PREFIX) {
         return crate::commands::unity_embed_host_url(&format!("view-{view_id}"), "view", view_id);
     }
     if is_view_host_pool_label(label) {
@@ -4716,13 +4679,11 @@ fn merge_view_tab_into_host_window(
         window_label,
         unity_status,
     )?;
-    if !is_inspector_tab_id(view_id) {
-        if let Err(error) = start_view_file_watcher(app_handle, working_dir, view_id) {
-            eprintln!(
-                "[Locus] failed to watch View package '{}' for reload: {}",
-                view_id, error
-            );
-        }
+    if let Err(error) = start_view_file_watcher(app_handle, working_dir, view_id) {
+        eprintln!(
+            "[Locus] failed to watch View package '{}' for reload: {}",
+            view_id, error
+        );
     }
     Ok(ViewRunResult {
         id: view_id.to_string(),
@@ -4740,18 +4701,6 @@ fn detached_view_window_label(view_id: &str) -> String {
         .take(8)
         .collect::<String>();
     format!("{}{}-{}", VIEW_WINDOW_LABEL_PREFIX, view_id, suffix)
-}
-
-/// Inspector tab ids contain characters that are invalid in window labels, so
-/// inspector host windows always get a random `view-inspector-*` label.
-fn detached_inspector_window_label() -> String {
-    let suffix = uuid::Uuid::new_v4()
-        .simple()
-        .to_string()
-        .chars()
-        .take(8)
-        .collect::<String>();
-    format!("{}{}", VIEW_INSPECTOR_WINDOW_LABEL_PREFIX, suffix)
 }
 
 fn main_window_always_on_top(app_handle: &AppHandle) -> bool {
@@ -5528,14 +5477,6 @@ pub async fn detach_view_tab_window(
 ) -> Result<ViewRunResult, String> {
     let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
     let scope_key = view_workspace_scope_key(&workspace_ref);
-    if is_inspector_tab_id(&request.view_id) {
-        return detach_inspector_tab_window(
-            app_handle,
-            working_dir,
-            request,
-            view_windows_above_main,
-        );
-    }
     let detail = read_view_sync(working_dir, &request.view_id)?;
     let unity_status = ensure_view_open_requirements(working_dir, &detail.manifest).await?;
     let id = detail.summary.id.clone();
@@ -5629,155 +5570,6 @@ pub async fn detach_view_tab_window(
         window_label: label,
         host_url,
         package_root: detail.summary.package_root,
-    })
-}
-
-/// Opens (or reveals) a Locus inspector tab inside the View host window
-/// system. An already-hosted Inspector tab is focused in
-/// place, otherwise the tab merges into a reusable host window when allowed,
-/// and only then a fresh host window (or pool window) is created.
-pub async fn open_inspector_tab_window(
-    app_handle: &AppHandle,
-    working_dir: &str,
-    tab_id: &str,
-    view_windows_above_main: bool,
-    view_open_in_existing_window: bool,
-) -> Result<ViewRunResult, String> {
-    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
-    let scope_key = view_workspace_scope_key(&workspace_ref);
-    let id = normalize_inspector_tab_id(tab_id)?;
-
-    if let Some(host_label) = registered_view_host_label_scoped(&scope_key, &id) {
-        if let Some(window) = app_handle.get_webview_window(&host_label) {
-            emit_view_host_tab_select(app_handle, &host_label, &id, false);
-            focus_view_host_window_with_unity_owner_guard(
-                app_handle,
-                working_dir,
-                &window,
-                &host_label,
-                None,
-            )?;
-            let host_url = view_host_url_for_label_scoped(&id, &host_label, &workspace_ref);
-            return Ok(ViewRunResult {
-                id,
-                window_label: host_label,
-                host_url,
-                package_root: String::new(),
-            });
-        }
-        clear_registered_view_host_scoped(&scope_key, &id);
-    }
-
-    if view_open_in_existing_window {
-        if let Some(target_label) = reusable_view_host_window_label_scoped(
-            app_handle,
-            &scope_key,
-            &scoped_view_window_label(&workspace_ref, &id),
-        ) {
-            let target_host_url =
-                view_host_url_for_label_scoped(&id, &target_label, &workspace_ref);
-            return merge_view_tab_into_host_window(
-                app_handle,
-                working_dir,
-                &id,
-                &target_label,
-                &target_host_url,
-                "",
-                None,
-                &scope_key,
-            );
-        }
-    }
-
-    detach_inspector_tab_window(
-        app_handle,
-        working_dir,
-        ViewDetachTabRequest {
-            view_id: id,
-            source_host_label: None,
-            x: None,
-            y: None,
-        },
-        view_windows_above_main,
-    )
-}
-
-fn detach_inspector_tab_window(
-    app_handle: &AppHandle,
-    working_dir: &str,
-    request: ViewDetachTabRequest,
-    view_windows_above_main: bool,
-) -> Result<ViewRunResult, String> {
-    let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
-    let scope_key = view_workspace_scope_key(&workspace_ref);
-    let id = normalize_inspector_tab_id(&request.view_id)?;
-    let pool_label = None;
-    let using_pool = pool_label.is_some();
-    let label = pool_label.unwrap_or_else(detached_inspector_window_label);
-    let host_url = if using_pool {
-        VIEW_HOST_POOL_ROUTE.to_string()
-    } else {
-        view_host_url_for_tab_id_scoped(&id, &workspace_ref)
-    };
-    let position = match (request.x, request.y) {
-        (Some(x), Some(y)) => Some((x, y)),
-        _ => None,
-    };
-
-    if let Some(window) = app_handle.get_webview_window(&label) {
-        if using_pool {
-            configure_claimed_view_host_pool_window(
-                app_handle,
-                &window,
-                LOCUS_INSPECTOR_WINDOW_TITLE,
-                position,
-            )?;
-        } else {
-            focus_view_host_window_with_unity_owner_guard(
-                app_handle,
-                working_dir,
-                &window,
-                &label,
-                None,
-            )?;
-        }
-    } else {
-        build_view_window(
-            app_handle,
-            &label,
-            &host_url,
-            LOCUS_INSPECTOR_WINDOW_TITLE,
-            position,
-            view_windows_above_main,
-        )?;
-    }
-
-    if let Err(error) = set_view_tab_host_scoped_sync(
-        ViewSetTabHostRequest {
-            host_label: label.clone(),
-            view_ids: vec![id.clone()],
-            keep_existing_for_host: false,
-        },
-        &scope_key,
-    ) {
-        eprintln!(
-            "[Locus ViewHost] inspector register failed tab_id={} target={} error={}",
-            id, label, error
-        );
-    }
-    emit_view_host_tab_select(app_handle, &label, &id, using_pool);
-
-    if using_pool {
-        if let Err(error) = ensure_view_host_pool_window(app_handle, view_windows_above_main) {
-            eprintln!("[Locus ViewHostPool] replenish failed: {}", error);
-        }
-    }
-
-    Ok(ViewRunResult {
-        id,
-        window_label: label,
-        host_url,
-        package_root: String::new(),
     })
 }
 

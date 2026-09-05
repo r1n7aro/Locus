@@ -166,6 +166,9 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
 
     const existingProject = projectsById.value[checkout.projectId];
     if (existingProject) {
+      if (!projectOrder.value.includes(checkout.projectId)) {
+        projectOrder.value.push(checkout.projectId);
+      }
       const detectedServices = checkout.runtime?.detectedServices ?? [];
       if (detectedServices.length > 0) {
         existingProject.detectedServices = Array.from(new Set([
@@ -512,6 +515,13 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     return openAndFocusInPane(path, windowId.value, paneId.value);
   }
 
+  async function removeProject(projectId: string): Promise<boolean> {
+    const removed = await projectService.removeWorkspace(projectId);
+    if (!removed) return false;
+    projectOrder.value = projectOrder.value.filter((candidate) => candidate !== projectId);
+    return true;
+  }
+
   async function setActiveSessionInPane(
     activeSessionId: string | null,
     targetWindowId: string,
@@ -605,6 +615,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     initialize,
     openAndFocus,
     openAndFocusInPane,
+    removeProject,
     focusCheckout,
     focusCheckoutInPane,
     focusWorkspaceRef,

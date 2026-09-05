@@ -29,15 +29,17 @@ import HotReloadSettings from "./settings/HotReloadSettings.vue";
 import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
 import TestingSettings from "./settings/TestingSettings.vue";
 import ExperimentalSettings from "./settings/ExperimentalSettings.vue";
-import ArchivedSessionsSettings from "./settings/ArchivedSessionsSettings.vue";
 import { useUiStore } from "../stores/ui";
 import { useChatStore } from "../stores/chat";
 
-defineProps<{
+const props = withDefaults(defineProps<{
+  active?: boolean;
   allModels: ModelOption[];
   agents: AgentInfo[];
   subagents: AgentInfo[];
-}>();
+}>(), {
+  active: true,
+});
 
 const emit = defineEmits<{
   authChanged: [];
@@ -251,16 +253,6 @@ watch(
         </button>
         <button
           class="sidebar-item"
-          :class="{ active: activeCategory === 'archived' }"
-          @click="activeCategory = 'archived'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M2.5 2h11A1.5 1.5 0 0 1 15 3.5v2A1.5 1.5 0 0 1 13.5 7H13v5.5A1.5 1.5 0 0 1 11.5 14h-7A1.5 1.5 0 0 1 3 12.5V7h-.5A1.5 1.5 0 0 1 1 5.5v-2A1.5 1.5 0 0 1 2.5 2zm0 1a.5.5 0 0 0-.5.5v2a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5v-2a.5.5 0 0 0-.5-.5h-11zM4 7v5.5a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5V7H4zm2 2h4v1H6V9z"/>
-          </svg>
-          <span>{{ t("settings.tab.archived") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
           :class="{ active: activeCategory === 'about' }"
           @click="activeCategory = 'about'"
         >
@@ -428,11 +420,7 @@ watch(
         <ShortcutSettings />
       </template>
 
-      <template v-if="activeCategory === 'archived'">
-        <ArchivedSessionsSettings />
-      </template>
-
-      <template v-if="activeCategory === 'console'">
+      <template v-if="props.active && activeCategory === 'console'">
         <ConsoleSettings />
       </template>
 

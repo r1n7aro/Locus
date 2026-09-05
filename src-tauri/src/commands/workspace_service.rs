@@ -407,7 +407,7 @@ pub fn list_project_contexts(
     store: State<'_, Arc<SessionStore>>,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<ProjectContextDescriptor>, AppError> {
-    let persisted = store.list_workspace_checkouts(None)?;
+    let persisted = store.list_visible_workspace_checkouts()?;
     let mut projects =
         std::collections::BTreeMap::<String, Vec<WorkspaceCheckoutDescriptor>>::new();
     for checkout in persisted {
@@ -466,6 +466,7 @@ pub fn list_project_contexts(
 pub async fn open_workspace(
     path: String,
     registry: State<'_, Arc<ProjectRegistry>>,
+    store: State<'_, Arc<SessionStore>>,
     app_handle: tauri::AppHandle,
 ) -> Result<WorkspaceRuntimeDescriptor, AppError> {
     let path = path.trim().to_string();
@@ -488,10 +489,38 @@ pub async fn open_workspace(
         .map_err(|error| {
             AppError::new("workspace.open_failed", "Failed to open the workspace.").detail(error)
         })?;
+    store.set_workspace_project_visible(runtime.project_id().as_str(), true)?;
     if let Ok(data_dir) = crate::commands::resolve_runtime_storage_dir(&app_handle) {
         crate::commands::save_recent_dir_pub(&data_dir, &runtime.root().to_string_lossy());
     }
     Ok(runtime_descriptor(&runtime))
+}
+
+#[tauri::command]
+pub fn remove_workspace(
+    project_id: String,
+    store: State<'_, Arc<SessionStore>>,
+    app_handle: tauri::AppHandle,
+) -> Result<bool, AppError> {
+    let project_id = project_id.trim();
+    if project_id.is_empty() {
+        return Err(AppError::new(
+            "workspace.project_id_empty",
+            "A workspace project id is required.",
+        ));
+    }
+    let roots = store
+        .list_workspace_checkouts(Some(project_id))?
+        .into_iter()
+        .map(|checkout| checkout.root_path)
+        .collect::<Vec<_>>();
+    let removed = store.set_workspace_project_visible(project_id, false)?;
+    if removed {
+        if let Ok(data_dir) = crate::commands::resolve_runtime_storage_dir(&app_handle) {
+            let _ = crate::commands::remove_recent_dirs_pub(&data_dir, &roots);
+        }
+    }
+    Ok(removed)
 }
 
 #[tauri::command]

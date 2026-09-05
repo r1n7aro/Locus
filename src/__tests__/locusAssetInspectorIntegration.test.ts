@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
@@ -8,197 +8,86 @@ function read(relPath: string) {
   return readFileSync(resolve(cwd, relPath), "utf8");
 }
 
-describe("Locus asset inspector integration", () => {
-  it("routes asset context menu actions to the Locus Inspector", () => {
+describe("Locus asset Inspector integration", () => {
+  it("routes the single Locus Inspector action into Workbench", () => {
     const chat = read("src/components/ChatView.vue");
-    const app = read("src/App.vue");
-    const assetView = read("src/components/AssetView.vue");
-    const pane = read("src/components/LocusAssetInspectorPane.vue");
-    const workspacePreview = read("src/components/asset/WorkspaceAssetPreview.vue");
-    const service = read("src/services/locusAssetInspectorWindow.ts");
-    const tauriCapability = read("src-tauri/capabilities/default.json");
-    const zh = read("src/language/zh.json");
-    const en = read("src/language/en.json");
+    const service = read("src/services/locusAssetInspector.ts");
 
-    expect(chat).toContain("openLocusAssetInspector");
+    expect(chat).toContain("openLocusAssetInspectorWorkbenchTab");
     expect(chat).toContain("assetRefContextCanOpenLocusInspector");
     expect(chat).toContain("doAssetRefOpenInLocusInspector");
-    expect(chat).toContain("doAssetRefOpenInLocusInspectorWindow");
-    expect(chat).toContain('target.kind === "sceneObject"');
-    expect(chat).toContain('kind: "sceneObject"');
-    expect(chat).toContain(".unity-object-identity[data-unity-ref-kind]");
+    expect(chat).toContain('action === "locusInspector"');
     expect(chat).toContain('t("common.openInLocusInspector")');
-    expect(chat).toContain('t("common.openInLocusInspectorWindow")');
-    const selectInUnityIndex = chat.indexOf('t("common.selectInUnity")');
-    const openInspectorIndex = chat.indexOf('t("common.openInLocusInspector")');
-    expect(selectInUnityIndex).toBeGreaterThan(0);
-    expect(openInspectorIndex).toBeGreaterThan(selectInUnityIndex);
-    expect(chat.slice(selectInUnityIndex, openInspectorIndex)).toContain('class="asset-ref-ctx-sep"');
+    expect(chat).not.toContain("doAssetRefOpenInLocusInspectorWindow");
+    expect(chat).not.toContain("common.openInLocusInspectorWindow");
+    expect(chat).not.toContain("openLocusAssetInspectorPanel");
 
-    // Inspector targets use the same Workbench tab group as every other editor.
-    expect(app).not.toContain("LocusAssetInspectorWindow");
-    expect(app).not.toContain("isLocusAssetInspectorWindowLocation");
-    expect(service).toContain('LOCUS_ASSET_INSPECTOR_TAB_ID_PREFIX = "locus-inspector:"');
-    expect(service).toContain("buildLocusAssetInspectorTabId");
-    expect(service).toContain("parseLocusAssetInspectorTabId");
     expect(service).toContain("WORKBENCH_INSPECTOR_OPEN_EVENT");
     expect(service).toContain("emitTo<WorkbenchInspectorOpenPayload>");
-    expect(service).toContain("scenePath");
-    expect(service).toContain("objectPath");
-
-    expect(pane).toContain("WorkspaceAssetPreview");
-    expect(pane).toContain('kind === "sceneObject"');
-    expect(pane).toContain("objectPath");
-    expect(pane).toContain(':workspace-ref="workspaceRef"');
-    expect(pane).toContain(":auto-load-preview=\"true\"");
-    expect(pane).toContain(":show-header=\"false\"");
-    expect(workspacePreview).toContain("UnityObjectPreview");
-    expect(workspacePreview).toContain('level="inspector"');
-    expect(workspacePreview).toContain(":collapsible=\"false\"");
-    expect(workspacePreview).toContain(':workspace-ref="workspaceRef"');
-    expect(assetView).toContain("WorkspaceAssetPreview");
-    expect(assetView).toContain(':workspace-ref="workspaceRef ?? null"');
-    expect(assetView).toContain(':auto-load-preview="false"');
-    // The preview header already names the target; no extra path/source row.
-    expect(pane).not.toContain("locus-asset-inspector-pane-header");
-
-    expect(tauriCapability).not.toContain('"locus-asset-inspector"');
-    expect(tauriCapability).toContain('"view-*"');
-    expect(tauriCapability).toContain('"core:window:allow-close"');
-    expect(tauriCapability).toContain('"core:window:allow-destroy"');
-    expect(zh).toContain('"common.openInLocusInspector": "在 Locus Inspector 中打开"');
-    expect(zh).toContain('"common.openInLocusInspectorWindow": "在工作台标签页中打开"');
-    expect(zh).toContain('"asset.inspector.source.disk": "磁盘"');
-    expect(zh).toContain('"asset.inspector.source.live": "Live"');
-    expect(en).toContain('"common.openInLocusInspector": "Open in Locus Inspector"');
-    expect(en).toContain('"common.openInLocusInspectorWindow": "Open in Workbench tab"');
-    expect(en).toContain('"asset.inspector.source.disk": "Disk"');
-    expect(en).toContain('"asset.inspector.source.live": "Live"');
+    expect(service).toContain("isWorkbenchWindowLabel(currentLabel)");
+    expect(service).toContain('targetLabel = isWorkbenchWindowLabel(currentLabel) ? currentLabel : "main"');
   });
 
-  it("hosts inspector targets inside Workbench editor groups", () => {
+  it("hosts Inspector targets inside standard Workbench editor groups", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    const baseTabs = read("src/components/ui/BaseTabStrip.vue");
     const editor = read("src/components/workbench/WorkbenchAssetEditor.vue");
-    const zh = read("src/language/zh.json");
-    const en = read("src/language/en.json");
+    const preview = read("src/components/asset/WorkspaceAssetPreview.vue");
 
     expect(workbench).toContain("WORKBENCH_INSPECTOR_OPEN_EVENT");
     expect(workbench).toContain("openInspectorInWorkbench(event.payload)");
     expect(workbench).toContain('kind: "sceneObject"');
     expect(workbench).toContain('kind: "asset"');
+    expect(workbench).toContain("workbenchResourceKey(resource)");
     expect(workbench).toContain("<WorkbenchAssetEditor");
     expect(editor).toContain("WorkspaceAssetPreview");
     expect(editor).toContain(':show-header="false"');
-    expect(baseTabs).toContain('@click.stop="emit(\'close\', tab.id)"');
-    expect(baseTabs).toContain("handleAuxClick");
-    expect(baseTabs).toContain("t('common.close')");
-    expect(zh).toContain('"view.host.closeTab"');
-    expect(en).toContain('"view.host.closeTab"');
+    expect(preview).toContain("UnityObjectPreview");
+    expect(preview).toContain('level="inspector"');
+    expect(preview).toContain(':collapsible="false"');
   });
 
-  it("hosts an embedded floating inspector panel in the main window", () => {
+  it("removes the floating panel and legacy View-host Inspector surfaces", () => {
     const app = read("src/App.vue");
-    const composable = read("src/composables/useLocusAssetInspectorPanel.ts");
-    const panel = read("src/components/LocusAssetInspectorPanel.vue");
+    const viewHost = read("src/components/ViewHostWindow.vue");
+    const viewService = read("src/services/view.ts");
+    const viewBackend = read("src-tauri/src/view.rs");
 
-    expect(app).toContain("const LocusAssetInspectorPanel = defineAsyncComponent");
-    expect(app).toContain("setLocusAssetInspectorPanelHostAvailable(!isStandaloneWindow)");
-    expect(app).toContain("<LocusAssetInspectorPanel v-if=\"!isStandaloneWindow && locusAssetInspectorPanel.state.open\" />");
+    expect(app).not.toContain("LocusAssetInspectorPanel");
+    expect(app).not.toContain("useLocusAssetInspectorPanel");
+    expect(viewHost).not.toContain("LocusAssetInspectorPane");
+    expect(viewHost).not.toContain("isLocusAssetInspectorTabId");
+    expect(viewService).not.toContain("viewOpenInspectorTab");
+    expect(viewBackend).not.toContain("LOCUS_INSPECTOR_TAB_ID_PREFIX");
+    expect(viewBackend).not.toContain("open_inspector_tab_window");
 
-    // Embedded mode must fall back to the standalone window when no panel host
-    // exists; auto mode only embeds when the window fits the panel.
-    expect(composable).toContain("export async function openLocusAssetInspector(");
-    expect(composable).toContain("canFitEmbeddedLocusAssetInspectorPanel");
-    expect(composable).toContain('|| (mode === "auto" && canFitEmbeddedLocusAssetInspectorPanel())');
-    expect(composable).toContain("if (preferEmbedded && openLocusAssetInspectorPanel(payload, workspaceRef))");
-    expect(composable).toContain("return openLocusAssetInspectorWindow(workspaceRef, payload);");
-    expect(composable).toContain("normalizeLocusAssetInspectorPayload");
-    expect(composable).toContain("isValidLocusAssetInspectorPayload");
-
-    // Draggable / resizable floating panel with the shared inspector preview.
-    expect(panel).toContain("WorkspaceAssetPreview");
-    expect(panel).toContain(':workspace-ref="state.workspaceRef"');
-    expect(panel).toContain(":auto-load-preview=\"true\"");
-    expect(panel).toContain("@source-change=\"handlePreviewSourceChange\"");
-    expect(panel).toContain("handleTitlebarPointerDown");
-    expect(panel).toContain("handleResizePointerDown");
-    // Carve the panel out of the native window drag region so it can float
-    // over the tab bar without dragging the whole main window.
-    expect(panel).toContain("-webkit-app-region: no-drag;");
-    // Resizable from every edge and corner, anchoring the opposite side.
-    expect(panel).toContain("handleResizePointerDown($event, 'se')");
-    expect(panel).toContain('["n", "s", "e", "w", "nw", "ne", "sw"]');
-    expect(panel).toContain("function resizeRect(");
-    expect(panel).toContain("setPointerCapture");
-    expect(panel).toContain("clampRect");
-    expect(panel).toContain("locus:assetInspectorPanelRect");
-    expect(panel).toContain("openLocusAssetInspectorWindow");
-    expect(panel).toContain("closeLocusAssetInspectorPanel");
+    for (const removed of [
+      "src/components/LocusAssetInspectorPanel.vue",
+      "src/components/LocusAssetInspectorPane.vue",
+      "src/composables/useLocusAssetInspectorPanel.ts",
+      "src/services/locusAssetInspectorWindow.ts",
+    ]) {
+      expect(existsSync(resolve(cwd, removed))).toBe(false);
+    }
   });
 
-  it("routes session asset reference clicks through the configurable click action", () => {
-    const chat = read("src/components/ChatView.vue");
+  it("exposes one Workbench Inspector preference and migrates legacy values", () => {
     const displaySettings = read("src/composables/useDisplaySettings.ts");
     const displayPanel = read("src/components/settings/DisplaySettings.vue");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
-    expect(displaySettings).toContain("export type AssetRefClickAction =");
-    expect(displaySettings).toContain("assetRefClickAction: AssetRefClickAction;");
-    // Adaptive is the default: embed when the window fits, otherwise window.
-    expect(displaySettings).toContain('| "locusInspectorAuto"');
-    expect(displaySettings).toContain('assetRefClickAction: "locusInspectorAuto",');
-    // The Unity embed window has its own click action, defaulting to the
-    // editor's native Inspector.
-    expect(displaySettings).toContain('| "unityInspector"');
-    expect(displaySettings).toContain("unityEmbedAssetRefClickAction: AssetRefClickAction;");
-    expect(displaySettings).toContain('unityEmbedAssetRefClickAction: "unityInspector",');
-
-    expect(chat).toContain("runAssetRefClickAction");
-    expect(chat).toContain("displaySettings.assetRefClickAction");
-    expect(chat).toContain("displaySettings.unityEmbedAssetRefClickAction");
-    expect(chat).toContain("isUnityEmbeddedWindow()");
-    expect(chat).toContain('action === "unityInspector"');
-    expect(chat).toContain("openAssetRefInUnityInspector");
-    expect(chat).toContain("legacyAssetRefClick");
-    expect(chat).toContain('action === "locusInspectorAuto"');
-    expect(chat).toContain('action === "locusInspectorWindow"');
-    expect(chat).toContain(': "auto"');
-    expect(chat).toContain('if (action === "fileBrowser")');
-
-    expect(displayPanel).toContain("assetRefClickActionOptions");
-    expect(displayPanel).toContain("unityEmbedAssetRefClickActionOptions");
-    // Both pickers are dropdowns with a per-option description (hint).
-    expect(displayPanel).toContain('import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";');
-    expect(displayPanel).toContain('value: "locusInspectorAuto"');
-    expect(displayPanel).toContain('hint: t("settings.display.assetRefClickInspectorAutoDesc")');
-    expect(displayPanel).toContain('value: "unityInspector"');
-    expect(displayPanel).toContain('hint: t("settings.display.assetRefClickUnityInspectorDesc")');
-    expect(displayPanel).toContain('hint: t("settings.display.assetRefClickUnitySelectDesc")');
-    expect(displayPanel).toContain('hint: t("settings.display.assetRefClickFileBrowserDesc")');
-    expect(displayPanel).toContain('hint: t("settings.display.assetRefClickInspectorEmbeddedDesc")');
-    expect(displayPanel).toContain('hint: t("settings.display.assetRefClickInspectorWindowDesc")');
-    expect(displayPanel).toContain(":model-value=\"display.assetRefClickAction\"");
-    expect(displayPanel).toContain(":model-value=\"display.unityEmbedAssetRefClickAction\"");
-    expect(displayPanel).toContain("@update:model-value=\"setDisplay('assetRefClickAction', $event as AssetRefClickAction)\"");
-    expect(displayPanel).toContain("@update:model-value=\"setDisplay('unityEmbedAssetRefClickAction', $event as AssetRefClickAction)\"");
-
-    for (const lang of [zh, en]) {
-      expect(lang).toContain('"settings.display.assetRefClickTitle"');
-      expect(lang).toContain('"settings.display.assetRefClickUnityEmbedTarget"');
-      expect(lang).toContain('"settings.display.assetRefClickUnityInspector"');
-      expect(lang).toContain('"settings.display.assetRefClickInspectorAuto"');
-      expect(lang).toContain('"settings.display.assetRefClickUnitySelect"');
-      expect(lang).toContain('"settings.display.assetRefClickFileBrowser"');
-      expect(lang).toContain('"settings.display.assetRefClickInspectorEmbedded"');
-      expect(lang).toContain('"settings.display.assetRefClickInspectorWindow"');
-      expect(lang).toContain('"settings.display.assetRefClickUnityInspectorDesc"');
-      expect(lang).toContain('"settings.display.assetRefClickInspectorAutoDesc"');
-      expect(lang).toContain('"settings.display.assetRefClickUnitySelectDesc"');
-      expect(lang).toContain('"settings.display.assetRefClickFileBrowserDesc"');
-      expect(lang).toContain('"settings.display.assetRefClickInspectorEmbeddedDesc"');
-      expect(lang).toContain('"settings.display.assetRefClickInspectorWindowDesc"');
-    }
+    expect(displaySettings).toContain('| "locusInspector";');
+    expect(displaySettings).toContain('assetRefClickAction: "locusInspector",');
+    expect(displaySettings).toContain("LEGACY_LOCUS_INSPECTOR_ACTIONS");
+    expect(displaySettings).toContain('return "locusInspector";');
+    expect(displayPanel).toContain('value: "locusInspector"');
+    expect(displayPanel).toContain('hint: t("settings.display.assetRefClickInspectorDesc")');
+    expect(displayPanel).not.toContain('value: "locusInspectorAuto"');
+    expect(displayPanel).not.toContain('value: "locusInspectorEmbedded"');
+    expect(displayPanel).not.toContain('value: "locusInspectorWindow"');
+    expect(zh).toContain('"settings.display.assetRefClickInspector": "Locus Inspector"');
+    expect(zh).toContain("在当前工作台中打开资产或 GameObject 标签页");
+    expect(en).toContain('"settings.display.assetRefClickInspector": "Locus Inspector"');
+    expect(en).toContain("Opens the asset or GameObject as a tab in the current Workbench");
   });
 });

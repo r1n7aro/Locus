@@ -17,9 +17,27 @@ export type AssetRefClickAction =
   | "unitySelect"
   | "fileBrowser"
   | "unityInspector"
-  | "locusInspectorAuto"
-  | "locusInspectorEmbedded"
-  | "locusInspectorWindow";
+  | "locusInspector";
+
+const LEGACY_LOCUS_INSPECTOR_ACTIONS = new Set([
+  "locusInspectorAuto",
+  "locusInspectorEmbedded",
+  "locusInspectorWindow",
+]);
+
+export function normalizeAssetRefClickAction(
+  value: unknown,
+  fallback: AssetRefClickAction,
+): AssetRefClickAction {
+  if (LEGACY_LOCUS_INSPECTOR_ACTIONS.has(String(value))) return "locusInspector";
+  if (
+    value === "unitySelect"
+    || value === "fileBrowser"
+    || value === "unityInspector"
+    || value === "locusInspector"
+  ) return value;
+  return fallback;
+}
 
 export const DEFAULT_SESSION_MESSAGE_PAGE_SIZE = 120;
 export const SESSION_MESSAGE_PAGE_SIZE_OPTIONS = [80, 120, 160, 240, 400] as const;
@@ -82,6 +100,8 @@ export interface DisplaySettings {
   workspaceSectionVisibility: Record<WorkspaceSectionVisibilityKind, boolean>;
   /** Knowledge roots projected into the Development tree */
   knowledgeFolderVisibility: Record<KnowledgeFolderKind, boolean>;
+  /** Add newly created Plan and Design documents below the Knowledge tree entry. */
+  autoPlaceNewPlanDesignKnowledgeDocuments: boolean;
   /** Directory names hidden from the Files page in every workspace. */
   fileExplorerHiddenDirectories: string[];
   /** Additional directory names hidden when the workspace is a Unity project. */
@@ -200,6 +220,7 @@ const defaults: DisplaySettings = {
   workspaceDisplayMode: "single",
   workspaceSectionVisibility: { ...defaultWorkspaceSectionVisibility },
   knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
+  autoPlaceNewPlanDesignKnowledgeDocuments: true,
   fileExplorerHiddenDirectories: [...DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES],
   unityFileExplorerHiddenDirectories: [...DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES],
   showPluginsTab: true,
@@ -214,7 +235,7 @@ const defaults: DisplaySettings = {
   gitDiffReviewTarget: "window",
   planApprovalTarget: "card",
   memoryFileOpenTarget: "knowledge",
-  assetRefClickAction: "locusInspectorAuto",
+  assetRefClickAction: "locusInspector",
   // Inside the Unity embed window the editor's own Inspector is one click
   // away, so asset/GameObject refs open there by default.
   unityEmbedAssetRefClickAction: "unityInspector",
@@ -273,6 +294,14 @@ function load(): DisplaySettings {
           DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES,
         ),
         sessionMessagePageSize: normalizeSessionMessagePageSize(parsed.sessionMessagePageSize),
+        assetRefClickAction: normalizeAssetRefClickAction(
+          parsed.assetRefClickAction,
+          defaults.assetRefClickAction,
+        ),
+        unityEmbedAssetRefClickAction: normalizeAssetRefClickAction(
+          parsed.unityEmbedAssetRefClickAction,
+          defaults.unityEmbedAssetRefClickAction,
+        ),
         fonts: { ...defaultFonts, ...parsed.fonts },
       };
     }
@@ -318,6 +347,10 @@ export function useDisplaySettings() {
     state[key] = (
       key === "sessionMessagePageSize"
         ? normalizeSessionMessagePageSize(value)
+        : key === "assetRefClickAction"
+          ? normalizeAssetRefClickAction(value, defaults.assetRefClickAction)
+        : key === "unityEmbedAssetRefClickAction"
+          ? normalizeAssetRefClickAction(value, defaults.unityEmbedAssetRefClickAction)
         : key === "fileExplorerHiddenDirectories" || key === "unityFileExplorerHiddenDirectories"
           ? normalizeHiddenDirectoryNames(value)
         : value

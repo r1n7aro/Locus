@@ -9,10 +9,10 @@ function read(relPath: string) {
 }
 
 describe("Unity embedded session view", () => {
-  it("routes the Unity overlay to the shared chat workspace", () => {
+  it("routes the Unity overlay to the scoped development workspace", () => {
     const app = read("src/App.vue");
     const view = read("src/components/UnityEmbeddedSessionView.vue");
-    const workspace = read("src/components/ChatWorkspaceView.vue");
+    const workspace = read("src/components/workbench/DevelopmentWorkbench.vue");
     const command = read("src-tauri/src/commands/unity_embed.rs");
     const runtime = read("src/services/locusRuntime.ts");
 
@@ -21,27 +21,27 @@ describe("Unity embedded session view", () => {
     expect(app).toContain("const UnityEmbeddedSessionView = defineAsyncComponent");
     expect(app).toContain("isUnityEmbedWindow");
     expect(app).toContain("<UnityEmbeddedSessionView");
+    expect(app).toContain("await bindUnityEmbedWorkspace();");
+    expect(app.indexOf("await bindUnityEmbedWorkspace();"))
+      .toBeLessThan(app.indexOf("await bootstrapCritical();", app.indexOf("if (isUnityEmbedWindow)")));
     expect(app).toContain("await bootstrapCritical();");
     expect(app).toContain("await registerListeners();");
-    expect(view).toContain("<ChatWorkspaceView");
+    expect(view).toContain("<DevelopmentWorkbench");
+    expect(view).toContain(':window-id="windowId"');
+    expect(view).toContain(':fixed-workspace-ref="initialWorkspaceRef"');
     expect(view).toContain("activateUnityEmbedForInput");
     expect(view).toContain("setUnityEmbedMouseActivationSuppressed");
     expect(view).toContain("getUnityEmbedFocusDebugSnapshot");
     expect(view).toContain("@pointerdown.capture=\"handlePointerDown\"");
     expect(view).not.toContain("@pointerover.capture");
     expect(view).not.toContain("@pointermove.capture");
-    expect(view).toContain("layout-mode=\"auto\"");
-    expect(view).not.toContain("default-session-panel-collapsed");
-    expect(view).toContain('session-panel-storage-scope="unity"');
     expect(view).toContain("box-shadow: inset 0 1px 0 color-mix(in srgb, var(--border-color) 82%, var(--text-secondary) 18%);");
-    expect(workspace).toContain("<ChatView");
-    expect(workspace).toContain(':default-session-panel-collapsed="defaultSessionPanelCollapsed"');
-    expect(workspace).toContain(':session-panel-storage-scope="sessionPanelStorageScope"');
-    expect(workspace).toContain("defaultSessionPanelCollapsed: false");
-    expect(workspace).toContain("<ThinkingPanel");
-    expect(workspace).toContain("<ChatSidebarPanel");
-    expect(workspace).toContain(':storage-scope="sessionPanelStorageScope"');
-    expect(workspace).toContain("@layout-mode-change=\"handleLayoutModeChange\"");
+    expect(workspace).toContain("fixedWorkspaceRef?: WorkspaceRef | null;");
+    expect(workspace).toContain("initialWorkspaceCheckout()");
+    expect(workspace).toContain("openInitialSessionIfRequested()");
+    expect(workspace).toContain("workspaceContextStore.focusedCheckout?.projectId === projects[0].projectId");
+    expect(workspace).toContain("<WorkbenchSplitHost");
+    expect(workspace).toContain("<WorkspaceTree");
     expect(view).not.toContain("useEmbeddedChatSession");
     expect(view).not.toContain("<EmbeddedChatPane");
     expect(runtime).toContain('export type LocusRuntimeKind = "tauri" | "browser";');
@@ -376,7 +376,7 @@ describe("Unity embedded session view", () => {
     expect(command).toContain("UnityEmbedAssetDragStatePayload");
     expect(command).toContain('"unity-embed-asset-drag-state"');
     expect(command).toContain(
-      "ensure_unity_embed_asset_drag_release_monitor(app_handle, &binding.workspace_ref)",
+      "ensure_unity_embed_asset_drag_release_monitor(app_handle, &workspace_ref)",
     );
     expect(command).toContain("monitor_unity_embed_asset_drag_release");
     expect(command).toContain("unity_asset_drag_release_probe");
@@ -391,15 +391,15 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain("public DroppedAssetRef[] assetRefs;");
     expect(unityWindow).toContain('[MenuItem("Assets/Send to Locus", false, 0)');
     expect(unityWindow).toContain('[MenuItem("GameObject/Send to Locus", false, 0)');
-    expect(unityWindow).toContain("public enum SendToLocusMode");
+    expect(unityWindow).not.toContain("public enum SendToLocusMode");
     expect(unityWindow).toContain("public sealed class LocusFileAttachment");
-    expect(unityWindow).toContain("FocusedSession");
-    expect(unityWindow).toContain("NewSession");
-    expect(unityWindow).toContain("public static bool SendToLocus(");
-    expect(unityWindow).toContain("SendToLocusMode mode = SendToLocusMode.FocusedSession");
+    expect(unityWindow).toContain("private const string SendToLocusEvent = \"unity-send-to-locus\";");
+    expect(unityWindow).toContain("private sealed class SendToLocusMessage");
+    expect(unityWindow).toContain("public static bool SendToLocus()");
     expect(unityWindow).toContain("IReadOnlyList<LocusFileAttachment> attachments");
-    expect(unityWindow).toContain('type = "fileDrop"');
-    expect(unityWindow).toContain('return "newSession";');
+    expect(unityWindow).toContain("LocusBridge.TrySendEventToRust(");
+    expect(unityWindow).not.toContain('type = "fileDrop"');
+    expect(unityWindow).not.toContain('return "newSession";');
     expect(unityWindow).not.toContain("InitializeConsoleIntegration");
     expect(unityWindow).not.toContain("locus-console-send-button");
     expect(unityWindow).not.toContain('text = "Send to Locus"');
@@ -417,6 +417,7 @@ describe("Unity embedded session view", () => {
     expect(workspaceCommands).toContain("pub async fn get_unity_console_text");
     expect(workspaceCommands).toContain('send_message(&cwd, "get_console_text", "")');
     expect(app).toContain("commands::get_unity_console_text");
+    expect(bridge).toContain("internal static bool TrySendEventToRust");
     expect(unityWindow).toContain("BuildSelectedAssetRefs");
     expect(unityWindow).toContain("SendSelectedRefsToLocus");
     expect(unityWindow).toContain("WritePipeLineOnce");
@@ -434,11 +435,9 @@ describe("Unity embedded session view", () => {
     expect(unityWindow).toContain('source = "unity"');
     expect(unityWindow).toContain('message.type == "open" || message.type == "update"');
     expect(command).toContain("asset_refs: Option<Vec<UnityEmbedAssetRef>>");
-    expect(command).toContain("files: Option<Vec<LocusFileDropRef>>");
-    expect(command).toContain("send_mode: Option<String>");
-    expect(command).toContain('Some("newSession") => Some("newSession".to_string())');
+    expect(command).not.toContain("send_mode: Option<String>");
     expect(command).toContain('"assetDrop" =>');
-    expect(command).toContain('"fileDrop" =>');
+    expect(command).not.toContain('"fileDrop" =>');
     expect(command).toContain('"assetDrag" =>');
     expect(command).toContain('"consoleText" =>');
     expect(command).toContain("text_entries: Option<Vec<UnityEmbedTextDropEntry>>");
@@ -449,7 +448,8 @@ describe("Unity embedded session view", () => {
     expect(service).toContain("getUnityConsoleText");
     expect(service).toContain("get_unity_console_text");
     expect(service).toContain("subscribeUnityEmbedAssetDrop");
-    expect(service).toContain('sendMode?: "focusedSession" | "newSession"');
+    expect(service).toContain("subscribeUnitySendToLocus");
+    expect(service).toContain('event.eventName !== "unity-send-to-locus"');
     expect(service).toContain("subscribeUnityEmbedTextDrop");
     expect(service).toContain("subscribeLocusFileDrop");
     expect(service).toContain("subscribeUnityEmbedAssetDragState");
@@ -473,7 +473,7 @@ describe("Unity embedded session view", () => {
     expect(input).toContain("consoleTextAttachments = ref<ConsoleTextAttachment[]>([])");
     expect(input).toContain("localFileAttachments = ref<LocalFileAttachment[]>([])");
     expect(input).toContain("subscribeUnityEmbedAssetDrop((payload)");
-    expect(input).toContain('sendMode === "newSession"');
+    expect(input).not.toContain('sendMode === "newSession"');
     expect(input).toContain("async function handleLocusFileDrop(payload: LocusFileDropPayload)");
     expect(input).toContain("subscribeUnityEmbedTextDrop((payload)");
     expect(input).toContain("subscribeLocusFileDrop((payload)");
@@ -539,19 +539,25 @@ describe("Unity embedded session view", () => {
     expect(unityTypes).not.toContain("Selection.activeObject = obj");
   });
 
-  it("routes Send to Locus payloads to the restored main window with workspace scope", () => {
-    const command = read("src-tauri/src/commands/unity_embed.rs");
-    const app = read("src-tauri/src/lib.rs");
+  it("routes Send to Locus through the Native Bridge workspace event stream", () => {
+    const unityWindow = read("locus_unity/Editor/LocusEditorWindow.cs");
+    const bridge = read("locus_unity/Editor/LocusBridge.cs");
     const service = read("src/services/unity.ts");
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
-    expect(command).toContain("crate::reveal_main_window(app_handle);");
-    expect(command).toContain("MAIN_WINDOW_LABEL");
-    expect(command).toContain("workspace_ref: Some(binding.workspace_ref.clone())");
-    expect(app).toContain("pub(crate) fn reveal_main_window");
-    expect(app).toContain("window.unminimize()");
-    expect(app).toContain("window.show()");
-    expect(app).toContain("window.set_focus()");
-    expect(service).toContain("workspaceRef?: WorkspaceRef;");
+    expect(unityWindow).toContain('SendToLocusEvent = "unity-send-to-locus"');
+    expect(unityWindow).toContain("LocusBridge.TrySendEventToRust(");
+    expect(unityWindow).not.toContain("QueueSendToLocusMessage");
+    expect(bridge).toContain("internal static bool TrySendEventToRust");
+    expect(bridge).toContain("if (!HasConnectedDesktopClient())");
+    expect(service).toContain("subscribeUnitySendToLocus(");
+    expect(service).toContain("WORKSPACE_EVENT_NAME");
+    expect(service).toContain("expectedGeneration: event.workspaceGeneration");
+    expect(workbench).toContain("lastFocusedSendToLocusSessionEditor(");
+    expect(workbench).toContain("appendComposerDraft(draft)");
+    const handlerStart = workbench.indexOf("async function handleUnitySendToLocus(");
+    const handlerEnd = workbench.indexOf("\nfunction knowledgeDragAssetRefs(", handlerStart);
+    expect(workbench.slice(handlerStart, handlerEnd)).not.toContain("createNewSession");
   });
 
   it("offers reference context-menu actions for assets and knowledge documents", () => {

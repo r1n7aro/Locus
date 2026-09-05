@@ -212,6 +212,80 @@ describe("development workbench editor groups", () => {
     expect(store).toContain(":workspace:${encodeURIComponent(normalizedScopeId)}");
   });
 
+  it("keeps single-workspace checkout changes transactional across restore and external opens", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const store = read("src/stores/workbench.ts");
+
+    expect(workbench).toContain("const singleWorkspaceScopeId = ref<string | null>");
+    expect(workbench).toContain("await adoptWorkbenchWorkspaceContext(context.focusedCheckoutId)");
+    expect(workbench).toContain("await activateCheckoutScopedWorkbench(checkout.checkoutId)");
+    expect(workbench).toContain("if (!isCurrent()) return;");
+    expect(workbench.indexOf("if (!isCurrent()) return;")).toBeLessThan(
+      workbench.indexOf("await openWorkbenchResource({", workbench.indexOf("function syncWorkbenchWorkspaceScope")),
+    );
+    expect(workbench).toContain("await reconcileRestoredWorkbenchEditors(nextWorkspaceScopeId)");
+    expect(workbench).toContain("checkoutId !== expectedWorkspaceScopeId");
+    expect(store).toContain("repairStoredWorkspaceScopes(windowId)");
+    expect(store).toContain("requireEditorWorkspaceScope(windowId, input, \"openEditor\")");
+    expect(store).toContain("refused to persist a layout outside checkout scope");
+
+    const contextProxyStart = workbench.indexOf("const workspaceContextStore = new Proxy(");
+    const contextProxyEnd = workbench.indexOf(
+      "\nconst initialWorkbenchWorkspaceScopeId",
+      contextProxyStart,
+    );
+    const contextProxyFlow = workbench.slice(contextProxyStart, contextProxyEnd);
+    expect(contextProxyFlow).toMatch(
+      /case "focusCheckout"[\s\S]*activateCheckoutScopedWorkbench\(checkoutId\)/,
+    );
+    expect(contextProxyFlow).toMatch(
+      /case "openAndFocus"[\s\S]*existingCheckout[\s\S]*activateCheckoutScopedWorkbench\(existingCheckout\.checkoutId\)/,
+    );
+
+    const scopedActivationStart = workbench.indexOf(
+      "async function activateCheckoutScopedWorkbench(",
+    );
+    const scopedActivationEnd = workbench.indexOf(
+      "\nfunction syncWorkbenchWorkspaceScope(",
+      scopedActivationStart,
+    );
+    const scopedActivationFlow = workbench.slice(scopedActivationStart, scopedActivationEnd);
+    expect(scopedActivationFlow.indexOf("await adoptWorkbenchWorkspaceContext(checkoutId)")).toBeLessThan(
+      scopedActivationFlow.indexOf("workspaceContextBaseStore.focusCheckoutInPane("),
+    );
+
+    const openResourceStart = workbench.indexOf("async function openWorkbenchResource(");
+    const openResourceEnd = workbench.indexOf("\nlet initialSessionApplied", openResourceStart);
+    const openResourceFlow = workbench.slice(openResourceStart, openResourceEnd);
+    expect(openResourceFlow.indexOf("activateCheckoutScopedWorkbench(inputCheckoutId)")).toBeLessThan(
+      openResourceFlow.indexOf("workbenchStore.openEditor("),
+    );
+
+    const viewStart = workbench.indexOf("async function openViewInWorkbench(");
+    const inspectorStart = workbench.indexOf("async function openInspectorInWorkbench(");
+    const transferStart = workbench.indexOf("async function acceptWorkbenchTransferRecord(");
+    const transferEnd = workbench.indexOf("\nasync function acceptWorkbenchTransfer(", transferStart);
+    expect(workbench.slice(viewStart, inspectorStart)).toMatch(
+      /activateCheckoutScopedWorkbench\(checkout\.checkoutId\)[\s\S]*openWorkbenchResource\(/,
+    );
+    expect(workbench.slice(inspectorStart, transferStart)).toMatch(
+      /activateCheckoutScopedWorkbench\(checkout\.checkoutId\)[\s\S]*openWorkbenchResource\(/,
+    );
+    expect(workbench.slice(transferStart, transferEnd)).toMatch(
+      /activateCheckoutScopedWorkbench\(checkoutId\)[\s\S]*acceptTransferredEditor\(/,
+    );
+
+    const dropStart = workbench.indexOf("async function commitWorkbenchInternalDrop(");
+    const dropEnd = workbench.indexOf("\nfunction handleWorkbenchInternalDrop", dropStart);
+    const dropFlow = workbench.slice(dropStart, dropEnd);
+    expect(dropFlow).toContain("destinationPaneId = workbenchWindow.value.focusedPaneId");
+    expect(dropFlow).toContain("paneId: destinationPaneId");
+    expect(dropFlow).toMatch(
+      /workbenchStore\.splitPane\(\s*WORKBENCH_WINDOW_ID,\s*destinationPaneId,/,
+    );
+    expect(dropFlow).toContain(") ?? destinationPaneId;");
+  });
+
   it("keeps close fallback inside the active project and hands off pane focus before disposal", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const store = read("src/stores/workbench.ts");
@@ -258,22 +332,32 @@ describe("development workbench editor groups", () => {
     expect(sessionEditor).toContain("async function focusComposerInput(): Promise<void>");
   });
 
-  it("opens Send to Locus API attachments in the main workbench session surface", () => {
+  it("appends Send to Locus attachments only to the last focused composer", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const chatWorkspace = read("src/components/ChatWorkspaceView.vue");
+    const focusService = read("src/services/unitySendToLocusFocus.ts");
     const sessionEditor = read("src/components/workbench/WorkbenchSessionEditor.vue");
+    const chatView = read("src/components/ChatView.vue");
+    const input = read("src/components/chat/RichChatInput.vue");
 
-    expect(workbench).toContain("if (payload.sendMode)");
-    expect(workbench).toContain("handleSendToLocusDraft(");
-    expect(workbench).toContain('if (WORKBENCH_WINDOW_ID !== "main") return;');
-    expect(workbench).toContain('uiStore.setPage("development");');
-    expect(workbench).toContain("sendToLocusCheckout(workspaceRef)");
-    expect(workbench).toContain("createNewSessionWithAttachmentsForCheckout(checkout, draft)");
-    expect(workbench).toContain("attachmentDraft({ localFiles: payload.files })");
-    expect(workbench).toContain("attachmentDraft({ assetRefs: payload.refs })");
-    expect(workbench).toContain("mergeAttachmentDrafts(");
-    expect(sessionEditor).toContain("function exportComposerDraft()");
-    expect(sessionEditor).toContain("defineExpose({");
-    expect(sessionEditor).toContain("appendComposerDraft,");
-    expect(sessionEditor).toContain("exportComposerDraft,");
+    expect(workbench).toContain("subscribeUnitySendToLocus");
+    expect(focusService).toContain('surface: "workbench"');
+    expect(focusService).toContain('surface: "chatWorkspace"');
+    expect(workbench).toContain("handleWorkbenchComposerFocus(");
+    expect(workbench).toContain("lastFocusedSendToLocusSessionEditor(");
+    expect(workbench).toContain("appendComposerDraft(draft)");
+    const handlerStart = workbench.indexOf("async function handleUnitySendToLocus(");
+    const handlerEnd = workbench.indexOf("\nfunction knowledgeDragAssetRefs(", handlerStart);
+    const handler = workbench.slice(handlerStart, handlerEnd);
+    expect(handler).not.toContain("createNewSessionWithAttachmentsForCheckout");
+    expect(handler).not.toContain('uiStore.setPage("development")');
+    expect(workbench).toContain('@composer-focus="handleWorkbenchComposerFocus(paneId, $event)"');
+    expect(chatWorkspace).toContain("subscribeUnitySendToLocus");
+    expect(chatWorkspace).toContain('surface: "chatWorkspace"');
+    expect(chatWorkspace).toContain("appendComposerDraft(draft)");
+    expect(chatWorkspace).toContain('@composer-focus="handleComposerFocus"');
+    expect(sessionEditor).toContain('event: "composer-focus"');
+    expect(chatView).toContain("composerFocus: []");
+    expect(input).toContain('(e: "focus"): void;');
   });
 });

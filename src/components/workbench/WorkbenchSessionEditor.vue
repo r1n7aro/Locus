@@ -45,6 +45,7 @@ const emit = defineEmits<{
     source: "control" | "shortcut";
   }): void;
   (event: "composer-draft-change", payload: { editorId: string; hasDraft: boolean }): void;
+  (event: "composer-focus", payload: { editorId: string }): void;
   (event: "session-forked", payload: {
     editorId: string;
     sourceSessionId: string;
@@ -273,6 +274,19 @@ watch([sessionId, latestCompletedRunId] as const, ([targetSessionId, runId]) => 
   chatChangesStore.setLatestCompletedRunId(targetSessionId, runId);
 });
 
+watch(
+  [sessionId, () => undoableMessageIds.value.size] as const,
+  ([targetSessionId, undoableCount], [previousSessionId, previousUndoableCount]) => {
+    if (
+      !targetSessionId
+      || targetSessionId !== previousSessionId
+      || undoableCount === previousUndoableCount
+    ) return;
+    chatChangesStore.setActiveRunId(targetSessionId, currentRunId.value);
+    void chatChangesStore.refresh(targetSessionId);
+  },
+);
+
 watch(isStreaming, (streaming, wasStreaming) => {
   if (!streaming && wasStreaming && sessionId.value) {
     void chatChangesStore.refresh(sessionId.value);
@@ -494,7 +508,7 @@ defineExpose({
 </script>
 
 <template>
-  <div class="workbench-session-shell">
+  <div class="workbench-session-shell" :data-session-id="sessionId || undefined">
     <ChatView
       ref="chatViewRef"
       class="workbench-session-editor"
@@ -595,6 +609,7 @@ defineExpose({
     @request-plan-mode="setPlanMode"
     @export-session-context="handleExportSessionContext"
     @review-session-context="handleReviewSessionContext"
+    @composer-focus="emit('composer-focus', { editorId: props.editor.editorId })"
     @open-thinking="handleOpenThinking"
     @open-knowledge-document="handleOpenKnowledgeDocument('editor', $event)"
     @open-knowledge-document-in-knowledge="handleOpenKnowledgeDocument('knowledge', $event)"

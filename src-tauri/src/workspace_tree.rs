@@ -17,6 +17,7 @@ const WORKSPACE_TREE_INDEX: &str = "index.json";
 const DEFAULT_PRESET_ID: &str = "default";
 const DEFAULT_PRESET_NAME: &str = "Default";
 const WORKSPACE_TREE_V2_MIGRATION_ID: &str = "workspace-tree-migration-v2";
+const DEFAULT_HIDDEN_SYSTEM_RESOURCE_ID: &str = "archived";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -380,9 +381,9 @@ fn validate_nodes(project_id: &str, nodes: &[ProjectExplorerNode]) -> Result<(),
                     node.node_id, parent_id
                 )
             })?;
-            if parent.node_kind != "folder" {
+            if !parent_accepts_node(parent, node) {
                 return Err(format!(
-                    "Workspace tree node '{}' references a non-folder parent",
+                    "Workspace tree node '{}' references an incompatible parent",
                     node.node_id
                 ));
             }
@@ -392,7 +393,7 @@ fn validate_nodes(project_id: &str, nodes: &[ProjectExplorerNode]) -> Result<(),
         while let Some(parent_id) = cursor {
             if parent_id == node.node_id || !visited.insert(parent_id) {
                 return Err(format!(
-                    "Workspace tree contains a folder cycle at '{}'",
+                    "Workspace tree contains a cycle at '{}'",
                     node.node_id
                 ));
             }
@@ -404,9 +405,20 @@ fn validate_nodes(project_id: &str, nodes: &[ProjectExplorerNode]) -> Result<(),
     Ok(())
 }
 
-fn validate_parent(
+fn parent_accepts_node(parent: &ProjectExplorerNode, child: &ProjectExplorerNode) -> bool {
+    parent.node_kind == "folder"
+        || (parent.node_kind == "resource"
+            && parent.resource_kind.as_deref() == Some("session")
+            && child.node_kind == "resource"
+            && child.resource_kind.as_deref() == Some("session"))
+}
+
+fn validate_parent_for_node(
     nodes: &[ProjectExplorerNode],
     parent_node_id: Option<&str>,
+    node_kind: &str,
+    resource_kind: Option<&str>,
+    allow_session_parent: bool,
 ) -> Result<(), String> {
     let Some(parent_node_id) = parent_node_id else {
         return Ok(());
@@ -415,8 +427,27 @@ fn validate_parent(
         .iter()
         .find(|node| node.node_id == parent_node_id)
         .ok_or_else(|| format!("Workspace tree parent does not exist: {parent_node_id}"))?;
-    if parent.node_kind != "folder" {
-        return Err("Workspace tree parent must be a folder".to_string());
+    let candidate = ProjectExplorerNode {
+        node_id: String::new(),
+        project_id: parent.project_id.clone(),
+        node_kind: node_kind.to_string(),
+        parent_node_id: None,
+        resource_kind: resource_kind.map(str::to_string),
+        resource_id: None,
+        folder_name: None,
+        hidden: false,
+        source_path: None,
+        source_kind: None,
+        position: 0,
+    };
+    if parent.node_kind != "folder"
+        && !(allow_session_parent && parent_accepts_node(parent, &candidate))
+    {
+        return Err(if allow_session_parent {
+            "Workspace tree parent must be a folder, or a session for session children".to_string()
+        } else {
+            "Workspace tree parent must be a folder".to_string()
+        });
     }
     Ok(())
 }
@@ -445,28 +476,42 @@ fn move_node(
     parent_node_id: Option<&str>,
     position: i64,
 ) -> Result<(), String> {
-    validate_parent(nodes, parent_node_id)?;
+    move_node_with_policy(nodes, node_id, parent_node_id, position, false)
+}
+
+fn move_node_with_policy(
+    nodes: &mut Vec<ProjectExplorerNode>,
+    node_id: &str,
+    parent_node_id: Option<&str>,
+    position: i64,
+    allow_session_parent: bool,
+) -> Result<(), String> {
     let index = nodes
         .iter()
         .position(|node| node.node_id == node_id)
         .ok_or_else(|| format!("Workspace tree node does not exist: {node_id}"))?;
+    validate_parent_for_node(
+        nodes,
+        parent_node_id,
+        &nodes[index].node_kind,
+        nodes[index].resource_kind.as_deref(),
+        allow_session_parent,
+    )?;
     if parent_node_id == Some(node_id) {
-        return Err("Workspace tree folder cannot contain itself".to_string());
+        return Err("Workspace tree node cannot contain itself".to_string());
     }
-    if nodes[index].node_kind == "folder" {
-        let by_id = nodes
-            .iter()
-            .map(|node| (node.node_id.as_str(), node))
-            .collect::<HashMap<_, _>>();
-        let mut cursor = parent_node_id;
-        while let Some(parent_id) = cursor {
-            if parent_id == node_id {
-                return Err("Workspace tree folder cannot move into its descendant".to_string());
-            }
-            cursor = by_id
-                .get(parent_id)
-                .and_then(|parent| parent.parent_node_id.as_deref());
+    let by_id = nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let mut cursor = parent_node_id;
+    while let Some(parent_id) = cursor {
+        if parent_id == node_id {
+            return Err("Workspace tree node cannot move into its descendant".to_string());
         }
+        cursor = by_id
+            .get(parent_id)
+            .and_then(|parent| parent.parent_node_id.as_deref());
     }
     let old_parent = nodes[index].parent_node_id.clone();
     nodes[index].parent_node_id = parent_node_id.map(str::to_string);
@@ -533,7 +578,7 @@ fn mount_path_node(
     name: Option<&str>,
     position: i64,
 ) -> Result<(), String> {
-    validate_parent(nodes, parent_node_id)?;
+    validate_parent_for_node(nodes, parent_node_id, "folder", None, false)?;
     let source = dunce::canonicalize(Path::new(path.trim())).map_err(|error| {
         format!(
             "Workspace tree mount path is unavailable '{}': {error}",
@@ -626,7 +671,7 @@ fn apply_operation(
             name,
             position,
         } => {
-            validate_parent(nodes, parent_node_id.as_deref())?;
+            validate_parent_for_node(nodes, parent_node_id.as_deref(), "folder", None, false)?;
             let name = name.trim();
             if name.is_empty() {
                 return Err("Workspace tree folder name cannot be empty".to_string());
@@ -674,6 +719,7 @@ fn apply_operation(
             position,
         } => move_node(nodes, node_id, parent_node_id.as_deref(), *position),
         ProjectExplorerOperation::PlaceResource {
+            node_id,
             resource_kind,
             resource_id,
             source_kind,
@@ -685,16 +731,37 @@ fn apply_operation(
                     "Unsupported workspace tree resource kind: {resource_kind}"
                 ));
             }
-            validate_parent(nodes, parent_node_id.as_deref())?;
-            let node_id = nodes
+            validate_parent_for_node(
+                nodes,
+                parent_node_id.as_deref(),
+                "resource",
+                Some(resource_kind),
+                true,
+            )?;
+            let existing_node_id = nodes
                 .iter()
                 .find(|node| {
                     node.resource_kind.as_deref() == Some(resource_kind)
                         && node.resource_id.as_deref() == Some(resource_id)
                 })
-                .map(|node| node.node_id.clone())
+                .map(|node| node.node_id.clone());
+            let restores_existing = existing_node_id.is_some();
+            let node_id = existing_node_id
+                .or_else(|| {
+                    node_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| format!("resource:{resource_kind}:{}", Uuid::new_v4()));
-            if !nodes.iter().any(|node| node.node_id == node_id) {
+            if let Some(existing) = nodes.iter().find(|node| node.node_id == node_id) {
+                if existing.resource_kind.as_deref() != Some(resource_kind)
+                    || existing.resource_id.as_deref() != Some(resource_id)
+                {
+                    return Err(format!("Workspace tree node already exists: {node_id}"));
+                }
+            } else {
                 nodes.push(ProjectExplorerNode {
                     node_id: node_id.clone(),
                     project_id: project_id.to_string(),
@@ -703,19 +770,25 @@ fn apply_operation(
                     resource_kind: Some(resource_kind.clone()),
                     resource_id: Some(resource_id.clone()),
                     folder_name: None,
-                    hidden: false,
+                    hidden: resource_kind == "system"
+                        && resource_id == DEFAULT_HIDDEN_SYSTEM_RESOURCE_ID,
                     source_path: None,
                     source_kind: source_kind.clone(),
                     position: i64::MAX / 2,
                 });
-            } else if let Some(node) = nodes.iter_mut().find(|node| node.node_id == node_id) {
+            }
+            if restores_existing {
+                let node = nodes
+                    .iter_mut()
+                    .find(|node| node.node_id == node_id)
+                    .expect("existing workspace tree resource disappeared");
                 if source_kind.is_some() {
                     node.source_kind = source_kind.clone();
                 }
                 // Explicit placement restores a system resource that was hidden earlier.
                 node.hidden = false;
             }
-            move_node(nodes, &node_id, parent_node_id.as_deref(), *position)
+            move_node_with_policy(nodes, &node_id, parent_node_id.as_deref(), *position, true)
         }
         ProjectExplorerOperation::RemoveResourcePlacement {
             resource_kind,
@@ -1113,6 +1186,7 @@ mod tests {
             "place-collaboration",
             &[
                 ProjectExplorerOperation::PlaceResource {
+                    node_id: None,
                     resource_kind: "session".to_string(),
                     resource_id: "session-a".to_string(),
                     source_kind: None,
@@ -1120,6 +1194,7 @@ mod tests {
                     position: 0,
                 },
                 ProjectExplorerOperation::PlaceResource {
+                    node_id: None,
                     resource_kind: "system".to_string(),
                     resource_id: "collaboration".to_string(),
                     source_kind: None,
@@ -1184,10 +1259,178 @@ mod tests {
     }
 
     #[test]
+    fn sessions_can_contain_sessions_and_reject_other_resource_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let nested = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "place-nested-sessions",
+            &[
+                ProjectExplorerOperation::PlaceResource {
+                    node_id: Some("session-node:parent".to_string()),
+                    resource_kind: "session".to_string(),
+                    resource_id: "parent-session".to_string(),
+                    source_kind: None,
+                    parent_node_id: None,
+                    position: 0,
+                },
+                ProjectExplorerOperation::PlaceResource {
+                    node_id: Some("session-node:child".to_string()),
+                    resource_kind: "session".to_string(),
+                    resource_id: "child-session".to_string(),
+                    source_kind: None,
+                    parent_node_id: Some("session-node:parent".to_string()),
+                    position: 0,
+                },
+            ],
+        )
+        .unwrap();
+        let child = nested
+            .snapshot
+            .nodes
+            .iter()
+            .find(|node| node.resource_id.as_deref() == Some("child-session"))
+            .unwrap();
+        assert_eq!(child.parent_node_id.as_deref(), Some("session-node:parent"));
+        assert_eq!(
+            snapshot(temp.path(), "project-a")
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|node| node.resource_id.as_deref() == Some("child-session"))
+                .and_then(|node| node.parent_node_id.as_deref()),
+            Some("session-node:parent")
+        );
+
+        let manual_nesting = apply_operations(
+            temp.path(),
+            "project-a",
+            nested.snapshot.revision,
+            "manually-nest-parent-under-child",
+            &[ProjectExplorerOperation::MoveNode {
+                node_id: "session-node:parent".to_string(),
+                parent_node_id: Some("session-node:child".to_string()),
+                position: 0,
+            }],
+        )
+        .unwrap_err();
+        assert!(manual_nesting.contains("parent must be a folder"));
+
+        let incompatible = apply_operations(
+            temp.path(),
+            "project-a",
+            nested.snapshot.revision,
+            "place-knowledge-under-session",
+            &[ProjectExplorerOperation::PlaceResource {
+                node_id: Some("knowledge-node".to_string()),
+                resource_kind: "knowledge".to_string(),
+                resource_id: "knowledge-a".to_string(),
+                source_kind: Some("knowledge".to_string()),
+                parent_node_id: Some("session-node:parent".to_string()),
+                position: 1,
+            }],
+        )
+        .unwrap_err();
+        assert!(incompatible.contains("session for session children"));
+
+        let cycle = apply_operations(
+            temp.path(),
+            "project-a",
+            nested.snapshot.revision,
+            "automatically-nest-parent-under-child",
+            &[ProjectExplorerOperation::PlaceResource {
+                node_id: None,
+                resource_kind: "session".to_string(),
+                resource_id: "parent-session".to_string(),
+                source_kind: None,
+                parent_node_id: Some("session-node:child".to_string()),
+                position: 0,
+            }],
+        )
+        .unwrap_err();
+        assert!(cycle.contains("cannot move into its descendant"));
+
+        let extracted = apply_operations(
+            temp.path(),
+            "project-a",
+            nested.snapshot.revision,
+            "move-child-out",
+            &[ProjectExplorerOperation::MoveNode {
+                node_id: "session-node:child".to_string(),
+                parent_node_id: None,
+                position: 1,
+            }],
+        )
+        .unwrap();
+        assert!(extracted
+            .snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "session-node:child")
+            .unwrap()
+            .parent_node_id
+            .is_none());
+    }
+
+    #[test]
+    fn archived_system_resource_starts_hidden_and_can_be_shown() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let placed = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "place-archived",
+            &[ProjectExplorerOperation::PlaceResource {
+                node_id: None,
+                resource_kind: "system".to_string(),
+                resource_id: "archived".to_string(),
+                source_kind: None,
+                parent_node_id: None,
+                position: 0,
+            }],
+        )
+        .unwrap();
+        let archived = placed
+            .snapshot
+            .nodes
+            .iter()
+            .find(|node| node.resource_id.as_deref() == Some("archived"))
+            .unwrap();
+        assert!(archived.hidden);
+        let archived_node_id = archived.node_id.clone();
+
+        let shown = apply_operations(
+            temp.path(),
+            "project-a",
+            placed.snapshot.revision,
+            "show-archived",
+            &[ProjectExplorerOperation::SetNodeHidden {
+                node_id: archived_node_id.clone(),
+                hidden: false,
+            }],
+        )
+        .unwrap();
+
+        assert!(
+            !shown
+                .snapshot
+                .nodes
+                .iter()
+                .find(|node| node.node_id == archived_node_id)
+                .unwrap()
+                .hidden
+        );
+    }
+
+    #[test]
     fn knowledge_removal_drops_the_placement_and_allows_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let initial = snapshot(temp.path(), "project-a").unwrap();
         let placement = ProjectExplorerOperation::PlaceResource {
+            node_id: None,
             resource_kind: "knowledge".to_string(),
             resource_id: "kd_builtin_memory_user_preference".to_string(),
             source_kind: Some("knowledge".to_string()),
@@ -1238,6 +1481,7 @@ mod tests {
             "place-system-resources",
             &[
                 ProjectExplorerOperation::PlaceResource {
+                    node_id: None,
                     resource_kind: "system".to_string(),
                     resource_id: "newSession".to_string(),
                     source_kind: None,
@@ -1245,6 +1489,7 @@ mod tests {
                     position: 0,
                 },
                 ProjectExplorerOperation::PlaceResource {
+                    node_id: None,
                     resource_kind: "system".to_string(),
                     resource_id: "knowledge".to_string(),
                     source_kind: None,
@@ -1252,6 +1497,7 @@ mod tests {
                     position: 1,
                 },
                 ProjectExplorerOperation::PlaceResource {
+                    node_id: None,
                     resource_kind: "session".to_string(),
                     resource_id: "session-a".to_string(),
                     source_kind: None,
@@ -1259,6 +1505,7 @@ mod tests {
                     position: 2,
                 },
                 ProjectExplorerOperation::PlaceResource {
+                    node_id: None,
                     resource_kind: "system".to_string(),
                     resource_id: "collaboration".to_string(),
                     source_kind: None,

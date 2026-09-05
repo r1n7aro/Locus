@@ -112,9 +112,9 @@ const memoryFileOpenTargetOptions = computed(() => [
 
 const assetRefClickActionOptions = computed(() => [
   {
-    value: "locusInspectorAuto",
-    label: t("settings.display.assetRefClickInspectorAuto"),
-    hint: t("settings.display.assetRefClickInspectorAutoDesc"),
+    value: "locusInspector",
+    label: t("settings.display.assetRefClickInspector"),
+    hint: t("settings.display.assetRefClickInspectorDesc"),
   },
   {
     value: "unitySelect",
@@ -125,16 +125,6 @@ const assetRefClickActionOptions = computed(() => [
     value: "fileBrowser",
     label: t("settings.display.assetRefClickFileBrowser"),
     hint: t("settings.display.assetRefClickFileBrowserDesc"),
-  },
-  {
-    value: "locusInspectorEmbedded",
-    label: t("settings.display.assetRefClickInspectorEmbedded"),
-    hint: t("settings.display.assetRefClickInspectorEmbeddedDesc"),
-  },
-  {
-    value: "locusInspectorWindow",
-    label: t("settings.display.assetRefClickInspectorWindow"),
-    hint: t("settings.display.assetRefClickInspectorWindowDesc"),
   },
 ]);
 
@@ -269,6 +259,15 @@ onMounted(async () => {
         @update:model-value="setWorkspaceSectionVisibility(item.kind, $event)"
       />
       <span>{{ t("settings.display.showWorkspaceSection", t(item.labelKey)) }}</span>
+    </div>
+
+    <div class="toggle-row">
+      <BaseCheckbox
+        :model-value="display.autoPlaceNewPlanDesignKnowledgeDocuments"
+        :aria-label="t('settings.display.autoPlaceNewPlanDesignKnowledgeDocuments')"
+        @update:model-value="setDisplay('autoPlaceNewPlanDesignKnowledgeDocuments', $event)"
+      />
+      <span>{{ t("settings.display.autoPlaceNewPlanDesignKnowledgeDocuments") }}</span>
     </div>
 
     <div class="toggle-row">

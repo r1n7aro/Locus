@@ -60,6 +60,11 @@ describe("workbench store", () => {
       path: "Assets/Player.prefab",
     })).toBe("asset:project-a:Assets/Player.prefab");
     expect(workbenchResourceKey({
+      kind: "asset",
+      projectId: "project-a",
+      path: "Assets/Docs/Rules.md",
+    })).toBe("workspace-file:project-a:Assets/Docs/Rules.md");
+    expect(workbenchResourceKey({
       kind: "sceneObject",
       projectId: "project-a",
       scenePath: "Assets/Main.unity",
@@ -71,6 +76,43 @@ describe("workbench store", () => {
       nodeId: "mount-a",
       relativePath: "Assets/Characters",
     })).toBe("local-directory:project-a:mount-a:Assets/Characters");
+  });
+
+  it("routes new and restored Markdown assets through the workspace file editor", () => {
+    const markdownEditor = createWorkbenchEditorInput({
+      kind: "asset",
+      projectId: "project-a",
+      path: "Assets/Docs/Rules.md",
+    }, "Rules.md");
+    expect(markdownEditor.resource).toEqual({
+      kind: "workspaceFile",
+      projectId: "project-a",
+      path: "Assets/Docs/Rules.md",
+    });
+
+    const firstStore = useWorkbenchStore();
+    firstStore.ensureWindow("main");
+    firstStore.openEditor("main", createWorkbenchEditorInput({
+      kind: "asset",
+      projectId: "project-a",
+      path: "Assets/Player.prefab",
+    }, "Rules.md"));
+    firstStore.persist("main");
+    const legacy = JSON.parse(localStorage.getItem("locus:workbench-window:main")!);
+    legacy.groups.main.tabs[0].resource = {
+      kind: "asset",
+      projectId: "project-a",
+      path: "Assets/Docs/Legacy.markdown",
+    };
+    localStorage.setItem("locus:workbench-window:main", JSON.stringify(legacy));
+
+    setActivePinia(createPinia());
+    const restored = useWorkbenchStore().ensureWindow("main");
+    expect(restored.groups.main!.tabs[0]!.resource).toEqual({
+      kind: "workspaceFile",
+      projectId: "project-a",
+      path: "Assets/Docs/Legacy.markdown",
+    });
   });
 
   it("replaces one unpinned preview and derives tab-strip visibility from tab count", () => {
@@ -384,6 +426,156 @@ describe("workbench store", () => {
     ]);
     expect(localStorage.getItem("locus:workbench-window:main:workspace:checkout-a")).not.toBeNull();
     expect(localStorage.getItem("locus:workbench-window:main:workspace:checkout-b")).not.toBeNull();
+  });
+
+  it("rejects a foreign checkout editor before it can mutate a scoped layout", () => {
+    const store = useWorkbenchStore();
+    store.switchWorkspaceScope("main", "checkout-a");
+    store.openEditor("main", sessionEditor("session-a", { preview: false }));
+    const key = "locus:workbench-window:main:workspace:checkout-a";
+    const persistedBefore = localStorage.getItem(key);
+
+    expect(() => store.openEditor(
+      "main",
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+    )).toThrow(/openEditor requires checkout checkout-a; received checkout-b/);
+    const activeEditorId = store.windows.main!.groups.main!.activeEditorId!;
+    expect(() => store.updateEditor("main", "main", activeEditorId, {
+      checkoutBinding: { checkoutId: "checkout-b" },
+    })).toThrow(/updateEditor requires checkout checkout-a; received checkout-b/);
+    expect(() => store.replaceEditor(
+      "main",
+      "main",
+      activeEditorId,
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+    )).toThrow(/replaceEditor requires checkout checkout-a; received checkout-b/);
+    expect(() => store.splitPane(
+      "main",
+      "main",
+      "right",
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+    )).toThrow(/splitPane requires checkout checkout-a; received checkout-b/);
+    expect(() => store.acceptTransferredEditor(
+      "main",
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+      "main",
+    )).toThrow(/acceptTransferredEditor requires checkout checkout-a; received checkout-b/);
+    expect(localStorage.getItem(key)).toBe(persistedBefore);
+    expect(store.windows.main!.groups.main!.tabs.map((editor) => (
+      editor.checkoutBinding?.checkoutId
+    ))).toEqual(["checkout-a"]);
+  });
+
+  it("repairs shifted workspace slots by each editor's checkout binding", () => {
+    const firstStore = useWorkbenchStore();
+    firstStore.switchWorkspaceScope("main", "checkout-a");
+    firstStore.openEditor("main", sessionEditor("session-a", { preview: false }));
+    firstStore.switchWorkspaceScope("main", "checkout-b");
+    firstStore.openEditor(
+      "main",
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+    );
+    firstStore.switchWorkspaceScope("main", "checkout-c");
+    firstStore.openEditor(
+      "main",
+      sessionEditor("session-c", { preview: false, checkoutId: "checkout-c" }),
+    );
+
+    const keyA = "locus:workbench-window:main:workspace:checkout-a";
+    const keyB = "locus:workbench-window:main:workspace:checkout-b";
+    const keyC = "locus:workbench-window:main:workspace:checkout-c";
+    const stateA = localStorage.getItem(keyA)!;
+    const stateB = localStorage.getItem(keyB)!;
+    const stateC = localStorage.getItem(keyC)!;
+    localStorage.setItem(keyA, stateB);
+    localStorage.setItem(keyB, stateC);
+    localStorage.setItem(keyC, stateA);
+
+    setActivePinia(createPinia());
+    const restoredStore = useWorkbenchStore();
+    const restoredA = restoredStore.switchWorkspaceScope("main", "checkout-a");
+    expect(restoredA.groups.main!.tabs.map((editor) => editor.title)).toEqual(["session-a"]);
+    const restoredB = restoredStore.switchWorkspaceScope("main", "checkout-b");
+    expect(restoredB.groups.main!.tabs.map((editor) => editor.title)).toEqual(["session-b"]);
+    const restoredC = restoredStore.switchWorkspaceScope("main", "checkout-c");
+    expect(restoredC.groups.main!.tabs.map((editor) => editor.title)).toEqual(["session-c"]);
+  });
+
+  it("partitions a mixed historical layout without duplicating an existing destination editor", () => {
+    const firstStore = useWorkbenchStore();
+    firstStore.switchWorkspaceScope("main", "checkout-a");
+    firstStore.openEditor("main", sessionEditor("session-a", { preview: false }));
+    firstStore.switchWorkspaceScope("main", "checkout-b");
+    firstStore.openEditor(
+      "main",
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+    );
+
+    const keyA = "locus:workbench-window:main:workspace:checkout-a";
+    const keyB = "locus:workbench-window:main:workspace:checkout-b";
+    const stateA = JSON.parse(localStorage.getItem(keyA)!);
+    const stateB = JSON.parse(localStorage.getItem(keyB)!);
+    const foreignEditor = stateB.groups.main.tabs[0];
+    stateA.groups.main.tabs.push(foreignEditor);
+    stateA.groups.main.activeEditorId = foreignEditor.editorId;
+    stateA.groups.main.focusedCheckoutId = "checkout-b";
+    localStorage.setItem(keyA, JSON.stringify(stateA));
+
+    setActivePinia(createPinia());
+    const restoredStore = useWorkbenchStore();
+    const restoredA = restoredStore.switchWorkspaceScope("main", "checkout-a");
+    expect(restoredA.groups.main!.tabs.map((editor) => editor.title)).toEqual(["session-a"]);
+    const restoredB = restoredStore.switchWorkspaceScope("main", "checkout-b");
+    expect(restoredB.groups.main!.tabs.map((editor) => editor.title)).toEqual(["session-b"]);
+  });
+
+  it("re-homes a lone displaced layout and restores the source slot as empty", () => {
+    const firstStore = useWorkbenchStore();
+    firstStore.switchWorkspaceScope("main", "checkout-b");
+    firstStore.openEditor(
+      "main",
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+    );
+
+    const keyA = "locus:workbench-window:main:workspace:checkout-a";
+    const keyB = "locus:workbench-window:main:workspace:checkout-b";
+    localStorage.setItem(keyA, localStorage.getItem(keyB)!);
+    localStorage.removeItem(keyB);
+
+    setActivePinia(createPinia());
+    const restoredStore = useWorkbenchStore();
+    const restoredA = restoredStore.switchWorkspaceScope("main", "checkout-a");
+    expect(restoredA.groups.main!.tabs).toEqual([]);
+    const restoredB = restoredStore.switchWorkspaceScope("main", "checkout-b");
+    expect(restoredB.groups.main!.tabs.map((editor) => editor.title)).toEqual(["session-b"]);
+  });
+
+  it("refuses to overwrite a scoped key when in-memory state is contaminated", () => {
+    const store = useWorkbenchStore();
+    store.switchWorkspaceScope("main", "checkout-a");
+    const state = store.windows.main!;
+    store.openEditor("main", sessionEditor("session-a", { preview: false }));
+    const key = "locus:workbench-window:main:workspace:checkout-a";
+    const persistedBefore = localStorage.getItem(key);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    state.groups.main!.tabs.push(
+      sessionEditor("session-b", { preview: false, checkoutId: "checkout-b" }),
+    );
+
+    store.persist("main");
+
+    expect(localStorage.getItem(key)).toBe(persistedBefore);
+    expect(error).toHaveBeenCalledWith(
+      "[workbench] refused to persist a layout outside checkout scope checkout-a",
+    );
+    state.groups.main!.tabs = state.groups.main!.tabs.filter(
+      (editor) => editor.checkoutBinding?.checkoutId === "checkout-a",
+    );
+    state.groups.main!.focusedCheckoutId = "checkout-b";
+    store.persist("main");
+    expect(localStorage.getItem(key)).toBe(persistedBefore);
+    expect(error).toHaveBeenCalledTimes(2);
+    error.mockRestore();
   });
 
   it("restores a workspace-scoped layout after recreating the store", () => {
