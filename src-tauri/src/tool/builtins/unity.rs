@@ -508,8 +508,9 @@ pub(super) fn unity_lock() -> ToolDef {
                         Some(value @ 1..=900) => value,
                         _ => {
                             return ToolResult {
-                                output: "Parameter 'timeout_seconds' must be an integer from 1 to 900."
-                                    .to_string(),
+                                output:
+                                    "Parameter 'timeout_seconds' must be an integer from 1 to 900."
+                                        .to_string(),
                                 is_error: true,
                             };
                         }

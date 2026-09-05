@@ -1,5 +1,5 @@
 {
-  "description": "Release the cooperative lock for shared Unity Editor state after the current critical section is complete. Call this promptly after the state-sensitive operation and its verification finish so the next waiting Agent can proceed. Releasing an already-free lock succeeds. An Agent cannot release a lock owned by another Agent. Agent run completion and cancellation also clean up locks owned by that run's session.",
+  "description": "Release the cooperative lock immediately after the last direct Editor-state control or state-dependent tool call in the minimal critical section so the next waiting Agent can proceed. Perform subsequent asset/code edits and ordinary verification outside the lock. Releasing an already-free lock succeeds. An Agent cannot release a lock owned by another Agent. Agent run completion and cancellation also clean up locks owned by that run's session.",
   "parameters": {
     "type": "object",
     "properties": {},
