@@ -165,10 +165,6 @@ export interface ViewDetachTabRequest {
   y?: number | null;
 }
 
-export interface ViewOpenInspectorTabRequest {
-  tabId: string;
-}
-
 export interface ViewContentMountRequest {
   viewId: string;
   hostLabel: string;
@@ -557,13 +553,6 @@ export function viewSetTabHost(workspaceRef: WorkspaceRef, request: ViewSetTabHo
 
 export function viewDetachTab(workspaceRef: WorkspaceRef, request: ViewDetachTabRequest): Promise<ViewRunResult> {
   return ipcInvoke<ViewRunResult>("view_detach_tab", { workspaceRef, request });
-}
-
-export function viewOpenInspectorTab(
-  workspaceRef: WorkspaceRef,
-  request: ViewOpenInspectorTabRequest,
-): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_open_inspector_tab", { workspaceRef, request });
 }
 
 export function viewHostPoolPrepare(workspaceRef: WorkspaceRef): Promise<ViewRunResult> {
