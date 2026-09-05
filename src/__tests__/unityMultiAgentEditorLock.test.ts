@@ -6,8 +6,9 @@ const root = resolve(import.meta.dirname, "../..");
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
 
 describe("Unity multi-Agent single Editor coordination", () => {
-  it("defines wait and try acquisition without tying safety to readonly", () => {
+  it("defines wait and try acquisition around only minimal Editor-state control", () => {
     const definition = JSON.parse(read("tools/unity_lock.json"));
+    const releaseDefinition = JSON.parse(read("tools/unity_release.json"));
     const builtin = read("src-tauri/src/tool/builtins/unity.rs");
     const lockStart = builtin.indexOf("pub(super) fn unity_lock()");
     const lockEnd = builtin.indexOf("pub(super) fn unity_release()", lockStart);
@@ -15,8 +16,15 @@ describe("Unity multi-Agent single Editor coordination", () => {
 
     expect(definition.parameters.properties.mode.enum).toEqual(["wait", "try"]);
     expect(definition.parameters.properties.mode.default).toBe("wait");
-    expect(definition.description).toContain("not on `unity_execute.readonly`");
-    expect(definition.description).toContain("mutating `unity_execute` may run without this lock");
+    expect(definition.description).toContain("smallest critical section");
+    expect(definition.description).toContain("Never hold the lock for an entire task or workflow");
+    expect(definition.description).toContain("Asset and code work does not require this lock");
+    expect(definition.description).toContain("only the recompile/state-dependent portion may need the lock");
+    expect(definition.description).toContain("not on whether an operation mutates assets or on `unity_execute.readonly`");
+    expect(definition.description).toContain("mutating `unity_execute` runs without this lock");
+    expect(definition.parameters.properties.reason.description).toContain("Do not list asset or code edits");
+    expect(releaseDefinition.description).toContain("immediately after the last direct Editor-state control");
+    expect(releaseDefinition.description).toContain("asset/code edits and ordinary verification outside the lock");
     expect(definition.description).toContain("complete holder session and reason");
     expect(lockImplementation).toContain("UnityEditorLockAcquireError::Busy");
     expect(lockImplementation).toMatch(/UnityEditorLockAcquireError::Busy[\s\S]*is_error: false/);
