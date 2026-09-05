@@ -6,6 +6,10 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
+import {
+  createAnimationFrameResizeObserver,
+  type ResizeObserverHandle,
+} from "../../composables/resizeObserver";
 import { getDebugMode } from "../../services/permissions";
 import { normalizeAppError } from "../../services/errors";
 import { useNotificationStore } from "../../stores/notification";
@@ -36,7 +40,6 @@ const CONSOLE_MESSAGE_PREVIEW_LIMIT = 4_000;
 const CONSOLE_VIRTUAL_ESTIMATED_ROW_HEIGHT = 36;
 const CONSOLE_VIRTUAL_OVERSCAN_PX = 360;
 const CONSOLE_VIRTUAL_FALLBACK_VIEWPORT_HEIGHT = 520;
-const CONSOLE_VIRTUAL_MEASUREMENT_CACHE_LIMIT = 4_096;
 const DEFAULT_COLUMN_WIDTHS: ConsoleColumnWidths = {
   timeWidth: 88,
   sourceWidth: 72,
@@ -54,7 +57,7 @@ const MAX_COLUMN_WIDTHS: ConsoleColumnWidths = {
 };
 
 const notificationStore = useNotificationStore();
-const entries = ref<DebugConsoleEntry[]>(getDebugConsoleSnapshot());
+const entries = shallowRef<DebugConsoleEntry[]>(getDebugConsoleSnapshot());
 const debugEnabled = ref(false);
 const autoScroll = ref(true);
 const isExporting = ref(false);
@@ -137,6 +140,19 @@ function firstRowStartingAtOrAfter(offsets: number[], target: number, total: num
   return low;
 }
 
+// Keep the O(n) prefix sums independent of scrolling through the visible range.
+const virtualRowOffsets = computed(() => {
+  const source = filteredEntries.value;
+  const offsets = new Array<number>(source.length + 1);
+  offsets[0] = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const measured = measuredRowHeights.value.get(source[index]!.id);
+    offsets[index + 1] = offsets[index]!
+      + Math.max(1, measured ?? CONSOLE_VIRTUAL_ESTIMATED_ROW_HEIGHT);
+  }
+  return offsets;
+});
+
 const virtualConsoleLayout = computed(() => {
   const source = filteredEntries.value;
   const total = source.length;
@@ -147,13 +163,7 @@ const virtualConsoleLayout = computed(() => {
     };
   }
 
-  const offsets = new Array<number>(total + 1);
-  offsets[0] = 0;
-  for (let index = 0; index < total; index += 1) {
-    const measured = measuredRowHeights.value.get(source[index]!.id);
-    offsets[index + 1] = offsets[index]!
-      + Math.max(1, measured ?? CONSOLE_VIRTUAL_ESTIMATED_ROW_HEIGHT);
-  }
+  const offsets = virtualRowOffsets.value;
 
   const effectiveViewportHeight = virtualViewportHeight.value > 0
     ? virtualViewportHeight.value
@@ -162,7 +172,7 @@ const virtualConsoleLayout = computed(() => {
     CONSOLE_VIRTUAL_ESTIMATED_ROW_HEIGHT,
     effectiveViewportHeight - virtualHeaderHeight.value,
   );
-  const bodyScrollTop = Math.max(0, virtualScrollTop.value - virtualHeaderHeight.value);
+  const bodyScrollTop = Math.max(0, virtualScrollTop.value);
   const rangeStart = Math.max(0, bodyScrollTop - CONSOLE_VIRTUAL_OVERSCAN_PX);
   const rangeEnd = Math.min(
     offsets[total]!,
@@ -313,22 +323,39 @@ function scrollToLatest() {
   virtualScrollTop.value = 0;
 }
 
-let virtualViewportResizeObserver: ResizeObserver | null = null;
-let virtualRowResizeObserver: ResizeObserver | null = null;
+let virtualViewportResizeObserver: ResizeObserverHandle | null = null;
+let virtualRowResizeObserver: ResizeObserverHandle | null = null;
 let virtualScrollFrame = 0;
+let virtualViewportWidth = 0;
+let rowMeasurementsInvalidated = false;
 const virtualRowElements = new Map<string, HTMLElement>();
+
+function invalidateVirtualRowMeasurements() {
+  measuredRowHeights.value = new Map();
+  rowMeasurementsInvalidated = true;
+  scheduleVirtualViewportMetrics();
+}
 
 function updateVirtualViewportMetrics() {
   const list = listRef.value;
   const nextScrollTop = list?.scrollTop ?? 0;
   const nextViewportHeight = list?.clientHeight ?? 0;
+  const nextViewportWidth = list?.clientWidth ?? 0;
   const nextHeaderHeight = headerRef.value?.getBoundingClientRect().height ?? 0;
+  if (nextViewportWidth > 0 && virtualViewportWidth !== nextViewportWidth) {
+    virtualViewportWidth = nextViewportWidth;
+    invalidateVirtualRowMeasurements();
+  }
   if (virtualScrollTop.value !== nextScrollTop) virtualScrollTop.value = nextScrollTop;
   if (nextViewportHeight > 0 && virtualViewportHeight.value !== nextViewportHeight) {
     virtualViewportHeight.value = nextViewportHeight;
   }
   if (nextHeaderHeight > 0 && virtualHeaderHeight.value !== nextHeaderHeight) {
     virtualHeaderHeight.value = nextHeaderHeight;
+  }
+  if (rowMeasurementsInvalidated) {
+    rowMeasurementsInvalidated = false;
+    measureVirtualRows();
   }
 }
 
@@ -344,27 +371,26 @@ function scheduleVirtualViewportMetrics() {
   });
 }
 
-function updateMeasuredRowHeight(entryId: string, height: number) {
-  const roundedHeight = Math.max(1, Math.ceil(height));
-  if (measuredRowHeights.value.get(entryId) === roundedHeight) return;
-  const next = new Map(measuredRowHeights.value);
-  next.set(entryId, roundedHeight);
-  if (next.size > CONSOLE_VIRTUAL_MEASUREMENT_CACHE_LIMIT) {
-    const liveIds = new Set(filteredEntries.value.map((entry) => entry.id));
-    for (const cachedId of next.keys()) {
-      if (!liveIds.has(cachedId)) next.delete(cachedId);
-    }
+function measureVirtualRows(observedEntries?: ResizeObserverEntry[]) {
+  // Read every row before publishing a single update. Never change the virtual
+  // body during ResizeObserver delivery: that resizes its observed viewport.
+  let next: Map<string, number> | null = null;
+  const measurements = observedEntries
+    ?? [...virtualRowElements.values()].map((target) => ({ target, borderBoxSize: [] }));
+  for (const observed of measurements) {
+    const element = observed.target as HTMLElement;
+    const entryId = element.dataset.consoleEntryId;
+    if (!entryId || virtualRowElements.get(entryId) !== element) continue;
+    const height = observed.borderBoxSize?.[0]?.blockSize
+      ?? element.getBoundingClientRect().height;
+    // A hidden/unmounted row must not poison the cache with a 1px height.
+    if (!Number.isFinite(height) || height <= 0) continue;
+    const roundedHeight = Math.ceil(height);
+    if (measuredRowHeights.value.get(entryId) === roundedHeight) continue;
+    next ??= new Map(measuredRowHeights.value);
+    next.set(entryId, roundedHeight);
   }
-  measuredRowHeights.value = next;
-}
-
-function measureVirtualRow(element: HTMLElement, observedHeight?: number) {
-  const entryId = element.dataset.consoleEntryId;
-  if (!entryId) return;
-  const height = typeof observedHeight === "number" && observedHeight > 0
-    ? observedHeight
-    : element.getBoundingClientRect().height;
-  updateMeasuredRowHeight(entryId, height);
+  if (next) measuredRowHeights.value = next;
 }
 
 function setVirtualRowRef(entryId: string, value: unknown) {
@@ -378,7 +404,7 @@ function setVirtualRowRef(entryId: string, value: unknown) {
   if (!nextElement) return;
   nextElement.dataset.consoleEntryId = entryId;
   virtualRowElements.set(entryId, nextElement);
-  virtualRowResizeObserver?.observe(nextElement);
+  virtualRowResizeObserver?.observe(nextElement, { box: "border-box" });
 }
 
 function isMessageLong(entry: DebugConsoleEntry): boolean {
@@ -547,19 +573,12 @@ let unsubscribe: (() => void) | null = null;
 onMounted(async () => {
   updateVirtualViewportMetrics();
   if (typeof ResizeObserver !== "undefined") {
-    virtualViewportResizeObserver = new ResizeObserver(updateVirtualViewportMetrics);
-    if (listRef.value) virtualViewportResizeObserver.observe(listRef.value);
-    if (headerRef.value) virtualViewportResizeObserver.observe(headerRef.value);
-    virtualRowResizeObserver = new ResizeObserver((observedEntries) => {
-      for (const observed of observedEntries) {
-        measureVirtualRow(
-          observed.target as HTMLElement,
-          observed.borderBoxSize?.[0]?.blockSize,
-        );
-      }
-    });
+    virtualViewportResizeObserver = createAnimationFrameResizeObserver(updateVirtualViewportMetrics);
+    if (listRef.value) virtualViewportResizeObserver?.observe(listRef.value);
+    if (headerRef.value) virtualViewportResizeObserver?.observe(headerRef.value);
+    virtualRowResizeObserver = createAnimationFrameResizeObserver(measureVirtualRows);
     for (const element of virtualRowElements.values()) {
-      virtualRowResizeObserver.observe(element);
+      virtualRowResizeObserver?.observe(element, { box: "border-box" });
     }
   }
   unsubscribe = subscribeDebugConsole(() => {
@@ -586,6 +605,27 @@ onUnmounted(() => {
 });
 
 watch(
+  entries,
+  (snapshot) => {
+    const liveIds = new Set(snapshot.map((entry) => entry.id));
+    const nextHeights = new Map(measuredRowHeights.value);
+    for (const id of nextHeights.keys()) {
+      if (!liveIds.has(id)) nextHeights.delete(id);
+    }
+    if (nextHeights.size !== measuredRowHeights.value.size) measuredRowHeights.value = nextHeights;
+    const nextExpanded = new Set([...expandedEntryIds.value].filter((id) => liveIds.has(id)));
+    if (nextExpanded.size !== expandedEntryIds.value.size) expandedEntryIds.value = nextExpanded;
+  },
+);
+
+watch([columnWidths, searchQuery], invalidateVirtualRowMeasurements);
+
+watch([levelFilter, sourceFilter, searchQuery], scrollToLatest);
+watch(autoScroll, (enabled) => {
+  if (enabled) scrollToLatest();
+});
+
+watch(
   () => [filteredEntries.value[0]?.id ?? "", filteredEntries.value.length],
   async () => {
     scheduleVirtualViewportMetrics();
@@ -597,7 +637,7 @@ watch(
 </script>
 
 <template>
-  <div class="settings-section">
+  <div class="settings-section console-section">
     <div class="section-label">{{ t("settings.console.title") }}</div>
     <p class="section-desc">{{ t("settings.console.desc") }}</p>
 
@@ -774,11 +814,26 @@ watch(
 </template>
 
 <style scoped>
+.console-section {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.console-section > .section-label,
+.console-section > .section-desc {
+  flex-shrink: 0;
+}
+
 .console-panel {
   display: flex;
+  flex: 1;
   flex-direction: column;
   gap: 10px;
-  min-height: 520px;
+  min-height: 0;
+  overflow: hidden;
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background: var(--panel-bg);
@@ -789,6 +844,7 @@ watch(
   display: flex;
   align-items: center;
   flex-wrap: wrap;
+  flex-shrink: 0;
   gap: 8px;
 }
 
@@ -825,6 +881,7 @@ watch(
 
 .console-meta {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -848,6 +905,7 @@ watch(
     + var(--console-source-width)
     + var(--console-module-width)
     + var(--console-message-min-width)
+    + 54px
   );
 }
 
@@ -857,7 +915,7 @@ watch(
   overflow-anchor: none;
 }
 
-.console-virtual-row {
+.console-row.console-virtual-row {
   position: absolute;
   top: 0;
   right: 0;

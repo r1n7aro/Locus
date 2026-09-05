@@ -27,7 +27,7 @@ describe("ConsoleSettings layout", () => {
     expect(source).toContain("const virtualConsoleLayout = computed(() => {");
     expect(source).toContain("const measuredRowHeights = shallowRef<Map<string, number>>(new Map())");
     expect(source).toContain("const CONSOLE_VIRTUAL_OVERSCAN_PX = 360");
-    expect(source).toContain("virtualRowResizeObserver = new ResizeObserver");
+    expect(source).toContain("virtualRowResizeObserver = createAnimationFrameResizeObserver(measureVirtualRows)");
     expect(source).toContain('class="console-virtual-body"');
     expect(source).toContain('v-for="{ entry, index, top } in virtualConsoleLayout.rows"');
     expect(source).toContain(":style=\"{ transform: `translateY(${top}px)` }\"");
