@@ -27,7 +27,10 @@ import { sanitizeRenderedMarkdownHtml } from "../composables/markdownSanitize";
 import { loadCachedMarkdownPathStatuses } from "../composables/markdownPathStatusCache";
 import { useInternalDragController } from "../composables/useInternalDrag";
 import { useTextViewerZoom } from "../composables/useTextViewerZoom";
+import { workspaceFileChangeMatches } from "../composables/useFileChangeRevalidation";
 import { resolveMarkdownImage } from "../services/markdownImage";
+import { subscribeWorkspaceFileChanges } from "../services/workspaceExplorer";
+import type { RuntimeUnsubscribe } from "../services/locusRuntime";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
 import { normalizeViewError, viewRun, viewTree, type ViewPackageSummary } from "../services/view";
 import { useNotificationStore } from "../stores/notification";
@@ -67,12 +70,15 @@ const internalDrag = useInternalDragController();
 const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
 const inlinePathStatuses = ref<Map<string, MarkdownPathStatus>>(new Map());
+const markdownPreviewRevisionEpoch = ref(0);
 const appContext = getCurrentInstance()?.appContext ?? null;
 const markdownUnityObjectPreviewHosts = new Set<HTMLElement>();
 const markdownUnityPropertyFenceHosts = new Set<HTMLElement>();
 let markdownViewRefLoadRun = 0;
 let markdownInlinePathStatusLoadRun = 0;
 let markdownInlinePathStatusKey = "";
+let releaseWorkspaceFileChanges: RuntimeUnsubscribe | null = null;
+let markdownRendererUnmounted = false;
 
 function escapeRegExp(source: string): string {
   return source.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -362,6 +368,7 @@ function mountMarkdownUnityObjectPreviews() {
       level,
       draggable: false,
       autoLoadPreview: true,
+      previewRevision: String(markdownPreviewRevisionEpoch.value),
       previewStateKey: markdownUnityObjectPreviewStateKey(host, index, model, level),
     });
     if (appContext) {
@@ -520,7 +527,31 @@ watch(
   { immediate: true, flush: "post" },
 );
 
+void subscribeWorkspaceFileChanges((event) => {
+  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  if (!workspaceFileChangeMatches(event, workspaceRef, event.payload.path)) return;
+  const normalizedContent = props.content.replace(/\\/g, "/").toLocaleLowerCase();
+  const normalizedPath = event.payload.path.replace(/\\/g, "/").toLocaleLowerCase();
+  if (!normalizedPath || !normalizedContent.includes(normalizedPath)) return;
+  markdownPreviewRevisionEpoch.value += 1;
+  if (/\.(?:png|jpe?g|gif|bmp|webp|svg)$/i.test(normalizedPath)) {
+    markdownImageCache.clear();
+    for (const image of rootRef.value?.querySelectorAll<HTMLImageElement>(
+      "img[data-md-image-source]",
+    ) ?? []) {
+      delete image.dataset.mdImageResolvedFor;
+    }
+  }
+  void nextTick(refreshMarkdownEnhancements);
+}).then((release) => {
+  if (markdownRendererUnmounted) release();
+  else releaseWorkspaceFileChanges = release;
+});
+
 onBeforeUnmount(() => {
+  markdownRendererUnmounted = true;
+  releaseWorkspaceFileChanges?.();
+  releaseWorkspaceFileChanges = null;
   markdownImageResolveRun++;
   unmountMarkdownUnityPropertyFences();
   unmountMarkdownUnityObjectPreviews();

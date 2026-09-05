@@ -2,21 +2,30 @@
 import type { Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { computed, nextTick, ref, watch } from "vue";
+import { AlertTriangle } from "lucide";
 import { t } from "../../i18n";
+import { useFileChangeRevalidation } from "../../composables/useFileChangeRevalidation";
 import { normalizeAppError } from "../../services/errors";
 import { previewWorkspaceAsset } from "../../services/asset";
 import type { WorkspaceRef } from "../../services/project";
 import {
   projectExplorerPreviewFile,
+  projectExplorerFileRevision,
   projectExplorerWriteFile,
   workspaceFilePreview,
+  workspaceFileRevision,
   workspaceFileWrite,
 } from "../../services/workspaceExplorer";
 import type { AssetPreviewPayload } from "../../types";
-import type { ProjectExplorerFilePreview } from "../../types/workbench";
+import type {
+  ProjectExplorerFilePreview,
+  ProjectExplorerFileRevision,
+} from "../../types/workbench";
 import type { WorkbenchEditorTransferSnapshot } from "../../types/workbench";
 import WorkspaceAssetPreview from "../asset/WorkspaceAssetPreview.vue";
 import AssetTextViewer from "../asset/AssetTextViewer.vue";
+import LucideIcon from "../icons/LucideIcon.vue";
+import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 import type { MarkdownEditorViewMode } from "../ui/markdownEditorViewMode";
@@ -40,6 +49,8 @@ const sourceText = ref("");
 const editorDocument = ref<Text | null>(null);
 const dirty = ref(false);
 const saving = ref(false);
+const diskChanged = ref(false);
+const observedDiskRevision = ref<ProjectExplorerFileRevision | null>(null);
 const originalLineEnding = ref<"\n" | "\r\n" | "\r">("\n");
 const sourceEditor = ref<InstanceType<typeof BaseMarkdownEditor> | null>(null);
 const pendingPosition = ref<{ line: number; column: number } | null>(null);
@@ -83,33 +94,33 @@ function formatSize(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-async function loadPreview(): Promise<void> {
+async function readPreview(): Promise<ProjectExplorerFilePreview> {
+  return props.workspaceRef
+    ? await workspaceFilePreview(props.path, props.workspaceRef)
+    : await projectExplorerPreviewFile(props.projectId ?? "", props.path);
+}
+
+async function loadPreview(options: { keepCurrent?: boolean } = {}): Promise<boolean> {
   const epoch = ++requestEpoch;
   loading.value = true;
   error.value = "";
-  preview.value = null;
-  assetPayload.value = null;
-  sourceText.value = "";
-  editorDocument.value = null;
-  setDirty(false);
+  if (!options.keepCurrent) {
+    preview.value = null;
+    assetPayload.value = null;
+    sourceText.value = "";
+    editorDocument.value = null;
+    setDirty(false);
+  }
   try {
-    const next = props.workspaceRef
-      ? await workspaceFilePreview(props.path, props.workspaceRef)
-      : await projectExplorerPreviewFile(props.projectId ?? "", props.path);
-    if (epoch !== requestEpoch) return;
-    preview.value = next;
-    sourceText.value = next.text ?? "";
-    originalLineEnding.value = next.text?.includes("\r\n")
-      ? "\r\n"
-      : next.text?.includes("\r")
-        ? "\r"
-        : "\n";
+    const next = await readPreview();
+    if (epoch !== requestEpoch) return false;
+    let nextAssetPayload: AssetPreviewPayload | null = null;
     if (
       next.kind === "unity"
       && next.checkoutId
       && next.workspaceRelativePath
     ) {
-      assetPayload.value = await previewWorkspaceAsset(
+      nextAssetPayload = await previewWorkspaceAsset(
         next.workspaceRelativePath,
         undefined,
         {
@@ -118,13 +129,81 @@ async function loadPreview(): Promise<void> {
         },
       );
     }
+    if (epoch !== requestEpoch) return false;
+    preview.value = next;
+    assetPayload.value = nextAssetPayload;
+    sourceText.value = next.text ?? "";
+    editorDocument.value = null;
+    originalLineEnding.value = next.text?.includes("\r\n")
+      ? "\r\n"
+      : next.text?.includes("\r")
+        ? "\r"
+        : "\n";
+    diskChanged.value = false;
+    observedDiskRevision.value = null;
+    setDirty(false);
     if (epoch === requestEpoch) void applyPendingPosition();
+    return true;
   } catch (cause) {
-    if (epoch !== requestEpoch) return;
+    if (epoch !== requestEpoch) return false;
     error.value = normalizeAppError(cause).message;
+    return false;
   } finally {
     if (epoch === requestEpoch) loading.value = false;
   }
+}
+
+async function probeFileRevision(): Promise<ProjectExplorerFileRevision> {
+  return props.workspaceRef
+    ? await workspaceFileRevision(props.path, props.workspaceRef)
+    : await projectExplorerFileRevision(props.projectId ?? "", props.path);
+}
+
+const { checkNow: refreshIfChanged } = useFileChangeRevalidation({
+  active: () => props.active !== false,
+  currentRevision: () => observedDiskRevision.value ?? preview.value?.revision ?? null,
+  probe: probeFileRevision,
+  workspaceRef: () => props.workspaceRef,
+  workspacePath: () => props.workspaceRef ? props.path : null,
+  onChanged: async (revision) => {
+    observedDiskRevision.value = revision;
+    if (dirty.value) {
+      diskChanged.value = true;
+      return;
+    }
+    await loadPreview({ keepCurrent: true });
+  },
+});
+
+async function useDiskVersion(): Promise<void> {
+  await loadPreview({ keepCurrent: true });
+}
+
+async function keepLocalVersion(): Promise<void> {
+  const localText = serializedEditorText();
+  const localLineEnding = originalLineEnding.value;
+  const viewBefore = sourceEditor.value?.getEditorView();
+  const selection = viewBefore ? {
+    anchor: viewBefore.state.selection.main.anchor,
+    head: viewBefore.state.selection.main.head,
+  } : null;
+  const loaded = await loadPreview({ keepCurrent: true });
+  if (!loaded || preview.value?.kind !== "text" || !preview.value.editable) return;
+  await nextTick();
+  const view = sourceEditor.value?.getEditorView();
+  if (!view) return;
+  const normalized = localText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: normalized },
+    selection: selection ? {
+      anchor: Math.min(normalized.length, selection.anchor),
+      head: Math.min(normalized.length, selection.head),
+    } : undefined,
+  });
+  originalLineEnding.value = localLineEnding;
+  diskChanged.value = false;
+  observedDiskRevision.value = null;
+  setDirty(normalized !== normalizedSourceText.value);
 }
 
 async function applyPendingPosition(): Promise<boolean> {
@@ -201,6 +280,8 @@ async function saveFile(): Promise<boolean> {
     preview.value = next;
     sourceText.value = next.text ?? "";
     editorDocument.value = null;
+    diskChanged.value = false;
+    observedDiskRevision.value = null;
     setDirty(false);
     return true;
   } catch (cause) {
@@ -261,14 +342,20 @@ watch(
     props.workspaceRef?.checkoutId,
     props.workspaceRef?.expectedGeneration,
   ] as const,
-  loadPreview,
+  () => void loadPreview(),
   { immediate: true },
 );
 watch(() => props.active, (active) => {
   if (active) void applyPendingPosition();
 });
 
-defineExpose({ saveFile, revealPosition, exportTransferSnapshot, applyTransferSnapshot });
+defineExpose({
+  saveFile,
+  revealPosition,
+  refreshIfChanged,
+  exportTransferSnapshot,
+  applyTransferSnapshot,
+});
 </script>
 
 <template>
@@ -286,7 +373,9 @@ defineExpose({ saveFile, revealPosition, exportTransferSnapshot, applyTransferSn
       } : null"
       :path="preview.workspaceRelativePath || preview.path"
       :title="preview.name"
+      :active="active !== false"
       :payload="assetPayload"
+      :preview-revision="preview.revision.key"
       :loading="loading"
       :error="error"
       :auto-load-preview="false"
@@ -294,6 +383,20 @@ defineExpose({ saveFile, revealPosition, exportTransferSnapshot, applyTransferSn
     />
 
     <template v-else-if="preview">
+      <div v-if="diskChanged" class="workspace-file-preview-conflict" role="status">
+        <span class="workspace-file-preview-conflict-text">
+          <LucideIcon :icon="AlertTriangle" :size="14" :stroke-width="1.8" />
+          {{ t("development.editor.diskChanged") }}
+        </span>
+        <span class="workspace-file-preview-conflict-actions">
+          <BaseButton size="sm" @click="useDiskVersion">
+            {{ t("development.editor.useDisk") }}
+          </BaseButton>
+          <BaseButton size="sm" @click="keepLocalVersion">
+            {{ t("development.editor.keepLocal") }}
+          </BaseButton>
+        </span>
+      </div>
       <div v-if="error" class="workspace-file-preview-inline-error">{{ error }}</div>
       <div class="workspace-file-preview-body">
         <BaseMarkdownEditor
@@ -373,6 +476,32 @@ defineExpose({ saveFile, revealPosition, exportTransferSnapshot, applyTransferSn
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.workspace-file-preview-conflict {
+  flex-shrink: 0;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 8px 5px 10px;
+  border-bottom: 1px solid var(--status-warn-border, var(--border-color));
+  background: var(--status-warn-bg, var(--sidebar-bg));
+  color: var(--status-warn-fg, var(--text-color));
+  font-size: 12px;
+}
+
+.workspace-file-preview-conflict-text {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.workspace-file-preview-conflict-actions {
+  display: inline-flex;
+  gap: 6px;
+  margin-left: auto;
 }
 
 .workspace-file-preview-body {

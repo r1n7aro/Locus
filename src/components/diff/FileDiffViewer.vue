@@ -6,6 +6,9 @@ import { gitExecute } from "../../services/git";
 import { t } from "../../i18n";
 import { useResizablePanel } from "../../composables/useResizablePanel";
 import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
+import { workspaceFileChangeMatches } from "../../composables/useFileChangeRevalidation";
+import { subscribeWorkspaceFileChanges } from "../../services/workspaceExplorer";
+import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { highlightDiffHunk } from "./fileDiffText";
 import type {
   FileDiffPayload,
@@ -66,6 +69,9 @@ const emit = defineEmits<{
 
 const lfsPulling = ref(false);
 const lfsPullError = ref<string | null>(null);
+const sourceChanged = ref(false);
+let releaseWorkspaceFileChanges: RuntimeUnsubscribe | null = null;
+let diffViewerUnmounted = false;
 const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 
 async function pullLfsObject() {
@@ -276,6 +282,7 @@ watch(
     props.workspaceRef?.expectedGeneration ?? null,
   ] as const,
   ([payload]) => {
+    sourceChanged.value = false;
     lazyTextRequestGeneration += 1;
     semanticRequestGeneration += 1;
     activeTab.value = resolveInitialTab(payload);
@@ -698,15 +705,28 @@ defineExpose({
 
 onMounted(() => {
   document.addEventListener("keydown", onDocumentKeydown);
+  void subscribeWorkspaceFileChanges((event) => {
+    if (!workspaceFileChangeMatches(event, props.workspaceRef, props.payload.filePath)) return;
+    sourceChanged.value = true;
+  }).then((release) => {
+    if (diffViewerUnmounted) release();
+    else releaseWorkspaceFileChanges = release;
+  });
 });
 
 onUnmounted(() => {
+  diffViewerUnmounted = true;
+  releaseWorkspaceFileChanges?.();
+  releaseWorkspaceFileChanges = null;
   document.removeEventListener("keydown", onDocumentKeydown);
 });
 </script>
 
 <template>
   <div class="diff-viewer" :class="{ compact }" @scroll="onTextScroll">
+    <div v-if="sourceChanged" class="diff-source-changed" role="status">
+      {{ t("diff.sourceChanged") }}
+    </div>
     <div v-if="payload.isBinary" class="diff-binary-shell">
       <div v-if="payload.binaryPreview" class="diff-binary-preview">
         <BinaryPreviewHost
@@ -978,6 +998,19 @@ onUnmounted(() => {
   padding: 16px;
   text-align: center;
   color: var(--text-secondary);
+}
+
+.diff-source-changed {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--status-warn-border, var(--border-color));
+  background: var(--status-warn-bg, var(--sidebar-bg));
+  color: var(--status-warn-fg, var(--text-color));
+  font-family: var(--font-ui);
+  font-size: 12px;
 }
 
 .diff-fallback.compact {

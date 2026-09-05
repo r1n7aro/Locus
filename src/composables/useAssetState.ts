@@ -16,6 +16,11 @@ import {
 } from "../services/project";
 import { WORKSPACE_EVENT_NAME } from "../services/project";
 import type { RoutedWorkspaceEvent, WorkspaceRef } from "../services/project";
+import {
+  subscribeWorkspaceFileChanges,
+  type WorkspaceFileChangedPayload,
+} from "../services/workspaceExplorer";
+import type { RuntimeUnsubscribe } from "../services/locusRuntime";
 import { t } from "../i18n";
 import { isUnityConnectionError, normalizeAppError } from "../services/errors";
 import { getWarmup } from "./warmupCache";
@@ -33,6 +38,7 @@ import type {
 interface AssetProps {
   workingDir: string;
   workspaceRef?: WorkspaceRef | null;
+  active?: boolean;
 }
 
 // ── Explorer node ──────────────────────────────────────────
@@ -163,6 +169,8 @@ export function useAssetState(props: AssetProps) {
   const watcherTuningSaving = ref(false);
   let explorerInitialization = 0;
   let explorerInitializing = false;
+  const pendingExplorerFileChanges = new Map<string, WorkspaceFileChangedPayload["kind"]>();
+  let explorerFileChangeTimer: ReturnType<typeof setTimeout> | null = null;
   const hasWorkspace = computed(() => !!props.workingDir.trim() && !!props.workspaceRef);
   const hiddenDirectories = computed(() => {
     const names = [
@@ -184,9 +192,96 @@ export function useAssetState(props: AssetProps) {
     return workspaceRef;
   }
 
+  function explorerParentPath(path: string): string {
+    const normalized = path.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+    const separator = normalized.lastIndexOf("/");
+    return separator > 0 ? normalized.slice(0, separator) : WORKSPACE_ROOT_PATH;
+  }
+
+  function explorerPathHidden(path: string): boolean {
+    const normalized = path.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+    if (isUnityWorkspace.value && normalized.toLocaleLowerCase().endsWith(".meta")) return true;
+    const hidden = new Set(hiddenDirectories.value.map((name) => name.toLocaleLowerCase()));
+    return normalized
+      .split("/")
+      .slice(0, -1)
+      .some((segment) => hidden.has(segment.toLocaleLowerCase()));
+  }
+
+  async function applyExplorerFileChange(
+    path: string,
+    kind: WorkspaceFileChangedPayload["kind"],
+  ): Promise<void> {
+    if (!hasWorkspace.value || explorerPathHidden(path)) return;
+    const parent = findNodeByPath(explorerParentPath(path));
+    if (!parent || parent.kind !== "folder" || !parent.loaded) return;
+    const normalizedPath = path.replace(/\\/g, "/");
+    const childIndex = parent.children.findIndex((child) => (
+      child.path.toLocaleLowerCase() === normalizedPath.toLocaleLowerCase()
+    ));
+
+    if (kind === "delete") {
+      if (childIndex < 0) return;
+      parent.children.splice(childIndex, 1);
+      parent.totalCount = Math.max(0, parent.totalCount - 1);
+      parent.nextOffset = Math.max(0, parent.nextOffset - 1);
+      parent.hasChildFolders = parent.children.some((child) => child.kind === "folder");
+      if (selectedNode.value?.path.toLocaleLowerCase() === normalizedPath.toLocaleLowerCase()) {
+        closePreview();
+        selectedNode.value = null;
+      }
+      explorerTree.value = [...explorerTree.value];
+      return;
+    }
+
+    if (childIndex >= 0) return;
+    const workspaceRef = props.workspaceRef;
+    if (!workspaceRef) return;
+    const [entry] = await statWorkspaceEntries([normalizedPath], workspaceRef);
+    if (!entry?.exists || (entry.entryKind !== "file" && entry.entryKind !== "folder")) return;
+    if (parent.children.some((child) => (
+      child.path.toLocaleLowerCase() === normalizedPath.toLocaleLowerCase()
+    ))) return;
+    const name = normalizedPath.split("/").filter(Boolean).pop() ?? normalizedPath;
+    parent.children.push(entry.entryKind === "folder"
+      ? createFolderNode(name, normalizedPath, parent.depth + 1, false)
+      : createFileNode(name, normalizedPath, parent.depth + 1));
+    parent.totalCount += 1;
+    parent.nextOffset += 1;
+    parent.hasChildFoldersKnown = true;
+    parent.hasChildFolders = parent.children.some((child) => child.kind === "folder");
+    explorerTree.value = [...explorerTree.value];
+  }
+
+  function armExplorerFileChangeFlush(): void {
+    if (props.active === false || pendingExplorerFileChanges.size === 0) return;
+    if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
+    explorerFileChangeTimer = setTimeout(() => {
+      explorerFileChangeTimer = null;
+      const changes = [...pendingExplorerFileChanges.entries()];
+      pendingExplorerFileChanges.clear();
+      void (async () => {
+        for (const [changedPath, changedKind] of changes) {
+          await applyExplorerFileChange(changedPath, changedKind);
+        }
+      })();
+    }, 120);
+  }
+
+  function scheduleExplorerFileChange(
+    path: string,
+    kind: WorkspaceFileChangedPayload["kind"],
+  ): void {
+    pendingExplorerFileChanges.set(path.replace(/\\/g, "/"), kind);
+    armExplorerFileChangeFlush();
+  }
+
   function resetWorkspaceState() {
     explorerInitialization += 1;
     explorerInitializing = false;
+    if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
+    explorerFileChangeTimer = null;
+    pendingExplorerFileChanges.clear();
     invalidatePreviewSession();
     explorerTree.value = [];
     expandedPaths.value = new Set();
@@ -997,6 +1092,8 @@ export function useAssetState(props: AssetProps) {
 
   // ── Lifecycle ────────────────────────────────────────────
   let unlistenScoped: UnlistenFn | null = null;
+  let releaseWorkspaceFileChanges: RuntimeUnsubscribe | null = null;
+  let assetStateUnmounted = false;
   let watcherPollTimer: ReturnType<typeof setInterval> | null = null;
 
   // Lightweight polling so the watcher card can show queue depth + current
@@ -1027,6 +1124,17 @@ export function useAssetState(props: AssetProps) {
     } else {
       resetWorkspaceState();
     }
+    const releaseFileChanges = await subscribeWorkspaceFileChanges((event) => {
+      const workspaceRef = props.workspaceRef;
+      if (!workspaceRef || event.checkoutId !== workspaceRef.checkoutId) return;
+      if (
+        workspaceRef.expectedGeneration != null
+        && event.workspaceGeneration !== workspaceRef.expectedGeneration
+      ) return;
+      scheduleExplorerFileChange(event.payload.path, event.payload.kind);
+    });
+    if (assetStateUnmounted) releaseFileChanges();
+    else releaseWorkspaceFileChanges = releaseFileChanges;
     try {
       const applyScanPhase = async (phase: AssetDbScanEvent) => {
         if (!hasWorkspace.value) return;
@@ -1080,8 +1188,14 @@ export function useAssetState(props: AssetProps) {
   });
 
   onUnmounted(() => {
+    assetStateUnmounted = true;
     unlistenScoped?.();
     unlistenScoped = null;
+    releaseWorkspaceFileChanges?.();
+    releaseWorkspaceFileChanges = null;
+    if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
+    explorerFileChangeTimer = null;
+    pendingExplorerFileChanges.clear();
     stopWatcherPoll();
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
     releaseSelectionLock?.();
@@ -1105,6 +1219,10 @@ export function useAssetState(props: AssetProps) {
       startWatcherPoll();
     },
   );
+
+  watch(() => props.active, (active) => {
+    if (active !== false) armExplorerFileChangeFlush();
+  });
 
   watch(
     () => hiddenDirectories.value.join("\u0000"),
@@ -1256,6 +1374,7 @@ export function useAssetState(props: AssetProps) {
     probeFolderPath,
     loadMoreFolder,
     loadCurrentFolderMore,
+    applyExplorerFileChange,
     selectNode,
     closePreview,
     runFilenameSearch,

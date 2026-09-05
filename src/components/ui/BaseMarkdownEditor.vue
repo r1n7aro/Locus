@@ -22,7 +22,10 @@ import { normalizeMarkdownEditorLineEndings } from "./markdownEditorFormatting";
 import type { MarkdownEditorViewMode } from "./markdownEditorViewMode";
 import { resolveMarkdownImage } from "../../services/markdownImage";
 import type { WorkspaceRef } from "../../services/project";
+import { subscribeWorkspaceFileChanges } from "../../services/workspaceExplorer";
+import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { useTextViewerZoom } from "../../composables/useTextViewerZoom";
+import { workspaceFileChangeMatches } from "../../composables/useFileChangeRevalidation";
 
 const workspaceMarkdownImageResolver: MarkdownImageResolver = (source, context) => {
   if (!context.workspaceRef) return null;
@@ -81,6 +84,7 @@ const modeCompartment = new Compartment();
 const readOnlyCompartment = new Compartment();
 const placeholderCompartment = new Compartment();
 const localSessionCache = new MarkdownEditorSessionCache();
+const imageCacheEpoch = ref(0);
 const {
   textViewerZoomScale,
   textViewerZoomStyle,
@@ -99,6 +103,8 @@ let currentScrollTop = 0;
 let currentScrollLeft = 0;
 let removeScrollTracking: (() => void) | null = null;
 let activeScrollElement: HTMLElement | null = null;
+let releaseWorkspaceFileChanges: RuntimeUnsubscribe | null = null;
+let editorUnmounted = false;
 
 function normalizeMarkdown(value: string): string {
   return normalizeMarkdownEditorLineEndings(value);
@@ -135,7 +141,7 @@ function currentLivePreviewOptions(): MarkdownLivePreviewOptions {
     ...options,
     imageResolver: workspaceMarkdownImageResolver,
     imageContext: {
-      cacheKey: `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`,
+      cacheKey: `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}:${imageCacheEpoch.value}`,
       contentPath: props.contentPath,
       workspaceRef: {
         checkoutId: workspaceRef.checkoutId,
@@ -452,6 +458,17 @@ function handleEditorWheel(event: WheelEvent): void {
 
 onMounted(() => {
   mountEditor();
+  void subscribeWorkspaceFileChanges((event) => {
+    if (!workspaceFileChangeMatches(event, props.workspaceRef, event.payload.path)) return;
+    if (!/\.(?:png|jpe?g|gif|bmp|webp|svg)$/i.test(event.payload.path)) return;
+    const source = (editorView?.state.doc.toString() ?? props.modelValue).replace(/\\/g, "/");
+    if (!source.toLocaleLowerCase().includes(event.payload.path.toLocaleLowerCase())) return;
+    imageCacheEpoch.value += 1;
+    reconfigureEditor();
+  }).then((release) => {
+    if (editorUnmounted) release();
+    else releaseWorkspaceFileChanges = release;
+  });
 });
 
 watch(
@@ -519,6 +536,9 @@ watch(textViewerZoomScale, () => {
 });
 
 onBeforeUnmount(() => {
+  editorUnmounted = true;
+  releaseWorkspaceFileChanges?.();
+  releaseWorkspaceFileChanges = null;
   suspendEditor();
   localSessionCache.clear();
 });
