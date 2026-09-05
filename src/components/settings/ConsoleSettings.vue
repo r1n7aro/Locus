@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { t } from "../../i18n";
 import BaseButton from "../ui/BaseButton.vue";
@@ -33,6 +33,10 @@ const CONSOLE_COLUMN_STORAGE_KEY = "locus.settings.console.columns.v1";
 const CONSOLE_MESSAGE_MIN_WIDTH = 320;
 const CONSOLE_MESSAGE_MAX_HEIGHT = 132;
 const CONSOLE_MESSAGE_PREVIEW_LIMIT = 4_000;
+const CONSOLE_VIRTUAL_ESTIMATED_ROW_HEIGHT = 36;
+const CONSOLE_VIRTUAL_OVERSCAN_PX = 360;
+const CONSOLE_VIRTUAL_FALLBACK_VIEWPORT_HEIGHT = 520;
+const CONSOLE_VIRTUAL_MEASUREMENT_CACHE_LIMIT = 4_096;
 const DEFAULT_COLUMN_WIDTHS: ConsoleColumnWidths = {
   timeWidth: 88,
   sourceWidth: 72,
@@ -58,9 +62,14 @@ const levelFilter = ref<LevelFilter>("all");
 const sourceFilter = ref<SourceFilter>("all");
 const searchQuery = ref("");
 const listRef = ref<HTMLElement | null>(null);
+const headerRef = ref<HTMLElement | null>(null);
 const expandedEntryIds = ref<Set<string>>(new Set());
 const activeResizeColumn = ref<ResizableConsoleColumn | null>(null);
 const columnWidths = ref<ConsoleColumnWidths>(loadStoredColumnWidths());
+const virtualScrollTop = ref(0);
+const virtualViewportHeight = ref(0);
+const virtualHeaderHeight = ref(32);
+const measuredRowHeights = shallowRef<Map<string, number>>(new Map());
 
 const levelOptions = computed(() => [
   { value: "all", label: t("settings.console.level.all") },
@@ -105,6 +114,78 @@ const filteredEntries = computed(() => {
     )
     .map(({ entry }) => entry);
 });
+
+function firstRowEndingAfter(offsets: number[], target: number, total: number): number {
+  let low = 0;
+  let high = total;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if ((offsets[middle + 1] ?? 0) <= target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function firstRowStartingAtOrAfter(offsets: number[], target: number, total: number): number {
+  let low = 0;
+  let high = total;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if ((offsets[middle] ?? 0) < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+const virtualConsoleLayout = computed(() => {
+  const source = filteredEntries.value;
+  const total = source.length;
+  if (total === 0) {
+    return {
+      rows: [] as Array<{ entry: DebugConsoleEntry; index: number; top: number }>,
+      totalHeight: 0,
+    };
+  }
+
+  const offsets = new Array<number>(total + 1);
+  offsets[0] = 0;
+  for (let index = 0; index < total; index += 1) {
+    const measured = measuredRowHeights.value.get(source[index]!.id);
+    offsets[index + 1] = offsets[index]!
+      + Math.max(1, measured ?? CONSOLE_VIRTUAL_ESTIMATED_ROW_HEIGHT);
+  }
+
+  const effectiveViewportHeight = virtualViewportHeight.value > 0
+    ? virtualViewportHeight.value
+    : CONSOLE_VIRTUAL_FALLBACK_VIEWPORT_HEIGHT;
+  const bodyViewportHeight = Math.max(
+    CONSOLE_VIRTUAL_ESTIMATED_ROW_HEIGHT,
+    effectiveViewportHeight - virtualHeaderHeight.value,
+  );
+  const bodyScrollTop = Math.max(0, virtualScrollTop.value - virtualHeaderHeight.value);
+  const rangeStart = Math.max(0, bodyScrollTop - CONSOLE_VIRTUAL_OVERSCAN_PX);
+  const rangeEnd = Math.min(
+    offsets[total]!,
+    bodyScrollTop + bodyViewportHeight + CONSOLE_VIRTUAL_OVERSCAN_PX,
+  );
+  const start = Math.min(total - 1, firstRowEndingAfter(offsets, rangeStart, total));
+  const end = Math.max(
+    start + 1,
+    Math.min(total, firstRowStartingAtOrAfter(offsets, rangeEnd, total)),
+  );
+
+  return {
+    rows: source.slice(start, end).map((entry, localIndex) => {
+      const index = start + localIndex;
+      return { entry, index, top: offsets[index]! };
+    }),
+    totalHeight: offsets[total]!,
+  };
+});
+
+const virtualConsoleBodyStyle = computed(() => ({
+  height: `${virtualConsoleLayout.value.totalHeight}px`,
+}));
 
 const statusLabel = computed(() =>
   debugEnabled.value
@@ -229,6 +310,75 @@ function highlightSegments(text: string): HighlightSegment[] {
 function scrollToLatest() {
   if (!listRef.value) return;
   listRef.value.scrollTop = 0;
+  virtualScrollTop.value = 0;
+}
+
+let virtualViewportResizeObserver: ResizeObserver | null = null;
+let virtualRowResizeObserver: ResizeObserver | null = null;
+let virtualScrollFrame = 0;
+const virtualRowElements = new Map<string, HTMLElement>();
+
+function updateVirtualViewportMetrics() {
+  const list = listRef.value;
+  const nextScrollTop = list?.scrollTop ?? 0;
+  const nextViewportHeight = list?.clientHeight ?? 0;
+  const nextHeaderHeight = headerRef.value?.getBoundingClientRect().height ?? 0;
+  if (virtualScrollTop.value !== nextScrollTop) virtualScrollTop.value = nextScrollTop;
+  if (nextViewportHeight > 0 && virtualViewportHeight.value !== nextViewportHeight) {
+    virtualViewportHeight.value = nextViewportHeight;
+  }
+  if (nextHeaderHeight > 0 && virtualHeaderHeight.value !== nextHeaderHeight) {
+    virtualHeaderHeight.value = nextHeaderHeight;
+  }
+}
+
+function scheduleVirtualViewportMetrics() {
+  if (virtualScrollFrame) return;
+  if (typeof requestAnimationFrame !== "function") {
+    updateVirtualViewportMetrics();
+    return;
+  }
+  virtualScrollFrame = requestAnimationFrame(() => {
+    virtualScrollFrame = 0;
+    updateVirtualViewportMetrics();
+  });
+}
+
+function updateMeasuredRowHeight(entryId: string, height: number) {
+  const roundedHeight = Math.max(1, Math.ceil(height));
+  if (measuredRowHeights.value.get(entryId) === roundedHeight) return;
+  const next = new Map(measuredRowHeights.value);
+  next.set(entryId, roundedHeight);
+  if (next.size > CONSOLE_VIRTUAL_MEASUREMENT_CACHE_LIMIT) {
+    const liveIds = new Set(filteredEntries.value.map((entry) => entry.id));
+    for (const cachedId of next.keys()) {
+      if (!liveIds.has(cachedId)) next.delete(cachedId);
+    }
+  }
+  measuredRowHeights.value = next;
+}
+
+function measureVirtualRow(element: HTMLElement, observedHeight?: number) {
+  const entryId = element.dataset.consoleEntryId;
+  if (!entryId) return;
+  const height = typeof observedHeight === "number" && observedHeight > 0
+    ? observedHeight
+    : element.getBoundingClientRect().height;
+  updateMeasuredRowHeight(entryId, height);
+}
+
+function setVirtualRowRef(entryId: string, value: unknown) {
+  const nextElement = value instanceof HTMLElement ? value : null;
+  const previousElement = virtualRowElements.get(entryId);
+  if (previousElement === nextElement) return;
+  if (previousElement) {
+    virtualRowResizeObserver?.unobserve(previousElement);
+    virtualRowElements.delete(entryId);
+  }
+  if (!nextElement) return;
+  nextElement.dataset.consoleEntryId = entryId;
+  virtualRowElements.set(entryId, nextElement);
+  virtualRowResizeObserver?.observe(nextElement);
 }
 
 function isMessageLong(entry: DebugConsoleEntry): boolean {
@@ -395,21 +545,50 @@ async function exportLogs() {
 let unsubscribe: (() => void) | null = null;
 
 onMounted(async () => {
+  updateVirtualViewportMetrics();
+  if (typeof ResizeObserver !== "undefined") {
+    virtualViewportResizeObserver = new ResizeObserver(updateVirtualViewportMetrics);
+    if (listRef.value) virtualViewportResizeObserver.observe(listRef.value);
+    if (headerRef.value) virtualViewportResizeObserver.observe(headerRef.value);
+    virtualRowResizeObserver = new ResizeObserver((observedEntries) => {
+      for (const observed of observedEntries) {
+        measureVirtualRow(
+          observed.target as HTMLElement,
+          observed.borderBoxSize?.[0]?.blockSize,
+        );
+      }
+    });
+    for (const element of virtualRowElements.values()) {
+      virtualRowResizeObserver.observe(element);
+    }
+  }
   unsubscribe = subscribeDebugConsole(() => {
     entries.value = getDebugConsoleSnapshot();
   });
   await refreshAll();
+  await nextTick();
+  updateVirtualViewportMetrics();
 });
 
 onUnmounted(() => {
   unsubscribe?.();
   unsubscribe = null;
+  if (virtualScrollFrame) {
+    if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(virtualScrollFrame);
+    virtualScrollFrame = 0;
+  }
+  virtualViewportResizeObserver?.disconnect();
+  virtualViewportResizeObserver = null;
+  virtualRowResizeObserver?.disconnect();
+  virtualRowResizeObserver = null;
+  virtualRowElements.clear();
   stopColumnResize(false);
 });
 
 watch(
   () => [filteredEntries.value[0]?.id ?? "", filteredEntries.value.length],
   async () => {
+    scheduleVirtualViewportMetrics();
     if (!autoScroll.value) return;
     await nextTick();
     scrollToLatest();
@@ -474,9 +653,14 @@ watch(
         <span>{{ statusLabel }}</span>
       </div>
 
-      <div ref="listRef" class="console-list">
+      <div
+        ref="listRef"
+        class="console-list"
+        role="log"
+        @scroll="scheduleVirtualViewportMetrics"
+      >
         <div class="console-grid" :style="consoleGridStyle">
-          <div class="console-header">
+          <div ref="headerRef" class="console-header">
             <div class="console-header-cell console-header-cell-resizable">
               <span class="console-header-label">{{ t("settings.console.column.time") }}</span>
               <button
@@ -525,50 +709,61 @@ watch(
             {{ t("settings.console.empty") }}
           </div>
           <div
-            v-for="entry in filteredEntries"
-            :key="entry.id"
-            class="console-row"
-            :class="`level-${entry.level}`"
+            v-else
+            class="console-virtual-body"
+            :style="virtualConsoleBodyStyle"
           >
-            <span class="console-time">{{ formatTime(entry.timestampMs) }}</span>
-            <span class="console-source">
-              <template
-                v-for="(segment, segmentIndex) in highlightSegments(formatSource(entry.source))"
-                :key="segmentIndex"
-              >
-                <mark v-if="segment.hit" class="console-search-hit">{{ segment.text }}</mark>
-                <template v-else>{{ segment.text }}</template>
-              </template>
-            </span>
-            <span class="console-module" :title="entry.module">
-              <template
-                v-for="(segment, segmentIndex) in highlightSegments(entry.module)"
-                :key="segmentIndex"
-              >
-                <mark v-if="segment.hit" class="console-search-hit">{{ segment.text }}</mark>
-                <template v-else>{{ segment.text }}</template>
-              </template>
-            </span>
-            <div class="console-message-cell">
-              <pre class="console-message"><template
-                v-for="(segment, segmentIndex) in highlightSegments(displayMessage(entry))"
-                :key="segmentIndex"
-              ><mark v-if="segment.hit" class="console-search-hit">{{ segment.text }}</mark><template v-else>{{ segment.text }}</template></template></pre>
-              <div v-if="isMessageLong(entry)" class="console-message-meta">
-                <span v-if="!isMessageExpanded(entry.id)">
-                  {{ t("settings.console.hiddenChars", hiddenMessageChars(entry)) }}
-                </span>
-                <button
-                  type="button"
-                  class="console-message-toggle"
-                  @click="toggleMessageExpanded(entry.id)"
+            <div
+              v-for="{ entry, index, top } in virtualConsoleLayout.rows"
+              :key="entry.id"
+              :ref="(element) => setVirtualRowRef(entry.id, element)"
+              class="console-row console-virtual-row"
+              :class="[
+                `level-${entry.level}`,
+                { 'is-last': index === filteredEntries.length - 1 },
+              ]"
+              :style="{ transform: `translateY(${top}px)` }"
+            >
+              <span class="console-time">{{ formatTime(entry.timestampMs) }}</span>
+              <span class="console-source">
+                <template
+                  v-for="(segment, segmentIndex) in highlightSegments(formatSource(entry.source))"
+                  :key="segmentIndex"
                 >
-                  {{
-                    isMessageExpanded(entry.id)
-                      ? t("settings.console.collapseMessage")
-                      : t("settings.console.expandMessage")
-                  }}
-                </button>
+                  <mark v-if="segment.hit" class="console-search-hit">{{ segment.text }}</mark>
+                  <template v-else>{{ segment.text }}</template>
+                </template>
+              </span>
+              <span class="console-module" :title="entry.module">
+                <template
+                  v-for="(segment, segmentIndex) in highlightSegments(entry.module)"
+                  :key="segmentIndex"
+                >
+                  <mark v-if="segment.hit" class="console-search-hit">{{ segment.text }}</mark>
+                  <template v-else>{{ segment.text }}</template>
+                </template>
+              </span>
+              <div class="console-message-cell">
+                <pre class="console-message"><template
+                  v-for="(segment, segmentIndex) in highlightSegments(displayMessage(entry))"
+                  :key="segmentIndex"
+                ><mark v-if="segment.hit" class="console-search-hit">{{ segment.text }}</mark><template v-else>{{ segment.text }}</template></template></pre>
+                <div v-if="isMessageLong(entry)" class="console-message-meta">
+                  <span v-if="!isMessageExpanded(entry.id)">
+                    {{ t("settings.console.hiddenChars", hiddenMessageChars(entry)) }}
+                  </span>
+                  <button
+                    type="button"
+                    class="console-message-toggle"
+                    @click="toggleMessageExpanded(entry.id)"
+                  >
+                    {{
+                      isMessageExpanded(entry.id)
+                        ? t("settings.console.collapseMessage")
+                        : t("settings.console.expandMessage")
+                    }}
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -654,6 +849,20 @@ watch(
     + var(--console-module-width)
     + var(--console-message-min-width)
   );
+}
+
+.console-virtual-body {
+  position: relative;
+  width: 100%;
+  overflow-anchor: none;
+}
+
+.console-virtual-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  contain: layout paint style;
 }
 
 .console-header,
@@ -757,7 +966,7 @@ watch(
   background: var(--hover-bg);
 }
 
-.console-row:last-child {
+.console-row.is-last {
   border-bottom: none;
 }
 

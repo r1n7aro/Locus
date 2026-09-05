@@ -25,11 +25,21 @@ describe("runtime CDP debug mode", () => {
   it("keeps the disabled path free of listeners, polling, and WebView2 startup flags", () => {
     const runtime = read("src-tauri/src/cdp_debug.rs");
     const app = read("src-tauri/src/lib.rs");
+    const frontendDiagnostics = read("src/services/webviewBridgeDiagnostics.ts");
 
     expect(runtime.indexOf("if !enabled {")).toBeLessThan(runtime.indexOf("bind_listener().await"));
     expect(app).not.toContain("--remote-debugging-port");
     expect(app).not.toContain("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS");
     expect(app).toContain('if app.state::<Arc<AppConfig>>().debug_enabled() {');
+    expect(frontendDiagnostics).toContain(
+      'performanceDiagnosticsModulePromise ??= import("./runtimePerformanceDiagnostics")',
+    );
+    expect(frontendDiagnostics).toMatch(
+      /function startDiagnostics[\s\S]*?startPerformanceDiagnostics\(\)[\s\S]*?scheduleHeartbeat/,
+    );
+    expect(frontendDiagnostics).toMatch(
+      /function stopDiagnostics[\s\S]*?stopPerformanceDiagnostics\(\)/,
+    );
   });
 
   it("exposes native WebView2 CDP calls and forwards runtime protocol events", () => {
@@ -53,5 +63,18 @@ describe("runtime CDP debug mode", () => {
     expect(runtime).toContain("browser_state.contains(session_id)");
     expect(runtime).toMatch(/browser_state\s*\.sessions/);
     expect(runtime).not.toContain('const MAIN_TARGET_SESSION_ID: &str');
+  });
+
+  it("provides an event-triggered circular stall trace recorder", () => {
+    const packageJson = read("package.json");
+    const recorder = read("scripts/locus-stall-recorder.ts");
+
+    expect(packageJson).toContain('"locus:test:stall-capture"');
+    expect(recorder).toContain('recordMode: "recordContinuously"');
+    expect(recorder).toContain('transferMode: "ReturnAsStream"');
+    expect(recorder).toContain('cdpClient.send("IO.read"');
+    expect(recorder).toContain('event.method !== "Runtime.consoleAPICalled"');
+    expect(recorder).toContain("__LOCUS_RUNTIME_PERFORMANCE_INCIDENT__");
+    expect(recorder).toContain("createGzip");
   });
 });

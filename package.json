@@ -44,6 +44,7 @@
     "locus:test:markdown-editor": "bun run scripts/locus-markdown-editor-benchmark.ts",
     "locus:test:workbench-window": "bun run scripts/locus-workbench-window-cdp-test.ts",
     "locus:test:chat-live-tools": "bun run scripts/locus-chat-live-tool-stress.ts",
+    "locus:test:stall-capture": "bun run scripts/locus-stall-recorder.ts",
     "locus:test:unity": "bun run scripts/locus-unity-test.mjs",
     "locus:test:unity:workspace": "bun run scripts/locus-unity-test.mjs --suite workspace",
     "locus:test:unity:workspace-switch": "bun run scripts/locus-unity-test.mjs --suite workspace-switch",
