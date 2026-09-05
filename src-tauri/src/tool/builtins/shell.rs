@@ -340,7 +340,13 @@ pub(super) fn bash() -> ToolDef {
                 if let Some(report) = progress.as_ref() {
                     report(format!("Command running: {}", command));
                 }
-                let execution = run_captured_command(cmd, output_reporter, process_owner);
+                let execution = run_captured_command_with_input(
+                    cmd,
+                    None,
+                    output_reporter,
+                    process_owner,
+                    ctx.output_path.clone(),
+                );
                 let result = if background {
                     if let Some(ref mut cancel_rx) = cancel_rx {
                         tokio::select! {
@@ -425,7 +431,7 @@ pub(super) struct CapturedCommandOutput {
     pub(super) bytes: Vec<u8>,
 }
 
-async fn forward_captured_pipe<R>(mut pipe: R, sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>)
+async fn forward_captured_pipe<R>(mut pipe: R, sender: tokio::sync::mpsc::Sender<Vec<u8>>)
 where
     R: AsyncRead + Unpin,
 {
@@ -434,7 +440,7 @@ where
         match pipe.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                if sender.send(buffer[..read].to_vec()).is_err() {
+                if sender.send(buffer[..read].to_vec()).await.is_err() {
                     break;
                 }
             }
@@ -443,20 +449,17 @@ where
     }
 }
 
-async fn run_captured_command(
-    command: tokio::process::Command,
-    output_reporter: Option<crate::async_tasks::TaskOutputReporter>,
-    process_owner: ProcessOwner,
-) -> std::io::Result<CapturedCommandOutput> {
-    run_captured_command_with_input(command, None, output_reporter, process_owner).await
-}
-
 pub(super) async fn run_captured_command_with_input(
     command: tokio::process::Command,
     input: Option<Vec<u8>>,
     output_reporter: Option<crate::async_tasks::TaskOutputReporter>,
     process_owner: ProcessOwner,
+    output_path: Option<std::path::PathBuf>,
 ) -> std::io::Result<CapturedCommandOutput> {
+    let mut log = output_path
+        .as_ref()
+        .map(std::fs::File::create)
+        .transpose()?;
     let mut child = spawn_managed(command, process_owner)?;
     if let Some(input) = input {
         let Some(mut stdin) = child.take_stdin() else {
@@ -472,7 +475,7 @@ pub(super) async fn run_captured_command_with_input(
     }
     let stdout = child.take_stdout();
     let stderr = child.take_stderr();
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(32);
     if let Some(stdout) = stdout {
         tokio::spawn(forward_captured_pipe(stdout, sender.clone()));
     }
@@ -485,6 +488,7 @@ pub(super) async fn run_captured_command_with_input(
     let mut status = None;
     let mut pipes_open = true;
     let mut bytes = Vec::new();
+    let mut truncated = false;
     while status.is_none() || pipes_open {
         tokio::select! {
             result = &mut wait, if status.is_none() => {
@@ -493,10 +497,18 @@ pub(super) async fn run_captured_command_with_input(
             chunk = receiver.recv(), if pipes_open => {
                 match chunk {
                     Some(chunk) => {
+                        if let Some(log) = log.as_mut() {
+                            std::io::Write::write_all(log, &chunk)?;
+                        }
                         if let Some(report) = output_reporter.as_ref() {
                             report(decode_console_bytes(&chunk));
                         }
                         bytes.extend_from_slice(&chunk);
+                        if log.is_some() && bytes.len() > 50_000 {
+                            truncated = true;
+                            let tail_start = bytes.len() - 25_000;
+                            bytes.drain(25_000..tail_start);
+                        }
                     }
                     None => pipes_open = false,
                 }
@@ -504,6 +516,17 @@ pub(super) async fn run_captured_command_with_input(
         }
     }
 
+    if let Some(log) = log.as_mut() {
+        std::io::Write::flush(log)?;
+    }
+    if truncated {
+        bytes.splice(
+            25_000..25_000,
+            b"\n[output omitted; see the full task log]\n"
+                .iter()
+                .copied(),
+        );
+    }
     Ok(CapturedCommandOutput {
         status: status.expect("child wait completed"),
         bytes,
@@ -1302,5 +1325,47 @@ mod tests {
         let streamed = streamed.lock().expect("lock streamed output");
         assert!(streamed.contains("first"));
         assert!(streamed.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn async_capture_persists_untruncated_log_with_bounded_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.log");
+        let mut command = if cfg!(windows) {
+            let mut cmd = async_command("cmd.exe");
+            cmd.args([
+                "/D",
+                "/C",
+                "for /L %i in (1,1,12000) do @echo async-capture-line-%i",
+            ]);
+            cmd
+        } else {
+            let mut cmd = async_command("sh");
+            cmd.args([
+                "-c",
+                "i=1; while [ $i -le 12000 ]; do echo async-capture-line-$i; i=$((i+1)); done",
+            ]);
+            cmd
+        };
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let captured = super::run_captured_command_with_input(
+            command,
+            None,
+            None,
+            ProcessOwner::default(),
+            Some(path.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(captured.status.success());
+        let log = std::fs::read_to_string(path).unwrap();
+        assert!(log.contains("async-capture-line-6000"));
+        assert_eq!(log.lines().count(), 12000);
+        assert!(captured.bytes.len() < 51_000);
+        let preview = String::from_utf8_lossy(&captured.bytes);
+        assert!(preview.contains("output omitted"));
+        assert!(preview.contains("async-capture-line-12000"));
     }
 }

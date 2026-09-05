@@ -2414,6 +2414,7 @@ async fn launch_workspace_mock_chat_with_prompt(
         Some("mock/tool".to_string()),
         None,
         Some(false),
+        Some(false),
         None,
         None,
         None,

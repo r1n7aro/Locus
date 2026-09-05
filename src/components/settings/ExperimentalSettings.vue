@@ -12,7 +12,7 @@ import { useNotificationStore } from "../../stores/notification";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 
 const notificationStore = useNotificationStore();
-const asyncTasksEnabled = ref(false);
+const asyncTasksEnabled = ref(true);
 const asyncTasksReady = ref(false);
 const asyncTasksBusy = ref(false);
 const asyncTasksStatusLabel = computed(() =>

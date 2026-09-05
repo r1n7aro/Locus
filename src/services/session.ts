@@ -32,6 +32,7 @@ export interface ChatParams {
   model?: string | null;
   effort?: string | null;
   fastMode?: boolean | null;
+  multiAgentEnabled?: boolean | null;
   images?: ImageAttachment[] | null;
   assetRefs?: AssetRefAttachment[] | null;
   sessionType?: string | null;
@@ -181,12 +182,14 @@ export function saveSessionExecutionState(
   modelId: string,
   effort: string | null,
   fastMode: boolean,
+  multiAgentEnabled?: boolean,
 ): Promise<void> {
   return ipcInvoke("save_session_execution_state", {
     sessionId,
     modelId,
     effort,
     fastMode,
+    multiAgentEnabled,
   });
 }
 

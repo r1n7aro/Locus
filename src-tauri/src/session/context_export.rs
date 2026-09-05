@@ -15,7 +15,7 @@ use crate::session::models::{
 use crate::session::store::SessionStore;
 
 const EXPORT_FORMAT: &str = "locus.context_review";
-const EXPORT_FORMAT_VERSION: u32 = 8;
+const EXPORT_FORMAT_VERSION: u32 = 9;
 const EMPTY: &str = "empty";
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +86,8 @@ struct SourceMetadata {
 
 #[derive(Serialize)]
 struct SessionExport {
+    async_tasks: Value,
+    agent_messages: Value,
     metadata: Value,
     token_usage: Value,
     cache_invalidations: Value,
@@ -194,9 +196,17 @@ pub fn export_session_context_yaml(
         let todos = store.get_todos(session_id).ok();
         let mut messages = detail.messages.clone();
         expand_persisted_outputs(store, &mut messages);
+        let response_metadata = store.get_response_request_metadata(session_id)?;
         let messages = messages
             .into_iter()
-            .map(export_message)
+            .map(|message| {
+                let response = response_metadata.get(&message.id)
+                    .and_then(|value| value.get("codex_response"))
+                    .filter(|value| !value.is_null()).cloned().unwrap_or_else(empty_value);
+                let mut exported = export_message(message)?;
+                exported["codexResponse"] = response;
+                Ok::<_, String>(exported)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let compactions = store.list_compacted_context_outputs(session_id)?;
         let compactions = if compactions.is_empty() {
@@ -244,6 +254,7 @@ pub fn export_session_context_yaml(
             "lastModelId": non_empty_value(detail.last_model_id.as_deref()),
             "lastEffort": non_empty_value(detail.last_effort.as_deref()),
             "lastFastMode": detail.last_fast_mode.map(Value::Bool).unwrap_or_else(empty_value),
+            "lastMultiAgentEnabled": detail.last_multi_agent_enabled.map(Value::Bool).unwrap_or_else(empty_value),
             "sessionType": non_empty_value(Some(&detail.session_type)),
             "parentSessionId": non_empty_value(detail.parent_session_id.as_deref()),
             "projectId": non_empty_value(session_scope.project_id.as_deref()),
@@ -279,6 +290,8 @@ pub fn export_session_context_yaml(
             .unwrap_or_else(empty_value);
 
         sessions.push(SessionExport {
+            async_tasks: store.export_async_tasks(&session_id)?,
+            agent_messages: store.export_agent_messages(&session_id)?,
             metadata,
             token_usage,
             cache_invalidations,

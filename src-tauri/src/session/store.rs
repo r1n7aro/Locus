@@ -27,6 +27,10 @@ use crate::commands::{
 };
 use crate::compact;
 
+mod async_task_results;
+mod agent_messages;
+mod multi_agent;
+
 #[derive(Clone)]
 pub struct SessionStore {
     conn: Arc<Mutex<Connection>>,
@@ -892,7 +896,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 40;
+    const SCHEMA_VERSION: i32 = 44;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1430,7 +1434,46 @@ impl SessionStore {
             })?;
         }
 
-        debug_assert_eq!(Self::SCHEMA_VERSION, 40, "add a new migration block above");
+        if current < 41 {
+            Self::migrate(conn, 41, "version Codex response replay metadata", Self::migrate_codex_response_replay)?;
+        }
+
+        if current < 42 {
+            Self::migrate(conn, 42, "persist async task results and completion delivery", Self::create_async_task_schema)?;
+        }
+
+        if current < 43 {
+            Self::migrate(conn, 43, "persist async task attempts and subagent continuation", Self::migrate_async_task_attempts)?;
+        }
+        if current < 44 {
+            Self::migrate(conn, 44, "persist session multi agent selection", Self::migrate_multi_agent_selection)?;
+        }
+        debug_assert_eq!(Self::SCHEMA_VERSION, 44, "add a new migration block above");
+        Ok(())
+    }
+
+    /// Older clients did not persist canonical response items. Mark their
+    /// absence explicitly and re-key content-addressed payloads atomically.
+    /// Running this migration twice leaves both references and payloads stable.
+    fn migrate_codex_response_replay(conn: &Connection) -> rusqlite::Result<()> {
+        let rows = {
+            let mut stmt = conn.prepare("SELECT id, payload_json FROM response_request_payloads")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (old_id, payload) in rows {
+            let mut value: serde_json::Value = serde_json::from_str(&payload)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let Some(object) = value.as_object_mut() else { continue; };
+            if object.contains_key("codex_response") { continue; }
+            object.insert("codex_response".to_string(), serde_json::Value::Null);
+            let (new_id, payload_json) = response_request_payload(&value)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(error))))?;
+            conn.execute("INSERT OR IGNORE INTO response_request_payloads (id, payload_json) VALUES (?1, ?2)",
+                params![new_id, payload_json])?;
+            conn.execute("UPDATE messages SET response_request_id = ?1 WHERE response_request_id = ?2", params![new_id, old_id])?;
+            conn.execute("DELETE FROM response_request_payloads WHERE id = ?1", params![old_id])?;
+        }
         Ok(())
     }
 
@@ -1746,6 +1789,7 @@ impl SessionStore {
                 last_model_id TEXT,
                 last_effort TEXT,
                 last_fast_mode INTEGER,
+                last_multi_agent_enabled INTEGER CHECK(last_multi_agent_enabled IN (0, 1)),
                 archived_at INTEGER,
                 latest_completed_run_id TEXT,
                 latest_todo_run_id TEXT,
@@ -1813,6 +1857,7 @@ impl SessionStore {
         .and_then(|_| Self::create_model_usage_schema(conn))
         .and_then(|_| Self::create_prompt_prefix_cache_schema(conn))
         .and_then(|_| Self::create_prompt_cache_check_schema(conn))
+        .and_then(|_| Self::create_async_task_schema(conn))
     }
 
     fn create_workspace_persistence_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -3685,6 +3730,10 @@ impl SessionStore {
                 ],
             )
             .map_err(|e| format!("Failed to create forked session: {}", e))?;
+            conn.execute(
+                "UPDATE sessions SET last_multi_agent_enabled = (SELECT last_multi_agent_enabled FROM sessions WHERE id = ?1) WHERE id = ?2",
+                params![source_id, new_id],
+            ).map_err(|e| format!("Failed to copy multi agent selection: {}", e))?;
 
             let message_rows = {
                 let mut stmt = conn
@@ -3914,6 +3963,7 @@ impl SessionStore {
             Option<String>,
             Option<String>,
         );
+        let multi_agent_enabled = snapshot.get_session_multi_agent_enabled(source_id)?;
         type SnapshotUsageRow = (i64, i64, i64, i64, i64, i64, f64, i64, i64, i64);
         type SnapshotCacheCheckRow = (String, String, String, i64, i64, i64, i64, i64, String, i64);
         type SnapshotTodoRow = (i64, String, String, String);
@@ -4113,6 +4163,10 @@ impl SessionStore {
                 ],
             )
             .map_err(|e| format!("Failed to create snapshot fork session: {}", e))?;
+            conn.execute(
+                "UPDATE sessions SET last_multi_agent_enabled = ?1 WHERE id = ?2",
+                params![multi_agent_enabled, new_id],
+            ).map_err(|e| format!("Failed to copy snapshot multi agent selection: {}", e))?;
 
             for message in messages {
                 let content = if copied_tool_results {
@@ -5491,6 +5545,7 @@ impl SessionStore {
             .map_err(|e| format!("Session not found: {}", e))?;
 
         let raw_messages = self.get_messages_with_conn(&conn, id)?;
+        let last_multi_agent_enabled = Self::read_multi_agent_selection(&conn, id)?;
         // History normalization clones and enriches tool calls. Release the
         // single SQLite connection first so unrelated lightweight reads do not
         // wait behind that CPU work.
@@ -5512,6 +5567,7 @@ impl SessionStore {
             created_at,
             updated_at,
             messages,
+            last_multi_agent_enabled,
             pending_inputs: Vec::new(),
             runtime: None,
         })
@@ -5560,6 +5616,7 @@ impl SessionStore {
             .map_err(|e| format!("Session not found: {}", e))?;
 
         let raw_page = Self::get_message_page_with_conn(&conn, id, None, message_limit)?;
+        let last_multi_agent_enabled = Self::read_multi_agent_selection(&conn, id)?;
         let user_message_ids = Self::get_session_user_message_ids_with_conn(&conn, id)?;
         drop(conn);
 
@@ -5582,6 +5639,7 @@ impl SessionStore {
                 created_at,
                 updated_at,
                 messages,
+                last_multi_agent_enabled,
                 pending_inputs: Vec::new(),
                 runtime: None,
             },
@@ -5785,6 +5843,7 @@ impl SessionStore {
         model_id: &str,
         effort: Option<&str>,
         fast_mode: bool,
+        multi_agent_enabled: Option<bool>,
     ) -> Result<(), String> {
         let model_id = model_id.trim();
         if model_id.is_empty() {
@@ -5795,9 +5854,10 @@ impl SessionStore {
         let updated = conn
             .execute(
                 "UPDATE sessions
-                 SET last_model_id = ?1, last_effort = ?2, last_fast_mode = ?3
+                 SET last_model_id = ?1, last_effort = ?2, last_fast_mode = ?3,
+                     last_multi_agent_enabled = COALESCE(?5, last_multi_agent_enabled)
                  WHERE id = ?4",
-                params![model_id, effort, fast_mode, session_id],
+                params![model_id, effort, fast_mode, session_id, multi_agent_enabled],
             )
             .map_err(|e| format!("Failed to update session execution state: {}", e))?;
         if updated == 0 {
@@ -6488,10 +6548,23 @@ impl SessionStore {
         tool_calls: &[ToolCallInfo],
         render_parts: &[AssistantRenderPart],
     ) -> Result<(), String> {
-        let tool_calls_json = serde_json::to_string(tool_calls)
-            .map_err(|e| format!("Failed to serialize tool_calls: {}", e))?;
-        let render_parts = render_parts.to_vec();
+        let mut tool_calls = tool_calls.to_vec();
+        let mut render_parts = render_parts.to_vec();
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let existing_json: Option<String> = conn.query_row(
+            "SELECT tool_calls FROM messages WHERE id = ?1", [message_id], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?.flatten();
+        if let Some(existing_json) = existing_json {
+            let existing: Vec<ToolCallInfo> = serde_json::from_str(&existing_json).map_err(|e| e.to_string())?;
+            Self::preserve_background_results(&mut tool_calls, &existing);
+            for part in &mut render_parts {
+                if let AssistantRenderPart::ToolCall { tool_call, .. } = part {
+                    Self::preserve_background_results(std::slice::from_mut(tool_call), &existing);
+                }
+            }
+        }
+        let tool_calls_json = serde_json::to_string(&tool_calls)
+            .map_err(|e| format!("Failed to serialize tool_calls: {}", e))?;
         let metadata_json: Option<String> = conn
             .query_row(
                 "SELECT metadata_json FROM messages WHERE id = ?1",
@@ -10303,7 +10376,7 @@ mod tests {
         );
 
         store
-            .set_session_execution_state("session-fast", "openai/gpt-5.6-sol", Some("xhigh"), false)
+            .set_session_execution_state("session-fast", "openai/gpt-5.6-sol", Some("xhigh"), false, None)
             .expect("persist session execution state");
         let detail = store
             .load_session("session-fast")
@@ -10361,6 +10434,36 @@ mod tests {
     }
 
     #[test]
+    fn v40_codex_replay_migration_is_repeatable_and_old_context_exports_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("locus.db");
+        let conn = Connection::open(&path).unwrap();
+        SessionStore::create_latest_schema(&conn).unwrap();
+        conn.execute_batch("INSERT INTO sessions (id,title,session_type,created_at,updated_at)
+            VALUES ('legacy','Replay migration','chat',100,100); PRAGMA user_version=40;").unwrap();
+        let old = serde_json::json!({"model":"gpt-5.4","store":false,"instructions":"legacy"});
+        let (old_id, payload) = super::response_request_payload(&old).unwrap();
+        conn.execute("INSERT INTO response_request_payloads(id,payload_json) VALUES(?1,?2)",params![old_id,payload]).unwrap();
+        conn.execute("INSERT INTO messages(id,session_id,role,content,created_at,response_request_id)
+            VALUES('answer','legacy','assistant','old answer',100,?1)",params![old_id]).unwrap();
+        drop(conn);
+        let store = SessionStore::new(dir.path()).unwrap();
+        let metadata = store.get_response_request_metadata("legacy").unwrap();
+        assert!(metadata["answer"].get("codex_response").unwrap().is_null());
+        let conn = Connection::open(&path).unwrap();
+        SessionStore::migrate_codex_response_replay(&conn).unwrap();
+        SessionStore::migrate_codex_response_replay(&conn).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM response_request_payloads",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,1);
+        assert_eq!(metadata,store.get_response_request_metadata("legacy").unwrap());
+        let export = dir.path().join("legacy.yaml");
+        crate::session::context_export::export_session_context_yaml(&store,"legacy","",None,None,&export).unwrap();
+        let yaml: serde_json::Value = serde_yaml::from_str(&std::fs::read_to_string(export).unwrap()).unwrap();
+        assert_eq!(yaml["sessions"][0]["messages"][0]["codexResponse"],"empty");
+        assert_eq!(yaml["sessions"][0]["messages"][0]["content"],"old answer");
+    }
+
+    #[test]
     fn v24_database_deduplicates_response_requests_and_keeps_them_readable() {
         let dir = tempdir().expect("create temp dir");
         let db_path = dir.path().join("locus.db");
@@ -10412,6 +10515,8 @@ mod tests {
         let restored = store
             .get_response_request_metadata("session-1")
             .expect("load response requests");
+        let mut response_request = response_request;
+        response_request["codex_response"] = serde_json::Value::Null;
         assert_eq!(restored.get("message-1"), Some(&response_request));
         assert_eq!(restored.get("message-2"), Some(&response_request));
 

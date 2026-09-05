@@ -51,6 +51,8 @@ pub struct SessionDetail {
     pub last_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_fast_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_multi_agent_enabled: Option<bool>,
     pub session_type: String,
     pub parent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

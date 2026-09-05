@@ -272,7 +272,7 @@ fn default_debug_flag() -> Arc<AtomicBool> {
 }
 
 fn default_async_tasks_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
+    Arc::new(AtomicBool::new(true))
 }
 
 fn default_unity_multi_agent_editor_enabled() -> Arc<AtomicBool> {
@@ -548,6 +548,10 @@ pub struct AppConfig {
     /// Experimental background execution for selected long-running tools.
     #[serde(default = "default_async_tasks_enabled", with = "serde_atomic_bool")]
     pub async_tasks_enabled: Arc<AtomicBool>,
+    /// Enable background tools once for older installations, then preserve
+    /// subsequent user choices, including an explicit opt-out.
+    #[serde(default)]
+    pub async_tasks_default_enabled_migrated: bool,
     /// Experimental cooperative lock protocol for multiple Agent sessions
     /// sharing one Unity Editor. The lock is advisory and never gates Unity
     /// tool execution in the harness.
@@ -755,6 +759,7 @@ impl AppConfig {
             session_undo_enabled: default_session_undo_enabled(),
             file_tool_workspace_boundary: default_debug_flag(),
             async_tasks_enabled: default_async_tasks_enabled(),
+            async_tasks_default_enabled_migrated: true,
             unity_multi_agent_editor_enabled: default_unity_multi_agent_editor_enabled(),
             close_behavior: default_close_behavior(),
             dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
@@ -826,13 +831,15 @@ impl AppConfig {
         let migrated_native_tool_loading = Self::apply_native_tool_loading_migration(&mut value);
         let migrated_workspace_service_ttl =
             Self::apply_workspace_service_ttl_hour_migration(&mut value);
+        let migrated_async_tasks = Self::apply_async_tasks_default_migration(&mut value);
         let config = serde_json::from_value::<AppConfig>(value)
             .map_err(|e| format!("failed to deserialize config: {}", e))?;
         Ok((
             config,
             scrubbed_legacy_secret
                 || migrated_native_tool_loading
-                || migrated_workspace_service_ttl,
+                || migrated_workspace_service_ttl
+                || migrated_async_tasks,
         ))
     }
 
@@ -865,6 +872,25 @@ impl AppConfig {
                 .as_ref()
                 .and_then(|v| v.as_str())
                 .unwrap_or("<default>")
+        );
+        true
+    }
+
+    fn apply_async_tasks_default_migration(value: &mut Value) -> bool {
+        let Some(obj) = value.as_object_mut() else {
+            return false;
+        };
+        if obj
+            .get("async_tasks_default_enabled_migrated")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return false;
+        }
+        obj.insert("async_tasks_enabled".to_string(), Value::Bool(true));
+        obj.insert(
+            "async_tasks_default_enabled_migrated".to_string(),
+            Value::Bool(true),
         );
         true
     }
@@ -1626,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn async_tasks_default_to_disabled_and_persist_opt_in() {
+    fn async_tasks_legacy_missing_setting_enables_once_and_persists_opt_out() {
         let temp = tempfile::tempdir().expect("tempdir");
         let config_path = temp.path().join("config.json");
         fs::write(
@@ -1639,13 +1665,42 @@ mod tests {
         .expect("legacy config");
 
         let config = AppConfig::load_from_path(&config_path);
-        assert!(!config.async_tasks_enabled());
+        assert!(config.async_tasks_enabled());
 
         config
-            .set_async_tasks_enabled(true)
-            .expect("persist async task opt-in");
+            .set_async_tasks_enabled(false)
+            .expect("persist async task opt-out");
         let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(reloaded.async_tasks_enabled());
+        assert!(!reloaded.async_tasks_enabled());
+    }
+
+    #[test]
+    fn async_tasks_fresh_install_enables_and_preserves_later_opt_out() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(config.async_tasks_enabled());
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(saved["async_tasks_enabled"], true);
+        assert_eq!(saved["async_tasks_default_enabled_migrated"], true);
+        config.set_async_tasks_enabled(false).unwrap();
+        assert!(!AppConfig::load_from_path(&config_path).async_tasks_enabled());
+    }
+
+    #[test]
+    fn async_tasks_existing_disabled_setting_is_upgraded_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.json");
+        fs::write(&config_path, r#"{
+            "model": "legacy-model", "debug": false, "async_tasks_enabled": false
+        }"#).unwrap();
+        let config = AppConfig::load_from_path(&config_path);
+        assert!(config.async_tasks_enabled());
+        let saved = fs::read_to_string(&config_path).unwrap();
+        let (_, rewritten) = AppConfig::parse_content(&saved).unwrap();
+        assert!(!rewritten, "loading a migrated configuration must be idempotent");
+        config.set_async_tasks_enabled(false).unwrap();
+        assert!(!AppConfig::load_from_path(&config_path).async_tasks_enabled());
     }
 
     #[test]

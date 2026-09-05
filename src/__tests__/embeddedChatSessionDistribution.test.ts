@@ -150,6 +150,44 @@ describe("embedded chat session distribution", () => {
     mocks.tauriListen.mockClear();
   });
 
+  it("restores multi agent per session, synchronizes it, and forwards it to each run", async () => {
+    mocks.loadSession.mockImplementation(async (id: string) => ({
+      id, title: id, sessionType: "chat", parentSessionId: null,
+      createdAt: 1, updatedAt: 1, messages: [], pendingInputs: [],
+      lastMultiAgentEnabled: id === "multi-agent-on" ? true : undefined,
+    }));
+    mocks.chat.mockImplementation(async (request) => ({ sessionId: request.sessionId, runId: `run-${request.sessionId}` }));
+    let first!: ReturnType<typeof useEmbeddedChatSession>;
+    let second!: ReturnType<typeof useEmbeddedChatSession>;
+    const app = createApp(defineComponent({
+      setup() {
+        const common = {
+          workspaceRef: { checkoutId: "checkout-multi-agent", expectedGeneration: 1 },
+          selectedModelId: "model-a",
+          buildRequest: (input: string) => ({ text: input }),
+        };
+        first = useEmbeddedChatSession({ ...common, sessionKey: "multi-agent-pane-on", initialSessionId: "multi-agent-on" });
+        second = useEmbeddedChatSession({ ...common, sessionKey: "multi-agent-pane-off", initialSessionId: "multi-agent-off" });
+        return () => h("div");
+      },
+    }));
+    app.mount(document.createElement("div"));
+    try {
+      await vi.waitFor(() => expect(first.sessionMultiAgentEnabled.value).toBe(true));
+      expect(second.sessionMultiAgentEnabled.value).toBe(false);
+      publishSessionExecutionState({ sessionId: "multi-agent-on", modelId: "model-a", effort: "max", fastMode: false, multiAgentEnabled: false });
+      expect(first.sessionMultiAgentEnabled.value).toBe(false);
+      expect(second.sessionMultiAgentEnabled.value).toBe(false);
+      publishSessionExecutionState({ sessionId: "multi-agent-on", modelId: "model-a", effort: "high", fastMode: false, multiAgentEnabled: true });
+      await first.compact();
+      await second.compact();
+      expect(mocks.chat).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "multi-agent-on", multiAgentEnabled: true }));
+      expect(mocks.chat).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "multi-agent-off", multiAgentEnabled: false }));
+    } finally {
+      app.unmount();
+    }
+  });
+
   it("starts manual compaction for an idle workbench session without adding a user message", async () => {
     const sessionId = "idle-workbench-compact-session";
     const existingMessage = {

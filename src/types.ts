@@ -450,6 +450,7 @@ export interface SessionDetail {
   lastModelId?: string | null;
   lastEffort?: EffortLevel | null;
   lastFastMode?: boolean | null;
+  lastMultiAgentEnabled?: boolean | null;
   sessionType: string;
   parentSessionId: string | null;
   projectId?: string | null;

@@ -191,17 +191,20 @@ function publishSessionExecutionState() {
   const modelId = modelStore.selectedModelId;
   const effort = modelStore.effort;
   const fastMode = modelStore.effectiveCodexFastMode;
+  const multiAgentEnabled = chatStore.sessionMultiAgentEnabled;
   chatStore.applyActiveSessionExecutionState(
     sessionId,
     modelId,
     effort,
     fastMode,
+    multiAgentEnabled,
   );
   void broadcastSessionExecutionState({
     sessionId,
     modelId,
     effort,
     fastMode,
+    multiAgentEnabled,
   });
   sessionExecutionStateSaveQueue = sessionExecutionStateSaveQueue
     .catch(() => undefined)
@@ -210,6 +213,7 @@ function publishSessionExecutionState() {
       modelId,
       effort,
       fastMode,
+      multiAgentEnabled,
     ))
     .catch((error: unknown) => {
       console.warn("save_session_execution_state failed:", error);
@@ -229,6 +233,11 @@ function selectWorkspaceEffort(effort: EffortLevel) {
 
 function selectWorkspaceFastMode(enabled: boolean) {
   modelStore.selectCodexFastMode(enabled);
+  publishSessionExecutionState();
+}
+
+function selectWorkspaceMultiAgent(enabled: boolean) {
+  chatStore.sessionMultiAgentEnabled = enabled;
   publishSessionExecutionState();
 }
 
@@ -731,6 +740,7 @@ onUnmounted(() => {
       :effort-levels="modelStore.availableEfforts"
       :fast-mode-enabled="modelStore.effectiveCodexFastMode"
       :fast-mode-available="modelStore.codexFastModeAvailable"
+      :multi-agent-enabled="chatStore.sessionMultiAgentEnabled"
       :token-usage="chatStore.tokenUsage"
       :codex-connected="authStore.codexAuthenticated"
       :pending-question="chatStore.pendingQuestion"
@@ -762,6 +772,7 @@ onUnmounted(() => {
       @select-model="selectWorkspaceModel"
       @select-effort="selectWorkspaceEffort"
       @select-fast-mode="selectWorkspaceFastMode"
+      @select-multi-agent="selectWorkspaceMultiAgent"
       @export-session-context="exportSessionContext"
       @review-session-context="reviewSessionContext"
       @remove-managed-composer-file="removeManagedComposerFile"

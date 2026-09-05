@@ -2,6 +2,8 @@
 import { createApp, defineComponent, h, nextTick, reactive, ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceRef } from "../services/project";
+import { saveSessionExecutionState } from "../services/session";
+import { broadcastSessionExecutionState } from "../services/sessionExecutionState";
 import type { WorkbenchEditorInput } from "../types/workbench";
 
 const compact = vi.fn();
@@ -47,6 +49,7 @@ const controller = {
   sessionModelId: ref<string | null>("model-a"),
   sessionEffort: ref("high"),
   sessionFastMode: ref(true),
+  sessionMultiAgentEnabled: ref(false),
   parentSessionId: ref<string | null>("parent-session"),
   latestCompletedRunId: ref<string | null>("run-complete"),
   planModeActive: ref(true),
@@ -127,6 +130,11 @@ vi.mock("../stores/agent", () => ({
       name: "Agent A",
       isDefault: true,
       defaultEffort: "high",
+    }, {
+      id: "agent-child",
+      name: "Child Agent",
+      isDefault: false,
+      defaultEffort: "low",
     }],
   }),
 }));
@@ -149,6 +157,11 @@ vi.mock("../stores/model", () => ({
     availableModels: [{
       id: "model-a",
       name: "Model A",
+      provider: "openai_codex",
+      supportedEfforts: ["low", "high"],
+    }, {
+      id: "model-child",
+      name: "Child Model",
       provider: "openai_codex",
       supportedEfforts: ["low", "high"],
     }],
@@ -184,6 +197,11 @@ vi.mock("../components/ChatView.vue", () => ({
       workspaceRef: Object,
       currentRunId: String,
       isViewingSubagent: Boolean,
+      selectedAgentId: String,
+      selectedModelId: String,
+      effort: String,
+      fastModeEnabled: Boolean,
+      multiAgentEnabled: Boolean,
       sessionHistoryLoading: Boolean,
       sessionHistoryHasMore: Boolean,
       loadOlderHistory: Function,
@@ -200,6 +218,7 @@ vi.mock("../components/ChatView.vue", () => ({
       "exportSessionContext",
       "reviewSessionContext",
       "openThinking",
+      "selectMultiAgent",
     ],
     setup(props, { emit, expose }) {
       chatViewProps = props as unknown as Record<string, unknown>;
@@ -210,6 +229,7 @@ vi.mock("../components/ChatView.vue", () => ({
         focusComposerInput: vi.fn(),
       });
       return () => h("div", { class: "chat-view-stub" }, [
+        h("button", { class: "multi-agent", onClick: () => emit("selectMultiAgent", !props.multiAgentEnabled) }, "multi agent"),
         h("button", { class: "compact", onClick: () => emit("compact") }, "compact"),
         h("button", { class: "resume", onClick: () => emit("resume") }, "resume"),
         h("button", { class: "plan", onClick: () => emit("requestPlanMode", true) }, "plan"),
@@ -301,6 +321,11 @@ function mountEditor(listeners: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  controller.sessionAgentId.value = "agent-a";
+  controller.sessionModelId.value = "model-a";
+  controller.sessionEffort.value = "high";
+  controller.sessionFastMode.value = true;
+  controller.sessionMultiAgentEnabled.value = false;
   changesState.panelVisible = false;
   chatViewProps = null;
   thinkingPanelProps = null;
@@ -310,6 +335,64 @@ beforeEach(() => {
 });
 
 describe("WorkbenchSessionEditor scoped host", () => {
+  it("persists multi agent independently of the selected effort", async () => {
+    const { app, host } = mountEditor();
+    try {
+      await flushUi();
+      host.querySelector<HTMLButtonElement>(".multi-agent")!.click();
+      await flushUi();
+      expect(chatViewProps).toMatchObject({ effort: "high", multiAgentEnabled: true });
+      expect(saveSessionExecutionState).toHaveBeenLastCalledWith("session-source", "model-a", "high", true, true);
+      expect(broadcastSessionExecutionState).toHaveBeenLastCalledWith(expect.objectContaining({ sessionId: "session-source", multiAgentEnabled: true }));
+      host.querySelector<HTMLButtonElement>(".multi-agent")!.click();
+      await flushUi();
+      expect(saveSessionExecutionState).toHaveBeenLastCalledWith("session-source", "model-a", "high", true, false);
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it.each([false, true])("restores child execution settings with delayed hydration: %s", async (delayed) => {
+    function hydrateChild() {
+      controller.sessionAgentId.value = "agent-child";
+      controller.sessionModelId.value = "model-child";
+      controller.sessionEffort.value = "low";
+      controller.sessionFastMode.value = false;
+      controller.sessionMultiAgentEnabled.value = true;
+    }
+    if (!delayed) hydrateChild();
+    const { app, host } = mountEditor();
+    try {
+      await flushUi();
+      if (delayed) {
+        hydrateChild();
+        await flushUi();
+      }
+
+      expect(chatViewProps).toMatchObject({
+        isViewingSubagent: true,
+        selectedAgentId: "agent-child",
+        selectedModelId: "model-child",
+        effort: "low",
+        fastModeEnabled: false,
+        multiAgentEnabled: true,
+      });
+      expect(controller.setExecutionSelection).toHaveBeenLastCalledWith({
+        agentId: "agent-child",
+        modelId: "model-child",
+        effort: "low",
+        fastMode: false,
+        multiAgentEnabled: true,
+      });
+      expect(saveSessionExecutionState).not.toHaveBeenCalled();
+      expect(broadcastSessionExecutionState).not.toHaveBeenCalled();
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
   it("binds the pane controller and forwards session host actions", async () => {
     const sessionForked = vi.fn();
     const exportSessionContext = vi.fn();

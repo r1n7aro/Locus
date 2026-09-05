@@ -93,6 +93,7 @@ interface EmbeddedChatState extends StreamState {
   sessionModelId: string | null;
   sessionEffort: EffortLevel | null;
   sessionFastMode: boolean | null;
+  sessionMultiAgentEnabled: boolean;
   parentSessionId: string | null;
   latestCompletedRunId: string | null;
   latestTodoRunId: string | null;
@@ -140,6 +141,7 @@ export interface UseEmbeddedChatSessionOptions {
   effort?: MaybeRefOrGetter<EffortLevel | null | undefined>;
   effortSupported?: MaybeRefOrGetter<boolean | undefined>;
   fastMode?: MaybeRefOrGetter<boolean | undefined>;
+  multiAgentEnabled?: MaybeRefOrGetter<boolean | undefined>;
   /** Knowledge access for this pane. Every launch snapshots and forwards it explicitly. */
   knowledgeMode?: MaybeRefOrGetter<KnowledgeAccessMode | null | undefined>;
   /** Knowledge document this session is scoped to; injected into the agent env by the backend. */
@@ -174,6 +176,7 @@ function createState(key: string): EmbeddedChatState {
     sessionModelId: null,
     sessionEffort: null,
     sessionFastMode: null,
+    sessionMultiAgentEnabled: false,
     parentSessionId: null,
     latestCompletedRunId: null,
     latestTodoRunId: null,
@@ -959,6 +962,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.sessionModelId = detail.lastModelId ?? null;
     state.sessionEffort = detail.lastEffort ?? null;
     state.sessionFastMode = detail.lastFastMode ?? null;
+    state.sessionMultiAgentEnabled = detail.lastMultiAgentEnabled ?? false;
     state.parentSessionId = detail.parentSessionId;
     state.latestCompletedRunId = detail.latestCompletedRunId ?? null;
     state.todos = sessionTodos.items;
@@ -1267,6 +1271,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     modelId: string;
     effort: EffortLevel | null;
     fastMode: boolean;
+    multiAgentEnabled: boolean;
   } | null {
     const selectedModelId = toValue(options.selectedModelId)?.trim() ?? "";
     let modelId = selectedModelId;
@@ -1290,7 +1295,8 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         : null;
     const paneFastMode = toValue(options.fastMode) ?? state.sessionFastMode ?? false;
     const fastMode = paneFastMode === true && !!model && modelSupportsFastMode(model);
-    return { modelId, effort, fastMode };
+    const multiAgentEnabled = toValue(options.multiAgentEnabled) ?? state.sessionMultiAgentEnabled;
+    return { modelId, effort, fastMode, multiAgentEnabled };
   }
 
   async function send(requestOverride?: EmbeddedChatRequest | null) {
@@ -1485,6 +1491,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         model: execution.modelId,
         effort: execution.effort,
         fastMode: execution.fastMode,
+        multiAgentEnabled: execution.multiAgentEnabled,
         images: request.images && request.images.length > 0 ? request.images : null,
         assetRefs: request.assetRefs && request.assetRefs.length > 0 ? request.assetRefs : null,
         sessionType: options.sessionType ?? "chat",
@@ -1516,6 +1523,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       boundState.sessionModelId = execution.modelId;
       boundState.sessionEffort = execution.effort;
       boundState.sessionFastMode = execution.fastMode;
+      boundState.sessionMultiAgentEnabled = execution.multiAgentEnabled;
       boundState.resumeAvailable = false;
       boundState.hydrated = true;
       if (request.mode === "plan") boundState.planModeActive = true;
@@ -1625,6 +1633,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         model: execution.modelId,
         effort: execution.effort,
         fastMode: execution.fastMode,
+        multiAgentEnabled: execution.multiAgentEnabled,
         images: null,
         assetRefs: null,
         sessionType: options.sessionType ?? "chat",
@@ -1663,6 +1672,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       boundState.sessionModelId = execution.modelId;
       boundState.sessionEffort = execution.effort;
       boundState.sessionFastMode = execution.fastMode;
+      boundState.sessionMultiAgentEnabled = execution.multiAgentEnabled;
       boundState.resumeAvailable = false;
       sessionStates.set(launch.sessionId, boundState);
       if (activeState.value === state && boundState !== state) {
@@ -1962,12 +1972,14 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     modelId: string,
     effort: EffortLevel,
     fastMode: boolean,
+    multiAgentEnabled?: boolean,
   ): boolean {
     const state = sessionStates.get(targetSessionId);
     if (!state || state.sessionId !== targetSessionId) return false;
     state.sessionModelId = modelId;
     state.sessionEffort = effort;
     state.sessionFastMode = fastMode;
+    if (multiAgentEnabled !== undefined) state.sessionMultiAgentEnabled = multiAgentEnabled;
     return true;
   }
 
@@ -2169,12 +2181,14 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     modelId?: string | null;
     effort?: EffortLevel | null;
     fastMode?: boolean | null;
+    multiAgentEnabled?: boolean;
   }): void {
     const state = activeState.value;
     state.sessionAgentId = selection.agentId ?? null;
     state.sessionModelId = selection.modelId ?? null;
     state.sessionEffort = selection.effort ?? null;
     state.sessionFastMode = selection.fastMode ?? null;
+    if (selection.multiAgentEnabled !== undefined) state.sessionMultiAgentEnabled = selection.multiAgentEnabled;
   }
 
   const inputText = computed({
@@ -2265,6 +2279,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const sessionModelId = computed(() => activeState.value.sessionModelId);
   const sessionEffort = computed(() => activeState.value.sessionEffort);
   const sessionFastMode = computed(() => activeState.value.sessionFastMode);
+  const sessionMultiAgentEnabled = computed(() => activeState.value.sessionMultiAgentEnabled);
   const parentSessionId = computed(() => activeState.value.parentSessionId);
   const latestCompletedRunId = computed(() => activeState.value.latestCompletedRunId);
   const planModeActive = computed(() => activeState.value.planModeActive);
@@ -2302,6 +2317,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       update.modelId,
       update.effort,
       update.fastMode,
+      update.multiAgentEnabled,
     ),
   );
 
@@ -2356,6 +2372,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     sessionModelId,
     sessionEffort,
     sessionFastMode,
+    sessionMultiAgentEnabled,
     parentSessionId,
     latestCompletedRunId,
     planModeActive,

@@ -15,6 +15,60 @@ if TYPE_CHECKING:
     from ._client import Client
 
 
+@dataclass(frozen=True, slots=True)
+class TaskStatus:
+    """Snapshot of a background bash, Python, Unity, or subagent task."""
+
+    task_id: str
+    session_id: str
+    tool_name: str
+    status: str
+    notify: bool
+    created_at: int
+    updated_at: int
+    finished_at: int | None = None
+    progress: str | None = None
+    output: str | None = None
+    is_error: bool | None = None
+    description: str | None = None
+    output_path: str | None = None
+    attempt: int = 1
+    started_at: int | None = None
+    child_session_id: str | None = None
+    can_resume: bool = False
+
+    @property
+    def done(self) -> bool:
+        return self.status in {"completed", "failed", "cancelled"}
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "TaskStatus":
+        return cls(
+            task_id=payload["taskId"], session_id=payload["sessionId"],
+            tool_name=payload["toolName"], status=payload["status"],
+            notify=payload["notify"], created_at=payload["createdAt"],
+            updated_at=payload["updatedAt"], finished_at=payload.get("finishedAt"),
+            progress=payload.get("progress"), output=payload.get("output"),
+            is_error=payload.get("isError"), description=payload.get("description"),
+            output_path=payload.get("outputPath"),
+            attempt=payload.get("attempt", 1), started_at=payload.get("startedAt"),
+            child_session_id=payload.get("childSessionId"), can_resume=bool(payload.get("canResume", False)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TaskMessageDelivery:
+    """Receipt for a durably queued agent message; queued does not mean read."""
+
+    message_id: str
+    task_id: str
+    status: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "TaskMessageDelivery":
+        return cls(message_id=payload["messageId"], task_id=payload["taskId"], status=payload["status"])
+
+
 def _agent_id(name: str) -> str:
     slug = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-_")
     if slug:

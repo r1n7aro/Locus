@@ -9,6 +9,7 @@ export interface SessionExecutionStateChanged {
   modelId: string;
   effort: EffortLevel;
   fastMode: boolean;
+  multiAgentEnabled?: boolean;
 }
 
 export async function broadcastSessionExecutionState(
@@ -20,5 +21,6 @@ export async function broadcastSessionExecutionState(
     modelId: payload.modelId.trim(),
     effort: payload.effort,
     fastMode: payload.fastMode,
+    multiAgentEnabled: payload.multiAgentEnabled,
   });
 }

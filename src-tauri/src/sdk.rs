@@ -170,6 +170,16 @@ const STATIC_MODELS: &[StaticModel] = &[
 
 const CODEX_FALLBACK_MODELS: &[StaticModel] = &[
     StaticModel {
+        id: "openai/gpt-6-astra",
+        name: "GPT-6 Astra",
+        provider: "openai_codex",
+        context_window: Some(258_400),
+        default_effort: Some("low"),
+        supported_efforts: CODEX_EFFORTS,
+        additional_speed_tiers: FAST_SPEED_TIER,
+        provider_default: false,
+    },
+    StaticModel {
         id: "openai/gpt-5.6-sol",
         name: "GPT-5.6 Sol",
         provider: "openai_codex",
@@ -690,7 +700,7 @@ fn validate_agent_id(value: &str) -> Result<String, String> {
     }) {
         return Err("Agent id may contain lowercase letters, digits, '-' and '_'".to_string());
     }
-    if canonical_agent_id(id) != id {
+    if crate::agent::definition::is_hidden_legacy_agent_id(id) {
         return Err(format!("Agent id '{id}' is reserved"));
     }
     Ok(id.to_string())
@@ -1399,6 +1409,7 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
         Some(model),
         effort,
         fast_mode,
+        None,
         None,
         None,
         Some(params.session_type.unwrap_or_else(|| "chat".to_string())),
@@ -2630,6 +2641,7 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         cancel_rx: None,
         progress: None,
         output: None,
+        output_path: None,
         background: false,
     };
     let lock_request = if matches!(canonical.as_str(), "write" | "edit") {
@@ -2728,8 +2740,92 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     ))
 }
 
+/// Start an idle root receiver with its persisted settings. The actual message
+/// stays in the durable mailbox and is injected as an agent reminder.
+pub(crate) async fn wake_session_for_agent_message(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    let store = app.state::<Arc<SessionStore>>();
+    if store.pending_agent_messages(session_id)?.is_empty() && store.pending_async_notifications(session_id)?.is_empty() { return Ok(()); }
+    let detail = store.load_session(session_id)?;
+    crate::commands::chat(
+        Some(session_id.to_string()),
+        None,
+        String::new(),
+        None, None,
+        detail.agent_id,
+        None,
+        detail.last_model_id,
+        detail.last_effort,
+        detail.last_fast_mode,
+        detail.last_multi_agent_enabled,
+        None, None,
+        Some(detail.session_type),
+        Some(if store.get_plan_mode_state(session_id)?.active { "plan" } else { "build" }.into()),
+        None, None, None, None, None, None, None,
+        app.clone(),
+        app.state::<Arc<SessionStore>>(),
+        app.state::<AgentDefRegistryState>(),
+        app.state::<Arc<crate::workspace_definition_registry::WorkspaceDefinitionRegistry>>(),
+        app.state::<Arc<crate::config::AppConfig>>(),
+        app.state::<Arc<ToolRegistry>>(),
+        app.state::<Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>(),
+        app.state::<Arc<tokio::sync::Mutex<crate::auth::AuthState>>>(),
+        app.state::<ApiKeyState>(),
+        app.state::<ProviderKeysState>(),
+        app.state::<crate::commands::CodexAuthStateHandle>(),
+        app.state::<Arc<crate::workspace_service::ProjectRegistry>>(),
+        app.state::<RawContextStore>(),
+        app.state::<ActiveTasks>(),
+        app.state::<crate::commands::AppKnowledgeDir>(),
+        app.state::<AppAgentDir>(),
+        app.state::<UndoManagerHandle>(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value, String> {
     match method {
+        "tasks.list" | "tasks.get" | "tasks.cancel" | "tasks.resume" | "tasks.wait" | "tasks.send_message" => {
+            let session_id = params.get("sessionId").and_then(Value::as_str).map(str::trim)
+                .filter(|id| !id.is_empty()).ok_or("Task APIs require the current sessionId")?;
+            let manager = app.state::<Arc<crate::async_tasks::AsyncTaskManager>>();
+            if method == "tasks.list" {
+                let tasks = manager.list_session_tasks(session_id)?.into_iter()
+                    .map(crate::async_tasks::AsyncTaskManager::task_payload).collect::<Result<Vec<_>, _>>()?;
+                return Ok(Value::Array(tasks));
+            }
+            let task_id = params.get("taskId").and_then(Value::as_str).map(str::trim)
+                .filter(|id| !id.is_empty()).ok_or("taskId is required")?;
+            if method == "tasks.send_message" {
+                let message = params.get("message").and_then(Value::as_str).ok_or("message is required")?;
+                let (receipt, task) = manager.queue_task_message(session_id, task_id, message)?;
+                if let Some(task) = task {
+                    manager.inner().ensure_message_delivery(app.clone(), task, receipt["messageId"].as_str().unwrap().to_string());
+                } else {
+                    let (target, _, _) = manager.resolve_message_target(session_id, task_id)?;
+                    manager.inner().ensure_parent_message_delivery(app.clone(), target, receipt["messageId"].as_str().unwrap().to_string());
+                }
+                return Ok(receipt);
+            }
+            if method == "tasks.wait" {
+                let timeout = params.get("timeoutMs").and_then(Value::as_u64).unwrap_or(30_000);
+                return crate::async_tasks::AsyncTaskManager::task_payload(manager.wait_task(session_id, task_id, timeout).await?);
+            }
+            let current = manager.get_session_task(session_id, task_id)?;
+            let snapshot = if method == "tasks.cancel" {
+                manager.cancel(&current.task_id)?
+            } else if method == "tasks.resume" {
+                if !app.state::<Arc<crate::config::AppConfig>>().async_tasks_enabled() {
+                    return Err("Async tasks are disabled in Settings > Experimental.".into());
+                }
+                let message = params.get("message").and_then(Value::as_str).unwrap_or_default().to_string();
+                manager.inner().resume_task(session_id, task_id, message, app.clone())?
+            } else {
+                current
+            };
+            crate::async_tasks::AsyncTaskManager::task_payload(snapshot)
+        }
         "agents.list" => list_agents(app).await,
         "agents.prompt" => prompt_agent(app, parse_params(params)?).await,
         "models.list" => list_models(app, parse_params(params)?).await,
@@ -2910,6 +3006,7 @@ mod tests {
         assert_eq!(validate_agent_id("sdk-agent_2").unwrap(), "sdk-agent_2");
         assert!(validate_agent_id("Reviewer").is_err());
         assert!(validate_agent_id("doc").is_err());
+        assert!(validate_agent_id("dev").is_err());
         assert!(validate_agent_id("with space").is_err());
     }
 
@@ -2928,6 +3025,7 @@ mod tests {
         for model in STATIC_MODELS.iter().chain(CODEX_FALLBACK_MODELS) {
             assert!(ids.insert(model.id), "duplicate SDK model id {}", model.id);
         }
+        assert!(ids.contains("openai/gpt-6-astra"));
         assert!(ids.contains("openai/gpt-5.6-sol"));
         assert!(ids.contains("claude-opus-4.8"));
         assert!(ids.contains("openrouter/claude-opus-4.8"));

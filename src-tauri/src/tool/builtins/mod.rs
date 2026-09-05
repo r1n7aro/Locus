@@ -29,8 +29,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(filesystem::edit());
     registry.register_builtin(shell::bash());
     registry.register_builtin(python::python());
-    registry.register_builtin_with_load_mode(get_task_status_tool(), ToolLoadMode::Lazy);
-    registry.register_builtin_with_load_mode(cancel_task_tool(), ToolLoadMode::Lazy);
     registry.register_builtin(search::grep());
     registry.register_builtin(unity::unity_asset_search());
     registry.register_builtin(misc::web_fetch());
@@ -133,80 +131,6 @@ fn config_query_tool() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::CONFIG_QUERY);
     ToolDef {
         name: "config_query".to_string(),
-        description: prompt.description,
-        parameters: prompt.parameters,
-        mutates_workspace: false,
-        execute,
-    }
-}
-
-fn get_task_status_tool() -> ToolDef {
-    let execute: ToolExecuteFn = std::sync::Arc::new(|args, ctx| {
-        Box::pin(async move {
-            let Some(task_id) = args
-                .get("task_id")
-                .or_else(|| args.get("taskId"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                return ToolResult {
-                    output: "Missing required parameter: task_id".to_string(),
-                    is_error: true,
-                };
-            };
-            let Some(app_handle) = ctx.app_handle else {
-                return ToolResult {
-                    output: "Async task manager is unavailable.".to_string(),
-                    is_error: true,
-                };
-            };
-            use tauri::Manager;
-            app_handle
-                .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
-                .status_result(task_id)
-        })
-    });
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::GET_TASK_STATUS);
-    ToolDef {
-        name: crate::async_tasks::GET_TASK_STATUS_TOOL_NAME.to_string(),
-        description: prompt.description,
-        parameters: prompt.parameters,
-        mutates_workspace: false,
-        execute,
-    }
-}
-
-fn cancel_task_tool() -> ToolDef {
-    let execute: ToolExecuteFn = std::sync::Arc::new(|args, ctx| {
-        Box::pin(async move {
-            let Some(task_id) = args
-                .get("task_id")
-                .or_else(|| args.get("taskId"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                return ToolResult {
-                    output: "Missing required parameter: task_id".to_string(),
-                    is_error: true,
-                };
-            };
-            let Some(app_handle) = ctx.app_handle else {
-                return ToolResult {
-                    output: "Async task manager is unavailable.".to_string(),
-                    is_error: true,
-                };
-            };
-            use tauri::Manager;
-            app_handle
-                .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
-                .cancel_result(task_id)
-        })
-    });
-    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::CANCEL_TASK);
-    ToolDef {
-        name: crate::async_tasks::CANCEL_TASK_TOOL_NAME.to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,

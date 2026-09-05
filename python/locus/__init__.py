@@ -17,6 +17,8 @@ from ._client import (
     LocusUnavailableError,
 )
 from ._models import (
+    TaskStatus,
+    TaskMessageDelivery,
     Agent,
     ModelInfo,
     Run,
@@ -43,6 +45,14 @@ from ._models import (
 from ._tools import Tool, tool
 
 __all__ = [
+    "TaskStatus",
+    "TaskMessageDelivery",
+    "wait_task",
+    "send_message",
+    "get_task_status",
+    "cancel_task",
+    "list_tasks",
+    "resume_task",
     "Agent",
     "Client",
     "LocusRunError",
@@ -142,6 +152,30 @@ async def call_tool(
 
 async def get_workspace() -> WorkspaceInfo:
     return await _client().get_workspace()
+
+
+async def get_task_status(task_id: str) -> TaskStatus:
+    return await _client().get_task_status(task_id)
+
+
+async def cancel_task(task_id: str) -> TaskStatus:
+    return await _client().cancel_task(task_id)
+
+
+async def list_tasks() -> list[TaskStatus]:
+    return await _client().list_tasks()
+
+
+async def wait_task(task_id: str, *, timeout: float = 30.0) -> TaskStatus:
+    return await _client().wait_task(task_id, timeout=timeout)
+
+
+async def send_message(task_id: str, message: str) -> TaskMessageDelivery:
+    return await _client().send_message(task_id, message)
+
+
+async def resume_task(task_id: str, *, message: str | None = None) -> TaskStatus:
+    return await _client().resume_task(task_id, message=message)
 
 
 async def get_unity_editor_status(*, project: str) -> UnityEditorStatus:

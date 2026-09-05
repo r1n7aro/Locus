@@ -1,9 +1,13 @@
 mod auto_review;
+mod async_resume;
 mod backend;
 mod claude_code_cli;
 mod dangerous_command;
+mod multi_agent;
+mod plan_policy;
 mod prompt_context;
 mod read_file;
+mod subagent_model;
 mod unity_capture;
 mod view_capture;
 
@@ -283,9 +287,12 @@ pub struct AgentInstance {
     /// erroring only at call time. Spawn-time snapshot; `execute_subagent` keeps
     /// the live-config depth check as backstop.
     subagent_tool_suppressed: bool,
+    multi_agent_enabled: bool,
     effort: Option<String>,
     codex_fast_mode: bool,
     async_tasks_enabled: bool,
+    background_task_id: Option<String>,
+    resumed_subagent: Option<crate::async_tasks::SubagentResumeInfo>,
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
     app_agent_dir: Arc<Option<std::path::PathBuf>>,
     knowledge_access_mode: KnowledgeAccessMode,
@@ -2381,37 +2388,18 @@ fn render_tree_lines(
     lines
 }
 
-fn prompt_type_root_description(
-    doc_type: crate::knowledge_store::KnowledgeType,
-    access_mode: KnowledgeAccessMode,
-) -> &'static str {
-    match (doc_type, access_mode) {
-        (crate::knowledge_store::KnowledgeType::Design, KnowledgeAccessMode::ReadOnly) => {
+fn prompt_type_root_description(doc_type: crate::knowledge_store::KnowledgeType) -> &'static str {
+    match doc_type {
+        crate::knowledge_store::KnowledgeType::Design => {
             "Project design direction discussed with the user, including game design and technical architecture"
         }
-        (crate::knowledge_store::KnowledgeType::Design, _) => {
-            "Project design direction discussed with the user, including game design and technical architecture | Update only when the user introduces design direction. The user reviews the update"
-        }
-        (crate::knowledge_store::KnowledgeType::Plan, KnowledgeAccessMode::ReadOnly) => {
+        crate::knowledge_store::KnowledgeType::Plan => {
             "Execution plans, milestones, dependencies, and progress"
         }
-        (crate::knowledge_store::KnowledgeType::Plan, _) => {
-            "Execution plans, milestones, dependencies, and progress | Keep active plans current as work advances"
-        }
-        (crate::knowledge_store::KnowledgeType::Reference, _) => {
-            "External material | Read-only"
-        }
-        (crate::knowledge_store::KnowledgeType::Skill, KnowledgeAccessMode::ReadOnly) => {
-            "Standard workflows for getting work done"
-        }
-        (crate::knowledge_store::KnowledgeType::Skill, _) => {
-            "Standard workflows for getting work done. Update a skill when technical changes affect its flow. Suggest a new skill when a task looks reusable"
-        }
-        (crate::knowledge_store::KnowledgeType::Memory, KnowledgeAccessMode::ReadOnly) => {
-            "Project memory and long-term working context"
-        }
-        (crate::knowledge_store::KnowledgeType::Memory, _) => {
-            "User context, long-term preferences, and project background | Update when the user explicitly provides durable context"
+        crate::knowledge_store::KnowledgeType::Reference => "External material with source information",
+        crate::knowledge_store::KnowledgeType::Skill => "Standard workflows for getting work done",
+        crate::knowledge_store::KnowledgeType::Memory => {
+            "User context, long-term preferences, and project background"
         }
     }
 }
@@ -2655,7 +2643,7 @@ fn build_prompt_physical_root_tree(
         insert_prompt_tree_directory(
             &mut tree,
             &parts,
-            Some(prompt_type_root_description(source.doc_type, access_mode)),
+            Some(prompt_type_root_description(source.doc_type)),
             suffix,
         );
         let visible_files = match source.doc_type {
@@ -2886,15 +2874,13 @@ fn build_structure_section(
 fn build_search_section(semantic_search_enabled: bool) -> String {
     let mut lines = vec!["### Search"];
     if semantic_search_enabled {
-        lines.push("1. Use `knowledge_query` when the injected context does not already answer the task. Split exact terms into `lexicalQuery` and intent-style retrieval into `semanticQuery` when useful.");
+        lines.push("Use `knowledge_query` for missing context: `lexicalQuery` for exact terms and `semanticQuery` for meaning.");
     } else {
-        lines.push("1. Use `knowledge_query` when the injected context does not already answer the task. Put exact terms, titles, paths, identifiers, or short keyword combinations into `lexicalQuery`.");
+        lines.push("Use `knowledge_query` with `lexicalQuery` for missing context. Semantic search is disabled.");
     }
     lines.extend([
-        "2. Query results return a real path and physical line range. Use `read` with that exact path plus `offset` and `limit`; line 1 is the first physical file line, including frontmatter.",
-        "3. `Structure` lists registered physical directories directly. Paths inside the selected workspace are workspace-relative; registered package and external knowledge outside the workspace use absolute physical paths.",
-        "4. Use `list` and `grep` for ordinary filesystem browsing after a query identifies a relevant directory.",
-        "5. Reuse already injected or already read content. Read again only when another line range is required or the file changed.",
+        "Read returned paths and physical line ranges with `read` (`offset`/`limit`, including frontmatter). Reuse current content already loaded.",
+        "`Structure` lists physical directories: workspace-relative inside the checkout, absolute for registered external sources.",
     ]);
     lines.join("\n")
 }
@@ -2910,10 +2896,9 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
     }
 
     [
-        "### Maintenance",
-        "- When the user gives you new project information, or your changes affect the correctness of knowledge documents, keep the knowledge base current and structurally sound, and report your update to the user.",
-        "- Create knowledge Markdown with `write`, update it with `edit`, and use `bash` for deletion or movement. In writable knowledge directories, `write` generates frontmatter automatically and reports the generated fields.",
-        "- Respect existing maintenance rules on any document or folder you maintain.",
+        "### Access",
+        "- Require both source write access and authorization for the knowledge role. Apply the document or folder maintenance rules to every change.",
+        "- For authorized changes, create Markdown with `write`, update with `edit`, and move or delete with `bash`.",
     ]
     .join("\n")
 }
@@ -3262,7 +3247,7 @@ fn build_l3_rule_section(
     }
 
     Ok(format!(
-        "## L3 Rules\nThese rule-injected documents are active session rules. Treat their full document content and any included maintenance rules below as always-on instructions.\n\n{}",
+        "## L3 Rules\nActive project rules and workflows. Apply them to the current task within tool permissions and the user's authorized scope. Use current observations for project facts.\n\n{}",
         entries
             .into_iter()
             .map(|entry| entry.content)
@@ -4025,9 +4010,12 @@ impl AgentInstance {
             subagent_depth: 0,
             subagent_active: Arc::new(AtomicU32::new(0)),
             subagent_tool_suppressed: false,
+            multi_agent_enabled: false,
             effort: effective_effort,
             codex_fast_mode: false,
             async_tasks_enabled: false,
+            background_task_id: None,
+            resumed_subagent: None,
             app_knowledge_dir,
             app_agent_dir,
             knowledge_access_mode,
@@ -4163,10 +4151,10 @@ impl AgentInstance {
         let display = plan_file.to_string_lossy();
         let info = if plan_file.is_file() {
             format!(
-                "A plan file already exists at {display} from earlier planning in this session.\nBefore any new planning: read it and evaluate it against the current request — refine it if this continues the same task, or overwrite it if the task is different. Always update the plan file before calling exit_plan_mode."
+                "A plan file already exists at {display}. For implementation planning, read it and use `edit` to refine or replace its content for the current task before calling exit_plan_mode."
             )
         } else {
-            format!("No plan file exists yet. Create your plan at {display} using the write tool.")
+            format!("No plan file exists yet. For implementation planning, create it at {display} using `write`.")
         };
         crate::prompt::plan::PLAN_REMINDER.replace("{plan_file_info}", &info)
     }
@@ -4221,24 +4209,21 @@ impl AgentInstance {
     }
 
     /// Returns the rejection message when a tool call violates plan-mode
-    /// enforcement. Read-only tools always pass; the main planning agent may
-    /// additionally edit the plan file, fetch the web, and delegate to
-    /// (forced read-only) subagents. unity_recompile stays allowed via
-    /// is_readonly_tool: it validates plan feasibility through compile
-    /// diagnostics without touching sources.
+    /// enforcement. Observation is classified separately from scheduling:
+    /// Editor control and test tools may leave source files unchanged while
+    /// still mutating runtime state. The main agent may also edit its plan
+    /// file and delegate to forced-read-only subagents.
     fn plan_mode_tool_violation(
         &self,
         runtime: &PlanRuntime,
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
-        if Self::is_readonly_tool_call(tool_name, args) {
+        if plan_policy::allows_observation(tool_name, args) {
             return None;
         }
         match runtime {
             PlanRuntime::Main { plan_file } => match tool_name {
-                // Network reads don't mutate the system; planning may need docs.
-                "web_fetch" => None,
                 // Subagents inherit read-only enforcement (see run_subagent).
                 "subagent" => None,
                 // Intercepted before enforcement; listed for completeness.
@@ -4307,6 +4292,7 @@ impl AgentInstance {
             cancel_rx: Some(self.cancel_waiter()),
             progress: None,
             output: None,
+            output_path: None,
             background: false,
         }
     }
@@ -4317,16 +4303,15 @@ impl AgentInstance {
     /// silently hiding them.
     async fn resolve_configured_tool_names(&self) -> Vec<String> {
         let mut tools = self.def.tools.clone();
+        if self.multi_agent_enabled && self.tool_registry.tool_description("subagent").is_some() {
+            push_unique_tool_name(&mut tools, "subagent");
+        }
         if crate::unity_editor_lock::is_enabled() {
             push_unique_tool_name(&mut tools, "unity_lock");
             push_unique_tool_name(&mut tools, "unity_release");
         }
         for tool_name in self.tool_registry.skill_tool_names() {
             push_unique_tool_name(&mut tools, &tool_name);
-        }
-        if self.async_tasks_enabled {
-            push_unique_tool_name(&mut tools, crate::async_tasks::GET_TASK_STATUS_TOOL_NAME);
-            push_unique_tool_name(&mut tools, crate::async_tasks::CANCEL_TASK_TOOL_NAME);
         }
         // MCP tools ride on the manager's synchronous snapshot (updated by
         // startup/settings/mcp_reload reconciles). ensure_fresh backstops
@@ -4435,7 +4420,9 @@ impl AgentInstance {
     }
 
     fn tool_runtime_unavailable_reason(&self, name: &str) -> Option<&'static str> {
-        self.tool_environment_unavailable_reason(name)
+        (name == "subagent" && !self.multi_agent_enabled)
+            .then_some("multi_agent_disabled")
+            .or_else(|| self.tool_environment_unavailable_reason(name))
             .or_else(|| (!self.tool_supported_by_model(name)).then_some("model_vision_unsupported"))
             .or_else(|| {
                 (self.subagent_tool_suppressed && name == "subagent")
@@ -4595,6 +4582,16 @@ impl AgentInstance {
     }
 
     fn resolve_api_tool(&self, name: &str) -> Option<serde_json::Value> {
+        if self.canonical_tool_name(name).as_deref() == Some("subagent")
+            && (!self.multi_agent_enabled || self.subagent_tool_suppressed)
+        {
+            return None;
+        }
+        self.resolve_tool_schema(name)
+    }
+
+    /// Definition inspection must remain available even when a session cannot call the tool.
+    fn resolve_tool_schema(&self, name: &str) -> Option<serde_json::Value> {
         self.tool_registry
             .resolve_api_tool(name)
             .or_else(|| {
@@ -4703,7 +4700,7 @@ impl AgentInstance {
         // Depth-capped subagents lose `subagent` entirely: the request tool
         // list, lazy manifest, tool_load and tool_call all derive from this
         // set, so the model is never offered a tool it cannot use.
-        if self.subagent_tool_suppressed {
+        if !self.multi_agent_enabled || self.subagent_tool_suppressed {
             allowed.remove("subagent");
         }
         allowed
@@ -5226,11 +5223,26 @@ impl AgentInstance {
         truncated
     }
 
-    fn format_lazy_tool_manifest(entries: &[(String, String)]) -> String {
+    fn format_lazy_tool_manifest(
+        entries: &[(String, String)],
+        renderer: LazyToolRenderer,
+    ) -> String {
+        let guidance = match renderer {
+            LazyToolRenderer::CodexNative => {
+                "Load deferred tool schemas through native `tool_search`, passing their exact names in `wire_names`, then call the exposed tools directly. Prefer this native path for individual tool calls; use the Python SDK for workflows that need Python processing or orchestration."
+            }
+            LazyToolRenderer::AnthropicNative => {
+                "These tools have deferred definitions. Load them by name with `tool_load`; their schemas expand through native tool references, then call the tools directly."
+            }
+            LazyToolRenderer::ToolLoadFallback => {
+                "These tool schemas are available by name through `tool_load`:"
+            }
+        };
         let mut lines = vec![
             "## Lazy Loaded Tools".to_string(),
             String::new(),
-            "These tool schemas are available by name through `tool_load`:".to_string(),
+            guidance.to_string(),
+            String::new(),
         ];
         lines.extend(entries.iter().map(|(name, summary)| {
             if summary.is_empty() {
@@ -5243,8 +5255,18 @@ impl AgentInstance {
     }
 
     async fn lazy_tool_manifest_prompt(&self) -> Option<String> {
+        self.lazy_tool_manifest_prompt_for_renderer(self.cached_lazy_tool_renderer())
+            .await
+    }
+
+    async fn lazy_tool_manifest_prompt_for_renderer(
+        &self,
+        renderer: LazyToolRenderer,
+    ) -> Option<String> {
         let tool_names = self.lazy_tool_manifest_names().await;
-        if tool_names.is_empty() {
+        // Codex also needs the native loading route when only Skill documents
+        // (rather than the default lazy catalog) supply deferred tool names.
+        if tool_names.is_empty() && renderer != LazyToolRenderer::CodexNative {
             return None;
         }
         let entries: Vec<(String, String)> = tool_names
@@ -5260,7 +5282,7 @@ impl AgentInstance {
                 (name, summary)
             })
             .collect();
-        Some(Self::format_lazy_tool_manifest(&entries))
+        Some(Self::format_lazy_tool_manifest(&entries, renderer))
     }
 
     fn normalize_tool_call_names(&self, tool_calls: &mut [ToolCallInfo]) {
@@ -5312,7 +5334,7 @@ impl AgentInstance {
                 !codex_native_tool_search || !matches!(name.as_str(), "tool_load" | "tool_call")
             })
             .filter_map(|configured_name| {
-                let (tool, definition_available) = match self.resolve_api_tool(configured_name) {
+                let (tool, definition_available) = match self.resolve_tool_schema(configured_name) {
                     Some(tool) => (self.contextualize_api_tool(tool), true),
                     None => (
                         serde_json::json!({
@@ -5709,8 +5731,8 @@ impl AgentInstance {
                 )
             }
         };
-        // Model, reasoning effort, Codex service tier, and workspace prompt
-        // inputs all select a new prompt-prefix identity. Once any of them
+        // Model, reasoning effort, Codex service tier, lazy-tool route, and
+        // workspace prompt inputs select a new prompt-prefix identity. When one
         // changes, rebuild the locally synthesized prefix on the next turn.
         let extra_workdirs_prompt = if self.has_selected_working_dir() {
             let injection_config = crate::commands::load_agent_injection_config_layers(
@@ -5737,7 +5759,9 @@ impl AgentInstance {
             "model": self.effective_model.as_str(),
             "effort": self.effort.as_deref(),
             "fastMode": self.codex_fast_mode,
+            "multiAgentEnabled": self.multi_agent_enabled,
             "extraWorkdirs": extra_workdirs_fingerprint,
+            "lazyToolRenderer": self.cached_lazy_tool_renderer().strategy_label(),
         })
         .to_string();
         PromptPrefixCachePolicy {
@@ -5827,7 +5851,7 @@ impl AgentInstance {
     }
 
     fn knowledge_query_lexical_only_description() -> &'static str {
-        "Search registered Design, Plan, Memory, Reference, and Skill sources with `lexicalQuery`. When lexical indexing is off, the query falls back to direct text scanning. Returns ranked plain-text results with directly readable paths, physical line ranges, optional summaries, and bounded hit context. Titles are omitted because they match file names."
+        "Search Design, Memory, Reference, and Skill sources, plus plan/ execution documents, with `lexicalQuery`. With lexical indexing off, searches use direct text scanning. Results provide readable paths, physical line ranges, optional summaries, and bounded hit context. Use read for the needed ranges."
     }
 
     fn render_unity_recompile_description(
@@ -5838,10 +5862,11 @@ impl AgentInstance {
         const MARKER: &str = "{optional_capability_guidance}";
         let mut guidance = Vec::new();
         if code_diagnostics_available {
-            guidance.push("To merely check for compile errors, prefer `code_diagnostics` — it is fast and does not touch Unity.");
+            guidance
+                .push("For source diagnostics without applying changes, use `code_diagnostics`.");
         }
         if unity_hot_reload_available {
-            guidance.push("If you only changed method bodies, prefer `unity_hot_reload` for ~2-second iteration (especially in Play Mode); structural changes and anything it reports as cold still need this tool.");
+            guidance.push("For live iteration, use `unity_hot_reload` when available and follow its applied/cold result. Use this tool for cold changes and full compilation or domain reload.");
         }
         if guidance.is_empty() {
             return description
@@ -5940,16 +5965,7 @@ impl AgentInstance {
             );
         }
         let contextualized = if name == "subagent" {
-            let subagents = self.registry.list_subagent_descriptions();
-            let agent_list = subagents
-                .iter()
-                .map(|(id, desc)| format!("- {}: {}", id, desc))
-                .collect::<Vec<_>>()
-                .join("\n");
-            (
-                crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list),
-                parameters,
-            )
+            (self.render_subagent_tool_description(), parameters)
         } else if name == "knowledge_query" && !self.knowledge_semantic_search_enabled() {
             Self::remove_knowledge_query_semantic_parameter(&mut parameters);
             (
@@ -5981,6 +5997,7 @@ impl AgentInstance {
             });
             crate::async_tasks::augment_tool_schema(name, &mut tool);
             self.def.apply_tool_description_override(name, &mut tool);
+            self.apply_multi_agent_guidance(name, &mut tool);
             let function = &mut tool["function"];
             let description = function["description"]
                 .as_str()
@@ -5997,6 +6014,7 @@ impl AgentInstance {
             }
         });
         self.def.apply_tool_description_override(name, &mut tool);
+        self.apply_multi_agent_guidance(name, &mut tool);
         let function = &mut tool["function"];
         (
             function["description"]
@@ -6037,21 +6055,13 @@ impl AgentInstance {
             }
         }
         if name == "subagent" {
-            let subagents = self.registry.list_subagent_descriptions();
-            let agent_list = subagents
-                .iter()
-                .map(|(id, desc)| format!("- {}: {}", id, desc))
-                .collect::<Vec<_>>()
-                .join("\n");
             if let Some(function) = tool
                 .get_mut("function")
                 .and_then(serde_json::Value::as_object_mut)
             {
                 function.insert(
                     "description".to_string(),
-                    serde_json::json!(
-                        crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list)
-                    ),
+                    serde_json::json!(self.render_subagent_tool_description()),
                 );
             }
         } else if name == "knowledge_query" && !self.knowledge_semantic_search_enabled() {
@@ -6093,6 +6103,7 @@ impl AgentInstance {
             crate::async_tasks::augment_tool_schema(&name, &mut tool);
         }
         self.def.apply_tool_description_override(&name, &mut tool);
+        self.apply_multi_agent_guidance(&name, &mut tool);
         tool
     }
 
@@ -6159,30 +6170,8 @@ impl AgentInstance {
     /// skill tools are discovered by reading their skill documents, and
     /// listing them here would mutate the tools prefix on every activation.
     async fn native_tool_load_manifest_section(&self) -> Option<String> {
-        let tool_names = self.lazy_tool_manifest_names().await;
-        if tool_names.is_empty() {
-            return None;
-        }
-        let mut lines = vec![
-            "## Deferred tools".to_string(),
-            String::new(),
-            "These additional tools are declared with deferred definitions. Load them by name with `tool_load`; the full schemas expand automatically and the tools become directly callable:".to_string(),
-        ];
-        for name in tool_names {
-            let summary = self
-                .tool_description(&name)
-                .map(|(description, parameters)| {
-                    self.contextualize_tool_description(&name, description, parameters)
-                })
-                .map(|(description, _)| Self::summarize_tool_description(&description))
-                .unwrap_or_default();
-            if summary.is_empty() {
-                lines.push(format!("- `{}`", name));
-            } else {
-                lines.push(format!("- `{}` — {}", name, summary));
-            }
-        }
-        Some(lines.join("\n"))
+        self.lazy_tool_manifest_prompt_for_renderer(LazyToolRenderer::AnthropicNative)
+            .await
     }
 
     /// One-stop request tool assembly for the agent loop: picks the native
@@ -6618,24 +6607,18 @@ impl AgentInstance {
             }
         }
 
-        // Native renderers withdraw the env manifest: the deferred catalog
-        // rides on the tool declarations themselves (tool_load description /
-        // tool_search declaration), removing this system-prompt wobble source.
-        if has_working_dir
-            && !self.cached_lazy_tool_renderer().is_native()
+        // Anthropic carries this same manifest in tool_load's declaration.
+        // Codex keeps schemas client-side, so its exact-name loader needs the
+        // stable lazy-name catalog here as well as in the injection preview.
+        let lazy_renderer = self.cached_lazy_tool_renderer();
+        if (has_working_dir || lazy_renderer == LazyToolRenderer::CodexNative)
+            && lazy_renderer != LazyToolRenderer::AnthropicNative
             && injection_config.state("lazy_tool_names").enabled
         {
             if let Some(lazy_tool_manifest) = self.lazy_tool_manifest_prompt().await {
                 env.push_str("\n\n");
                 env.push_str(&lazy_tool_manifest);
             }
-        }
-
-        if self.cached_lazy_tool_renderer() == LazyToolRenderer::CodexNative
-            && injection_config.state("lazy_tool_names").enabled
-        {
-            env.push_str("\n\n## Deferred Tool Loading\n\n");
-            env.push_str(CODEX_TOOL_SEARCH_EXACT_NAME_GUIDANCE);
         }
 
         let rules_started_at = Instant::now();
@@ -6662,10 +6645,7 @@ impl AgentInstance {
 
             let mut sections = Vec::new();
             if !rule_sections.is_empty() {
-                sections.push(format!(
-                    "## Rules (IMPORTANT — follow these rules strictly)\n\n{}",
-                    rule_sections.join("\n\n")
-                ));
+                sections.push(format!("## Agent Rules\n\n{}", rule_sections.join("\n\n")));
             }
             if has_working_dir && self.knowledge_access_mode.allows_context() {
                 if let Ok(l3_rules) = build_l3_rule_section(
@@ -6679,6 +6659,9 @@ impl AgentInstance {
                 }
             }
 
+            if let Some(guidance) = self.explicit_delegation_guidance() {
+                sections.push(format!("<multi_agent_mode>\n{guidance}\n</multi_agent_mode>"));
+            }
             sections.join("\n\n")
         };
         eprintln!(
@@ -8334,8 +8317,9 @@ impl AgentInstance {
     }
 
     #[allow(dead_code)]
-    pub fn spawn_child(
+    pub async fn spawn_child(
         &self,
+        app_handle: &AppHandle,
         child_def_id: &str,
         store: &SessionStore,
     ) -> Result<AgentInstance, String> {
@@ -8355,35 +8339,14 @@ impl AgentInstance {
             Some(child_def_id),
         )?;
 
-        let mut child = AgentInstance::new(
-            Arc::new(child_def.clone()),
+        self.new_subagent_instance(
+            app_handle,
+            store,
+            child_def.clone(),
             &child_session_id,
-            self.backend.clone(),
-            self.debug,
-            self.registry.clone(),
-            self.tool_registry.clone(),
-            self.working_dir.clone(),
-            self.raw_store.clone(),
-            self.workspace_id.clone(),
-            self.resolve_subagent_model_name(child_def_id)
-                .unwrap_or_else(|| self.effective_model.clone()),
-            self.resolve_subagent_effort(child_def_id),
-            self.app_knowledge_dir.clone(),
-            self.app_agent_dir.clone(),
-            self.knowledge_access_mode,
-            self.undo_manager.clone(),
-            self.subagent_model_overrides.clone(),
             self.cancel_waiter(),
-        );
-        child.subagent_depth = self.subagent_depth + 1;
-        child.execution_context = self.execution_context.clone();
-        child.subagent_active = self.subagent_active.clone();
-        child.session_undo_enabled = self.session_undo_enabled;
-        child.async_tasks_enabled = self.async_tasks_enabled;
-        child.codex_fast_mode = self.resolve_subagent_fast_mode(child_def_id);
-        child.subagent_effort_overrides = self.subagent_effort_overrides.clone();
-        child.subagent_fast_mode_overrides = self.subagent_fast_mode_overrides.clone();
-        Ok(child)
+        )
+        .await
     }
 
     async fn call_llm(
@@ -10114,6 +10077,13 @@ impl AgentInstance {
         user_text: &str,
     ) -> Option<String> {
         let mut parts = Vec::new();
+        if let Some(manager) = app_handle.try_state::<Arc<crate::async_tasks::AsyncTaskManager>>() {
+            match manager.identity_reminder(&self.session_id) {
+                Ok(identity) if !identity.is_empty() => parts.push(identity),
+                Err(error) => eprintln!("[Agent identity] {error}"),
+                _ => {},
+            }
+        }
         if let Some(intent) = user_intent {
             let skill_reminder = self.build_selected_skill_reminder(intent, user_text);
             if !skill_reminder.is_empty() {
@@ -10884,12 +10854,18 @@ impl AgentInstance {
             first_user_message_id.is_some()
         );
 
+        self.register_async_resumer(app_handle, store, &run_id);
         if matches!(&self.backend, LlmBackend::ClaudeCodeCli) {
-            let prompt_text = crate::session::history::render_prompt_content(
+            let mut prompt_text = crate::session::history::render_prompt_content(
                 &actual_user_text,
                 current_prompt_prefix,
                 user_prompt_suffix.as_deref(),
             );
+            let async_tasks = app_handle.state::<Arc<crate::async_tasks::AsyncTaskManager>>();
+            for reminder in async_tasks.deliver_notifications(&self.session_id, store)? {
+                prompt_text.push_str("\n\n");
+                prompt_text.push_str(&reminder);
+            }
             let system_prompt = {
                 let mut parts = vec![prompt_parts.base_prompt.as_str()];
                 if !prompt_parts.rules_prompt.is_empty() {
@@ -13143,6 +13119,8 @@ impl AgentInstance {
                     continue 'agent_loop;
                 }
 
+                if !store.pending_agent_messages(&self.session_id)?.is_empty() { continue 'agent_loop; }
+
                 if !model_needs_follow_up {
                     store.close_run_pending_input_queue(&run_id)?;
                     final_thinking_text = response.thinking_text;
@@ -13172,7 +13150,7 @@ impl AgentInstance {
                     .map_err(|e| format!("Failed to lock pending input queue: {}", e))?;
                 queue.claim_immediate(&self.session_id, &run_id)
             };
-            if model_needs_follow_up || !pending_inputs.is_empty() {
+            if model_needs_follow_up || !pending_inputs.is_empty() || !store.pending_agent_messages(&self.session_id)?.is_empty() {
                 let thinking_opt = if response.thinking_text.is_empty() {
                     None
                 } else {
@@ -13419,9 +13397,8 @@ impl AgentInstance {
                 | "unity_test_run"
                 | "unity_yaml_search"
                 | "unity_yaml_read"
-                // Deliberate: recompile rebuilds scripts and reloads the
-                // domain but never modifies sources — plan mode keeps it so
-                // plans can be validated against compile diagnostics.
+                // Scheduling groups these source-preserving runtime tools;
+                // plan_policy separately blocks their Editor/test mutations.
                 | "unity_recompile"
                 | "unity_set_play_mode"
                 | "code_find_references"
@@ -13533,7 +13510,6 @@ impl AgentInstance {
                 | "list"
                 | "config_query"
                 | "tool_load"
-                | "get_task_status"
                 | "code_find_references"
                 | "code_goto_definition"
                 | "code_symbol_search"
@@ -14794,6 +14770,13 @@ impl AgentInstance {
         requested_status: &str,
         run_id: &str,
     ) -> ToolConfirmDecision {
+        if self.plan_runtime_snapshot().is_some() {
+            if let Some(output) =
+                plan_policy::editor_status_change_violation(current_status, requested_status)
+            {
+                return ToolConfirmDecision::PreflightError { output };
+            }
+        }
         let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
         let perms = perms_state.0.read().await;
         let requires_confirm = Self::permission_setting_requires_confirm(
@@ -14957,11 +14940,14 @@ impl AgentInstance {
         instance.subagent_depth = self.subagent_depth;
         instance.subagent_active = self.subagent_active.clone();
         instance.subagent_tool_suppressed = self.subagent_tool_suppressed;
+        instance.multi_agent_enabled = self.multi_agent_enabled;
         instance.session_undo_enabled = self.session_undo_enabled;
         instance.codex_fast_mode = self.codex_fast_mode;
         instance.subagent_effort_overrides = self.subagent_effort_overrides.clone();
         instance.subagent_fast_mode_overrides = self.subagent_fast_mode_overrides.clone();
         instance.async_tasks_enabled = self.async_tasks_enabled;
+        instance.background_task_id = self.background_task_id.clone();
+        instance.resumed_subagent = self.resumed_subagent.clone();
         instance.knowledge_focus = self.knowledge_focus.clone();
         instance.set_plan_runtime(self.plan_runtime_snapshot());
         instance
@@ -14984,23 +14970,7 @@ impl AgentInstance {
             .state::<Arc<crate::async_tasks::AsyncTaskManager>>()
             .inner()
             .clone();
-        let notifications = manager.take_notifications(&self.session_id);
-        if notifications.is_empty() {
-            return Ok(0);
-        }
-        let count = notifications.len();
-        let reminder = notifications.join("\n\n");
-        store.add_message_with_images_asset_refs_and_signature(
-            &self.session_id,
-            MessageRole::User,
-            "",
-            None,
-            None,
-            None,
-            None,
-            Some(&reminder),
-        )?;
-        Ok(count)
+        Ok(manager.deliver_notifications(&self.session_id, store)?.len())
     }
 
     async fn start_async_tool(
@@ -15023,6 +14993,14 @@ impl AgentInstance {
             async_mode.should_notify(),
             Some(&self.working_dir),
         );
+        if let Err(output) = manager.prepare_named_task(&started.task_id, args.get("description").and_then(serde_json::Value::as_str), if tc.name == "subagent" { args.get("name").and_then(serde_json::Value::as_str) } else { None }) {
+            manager.discard_task(&started.task_id);
+            return ExecutedToolResult::from_tool_result(ToolResult { output, is_error: true });
+        }
+        if let Err(output) = manager.bind_origin(&started.task_id, assistant_message_id, &tc.id) {
+            manager.discard_task(&started.task_id);
+            return ExecutedToolResult::from_tool_result(ToolResult { output, is_error: true });
+        }
         let immediate = manager.start_result(&started.task_id);
         let (startup_result_tx, startup_result_rx) = tokio::sync::oneshot::channel();
         let (startup_handled_tx, startup_handled_rx) = tokio::sync::oneshot::channel();
@@ -15048,7 +15026,8 @@ impl AgentInstance {
                 execution.workspace.as_ref(),
             )
         });
-        let executor = self.clone_for_background_task(started.cancel_rx.clone());
+        let mut executor = self.clone_for_background_task(started.cancel_rx.clone());
+        executor.background_task_id = Some(task_id.clone());
 
         let initial_manager = manager.clone();
         let initial_task_id = task_id.clone();
@@ -15201,6 +15180,7 @@ impl AgentInstance {
                 context.progress = Some(progress);
                 context.output = Some(output);
                 context.background = true;
+                context.output_path = manager.output_path(&task_id);
                 ExecutedToolResult::from_tool_result(
                     executor
                         .tool_registry
@@ -15253,9 +15233,18 @@ impl AgentInstance {
                 return;
             }
 
-            let startup_failure_was_returned = match startup_result_tx.send(result.clone()) {
-                Ok(()) => startup_handled_rx.await.unwrap_or(false),
-                Err(_) => false,
+            // Once a child conversation exists, even an immediate network
+            // failure is a resumable task result, not a launch validation error.
+            let child_was_started = tool_name == "subagent"
+                && manager.snapshot(&task_id).is_some_and(|task| task.resume.is_some());
+            let startup_failure_was_returned = if child_was_started {
+                drop(startup_result_tx);
+                false
+            } else {
+                match startup_result_tx.send(result.clone()) {
+                    Ok(()) => startup_handled_rx.await.unwrap_or(false),
+                    Err(_) => false,
+                }
             };
             executor
                 .record_failed_tool_call(
@@ -15270,6 +15259,7 @@ impl AgentInstance {
                 )
                 .await;
             let result = result.into_tool_result();
+            if startup_failure_was_returned { manager.suppress_notification(&task_id); }
             if let Some(snapshot) = manager.finish_without_notification(&task_id, &result) {
                 crate::async_tasks::emit_task_updated(
                     &app_handle,
@@ -15292,9 +15282,7 @@ impl AgentInstance {
                         tool_call_id, error
                     );
                 }
-                if !startup_failure_was_returned {
-                    manager.enqueue_completion_notification(&snapshot);
-                }
+                manager.enqueue_completion_notification(&snapshot);
             }
             run_guard.complete();
         });
@@ -17704,6 +17692,36 @@ impl AgentInstance {
             Some(override_model) if !override_model.is_empty() => Some(override_model.clone()),
             _ => Some(self.effective_model.clone()),
         }
+    }
+
+    fn subagent_model_display_name(model: &str) -> &str {
+        let model = model.trim();
+        model
+            .strip_prefix("openai/")
+            .or_else(|| model.strip_prefix("openrouter/"))
+            .or_else(|| model.strip_prefix("claude_code/"))
+            .unwrap_or(model)
+    }
+
+    fn render_subagent_tool_description(&self) -> String {
+        let agent_list = self
+            .registry
+            .list_subagent_descriptions()
+            .into_iter()
+            .map(|(id, description)| {
+                let model = self
+                    .resolve_subagent_model_name(&id)
+                    .unwrap_or_else(|| self.effective_model.clone());
+                format!(
+                    "- {}: {} Uses model `{}`.",
+                    id,
+                    description.trim(),
+                    Self::subagent_model_display_name(&model)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list)
     }
 
     fn resolve_subagent_effort(&self, subagent_type: &str) -> Option<String> {
@@ -21169,7 +21187,13 @@ impl AgentInstance {
             self.id, agent_def.name, subagent_type, description
         );
 
-        let child_session_id = match store.create_session_scoped(
+        let child_session_id = if let Some(resume) = &self.resumed_subagent {
+            let detail = store.load_session(&resume.child_session_id)?;
+            if detail.parent_session_id.as_deref() != Some(self.session_id.as_str()) || resume.agent_id != subagent_type {
+                return Err("Subagent continuation does not belong to this parent session.".into());
+            }
+            resume.child_session_id.clone()
+        } else { match store.create_session_scoped(
             &format!("sub:{}", description),
             Some(&self.session_id),
             self.workspace_id.as_deref(),
@@ -21183,54 +21207,26 @@ impl AgentInstance {
             Err(e) => {
                 return Err(format!("Failed to create subagent session: {}", e));
             }
-        };
+        } };
+        let child_usage_before = if self.resumed_subagent.is_some() { Some(store.get_token_usage(&child_session_id)?) } else { None };
 
         let (child_cancel_tx, child_cancel_rx) = tokio::sync::watch::channel(false);
         let child_cancel_state = child_cancel_rx.clone();
-        let mut child = AgentInstance::new(
-            Arc::new(agent_def),
-            &child_session_id,
-            self.backend.clone(),
-            self.debug,
-            self.registry.clone(),
-            self.tool_registry.clone(),
-            self.working_dir.clone(),
-            self.raw_store.clone(),
-            self.workspace_id.clone(),
-            self.resolve_subagent_model_name(subagent_type)
-                .unwrap_or_else(|| self.effective_model.clone()),
-            self.resolve_subagent_effort(subagent_type),
-            self.app_knowledge_dir.clone(),
-            self.app_agent_dir.clone(),
-            self.knowledge_access_mode,
-            self.undo_manager.clone(),
-            self.subagent_model_overrides.clone(),
-            child_cancel_rx,
-        );
+        let mut child = self
+            .new_subagent_instance(app_handle, store, agent_def, &child_session_id, child_cancel_rx)
+            .await?;
         child.parent_tool_call = Some(ParentToolCall::new(
             self.session_id.clone(),
             run_id.to_string(),
             tool_call_id.to_string(),
         ));
-        child.execution_context = self.execution_context.clone();
-        child.subagent_depth = self.subagent_depth + 1;
-        child.subagent_active = self.subagent_active.clone();
-        child.session_undo_enabled = self.session_undo_enabled;
-        child.codex_fast_mode = self.resolve_subagent_fast_mode(subagent_type);
-        child.subagent_effort_overrides = self.subagent_effort_overrides.clone();
-        child.subagent_fast_mode_overrides = self.subagent_fast_mode_overrides.clone();
-        // A child spawned at the depth cap never sees `subagent` in its tool
-        // surface at all, instead of discovering the limit by erroring.
-        let max_depth = app_handle
-            .try_state::<Arc<crate::config::AppConfig>>()
-            .map(|config| config.subagent_max_depth())
-            .unwrap_or(crate::config::DEFAULT_SUBAGENT_MAX_DEPTH);
-        child.subagent_tool_suppressed = child.subagent_depth >= max_depth;
-        // Plan mode propagates to children: a subagent spawned while the
-        // parent plans runs strictly read-only (no plan file, no
-        // exit_plan_mode) so `subagent` cannot become a plan-mode bypass.
-        if self.plan_runtime_snapshot().is_some() {
-            child.mark_plan_readonly_subagent();
+        if let Some(task_id) = &self.background_task_id {
+            app_handle.state::<Arc<crate::async_tasks::AsyncTaskManager>>().bind_subagent(task_id, crate::async_tasks::SubagentResumeInfo {
+                child_session_id: child_session_id.clone(), agent_id: subagent_type.to_string(),
+                working_dir: self.working_dir.clone(), model_id: child.effective_model.clone(),
+                effort: child.effort.clone(), fast_mode: child.codex_fast_mode,
+                readonly: self.plan_runtime_snapshot().is_some() || self.resumed_subagent.as_ref().is_some_and(|info| info.readonly),
+            })?;
         }
 
         // Register the child like any other active session so the frontend can
@@ -21274,9 +21270,7 @@ impl AgentInstance {
             } else {
                 Err("Subagent run registration was cancelled".to_string())
             };
-            let _ = result_tx.send(result);
             child_store.clear_runtime_run_if_current(&child_session_for_task, &child_run_for_task);
-            let _ = done_tx.send(true);
             let mut tasks = active_tasks_for_task.lock().await;
             if tasks
                 .get(&child_session_for_task)
@@ -21284,6 +21278,9 @@ impl AgentInstance {
             {
                 tasks.remove(&child_session_for_task);
             }
+            drop(tasks);
+            let _ = done_tx.send(true);
+            let _ = result_tx.send(result);
         });
         let mut child_cancel_guard = CancelOnDropSignal::new(child_cancel_tx.clone());
         {
@@ -21324,7 +21321,8 @@ impl AgentInstance {
                     result_text.len()
                 );
 
-                if let Ok(child_usage) = store.get_token_usage(&child_session_id) {
+                if let Ok(mut child_usage) = store.get_token_usage(&child_session_id) {
+                    async_resume::subtract_previous_usage(&mut child_usage, child_usage_before.as_ref());
                     if child_usage.total_input_tokens > 0
                         || child_usage.total_output_tokens > 0
                         || child_usage.total_cache_read_tokens > 0
@@ -21418,7 +21416,8 @@ impl AgentInstance {
                     self.id, subagent_type, e
                 );
 
-                if let Ok(child_usage) = store.get_token_usage(&child_session_id) {
+                if let Ok(mut child_usage) = store.get_token_usage(&child_session_id) {
+                    async_resume::subtract_previous_usage(&mut child_usage, child_usage_before.as_ref());
                     if child_usage.total_input_tokens > 0
                         || child_usage.total_output_tokens > 0
                         || child_usage.total_cache_read_tokens > 0
@@ -21503,7 +21502,7 @@ impl AgentInstance {
         })
     }
 
-    async fn execute_subagent(
+    async fn execute_subagent_inner(
         &self,
         app_handle: &AppHandle,
         store: &SessionStore,
@@ -21511,6 +21510,9 @@ impl AgentInstance {
         tool_call_id: &str,
         run_id: &str,
     ) -> ExecutedToolResult {
+        if !self.multi_agent_enabled {
+            return self.multi_agent_disabled_result();
+        }
         let description = args["description"].as_str().unwrap_or("subagent work");
         let prompt = match args["prompt"].as_str() {
             Some(p) if !p.is_empty() => p,
@@ -22192,19 +22194,26 @@ mod tests {
     }
 
     #[test]
-    fn readonly_subagent_definitions_share_the_readonly_parallel_phase() {
+    fn script_capable_subagents_use_conservative_workspace_scheduling() {
         let agent_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
         let mut agent = test_agent_instance(String::new());
         agent.registry = Arc::new(AgentDefRegistry::load(Some(agent_dir.as_path()), None));
         agent.tool_registry = Arc::new(ToolRegistry::with_builtins());
 
-        assert!(agent.subagent_call_is_workspace_readonly(
+        let explorer = agent.registry.get("explorer").expect("Explorer should load");
+        let mut static_explorer = explorer.clone();
+        static_explorer.tools.retain(|name| name != "unity_execute");
+        assert!(agent.agent_definition_is_workspace_readonly(&static_explorer));
+
+        // Prompt instructions cannot prove every future C# call is read-only.
+        // Individual calls still use their explicit readonly argument.
+        assert!(!agent.subagent_call_is_workspace_readonly(
             "subagent",
             &json!({"subagent_type": "explorer"})
         ));
         assert!(!agent
             .subagent_call_is_workspace_readonly("subagent", &json!({"subagent_type": "git"})));
-        assert!(agent.subagent_call_is_workspace_readonly(
+        assert!(!agent.subagent_call_is_workspace_readonly(
             "tool_call",
             &json!({
                 "toolName": "subagent",
@@ -22213,6 +22222,10 @@ mod tests {
         ));
 
         agent.mark_plan_readonly_subagent();
+        assert!(agent.subagent_call_is_workspace_readonly(
+            "subagent",
+            &json!({"subagent_type": "explorer"})
+        ));
         assert!(
             agent.subagent_call_is_workspace_readonly("subagent", &json!({"subagent_type": "git"}))
         );
@@ -22465,7 +22478,6 @@ mod tests {
             "list",
             "config_query",
             "tool_load",
-            "get_task_status",
             "code_diagnostics",
             "knowledge_query",
             "skill_list",
@@ -23372,6 +23384,28 @@ PrefabInstance:
     }
 
     #[test]
+    fn lazy_tool_renderer_changes_prompt_prefix_cache_identity() {
+        let mut instance = test_agent_instance(String::new());
+        instance.configure_preview_lazy_tool_renderer(
+            Some("openai/gpt-6-astra"),
+            crate::config::DynamicToolLoadingMode::MetaTool,
+            None,
+        );
+        let fallback = instance.prompt_prefix_cache_policy();
+        instance.configure_preview_lazy_tool_renderer(
+            Some("openai/gpt-6-astra"),
+            crate::config::DynamicToolLoadingMode::Native,
+            None,
+        );
+        let native = instance.prompt_prefix_cache_policy();
+        assert_ne!(fallback.cache_key, native.cache_key);
+        assert_eq!(
+            native.cache_key,
+            instance.prompt_prefix_cache_policy().cache_key
+        );
+    }
+
+    #[test]
     fn prompt_prefix_cache_identity_tracks_extra_workdir_prompt() {
         let root = tempdir().expect("create root");
         let workspace = root.path().join("workspace");
@@ -23479,6 +23513,53 @@ PrefabInstance:
             Some("medium")
         );
         assert!(instance.resolve_subagent_fast_mode("unity"));
+    }
+
+    #[tokio::test]
+    async fn subagent_tool_description_names_each_effective_model() {
+        let agent_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../agent");
+        let registry = Arc::new(AgentDefRegistry::load(Some(agent_dir.as_path()), None));
+        let mut tool_registry = ToolRegistry::with_builtins();
+        tool_registry.register_subagent_tool(&registry.list_subagent_descriptions());
+
+        let mut instance = test_agent_instance(String::new());
+        instance.set_multi_agent_enabled(true);
+        instance.registry = registry;
+        instance.tool_registry = Arc::new(tool_registry);
+        instance.effective_model = "openai/gpt-5.6-sol".to_string();
+        instance
+            .subagent_model_overrides
+            .insert("explorer".to_string(), "openai/gpt-5.6-luna".to_string());
+
+        let direct_tools = instance.build_api_tools(&["subagent".to_string()]).await;
+        let direct_description = direct_tools[0]["function"]["description"]
+            .as_str()
+            .expect("direct subagent description");
+        let listed_agents = direct_description
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect::<Vec<_>>();
+        assert!(!listed_agents.is_empty());
+        assert!(listed_agents
+            .iter()
+            .all(|line| line.contains("Uses model `")));
+        let explorer = listed_agents
+            .iter()
+            .find(|line| line.starts_with("- explorer:"))
+            .expect("explorer model line");
+        assert!(explorer.contains("Uses model `gpt-5.6-luna`."));
+        let unity = listed_agents
+            .iter()
+            .find(|line| line.starts_with("- unity:"))
+            .expect("unity model line");
+        assert!(unity.contains("Uses model `gpt-5.6-sol`."));
+
+        let (description, parameters) = instance
+            .tool_description("subagent")
+            .expect("registered subagent tool");
+        let (loaded_description, _) =
+            instance.contextualize_tool_description("subagent", description, parameters);
+        assert_eq!(loaded_description, direct_description);
     }
 
     fn test_agent_instance_with_tools_and_mode(
@@ -23754,14 +23835,14 @@ PrefabInstance:
         );
 
         let names = instance.resolve_effective_tool_names().await;
-        assert!(names.contains(&"get_task_status".to_string()));
-        assert!(names.contains(&"cancel_task".to_string()));
+        assert!(!names.contains(&"get_task_status".to_string()));
+        assert!(!names.contains(&"cancel_task".to_string()));
 
         let preview_items = instance.available_tool_prompt_items().await;
-        assert!(preview_items
+        assert!(!preview_items
             .iter()
             .any(|item| item.title == "get_task_status"));
-        assert!(preview_items.iter().any(|item| item.title == "cancel_task"));
+        assert!(!preview_items.iter().any(|item| item.title == "cancel_task"));
         let bash = preview_items
             .iter()
             .find(|item| item.title == "bash")
@@ -24208,8 +24289,75 @@ PrefabInstance:
             .lock()
             .expect("lazy renderer lock") = LazyToolRenderer::CodexNative;
         let prompt_parts = instance.build_system_prompt_parts().await;
-        assert!(prompt_parts.env_prompt.contains("## Deferred Tool Loading"));
-        assert!(prompt_parts.env_prompt.contains("`wire_names` array"));
+        assert!(prompt_parts.env_prompt.contains("## Lazy Loaded Tools"));
+        assert!(prompt_parts.env_prompt.contains("native `tool_search`"));
+        assert!(prompt_parts.env_prompt.contains("`wire_names`"));
+    }
+
+    #[tokio::test]
+    async fn lazy_tool_manifest_matches_preview_and_provider_call_path() {
+        let temp = tempdir().expect("temp dir");
+        let mut instance = native_plan_test_instance(&temp);
+        instance.set_async_tasks_enabled(true);
+
+        for renderer in [
+            LazyToolRenderer::CodexNative,
+            LazyToolRenderer::AnthropicNative,
+            LazyToolRenderer::ToolLoadFallback,
+        ] {
+            *instance.lazy_tool_renderer.lock().expect("renderer lock") = renderer;
+            let preview = instance.list_injected_prompt_items().await;
+            let manifest = &preview
+                .iter()
+                .find(|item| item.id == "lazy_tool_names")
+                .expect("lazy manifest")
+                .content;
+            assert!(!manifest.contains("- `get_task_status`"));
+            assert!(!manifest.contains("- `cancel_task`"));
+            assert!(manifest.contains("- `web_fetch`"));
+            assert!(!manifest.contains("- `read`"));
+            assert!(!manifest.contains("- `skill_list`"));
+
+            let parts = instance.build_system_prompt_parts().await;
+            if renderer == LazyToolRenderer::AnthropicNative {
+                let plan = instance
+                    .build_native_request_tool_plan(renderer, &HashSet::new())
+                    .await;
+                let tools = instance.build_api_tools_for_plan(renderer, &plan).await;
+                let tool_load = tools
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "tool_load")
+                    .expect("native loader");
+                assert!(tool_load["function"]["description"]
+                    .as_str()
+                    .expect("description")
+                    .contains(manifest));
+                assert!(!parts.env_prompt.contains("## Lazy Loaded Tools"));
+            } else {
+                assert!(parts.env_prompt.contains(manifest));
+            }
+
+            if renderer == LazyToolRenderer::CodexNative {
+                assert!(manifest.contains("native `tool_search`"));
+                assert!(manifest.contains("`wire_names`"));
+                assert!(!manifest.contains("`tool_load`"));
+                assert!(!manifest.contains("`tool_call`"));
+                let loaded = instance
+                    .execute_codex_tool_search(
+                        &serde_json::json!({ "wire_names": ["web_fetch"] }),
+                        &HashSet::new(),
+                    )
+                    .await;
+                assert!(!loaded.is_error, "{}", loaded.output);
+                let result: serde_json::Value =
+                    serde_json::from_str(&loaded.output).expect("search result");
+                assert_eq!(result["tools"][0]["name"], "web_fetch");
+                assert_eq!(result["tools"][0]["parameters"]["required"][0], "url");
+            } else {
+                assert!(manifest.contains("`tool_load`"));
+                assert!(!manifest.contains("`tool_search`"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -24405,7 +24553,7 @@ PrefabInstance:
         let description = tool_load["function"]["description"]
             .as_str()
             .unwrap_or_default();
-        assert!(description.contains("## Deferred tools"));
+        assert!(description.contains("## Lazy Loaded Tools"));
         assert!(description.contains("`web_fetch`"));
         assert!(!deferred_flag(tool_load));
 
@@ -28068,7 +28216,7 @@ Search, install, audit, and export a plugin.
             "grep",
             "list",
             "ask_user_question",
-            "unity_recompile",
+            "code_diagnostics",
             "todowrite",
             "web_fetch",
             "subagent",
@@ -28089,7 +28237,15 @@ Search, install, audit, and export a plugin.
         let instance = test_agent_instance("C:/Project".to_string());
         let runtime = main_plan_runtime("C:/Data/plan/proj/sess.md");
 
-        for tool in ["bash", "unity_execute", "knowledge_create", "view_run"] {
+        for tool in [
+            "bash",
+            "unity_execute",
+            "knowledge_create",
+            "view_run",
+            "unity_recompile",
+            "unity_set_play_mode",
+            "unity_test_run",
+        ] {
             assert!(
                 instance
                     .plan_mode_tool_violation(&runtime, tool, &serde_json::json!({}))
@@ -28137,8 +28293,10 @@ Search, install, audit, and export a plugin.
             "edit",
             "bash",
             "subagent",
-            "web_fetch",
             "exit_plan_mode",
+            "unity_recompile",
+            "unity_set_play_mode",
+            "unity_test_run",
         ] {
             assert!(
                 instance
@@ -28150,6 +28308,9 @@ Search, install, audit, and export a plugin.
         }
         assert!(instance
             .plan_mode_tool_violation(&runtime, "read", &serde_json::json!({}))
+            .is_none());
+        assert!(instance
+            .plan_mode_tool_violation(&runtime, "web_fetch", &serde_json::json!({}))
             .is_none());
         assert!(instance
             .plan_mode_tool_violation(&runtime, "bash", &serde_json::json!({"readonly": true}))
@@ -28262,6 +28423,7 @@ Search, install, audit, and export a plugin.
             cancel_rx,
         );
 
+        instance.set_multi_agent_enabled(true);
         let names = instance.build_request_tool_names().await;
         assert!(
             names.iter().any(|name| name == "subagent"),
@@ -28298,14 +28460,14 @@ Search, install, audit, and export a plugin.
         assert!(rendered.contains("exit_plan_mode"));
         assert!(rendered.contains("ask_user_question"));
         assert!(rendered.contains("Locus/knowledge/plan/"));
-        assert!(rendered.contains("post-approval implementation step"));
+        assert!(rendered.contains("after approval"));
 
         let dir = tempfile::tempdir().expect("tempdir");
         let existing = dir.path().join("sess.md");
         std::fs::write(&existing, "# Plan\n- step").expect("write plan");
         let rendered = AgentInstance::render_plan_reminder(&existing);
         assert!(rendered.contains("A plan file already exists"));
-        assert!(rendered.contains("refine it if this continues the same task"));
+        assert!(rendered.contains("use `edit` to refine or replace its content"));
     }
 
     #[test]

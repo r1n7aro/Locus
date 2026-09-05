@@ -1,11 +1,14 @@
 {
-  "description": "Run Python in the current checkout with the Locus Python SDK ready to use. The selected runtime from Settings > General is used, and `locus`, `project`, and `workspace_ref` are injected into an async body, so top-level `await` works.\n\nUse action=`help` when a workflow needs more SDK surface. Topics cover agents, sessions, tools, workspace services, and callbacks. Use `locus.list_agents()`, `locus.list_sessions()`, `locus.list_running_sessions()`, and `locus.list_tools()` for discovery; running sessions support `send_message()` for sourced cross-session input. Pass the injected `workspace_ref` to checkout-scoped Agent runs and tool calls. For action=`run`, set readonly=true only when the Python body and every SDK/tool call it makes are observation-only.",
+  "description": "Run Python with the selected runtime and Locus SDK. `locus`, `project`, and `workspace_ref` are injected into an async body; top-level await works. Pass workspace_ref to checkout-scoped runs and tool calls.\n\nUse action=help for SDK topics. Discover with locus.list_agents(), list_sessions(), list_running_sessions(), and list_tools(); running sessions support send_message(). For action=run, readonly=true requires the body and every nested SDK/tool call to be observation-only. Task APIs are built in: await locus.list_tasks() lists only current-session tasks; get_task_status(id), wait_task(id, timeout=30), cancel_task(id), resume_task(id, message=...) and send_message(id, text) use short task ids or assigned subagent names. Resume supports failed/cancelled subagents only. Messages to finished subagents automatically continue their existing conversation; children can message parent. Task-control-only scripts use readonly=true to avoid waiting for the workspace mutation lock. No tool loading is needed. Use action=help topic=tasks for details.",
   "parameters": {
     "type": "object",
     "properties": {
       "action": {
         "type": "string",
-        "enum": ["run", "help"],
+        "enum": [
+          "run",
+          "help"
+        ],
         "description": "Run Python code, or progressively load one SDK help topic. Default run.",
         "default": "run"
       },
@@ -15,7 +18,15 @@
       },
       "topic": {
         "type": "string",
-        "enum": ["overview", "agents", "sessions", "tools", "unity", "callbacks"],
+        "enum": [
+          "overview",
+          "agents",
+          "sessions",
+          "tools",
+          "tasks",
+          "unity",
+          "callbacks"
+        ],
         "description": "SDK documentation topic returned by action=help. Default overview."
       },
       "description": {
@@ -31,7 +42,10 @@
         "description": "Timeout in milliseconds for sync execution. Default 120000; maximum 1800000. Background async/notify execution has no deadline."
       }
     },
-    "required": ["action", "description"],
+    "required": [
+      "action",
+      "description"
+    ],
     "additionalProperties": false
   }
 }

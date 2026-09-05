@@ -805,6 +805,7 @@ async fn execute_workspace_tool(
                 cancel_rx: None,
                 progress: None,
                 output: None,
+                output_path: None,
                 background: false,
             };
             let result = tool_registry

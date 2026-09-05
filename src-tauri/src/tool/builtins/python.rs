@@ -12,6 +12,7 @@ const HELP_OVERVIEW: &str = include_str!("../../../../prompt/python-sdk/overview
 const HELP_AGENTS: &str = include_str!("../../../../prompt/python-sdk/agents.md");
 const HELP_SESSIONS: &str = include_str!("../../../../prompt/python-sdk/sessions.md");
 const HELP_TOOLS: &str = include_str!("../../../../prompt/python-sdk/tools.md");
+const HELP_TASKS: &str = include_str!("../../../../prompt/python-sdk/tasks.md");
 const HELP_UNITY: &str = include_str!("../../../../prompt/python-sdk/unity.md");
 const HELP_CALLBACKS: &str = include_str!("../../../../prompt/python-sdk/callbacks.md");
 
@@ -21,10 +22,11 @@ fn help_topic(topic: Option<&str>) -> Result<&'static str, String> {
         Some("agents") => Ok(HELP_AGENTS),
         Some("sessions") => Ok(HELP_SESSIONS),
         Some("tools") => Ok(HELP_TOOLS),
+        Some("tasks") => Ok(HELP_TASKS),
         Some("unity") => Ok(HELP_UNITY),
         Some("callbacks") => Ok(HELP_CALLBACKS),
         Some(value) => Err(format!(
-            "Unknown Python SDK help topic '{value}'. Use overview, agents, sessions, tools, unity, or callbacks."
+            "Unknown Python SDK help topic '{value}'. Use overview, agents, sessions, tools, tasks, unity, or callbacks."
         )),
     }
 }
@@ -218,6 +220,7 @@ pub(super) fn python() -> ToolDef {
                     Some(source.into_bytes()),
                     ctx.output.clone(),
                     owner,
+                    ctx.output_path.clone(),
                 );
 
                 let result = if ctx.background {
