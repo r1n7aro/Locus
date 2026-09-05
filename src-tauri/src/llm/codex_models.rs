@@ -366,8 +366,8 @@ fn cached_context_limits_with_trusted_override(
         .and_then(|model| model.context_limits_with_trusted_override(context_window))
 }
 
-/// Applies the configured GPT-5.6 raw context window on top of Codex model
-/// metadata. The explicit local value is trusted up to 1M and can therefore
+/// Applies the configured raw context window to every Codex subscription model.
+/// The explicit local value is trusted up to 1M and can therefore
 /// exceed an older remote catalog maximum.
 pub fn resolve_context_limits(
     cache_dir: Option<&Path>,
@@ -375,8 +375,8 @@ pub fn resolve_context_limits(
     context_window: u32,
 ) -> Option<CodexContextLimits> {
     let key = normalize_model_key(model);
-    if !is_gpt_5_6_model_key(&key) {
-        return cache_dir.and_then(|dir| cached_context_limits(dir, &key));
+    if key.is_empty() {
+        return None;
     }
 
     let requested_context_window =
@@ -397,10 +397,6 @@ fn normalize_model_key(model: &str) -> String {
     let trimmed = model.trim();
     let trimmed = trimmed.strip_prefix("openai/").unwrap_or(trimmed);
     trimmed.to_ascii_lowercase()
-}
-
-fn is_gpt_5_6_model_key(model: &str) -> bool {
-    model == "gpt-5.6" || model.starts_with("gpt-5.6-")
 }
 
 fn codex_models_endpoint(base_url: Option<&str>) -> String {
@@ -605,6 +601,38 @@ mod tests {
     }
 
     #[test]
+    fn astra_release_metadata_resolves_subscription_context_limits() {
+        let model: CodexRemoteModel = serde_json::from_value(serde_json::json!({
+            "slug": "gpt-6-astra",
+            "display_name": "GPT-6-Astra",
+            "visibility": "list",
+            "priority": 1,
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [
+                { "effort": "low" }, { "effort": "medium" }, { "effort": "high" },
+                { "effort": "xhigh" }, { "effort": "max" }, { "effort": "ultra" }
+            ],
+            "context_window": 272_000,
+            "max_context_window": 872_000,
+            "service_tiers": [{ "id": "priority", "name": "Fast" }]
+        }))
+        .expect("parse Astra release metadata");
+        let dir = tempfile::tempdir().unwrap();
+        persist_cache(dir.path(), &[model.clone()], None).unwrap();
+        let limits = resolve_context_limits(Some(dir.path()), "openai/gpt-6-astra", 272_000)
+            .expect("Astra cached context limits");
+        assert_eq!(limits.context_window, 272_000);
+        assert_eq!(limits.effective_context_window, 258_400);
+        assert_eq!(limits.auto_compact_token_limit, 244_800);
+
+        let models = remote_models_to_available(vec![model]);
+        assert_eq!(models[0].id, "openai/gpt-6-astra");
+        assert_eq!(models[0].default_effort.as_deref(), Some("low"));
+        assert_eq!(models[0].additional_speed_tiers, vec!["fast"]);
+        assert_eq!(models[0].effective_context_window, Some(258_400));
+    }
+
+    #[test]
     fn service_tier_metadata_exposes_one_fast_capability() {
         let mut model = remote("gpt-5.6-sol", 1, "list");
         model.additional_speed_tiers.clear();
@@ -740,42 +768,96 @@ mod tests {
     }
 
     #[test]
-    fn gpt_5_6_context_window_is_configurable() {
+    fn subscription_context_window_is_configurable_for_every_model() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let mut model = remote("gpt-5.6-sol", 1, "list");
-        model.context_window = Some(272_000);
-        model.max_context_window = Some(272_000);
-        persist_cache(dir.path(), std::slice::from_ref(&model), None).expect("persist cache");
+        let models: Vec<_> = [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex-spark",
+            "gpt-future",
+        ]
+        .into_iter()
+        .map(|slug| {
+            let mut model = remote(slug, 1, "list");
+            model.context_window = Some(272_000);
+            model.max_context_window = Some(272_000);
+            model.auto_compact_token_limit = Some(244_800);
+            model
+        })
+        .collect();
+        persist_cache(dir.path(), &models, None).expect("persist cache");
 
-        let standard = resolve_context_limits(Some(dir.path()), "openai/gpt-5.6-sol", 272_000)
-            .expect("standard limits");
-        assert_eq!(standard.context_window, 272_000);
-        assert_eq!(standard.effective_context_window, 258_400);
-        assert_eq!(standard.auto_compact_token_limit, 244_800);
+        for model in &models {
+            for id in [model.slug.clone(), format!("openai/{}", model.slug)] {
+                for window in [272_000, 400_000, 500_000] {
+                    let limits = resolve_context_limits(Some(dir.path()), &id, window)
+                        .expect("configured subscription limits");
+                    assert_eq!(limits.context_window, window, "{id}");
+                    assert_eq!(limits.effective_context_window, window * 95 / 100, "{id}");
+                    assert_eq!(limits.auto_compact_token_limit, window * 90 / 100, "{id}");
+                }
+            }
+        }
 
-        let custom = resolve_context_limits(Some(dir.path()), "openai/gpt-5.6-sol", 500_000)
-            .expect("custom limits");
-        assert_eq!(custom.context_window, 500_000);
-        assert_eq!(custom.effective_context_window, 475_000);
-        assert_eq!(custom.auto_compact_token_limit, 450_000);
-
-        let available = remote_models_to_available(vec![model]);
-        assert_eq!(available[0].effective_context_window, Some(258_400));
+        let available = remote_models_to_available(models);
+        assert!(available
+            .iter()
+            .all(|model| model.effective_context_window == Some(258_400)));
     }
 
     #[test]
-    fn gpt_5_6_custom_context_overrides_server_catalog_maximum_and_clamps_at_1m() {
+    fn subscription_context_window_works_without_cached_metadata() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let mut model = remote("gpt-5.6-sol", 1, "list");
+        persist_cache(dir.path(), &[remote("gpt-6-astra", 1, "list")], None)
+            .expect("persist cache without context metadata");
+
+        for cache_dir in [None, Some(dir.path())] {
+            for model in ["openai/gpt-6-astra", "gpt-5.5", "gpt-future"] {
+                let limits = resolve_context_limits(cache_dir, model, 400_000)
+                    .expect("configured limits without context metadata");
+                assert_eq!(limits.context_window, 400_000, "{model}");
+                assert_eq!(limits.effective_context_window, 380_000, "{model}");
+                assert_eq!(limits.auto_compact_token_limit, 360_000, "{model}");
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_context_window_preserves_the_catalog_effective_percentage() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut model = remote("gpt-6-astra", 1, "list");
+        model.context_window = Some(272_000);
+        model.effective_context_window_percent = 90;
+        persist_cache(dir.path(), &[model], None).expect("persist cache");
+
+        let custom = resolve_context_limits(Some(dir.path()), "openai/gpt-6-astra", 500_000)
+            .expect("custom limits");
+        assert_eq!(custom.context_window, 500_000);
+        assert_eq!(custom.effective_context_window, 450_000);
+        assert_eq!(custom.auto_compact_token_limit, 450_000);
+    }
+
+    #[test]
+    fn subscription_custom_context_overrides_server_limits_and_clamps_to_supported_range() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let mut model = remote("gpt-6-astra", 1, "list");
         model.context_window = Some(272_000);
         model.max_context_window = Some(272_000);
         model.auto_compact_token_limit = Some(244_800);
         persist_cache(dir.path(), &[model], None).expect("persist cache");
 
-        let limits = resolve_context_limits(Some(dir.path()), "gpt-5.6-sol", 2_000_000)
-            .expect("custom limits");
-        assert_eq!(limits.context_window, 1_000_000);
-        assert_eq!(limits.effective_context_window, 950_000);
-        assert_eq!(limits.auto_compact_token_limit, 900_000);
+        for (requested, expected) in [(1, 16_000), (2_000_000, 1_000_000)] {
+            for cache_dir in [None, Some(dir.path())] {
+                let limits = resolve_context_limits(cache_dir, "openai/gpt-6-astra", requested)
+                    .expect("custom limits");
+                assert_eq!(limits.context_window, expected);
+                assert_eq!(limits.effective_context_window, expected * 95 / 100);
+                assert_eq!(limits.auto_compact_token_limit, expected * 90 / 100);
+            }
+        }
     }
 }

@@ -45,12 +45,13 @@ describe("useModelStore OpenAI effort mapping", () => {
     modelServiceMocks.saveCodexFastMode.mockResolvedValue(undefined);
   });
 
-  it("includes the GPT-5.6 family in the Codex fallback catalog", () => {
+  it("includes Astra and the GPT-5.6 family in the Codex fallback catalog", () => {
     const authStore = useAuthStore();
     authStore.codexAuthenticated = true;
     const modelStore = useModelStore();
 
     expect(modelStore.codexModels.map((model) => model.id)).toEqual([
+      "openai/gpt-6-astra",
       "openai/gpt-5.6-sol",
       "openai/gpt-5.6-terra",
       "openai/gpt-5.6-luna",
@@ -58,12 +59,21 @@ describe("useModelStore OpenAI effort mapping", () => {
       "openai/gpt-5.4",
     ]);
     expect(modelStore.codexModels[0]).toEqual(expect.objectContaining({
+      name: "GPT-6 Astra",
+      contextWindow: 258_400,
+      defaultEffort: "low",
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+      additionalSpeedTiers: ["fast"],
+      isDefault: false,
+    }));
+    expect(modelStore.codexModels[1]).toEqual(expect.objectContaining({
       name: "GPT-5.6 Sol",
       contextWindow: 258_400,
       defaultEffort: "low",
       supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
       isDefault: true,
     }));
+    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-6-astra")).toBe(true);
     expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.6-sol")).toBe(true);
     expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.5")).toBe(true);
     expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.4")).toBe(true);
@@ -114,12 +124,14 @@ describe("useModelStore OpenAI effort mapping", () => {
 
     expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.5")).toBe(true);
     expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-5.4")).toBe(false);
+    expect(modelStore.availableModels.some((model) => model.id === "openai/gpt-6-astra")).toBe(false);
   });
 
   it("normalizes remote Codex model labels from model slugs", async () => {
     const authStore = useAuthStore();
     authStore.codexAuthenticated = true;
     modelServiceMocks.getCodexAvailableModels.mockResolvedValue([
+      { id: "openai/gpt-6-astra", name: "GPT-6-Astra", provider: "openai_codex" },
       { id: "openai/gpt-5.4", name: "gpt-5.4", provider: "openai_codex" },
       { id: "openai/gpt-5.6-sol", name: "GPT-5.6-Sol", provider: "openai_codex" },
       { id: "openai/gpt-5.6-terra", name: "GPT-5.6-Terra", provider: "openai_codex" },
@@ -134,6 +146,7 @@ describe("useModelStore OpenAI effort mapping", () => {
     await modelStore.loadCodexAvailableModels();
 
     expect(modelStore.codexModels.map((model) => model.name)).toEqual([
+      "GPT-6 Astra",
       "GPT-5.4",
       "GPT-5.6 Sol",
       "GPT-5.6 Terra",
@@ -143,6 +156,8 @@ describe("useModelStore OpenAI effort mapping", () => {
       "GPT-5.3 Codex",
       "GPT-5.3 Codex Spark",
     ]);
+    modelStore.selectModel("openai/gpt-6-astra");
+    expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   it("exposes xhigh and hides none for GPT-5.5", () => {
@@ -204,6 +219,35 @@ describe("useModelStore OpenAI effort mapping", () => {
 
     expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(modelStore.effortSupported).toBe(true);
+  });
+
+  it("supports Astra effort selection and Fast mode through the subscription catalog", async () => {
+    const authStore = useAuthStore();
+    authStore.codexAuthenticated = true;
+    const modelStore = useModelStore();
+    modelStore.selectModel("openai/gpt-6-astra");
+
+    expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(modelStore.effortSupported).toBe(true);
+    expect(modelStore.codexFastModeAvailable).toBe(true);
+    modelStore.selectCodexFastMode(true);
+    expect(modelStore.effectiveCodexFastMode).toBe(true);
+
+    // The release manifest's ultra preset requires Codex's orchestration layer.
+    modelServiceMocks.getCodexAvailableModels.mockResolvedValue([{
+      id: "openai/gpt-6-astra",
+      name: "GPT-6-Astra",
+      provider: "openai_codex",
+      defaultEffort: "low",
+      supportedEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      additionalSpeedTiers: ["fast"],
+      contextWindow: 258_400,
+    }]);
+    await modelStore.loadCodexAvailableModels();
+
+    expect(modelStore.availableEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(modelStore.effectiveCodexFastMode).toBe(true);
+    expect(modelStore.codexModels[0].contextWindow).toBe(258_400);
   });
 
   it("enables one Fast mode state only for supported Codex models", async () => {

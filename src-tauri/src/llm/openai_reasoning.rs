@@ -57,7 +57,7 @@ pub fn apply_text_verbosity_default(body: &mut serde_json::Value, model: &str) {
 
 pub fn default_text_verbosity_for_model(model: &str) -> Option<&'static str> {
     let model = normalize_model_name(model);
-    if model.contains("gpt-5") {
+    if model.contains("gpt-5") || model.contains("gpt-6-astra") {
         Some("low")
     } else {
         None
@@ -149,7 +149,7 @@ const UNSUPPORTED: SupportedEfforts = SupportedEfforts {
 fn supported_efforts(model: &str) -> SupportedEfforts {
     let model = model.trim().to_ascii_lowercase();
 
-    if model.contains("gpt-5.6") {
+    if model.contains("gpt-6-astra") || model.contains("gpt-5.6") {
         return LOW_MEDIUM_HIGH_XHIGH_MAX;
     }
     if model.contains("gpt-5.5-pro")
@@ -187,6 +187,20 @@ mod tests {
         apply_explicit_reasoning_effort, apply_reasoning_effort, apply_text_verbosity_default,
         custom_reasoning_effort, default_text_verbosity_for_model, reasoning_effort_for_model,
     };
+
+    #[test]
+    fn astra_accepts_wire_efforts_and_defaults_to_low_verbosity() {
+        for model in ["gpt-6-astra", "openai/gpt-6-astra"] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                assert_eq!(reasoning_effort_for_model(model, Some(effort)), Some(effort));
+            }
+            // Codex implements ultra through local multi-agent orchestration.
+            for effort in ["none", "minimal", "ultra"] {
+                assert_eq!(reasoning_effort_for_model(model, Some(effort)), None);
+            }
+            assert_eq!(default_text_verbosity_for_model(model), Some("low"));
+        }
+    }
 
     #[test]
     fn gpt55_accepts_xhigh_and_hides_none() {
