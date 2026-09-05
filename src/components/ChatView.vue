@@ -281,6 +281,7 @@ const props = defineProps<{
   effort: EffortLevel;
   effortSupported: boolean;
   effortLevels: EffortLevel[];
+  multiAgentEnabled?: boolean;
   fastModeEnabled: boolean;
   fastModeAvailable: boolean;
   tokenUsage: TokenUsage;
@@ -383,6 +384,7 @@ const emit = defineEmits<{
   selectModel: [id: string];
   selectEffort: [level: EffortLevel];
   selectFastMode: [enabled: boolean];
+  selectMultiAgent: [enabled: boolean];
   exportSessionContext: [request: SessionContextExportRequest];
   reviewSessionContext: [request: SessionContextExportRequest];
   removeManagedComposerFile: [fileId: string];
@@ -3692,12 +3694,14 @@ onUnmounted(() => {
               :effort="effort"
               :efforts="effortLevels"
               :effort-supported="effortSupported"
+              :multi-agent-enabled="multiAgentEnabled"
               :fast-mode-enabled="fastModeEnabled"
               :fast-mode-available="fastModeAvailable"
               :disabled="isStreaming"
               @select-agent="emit('selectAgent', $event)"
               @select-model="emit('selectModel', $event)"
               @select-effort="emit('selectEffort', $event)"
+              @select-multi-agent="emit('selectMultiAgent', $event)"
               @select-fast-mode="emit('selectFastMode', $event)"
             />
             <TokenUsageBar

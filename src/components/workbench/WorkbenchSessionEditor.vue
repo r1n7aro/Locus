@@ -84,6 +84,7 @@ const editorAgentId = ref(agentStore.selectedAgentId?.trim() ?? "");
 const editorModelId = ref(modelStore.selectedModelId);
 const editorEffort = ref<EffortLevel>(modelStore.effort);
 const editorFastMode = ref(modelStore.effectiveCodexFastMode);
+const editorMultiAgentEnabled = ref(false);
 const selectedAgentId = computed(() => {
   const current = editorAgentId.value.trim();
   if (current && agentStore.agents.some((agent) => agent.id === current)) return current;
@@ -179,6 +180,7 @@ const {
   sessionModelId,
   sessionEffort,
   sessionFastMode,
+  sessionMultiAgentEnabled,
   parentSessionId,
   latestCompletedRunId,
   planModeActive,
@@ -226,6 +228,7 @@ const {
   effort: editorEffort,
   effortSupported: editorEffortSupported,
   fastMode: editorFastMode,
+  multiAgentEnabled: editorMultiAgentEnabled,
   knowledgeMode: computed(() => knowledgeAccessState.mode),
   buildRequest(input) {
     return { text: input, displayText: input };
@@ -306,12 +309,13 @@ watch(errorMessage, (message) => {
 });
 
 watch(
-  [sessionAgentId, sessionModelId, sessionEffort, sessionFastMode] as const,
-  ([agentId, modelId, effort, fastMode]) => {
+  [sessionAgentId, sessionModelId, sessionEffort, sessionFastMode, sessionMultiAgentEnabled] as const,
+  ([agentId, modelId, effort, fastMode, multiAgentEnabled]) => {
     if (agentId && agentStore.agents.some((agent) => agent.id === agentId)) editorAgentId.value = agentId;
     if (modelId && modelStore.availableModels.some((model) => model.id === modelId)) editorModelId.value = modelId;
     if (effort && editorEfforts.value.includes(effort)) editorEffort.value = effort;
     if (fastMode != null) editorFastMode.value = editorFastModeAvailable.value && fastMode;
+    editorMultiAgentEnabled.value = multiAgentEnabled;
   },
   { immediate: true },
 );
@@ -328,24 +332,26 @@ function persistExecutionSelection(): void {
   const modelId = editorModelId.value;
   const effort = editorEffort.value;
   const fastMode = editorFastModeAvailable.value && editorFastMode.value;
+  const multiAgentEnabled = editorMultiAgentEnabled.value;
   void broadcastSessionExecutionState({
     sessionId: targetSessionId,
     modelId,
     effort,
     fastMode,
+    multiAgentEnabled,
   });
   executionStateSaveQueue = executionStateSaveQueue
     .catch(() => undefined)
-    .then(() => saveSessionExecutionState(targetSessionId, modelId, effort, fastMode))
+    .then(() => saveSessionExecutionState(targetSessionId, modelId, effort, fastMode, multiAgentEnabled))
     .catch((error: unknown) => {
       console.warn("save_session_execution_state failed:", error);
     });
 }
 
 watch(
-  [selectedAgentId, editorModelId, editorEffort, editorFastMode] as const,
-  ([agentId, modelId, effort, fastMode]) => {
-    setExecutionSelection({ agentId, modelId, effort, fastMode });
+  [selectedAgentId, editorModelId, editorEffort, editorFastMode, editorMultiAgentEnabled] as const,
+  ([agentId, modelId, effort, fastMode, multiAgentEnabled]) => {
+    setExecutionSelection({ agentId, modelId, effort, fastMode, multiAgentEnabled });
   },
   { immediate: true },
 );
@@ -428,6 +434,11 @@ function handleSelectEffort(effort: EffortLevel): void {
 
 function handleSelectFastMode(enabled: boolean): void {
   editorFastMode.value = editorFastModeAvailable.value && enabled;
+  persistExecutionSelection();
+}
+
+function handleSelectMultiAgent(enabled: boolean): void {
+  editorMultiAgentEnabled.value = enabled;
   persistExecutionSelection();
 }
 
@@ -597,6 +608,8 @@ defineExpose({
     @select-model="handleSelectModel"
     @select-effort="handleSelectEffort"
     @select-fast-mode="handleSelectFastMode"
+    :multi-agent-enabled="editorMultiAgentEnabled"
+    @select-multi-agent="handleSelectMultiAgent"
     @answer-question="answerQuestion"
     @answer-tool-confirm="answerToolConfirm"
     @answer-all-tool-confirms="answerAllToolConfirms"

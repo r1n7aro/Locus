@@ -903,6 +903,7 @@ async fn workspace_agent_preview_instance(
     agent_id: &str,
     knowledge_access_mode: KnowledgeAccessMode,
     selected_model: Option<&str>,
+    subagent_models: Option<HashMap<String, String>>,
     operation: &'static str,
     definitions: &WorkspaceDefinitionRegistry,
     workspace_tools: &WorkspaceToolRegistry,
@@ -966,7 +967,7 @@ async fn workspace_agent_preview_instance(
         app_agent_dir,
         knowledge_access_mode,
         None,
-        HashMap::new(),
+        subagent_models.unwrap_or_default(),
         tokio::sync::watch::channel(false).1,
     );
     instance.set_execution_context(execution);
@@ -1039,6 +1040,7 @@ pub async fn get_workspace_agent_rendered_env_prompt(
         &agent_id,
         KnowledgeAccessMode::Full,
         selected_model.as_deref(),
+        None,
         "getWorkspaceAgentRenderedEnvPrompt",
         definitions.inner().as_ref(),
         workspace_tools.inner().as_ref(),
@@ -1112,6 +1114,7 @@ pub async fn get_workspace_agent_system_prompt_stats(
         &agent_id,
         KnowledgeAccessMode::Full,
         selected_model.as_deref(),
+        None,
         "getWorkspaceAgentSystemPromptStats",
         definitions.inner().as_ref(),
         workspace_tools.inner().as_ref(),
@@ -1135,7 +1138,15 @@ fn custom_backend_for_model(selected_model: &str) -> Result<LlmBackend, AppError
         .ok()
         .flatten()
         .unwrap_or_default();
-    Ok(LlmBackend::Custom {
+    Ok(custom_backend_from_config(provider, model, api_key))
+}
+
+pub(crate) fn custom_backend_from_config(
+    provider: crate::commands::CustomProvider,
+    model: crate::commands::CustomProviderModel,
+    api_key: String,
+) -> LlmBackend {
+    LlmBackend::Custom {
         api_key,
         api_model: model.api_model,
         endpoint: provider.endpoint,
@@ -1151,12 +1162,10 @@ fn custom_backend_for_model(selected_model: &str) -> Result<LlmBackend, AppError
         reasoning_replay_field: model.reasoning_replay_field,
         server_tools: model.server_tools,
         supports_vision: model.supports_vision,
-    })
+    }
 }
 
 async fn resolve_model_backend(
-    _app_handle: &AppHandle,
-    _def: &crate::agent::definition::AgentDef,
     selected_model: &str,
     config: &AppConfig,
     auth: &Arc<tokio::sync::Mutex<AuthState>>,
@@ -1255,11 +1264,27 @@ async fn resolve_model_backend(
     .into())
 }
 
+/// Resolve fresh credentials and model-level tuning for a spawned/resumed agent.
+pub(crate) async fn resolve_model_backend_for_app(
+    app_handle: &AppHandle,
+    selected_model: &str,
+) -> Result<LlmBackend, AppError> {
+    resolve_model_backend(
+        selected_model,
+        app_handle.state::<Arc<AppConfig>>().inner().as_ref(),
+        app_handle.state::<Arc<tokio::sync::Mutex<AuthState>>>().inner(),
+        app_handle.state::<ApiKeyState>().inner(),
+        app_handle.state::<CodexAuthStateHandle>().inner(),
+    )
+    .await
+}
+
 #[tauri::command]
 pub async fn list_agent_injected_items(
     agent_id: String,
     knowledge_mode: Option<String>,
     selected_model: Option<String>,
+    subagent_models: Option<HashMap<String, String>>,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     config: State<'_, Arc<AppConfig>>,
@@ -1293,7 +1318,7 @@ pub async fn list_agent_injected_items(
         app_agent_dir.0.clone(),
         knowledge_access_mode,
         None,
-        HashMap::new(),
+        subagent_models.unwrap_or_default(),
         tokio::sync::watch::channel(false).1,
     );
     instance.set_async_tasks_enabled(config.async_tasks_enabled());
@@ -1312,6 +1337,7 @@ pub async fn list_workspace_agent_injected_items(
     agent_id: String,
     knowledge_mode: Option<String>,
     selected_model: Option<String>,
+    subagent_models: Option<HashMap<String, String>>,
     definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     workspace_tools: State<'_, Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
@@ -1327,6 +1353,7 @@ pub async fn list_workspace_agent_injected_items(
         &agent_id,
         knowledge_access_mode,
         selected_model.as_deref(),
+        subagent_models,
         "listWorkspaceAgentInjectedItems",
         definitions.inner().as_ref(),
         workspace_tools.inner().as_ref(),
@@ -1548,6 +1575,7 @@ pub async fn chat(
     model: Option<String>,
     effort: Option<String>,
     fast_mode: Option<bool>,
+    multi_agent_enabled: Option<bool>,
     images: Option<Vec<ImageData>>,
     asset_refs: Option<Vec<AssetRefData>>,
     session_type: Option<String>,
@@ -1739,78 +1767,14 @@ pub async fn chat(
         .ok_or_else(|| "No model selected. Select a model before sending a message.".to_string())?
         .to_string();
 
-    // - "openrouter/..." → OpenRouter
-    // - "openai/..." → OpenAI Codex
-    let is_mock = selected_model.starts_with("mock/");
-    let is_custom = selected_model.starts_with("custom/");
-    let is_openrouter = selected_model.starts_with("openrouter/");
-    let is_claude_code = selected_model.starts_with("claude_code/");
-    let is_openai_codex = selected_model.starts_with("openai/");
-    let is_anthropic_direct = !selected_model.contains('/');
-
-    let backend = if is_mock {
-        if !config.debug_enabled() {
-            return Err("Simulated models require Debug mode".to_string().into());
-        }
-        let profile = MockModelProfile::from_model_id(&selected_model)
-            .ok_or_else(|| format!("Unknown simulated model preset: {}", selected_model))?;
-        LlmBackend::Mock { profile }
-    } else if is_custom {
-        custom_backend_for_model(&selected_model)?
-    } else if is_openrouter {
-        let api_key = api_key_state.read().await.clone();
-        if !api_key.is_empty() {
-            LlmBackend::OpenRouter {
-                api_key,
-                base_url: config.base_url.clone(),
-            }
-        } else {
-            return Err("OpenRouter API key not configured".to_string().into());
-        }
-    } else if is_openai_codex {
-        let mut codex_guard = codex.lock().await;
-        match codex_guard.access_token().await {
-            Ok(_) => LlmBackend::OpenAiCodex {
-                auth: codex.inner().clone(),
-                transport: codex_model_config.transport,
-                base_url: config.base_url.clone(),
-            },
-            Err(e) => {
-                return Err(format!("OpenAI Codex token failed (please re-login): {}", e).into());
-            }
-        }
-    } else if is_claude_code {
-        LlmBackend::ClaudeCodeCli
-    } else if is_anthropic_direct {
-        let mut auth_guard = auth.lock().await;
-        if auth_guard.is_authenticated() {
-            match auth_guard.access_token().await {
-                Ok(token) => {
-                    let user_metadata = auth_guard
-                        .claude_code_user_metadata()
-                        .map_err(|e| format!("Anthropic OAuth metadata failed: {}", e))?;
-                    LlmBackend::Anthropic {
-                        access_token: token,
-                        base_url: config.base_url.clone(),
-                        user_metadata,
-                    }
-                }
-                Err(e) => {
-                    return Err(format!("Anthropic OAuth token failed: {}", e).into());
-                }
-            }
-        } else {
-            return Err("Not logged in to Anthropic, please log in from settings"
-                .to_string()
-                .into());
-        }
-    } else {
-        return Err(format!(
-            "Unrecognized model provider: {}. Use openrouter/, claude_code/, or openai/ prefix, or Anthropic direct format",
-            selected_model
-        ).into());
-    };
-
+    let backend = resolve_model_backend(
+        &selected_model,
+        config.inner().as_ref(),
+        auth.inner(),
+        api_key_state.inner(),
+        codex.inner(),
+    )
+    .await?;
     if let Some(title_prompt) = prepared_title_prompt {
         let expected_title = store
             .get_session_title(&sid)?
@@ -1908,6 +1872,13 @@ pub async fn chat(
         instance.set_execution_context(execution_context);
     }
     let effective_fast_mode = fast_mode.unwrap_or(false);
+    let effective_multi_agent_enabled = match multi_agent_enabled {
+        Some(enabled) => enabled,
+        None => store.get_session_multi_agent_enabled(&sid)
+            .map_err(|error| AppError::new("session.execution_state_load_failed", "Failed to load session execution state.").detail(error).operation("chat"))?
+            .unwrap_or(false),
+    };
+    instance.set_multi_agent_enabled(effective_multi_agent_enabled);
     instance.set_codex_fast_mode(effective_fast_mode);
     instance.set_session_undo_enabled(config.session_undo_enabled());
     instance.set_subagent_runtime_overrides(
@@ -1954,6 +1925,7 @@ pub async fn chat(
         &selected_model,
         effort.as_deref(),
         effective_fast_mode,
+        Some(effective_multi_agent_enabled),
     ) {
         let _ = store.update_run_status(&run_id, "error", Some(&error));
         return Err(AppError::new(
@@ -2050,6 +2022,7 @@ pub async fn chat(
             let mut async_reminder: Option<String> = None;
             let mut compact_requested = false;
             let follow_up = loop {
+                if *idle_cancel_rx.borrow() { break None; }
                 let (claimed_compact, claimed) = {
                     let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
                         handle.state();
@@ -2084,7 +2057,7 @@ pub async fn chat(
                 let (notifications, has_pending_notifications) =
                     async_tasks.take_notifications_and_pending(&sid_clone);
                 if !notifications.is_empty() {
-                    async_reminder = Some(notifications.join("\n\n"));
+                    async_reminder = Some("<system-reminder>\nBackground task results are ready. Process the delivered results and continue the unfinished work.\n</system-reminder>".to_string());
                     break None;
                 }
                 if !has_pending_notifications || *idle_cancel_rx.borrow() {
@@ -2099,6 +2072,7 @@ pub async fn chat(
             if !compact_requested && follow_up.is_none() && async_reminder.is_none() {
                 break;
             }
+            if *idle_cancel_rx.borrow() { break; }
 
             // Every queued input/reminder/compact is a new Agent run. Rebind
             // the checkout's current service generation before persisting it;
@@ -2132,12 +2106,6 @@ pub async fn chat(
                             if let Ok(mut queue) = queue_state.lock() {
                                 queue.restore_claimed(vec![follow_up]);
                             };
-                        } else if let Some(reminder) = async_reminder {
-                            let async_tasks: tauri::State<
-                                '_,
-                                Arc<crate::async_tasks::AsyncTaskManager>,
-                            > = handle.state();
-                            async_tasks.enqueue_notification(&sid_clone, reminder);
                         }
                         eprintln!(
                             "[Locus] failed to rebind queued follow-up for session {} after run {}: {}",
@@ -2168,10 +2136,6 @@ pub async fn chat(
                     if let Ok(mut queue) = queue_state.lock() {
                         queue.restore_claimed(vec![follow_up]);
                     };
-                } else if let Some(reminder) = async_reminder {
-                    let async_tasks: tauri::State<'_, Arc<crate::async_tasks::AsyncTaskManager>> =
-                        handle.state();
-                    async_tasks.enqueue_notification(&sid_clone, reminder);
                 }
                 eprintln!(
                     "[Locus] failed to start queued follow-up for session {} after run {}: {}",
@@ -2199,12 +2163,6 @@ pub async fn chat(
                             if let Ok(mut queue) = queue_state.lock() {
                                 queue.restore_claimed(vec![follow_up]);
                             };
-                        } else if let Some(reminder) = async_reminder {
-                            let async_tasks: tauri::State<
-                                '_,
-                                Arc<crate::async_tasks::AsyncTaskManager>,
-                            > = handle.state();
-                            async_tasks.enqueue_notification(&sid_clone, reminder);
                         }
                         if let Err(error) = store_for_task.update_run_status(
                             &next_run_id,
@@ -2658,10 +2616,11 @@ pub async fn save_session_execution_state(
     model_id: String,
     effort: Option<String>,
     fast_mode: bool,
+    multi_agent_enabled: Option<bool>,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<(), AppError> {
     store
-        .set_session_execution_state(&session_id, &model_id, effort.as_deref(), fast_mode)
+        .set_session_execution_state(&session_id, &model_id, effort.as_deref(), fast_mode, multi_agent_enabled)
         .map_err(|error| {
             AppError::new(
                 "session.execution_state_persist_failed",
@@ -3195,8 +3154,6 @@ pub async fn get_session_context_usage_report(
         .ok_or_else(|| "This session has no model usage yet".to_string())?
         .to_string();
     let backend = resolve_model_backend(
-        &app_handle,
-        &def,
         &selected_model,
         config.inner().as_ref(),
         auth.inner(),
@@ -3272,6 +3229,7 @@ pub async fn get_session_context_usage_report(
     }
     instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
+    instance.set_multi_agent_enabled(detail.last_multi_agent_enabled.unwrap_or(false));
     Ok(instance
         .session_context_usage_report(
             &app_handle,

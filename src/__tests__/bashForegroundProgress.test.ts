@@ -23,7 +23,8 @@ describe("foreground bash progress", () => {
 
     expect(foregroundBash).toContain("tool_context.output = Some");
     expect(foregroundBash).toContain("StreamEvent::ToolCallDelta");
-    expect(shell).toContain("run_captured_command(cmd, output_reporter, process_owner)");
+    expect(shell).toContain("let execution = run_captured_command_with_input(");
+    expect(shell).toContain("ctx.output_path.clone()");
     expect(shell).toContain("spawn_managed(command, process_owner)");
     expect(shell).toContain("report(decode_console_bytes(&chunk))");
     expect(reducer).toContain('case "toolCallDelta"');

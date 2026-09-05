@@ -664,6 +664,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
           payload.modelId,
           payload.effort,
           payload.fastMode,
+          payload.multiAgentEnabled,
         );
         publishSessionExecutionState(payload);
       },

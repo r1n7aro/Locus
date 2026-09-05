@@ -27,7 +27,7 @@ describe("sub-agent model defaults", () => {
   it("passes both overrides into the child-agent runtime", () => {
     const chatStore = read("src/stores/chat.ts");
     const sessionCommand = read("src-tauri/src/commands/session.rs");
-    const agentRuntime = read("src-tauri/src/agent/instance/mod.rs");
+    const agentRuntime = read("src-tauri/src/agent/instance/subagent_model.rs");
 
     expect(chatStore).toContain("subagentEfforts:");
     expect(chatStore).toContain("subagentFastModes:");

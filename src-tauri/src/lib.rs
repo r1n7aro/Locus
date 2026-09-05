@@ -928,7 +928,7 @@ pub fn run() {
             let pending_input_queue: PendingInputQueueHandle = Arc::new(std::sync::Mutex::new(
                 session::pending_inputs::PendingInputQueue::default(),
             ));
-            let async_task_manager = Arc::new(async_tasks::AsyncTaskManager::default());
+            let async_task_manager = Arc::new(async_tasks::AsyncTaskManager::new(store.clone())?);
 
             let question_store: QuestionStore = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let knowledge_proposal_drafts: KnowledgeProposalDraftStore =

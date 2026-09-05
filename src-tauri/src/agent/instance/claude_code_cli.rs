@@ -1306,8 +1306,28 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                     .await;
             }
 
+            // Claude owns its model loop. Deliver queued completions alongside
+            // the last tool response, before it makes its next model request.
+            let mut output = stored_output;
+            if self.pending_round.is_none() {
+                use tauri::Manager;
+                let manager = self
+                    .app_handle
+                    .state::<Arc<crate::async_tasks::AsyncTaskManager>>();
+                match manager.deliver_notifications(&self.agent.session_id, self.store) {
+                    Ok(reminders) => {
+                        for reminder in reminders {
+                            output.push_str("\n\n");
+                            output.push_str(&reminder);
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("[Agent async] CLI result delivery will retry: {error}")
+                    }
+                }
+            }
             ClaudeCodeToolResult {
-                output: result.output,
+                output,
                 is_error: result.is_error,
                 images: result.images,
             }

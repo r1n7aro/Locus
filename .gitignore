@@ -123,4 +123,5 @@ experiments/
 user-agents/
 ref
 AGENTS.md
+!prompt/python-sdk/agents.md
 testproject/

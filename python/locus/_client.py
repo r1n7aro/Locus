@@ -196,6 +196,95 @@ class Client:
         payload = await self.rpc("workspace.get")
         return WorkspaceInfo.from_payload(payload)
 
+    async def get_task_status(self, task_id: str) -> "TaskStatus":
+        """Read progress or the saved final result without consuming its notification."""
+        from ._models import TaskStatus
+
+        task_id = task_id.strip()
+        if not task_id:
+            raise ValueError("task_id cannot be empty")
+        return TaskStatus.from_payload(await self.rpc("tasks.get", {"taskId": task_id, "sessionId": self._task_session_id()}))
+
+    async def cancel_task(self, task_id: str) -> "TaskStatus":
+        """Request cancellation; terminal tasks return their existing result."""
+        from ._models import TaskStatus
+
+        task_id = task_id.strip()
+        if not task_id:
+            raise ValueError("task_id cannot be empty")
+        return TaskStatus.from_payload(await self.rpc("tasks.cancel", {"taskId": task_id, "sessionId": self._task_session_id()}))
+
+    def _task_session_id(self) -> str:
+        if not self.current_session_id:
+            raise LocusSdkError("Task APIs require the current Locus session. Run this code through its Python tool.")
+        return self.current_session_id
+
+    async def wait_task(self, task_id: str, *, timeout: float = 30.0) -> "TaskStatus":
+        """Wait for completion, returning the latest status on timeout.
+
+        Timeout does not cancel the task or consume its notification. Failed
+        and cancelled tasks are returned normally with ``done=True``.
+        """
+        import math
+        from ._models import TaskStatus
+
+        task_id = task_id.strip()
+        if not task_id:
+            raise ValueError("task_id cannot be empty")
+        if not math.isfinite(timeout) or timeout < 0 or timeout > 300:
+            raise ValueError("timeout must be between 0 and 300 seconds")
+        session_id = self._task_session_id()
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            wait_seconds = min(30.0, remaining)
+            task = TaskStatus.from_payload(await self.rpc("tasks.wait", {
+                "sessionId": session_id, "taskId": task_id,
+                "timeoutMs": max(0, int(wait_seconds * 1000)),
+            }, timeout=wait_seconds + 5.0))
+            if task.done or asyncio.get_running_loop().time() >= deadline:
+                return task
+
+    async def send_message(self, task_id: str, message: str) -> "TaskMessageDelivery":
+        """Message a child by task name, ``parent``, or ``parent/NAME``.
+
+        Running agents receive messages before their next model request.
+        Finished subagents automatically continue their existing conversation.
+        """
+        from ._models import TaskMessageDelivery
+
+        task_id = task_id.strip()
+        if not task_id:
+            raise ValueError("task_id cannot be empty")
+        if not message.strip() or len(message) > 32_000:
+            raise ValueError("message must contain 1–32000 characters")
+        return TaskMessageDelivery.from_payload(await self.rpc("tasks.send_message", {
+            "sessionId": self._task_session_id(), "taskId": task_id, "message": message,
+        }))
+
+    async def list_tasks(self) -> list["TaskStatus"]:
+        """List all background tasks belonging to the current session only."""
+        from ._models import TaskStatus
+
+        rows = await self.rpc("tasks.list", {"sessionId": self._task_session_id()})
+        return [TaskStatus.from_payload(row) for row in rows]
+
+    async def resume_task(self, task_id: str, *, message: str | None = None) -> "TaskStatus":
+        """Continue a failed/cancelled subagent in its original child session.
+
+        The task id is preserved, attempt increases, and completion is notified.
+        Exited bash/Python processes cannot be resumed.
+        """
+        from ._models import TaskStatus
+
+        task_id = task_id.strip()
+        if not task_id:
+            raise ValueError("task_id cannot be empty")
+        payload = await self.rpc("tasks.resume", {
+            "sessionId": self._task_session_id(), "taskId": task_id, "message": message,
+        })
+        return TaskStatus.from_payload(payload)
+
     async def get_unity_editor_status(self, *, project: str) -> "UnityEditorStatus":
         """Return the process, connection, and semantic state for a Unity project."""
         from ._models import UnityEditorStatus

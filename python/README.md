@@ -41,6 +41,19 @@ asyncio.run(main())
 
 ## API 覆盖
 
+任务接口直接内置在 SDK 中，无需发现或加载工具。`list_tasks()` 只列出当前会话的任务；
+`get_task_status(id)` 返回状态、结果、日志路径和续跑次数。`wait_task(id, timeout=30)`
+等待完成，超时返回当前状态且不取消任务；`cancel_task(id)` 请求取消。
+`resume_task(id, message=...)` 在失败或取消的 subagent 原子会话中续跑，完成后自动通知父 Agent。
+Bash/Python 不支持续跑。查询和等待不会消耗通知。
+
+任务 ID 在会话内分配为 `t1`、`t2` 等短 ID。创建 subagent 时可指定 `name="reviewer"`，
+此后返回和使用的 ID 即为 `reviewer`；同会话不能重名。`send_message("reviewer", text)`
+给子 Agent 发消息，已结束的 subagent 会自动续跑原子会话。子 Agent 的注入信息包含自身 ID
+和父 Agent 地址 `parent`；可用 `send_message("parent", text)` 回报，或
+`send_message("parent/tester", text)` 联系同级 Agent。消息在下一次模型请求前注入。
+仅执行任务控制的 Python 脚本使用 `readonly=true`。完整契约见 [tasks 帮助](../prompt/python-sdk/tasks.md)。
+
 - 资源发现：`list_models()`、`list_agents()`、`list_tools()`、`get_workspace()`。
 - Agent 编排：`Agent(...)`、`define_agent(...)`、`prompt(...)`；支持 Locus 工具与 `@locus.tool` Python 回调混合绑定。
 - 工具执行：`call_tool(...)`、`ToolInfo.call(...)`；返回 `ToolCallResult`，可通过 `raise_for_error()` 转为异常。

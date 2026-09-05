@@ -119,7 +119,7 @@ describe("agent parallel tool scheduling safety", () => {
   it("runs each subagent behind the active-task registry and a cancel-on-drop boundary", () => {
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const runSubagent = agent.indexOf("async fn run_subagent(");
-    const childConstruction = agent.indexOf("let mut child = AgentInstance::new(", runSubagent);
+    const childConstruction = agent.indexOf(".new_subagent_instance(", runSubagent);
     const promptOwnership = agent.indexOf("let child_prompt = prompt.to_owned();", childConstruction);
     const spawn = agent.indexOf("let child_task = tokio::spawn(async move", promptOwnership);
     const childRun = agent.indexOf(".run_with_run_id(", spawn);

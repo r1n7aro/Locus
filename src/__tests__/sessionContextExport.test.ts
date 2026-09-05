@@ -2,14 +2,14 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 function read(path: string): string {
-  return readFileSync(path, "utf8");
+  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
 }
 
 describe("structured session context export", () => {
-  it("uses schema v40 with workspace visibility and prior context migrations", () => {
+  it("uses schema v44 with session multi agent selection and prior context migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 40;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 44;");
     expect(store).toContain('36,\n                "persist project contexts, shared sessions, and scoped runs"');
     expect(store).toContain('37,\n                "backfill unambiguous legacy session checkout bindings"');
     expect(store).toContain('38,\n                "persist explicit citation arrays on assistant text render parts"');
@@ -56,7 +56,7 @@ describe("structured session context export", () => {
     const lib = read("src-tauri/src/lib.rs");
 
     expect(exporter).toContain('const EXPORT_FORMAT: &str = "locus.context_review";');
-    expect(exporter).toContain("const EXPORT_FORMAT_VERSION: u32 = 8;");
+    expect(exporter).toContain("const EXPORT_FORMAT_VERSION: u32 = 9;");
     expect(exporter).toContain('"defaultCheckoutId"');
     expect(exporter).toContain('"branchRef"');
     expect(exporter).toContain('"headOid"');

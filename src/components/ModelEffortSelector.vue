@@ -17,6 +17,7 @@ const props = defineProps<{
   effort: EffortLevel;
   efforts?: EffortLevel[];
   effortSupported?: boolean;
+  multiAgentEnabled?: boolean;
   fastModeEnabled?: boolean;
   fastModeAvailable?: boolean;
   align?: "start" | "end";
@@ -27,6 +28,7 @@ const emit = defineEmits<{
   selectAgent: [id: string];
   selectModel: [id: string];
   selectEffort: [level: EffortLevel];
+  selectMultiAgent: [enabled: boolean];
   selectFastMode: [enabled: boolean];
 }>();
 
@@ -191,7 +193,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
         class="model-effort-dropdown"
         :class="{
           'has-agent': hasAgentPanel,
-          'has-effort': effortSupported,
+          'has-effort': true,
           'align-start': align === 'start',
         }"
       >
@@ -250,17 +252,30 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
           </template>
         </div>
 
-        <div v-if="effortSupported" class="model-effort-effort-panel">
+        <div class="model-effort-effort-panel">
           <div class="model-effort-section-label">{{ t("thinking.selector.title") }}</div>
+          <template v-if="effortSupported">
+            <button
+              v-for="level in levels"
+              :key="level.value"
+              type="button"
+              class="model-effort-option ui-select-none"
+              :class="{ active: level.value === effort }"
+              @click="selectEffort(level.value)"
+            >
+              <span class="model-effort-option-name">{{ level.label }}</span>
+            </button>
+          </template>
+          <div class="model-effort-divider"></div>
           <button
-            v-for="level in levels"
-            :key="level.value"
             type="button"
-            class="model-effort-option ui-select-none"
-            :class="{ active: level.value === effort }"
-            @click="selectEffort(level.value)"
+            class="model-effort-option model-effort-multi-agent ui-select-none"
+            :class="{ active: multiAgentEnabled }"
+            :aria-pressed="multiAgentEnabled === true"
+            :disabled="disabled"
+            @click="emit('selectMultiAgent', !multiAgentEnabled)"
           >
-            <span class="model-effort-option-name">{{ level.label }}</span>
+            <span class="model-effort-option-name">Multi-Agent</span>
           </button>
         </div>
       </div>
@@ -377,7 +392,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 .model-effort-dropdown.has-effort:not(.has-agent) {
   width: min(420px, calc(100vw - 24px));
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 96px;
+  grid-template-columns: minmax(0, 1fr) 120px;
 }
 
 .model-effort-dropdown.has-agent {
@@ -389,7 +404,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 
 .model-effort-dropdown.has-agent.has-effort {
   width: min(660px, calc(100vw - 24px));
-  grid-template-columns: 150px minmax(0, 1fr) 96px;
+  grid-template-columns: 150px minmax(0, 1fr) 120px;
 }
 
 :root[data-theme="dark"] .model-effort-dropdown {
@@ -486,6 +501,21 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 
 .model-effort-option.active {
   background: var(--active-bg);
+}
+
+.model-effort-multi-agent.active {
+  background: color-mix(in srgb, var(--accent-color) 18%, var(--bg-color));
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+.model-effort-multi-agent.active .model-effort-option-name {
+  color: var(--accent-color);
+  font-weight: 600;
+}
+
+.model-effort-option:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
 }
 
 .model-effort-option-name {

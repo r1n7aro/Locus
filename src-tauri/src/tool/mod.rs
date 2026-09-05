@@ -30,6 +30,7 @@ pub struct ToolExecutionContext {
     pub cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
     pub progress: Option<crate::async_tasks::TaskProgressReporter>,
     pub output: Option<crate::async_tasks::TaskOutputReporter>,
+    pub output_path: Option<std::path::PathBuf>,
     pub background: bool,
 }
 
@@ -116,8 +117,6 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
         "unity_capture_viewport"
             | "unity_run_states"
             | "web_fetch"
-            | "get_task_status"
-            | "cancel_task"
     ) {
         ToolLoadMode::Lazy
     } else {
@@ -141,8 +140,6 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "list",
     "bash",
     "python",
-    "get_task_status",
-    "cancel_task",
     // Planning, delegation & user interaction.
     "todowrite",
     "subagent",
@@ -478,6 +475,10 @@ impl ToolRegistry {
                     "prompt": {
                         "type": "string",
                         "description": "The task for the agent to perform"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional task id, unique in this session: 1–48 letters, digits, '_' or '-'. Defaults to a short id such as t1. Use this name with Python task APIs and send_message. Reserved names: parent, self."
                     },
                     "subagent_type": {
                         "type": "string",

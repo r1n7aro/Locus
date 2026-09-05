@@ -41,7 +41,7 @@ describe("selector dropdown alignment", () => {
     expect(source).toContain("right: 0;");
     expect(source).toContain("transform-origin: bottom right;");
     expect(source).toContain(".model-effort-dropdown.has-agent.has-effort {");
-    expect(source).toContain("grid-template-columns: 150px minmax(0, 1fr) 96px;");
+    expect(source).toContain("grid-template-columns: 150px minmax(0, 1fr) 120px;");
     expect(source).toContain(".model-effort-agent-panel {");
     expect(source).toContain(".model-effort-effort-panel {");
     expect(source).toContain(".model-effort-agent {");

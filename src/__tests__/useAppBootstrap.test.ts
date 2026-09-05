@@ -774,6 +774,7 @@ describe("useAppBootstrap onboarding completion", () => {
         modelId: "openai/gpt-5.6-sol",
         effort: "xhigh",
         fastMode: true,
+        multiAgentEnabled: true,
       },
     });
 
@@ -781,6 +782,7 @@ describe("useAppBootstrap onboarding completion", () => {
       "session-1",
       "openai/gpt-5.6-sol",
       "xhigh",
+      true,
       true,
     );
   });

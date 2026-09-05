@@ -1,22 +1,17 @@
-Launch a sub-agent to handle focused research or implementation work autonomously.
-
-Only currently available agent types are listed below:
+Delegate a bounded research or implementation task to an available agent:
 {agent_list}
 
-When using the subagent tool, specify a subagent_type parameter to select which agent type to use.
+Set subagent_type and provide the question, scope, and expected result. Use explorer for multi-file research; use a writable agent for authorized implementation. For simple directed searches or a few known files, use direct tools. Independent read-only research may overlap other safe reads when the active interface supports it.
 
-When to use the subagent tool:
-- When you need to locate relevant systems, entry points, or callbacks across the project
-- When you need to trace initialization flow, runtime wiring, or dependency chains across multiple files or assets
-- When you need to answer questions about how a feature or subsystem works in the codebase
-- For broad codebase exploration and deep research, use subagent_type "explorer"
-- Read-only agents such as "explorer" can be sent in the same tool round as independent read, list, and grep calls; those calls run concurrently
-- For delegated implementation or follow-up work in a child Unity session, use subagent_type "unity"
-- For tasks involving code changes across multiple files, use the appropriate agent type
-- When calling explorer, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions
+Nesting and concurrency follow Locus settings (defaults: depth 1, concurrency 3). Depth-capped agents do not receive this tool; concurrency errors report the current limit. Plan-mode children are forced read-only. Treat child findings as evidence to verify and integrate into the requested result.
 
-When NOT to use the subagent tool:
-- For simple, directed codebase searches (e.g. for a specific file/class/function) use grep, list, or read directly
-- If you only need to read 1-2 specific files for an ongoing task, use read directly
 
-Limits: subagent nesting depth and the number of concurrently running subagents are capped (defaults: depth 1, meaning subagents cannot spawn subagents of their own, and 3 concurrent). Subagents at the depth cap do not get the subagent tool at all; a call past the concurrency cap fails with an error stating the current limit. Both caps are user-configurable in Locus Settings > General.
+Optionally set name to a short, unique task id such as reviewer (1–48 letters,
+digits, underscores or hyphens). Otherwise Locus assigns t1, t2, etc. Task ids
+are local to this session and remain stable across continuation. Use Python
+await locus.send_message("reviewer", message) to send follow-ups, or
+await locus.wait_task("reviewer", timeout=30) to wait. A finished subagent
+receiving a message continues its original conversation and notifies you when
+it finishes. The child receives its own id and parent_id=parent so it can reply.
+Task-control-only Python scripts use readonly=true. For the full API use
+python action=help topic=tasks.

@@ -429,6 +429,7 @@ export const useChatStore = defineStore("chat", () => {
   const sessionAgentId = ref<string | null>(null);
   const sessionEffort = ref<EffortLevel | null>(null);
   const sessionFastMode = ref<boolean | null>(null);
+  const sessionMultiAgentEnabled = ref(false);
   const toolPermissionMode = ref<ToolPermissionMode>("auto");
   const sessionAgentLocked = computed(() => !!activeSessionId.value && !!sessionAgentId.value);
   const canResumeInterrupted = computed(() => {
@@ -704,6 +705,7 @@ export const useChatStore = defineStore("chat", () => {
     modelId: string,
     effort: EffortLevel,
     fastMode: boolean,
+    multiAgentEnabled?: boolean,
   ) {
     if (!sessionId || activeSessionId.value !== sessionId) return;
     const modelStore = useModelStore();
@@ -712,6 +714,7 @@ export const useChatStore = defineStore("chat", () => {
     modelStore.applyContextCodexFastMode(fastMode);
     sessionEffort.value = effort;
     sessionFastMode.value = fastMode;
+    if (multiAgentEnabled !== undefined) sessionMultiAgentEnabled.value = multiAgentEnabled;
   }
 
   function ensureLivePartStream(partId: string): StreamingTextChunks {
@@ -756,6 +759,7 @@ export const useChatStore = defineStore("chat", () => {
     modelStore.applySessionModel(detail.lastModelId);
     sessionEffort.value = detail.lastEffort ?? modelStore.defaultEffort;
     sessionFastMode.value = detail.lastFastMode ?? modelStore.defaultCodexFastMode;
+    sessionMultiAgentEnabled.value = detail.lastMultiAgentEnabled ?? false;
     modelStore.applyContextEffort(sessionEffort.value);
     modelStore.applyContextCodexFastMode(sessionFastMode.value);
     if (detail.agentId) {
@@ -2450,6 +2454,7 @@ export const useChatStore = defineStore("chat", () => {
     sessionAgentId.value = null;
     sessionEffort.value = null;
     sessionFastMode.value = null;
+    sessionMultiAgentEnabled.value = false;
     sessionHistoryHasMore.value = false;
     sessionHistoryOldestRowId.value = null;
     sessionHistoryLoading.value = false;
@@ -2509,6 +2514,7 @@ export const useChatStore = defineStore("chat", () => {
     sessionAgentId.value = null;
     sessionEffort.value = null;
     sessionFastMode.value = null;
+    sessionMultiAgentEnabled.value = false;
     useAgentStore().resetToDefault();
     const modelStore = useModelStore();
     modelStore.resolveSelectedModel(true);
@@ -2896,6 +2902,7 @@ export const useChatStore = defineStore("chat", () => {
         model,
         effort: modelStore.effortSupported ? modelStore.effort : null,
         fastMode,
+        multiAgentEnabled: sessionMultiAgentEnabled.value,
         images: images.length > 0 ? images : null,
         assetRefs: assetRefs.length > 0 ? assetRefs : null,
         mode: overrides?.mode || null,
@@ -3035,6 +3042,7 @@ export const useChatStore = defineStore("chat", () => {
         model,
         effort: modelStore.effortSupported ? modelStore.effort : null,
         fastMode,
+        multiAgentEnabled: sessionMultiAgentEnabled.value,
         images: null,
         assetRefs: null,
         mode: "build",
@@ -3193,6 +3201,7 @@ export const useChatStore = defineStore("chat", () => {
         model,
         effort: modelStore.effortSupported ? modelStore.effort : null,
         fastMode,
+        multiAgentEnabled: sessionMultiAgentEnabled.value,
         images: null,
         assetRefs: null,
         mode: "compact",
@@ -3695,6 +3704,7 @@ export const useChatStore = defineStore("chat", () => {
     sessionAgentId,
     sessionEffort,
     sessionFastMode,
+    sessionMultiAgentEnabled,
     toolPermissionMode,
     sessionAgentLocked,
     sessionPlanModes,
