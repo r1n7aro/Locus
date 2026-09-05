@@ -28,6 +28,7 @@ const props = defineProps<{
   workingDir: string;
   workspaceRef?: WorkspaceRef | null;
   projectId?: string | null;
+  active?: boolean;
 }>();
 const uiStore = useUiStore();
 const internalDrag = useInternalDragController();
@@ -239,6 +240,7 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
               :workspace-ref="workspaceRef ?? null"
               :path="previewDisplayPath"
               :title="previewDisplayName"
+              :active="active !== false"
               :payload="previewPayload"
               :loading="previewLoading"
               :error="previewError"
@@ -358,6 +360,7 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
               :workspace-ref="workspaceRef ?? null"
               :path="previewDisplayPath"
               :title="previewDisplayName"
+              :active="active !== false"
               :payload="previewPayload"
               :loading="previewLoading"
               :error="previewError"

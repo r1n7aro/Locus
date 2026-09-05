@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Maximize2, Minus, X } from "lucide";
 import { t } from "../i18n";
+import { useFileChangeRevalidation } from "../composables/useFileChangeRevalidation";
 import { normalizeAppError } from "../services/errors";
 import { getSubWindowClaimedQuery } from "../services/subWindow";
 import {
@@ -13,7 +14,14 @@ import {
   TOOL_FILE_PREVIEW_WINDOW_LABEL,
   type ToolFilePreviewWindowPayload,
 } from "../services/toolFilePreviewWindow";
-import { previewWorkspaceFile, type WorkspaceFilePreview } from "../services/unity";
+import {
+  focusedWorkspaceRef,
+  previewWorkspaceFile,
+  type WorkspaceFilePreview,
+} from "../services/unity";
+import { workspaceFileRevision } from "../services/workspaceExplorer";
+import type { WorkspaceRef } from "../services/project";
+import type { ProjectExplorerFileRevision } from "../types/workbench";
 import AssetTextViewer from "./asset/AssetTextViewer.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
@@ -24,6 +32,8 @@ const activePayload = ref<ToolFilePreviewWindowPayload | null>(null);
 const preview = ref<WorkspaceFilePreview | null>(null);
 const loading = ref(false);
 const error = ref("");
+const activeWorkspaceRef = ref<WorkspaceRef | null>(null);
+const fileRevision = ref<ProjectExplorerFileRevision | null>(null);
 let unlistenPayload: UnlistenFn | null = null;
 let loadSeq = 0;
 
@@ -66,8 +76,12 @@ async function loadFile(payload: ToolFilePreviewWindowPayload) {
   void appWindow.setTitle(`Locus - ${fileName.value}`).catch(() => {});
 
   try {
-    const nextPreview = await previewWorkspaceFile(nextPath, undefined, true);
+    const workspaceRef = focusedWorkspaceRef();
+    const nextPreview = await previewWorkspaceFile(workspaceRef, nextPath, undefined, true);
+    const nextRevision = await workspaceFileRevision(nextPath, workspaceRef).catch(() => null);
     if (seq !== loadSeq) return;
+    activeWorkspaceRef.value = workspaceRef;
+    fileRevision.value = nextRevision;
     preview.value = nextPreview;
   } catch (cause) {
     if (seq !== loadSeq) return;
@@ -76,6 +90,23 @@ async function loadFile(payload: ToolFilePreviewWindowPayload) {
     if (seq === loadSeq) loading.value = false;
   }
 }
+
+useFileChangeRevalidation({
+  active: () => !!activePayload.value,
+  currentRevision: () => fileRevision.value,
+  probe: async () => {
+    const workspaceRef = activeWorkspaceRef.value ?? focusedWorkspaceRef();
+    return workspaceFileRevision(filePath.value, workspaceRef);
+  },
+  workspaceRef: () => activeWorkspaceRef.value,
+  workspacePath: () => filePath.value,
+  onBaseline: (revision) => {
+    fileRevision.value = revision;
+  },
+  onChanged: async () => {
+    if (activePayload.value) await loadFile(activePayload.value);
+  },
+});
 
 async function closeWindow() {
   try {

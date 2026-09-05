@@ -9,6 +9,7 @@ import type {
   SemanticTargetRequest,
 } from "../types";
 import type { WorkspaceRef } from "./project";
+import { subscribeWorkspaceFileChanges } from "./workspaceExplorer";
 import {
   WORKSPACE_EVENT_NAME,
   type RoutedWorkspaceEvent,
@@ -135,6 +136,18 @@ function lruGet(key: string): FileDiffPayload | undefined {
 // ── In-flight dedup ──
 
 const inflight = new Map<string, Promise<FileDiffPayload>>();
+let workspaceChangeSubscriptionStarted = false;
+
+function ensureDiffWorkspaceChangeSubscription(): void {
+  if (workspaceChangeSubscriptionStarted) return;
+  workspaceChangeSubscriptionStarted = true;
+  void subscribeWorkspaceFileChanges((event) => {
+    invalidateDiffCacheForFiles([event.payload.path], {
+      checkoutId: event.checkoutId,
+      expectedGeneration: event.workspaceGeneration,
+    });
+  });
+}
 
 // ── Public API ──
 
@@ -142,6 +155,7 @@ export async function diffSingleFile(
   request: FileDiffRequest,
   workspaceRef?: WorkspaceRef | null,
 ): Promise<FileDiffPayload> {
+  ensureDiffWorkspaceChangeSubscription();
   const key = computeRequestKey(request, workspaceRef);
 
   // Check cache
@@ -223,12 +237,23 @@ export function invalidateDiffCache(key: string) {
  * the given workspace-relative paths (e.g. after a per-file revert changed
  * the worktree side of the diff).
  */
-export function invalidateDiffCacheForFiles(paths: readonly string[]) {
+export function invalidateDiffCacheForFiles(
+  paths: readonly string[],
+  workspaceRef?: WorkspaceRef | null,
+) {
   if (paths.length === 0) return;
   const targets = new Set(paths);
   const matches = (key: string) => {
     const request = parseDiffRequestKey(key);
     if (!request) return false;
+    if (workspaceRef) {
+      const keyWorkspaceRef = parseDiffWorkspaceRefFromKey(key);
+      if (!keyWorkspaceRef || keyWorkspaceRef.checkoutId !== workspaceRef.checkoutId) return false;
+      if (
+        workspaceRef.expectedGeneration != null
+        && keyWorkspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
+      ) return false;
+    }
     return targets.has(request.filePath) || (!!request.oldPath && targets.has(request.oldPath));
   };
   for (const key of [...cache.keys()]) {

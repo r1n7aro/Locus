@@ -1,9 +1,15 @@
 import { ipcInvoke } from "./ipc";
-import type { WorkspaceRef } from "./project";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
+import {
+  WORKSPACE_EVENT_NAME,
+  type RoutedWorkspaceEvent,
+  type WorkspaceRef,
+} from "./project";
 import type {
   ProjectCollaborationSnapshot,
   ProjectExplorerMutationResult,
   ProjectExplorerFilePreview,
+  ProjectExplorerFileRevision,
   ProjectExplorerMountListing,
   ProjectExplorerOperation,
   ProjectExplorerPresetSummary,
@@ -12,6 +18,39 @@ import type {
 } from "../types/workbench";
 
 export const PROJECT_EXPLORER_CHANGED_EVENT = "project-explorer-changed";
+export const WORKSPACE_FILE_CHANGED_EVENT = "workspace-file-changed";
+
+export interface WorkspaceFileChangedPayload {
+  seq: number;
+  generation: number;
+  path: string;
+  kind: "upsert" | "delete";
+  source: "os_watcher" | "locus_write" | "plugin_install" | "reconcile";
+}
+
+type WorkspaceFileChangedEvent = RoutedWorkspaceEvent<WorkspaceFileChangedPayload>;
+const workspaceFileChangeListeners = new Set<(event: WorkspaceFileChangedEvent) => void>();
+let workspaceFileChangeSubscriptionStarted = false;
+
+function ensureWorkspaceFileChangeSubscription(): void {
+  if (workspaceFileChangeSubscriptionStarted) return;
+  workspaceFileChangeSubscriptionStarted = true;
+  void getLocusRuntime().subscribe<WorkspaceFileChangedEvent>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== WORKSPACE_FILE_CHANGED_EVENT) return;
+      for (const listener of workspaceFileChangeListeners) {
+        try {
+          listener(event);
+        } catch (error) {
+          console.warn("[workspace-file-change] listener failed", error);
+        }
+      }
+    },
+  ).catch(() => {
+    workspaceFileChangeSubscriptionStarted = false;
+  });
+}
 
 export function projectExplorerSnapshot(projectId: string): Promise<ProjectExplorerSnapshot> {
   return ipcInvoke<ProjectExplorerSnapshot>("project_explorer_snapshot", { projectId });
@@ -101,6 +140,16 @@ export function projectExplorerPreviewFile(
   });
 }
 
+export function projectExplorerFileRevision(
+  projectId: string,
+  path: string,
+): Promise<ProjectExplorerFileRevision> {
+  return ipcInvoke<ProjectExplorerFileRevision>("project_explorer_file_revision", {
+    projectId,
+    path,
+  });
+}
+
 export function projectExplorerWriteFile(
   projectId: string,
   path: string,
@@ -122,6 +171,26 @@ export function workspaceFilePreview(
   return ipcInvoke<ProjectExplorerFilePreview>("workspace_file_preview", {
     filePath,
     workspaceRef,
+  });
+}
+
+export function workspaceFileRevision(
+  filePath: string,
+  workspaceRef: WorkspaceRef,
+): Promise<ProjectExplorerFileRevision> {
+  return ipcInvoke<ProjectExplorerFileRevision>("workspace_file_revision", {
+    filePath,
+    workspaceRef,
+  });
+}
+
+export function subscribeWorkspaceFileChanges(
+  handler: (event: WorkspaceFileChangedEvent) => void,
+): Promise<RuntimeUnsubscribe> {
+  workspaceFileChangeListeners.add(handler);
+  ensureWorkspaceFileChangeSubscription();
+  return Promise.resolve(() => {
+    workspaceFileChangeListeners.delete(handler);
   });
 }
 

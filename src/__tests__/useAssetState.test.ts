@@ -348,6 +348,55 @@ describe("useAssetState preview flow", () => {
     expect(hidden).not.toContain("Library");
   });
 
+  it("updates a loaded directory precisely when files are created or deleted", async () => {
+    projectServiceMocks.listDirEntriesPage.mockImplementation((path: string, _workspaceRef: unknown, _offset: number, limit: number) => {
+      if (path === ".") return Promise.resolve(dirEntriesPage([
+        { name: "Assets", relPath: "Assets", isDir: true },
+      ]));
+      if (path === "Assets") return Promise.resolve(dirEntriesPage([
+        { name: "Existing.md", relPath: "Assets/Existing.md", isDir: false },
+      ], 1, Math.min(1, limit), false));
+      return Promise.resolve(dirEntriesPage([]));
+    });
+
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef }));
+    await state.initializeExplorer();
+    await state.selectFolder("Assets");
+    await flushPromises();
+    expect(state.visibleDirectoryEntries.value.map((entry) => entry.path)).toEqual([
+      "Assets/Existing.md",
+    ]);
+
+    projectServiceMocks.statWorkspaceEntries.mockClear();
+    projectServiceMocks.statWorkspaceEntries.mockResolvedValueOnce([
+      { path: "Assets/New.md", exists: true, entryKind: "file" },
+    ]);
+    await state.applyExplorerFileChange("Assets/New.md", "upsert");
+
+    expect(projectServiceMocks.statWorkspaceEntries).toHaveBeenCalledWith(
+      ["Assets/New.md"],
+      workspaceRef,
+    );
+    expect(state.visibleDirectoryEntries.value.map((entry) => entry.path)).toEqual([
+      "Assets/Existing.md",
+      "Assets/New.md",
+    ]);
+
+    await state.applyExplorerFileChange("Assets/New.md", "delete");
+
+    expect(state.visibleDirectoryEntries.value.map((entry) => entry.path)).toEqual([
+      "Assets/Existing.md",
+    ]);
+    expect(projectServiceMocks.listDirEntriesPage).toHaveBeenCalledWith(
+      "Assets",
+      workspaceRef,
+      0,
+      200,
+      false,
+      expect.any(Array),
+    );
+  });
+
   it("applies Unity-only hidden directories after detecting a Unity workspace", async () => {
     projectServiceMocks.statWorkspaceEntries.mockResolvedValue([
       { path: "Assets", exists: true, entryKind: "folder" },

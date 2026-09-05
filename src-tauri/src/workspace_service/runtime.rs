@@ -364,6 +364,8 @@ impl WorkspaceCoreServices {
                     Arc::clone(&self.asset_db),
                     watcher_tuning,
                     Arc::clone(&self.workspace_changes),
+                    app_handle.clone(),
+                    crate::workspace_service::event::WorkspaceEventScope::for_runtime(runtime),
                 )?);
             }
         }

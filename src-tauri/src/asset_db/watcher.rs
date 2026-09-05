@@ -657,7 +657,10 @@ fn record_workspace_changes_for_event(
     project_root: &Path,
     linked_roots: &[LinkedAssetRoot],
     change_hub: &crate::workspace_changes::WorkspaceChangeHub,
-) -> (Vec<Vec<String>>, usize) {
+) -> (
+    Vec<Vec<crate::workspace_changes::WorkspaceChangeEvent>>,
+    usize,
+) {
     if event.need_rescan() {
         eprintln!(
             "[AssetDb Watcher] compile journal rescan: kind={:?}, paths={:?}",
@@ -689,7 +692,7 @@ fn record_workspace_changes_for_event(
                     if compile_input {
                         recorded += 1;
                     }
-                    observed_rels.push(observed.path);
+                    observed_rels.push(observed);
                 }
             }
         }
@@ -1664,6 +1667,8 @@ fn event_receiver_loop(
     linked_roots: SharedLinkedAssetRoots,
     activity: Arc<RecentQueueActivityLog>,
     change_hub: Arc<crate::workspace_changes::WorkspaceChangeHub>,
+    app_handle: tauri::AppHandle,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
 ) {
     eprintln!("[AssetDb Watcher] event receiver thread started");
     while !stop.load(Ordering::Relaxed) {
@@ -1674,14 +1679,26 @@ fn event_receiver_loop(
                     .read()
                     .map(|roots| roots.clone())
                     .unwrap_or_default();
-                let (workspace_rels_by_path, _) = record_workspace_changes_for_event(
+                let (workspace_changes_by_path, _) = record_workspace_changes_for_event(
                     &event,
                     &project_root,
                     linked_roots_snapshot.as_slice(),
                     &change_hub,
                 );
                 let structural = is_structural_event(&event.kind);
-                for (path, workspace_rels) in event.paths.iter().zip(workspace_rels_by_path) {
+                for (path, workspace_changes) in event.paths.iter().zip(workspace_changes_by_path) {
+                    for change in &workspace_changes {
+                        crate::workspace_service::event::emit_for_workspace_scope(
+                            &app_handle,
+                            &event_scope,
+                            crate::workspace_changes::WORKSPACE_FILE_CHANGED_EVENT,
+                            change.clone(),
+                        );
+                    }
+                    let workspace_rels = workspace_changes
+                        .into_iter()
+                        .map(|change| change.path)
+                        .collect::<Vec<_>>();
                     let mapped = asset_rel_paths_and_reasons_from_workspace_rels(&workspace_rels);
                     let mapped_any = !mapped.is_empty();
                     for (rel, reason) in mapped {
@@ -2533,6 +2550,8 @@ impl AssetDbWatcher {
         graph_state: Arc<Mutex<Option<AssetDb>>>,
         tuning: Arc<WatcherTuning>,
         change_hub: Arc<crate::workspace_changes::WorkspaceChangeHub>,
+        app_handle: tauri::AppHandle,
+        event_scope: crate::workspace_service::event::WorkspaceEventScope,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let dirty_queue = Arc::new(DirtyQueue::new());
@@ -2592,6 +2611,8 @@ impl AssetDbWatcher {
                     linked_roots_ev,
                     activity_ev,
                     change_hub_ev,
+                    app_handle,
+                    event_scope,
                 );
             })
             .map_err(|e| format!("Failed to spawn event thread: {}", e))?;
@@ -3798,8 +3819,15 @@ mod tests {
 
         let hub = healthy_change_hub(&root);
         let event = notify::Event::new(EventKind::Create(CreateKind::File)).add_path(script);
-        let (_, recorded) = record_workspace_changes_for_event(&event, &root, &[], &hub);
+        let (events, recorded) = record_workspace_changes_for_event(&event, &root, &[], &hub);
         assert_eq!(recorded, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].len(), 1);
+        assert_eq!(events[0][0].path, "Assets/NewScript.cs");
+        assert_eq!(
+            events[0][0].kind,
+            crate::workspace_changes::WorkspaceChangeKind::Upsert
+        );
         let snapshot = hub.unity_snapshot(&root, &[]);
         assert_eq!(
             snapshot.mode,

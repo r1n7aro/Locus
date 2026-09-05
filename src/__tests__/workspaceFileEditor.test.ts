@@ -9,6 +9,9 @@ const workspaceExplorerMocks = vi.hoisted(() => ({
   preview: vi.fn(),
   write: vi.fn(),
   workspacePreview: vi.fn(),
+  revision: vi.fn(),
+  workspaceRevision: vi.fn(),
+  workspaceChangeHandlers: [] as Array<(event: any) => void>,
   workspaceWrite: vi.fn(),
   editorDispatch: vi.fn(),
   editorFocus: vi.fn(),
@@ -16,9 +19,18 @@ const workspaceExplorerMocks = vi.hoisted(() => ({
 
 vi.mock("../services/workspaceExplorer", () => ({
   projectExplorerPreviewFile: workspaceExplorerMocks.preview,
+  projectExplorerFileRevision: workspaceExplorerMocks.revision,
   projectExplorerWriteFile: workspaceExplorerMocks.write,
   workspaceFilePreview: workspaceExplorerMocks.workspacePreview,
+  workspaceFileRevision: workspaceExplorerMocks.workspaceRevision,
   workspaceFileWrite: workspaceExplorerMocks.workspaceWrite,
+  subscribeWorkspaceFileChanges: vi.fn(async (handler: (event: any) => void) => {
+    workspaceExplorerMocks.workspaceChangeHandlers.push(handler);
+    return () => {
+      const index = workspaceExplorerMocks.workspaceChangeHandlers.indexOf(handler);
+      if (index >= 0) workspaceExplorerMocks.workspaceChangeHandlers.splice(index, 1);
+    };
+  }),
 }));
 
 vi.mock("../components/ui/BaseMarkdownEditor.vue", async () => {
@@ -27,6 +39,7 @@ vi.mock("../components/ui/BaseMarkdownEditor.vue", async () => {
   return {
     default: defineComponent({
       props: {
+        modelValue: { type: String, default: "" },
         contentPath: { type: String, default: "" },
         viewMode: { type: String, default: "rendered" },
       },
@@ -42,6 +55,7 @@ vi.mock("../components/ui/BaseMarkdownEditor.vue", async () => {
           class: "workspace-file-editor-test-change",
           "data-content-path": props.contentPath,
           "data-view-mode": props.viewMode,
+          "data-model-value": props.modelValue,
           onClick: () => emit("documentChange", {
             doc: Text.of(props.contentPath.toLowerCase().endsWith(".md")
               ? ["# Edited", ""]
@@ -66,6 +80,12 @@ function textPreview(text: string, contentHash: string): ProjectExplorerFilePrev
     totalLines: 2,
     truncated: false,
     editable: true,
+    revision: {
+      exists: true,
+      size: text.length,
+      modifiedAtNanos: contentHash,
+      key: `${text.length}:${contentHash}`,
+    },
   };
 }
 
@@ -86,11 +106,33 @@ async function flush(): Promise<void> {
   await nextTick();
 }
 
+function emitWorkspaceFileChange(path: string, workspaceGeneration = 7): void {
+  for (const handler of workspaceExplorerMocks.workspaceChangeHandlers) {
+    handler({
+      eventName: "workspace-file-changed",
+      streamRevision: 1,
+      projectId: "project-a",
+      checkoutId: "checkout-a",
+      workspaceGeneration,
+      payload: {
+        seq: 1,
+        generation: 1,
+        path,
+        kind: "upsert",
+        source: "os_watcher",
+      },
+    });
+  }
+}
+
 afterEach(() => {
   document.body.innerHTML = "";
   workspaceExplorerMocks.preview.mockReset();
   workspaceExplorerMocks.write.mockReset();
   workspaceExplorerMocks.workspacePreview.mockReset();
+  workspaceExplorerMocks.revision.mockReset();
+  workspaceExplorerMocks.workspaceRevision.mockReset();
+  workspaceExplorerMocks.workspaceChangeHandlers.length = 0;
   workspaceExplorerMocks.workspaceWrite.mockReset();
   workspaceExplorerMocks.editorDispatch.mockReset();
   workspaceExplorerMocks.editorFocus.mockReset();
@@ -273,6 +315,144 @@ describe("workspace file editor", () => {
       "workspace-hash-before",
       workspaceRef,
     );
+    app.unmount();
+  });
+
+  it("reloads a clean active editor only after its exact workspace file changes", async () => {
+    const before = markdownPreview("# Version 4\n", "hash-v4");
+    const after = markdownPreview("# Version 5\n", "hash-v5");
+    workspaceExplorerMocks.workspacePreview
+      .mockResolvedValueOnce(before)
+      .mockResolvedValueOnce(after);
+    workspaceExplorerMocks.workspaceRevision.mockResolvedValue(after.revision);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup() {
+        return () => h(WorkspaceFilePreview, {
+          path: "Assets/Docs/combat.md",
+          workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 7 },
+          active: true,
+        });
+      },
+    });
+    app.mount(host);
+    await flush();
+
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(1);
+    emitWorkspaceFileChange("Assets/Other.md");
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(1);
+
+    emitWorkspaceFileChange("Assets/Docs/combat.md");
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    await flush();
+    expect(workspaceExplorerMocks.workspaceRevision).toHaveBeenCalledTimes(1);
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(2);
+    expect(
+      host.querySelector<HTMLElement>(".workspace-file-editor-test-change")?.dataset.modelValue,
+    ).toBe("# Version 5\n");
+    app.unmount();
+  });
+
+  it("uses a metadata probe on focus and skips unchanged file content reads", async () => {
+    const current = markdownPreview("# Stable\n", "hash-stable");
+    workspaceExplorerMocks.workspacePreview.mockResolvedValue(current);
+    workspaceExplorerMocks.workspaceRevision.mockResolvedValue(current.revision);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup() {
+        return () => h(WorkspaceFilePreview, {
+          path: "Assets/Docs/combat.md",
+          workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 7 },
+          active: true,
+        });
+      },
+    });
+    app.mount(host);
+    await flush();
+
+    window.dispatchEvent(new Event("focus"));
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    expect(workspaceExplorerMocks.workspaceRevision).toHaveBeenCalledTimes(1);
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(1);
+    app.unmount();
+  });
+
+  it("defers file probes for inactive tabs until activation", async () => {
+    const before = markdownPreview("# Version 4\n", "hash-v4");
+    const after = markdownPreview("# Version 5\n", "hash-v5");
+    workspaceExplorerMocks.workspacePreview
+      .mockResolvedValueOnce(before)
+      .mockResolvedValueOnce(after);
+    workspaceExplorerMocks.workspaceRevision.mockResolvedValue(after.revision);
+    const active = ref(false);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup() {
+        return () => h(WorkspaceFilePreview, {
+          path: "Assets/Docs/combat.md",
+          workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 7 },
+          active: active.value,
+        });
+      },
+    });
+    app.mount(host);
+    await flush();
+
+    emitWorkspaceFileChange("Assets/Docs/combat.md");
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    expect(workspaceExplorerMocks.workspaceRevision).not.toHaveBeenCalled();
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(1);
+
+    active.value = true;
+    await nextTick();
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    await flush();
+    expect(workspaceExplorerMocks.workspaceRevision).toHaveBeenCalledTimes(1);
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(2);
+    app.unmount();
+  });
+
+  it("keeps dirty edits visible and exposes an explicit disk conflict choice", async () => {
+    const before = markdownPreview("# Version 4\n", "hash-v4");
+    const after = markdownPreview("# Version 5\n", "hash-v5");
+    workspaceExplorerMocks.workspacePreview
+      .mockResolvedValueOnce(before)
+      .mockResolvedValueOnce(after);
+    workspaceExplorerMocks.workspaceRevision.mockResolvedValue(after.revision);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup() {
+        return () => h(WorkspaceFilePreview, {
+          path: "Assets/Docs/combat.md",
+          workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 7 },
+          active: true,
+        });
+      },
+    });
+    app.mount(host);
+    await flush();
+    host.querySelector<HTMLButtonElement>(".workspace-file-editor-test-change")?.click();
+    await nextTick();
+
+    emitWorkspaceFileChange("Assets/Docs/combat.md");
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    await flush();
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(1);
+    const conflict = host.querySelector<HTMLElement>(".workspace-file-preview-conflict");
+    expect(conflict).not.toBeNull();
+
+    conflict?.querySelector<HTMLButtonElement>("button")?.click();
+    await flush();
+    expect(workspaceExplorerMocks.workspacePreview).toHaveBeenCalledTimes(2);
+    expect(host.querySelector(".workspace-file-preview-conflict")).toBeNull();
+    expect(
+      host.querySelector<HTMLElement>(".workspace-file-editor-test-change")?.dataset.modelValue,
+    ).toBe("# Version 5\n");
     app.unmount();
   });
 });

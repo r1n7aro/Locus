@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use serde::Serialize;
 
+pub const WORKSPACE_FILE_CHANGED_EVENT: &str = "workspace-file-changed";
+
 pub const MAX_PENDING_PATHS_PER_WORKSPACE: usize = 16_384;
 const MAX_DUPLICATE_FINGERPRINT_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -26,7 +28,8 @@ pub enum WorkspaceChangeSource {
 /// Normalized event envelope shared by immediate consumers. Durable state is
 /// maintained by each projection: RefGraph keeps its own dirty queue/DB,
 /// while the Unity projection coalesces compile inputs in this hub.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WorkspaceChangeEvent {
     pub seq: u64,
     pub generation: u64,
