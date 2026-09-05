@@ -1,6 +1,6 @@
 [package]
 name = "locus"
-version = "0.8.1"
+version = "0.8.2"
 description = "A opensource unity dev agent"
 authors = ["FarLocus"]
 edition = "2021"
@@ -40,7 +40,9 @@ serde_yaml = "0.9.34"
 semver = "1.0.28"
 aisdk = { version = "0.5.2", features = ["openrouter"] }
 rusqlite = { version = "0.40.2", features = ["backup", "bundled"] }
-uuid = { version = "1.24.1", features = ["v4", "serde"] }
+uuid = { version = "1.24.1", features = ["v4", "v5", "serde"] }
+zstd = "0.13"
+imagesize = "0.15"
 futures = "0.3.34"
 fs4 = "1.1.0"
 walkdir = "2.5.0"

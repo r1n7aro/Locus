@@ -62,7 +62,8 @@ pub(super) fn model_context_limit(model: &str) -> u32 {
     // runtime budget, so match them by family rather than exact version.
     if m == "gpt-5.6" || m.starts_with("gpt-5.6-") {
         OPENAI_CODEX_5_6_CONTEXT_LIMIT
-    } else if matches_versioned_model(&m, "gpt-5.5")
+    } else if matches_versioned_model(&m, "gpt-6-astra")
+        || matches_versioned_model(&m, "gpt-5.5")
         || matches_versioned_model(&m, "gpt-5.5-pro")
         || matches_versioned_model(&m, "gpt-5.4")
         || matches_versioned_model(&m, "gpt-5.4-pro")
@@ -188,6 +189,14 @@ mod tests {
 
     #[test]
     fn uses_codex_runtime_context_limits_for_openai_subscription_models() {
+        assert_eq!(
+            model_context_limit("openai/gpt-6-astra"),
+            OPENAI_CODEX_CONTEXT_LIMIT
+        );
+        assert_eq!(
+            model_context_limit("gpt-6-astra"),
+            OPENAI_CODEX_CONTEXT_LIMIT
+        );
         assert_eq!(
             model_context_limit("openai/gpt-5.6-sol"),
             OPENAI_CODEX_5_6_CONTEXT_LIMIT

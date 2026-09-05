@@ -31,6 +31,12 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tower_service::Service;
 use url::Url;
 
+#[cfg(test)]
+mod compatibility_tests;
+mod prewarm;
+mod protocol;
+mod retention;
+
 const DEFAULT_CODEX_PROVIDER_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const RESPONSES_ENDPOINT_PATH: &str = "/responses";
 const RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE: &str = "responses_websockets=2026-02-06";
@@ -247,6 +253,7 @@ struct CachedWebsocketSession {
     last_response: Option<LastWebsocketResponse>,
     disable_websockets: bool,
     connection_key: Option<String>,
+    prewarm_attempted: bool,
 }
 
 type SharedCachedWebsocketSession = Arc<tokio::sync::Mutex<CachedWebsocketSession>>;
@@ -458,6 +465,15 @@ fn build_input_with_metadata(
             // protocol routes receive the original provider payload instead.
             continue;
         }
+        if msg.role == MessageRole::Assistant {
+            if let Some(output) = response_request_metadata
+                .and_then(|metadata| metadata.get(&msg.id))
+                .and_then(|metadata| protocol::replay_output(metadata, msg))
+            {
+                input.extend(output.iter().cloned());
+                continue;
+            }
+        }
         match msg.role {
             MessageRole::User => {
                 input.push(serde_json::json!({
@@ -602,6 +618,32 @@ fn build_request_body(
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     options: CodexStreamOptions,
 ) -> serde_json::Value {
+    let mut body = build_standard_request_body(
+        model,
+        system_prompt,
+        history,
+        tools,
+        thinking_level,
+        session_id,
+        response_request_metadata,
+        options,
+    );
+    if protocol::uses_lite(model) {
+        protocol::apply_lite(&mut body, session_id);
+    }
+    body
+}
+
+fn build_standard_request_body(
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    thinking_level: Option<&str>,
+    session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    options: CodexStreamOptions,
+) -> serde_json::Value {
     let input = build_input_with_metadata(history, response_request_metadata);
     let mut responses_tools = convert_tools(tools);
 
@@ -614,10 +656,11 @@ fn build_request_body(
     }
 
     let mut body = serde_json::json!({
-        "model": model,
+        "model": model.strip_prefix("openai/").unwrap_or(model),
         "input": input,
         "stream": true,
         "store": false,
+        "include": ["reasoning.encrypted_content"],
     });
 
     if options.remote_compaction_v2 {
@@ -637,7 +680,11 @@ fn build_request_body(
         body["instructions"] = serde_json::json!(system_prompt);
     }
 
-    apply_reasoning_effort(&mut body, model, thinking_level);
+    apply_reasoning_effort(
+        &mut body,
+        model,
+        thinking_level.or_else(|| protocol::uses_lite(model).then_some("low")),
+    );
     apply_text_verbosity_default(&mut body, model);
     if let Some(output) = options.structured_output.as_ref() {
         body["text"]["format"] = serde_json::json!({
@@ -699,7 +746,7 @@ fn build_request_body_with_tool_search(
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     options: CodexStreamOptions,
 ) -> serde_json::Value {
-    let mut body = build_request_body(
+    let mut body = build_standard_request_body(
         model,
         system_prompt,
         history,
@@ -721,6 +768,9 @@ fn build_request_body_with_tool_search(
         }
     }
 
+    if protocol::uses_lite(model) {
+        protocol::apply_lite(&mut body, session_id);
+    }
     body
 }
 
@@ -732,6 +782,7 @@ fn request_without_input(body: &serde_json::Value) -> serde_json::Value {
         map.remove("type");
         map.remove("tools");
         map.remove("tool_choice");
+        map.remove("codex_response");
     }
     request
 }
@@ -747,6 +798,8 @@ fn websocket_request_signature(body: &serde_json::Value) -> serde_json::Value {
         map.remove("type");
         map.remove("client_metadata");
         map.remove("stream_options");
+        map.remove("access_programs");
+        map.remove("generate");
     }
     request
 }
@@ -852,12 +905,27 @@ fn build_history_request_input(
             let Some(previous_request) = response_request_metadata.get(&message.id) else {
                 continue;
             };
-            if previous_request != &current_request {
+            if request_without_input(previous_request) != current_request {
                 continue;
             }
 
-            let baseline =
+            let mut baseline =
                 build_input_with_metadata(&history[..=index], Some(response_request_metadata));
+            // The sliced prefix can synthesize interrupted outputs for this
+            // assistant. Real tool outputs belong to the continuation delta.
+            while baseline.last().is_some_and(|item| {
+                matches!(
+                    item["type"].as_str(),
+                    Some("function_call_output" | "tool_search_output")
+                ) && message
+                    .tool_calls
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|call| item["call_id"].as_str() == Some(call.id.as_str()))
+            }) {
+                baseline.pop();
+            }
             if full_input.starts_with(&baseline) {
                 return ContinuationRequestInput {
                     input: full_input[baseline.len()..].to_vec(),
@@ -903,6 +971,12 @@ fn build_cached_websocket_request_input(
             let mut incremental_start = last_response.input.len();
             let response_items_match = previous_input_matches
                 && last_response.items_added.iter().all(|response_item| {
+                    if full_input.get(incremental_start).is_some_and(|current| {
+                        response_items_equal_ignoring_internal_metadata(response_item, current)
+                    }) {
+                        incremental_start += 1;
+                        return true;
+                    }
                     let Some(previous) = cached_response_item_for_request(response_item) else {
                         return true;
                     };
@@ -938,6 +1012,12 @@ fn apply_transport_request_input(
     let mut request = body.clone();
     if let Some(map) = request.as_object_mut() {
         map.insert("input".to_string(), serde_json::json!(request_input.input));
+        if let Some(input) = map
+            .get_mut("input")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            protocol::prepare_items(input);
+        }
         if let Some(previous_response_id) = request_input.previous_response_id {
             map.insert(
                 "previous_response_id".to_string(),
@@ -1090,6 +1170,12 @@ fn build_compact_request_body(
     if fast_mode {
         body["service_tier"] = serde_json::json!("priority");
     }
+    if protocol::uses_lite(model) {
+        protocol::apply_lite(&mut body, session_id);
+        body.as_object_mut().unwrap().remove("tool_choice");
+        body.as_object_mut().unwrap().remove("client_metadata");
+    }
+    protocol::prepare_items(body["input"].as_array_mut().unwrap());
     body
 }
 
@@ -1239,7 +1325,14 @@ pub async fn compact_conversation_history(
         .header("originator", CODEX_ORIGINATOR_HEADER_VALUE)
         .header("version", CODEX_CLIENT_VERSION)
         .header(X_CODEX_ROUTING_HINT_HEADER, &routing_hint)
-        .json(&body);
+        .header("Content-Encoding", "zstd")
+        .body(
+            protocol::encode_http_body(&body)
+                .map_err(|error| CodexRemoteCompactError::new(error, raw_request.clone(), ""))?,
+        );
+    if protocol::is_lite_request(&body) {
+        req = req.header(protocol::LITE_HEADER, "true");
+    }
     if let Some(sid) = session_id {
         req = req.header("session-id", sid).header("thread-id", sid);
     }
@@ -1278,36 +1371,15 @@ pub async fn compact_conversation_history(
     Ok(outcome)
 }
 
-const REMOTE_COMPACTION_V2_RETAINED_BYTES: usize = 64_000 * 4;
-
 fn retained_remote_compaction_v2_window(
     history: &[ChatMessage],
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     compaction_item: serde_json::Value,
 ) -> Vec<serde_json::Value> {
     let input = build_input_with_metadata(history, response_request_metadata);
-    let mut remaining = REMOTE_COMPACTION_V2_RETAINED_BYTES;
-    let mut retained_reversed = Vec::new();
-
-    for item in input.into_iter().rev() {
-        let role = item.get("role").and_then(|value| value.as_str());
-        // Locus stores assistant entries as completed answers. Codex main
-        // excludes final agent answers from the retained V2 window, while
-        // retaining user/developer/system context around the opaque summary.
-        if !matches!(role, Some("user" | "developer" | "system")) {
-            continue;
-        }
-        let serialized_bytes = serde_json::to_vec(&item).map_or(usize::MAX, |value| value.len());
-        if serialized_bytes > remaining {
-            continue;
-        }
-        remaining = remaining.saturating_sub(serialized_bytes);
-        retained_reversed.push(item);
-    }
-
-    retained_reversed.reverse();
-    retained_reversed.push(compaction_item);
-    retained_reversed
+    let mut retained = retention::retain(input, 64_000);
+    retained.push(compaction_item);
+    retained
 }
 
 fn validate_remote_compaction_v2_output(
@@ -1517,6 +1589,7 @@ async fn take_cached_websocket_session_state(
         state.last_response = None;
         state.disable_websockets = false;
         state.connection_key = Some(connection_key.to_string());
+        state.prewarm_attempted = false;
     }
 
     let socket = state.connection.take();
@@ -2051,6 +2124,7 @@ fn valid_tool_arguments(arguments: &str) -> bool {
 
 struct CodexStreamState {
     full_text: String,
+    text_parts: HashMap<String, String>,
     thinking_text: String,
     thinking_kind: Option<ReasoningContentKind>,
     thinking_started_at: Option<Instant>,
@@ -2070,12 +2144,14 @@ struct CodexStreamState {
     citation_collector: CitationCollector,
     got_terminal_event: bool,
     got_completed_event: bool,
+    metadata_events: serde_json::Value,
 }
 
 impl CodexStreamState {
     fn new() -> Self {
         Self {
             full_text: String::new(),
+            text_parts: HashMap::new(),
             thinking_text: String::new(),
             thinking_kind: None,
             thinking_started_at: None,
@@ -2094,6 +2170,7 @@ impl CodexStreamState {
             citation_collector: CitationCollector::default(),
             got_terminal_event: false,
             got_completed_event: false,
+            metadata_events: serde_json::json!({}),
         }
     }
 
@@ -2186,6 +2263,14 @@ fn next_sse_separator(buffer: &str) -> Option<(usize, usize)> {
     }
 }
 
+fn text_part_key(event: &serde_json::Value) -> String {
+    format!(
+        "{}:{}",
+        event["item_id"].as_str().unwrap_or_default(),
+        event["content_index"].as_u64().unwrap_or_default()
+    )
+}
+
 fn process_sse_event_block<F, G, H>(
     event_text: &str,
     debug: bool,
@@ -2202,7 +2287,7 @@ where
     for line in event_text.lines() {
         let line = line.trim();
 
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:") {
             let data = data.trim();
             if data == "[DONE]" {
                 return Ok(true);
@@ -2221,15 +2306,45 @@ where
                 }
             };
 
+            if let Some(error) = protocol::event_error(&event) {
+                return Err(error);
+            }
             match event.get("type").and_then(|t| t.as_str()) {
+                Some("response.created" | "response.in_progress") => {
+                    if let Some(id) = event["response"]["id"].as_str() {
+                        state.response_id = Some(id.to_string());
+                    }
+                }
+                Some(
+                    kind @ ("response.metadata" | "codex.response.metadata" | "codex.rate_limits"),
+                ) => {
+                    // Retain the latest metadata of each kind for diagnostics and
+                    // sticky routing, without growing with every token delta.
+                    state.metadata_events[kind] = event.clone();
+                }
                 Some("response.output_text.delta") => {
                     if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
+                        let key = text_part_key(&event);
+                        state.text_parts.entry(key).or_default().push_str(delta);
                         state
                             .citation_collector
                             .observe_text_delta(&event, &state.full_text);
                         state.finish_thinking_timing();
                         state.full_text.push_str(delta);
                         on_text_delta(delta.to_string());
+                    }
+                }
+                Some("response.output_text.done") => {
+                    if let Some(text) = event["text"].as_str() {
+                        let previous = state.text_parts.entry(text_part_key(&event)).or_default();
+                        if let Some(suffix) = text
+                            .strip_prefix(previous.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            state.full_text.push_str(suffix);
+                            on_text_delta(suffix.to_string());
+                            *previous = text.to_string();
+                        }
                     }
                 }
                 Some("response.output_text.annotation.added") => {
@@ -2311,12 +2426,7 @@ where
                                 .unwrap_or("")
                                 .trim()
                                 .to_string();
-                            let name = item
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
+                            let name = protocol::local_function_name(item);
                             let arguments = item
                                 .get("arguments")
                                 .and_then(|v| v.as_str())
@@ -2419,10 +2529,39 @@ where
                 Some("response.output_item.done") => {
                     state.citation_collector.observe_output_item(&event);
                     if let Some(item) = event.get("item") {
-                        state.items_added.push(item.clone());
+                        if let Some(index) = state.items_added.iter().position(|existing| {
+                            item.get("id").is_some() && existing.get("id") == item.get("id")
+                        }) {
+                            state.items_added[index] = item.clone();
+                        } else {
+                            state.items_added.push(item.clone());
+                        }
                         let item_type = item.get("type").and_then(|t| t.as_str());
                         if item_type == Some("function_call") {
-                            let item_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                            let item_id = item
+                                .get("id")
+                                .or_else(|| item.get("call_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let entry = state
+                                .tool_calls_map
+                                .entry(item_id.to_string())
+                                .or_insert_with(|| PartialToolCall {
+                                    call_id: item["call_id"]
+                                        .as_str()
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    name: protocol::local_function_name(item),
+                                    arguments: String::new(),
+                                    arguments_done: false,
+                                    item_done: false,
+                                    notified: false,
+                                    start_order: None,
+                                });
+                            // The done item is authoritative, including namespace/name.
+                            if item["name"].as_str().is_some_and(|name| !name.is_empty()) {
+                                entry.name = protocol::local_function_name(item);
+                            }
                             if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str())
                             {
                                 if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
@@ -2546,12 +2685,58 @@ where
                     }
                 }
                 Some("response.completed") | Some("response.incomplete") => {
+                    // Some gateways provide canonical output only on completed.
+                    // Reconcile those items through the same tool parser once.
+                    if let Some(output) = event["response"]["output"].as_array() {
+                        for item in output {
+                            let seen = state.items_added.iter().any(|existing| {
+                                existing == item
+                                    || (item.get("id").is_some()
+                                        && existing.get("id") == item.get("id"))
+                            });
+                            if !seen {
+                                process_sse_event_block(
+                                    &format!(
+                                        "data: {}",
+                                        serde_json::json!({
+                                    "type":"response.output_item.done", "item":item})
+                                    ),
+                                    debug,
+                                    state,
+                                    on_text_delta,
+                                    on_thinking_delta,
+                                    on_tool_call_start,
+                                )?;
+                            }
+                        }
+                        if state.full_text.is_empty() {
+                            for item in output.iter().filter(|item| item["type"] == "message") {
+                                for part in item["content"].as_array().into_iter().flatten() {
+                                    if let Some(text) = part["text"].as_str() {
+                                        state.full_text.push_str(text);
+                                        on_text_delta(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
                     state.got_terminal_event = true;
                     state.got_completed_event = event.get("type").and_then(|value| value.as_str())
                         == Some("response.completed");
                     state.finish_thinking_timing();
                     if let Some(response) = event.get("response") {
                         state.end_turn = response.get("end_turn").and_then(|value| value.as_bool());
+                        for key in [
+                            "model",
+                            "headers",
+                            "usage",
+                            "usage_metadata",
+                            "safety_buffering",
+                        ] {
+                            if let Some(value) = response.get(key) {
+                                state.metadata_events[key] = value.clone();
+                            }
+                        }
                         state.response_id = response
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -2726,7 +2911,7 @@ fn safe_stream_recovery_action(
     SafeStreamRecoveryAction::Fail
 }
 
-enum CodexWebsocketAttempt {
+enum CodexTransportAttempt {
     Response(LlmResponse),
     FallbackToHttp,
 }
@@ -2839,7 +3024,12 @@ where
         )
         .await
         {
-            Ok(resp) => return Ok(resp),
+            Ok(CodexTransportAttempt::Response(resp)) => return Ok(resp),
+            Ok(CodexTransportAttempt::FallbackToHttp) => {
+                active_transport = CodexTransportMode::Http;
+                retries = 0;
+                continue;
+            }
             Err(err) => {
                 if active_transport == CodexTransportMode::Websocket
                     && cached_websocket_http_fallback_enabled(
@@ -2907,7 +3097,7 @@ async fn stream_chat_once<F, G, H>(
     on_text_delta: &F,
     on_thinking_delta: &G,
     on_tool_call_start: &H,
-) -> Result<LlmResponse, String>
+) -> Result<CodexTransportAttempt, String>
 where
     F: Fn(String) + Send + Sync + 'static,
     G: Fn(String) + Send + Sync + 'static,
@@ -2938,26 +3128,26 @@ where
     };
 
     match transport {
-        CodexTransportMode::Http => {
-            stream_chat_http_once(
-                access_token,
-                account_id,
-                base_url,
-                model,
-                history,
-                tools,
-                session_id,
-                debug,
-                body,
-                transport_response_request_metadata,
-                on_text_delta,
-                on_thinking_delta,
-                on_tool_call_start,
-            )
-            .await
-        }
+        CodexTransportMode::Http => stream_chat_http_once(
+            access_token,
+            account_id,
+            base_url,
+            model,
+            history,
+            tools,
+            session_id,
+            debug,
+            body,
+            transport_response_request_metadata,
+            turn_state,
+            on_text_delta,
+            on_thinking_delta,
+            on_tool_call_start,
+        )
+        .await
+        .map(CodexTransportAttempt::Response),
         CodexTransportMode::Websocket => {
-            match stream_chat_websocket_once(
+            stream_chat_websocket_once(
                 access_token,
                 account_id,
                 base_url,
@@ -2967,34 +3157,13 @@ where
                 session_id,
                 transport_session_id,
                 debug,
-                body.clone(),
+                body,
                 turn_state,
                 on_text_delta,
                 on_thinking_delta,
                 on_tool_call_start,
             )
-            .await?
-            {
-                CodexWebsocketAttempt::Response(resp) => Ok(resp),
-                CodexWebsocketAttempt::FallbackToHttp => {
-                    stream_chat_http_once(
-                        access_token,
-                        account_id,
-                        base_url,
-                        model,
-                        history,
-                        tools,
-                        session_id,
-                        debug,
-                        body,
-                        transport_response_request_metadata,
-                        on_text_delta,
-                        on_thinking_delta,
-                        on_tool_call_start,
-                    )
-                    .await
-                }
-            }
+            .await
         }
     }
 }
@@ -3010,6 +3179,7 @@ async fn stream_chat_http_once<F, G, H>(
     debug: bool,
     body: serde_json::Value,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    turn_state: &mut TurnState,
     on_text_delta: &F,
     on_thinking_delta: &G,
     on_tool_call_start: &H,
@@ -3082,7 +3252,11 @@ where
             REMOTE_COMPACTION_V2_BETA_FEATURE,
         )
         .header(X_CODEX_ROUTING_HINT_HEADER, &routing_hint)
-        .json(&request_body);
+        .header("Content-Encoding", "zstd")
+        .body(protocol::encode_http_body(&request_body)?);
+    if protocol::is_lite_request(&request_body) {
+        req = req.header(protocol::LITE_HEADER, "true");
+    }
 
     if let Some(sid) = session_id {
         req = req
@@ -3094,11 +3268,16 @@ where
         req = req.header("ChatGPT-Account-ID", aid);
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("Codex request failed: {}", e))?;
+    if let Some(state) = turn_state.header_value() {
+        req = req.header(X_CODEX_TURN_STATE_HEADER, state);
+    }
+    let resp = req.send().await.map_err(protocol::http_error)?;
 
+    turn_state.store_header(
+        resp.headers()
+            .get(X_CODEX_TURN_STATE_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    );
     let status = resp.status();
     if !status.is_success() {
         let err_body = resp.text().await.unwrap_or_default();
@@ -3158,163 +3337,6 @@ where
         )? {
             break;
         }
-
-        /* while let Some(pos) = buffer.find("\n\n") {
-            let event_text = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
-
-            for line in event_text.lines() {
-                let line = line.trim();
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    let data = data.trim();
-                    if data == "[DONE]" {
-                        break 'outer;
-                    }
-
-                    let event: serde_json::Value = match serde_json::from_str(data) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            if debug {
-                                eprintln!("[DEBUG][OpenAI Codex] failed to parse SSE data: {} | raw: {}", e, data);
-                            }
-                            continue;
-                        }
-                    };
-
-                    match event.get("type").and_then(|t| t.as_str()) {
-                        Some("response.output_text.delta") => {
-                            if let Some(delta) = event.get("delta").and_then(|d| d.as_str()) {
-                                full_text.push_str(delta);
-                                on_text_delta(delta.to_string());
-                            }
-                        }
-
-                        Some("response.output_item.added") => {
-                            if let Some(item) = event.get("item") {
-                                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                    let call_id = item
-                                        .get("call_id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let name = item
-                                        .get("name")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let arguments = item
-                                        .get("arguments")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let item_id = item
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or(&call_id)
-                                        .to_string();
-
-                                    on_tool_call_start(call_id.clone(), name.clone());
-                                    tool_calls_map.insert(
-                                        item_id,
-                                        PartialToolCall {
-                                            call_id,
-                                            name,
-                                            arguments,
-                                            arguments_done: false,
-                                            item_done: false,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-
-                        Some("response.function_call_arguments.delta") => {
-                            let item_id = event
-                                .get("item_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let delta = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                            if let Some(tc) = tool_calls_map.get_mut(item_id) {
-                                tc.arguments.push_str(delta);
-                            }
-                        }
-
-                        Some("response.function_call_arguments.done") => {
-                            let item_id = event
-                                .get("item_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if let Some(arguments) = event.get("arguments").and_then(|v| v.as_str()) {
-                                if let Some(tc) = tool_calls_map.get_mut(item_id) {
-                                    tc.arguments = arguments.to_string();
-                                    tc.arguments_done = true;
-                                }
-                            }
-                        }
-
-                        Some("response.output_item.done") => {
-                            if let Some(item) = event.get("item") {
-                                if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-                                    let item_id = item
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
-                                    if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str()) {
-                                        if let Some(tc) = tool_calls_map.get_mut(item_id) {
-                                            tc.arguments = arguments.to_string();
-                                            tc.item_done = true;
-                                        }
-                                    } else if let Some(tc) = tool_calls_map.get_mut(item_id) {
-                                        tc.item_done = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        Some("response.completed") | Some("response.incomplete") => {
-                            got_terminal_event = true;
-                            if let Some(r) = event.get("response") {
-                                if let Some(usage) = r.get("usage") {
-                                    cached_tokens = usage
-                                        .get("input_tokens_details")
-                                        .and_then(|d| d.get("cached_tokens"))
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0) as u32;
-                                    input_tokens = usage
-                                        .get("input_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0)
-                                        .saturating_sub(cached_tokens as u64)
-                                        as u32;
-                                    output_tokens = usage
-                                        .get("output_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0) as u32;
-                                }
-                                if event.get("type").and_then(|t| t.as_str())
-                                    == Some("response.incomplete")
-                                {
-                                    finish_reason = "length".to_string();
-                                }
-                            }
-                            break 'outer;
-                        }
-
-                        Some("error") => {
-                            let msg = event
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("Unknown error");
-                            return Err(format!("OpenAI Codex stream error: {}", msg));
-                        }
-
-                        _ => {}
-                    }
-                }
-            }
-        }
-        */
     }
 
     let trailing_text = utf8_decoder.finish();
@@ -3388,6 +3410,13 @@ where
         );
     }
 
+    let continuation_request = protocol::response_metadata(
+        continuation_request,
+        &stream_state.items_added,
+        &stream_state.full_text,
+        &tool_calls,
+        &stream_state.metadata_events,
+    );
     let citations = stream_state
         .citation_collector
         .collect(&stream_state.items_added, &stream_state.full_text);
@@ -3429,7 +3458,7 @@ async fn stream_chat_websocket_once<F, G, H>(
     on_text_delta: &F,
     on_thinking_delta: &G,
     on_tool_call_start: &H,
-) -> Result<CodexWebsocketAttempt, String>
+) -> Result<CodexTransportAttempt, String>
 where
     F: Fn(String) + Send + 'static,
     G: Fn(String) + Send + 'static,
@@ -3438,18 +3467,20 @@ where
     let continuation_request = request_without_input(&body);
     let ws_url = codex_websocket_url(base_url)?;
     let connection_key = websocket_connection_key(base_url, account_id);
-    let (shared_session, cached_socket, last_response, disable_websockets) = match cache_session_id
-    {
-        Some(session_id) => take_cached_websocket_session_state(session_id, &connection_key).await,
-        None => (
-            Arc::new(tokio::sync::Mutex::new(CachedWebsocketSession::default())),
-            None,
-            None,
-            false,
-        ),
-    };
+    let (shared_session, cached_socket, mut last_response, disable_websockets) =
+        match cache_session_id {
+            Some(session_id) => {
+                take_cached_websocket_session_state(session_id, &connection_key).await
+            }
+            None => (
+                Arc::new(tokio::sync::Mutex::new(CachedWebsocketSession::default())),
+                None,
+                None,
+                false,
+            ),
+        };
     if disable_websockets {
-        return Ok(CodexWebsocketAttempt::FallbackToHttp);
+        return Ok(CodexTransportAttempt::FallbackToHttp);
     }
 
     let ws_request = build_websocket_transport_request(
@@ -3457,7 +3488,6 @@ where
         last_response.as_ref(),
         /*include_type_field*/ true,
     );
-    let raw_request = serde_json::to_string_pretty(&ws_request).unwrap_or_default();
     let cached_turn_state = turn_state.header_value().map(str::to_string);
     let fast_mode = ws_request
         .get("service_tier")
@@ -3472,6 +3502,77 @@ where
         tools.len()
     );
 
+    let request = build_codex_websocket_handshake_request(
+        &ws_url,
+        access_token,
+        account_id,
+        request_session_id,
+        Some(&routing_hint),
+        cached_turn_state.as_deref(),
+    )?;
+
+    let mut socket = match cached_socket {
+        Some(socket) => socket,
+        None => match connect_codex_websocket(request, turn_state).await? {
+            WebsocketConnectOutcome::Connected(socket) => socket,
+            WebsocketConnectOutcome::FallbackToHttp => {
+                clear_cached_websocket_session_state(
+                    &shared_session,
+                    &connection_key,
+                    /*disable_websockets*/ true,
+                )
+                .await;
+                return Ok(CodexTransportAttempt::FallbackToHttp);
+            }
+        },
+    };
+
+    let should_prewarm = cache_session_id.is_some()
+        && last_response.is_none()
+        && !body["input"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item["type"] == "compaction_trigger")
+        })
+        && {
+            let mut state = shared_session.lock().await;
+            let first = !state.prewarm_attempted;
+            state.prewarm_attempted = true;
+            first
+        };
+    if should_prewarm {
+        match prewarm::run(&mut socket, &body, turn_state).await {
+            Ok(response) => last_response = Some(response),
+            Err(error) => {
+                eprintln!("[OpenAI Codex] prewarm failed; reconnecting for inference: {error}");
+                drop(socket);
+                let request = build_codex_websocket_handshake_request(
+                    &ws_url,
+                    access_token,
+                    account_id,
+                    request_session_id,
+                    Some(&routing_hint),
+                    turn_state.header_value(),
+                )?;
+                socket = match connect_codex_websocket(request, turn_state).await? {
+                    WebsocketConnectOutcome::Connected(socket) => socket,
+                    WebsocketConnectOutcome::FallbackToHttp => {
+                        clear_cached_websocket_session_state(
+                            &shared_session,
+                            &connection_key,
+                            true,
+                        )
+                        .await;
+                        return Ok(CodexTransportAttempt::FallbackToHttp);
+                    }
+                };
+                last_response = None;
+            }
+        }
+    }
+    let mut ws_request = build_websocket_transport_request(&body, last_response.as_ref(), true);
+    protocol::add_turn_state(&mut ws_request, turn_state.header_value());
+    let raw_request = serde_json::to_string_pretty(&ws_request).unwrap_or_default();
     if debug {
         let mut headers: Vec<(&str, &str)> = vec![
             ("Authorization", "Bearer <token>"),
@@ -3503,31 +3604,6 @@ where
             &raw_request,
         );
     }
-
-    let request = build_codex_websocket_handshake_request(
-        &ws_url,
-        access_token,
-        account_id,
-        request_session_id,
-        Some(&routing_hint),
-        cached_turn_state.as_deref(),
-    )?;
-
-    let mut socket = match cached_socket {
-        Some(socket) => socket,
-        None => match connect_codex_websocket(request, turn_state).await? {
-            WebsocketConnectOutcome::Connected(socket) => socket,
-            WebsocketConnectOutcome::FallbackToHttp => {
-                clear_cached_websocket_session_state(
-                    &shared_session,
-                    &connection_key,
-                    /*disable_websockets*/ true,
-                )
-                .await;
-                return Ok(CodexWebsocketAttempt::FallbackToHttp);
-            }
-        },
-    };
 
     let request_text = match serde_json::to_string(&ws_request) {
         Ok(text) => text,
@@ -3612,6 +3688,11 @@ where
                 let payload = text.to_string();
                 raw_response.push_str(&payload);
                 raw_response.push('\n');
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    if let Some(state) = protocol::event_turn_state(&event) {
+                        turn_state.store_header(Some(state));
+                    }
+                }
                 if let Some(error_message) = websocket_event_error_message(&payload) {
                     clear_cached_websocket_session_state(
                         &shared_session,
@@ -3644,52 +3725,9 @@ where
                     break;
                 }
             }
-            Message::Binary(bytes) => {
-                let payload = match String::from_utf8(bytes.to_vec()) {
-                    Ok(payload) => payload,
-                    Err(_) => {
-                        clear_cached_websocket_session_state(
-                            &shared_session,
-                            &connection_key,
-                            /*disable_websockets*/ false,
-                        )
-                        .await;
-                        return Err("WebSocket returned non-UTF8 binary payload".to_string());
-                    }
-                };
-                raw_response.push_str(&payload);
-                raw_response.push('\n');
-                if let Some(error_message) = websocket_event_error_message(&payload) {
-                    clear_cached_websocket_session_state(
-                        &shared_session,
-                        &connection_key,
-                        /*disable_websockets*/ false,
-                    )
-                    .await;
-                    return Err(error_message);
-                }
-                let event_text = format!("data: {}", payload);
-                if match process_sse_event_block(
-                    &event_text,
-                    debug,
-                    &mut stream_state,
-                    on_text_delta,
-                    on_thinking_delta,
-                    on_tool_call_start,
-                ) {
-                    Ok(done) => done,
-                    Err(error) => {
-                        clear_cached_websocket_session_state(
-                            &shared_session,
-                            &connection_key,
-                            /*disable_websockets*/ false,
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                } {
-                    break;
-                }
+            Message::Binary(_) => {
+                clear_cached_websocket_session_state(&shared_session, &connection_key, false).await;
+                return Err("WebSocket returned an unexpected binary message".to_string());
             }
             // The dedicated websocket pump consumes Ping/Pong and sends Pong
             // immediately, so response processing only observes data frames.
@@ -3803,10 +3841,17 @@ where
         );
     }
 
+    let continuation_request = protocol::response_metadata(
+        continuation_request,
+        &stream_state.items_added,
+        &stream_state.full_text,
+        &tool_calls,
+        &stream_state.metadata_events,
+    );
     let citations = stream_state
         .citation_collector
         .collect(&stream_state.items_added, &stream_state.full_text);
-    Ok(CodexWebsocketAttempt::Response(LlmResponse {
+    Ok(CodexTransportAttempt::Response(LlmResponse {
         text: stream_state.full_text,
         citations,
         tool_calls,
@@ -3940,6 +3985,25 @@ mod tests {
             knowledge_proposal: None,
             render_parts: None,
         }
+    }
+
+    fn assistant_read_call() -> ChatMessage {
+        assistant_message_with_tool_calls(
+            "assistant-1",
+            "",
+            Some("resp_prev"),
+            vec![ToolCallInfo {
+                id: "call_1".to_string(),
+                name: "read".to_string(),
+                arguments: "{}".to_string(),
+                order: None,
+                server_tool: None,
+                server_tool_output: None,
+                outcome: None,
+                recorded_output: None,
+                nested_tool_calls: None,
+            }],
+        )
     }
 
     fn tool_message(id: &str, tool_call_id: &str, content: &str) -> ChatMessage {
@@ -4534,10 +4598,10 @@ mod tests {
             &ignore_thinking,
             &ignore_tool,
         )
-        .expect("incomplete event should parse");
+        .expect_err("incomplete response must stop the tool round");
 
-        assert!(stopped);
-        assert!(state.got_terminal_event);
+        assert!(stopped.contains("incomplete response"));
+        assert!(!state.got_terminal_event);
         assert!(!state.got_completed_event);
     }
 
@@ -4665,18 +4729,21 @@ mod tests {
 
     #[test]
     fn builds_function_call_output_with_image_content() {
-        let input = build_input(&[tool_message_with_images(
-            "tool-1",
-            "call_1",
-            "Unity screenshot captured.",
-            vec![ImageData {
-                data: "YWJj".to_string(),
-                mime_type: "image/png".to_string(),
-            }],
-        )]);
+        let input = build_input(&[
+            assistant_read_call(),
+            tool_message_with_images(
+                "tool-1",
+                "call_1",
+                "Unity screenshot captured.",
+                vec![ImageData {
+                    data: "YWJj".to_string(),
+                    mime_type: "image/png".to_string(),
+                }],
+            ),
+        ]);
 
-        assert_eq!(input[0]["type"], serde_json::json!("function_call_output"));
-        let output = input[0]["output"]
+        assert_eq!(input[1]["type"], serde_json::json!("function_call_output"));
+        let output = input[1]["output"]
             .as_array()
             .expect("tool output should be a content array");
         assert_eq!(output[0]["type"], serde_json::json!("input_text"));
@@ -4723,6 +4790,32 @@ mod tests {
             "Plan first."
         );
         assert_eq!(state.full_text, "Answer.");
+    }
+
+    #[test]
+    fn astra_subscription_request_preserves_effort_and_fast_mode_over_websocket() {
+        let body = build_request_body(
+            "gpt-6-astra",
+            "You are Codex",
+            &[user_message_with_images("hello", vec![])],
+            &[],
+            Some("max"),
+            Some("astra-session"),
+            None,
+            CodexStreamOptions::default().with_fast_mode(true),
+        );
+        let request = build_websocket_transport_request(&body, None, true);
+
+        assert_eq!(request["type"], "response.create");
+        assert_eq!(request["model"], "gpt-6-astra");
+        assert_eq!(request["reasoning"]["effort"], "max");
+        assert_eq!(request["text"]["verbosity"], "low");
+        assert_eq!(request["service_tier"], "priority");
+        assert_eq!(request["store"], false);
+        assert_eq!(request["prompt_cache_key"], "astra-session");
+        assert!(request.get("previous_response_id").is_none());
+        assert!(request.get("temperature").is_none());
+        assert!(request.get("max_output_tokens").is_none());
     }
 
     #[test]
@@ -5505,7 +5598,7 @@ mod tests {
         let body = serde_json::json!({
             "model": "gpt-5.4",
             "input": build_input(&[
-                assistant_message("assistant-1", "call tools", Some("resp_prev")),
+                assistant_read_call(),
                 tool_message("tool-1", "call_1", "done"),
                 user_message_with_images("继续", vec![]),
             ]),
@@ -5518,7 +5611,7 @@ mod tests {
         let request = build_history_transport_request(
             &body,
             &[
-                assistant_message("assistant-1", "call tools", Some("resp_prev")),
+                assistant_read_call(),
                 tool_message("tool-1", "call_1", "done"),
                 user_message_with_images("继续", vec![]),
             ],
@@ -5547,7 +5640,7 @@ mod tests {
         let body = serde_json::json!({
             "model": "gpt-5.4",
             "input": build_input(&[
-                assistant_message("assistant-1", "call tools", Some("resp_prev")),
+                assistant_read_call(),
                 tool_message("tool-1", "call_1", "done"),
                 user_message_with_images("continue", vec![]),
             ]),
@@ -5560,7 +5653,7 @@ mod tests {
         let request = build_history_transport_request(
             &body,
             &[
-                assistant_message("assistant-1", "call tools", Some("resp_prev")),
+                assistant_read_call(),
                 tool_message("tool-1", "call_1", "done"),
                 user_message_with_images("continue", vec![]),
             ],
@@ -5949,7 +6042,7 @@ mod tests {
         let body = serde_json::json!({
             "model": "gpt-5.4",
             "input": build_input(&[
-                assistant_message("assistant-1", "call tools", Some("resp_prev")),
+                assistant_read_call(),
                 tool_message("tool-1", "call_1", "done"),
                 user_message_with_images("继续", vec![]),
             ]),

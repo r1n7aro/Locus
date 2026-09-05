@@ -121,6 +121,16 @@ const builtinModels: ModelOption[] = [
 
 const codexFallbackModels: ModelOption[] = [
   {
+    id: "openai/gpt-6-astra",
+    name: "GPT-6 Astra",
+    provider: "openai_codex",
+    contextWindow: 258_400,
+    defaultEffort: "low",
+    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
+    additionalSpeedTiers: ["fast"],
+    isDefault: false,
+  },
+  {
     id: "openai/gpt-5.6-sol",
     name: "GPT-5.6 Sol",
     provider: "openai_codex",
@@ -201,12 +211,12 @@ function isSameEffortList(a: EffortLevel[], b: EffortLevel[]): boolean {
 
 function supportsOpenAiReasoningModel(model: string): boolean {
   const m = normalizeOpenAiReasoningModel(model);
-  return m.includes("codex") || m.includes("gpt-5");
+  return m.includes("codex") || m.includes("gpt-5") || m.includes("gpt-6-astra");
 }
 
 function openAiReasoningLevels(model: string): EffortLevel[] {
   const m = normalizeOpenAiReasoningModel(model);
-  if (m.includes("gpt-5.6")) return ["low", "medium", "high", "xhigh", "max"];
+  if (m.includes("gpt-6-astra") || m.includes("gpt-5.6")) return ["low", "medium", "high", "xhigh", "max"];
   if (m.includes("gpt-5.5-pro") || m.includes("gpt-5.4-pro") || m.includes("gpt-5.2-pro")) return ["medium", "high"];
   if (m.includes("gpt-5-pro")) return ["high"];
   if (m.includes("gpt-5.1-codex-mini")) return ["medium", "high"];
@@ -222,13 +232,8 @@ function normalizeCodexTransport(config?: Partial<CodexModelConfig> | null): Cod
   return config?.transport === "http" ? "http" : "websocket";
 }
 
-function isGpt56CodexModel(modelId: string): boolean {
-  const normalized = modelId.trim().toLowerCase().replace(/^openai\//, "");
-  return normalized === "gpt-5.6" || normalized.startsWith("gpt-5.6-");
-}
-
 function applyCodexContextWindow(model: ModelOption, configuredContextWindow: number): ModelOption {
-  if (!isGpt56CodexModel(model.id)) return model;
+  if (model.provider !== "openai_codex") return model;
   const contextWindow = codexEffectiveContextWindow(configuredContextWindow);
   return contextWindow === model.contextWindow ? model : { ...model, contextWindow };
 }

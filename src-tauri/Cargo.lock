@@ -3151,6 +3151,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagesize"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3687,7 +3693,7 @@ dependencies = [
 
 [[package]]
 name = "locus"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "aes-gcm",
  "aisdk",
@@ -3712,6 +3718,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ignore",
+ "imagesize",
  "indexmap 2.14.0",
  "junction",
  "keyring",
@@ -3766,6 +3773,7 @@ dependencies = [
  "windows-core 0.61.2",
  "winreg 0.56.0",
  "zip",
+ "zstd",
 ]
 
 [[package]]
@@ -6365,6 +6373,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8433,6 +8447,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

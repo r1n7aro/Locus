@@ -366,7 +366,7 @@ fn collect_api(out: &mut Vec<ConfigEntry>) {
         key: "api.codex_context_window".into(),
         category: "api".into(),
         label: "Codex Context Window".into(),
-        description: "Raw GPT-5.6 context window used by Locus; defaults to 272K and supports values up to 1M."
+        description: "Raw context window for all Codex subscription models; defaults to 272K and supports values up to 1M."
             .into(),
         storage: "persistent_config_dir/codex_model_config.json → contextWindow".into(),
         current_value: codex_model_config

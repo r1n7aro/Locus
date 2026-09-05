@@ -16,7 +16,7 @@ pub mod think_tag_filter;
 pub mod tool_references;
 pub mod utf8_stream;
 
-pub(crate) const CODEX_CLIENT_VERSION: &str = "0.144.1";
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.153.4";
 
 /// Normalize historical tool call arguments before replaying them to an
 /// OpenAI-shaped endpoint. Strict servers (vLLM-based providers such as
