@@ -11,6 +11,9 @@ import {
   subscribeLocusRuntimeInvokeActivity,
   type LocusRuntimeInvokeActivity,
 } from "../services/locusRuntime";
+import {
+  isRuntimePerformanceDiagnosticsRunning,
+} from "../services/runtimePerformanceDiagnostics";
 
 function installReadOnlyTauriInvoke(
   invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>,
@@ -82,6 +85,29 @@ describe("webview bridge diagnostics", () => {
 
     expect(Object.getOwnPropertyDescriptor(internals, "invoke")).toEqual(descriptorBefore);
     expect(internals.invoke).toBe(nativeInvoke);
+  });
+
+  it("keeps runtime performance diagnostics stopped when debug mode is disabled", async () => {
+    installReadOnlyTauriInvoke(async () => undefined);
+
+    initWebviewBridgeDiagnostics();
+    await vi.dynamicImportSettled();
+
+    expect(isRuntimePerformanceDiagnosticsRunning()).toBe(false);
+  });
+
+  it("starts and stops runtime performance diagnostics with debug mode", async () => {
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    installReadOnlyTauriInvoke(async () => undefined);
+    enableStartupDiagnostics();
+
+    initWebviewBridgeDiagnostics();
+    await vi.dynamicImportSettled();
+    expect(isRuntimePerformanceDiagnosticsRunning()).toBe(true);
+
+    teardownWebviewBridgeDiagnostics();
+    await vi.dynamicImportSettled();
+    expect(isRuntimePerformanceDiagnosticsRunning()).toBe(false);
   });
 
   it("tracks project-owned runtime invokes without mutating Tauri internals", async () => {

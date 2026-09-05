@@ -77,6 +77,9 @@ let stallReportedForRequest = false;
 let lifecycleEvents: FrontendLifecycleEvent[] = [];
 const pendingInvokes = new Map<number, PendingInvoke>();
 const sessionId = createSessionId();
+type RuntimePerformanceDiagnosticsModule = typeof import("./runtimePerformanceDiagnostics");
+let performanceDiagnosticsModulePromise: Promise<RuntimePerformanceDiagnosticsModule> | null = null;
+let performanceDiagnosticsActivation = 0;
 
 function createSessionId(): string {
   try {
@@ -187,6 +190,44 @@ function buildHeartbeat(): FrontendBridgeHeartbeat {
     lifecycle: lifecycleEvents.slice(-MAX_LIFECYCLE_EVENTS),
     recoveredStall: readStoredJson<FrontendBridgeStallSnapshot>(STALL_STORAGE_KEY),
   };
+}
+
+function runtimePerformanceContext(): Record<string, unknown> {
+  const now = Date.now();
+  return {
+    sessionId,
+    eventLoopLagMs: lastEventLoopLagMs,
+    callbackCount: callbackCount(),
+    pendingInvokes: snapshotPendingInvokes(pendingInvokes.values(), now),
+    lifecycle: lifecycleEvents.slice(-MAX_LIFECYCLE_EVENTS),
+  };
+}
+
+function startPerformanceDiagnostics(): void {
+  const activation = ++performanceDiagnosticsActivation;
+  performanceDiagnosticsModulePromise ??= import("./runtimePerformanceDiagnostics");
+  void performanceDiagnosticsModulePromise
+    .then((module) => {
+      if (!running || performanceDiagnosticsActivation !== activation) return;
+      module.startRuntimePerformanceDiagnostics({
+        getContext: runtimePerformanceContext,
+      });
+    })
+    .catch((error) => {
+      if (performanceDiagnosticsActivation !== activation) return;
+      performanceDiagnosticsModulePromise = null;
+      console.warn("[RuntimePerformance]", "diagnostics module failed to load", error);
+    });
+}
+
+function stopPerformanceDiagnostics(): void {
+  performanceDiagnosticsActivation += 1;
+  if (!performanceDiagnosticsModulePromise) return;
+  void performanceDiagnosticsModulePromise
+    .then((module) => module.stopRuntimePerformanceDiagnostics())
+    .catch(() => {
+      performanceDiagnosticsModulePromise = null;
+    });
 }
 
 function installInvokeTracking(): void {
@@ -308,6 +349,7 @@ function startDiagnostics(): void {
     window.addEventListener("beforeunload", handleBeforeUnload);
     document.addEventListener("visibilitychange", handleVisibilityChange);
     installInvokeTracking();
+    startPerformanceDiagnostics();
     scheduleHeartbeat(250);
   } catch (error) {
     running = false;
@@ -320,6 +362,7 @@ function startDiagnostics(): void {
     window.removeEventListener("beforeunload", handleBeforeUnload);
     document.removeEventListener("visibilitychange", handleVisibilityChange);
     restoreInvokeTracking();
+    stopPerformanceDiagnostics();
     console.warn("[WebViewBridge] diagnostics initialization failed", error);
   }
 }
@@ -338,6 +381,7 @@ function stopDiagnostics(): void {
   window.removeEventListener("beforeunload", handleBeforeUnload);
   document.removeEventListener("visibilitychange", handleVisibilityChange);
   restoreInvokeTracking();
+  stopPerformanceDiagnostics();
 }
 
 export function initWebviewBridgeDiagnostics(): void {

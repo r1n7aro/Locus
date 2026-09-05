@@ -13,6 +13,15 @@ interface CdpMessage {
   id?: number;
   result?: unknown;
   error?: { message?: string };
+  method?: string;
+  params?: Record<string, unknown>;
+  sessionId?: string;
+}
+
+export interface CdpEventMessage {
+  method: string;
+  params: Record<string, unknown>;
+  sessionId?: string;
 }
 
 export async function findLocusWebViewTarget(
@@ -72,11 +81,27 @@ export class CdpClient {
     resolve: (value: unknown) => void;
     reject: (reason: Error) => void;
   }>();
+  private eventListeners = new Set<(event: CdpEventMessage) => void>();
 
   private constructor(private readonly socket: WebSocket) {
     socket.addEventListener("message", (event) => {
       const message = JSON.parse(String(event.data)) as CdpMessage;
-      if (!message.id) return;
+      if (!message.id) {
+        if (!message.method) return;
+        const protocolEvent: CdpEventMessage = {
+          method: message.method,
+          params: message.params ?? {},
+          ...(message.sessionId ? { sessionId: message.sessionId } : {}),
+        };
+        for (const listener of this.eventListeners) {
+          try {
+            listener(protocolEvent);
+          } catch {
+            // Protocol listeners are diagnostic observers and remain isolated.
+          }
+        }
+        return;
+      }
       const request = this.pending.get(message.id);
       if (!request) return;
       this.pending.delete(message.id);
@@ -114,6 +139,11 @@ export class CdpClient {
     });
   }
 
+  subscribeEvents(listener: (event: CdpEventMessage) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
   async evaluate<T = Record<string, unknown>>(expression: string): Promise<T> {
     const response = await this.send("Runtime.evaluate", {
       expression,
@@ -135,6 +165,7 @@ export class CdpClient {
   }
 
   close() {
+    this.eventListeners.clear();
     this.socket.close();
   }
 }

@@ -9,6 +9,31 @@ function read(relPath: string) {
 }
 
 describe("ConsoleSettings layout", () => {
+  it("unmounts the live console when the cached settings page is inactive", () => {
+    const app = read("src/App.vue");
+    const settings = read("src/components/SettingsView.vue");
+    const console = read("src/components/settings/ConsoleSettings.vue");
+
+    expect(app).toContain(':active="uiStore.activePage === \'settings\'"');
+    expect(settings).toContain("active?: boolean;");
+    expect(settings).toContain('v-if="props.active && activeCategory === \'console\'"');
+    expect(console).toContain("unsubscribe = subscribeDebugConsole");
+    expect(console).toMatch(/onUnmounted\(\(\) => \{[\s\S]*unsubscribe\?\.\(\);/);
+  });
+
+  it("virtualizes visible log rows and measures expanded row heights", () => {
+    const source = read("src/components/settings/ConsoleSettings.vue");
+
+    expect(source).toContain("const virtualConsoleLayout = computed(() => {");
+    expect(source).toContain("const measuredRowHeights = shallowRef<Map<string, number>>(new Map())");
+    expect(source).toContain("const CONSOLE_VIRTUAL_OVERSCAN_PX = 360");
+    expect(source).toContain("virtualRowResizeObserver = new ResizeObserver");
+    expect(source).toContain('class="console-virtual-body"');
+    expect(source).toContain('v-for="{ entry, index, top } in virtualConsoleLayout.rows"');
+    expect(source).toContain(":style=\"{ transform: `translateY(${top}px)` }\"");
+    expect(source).not.toContain('v-for="entry in filteredEntries"');
+  });
+
   it("supports resizable log columns with persisted widths", () => {
     const source = read("src/components/settings/ConsoleSettings.vue");
 
