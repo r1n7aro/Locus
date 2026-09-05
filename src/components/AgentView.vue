@@ -53,6 +53,7 @@ import type { WorkspaceRef } from "../services/project";
 import { agentProjectTypesLabel } from "../utils/agentProjectTypes";
 
 const props = defineProps<{
+  active?: boolean;
   workingDir: string;
   agentList: AgentInfo[];
   workspaceRef?: WorkspaceRef | null;
@@ -236,6 +237,10 @@ function toolMetaString(meta: InjectedPromptItem["meta"], key: string): string {
   return typeof value === "string" ? value : "";
 }
 
+function currentSubagentModels(): Record<string, string> {
+  return modelStore.modelDefaults?.subagentModels ?? {};
+}
+
 /// MCP wire names render as the bare tool name; the persisted identity
 /// (item.title, override keys) stays the full wire name.
 function toolItemDisplayTitle(item: InjectedPromptItem): string {
@@ -382,6 +387,8 @@ function toolUnavailableReasonText(reason: string): string {
       return t("agent.tool.unavailableReason.modelVisionUnsupported");
     case "subagent_depth_limit":
       return t("agent.tool.unavailableReason.subagentDepthLimit");
+    case "multi_agent_disabled":
+      return t("agent.tool.unavailableReason.multiAgentDisabled");
     case "tool_definition_unavailable":
       return t("agent.tool.unavailableReason.toolDefinitionUnavailable");
     default:
@@ -877,8 +884,14 @@ async function loadInjectedItems() {
           agentId,
           null,
           modelStore.selectedModelId,
+          currentSubagentModels(),
         )
-      : await listAgentInjectedItems(agentId, null, modelStore.selectedModelId);
+      : await listAgentInjectedItems(
+          agentId,
+          null,
+          modelStore.selectedModelId,
+          currentSubagentModels(),
+        );
     if (requestId !== injectedRequestId) return;
     injectedItems.value = items;
     if (selected.value?.type === "injected") {
@@ -1370,7 +1383,17 @@ watch(
 );
 
 watch(
-  () => modelStore.selectedModelId,
+  () => props.active,
+  (active) => {
+    if (active && selectedAgentId.value) refreshAll();
+  },
+);
+
+watch(
+  () => [
+    modelStore.selectedModelId,
+    JSON.stringify(currentSubagentModels()),
+  ],
   () => {
     if (!selectedAgentId.value) return;
     void loadPromptStats();

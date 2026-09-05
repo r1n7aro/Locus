@@ -18,6 +18,7 @@ import { useChatStore } from "./stores/chat";
 import { useNotificationStore } from "./stores/notification";
 import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
+import { useAgentWorkspaceScope } from "./composables/useAgentWorkspaceScope";
 import { useUnityAssetDropTarget } from "./composables/useUnityAssetDropTarget";
 import { knowledgeGetEmbeddingStatus } from "./services/knowledge";
 import { APP_CLOSE_REQUESTED_EVENT, getRunningTaskCount, requestAppExit } from "./services/system";
@@ -137,6 +138,11 @@ const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const appUpdateStore = useAppUpdateStore();
 const { state: displaySettings } = useDisplaySettings();
+const {
+  runtime: agentWorkspaceRuntime,
+  workingDir: agentWorkingDir,
+  workspaceRef: agentWorkspaceRef,
+} = useAgentWorkspaceScope();
 const unityEmbedBootstrapped = ref(false);
 const unityEmbedBootstrapError = ref<string | null>(null);
 const KNOWLEDGE_RUNTIME_LOADING_OPERATION = "knowledgeEmbeddingRuntimeLoading";
@@ -311,10 +317,14 @@ function isTopTabActive(tab: TopTabItem) {
   return uiStore.activePage === tab.id;
 }
 
+function topTabWorkspaceRuntime(tab: TopTabItem) {
+  return tab.id === "agent" ? agentWorkspaceRuntime.value : workspaceContextStore.focusedRuntime;
+}
+
 function canOpenTopTabInWindow(tab: TopTabItem) {
   return tab.id !== "development" && (
     isAppWorkspacePageId(tab.id)
-    || (workspaceContextStore.focusedRuntime !== null && isCheckoutWorkspacePageId(tab.id))
+    || (topTabWorkspaceRuntime(tab) !== null && isCheckoutWorkspacePageId(tab.id))
   );
 }
 
@@ -322,7 +332,7 @@ async function openTopTabInWindow(tab: TopTabItem) {
   topTabContextMenu.value = null;
   if (!canOpenTopTabInWindow(tab)) return;
   try {
-    const runtime = workspaceContextStore.focusedRuntime;
+    const runtime = topTabWorkspaceRuntime(tab);
     if (runtime && isCheckoutWorkspacePageId(tab.id)) {
       await openWorkspacePageWindow({
         scope: "checkout",
@@ -392,9 +402,6 @@ const appCloseConfirmOpen = ref(false);
 const appCloseBusy = ref(false);
 const appCloseRunningTaskCount = ref(0);
 const runningSessionCount = computed(() => chatStore.streamingSessionIds.size);
-const focusedWorkspaceRoot = computed(
-  () => workspaceContextStore.focusedRoot || projectStore.workingDir,
-);
 const showAppUpdateModal = computed(() =>
   Boolean(
     appUpdateStore.updateInfo
@@ -867,8 +874,9 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
           :is="agentViewComponent"
           v-if="uiStore.agentMounted && agentViewComponent"
           v-show="uiStore.activePage === 'agent'"
-          :working-dir="focusedWorkspaceRoot"
-          :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
+          :active="uiStore.activePage === 'agent'"
+          :working-dir="agentWorkingDir"
+          :workspace-ref="agentWorkspaceRef"
           :agent-list="[...agentStore.agents, ...agentStore.subagents]"
         />
         <div
