@@ -45,10 +45,10 @@ describe("unity_execute printJson", () => {
     const definition = JSON.parse(read("tools/unity_execute.json"));
     const driver = read("src-tauri/src/cli_driver.rs");
 
-    expect(definition.description).toContain("anonymous objects");
-    expect(definition.description).toContain("never invokes target property getters");
-    expect(definition.description).toContain("BFS-owned `$id`/`$ref`");
-    expect(definition.description).toContain("nested Unity object references");
+    expect(definition.description).toContain("serializes stored data");
+    expect(definition.description).toContain("without invoking property getters");
+    expect(definition.description).toContain("$id/$ref");
+    expect(definition.description).toContain("nested Unity references");
     expect(driver).toContain("E3J anonymous JSON");
     expect(driver).toContain("E3J reference loop");
     expect(driver).toContain("E3J BFS ownership");

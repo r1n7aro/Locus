@@ -1,5 +1,5 @@
 {
-  "description": "Query the Unity asset reference graph database to search for asset relationships in both directions.\n\nSupports two search directions:\n- 'references': Find which assets reference (use) the given asset (incoming edges). Answers: \"what uses this asset?\"\n- 'dependencies': Find which assets the given asset depends on (outgoing edges). Answers: \"what does this asset use?\"\n\nGiven an asset path, resolves its GUID and queries the pre-built reference graph (rescan from the UI if results look stale).\n\nReturns results grouped by asset path with detailed ref_path showing the exact location within the asset where the reference occurs, including the GameObject hierarchy path, component type, and field name (e.g. 'Root/Child/MonoBehaviour/m_Script').",
+  "description": "Query the indexed Unity asset graph from a project-relative asset path. references finds incoming usages; dependencies finds outgoing dependencies. Results group by asset and include ref_path for the hierarchy/component/field location. Use the indexed graph's freshness when interpreting missing results; rescan from the UI if stale.",
   "parameters": {
     "type": "object",
     "properties": {

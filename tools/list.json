@@ -1,5 +1,5 @@
 {
-  "description": "List directory contents in the selected project.\nUse this tool for directories; use read for files.\nUseful for exploring project structure before using more targeted tools like grep or read.\n\nOutput format: tree-style indented listing. Directories end with /. Plain entries without a trailing / are files. When include_files is false, all returned entries are directories.\nItems exceeding the per-directory limit are indicated with '... and N more'.\n\nRoot-level generated, cache, log, and build directories are automatically excluded from output. Files ending in .meta are also excluded.\nYou MUST set path explicitly; never rely on the current process directory or an implicit project subdirectory.",
+  "description": "List a directory as a bounded tree. Set path explicitly; use read for files. Entries ending in / are directories. include_files=false returns directories only; omitted entries are summarized with counts. Root-level generated/cache/log/build directories and .meta files are excluded.",
   "parameters": {
     "type": "object",
     "properties": {

@@ -43,9 +43,6 @@ describe("Unity Test Framework tools", () => {
     expect(executeDefinition.description).toContain("UnityTestApi.Start");
     expect(executeDefinition.description).toContain("Status(runId)");
     expect(executeDefinition.description).toContain("com.unity.test-framework");
-    expect(read("agent/unity/rule/tool_usage_strategy.md")).toContain(
-      "UnityTestApi.ListAsync",
-    );
   });
 
   it("compiles the adapter only when com.unity.test-framework is installed", () => {
@@ -94,8 +91,8 @@ describe("Unity Test Framework tools", () => {
     expect(workspace).toContain("unity_test_sources_pending");
     expect(bridge).toContain("require_unity_test_sources_converged");
     expect(bridge).toContain("clear_unity_test_pending_sources_through");
-    expect(listDefinition.description).toContain("call unity_recompile before listing");
-    expect(runDefinition.description).toContain("call unity_recompile before running");
+    expect(listDefinition.description).toContain("complete unity_recompile before discovery");
+    expect(runDefinition.description).toContain("complete unity_recompile before running");
   });
 
   it("makes filters optional and accepts both Unity Test modes in one request", () => {
@@ -112,7 +109,7 @@ describe("Unity Test Framework tools", () => {
         "edit|play",
       ]);
       expect(definition.parameters.properties.mode.default).toBe("edit|play");
-      expect(definition.description).toContain("do not send empty arrays");
+      expect(definition.description).toMatch(/omit unused filter arrays/i);
     }
     expect(service).toContain("value.Split('|')");
     expect(service).toContain("TestMode.EditMode | TestMode.PlayMode");
@@ -150,7 +147,7 @@ describe("Unity Test Framework tools", () => {
     const runDefinition = JSON.parse(read("tools/unity_test_run.json"));
 
     expect(runDefinition.parameters.properties.resume_run_id).toBeUndefined();
-    expect(runDefinition.description).toContain("cancels the active Unity Test run");
+    expect(runDefinition.description).toContain("Cancellation/host timeout cancels the run");
     expect(agent).toContain('if tc.name == "unity_test_run"');
     expect(agent).toContain("unity_test_cancellation_failed");
     expect(bridge).toContain("let mut dialog_events = dialog::subscribe()");

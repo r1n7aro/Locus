@@ -15,8 +15,8 @@ export const useAgentStore = defineStore("agent", () => {
 
   function resolveAgentId(id: string) {
     const trimmed = id.trim();
-    if (!trimmed) return "";
-    if (["dev", "doc", "wiki", "git", "knowledge", "runtime_debugger"].includes(trimmed)) {
+    if (!trimmed || trimmed === "dev") return "";
+    if (["doc", "wiki", "git", "knowledge", "runtime_debugger"].includes(trimmed)) {
       return agents.value.some((agent) => agent.id === "unity") ? "unity" : trimmed;
     }
     return trimmed;

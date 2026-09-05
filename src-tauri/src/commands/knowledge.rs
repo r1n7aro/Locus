@@ -7,7 +7,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
-use crate::agent::definition::{app_agent_layer_dirs, canonical_agent_id};
+use crate::agent::definition::{app_agent_layer_dirs, canonical_agent_id, is_removed_agent_id};
 use crate::binary_cache::BinaryCache;
 use crate::error::{AppError, ErrorSeverity};
 use crate::feishu_docs::{
@@ -4139,16 +4139,14 @@ pub struct AgentToolLoadConfig {
 }
 
 fn workspace_agent_layer_dirs(working_dir: &str, agent_id: &str) -> Vec<std::path::PathBuf> {
+    if is_removed_agent_id(agent_id) {
+        return Vec::new();
+    }
     let agent_id = canonical_agent_id(agent_id);
     let root = std::path::Path::new(working_dir)
         .join("Locus")
         .join("agent");
-    let mut dirs = Vec::new();
-    if agent_id == crate::agent::definition::DEFAULT_AGENT_ID {
-        dirs.push(root.join(crate::agent::definition::LEGACY_UNITY_AGENT_ID));
-    }
-    dirs.push(root.join(agent_id));
-    dirs
+    vec![root.join(agent_id)]
 }
 
 fn tool_load_config_path(working_dir: &str, agent_id: &str) -> std::path::PathBuf {
@@ -4178,6 +4176,9 @@ fn save_tool_load_config(
     agent_id: &str,
     config: &AgentToolLoadConfig,
 ) -> Result<(), String> {
+    if is_removed_agent_id(agent_id) {
+        return Err(format!("Unknown agent: {}", agent_id));
+    }
     let path = tool_load_config_path(working_dir, agent_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -4472,6 +4473,9 @@ fn save_workspace_injection_config(
     agent_id: &str,
     configs: &AgentInjectionConfig,
 ) -> Result<(), String> {
+    if is_removed_agent_id(agent_id) {
+        return Err(format!("Unknown agent: {}", agent_id));
+    }
     let path = injection_config_path(working_dir, agent_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -4592,6 +4596,9 @@ impl AgentRuleFileEntry {
 }
 
 fn rules_dir(working_dir: &str, agent_id: &str) -> Result<std::path::PathBuf, String> {
+    if is_removed_agent_id(agent_id) {
+        return Err(format!("Unknown agent: {}", agent_id));
+    }
     let agent_id = canonical_agent_id(agent_id);
     let dir = std::path::Path::new(working_dir)
         .join("Locus")
@@ -4631,6 +4638,9 @@ fn save_rule_config(
     agent_id: &str,
     configs: &AgentRuleConfig,
 ) -> Result<(), String> {
+    if is_removed_agent_id(agent_id) {
+        return Err(format!("Unknown agent: {}", agent_id));
+    }
     let path = rule_config_path(working_dir, agent_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -4836,6 +4846,9 @@ pub fn collect_agent_rule_files(
     agent_id: &str,
     create_project_dir: bool,
 ) -> Result<Vec<AgentRuleFileEntry>, String> {
+    if is_removed_agent_id(agent_id) {
+        return Err(format!("Unknown agent: {}", agent_id));
+    }
     let agent_id = canonical_agent_id(agent_id).to_string();
     let configs = merged_rule_config_for_agent(app_agent_dir, working_dir, &agent_id);
     let mut items = Vec::new();
@@ -5145,11 +5158,87 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn removed_dev_agent_rules_and_settings_are_ignored_in_every_layer() {
+        for layer in ["agent", "user-agents", "workspace/Locus/agent"] {
+            let root = tempfile::tempdir().expect("temp root");
+            let bundled_root = root.path().join("agent");
+            let workspace = root.path().join("workspace");
+            let working_dir = workspace.to_string_lossy();
+            let legacy = root.path().join(layer).join("dev");
+            std::fs::create_dir_all(legacy.join("rule")).expect("legacy rule dir");
+            std::fs::write(legacy.join("rule/common_unity_pitfalls.md"), "Retired rule")
+                .expect("legacy-only rule");
+            std::fs::write(legacy.join("rule/current.md"), "Stale rule")
+                .expect("legacy duplicate rule");
+            std::fs::write(
+                legacy.join("rule_config.json"),
+                r#"{"current.md":{"enabled":false,"order":99},"common_unity_pitfalls.md":{"enabled":true}}"#,
+            )
+            .expect("legacy rule config");
+            std::fs::write(
+                legacy.join("tool_load_config.json"),
+                r#"{"directLoad":{"read":false},"enabled":{"read":false}}"#,
+            )
+            .expect("legacy tool config");
+            std::fs::write(
+                legacy.join("injection_config.json"),
+                r#"{"env":{"enabled":false}}"#,
+            )
+            .expect("legacy injection config");
+
+            let app_dir = Some(bundled_root.clone());
+            assert!(merged_rule_config_for_agent(&app_dir, &working_dir, "unity").is_empty());
+            let tools = merged_tool_load_config_for_agent(&app_dir, &working_dir, "unity");
+            assert!(tools.direct_load.is_empty());
+            assert!(tools.enabled.is_empty());
+            let injections = load_agent_injection_config_layers(&app_dir, &working_dir, "unity");
+            assert!(injections.app.is_empty());
+            assert!(injections.workspace.is_empty());
+            let rules = collect_agent_rule_files(&app_dir, &working_dir, "unity", false)
+                .expect("rules without Unity directory");
+            assert!(rules.iter().all(|rule| rule.file_name != "common_unity_pitfalls.md"
+                && rule.file_name != "current.md"));
+
+            let unity = bundled_root.join("unity");
+            std::fs::create_dir_all(unity.join("rule")).expect("Unity rule dir");
+            let current_rule = unity.join("rule/current.md");
+            std::fs::write(&current_rule, "Current rule").expect("Unity rule");
+            std::fs::write(
+                unity.join("rule_config.json"),
+                r#"{"current.md":{"enabled":true,"order":2}}"#,
+            )
+            .expect("Unity rule config");
+            let rules = collect_agent_rule_files(&app_dir, &working_dir, "unity", false)
+                .expect("Unity rules");
+            assert!(rules.iter().all(|rule| rule.file_name != "common_unity_pitfalls.md"));
+            let current = rules.iter().find(|rule| rule.file_name == "current.md")
+                .expect("current Unity rule");
+            assert_eq!(current.path, current_rule);
+            assert!(current.enabled);
+            assert_eq!(current.order, 2);
+            assert!(collect_agent_rule_files(&app_dir, &working_dir, "dev", false).is_err());
+            assert!(app_agent_layer_dirs(&bundled_root, "dev").is_empty());
+            assert!(workspace_agent_layer_dirs(&working_dir, "dev").is_empty());
+        }
+    }
+
+    #[test]
+    fn removed_dev_agent_settings_cannot_be_created() {
+        let root = tempfile::tempdir().expect("temp root");
+        let working_dir = root.path().to_string_lossy();
+        assert!(rules_dir(&working_dir, "dev").is_err());
+        assert!(save_rule_config(&working_dir, "dev", &AgentRuleConfig::new()).is_err());
+        assert!(save_tool_load_config(&working_dir, "dev", &AgentToolLoadConfig::default()).is_err());
+        assert!(save_workspace_injection_config(&working_dir, "dev", &AgentInjectionConfig::new()).is_err());
+        assert!(!root.path().join("Locus").exists());
+    }
+
+    #[test]
     fn agent_injection_config_layers_apply_user_defaults_and_workspace_overrides() {
         let root = tempfile::tempdir().expect("temp root");
         let bundled_root = root.path().join("agent");
-        let bundled_agent = bundled_root.join("dev");
-        let user_agent = crate::agent::definition::user_agent_dir(&bundled_root).join("dev");
+        let bundled_agent = bundled_root.join("unity");
+        let user_agent = crate::agent::definition::user_agent_dir(&bundled_root).join("unity");
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&bundled_agent).expect("bundled Agent dir");
         std::fs::create_dir_all(&user_agent).expect("user Agent dir");
@@ -5168,7 +5257,7 @@ mod tests {
         workspace_config.insert("env".to_string(), InjectionConfig { enabled: true });
         save_workspace_injection_config(
             workspace.to_string_lossy().as_ref(),
-            "dev",
+            "unity",
             &workspace_config,
         )
         .expect("workspace injection config");
@@ -5176,7 +5265,7 @@ mod tests {
         let layers = load_agent_injection_config_layers(
             &Some(bundled_root),
             workspace.to_string_lossy().as_ref(),
-            "dev",
+            "unity",
         );
         let env = layers.state("env");
         assert!(env.enabled);

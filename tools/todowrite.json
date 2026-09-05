@@ -1,5 +1,5 @@
 {
-  "description": "Use this tool to create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.\n\nUse for complex multistep tasks (3+ distinct steps), when the user provides multiple tasks or explicitly requests a todo list, and to capture requirements after new instructions. Skip it for single straightforward tasks, trivial work completable in under 3 steps, or purely conversational requests.\n\nKeep only ONE task in_progress at a time. Mark tasks completed IMMEDIATELY after finishing; complete current tasks before starting new ones.",
+  "description": "Maintain the current task's structured todo list. Use for complex work, multiple deliverables, or an explicit user request; skip trivial work and direct answers. Each call replaces the full list. Keep one task in_progress and update statuses as work completes.",
   "parameters": {
     "type": "object",
     "properties": {

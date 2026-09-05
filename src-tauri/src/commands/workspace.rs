@@ -245,6 +245,13 @@ fn load_agent_model_preferences() -> HashMap<String, AgentModelPreference> {
     let Ok(raw) = serde_json::from_str::<HashMap<String, AgentModelPreference>>(&content) else {
         return HashMap::new();
     };
+    normalize_agent_model_preferences(raw)
+}
+
+fn normalize_agent_model_preferences(
+    mut raw: HashMap<String, AgentModelPreference>,
+) -> HashMap<String, AgentModelPreference> {
+    raw.retain(|agent_id, _| !crate::agent::definition::is_removed_agent_id(agent_id));
 
     let mut normalized = HashMap::new();
     for (agent_id, preference) in raw.iter().filter(|(agent_id, _)| {
@@ -280,6 +287,9 @@ pub async fn save_agent_model_preference(
     let agent_id = crate::agent::definition::canonical_agent_id(agent_id.trim());
     if agent_id.is_empty() {
         return Err("Agent id cannot be empty".to_string().into());
+    }
+    if crate::agent::definition::is_removed_agent_id(agent_id) {
+        return Err(format!("Unknown agent: {}", agent_id).into());
     }
     let model_id = model_id.trim();
     if model_id.is_empty() {
@@ -386,7 +396,7 @@ impl Default for CodexTransportMode {
 pub struct CodexModelConfig {
     #[serde(default)]
     pub transport: CodexTransportMode,
-    /// Raw GPT-5.6 context window requested by Locus. Missing values retain
+    /// Raw context window for all Codex subscription models. Missing values retain
     /// the standard 272K default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
@@ -3107,6 +3117,24 @@ pub async fn get_workspace_config_registry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removed_dev_agent_model_preferences_are_not_inherited() {
+        let raw = serde_json::from_str(
+            r#"{"dev":{"modelId":"retired-model","effort":"high"}}"#,
+        )
+        .expect("legacy preferences");
+        assert!(super::normalize_agent_model_preferences(raw).is_empty());
+
+        let raw = serde_json::from_str(
+            r#"{"dev":{"modelId":"retired-model"},"unity":{"modelId":"current-model"},"simple":{"modelId":"simple-model"}}"#,
+        )
+        .expect("current preferences");
+        let preferences = super::normalize_agent_model_preferences(raw);
+        assert_eq!(preferences.len(), 2);
+        assert_eq!(preferences["unity"].model_id, "current-model");
+        assert_eq!(preferences["simple"].model_id, "simple-model");
+    }
+
     use super::{
         collect_dir_entries, collect_dir_entries_with_hidden,
         default_provider_prefix_cache_ttl_seconds, is_stale_custom_model_ref,

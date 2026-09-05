@@ -32,10 +32,18 @@ describe("Agent store legacy aliases", () => {
     const store = useAgentStore();
     await store.loadAgents();
 
-    for (const id of ["dev", "git", "knowledge", "runtime_debugger", "doc", "wiki"]) {
+    for (const id of ["git", "knowledge", "runtime_debugger", "doc", "wiki"]) {
       store.selectAgent(id);
       expect(store.selectedAgentId).toBe("unity");
     }
+  });
+
+  it("does not select or alias the removed dev Agent", async () => {
+    const store = useAgentStore();
+    await store.loadAgents();
+
+    store.selectAgent(" dev ");
+    expect(store.selectedAgentId).toBe("");
   });
 
   it("selects the workspace-compatible default when the checkout changes", async () => {

@@ -8,17 +8,16 @@ function read(relPath: string) {
   return readFileSync(resolve(cwd, relPath), "utf8");
 }
 
-describe("Dev agent work-in-progress output rules", () => {
+describe("Unity agent work-in-progress output rules", () => {
   it("keeps the progress-update contract enabled in the runtime prompt", () => {
     const rules = read("agent/unity/rule/output_principles.md");
     const config = JSON.parse(read("agent/unity/rule_config.json"));
 
     expect(config["output_principles.md"]).toMatchObject({ enabled: true });
-    expect(rules).toContain("Work-in-progress updates:");
-    expect(rules).toContain("before the first substantial tool-call batch");
-    expect(rules).toContain("when a meaningful phase finishes and more work remains");
-    expect(rules).toContain("more than four consecutive tool-call rounds");
-    expect(rules).toContain("Group related actions into one update");
-    expect(rules).toContain("Skip progress updates for a direct answer or an isolated trivial tool call");
+    expect(rules).toContain("For multi-step work");
+    expect(rules).toContain("before substantial tool use");
+    expect(rules).toContain("meaningful milestones");
+    expect(rules).toContain("group related calls");
+    expect(rules).toContain("final answer must stand on its own");
   });
 });

@@ -1,16 +1,12 @@
-## Knowledge Base Concept and Maintenance
+## Knowledge Ownership
 
-Maintain knowledge when the user explicitly provides durable context or implementation changes make an existing document incorrect.
+The four knowledge roles have distinct purposes and write permissions:
 
-Your Knowledge is divided into four parts:
+* **Design** records project direction, requirements, constraints, and design decisions discussed with the user. Create or change it with the user's explicit request or approval, and present the change for review.
+* **Memory** records the user's durable ideas, preferences, background, and long-term context. Write or revise it according to the user's clear intent.
+* **Reference** contains external material with its source information. Treat registered read-only sources as read-only.
+* **Skill** defines reusable execution steps and checks. Report a useful correction or improvement, and update the Skill within the user's approval, including approval already given in the task.
 
-* Design: design documents discussed and agreed upon by you and the user. These can serve as factual sources together with the project code. They must be modified only after the user's request, and the modification must receive the user's review and approval.
-* Memory: the user's durable ideas, preferences, hidden background, and long-term context. Changes follow the user's clear intent.
-* Skill: reusable process documents.
-* Reference: read-only externally imported documents, usually including the official Unity manual and API Reference.
+`plan/` stores execution plans, milestones, and progress. It is an execution-document search location; keep it distinct from agreed Design and personal Memory. During Plan mode, the session plan file is the only writable document.
 
-* When executing a Skill, if you find a blocker, missing step, unclear instruction, or reusable improvement in the Skill document, briefly report the issue and proposed change to the user; update the Skill only after user approval.
-
-After discussing game or engineering design, update Design only with the user's approval. Use `write` for a new Markdown document and `edit` for an existing document.
-
-Memory drifts over time. It records information that was true at the time it was written. If recalled memory conflicts with current observations, use the current observations as the source of truth, and update or delete outdated memory instead of continuing to act on old memory.
+Use current observations when recalled knowledge is stale. Persist corrections only within the relevant write permission and document maintenance rules. Task completion alone does not require a knowledge update. Query and read additional knowledge when the injected or previously read context is insufficient.

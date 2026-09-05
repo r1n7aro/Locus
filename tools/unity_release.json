@@ -1,5 +1,5 @@
 {
-  "description": "Release the cooperative lock immediately after the last direct Editor-state control or state-dependent tool call in the minimal critical section so the next waiting Agent can proceed. Perform subsequent asset/code edits and ordinary verification outside the lock. Releasing an already-free lock succeeds. An Agent cannot release a lock owned by another Agent. Agent run completion and cancellation also clean up locks owned by that run's session.",
+  "description": "Release this session's cooperative Editor lock after its last state-dependent call. Continue ordinary asset/code work outside the lock. Already-free locks succeed; another session's lock cannot be released. Run completion and cancellation also release owned locks.",
   "parameters": {
     "type": "object",
     "properties": {},

@@ -1,5 +1,5 @@
 {
-  "description": "Ask the user a clarifying question when you need more information to proceed effectively. Instead of guessing or performing broad speculative searches, present specific options to choose from.\n\nUse when the request is ambiguous, has multiple reasonable interpretations, or you must choose between valid approaches and want user input. Do NOT use when the request is clear or you can confidently determine the answer from context.\n\nGuidelines:\n- HARD LIMIT: at most 3 options, and the LAST option must always be a custom input option that lets the user type their own answer\n- Keep options concise (1-5 word label, short description) and cover the most likely interpretations\n- If there are more than 2 likely interpretations, pick the 2 most likely and use the 3rd slot for custom input\n- Write a clear, specific question that explains what you need to know",
+  "description": "Ask for missing information that materially changes the target, scope, or result. Resolve answers available from context or focused investigation first; ordinary implementation choices can follow project conventions.\n\nProvide a specific question and at most 3 concise options. The last option must allow custom input; the preceding options cover the most likely choices. Use labels of 1-5 words. Reuse prior answers and authorization.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,7 +9,7 @@
       },
       "options": {
         "type": "array",
-        "description": "List of options for the user to choose from (maximum 3). The last option should always allow custom text input.",
+        "description": "At most 3 options; the final option allows custom text input.",
         "maxItems": 3,
         "items": {
           "type": "object",
