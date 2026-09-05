@@ -914,6 +914,61 @@ mod windows_impl {
             assert_eq!(broker_accepted_request_id(&env).as_deref(), Some("req-42"));
         }
 
+        #[tokio::test]
+        async fn out_of_order_responses_are_dispatched_by_reply_to() {
+            let unique = format!(
+                "{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            );
+            let pipe_name = format!(r"\\.\pipe\locus_transport_reply_order_{unique}");
+            let project_key = format!("reply-order-project-{unique}");
+            let mut server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+                .expect("create test pipe");
+            let connect_task = tokio::spawn(connect_pipe(project_key, pipe_name.clone(), 1));
+            server.connect().await.expect("accept test pipe client");
+            let conn = connect_task
+                .await
+                .expect("connect task")
+                .expect("connect client");
+
+            let (first_tx, first_rx) = oneshot::channel();
+            let (second_tx, second_rx) = oneshot::channel();
+            {
+                let mut pending = conn.pending.lock().await;
+                pending.insert("req-first".to_string(), first_tx);
+                pending.insert("req-second".to_string(), second_tx);
+            }
+
+            server
+                .write_all(
+                    b"{\"reply_to\":\"req-second\",\"type\":\"response\",\"ok\":true,\"message\":\"second\"}\n\
+{\"reply_to\":\"req-first\",\"type\":\"response\",\"ok\":true,\"message\":\"first\"}\n",
+                )
+                .await
+                .expect("write reversed responses");
+            server.flush().await.expect("flush reversed responses");
+
+            let first = first_rx
+                .await
+                .expect("first response channel")
+                .expect("first response");
+            let second = second_rx
+                .await
+                .expect("second response channel")
+                .expect("second response");
+            assert_eq!(first.message.as_deref(), Some("first"));
+            assert_eq!(second.message.as_deref(), Some("second"));
+
+            remove_connection_if_same(&pipe_name, &conn).await;
+            close_connection(&conn, "test complete".to_string()).await;
+        }
+
         #[test]
         fn service_scope_is_removed_at_the_service_generation_boundary() {
             use crate::workspace_service::event::WorkspaceEventScope;

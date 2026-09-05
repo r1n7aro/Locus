@@ -440,9 +440,20 @@ impl SelfTest {
         super::set_event_app_handle(self.app.clone());
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let listener = self.app.listen_any("unity-editor-update", move |event| {
-            let _ = tx.send(event.payload().to_string());
-        });
+        let listener = self.app.listen_any(
+            crate::workspace_service::event::WORKSPACE_EVENT_NAME,
+            move |event| {
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+                    return;
+                };
+                if payload.get("eventName").and_then(serde_json::Value::as_str)
+                    != Some("unity-editor-update")
+                {
+                    return;
+                }
+                let _ = tx.send(event.payload().to_string());
+            },
+        );
 
         let result = tokio::time::timeout(EDITOR_UPDATE_WAIT_TIMEOUT, rx.recv()).await;
         self.app.unlisten(listener);
@@ -454,12 +465,12 @@ impl SelfTest {
             ),
             Ok(None) => self.fail(
                 "N9 native editor-update event route",
-                "unity-editor-update listener closed before receiving an event",
+                "locus://workspace-event listener closed before receiving a Unity editor update",
             ),
             Err(_) => self.fail(
                 "N9 native editor-update event route",
                 format!(
-                    "no unity-editor-update event arrived within {}s over the native transport",
+                    "no Unity editor update arrived through locus://workspace-event within {}s over the native transport",
                     EDITOR_UPDATE_WAIT_TIMEOUT.as_secs()
                 ),
             ),
