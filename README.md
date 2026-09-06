@@ -148,4 +148,4 @@ This project is a free and open-source tool for the Unity Editor, and is not aff
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=r1n7aro/Locus&type=Date)](https://www.star-history.com/#r1n7aro/Locus&Date)
+[![Star History Chart](https://star-history.dera.page/svg?repos=r1n7aro/Locus&type=Date)](https://star-history.dera.page/#r1n7aro/Locus&Date)
