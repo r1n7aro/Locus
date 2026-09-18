@@ -1,7 +1,8 @@
+import { materializationEpochFromParams } from "./project";
 import { listen } from "@tauri-apps/api/event";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
-import type { UnitySerializedPropertyTarget } from "./unitySerializedProperty";
+import type { UnitySerializedPropertyTarget, UnitySerializedPropertyWriteResult } from "./unitySerializedProperty";
 import type { WorkspaceRef } from "./project";
 
 export const UNITY_VALUE_EDITOR_WINDOW_LABEL = "locus-value-editor";
@@ -20,6 +21,7 @@ export const UNITY_VALUE_EDITOR_COMMITTED_EVENT = "locus-value-editor:committed"
 export type UnityValueEditorKind = "curve" | "gradient";
 
 export interface UnityValueEditorPayload {
+  historyOwner?: string;
   kind: UnityValueEditorKind;
   workspaceRef: WorkspaceRef;
   /** Full serialized-property target including propertyPath. */
@@ -28,6 +30,9 @@ export interface UnityValueEditorPayload {
 }
 
 export interface UnityValueEditorCommittedEvent {
+  historyOwner?: string;
+  historyReplay?: boolean;
+  result?: UnitySerializedPropertyWriteResult;
   kind: UnityValueEditorKind;
   workspaceRef: WorkspaceRef;
   target: UnitySerializedPropertyTarget;
@@ -67,9 +72,10 @@ export function getUnityValueEditorWindowPayload(
   }
   return {
     kind,
-    workspaceRef: { checkoutId, expectedGeneration: workspaceGeneration },
+    workspaceRef: { checkoutId, expectedGeneration: workspaceGeneration , expectedMaterializationEpoch: materializationEpochFromParams(params) },
     target,
     label: params.get("label") ?? undefined,
+    historyOwner: params.get("historyOwner") ?? undefined,
   };
 }
 
@@ -80,8 +86,9 @@ export function buildUnityValueEditorWindowQuery(payload: UnityValueEditorPayloa
     checkoutId: payload.workspaceRef.checkoutId,
     workspaceGeneration: String(payload.workspaceRef.expectedGeneration),
     target: JSON.stringify(payload.target),
-  });
+   ...(payload.workspaceRef.expectedMaterializationEpoch != null ? { materializationEpoch: String(payload.workspaceRef.expectedMaterializationEpoch) } : {}) });
   if (payload.label) params.set("label", payload.label);
+  if (payload.historyOwner) params.set("historyOwner", payload.historyOwner);
   return params.toString();
 }
 

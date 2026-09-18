@@ -3,7 +3,7 @@ import type { Component } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { ipcInvoke } from "./ipc";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
-import { WORKSPACE_EVENT_NAME, type RoutedWorkspaceEvent } from "./project";
+import type { RoutedWorkspaceEvent } from "./project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import {
   defineInspectorPropertyDrawers,
@@ -15,6 +15,7 @@ import {
   pluginUnityObjectDrawerLibrary,
   type UnityObjectDrawerRegistration,
 } from "./unityObjectDrawer";
+import { listenWorkspaceEvent } from "./workspaceEventHub";
 
 /**
  * Loads installed plugin "drawer" packages and registers their inspector
@@ -73,12 +74,25 @@ let changeListenerInstalled = false;
 let scopedChangeListenerInstalled = false;
 let loadedPackages: LoadedDrawerPackage[] = [];
 let injectedStyleEl: HTMLStyleElement | null = null;
+let workspaceWatchInstalled = false;
 
 export function bootstrapPluginInspectorDrawers(): void {
   if (!hasTauriWindowRuntime()) return;
-  void reloadPluginInspectorDrawers().catch((error) => {
-    console.warn("[inspectorDrawerExtensions] initial drawer load failed:", error);
-  });
+  if (!workspaceWatchInstalled) {
+    workspaceWatchInstalled = true;
+    const workspace = useWorkspaceContextStore();
+    // Owned by this WebView, just like the plugin-change subscriptions below.
+    Vue.watch(() => {
+      const scope = workspace.focusedWorkspaceRef;
+      return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}:${scope.expectedMaterializationEpoch ?? "empty"}`
+        : "app";
+    }, (scopeKey) => {
+      if (!scopeKey) return;
+      void reloadPluginInspectorDrawers().catch((error) => {
+        console.warn("[inspectorDrawerExtensions] workspace drawer load failed:", error);
+      });
+    }, { immediate: true });
+  }
   if (changeListenerInstalled) return;
   changeListenerInstalled = true;
   void listen(PLUGINS_CHANGED_EVENT, () => {
@@ -90,7 +104,7 @@ export function bootstrapPluginInspectorDrawers(): void {
   });
   if (!scopedChangeListenerInstalled) {
     scopedChangeListenerInstalled = true;
-    void listen<RoutedWorkspaceEvent>(WORKSPACE_EVENT_NAME, ({ payload }) => {
+    void listenWorkspaceEvent<RoutedWorkspaceEvent>("inspectorDrawerExtensions.bootstrapPluginInspectorDrawers", ({ payload }) => {
       if (payload.eventName !== PLUGINS_CHANGED_EVENT) return;
       const focusedCheckoutId = useWorkspaceContextStore().focusedWorkspaceRef?.checkoutId;
       if (focusedCheckoutId !== payload.checkoutId) return;

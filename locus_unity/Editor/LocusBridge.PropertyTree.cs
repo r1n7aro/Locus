@@ -27,6 +27,7 @@ namespace Locus
         [Serializable]
         private sealed class PropertyTreeTarget
         {
+            public string globalObjectId;
             public string kind;
             public string guid;
             public string path;
@@ -45,6 +46,7 @@ namespace Locus
         [Serializable]
         private sealed class PropertyTreeReadRequest
         {
+            public int arrayOffset;
             public string bindingId;
             public PropertyTreeTarget target;
             public int maxDepth;
@@ -209,7 +211,7 @@ namespace Locus
             return await RunPropertyTreeOnMainThread(
                 requestId,
                 "property_tree_read",
-                delegate { return ReadPropertyTree(request.bindingId, request.target, request.maxDepth, request.maxArrayItems, request.autoExpandCharLimit, request.hierarchyFields, IsDynamicSchemaMode(request.schemaMode)); });
+                delegate { return request.arrayOffset > 0 ? ReadPropertyTreeArrayPage(request, IsDynamicSchemaMode(request.schemaMode)) : ReadPropertyTree(request.bindingId, request.target, request.maxDepth, request.maxArrayItems, request.autoExpandCharLimit, request.hierarchyFields, IsDynamicSchemaMode(request.schemaMode)); });
         }
 
         private static async Task<PipeEnvelope> HandlePropertyTreeWrite(string requestId, string message)
@@ -325,6 +327,7 @@ namespace Locus
         {
             public ResolvedPropertyTreeWrite write;
             public SerializedProperty prop;
+            public SerializedPropertySnapshot before;
         }
 
         private const string PropertyTreeComponentEnabledPropertyPath = "m_Enabled";
@@ -390,6 +393,10 @@ namespace Locus
                 }
             }
 
+            bool hasCommit = groups.Values.SelectMany(group => group).Any(write => !IsPropertyTreePreviewMode(write.mode));
+            bool continuesPreview = groups.Values.SelectMany(group => group).Any(write =>
+                PropertyPreviewStarts.ContainsKey(PropertyPreviewKey(write.obj, write.target.propertyPath)));
+            if (hasCommit && !continuesPreview) Undo.IncrementCurrentGroup();
             foreach (KeyValuePair<int, List<ResolvedPropertyTreeWrite>> entry in groups)
             {
                 UnityEngine.Object obj = groupObjects[entry.Key];
@@ -411,7 +418,8 @@ namespace Locus
                                     write.bindingId,
                                     write.target,
                                     obj,
-                                    write.valueJson);
+                                    write.valueJson,
+                                    false);
                                 continue;
                             }
 
@@ -427,11 +435,13 @@ namespace Locus
                             }
                             else
                             {
+                                var before = TakePropertyBeforeSnapshot(obj, prop);
                                 SetSerializedPropertyValue(prop, write.valueJson);
                                 applied.Add(new AppliedPropertyTreeWrite
                                 {
                                     write = write,
-                                    prop = prop
+                                    prop = prop,
+                                    before = before
                                 });
                             }
                         }
@@ -449,9 +459,10 @@ namespace Locus
                     for (int i = 0; i < applied.Count; i++)
                     {
                         AppliedPropertyTreeWrite item = applied[i];
+                        CompletePropertySnapshotRestore(serialized, item.write.target.propertyPath, item.write.valueJson);
                         SerializedProperty freshProp = serialized.FindProperty(item.write.target.propertyPath);
                         resultItems[item.write.index] =
-                            BuildBindingReadJson(item.write.bindingId, item.write.target, freshProp != null ? freshProp : item.prop, true, item.write.dynamicSchema);
+                            WithPropertyBeforeSnapshot(BuildBindingReadJson(item.write.bindingId, item.write.target, freshProp != null ? freshProp : item.prop, true, item.write.dynamicSchema), item.before);
                     }
                 }
                 catch (Exception ex)
@@ -483,6 +494,8 @@ namespace Locus
 
         private static string BuildPropertyTreeObjectKey(PropertyTreeTarget target)
         {
+            if (!string.IsNullOrWhiteSpace(target.globalObjectId))
+                return "identity|" + target.globalObjectId.Trim();
             return (target.kind ?? "").Trim().ToLowerInvariant() + "|" +
                    (target.guid ?? "").Trim().ToLowerInvariant() + "|" +
                    (target.path ?? "").Trim().Replace('\\', '/') + "|" +
@@ -571,7 +584,7 @@ namespace Locus
                 throw new Exception("SerializedProperty not found: " + target.propertyPath);
             int propertyDepthLimit = maxDepth > 0 ? Math.Min(maxDepth, 16) : 4;
             int propertyArrayLimit = maxArrayItems > 0 ? Math.Min(maxArrayItems, 1024) : 64;
-            SerializedPropertySnapshot propertySnapshot = SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit, dynamicSchema);
+            SerializedPropertySnapshot propertySnapshot = SnapshotSerializedProperty(prop, propertyDepthLimit, propertyArrayLimit, dynamicSchema, false);
             ApplyPropertyTreeTargetToSnapshotTree(propertySnapshot, ToSerializedPropertyBindingTarget(target));
             return BuildBindingReadJson(
                 bindingId,
@@ -2104,7 +2117,7 @@ namespace Locus
                     staticProperty.prefabOverride = IsPropertyTreePrefabOverride(
                         obj,
                         "m_StaticEditorFlags");
-                    return staticProperty;
+                    return WithSyntheticPropertyRestoreState(obj, staticProperty);
                 }
                 SerializedPropertySnapshot activeProperty =
                     BuildPropertyTreeSyntheticBooleanPropertySnapshot(
@@ -2116,7 +2129,7 @@ namespace Locus
                 activeProperty.prefabOverride = IsPropertyTreePrefabOverride(
                     obj,
                     PropertyTreeGameObjectActivePropertyPath);
-                return activeProperty;
+                return WithSyntheticPropertyRestoreState(obj, activeProperty);
             }
 
             Component component = obj as Component;
@@ -2133,7 +2146,7 @@ namespace Locus
                 enabledProperty.prefabOverride = IsPropertyTreePrefabOverride(
                     obj,
                     PropertyTreeComponentEnabledPropertyPath);
-                return enabledProperty;
+                return WithSyntheticPropertyRestoreState(obj, enabledProperty);
             }
 
             return null;
@@ -2231,6 +2244,7 @@ namespace Locus
 
             return new SerializedPropertyBindingTarget
             {
+                globalObjectId = source.globalObjectId,
                 kind = source.kind ?? "",
                 guid = source.guid ?? "",
                 path = source.path ?? "",
@@ -2699,6 +2713,17 @@ namespace Locus
                 propertyPath = source.propertyPath
             };
 
+            target.globalObjectId = PropertyTreeIdentity(obj);
+            if (string.Equals(target.kind, "selection", StringComparison.OrdinalIgnoreCase) && obj != null)
+            {
+                target.path = AssetDatabase.GetAssetPath(obj);
+                Component selectedComponent = obj as Component;
+                GameObject selectedGo = obj as GameObject;
+                target.kind = EditorUtility.IsPersistent(obj) ? "asset" : selectedComponent != null ? "component" : "gameobject";
+                if (selectedComponent != null) selectedGo = selectedComponent.gameObject;
+                if (selectedGo != null) { target.scenePath = selectedGo.scene.path; target.objectPath = PropertyTreeHierarchyObjectPath(selectedGo); }
+                if (selectedComponent != null) target.componentType = selectedComponent.GetType().FullName;
+            }
             Type objectType = obj != null ? obj.GetType() : null;
             if (objectType != null)
             {
@@ -2785,6 +2810,7 @@ namespace Locus
                 return null;
             return new SerializedPropertyBindingTarget
             {
+                globalObjectId = source.globalObjectId,
                 kind = source.kind ?? "",
                 guid = source.guid ?? "",
                 path = source.path ?? "",
@@ -2847,6 +2873,7 @@ namespace Locus
                 throw new Exception("Preview write does not support array paths: " + propertyPath);
 
             object boxedTarget = obj;
+            BeginPropertyPreview(obj, prop);
             string error;
             if (!TrySetDirectPreviewPathValue(
                 ref boxedTarget,
@@ -3034,10 +3061,13 @@ namespace Locus
                 return BuildBindingReadJson(bindingId, target, prop, false, dynamicSchema);
             }
 
+            if (!PropertyPreviewStarts.ContainsKey(PropertyPreviewKey(obj, target.propertyPath))) Undo.IncrementCurrentGroup();
+            var before = TakePropertyBeforeSnapshot(obj, prop);
             SetSerializedPropertyValue(prop, valueJson);
             ApplyPropertyTreeSerializedChanges(serialized, obj);
+            CompletePropertySnapshotRestore(serialized, target.propertyPath, valueJson);
             SerializedProperty updated = serialized.FindProperty(target.propertyPath);
-            return BuildBindingReadJson(bindingId, target, updated != null ? updated : prop, true, dynamicSchema);
+            return WithPropertyBeforeSnapshot(BuildBindingReadJson(bindingId, target, updated != null ? updated : prop, true, dynamicSchema), before);
         }
 
         private static string DiscoverPropertyTreeProperties(PropertyTreeDiscoverRequest request)
@@ -4623,6 +4653,8 @@ namespace Locus
 
         private static UnityEngine.Object ResolvePropertyTreeObject(PropertyTreeTarget target)
         {
+            if (!string.IsNullOrEmpty(target.globalObjectId))
+                return ResolvePropertyTreeIdentity(target.globalObjectId);
             string kind = (target.kind ?? "").Trim().ToLowerInvariant();
             switch (kind)
             {
@@ -4662,6 +4694,8 @@ namespace Locus
                     }
                 }
             }
+            if (obj == null && target.targetFileId != 0)
+                throw new Exception("Asset object file ID not found: " + target.targetFileId + " in " + path);
             if (obj == null)
             {
                 obj = !string.IsNullOrWhiteSpace(path)
@@ -5058,8 +5092,28 @@ namespace Locus
             string bindingId,
             PropertyTreeTarget target,
             UnityEngine.Object obj,
-            string valueJson)
+            string valueJson,
+            bool beginUndoGroup = true)
         {
+            if (beginUndoGroup) Undo.IncrementCurrentGroup();
+            target = PropertyTreeTargetWithLocalFileIds(target, obj);
+            var before = BuildPropertyTreeSyntheticHeaderPropertySnapshot(obj, ToSerializedPropertyBindingTarget(target));
+            SerializedPropertySnapshot restore;
+            if (TryParseRestoreSnapshotCommand(valueJson, out restore)) {
+                if (!string.IsNullOrEmpty(restore.restoreState)) {
+                    using (var serialized = new SerializedObject(obj)) {
+                        serialized.Update(); string nativePath = SyntheticSerializedPath(target.propertyPath);
+                        var prop = serialized.FindProperty(nativePath);
+                        if (prop == null) throw new InvalidOperationException("Serialized header field no longer exists: " + nativePath);
+                        RestoreSerializedPropertySnapshot(prop, restore);
+                        ApplyPropertyTreeSerializedChanges(serialized, obj);
+                        CompletePropertySnapshotRestore(serialized, nativePath, valueJson);
+                    }
+                    var after = BuildPropertyTreeSyntheticHeaderPropertySnapshot(obj, ToSerializedPropertyBindingTarget(target));
+                    return WithPropertyBeforeSnapshot(BuildBindingReadJson(bindingId, target, after, true), before);
+                }
+                valueJson = SerializedPropertySnapshotValueJson(restore);
+            }
             bool value = ParseBoolJson(string.IsNullOrWhiteSpace(valueJson) ? "false" : valueJson);
             int undoGroup = Undo.GetCurrentGroup();
             Undo.SetCurrentGroupName("Locus Property Tree");
@@ -5095,7 +5149,7 @@ namespace Locus
             SerializedPropertySnapshot snapshot = BuildPropertyTreeSyntheticHeaderPropertySnapshot(
                 obj,
                 ToSerializedPropertyBindingTarget(target));
-            return BuildBindingReadJson(bindingId, target, snapshot, true);
+            return WithPropertyBeforeSnapshot(BuildBindingReadJson(bindingId, target, snapshot, true), before);
         }
 
         private static bool HasPropertyTreeComponentEnabledState(Component component)
@@ -5433,7 +5487,7 @@ namespace Locus
                    "\"message\":\"ok\"," +
                    "\"target\":" + TargetToJson(target) + "," +
                    snapshotFields + "," +
-                   (properties != null ? "\"properties\":" + ToJsonValue(properties, 0, SnapshotJsonDepthLimit, true) + "," : "") +
+                   (properties != null ? "\"properties\":" + Locus.Json.LocusJson.SerializeData(properties) + "," : "") +
                    "\"saved\":" + (saved ? "true" : "false") +
                    "}";
         }
@@ -5494,6 +5548,7 @@ namespace Locus
                    "\"scenePath\":" + NullableJsonString(target.scenePath) + "," +
                    "\"objectPath\":" + NullableJsonString(target.objectPath) + "," +
                    "\"objectFileId\":" + NullableJsonLong(target.objectFileId) + "," +
+                   "\"globalObjectId\":" + NullableJsonString(target.globalObjectId) + "," +
                    "\"targetFileId\":" + NullableJsonLong(target.targetFileId) + "," +
                    "\"componentType\":" + NullableJsonString(target.componentType) + "," +
                    "\"componentIndex\":" + target.componentIndex.ToString(CultureInfo.InvariantCulture) + "," +
@@ -5506,7 +5561,7 @@ namespace Locus
 
         private static string NullableJsonLong(long value)
         {
-            return value == 0 ? "null" : value.ToString(CultureInfo.InvariantCulture);
+            return value == 0 ? "null" : "\"" + value.ToString(CultureInfo.InvariantCulture) + "\"";
         }
 
         private static string NullableJsonString(string value)

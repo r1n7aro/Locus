@@ -1,0 +1,261 @@
+"""Actual SDK checks for dirty Editor state and exact object targeting."""
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+import sys
+import traceback
+
+import locus
+
+
+PROJECT = Path(sys.argv[1])
+SCOPE = json.loads(sys.argv[2])
+MANIFEST = json.loads(sys.argv[3])
+AMOUNT = "/MonoBehaviour/amount"
+DIRTY_AMOUNT = 987654
+CLEAN_EDIT_AMOUNT = 654321
+
+
+def hashes(path):
+    return {relative: hashlib.sha256((PROJECT / relative).read_bytes()).hexdigest()
+            for relative in [path, path + ".meta"]}
+
+
+def owner(snapshot):
+    matches = [obj for obj in snapshot["objects"] if any(field["property_path"] == AMOUNT for field in obj["fields"])]
+    assert len(matches) == 1, "Safety fixture requires one exact amount owner"
+    assert isinstance(matches[0]["object_id"], str), "Object IDs must remain exact strings"
+    return matches[0]
+
+
+def amount(snapshot):
+    return next(field["value"] for field in owner(snapshot)["fields"] if field["property_path"] == AMOUNT)
+
+
+def semantic_fields(snapshot):
+    return {field["property_path"]: field["value"] for field in owner(snapshot)["fields"]}
+
+
+def operation(snapshot, value, object_id=None):
+    return [{"op": "set", "object_id": object_id or owner(snapshot)["object_id"],
+             "property_path": AMOUNT, "value": value}]
+
+
+async def unity(code, readonly):
+    result = await locus.call_tool("unity_execute", {"code": code, "readonly": readonly,
+        "request_editor_status": "editing", "enable_non_public_access": True},
+        workspace_ref=SCOPE, timeout=120)
+    result.raise_for_error()
+    return result.output
+
+
+def state_from_output(output):
+    decoder = json.JSONDecoder()
+
+    def find(value, depth=0):
+        if depth > 6:
+            return None
+        if isinstance(value, dict):
+            if {"path", "amount", "dirty"} <= value.keys():
+                return value
+            for child in value.values():
+                result = find(child, depth + 1)
+                if result is not None:
+                    return result
+        elif isinstance(value, list):
+            for child in value:
+                result = find(child, depth + 1)
+                if result is not None:
+                    return result
+        elif isinstance(value, str):
+            for index, char in enumerate(value):
+                if char not in "{[":
+                    continue
+                try:
+                    child, _ = decoder.raw_decode(value[index:])
+                except json.JSONDecodeError:
+                    continue
+                result = find(child, depth + 1)
+                if result is not None:
+                    return result
+        return None
+
+    for index, char in enumerate(output):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(output[index:])
+        except json.JSONDecodeError:
+            continue
+        state = find(value)
+        if state is not None:
+            return state
+    raise AssertionError("Unity safety fixture returned no structured state: " + output)
+
+
+async def inspect(path):
+    return state_from_output(await unity("printJson(Locus.LocusAssetApiSafetyFixture.Inspect(" + json.dumps(path) + "));", True))
+
+
+async def rejected(awaitable, name, expected_error):
+    try:
+        await awaitable
+    except locus.LocusRpcError as error:
+        assert expected_error in str(error).lower(), (name, str(error))
+        return {"name": name, "passed": True, "error": str(error)}
+    raise AssertionError(name + " unexpectedly succeeded")
+
+
+async def main():
+    paths = [pair["yaml"] for pair in MANIFEST["pairs"] if pair["kind"] == "asset"]
+    assert len(paths) >= 2 and paths[0] != paths[1], "Safety test requires two distinct owned assets"
+    first, second = paths[:2]
+    live_targets = [{"kind": "asset", "path": second}]
+    for kind in ["scene", "prefab"]:
+        candidates = [pair["live"] for pair in MANIFEST["pairs"] if pair["kind"] == kind]
+        assert candidates, "Safety acceptance requires a " + kind + " fixture"
+        live_targets.append({"kind": kind, "path": candidates[0]})
+    yaml = locus.assets.backend("yaml", workspace_ref=SCOPE)
+    live = yaml.backend("live")
+    original_first = await yaml.read(first)
+    original_second = await yaml.read(second)
+    first_amount, second_amount = amount(original_first), amount(original_second)
+    assert first_amount == 731 and second_amount == 731, "Run safety acceptance after the baseline parity suite"
+    first_hashes, second_hashes = hashes(first), hashes(second)
+    original_state = await inspect(first)
+    assert original_state["amount"] == first_amount and original_state["dirty"] is False
+    checks = []
+    failure = None
+    cleanup_errors = []
+    owned_live_edits = []
+
+    async def assert_first_remains_dirty(stage):
+        state = await inspect(first)
+        assert state["amount"] == DIRTY_AMOUNT and state["dirty"] is True, (stage, state)
+        assert amount(await live.read(first)) == DIRTY_AMOUNT, stage + ": unrelated live amount changed"
+        assert hashes(first) == first_hashes, stage + ": unrelated dirty asset or meta was saved"
+
+    async def restore_live_edit(edit):
+        current = await live.read(edit["path"])
+        if amount(current) == edit["sentinel"]:
+            restored = await live.apply(edit["path"], operation(current, edit["original_amount"]),
+                                        expected_revision=current["revision"])
+            assert restored["applied"] is True and restored["persisted"] is True
+        elif amount(current) != edit["original_amount"]:
+            raise AssertionError("Live fixture changed unexpectedly; refusing an unowned restoration: " + edit["path"])
+        verified = await live.read(edit["path"])
+        assert semantic_fields(verified) == edit["original_fields"], "Live fixture semantics were not restored: " + edit["path"]
+        assert amount(await yaml.read(edit["path"])) == edit["original_amount"], "Live restoration was not persisted: " + edit["path"]
+
+    try:
+        marked = state_from_output(await unity("printJson(Locus.LocusAssetApiSafetyFixture.MarkDirty(" + json.dumps(first) + ",987654));", False))
+        assert marked["amount"] == DIRTY_AMOUNT and marked["dirty"] is True
+        live_dirty = await live.read(first)
+        disk_clean = await yaml.read(first)
+        assert amount(live_dirty) == DIRTY_AMOUNT, "Live backend did not read unsaved Editor state"
+        assert amount(disk_clean) == first_amount and disk_clean["revision"] == original_first["revision"]
+        assert hashes(first) == first_hashes, "Marking an asset dirty wrote its disk state"
+        checks.append({"name": "live_reads_unsaved_state_while_yaml_reads_disk", "passed": True,
+                       "live_amount": DIRTY_AMOUNT, "yaml_amount": first_amount})
+
+        checks.append(await rejected(yaml.apply(first, operation(disk_clean, 123456),
+            expected_revision=disk_clean["revision"]), "yaml_rejects_dirty_target", "dirty"))
+        assert hashes(first) == first_hashes and amount(await live.read(first)) == DIRTY_AMOUNT
+        assert (await inspect(first))["dirty"] is True
+
+        clean_before = await yaml.read(second)
+        clean_applied = await yaml.apply(second, operation(clean_before, CLEAN_EDIT_AMOUNT),
+                                        expected_revision=clean_before["revision"])
+        assert clean_applied["applied"] is True and clean_applied["persisted"] is True
+        assert amount(await yaml.read(second)) == CLEAN_EDIT_AMOUNT
+        assert amount(await live.read(second)) == CLEAN_EDIT_AMOUNT, "Coordinated YAML edit was not imported"
+        dirty_state = await inspect(first)
+        assert dirty_state["amount"] == DIRTY_AMOUNT and dirty_state["dirty"] is True
+        assert hashes(first) == first_hashes, "Editing a clean sibling saved or rewrote the dirty asset"
+        checks.append({"name": "yaml_edits_clean_asset_without_saving_unrelated_dirty_asset", "passed": True})
+
+        clean_current = await yaml.read(second)
+        await yaml.apply(second, operation(clean_current, second_amount), expected_revision=clean_current["revision"])
+        assert amount(await yaml.read(second)) == second_amount and amount(await live.read(second)) == second_amount
+        assert hashes(second) == second_hashes, "Restoring the sibling did not preserve its original serialized bytes"
+
+        for index, target in enumerate(live_targets):
+            snapshot = await live.read(target["path"])
+            edit = {**target, "sentinel": 765431 + index, "original_amount": amount(snapshot),
+                    "original_fields": semantic_fields(snapshot)}
+            assert edit["sentinel"] != edit["original_amount"], "Live safety edit must change the fixture value"
+            # Register before dispatch so cleanup can recognize a completed
+            # write even if its transport response fails or times out.
+            owned_live_edits.append(edit)
+            applied = await live.apply(target["path"], operation(snapshot, edit["sentinel"]),
+                                       expected_revision=snapshot["revision"])
+            assert applied["applied"] is True and applied["persisted"] is True
+            assert amount(await live.read(target["path"])) == edit["sentinel"]
+            assert amount(await yaml.read(target["path"])) == edit["sentinel"], "Live target was not persisted: " + target["path"]
+            await assert_first_remains_dirty("live " + target["kind"] + " save")
+            await restore_live_edit(edit)
+            await assert_first_remains_dirty("live " + target["kind"] + " restore")
+            checks.append({"name": "live_" + target["kind"] + "_save_preserves_unrelated_dirty_asset",
+                           "passed": True, "path": target["path"], "applied": True, "persisted": True,
+                           "restored_semantics": True})
+
+        # Unity may canonicalize this target's YAML during a successful save;
+        # failed object targeting must preserve the bytes immediately preceding it.
+        second_before_rejections = hashes(second)
+        for backend, context in [("yaml", yaml), ("live", live)]:
+            snapshot = await context.read(second)
+            wrong_id = "9223372036854775807"
+            assert all(obj["object_id"] != wrong_id for obj in snapshot["objects"])
+            checks.append(await rejected(context.apply(second, operation(snapshot, 222222, wrong_id),
+                expected_revision=snapshot["revision"]), backend + "_exact_missing_id_never_falls_back", "object"))
+            assert hashes(second) == second_before_rejections and amount(await live.read(second)) == second_amount
+        assert (await inspect(first))["dirty"] is True and amount(await live.read(first)) == DIRTY_AMOUNT
+        assert hashes(first) == first_hashes
+    except Exception as error:
+        failure = error
+    finally:
+        # Only revert the sentinel that this test writes, never an unexpected
+        # later value. RestoreAll restores the fixture helper's own dirty backup.
+        for edit in reversed(owned_live_edits):
+            try:
+                await restore_live_edit(edit)
+            except Exception as error:
+                cleanup_errors.append("live " + edit["kind"] + " fixture: " + str(error))
+        try:
+            current = await yaml.read(second)
+            if amount(current) == CLEAN_EDIT_AMOUNT:
+                await yaml.apply(second, operation(current, second_amount), expected_revision=current["revision"])
+            elif amount(current) != second_amount:
+                raise AssertionError("Clean fixture changed unexpectedly; refusing an unowned restoration")
+        except Exception as error:
+            cleanup_errors.append("clean fixture: " + str(error))
+        try:
+            await unity("printJson(Locus.LocusAssetApiSafetyFixture.RestoreAll());", False)
+            restored = await inspect(first)
+            assert restored["amount"] == first_amount and restored["dirty"] == original_state["dirty"]
+            assert amount(await live.read(first)) == first_amount
+            assert hashes(first) == first_hashes, "Dirty fixture restoration changed disk bytes"
+            assert amount(await yaml.read(second)) == second_amount
+        except Exception as error:
+            cleanup_errors.append("dirty fixture: " + str(error))
+
+    if cleanup_errors:
+        raise AssertionError({"test_error": str(failure) if failure else None, "cleanup_errors": cleanup_errors})
+    if failure is not None:
+        raise failure
+    checks.append({"name": "dirty_fixture_restored_without_saving", "passed": True})
+    report = {"passed": True, "dirty_path": first, "clean_path": second,
+              "live_targets": live_targets, "checks": checks}
+    output = PROJECT / "Temp" / "LocusAssetApiAcceptance"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "safety.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("LOCUS_ASSET_API_SAFETY_ACCEPTANCE:" + json.dumps(report, ensure_ascii=False), flush=True)
+
+
+try:
+    asyncio.run(main())
+except Exception as error:
+    print("LOCUS_ASSET_API_SAFETY_ACCEPTANCE:" + json.dumps({"passed": False, "error": str(error)}, ensure_ascii=False), flush=True)
+    traceback.print_exc()
+    raise

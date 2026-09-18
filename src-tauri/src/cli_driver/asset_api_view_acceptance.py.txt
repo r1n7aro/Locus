@@ -1,0 +1,149 @@
+"""Actual execute_typescript tool -> mounted native View -> assets IPC acceptance."""
+import asyncio
+import json
+from pathlib import Path
+import sys
+import traceback
+import uuid
+
+import locus
+
+
+PROJECT = Path(sys.argv[1])
+SCOPE = json.loads(sys.argv[2])
+MANIFEST = json.loads(sys.argv[3])
+
+VIEW_SOURCE = r'''<script setup lang="ts">
+import { ref } from "vue";
+import { locus } from "@locus/frontend";
+import { BaseButton } from "@locus/components";
+
+const status = ref("Ready");
+const report = ref("");
+const running = ref(false);
+const targets = __TARGETS__;
+
+function require(condition: unknown, message: string) {
+  if (!condition) throw new Error(message);
+}
+
+async function run() {
+  if (running.value) return;
+  running.value = true;
+  status.value = "Running";
+  const results: any[] = [];
+  try {
+    for (const target of targets) {
+      const assets = locus.assets.backend(target.backend);
+      const before = await assets.read(target.path);
+      const owners = before.objects.filter((object: any) => object.fields.some((field: any) => field.property_path === "/MonoBehaviour/amount"));
+      require(owners.length === 1, "Exact fixture object was not found");
+      const object = owners[0];
+      require(typeof object.object_id === "string", "Object ID was rounded");
+      const fields = Object.fromEntries(object.fields.map((field: any) => [field.property_path, field.value]));
+      const values = {
+        "/MonoBehaviour/amount": 842,
+        "/MonoBehaviour/note": "Native View TypeScript 中文\nprecise asset edit",
+        "/MonoBehaviour/large": assets.integer("9223372036854775806"),
+        "/MonoBehaviour/numbers": [17, 29, 41],
+      };
+      const operations = Object.entries(values).map(([property_path, value]) => ({ op: "set" as const, object_id: object.object_id, property_path, value }));
+      const original = Object.keys(values).map((property_path) => ({ op: "set" as const, object_id: object.object_id, property_path, value: fields[property_path] }));
+      const diskBefore = await locus.fs.read(target.path);
+      const preview = await assets.preview(target.path, operations, { expected_revision: before.revision });
+      require(!preview.applied && !preview.persisted, "Preview reported a write");
+      require(await locus.fs.read(target.path) === diskBefore, "View preview changed asset bytes");
+      let modified = false;
+      try {
+        const applied = await assets.apply(target.path, operations, { expected_revision: before.revision });
+        modified = true;
+        require(applied.applied && applied.persisted, "View edit did not persist");
+        const read = await assets.read(target.path);
+        const actual = Object.fromEntries(read.objects.find((entry: any) => entry.object_id === object.object_id).fields.map((field: any) => [field.property_path, field.value]));
+        for (const [path, value] of Object.entries(values)) require(JSON.stringify(actual[path]) === JSON.stringify(value), "View read mismatch: " + path);
+        require(await locus.fs.read(target.path) !== diskBefore, "View edit did not reach disk");
+        let staleRejected = false;
+        try { await assets.apply(target.path, operations, { expected_revision: before.revision }); } catch { staleRejected = true; }
+        require(staleRejected, "View replay accepted a stale revision");
+        results.push({ backend: target.backend, path: target.path, object_id: object.object_id,
+          operations: operations.length, preview_preserved_disk: true, applied: true, persisted: true,
+          exact_integer: actual["/MonoBehaviour/large"], stale_rejected: true });
+      } finally {
+        if (modified) {
+          const current = await assets.read(target.path);
+          await assets.apply(target.path, original, { expected_revision: current.revision });
+          const restored = await assets.read(target.path);
+          const actual = Object.fromEntries(restored.objects.find((entry: any) => entry.object_id === object.object_id).fields.map((field: any) => [field.property_path, field.value]));
+          for (const entry of original) require(JSON.stringify(actual[entry.property_path]) === JSON.stringify(entry.value), "View could not restore fixture field " + entry.property_path);
+        }
+      }
+    }
+    report.value = JSON.stringify({ passed: true, checkout: locus.workspace.checkoutId, results });
+    console.info("ASSET_API_VIEW_REPORT", report.value);
+    status.value = "ASSET_API_VIEW_PASS ASSET_API_VIEW_FINISHED";
+  } catch (error) {
+    status.value = "ASSET_API_VIEW_FAIL ASSET_API_VIEW_FINISHED";
+    report.value = JSON.stringify({ passed: false, error: String(error), results });
+    console.error("Asset View acceptance", error);
+  } finally { running.value = false; }
+}
+</script>
+<template>
+  <main class="view-shell">
+    <header class="view-toolbar"><BaseButton :disabled="running" @click="run">Run asset test</BaseButton></header>
+    <section class="view-content"><p role="status" data-asset-api-status>{{ status }}</p><pre role="log" data-asset-api-result>{{ report }}</pre></section>
+  </main>
+</template>
+'''
+
+
+async def typescript(code, timeout=60):
+    result = await locus.call_tool("execute_typescript", {"code": code, "timeoutMs": 60000},
+                                   workspace_ref=SCOPE, timeout=timeout + 10)
+    result.raise_for_error()
+    payload = json.loads(result.output)
+    return payload.get("result", payload)
+
+
+async def main():
+    pair = next(entry for entry in MANIFEST["pairs"] if entry["kind"] == "asset")
+    targets = [{"backend": backend, "path": pair[backend]} for backend in ["yaml", "live"]]
+    view_id = "asset-api-test-" + uuid.uuid4().hex[:12]
+    source = VIEW_SOURCE.replace("__TARGETS__", json.dumps(targets, ensure_ascii=False))
+    created = await typescript("""
+const created = await locus.views.create({ id: %s, name: "Asset API acceptance", component: %s, temporary: true });
+const panel = await locus.views.open(created.manifest.id);
+await panel.wait({ condition: "textPresent", text: "Ready", timeoutMs: 30000 });
+return { viewId: created.manifest.id, packageRoot: created.summary.packageRoot };
+""" % (json.dumps(view_id), json.dumps(source)))
+    view_id = created["viewId"]
+
+    try:
+        executed = await typescript("""
+const panel = locus.views.get(%s);
+await panel.getByRole("button", "Run asset test").click();
+await panel.wait({ condition: "textPresent", text: "ASSET_API_VIEW_FINISHED", timeoutMs: 45000 });
+const status = await panel.snapshot({ maxElements: 20 });
+const logs = await panel.logs(10);
+return { status, logs, workspace: locus.workspace };
+""" % json.dumps(view_id))
+        assert "ASSET_API_VIEW_PASS" in json.dumps(executed["status"]), json.dumps(executed, ensure_ascii=False)
+        assert executed["workspace"]["checkoutId"] == SCOPE["checkoutId"]
+        result = {"passed": True, "view_id": view_id, "created": created, "targets": targets, "execution": executed}
+        output = PROJECT / "Temp" / "LocusAssetApiAcceptance"
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "view.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("LOCUS_ASSET_API_VIEW_ACCEPTANCE:" + json.dumps(result, ensure_ascii=False), flush=True)
+    finally:
+        await typescript("""
+for (const instance of locus.views.instances().filter((view) => view.viewId === %s)) await locus.workbench.close(instance.instanceId);
+return { closed: true };
+""" % json.dumps(view_id))
+
+
+try:
+    asyncio.run(main())
+except Exception as error:
+    print("LOCUS_ASSET_API_VIEW_ACCEPTANCE:" + json.dumps({"passed": False, "error": str(error)}, ensure_ascii=False), flush=True)
+    traceback.print_exc()
+    raise

@@ -199,7 +199,7 @@ function loadWorkspaceAssetTargetCached(
 </script>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { computed, onBeforeUnmount, provide, ref, shallowRef, watch } from "vue";
 import type {
   AssetBinaryMeta,
   AssetPreviewPayload,
@@ -252,9 +252,13 @@ import {
 } from "./unityObjectPreview";
 import UnityObjectEditorPanel from "./UnityObjectEditorPanel.vue";
 import UnityObjectIdentity from "./UnityObjectIdentity.vue";
+import { useOptionalViewContext } from "../view/viewExecutionScope";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+import { UNITY_PROPERTY_WORKSPACE, useUnityPropertyEditingContext, propertyEditingMatchesWorkspace } from "../unity/unityPropertyEditingContext";
 
 const workspaceContextStore = useWorkspaceContextStore();
+const viewContext = useOptionalViewContext();
+const propertyEditing = useUnityPropertyEditingContext();
 
 const props = withDefaults(defineProps<{
   model: UnityObjectPreviewInput | UnityObjectPreviewModel;
@@ -304,16 +308,21 @@ const props = withDefaults(defineProps<{
 });
 
 function requirePreviewWorkspaceRef(): WorkspaceRef {
-  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  const workspaceRef = props.workspaceRef ?? (viewContext?.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
   if (!workspaceRef) throw new Error("A workspace checkout is required for this preview.");
   return workspaceRef;
 }
 
 const locusInspectorPropertyRuntime = createUnityPropertyRuntime({
   read: (request) => readUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
-  write: (request) => writeUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
-  apply: (request) => applyUnitySerializedProperties(requirePreviewWorkspaceRef(), request),
+  write: (request, options) => propertyEditingMatchesWorkspace(propertyEditing, requirePreviewWorkspaceRef())
+    ? propertyEditing!.adapter.write(request, options) : writeUnitySerializedProperty(requirePreviewWorkspaceRef(), request),
+  apply: (request, options) => propertyEditingMatchesWorkspace(propertyEditing, requirePreviewWorkspaceRef())
+    ? propertyEditing!.adapter.apply(request, { ...options, onApplied: async () => {
+        if (!editorWriteInFlight && !disposed) await loadLivePropertyTree(true, { background: true });
+      } }) : applyUnitySerializedProperties(requirePreviewWorkspaceRef(), request),
 });
+provide(UNITY_PROPERTY_WORKSPACE, requirePreviewWorkspaceRef);
 
 const emit = defineEmits<{
   select: [model: UnityObjectPreviewModel];
@@ -345,7 +354,7 @@ const targetCache = ref<Map<string, SemanticTargetInspector>>(new Map());
 const autoTargetLoading = ref(false);
 const autoTargetError = ref("");
 const livePropertyTree = ref<UnityObjectPropertyTreeInput | null>(null);
-const liveBoundPropertyTree = ref<UnityBoundPropertyTree | null>(null);
+const liveBoundPropertyTree = shallowRef<UnityBoundPropertyTree | null>(null);
 const livePropertyLoading = ref(false);
 const livePropertyError = ref("");
 let autoPreviewRun = 0;
@@ -393,6 +402,7 @@ const UNITY_SCENE_OBJECT_PATH_RE = /^((?:Assets|Packages)\/.+?\.unity)\/(.+)$/i;
 
 function unitySerializedTargetKey(target: UnitySerializedPropertyTarget | null | undefined): string {
   if (!target) return "";
+  if (target.globalObjectId) return `identity|${target.globalObjectId}`;
   return [
     target.kind,
     target.path ?? "",
@@ -542,6 +552,12 @@ const editorPropertyTreeBinding = computed<InspectorPropertyTreeBinding>(() => {
     disabled: props.disabled || livePropertyLoading.value,
     readonly: props.readonly,
     editable: hasEditableUnityPropertySnapshot(propertyTree),
+    loadChildren: async (property) => {
+      const bound = liveBoundPropertyTree.value;
+      if (!bound) return;
+      await bound.loadChildren(property);
+      livePropertyTree.value = unityBoundPropertySnapshots(bound) as UnityObjectPropertyTreeInput;
+    },
   });
 });
 const previewSourceState = computed<UnityObjectPreviewSourceState>(() => {
@@ -1417,7 +1433,7 @@ watch(
 // the object shown here, refresh the live property tree in the background.
 let unlistenValueEditor: (() => void) | null = null;
 void listenUnityValueEditorCommitted((event) => {
-  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  const workspaceRef = props.workspaceRef ?? (viewContext?.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
   if (
     !workspaceRef
     || event.workspaceRef.checkoutId !== workspaceRef.checkoutId
@@ -1431,7 +1447,7 @@ void listenUnityValueEditorCommitted((event) => {
   if (eventObjectKey !== unitySerializedTargetKey(target)) return;
   void loadLivePropertyTree(true, { background: true });
 }).then((dispose) => {
-  unlistenValueEditor = dispose;
+  if (disposed) dispose(); else unlistenValueEditor = dispose;
 });
 
 onBeforeUnmount(() => {

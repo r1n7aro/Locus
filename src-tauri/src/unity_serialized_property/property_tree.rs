@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use regex::{Regex, RegexBuilder};
 use serde_yaml::{Mapping, Value as YamlValue};
+use crate::unity_asset_core::semantic::SemanticAsset;
 
 use crate::view::{
     UnityPropertyTreeSubassetEntry, UnitySerializedPropertySnapshot, UnitySerializedPropertyTarget,
@@ -371,6 +372,15 @@ struct DocumentDescriptor {
 struct YamlPropertyDocument {
     root: UnitySerializedPropertySnapshot,
     managed_references: HashMap<i64, UnitySerializedPropertySnapshot>,
+    property_index: HashMap<String, Vec<usize>>,
+}
+
+fn index_document(root:&UnitySerializedPropertySnapshot)->HashMap<String,Vec<usize>> {
+    fn visit(node:&UnitySerializedPropertySnapshot,path:&mut Vec<usize>,index:&mut HashMap<String,Vec<usize>>) {
+        index.insert(node.property_path.clone(),path.clone());
+        for (i,child) in node.children.iter().enumerate() {path.push(i);visit(child,path,index);path.pop();}
+    }
+    let mut index=HashMap::new();visit(root,&mut vec![],&mut index);index
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -387,6 +397,8 @@ enum PropertyInstanceId {
 /// local file id internally; callers only see stable semantic paths.
 #[derive(Debug, Clone)]
 pub struct YamlPropertyTree {
+    semantic: Arc<SemanticAsset>,
+    source_dependencies: std::collections::BTreeMap<PathBuf,String>,
     asset_path: String,
     root_owner_file_id: i64,
     root: UnitySerializedPropertySnapshot,
@@ -415,7 +427,7 @@ pub(crate) fn cached_yaml_property_tree(path: &Path) -> Option<Arc<YamlPropertyT
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.get(path).and_then(|entry| {
         (entry.modified == modified && entry.len == len)
-            .then(|| entry.tree.clone())
+            .then(|| entry.tree.clone().filter(|tree|tree.source_dependencies.iter().all(|(path,revision)|std::fs::read(path).is_ok_and(|bytes|blake3::hash(&bytes).to_hex().as_str()==revision))))
             .flatten()
     })
 }
@@ -1203,6 +1215,7 @@ async fn read_live_target(
     let result = super::read(
         working_dir,
         super::UnitySerializedPropertyReadRequest {
+            array_offset: None,
             binding_id: None,
             target,
             max_depth: Some(depth.min(AGENT_PROPERTY_TREE_COMPLETE_MAX_DEPTH) as i32),
@@ -1475,6 +1488,20 @@ impl YamlPropertyTree {
         project_root: Option<&Path>,
         guid_paths: &HashMap<String, String>,
     ) -> Result<Self, String> {
+        if let Some(root)=project_root {
+            if crate::unity_asset_core::parse(text.as_bytes()).map_err(|e|e.to_string())?.documents.iter().any(|d|d.class_id.as_deref()==Some("1001")) {
+                let (projected,dependencies,mut source_guids)=crate::unity_assets::prefab_property_projection(root,asset_path,text.as_bytes())?;
+                source_guids.extend(guid_paths.clone());
+                let mut tree=Self::parse(asset_path,&projected,project_root,&source_guids)?;
+                tree.source_dependencies=dependencies;
+                return Ok(tree);
+            }
+        }
+        let hints = if let Some(root) = project_root {
+            crate::unity_assets::schema::ProjectSchema::load(root)?.scalar_hints(text.as_bytes())?
+        } else { Default::default() };
+        let semantic = Arc::new(SemanticAsset::new(crate::unity_asset_core::inspect_with_hints(text.as_bytes(), &hints)
+            .map_err(|error| error.to_string())?)?);
         let docs = crate::unity_yaml::parse_yaml_docs_str(text);
         if docs.is_empty() {
             return Err(format!("No Unity YAML documents found in '{}'", asset_path));
@@ -1515,19 +1542,11 @@ impl YamlPropertyTree {
 
         let mut documents = HashMap::new();
         for doc in &docs {
-            let start = (doc.line_start + 1).min(lines.len());
-            let end = doc.line_end.min(lines.len());
-            let body = lines[start..end].join("\n");
-            let parsed: YamlValue = serde_yaml::from_str(&body).map_err(|error| {
-                format!(
-                    "Failed to parse Unity YAML document {} in '{}': {}",
-                    doc.doc_index, asset_path, error
-                )
-            })?;
+            let parsed = semantic.yaml_value(&doc.file_id.to_string())?;
             let descriptor = descriptors
                 .get(&doc.file_id)
                 .expect("descriptor is built for every YAML document");
-            let value = unwrap_document_value(&parsed, &doc.type_name);
+            let value = &parsed;
             let target = document_target(asset_path, descriptor, "");
             let mut root = UnitySerializedPropertySnapshot {
                 property_path: String::new(),
@@ -1559,6 +1578,7 @@ impl YamlPropertyTree {
             documents.insert(
                 doc.file_id,
                 YamlPropertyDocument {
+                    property_index: index_document(&root),
                     root,
                     managed_references,
                 },
@@ -1596,6 +1616,8 @@ impl YamlPropertyTree {
         };
 
         let mut tree = Self {
+            semantic,
+            source_dependencies: Default::default(),
             asset_path: asset_path.trim_end_matches('/').to_string(),
             root_owner_file_id,
             root,
@@ -1604,6 +1626,83 @@ impl YamlPropertyTree {
         };
         tree.canonical_paths = tree.compute_canonical_paths();
         Ok(tree)
+    }
+
+    /// Field-oriented adapter for View/SDK targets. Uses the same node builder,
+    /// reference traversal and projection as Agent read/search; no frontend AST.
+    pub fn from_snapshot(asset_path: &str, snapshot: crate::unity_asset_core::AssetSnapshot) -> Result<Self, String> {
+        let semantic = Arc::new(SemanticAsset::new(snapshot)?);
+        let mut descriptors = HashMap::new();
+        for object in &semantic.snapshot.objects {
+            let file_id = object.object_id.parse::<i64>().map_err(|e| e.to_string())?;
+            let name = semantic.resolve(&object.object_id, "m_Name", true)?.value
+                .and_then(serde_json::Value::as_str).filter(|name| !name.is_empty()).unwrap_or(&object.root_type).to_string();
+            descriptors.insert(file_id, DocumentDescriptor { file_id, display_name: name,
+                type_name: object.root_type.clone(), type_full_name: object.root_type.clone(), schema: None });
+        }
+        let mut documents = HashMap::new();
+        for object in &semantic.snapshot.objects {
+            let file_id = object.object_id.parse::<i64>().map_err(|e| e.to_string())?;
+            let descriptor = &descriptors[&file_id];
+            let target = document_target(asset_path, descriptor, "");
+            let mut root = UnitySerializedPropertySnapshot { node_kind:"object".into(), binding_target:Some(target.clone()),
+                name:descriptor.display_name.clone(), display_name:descriptor.display_name.clone(), property_type:"Object".into(),
+                value_type:"Object".into(), array_size:-1, ..Default::default() };
+            root.children = build_children(&semantic.yaml_value(&object.object_id)?, "", None, &target, &descriptors, &HashMap::new(), 0);
+            root.has_children = !root.children.is_empty(); root.visible_child_count = root.children.len() as i32;
+            let managed_references = extract_managed_reference_registry(&root);
+            let property_index=index_document(&root);
+            documents.insert(file_id, YamlPropertyDocument { root, managed_references, property_index });
+        }
+        let root_owner_file_id = semantic.snapshot.objects.first().ok_or("property.empty_asset")?.object_id.parse::<i64>().map_err(|e|e.to_string())?;
+        let root = documents[&root_owner_file_id].root.clone();
+        let mut tree = Self { semantic, source_dependencies:Default::default(), asset_path:asset_path.into(), root_owner_file_id, root, documents, canonical_paths:HashMap::new() };
+        tree.canonical_paths = tree.compute_canonical_paths();
+        Ok(tree)
+    }
+
+    pub fn semantic(&self) -> &SemanticAsset { &self.semantic }
+
+    pub fn read_target(&self, object_id: i64, property_path: &str, depth: usize, limit: usize, offset: usize) -> Result<UnitySerializedPropertySnapshot, String> {
+        let resolved = self.semantic.resolve(&object_id.to_string(), property_path, false)?;
+        let document = self.documents.get(&object_id).ok_or("property.unknown_object")?;
+        let fallback;
+        let indexed = document.property_index.get(&resolved.serialized_path).and_then(|indexes| {
+            indexes.iter().try_fold(&document.root,|node,index|node.children.get(*index))
+        });
+        let source = if let Some(source) = indexed { source } else {
+            // Compact atoms (Vector/Color/etc.) hide their physical members in
+            // display, but those members remain independently addressable.
+            let raw = serde_yaml::to_value(resolved.value.ok_or("property.unknown_field")?).map_err(|e|e.to_string())?;
+            fallback = build_snapshot(property_leaf_name(property_path), &raw, property_path, None,
+                document.root.binding_target.as_ref().ok_or("property.missing_target")?, &HashMap::new(), &HashMap::new(), 0, false);
+            &fallback
+        };
+        let paged;
+        let source = if source.is_array && offset > 0 {
+            paged = { let mut source = source.clone(); source.children = source.children.into_iter().skip(offset).collect(); source };
+            &paged
+        } else { source };
+        let mut canonical = HashMap::new();
+        canonical.insert(PropertyInstanceId::UnityObject(object_id), self.asset_path.clone());
+        let mut projected = self.project_node(source, object_id, &format!("{}/{}",self.asset_path,property_path), depth.min(16), limit.clamp(1,1024), &mut canonical);
+        fn bind(node: &mut UnitySerializedPropertySnapshot, owner: i64, path: &str) {
+            node.property_path = path.into();
+            if let Some(target) = &mut node.binding_target { target.property_path = Some(path.into()); }
+            // Floating curve/gradient editors own a live bridge connection.
+            // YAML exposes their shared values for programmatic API writes, but
+            // must not accidentally open a live writer from this bound tree.
+            node.editable = !path.is_empty() && (node.is_array || matches!(node.value_type.as_str(), "Integer"|"Long"|"UnsignedLong"|"Boolean"|"Float"|"String"|"Vector2"|"Vector3"|"Vector4"));
+            for child in &mut node.children {
+                let child_owner = child.binding_target.as_ref().and_then(|target|target.target_file_id).unwrap_or(owner);
+                let child_path = if child_owner != owner { child.property_path.clone() }
+                    else if node.is_array { format!("{path}.Array.data[{}]",child.name) }
+                    else { let name = property_leaf_name(&child.property_path); if path.is_empty() { name.into() } else { format!("{path}.{name}") } };
+                bind(child, child_owner, &child_path);
+            }
+        }
+        bind(&mut projected,object_id,property_path);
+        Ok(projected)
     }
 
     pub fn parse_prefab_instance(
@@ -3213,14 +3312,14 @@ fn build_snapshot(
             property_type: "ManagedReference".to_string(),
             value_type: "ManagedReference".to_string(),
             field_type_full_name: field_type,
-            value: serde_json::json!({ "rid": reference_id }),
-            display_value: if reference_id <= 0 {
+            value: serde_json::json!({ "rid": reference_id.to_string() }),
+            display_value: if reference_id < 0 {
                 "null".to_string()
             } else {
                 format!("rid:{}", reference_id)
             },
             editable: false,
-            has_children: reference_id > 0,
+            has_children: reference_id >= 0,
             array_size: -1,
             is_managed_reference: true,
             managed_reference_id: reference_id,
@@ -3361,12 +3460,14 @@ fn build_snapshot(
         YamlValue::Number(value) => {
             if let Some(integer) = value.as_i64() {
                 (
-                    "Integer".to_string(),
+                    if integer.unsigned_abs() > 9_007_199_254_740_991 { "Long" } else { "Integer" }.to_string(),
                     integer.to_string(),
-                    serde_json::Value::Number(integer.into()),
+                    if integer.unsigned_abs() > 9_007_199_254_740_991 { serde_json::Value::String(integer.to_string()) } else { serde_json::Value::Number(integer.into()) },
                     false,
                     Vec::new(),
                 )
+            } else if let Some(integer) = value.as_u64() {
+                ("UnsignedLong".to_string(), integer.to_string(), serde_json::Value::String(integer.to_string()), false, Vec::new())
             } else {
                 let float = value.as_f64().unwrap_or_default();
                 (
@@ -3431,6 +3532,10 @@ fn compact_yaml_unity_value(
     value: &YamlValue,
     field_type: &str,
 ) -> Option<(String, String, serde_json::Value)> {
+    if let Some((kind,value))=serde_json::to_value(value).ok().and_then(|value|crate::unity_asset_core::property_values::project(&value)) {
+        let count=value[if kind=="Gradient"{"colorKeys"}else{"keys"}].as_array().map(Vec::len).unwrap_or(0);
+        return Some((kind.into(),format!("{count} keys"),value));
+    }
     let mapping = match value {
         YamlValue::Mapping(mapping) => mapping,
         _ => return None,
@@ -3704,7 +3809,7 @@ fn parse_managed_reference_stub(value: &YamlValue) -> Option<i64> {
 }
 
 fn managed_reference_id(node: &UnitySerializedPropertySnapshot) -> Option<i64> {
-    (node.is_managed_reference && node.managed_reference_id > 0)
+    (node.is_managed_reference && node.managed_reference_id >= 0)
         .then_some(node.managed_reference_id)
 }
 
@@ -3732,9 +3837,9 @@ fn extract_managed_reference_registry(
             .children
             .iter()
             .find(|child| child.name == "rid")
-            .and_then(|child| child.value.as_i64())
+            .and_then(|child| child.value.as_i64().or_else(|| child.value.as_str().and_then(|value|value.parse().ok())))
             .unwrap_or_default();
-        if reference_id <= 0 {
+        if reference_id < 0 {
             continue;
         }
         let Some(data) = entry.children.iter().find(|child| child.name == "data") else {
@@ -3780,20 +3885,6 @@ fn extract_managed_reference_registry(
     registry
 }
 
-fn unwrap_document_value<'a>(value: &'a YamlValue, type_name: &str) -> &'a YamlValue {
-    let Some(mapping) = value.as_mapping() else {
-        return value;
-    };
-    if let Some(value) = mapping.get(YamlValue::String(type_name.to_string())) {
-        return value;
-    }
-    if mapping.len() == 1 {
-        if let Some((_, value)) = mapping.iter().next() {
-            return value;
-        }
-    }
-    value
-}
 
 fn untag_yaml(value: &YamlValue) -> &YamlValue {
     match value {
@@ -5053,7 +5144,7 @@ fn relative_serialized_property_segments(base: &str, full: &str) -> Option<Vec<S
 }
 
 fn property_leaf_name(path: &str) -> &str {
-    if let Some(index) = path.rfind(".Array.data[") {
+    if let Some(index) = path.rfind(".Array.data[").filter(|_|path.ends_with(']')) {
         return path[index + ".Array.data[".len()..]
             .strip_suffix(']')
             .unwrap_or(&path[index + ".Array.data[".len()..]);

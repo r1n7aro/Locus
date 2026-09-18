@@ -1416,7 +1416,13 @@ namespace Locus
                 sb.Append("\"");
                 sb.Append(JsonEscape(field.Name));
                 sb.Append("\":");
-                sb.Append(ToJsonValue(field.GetValue(value), depth, maxDepth, schemaSafeTruncation));
+                object fieldValue = field.GetValue(value);
+                // Persistent Unity IDs must survive the JavaScript JSON boundary.
+                // Keep the in-editor representation as long for Unity API calls.
+                if ((value is SerializedPropertyBindingTarget && (field.Name == "objectFileId" || field.Name == "targetFileId"))
+                    || (value is SerializedPropertySnapshot && field.Name == "managedReferenceId"))
+                    fieldValue = Convert.ToString(fieldValue, CultureInfo.InvariantCulture);
+                sb.Append(ToJsonValue(fieldValue, depth, maxDepth, schemaSafeTruncation));
             }
 
             foreach (PropertyInfo property in type.GetProperties(BindingFlags.Public | BindingFlags.Instance))

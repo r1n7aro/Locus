@@ -37,13 +37,14 @@ export interface UnitySerializedPropertyAttributeInfo {
 }
 
 export interface UnitySerializedPropertyTargetSnapshot {
+  globalObjectId?: string | null;
   kind: string;
   guid?: string | null;
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;
-  objectFileId?: number | null;
-  targetFileId?: number | null;
+  objectFileId?: string | number | null;
+  targetFileId?: string | number | null;
   componentType?: string | null;
   componentIndex?: number | null;
   targetTypeFullName?: string | null;
@@ -53,6 +54,7 @@ export interface UnitySerializedPropertyTargetSnapshot {
 }
 
 export interface UnitySerializedPropertySnapshot {
+  restoreState?: string | null;
   propertyPath: string;
   semanticPath?: string;
   nodeKind?: string;
@@ -80,7 +82,7 @@ export interface UnitySerializedPropertySnapshot {
   enumOptions?: UnitySelectOption[];
   children?: UnitySerializedPropertySnapshot[];
   isManagedReference?: boolean;
-  managedReferenceId?: number;
+  managedReferenceId?: string | number;
   managedReferenceFullTypename?: string;
   managedReferenceFieldTypename?: string;
   managedReferenceDisplayName?: string;
@@ -189,11 +191,11 @@ export function normalizeUnityPropertyType(type: string | null | undefined): str
 }
 
 export function isUnityIntegerPropertyType(type: string | null | undefined): boolean {
-  return ["Integer", "ArraySize", "LayerMask"].includes(normalizeUnityPropertyType(type));
+  return ["Integer", "ArraySize", "LayerMask", "Long", "UnsignedLong"].includes(normalizeUnityPropertyType(type));
 }
 
 export function isUnityNumberPropertyType(type: string | null | undefined): boolean {
-  return isUnityIntegerPropertyType(type) || normalizeUnityPropertyType(type) === "Float";
+  return isUnityIntegerPropertyType(type) || ["Float", "Double"].includes(normalizeUnityPropertyType(type));
 }
 
 export function isUnityVectorPropertyType(type: string | null | undefined): boolean {
@@ -278,11 +280,21 @@ export function parseUnitySerializedEditValue(
     throw new Error("Expected boolean value");
   }
 
+  if (normalized === "Long" || normalized === "UnsignedLong") {
+    if (typeof rawValue === "number" && !Number.isSafeInteger(rawValue)) throw new Error("Expected an exact integer string");
+    const text = String(rawValue ?? "").trim();
+    if (!/^[+-]?\d+$/.test(text)) throw new Error("Expected integer value");
+    const value = BigInt(text);
+    const min = normalized === "Long" ? -(1n << 63n) : 0n;
+    const max = normalized === "Long" ? (1n << 63n) - 1n : (1n << 64n) - 1n;
+    if (value < min || value > max) throw new Error("Integer is out of range");
+    return value.toString();
+  }
   if (isUnityIntegerPropertyType(normalized)) {
     return parseUnityInteger(rawValue);
   }
 
-  if (normalized === "Float") {
+  if (normalized === "Float" || normalized === "Double") {
     return parseUnityNumber(rawValue);
   }
 
@@ -325,6 +337,7 @@ export function constrainUnityNumberValue(
     next = Math.max(min, Math.min(max, next));
   }
   if (isUnityIntegerPropertyType(type)) next = Math.round(next);
+  if (normalizeUnityPropertyType(type) === "Double") return next;
   return normalizeUnityNumberPrecision(next);
 }
 

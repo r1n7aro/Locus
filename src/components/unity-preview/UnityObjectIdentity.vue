@@ -16,6 +16,7 @@ import {
 } from "../../composables/useInternalDrag";
 import { resolveRefGraphGuid, resolveRefGraphPath } from "../../services/refGraph";
 import type { WorkspaceRef } from "../../services/project";
+import { useOptionalViewContext } from "../view/viewExecutionScope";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import { startWorkbenchReferenceInternalDrag } from "../workbench/workbenchReferenceDrag";
 
@@ -45,6 +46,7 @@ const emit = defineEmits<{
   select: [model: UnityObjectPreviewModel];
 }>();
 const workspaceContextStore = useWorkspaceContextStore();
+const viewContext = useOptionalViewContext();
 const internalDrag = useInternalDragController();
 
 const objectModel = computed(() => normalizeUnityObjectPreviewModel(props.model));
@@ -99,7 +101,7 @@ watch(
     const token = ++resolveToken;
     resolvedGuid.value = guid;
     resolvedPath.value = path;
-    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    const workspaceRef = (viewContext?.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
 
     if (workspaceRef && !guid && /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i.test(path)) {
       void resolveRefGraphGuid(path, workspaceRef)
@@ -154,7 +156,7 @@ function handleSelect() {
 
 function handlePointerDown(event: PointerEvent) {
   if (!props.draggable || event.button !== 0 || event.isPrimary === false) return;
-  const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
+  const workspaceRef = props.workspaceRef ?? (viewContext?.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
   if (!workspaceRef) return;
   const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
   if (!checkout?.projectId || !checkout.root) return;

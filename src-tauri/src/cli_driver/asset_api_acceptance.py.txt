@@ -1,0 +1,264 @@
+"""Run through the real Python SDK; the driver owns Editor lifecycle and fixtures."""
+import asyncio
+import copy
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+import traceback
+from time import perf_counter
+
+import locus
+
+
+PROJECT = Path(sys.argv[1])
+SCOPE = json.loads(sys.argv[2])
+MANIFEST = json.loads(sys.argv[3])
+BACKEND = sys.argv[4]
+NUMERIC_ARRAY_FIELDS = {
+    "bytes", "signedBytes", "shorts", "unsignedShorts", "integers", "unsignedIntegers",
+    "longs", "unsignedLongs", "floats", "doubles", "booleans", "characters", "modes",
+}
+
+
+def disk_hashes(paths):
+    hashes = {}
+    for path in paths:
+        for relative in [path, path + ".meta"]:
+            absolute = PROJECT / relative
+            hashes[relative] = hashlib.sha256(absolute.read_bytes()).hexdigest() if absolute.is_file() else None
+    return hashes
+
+
+def owning_object(snapshot, kind="asset"):
+    matches = [obj for obj in snapshot["objects"] if (
+        obj["root_type"] == "Material" if kind == "material" else any(
+            field["property_path"] == "/MonoBehaviour/amount" for field in obj["fields"]))]
+    assert len(matches) == 1, "Fixture must have one exact object owning amount"
+    assert isinstance(matches[0]["object_id"], str), "Object identity must remain a decimal string"
+    return matches[0]
+
+
+def values_of(obj):
+    return {field["property_path"]: field["value"] for field in obj["fields"]}
+
+
+def make_operations(snapshot, shared_reference, kind="asset"):
+    obj = owning_object(snapshot, kind)
+    fields = values_of(obj)
+    if kind == "material":
+        expected = {"/Material/m_CustomRenderQueue": 2600, "/Material/m_DoubleSidedGI": 1}
+        assert expected.keys() <= fields.keys(), "Material fixture requires render queue and double-sided GI fields"
+        operations = [{"op": "set", "object_id": obj["object_id"], "property_path": path, "value": value}
+                      for path, value in expected.items()]
+        return obj["object_id"], operations, expected
+    operations = []
+    expected = {}
+
+    def set_field(name, value):
+        path = name if name.startswith("/") else "/MonoBehaviour/" + name
+        if path not in fields:
+            return
+        operations.append({"op": "set", "object_id": obj["object_id"], "property_path": path, "value": value})
+        expected[path] = value
+
+    set_field("amount", 731)
+    if kind == "numeric_arrays":
+        prefix = "/" + obj["root_type"] + "/"
+        arrays = []
+        for field in obj["fields"]:
+            path = field["property_path"]
+            if not path.startswith(prefix):
+                continue
+            name = path[len(prefix):]
+            if "/" in name or name == "amount" or name.startswith("m_"):
+                continue
+            values = field["value"]
+            assert field["kind"] == "array" and isinstance(values, list), (
+                "Primitive array field did not decode as an array", name, field["kind"], values)
+            assert values, ("Primitive array fixture must have a non-empty initial value", name)
+            original = copy.deepcopy(values)
+            fill = copy.deepcopy(original[0])
+            size = len(original)
+            ref = {"object_id": obj["object_id"], "property_path": path}
+            operations.extend([
+                {"op": "set", **ref, "value": copy.deepcopy(original)},
+                {"op": "array_insert", **ref, "index": 1, "value": copy.deepcopy(fill)},
+                {"op": "array_remove", **ref, "index": 0},
+                {"op": "array_move", **ref, "index": 0, "to_index": size - 1},
+                {"op": "array_resize", **ref, "size": size + 1, "value": copy.deepcopy(fill)},
+            ])
+            original.insert(1, copy.deepcopy(fill))
+            del original[0]
+            moved = original.pop(0)
+            original.insert(size - 1, moved)
+            original.append(copy.deepcopy(fill))
+            expected[path] = original
+            arrays.append(name)
+        assert len(arrays) == 13 and set(arrays) == NUMERIC_ARRAY_FIELDS, (
+            "Primitive array fixture must expose all 13 declared arrays",
+            "missing", sorted(NUMERIC_ARRAY_FIELDS - set(arrays)),
+            "unexpected", sorted(set(arrays) - NUMERIC_ARRAY_FIELDS))
+        return obj["object_id"], operations, expected
+    set_field("note", 'same API: 中文 "quotes" \\slash\nsecond line: # YAML : [] {}')
+    set_field("enabled", 0)
+    set_field("speed", 12.5)
+    set_field("mode", 7)
+    set_field("large", locus.asset_integer("-9007199254740993"))
+    set_field("vector", {"x": 1.25, "y": -2.5, "z": 3.75})
+    set_field("tint", {"r": 0.125, "g": 0.25, "b": 0.5, "a": 1.0})
+    if "/MonoBehaviour/reference" in fields:
+        set_field("reference", {"fileID": "0"})
+        set_field("reference", shared_reference)
+
+    numbers = "/MonoBehaviour/numbers"
+    assert numbers in fields, "Every acceptance fixture requires an int array"
+    set_field("numbers", [1, 2, 3])
+    ref = {"object_id": obj["object_id"], "property_path": numbers}
+    operations.extend([
+        {"op": "array_insert", **ref, "index": 1, "value": 9},
+        {"op": "array_remove", **ref, "index": 2},
+        {"op": "array_move", **ref, "index": 0, "to_index": 2},
+        {"op": "array_resize", **ref, "size": 5, "value": 4},
+        {"op": "array_resize", **ref, "size": 4},
+    ])
+    expected[numbers] = [9, 3, 1, 4]
+
+    rows_path = "/MonoBehaviour/rows"
+    rows = fields.get(rows_path)
+    if isinstance(rows, list) and rows:
+        row = copy.deepcopy(rows[0])
+        assert isinstance(row, dict) and "amount" in row and "name" in row, "Unexpected fixture row schema"
+        row["name"] = "edited row"
+        row["amount"] = 47
+        set_field("rows", [row, {**row, "name": "inserted row", "amount": 48}])
+
+    root_pointer = fields.get("/MonoBehaviour/root")
+    if isinstance(root_pointer, dict) and root_pointer.get("rid") not in {None, "0", "-2"}:
+        assert isinstance(root_pointer["rid"], str), "Managed-reference IDs must remain strings"
+        health_path = "/MonoBehaviour/references/RefIds/@rid=" + root_pointer["rid"] + "/data/health"
+        assert health_path in fields, "Shared managed-reference root must expose its stable registry field"
+        set_field(health_path, 991)
+        expected["/MonoBehaviour/root"] = root_pointer
+        if "/MonoBehaviour/alias" in fields:
+            expected["/MonoBehaviour/alias"] = fields["/MonoBehaviour/alias"]
+
+    return obj["object_id"], operations, expected
+
+
+async def expect_rejected(awaitable, label):
+    try:
+        await awaitable
+    except locus.LocusRpcError as error:
+        return {"name": label, "rejected": True, "error": str(error)}
+    raise AssertionError(label + " unexpectedly succeeded")
+
+
+async def main():
+    total_started = perf_counter()
+    read_all_seconds = 0.0
+    assets = locus.assets.backend(BACKEND, workspace_ref=SCOPE)
+    capability = await assets.capabilities()
+    assert capability["backend"] == BACKEND
+    assert capability["starts_editor"] is False
+    assert set(["set", "array_insert", "array_remove", "array_move", "array_resize"]) <= set(capability["supported_operations"])
+    pairs = MANIFEST["pairs"]
+    assert len(pairs) >= 2, "Batch rollback acceptance needs at least two assets"
+    paths = [pair[BACKEND] for pair in pairs]
+    shared_path = MANIFEST["shared"]
+    read_started = perf_counter()
+    shared_snapshot = await assets.read(shared_path)
+    read_all_seconds += perf_counter() - read_started
+    shared = owning_object(shared_snapshot)
+    meta = (PROJECT / (shared_path + ".meta")).read_text(encoding="utf-8-sig")
+    guid = re.search(r"(?m)^guid:\s*([0-9a-fA-F]{32})\s*$", meta)
+    assert guid, "Shared fixture requires a stable GUID"
+    shared_reference = {"fileID": shared["object_id"], "guid": guid.group(1).lower(), "type": 2}
+
+    entries, expected_values, objects = [], {}, {}
+    for pair, path in zip(pairs, paths):
+        read_started = perf_counter()
+        snapshot = await assets.read(path)
+        read_all_seconds += perf_counter() - read_started
+        object_id, operations, expected = make_operations(snapshot, shared_reference, pair["kind"])
+        entries.append({"path": path, "expected_revision": snapshot["revision"], "operations": operations})
+        expected_values[path], objects[path] = expected, object_id
+
+    before = disk_hashes(paths + [shared_path])
+    preview_started = perf_counter()
+    preview = await assets.preview_batch(entries)
+    preview_batch_ms = (perf_counter() - preview_started) * 1000
+    assert preview["applied"] is False and preview["persisted"] is False
+    assert disk_hashes(paths + [shared_path]) == before, "Preview changed asset or meta bytes"
+    assert len(preview["results"]) == len(entries)
+    checks = [{"name": "preview_preserves_disk", "passed": True}]
+
+    invalid = copy.deepcopy(entries)
+    invalid[1]["operations"].append({"op": "set", "object_id": objects[paths[1]],
+        "property_path": "/MonoBehaviour/__missing_asset_api_field__", "value": 12})
+    checks.append(await expect_rejected(assets.apply_batch(invalid), "invalid_second_asset_rolls_back_batch"))
+    assert disk_hashes(paths + [shared_path]) == before, "Invalid batch changed asset or meta bytes"
+    for entry in entries:
+        assert (await assets.read(entry["path"]))["revision"] == entry["expected_revision"], "Invalid batch changed Editor state"
+
+    stale = copy.deepcopy(entries)
+    stale[1]["expected_revision"] = "stale-fixture-revision"
+    checks.append(await expect_rejected(assets.apply_batch(stale), "stale_second_asset_rejects_entire_batch"))
+    assert disk_hashes(paths + [shared_path]) == before, "Stale batch changed asset or meta bytes"
+
+    wrong_type = copy.deepcopy(entries)
+    typed_index = next(index for index, pair in enumerate(pairs) if pair["kind"] == "asset")
+    wrong_type[typed_index]["operations"].append({"op": "set", "object_id": objects[paths[typed_index]],
+        "property_path": "/MonoBehaviour/amount", "value": 1.5})
+    checks.append(await expect_rejected(assets.apply_batch(wrong_type), "float_to_integer_field_rejects_entire_batch"))
+    assert disk_hashes(paths + [shared_path]) == before, "Type-invalid batch changed asset or meta bytes"
+
+    apply_started = perf_counter()
+    result = await assets.apply_batch(entries)
+    apply_batch_ms = (perf_counter() - apply_started) * 1000
+    assert result["applied"] is True and result["persisted"] is True
+    assert len(result["results"]) == len(entries)
+    assert all(item["applied"] is True and item["persisted"] is True for item in result["results"])
+    observed = []
+    for pair, entry in zip(pairs, entries):
+        path = entry["path"]
+        snapshot = await assets.read(path)
+        obj = owning_object(snapshot, pair["kind"])
+        assert obj["object_id"] == objects[path], "Object identity changed during editing"
+        current = values_of(obj)
+        for field_path, expected in expected_values[path].items():
+            assert current.get(field_path) == expected, (path, field_path, current.get(field_path), expected)
+        assert snapshot["revision"] != entry["expected_revision"], "Committed edits did not advance revision"
+        observed.append({"path": path, "kind": pair["kind"], "object_id": obj["object_id"],
+            "revision": snapshot["revision"], "values": {key: current[key] for key in expected_values[path]}})
+    after = disk_hashes(paths + [shared_path])
+    assert all(after[path] != before[path] for path in paths), "An applied asset was not persisted"
+    for path in paths + [shared_path]:
+        assert after[path + ".meta"] == before[path + ".meta"], ("Successful apply changed a meta file", path + ".meta")
+    checks.append({"name": "successful_apply_preserves_all_meta_files", "passed": True, "files": len(paths) + 1})
+    assert after[shared_path] == before[shared_path], "Referenced asset was changed unexpectedly"
+    checks.append(await expect_rejected(assets.apply_batch(entries), "replayed_array_batch_rejects_old_revisions"))
+    assert disk_hashes(paths + [shared_path]) == after, "Retry with stale revisions reapplied array changes"
+
+    report = {"backend": BACKEND, "passed": True, "entries": observed,
+              "asset_count": len(entries), "initial_read_count": len(entries) + 1,
+              "operations": sum(len(entry["operations"]) for entry in entries),
+              "arrays_checked": sum(13 for pair in pairs if pair["kind"] == "numeric_arrays"),
+              "read_all_ms": round(read_all_seconds * 1000, 3),
+              "preview_batch_ms": round(preview_batch_ms, 3),
+              "apply_batch_ms": round(apply_batch_ms, 3),
+              "total_ms": round((perf_counter() - total_started) * 1000, 3), "checks": checks}
+    output = PROJECT / "Temp" / "LocusAssetApiAcceptance"
+    output.mkdir(parents=True, exist_ok=True)
+    (output / (BACKEND + ".json")).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("LOCUS_ASSET_API_ACCEPTANCE:" + json.dumps(report, ensure_ascii=False), flush=True)
+
+
+try:
+    asyncio.run(main())
+except Exception as error:
+    print("LOCUS_ASSET_API_ACCEPTANCE:" + json.dumps({"backend": BACKEND, "passed": False,
+        "error": str(error)}, ensure_ascii=False), flush=True)
+    traceback.print_exc()
+    raise

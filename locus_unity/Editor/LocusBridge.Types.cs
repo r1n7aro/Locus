@@ -123,7 +123,8 @@ namespace Locus
             public void print(object obj)
             {
                 TouchActivity();
-                _output.AppendLine(obj != null ? obj.ToString() : "null");
+                string text = obj != null ? obj.ToString() : "null";
+                lock (_output) _output.AppendLine(text);
             }
 
             /// <summary>
@@ -138,7 +139,7 @@ namespace Locus
                 TouchActivity();
                 if (obj == null)
                 {
-                    _output.AppendLine("null");
+                    lock (_output) _output.AppendLine("null");
                     return;
                 }
 
@@ -150,14 +151,15 @@ namespace Locus
                     else
                         json = Locus.Json.LocusJson.Serialize(obj);
 
-                    _output.AppendLine(json);
+                    lock (_output) _output.AppendLine(json);
                 }
                 catch (Exception ex)
                 {
                     Type errorType = ex.GetType();
-                    _output.Append("[printJson error: ")
-                           .Append(errorType.FullName ?? errorType.Name)
-                           .AppendLine("]");
+                    lock (_output)
+                        _output.Append("[printJson error: ")
+                               .Append(errorType.FullName ?? errorType.Name)
+                               .AppendLine("]");
                 }
             }
 
@@ -166,12 +168,12 @@ namespace Locus
             /// </summary>
             public void clear()
             {
-                _output.Length = 0;
+                lock (_output) _output.Length = 0;
             }
 
             public string GetOutput()
             {
-                return _output.ToString();
+                lock (_output) return _output.ToString();
             }
         }
     }

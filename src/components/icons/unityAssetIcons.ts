@@ -1,5 +1,4 @@
 import {
-  BookText,
   Box,
   Clapperboard,
   File as LucideFile,
@@ -17,6 +16,7 @@ import {
   Map as MapIcon,
   Package as PackageIcon,
   Palette,
+  Sheet,
   Sparkles,
   type IconNode,
 } from "lucide";
@@ -30,6 +30,7 @@ export type UnityAssetIconKind =
   | "script"
   | "json"
   | "markdown"
+  | "spreadsheet"
   | "shader"
   | "texture"
   | "model"
@@ -70,7 +71,8 @@ export const UNITY_ASSET_ICON_NODES: Record<UnityAssetIconKind, IconNode> = {
   python: FileTerminal,
   script: FileCode,
   json: FileBraces,
-  markdown: BookText,
+  markdown: FileText,
+  spreadsheet: Sheet,
   shader: Sparkles,
   texture: FileImage,
   model: PackageIcon,
@@ -92,6 +94,7 @@ const UNITY_PYTHON_EXTENSIONS = [".py", ".pyw"];
 const UNITY_SCRIPT_EXTENSIONS = [".asmdef", ".asmref", ".js", ".jsx", ".ts", ".tsx"];
 const UNITY_JSON_EXTENSIONS = [".json", ".jsonc"];
 const UNITY_MARKDOWN_EXTENSIONS = [".md", ".markdown", ".mdx"];
+const UNITY_SPREADSHEET_EXTENSIONS = [".csv"];
 const UNITY_SHADER_EXTENSIONS = [".shader", ".shadergraph", ".compute", ".hlsl", ".cginc"];
 const UNITY_TEXTURE_EXTENSIONS = [
   ".png",
@@ -114,7 +117,7 @@ const UNITY_ANIMATION_EXTENSIONS = [".anim", ".controller", ".overridecontroller
 const UNITY_AUDIO_EXTENSIONS = [".wav", ".mp3", ".ogg", ".aif", ".aiff", ".flac", ".xm", ".mod", ".it", ".s3m"];
 const UNITY_FONT_EXTENSIONS = [".ttf", ".otf", ".fontsettings"];
 const UNITY_VIDEO_EXTENSIONS = [".mp4", ".mov", ".webm", ".avi", ".mpeg", ".mpg"];
-const UNITY_TEXT_EXTENSIONS = [".txt", ".xml", ".yaml", ".yml", ".csv", ".bytes", ".uxml", ".uss"];
+const UNITY_TEXT_EXTENSIONS = [".txt", ".xml", ".yaml", ".yml", ".bytes", ".uxml", ".uss"];
 
 export const UNITY_ASSET_ICON_FILE_EXTENSIONS = [
   ".unity",
@@ -127,6 +130,7 @@ export const UNITY_ASSET_ICON_FILE_EXTENSIONS = [
   ...UNITY_SCRIPT_EXTENSIONS,
   ...UNITY_JSON_EXTENSIONS,
   ...UNITY_MARKDOWN_EXTENSIONS,
+  ...UNITY_SPREADSHEET_EXTENSIONS,
   ...UNITY_SHADER_EXTENSIONS,
   ...UNITY_TEXTURE_EXTENSIONS,
   ...UNITY_MODEL_EXTENSIONS,
@@ -162,6 +166,7 @@ export function unityAssetIconKindForPath(filePath: string, options: IconKindOpt
   if (hasExtension(fileName, UNITY_SCRIPT_EXTENSIONS)) return "script";
   if (hasExtension(fileName, UNITY_JSON_EXTENSIONS)) return "json";
   if (hasExtension(fileName, UNITY_MARKDOWN_EXTENSIONS)) return "markdown";
+  if (hasExtension(fileName, UNITY_SPREADSHEET_EXTENSIONS)) return "spreadsheet";
   if (hasExtension(fileName, UNITY_SHADER_EXTENSIONS)) return "shader";
   if (hasExtension(fileName, UNITY_TEXTURE_EXTENSIONS)) return "texture";
   if (hasExtension(fileName, UNITY_MODEL_EXTENSIONS)) return "model";

@@ -59,6 +59,7 @@ export function subscribeAssetDbScan(
       ) return;
       handler(event.payload);
     },
+    { owner: "asset.subscribeAssetDbScan" },
   );
 }
 

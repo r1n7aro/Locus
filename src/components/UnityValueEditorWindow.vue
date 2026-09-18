@@ -171,6 +171,8 @@ async function applyChanges() {
     dirty.value = false;
     previewSent = false;
     void emitTauriEvent(UNITY_VALUE_EDITOR_COMMITTED_EVENT, {
+      historyOwner: payload.value?.historyOwner,
+      result,
       kind,
       workspaceRef,
       target,

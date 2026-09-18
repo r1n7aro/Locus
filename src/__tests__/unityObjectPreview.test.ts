@@ -418,8 +418,8 @@ describe("unityObjectPreview", () => {
     expect(propertyTree).toContain("tooltip");
     expect(serializedValue).toContain("UnitySerializedPropertyAttributeInfo");
     expect(serializedValue).toContain("bindingTarget?: UnitySerializedPropertyTargetSnapshot");
-    expect(serializedValue).toContain("objectFileId?: number | null");
-    expect(serializedValue).toContain("targetFileId?: number | null");
+    expect(serializedValue).toContain("objectFileId?: string | number | null");
+    expect(serializedValue).toContain("targetFileId?: string | number | null");
     expect(serializedProperties).toContain("SnapshotSerializedObject");
     expect(serializedProperties).toContain("SerializedPropertyBindingTarget");
     expect(serializedProperties).toContain("SerializedPropertyAttributeInfo");

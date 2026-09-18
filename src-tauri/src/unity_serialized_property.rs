@@ -7,10 +7,14 @@ use crate::view::{
 };
 
 pub mod property_tree;
+#[cfg(test)]
+mod wire_tests;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnitySerializedPropertyReadRequest {
+    #[serde(default)]
+    pub array_offset: Option<i32>,
     #[serde(default)]
     pub binding_id: Option<String>,
     pub target: UnitySerializedPropertyTarget,
@@ -89,6 +93,7 @@ pub async fn read(
         "target": request.target,
         "maxDepth": request.max_depth.unwrap_or_default(),
         "maxArrayItems": request.max_array_items.unwrap_or_default(),
+        "arrayOffset": request.array_offset.unwrap_or_default(),
         "autoExpandCharLimit": request.auto_expand_char_limit.unwrap_or_default(),
         "schemaMode": schema_mode,
     });

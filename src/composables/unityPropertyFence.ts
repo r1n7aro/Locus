@@ -263,6 +263,10 @@ function normalizeJsonTarget(record: Record<string, unknown>): UnitySerializedPr
   if (!kind || !propertyPath) return null;
 
   const componentIndex = numberField(record.componentIndex);
+  for (const key of ["objectFileId", "gameObjectFileId", "fileId", "targetFileId"]) {
+    const value = record[key];
+    if (value !== undefined && value !== null && value !== 0 && value !== "0" && nonZeroIntegerField(value) === null) return null;
+  }
   const objectFileId = nonZeroIntegerField(record.objectFileId)
     ?? nonZeroIntegerField(record.gameObjectFileId)
     ?? nonZeroIntegerField(record.fileId);
@@ -611,11 +615,12 @@ function numberField(value: unknown): number | null {
   return null;
 }
 
-function nonZeroIntegerField(value: unknown): number | null {
-  if (typeof value === "number" && Number.isInteger(value) && value !== 0) return value;
-  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) {
-    const parsed = Number(value.trim());
-    return parsed === 0 ? null : parsed;
+function nonZeroIntegerField(value: unknown): number | string | null {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value !== 0) return value;
+  if (typeof value === "string" && /^-?(?:0|[1-9]\d*)$/.test(value)) {
+    const parsed = BigInt(value);
+    if (parsed === 0n || parsed < -(1n << 63n) || parsed >= 1n << 63n) return null;
+    return Number.isSafeInteger(Number(value)) ? Number(value) : value;
   }
   return null;
 }

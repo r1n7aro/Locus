@@ -37,13 +37,14 @@ export interface InspectorPropertyAttributeInfo {
 }
 
 export interface InspectorPropertyTargetSnapshot {
+  globalObjectId?: string | null;
   kind: string;
   guid?: string | null;
   path?: string | null;
   scenePath?: string | null;
   objectPath?: string | null;
-  objectFileId?: number | null;
-  targetFileId?: number | null;
+  objectFileId?: string | number | null;
+  targetFileId?: string | number | null;
   componentType?: string | null;
   componentIndex?: number | null;
   targetTypeFullName?: string | null;
@@ -83,6 +84,7 @@ export interface InspectorPropertySubassetEntry {
 }
 
 export interface InspectorPropertySnapshot {
+  restoreState?: string | null;
   propertyPath: string;
   semanticPath?: string;
   nodeKind?: string;
@@ -110,7 +112,7 @@ export interface InspectorPropertySnapshot {
   enumOptions?: InspectorSelectOptionInput[];
   children?: InspectorPropertySnapshot[];
   isManagedReference?: boolean;
-  managedReferenceId?: number;
+  managedReferenceId?: string | number;
   managedReferenceFullTypename?: string;
   managedReferenceFieldTypename?: string;
   managedReferenceDisplayName?: string;
@@ -177,6 +179,7 @@ export interface InspectorPropertyTreeBindingInput {
   readonly?: boolean;
   editable?: boolean;
   commit?: InspectorPropertyTreeCommitHandler | null;
+  loadChildren?: (property: InspectorProperty) => Promise<void>;
 }
 
 export interface InspectorPropertyTreeBinding {
@@ -189,6 +192,7 @@ export interface InspectorPropertyTreeBinding {
   readonly: boolean;
   editable: boolean;
   commit: InspectorPropertyTreeCommitHandler;
+  loadChildren?: (property: InspectorProperty) => Promise<void>;
 }
 
 export type InspectorPropertyDrawerMatcher = (
@@ -399,7 +403,7 @@ const VECTOR_TYPES = new Set([
   "Vector3Int",
   "RectInt",
 ]);
-const NUMBER_TYPES = new Set(["Integer", "ArraySize", "Float"]);
+const NUMBER_TYPES = new Set(["Integer", "ArraySize", "Float", "Double", "Long", "UnsignedLong"]);
 const BOUNDS_TYPES = new Set(["Bounds", "BoundsInt"]);
 const DEFAULT_AUTO_COLLAPSE_CHILD_COUNT = 24;
 const EMPTY_PROPERTY_DRAWER_REGISTRY: NormalizedPropertyDrawerRegistry = {
@@ -751,6 +755,7 @@ export function createInspectorPropertyTreeBinding(
     readonly: input.readonly === true,
     editable: input.editable !== false,
     commit: input.commit ?? noopInspectorPropertyTreeCommit,
+    loadChildren: input.loadChildren,
   };
 }
 

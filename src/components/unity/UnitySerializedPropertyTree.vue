@@ -28,6 +28,7 @@ import {
 } from "./unitySerializedValue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
+import BaseButton from "../ui/BaseButton.vue";
 import { t } from "../../i18n";
 
 type ArrayDragEdge = "before" | "after";
@@ -143,6 +144,16 @@ const managedTypeQuery = ref("");
 const selectedManagedType = computed(() => inspectorProperty.value?.managedReferenceFullTypename || "");
 const selectedManagedTypeOption = computed(() => inspectorProperty.value?.selectedManagedReferenceType ?? null);
 const arrayCollapsed = ref(false);
+const loadingChildren = ref(false);
+const childrenError = ref("");
+async function loadChildren() {
+  const property = inspectorProperty.value;
+  if (!property || !propertyTreeBinding.value.loadChildren || loadingChildren.value) return;
+  loadingChildren.value = true; childrenError.value = "";
+  try { await propertyTreeBinding.value.loadChildren(property); }
+  catch (error) { childrenError.value = error instanceof Error ? error.message : String(error); }
+  finally { loadingChildren.value = false; }
+}
 const arrayDrag = ref<ArrayDragState | null>(null);
 const arrayPointerDrag = shallowRef<ArrayPointerDragState | null>(null);
 const arrayOptimisticMove = ref<ArrayDragState | null>(null);
@@ -261,12 +272,14 @@ function childSource(property: InspectorProperty): InspectorPropertyTreeBindingI
     readonly: binding.readonly,
     editable: binding.editable,
     commit: binding.commit,
+    loadChildren: binding.loadChildren,
   };
 }
 
 function leafBindingTarget(property: InspectorProperty) {
   const root = property.root.snapshot as UnitySerializedPropertySnapshot;
-  const target = root.bindingTarget ?? root.target ?? null;
+  const own = property.snapshot as UnitySerializedPropertySnapshot;
+  const target = own.bindingTarget ?? own.target ?? root.bindingTarget ?? root.target ?? null;
   if (!target) return null;
   return { ...target, propertyPath: property.propertyPath };
 }
@@ -275,10 +288,10 @@ function toUnityCommitEvent(
   commit: InspectorPropertyCommit,
   writeMode: UnitySerializedPropertyCommitEvent["writeMode"] = "commit",
 ): UnitySerializedPropertyCommitEvent {
-  const target = (commit.property.root.snapshot as UnitySerializedPropertySnapshot).bindingTarget
-    ?? (commit.property.root.snapshot as UnitySerializedPropertySnapshot).target
-    ?? (commit.snapshot as UnitySerializedPropertySnapshot).bindingTarget
+  const target = (commit.snapshot as UnitySerializedPropertySnapshot).bindingTarget
     ?? (commit.snapshot as UnitySerializedPropertySnapshot).target
+    ?? (commit.property.root.snapshot as UnitySerializedPropertySnapshot).bindingTarget
+    ?? (commit.property.root.snapshot as UnitySerializedPropertySnapshot).target
     ?? null;
   return {
     propertyPath: commit.propertyPath,
@@ -950,6 +963,13 @@ function commitManagedType(value: string) {
         @preview="previewLeaf"
         @commit="commitLeaf"
       />
+    </div>
+    <div v-if="inspectorProperty.snapshot.childrenTruncated && !arrayCollapsed" class="property-continuation">
+      <BaseButton v-if="propertyTreeBinding.loadChildren" class="property-load-more" :disabled="loadingChildren" @click="loadChildren">
+        {{ loadingChildren ? t('common.loading') : t('common.loadMore') }}
+      </BaseButton>
+      <span v-else>{{ t('common.truncated') }}</span>
+      <span v-if="childrenError" role="alert">{{ childrenError }}</span>
     </div>
   </div>
 </template>

@@ -56,6 +56,49 @@ const RESIZING_BODY_CLASS = "locus-serialized-table-resizing";
 
 const scrollerRef = ref<HTMLElement | null>(null);
 const tableRef = ref<HTMLTableElement | null>(null);
+const scrollTop = ref(0);
+const viewportHeight = ref(600);
+const measuredRows = ref(new Map<string, number>());
+const mountedRows = new Map<string, HTMLElement>();
+let rowObserver: ResizeObserver | null = null;
+const rowOffsets = computed(() => {
+  const offsets = [0];
+  for (const row of props.rows) offsets.push(offsets[offsets.length - 1] + (measuredRows.value.get(row.id) ?? 48));
+  return offsets;
+});
+function rowAtOffset(offset: number): number {
+  let low = 0, high = props.rows.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (rowOffsets.value[middle + 1] <= offset) low = middle + 1; else high = middle;
+  }
+  return Math.min(low, Math.max(0, props.rows.length - 1));
+}
+const visibleStart = computed(() => Math.max(0, rowAtOffset(scrollTop.value) - 6));
+const visibleEnd = computed(() => Math.min(props.rows.length, rowAtOffset(scrollTop.value + viewportHeight.value) + 7));
+const visibleRows = computed(() => props.rows.slice(visibleStart.value, visibleEnd.value));
+const topSpacer = computed(() => rowOffsets.value[visibleStart.value] ?? 0);
+const bottomSpacer = computed(() => (rowOffsets.value[props.rows.length] ?? 0) - (rowOffsets.value[visibleEnd.value] ?? 0));
+function observeRow(element: unknown, id: string) {
+  const previous = mountedRows.get(id);
+  if (previous) rowObserver?.unobserve(previous);
+  if (element instanceof HTMLElement) { mountedRows.set(id, element); rowObserver?.observe(element); }
+  else mountedRows.delete(id);
+}
+function updateViewport() {
+  const scroller = scrollerRef.value;
+  if (!scroller) return;
+  const focused = document.activeElement;
+  if (focused instanceof HTMLElement && scroller.contains(focused) && scroller.scrollTop !== scrollTop.value) {
+    const rowId = focused.closest<HTMLElement>("tr[data-row-id]")?.dataset.rowId;
+    const rowIndex = rowId ? props.rows.findIndex((row) => row.id === rowId) : -1;
+    const start = Math.max(0, rowAtOffset(scroller.scrollTop) - 6);
+    const end = Math.min(props.rows.length, rowAtOffset(scroller.scrollTop + (scroller.clientHeight || 600)) + 7);
+    if (rowIndex >= 0 && (rowIndex < start || rowIndex >= end)) focused.blur();
+  }
+  scrollTop.value = scroller.scrollTop;
+  viewportHeight.value = scroller.clientHeight || 600;
+}
 const columnWidthOverrides = ref<Record<string, number>>({ ...props.columnWidths });
 const resizingColumnKey = ref("");
 
@@ -141,12 +184,14 @@ function widthForCell(cell: SerializedTableCell): number {
   return 112;
 }
 
+const maxCellWidths = computed(() => {
+  const widths = new Map<string, number>();
+  for (const row of props.rows) for (const cell of row.cells) widths.set(cell.columnId, Math.max(widths.get(cell.columnId) ?? 0, widthForCell(cell)));
+  return widths;
+});
 function autoColumnWidth(column: SerializedTableColumnConfig): number {
   const labelWidth = estimateLabelWidth(columnDisplayName(column));
-  const cellWidth = props.rows.reduce((maxWidth, row) => {
-    const cell = row.cells.find((item) => item.columnId === column.id);
-    return cell ? Math.max(maxWidth, widthForCell(cell)) : maxWidth;
-  }, 0);
+  const cellWidth = maxCellWidths.value.get(column.id) ?? 0;
   return Math.min(
     MAX_DATA_COLUMN_WIDTH,
     Math.max(MIN_DATA_COLUMN_WIDTH, labelWidth, cellWidth),
@@ -338,11 +383,28 @@ watch(() => props.columns, scheduleLayoutCheck, { deep: true });
 watch(() => props.rows, scheduleLayoutCheck, { deep: true });
 
 onMounted(() => {
+  updateViewport();
+  window.addEventListener("resize", updateViewport);
+  if (typeof ResizeObserver !== "undefined") {
+    rowObserver = new ResizeObserver((entries) => {
+      const heights = new Map(measuredRows.value);
+      let changed = false;
+      for (const entry of entries) {
+        const id = (entry.target as HTMLElement).dataset.rowId;
+        const height = entry.target.getBoundingClientRect().height;
+        if (id && height > 0 && Math.abs((heights.get(id) ?? 48) - height) > 0.5) { heights.set(id, height); changed = true; }
+      }
+      if (changed) measuredRows.value = heights;
+    });
+    for (const row of mountedRows.values()) rowObserver.observe(row);
+  }
   window.addEventListener("resize", scheduleLayoutCheck);
   scheduleLayoutCheck();
 });
 
 onBeforeUnmount(() => {
+  rowObserver?.disconnect();
+  window.removeEventListener("resize", updateViewport);
   if (layoutCheckFrame) window.cancelAnimationFrame(layoutCheckFrame);
   stopColumnResize(false);
   window.removeEventListener("resize", scheduleLayoutCheck);
@@ -351,8 +413,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="locus-serialized-table">
-    <div ref="scrollerRef" class="locus-serialized-table-scroller" @wheel.capture="handleTableWheel">
-      <table ref="tableRef" :style="tableLayoutStyle">
+    <div ref="scrollerRef" class="locus-serialized-table-scroller" @wheel.capture="handleTableWheel" @scroll.passive="updateViewport">
+      <table ref="tableRef" :style="tableLayoutStyle" :aria-rowcount="rows.length + 1">
         <colgroup>
           <col :style="{ width: assetColumnWidth + 'px' }" />
           <col
@@ -403,7 +465,8 @@ onBeforeUnmount(() => {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="row in rows" :key="row.id">
+          <tr v-if="topSpacer" aria-hidden="true"><td class="virtual-spacer" :colspan="columns.length + 2" :style="{ height: topSpacer + 'px' }" /></tr>
+          <tr v-for="(row, index) in visibleRows" :key="row.id" :ref="(element) => observeRow(element, row.id)" :data-row-id="row.id" :aria-rowindex="visibleStart + index + 2">
             <td class="asset-cell">
               <slot name="asset" :row="row">
                 <div class="asset-cell-content">
@@ -448,6 +511,7 @@ onBeforeUnmount(() => {
               </div>
             </td>
           </tr>
+          <tr v-if="bottomSpacer" aria-hidden="true"><td class="virtual-spacer" :colspan="columns.length + 2" :style="{ height: bottomSpacer + 'px' }" /></tr>
         </tbody>
       </table>
       <div v-if="!rows.length" class="locus-serialized-table-empty">
@@ -475,6 +539,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.virtual-spacer { padding: 0; border: 0; }
 .locus-serialized-table {
   width: 100%;
   height: 100%;
