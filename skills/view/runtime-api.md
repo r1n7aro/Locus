@@ -4,9 +4,11 @@ Use this when building a Locus View package. Prefer `@locus/view-runtime` for se
 
 ## Imports
 
-- `vue`: Vue runtime APIs are available; `createApp(...).mount(...)` is captured by the View host.
+- `vue`: the native Vue runtime. New entries export a component; legacy `createApp(...).mount(...)` retains plugin/provide/component registrations in the View subtree.
 - `@locus/view-runtime`: main service and helper SDK.
-- `@locus/components`: component module.
+- `@locus/components`: native component module.
+- `@locus/frontend`: exports `locus`, the shared Workbench, UI and View SDK.
+- `pinia`: the native Pinia runtime; the View inherits the host instance.
 - `node:fs/promises`, `fs/promises`: Promise-based filesystem APIs.
 - `node:fs`, `fs`: filesystem APIs with `promises` and common callback forms.
 - `node:path`, `path`: common path helpers.
@@ -30,11 +32,11 @@ Use this when building a Locus View package. Prefer `@locus/view-runtime` for se
 - `propertyDrawer`: `library`, `projectLibrary`, `register`, `registerValue`, `registerField`, `registerAttribute`, `registerPropertyPath`, `define`, `normalize`, `createLibrary`.
 - `unityObjectDrawer`: `library`, `projectLibrary`, `register`, `define`, `normalize`, `createLibrary`, `resolve`.
 - `objectReferencePicker`: `roots`, `searchQuery`, `filterResults`, `isResult`, `typeHint`, `typeKey`, `typeRule`, `normalizePath`, `extension`.
-- Helpers: `defineView`, `useViewState`, `useViewScript`, `onEditorUpdate`, `useUnityReferenceDrag`, `useUnityAssetDropTarget`, `useLocusFileDrag`, `useLocusFileDropTarget`.
+- Helpers: `defineView`, `useViewContext`, `useViewState(initial, stableKey?)`, `useViewScript`, `onEditorUpdate`, `useUnityReferenceDrag`, `useUnityAssetDropTarget`, `useLocusFileDrag`, `useLocusFileDropTarget`.
 - Graph helpers: `GraphViewController`, `defineGraphView`, `layoutGraphDocument`.
 - Serialized table helpers: `resolveSerializedTableSources`, `serializedTableSourcesFromAssets`, `normalizeSerializedTableSource`, `dedupeSerializedTableSources` (feed `SerializedTableView` from manual sources plus scripted providers).
 
-Legacy globals are still installed as `window.locus.view` and `window.locus.unity`.
+Legacy `window.locus.view` and `window.locus.unity` resolve through an instance-local compatibility proxy. They do not overwrite the native window's globals. New code imports services and `locus` explicitly.
 
 Some visual components are still available from `@locus/view-runtime` for compatibility. New View code should import them from `@locus/components`.
 
@@ -77,6 +79,8 @@ Common string path forms:
 
 Bound property objects expose `write`, `preview`, `undo`, `redo`, `draw`, and `drawDefaultEditor`. Bound trees expose `root`, `properties`, `get`, `require`, `refresh`, `writeProperty`, `writeCommit`, `apply`, `undo`, `redo`, `drawDefaultEditor`, and `drawPropertyEditor`.
 
+Bound trees also expose `loadChildren(property)` for truncated nodes. Array continuations use `arrayOffset` and a bounded page size, including arrays larger than 1024 elements. Resolved targets retain `globalObjectId`; preserve it when deriving another property path. `Long` and `UnsignedLong` values use exact decimal strings. Write responses provide authoritative `beforeSnapshot` and opaque `restoreState` data for history; do not reconstruct undo values from display text or truncated children. Native property editors embedded in a View share its editing workspace and undo history.
+
 ## Expanded Helper Exports
 
 These are also available from `@locus/view-runtime` for custom renderers and advanced editors:
@@ -93,11 +97,13 @@ These are also available from `@locus/view-runtime` for custom renderers and adv
 `@locus/components` exposes:
 
 - `BaseButton`, `BaseCheckbox`, `BaseDropdown`, `BaseSegmented`, `BaseSwitch`.
-- `CanvasView`, `GraphView`, `SerializedTableView`.
+- `CanvasView`, `GraphView`, `LinkBoard`, `SerializedTableView`.
 - `UnityBoolField`, `UnityBoundsField`, `UnityColorField`, `UnityColorHdrField`, `UnityCurveField`, `UnityEnumField`, `UnityFlagsField`, `UnityGradientField`, `UnityLayerMaskField`, `UnityNumberField`, `UnityObjectReferenceField`, `UnityPropertyDraw`, `UnityPropertyEditor`, `UnitySerializedPropertyTree`, `UnityVectorField`.
 - `UnityObjectPreview`, `UnityReferenceChip`, `UnityDropZone`.
 
-`SerializedTableView` renders rows of Unity serialized cells with resizable persisted columns, a progress/status bar, and per-cell editors. Props: `columns`, `rows`, `loading`, `status`, `error`, `progress`, `savingCellKey`, `sourceCount`, `columnWidths` (v-model). Events: `commit` (`SerializedTableCommitEvent`), `update:columnWidths`. The `serialized-table` template shows the full wiring against a `SerializedTableApi` C# script.
+`SerializedTableView` renders rows of Unity serialized cells with resizable columns, a progress/status bar, and per-cell editors. Props: `columns`, `rows`, `loading`, `status`, `error`, `progress`, `savingCellKey`, `sourceCount`, `columnWidths` (v-model). Events: `commit` (`SerializedTableCommitEvent`), `update:columnWidths`. The caller supplies data loading, commit handling and optional persistence.
+
+`LinkBoard` renders source-to-target connections. Props: `sources`, `targets`, `modelValue` (v-model), optional `sourceTitle`, `targetTitle`, `readonly`, `multiple`. Endpoints are `{ id, label, disabled? }`; connections are `{ source, target }`. It handles selection, connection lines, resize and unlinking; the caller owns data and persistence. `components.md` contains composition examples for this and the existing editors. `locus.views.components()` lists the available native components.
 
 `UnityCurveField` and `UnityGradientField` render AnimationCurve / Gradient previews; when given `editable` plus a `bindingTarget` (the property tree passes both automatically), clicking them opens the floating Locus value editor window, which owns its own preview/commit write-back and broadcasts `locus-value-editor:committed` on apply.
 
@@ -113,12 +119,127 @@ Locus plugins can ship `drawers/<drawer-id>/` packages that extend the in-app In
 
 ## Agent Tools
 
-The View skill grants these normal tools: `view_list`, `view_create`, `view_reload`, `view_run`, `view_compile_script`, `view_call_script`, `view_property_read`, `view_property_discover`, `view_property_write`, `view_property_apply`.
+The View skill grants the single `execute_typescript` TypeScript tool. It exposes the shared native frontend SDK; see `frontend-sdk.md`.
 
-Debug-only tools live in `debug.md`: `view_capture`, `view_snapshot`, `view_action`, `view_wait`, `view_console_read`, `view_debug_eval`.
+Debugging uses the same SDK and tool as authoring. `debug.md` contains the inspection workflow.
 
 ## Usage Guidance
+
+### Property backend and deferred writes
+
+Select the backend once in View code, using the shared SDK. Controls and bound
+trees inherit that selection; do not add mode selectors to individual controls.
+Existing `property` calls continue to use Unity's main-thread API.
+
+```ts
+import { locus } from "@locus/frontend";
+
+const properties = locus.unity.property.backend("yaml"); // "live" = Unity API (default)
+const target = { kind: "asset", path: "Assets/Data.asset", targetFileId: "11400000" };
+const tree = await properties.readTree(target);
+// tree.drawDefaultEditor() reuses the existing Property Tree controls.
+// Numeric drag preview stays local; committing a field persists its YAML.
+
+const before = await properties.read({ target });
+const batch = properties.batch();
+batch.enqueue({ target: { ...before.target, propertyPath: "amount" }, value: 42,
+  expectedRevision: before.revision });
+batch.enqueue({ target: { ...before.target, propertyPath: "note" }, value: "updated",
+  expectedRevision: before.revision });
+await batch.flush();
+await tree.refresh();
+```
+
+- `backend()` returns an independent instance; it does not switch existing trees
+  or batches. Requests and controls have no backend parameter. `read`, `write`,
+  `apply`, `readTree` and `batch` retain the instance's workspace and lifetime.
+- YAML reads project persisted serialized values into Property Tree snapshots.
+  They do not reproduce Editor-only attributes, enum choices, specialized
+  Editor floating Curve/Gradient editors or all synthetic headers. Text Prefab
+  effective values are resolved recursively through the shared dependency graph.
+  Reference slots are displayed read-only; existing managed-reference children can
+  be read and written through logical paths such as `node.next.amount`. Shared/cyclic
+  objects retain host-scoped identity. Explicit API writes accept serialized
+  `{fileID, guid, type}` / `{rid}` values. `property.discover({target,query})` returns
+  effective matches with exact `target` IDs, including virtual Prefab objects.
+  Raw serialized discovery remains available on `locus.assets.backend("yaml")`.
+- YAML targets require an `Assets/` path and exact persisted `targetFileId` for
+  multi-object assets. Use the returned `bindingTarget`; selection, runtime IDs,
+  and hierarchy/component locators require `live`.
+- YAML direct writes require `expectedRevision` from a YAML read. A bound tree
+  manages its own revision. Prefab reads also return `dependencies` and `prefabLayers`;
+  direct writes must include `expectedDependencies: read.dependencies`. Trees track
+  source revisions automatically. Stale data is rejected; refresh before retrying.
+  `writeMode` remains `commit/preview` for the live API and is independent of backend.
+  YAML direct writes support `commit`; bound numeric previews do not issue IPC.
+- Enqueueing performs no IO. `flush()` submits one `apply_properties` request; Rust
+  resolves the logical paths against the evolving graph and compiles ordered
+  operations into one existing asset transaction. The frontend does not parse YAML.
+  While Unity is connected, that transaction performs one main-thread preflight
+  and coordinated import pass. It does not use `SerializedProperty` setters for
+  YAML editing. With Unity closed, it writes offline without starting Unity.
+  This is not a guarantee that importing/OnValidate has no main-thread cost.
+- A batch supports up to 256 files / 10,000 edits. Repeated flush calls share the
+  in-flight promise. A failed batch cannot replay automatically: inspect its outcome,
+  `clear()`, reread and rebuild. `live` apply may report partial success; it is not
+  the same rollback contract as the YAML transaction.
+- For profiling, use `yaml.apply({writes, profile:true})`. The optional response
+  `profile` contains `prepareMs`, `commitMs`, `projectionMs`, `totalMs`,
+  `effectiveBuilds`, `treeBuilds`, `overrideValidationPasses`, `materializedCompilePasses`, `readProjections`
+  and byte-changing `changedFiles`. When connected, `profile.editor` separates
+  Unity `preflightMs`, `writeMs`, `importMs` and `changedFiles`; offline it is null.
+  Timings exclude frontend IPC serialization. No UI or global setting is required.
+  For bulk scripts that do not need per-write snapshots, use
+  `yaml.apply({writes, resultMode:"summary", profile:true})`. This returns
+  `{ok,message,writesApplied,transactionId,assets:[{path,revision,dependencies}],profile?}`
+  and skips Tree/beforeSnapshot projection while retaining identical validation and
+  transaction guards. Use each asset's returned revision/dependencies for later writes.
+  The default full response and `batch().flush()` are unchanged; live rejects summary.
+  Materialized writes and inherited scalar runs share phase snapshots and validation; commands
+  such as Revert/Apply/creation are ordering barriers. Always retain every returned
+  dependency, including source `.cs` and `.cs.meta` evidence.
+- YAML array commands support `resize`, `insert`, `delete`, `move`; growing and
+  inserting need an explicit fill `value`. Whole-array values are also accepted.
+  These commands also support inherited arrays and nested inline object lists.
+  Existing size overrides on empty source arrays require a source-proven element
+  schema. The batch compiles ordered edits into final size/leaf overrides.
+  Unity's implicit element construction/type creation and restore commands are
+  not emulated. Use `live` for those Inspector interactions.
+- YAML authoring commands are values sent through the same `write/apply/batch` API:
+  `{action:"revert"}` removes the current property override subtree, including array sizes/elements;
+  `{action:"applyToSource",level:1}` applies to the next source layer and clears
+  crossed overrides. `prefabLayers.length` applies to the materialized base.
+  Whole-array Apply is supported when it needs no non-null local object/rid remapping.
+  For a nested array whose containing element does not exist at the destination,
+  apply an outer array that exists there. Existing inherited managed leaves use
+  host-scoped registry identity, including aliases such as `node.next.amount`.
+  `{action:"createManaged",template:{rootRid,entries:[{rid,type:{class,ns,asm},data}]}}`
+  creates/replaces a materialized host slot using complete explicit data. Template
+  rid labels are remapped, cycles preserved and old aliases retained. Missing,
+  ambiguous, non-Serializable, abstract, generic or incompatible types are rejected.
+  Use the exact Unity registry identity: nested classes use `Outer/Inner`, not `Outer.Inner`
+  or CLR `Outer+Inner`. Property writes require source or supported built-in type evidence;
+  partial, conditional or unavailable schemas fail with `property.schema_unverified`.
+  The raw asset API remains a structural API with diagnostics, not an equivalent type guarantee.
+  `{action:"editObjects",add:[{id,classId,rootType,data}],remove:[id],updates:[{objectId,propertyPath,value}]}`
+  edits materialized object topology as one validated candidate. IDs must be exact
+  strings; supported templates are GameObject, Transform, RectTransform and MonoBehaviour.
+- Curves/gradients accept the standard live value payload in programmatic YAML
+  writes. Their default YAML Tree previews remain read-only because the floating
+  editor owns a live writer. Existing Prefab added/removed components and children
+  are projected with ownership and instance identity, so their fields can be edited.
+  Authoring topology on inherited objects, inherited managed creation/array structure,
+  cross-layer reference Apply and nonfinite curve tangents remain unsupported.
+  No implicit fallback, constructor or business-callback execution is provided;
+  implement view-specific validation/derived values in the View.
+- Bulk operations already expressed as raw asset operations can use
+  `const batch = locus.assets.backend("yaml").batch()`, then
+  `batch.enqueue(path, operations, {expected_revision})` and `await batch.flush()`.
+  This bypasses logical Property Tree resolution. Keep draft UI state local and
+  flush on explicit Apply, input commit or the end of a bulk job.
 
 Start with `view`, `unity`, `property`, and components from `@locus/components`. Reach for the expanded helper exports only when custom rendering or value parsing requires them.
 
 `session` covers the full session lifecycle: alongside `create`/`chat`/`wait`, it exposes `fork`/`forkFromMessage`, `list`/`listArchived`, `rename`, `archive`/`unarchive`, `delete`, and conversation-history `undo`/`rollback`. These operate on any session id in the current workspace — there is no per-View ownership scoping, so a View can manage sessions it did not create. `delete`, `undo`, and `rollback` are destructive and irreversible; confirm intent (and prefer `archive` for cleanup) before calling.
+
+`useViewContext()` provides the editor-bound workspace, active ref, lifetime signal and onDispose(). `useViewState(initial, stableKey)` retains editor state across source updates. Hot-updating CSS preserves the component instance; script/template updates remount the affected View.

@@ -1,77 +1,21 @@
 use crate::session::models::ImageData;
 use crate::tool::ToolResult;
-
 use super::{AgentInstance, ExecutedToolResult};
 
 impl AgentInstance {
-    pub(super) async fn execute_view_capture(
-        &self,
-        app_handle: &tauri::AppHandle,
-        args: &serde_json::Value,
-    ) -> ExecutedToolResult {
-        if !self.has_selected_working_dir() {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: "view_capture requires a selected Unity project working directory."
-                    .to_string(),
-                is_error: true,
-            });
+    pub(super) async fn execute_frontend_typescript(&self, app: &tauri::AppHandle, args: &serde_json::Value) -> ExecutedToolResult {
+        let code = args.get("code").and_then(|value| value.as_str()).unwrap_or("");
+        let label = args.get("windowLabel").and_then(|value| value.as_str());
+        let timeout = args.get("timeoutMs").and_then(|value| value.as_u64()).unwrap_or(30_000);
+        match crate::view::request_frontend_execution(app, &self.working_dir, code, label, timeout).await {
+            Ok(mut result) => {
+                let images = result.get("images").and_then(|value| value.as_array()).map(|values| values.iter().filter_map(|value| {
+                    Some(ImageData { data: value.get("data")?.as_str()?.to_string(), mime_type: value.get("mimeType")?.as_str()?.to_string() })
+                }).collect::<Vec<_>>()).unwrap_or_default();
+                if let Some(object) = result.as_object_mut() { object.insert("images".to_string(), serde_json::json!({ "attached": images.len() })); }
+                ExecutedToolResult::from_tool_result(ToolResult { output: result.to_string(), is_error: false }).with_images(images)
+            },
+            Err(error) => ExecutedToolResult::from_tool_result(ToolResult { output: error, is_error: true }),
         }
-
-        let view_id = match args
-            .get("viewId")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(value) => value.to_string(),
-            None => {
-                return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: "Missing required parameter: viewId".to_string(),
-                    is_error: true,
-                });
-            }
-        };
-
-        if let Err(error) = crate::view::read_view_sync(&self.working_dir, &view_id) {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: error,
-                is_error: true,
-            });
-        }
-
-        let capture =
-            match crate::view::capture_view_window(app_handle, &self.working_dir, &view_id).await {
-                Ok(value) => value,
-                Err(error) => {
-                    return ExecutedToolResult::from_tool_result(ToolResult {
-                        output: error,
-                        is_error: true,
-                    });
-                }
-            };
-
-        use base64::Engine as _;
-        let image = ImageData {
-            data: base64::engine::general_purpose::STANDARD.encode(&capture.bytes),
-            mime_type: capture.mime_type.clone(),
-        };
-        let output = serde_json::to_string_pretty(&serde_json::json!({
-            "status": "captured",
-            "viewId": capture.view_id,
-            "windowLabel": capture.window_label,
-            "format": capture.format,
-            "mimeType": capture.mime_type,
-            "width": capture.width,
-            "height": capture.height,
-            "byteSize": capture.byte_size,
-            "image": "attached"
-        }))
-        .unwrap_or_else(|_| "View screenshot captured. PNG image attached.".to_string());
-
-        ExecutedToolResult::from_tool_result(ToolResult {
-            output,
-            is_error: false,
-        })
-        .with_images(vec![image])
     }
 }

@@ -2,10 +2,6 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-const templateSource = readFileSync(
-  resolve(process.cwd(), "src-tauri/src/view/templates/serialized_table.rs"),
-  "utf8",
-);
 const componentSource = readFileSync(
   resolve(process.cwd(), "src/components/table/SerializedTableView.vue"),
   "utf8",
@@ -32,8 +28,7 @@ describe("serialized table View layout", () => {
     expect(componentSource).toContain("const columnWidthOverrides = ref<Record<string, number>>({ ...props.columnWidths });");
     expect(componentSource).toContain("function startColumnResize(event: PointerEvent");
     expect(componentSource).toContain("function updateColumnResize(event: PointerEvent)");
-    expect(templateSource).toContain("function persistColumnWidths(widths: Record<string, number>)");
-    expect(templateSource).toContain(":column-widths=\"columnWidths\"");
+    expect(componentSource).toContain('"update:columnWidths"');
     expect(componentSource).toContain("class=\"column-resize-handle\"");
     expect(componentSource).toContain('v-for="(column, index) in columns"');
     expect(componentSource).toContain("@pointerdown.prevent.stop=\"startColumnResize");
@@ -68,11 +63,4 @@ describe("serialized table View layout", () => {
     expect(componentSource).toMatch(/\.asset-cell-content,\s*[\s\S]*\.status-cell-content\s*\{[\s\S]*display:\s*flex;[\s\S]*flex-direction:\s*column;[\s\S]*justify-content:\s*center;/);
   });
 
-  it("wires the generated template through the shared SerializedTableView component", () => {
-    expect(templateSource).toContain("import { SerializedTableView } from \"@locus/components\";");
-    expect(templateSource).toContain("resolveSerializedTableSources");
-    expect(templateSource).toContain("<SerializedTableView");
-    expect(templateSource).toContain("@update:column-widths=\"persistColumnWidths\"");
-    expect(templateSource).toContain("@commit=\"commitCell\"");
-  });
 });

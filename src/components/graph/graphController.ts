@@ -23,7 +23,7 @@ export class GraphViewController implements GraphController {
   }
 
   saveGraph(_graph: GraphData): void {
-    // Default graph templates keep data in memory until a package overrides this method.
+    // Graph data stays in memory until the caller supplies persistence.
   }
 
   applyGraph(graph: GraphData): unknown | Promise<unknown> {

@@ -95,7 +95,7 @@ describe("View sidebar settings", () => {
     const sessionPanel = read("src/components/chat/SessionPanel.vue");
     const viewPage = read("src/components/ViewPackageView.vue");
     const service = read("src/services/view.ts");
-    const createTool = read("tools/view_create.json");
+    const frontendSdk = read("src/services/frontendSdk.ts");
 
     expect(icons).toContain("export const LOCUS_VIEW_ICON_LIBRARY");
     expect(icons).toContain("export function resolveLocusViewIcon");
@@ -103,9 +103,8 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain(":icon=\"resolveLocusViewIcon(entry.row.node.view?.icon)\"");
     expect(viewPage).toContain("view-package-reloaded");
     expect(service).toContain("icon?: string | null;");
-    expect(createTool).toContain("\"icon\"");
-    expect(createTool).toContain("\"InspectionPanel\"");
-    expect(createTool).toContain("\"serialized-table\"");
+    expect(frontendSdk).toContain("request: viewService.ViewCreateRequest");
+    expect(icons).toContain("InspectionPanel");
   });
 
   it("renders the View management page as a directory tree", () => {
@@ -124,7 +123,7 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("@contextmenu.prevent.stop=\"openTreeContextMenu($event, entry.row)\"");
     expect(viewPage).toContain("viewTreeDropTarget");
     expect(viewPage).not.toContain("@dragstart");
-    expect(viewPage).toContain("v-else-if=\"entry.row.depth > 0\"");
+    expect(viewPage).toContain("v-else-if=\"entry.row.depth > 0 && !props.listOnly\"");
     expect(viewPage).toContain("class=\"view-tree-row-actions\"");
     expect(viewPage).toContain("@click.stop=\"openTreeView(entry.row)\"");
     expect(viewPage).toContain(".view-tree-row-shell:hover .view-tree-row-actions");
@@ -152,21 +151,20 @@ describe("View sidebar settings", () => {
     expect(viewPage).toContain("deleteConfirm.node.label");
   });
 
-  it("lets view_create create temporary packages outside the visible View tree", () => {
+  it("lets the frontend SDK create temporary packages outside the visible View tree", () => {
     const service = read("src/services/view.ts");
-    const createTool = read("tools/view_create.json");
+    const frontendSdk = read("src/services/frontendSdk.ts");
     const runtime = read("src-tauri/src/view.rs");
-    const tool = read("src-tauri/src/tool/builtins/view.rs");
+    const commands = read("src-tauri/src/commands/view.rs");
 
     expect(service).toContain("temporary?: boolean;");
-    expect(createTool).toContain("\"temporary\"");
-    expect(createTool).toContain("do not appear in view_list");
+    expect(frontendSdk).toContain("viewService.viewCreate(refScope, request)");
     expect(runtime).toContain("temporary_views_root_for_workspace");
     expect(runtime).toContain("parse_view_create_request");
     expect(runtime).toContain("create_view_sync_with_scope");
     expect(runtime).toContain("resolve_view_package_root");
-    expect(tool).toContain("parse_view_create_request(args)");
-    expect(tool).toContain("create_view_sync_with_scope(&working_dir, request, temporary)");
+    expect(commands).toContain("parse_view_create_request(request)");
+    expect(commands).toContain("create_view_sync_with_scope(&working_dir, request, temporary)");
   });
 
   it("keeps View tree operations display-path based and package-aware", () => {

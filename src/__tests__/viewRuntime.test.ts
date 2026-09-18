@@ -673,7 +673,7 @@ await view.fs.readFile(shaderPath, "utf8");
 
   it("wires the View fs bridge through runtime, host, service, and Tauri commands", () => {
     const runtime = read("src/components/view/viewRuntime.ts");
-    const host = read("src/components/ViewHostWindow.vue");
+    const host = read("src/components/view/viewHostApi.ts");
     const service = read("src/services/view.ts");
     const commands = read("src-tauri/src/commands/view.rs");
     const lib = read("src-tauri/src/lib.rs");

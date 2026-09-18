@@ -1,5 +1,7 @@
 # View Package 功能计划
 
+本文保留历史设计记录。当前创建流程已改为单文件 Vue 与可复用组件组合，模板创建已移除；以 [View 原生运行时](view-native-runtime.md) 和 `skills/view/components.md` 为准。
+
 状态：P0 / P1 / P2 / P3 已实现基础版本并进入验证  
 日期：2026-05-21  
 范围：Locus View / View Package / View Runtime / View tools / Unity 数据绑定

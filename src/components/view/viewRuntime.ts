@@ -3,24 +3,35 @@ import {
   computed,
   h,
   markRaw,
-  nextTick,
   onMounted,
   onBeforeUnmount,
   onErrorCaptured,
+  getCurrentInstance,
+  provide,
   reactive,
   readonly,
   ref,
-  shallowRef,
   type Component,
   type ComputedRef,
   type PropType,
 } from "vue";
 import * as VueRuntime from "vue";
+import * as PiniaRuntime from "pinia";
+import { createFrontendSdk } from "../../services/frontendSdk";
+import { emit as emitTauriEvent } from "@tauri-apps/api/event";
+import { listenUnityValueEditorCommitted, UNITY_VALUE_EDITOR_COMMITTED_EVENT } from "../../services/unityValueEditorWindow";
+import { UNITY_PROPERTY_EDITING, UNITY_PROPERTY_WORKSPACE } from "../unity/unityPropertyEditingContext";
+import { t } from "../../i18n";
+import { VIEW_CONTEXT, useViewContext, useOptionalViewContext, type ViewExecutionScope } from "./viewExecutionScope";
+import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+import type { CompiledViewPackage } from "./viewCompilationTypes";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
+import { LinkBoard } from "../link-board";
+export type { LinkBoardConnection, LinkBoardEndpoint } from "../link-board";
 import {
   CanvasView,
   type CanvasClipboardEvent,
@@ -72,7 +83,6 @@ import type {
   ViewRuntimeUpdateEvent,
 } from "../../services/view";
 import type { WorkspaceRef } from "../../services/project";
-import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 import type {
   UnitySerializedPropertyApplyRequest,
   UnitySerializedPropertyApplyResult,
@@ -110,9 +120,7 @@ import {
 } from "../../composables/useUnityReferenceDragSource";
 import { useUnityAssetDropTarget as useUnityAssetDropTargetBase } from "../../composables/useUnityAssetDropTarget";
 import {
-  sanitizeCssForPreview,
   viewPackageRelPath,
-  viewFileContent,
 } from "./viewPackageFiles";
 import type { ViewSfcCompileResult } from "./viewCompiler";
 import {
@@ -308,12 +316,19 @@ export interface ViewRuntimeApi {
 export interface ViewRuntimeComponentOptions {
   detail: ViewPackageDetail;
   api: ViewRuntimeApi;
+  compilation: CompiledViewPackage;
+  scope: ViewExecutionScope;
+  onError?: (error: unknown) => void;
 }
 
 interface RuntimeContext {
   detail: ViewPackageDetail;
   api: ViewRuntimeApi;
   styles: string[];
+  scope: ViewExecutionScope;
+  compilation: CompiledViewPackage;
+  globals: Record<string, unknown>;
+  entryApp?: VueRuntime.App;
   compileViewSfc: CompileViewSfc;
   transformModuleSource: TransformModuleSource;
   entryComponent?: Component;
@@ -348,6 +363,7 @@ export interface ViewRuntimePropertyWriteOptions {
 }
 
 export interface ViewRuntimePropertyApplyOptions {
+  onApplied?: (result: UnitySerializedPropertyApplyResult) => void | Promise<void>;
   undoable?: boolean;
   label?: string;
 }
@@ -496,8 +512,9 @@ function isUnityAssetReference(ref: AssetRefAttachment): boolean {
 async function selectUnityReference(
   input: ViewUnityReferenceInput,
   options: { focusProjectWindow?: boolean } = {},
+  boundWorkspaceRef?: WorkspaceRef,
 ) {
-  const workspaceRef = useWorkspaceContextStore().focusedWorkspaceRef;
+  const workspaceRef = boundWorkspaceRef ?? useViewContext().workspaceRef;
   if (!workspaceRef) return;
   const sceneObject = sceneObjectTargetFromReference(input);
   if (sceneObject) {
@@ -509,8 +526,8 @@ async function selectUnityReference(
   await selectUnityAsset(workspaceRef, ref.path, options);
 }
 
-async function inspectUnityReference(input: ViewUnityReferenceInput) {
-  const workspaceRef = useWorkspaceContextStore().focusedWorkspaceRef;
+async function inspectUnityReference(input: ViewUnityReferenceInput, boundWorkspaceRef?: WorkspaceRef) {
+  const workspaceRef = boundWorkspaceRef ?? useViewContext().workspaceRef;
   if (!workspaceRef) return;
   const sceneObject = sceneObjectTargetFromReference(input);
   if (sceneObject) {
@@ -735,6 +752,8 @@ const UnityReferenceChip = defineComponent({
     },
   },
   setup(props, { slots }) {
+    const viewContext = useOptionalViewContext();
+    const workspace = useWorkspaceContextStore();
     const refItem = computed(() => normalizeUnityReference(
       props.reference ?? {
         path: props.path,
@@ -746,13 +765,15 @@ const UnityReferenceChip = defineComponent({
     const label = computed(() => props.name || refItem.value?.name || basenameWithoutExtension(props.path));
 
     async function click(event: MouseEvent) {
+      const workspaceRef = viewContext?.workspaceRef ?? workspace.focusedWorkspaceRef;
+      if (!workspaceRef) return;
       const current = refItem.value;
       if (!current) return;
       if (props.inspectOnMeta && (event.ctrlKey || event.metaKey)) {
-        await inspectUnityReference(current);
+        await inspectUnityReference(current, workspaceRef);
         return;
       }
-      await selectUnityReference(current);
+      await selectUnityReference(current, {}, workspaceRef);
     }
 
     return () => h("button", {
@@ -796,6 +817,7 @@ export const LOCUS_COMPONENTS = {
   BaseDropdown,
   BaseSegmented,
   BaseSwitch,
+  LinkBoard,
   CanvasView,
   GraphView,
   SerializedTableView,
@@ -839,15 +861,13 @@ function runtimeErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function afterNextFrame(task: () => void) {
-  if (typeof requestAnimationFrame === "function") {
-    requestAnimationFrame(() => task());
-    return;
-  }
-  setTimeout(task, 0);
-}
-
 function createViewUndoService() {
+  let operationTail: Promise<unknown> = Promise.resolve();
+  function enqueue<T>(job: () => Promise<T>): Promise<T> {
+    const result = operationTail.then(job);
+    operationTail = result.catch(() => undefined);
+    return result;
+  }
   const undoStack: Required<ViewRuntimeUndoEntry>[] = [];
   const redoStack: Required<ViewRuntimeUndoEntry>[] = [];
   const state = reactive<ViewRuntimeUndoState>({
@@ -878,7 +898,9 @@ function createViewUndoService() {
     refreshState();
   }
 
-  async function run(direction: "undo" | "redo") {
+  function run(direction: "undo" | "redo") { return enqueue(() => runNow(direction)); }
+
+  async function runNow(direction: "undo" | "redo") {
     if (state.running) return;
     const source = direction === "undo" ? undoStack : redoStack;
     const target = direction === "undo" ? redoStack : undoStack;
@@ -937,6 +959,7 @@ function createViewUndoService() {
     clear,
     handleKeydown,
     isRunning: () => state.running,
+    enqueue,
   };
 }
 
@@ -957,36 +980,14 @@ function snapshotHistoryKey(snapshot: ViewSerializedPropertySnapshotInput | null
       arraySize: snapshot.arraySize,
       managedReferenceFullTypename: snapshot.managedReferenceFullTypename,
       children: snapshot.children,
+      restoreState: snapshot.restoreState,
     });
   } catch {
     return `${snapshot.propertyPath}|${snapshot.displayValue}`;
   }
 }
 
-function propertyWriteKey(request: UnitySerializedPropertyWriteRequest): string {
-  try {
-    return JSON.stringify({
-      bindingId: request.bindingId ?? "",
-      target: request.target,
-    });
-  } catch {
-    return `${request.bindingId ?? ""}`;
-  }
-}
-
 function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof createViewUndoService>) {
-  const writeQueues = new Map<string, Promise<unknown>>();
-
-  function queueWrite<T>(key: string, job: () => Promise<T>): Promise<T> {
-    const previous = writeQueues.get(key) ?? Promise.resolve();
-    const run = previous.catch(() => undefined).then(job);
-    let tracked: Promise<unknown>;
-    tracked = run.finally(() => {
-      if (writeQueues.get(key) === tracked) writeQueues.delete(key);
-    });
-    writeQueues.set(key, tracked);
-    return run;
-  }
 
   async function readBeforeSnapshot(
     request: UnitySerializedPropertyWriteRequest,
@@ -1014,8 +1015,8 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
     const redoRequest = { bindingId, target, value: snapshotRestoreValue(after) };
     undo.record({
       label,
-      undo: () => write(undoRequest, { undoable: false, onApplied: options.onApplied }),
-      redo: () => write(redoRequest, { undoable: false, onApplied: options.onApplied }),
+      undo: () => writeNow(undoRequest, { undoable: false, onApplied: options.onApplied }),
+      redo: () => writeNow(redoRequest, { undoable: false, onApplied: options.onApplied }),
     });
   }
 
@@ -1026,10 +1027,11 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
     const shouldRecord = options.undoable !== false && !undo.isRunning();
     const before = shouldRecord ? await readBeforeSnapshot(request, options) : null;
     const result = await api.unityPropertyWrite(request);
-    await options.onApplied?.(result);
-    if (shouldRecord && before) {
-      recordWriteUndo(request, before, result, options);
+    if (!result.ok) throw new Error(result.message || "Failed to write Unity property.");
+    if (shouldRecord && (result.beforeSnapshot || before)) {
+      recordWriteUndo(request, result.beforeSnapshot ?? before!, result, options);
     }
+    await options.onApplied?.(result);
     return result;
   }
 
@@ -1037,10 +1039,14 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
     request: UnitySerializedPropertyWriteRequest,
     options: ViewRuntimePropertyWriteOptions = {},
   ): Promise<UnitySerializedPropertyWriteResult> {
-    return queueWrite(propertyWriteKey(request), () => writeNow(request, options));
+    return undo.enqueue(() => writeNow(request, options));
   }
 
-  async function apply(
+  function apply(request: UnitySerializedPropertyApplyRequest, options: ViewRuntimePropertyApplyOptions = {}) {
+    return undo.enqueue(() => applyNow(request, options));
+  }
+
+  async function applyNow(
     request: UnitySerializedPropertyApplyRequest,
     options: ViewRuntimePropertyApplyOptions = {},
   ): Promise<UnitySerializedPropertyApplyResult> {
@@ -1056,16 +1062,16 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
     const result = await api.unityPropertyApply(request);
     if (shouldRecord) {
       const undoWrites: UnitySerializedPropertyApplyWrite[] = result.results
-        .map((after, index): UnitySerializedPropertyApplyWrite | null => before[index] && after.target
+        .map((after, index): UnitySerializedPropertyApplyWrite | null => (after.beforeSnapshot || before[index]?.ok) && after.ok && after.target
           ? {
             bindingId: after.bindingId,
             target: after.target,
-            value: snapshotRestoreValue(before[index]!),
+            value: snapshotRestoreValue(after.beforeSnapshot ?? before[index]!),
           }
           : null)
         .filter((item): item is UnitySerializedPropertyApplyWrite => !!item);
       const redoWrites: UnitySerializedPropertyApplyWrite[] = result.results
-        .filter((after) => after.target)
+        .filter((after, index) => after.ok && after.target && (after.beforeSnapshot || before[index]?.ok))
         .map((after) => ({
           bindingId: after.bindingId,
           target: after.target,
@@ -1074,10 +1080,14 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
       if (undoWrites.length && redoWrites.length) {
         undo.record({
           label: options.label || "View properties",
-          undo: () => apply({ writes: undoWrites }, { undoable: false }),
-          redo: () => apply({ writes: redoWrites }, { undoable: false }),
+          undo: () => applyNow({ writes: undoWrites }, { undoable: false, onApplied: options.onApplied }),
+          redo: () => applyNow({ writes: redoWrites }, { undoable: false, onApplied: options.onApplied }),
         });
       }
+    }
+    await options.onApplied?.(result);
+    if (!result.ok || result.results.some((item) => !item.ok)) {
+      throw new Error(result.results.find((item) => !item.ok)?.message || result.message || "Failed to apply Unity properties.");
     }
     return result;
   }
@@ -1085,6 +1095,7 @@ function createViewPropertyRuntime(api: ViewRuntimeApi, undo: ReturnType<typeof 
   return {
     write,
     apply,
+    recordExternal: recordWriteUndo,
   };
 }
 
@@ -1102,25 +1113,17 @@ export function createViewSfcModuleExports(component: Component): Record<string,
 }
 
 function createVueModule(context: RuntimeContext): ModuleExports {
-  const createAppShim = (component: Component) => {
-    context.entryComponent = component;
-    const app: {
-      mount: () => undefined;
-      use: () => unknown;
-      component: () => unknown;
-      provide: () => unknown;
-    } = {
-      mount: () => undefined,
-      use: () => app,
-      component: () => app,
-      provide: () => app,
-    };
-    return app;
-  };
-
   return {
-    ...VueRuntime,
-    createApp: createAppShim,
+    ...context.scope.vueRuntime(VueRuntime),
+    createApp: (component: Component, props?: Record<string, unknown>) => {
+      context.entryComponent = component;
+      // A compatibility application records real plugin/provide/component
+      // registrations but never mounts a second application or creates Pinia.
+      const app = VueRuntime.createApp(component, props);
+      context.entryApp = app;
+      app.mount = (() => undefined) as unknown as typeof app.mount;
+      return app;
+    },
   };
 }
 
@@ -1548,15 +1551,21 @@ function isNodePathSpecifier(specifier: string): boolean {
   return specifier === "path" || specifier === "node:path";
 }
 
-function createViewRuntimeApi(detail: ViewPackageDetail, api: ViewRuntimeApi): ViewRuntimeModuleApi {
+function createViewRuntimeApi(detail: ViewPackageDetail, api: ViewRuntimeApi, scope?: ViewExecutionScope): ViewRuntimeModuleApi {
   const cached = runtimeApiCache.get(api);
   if (cached) return cached;
-  const runtime = createViewRuntimeApiUncached(detail, api);
+  const runtime = createViewRuntimeApiUncached(detail, api, scope);
   runtimeApiCache.set(api, runtime);
   return runtime;
 }
 
-function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntimeApi) {
+function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntimeApi, scope?: ViewExecutionScope) {
+  const track = <T extends (...args: any[]) => () => void>(register: T): T => ((...args: Parameters<T>) => {
+    const release = register(...args); return scope ? scope.track(release) : release;
+  }) as T;
+  const trackSubscription = <T extends (...args: any[]) => Promise<() => void>>(subscribe: T): T => ((...args: Parameters<T>) => {
+    const registration = subscribe(...args); return scope ? scope.trackAsync(registration) : registration;
+  }) as T;
   const undo = createViewUndoService();
   const propertyWrites = createViewPropertyRuntime(api, undo);
   const unityProperty = UnityPropertyBinding.createUnityPropertyRuntime({
@@ -1574,6 +1583,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
         label: options.label,
         undoable: options.undoable,
         beforeSnapshot: (options.beforeSnapshot ?? null) as ViewSerializedPropertySnapshotInput | null,
+        onApplied: options.onApplied,
       });
     },
     apply: (request, options = {}) => {
@@ -1583,19 +1593,34 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
       return propertyWrites.apply(request, {
         label: options.label,
         undoable: options.undoable,
+        onApplied: options.onApplied,
       });
     },
     undo: undo.undo,
     redo: undo.redo,
   });
+  const historyOwner = scope ? `${scope.context.windowLabel}:${scope.context.editorId}:${scope.context.viewId}` : "";
+  if (scope) scope.trackAsync(listenUnityValueEditorCommitted((event) => {
+    const result = event.result;
+    if (!historyOwner || event.historyOwner !== historyOwner || event.historyReplay || !result?.ok || !result.beforeSnapshot) return;
+    if (event.workspaceRef.checkoutId !== api.workspaceRef?.checkoutId || event.workspaceRef.expectedGeneration !== api.workspaceRef.expectedGeneration) return;
+    if (event.workspaceRef.expectedMaterializationEpoch !== api.workspaceRef.expectedMaterializationEpoch) return;
+    propertyWrites.recordExternal({ target: result.target, value: event.value }, result.beforeSnapshot, result, {
+      onApplied: async (applied) => {
+        await unityProperty.refreshTargets(applied.target);
+        await emitTauriEvent(UNITY_VALUE_EDITOR_COMMITTED_EVENT, { ...event, result: applied, value: applied.value, historyReplay: true });
+      },
+    });
+    void unityProperty.refreshTargets(result.target).catch((error) => console.warn("[view-runtime] property refresh failed", error));
+  }));
   const propertyDrawer = {
     library: PropertyTreeService.publicInspectorPropertyDrawerLibrary,
     projectLibrary: PropertyTreeService.projectInspectorPropertyDrawerLibrary,
-    register: PropertyTreeService.registerInspectorPropertyDrawer,
-    registerValue: PropertyTreeService.registerInspectorValueDrawer,
-    registerField: PropertyTreeService.registerInspectorFieldDrawer,
-    registerAttribute: PropertyTreeService.registerInspectorAttributeDrawer,
-    registerPropertyPath: PropertyTreeService.registerInspectorPropertyPathDrawer,
+    register: track(PropertyTreeService.registerInspectorPropertyDrawer),
+    registerValue: track(PropertyTreeService.registerInspectorValueDrawer),
+    registerField: track(PropertyTreeService.registerInspectorFieldDrawer),
+    registerAttribute: track(PropertyTreeService.registerInspectorAttributeDrawer),
+    registerPropertyPath: track(PropertyTreeService.registerInspectorPropertyPathDrawer),
     define: PropertyTreeService.defineInspectorPropertyDrawers,
     normalize: PropertyTreeService.normalizeInspectorPropertyDrawers,
     createLibrary: PropertyTreeService.createInspectorPropertyDrawerLibrary,
@@ -1603,7 +1628,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
   const unityObjectDrawer = {
     library: UnityObjectDrawerService.publicUnityObjectDrawerLibrary,
     projectLibrary: UnityObjectDrawerService.projectUnityObjectDrawerLibrary,
-    register: UnityObjectDrawerService.registerUnityObjectDrawer,
+    register: track(UnityObjectDrawerService.registerUnityObjectDrawer),
     define: UnityObjectDrawerService.defineUnityObjectDrawers,
     normalize: UnityObjectDrawerService.normalizeUnityObjectDrawers,
     createLibrary: UnityObjectDrawerService.createUnityObjectDrawerLibrary,
@@ -1680,19 +1705,19 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
       openUnitySceneObjectInspector(api.workspaceRef, scenePath, objectPath),
     openSceneObjectInspector: (scenePath: string, objectPath: string) =>
       openUnitySceneObjectInspector(api.workspaceRef, scenePath, objectPath),
-    select: selectUnityReference,
-    inspect: inspectUnityReference,
+    select: (input: ViewUnityReferenceInput, options?: { focusProjectWindow?: boolean }) => selectUnityReference(input, options, api.workspaceRef),
+    inspect: (input: ViewUnityReferenceInput) => inspectUnityReference(input, api.workspaceRef),
     drag: {
       start: (event: DragEvent, refs: ViewUnityReferenceInput | ViewUnityReferenceInput[]) =>
         startUnityReferenceHtmlDrag(event, normalizeUnityReferences(refs)),
       arm: (event: PointerEvent, refs: ViewUnityReferenceInput | ViewUnityReferenceInput[]) =>
         armUnityReferencePointerDrag(event, normalizeUnityReferences(refs)),
       commitDrop: commitUnityEmbedAssetDrop,
-      onDrop: subscribeUnityEmbedAssetDrop,
-      onState: subscribeUnityEmbedAssetDragState,
+      onDrop: trackSubscription(subscribeUnityEmbedAssetDrop),
+      onState: trackSubscription(subscribeUnityEmbedAssetDragState),
     },
-    onDrop: subscribeUnityEmbedAssetDrop,
-    onDragState: subscribeUnityEmbedAssetDragState,
+    onDrop: trackSubscription(subscribeUnityEmbedAssetDrop),
+    onDragState: trackSubscription(subscribeUnityEmbedAssetDragState),
     objectDrawer: unityObjectDrawer,
     objectReferencePicker,
   };
@@ -1703,11 +1728,11 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
         startLocusFileHtmlDrag(event, normalizeLocusFiles(refs)),
       arm: (event: PointerEvent, refs: LocusFileDropRef | LocusFileDropRef[]) =>
         armLocusFilePointerDrag(event, normalizeLocusFiles(refs)),
-      onDrop: subscribeLocusFileDrop,
-      onState: subscribeLocusFileDragState,
+      onDrop: trackSubscription(subscribeLocusFileDrop),
+      onState: trackSubscription(subscribeLocusFileDragState),
     },
-    onDrop: subscribeLocusFileDrop,
-    onDragState: subscribeLocusFileDragState,
+    onDrop: trackSubscription(subscribeLocusFileDrop),
+    onDragState: trackSubscription(subscribeLocusFileDragState),
   };
 
   const view = {
@@ -1746,6 +1771,7 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
   };
 
   return {
+    locus: createFrontendSdk(api.workspaceRef, { signal: scope?.context.signal, windowLabel: scope?.context.windowLabel, ownerWindow: scope?.ownerWindow }),
     view,
     session,
     llm,
@@ -1758,6 +1784,17 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     propertyDrawer,
     unityObjectDrawer,
     property: unityProperty,
+    propertyEditing: {
+      workspaceRef: api.workspaceRef,
+      historyOwner,
+      adapter: {
+        read: (request: UnityPropertyBinding.UnityBoundPropertyReadRequest) => api.unityPropertyRead(request),
+        write: (request: UnityPropertyBinding.UnityBoundPropertyWriteRequest, options?: UnityPropertyBinding.UnityBoundPropertyWriteOptions) =>
+          unityProperty.write(request.target, request.value, { ...options, writeMode: request.writeMode ?? undefined }),
+        apply: (request: UnityPropertyBinding.UnityBoundPropertyApplyRequest, options?: UnityPropertyBinding.UnityBoundPropertyApplyOptions) => unityProperty.apply(request.writes, options),
+        undo: undo.undo, redo: undo.redo,
+      },
+    },
     defineView: <T>(value: T) => value,
     defineGraphView,
     CanvasView,
@@ -1781,27 +1818,23 @@ function createViewRuntimeApiUncached(detail: ViewPackageDetail, api: ViewRuntim
     ...UnityPropertyPathService,
     ...UnityObjectDrawerService,
     ...UnityObjectReferencePickerService,
+    registerInspectorPropertyDrawer: propertyDrawer.register,
+    registerInspectorValueDrawer: propertyDrawer.registerValue,
+    registerInspectorFieldDrawer: propertyDrawer.registerField,
+    registerInspectorAttributeDrawer: propertyDrawer.registerAttribute,
+    registerInspectorPropertyPathDrawer: propertyDrawer.registerPropertyPath,
+    registerUnityObjectDrawer: unityObjectDrawer.register,
     onEditorUpdate: (handler: (event: ViewRuntimeUpdateEvent) => void) => view.onUpdate(handler),
     useUnityReferenceDrag,
     useUnityAssetDropTarget: useUnityAssetDropTargetRuntime,
     useLocusFileDrag,
     useLocusFileDropTarget: useLocusFileDropTargetRuntime,
-    useViewState: <T extends object>(initial: T) => reactive(initial),
+    useViewContext,
+    t,
+    useViewState: <T extends object>(initial: T, key?: string) => scope ? scope.state(reactive(initial), key) : reactive(initial),
     useViewScript: (scriptName: string) => ({
       call: (method: string, args?: unknown) => view.callScript(scriptName, method, args),
     }),
-  };
-}
-
-function installLegacyWindowApi(runtime: ReturnType<typeof createViewRuntimeApi>) {
-  if (typeof window === "undefined") return;
-  const target = window as typeof window & {
-    locus?: Record<string, unknown>;
-  };
-  target.locus = {
-    ...(target.locus ?? {}),
-    view: runtime.view,
-    unity: runtime.unity,
   };
 }
 
@@ -1813,8 +1846,10 @@ function createModuleLoader(context: RuntimeContext) {
 
   function load(specifier: string, importer = viewPackageRelPath(context.detail, "src/App.vue")): ModuleExports {
     if (specifier === "vue") return createVueModule(context);
-    if (specifier === "@locus/view-runtime") return createViewRuntimeApi(context.detail, context.api);
+    if (specifier === "pinia") return PiniaRuntime as unknown as ModuleExports;
+    if (specifier === "@locus/view-runtime") return createViewRuntimeApi(context.detail, context.api, context.scope);
     if (specifier === "@locus/components") return LOCUS_COMPONENT_MODULE;
+    if (specifier === "@locus/frontend") return { locus: createViewRuntimeApi(context.detail, context.api, context.scope).locus };
     if (isNodeFsPromisesSpecifier(specifier)) return createNodeFsPromisesModule(context.api);
     if (isNodeFsSpecifier(specifier)) return createNodeFsModule(context.api);
     if (isNodePathSpecifier(specifier)) return createNodePathModule();
@@ -1826,7 +1861,7 @@ function createModuleLoader(context: RuntimeContext) {
     if (cache.has(file.relPath)) return cache.get(file.relPath)!;
 
     if (file.relPath.endsWith(".css")) {
-      context.styles.push(file.content);
+      context.styles.push(...(context.compilation.modules[file.relPath]?.styles ?? []));
       const exports = {};
       cache.set(file.relPath, exports);
       return exports;
@@ -1851,14 +1886,16 @@ function createModuleLoader(context: RuntimeContext) {
 
     const module = { exports: {} as ModuleExports };
     cache.set(file.relPath, module.exports);
-    const code = context.transformModuleSource(file.content, file.relPath);
-    const execute = new Function("__import", "exports", "module", "__vue", "__runtime", code);
+    const code = context.compilation.modules[file.relPath]?.code;
+    if (code == null) throw new Error(`View module was not compiled: ${file.relPath}`);
+    const execute = new Function("__import", "exports", "module", "__vue", "__runtime", ...Object.keys(context.globals), code);
     execute(
       (childSpecifier: string) => load(childSpecifier, file.relPath),
       module.exports,
       module,
       createVueModule(context),
-      createViewRuntimeApi(context.detail, context.api),
+      createViewRuntimeApi(context.detail, context.api, context.scope),
+      ...Object.values(context.globals),
     );
     cache.set(file.relPath, module.exports);
     return module.exports;
@@ -1867,19 +1904,21 @@ function createModuleLoader(context: RuntimeContext) {
   return load;
 }
 
-function buildSfcComponent(context: RuntimeContext, source: string, relPath: string): Component {
-  const compiled = context.compileViewSfc(source, relPath);
+function buildSfcComponent(context: RuntimeContext, _source: string, relPath: string): Component {
+  const compiled = context.compilation.modules[relPath];
+  if (!compiled) throw new Error(`View component was not compiled: ${relPath}`);
   const importModule = context.importModule;
   context.styles.push(...compiled.styles);
 
   const module = { exports: {} as ModuleExports };
-  const execute = new Function("__import", "exports", "module", "__vue", "__runtime", compiled.code);
+  const execute = new Function("__import", "exports", "module", "__vue", "__runtime", ...Object.keys(context.globals), compiled.code);
   execute(
     (specifier: string) => importModule(specifier, relPath),
     module.exports,
     module,
     createVueModule(context),
-    createViewRuntimeApi(context.detail, context.api),
+    createViewRuntimeApi(context.detail, context.api, context.scope),
+      ...Object.values(context.globals),
   );
   const options = (module.exports.default ?? {}) as Record<string, unknown>;
   return defineComponent({
@@ -1889,113 +1928,6 @@ function buildSfcComponent(context: RuntimeContext, source: string, relPath: str
       ...((options.components as Record<string, Component> | undefined) ?? {}),
     },
   });
-}
-
-function viewRuntimeStyleText(detail: ViewPackageDetail, styles: string[]): string {
-  return [
-    viewRuntimeBaseCss(),
-    sanitizeCssForPreview(viewFileContent(detail, detail.manifest.style)),
-    ...styles.map(sanitizeCssForPreview),
-  ].join("\n\n");
-}
-
-function useViewRuntimeStyles(detail: ViewPackageDetail): (styles: string[]) => void {
-  const styleEl = document.createElement("style");
-  styleEl.dataset.locusViewRuntimeStyle = detail.manifest.id;
-  const applyStyles = (styles: string[]) => {
-    styleEl.textContent = viewRuntimeStyleText(detail, styles);
-  };
-  applyStyles([]);
-  document.head.appendChild(styleEl);
-  onBeforeUnmount(() => {
-    styleEl.remove();
-  });
-  return applyStyles;
-}
-
-function viewRuntimeBaseCss(): string {
-  return `body {
-  background: var(--bg-color);
-  color: var(--text-color);
-}
-
-.locus-view-runtime-root {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  overflow: auto;
-  background: var(--bg-color);
-  color: var(--text-color);
-  font-family: var(--font-ui);
-}
-
-.locus-view-runtime-root input[type="number"] {
-  appearance: textfield;
-  -moz-appearance: textfield;
-}
-
-.locus-view-runtime-root input[type="number"]::-webkit-inner-spin-button,
-.locus-view-runtime-root input[type="number"]::-webkit-outer-spin-button {
-  margin: 0;
-  -webkit-appearance: none;
-}
-
-.locus-unity-reference-chip {
-  max-width: 100%;
-  min-height: 24px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  padding: 2px 7px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-color);
-  font: inherit;
-  font-size: 12px;
-  line-height: 1.3;
-  text-align: left;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  cursor: default;
-}
-
-.locus-unity-reference-chip:hover,
-.locus-unity-reference-chip:focus-visible {
-  border-color: var(--border-strong);
-  background: var(--hover-bg);
-  outline: none;
-}
-
-.locus-unity-drop-zone {
-  min-height: 32px;
-  border: 1px dashed var(--border-color);
-  border-radius: 6px;
-}
-
-.locus-unity-drop-zone.is-active {
-  border-color: var(--accent-color);
-  background: var(--accent-soft);
-}
-
-.view-runtime-error {
-  margin: 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--status-danger-border);
-  border-radius: 6px;
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.view-runtime-loading {
-  margin: 12px;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.45;
-}`;
 }
 
 function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntimeApi): ViewRuntimeApi {
@@ -2230,153 +2162,46 @@ function createInstrumentedRuntimeApi(detail: ViewPackageDetail, api: ViewRuntim
 
 export function createViewRuntimeComponent(options: ViewRuntimeComponentOptions): Component {
   const instrumentedApi = createInstrumentedRuntimeApi(options.detail, options.api);
-  const runtime = createViewRuntimeApi(options.detail, instrumentedApi);
-  installLegacyWindowApi(runtime);
-
-  return markRaw(
-    defineComponent({
-      name: "LocusViewRuntimeRoot",
-      setup() {
-        const runtimeError = ref("");
-        const loading = ref(true);
-        const appComponent = shallowRef<Component | null>(null);
-        const applyStyles = useViewRuntimeStyles(options.detail);
-        let disposed = false;
-
-        onBeforeUnmount(() => {
-          disposed = true;
-        });
-
-        const prepare = async () => {
-          const viewId = options.detail.manifest.id;
-          const prepareStartedAt = perfNowMs();
-          markStartupPhase("runtimePrepare_start", {
-            viewId,
-            entry: options.detail.manifest.entry,
-            fileCount: options.detail.files.length,
-          });
-          try {
-            const compilerImportStartedAt = perfNowMs();
-            markStartupPhase("runtimeCompilerImport_start", { viewId });
-            const { compileViewSfc, transformModuleSource } = await import("./viewSfcCompiler");
-            markStartupPhase("runtimeCompilerImport_done", {
-              viewId,
-              elapsedMs: elapsedMs(compilerImportStartedAt),
-            });
-            const styles: string[] = [];
-            const context: RuntimeContext = {
-              detail: options.detail,
-              api: instrumentedApi,
-              styles,
-              compileViewSfc,
-              transformModuleSource,
-              importModule: () => {
-                throw new Error("View module loader is not ready.");
-              },
-            };
-            const moduleLoaderStartedAt = perfNowMs();
-            context.importModule = createModuleLoader(context);
-            markStartupPhase("runtimeModuleLoader_ready", {
-              viewId,
-              elapsedMs: elapsedMs(moduleLoaderStartedAt),
-            });
-            const appPath = viewPackageRelPath(options.detail, "src/App.vue");
-            const entryPath = viewPackageRelPath(options.detail, options.detail.manifest.entry);
-            const entryImportStartedAt = perfNowMs();
-            markStartupPhase("runtimeEntryImport_start", { viewId, entryPath });
-            const entryExports = context.importModule(entryPath, appPath);
-            markStartupPhase("runtimeEntryImport_done", {
-              viewId,
-              entryPath,
-              elapsedMs: elapsedMs(entryImportStartedAt),
-              styleCount: styles.length,
-            });
-            const componentResolveStartedAt = perfNowMs();
-            const entryComponent = context.entryComponent
-              ?? ((entryExports.default as Component | undefined) || undefined);
-            const appFile = fileByPath(options.detail, appPath);
-            const resolvedComponent = entryComponent
-              ?? (appFile
-                ? buildSfcComponent(context, appFile.content, appFile.relPath)
-                : defineComponent({
-                    setup: () => () => h("main", { class: "view-preview-empty" }, options.detail.manifest.name),
-                  }));
-            markStartupPhase("runtimeComponentResolve_done", {
-              viewId,
-              elapsedMs: elapsedMs(componentResolveStartedAt),
-              usedEntryComponent: !!entryComponent,
-              hasAppFile: !!appFile,
-            });
-
-            if (disposed) {
-              markStartupPhase("runtimePrepare_aborted", {
-                viewId,
-                elapsedMs: elapsedMs(prepareStartedAt),
-              });
-              return;
-            }
-            const styleApplyStartedAt = perfNowMs();
-            applyStyles(styles);
-            markStartupPhase("runtimeStylesApply_done", {
-              viewId,
-              elapsedMs: elapsedMs(styleApplyStartedAt),
-              styleCount: styles.length,
-            });
-            appComponent.value = markRaw(resolvedComponent);
-            const firstInteractiveStartedAt = perfNowMs();
-            markStartupPhase("runtimePrepare_done", {
-              viewId,
-              elapsedMs: elapsedMs(prepareStartedAt),
-              styleCount: styles.length,
-            });
-            void nextTick().then(() => {
-              afterNextFrame(() => {
-                if (disposed) return;
-                markStartupPhase("viewFirstInteractive", {
-                  viewId,
-                  elapsedMs: elapsedMs(prepareStartedAt),
-                  sinceRuntimePrepareDoneMs: elapsedMs(firstInteractiveStartedAt),
-                });
-              });
-            });
-          } catch (prepareError) {
-            if (disposed) return;
-            runtimeError.value = prepareError instanceof Error
-              ? prepareError.message
-              : String(prepareError);
-            markStartupPhase("runtimePrepare_error", {
-              viewId,
-              elapsedMs: elapsedMs(prepareStartedAt),
-              message: runtimeError.value,
-            });
-            console.error("[view-runtime]", prepareError);
-          } finally {
-            if (!disposed) {
-              loading.value = false;
-            }
-          }
+  const runtime = createViewRuntimeApi(options.detail, instrumentedApi, options.scope);
+  const context: RuntimeContext = {
+    detail: options.detail, api: instrumentedApi, styles: [], scope: options.scope,
+    compilation: options.compilation, globals: options.scope.globals(runtime),
+    compileViewSfc: () => { throw new Error("View compilation belongs to the compiler worker."); },
+    transformModuleSource: () => { throw new Error("View compilation belongs to the compiler worker."); },
+    importModule: () => { throw new Error("View module loader is not ready."); },
+  };
+  context.importModule = createModuleLoader(context);
+  const appPath = viewPackageRelPath(options.detail, "src/App.vue");
+  const entry = context.importModule(viewPackageRelPath(options.detail, options.detail.manifest.entry), appPath);
+  const component = context.entryComponent ?? entry.default as Component | undefined;
+  const appFile = fileByPath(options.detail, appPath);
+  const resolved = component ?? (appFile ? buildSfcComponent(context, appFile.content, appFile.relPath) : null);
+  if (!resolved) throw new Error("View entry must export a Vue component or call createApp().");
+  return markRaw(defineComponent({
+    name: "LocusViewRuntimeRoot",
+    setup() {
+      const instance = getCurrentInstance()!;
+      if (context.entryApp) {
+        const configured = context.entryApp._context;
+        const inherited = instance.appContext;
+        // Inherit the native application while keeping legacy app-local
+        // registrations inside this View's subtree.
+        instance.appContext = {
+          ...inherited,
+          config: { ...inherited.config, ...configured.config,
+            globalProperties: Object.assign(Object.create(inherited.config.globalProperties), configured.config.globalProperties) },
+          components: { ...inherited.components, ...configured.components },
+          directives: { ...inherited.directives, ...configured.directives },
+          mixins: [...inherited.mixins, ...configured.mixins],
         };
-
-        void prepare();
-
-        onErrorCaptured((capturedError) => {
-          runtimeError.value = capturedError instanceof Error
-            ? capturedError.message
-            : String(capturedError);
-          console.error("[view-runtime]", capturedError);
-          return false;
-        });
-        return () => h("div", {
-          class: "locus-view-runtime-root",
-          onKeydownCapture: runtime.view.undo.handleKeydown,
-        }, [
-          runtimeError.value
-            ? h("div", { class: "view-runtime-error" }, runtimeError.value)
-            : appComponent.value
-              ? h(appComponent.value)
-              : h("div", { class: "view-runtime-loading" }, loading.value ? "Loading view..." : ""),
-        ]);
-      },
-    }),
-  );
+        for (const key of Reflect.ownKeys(configured.provides)) provide(key, configured.provides[key]);
+      }
+      provide(VIEW_CONTEXT, options.scope.context);
+      provide(UNITY_PROPERTY_EDITING, runtime.propertyEditing);
+      provide(UNITY_PROPERTY_WORKSPACE, () => options.scope.context.workspaceRef);
+      onBeforeUnmount(() => options.scope.dispose());
+      onErrorCaptured((error) => { options.onError?.(error); return false; });
+      return () => h("div", { class: "locus-view-runtime-root", onKeydownCapture: runtime.view.undo.handleKeydown }, [h(resolved)]);
+    },
+  }));
 }

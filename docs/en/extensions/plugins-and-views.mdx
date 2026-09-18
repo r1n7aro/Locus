@@ -41,7 +41,7 @@ The Plugin Hub reads the official registry by default, and teams can add their o
 A View is a custom project editor panel that runs on Locus's own frontend: the Agent combines a Vue interface, runtime scripts, and Unity property data into a View package that runs as a standalone tool, such as a level table editor or an ability tuning panel.
 
 - **Browse**: the Views tab lists all Views of the current workspace; click a name to open it. Some Views require a Unity Editor connection.
-- **Create**: type `/view` with a request in a session, and the Agent enters the View workflow to create or update a View package.
+- **Create**: type `/view` with a request in a session. The Agent composes existing canvas, graph, table and Unity controls in one Vue file. The file name supplies the defaults; optional names, icons and Unity connection requirements live inside the file. The SDK can initialize the requested directory structure.
 - **Organize**: drag entries to reorder or drop them into folders; right-click for new folder, rename, move, or delete. Views installed by a plugin are managed by that plugin and can only be deleted by uninstalling it.
 - **List entry**: `Show Views in session list` in Settings > Display puts View entries into the left column of the Sessions tab.
 

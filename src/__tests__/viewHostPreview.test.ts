@@ -8,6 +8,18 @@ import {
 import type { ViewPackageDetail } from "../services/view";
 
 describe("viewHostPreview", () => {
+  it("previews the root Vue entry and inline styles when the manifest has no style file", () => {
+    const detail: ViewPackageDetail = {
+      summary: { id: "panel", name: "panel", apiVersion: "1", version: "1", template: "component", displayPath: "panel", packageRoot: "/views/panel", manifestPath: "/views/panel/panel.vue", updatedAt: 1, capabilities: { unity: false }, requirements: { unityConnection: false } },
+      manifest: { id: "panel", name: "panel", schema: "locus.view.v1", apiVersion: "1", version: "1", template: "component", entry: "panel.vue", scripts: [], capabilities: { unity: false }, requirements: { unityConnection: false } },
+      files: [{ relPath: "panel.vue", content: '<view>{"name":"Panel"}</view><template><p class="single-panel">Panel</p></template><style scoped>.single-panel { padding: 17px; }</style>', kind: "source", size: 1, truncated: false }],
+    };
+    const preview = buildViewPreviewSrcdoc(detail);
+    expect(preview).toContain('<p class="single-panel">Panel</p>');
+    expect(preview).toContain('.single-panel { padding: 17px; }');
+    expect(preview).not.toContain('<view>');
+  });
+
   it("extracts the Vue template body", () => {
     expect(extractVueTemplate("<template><main>View</main></template>")).toBe("<main>View</main>");
   });

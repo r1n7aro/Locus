@@ -302,10 +302,11 @@ h1 {
 // must not inject per-template runtime shims that the real host never loads.
 export function buildViewPreviewSrcdoc(detail: ViewPackageDetail | null): string {
   if (!detail) return "";
-  const appSource = viewFileContent(detail, "src/App.vue");
-  const styleSource = viewFileContent(detail, detail.manifest.style);
+  const appSource = viewFileContent(detail, detail.manifest.entry.endsWith(".vue") ? detail.manifest.entry : "src/App.vue");
+  const styleSource = detail.manifest.style ? viewFileContent(detail, detail.manifest.style) : "";
   const template = stripScripts(extractVueTemplate(appSource));
-  const safeCss = sanitizeCssForPreview(styleSource);
+  const inlineStyles = parseVueSfc(appSource, { sourceMap: false }).descriptor.styles.map((style) => style.content).join("\n");
+  const safeCss = sanitizeCssForPreview([styleSource, inlineStyles].join("\n"));
   const body = template || `<main class="view-preview-empty">${escapeHtml(detail.manifest.name)}</main>`;
   const runtimeBaseCss = locusViewRuntimeBaseCss();
   const runtimeCompatibilityCss = locusViewRuntimeCompatibilityCss();

@@ -22,9 +22,9 @@ function parseViewSfc(source: string, fileName: string): SFCDescriptor {
   return parsed.descriptor;
 }
 
-function viewSfcScopeId(source: string, fileName: string): string {
+function viewSfcScopeId(_source: string, fileName: string): string {
   let hash = 2166136261;
-  const input = `${fileName}\n${source}`;
+  const input = fileName;
   for (let index = 0; index < input.length; index += 1) {
     hash ^= input.charCodeAt(index);
     hash = Math.imul(hash, 16777619);

@@ -13,6 +13,7 @@ import {
   useInternalDragController,
 } from "../composables/useInternalDrag";
 import { withInternalTreePreview } from "./explorer/internalTreePreview";
+import { VIEW_TREE_INTERNAL_DRAG_TYPE, viewWorkspaceDragReference, type ViewWorkspaceDragPayload } from "./view/viewWorkspaceDrag";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Box,
@@ -60,8 +61,10 @@ import LucideIcon from "./icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
-import { findMigratedViewRuntimeApiUsage } from "./view/viewPackageDiagnostics";
-import { compileViewSfc, transformModuleSource } from "./view/viewSfcCompiler";
+import { compileViewPackage } from "./view/viewCompilation";
+import { useWorkspaceEventScope } from "../composables/useWorkspaceEventScope";
+
+const workspaceEventSignal = useWorkspaceEventScope();
 
 interface ViewTreeNode {
   kind: "folder" | "view";
@@ -123,6 +126,9 @@ interface ViewDropTarget {
 const props = defineProps<{
   workingDir: string;
   workspaceRef: WorkspaceRef | null;
+  listOnly?: boolean;
+  toolbarTarget?: HTMLElement | null;
+  projectId?: string | null;
 }>();
 
 const STORAGE_KEY_VIEW_EXPANDED = "locus:viewPackageExpanded";
@@ -162,7 +168,6 @@ let nextViewLoadRun = 0;
 let unsubscribeWorkspaceEvents: RuntimeUnsubscribe | null = null;
 const internalDrag = useInternalDragController();
 let unregisterViewTreeDropTarget: (() => void) | null = null;
-const VIEW_TREE_INTERNAL_DRAG_TYPE = "locus/view-tree";
 
 const hasWorkspace = computed(() => !!props.workingDir.trim() && !!props.workspaceRef);
 
@@ -467,10 +472,6 @@ function applyTreeSnapshot(snapshot: ViewTreeSnapshot) {
   pruneViewCompileDiagnostics(snapshot.views);
 }
 
-function isViewCompileFile(relPath: string): boolean {
-  return /\.(vue|ts|js)$/i.test(relPath);
-}
-
 function normalizeCompileErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : normalizeAppError(error).message;
   const lines = message
@@ -556,21 +557,7 @@ function clearViewCompileDiagnostics() {
 async function validateViewCompile(view: ViewPackageSummary): Promise<string> {
   try {
     const detail = await viewRead(requireWorkspaceRef(), view.id);
-    for (const file of detail.files) {
-      if (!isViewCompileFile(file.relPath)) continue;
-      if (file.truncated) {
-        throw new Error(`${file.relPath}: ${t("view.status.compileSourceTruncated")}`);
-      }
-      const migratedApiUsage = findMigratedViewRuntimeApiUsage(file);
-      if (migratedApiUsage) {
-        throw new Error(migratedApiUsage);
-      }
-      if (file.relPath.endsWith(".vue")) {
-        compileViewSfc(file.content, file.relPath);
-      } else {
-        transformModuleSource(file.content, file.relPath);
-      }
-    }
+    await compileViewPackage(detail);
     return "";
   } catch (error) {
     return normalizeCompileErrorMessage(error);
@@ -682,6 +669,7 @@ function toggleRow(row: VisibleViewRow) {
 }
 
 function treeIndentPx(depth: number): number {
+  if (props.listOnly) return 10 + Math.max(0, depth) * 14;
   return VIEW_TREE_INDENT_BASE_PX + Math.max(0, depth) * VIEW_TREE_INDENT_STEP_PX;
 }
 
@@ -693,6 +681,7 @@ function selectTreeRow(row: VisibleViewRow) {
   }
   if (row.node.view) {
     selectView(row.node.view);
+    if (props.listOnly) void openViewPackage(row.node.view);
   }
 }
 
@@ -1021,12 +1010,19 @@ function onTreePointerDown(row: VisibleViewRow, event: PointerEvent) {
 
   internalDrag.start(event, {
     id: `view-tree:${row.node.key}`,
-    payload: { type: VIEW_TREE_INTERNAL_DRAG_TYPE, data: { node: row.node } },
+    payload: {
+      type: VIEW_TREE_INTERNAL_DRAG_TYPE,
+      data: {
+        node: row.node,
+        workspaceView: viewWorkspaceDragReference(props.projectId, props.workspaceRef, row.node.view),
+      },
+    },
     preview: {
       label: row.node.label,
       kind: row.node.kind === "folder" ? "folder" : "package",
+      icon: row.node.view ? resolveLocusViewIcon(row.node.view.icon) : Folder,
     },
-    allowedOperations: ["move"],
+    allowedOperations: ["move", "copy"],
     onActivated: () => {
       draggingNode.value = row.node;
       dragTargetKey.value = "";
@@ -1039,7 +1035,7 @@ function onTreePointerDown(row: VisibleViewRow, event: PointerEvent) {
   });
 }
 
-interface ViewTreeInternalDragData {
+interface ViewTreeInternalDragData extends ViewWorkspaceDragPayload {
   node: ViewTreeNode;
 }
 
@@ -1317,6 +1313,7 @@ onMounted(async () => {
         void loadViews();
       }
     },
+    { owner: "ViewPackageView.views", signal: workspaceEventSignal },
   );
   if (hasWorkspace.value) await loadViews();
 });
@@ -1331,7 +1328,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="viewPackageRootRef" class="view-package-view">
+  <div ref="viewPackageRootRef" class="view-package-view" :class="{ 'is-list-only': props.listOnly }">
     <WorkspaceRequiredState
       v-if="!hasWorkspace"
       :description="t('workspace.required.viewDescription')"
@@ -1340,18 +1337,21 @@ onUnmounted(() => {
     <template v-else>
       <div class="view-layout">
         <aside class="view-sidebar">
-          <div class="view-pane-header">
-            <span>{{ t("view.list.title") }}</span>
+          <div :class="props.listOnly ? 'view-secondary-toolbar' : 'view-pane-header'">
+            <span v-if="!props.listOnly">{{ t("view.list.title") }}</span>
+            <Teleport :to="props.toolbarTarget ?? 'body'" :disabled="!props.listOnly || !props.toolbarTarget">
             <div class="view-pane-header-actions">
               <BaseButton
                 class="view-header-action"
                 :title="importing ? t('view.action.importing') : t('view.import.action')"
+                :aria-label="t('view.import.action')"
                 :disabled="importing"
                 @click="importViewPackage('')"
               >
                 <LucideIcon :icon="Upload" :size="13" :stroke-width="2" />
               </BaseButton>
             </div>
+            </Teleport>
           </div>
 
           <div
@@ -1460,7 +1460,7 @@ onUnmounted(() => {
                   @click="selectTreeRow(entry.row)"
                 >
                   <span
-                    v-if="entry.row.node.kind === 'folder'"
+                    v-if="entry.row.node.kind === 'folder' && !props.listOnly"
                     class="view-tree-branch-slot"
                     @click.stop="toggleRow(entry.row)"
                   >
@@ -1473,7 +1473,7 @@ onUnmounted(() => {
                     />
                   </span>
                   <span
-                    v-else-if="entry.row.depth > 0"
+                    v-else-if="entry.row.depth > 0 && !props.listOnly"
                     class="view-tree-branch-spacer"
                     aria-hidden="true"
                   ></span>
@@ -1606,7 +1606,7 @@ onUnmounted(() => {
           </div>
         </aside>
 
-        <section class="view-detail">
+        <section v-if="!props.listOnly" class="view-detail">
           <div class="view-detail-toolbar">
             <div class="view-detail-title">
               <span>{{ selectedView?.name || t("view.detail.emptyTitle") }}</span>
@@ -1640,10 +1640,6 @@ onUnmounted(() => {
               <div class="view-metadata-row">
                 <dt>{{ t("view.metadata.id") }}</dt>
                 <dd class="mono">{{ selectedView.id }}</dd>
-              </div>
-              <div class="view-metadata-row">
-                <dt>{{ t("view.metadata.template") }}</dt>
-                <dd class="mono">{{ selectedView.template }}</dd>
               </div>
               <div class="view-metadata-row">
                 <dt>{{ t("view.metadata.version") }}</dt>
@@ -1822,6 +1818,58 @@ onUnmounted(() => {
   border-right: 1px solid var(--border-color);
   background: var(--sidebar-bg);
   overflow: hidden;
+}
+
+.is-list-only .view-sidebar {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  border-right: 0;
+}
+
+.view-secondary-toolbar {
+  display: contents;
+}
+
+.is-list-only .view-list {
+  padding: 4px 0;
+}
+
+.is-list-only .view-tree-row,
+.is-list-only .view-tree-empty-folder-row,
+.is-list-only .view-tree-create-row,
+.is-list-only .view-tree-rename-row {
+  min-height: 30px;
+  gap: 4px;
+  padding-right: 8px;
+}
+
+.is-list-only .view-tree-label {
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.is-list-only .view-tree-kind-icon {
+  height: 18px;
+}
+
+.is-list-only .view-tree-kind-icon :deep(svg) {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+.is-list-only .view-tree-row-shell:not(.folder) .view-tree-label {
+  font-weight: 400;
+}
+
+.is-list-only .view-tree-row-shell.active {
+  box-shadow: inset 2px 0 0 var(--accent-color);
+}
+
+.is-list-only .view-tree-kind-icon.folder.open {
+  color: color-mix(in srgb, var(--accent-color) 38%, var(--text-secondary) 62%);
 }
 
 .view-pane-header {

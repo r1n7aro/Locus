@@ -1,0 +1,13 @@
+{
+  "description": "Execute TypeScript in the live Locus frontend through its TypeScript SDK. This skill-loaded tool is the single entry for creating, opening, editing and debugging Views and controlling the Locus Workbench UI. The variable `locus` is provided, or import it from `@locus/frontend`. Use `return` for the result. APIs include locus.workbench.tabs/activate/close, locus.ui.snapshot/locator/getByRole/wait/capture, locus.views.list/components/create/open/get/instances/reload, locus.fs.read/write/list, and locus.unity.property.read/discover/write/apply. Discover native reusable components with locus.views.components(). Create a Vue View with locus.views.create({fileName, component}); omit component to initialize an empty Vue file, and use directories to initialize package structure. There are no View templates; optional metadata belongs in its leading <view> JSON block. View handles expose snapshot, locator, wait, reload, logs, activate and capture. capture() attaches a PNG to the tool result. Read the View skill's frontend-sdk.md for types and examples. Do not use raw Tauri IPC or create another WebView.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "code": { "type": "string", "description": "TypeScript async function body. Example: const panel = await locus.views.open('asset-editor'); return await panel.snapshot();" },
+      "windowLabel": { "type": "string", "description": "Existing Locus window label. Defaults to the main Workbench window." },
+      "timeoutMs": { "type": "integer", "minimum": 250, "maximum": 60000, "description": "Execution timeout; defaults to 30000 ms." }
+    },
+    "required": ["code"]
+  }
+}

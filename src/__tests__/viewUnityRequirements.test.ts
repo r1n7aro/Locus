@@ -11,11 +11,11 @@ function read(relPath: string) {
 describe("View Unity requirements", () => {
   it("declares and enforces Unity connection requirements before View runtime render", () => {
     const service = read("src/services/view.ts");
-    const host = read("src/components/ViewHostWindow.vue");
+    const host = read("src/components/view/ViewRuntimeHost.vue");
     const page = read("src/components/ViewPackageView.vue");
     const sessionPanel = read("src/components/chat/SessionPanel.vue");
     const runtime = read("src-tauri/src/view.rs");
-    const templates = read("src-tauri/src/view/templates/mod.rs");
+    const component = read("src-tauri/src/view/single_file.rs");
     const zh = read("src/language/zh.json");
     const en = read("src/language/en.json");
 
@@ -26,8 +26,8 @@ describe("View Unity requirements", () => {
     expect(service).toContain("export function normalizeViewError");
     expect(service).toContain("view.error.unityConnectionRequiredNamed");
 
-    expect(templates).toContain("requirements: Some(ViewRequirements");
-    expect(templates).toContain("\"inspector-form\" | \"field-blocks\" | \"node-graph\" | \"serialized-table\"");
+    expect(component).toContain("requirements: Some(ViewRequirements");
+    expect(component).toContain("unity_connection: unity");
 
     expect(runtime).toContain("pub requirements: Option<ViewRequirements>");
     expect(runtime).toContain("ensure_view_open_requirements");

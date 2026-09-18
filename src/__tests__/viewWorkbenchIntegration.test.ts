@@ -30,12 +30,19 @@ describe("View Workbench integration", () => {
     expect(workbench).toContain("<WorkbenchViewEditor");
     expect(workbench).toContain(":view-id=\"editor.resource.viewId\"");
     expect(workbench).toContain("ensureWorkbenchViewEditorReady");
-    expect(editor).toContain("viewContentMount(workspaceRef, request)");
-    expect(editor).toContain("viewContentHide(props.workspaceRef, props.viewId)");
+    expect(editor).toContain("<ViewRuntimeHost");
+    expect(editor).not.toContain("viewContentMount");
+    expect(editor).toContain(':instance-id="instanceId"');
     expect(tabs).toContain('case "view"');
+
+    const tabOpen = workbench.slice(workbench.indexOf("async function openViewInWorkbench("), workbench.indexOf("provide(WORKBENCH_FILE_OPEN_KEY"));
+    expect(tabOpen).toContain('preview: false');
+    expect(tabOpen).toContain('pinned: true');
+    expect(tabOpen).toContain("workbenchStore.pinEditor(WORKBENCH_WINDOW_ID, existing.paneId, existing.editor.editorId)");
+    expect(tabOpen).toContain("await focusWorkbenchEditor(existing.paneId, existing.editor.editorId)");
   });
 
-  it("hands the native View child window over before removing a transferred tab", () => {
+  it("waits for the target View instance before removing a transferred tab", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const ready = workbench.indexOf("await ensureWorkbenchViewEditorReady(result.editorId)");
     const acknowledge = workbench.indexOf("const acknowledgement: WorkbenchWindowTransferAckPayload", ready);

@@ -1,18 +1,16 @@
 use std::sync::Arc;
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::error::AppError;
 use crate::view::{
     append_view_frontend_log_sync, call_view_script, compile_view_script,
     complete_view_automation_request, create_view_folder_sync, create_view_sync_with_scope,
-    delete_view_entry_sync, destroy_view_content_window_scoped, emit_view_reload_for_scope,
-    emit_view_tree_changed_for_scope, export_view_package_sync, hide_view_content_window_scoped,
-    import_view_package_sync, list_view_tree_sync, list_views_sync, mount_view_content_window,
-    move_view_entry_sync, open_view_frontend_log_sync, open_view_in_workbench,
+    delete_view_entry_sync, emit_view_reload_for_scope,
+    emit_view_tree_changed_for_scope, export_view_package_sync, import_view_package_sync, list_view_tree_sync, list_views_sync, move_view_entry_sync, open_view_frontend_log_sync,
     open_view_unity_embed_window, parse_view_create_request, read_view_frontend_log_sync,
     read_view_sync, reload_view_sync, rename_view_entry_sync, set_view_tab_host_scoped_sync,
-    supported_view_templates, view_fs_access as view_fs_access_impl,
+    view_fs_access as view_fs_access_impl,
     view_fs_append_file as view_fs_append_file_impl, view_fs_copy_file as view_fs_copy_file_impl,
     view_fs_lstat as view_fs_lstat_impl, view_fs_mkdir as view_fs_mkdir_impl,
     view_fs_read_file as view_fs_read_file_impl, view_fs_readdir as view_fs_readdir_impl,
@@ -20,15 +18,14 @@ use crate::view::{
     view_fs_stat as view_fs_stat_impl, view_fs_unlink as view_fs_unlink_impl,
     view_fs_write_file as view_fs_write_file_impl, view_storage_get_sync, view_storage_remove_sync,
     view_storage_set_sync, ViewAutomationStore, ViewCallScriptRequest, ViewCallScriptResult,
-    ViewCompileScriptRequest, ViewCompileScriptResult, ViewContentMountRequest,
-    ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewExportPackageRequest, ViewFolderSummary,
+    ViewCompileScriptRequest, ViewCompileScriptResult, ViewCreateFolderRequest, ViewDeleteEntryRequest, ViewExportPackageRequest, ViewFolderSummary,
     ViewFrontendLogEntry, ViewFrontendLogReadRequest, ViewFrontendLogRequest,
     ViewFsCopyFileRequest, ViewFsMkdirRequest, ViewFsPathRequest, ViewFsReadFileRequest,
     ViewFsReadFileResult, ViewFsReaddirRequest, ViewFsReaddirResult, ViewFsRenameRequest,
     ViewFsRmRequest, ViewFsStatResult, ViewFsWriteFileRequest, ViewImportPackageRequest,
     ViewMoveEntryRequest, ViewPackageDetail, ViewPackageImportResult, ViewPackageSummary,
     ViewRenameEntryRequest, ViewRunResult, ViewSetTabHostRequest, ViewStorageGetRequest,
-    ViewStorageRemoveRequest, ViewStorageSetRequest, ViewTemplateSummary, ViewTreeSnapshot,
+    ViewStorageRemoveRequest, ViewStorageSetRequest, ViewTreeSnapshot,
 };
 use crate::workspace_service::{
     ProjectRegistry as InnerProjectRegistry, ResolvedWorkspaceScope, WorkspaceRef,
@@ -39,6 +36,10 @@ type ProjectRegistry = Arc<InnerProjectRegistry>;
 
 fn view_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
+        error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
+            "workspace.materialization_stale",
+            "The checkout assignment changed. Reopen the checkout before continuing.",
+        ).detail(error.to_string()),
         WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
             "workspace.registry_unavailable",
             "The workspace registry is unavailable.",
@@ -74,11 +75,6 @@ fn resolve_view_workspace_scope(
 
 fn view_scope_root(scope: &ResolvedWorkspaceScope) -> String {
     scope.runtime().root().to_string_lossy().to_string()
-}
-
-#[tauri::command]
-pub async fn view_templates() -> Result<Vec<ViewTemplateSummary>, AppError> {
-    Ok(supported_view_templates())
 }
 
 #[tauri::command]
@@ -249,21 +245,20 @@ pub async fn view_reload(
 #[tauri::command]
 pub async fn view_run(
     view_id: String,
+    window_label: Option<String>,
     workspace_ref: WorkspaceRef,
     registry: State<'_, ProjectRegistry>,
     app_handle: AppHandle,
+    window: tauri::WebviewWindow,
 ) -> Result<ViewRunResult, AppError> {
     let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    let runtime = scope.runtime().clone();
-    let _ready = super::workspace::resolve_unity_ready_ipc_scope(
-        &registry,
-        &workspace_ref,
-        "view_run_in_unity",
-    )
-    .await?;
-    super::ensure_unity_embed_control_server(app_handle.clone(), runtime);
     let working_dir = view_scope_root(&scope);
-    open_view_in_workbench(&app_handle, &working_dir, &view_id)
+    if let Some(label) = window_label.as_deref() {
+        if (label != "main" && !label.starts_with("workbench-")) || app_handle.get_webview_window(label).is_none() {
+            return Err(AppError::from(format!("Workbench window is unavailable: {label}")));
+        }
+    }
+    crate::view::open_view_in_workbench_on_window(&app_handle, &working_dir, &view_id, Some(window_label.as_deref().unwrap_or(window.label())))
         .await
         .map_err(Into::into)
 }
@@ -295,42 +290,6 @@ pub async fn view_set_tab_host(
         workspace_ref.expected_generation.unwrap_or_default()
     );
     set_view_tab_host_scoped_sync(request, &scope_key).map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_content_mount(
-    request: ViewContentMountRequest,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    app_handle: AppHandle,
-) -> Result<ViewRunResult, AppError> {
-    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    let working_dir = view_scope_root(&scope);
-    mount_view_content_window(&app_handle, &working_dir, request)
-        .await
-        .map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_content_hide(
-    view_id: String,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let _scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    hide_view_content_window_scoped(&app_handle, &workspace_ref, &view_id).map_err(Into::into)
-}
-
-#[tauri::command]
-pub async fn view_content_destroy(
-    view_id: String,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
-    app_handle: AppHandle,
-) -> Result<(), AppError> {
-    let _scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    destroy_view_content_window_scoped(&app_handle, &workspace_ref, &view_id).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -587,16 +546,32 @@ pub async fn view_automation_respond(
     ok: bool,
     result: Option<serde_json::Value>,
     error: Option<String>,
-    workspace_ref: WorkspaceRef,
-    registry: State<'_, ProjectRegistry>,
     store: State<'_, Arc<ViewAutomationStore>>,
-) -> Result<(), AppError> {
-    let _scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
-    if complete_view_automation_request(store.inner().as_ref(), request_id, ok, result, error) {
-        Ok(())
-    } else {
-        Err(AppError::from(
-            "View automation request is no longer pending",
-        ))
-    }
+) -> Result<bool, AppError> {
+    // A late or duplicate reply is an expired transport message, not a UI error.
+    Ok(complete_view_automation_request(store.inner().as_ref(), request_id, ok, result, error))
+}
+
+#[tauri::command]
+pub async fn view_watch(workspace_ref: WorkspaceRef, view_id: String, token: String, host_label: String, registry: State<'_, ProjectRegistry>, app_handle: AppHandle) -> Result<(), AppError> {
+    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
+    crate::view::register_native_view_host(&app_handle, &view_scope_root(&scope), &workspace_ref, &view_id, &token, &host_label).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn view_unwatch(workspace_ref: WorkspaceRef, view_id: String, token: String, host_label: String) -> Result<(), AppError> {
+    // Release a lease even if its checkout has already been retired.
+    crate::view::release_native_view_host(&workspace_ref, &view_id, &token, &host_label);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn view_append_frontend_logs(workspace_ref: WorkspaceRef, requests: Vec<ViewFrontendLogRequest>, registry: State<'_, ProjectRegistry>) -> Result<(), AppError> {
+    let scope = resolve_view_workspace_scope(&registry, &workspace_ref)?;
+    crate::view::append_view_frontend_logs_sync(&view_scope_root(&scope), requests).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn frontend_capture(window_label: String, clip: Option<serde_json::Value>, app_handle: AppHandle) -> Result<serde_json::Value, AppError> {
+    crate::view::capture_frontend_window(&app_handle, &window_label, clip).await.map_err(Into::into)
 }
