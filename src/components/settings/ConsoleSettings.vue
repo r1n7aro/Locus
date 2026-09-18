@@ -16,7 +16,6 @@ import { useNotificationStore } from "../../stores/notification";
 import {
   clearDebugConsole,
   getDebugConsoleSnapshot,
-  initDebugConsole,
   refreshDebugConsole,
   revealLogFile,
   saveDebugConsoleLogExport,
@@ -497,7 +496,6 @@ async function syncDebugMode() {
 
 async function refreshAll() {
   try {
-    await initDebugConsole();
     await refreshDebugConsole();
     entries.value = getDebugConsoleSnapshot();
     await syncDebugMode();
@@ -541,8 +539,7 @@ async function openLogFile() {
 }
 
 async function exportLogs() {
-  const snapshot = entries.value.slice();
-  if (snapshot.length === 0 || isExporting.value) return;
+  if (isExporting.value) return;
 
   try {
     isExporting.value = true;
@@ -552,7 +549,7 @@ async function exportLogs() {
     });
     if (!filePath) return;
 
-    const savedPath = await saveDebugConsoleLogExport(filePath, snapshot);
+    const savedPath = await saveDebugConsoleLogExport(filePath);
     notificationStore.addNotice("success", t("settings.console.exported", savedPath), {
       operation: "exportDebugConsole",
       skipConsoleLog: true,
@@ -675,7 +672,7 @@ watch(
         <BaseButton
           class="console-action"
           size="sm"
-          :disabled="entries.length === 0 || isExporting"
+          :disabled="isExporting"
           @click="exportLogs"
         >
           {{ isExporting ? t("settings.console.exporting") : t("settings.console.export") }}

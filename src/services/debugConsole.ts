@@ -4,17 +4,20 @@ import { invokeLocusRuntime } from "./locusRuntime";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 const MAX_ENTRIES = 2_000;
+const MAX_TEXT_CHARS = 1024 * 1024;
+const MAX_MESSAGE_CHARS = 16_000;
+const MAX_FIELD_CHARS = 512;
 const BACKEND_EVENT_NAME = "app-log-batch";
 const DISPLAY_FLUSH_DELAY_MS = 16;
 const DISPLAY_MAX_PENDING = 4_096;
 const FORWARD_FLUSH_DELAY_MS = 400;
 const FORWARD_MAX_BATCH = 128;
-const FORWARD_MAX_PENDING = 1_000;
-const FORWARD_MAX_MESSAGE_CHARS = 16_000;
+const FORWARD_MAX_BATCH_CHARS = 128 * 1024;
 
 const listeners = new Set<() => void>();
 const entryIds = new Set<string>();
 const entries: DebugConsoleEntry[] = [];
+let entriesChars = 0;
 
 const originalConsole = {
   log: console.log.bind(console),
@@ -27,6 +30,11 @@ const originalConsole = {
 let consoleInstalled = false;
 let backendReady = false;
 let backendUnlisten: UnlistenFn | null = null;
+let backendBridgeRequest: Promise<void> | null = null;
+let backendSnapshotRequest: Promise<void> | null = null;
+let backendSnapshotLoaded = false;
+let backendGeneration = 0;
+let snapshotRevision = 0;
 let nextFrontendId = 1;
 let nextDroppedMarkerId = 1;
 
@@ -44,52 +52,48 @@ function notify() {
 }
 
 function trimEntries() {
-  while (entries.length > MAX_ENTRIES) {
+  while (entries.length > MAX_ENTRIES || entriesChars > MAX_TEXT_CHARS) {
     const removed = entries.shift();
     if (removed) {
       entryIds.delete(removed.id);
+      entriesChars -= entryTextChars(removed);
     }
   }
 }
 
-function normalizeExportMessage(message: string): string {
-  return message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+function entryTextChars(entry: DebugConsoleEntry): number {
+  return entry.id.length + entry.level.length + entry.source.length
+    + entry.module.length + entry.target.length + entry.message.length;
 }
 
-function formatExportEntry(entry: DebugConsoleEntry): string {
-  const timestamp = new Date(entry.timestampMs).toISOString();
-  const prefix = `[${timestamp}] [${entry.level.toUpperCase()}] [${entry.source}] [${entry.module}]`;
-  const messageLines = normalizeExportMessage(entry.message).split("\n");
-  const [firstLine = "", ...restLines] = messageLines;
-  const continuation = restLines.map((line) => `    ${line}`);
-  return [`${prefix} ${firstLine}`, ...continuation].join("\n");
+function boundConsoleText(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const suffix = " …(truncated)";
+  let end = limit - suffix.length;
+  // Do not split a UTF-16 surrogate pair at the preview boundary.
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  // Copy only the bounded prefix: V8 sliced strings can otherwise retain the
+  // entire original log allocation, even after it has left the queues.
+  const prefix: string = JSON.parse(JSON.stringify(value.slice(0, end)));
+  return prefix + suffix;
 }
 
-export function formatDebugConsoleEntriesForLogExport(
-  logEntries: readonly DebugConsoleEntry[],
-  exportedAt = new Date(),
-): string {
-  const sortedEntries = logEntries
-    .map((entry, index) => ({ entry, index }))
-    .sort((left, right) =>
-      left.entry.timestampMs - right.entry.timestampMs || left.index - right.index,
-    )
-    .map(({ entry }) => entry);
-  const header = [
-    "# Locus Console Log Export",
-    `# Exported At: ${exportedAt.toISOString()}`,
-    `# Entries: ${sortedEntries.length}`,
-  ].join("\n");
-  const body = sortedEntries.map(formatExportEntry).join("\n");
-  return body ? `${header}\n\n${body}\n` : `${header}\n`;
+function boundConsoleEntry(entry: DebugConsoleEntry): DebugConsoleEntry {
+  return {
+    ...entry,
+    message: boundConsoleText(entry.message, MAX_MESSAGE_CHARS),
+    module: boundConsoleText(entry.module, MAX_FIELD_CHARS),
+    target: boundConsoleText(entry.target, MAX_FIELD_CHARS),
+  };
 }
 
 export async function saveDebugConsoleLogExport(
   filePath: string,
-  logEntries: readonly DebugConsoleEntry[],
 ): Promise<string> {
-  const content = formatDebugConsoleEntriesForLogExport(logEntries);
-  return invokeLocusRuntime<string>("save_log_export", { filePath, content });
+  // Export the durable source, including records no longer in the UI buffer.
+  while (forwardInFlight || forwardQueue.length > 0) await flushForwardQueue();
+  return invokeLocusRuntime<string>("save_log_export", { filePath });
 }
 
 export interface ForwardedLogLine {
@@ -101,16 +105,12 @@ export interface ForwardedLogLine {
 
 export function buildForwardPayload(
   batch: readonly DebugConsoleEntry[],
-  maxMessageChars = FORWARD_MAX_MESSAGE_CHARS,
 ): ForwardedLogLine[] {
   return batch.map((entry) => ({
     timestampMs: entry.timestampMs,
     level: entry.level,
     module: entry.module,
-    message:
-      entry.message.length > maxMessageChars
-        ? `${entry.message.slice(0, maxMessageChars)} …(truncated)`
-        : entry.message,
+    message: entry.message,
   }));
 }
 
@@ -118,53 +118,64 @@ export function buildForwardPayload(
 // (best-effort, batched) so crash/freeze reports include the JS side too.
 const forwardQueue: DebugConsoleEntry[] = [];
 let forwardTimer: ReturnType<typeof setTimeout> | null = null;
-let forwardInFlight = false;
-let forwardDropped = 0;
+let forwardInFlight: Promise<void> | null = null;
 
-function scheduleForwardFlush() {
+function scheduleForwardFlush(delayMs = FORWARD_FLUSH_DELAY_MS) {
   if (forwardTimer !== null) return;
   forwardTimer = setTimeout(() => {
     forwardTimer = null;
-    void flushForwardQueue();
-  }, FORWARD_FLUSH_DELAY_MS);
+    void flushForwardQueue().catch(() => {
+      // Keep logging failures out of the console capture pipeline.
+    });
+  }, delayMs);
 }
 
 function queueForwardToFile(entry: DebugConsoleEntry) {
   if (!hasTauriWindowRuntime()) return;
-  if (forwardQueue.length >= FORWARD_MAX_PENDING) {
-    forwardQueue.shift();
-    forwardDropped += 1;
-  }
+  // This is a write queue, not the display ring. Keep records until the
+  // backend accepts them, including records evicted from the visible console.
   forwardQueue.push(entry);
   scheduleForwardFlush();
 }
 
-async function flushForwardQueue() {
-  if (forwardInFlight || forwardQueue.length === 0) return;
-  forwardInFlight = true;
-  const batch = forwardQueue.splice(0, FORWARD_MAX_BATCH);
-  const droppedCount = forwardDropped;
-  forwardDropped = 0;
-  try {
-    await invokeLocusRuntime("append_frontend_logs", {
-      entries: buildForwardPayload(batch),
-      droppedCount,
-    });
-  } catch {
-    // Swallow: logging must never spam the console (a console.error here
-    // would re-enter this pipeline) and the backend may simply be gone.
-  } finally {
-    forwardInFlight = false;
-    if (forwardQueue.length > 0) scheduleForwardFlush();
+function flushForwardQueue(): Promise<void> {
+  if (forwardInFlight) return forwardInFlight;
+  if (forwardQueue.length === 0) return Promise.resolve();
+  if (forwardTimer !== null) {
+    clearTimeout(forwardTimer);
+    forwardTimer = null;
   }
+  let count = 0;
+  let chars = 0;
+  for (const entry of forwardQueue) {
+    if (count >= FORWARD_MAX_BATCH || (count > 0 && chars + entryTextChars(entry) > FORWARD_MAX_BATCH_CHARS)) break;
+    chars += entryTextChars(entry);
+    count += 1;
+  }
+  const batch = forwardQueue.splice(0, count);
+  let failed = false;
+  const request = invokeLocusRuntime("append_frontend_logs", {
+    entries: buildForwardPayload(batch),
+  }).then(() => undefined).catch((error: unknown) => {
+    failed = true;
+    forwardQueue.unshift(...batch);
+    throw error;
+  }).finally(() => {
+    forwardInFlight = null;
+    if (forwardQueue.length > 0) scheduleForwardFlush(failed ? FORWARD_FLUSH_DELAY_MS : 0);
+  });
+  forwardInFlight = request;
+  return request;
 }
 
 function pushEntries(batch: DebugConsoleEntry[]) {
   let changed = false;
-  for (const entry of batch) {
-    if (entryIds.has(entry.id)) continue;
+  for (const incoming of batch) {
+    if (entryIds.has(incoming.id)) continue;
+    const entry = boundConsoleEntry(incoming);
     entryIds.add(entry.id);
     entries.push(entry);
+    entriesChars += entryTextChars(entry);
     changed = true;
   }
   if (!changed) return;
@@ -174,6 +185,7 @@ function pushEntries(batch: DebugConsoleEntry[]) {
 }
 
 const displayQueue: DebugConsoleEntry[] = [];
+let displayQueueChars = 0;
 let displayFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let displayDropped = 0;
 
@@ -203,6 +215,7 @@ function flushDisplayQueue() {
   clearDisplayFlushTimer();
   if (displayQueue.length === 0 && displayDropped === 0) return;
   const batch = displayQueue.splice(0, displayQueue.length);
+  displayQueueChars = 0;
   const droppedCount = displayDropped;
   displayDropped = 0;
   if (droppedCount > 0) {
@@ -220,12 +233,15 @@ function queueDisplayEntries(batch: readonly DebugConsoleEntry[], droppedCount =
   if (Number.isFinite(droppedCount)) {
     displayDropped += Math.max(0, Math.trunc(droppedCount));
   }
-  for (const entry of batch) {
-    if (displayQueue.length >= DISPLAY_MAX_PENDING) {
-      displayQueue.shift();
+  for (const incoming of batch) {
+    const entry = boundConsoleEntry(incoming);
+    displayQueue.push(entry);
+    displayQueueChars += entryTextChars(entry);
+    while (displayQueue.length > DISPLAY_MAX_PENDING || displayQueueChars > MAX_TEXT_CHARS) {
+      const removed = displayQueue.shift()!;
+      displayQueueChars -= entryTextChars(removed);
       displayDropped += 1;
     }
-    displayQueue.push(entry);
   }
   scheduleDisplayFlush();
 }
@@ -364,45 +380,72 @@ function installConsoleCapture() {
   });
 }
 
-async function fetchBackendSnapshot() {
-  const snapshot = await invokeLocusRuntime<DebugConsoleEntry[]>("get_log_entries", {
-    limit: MAX_ENTRIES,
+function fetchBackendSnapshot(): Promise<void> {
+  if (backendSnapshotRequest) return backendSnapshotRequest;
+  const generation = backendGeneration;
+  const revision = snapshotRevision;
+  const request = (async () => {
+    const snapshot = await invokeLocusRuntime<DebugConsoleEntry[]>("get_log_entries", {
+      limit: MAX_ENTRIES,
+    });
+    if (generation !== backendGeneration || revision !== snapshotRevision) return;
+    pushEntries(snapshot);
+    backendSnapshotLoaded = true;
+  })().finally(() => {
+    if (backendSnapshotRequest === request) backendSnapshotRequest = null;
   });
-  pushEntries(snapshot);
+  backendSnapshotRequest = request;
+  return request;
 }
 
 async function ensureBackendBridge() {
-  if (!hasTauriWindowRuntime()) return;
-  if (!backendReady) {
-    backendUnlisten = await listen<BackendLogBatchEvent>(BACKEND_EVENT_NAME, (event) => {
-      queueDisplayEntries(event.payload.entries, event.payload.droppedCount);
+  if (!hasTauriWindowRuntime() || backendReady) return;
+  if (backendBridgeRequest) return backendBridgeRequest;
+  const generation = backendGeneration;
+  const request = (async () => {
+    const unlisten = await listen<BackendLogBatchEvent>(BACKEND_EVENT_NAME, (event) => {
+      if (generation === backendGeneration) {
+        queueDisplayEntries(event.payload.entries, event.payload.droppedCount);
+      }
     });
+    if (generation !== backendGeneration) {
+      unlisten();
+      return;
+    }
+    backendUnlisten = unlisten;
     backendReady = true;
-    await fetchBackendSnapshot();
-    return;
-  }
-
-  await fetchBackendSnapshot();
+  })().finally(() => {
+    if (backendBridgeRequest === request) backendBridgeRequest = null;
+  });
+  backendBridgeRequest = request;
+  return request;
 }
 
 export async function initDebugConsole() {
   installConsoleCapture();
   try {
     await ensureBackendBridge();
+    if (backendReady && !backendSnapshotLoaded) await fetchBackendSnapshot();
   } catch (error) {
     originalConsole.warn("[debugConsole] failed to initialize backend log bridge", error);
   }
 }
 
 export async function refreshDebugConsole() {
+  installConsoleCapture();
   await ensureBackendBridge();
+  if (backendReady) await fetchBackendSnapshot();
 }
 
 export async function clearDebugConsole() {
+  snapshotRevision += 1;
+  backendSnapshotRequest = null;
   clearDisplayFlushTimer();
   displayQueue.splice(0, displayQueue.length);
+  displayQueueChars = 0;
   displayDropped = 0;
   entries.splice(0, entries.length);
+  entriesChars = 0;
   entryIds.clear();
   notify();
   await invokeLocusRuntime("clear_log_entries");
@@ -421,11 +464,16 @@ export function subscribeDebugConsole(listener: () => void): () => void {
 }
 
 export function teardownDebugConsole() {
+  backendGeneration += 1;
+  backendBridgeRequest = null;
+  backendSnapshotRequest = null;
+  backendSnapshotLoaded = false;
   backendUnlisten?.();
   backendUnlisten = null;
   backendReady = false;
   clearDisplayFlushTimer();
   displayQueue.splice(0, displayQueue.length);
+  displayQueueChars = 0;
   displayDropped = 0;
   if (forwardTimer !== null) {
     clearTimeout(forwardTimer);

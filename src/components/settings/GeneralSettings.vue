@@ -6,6 +6,7 @@ import BaseDropdown from "../ui/BaseDropdown.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
+import WorkspaceResourceSettings from "./WorkspaceResourceSettings.vue";
 import { getCachedDebugMode, getDebugMode, setDebugMode } from "../../services/permissions";
 import { gitRuntimeState, gitSaveRuntimeSelection } from "../../services/git";
 import {
@@ -1009,6 +1010,7 @@ async function selectPythonRuntime(selectedId: string) {
   </div>
 
   <div class="settings-section">
+    <WorkspaceResourceSettings />
     <div class="section-label">{{ t("settings.general.unityBackgroundHook") }}</div>
     <p class="section-desc">{{ t("settings.general.unityBackgroundHookDesc") }}</p>
     <label class="debug-toggle" :aria-busy="!unityBackgroundHookReady">

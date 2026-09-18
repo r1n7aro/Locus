@@ -8,6 +8,7 @@ import {
   type LocusRuntimeInvokeActivity,
 } from "./locusRuntime";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import { setWorkspaceEventDiagnosticsEnabled, snapshotWorkspaceEvents } from "./workspaceEventHub";
 
 const HEARTBEAT_COMMAND = "debug_webview_bridge_heartbeat";
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -200,6 +201,7 @@ function runtimePerformanceContext(): Record<string, unknown> {
     callbackCount: callbackCount(),
     pendingInvokes: snapshotPendingInvokes(pendingInvokes.values(), now),
     lifecycle: lifecycleEvents.slice(-MAX_LIFECYCLE_EVENTS),
+    workspaceEvents: snapshotWorkspaceEvents(),
   };
 }
 
@@ -336,6 +338,7 @@ function handleVisibilityChange(): void {
 function startDiagnostics(): void {
   if (running || !hasTauriWindowRuntime()) return;
   running = true;
+  setWorkspaceEventDiagnosticsEnabled(true);
   try {
     try {
       window.localStorage.setItem(DEBUG_MODE_STORAGE_KEY, "1");
@@ -353,6 +356,7 @@ function startDiagnostics(): void {
     scheduleHeartbeat(250);
   } catch (error) {
     running = false;
+    setWorkspaceEventDiagnosticsEnabled(false);
     if (heartbeatTimer !== null) {
       clearTimeout(heartbeatTimer);
       heartbeatTimer = null;
@@ -371,6 +375,7 @@ function stopDiagnostics(): void {
   if (!running) return;
   appendLifecycleEvent("diagnostics-stop");
   running = false;
+  setWorkspaceEventDiagnosticsEnabled(false);
   removeStoredValue(DEBUG_MODE_STORAGE_KEY);
   if (heartbeatTimer !== null) {
     clearTimeout(heartbeatTimer);

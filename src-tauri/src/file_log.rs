@@ -5,15 +5,15 @@
 //!    process crash (only an OS/power failure can lose it), so the worker never
 //!    buffers formatted lines in user space across batches and panics are
 //!    appended synchronously from the panic hook.
-//! 2. Hot-path cost: callers only clone the entry and `try_send` on a bounded
-//!    channel. The channel never blocks; overflow increments a dropped counter
-//!    that is materialized as a marker line once the worker catches up.
+//! 2. Hot-path cost: callers normally only clone the entry and `try_send` on a
+//!    bounded channel. Overflow writes the full archive synchronously instead
+//!    of discarding it; only the rotating diagnostic preview can drop lines.
 //!
-//! A single worker thread drains the channel in batches and issues one
-//! `write_all` per batch, which keeps syscall pressure low without `fsync`.
+//! A single worker drains the channel, writes full records to the session
+//! archive, and batches the rotating diagnostic preview without `fsync`.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
@@ -48,6 +48,119 @@ struct SharedFile {
     rotated_path: PathBuf,
     max_bytes: u64,
     state: Mutex<Option<FileState>>,
+}
+
+/// Full text for this process lifetime. The small rotating diagnostic log and
+/// the UI ring are previews; neither is a source for exporting complete logs.
+#[derive(Debug)]
+struct SessionArchive {
+    path: PathBuf,
+    state: Mutex<SessionArchiveState>,
+}
+
+#[derive(Debug)]
+struct SessionArchiveState {
+    file: File,
+    write_error: Option<String>,
+}
+
+impl SessionArchive {
+    fn create(dir: &Path) -> Result<Self, String> {
+        let dir = dir.join("sessions");
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let path = dir.join(format!(
+            "locus-{}-{}.log",
+            chrono::Local::now().format("%Y%m%d-%H%M%S"),
+            uuid::Uuid::new_v4()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("failed to create session log {}: {error}", path.display()))?;
+        Ok(Self {
+            path,
+            state: Mutex::new(SessionArchiveState {
+                file,
+                write_error: None,
+            }),
+        })
+    }
+
+    fn append(&self, text: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Err(error) = state.file.write_all(text.as_bytes()) {
+            state.write_error = Some(error.to_string());
+        }
+    }
+
+    fn append_nonblocking(&self, text: &str) {
+        match self.state.try_lock() {
+            Ok(mut state) => {
+                if let Err(error) = state.file.write_all(text.as_bytes()) {
+                    state.write_error = Some(error.to_string());
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut state = poisoned.into_inner();
+                if let Err(error) = state.file.write_all(text.as_bytes()) {
+                    state.write_error = Some(error.to_string());
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // Panic reporting must not deadlock on the interrupted writer.
+                if let Ok(mut file) = OpenOptions::new().append(true).open(&self.path) {
+                    let _ = file.write_all(text.as_bytes());
+                }
+            }
+        }
+    }
+
+    fn export_to(&self, destination: &Path) -> Result<(), String> {
+        // Read only the stable prefix present when export starts. Appends can
+        // continue while io::copy streams the file without buffering it in RAM.
+        let length = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(error) = &state.write_error {
+                return Err(format!("session log could not be fully written: {error}"));
+            }
+            state
+                .file
+                .metadata()
+                .map_err(|error| error.to_string())?
+                .len()
+        };
+        let mut source = File::open(&self.path)
+            .map_err(|error| error.to_string())?
+            .take(length);
+        let parent = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        // Stage the output so a failed copy leaves an existing export intact.
+        let mut output =
+            tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+        let copied =
+            std::io::copy(&mut source, output.as_file_mut()).map_err(|error| error.to_string())?;
+        if copied != length {
+            return Err("session log changed while exporting".to_string());
+        }
+        output
+            .as_file()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        output
+            .persist(destination)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 }
 
 impl SharedFile {
@@ -146,6 +259,7 @@ pub struct FileLogSink {
     tx: SyncSender<SinkMsg>,
     dropped: Arc<AtomicU64>,
     shared: Arc<SharedFile>,
+    archive: Arc<SessionArchive>,
 }
 
 impl FileLogSink {
@@ -157,6 +271,8 @@ impl FileLogSink {
     fn init_with_max_bytes(dir: &Path, max_bytes: u64) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(dir)
             .map_err(|error| format!("failed to create log dir {}: {error}", dir.display()))?;
+        let archive = Arc::new(SessionArchive::create(dir)?);
+        archive.append(&session_banner());
         let shared = Arc::new(SharedFile {
             path: dir.join(LOG_FILE_NAME),
             rotated_path: dir.join(ROTATED_FILE_NAME),
@@ -183,15 +299,17 @@ impl FileLogSink {
         let dropped = Arc::new(AtomicU64::new(0));
         let worker_shared = shared.clone();
         let worker_dropped = dropped.clone();
+        let worker_archive = archive.clone();
         std::thread::Builder::new()
             .name(WORKER_THREAD_NAME.to_string())
-            .spawn(move || worker_loop(rx, worker_shared, worker_dropped))
+            .spawn(move || worker_loop(rx, worker_shared, worker_archive, worker_dropped))
             .map_err(|error| format!("failed to spawn log worker: {error}"))?;
 
         Ok(Arc::new(Self {
             tx,
             dropped,
             shared,
+            archive,
         }))
     }
 
@@ -213,13 +331,47 @@ impl FileLogSink {
         &self.shared.path
     }
 
-    /// Hot path: never blocks. Overflow and worker loss only bump a counter.
+    pub fn export_to(&self, destination: &Path) -> Result<(), String> {
+        let destination_absolute = if destination.exists() {
+            dunce::canonicalize(destination).map_err(|error| error.to_string())?
+        } else {
+            std::path::absolute(destination).map_err(|error| error.to_string())?
+        };
+        // An export must never replace the active archive or rotating sink.
+        for source in [
+            &self.archive.path,
+            &self.shared.path,
+            &self.shared.rotated_path,
+        ] {
+            if let Ok(source) = dunce::canonicalize(source) {
+                let same_path = if cfg!(windows) {
+                    source
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&destination_absolute.to_string_lossy())
+                } else {
+                    source == destination_absolute
+                };
+                if same_path {
+                    return Err("export destination is an active log file".to_string());
+                }
+            }
+        }
+        if !self.flush_blocking(Duration::from_secs(10)) {
+            return Err("timed out while flushing session logs".to_string());
+        }
+        self.archive.export_to(destination)
+    }
+
+    /// Queue normally; on overflow preserve the full record in the archive.
     pub fn enqueue(&self, entry: AppLogEntry) {
         match self.tx.try_send(SinkMsg::Entry(entry)) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Full(SinkMsg::Entry(entry)))
+            | Err(TrySendError::Disconnected(SinkMsg::Entry(entry))) => {
+                self.archive.append(&format_full_entry_line(&entry));
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
+            Err(_) => unreachable!("enqueue only sends entries"),
         }
     }
 
@@ -237,10 +389,16 @@ impl FileLogSink {
     /// text reaches the OS before the process dies.
     pub fn append_sync(&self, text: &str) {
         self.shared.write_block_nonblocking(text);
+        self.archive.append_nonblocking(text);
     }
 }
 
-fn worker_loop(rx: Receiver<SinkMsg>, shared: Arc<SharedFile>, dropped: Arc<AtomicU64>) {
+fn worker_loop(
+    rx: Receiver<SinkMsg>,
+    shared: Arc<SharedFile>,
+    archive: Arc<SessionArchive>,
+    dropped: Arc<AtomicU64>,
+) {
     while let Ok(first) = rx.recv() {
         let mut batch = Vec::with_capacity(16);
         batch.push(first);
@@ -255,11 +413,16 @@ fn worker_loop(rx: Receiver<SinkMsg>, shared: Arc<SharedFile>, dropped: Arc<Atom
         let mut buf = String::new();
         let dropped_now = dropped.swap(0, Ordering::Relaxed);
         if dropped_now > 0 {
-            buf.push_str(&format_dropped_line(dropped_now));
+            let marker = format_dropped_line(dropped_now);
+            archive.append(&marker);
+            buf.push_str(&marker);
         }
         for msg in batch {
             match msg {
-                SinkMsg::Entry(entry) => buf.push_str(&format_entry_line(&entry)),
+                SinkMsg::Entry(entry) => {
+                    archive.append(&format_full_entry_line(&entry));
+                    buf.push_str(&format_entry_line(&entry));
+                }
                 SinkMsg::Flush(ack) => acks.push(ack),
             }
         }
@@ -334,7 +497,7 @@ fn session_banner() -> String {
 
 fn format_dropped_line(count: u64) -> String {
     format!(
-        "{} [WARN] [backend] [FileLog] {count} log line(s) dropped (file log queue overflow)\n",
+        "{} [WARN] [backend] [FileLog] {count} log line(s) dropped from diagnostic preview (full text retained in session log)\n",
         format_local_now()
     )
 }
@@ -367,6 +530,15 @@ fn format_entry_line(entry: &AppLogEntry) -> String {
         message.push_str(&format!(" …(truncated {removed} bytes)"));
     }
 
+    render_entry_message(entry, &message)
+}
+
+fn format_full_entry_line(entry: &AppLogEntry) -> String {
+    let message = entry.message.replace("\r\n", "\n").replace('\r', "\n");
+    render_entry_message(entry, &message)
+}
+
+fn render_entry_message(entry: &AppLogEntry, message: &str) -> String {
     let mut lines = message.split('\n');
     let first = lines.next().unwrap_or_default();
     let mut rendered = format!(
@@ -479,5 +651,87 @@ mod tests {
         let line = format_dropped_line(42);
         assert!(line.contains("42 log line(s) dropped"));
         assert!(line.contains("[FileLog]"));
+    }
+
+    #[test]
+    fn export_keeps_full_bodies_and_records_evicted_or_cleared_from_the_console() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileLogSink::init_with_max_bytes(dir.path(), 1024).unwrap();
+        let store = crate::logging::AppLogStore::new(2);
+        store.attach_file_sink(sink.clone());
+        let full_message = format!("{}COMPLETE_TAIL", "日志正文".repeat(100_000));
+        store.push_backend(tracing::Level::DEBUG, "test", None, full_message.clone());
+        for index in 0..2500 {
+            store.push_backend(
+                tracing::Level::INFO,
+                "test",
+                None,
+                format!("record-{index}"),
+            );
+        }
+        assert_eq!(store.snapshot(2000).len(), 2);
+        store.clear();
+        let output = dir.path().join("export.log");
+        sink.export_to(&output).unwrap();
+        let content = std::fs::read_to_string(output).unwrap();
+        assert!(content.contains(&full_message));
+        assert!(!content.contains("truncated"));
+        for index in 0..2500 {
+            assert!(content.contains(&format!("record-{index}\n")));
+        }
+        assert!(content.find("COMPLETE_TAIL").unwrap() < content.find("record-0\n").unwrap());
+        assert!(store.snapshot(2000).is_empty());
+    }
+
+    #[test]
+    fn session_exports_exclude_previous_runs_and_include_sync_panic_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let previous = FileLogSink::init(dir.path()).unwrap();
+        previous.enqueue(entry("info", "previous", "PREVIOUS_RUN"));
+        assert!(previous.flush_blocking(Duration::from_secs(5)));
+        let current = FileLogSink::init(dir.path()).unwrap();
+        assert_ne!(previous.archive.path, current.archive.path);
+        current.enqueue(entry("info", "current", "CURRENT_RUN"));
+        current.append_sync("PANIC_FULL_TEXT\n");
+        let output = dir.path().join("current.log");
+        current.export_to(&output).unwrap();
+        let content = std::fs::read_to_string(output).unwrap();
+        assert!(!content.contains("PREVIOUS_RUN"));
+        assert!(content.contains("CURRENT_RUN"));
+        assert!(content.contains("PANIC_FULL_TEXT"));
+    }
+
+    #[test]
+    fn export_refuses_active_paths_and_preserves_existing_files_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileLogSink::init(dir.path()).unwrap();
+        sink.enqueue(entry("info", "test", "DO_NOT_OVERWRITE"));
+        assert!(sink.export_to(&sink.archive.path).is_err());
+        assert!(sink.export_to(sink.log_path()).is_err());
+        let output = dir.path().join("existing.log");
+        std::fs::write(&output, "existing export").unwrap();
+        sink.archive.state.lock().unwrap().write_error = Some("disk full".to_string());
+        assert!(sink.export_to(&output).is_err());
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "existing export");
+    }
+
+    #[test]
+    fn queue_overflow_preserves_full_text_in_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileLogSink::init(dir.path()).unwrap();
+        let (tx, _rx) = sync_channel(1);
+        let (ack_tx, _ack_rx) = sync_channel(1);
+        tx.try_send(SinkMsg::Flush(ack_tx)).ok().unwrap();
+        let overflow_sink = FileLogSink {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            shared: sink.shared.clone(),
+            archive: sink.archive.clone(),
+        };
+        let message = format!("{}OVERFLOW_TAIL", "x".repeat(100_000));
+        overflow_sink.enqueue(entry("warn", "overflow", &message));
+        let content = std::fs::read_to_string(&sink.archive.path).unwrap();
+        assert!(content.contains(&message));
+        assert_eq!(overflow_sink.dropped.load(Ordering::Relaxed), 1);
     }
 }

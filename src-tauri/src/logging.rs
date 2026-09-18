@@ -65,8 +65,12 @@ macro_rules! eprintln {
 
 pub(crate) const APP_LOG_BATCH_EVENT: &str = "app-log-batch";
 pub(crate) const DEFAULT_LOG_CAPACITY: usize = 2_000;
+const CONSOLE_MAX_MESSAGE_BYTES: usize = 16 * 1024;
+const CONSOLE_MAX_FIELD_BYTES: usize = 512;
+const CONSOLE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const FRONTEND_EVENT_MAX_PENDING: usize = 2_048;
 const FRONTEND_EVENT_MAX_BATCH: usize = 128;
+const FRONTEND_EVENT_MAX_BATCH_BYTES: usize = 128 * 1024;
 const FRONTEND_EVENT_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -81,6 +85,63 @@ pub struct AppLogEntry {
     pub message: String,
 }
 
+impl AppLogEntry {
+    fn text_bytes(&self) -> usize {
+        self.id.len()
+            + self.level.len()
+            + self.source.len()
+            + self.module.len()
+            + self.target.len()
+            + self.message.len()
+    }
+
+    fn bound_console_text(&mut self) {
+        truncate_console_text(&mut self.message, CONSOLE_MAX_MESSAGE_BYTES);
+        truncate_console_text(&mut self.module, CONSOLE_MAX_FIELD_BYTES);
+        truncate_console_text(&mut self.target, CONSOLE_MAX_FIELD_BYTES);
+    }
+}
+
+fn truncate_console_text(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    const SUFFIX: &str = " …(truncated)";
+    let mut end = max_bytes - SUFFIX.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    value.push_str(SUFFIX);
+    // Truncating the length alone retains a potentially multi-megabyte allocation.
+    value.shrink_to_fit();
+}
+
+#[derive(Debug, Default)]
+struct ConsoleLogBuffer {
+    entries: VecDeque<AppLogEntry>,
+    text_bytes: usize,
+}
+
+impl ConsoleLogBuffer {
+    fn push(&mut self, entry: AppLogEntry, capacity: usize) -> u64 {
+        self.text_bytes += entry.text_bytes();
+        self.entries.push_back(entry);
+        let mut dropped = 0;
+        while self.entries.len() > capacity || self.text_bytes > CONSOLE_MAX_BYTES {
+            self.pop_front();
+            dropped += 1;
+        }
+        dropped
+    }
+
+    fn pop_front(&mut self) -> Option<AppLogEntry> {
+        let entry = self.entries.pop_front()?;
+        self.text_bytes -= entry.text_bytes();
+        Some(entry)
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppLogBatchEvent {
@@ -90,18 +151,16 @@ struct AppLogBatchEvent {
 
 #[derive(Debug, Default)]
 struct FrontendEventQueue {
-    pending: VecDeque<AppLogEntry>,
+    pending: ConsoleLogBuffer,
     dropped_count: u64,
     flush_scheduled: bool,
 }
 
 impl FrontendEventQueue {
     fn push(&mut self, entry: AppLogEntry) -> bool {
-        if self.pending.len() >= FRONTEND_EVENT_MAX_PENDING {
-            self.pending.pop_front();
-            self.dropped_count = self.dropped_count.saturating_add(1);
-        }
-        self.pending.push_back(entry);
+        self.dropped_count = self
+            .dropped_count
+            .saturating_add(self.pending.push(entry, FRONTEND_EVENT_MAX_PENDING));
         if self.flush_scheduled {
             false
         } else {
@@ -111,12 +170,22 @@ impl FrontendEventQueue {
     }
 
     fn take_batch(&mut self) -> Option<AppLogBatchEvent> {
-        if self.pending.is_empty() {
+        if self.pending.entries.is_empty() {
             self.flush_scheduled = false;
             return None;
         }
-        let take_count = self.pending.len().min(FRONTEND_EVENT_MAX_BATCH);
-        let entries = self.pending.drain(..take_count).collect();
+        let mut entries = Vec::new();
+        let mut text_bytes = 0;
+        while let Some(next) = self.pending.entries.front() {
+            if entries.len() >= FRONTEND_EVENT_MAX_BATCH
+                || (!entries.is_empty()
+                    && text_bytes + next.text_bytes() > FRONTEND_EVENT_MAX_BATCH_BYTES)
+            {
+                break;
+            }
+            text_bytes += next.text_bytes();
+            entries.push(self.pending.pop_front().expect("front entry exists"));
+        }
         let dropped_count = std::mem::take(&mut self.dropped_count);
         Some(AppLogBatchEvent {
             entries,
@@ -129,7 +198,7 @@ impl FrontendEventQueue {
 pub struct AppLogStore {
     capacity: usize,
     next_id: AtomicU64,
-    entries: Mutex<VecDeque<AppLogEntry>>,
+    entries: Mutex<ConsoleLogBuffer>,
     app_handle: Mutex<Option<AppHandle>>,
     file_sink: OnceLock<Arc<crate::file_log::FileLogSink>>,
     self_weak: OnceLock<Weak<AppLogStore>>,
@@ -141,7 +210,7 @@ impl AppLogStore {
         Self {
             capacity,
             next_id: AtomicU64::new(1),
-            entries: Mutex::new(VecDeque::with_capacity(capacity.min(64))),
+            entries: Mutex::new(ConsoleLogBuffer::default()),
             app_handle: Mutex::new(None),
             file_sink: OnceLock::new(),
             self_weak: OnceLock::new(),
@@ -166,7 +235,7 @@ impl AppLogStore {
 
     pub fn clear(&self) {
         if let Ok(mut entries) = self.entries.lock() {
-            entries.clear();
+            *entries = ConsoleLogBuffer::default();
         }
     }
 
@@ -174,9 +243,9 @@ impl AppLogStore {
         let Ok(entries) = self.entries.lock() else {
             return Vec::new();
         };
-        let total = entries.len();
+        let total = entries.entries.len();
         let start = total.saturating_sub(limit);
-        entries.iter().skip(start).cloned().collect()
+        entries.entries.iter().skip(start).cloned().collect()
     }
 
     pub fn push_backend(
@@ -189,7 +258,7 @@ impl AppLogStore {
         let display_target = normalize_target(target);
         let (module, message) =
             normalize_module_and_message(&display_target, module_override, message);
-        let entry = AppLogEntry {
+        let mut entry = AppLogEntry {
             id: format!("backend-{}", self.next_id.fetch_add(1, Ordering::Relaxed)),
             timestamp_ms: Utc::now().timestamp_millis(),
             level: normalize_level(level).to_string(),
@@ -203,11 +272,12 @@ impl AppLogStore {
             sink.enqueue(entry.clone());
         }
 
+        // The persistent file keeps its own, larger limit. Bound the console
+        // copy before both storage and IPC: a row preview cannot prevent the
+        // WebView from parsing and retaining an oversized request-body log.
+        entry.bound_console_text();
         if let Ok(mut entries) = self.entries.lock() {
-            if entries.len() >= self.capacity {
-                entries.pop_front();
-            }
-            entries.push_back(entry.clone());
+            entries.push(entry.clone(), self.capacity);
         }
 
         self.enqueue_frontend_event(entry);
@@ -492,7 +562,9 @@ where
 mod tests {
     use super::{
         allow_level, classify_print_level, extract_bracket_prefix, normalize_module_and_message,
-        AppLogEntry, FrontendEventQueue, FRONTEND_EVENT_MAX_BATCH, FRONTEND_EVENT_MAX_PENDING,
+        AppLogEntry, AppLogStore, FrontendEventQueue, CONSOLE_MAX_BYTES, CONSOLE_MAX_FIELD_BYTES,
+        CONSOLE_MAX_MESSAGE_BYTES, DEFAULT_LOG_CAPACITY, FRONTEND_EVENT_MAX_BATCH,
+        FRONTEND_EVENT_MAX_BATCH_BYTES, FRONTEND_EVENT_MAX_PENDING,
     };
     use std::sync::atomic::AtomicBool;
     use tracing::Level;
@@ -606,7 +678,7 @@ mod tests {
             assert_eq!(scheduled, index == 0);
         }
 
-        assert_eq!(queue.pending.len(), FRONTEND_EVENT_MAX_PENDING);
+        assert_eq!(queue.pending.entries.len(), FRONTEND_EVENT_MAX_PENDING);
         let first = queue.take_batch().expect("first batch");
         assert_eq!(first.entries.len(), FRONTEND_EVENT_MAX_BATCH);
         assert_eq!(first.dropped_count, 100);
@@ -623,5 +695,95 @@ mod tests {
             target: "locus_lib::logging".to_string(),
             message: "next".to_string(),
         }));
+    }
+
+    #[test]
+    fn console_bounds_large_utf8_logs_before_storage_without_truncating_the_file_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = crate::file_log::FileLogSink::init(dir.path()).unwrap();
+        let store = AppLogStore::new(DEFAULT_LOG_CAPACITY);
+        store.attach_file_sink(sink.clone());
+        let message = format!("{}FILE_ONLY_TAIL", "日志".repeat(4_000));
+        store.push_backend(Level::DEBUG, &"模块".repeat(1_000), None, message);
+
+        let snapshot = store.snapshot(DEFAULT_LOG_CAPACITY);
+        let entry = &snapshot[0];
+        assert!(entry.message.len() <= CONSOLE_MAX_MESSAGE_BYTES);
+        assert!(entry.message.ends_with(" …(truncated)"));
+        assert!(!entry.message.contains("FILE_ONLY_TAIL"));
+        assert!(entry.message.capacity() <= CONSOLE_MAX_MESSAGE_BYTES);
+        assert!(
+            store.entries.lock().unwrap().entries[0].message.capacity()
+                <= CONSOLE_MAX_MESSAGE_BYTES
+        );
+        assert!(entry.module.len() <= CONSOLE_MAX_FIELD_BYTES);
+        assert!(entry.target.len() <= CONSOLE_MAX_FIELD_BYTES);
+        assert!(sink.flush_blocking(std::time::Duration::from_secs(5)));
+        assert!(std::fs::read_to_string(sink.log_path())
+            .unwrap()
+            .contains("FILE_ONLY_TAIL"));
+    }
+
+    #[test]
+    fn console_snapshot_has_a_byte_budget_and_retains_latest_entries() {
+        let store = AppLogStore::new(DEFAULT_LOG_CAPACITY);
+        for index in 0..DEFAULT_LOG_CAPACITY {
+            store.push_backend(
+                Level::DEBUG,
+                "test",
+                None,
+                format!("{index}: {}", "x".repeat(CONSOLE_MAX_MESSAGE_BYTES)),
+            );
+        }
+        let snapshot = store.snapshot(DEFAULT_LOG_CAPACITY);
+        assert!(snapshot.len() < DEFAULT_LOG_CAPACITY);
+        assert!(snapshot.iter().map(AppLogEntry::text_bytes).sum::<usize>() <= CONSOLE_MAX_BYTES);
+        assert!(snapshot.last().unwrap().message.starts_with("1999:"));
+        assert_eq!(store.snapshot(1).len(), 1);
+        store.clear();
+        assert!(store.snapshot(DEFAULT_LOG_CAPACITY).is_empty());
+        assert_eq!(store.entries.lock().unwrap().text_bytes, 0);
+        store.push_backend(Level::INFO, "test", None, "after clear".to_string());
+        assert_eq!(store.snapshot(1)[0].message, "after clear");
+    }
+
+    #[test]
+    fn frontend_event_queue_bounds_bytes_and_reports_overflow_once() {
+        let store = AppLogStore::new(1);
+        store.push_backend(Level::DEBUG, "test", None, "x".repeat(1_433_542));
+        let entry = store.snapshot(1).pop().unwrap();
+        let mut queue = FrontendEventQueue::default();
+        for _ in 0..1_000 {
+            queue.push(entry.clone());
+        }
+        assert!(queue.pending.text_bytes <= CONSOLE_MAX_BYTES);
+        let retained = queue.pending.entries.len();
+        let first = queue.take_batch().unwrap();
+        assert_eq!(first.dropped_count, (1_000 - retained) as u64);
+        assert!(
+            first
+                .entries
+                .iter()
+                .map(AppLogEntry::text_bytes)
+                .sum::<usize>()
+                <= FRONTEND_EVENT_MAX_BATCH_BYTES
+        );
+        let mut delivered = first.entries.len();
+        while let Some(batch) = queue.take_batch() {
+            assert_eq!(batch.dropped_count, 0);
+            assert!(batch.entries.len() <= FRONTEND_EVENT_MAX_BATCH);
+            assert!(
+                batch
+                    .entries
+                    .iter()
+                    .map(AppLogEntry::text_bytes)
+                    .sum::<usize>()
+                    <= FRONTEND_EVENT_MAX_BATCH_BYTES
+            );
+            delivered += batch.entries.len();
+        }
+        assert_eq!(delivered, retained);
+        assert_eq!(queue.pending.text_bytes, 0);
+        assert!(!queue.flush_scheduled);
     }
 }

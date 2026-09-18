@@ -7,8 +7,6 @@ use crate::logging::{AppLogEntry, AppLogStore};
 
 const DEFAULT_LOG_FETCH_LIMIT: usize = 2_000;
 const FRONTEND_LOG_MAX_BATCH: usize = 256;
-const FRONTEND_LOG_MAX_FIELD_CHARS: usize = 200;
-const FRONTEND_LOG_MAX_MESSAGE_CHARS: usize = 16_000;
 
 #[tauri::command]
 pub async fn get_log_entries(
@@ -36,23 +34,14 @@ pub struct FrontendLogLine {
     pub message: String,
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let truncated: String = value.chars().take(max_chars).collect();
-    format!("{truncated} …(truncated)")
-}
-
 /// Normalizes one frontend-reported line into the shared log entry shape.
-/// Level falls back to `info` outside the known set; module and message are
-/// bounded so a runaway frontend loop cannot flood the file with huge lines.
+/// Display limits do not apply to the durable log or its exports.
 pub(crate) fn sanitize_frontend_log_line(line: &FrontendLogLine) -> AppLogEntry {
     let level = match line.level.to_ascii_lowercase().as_str() {
         level @ ("trace" | "debug" | "info" | "warn" | "error") => level.to_string(),
         _ => "info".to_string(),
     };
-    let module = truncate_chars(line.module.trim(), FRONTEND_LOG_MAX_FIELD_CHARS);
+    let module = line.module.trim().to_string();
     let module = if module.is_empty() {
         "frontend".to_string()
     } else {
@@ -65,7 +54,7 @@ pub(crate) fn sanitize_frontend_log_line(line: &FrontendLogLine) -> AppLogEntry 
         source: "frontend".to_string(),
         module: module.clone(),
         target: module,
-        message: truncate_chars(&line.message, FRONTEND_LOG_MAX_MESSAGE_CHARS),
+        message: line.message.clone(),
     }
 }
 
@@ -78,6 +67,12 @@ pub async fn append_frontend_logs(
     dropped_count: Option<u64>,
     logs: State<'_, Arc<AppLogStore>>,
 ) -> Result<(), AppError> {
+    if entries.len() > FRONTEND_LOG_MAX_BATCH {
+        return Err(AppError::new(
+            "log.append.batch_too_large",
+            "Too many frontend log entries",
+        ));
+    }
     let Some(sink) = logs.file_sink() else {
         return Ok(());
     };
@@ -89,7 +84,7 @@ pub async fn append_frontend_logs(
             message: format!("{dropped} frontend log line(s) dropped before forwarding"),
         }));
     }
-    for line in entries.iter().take(FRONTEND_LOG_MAX_BATCH) {
+    for line in &entries {
         sink.enqueue(sanitize_frontend_log_line(line));
     }
     Ok(())
@@ -122,7 +117,10 @@ pub async fn reveal_log_file(logs: State<'_, Arc<AppLogStore>>) -> Result<String
 }
 
 #[tauri::command]
-pub async fn save_log_export(file_path: String, content: String) -> Result<String, AppError> {
+pub async fn save_log_export(
+    file_path: String,
+    logs: State<'_, Arc<AppLogStore>>,
+) -> Result<String, AppError> {
     let trimmed = file_path.trim();
     if trimmed.is_empty() {
         return Err(
@@ -141,25 +139,23 @@ pub async fn save_log_export(file_path: String, content: String) -> Result<Strin
         path.set_extension("log");
     }
 
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            AppError::new(
-                "log.export.create_dir_failed",
-                "Failed to create log export directory",
-            )
-            .detail(error.to_string())
-            .operation("saveLogExport")
-        })?;
-    }
-
-    std::fs::write(&path, content.as_bytes()).map_err(|error| {
-        AppError::new("log.export.write_failed", "Failed to write log export")
-            .detail(error.to_string())
+    let sink = logs.file_sink().cloned().ok_or_else(|| {
+        AppError::new("log.file.disabled", "Persistent file logging is not active")
             .operation("saveLogExport")
     })?;
+    let export_path = path.clone();
+    tauri::async_runtime::spawn_blocking(move || sink.export_to(&export_path))
+        .await
+        .map_err(|error| {
+            AppError::new("log.export.worker_failed", "Log export failed")
+                .detail(error.to_string())
+                .operation("saveLogExport")
+        })?
+        .map_err(|error| {
+            AppError::new("log.export.write_failed", "Failed to write log export")
+                .detail(error)
+                .operation("saveLogExport")
+        })?;
 
     eprintln!("[Locus] exported console log to {}", path.display());
     Ok(path.to_string_lossy().to_string())
@@ -198,9 +194,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_truncates_oversized_messages() {
-        let entry = sanitize_frontend_log_line(&line("info", "m", &"喵".repeat(20_000)));
-        assert!(entry.message.chars().count() < 20_000);
-        assert!(entry.message.ends_with("…(truncated)"));
+    fn sanitize_preserves_complete_messages_and_modules_for_export() {
+        let message = format!("{}END", "喵".repeat(300_000));
+        let module = "module".repeat(200);
+        let entry = sanitize_frontend_log_line(&line("info", &module, &message));
+        assert_eq!(entry.message, message);
+        assert_eq!(entry.module, module);
     }
 }

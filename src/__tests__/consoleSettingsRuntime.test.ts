@@ -3,6 +3,8 @@ import { createApp, nextTick, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ConsoleSettings from "../components/settings/ConsoleSettings.vue";
 import type { DebugConsoleEntry } from "../types";
+import { initDebugConsole, refreshDebugConsole, saveDebugConsoleLogExport } from "../services/debugConsole";
+import { save } from "@tauri-apps/plugin-dialog";
 
 const consoleState = vi.hoisted(() => ({
   entries: [] as DebugConsoleEntry[],
@@ -19,8 +21,8 @@ vi.mock("../services/debugConsole", () => ({
     consoleState.listener = listener;
     return () => { consoleState.listener = null; };
   },
-  initDebugConsole: async () => {},
-  refreshDebugConsole: async () => {},
+  initDebugConsole: vi.fn(async () => {}),
+  refreshDebugConsole: vi.fn(async () => {}),
   clearDebugConsole: async () => {},
   revealLogFile: vi.fn(),
   saveDebugConsoleLogExport: vi.fn(),
@@ -71,6 +73,10 @@ async function mount() {
 }
 
 beforeEach(() => {
+  vi.mocked(initDebugConsole).mockClear();
+  vi.mocked(refreshDebugConsole).mockClear();
+  vi.mocked(save).mockReset();
+  vi.mocked(saveDebugConsoleLogExport).mockReset();
   consoleState.entries = Array.from({ length: 2000 }, (_, index) => ({
     id: `log-${index}`,
     timestampMs: index,
@@ -109,6 +115,30 @@ afterEach(() => {
 });
 
 describe("console virtual list runtime", () => {
+  it("exports the complete log even when the visible buffer is empty", async () => {
+    consoleState.entries = [];
+    vi.mocked(save).mockResolvedValue("all.log");
+    vi.mocked(saveDebugConsoleLogExport).mockResolvedValue("all.log");
+    await mount();
+    const button = [...root.querySelectorAll<HTMLButtonElement>(".console-action")]
+      .find((item) => item.textContent?.trim() === "settings.console.export")!;
+    expect(button.disabled).toBe(false);
+    button.click();
+    await tick();
+    expect(saveDebugConsoleLogExport).toHaveBeenCalledExactlyOnceWith("all.log");
+  });
+
+  it("fetches one snapshot per mount or manual refresh", async () => {
+    await mount();
+    expect(initDebugConsole).not.toHaveBeenCalled();
+    expect(refreshDebugConsole).toHaveBeenCalledTimes(1);
+    [...root.querySelectorAll<HTMLButtonElement>(".console-action")]
+      .find((button) => button.textContent?.trim() === "common.refresh")!.click();
+    await tick();
+    expect(refreshDebugConsole).toHaveBeenCalledTimes(2);
+    expect(initDebugConsole).not.toHaveBeenCalled();
+  });
+
   it("renders a bounded window and coalesces row measurements outside observer delivery", async () => {
     await mount();
     expect(rows().length).toBeLessThan(40);
