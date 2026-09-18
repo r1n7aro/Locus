@@ -7,6 +7,8 @@ mod diff;
 mod extra_workdirs;
 mod fonts;
 mod garbage_collection;
+mod global_search;
+pub use global_search::*;
 mod git;
 mod knowledge;
 mod log;

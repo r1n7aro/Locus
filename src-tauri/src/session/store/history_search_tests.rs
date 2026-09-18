@@ -1,6 +1,193 @@
 use super::super::tests::fixture;
 use super::*;
 
+#[test]
+fn global_search_fields_separate_titles_content_and_project_scope() {
+    let (_dir, store, active, archived, other) = fixture();
+    insert_messages(&store, &active, 3, "internal-marker");
+    let titles = store
+        .search_session_history_fields(
+            "project", "shader", false, None, 20, None, true, false, false, true,
+        )
+        .unwrap();
+    assert_eq!(titles.scanned_messages, 2);
+    assert!(titles
+        .matches
+        .iter()
+        .all(|hit| hit.updated_at > 1_700_000_000));
+    assert_eq!(titles.matches.len(), 2);
+    assert!(titles
+        .matches
+        .iter()
+        .all(|hit| hit.field == "title" && hit.message_id.is_none()));
+    assert!(titles.matches.iter().any(|hit| hit.session_id == other));
+    assert!(!titles.matches.iter().any(|hit| hit.session_id == archived));
+    let content = store
+        .search_session_history_fields(
+            "project",
+            "internal-marker",
+            false,
+            None,
+            20,
+            None,
+            false,
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+    assert_eq!(content.matches.len(), 1);
+    assert!(content.matches.iter().all(|hit| hit.field == "content"));
+    let outside = store
+        .search_session_history_fields(
+            "other-project",
+            "shader",
+            false,
+            None,
+            20,
+            None,
+            true,
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+    assert!(outside.matches.is_empty());
+    let archived = store
+        .search_session_history_fields(
+            "project", "shader", true, None, 20, None, true, false, false, true,
+        )
+        .unwrap();
+    assert_eq!(archived.matches.len(), 1);
+}
+
+#[test]
+fn global_search_title_previews_use_latest_visible_text_and_keep_sdk_title_excerpts() {
+    let (_dir, store, active, archived, _) = fixture();
+    let text = format!("Visible preview {}", "中文🙂".repeat(200));
+    store
+        .add_message(&active, MessageRole::Assistant, &text)
+        .unwrap();
+    store
+        .add_message(&active, MessageRole::Tool, "hidden tool payload")
+        .unwrap();
+    store
+        .add_message(&active, MessageRole::Assistant, " \n\t ")
+        .unwrap();
+    let empty = store
+        .create_session_scoped(
+            "Shader empty",
+            None,
+            Some("project"),
+            Some("checkout-a"),
+            "chat",
+            None,
+        )
+        .unwrap();
+    let page = store
+        .search_session_history_fields(
+            "project", "shader", false, None, 20, None, true, false, false, true,
+        )
+        .unwrap();
+    let hit = page
+        .matches
+        .iter()
+        .find(|hit| hit.session_id == active)
+        .unwrap();
+    assert!(hit.excerpt.starts_with("Visible preview 中文🙂"));
+    assert!(hit.excerpt.ends_with('…'));
+    assert_eq!(hit.excerpt.chars().count(), 321);
+    assert_eq!(hit.field, "title");
+    assert!(hit.message_id.is_none());
+    assert!(page
+        .matches
+        .iter()
+        .find(|hit| hit.session_id == empty)
+        .unwrap()
+        .excerpt
+        .is_empty());
+    assert!(!page.matches.iter().any(|hit| hit.session_id == archived));
+    let archived_page = store
+        .search_session_history_fields(
+            "project", "shader", true, None, 20, None, true, false, false, true,
+        )
+        .unwrap();
+    assert_eq!(
+        archived_page.matches[0].excerpt,
+        "检查 Shader 编译 100%_literal"
+    );
+    let sdk = store
+        .search_session_history("checkout-a", "shader", false, Some(&active), 20, None)
+        .unwrap();
+    assert_eq!(
+        sdk.matches
+            .iter()
+            .find(|hit| hit.field == "title")
+            .unwrap()
+            .excerpt,
+        "Shader 调试"
+    );
+}
+
+#[test]
+fn global_search_content_excludes_tool_payloads_and_resumes_without_duplicates() {
+    let (_dir, store, active, _, _) = fixture();
+    insert_messages(&store, &active, 1100, "content-hit");
+    store
+        .add_message(&active, MessageRole::Tool, "hidden-tool-hit")
+        .unwrap();
+    let mut cursor = None;
+    let mut ids = std::collections::HashSet::new();
+    for _ in 0..100 {
+        let page = store
+            .search_session_history_fields(
+                "checkout-a",
+                "content-hit",
+                false,
+                None,
+                20,
+                cursor.as_deref(),
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(page.scanned_messages <= MAX_SCAN_MESSAGES);
+        for hit in page.matches {
+            assert!(ids.insert(hit.message_id.unwrap()));
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none());
+    assert_eq!(ids.len(), 1100);
+    let mut cursor = None;
+    loop {
+        let page = store
+            .search_session_history_fields(
+                "checkout-a",
+                "hidden-tool-hit",
+                false,
+                None,
+                20,
+                cursor.as_deref(),
+                false,
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(page.matches.is_empty());
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+}
+
 fn insert_messages(store: &SessionStore, session: &str, count: usize, text: &str) {
     let mut conn = store.conn.lock().unwrap();
     let transaction = conn.transaction().unwrap();

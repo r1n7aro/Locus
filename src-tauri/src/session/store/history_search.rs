@@ -144,16 +144,58 @@ impl SessionStore {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<SessionSearchPage, String> {
+        self.search_session_history_fields(
+            checkout_id,
+            query,
+            archived,
+            session_id,
+            limit,
+            cursor,
+            true,
+            true,
+            true,
+            false,
+        )
+    }
+
+    /// UI title hits include a bounded preview of the latest visible message.
+    /// Content search avoids deserializing tool payloads or internal reasoning.
+    pub(crate) fn search_session_history_fields(
+        &self,
+        checkout_id: &str,
+        query: &str,
+        archived: bool,
+        session_id: Option<&str>,
+        limit: u32,
+        cursor: Option<&str>,
+        titles: bool,
+        content: bool,
+        internals: bool,
+        project_scope: bool,
+    ) -> Result<SessionSearchPage, String> {
         if query.trim().is_empty() || query.chars().count() > 1_000 || query.contains('\0') {
             return Err("query must contain 1..1000 characters and no NUL".into());
         }
         if !(1..=100).contains(&limit) {
             return Err("limit must be 1..100".into());
         }
-        let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(
+        let fingerprint_payload = if titles && content && internals && !project_scope {
+            // Preserve existing Python SDK cursors across this UI addition.
             serde_json::to_vec(&(checkout_id, query, archived, session_id))
-                .map_err(|e| e.to_string())?,
-        ));
+        } else {
+            serde_json::to_vec(&(
+                checkout_id,
+                query,
+                archived,
+                session_id,
+                titles,
+                content,
+                internals,
+                project_scope,
+            ))
+        }
+        .map_err(|e| e.to_string())?;
+        let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(fingerprint_payload));
         let mut state: Option<SearchCursor> = cursor
             .map(|token| {
                 if token.len() > 4096 {
@@ -208,17 +250,22 @@ impl SessionStore {
         };
         let mut matches = Vec::new();
         let mut pending = VecDeque::<SessionKey>::new();
+        let scope_column = if project_scope {
+            "workspace_id"
+        } else {
+            "default_checkout_id"
+        };
         loop {
             if state.current.is_none() {
                 if pending.is_empty() {
                     // Only small session metadata is ordered, never message text or hits.
                     let mut statement = conn
-                        .prepare(
-                            "SELECT id, updated_at FROM sessions WHERE default_checkout_id = ?1
+                        .prepare(&format!(
+                            "SELECT id, updated_at FROM sessions WHERE {scope_column} = ?1
                          AND (archived_at IS NOT NULL) = ?2 AND (?3 IS NULL OR id = ?3)
                          AND (?4 IS NULL OR updated_at < ?4 OR (updated_at = ?4 AND id > ?5))
-                         ORDER BY updated_at DESC, id ASC LIMIT 64",
-                        )
+                         ORDER BY updated_at DESC, id ASC LIMIT 64"
+                        ))
                         .map_err(|e| e.to_string())?;
                     let rows = statement
                         .query_map(
@@ -252,17 +299,17 @@ impl SessionStore {
             let position = state.current.as_mut().unwrap();
             // Revalidate resumed IDs; a caller cannot use a forged cursor to widen scope.
             // Fetch by ID so appending a message (updated_at changes) cannot skip the session.
-            let title: Option<String> = conn
+            let metadata: Option<(String, Option<String>, i64)> = conn
                 .query_row(
-                    "SELECT title FROM sessions WHERE id = ?1 AND default_checkout_id = ?2
-                 AND (archived_at IS NOT NULL) = ?3 AND (?4 IS NULL OR id = ?4)",
+                    &format!("SELECT title, default_checkout_id, updated_at FROM sessions WHERE id = ?1 AND {scope_column} = ?2
+                 AND (archived_at IS NOT NULL) = ?3 AND (?4 IS NULL OR id = ?4)"),
                     params![position.key.id, checkout_id, archived, session_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()
                 .map_err(|e| e.to_string())?;
             budget.sessions += 1;
-            let Some(title) = title else {
+            let Some((title, default_checkout_id, updated_at)) = metadata else {
                 state.after_session = state.current.take().map(|s| s.key);
                 if budget.exhausted() {
                     return finish(matches, Some(&state), &budget);
@@ -272,7 +319,32 @@ impl SessionStore {
             if !position.title_done {
                 position.title_done = true;
                 budget.bytes += title.len() as u64;
-                if let Some(hit) = matcher.find(&title) {
+                if let Some(hit) = titles.then(|| matcher.find(&title)).flatten() {
+                    let title_excerpt = if project_scope && !internals {
+                        // Reuse the session/rowid index and the cursor's snapshot.
+                        // Only a short user/assistant text preview crosses SQLite.
+                        let preview: Option<String> = conn
+                            .prepare_cached(
+                                "SELECT substr(trim(content, char(9) || char(10) || char(13) || ' '), 1, 321)
+                                 FROM messages WHERE session_id = ?1 AND rowid <= ?2
+                                 AND role IN ('user', 'assistant')
+                                 AND trim(content, char(9) || char(10) || char(13) || ' ') <> ''
+                                 ORDER BY rowid DESC LIMIT 1",
+                            )
+                            .map_err(|e| e.to_string())?
+                            .query_row(params![position.key.id, state.max_message_row_id], |row| row.get(0))
+                            .optional()
+                            .map_err(|e| e.to_string())?;
+                        if let Some(text) = preview {
+                            budget.messages += 1;
+                            budget.bytes += text.len() as u64;
+                            excerpt(text.trim(), 0)
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        excerpt(&title, hit)
+                    };
                     matches.push(SessionSearchMatch {
                         session_id: position.key.id.clone(),
                         session_title: title.clone(),
@@ -280,20 +352,29 @@ impl SessionStore {
                         message_row_id: None,
                         role: None,
                         field: "title".into(),
-                        excerpt: excerpt(&title, hit),
+                        excerpt: title_excerpt,
+                        default_checkout_id: default_checkout_id.clone(),
+                        updated_at,
                     });
                 }
                 if matches.len() >= limit as usize || budget.exhausted() {
                     return finish(matches, Some(&state), &budget);
                 }
             }
+            if !content && !internals {
+                state.after_session = state.current.take().map(|s| s.key);
+                continue;
+            }
             loop {
                 // Drop each 16-row statement before requesting the next batch. Even
                 // rollback-journal databases get frequent opportunities to commit writes.
                 let mut found = false;
                 {
+                    let scoped_query = MESSAGE_QUERY.replace("default_checkout_id", scope_column);
+                    let ui_query =
+                        scoped_query.replace("m.thinking_content, m.tool_calls", "NULL, NULL");
                     let mut statement = conn
-                        .prepare_cached(MESSAGE_QUERY)
+                        .prepare_cached(if internals { &scoped_query } else { &ui_query })
                         .map_err(|e| e.to_string())?;
                     let mut rows = statement
                         .query(params![
@@ -316,7 +397,13 @@ impl SessionStore {
                         for field in start_field..3 {
                             let text = text_column(row, 3 + field as usize)?;
                             budget.bytes += text.len() as u64;
-                            if let Some(hit) = matcher.find(text) {
+                            let role = text_column(row, 2)?;
+                            let enabled = if field == 0 {
+                                content && (internals || role == "user" || role == "assistant")
+                            } else {
+                                internals
+                            };
+                            if let Some(hit) = enabled.then(|| matcher.find(text)).flatten() {
                                 matches.push(SessionSearchMatch {
                                     session_id: position.key.id.clone(),
                                     session_title: title.clone(),
@@ -326,7 +413,17 @@ impl SessionStore {
                                     field: ["content", "thinking", "tool_calls"][field as usize]
                                         .into(),
                                     excerpt: excerpt(text, hit),
+                                    default_checkout_id: default_checkout_id.clone(),
+                                    updated_at,
                                 });
+                                // The project picker shows conversations, not an
+                                // unbounded list of repeated hits in one thread.
+                                // Resume directly at the next conversation.
+                                if project_scope && !internals {
+                                    position.row_id = 0;
+                                    position.field = 0;
+                                    return finish(matches, Some(&state), &budget);
+                                }
                             }
                             if field == 2 {
                                 position.row_id = row_id - 1;

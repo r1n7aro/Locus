@@ -14,6 +14,7 @@ import GeneralSettings from "./settings/GeneralSettings.vue";
 import DisplaySettings from "./settings/DisplaySettings.vue";
 import NotificationsSettings from "./settings/NotificationsSettings.vue";
 import ShortcutSettings from "./settings/ShortcutSettings.vue";
+import GlobalSearchSettings from "./settings/GlobalSearchSettings.vue";
 import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
 import ProxySettings from "./settings/ProxySettings.vue";
@@ -223,6 +224,14 @@ watch(
         </button>
         <button
           class="sidebar-item"
+          :class="{ active: activeCategory === 'globalSearch' }"
+          @click="activeCategory = 'globalSearch'"
+        >
+          <svg viewBox="0 0 16 16" fill="none" width="14" height="14" aria-hidden="true"><circle cx="6.75" cy="6.75" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="m10 10 3.75 3.75" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          <span>{{ t("settings.tab.globalSearch") }}</span>
+        </button>
+        <button
+          class="sidebar-item"
           :class="{ active: activeCategory === 'shortcuts' }"
           @click="activeCategory = 'shortcuts'"
         >
@@ -424,6 +433,9 @@ watch(
 
       <template v-if="props.active && activeCategory === 'console'">
         <ConsoleSettings />
+      </template>
+      <template v-if="activeCategory === 'globalSearch'">
+        <GlobalSearchSettings />
       </template>
 
       <template v-if="activeCategory === 'about'">

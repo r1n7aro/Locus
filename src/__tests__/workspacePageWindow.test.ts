@@ -100,6 +100,16 @@ describe("workspacePageWindow", () => {
     expect(agentKind).toContain("workspace-page-agent-");
   });
 
+  it("round-trips the global search settings destination for auxiliary workbenches", () => {
+    const payload: WorkspacePageWindowPayload = {
+      scope: "app", page: "settings", title: "全局搜索", settingsCategory: "globalSearch",
+    };
+    const query = buildWorkspacePageWindowQuery(payload);
+    expect(getWorkspacePageWindowPayload(`?${query}`)).toEqual(payload);
+    expect(getWorkspacePageWindowPayload(`?${query.replace("globalSearch", "unknown")}`))
+      .toEqual({ scope: "app", page: "settings", title: "全局搜索" });
+  });
+
   it("maps legacy app URLs and rejects legacy checkout ambiguity", () => {
     expect(getWorkspacePageWindowPayload("?workspacePageWindow=1&page=settings&title=设置"))
       .toEqual({ scope: "app", page: "settings", title: "设置" });

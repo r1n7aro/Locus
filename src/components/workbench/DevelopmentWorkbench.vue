@@ -61,7 +61,10 @@ import {
   type UnityEmbedAssetDropPayload,
   type UnitySendToLocusEventPayload,
 } from "../../services/unity";
-import { knowledgeRevealTarget } from "../../services/knowledge";
+import { knowledgeRead, knowledgeRevealTarget } from "../../services/knowledge";
+import GlobalSearch from "./GlobalSearch.vue";
+import type { GlobalSearchResult, GlobalSearchTarget } from "../../services/globalSearch";
+import { openWorkspacePageWindow } from "../../services/workspacePageWindow";
 import {
   openChatSessionWindow,
   openNewChatSessionWindow,
@@ -1090,6 +1093,59 @@ const explorerHeaderLabel = computed(() => {
     ?? "";
   return root ? shortPath(root) : t("development.explorer");
 });
+
+const globalSearchTargets = computed<GlobalSearchTarget[]>(() => visibleProjects.value.flatMap((project) => {
+  const preferred = props.fixedWorkspaceRef?.checkoutId
+    ?? (workspaceContextStore.focusedCheckout?.projectId === project.projectId ? workspaceContextStore.focusedCheckout.checkoutId : null);
+  const checkout = project.checkouts.find((entry) => entry.checkoutId === preferred && entry.available !== false && entry.runtime)
+    ?? project.checkouts.find((entry) => entry.available !== false && entry.runtime)
+    ?? project.checkouts.find((entry) => entry.available !== false);
+  if (!checkout) return [];
+  return [{ projectId: project.projectId, projectName: projectLabel(project),
+    workspaceRef: checkout.runtime ? checkoutWorkspaceRef(checkout) : { checkoutId: checkout.checkoutId } }];
+}));
+
+async function openGlobalSearchResult(hit: GlobalSearchResult): Promise<void> {
+  const { projectId, workspaceRef } = hit.target;
+  const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
+  if (!checkout?.runtime || checkout.available === false
+    || checkout.runtime.workspaceGeneration !== workspaceRef.expectedGeneration
+    || !workspaceMaterializationMatches(workspaceRef.expectedMaterializationEpoch, checkout.runtime.materializationEpoch)) {
+    throw new Error(t("workbench.unavailable.checkout"));
+  }
+  if (hit.kind === "session") {
+    const sessionCheckout = workspaceContextStore.checkoutsById[hit.checkoutId ?? checkout.checkoutId];
+    if (!sessionCheckout || sessionCheckout.projectId !== projectId || sessionCheckout.available === false) {
+      throw new Error(t("workbench.unavailable.checkout"));
+    }
+    if (!await workspaceContextStore.focusCheckout(sessionCheckout.checkoutId)) throw new Error(t("workbench.unavailable.checkout"));
+    await openWorkspaceSessionDescriptor({
+      resource: hit.archived
+        ? { kind: "section", section: "archived", projectId, sessionId: hit.id }
+        : { kind: "session", projectId, sessionId: hit.id },
+      title: hit.title, checkoutId: sessionCheckout.checkoutId,
+    }, "newTab");
+  } else if (hit.docType && hit.path) {
+    const result = await knowledgeRead({ kind: "document", type: hit.docType, path: hit.path, part: "summary" }, workspaceRef);
+    if (!result.document) throw new Error(t("workbench.unavailable.knowledge"));
+    secondaryDocuments.value[`${projectId}:${hit.id}`] = {
+      ...result.document, sourceCheckoutId: checkout.checkoutId,
+      sourceWorkspaceGeneration: checkout.runtime.workspaceGeneration,
+      sourceRoot: checkout.root, availableCheckoutIds: [checkout.checkoutId],
+    };
+    await openWorkbenchResourceFromWorkspaceTree({
+      resource: { kind: "knowledge", projectId, documentId: hit.id },
+      title: hit.title, checkoutId: checkout.checkoutId,
+    }, { preview: false, pinned: true });
+  }
+}
+
+async function openGlobalSearchSettings(): Promise<void> {
+  if (!props.auxiliary) { uiStore.openSettingsCategory("globalSearch"); return; }
+  try {
+    await openWorkspacePageWindow({ scope: "app", page: "settings", title: t("settings.tab.globalSearch"), settingsCategory: "globalSearch" });
+  } catch (error) { notificationStore.addNotice("error", normalizeAppError(error).message); }
+}
 
 const explorerHeaderTitle = computed(() => {
   if (!props.fixedWorkspaceRef && displaySettings.workspaceDisplayMode === "multi") return undefined;
@@ -8687,6 +8743,13 @@ watch(
     @dragend.capture="clearWorkspaceDragPointer"
     @drop.capture="clearWorkspaceDragPointer"
   >
+    <GlobalSearch
+      :active="!props.prewarm && (props.auxiliary || uiStore.activePage === 'development')"
+      :targets="globalSearchTargets"
+      :owner-window="ownerWindow"
+      :open-result="openGlobalSearchResult"
+      @settings="openGlobalSearchSettings"
+    />
     <Teleport to="body">
       <div
         v-if="showWorkspaceDragFloatingPreview && workspaceDragPreview"
@@ -9054,6 +9117,7 @@ watch(
                       && composerDropTarget.editorId === editor.editorId
                   "
                   :shortcut-active="focused && interactive"
+                  :active="focused && interactive"
                   :new-chat-shortcut-action="newSessionShortcutAction(group, editor)"
                   @ready="ready"
                    @session-created="handleWorkbenchSessionCreated(paneId, $event)"

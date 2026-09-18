@@ -52,6 +52,9 @@ const {
   refreshAuthAndModels,
   cleanup,
 } = useWorkspacePageBootstrap();
+if (payload?.scope === "app" && payload.settingsCategory === "globalSearch") {
+  uiStore.openSettingsCategory("globalSearch");
+}
 const diffOverlay = provideDiffOverlay();
 
 const pageComponent = computed<Component | null>(() =>

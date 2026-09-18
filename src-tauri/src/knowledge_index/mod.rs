@@ -2919,7 +2919,7 @@ fn get_or_build_unity_managed_retrieval_summary_cache(
     refresh_unity_managed_retrieval_summary_cache(working_dir, app_knowledge_dir, db)
 }
 
-async fn ensure_document_catalog_available(
+pub(crate) async fn ensure_document_catalog_available(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
     state: Arc<KnowledgeIndexState>,

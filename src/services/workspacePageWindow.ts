@@ -41,6 +41,7 @@ export interface AppWorkspacePageWindowPayload {
   scope: "app";
   page: AppWorkspacePageId;
   title: string;
+  settingsCategory?: "globalSearch";
 }
 
 export type WorkspacePageWindowPayload =
@@ -82,6 +83,7 @@ function normalizeCanonicalPayload(
       scope: "app",
       page: payload.page,
       title: normalizedTitle(payload.title, payload.page),
+      ...(payload.page === "settings" && payload.settingsCategory === "globalSearch" ? { settingsCategory: "globalSearch" as const } : {}),
     };
   }
 
@@ -152,7 +154,7 @@ export function getWorkspacePageWindowPayload(
 
   if (scope === "app") {
     if (!isAppWorkspacePageId(page) || hasCheckoutId || hasWorkspaceGeneration) return null;
-    return { scope: "app", page, title };
+    return { scope: "app", page, title, ...(page === "settings" && params.get("settingsCategory") === "globalSearch" ? { settingsCategory: "globalSearch" as const } : {}) };
   }
 
   if (scope === "checkout") {
@@ -189,6 +191,7 @@ export function buildWorkspacePageWindowQuery(payload: WorkspacePageWindowPayloa
     params.set("workspaceGeneration", String(normalized.workspaceGeneration));
     appendMaterializationEpoch(params,normalized.materializationEpoch);
   }
+  if (normalized.scope === "app" && normalized.settingsCategory) params.set("settingsCategory", normalized.settingsCategory);
   return params.toString();
 }
 

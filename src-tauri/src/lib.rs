@@ -1507,6 +1507,7 @@ pub fn run() {
             commands::knowledge_list_external_reference_directories,
             commands::knowledge_list_unity_managed_directory_stats,
             commands::knowledge_query,
+            commands::global_search,
             commands::knowledge_read,
             commands::knowledge_read_scoped,
             commands::knowledge_import_unity_reference_docs,

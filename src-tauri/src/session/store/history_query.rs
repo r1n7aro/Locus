@@ -12,6 +12,10 @@ pub struct SessionSearchMatch {
     pub role: Option<String>,
     pub field: String,
     pub excerpt: String,
+    #[serde(skip)]
+    pub default_checkout_id: Option<String>,
+    #[serde(skip)]
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Serialize)]
