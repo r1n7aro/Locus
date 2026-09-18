@@ -32,6 +32,7 @@ mod config;
 pub mod config_registry;
 pub mod csharp_compile;
 pub mod csharp_lsp;
+mod csv_document;
 pub(crate) mod diff;
 pub mod dotnet_runtime;
 pub(crate) mod eol;
@@ -48,6 +49,7 @@ mod llm;
 mod local_docs;
 pub mod mcp;
 pub(crate) mod merge;
+pub mod merge_jobs;
 pub mod model_catalog;
 pub mod network;
 pub mod plugin;
@@ -74,6 +76,8 @@ pub mod unity_serialized_schema;
 pub mod unity_type_index;
 pub mod unity_type_index_selftest;
 pub mod unity_yaml;
+pub mod unity_asset_core;
+pub mod unity_assets;
 pub mod vcs;
 pub mod view;
 #[cfg(target_os = "windows")]
@@ -559,6 +563,7 @@ pub fn run() {
                 resource_policy::ResourcePolicyStore::from_config(config.clone())
                     .map_err(|error| format!("Invalid workspace resource policy: {error}"))?,
             );
+            resource_policy::install_application_policy(resource_policy.clone());
             let workspace_service_factories: Vec<
                 Arc<dyn workspace_service::service::WorkspaceServiceFactory>,
             > = vec![Arc::new(
@@ -1228,6 +1233,8 @@ pub fn run() {
             commands::delete_pending_chat_input,
             commands::list_agents,
             commands::list_workspace_agents,
+            commands::read_workspace_agent_document,
+            commands::save_workspace_agent_document,
             commands::list_subagent_defs,
             commands::list_workspace_subagent_defs,
             commands::get_agent_system_prompt,
@@ -1255,6 +1262,7 @@ pub fn run() {
             commands::list_project_sessions,
             commands::list_archived_sessions,
             commands::list_archived_checkout_sessions,
+            commands::get_archived_checkout_storage_bytes,
             commands::rename_session,
             commands::archive_session,
             commands::unarchive_session,
@@ -1262,6 +1270,7 @@ pub fn run() {
             commands::get_session_usage,
             commands::get_session_context_usage_report,
             commands::get_model_usage_stats,
+            commands::garbage_collection,
             commands::get_session_active_run,
             commands::get_session_resume_available,
             commands::list_session_events,
@@ -1285,8 +1294,26 @@ pub fn run() {
             commands::schedule_app_storage_migration,
             commands::clear_app_storage_migration,
             commands::get_workspace_service_resource_limits,
+            commands::create_worktree,
+            commands::list_worktree_branches,
+            commands::select_worktree_branch,
+            commands::plan_worktree_selection,
+            commands::get_worktree_pool_usage,
+            commands::get_all_worktree_pool_usage,
+            commands::plan_worktree_creation,
+            commands::list_managed_worktrees,
+            commands::discover_worktrees,
+            commands::import_worktree,
+            commands::remove_managed_worktree,
+            commands::get_worktree_operations,
+            commands::bind_session_worktree,
+            commands::acquire_unity_project_slot,
+            commands::release_unity_project_slot,
+            commands::merge_job_prepare,
+            commands::merge_job_execute,
             commands::set_workspace_service_resource_limits,
             commands::get_workspace_service_resource_metrics,
+            commands::get_unity_editor_resources,
             commands::list_workspace_runtimes,
             commands::list_project_contexts,
             commands::open_workspace,
@@ -1366,6 +1393,7 @@ pub fn run() {
             commands::render_workspace_asset_preview_frame,
             commands::preview_workspace_asset_target,
             commands::unity_serialized_property_read,
+            commands::unity_assets_execute,
             commands::unity_serialized_property_discover,
             commands::unity_serialized_property_write,
             commands::unity_serialized_property_apply,
@@ -1465,6 +1493,10 @@ pub fn run() {
             commands::workspace_file_preview,
             commands::workspace_file_revision,
             commands::workspace_file_write,
+            commands::explorer_file_action,
+            commands::csv_view_read,
+            commands::csv_view_write,
+            commands::csv_file_relocate,
             commands::knowledge_list_scoped,
             commands::knowledge_list_page,
             commands::knowledge_list_page_scoped,
@@ -1529,6 +1561,7 @@ pub fn run() {
             commands::open_file_external,
             commands::reveal_workspace_file,
             commands::knowledge_reveal_target,
+            commands::knowledge_document_source,
             commands::resolve_markdown_image,
             commands::preview_workspace_file,
             commands::list_app_rules,
@@ -1682,7 +1715,6 @@ pub fn run() {
             commands::locus_start_native_file_drag,
             commands::locus_start_drag_preview,
             commands::locus_stop_drag_preview,
-            commands::view_templates,
             commands::view_list,
             commands::view_tree,
             commands::view_create,
@@ -1693,6 +1725,10 @@ pub fn run() {
             commands::view_export_package,
             commands::view_import_package,
             commands::view_read,
+            commands::view_watch,
+            commands::view_unwatch,
+            commands::view_append_frontend_logs,
+            commands::frontend_capture,
             commands::view_reload,
             commands::view_run,
             commands::view_run_in_unity,
@@ -1701,9 +1737,6 @@ pub fn run() {
             commands::sub_window_pool_prepare,
             commands::sub_window_pool_ready,
             commands::sub_window_claimed_query,
-            commands::view_content_mount,
-            commands::view_content_hide,
-            commands::view_content_destroy,
             commands::view_compile_script,
             commands::view_call_script,
             commands::view_append_frontend_log,

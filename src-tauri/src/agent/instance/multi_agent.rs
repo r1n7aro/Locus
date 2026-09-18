@@ -16,11 +16,11 @@ impl AgentInstance {
         (!self.multi_agent_enabled).then_some(EXPLICIT_DELEGATION_GUIDANCE)
     }
 
-    /// Append the session policy after agent-specific description overrides.
+    /// Delegation policy for all routes lives in the system prompt. Only the
+    /// dedicated subagent tool needs additional proactive usage guidance.
     pub(super) fn apply_multi_agent_guidance(&self, name: &str, tool: &mut serde_json::Value) {
         let guidance = match name {
             "subagent" if self.multi_agent_enabled => PROACTIVE_DELEGATION_GUIDANCE,
-            "python" if !self.multi_agent_enabled => EXPLICIT_DELEGATION_GUIDANCE,
             _ => return,
         };
         if let Some(description) = tool["function"]["description"].as_str() {

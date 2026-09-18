@@ -18,6 +18,7 @@ pub mod plan {
 
 /// Tool definition JSON（description + parameters schema）
 pub mod tools {
+    pub const EXECUTE_TYPESCRIPT: &str = include_str!("../../tools/execute_typescript.json");
     pub const SUBAGENT: &str = include_str!("../../tools/subagent.md");
 
     pub const READ: &str = include_str!("../../tools/read.json");
@@ -63,23 +64,6 @@ pub mod tools {
     pub const PLUGIN_UNINSTALL: &str = include_str!("../../tools/plugin_uninstall.json");
     pub const PLUGIN_SET_ENABLED: &str = include_str!("../../tools/plugin_set_enabled.json");
     pub const PLUGIN_EXPORT: &str = include_str!("../../tools/plugin_export.json");
-    pub const VIEW_CREATE: &str = include_str!("../../tools/view_create.json");
-    pub const VIEW_LIST: &str = include_str!("../../tools/view_list.json");
-    pub const VIEW_RELOAD: &str = include_str!("../../tools/view_reload.json");
-    pub const VIEW_RUN: &str = include_str!("../../tools/view_run.json");
-    pub const VIEW_COMPILE_SCRIPT: &str = include_str!("../../tools/view_compile_script.json");
-    pub const VIEW_CALL_SCRIPT: &str = include_str!("../../tools/view_call_script.json");
-    pub const VIEW_PROPERTY_READ: &str = include_str!("../../tools/view_property_read.json");
-    pub const VIEW_PROPERTY_DISCOVER: &str =
-        include_str!("../../tools/view_property_discover.json");
-    pub const VIEW_PROPERTY_WRITE: &str = include_str!("../../tools/view_property_write.json");
-    pub const VIEW_PROPERTY_APPLY: &str = include_str!("../../tools/view_property_apply.json");
-    pub const VIEW_CAPTURE: &str = include_str!("../../tools/view_capture.json");
-    pub const VIEW_SNAPSHOT: &str = include_str!("../../tools/view_snapshot.json");
-    pub const VIEW_ACTION: &str = include_str!("../../tools/view_action.json");
-    pub const VIEW_WAIT: &str = include_str!("../../tools/view_wait.json");
-    pub const VIEW_CONSOLE_READ: &str = include_str!("../../tools/view_console_read.json");
-    pub const VIEW_DEBUG_EVAL: &str = include_str!("../../tools/view_debug_eval.json");
     pub const CONFIG_QUERY: &str = include_str!("../../tools/config_query.json");
     pub const TOOL_LOAD: &str = include_str!("../../tools/tool_load.json");
     pub const TOOL_CALL: &str = include_str!("../../tools/tool_call.json");
@@ -125,28 +109,13 @@ pub mod tools {
         ("skill_list", SKILL_LIST),
         ("agent_reload", AGENT_RELOAD),
         ("mcp_reload", MCP_RELOAD),
+        ("execute_typescript", EXECUTE_TYPESCRIPT),
         ("plugin_list", PLUGIN_LIST),
         ("plugin_search", PLUGIN_SEARCH),
         ("plugin_install", PLUGIN_INSTALL),
         ("plugin_uninstall", PLUGIN_UNINSTALL),
         ("plugin_set_enabled", PLUGIN_SET_ENABLED),
         ("plugin_export", PLUGIN_EXPORT),
-        ("view_create", VIEW_CREATE),
-        ("view_list", VIEW_LIST),
-        ("view_reload", VIEW_RELOAD),
-        ("view_run", VIEW_RUN),
-        ("view_compile_script", VIEW_COMPILE_SCRIPT),
-        ("view_call_script", VIEW_CALL_SCRIPT),
-        ("view_property_read", VIEW_PROPERTY_READ),
-        ("view_property_discover", VIEW_PROPERTY_DISCOVER),
-        ("view_property_write", VIEW_PROPERTY_WRITE),
-        ("view_property_apply", VIEW_PROPERTY_APPLY),
-        ("view_capture", VIEW_CAPTURE),
-        ("view_snapshot", VIEW_SNAPSHOT),
-        ("view_action", VIEW_ACTION),
-        ("view_wait", VIEW_WAIT),
-        ("view_console_read", VIEW_CONSOLE_READ),
-        ("view_debug_eval", VIEW_DEBUG_EVAL),
         ("config_query", CONFIG_QUERY),
         ("tool_load", TOOL_LOAD),
         ("tool_call", TOOL_CALL),
@@ -208,7 +177,7 @@ mod tests {
 
     #[test]
     fn embedded_tool_vision_requirements_are_loaded_from_prompt_config() {
-        assert!(builtin_tool_requires_vision("view_capture"));
+        assert!(!builtin_tool_requires_vision("execute_typescript"));
         assert!(builtin_tool_requires_vision("unity_capture_viewport"));
         assert!(!builtin_tool_requires_vision("read"));
         assert!(!builtin_tool_requires_vision("unknown_tool"));

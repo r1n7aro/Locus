@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
@@ -36,6 +36,10 @@ use crate::{
 };
 
 const SDK_PATH: &str = "/sdk";
+mod worktrees;
+mod sessions;
+mod agent_rules;
+mod csv;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WAIT_MS: u64 = 30_000;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 120_000;
@@ -453,14 +457,18 @@ struct WorkspaceScopeParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UnityDialogParams {
-    project: String,
+struct UnityTargetParams {
+    project: Option<String>,
+    workspace_ref: Option<crate::workspace_service::WorkspaceRef>,
 }
+
+type UnityDialogParams = UnityTargetParams;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChooseUnityDialogParams {
-    project: String,
+    #[serde(flatten)]
+    target: UnityTargetParams,
     dialog_id: String,
     choice_id: String,
 }
@@ -468,20 +476,18 @@ struct ChooseUnityDialogParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WaitUnityExecutionParams {
-    project: String,
+    #[serde(flatten)]
+    target: UnityTargetParams,
     execution_id: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UnityEditorStatusParams {
-    project: String,
-}
+type UnityEditorStatusParams = UnityTargetParams;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EnsureUnityEditorParams {
-    project: String,
+    #[serde(flatten)]
+    target: UnityTargetParams,
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
@@ -493,12 +499,23 @@ struct EnsureUnityEditorParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RestartUnityEditorParams {
-    project: String,
+    #[serde(flatten)]
+    target: UnityTargetParams,
     #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
     wait_until: Option<String>,
     #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloseUnityEditorParams {
+    #[serde(flatten)]
+    target: UnityTargetParams,
     timeout_ms: Option<u64>,
     #[serde(default)]
     force: bool,
@@ -577,6 +594,7 @@ struct SdkUnityEditorStatus {
     project_path: String,
     checkout_id: String,
     workspace_generation: u64,
+    materialization_epoch:u64,
     connected: bool,
     ready: bool,
     process_state: crate::unity_bridge::UnityEditorProcessState,
@@ -688,6 +706,8 @@ struct CallToolParams {
     timeout_ms: Option<u64>,
     #[serde(default)]
     workspace_ref: Option<crate::workspace_service::WorkspaceRef>,
+    #[serde(default)]
+    execution_delegation: Option<String>,
 }
 
 fn validate_agent_id(value: &str) -> Result<String, String> {
@@ -1592,60 +1612,46 @@ async fn workspace_snapshot(
     let services = runtime.services().state_snapshots().await;
     Ok(json!({
         "path": runtime.root().to_string_lossy(),
+        "workspaceId": runtime.project_id(),
+        "unityConnected": crate::unity_bridge::is_unity_connected(&runtime.root().to_string_lossy()).await,
         "projectId": runtime.project_id(),
         "checkoutId": runtime.checkout_id(),
         "workspaceGeneration": runtime.generation(),
+        "materializationEpoch":runtime.materialization_epoch(),
         "services": services,
     }))
 }
 
 fn resolve_sdk_unity_runtime(
     app: &AppHandle,
-    project: &str,
+    target: &UnityTargetParams,
     operation: &str,
-) -> Result<Arc<crate::workspace_service::WorkspaceRuntime>, String> {
-    let project = project.trim();
-    if project.is_empty() {
-        return Err(format!("{operation} requires a non-empty project path"));
-    }
+) -> Result<crate::workspace_service::ResolvedWorkspaceScope, String> {
     let registry = app.state::<Arc<crate::workspace_service::ProjectRegistry>>();
-    let runtime = registry
-        .runtime_for_root(std::path::Path::new(project))
-        .ok_or_else(|| {
-            format!("{operation} project is not an active Locus workspace: {project}")
-        })?;
+    let scope = match (&target.project, &target.workspace_ref) {
+        (Some(_), Some(_)) => return Err("Specify project or workspaceRef, not both".into()),
+        (None, Some(reference)) => resolve_sdk_workspace_scope(app, reference, operation)?,
+        (Some(project), None) if !project.trim().is_empty() => {
+            let runtime = registry.runtime_for_root(std::path::Path::new(project.trim()))
+                .ok_or_else(|| format!("{operation} project is not an active Locus workspace: {project}"))?;
+            // Legacy path selection still acquires a scope lease and checks journal lifecycle.
+            registry.resolve_workspace_ref(&crate::workspace_service::WorkspaceRef::for_runtime(&runtime))
+                .map_err(|e| e.to_string())?
+        }
+        _ => return Err(format!("{operation} requires workspaceRef or a non-empty project path")),
+    };
+    let runtime = scope.runtime();
     let resolved_project = runtime.root().to_string_lossy().to_string();
     if !crate::unity_bridge::is_unity_project(&resolved_project) {
         return Err(format!(
             "{operation} requires an active Unity project: {resolved_project}"
         ));
     }
-    Ok(runtime)
-}
-
-fn resolve_sdk_unity_project(
-    app: &AppHandle,
-    project: &str,
-    operation: &str,
-) -> Result<String, String> {
-    resolve_sdk_unity_runtime(app, project, operation)
-        .map(|runtime| runtime.root().to_string_lossy().to_string())
-}
-
-fn unity_ensure_locks() -> &'static tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>
-{
-    static LOCKS: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-        OnceLock::new();
-    LOCKS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+    Ok(scope)
 }
 
 async fn unity_ensure_lock(checkout_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = unity_ensure_locks().lock().await;
-    Arc::clone(
-        locks
-            .entry(checkout_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-    )
+    crate::unity_bridge::managed_editor::lifecycle_lock(checkout_id).await
 }
 
 async fn sdk_unity_editor_status(
@@ -1659,6 +1665,7 @@ async fn sdk_unity_editor_status(
         .as_ref()
         .and_then(|snapshot| snapshot.readiness.clone());
     let service_status = service.as_ref().map(|snapshot| snapshot.status);
+    let _ = crate::unity_bridge::dialog::ensure_project_observed(&project_path).await;
     // Keep the two pipe probes sequential. Running them concurrently makes
     // one observer see the other's short-lived writer lock as channel busy.
     let connection = crate::unity_bridge::query_unity_connection_status(&project_path).await;
@@ -1689,7 +1696,8 @@ async fn sdk_unity_editor_status(
                 | ServiceReadinessPhase::Reloading
         )
     });
-    let connected = channel_connected || (process_running && service_connected);
+    let process_stopped = matches!(process_state, crate::unity_bridge::UnityEditorProcessState::NotRunning);
+    let connected = !process_stopped && (channel_connected || (process_running && service_connected));
     let main_thread_blocked = blocking_dialog.is_some()
         || matches!(
             semantic.main_thread.state.as_str(),
@@ -1717,10 +1725,11 @@ async fn sdk_unity_editor_status(
         project_path,
         checkout_id: runtime.checkout_id().to_string(),
         workspace_generation: runtime.generation(),
+        materialization_epoch:runtime.materialization_epoch(),
         connected,
         ready,
         process_state,
-        process_id: connection.editor_process_id.or(semantic.process.pid),
+        process_id: if process_stopped { None } else { connection.editor_process_id.or(semantic.process.pid) },
         editor_path: connection
             .editor_process_path
             .clone()
@@ -1751,11 +1760,45 @@ fn unity_safe_mode_wait_error(status: &SdkUnityEditorStatus, target: UnityEnsure
     )
 }
 
+fn unity_editor_dialog_wait_error(
+    project_path: &str,
+    process_id: Option<u32>,
+    expected_created_at_ms: Option<u64>,
+    target: UnityEnsureTarget,
+    mode: crate::unity_bridge::UnityLaunchMode,
+) -> Option<String> {
+    // A process-only request has nothing left to wait for. Connected/ready
+    // waits must yield to the Agent even before the managed bridge exists.
+    if target == UnityEnsureTarget::Process {
+        return None;
+    }
+    let dialog = crate::unity_bridge::dialog::current_dialog_for_process(
+        project_path,
+        process_id?,
+        expected_created_at_ms,
+    )?;
+    Some(format_unity_editor_dialog_wait_error(&dialog, target, mode))
+}
+
+fn format_unity_editor_dialog_wait_error(
+    dialog: &crate::unity_bridge::dialog::UnityModalDialog,
+    target: UnityEnsureTarget,
+    mode: crate::unity_bridge::UnityLaunchMode,
+) -> String {
+    let blocked = crate::unity_bridge::dialog::format_blocked_error(dialog, "editor_starting", None);
+    let project = serde_json::to_string(&dialog.project).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "{blocked}\n继续等待：\nresult = await locus.ensure_unity_editor(project={project}, mode=\"{}\", wait_until=\"{}\")\nprint(result.status)",
+        mode.as_str(), target.as_str()
+    )
+}
+
 async fn get_unity_editor_status(
     app: &AppHandle,
     params: UnityEditorStatusParams,
 ) -> Result<Value, String> {
-    let runtime = resolve_sdk_unity_runtime(app, &params.project, "unity.editor.status")?;
+    let scope = resolve_sdk_unity_runtime(app, &params, "unity.editor.status")?;
+    let runtime = scope.runtime();
     serde_json::to_value(sdk_unity_editor_status(&runtime).await).map_err(|error| error.to_string())
 }
 
@@ -1774,7 +1817,8 @@ async fn ensure_unity_editor(
         ));
     }
     let started_at = std::time::Instant::now();
-    let runtime = resolve_sdk_unity_runtime(app, &params.project, "unity.editor.ensure")?;
+    let scope = resolve_sdk_unity_runtime(app, &params.target, "unity.editor.ensure")?;
+    let runtime = scope.runtime();
     let checkout_id = runtime.checkout_id().to_string();
     let ensure_lock = unity_ensure_lock(&checkout_id).await;
     let _ensure_guard = tokio::time::timeout(
@@ -1791,9 +1835,10 @@ async fn ensure_unity_editor(
     // Starting the checkout service establishes the monitor and readiness
     // observer before a newly spawned editor begins connecting.
     let registry = app.state::<Arc<crate::workspace_service::ProjectRegistry>>();
-    let execution = registry
-        .execution_context(runtime.checkout_id(), &[ServiceKind::Unity])
-        .await
+    let deadline = tokio::time::Instant::from_std(started_at + Duration::from_millis(timeout_ms));
+    let execution = tokio::time::timeout_at(deadline,
+        registry.execution_context(runtime.checkout_id(), &[ServiceKind::Unity]))
+        .await.map_err(|_| "unity.editor.ensure timed out waiting for Unity service capacity")?
         .map_err(|error| format!("unity.editor.ensure could not start Unity service: {error}"))?;
     let _service_binding = execution
         .resolve_service(ServiceKind::Unity)
@@ -1805,14 +1850,9 @@ async fn ensure_unity_editor(
         crate::unity_bridge::UnityEditorProcessState::Running
     ) {
         match (launch_mode, initial_status.launch_mode) {
-            (crate::unity_bridge::UnityLaunchMode::Headless, Some(mode))
-                if mode != crate::unity_bridge::UnityLaunchMode::Headless =>
-            {
-                return Err(
-                    "unity.editor.ensure requested headless mode, but this checkout is already open in an interactive editor"
-                        .to_string(),
-                );
-            }
+            // A user's interactive Editor wins over automatic headless
+            // startup. Reuse it and report its actual mode; never replace it.
+            (crate::unity_bridge::UnityLaunchMode::Headless, Some(crate::unity_bridge::UnityLaunchMode::Interactive)) => {}
             (crate::unity_bridge::UnityLaunchMode::Headless, None) => {
                 return Err(
                     "unity.editor.ensure cannot verify that the running editor is headless"
@@ -1829,6 +1869,15 @@ async fn ensure_unity_editor(
             }
             _ => {}
         }
+    }
+    if let Some(error) = unity_editor_dialog_wait_error(
+        &initial_status.project_path,
+        initial_status.process_id,
+        None,
+        target,
+        launch_mode,
+    ) {
+        return Err(error);
     }
     if initial_status.satisfies(target) {
         return serde_json::to_value(SdkEnsureUnityEditorResult {
@@ -1847,11 +1896,11 @@ async fn ensure_unity_editor(
     let launch = match initial_status.process_state {
         crate::unity_bridge::UnityEditorProcessState::Running => None,
         crate::unity_bridge::UnityEditorProcessState::NotRunning => Some(
-            crate::unity_bridge::launch_project_with_mode(
+            tokio::time::timeout_at(deadline, crate::unity_bridge::launch_project_with_mode(
                 &initial_status.project_path,
                 launch_mode,
-            )
-            .await
+            ))
+            .await.map_err(|_| "unity.editor.ensure timed out waiting for Editor capacity")?
             .map_err(|error| format!("unity.editor.ensure failed to launch Unity: {error}"))?,
         ),
         crate::unity_bridge::UnityEditorProcessState::Unknown => {
@@ -1874,6 +1923,18 @@ async fn ensure_unity_editor(
 
     loop {
         let status = sdk_unity_editor_status(&runtime).await;
+        if let Some(error) = unity_editor_dialog_wait_error(
+            &status.project_path,
+            launch
+                .as_ref()
+                .map(|launch| launch.process_id)
+                .or(status.process_id),
+            launch_created_at_ms,
+            target,
+            launch_mode,
+        ) {
+            return Err(error);
+        }
         let mut launch_liveness = None;
         if let Some(expected_launch) = launch.as_ref() {
             if status.process_id != Some(expected_launch.process_id) {
@@ -1994,7 +2055,8 @@ async fn restart_unity_editor(
         ));
     }
     let started_at = std::time::Instant::now();
-    let runtime = resolve_sdk_unity_runtime(app, &params.project, "unity.editor.restart")?;
+    let scope = resolve_sdk_unity_runtime(app, &params.target, "unity.editor.restart")?;
+    let runtime = scope.runtime();
     let checkout_id = runtime.checkout_id().to_string();
     let restart_lock = unity_ensure_lock(&checkout_id).await;
     let _restart_guard = tokio::time::timeout(
@@ -2011,16 +2073,18 @@ async fn restart_unity_editor(
     // Keep the workspace's Unity monitor alive throughout close and launch so
     // the replacement process can immediately reconnect to the same checkout.
     let registry = app.state::<Arc<crate::workspace_service::ProjectRegistry>>();
-    let execution = registry
-        .execution_context(runtime.checkout_id(), &[ServiceKind::Unity])
-        .await
+    let deadline = tokio::time::Instant::from_std(started_at + Duration::from_millis(timeout_ms));
+    let execution = tokio::time::timeout_at(deadline,
+        registry.execution_context(runtime.checkout_id(), &[ServiceKind::Unity]))
+        .await.map_err(|_| "unity.editor.restart timed out waiting for Unity service capacity")?
         .map_err(|error| format!("unity.editor.restart could not start Unity service: {error}"))?;
     let _service_binding = execution
         .resolve_service(ServiceKind::Unity)
         .map_err(|error| format!("unity.editor.restart Unity service is unavailable: {error}"))?;
 
     let project_path = runtime.root().to_string_lossy().to_string();
-    let close_timeout = Duration::from_millis(timeout_ms.min(60_000));
+    let close_timeout = deadline.saturating_duration_since(tokio::time::Instant::now())
+        .min(Duration::from_secs(60));
     let close = if params.force {
         crate::unity_bridge::force_close_current_project_unity_processes(
             &project_path,
@@ -2033,8 +2097,9 @@ async fn restart_unity_editor(
     }
     .map_err(|error| format!("unity.editor.restart failed to close Unity: {error}"))?;
 
-    let launch = crate::unity_bridge::launch_project_with_mode(&project_path, launch_mode)
-        .await
+    let launch = tokio::time::timeout_at(deadline,
+        crate::unity_bridge::launch_project_with_mode(&project_path, launch_mode))
+        .await.map_err(|_| "unity.editor.restart timed out waiting for Editor capacity")?
         .map_err(|error| format!("unity.editor.restart failed to launch Unity: {error}"))?;
     let launch_created_at_ms =
         crate::unity_bridge::launched_unity_process_created_at_ms(launch.process_id);
@@ -2042,6 +2107,15 @@ async fn restart_unity_editor(
 
     loop {
         let status = sdk_unity_editor_status(&runtime).await;
+        if let Some(error) = unity_editor_dialog_wait_error(
+            &project_path,
+            Some(launch.process_id),
+            launch_created_at_ms,
+            target,
+            launch_mode,
+        ) {
+            return Err(error);
+        }
         let mut launch_liveness = None;
         if status.process_id != Some(launch.process_id) {
             match crate::unity_bridge::reaffirm_launched_unity_editor_process(
@@ -2123,8 +2197,32 @@ async fn restart_unity_editor(
     }
 }
 
+async fn close_unity_editor(app: &AppHandle, params: CloseUnityEditorParams) -> Result<Value, String> {
+    let timeout_ms = params.timeout_ms.unwrap_or(60_000);
+    if timeout_ms == 0 || timeout_ms > MAX_UNITY_ENSURE_TIMEOUT_MS {
+        return Err(format!("timeoutMs must be between 1 and {MAX_UNITY_ENSURE_TIMEOUT_MS}"));
+    }
+    let scope = resolve_sdk_unity_runtime(app, &params.target, "unity.editor.close")?;
+    let runtime = scope.runtime();
+    let lock = unity_ensure_lock(runtime.checkout_id().as_str()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let _guard = tokio::time::timeout_at(deadline, lock.lock()).await
+        .map_err(|_| "Timed out waiting for another Unity lifecycle operation")?;
+    let project = runtime.root().to_string_lossy().into_owned();
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let result = if params.force {
+        crate::unity_bridge::force_close_current_project_unity_processes(&project, remaining).await
+    } else {
+        crate::unity_bridge::close_current_project_unity_processes(&project, remaining).await
+    }?;
+    crate::unity_bridge::cleanup_closed_project_markers(&project).await?;
+    Ok(json!({"closedProcessIds": result.process_ids, "forcedProcessIds": result.forced_process_ids,
+        "status": sdk_unity_editor_status(runtime).await}))
+}
+
 async fn get_unity_dialog(app: &AppHandle, params: UnityDialogParams) -> Result<Value, String> {
-    let project = resolve_sdk_unity_project(app, &params.project, "unity.dialog.get")?;
+    let scope = resolve_sdk_unity_runtime(app, &params, "unity.dialog.get")?;
+    let project = scope.runtime().root().to_string_lossy().into_owned();
     crate::unity_bridge::dialog::ensure_project_observed(&project).await?;
     serde_json::to_value(crate::unity_bridge::dialog::current_dialog(&project))
         .map_err(|error| error.to_string())
@@ -2134,7 +2232,8 @@ async fn choose_unity_dialog(
     app: &AppHandle,
     params: ChooseUnityDialogParams,
 ) -> Result<Value, String> {
-    let project = resolve_sdk_unity_project(app, &params.project, "unity.dialog.choose")?;
+    let scope = resolve_sdk_unity_runtime(app, &params.target, "unity.dialog.choose")?;
+    let project = scope.runtime().root().to_string_lossy().into_owned();
     let dialog_id = params.dialog_id.trim();
     let choice_id = params.choice_id.trim();
     if dialog_id.is_empty() {
@@ -2151,7 +2250,8 @@ async fn wait_unity_execution(
     app: &AppHandle,
     params: WaitUnityExecutionParams,
 ) -> Result<Value, String> {
-    let project = resolve_sdk_unity_project(app, &params.project, "unity.execution.wait")?;
+    let scope = resolve_sdk_unity_runtime(app, &params.target, "unity.execution.wait")?;
+    let project = scope.runtime().root().to_string_lossy().into_owned();
     let execution_id = params.execution_id.trim();
     if execution_id.is_empty() {
         return Err("unity.execution.wait requires executionId".to_string());
@@ -2533,7 +2633,7 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
                 "Tool '{canonical}' requires workspaceRef with a live checkout generation"
             ));
         }
-        let outcome = crate::mcp::server::tools::execute_tool(
+        let outcome = crate::mcp::server::tools::execute_tool_with_delegation(
             app.clone(),
             canonical.clone(),
             params.arguments,
@@ -2543,6 +2643,7 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
                 .as_ref()
                 .expect("workspace scope is required above")
                 .workspace_ref(),
+            params.execution_delegation,
         )
         .await;
         let images = outcome
@@ -2599,13 +2700,6 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
             "Tool '{canonical}' requires workspaceRef with a live checkout generation"
         ));
     }
-    let workspace_event_scope = crate::workspace_service::event::WorkspaceEventScope::for_runtime(
-        workspace_scope
-            .as_ref()
-            .expect("workspace scope is required above")
-            .runtime()
-            .as_ref(),
-    );
     let unity_connected = if canonical == "read"
         && params
             .arguments
@@ -2644,46 +2738,9 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         output_path: None,
         background: false,
     };
-    let lock_request = if matches!(canonical.as_str(), "write" | "edit") {
-        Some(
-            params
-                .arguments
-                .get("filePath")
-                .and_then(Value::as_str)
-                .map(|path| {
-                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::PathWrite(
-                        vec![crate::agent::workspace_execution_lock::normalize_workspace_path_key(
-                            working_dir.as_deref().unwrap_or_default(),
-                            path,
-                        )],
-                    )
-                })
-                .unwrap_or(
-                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
-                ),
-        )
-    } else if canonical == "bash" {
-        crate::agent::instance::AgentInstance::bash_needs_primary_workspace_tracking_for(
-            working_dir.as_deref().unwrap_or_default(),
-            &params.arguments,
-        )
-        .then_some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
-    } else if canonical == "python" {
-        (!crate::tool::builtins::python_is_readonly(&params.arguments)).then_some(
-            crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
-        )
-    } else if canonical == "unity_execute" {
-        (!crate::agent::instance::AgentInstance::unity_execute_is_readonly(&params.arguments))
-            .then_some(
-                crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
-            )
-    } else if registry.mutates_workspace(&canonical)
-        || crate::agent::instance::AgentInstance::is_unity_execution_barrier_tool(&canonical)
-    {
-        Some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
-    } else {
-        None
-    };
+    let session_undo_enabled = app.state::<Arc<crate::config::AppConfig>>().session_undo_enabled();
+    let lock_request = direct_tool_lock_request(&canonical, &params.arguments,
+        working_dir.as_deref().unwrap_or_default(), registry.mutates_workspace(&canonical), session_undo_enabled);
     let owner = crate::agent::workspace_execution_lock::WorkspaceExecutionLockOwner {
         session_id: "python-sdk".to_string(),
         run_id: format!("sdk-tool-{}", uuid::Uuid::new_v4()),
@@ -2691,30 +2748,14 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
         workspace: working_dir.clone().unwrap_or_default(),
         tools: vec![canonical.clone()],
     };
-    let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
     let execute = async {
         let guard = if let Some(request) = lock_request {
-            match crate::agent::workspace_execution_lock::process_workspace_execution_lock(
-                &owner.workspace,
-            )
-            .acquire_with_diagnostics(
-                request,
-                owner,
-                lock_cancel_rx,
-                workspace_event_scope,
-                &app,
-            )
-            .await
+            match crate::merge_jobs::coordination::acquire_workspace(app,
+                workspace_scope.as_ref().expect("workspace scope is required above").runtime(),
+                request, owner, params.execution_delegation.as_deref()).await
             {
                 Ok(guard) => Some(guard),
-                Err(_) => {
-                    return ToolResult {
-                        output: format!(
-                            "Tool '{canonical}' was cancelled while waiting for workspace mutation coordination"
-                        ),
-                        is_error: true,
-                    }
-                }
+                Err(error) => return ToolResult { output: error, is_error: true },
             }
         } else {
             None
@@ -2731,13 +2772,59 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
             output: format!("Tool '{canonical}' timed out after {}s", timeout_ms / 1_000),
             is_error: true,
         });
-    Ok(direct_tool_result(
-        &canonical,
-        result.output,
-        result.is_error,
-        Value::Array(Vec::new()),
-        working_dir,
-    ))
+    Ok(direct_tool_result(&canonical, result.output, result.is_error, Value::Array(Vec::new()), working_dir))
+}
+
+/// Mirrors AgentInstance's foreground policy. Turning session undo off relaxes
+/// opaque writes; path writes and actual Unity execution barriers remain scoped.
+pub(crate) fn direct_tool_lock_request(
+    canonical: &str, arguments: &Value, working_dir: &str,
+    mutates_workspace: bool, session_undo_enabled: bool,
+) -> Option<crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest> {
+    if canonical == "execute_typescript" {
+        // Frontend callbacks re-enter IPC asset/merge endpoints, which acquire
+        // their own transaction scopes. Holding an outer gate until the UI
+        // replies would deadlock those writes; policy still marks this mutating.
+        None
+    } else if matches!(canonical, "write" | "edit") {
+        Some(
+            arguments
+                .get("filePath")
+                .and_then(Value::as_str)
+                .map(|path| {
+                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::PathWrite(
+                        vec![crate::agent::workspace_execution_lock::normalize_workspace_path_key(
+                            working_dir,
+                            path,
+                        )],
+                    )
+                })
+                .unwrap_or(
+                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
+                ),
+        )
+    } else if canonical == "bash" {
+        (session_undo_enabled && crate::agent::instance::AgentInstance::bash_needs_primary_workspace_tracking_for(
+            working_dir,
+            arguments,
+        ))
+        .then_some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
+    } else if canonical == "python" {
+        (session_undo_enabled && !crate::tool::builtins::python_is_readonly(arguments)).then_some(
+            crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
+        )
+    } else if canonical == "unity_execute" {
+        (!crate::agent::instance::AgentInstance::unity_execute_is_readonly(arguments))
+            .then_some(
+                crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
+            )
+    } else if (session_undo_enabled && mutates_workspace)
+        || crate::agent::instance::AgentInstance::is_unity_execution_barrier_tool(canonical)
+    {
+        Some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
+    } else {
+        None
+    }
 }
 
 /// Start an idle root receiver with its persisted settings. The actual message
@@ -2785,6 +2872,47 @@ pub(crate) async fn wake_session_for_agent_message(app: &AppHandle, session_id: 
 }
 
 async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value, String> {
+    if let Some(action) = method.strip_prefix("csv.") {
+        return csv::dispatch(app, action, params).await;
+    }
+    if let Some(action) = method.strip_prefix("agents.rules.") {
+        return agent_rules::dispatch(app, action, params).await;
+    }
+    if let Some(action) = method.strip_prefix("assets.") {
+        let reference = serde_json::from_value(params.get("workspaceRef").cloned().ok_or("Asset APIs require workspaceRef")?).map_err(|e|e.to_string())?;
+        let scope = resolve_sdk_workspace_scope(app, &reference, method)?;
+        let _guard = if action.starts_with("apply") || action=="recover" {
+            Some(crate::merge_jobs::coordination::acquire(app,scope.runtime(),method,params.get("execution_delegation").and_then(Value::as_str)).await?)
+        } else {None};
+        let mut request=params;
+        request["action"]=json!(action);
+        return crate::unity_assets::execute(scope.runtime().root(),request).await;
+    }
+    if let Some(action) = method.strip_prefix("worktrees.") {
+        return worktrees::dispatch(app, action, params).await;
+    }
+    if let Some(action)=method.strip_prefix("merges.") {
+        let workspace_ref:crate::workspace_service::WorkspaceRef=serde_json::from_value(params.get("workspaceRef").cloned().ok_or("Merge APIs require an explicit workspaceRef")?).map_err(|e|e.to_string())?;
+        let scope=resolve_sdk_workspace_scope(app,&workspace_ref,method)?;
+        let root=scope.runtime().root().to_path_buf();
+        let _merge_guard=if crate::merge_jobs::coordination::needs_guard(action,&params){Some(crate::merge_jobs::coordination::acquire(app,scope.runtime(),action,params.get("execution_delegation").and_then(Value::as_str)).await?)}else{None};
+        if action=="prepare" {
+            let request:crate::merge_jobs::PrepareRequest=serde_json::from_value(params.clone()).map_err(|e|e.to_string())?;
+            if request.project_id.as_ref().map(|id|id!=&scope.runtime().project_id().to_string()).unwrap_or(false){return Err("The destination checkout does not belong to project_id".into());}
+            let destination=params.get("destination").cloned().unwrap_or_else(||json!({"kind":"checkout"}));
+            let job=crate::merge_jobs::coordination::run_blocking(_merge_guard,move||{let _scope=scope;crate::merge_jobs::prepare_with_destination(&root,&request,&destination)}).await??;
+            let runtime=app.state::<Arc<crate::workspace_service::ProjectRegistry>>().register(&job.project_root)?;
+            return Ok(json!({"workspace_ref":crate::workspace_service::WorkspaceRef::for_runtime(&runtime),"job":crate::merge_jobs::summary(&job)}));
+        }
+        let job_id=params.get("job_id").and_then(Value::as_str).ok_or("Merge job_id is required")?.to_string();
+        if action=="apply"{crate::merge_jobs::preflight_apply(&root,&job_id).await?;}
+        if action=="validate"&&params.get("level").and_then(Value::as_str)==Some("unity") {
+            if params.get("paths").and_then(Value::as_array).is_some(){return crate::merge_jobs::validate_commit_unity(app,&root,&job_id,params).await;}
+            return crate::merge_jobs::validate_unity(&root,&job_id).await;
+        }
+        let action=action.to_string();
+        return crate::merge_jobs::coordination::run_blocking(_merge_guard,move||{let _scope=scope;crate::merge_jobs::execute(&root,&job_id,&action,params)}).await?;
+    }
     match method {
         "tasks.list" | "tasks.get" | "tasks.cancel" | "tasks.resume" | "tasks.wait" | "tasks.send_message" => {
             let session_id = params.get("sessionId").and_then(Value::as_str).map(str::trim)
@@ -2842,11 +2970,14 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
         "unity.editor.status" => get_unity_editor_status(app, parse_params(params)?).await,
         "unity.editor.ensure" => ensure_unity_editor(app, parse_params(params)?).await,
         "unity.editor.restart" => restart_unity_editor(app, parse_params(params)?).await,
+        "unity.editor.close" => close_unity_editor(app, parse_params(params)?).await,
         "unity.dialog.get" => get_unity_dialog(app, parse_params(params)?).await,
         "unity.dialog.choose" => choose_unity_dialog(app, parse_params(params)?).await,
         "unity.execution.wait" => wait_unity_execution(app, parse_params(params)?).await,
         "sessions.list" => list_sdk_sessions(app, parse_params(params)?).await,
         "sessions.get" => get_sdk_session(app, parse_params(params)?),
+        "sessions.read" => sessions::read(app, params),
+        "sessions.search" => sessions::search(app, params).await,
         "sessions.send" => send_sdk_session_message(app, parse_params(params)?).await,
         "sessions.events" => list_sdk_session_events(app, parse_params(params)?),
         "runs.get" => {
@@ -2992,6 +3123,51 @@ pub async fn start(app: AppHandle) -> Result<SocketAddr, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn direct_frontend_dispatcher_does_not_hold_outer_workspace_gate() {
+        for enabled in [true, false] {
+            assert!(super::direct_tool_lock_request(
+                "execute_typescript", &serde_json::json!({"code":"await locus.assets.apply_batch(entries)"}),
+                "F:/Project", true, enabled,
+            ).is_none());
+            // Ordinary Python still participates in its existing opaque lease.
+            assert_eq!(super::direct_tool_lock_request(
+                "python", &serde_json::json!({"readonly":false}), "F:/Project", true, enabled,
+            ).is_some(), enabled);
+        }
+    }
+
+    #[test]
+    fn direct_tools_respect_disabled_session_undo_without_widening_locks() {
+        use crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest as Lock;
+        use serde_json::json;
+        for name in ["bash", "python", "view_create"] {
+            assert!(super::direct_tool_lock_request(name, &json!({"readonly": false}),
+                "F:/Project", true, false).is_none(), "{name}");
+        }
+        assert!(matches!(super::direct_tool_lock_request("write", &json!({"filePath":"a.cs"}),
+            "F:/Project", true, false), Some(Lock::PathWrite(_))));
+        assert!(super::direct_tool_lock_request("unity_execute", &json!({"readonly":true}),
+            "F:/Project", true, false).is_none());
+        for name in ["unity_execute", "unity_recompile"] {
+            assert!(matches!(super::direct_tool_lock_request(name, &json!({"readonly":false}),
+                "F:/Project", true, false), Some(Lock::Exclusive)));
+        }
+        assert!(super::direct_tool_lock_request("python", &json!({"readonly":false}),
+            "F:/Project", true, true).is_some());
+    }
+
+    #[test]
+    fn unity_lifecycle_deserializes_epoch_bound_targets() {
+        let params: super::RestartUnityEditorParams = serde_json::from_value(serde_json::json!({
+            "workspaceRef":{"checkoutId":"a","expectedGeneration":2,"expectedMaterializationEpoch":3},
+            "force":false,
+        })).unwrap();
+        assert!(params.target.project.is_none());
+        assert_eq!(params.target.workspace_ref.unwrap().expected_materialization_epoch, Some(3));
+        let legacy: super::UnityTargetParams = serde_json::from_value(serde_json::json!({"project":"F:/Project"})).unwrap();
+        assert_eq!(legacy.project.as_deref(), Some("F:/Project"));
+    }
     use super::{
         cross_session_message, host_allowed, is_agent_only_tool, sdk_runtime_status, token_matches,
         unity_launch_wait_state, validate_agent_id, ListModelsParams, ListSessionsParams,
@@ -3075,6 +3251,58 @@ mod tests {
             UnityEnsureTarget::Connected
         );
         assert!(UnityEnsureTarget::parse(Some("running")).is_err());
+    }
+
+    #[test]
+    fn unity_startup_dialog_error_exposes_choices_and_resumes_without_restart() {
+        use crate::unity_bridge::{
+            dialog::{UnityDialogChoice, UnityModalDialog},
+            UnityLaunchMode,
+        };
+        let dialog = UnityModalDialog {
+            code: "unity_modal_dialog_blocked".to_string(),
+            dialog_id: "dialog-recovery".to_string(),
+            project: r"F:\Project with spaces".to_string(),
+            title: "Recovering Scene Backups".to_string(),
+            message: "Preserve backups in Assets/_Recovery/?".to_string(),
+            choices: vec![
+                UnityDialogChoice {
+                    id: "choice-0".to_string(),
+                    label: "Yes".to_string(),
+                },
+                UnityDialogChoice {
+                    id: "choice-1".to_string(),
+                    label: "No".to_string(),
+                },
+            ],
+            main_thread_blocked: true,
+            opened_at_ms: 1,
+        };
+        for (target, mode) in [
+            (UnityEnsureTarget::Ready, UnityLaunchMode::Interactive),
+            (UnityEnsureTarget::Connected, UnityLaunchMode::Headless),
+        ] {
+            let error = super::format_unity_editor_dialog_wait_error(&dialog, target, mode);
+            assert!(error.contains("code=unity_modal_dialog_blocked"));
+            assert!(error.contains("request_state=editor_starting"));
+            assert!(error.contains("dialog_id=dialog-recovery"));
+            assert!(error.contains("title=Recovering Scene Backups"));
+            assert!(error.contains("message=Preserve backups in Assets/_Recovery/?"));
+            assert!(error.contains("choice-0: Yes"));
+            assert!(error.contains("choice-1: No"));
+            assert!(error.contains("locus.choose_unity_dialog("));
+            assert!(error.contains("locus.ensure_unity_editor(project=\"F:\\\\Project with spaces\""));
+            assert!(error.contains(&format!("mode=\"{}\"", mode.as_str())));
+            assert!(error.contains(&format!("wait_until=\"{}\"", target.as_str())));
+            assert!(!error.contains("locus.restart_unity_editor("));
+        }
+        assert!(super::unity_editor_dialog_wait_error(
+            &dialog.project,
+            None,
+            None,
+            UnityEnsureTarget::Ready,
+            UnityLaunchMode::Interactive,
+        ).is_none());
     }
 
     #[test]

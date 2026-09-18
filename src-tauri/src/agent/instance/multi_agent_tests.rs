@@ -105,7 +105,7 @@ async fn multi_agent_disabled_adds_explicit_delegation_policy_to_new_prompts() {
 }
 
 #[tokio::test]
-async fn multi_agent_python_policy_survives_overrides_and_lazy_loading() {
+async fn multi_agent_policy_does_not_expand_python_tool_descriptions() {
     let mut agent = instance();
     Arc::make_mut(&mut agent.def)
         .tool_description_overrides
@@ -122,16 +122,61 @@ async fn multi_agent_python_policy_survives_overrides_and_lazy_loading() {
             agent.set_async_tasks_enabled(async_tasks);
             let direct = agent.build_api_tools(&["python".to_string()]).await;
             let description = direct[0]["function"]["description"].as_str().unwrap();
-            assert!(description.starts_with("Run workspace Python."));
-            assert_eq!(
-                description.matches(EXPLICIT_DELEGATION_GUIDANCE).count(),
-                usize::from(!enabled)
-            );
+            assert_eq!(description, "Run workspace Python.");
             let (text, parameters) = agent.tool_description("python").unwrap();
             let (lazy_description, _) =
                 agent.contextualize_tool_description("python", text, parameters);
             assert_eq!(lazy_description, description);
         }
+    }
+}
+
+#[tokio::test]
+async fn python_preview_and_api_share_minimal_schema_and_conditional_async_usage() {
+    let mut agent = instance();
+    let def = Arc::make_mut(&mut agent.def);
+    def.tools.push("python".to_string());
+    def.tool_description_overrides.insert(
+        "python".to_string(),
+        crate::agent::definition::AgentToolDescriptionOverride {
+            description: Some("Run {python_runtime} code. {python_sdk_documentation}".to_string()),
+            parameters: None,
+        },
+    );
+    for enabled in [false, true, false] {
+        agent.set_async_tasks_enabled(enabled);
+        let direct = agent.build_api_tools(&["python".to_string()]).await;
+        let function = &direct[0]["function"];
+        let description = function["description"].as_str().unwrap();
+        assert!(description.starts_with("Run Python "));
+        assert!(description.contains("SDK documentation"));
+        assert!(!description.contains("{python_"));
+        assert!(!description.contains("overview.md"));
+        assert!(!description.contains("locus."));
+        assert!(!description.contains(EXPLICIT_DELEGATION_GUIDANCE));
+        let properties = function["parameters"]["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), if enabled { 4 } else { 3 });
+        assert_eq!(properties.contains_key("async"), enabled);
+        assert_eq!(
+            function["parameters"]["required"],
+            serde_json::json!(["code", "readonly"])
+        );
+        if enabled {
+            let usage = properties["async"]["description"].as_str().unwrap();
+            assert!(usage.contains("await locus.list_tasks()"));
+            assert!(usage.contains("readonly=true"));
+        } else {
+            assert!(!function.to_string().contains("locus.list_tasks"));
+            assert!(!function.to_string().contains("notify"));
+        }
+        let (text, parameters) = agent.tool_description("python").unwrap();
+        let (lazy_description, lazy_parameters) =
+            agent.contextualize_tool_description("python", text, parameters);
+        assert_eq!(lazy_description, description);
+        assert_eq!(lazy_parameters, function["parameters"]);
+        let preview = agent.available_tool_prompt_items().await;
+        let python = preview.iter().find(|item| item.title == "python").unwrap();
+        assert_eq!(python.meta.as_ref().unwrap()["function"], *function);
     }
 }
 

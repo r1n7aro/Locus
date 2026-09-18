@@ -8,6 +8,8 @@ import urllib.request
 import uuid
 from typing import Any
 
+from ._scope import unity_target, workspace_payload
+
 _DEFAULT_TOOL_TIMEOUT = 120.0
 
 
@@ -74,6 +76,26 @@ class Client:
             "runtime selected inside a running Locus desktop instance."
         )
 
+    @property
+    def assets(self) -> "Assets":
+        from ._assets import Assets
+        return Assets(self)
+
+    @property
+    def csv(self) -> "Csv":
+        from ._csv import Csv
+        return Csv(self)
+
+    @property
+    def merges(self) -> "Merges":
+        from ._merges import Merges
+        return Merges(self)
+
+    @property
+    def worktrees(self) -> "Worktrees":
+        from ._worktrees import Worktrees
+        return Worktrees(self)
+
     def _rpc_sync(
         self,
         method: str,
@@ -138,17 +160,59 @@ class Client:
         rows = await self.rpc("agents.list")
         return [Agent.from_payload(row, self) for row in rows]
 
+    async def _agent_rules_request(
+        self, action: str, agent_id: str, *, workspace_ref: Any = None,
+        worktree: Any = None, **params: Any,
+    ) -> Any:
+        if not agent_id.strip():
+            raise ValueError("agent_id cannot be empty")
+        return await self.rpc(f"agents.rules.{action}", {
+            "workspaceRef": workspace_payload(workspace_ref, worktree),
+            "agentId": agent_id,
+            "executionDelegation": os.environ.get("LOCUS_SDK_EXECUTION_DELEGATION"),
+            **params,
+        })
+
+    async def list_agent_rules(self, agent_id: str, *, workspace_ref: Any = None, worktree: Any = None) -> list["AgentRule"]:
+        from ._agent_rules import AgentRule
+
+        rows = await self._agent_rules_request("list", agent_id, workspace_ref=workspace_ref, worktree=worktree)
+        return [AgentRule.from_payload(row) for row in rows]
+
+    async def read_agent_rule(self, agent_id: str, file_name: str, *, workspace_ref: Any = None, worktree: Any = None) -> str:
+        return await self._agent_rules_request("read", agent_id, fileName=file_name, workspace_ref=workspace_ref, worktree=worktree)
+
+    async def save_agent_rule(self, agent_id: str, file_name: str, content: str, *, workspace_ref: Any = None, worktree: Any = None) -> "AgentRule":
+        """Save a workspace rule; preserve the enabled state of an existing rule."""
+        from ._agent_rules import AgentRule
+
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        payload = await self._agent_rules_request("save", agent_id, fileName=file_name, content=content, workspace_ref=workspace_ref, worktree=worktree)
+        return AgentRule.from_payload(payload)
+
+    async def set_agent_rule_enabled(self, agent_id: str, file_name: str, enabled: bool, *, workspace_ref: Any = None, worktree: Any = None) -> "AgentRule":
+        """Enable or disable an existing rule only in the selected workspace."""
+        from ._agent_rules import AgentRule
+
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool")
+        payload = await self._agent_rules_request("set_enabled", agent_id, fileName=file_name, enabled=enabled, workspace_ref=workspace_ref, worktree=worktree)
+        return AgentRule.from_payload(payload)
+
     async def list_models(self, *, available_only: bool = True) -> list["ModelInfo"]:
         from ._models import ModelInfo
 
         rows = await self.rpc("models.list", {"availableOnly": available_only})
         return [ModelInfo.from_payload(row) for row in rows]
 
-    async def list_tools(self) -> list["ToolInfo"]:
-        from ._models import ToolInfo
+    async def list_tools(self, *, workspace_ref: Any = None, worktree: Any = None) -> list["ToolInfo"]:
+        from ._models import ToolInfo, WorkspaceRef
 
-        rows = await self.rpc("tools.list")
-        return [ToolInfo.from_payload(row, self) for row in rows]
+        reference = workspace_payload(workspace_ref, worktree, required=False)
+        rows = await self.rpc("tools.list", {"workspaceRef": reference})
+        bound_ref = None if reference is None else WorkspaceRef.from_payload(reference)
+        return [ToolInfo.from_payload(row, self, bound_ref) for row in rows]
 
     async def get_model(self, model_id: str, *, include_unavailable: bool = True) -> "ModelInfo":
         for model in await self.list_models(available_only=not include_unavailable):
@@ -156,8 +220,8 @@ class Client:
                 return model
         raise LocusRpcError(f"Unknown model '{model_id}'")
 
-    async def get_tool(self, name: str) -> "ToolInfo":
-        for tool in await self.list_tools():
+    async def get_tool(self, name: str, *, workspace_ref: Any = None, worktree: Any = None) -> "ToolInfo":
+        for tool in await self.list_tools(workspace_ref=workspace_ref, worktree=worktree):
             if tool.name == name:
                 return tool
         raise LocusRpcError(f"Unknown tool '{name}'")
@@ -169,9 +233,12 @@ class Client:
         *,
         timeout: float | None = None,
         workspace_ref: "WorkspaceRef | None" = None,
+        worktree: Any = None,
     ) -> "ToolCallResult":
         from ._models import ToolCallResult, ToolInfo
 
+        if isinstance(tool, ToolInfo) and workspace_ref is None and worktree is None:
+            workspace_ref = tool.workspace_ref
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
         name = tool.name if isinstance(tool, ToolInfo) else str(tool).strip()
@@ -184,16 +251,17 @@ class Client:
                 "name": name,
                 "arguments": arguments or {},
                 "timeoutMs": None if timeout is None else max(1, int(timeout * 1000)),
-                "workspaceRef": None if workspace_ref is None else workspace_ref.to_payload(),
+                "workspaceRef": workspace_payload(workspace_ref, worktree, required=False),
+                "executionDelegation": os.environ.get("LOCUS_SDK_EXECUTION_DELEGATION"),
             },
             timeout=effective_timeout + 5.0,
         )
         return ToolCallResult.from_payload(payload)
 
-    async def get_workspace(self) -> "WorkspaceInfo":
+    async def get_workspace(self, *, workspace_ref: Any = None, worktree: Any = None) -> "WorkspaceInfo":
         from ._models import WorkspaceInfo
 
-        payload = await self.rpc("workspace.get")
+        payload = await self.rpc("workspace.get", {"workspaceRef": workspace_payload(workspace_ref, worktree, required=False)})
         return WorkspaceInfo.from_payload(payload)
 
     async def get_task_status(self, task_id: str) -> "TaskStatus":
@@ -285,20 +353,20 @@ class Client:
         })
         return TaskStatus.from_payload(payload)
 
-    async def get_unity_editor_status(self, *, project: str) -> "UnityEditorStatus":
+    async def get_unity_editor_status(self, *, project: str | None = None,
+        worktree: Any = None, workspace_ref: Any = None) -> "UnityEditorStatus":
         """Return the process, connection, and semantic state for a Unity project."""
         from ._models import UnityEditorStatus
 
-        project = project.strip()
-        if not project:
-            raise ValueError("project cannot be empty")
-        payload = await self.rpc("unity.editor.status", {"project": project})
+        payload = await self.rpc("unity.editor.status", unity_target(project, workspace_ref, worktree))
         return UnityEditorStatus.from_payload(payload)
 
     async def ensure_unity_editor(
         self,
         *,
-        project: str,
+        project: str | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
         mode: str = "interactive",
         wait_until: str = "ready",
         timeout: float = 300.0,
@@ -309,14 +377,16 @@ class Client:
         accepts ``process``, ``connected``, or ``ready``. The
         operation is serialized per checkout, so concurrent workflows reuse a
         single editor process.
+
+        A blocking dialog raises ``LocusRpcError`` with its title, message,
+        dialog id, and choices. Choose via ``choose_unity_dialog``, then call
+        ``ensure_unity_editor`` again to continue waiting for this editor.
         """
         from ._models import UnityEditorEnsureResult
 
-        project = project.strip()
+        target = unity_target(project, workspace_ref, worktree)
         mode = mode.strip().lower()
         wait_until = wait_until.strip().lower()
-        if not project:
-            raise ValueError("project cannot be empty")
         if mode not in {"interactive", "headless"}:
             raise ValueError("mode must be 'interactive' or 'headless'")
         if wait_until not in {"process", "connected", "ready"}:
@@ -326,7 +396,7 @@ class Client:
         payload = await self.rpc(
             "unity.editor.ensure",
             {
-                "project": project,
+                **target,
                 "mode": mode,
                 "waitUntil": wait_until,
                 "timeoutMs": max(1, int(timeout * 1000)),
@@ -338,7 +408,9 @@ class Client:
     async def restart_unity_editor(
         self,
         *,
-        project: str,
+        project: str | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
         mode: str = "interactive",
         wait_until: str = "ready",
         timeout: float = 300.0,
@@ -349,14 +421,18 @@ class Client:
         With ``force=False``, Locus requests a normal close first and force
         closes remaining project processes after the close timeout. With
         ``force=True``, matching project processes are force-closed directly.
+
+        A blocking dialog raises ``LocusRpcError`` with its title, message,
+        dialog id, and choices, including before the managed bridge connects.
+        After choosing a startup dialog, use ``ensure_unity_editor`` to resume
+        waiting without restarting again. A close dialog pauses normal shutdown
+        before the force-close fallback; inspect status after choosing it.
         """
         from ._models import UnityEditorRestartResult
 
-        project = project.strip()
+        target = unity_target(project, workspace_ref, worktree)
         mode = mode.strip().lower()
         wait_until = wait_until.strip().lower()
-        if not project:
-            raise ValueError("project cannot be empty")
         if mode not in {"interactive", "headless"}:
             raise ValueError("mode must be 'interactive' or 'headless'")
         if wait_until not in {"process", "connected", "ready"}:
@@ -366,7 +442,7 @@ class Client:
         payload = await self.rpc(
             "unity.editor.restart",
             {
-                "project": project,
+                **target,
                 "mode": mode,
                 "waitUntil": wait_until,
                 "timeoutMs": max(1, int(timeout * 1000)),
@@ -376,7 +452,22 @@ class Client:
         )
         return UnityEditorRestartResult.from_payload(payload)
 
-    async def get_unity_dialog(self, *, project: str) -> "UnityModalDialog | None":
+    async def close_unity_editor(self, *, project: str | None = None, worktree: Any = None,
+        workspace_ref: Any = None, timeout: float = 60.0, force: bool = False) -> "UnityEditorCloseResult":
+        """Close this checkout's editor and owned import workers, without reopening it."""
+        import math
+        from ._models import UnityEditorCloseResult
+
+        if not math.isfinite(timeout) or timeout <= 0 or timeout > 1800:
+            raise ValueError("timeout must be greater than 0 and at most 1800 seconds")
+        payload = await self.rpc("unity.editor.close", {
+            **unity_target(project, workspace_ref, worktree),
+            "timeoutMs": max(1, int(timeout * 1000)), "force": bool(force),
+        }, timeout=timeout + 10)
+        return UnityEditorCloseResult.from_payload(payload)
+
+    async def get_unity_dialog(self, *, project: str | None = None,
+        worktree: Any = None, workspace_ref: Any = None) -> "UnityModalDialog | None":
         """Return the blocking modal dialog for a Unity project, if present.
 
         This RPC is handled by Locus's native window observer and remains
@@ -384,16 +475,15 @@ class Client:
         """
         from ._models import UnityModalDialog
 
-        project = project.strip()
-        if not project:
-            raise ValueError("project cannot be empty")
-        payload = await self.rpc("unity.dialog.get", {"project": project})
+        payload = await self.rpc("unity.dialog.get", unity_target(project, workspace_ref, worktree))
         return None if payload is None else UnityModalDialog.from_payload(payload)
 
     async def choose_unity_dialog(
         self,
         *,
-        project: str,
+        project: str | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
         dialog_id: str,
         choice_id: str,
     ) -> "UnityDialogChoiceResult":
@@ -404,11 +494,9 @@ class Client:
         """
         from ._models import UnityDialogChoiceResult
 
-        project = project.strip()
+        target = unity_target(project, workspace_ref, worktree)
         dialog_id = dialog_id.strip()
         choice_id = choice_id.strip()
-        if not project:
-            raise ValueError("project cannot be empty")
         if not dialog_id:
             raise ValueError("dialog_id cannot be empty")
         if not choice_id:
@@ -416,7 +504,7 @@ class Client:
         payload = await self.rpc(
             "unity.dialog.choose",
             {
-                "project": project,
+                **target,
                 "dialogId": dialog_id,
                 "choiceId": choice_id,
             },
@@ -426,22 +514,22 @@ class Client:
     async def wait_unity_execution(
         self,
         *,
-        project: str,
+        project: str | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
         execution_id: str,
         timeout: float | None = None,
     ) -> str:
         """Return the original result of a detached Unity execution."""
-        project = project.strip()
+        target = unity_target(project, workspace_ref, worktree)
         execution_id = execution_id.strip()
-        if not project:
-            raise ValueError("project cannot be empty")
         if not execution_id:
             raise ValueError("execution_id cannot be empty")
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be positive")
         payload = await self.rpc(
             "unity.execution.wait",
-            {"project": project, "executionId": execution_id},
+            {**target, "executionId": execution_id},
             timeout=_DEFAULT_TOOL_TIMEOUT if timeout is None else timeout,
         )
         return str(payload)
@@ -452,14 +540,23 @@ class Client:
         archived: bool = False,
         running_only: bool = False,
         limit: int | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
     ) -> list["SessionSummary"]:
+        """List one archive state in the injected or explicitly selected checkout.
+
+        Without a checkout selector or injected identity, the legacy unbound
+        session list is returned.
+        """
         from ._models import SessionSummary
 
         if limit is not None and limit <= 0:
             raise ValueError("limit must be positive")
+        reference = workspace_payload(workspace_ref, worktree, required=False)
         rows = await self.rpc(
             "sessions.list",
-            {"archived": archived, "runningOnly": running_only, "limit": limit},
+            {"archived": archived, "runningOnly": running_only, "limit": limit,
+             **({"workspaceRef": reference} if reference is not None else {})},
         )
         return [SessionSummary.from_payload(row, self) for row in rows]
 
@@ -467,9 +564,76 @@ class Client:
         self,
         *,
         limit: int | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
     ) -> list["SessionSummary"]:
         """Return sessions that currently own an active Locus run."""
-        return await self.list_sessions(running_only=True, limit=limit)
+        return await self.list_sessions(
+            running_only=True, limit=limit, worktree=worktree, workspace_ref=workspace_ref,
+        )
+
+    async def search_sessions(
+        self,
+        query: str,
+        *,
+        archived: bool = False,
+        session_id: str | None = None,
+        limit: int = 20,
+        cursor: str | None = None,
+        worktree: Any = None,
+        workspace_ref: Any = None,
+    ) -> "SessionSearchPage":
+        """Search titles, message text, thinking and tool calls in one checkout.
+
+        Search is literal (ASCII case-insensitive). Excerpts are bounded;
+        next_cursor continues without rescanning previous text. A page may be
+        empty while has_more is true when the scan budget was reached.
+        """
+        from ._sessions import SessionSearchPage, positive_int
+
+        if not isinstance(query, str) or not query.strip() or len(query) > 1000 or "\0" in query:
+            raise ValueError("query must contain 1..1000 characters and no NUL")
+        positive_int(limit, "limit", 100)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor or len(cursor) > 4096):
+            raise ValueError("cursor must be a nonempty search cursor of at most 4096 characters")
+        if session_id is not None:
+            session_id = session_id.strip()
+            if not session_id:
+                raise ValueError("session_id cannot be empty")
+        payload = await self.rpc("sessions.search", {
+            "workspaceRef": workspace_payload(workspace_ref, worktree),
+            "query": query, "archived": archived, "sessionId": session_id,
+            "limit": limit, "cursor": cursor,
+        })
+        return SessionSearchPage.from_payload(payload)
+
+    async def read_session(
+        self,
+        session_id: str,
+        *,
+        before_row_id: int | None = None,
+        limit: int = 50,
+        worktree: Any = None,
+        workspace_ref: Any = None,
+    ) -> "SessionMessagePage":
+        """Read the latest page, then older pages with oldest_message_row_id.
+
+        Supports both archived and unarchived sessions in the selected checkout.
+        Each page is chronological and keeps tool rounds together.
+        """
+        from ._sessions import SessionMessagePage, positive_int
+
+        session_id = session_id.strip()
+        if not session_id:
+            raise ValueError("session_id cannot be empty")
+        positive_int(limit, "limit", 1000)
+        if before_row_id is not None:
+            positive_int(before_row_id, "before_row_id", 2**63 - 1)
+        payload = await self.rpc("sessions.read", {
+            "workspaceRef": workspace_payload(workspace_ref, worktree),
+            "sessionId": session_id, "beforeRowId": before_row_id, "limit": limit,
+        })
+        return SessionMessagePage.from_payload(payload)
 
     async def get_session(self, session_id: str) -> "Session":
         from ._models import Session
@@ -590,6 +754,9 @@ class Client:
 
 
 from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._sessions import SessionMessagePage, SessionSearchPage
 
 if TYPE_CHECKING:
     from ._models import (

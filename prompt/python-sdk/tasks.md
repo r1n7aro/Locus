@@ -1,5 +1,7 @@
 # Tasks and agent messages
 
+When asynchronous execution is enabled, the `python` tool accepts `async="sync"` (wait for the result), `async="async"` (return a task id), or `async="notify"` (also deliver completion automatically). Background execution has no timeout; startup failures return directly. Python code supports top-level `await` in every mode. The task APIs below use the pre-injected `locus` module.
+
 These SDK methods are built in and require no tool discovery or loading. Task
 queries and controls use the current Python session automatically; they never
 list another session's tasks.

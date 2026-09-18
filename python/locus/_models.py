@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Iterator, TYPE_CHECKING
 
 from ._callbacks import callbacks
 from ._tools import Tool
+from ._agent_rules import AgentRule
 
 if TYPE_CHECKING:
     from ._client import Client
@@ -116,19 +117,23 @@ class ModelInfo:
 class WorkspaceRef:
     checkout_id: str
     expected_generation: int | None = None
+    expected_materialization_epoch: int | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
             "checkoutId": self.checkout_id,
             "expectedGeneration": self.expected_generation,
+            "expectedMaterializationEpoch": self.expected_materialization_epoch,
         }
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "WorkspaceRef":
         generation = payload.get("expectedGeneration")
+        epoch = payload.get("expectedMaterializationEpoch")
         return cls(
             checkout_id=payload.get("checkoutId", ""),
             expected_generation=None if generation is None else int(generation),
+            expected_materialization_epoch=None if epoch is None else int(epoch),
         )
 
 
@@ -137,6 +142,16 @@ class WorkspaceInfo:
     path: str | None
     workspace_id: str | None
     unity_connected: bool
+    project_id: str | None = None
+    checkout_id: str | None = None
+    workspace_generation: int | None = None
+    materialization_epoch: int | None = None
+
+    @property
+    def workspace_ref(self) -> WorkspaceRef:
+        if not self.checkout_id:
+            raise ValueError("Workspace has no checkout identity")
+        return WorkspaceRef(self.checkout_id, self.workspace_generation, self.materialization_epoch)
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "WorkspaceInfo":
@@ -144,6 +159,10 @@ class WorkspaceInfo:
             path=payload.get("path"),
             workspace_id=payload.get("workspaceId"),
             unity_connected=bool(payload.get("unityConnected")),
+            project_id=payload.get("projectId"),
+            checkout_id=payload.get("checkoutId"),
+            workspace_generation=payload.get("workspaceGeneration"),
+            materialization_epoch=payload.get("materializationEpoch"),
         )
 
 
@@ -223,6 +242,7 @@ class UnityEditorStatus:
                     if payload.get("workspaceGeneration") is None
                     else int(payload["workspaceGeneration"])
                 ),
+                expected_materialization_epoch=(None if payload.get("materializationEpoch") is None else int(payload["materializationEpoch"])),
             ),
             connected=bool(payload.get("connected")),
             ready=bool(payload.get("ready")),
@@ -294,6 +314,18 @@ class UnityEditorRestartResult:
             launch=UnityEditorLaunchInfo.from_payload(payload.get("launch") or {}),
             status=UnityEditorStatus.from_payload(payload.get("status") or {}),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class UnityEditorCloseResult:
+    closed_process_ids: tuple[int, ...]
+    forced_process_ids: tuple[int, ...]
+    status: UnityEditorStatus
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "UnityEditorCloseResult":
+        return cls(tuple(payload.get("closedProcessIds") or ()),
+            tuple(payload.get("forcedProcessIds") or ()), UnityEditorStatus.from_payload(payload["status"]))
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,9 +435,11 @@ class ToolInfo:
     mutates_workspace: bool = False
     agent_only: bool = False
     client: "Client | None" = field(default=None, repr=False, compare=False)
+    workspace_ref: WorkspaceRef | None = field(default=None, repr=False, compare=False)
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any], client: "Client | None" = None) -> "ToolInfo":
+    def from_payload(cls, payload: dict[str, Any], client: "Client | None" = None,
+        workspace_ref: WorkspaceRef | None = None) -> "ToolInfo":
         return cls(
             name=payload["name"],
             description=payload.get("description", ""),
@@ -414,6 +448,7 @@ class ToolInfo:
             mutates_workspace=bool(payload.get("mutatesWorkspace")),
             agent_only=bool(payload.get("agentOnly")),
             client=client,
+            workspace_ref=workspace_ref,
         )
 
     async def call(
@@ -422,14 +457,16 @@ class ToolInfo:
         *,
         timeout: float | None = None,
         workspace_ref: WorkspaceRef | None = None,
+        worktree: Any = None,
     ) -> ToolCallResult:
         if self.client is None:
             raise RuntimeError("ToolInfo is not attached to a Locus client")
         return await self.client.call_tool(
-            self.name,
+            self,
             arguments or {},
             timeout=timeout,
             workspace_ref=workspace_ref,
+            worktree=worktree,
         )
 
 
@@ -531,6 +568,27 @@ class Agent:
             "defaultEffort": self.default_effort,
             "modelRecommendation": self.model_recommendation,
         }
+
+    def _rule_client(self) -> "Client":
+        if self._inline:
+            raise ValueError("Workspace rules require an installed Agent; use locus.get_agent()")
+        return self._resolved_client()
+
+    async def list_rules(self, *, workspace_ref: Any = None, worktree: Any = None) -> list[AgentRule]:
+        """List effective rules, including inherited and disabled rules."""
+        return await self._rule_client().list_agent_rules(self.id, workspace_ref=workspace_ref, worktree=worktree)
+
+    async def read_rule(self, file_name: str, *, workspace_ref: Any = None, worktree: Any = None) -> str:
+        """Read rule Markdown using the exact key returned by list_rules()."""
+        return await self._rule_client().read_agent_rule(self.id, file_name, workspace_ref=workspace_ref, worktree=worktree)
+
+    async def save_rule(self, file_name: str, content: str, *, workspace_ref: Any = None, worktree: Any = None) -> AgentRule:
+        """Add/update a workspace rule without modifying installed defaults."""
+        return await self._rule_client().save_agent_rule(self.id, file_name, content, workspace_ref=workspace_ref, worktree=worktree)
+
+    async def set_rule_enabled(self, file_name: str, enabled: bool, *, workspace_ref: Any = None, worktree: Any = None) -> AgentRule:
+        """Disable or re-enable a rule in this workspace; plugin rules stay plugin-managed."""
+        return await self._rule_client().set_agent_rule_enabled(self.id, file_name, enabled, workspace_ref=workspace_ref, worktree=worktree)
 
     async def prompt(
         self,

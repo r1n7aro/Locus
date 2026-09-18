@@ -2,6 +2,7 @@ mod agent;
 mod code;
 mod code_unity;
 mod filesystem;
+mod filesystem_patch;
 mod knowledge;
 mod mcp;
 mod misc;
@@ -27,6 +28,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(filesystem::read());
     registry.register_builtin(filesystem::write());
     registry.register_builtin(filesystem::edit());
+    registry.register_builtin(filesystem_patch::apply_patch());
     registry.register_builtin(shell::bash());
     registry.register_builtin(python::python());
     registry.register_builtin(search::grep());
@@ -60,6 +62,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry
         .register_builtin_with_load_mode(skill::create_skill_package_tool(), ToolLoadMode::Skill);
     registry.register_builtin(skill::skill_list_tool());
+    registry.register_builtin_with_load_mode(view::execute_typescript(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(agent::agent_reload(), ToolLoadMode::Skill);
     registry.register_builtin(mcp::mcp_reload_tool());
     registry.register_builtin_with_load_mode(plugin::plugin_list(), ToolLoadMode::Skill);
@@ -68,22 +71,6 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin_with_load_mode(plugin::plugin_set_enabled(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_uninstall(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_export(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_create(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_list(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_reload(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_run(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_compile_script(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_call_script(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_property_read(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_property_discover(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_property_write(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_property_apply(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_capture(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_snapshot(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_action(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_wait(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_console_read(), ToolLoadMode::Skill);
-    registry.register_builtin_with_load_mode(view::view_debug_eval(), ToolLoadMode::Skill);
     registry.register_builtin(config_query_tool());
     registry.register_builtin(tool_load_tool());
     registry.register_builtin(tool_call_tool());

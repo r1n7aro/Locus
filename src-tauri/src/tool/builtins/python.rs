@@ -8,29 +8,6 @@ use crate::process_util::{async_command, ProcessOwner};
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 1_800_000;
 
-const HELP_OVERVIEW: &str = include_str!("../../../../prompt/python-sdk/overview.md");
-const HELP_AGENTS: &str = include_str!("../../../../prompt/python-sdk/agents.md");
-const HELP_SESSIONS: &str = include_str!("../../../../prompt/python-sdk/sessions.md");
-const HELP_TOOLS: &str = include_str!("../../../../prompt/python-sdk/tools.md");
-const HELP_TASKS: &str = include_str!("../../../../prompt/python-sdk/tasks.md");
-const HELP_UNITY: &str = include_str!("../../../../prompt/python-sdk/unity.md");
-const HELP_CALLBACKS: &str = include_str!("../../../../prompt/python-sdk/callbacks.md");
-
-fn help_topic(topic: Option<&str>) -> Result<&'static str, String> {
-    match topic.map(str::trim).filter(|value| !value.is_empty()) {
-        None | Some("overview") => Ok(HELP_OVERVIEW),
-        Some("agents") => Ok(HELP_AGENTS),
-        Some("sessions") => Ok(HELP_SESSIONS),
-        Some("tools") => Ok(HELP_TOOLS),
-        Some("tasks") => Ok(HELP_TASKS),
-        Some("unity") => Ok(HELP_UNITY),
-        Some("callbacks") => Ok(HELP_CALLBACKS),
-        Some(value) => Err(format!(
-            "Unknown Python SDK help topic '{value}'. Use overview, agents, sessions, tools, tasks, unity, or callbacks."
-        )),
-    }
-}
-
 fn indent_python_body(code: &str) -> String {
     code.lines()
         .map(|line| format!("    {line}"))
@@ -43,6 +20,7 @@ fn build_python_source(
     project: &str,
     checkout_id: &str,
     workspace_generation: u64,
+    materialization_epoch: u64,
 ) -> Result<String, String> {
     let project = serde_json::to_string(project)
         .map_err(|error| format!("Failed to encode checkout path: {error}"))?;
@@ -52,7 +30,7 @@ fn build_python_source(
         "import asyncio as __locus_asyncio\n\
 import locus as locus\n\
 project = {project}\n\
-workspace_ref = locus.WorkspaceRef(checkout_id={checkout_id}, expected_generation={workspace_generation})\n\
+workspace_ref = locus.WorkspaceRef(checkout_id={checkout_id}, expected_generation={workspace_generation}, expected_materialization_epoch={materialization_epoch})\n\
 \n\
 async def __locus_python_main__():\n{}\n\
 \n\
@@ -61,20 +39,10 @@ __locus_asyncio.run(__locus_python_main__())\n",
     ))
 }
 
-fn action(args: &serde_json::Value) -> &str {
-    args.get("action")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("run")
-}
-
 pub(crate) fn is_readonly(args: &serde_json::Value) -> bool {
-    action(args) == "help"
-        || args
-            .get("readonly")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+    args.get("readonly")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 pub(super) fn python() -> ToolDef {
@@ -87,30 +55,6 @@ pub(super) fn python() -> ToolDef {
         mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                match action(&args) {
-                    "help" => {
-                        return match help_topic(
-                            args.get("topic").and_then(serde_json::Value::as_str),
-                        ) {
-                            Ok(output) => ToolResult {
-                                output: output.trim().to_string(),
-                                is_error: false,
-                            },
-                            Err(output) => ToolResult {
-                                output,
-                                is_error: true,
-                            },
-                        };
-                    }
-                    "run" => {}
-                    value => {
-                        return ToolResult {
-                            output: format!("Unknown Python action '{value}'. Use run or help."),
-                            is_error: true,
-                        };
-                    }
-                }
-
                 if args
                     .get("readonly")
                     .and_then(serde_json::Value::as_bool)
@@ -154,6 +98,7 @@ pub(super) fn python() -> ToolDef {
                     &project,
                     execution.checkout_id.as_str(),
                     execution.workspace_generation,
+                    execution.workspace.materialization_epoch(),
                 ) {
                     Ok(source) => source,
                     Err(output) => {
@@ -203,6 +148,10 @@ pub(super) fn python() -> ToolDef {
                     "LOCUS_WORKSPACE_GENERATION",
                     OsString::from(execution.workspace_generation.to_string()),
                 );
+                command.env(
+                    "LOCUS_MATERIALIZATION_EPOCH",
+                    OsString::from(execution.workspace.materialization_epoch().to_string()),
+                );
 
                 let owner = ctx.process_owner.clone().unwrap_or_else(|| ProcessOwner {
                     working_dir: Some(project.clone()),
@@ -210,6 +159,17 @@ pub(super) fn python() -> ToolDef {
                 });
                 if let Some(session_id) = owner.session_id.as_deref() {
                     command.env("LOCUS_SESSION_ID", OsString::from(session_id));
+                }
+                let _sdk_delegation =
+                    crate::agent::workspace_execution_lock::register_sdk_delegation(
+                        execution.workspace.as_ref(),
+                        owner.session_id.as_deref(),
+                    );
+                if let Some(delegation) = &_sdk_delegation {
+                    command.env(
+                        "LOCUS_SDK_EXECUTION_DELEGATION",
+                        OsString::from(&delegation.token),
+                    );
                 }
 
                 if let Some(report) = ctx.progress.as_ref() {
@@ -296,7 +256,7 @@ pub(super) fn python() -> ToolDef {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_python_source, help_topic, is_readonly};
+    use super::{build_python_source, is_readonly};
 
     #[test]
     fn source_injects_checkout_scope_and_async_body() {
@@ -305,30 +265,83 @@ mod tests {
             r"F:\Project",
             "checkout-7",
             9,
+            3,
         )
         .expect("source");
         assert!(source.contains("project = \"F:\\\\Project\""));
         assert!(source.contains("checkout_id=\"checkout-7\""));
         assert!(source.contains("expected_generation=9"));
+        assert!(source.contains("expected_materialization_epoch=3"));
         assert!(source.contains("    status = await locus.get_unity_editor_status"));
         assert!(source.contains("__locus_asyncio.run(__locus_python_main__())"));
     }
 
     #[test]
-    fn help_topics_expand_without_running_python() {
-        assert!(help_topic(Some("agents"))
-            .unwrap()
-            .contains("Agent workflows"));
-        assert!(help_topic(Some("unity"))
-            .unwrap()
-            .contains("restart_unity_editor"));
-        assert!(help_topic(Some("missing")).is_err());
-        assert!(is_readonly(&serde_json::json!({"action": "help"})));
-        assert!(is_readonly(
-            &serde_json::json!({"action": "run", "readonly": true})
-        ));
-        assert!(!is_readonly(
-            &serde_json::json!({"action": "run", "readonly": false})
-        ));
+    fn readonly_requires_an_explicit_boolean() {
+        assert!(is_readonly(&serde_json::json!({"readonly": true})));
+        assert!(!is_readonly(&serde_json::json!({"readonly": false})));
+        assert!(!is_readonly(&serde_json::json!({"readonly": "true"})));
+        assert!(!is_readonly(&serde_json::json!({"action": "help"})));
+        assert!(!is_readonly(&serde_json::json!({})));
+    }
+
+    #[tokio::test]
+    async fn python_runs_directly_and_requires_code_and_readonly() {
+        let tool = super::python();
+        let properties = tool.parameters["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        assert_eq!(
+            tool.parameters["required"],
+            serde_json::json!(["code", "readonly"])
+        );
+        for (args, error) in [
+            (
+                serde_json::json!({"code": "print(1)"}),
+                "Missing required parameter: readonly",
+            ),
+            (
+                serde_json::json!({"readonly": true}),
+                "Missing required parameter: code",
+            ),
+            (
+                serde_json::json!({"readonly": true, "code": "  "}),
+                "Missing required parameter: code",
+            ),
+            (
+                serde_json::json!({"readonly": true, "code": "print(1)"}),
+                "Python requires a checkout-scoped execution context.",
+            ),
+        ] {
+            let result = (tool.execute)(args, crate::tool::ToolExecutionContext::default()).await;
+            assert!(result.is_error);
+            assert_eq!(result.output, error);
+        }
+    }
+
+    #[tokio::test]
+    async fn python_sdk_topic_is_readable_through_the_existing_read_tool() {
+        let docs = crate::python_runtime::locus_python_sdk_docs_dir(None).expect("docs directory");
+        let registry = crate::tool::ToolRegistry::with_builtins();
+        let (description, _) = registry.tool_description("python").expect("Python schema");
+        assert!(description.starts_with("Run Python "));
+        assert!(!description.contains("{python_"));
+        assert!(!description.contains("overview.md"));
+        assert_eq!(
+            registry.resolve_api_tool("python").unwrap()["function"]["description"],
+            description
+        );
+        let result = registry
+            .execute(
+                "read",
+                &serde_json::json!({
+                    "filePath": docs.join("agents.md").to_string_lossy(),
+                    "offset": 1,
+                    "limit": 12,
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("Agent workflows"));
+        assert!(result.output.contains("await locus.list_agents()"));
     }
 }

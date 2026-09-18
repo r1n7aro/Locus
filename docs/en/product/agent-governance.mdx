@@ -15,6 +15,13 @@ Locus is built for sustained use, not one-off Q&A. That's why models, rules, too
 - Per-round undo tracking for file changes
 - Raw context export
 - A visual dashboard for the Agent's system prompt, env, rules, runtime injections, and tool schemas
+- Agents can add, update, and toggle workspace rules through the Python SDK without opening settings
+
+## Workspace Rules
+
+Select the built-in Agent with `await locus.get_agent("unity")`. Use `list_rules()` to inspect rules, `read_rule(key)` to read Markdown, `save_rule(file_name, content)` to add or update a rule, and `set_rule_enabled(key, False)` to disable one. Pass `True` to re-enable it.
+
+The SDK defaults to the Python session's checkout and also accepts `workspace_ref=` or `worktree=`. Rule content and enablement are stored under that workspace's `Locus/agent/<agent-id>/`. Editing an inherited rule creates a workspace override; installed defaults and other workspaces stay unchanged. Changes appear in the existing Agent rule list and apply on the next model request, including the current run's next tool round.
 
 ## What This Solves
 

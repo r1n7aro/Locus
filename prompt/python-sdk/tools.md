@@ -26,3 +26,5 @@ print(result.output)
 ```
 
 Pass the injected `workspace_ref` to checkout-scoped tools. Built-in, MCP, and Skill tools share the same result model. Tool calls that require human interaction or agent-loop-only context are reported as unavailable.
+
+Inside the Python tool, omitting the selector uses its injected checkout identity. For another checkout, pass `worktree=wt` to discovery and calls, where `wt` is returned by `locus.worktrees.create/get/acquire` (`acquire` returns `.worktree`). Independent worktree calls can use `asyncio.gather`; they do not change the Agent's working directory. `workspace_ref=job.workspace_ref` also accepts the dictionary returned by merge jobs. Read [worktrees.md](worktrees.md) for the complete dual-Editor workflow.

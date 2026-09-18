@@ -1,5 +1,5 @@
 {
-  "description": "Refresh the Locus Agent index after creating or editing Agent files. Returns the writable user Agent root in the Locus installation directory and the newly loaded Agent list. Call once before editing to resolve the root, then again after edits to validate discovery.",
+  "description": "Refresh the Locus Agent index for the current session's checkout after creating or editing Agent files. Returns projectAgentRoot (<current-checkout>/Locus/agent/), userAgentRoot (the installation's user-agents/ directory), and the loaded Agent list with sources. Default new Agents to projectAgentRoot for team collaboration and version control; use userAgentRoot only for explicitly requested installation-level Agents shared across projects. Resolves roots without creating directories. Call before editing to choose the correct root, then after edits to validate discovery: project/both for project definitions, user/appUser for installation definitions.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,

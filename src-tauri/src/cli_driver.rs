@@ -20,6 +20,14 @@ use crate::unity_bridge::{
 };
 
 const DRIVER_NAME: &str = "unity-test";
+mod worktree_merge;
+mod project_pool_acceptance;
+mod merge_sdk_commit_acceptance;
+mod merge_sdk_acceptance;
+mod worktree_sdk_acceptance;
+mod headless_development;
+mod asset_api_acceptance;
+mod frame_debugger;
 const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_SUITE_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_POLL_MS: u64 = 500;
@@ -42,6 +50,12 @@ static UI_RUN_CANCEL: Mutex<Option<watch::Sender<bool>>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliDriverSuite {
+    HeadlessDevelopment,
+    WorktreeSdk,
+    Worktrees,
+    AssetMerge,
+    AssetApi,
+    ProjectPool,
     Workspace,
     WorkspaceSwitch,
     SessionUndo,
@@ -55,6 +69,7 @@ pub enum CliDriverSuite {
     ParallelEditRefresh,
     RecompileImport,
     Execute,
+    FrameDebugger,
     PythonSdk,
     ModalDialog,
     SafeMode,
@@ -65,6 +80,12 @@ pub enum CliDriverSuite {
 impl CliDriverSuite {
     fn as_str(self) -> &'static str {
         match self {
+            CliDriverSuite::HeadlessDevelopment => "headless-development",
+            CliDriverSuite::WorktreeSdk => "worktree-sdk",
+            CliDriverSuite::Worktrees => "worktrees",
+            CliDriverSuite::AssetMerge => "asset-merge",
+            CliDriverSuite::AssetApi => "asset-api",
+            CliDriverSuite::ProjectPool => "project-pool",
             CliDriverSuite::Workspace => "workspace",
             CliDriverSuite::WorkspaceSwitch => "workspace-switch",
             CliDriverSuite::SessionUndo => "session-undo",
@@ -78,6 +99,7 @@ impl CliDriverSuite {
             CliDriverSuite::ParallelEditRefresh => "parallel-edit-refresh",
             CliDriverSuite::RecompileImport => "recompile-import",
             CliDriverSuite::Execute => "execute",
+            CliDriverSuite::FrameDebugger => "frame-debugger",
             CliDriverSuite::PythonSdk => "python-sdk",
             CliDriverSuite::ModalDialog => "modal-dialog",
             CliDriverSuite::SafeMode => "safe-mode",
@@ -88,6 +110,10 @@ impl CliDriverSuite {
 
     fn event_name(self) -> Option<&'static str> {
         match self {
+            CliDriverSuite::HeadlessDevelopment => None,
+            CliDriverSuite::WorktreeSdk => None,
+            CliDriverSuite::AssetApi => None,
+            CliDriverSuite::Worktrees | CliDriverSuite::AssetMerge | CliDriverSuite::ProjectPool => None,
             CliDriverSuite::Workspace => None,
             CliDriverSuite::WorkspaceSwitch => None,
             CliDriverSuite::SessionUndo => None,
@@ -102,6 +128,7 @@ impl CliDriverSuite {
             CliDriverSuite::RecompileImport => None,
             // Bespoke suite: emits its own suite_* events like sidecar/type-index.
             CliDriverSuite::Execute => None,
+            CliDriverSuite::FrameDebugger => None,
             CliDriverSuite::PythonSdk => None,
             CliDriverSuite::ModalDialog => None,
             CliDriverSuite::SafeMode => None,
@@ -313,7 +340,9 @@ impl UnityIntegrationTestRunRequest {
 
 impl CliDriverConfig {
     pub fn requires_frontend(&self) -> bool {
-        self.suites.contains(&CliDriverSuite::SessionUndo)
+        self.suites.iter().any(|suite| {
+            matches!(suite, CliDriverSuite::SessionUndo | CliDriverSuite::AssetApi)
+        })
     }
 
     pub fn from_env_args() -> Option<Result<Self, String>> {
@@ -615,6 +644,12 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
             return Ok(());
         }
         "connect" => CliDriverSuite::Connect,
+        "worktrees" => CliDriverSuite::Worktrees,
+        "headless-development" => CliDriverSuite::HeadlessDevelopment,
+        "worktree-sdk" => CliDriverSuite::WorktreeSdk,
+        "asset-merge" => CliDriverSuite::AssetMerge,
+        "asset-api" => CliDriverSuite::AssetApi,
+        "project-pool" => CliDriverSuite::ProjectPool,
         "workspace" | "multi-workspace" | "multi_workspace" => CliDriverSuite::Workspace,
         "workspace-switch" | "workspace_switch" | "cross-project" | "cross_project" => {
             CliDriverSuite::WorkspaceSwitch
@@ -640,6 +675,7 @@ fn push_suite(suites: &mut Vec<CliDriverSuite>, value: &str) -> Result<(), Strin
         | "asset-refresh" | "asset_refresh" => CliDriverSuite::RecompileImport,
         "execute" | "exec" | "unity-execute" | "unity_execute" | "execute-code" | "run-states"
         | "run_states" | "runstates" => CliDriverSuite::Execute,
+        "frame-debugger" => CliDriverSuite::FrameDebugger,
         "python-sdk" | "python_sdk" | "sdk" | "sdk-editor" | "sdk_editor" => {
             CliDriverSuite::PythonSdk
         }
@@ -773,6 +809,31 @@ async fn run_driver(
         }),
     );
 
+    if config.suites.contains(&CliDriverSuite::HeadlessDevelopment) {
+        if config.suites.len() != 1 { return Err("The headless-development suite must run alone".into()); }
+        headless_development::run(&app_handle, &config, &sink).await?;
+        sink.emit("finished", json!({"ok":true}));
+        return Ok(());
+    }
+    if config.suites.contains(&CliDriverSuite::WorktreeSdk) {
+        if config.suites.len() != 1 { return Err("The worktree-sdk suite must run alone".into()); }
+        worktree_sdk_acceptance::run(&app_handle, &config, &sink).await?;
+        sink.emit("finished", json!({"ok":true}));
+        return Ok(());
+    }
+    if config.suites.contains(&CliDriverSuite::AssetApi) {
+        if config.suites.len()!=1 {return Err("The asset-api suite must run alone".into());}
+        asset_api_acceptance::run(&app_handle,&config,&sink,&mut cancel_rx).await?;
+        sink.emit("finished",json!({"ok":true}));return Ok(());
+    }
+
+    if config.suites.contains(&CliDriverSuite::Worktrees) {
+        if config.suites.len() != 1 { return Err("The worktrees suite must run alone".into()); }
+        worktree_merge::run_worktrees(&app_handle, &config, &sink, &mut cancel_rx).await?;
+        sink.emit("finished", json!({ "ok": true }));
+        return Ok(());
+    }
+
     if config.suites.contains(&CliDriverSuite::Workspace)
         || config.suites.contains(&CliDriverSuite::WorkspaceSwitch)
     {
@@ -837,6 +898,12 @@ async fn run_driver(
             return Err(UNITY_INTEGRATION_TEST_CANCELLED.to_string());
         }
         let suite_result = match suite {
+            CliDriverSuite::HeadlessDevelopment => Err("headless-development must be dispatched before connection".into()),
+            CliDriverSuite::WorktreeSdk => Err("worktree-sdk must be dispatched before connection".into()),
+            CliDriverSuite::Worktrees => Err("worktrees must be dispatched before connection".into()),
+            CliDriverSuite::AssetMerge => worktree_merge::run_asset_merge(&app_handle, &project, &config, &sink).await,
+            CliDriverSuite::AssetApi => Err("asset-api must be dispatched before connection".into()),
+            CliDriverSuite::ProjectPool => project_pool_acceptance::run(&app_handle, &project, &config, &sink).await,
             CliDriverSuite::Workspace => Err(
                 "The workspace suite must be dispatched before single-project suites".to_string(),
             ),
@@ -1040,6 +1107,7 @@ async fn run_driver(
                     Err(error) => Err(error),
                 }
             }
+            CliDriverSuite::FrameDebugger => frame_debugger::run(&project, &config, &sink).await,
             CliDriverSuite::PythonSdk if python_sdk_ran => Ok(()),
             CliDriverSuite::PythonSdk => Err(
                 "The python-sdk suite did not run before the shared connection preflight"
@@ -1267,6 +1335,7 @@ async fn run_workspace_suite(
                 &mut target_cancel,
             )
             .await?;
+            wait_for_unity_editor_idle(&target.project, &config, &sink, &mut target_cancel).await?;
             Ok::<_, String>((target, status))
         }
     });
@@ -2909,6 +2978,55 @@ async fn check_or_install_plugin(
             "Unity plugin is {:?}; rerun with --install-plugin to update the project copy",
             status
         )),
+    }
+}
+
+/// The native broker answers while Unity's main thread is still performing a
+/// cold import. Wait on an idempotent main-thread probe before compiling or
+/// executing test code; a broker connection alone does not establish readiness.
+async fn wait_for_unity_editor_idle(
+    project: &str,
+    config: &CliDriverConfig,
+    sink: &DriverEventSink,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let mut idle_since: Option<Instant> = None;
+    let mut last_report = String::new();
+    loop {
+        if *cancel_rx.borrow() { return Err(UNITY_INTEGRATION_TEST_CANCELLED.into()); }
+        let probe = tokio::select! {
+            response = unity_bridge::send_message_with_timeout(project, "get_reload_state", "", Duration::from_secs(5)) => response,
+            _ = cancel_rx.changed() => return Err(UNITY_INTEGRATION_TEST_CANCELLED.into()),
+        };
+        let description = match probe {
+            Ok(response) if response.ok => {
+                let state: Value = serde_json::from_str(response.message.as_deref().unwrap_or("{}"))
+                    .map_err(|error| format!("Invalid Editor readiness response: {error}"))?;
+                let idle = state["is_compiling"] == false && state["is_updating"] == false;
+                if idle {
+                    let since = idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_secs(2) {
+                        sink.emit("editor_main_thread_ready", json!({"project":project,"elapsedMs":started.elapsed().as_millis(),"state":state}));
+                        return Ok(());
+                    }
+                } else { idle_since = None; }
+                state.to_string()
+            }
+            Ok(response) => { idle_since = None; response.error.unwrap_or("Editor readiness probe failed".into()) }
+            Err(error) => { idle_since = None; error }
+        };
+        if description != last_report {
+            sink.emit("waiting_editor_main_thread", json!({"project":project,"elapsedMs":started.elapsed().as_millis(),"state":description}));
+            last_report = description;
+        }
+        if started.elapsed() >= config.connect_timeout {
+            return Err(format!("Unity main thread/import did not become ready in {}ms: {last_report}",config.connect_timeout.as_millis()));
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            _ = cancel_rx.changed() => return Err(UNITY_INTEGRATION_TEST_CANCELLED.into()),
+        }
     }
 }
 
@@ -8372,6 +8490,16 @@ mod tests {
                 "alias {alias}"
             );
         }
+    }
+
+    #[test]
+    fn frontend_suites_use_the_standard_main_window_startup() {
+        for suite in ["session-undo", "asset-api"] {
+            let parsed = parse(&["--locus-unity-test", "--suite", suite]).unwrap().unwrap();
+            assert!(parsed.requires_frontend(), "{suite} needs the real main WebView");
+        }
+        let connect = parse(&["--locus-unity-test", "--suite", "connect"]).unwrap().unwrap();
+        assert!(!connect.requires_frontend());
     }
 
     #[test]

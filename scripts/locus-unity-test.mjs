@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
+import { createWriteStream, mkdirSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { finished } from "node:stream/promises";
+import { randomUUID } from "node:crypto";
+import { unityDriverExitCode } from "./locus-unity-driver-result.mjs";
 
 const args = process.argv.slice(2);
 const passthrough = [];
@@ -10,6 +12,7 @@ let prepareNative = false;
 let prepareUnityBundle = false;
 let reuseDevServer = false;
 let outputDir = "";
+let driverBinary = "";
 
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
@@ -34,6 +37,11 @@ for (let index = 0; index < args.length; index += 1) {
     continue;
   }
   const [name, inlineValue] = splitArg(arg);
+  if (name === "--driver-binary") {
+    driverBinary = readOptionValue(name, inlineValue, args, index);
+    if (!inlineValue) index += 1;
+    continue;
+  }
   if (name === "--output-dir") {
     outputDir = resolve(readOptionValue(name, inlineValue, args, index));
     if (!inlineValue) index += 1;
@@ -43,6 +51,19 @@ for (let index = 0; index < args.length; index += 1) {
 }
 
 const bun = process.execPath;
+if (driverBinary) {
+  if (!isAbsolute(driverBinary)) {
+    console.error("[locus] --driver-binary requires an absolute executable path.");
+    process.exit(2);
+  }
+  driverBinary = resolve(driverBinary);
+  try {
+    if (!statSync(driverBinary).isFile()) throw new Error("not a file");
+  } catch (error) {
+    console.error(`[locus] --driver-binary is not an accessible executable file: ${driverBinary}: ${error.message}`);
+    process.exit(2);
+  }
+}
 
 // Keep the integration driver from silently exercising an old sidecar after
 // compile-server request/response changes. This is deliberately explicit even
@@ -57,8 +78,8 @@ if (prepareUnityBundle) {
 }
 
 const driverResult = await runUnityDriver(
-  bun,
-  [
+  driverBinary || bun,
+  driverBinary ? ["--locus-driver", "unity-test", ...passthrough] : [
     "run",
     "tauri",
     "dev",
@@ -75,18 +96,16 @@ const driverResult = await runUnityDriver(
   outputDir,
 );
 
-if (driverResult.signal) {
-  process.kill(process.pid, driverResult.signal);
-} else if (driverResult.code && driverResult.code !== 0) {
-  if (driverResult.finishedOk) {
+const driverExitCode = unityDriverExitCode(driverResult);
+if (driverExitCode === 0) {
+  if (driverResult.signal || (driverResult.code && driverResult.code !== 0)) {
     console.warn(
-      `[locus] Tauri dev exited with ${driverResult.code} after the Unity driver reported success; treating the driver result as authoritative.`,
+      `[locus] ${driverBinary ? "Driver binary" : "Tauri dev"} exited with ${driverResult.signal || driverResult.code} after the Unity driver reported success; treating the driver result as authoritative.`,
     );
-    process.exit(0);
-  } else {
-    printDriverFailure(driverResult);
-    process.exit(driverResult.code);
   }
+} else {
+  printDriverFailure(driverResult);
+  process.exit(driverExitCode);
 }
 
 function printHelp() {
@@ -95,6 +114,11 @@ function printHelp() {
 
 Examples:
   bun run locus:test:unity -- --project F:\\Game --suite connect
+  bun run locus:test:unity -- --project F:\\Game --suite worktrees --install-plugin
+  bun run locus:test:unity -- --project F:\\OwnedCheckout --suite asset-merge --install-plugin
+  bun run locus:test:unity -- --project F:\\OwnedCheckout --suite asset-api --install-plugin
+  bun run locus:test:unity -- --driver-binary E:\\LocusTemp\\driver\\locus.exe --project F:\\OwnedCheckout --suite asset-api --install-plugin
+  bun run locus:test:unity -- --project F:\\OwnedCheckout --suite project-pool --install-plugin
   bun run locus:test:unity -- --project F:\\Game --workspace-project F:\\GameCopy --workspace-project F:\\GameWorktree --suite workspace --install-plugin
   bun run locus:test:unity -- --project F:\\GameA --workspace-project F:\\GameB --suite workspace-switch --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite session-undo
@@ -109,15 +133,19 @@ Examples:
   bun run locus:test:unity -- --project F:\\Game --suite parallel-edit-refresh --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite recompile-import --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite execute --timeout-ms 1200000
+  bun run locus:test:unity -- --project F:\\Game --suite frame-debugger --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite python-sdk --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite modal-dialog --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite safe-mode --install-plugin
   bun run locus:test:unity -- --project F:\\Game --suite yaml-parity --yaml-parity-samples 8
 
 Driver options:
-  --suite <name>              workspace | workspace-switch | session-undo | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | python-sdk | modal-dialog | safe-mode | yaml-parity | unity-test | all
+  --suite <name>              headless-development | worktrees | worktree-sdk | asset-merge | asset-api | project-pool | workspace | workspace-switch | session-undo | connect | sidecar | type-index | state-probe | native-bridge | hot-reload | hot-reload-release | parallel-edit-refresh | recompile-import | execute | frame-debugger | python-sdk | modal-dialog | safe-mode | yaml-parity | unity-test | all
+                               headless-development creates an isolated worktree and verifies C# edits, tests, Editor reuse, idle TTL and process memory
+                               frame-debugger diagnoses capture, paused unity_execute and event-data readiness
                                hot-reload-release runs Release first, then switches to Debug at runtime and runs again
                                every CLI driver run enables Locus Debug mode inside its isolated config
+                               asset-api runs alone: offline YAML, Editor-coordinated YAML, live Editor and native View SDK parity
   --workspace-project <path>  Additional Unity project for a single-process workspace suite; repeat as needed
   --type-index-sample <mode>  sample32 | all, default sample32
   --type-index-full           Shortcut for --type-index-sample all
@@ -132,7 +160,18 @@ Driver options:
   --no-open-unity             Only connect to an already-open editor
   --no-force-edit-mode        Leave the current editor mode before hot-reload tests
 
+Worktree acceptance environment:
+  LOCUS_WORKTREE_TEST_ROOT             Absolute root for newly created test checkouts
+  LOCUS_UNITY_POOL_TEST_ROOT           Absolute root for project-pool test slots
+  LOCUS_WORKTREE_TEST_UNITY_VERSION    Optional Unity 6.5 version for owned test copies
+  LOCUS_WORKTREE_TEST_EXCLUDE_PATH     Optional package excluded only from the test baseline commit
+
+Frame Debugger diagnostic environment:
+  LOCUS_FRAME_DEBUGGER_PROBE_ROOT      Optional directory containing this suite's C# diagnostic files
+
 Wrapper options:
+  --driver-binary <abs exe>    Run an existing executable directly; skip Tauri build and dev server startup
+                              Retains compile-server:ensure, isolated runtime, driver logs and result parsing
   --prepare-native            Build locus_native.dll before starting Locus
   --prepare-unity-bundle      Rebuild the full locus_unity bundle before starting Locus
   --reuse-dev-server          Reuse the configured Vite devUrl and skip beforeDevCommand
@@ -231,6 +270,8 @@ function runUnityDriver(command, commandArgs, requestedLogDir) {
         WEBVIEW2_USER_DATA_FOLDER: runtime.webviewDataDir,
         TEMP: runtime.systemTempDir,
         TMP: runtime.systemTempDir,
+        ...(passthrough.some((arg) => arg === "asset-api" || arg === "--suite=asset-api")
+          ? { LOCUS_UNITY_TEST_PIPE_NAMESPACE: `asset-api-${randomUUID()}` } : {}),
         ...(reuseDevServer ? { LOCUS_REUSE_DEV_SERVER: "1" } : {}),
       },
     });

@@ -16,6 +16,7 @@ struct AgentReloadItem {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentReloadOutput {
+    project_agent_root: String,
     user_agent_root: String,
     default_agent_id: String,
     count: usize,
@@ -45,17 +46,8 @@ pub(super) fn agent_reload() -> ToolDef {
                     is_error: true,
                 };
             };
+            let project_agent_root = execution.root().join("Locus").join("agent");
             let user_agent_root = crate::agent::definition::user_agent_dir(bundled_root);
-            if let Err(error) = std::fs::create_dir_all(&user_agent_root) {
-                return ToolResult {
-                    output: format!(
-                        "Failed to create writable user Agent directory '{}': {}",
-                        user_agent_root.display(),
-                        error
-                    ),
-                    is_error: true,
-                };
-            }
             let definitions =
                 app_handle.state::<std::sync::Arc<
                     crate::workspace_definition_registry::WorkspaceDefinitionRegistry,
@@ -109,6 +101,7 @@ pub(super) fn agent_reload() -> ToolDef {
             );
 
             let output = AgentReloadOutput {
+                project_agent_root: project_agent_root.to_string_lossy().replace('\\', "/"),
                 user_agent_root: user_agent_root.to_string_lossy().replace('\\', "/"),
                 default_agent_id,
                 count: agents.len(),

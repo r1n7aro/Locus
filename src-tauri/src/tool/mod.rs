@@ -1,4 +1,5 @@
 pub mod builtins;
+pub(crate) mod apply_patch;
 pub(crate) mod failure_log;
 pub(crate) mod output;
 
@@ -135,6 +136,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     // Core file & shell operations.
     "read",
     "edit",
+    "apply_patch",
     "write",
     "grep",
     "list",
@@ -185,23 +187,8 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "plugin_set_enabled",
     "plugin_uninstall",
     "plugin_export",
-    // View authoring & automation.
-    "view_create",
-    "view_list",
-    "view_reload",
-    "view_run",
-    "view_compile_script",
-    "view_call_script",
-    "view_property_read",
-    "view_property_discover",
-    "view_property_write",
-    "view_property_apply",
-    "view_capture",
-    "view_snapshot",
-    "view_action",
-    "view_wait",
-    "view_console_read",
-    "view_debug_eval",
+    // Unified frontend SDK execution.
+    "execute_typescript",
 ];
 
 fn tool_priority_rank(name: &str) -> usize {
@@ -288,7 +275,14 @@ impl ToolRegistry {
 
     pub fn tool_description(&self, name: &str) -> Option<(String, serde_json::Value)> {
         self.get(name)
-            .map(|def| (def.description.clone(), def.parameters.clone()))
+            .map(|def| {
+                let description = if def.name == "python" {
+                    crate::python_runtime::render_python_tool_description(&def.description)
+                } else {
+                    def.description.clone()
+                };
+                (description, def.parameters.clone())
+            })
             .or_else(|| crate::commands::skill_package_tool_description_sync(name))
     }
 
@@ -350,11 +344,16 @@ impl ToolRegistry {
     pub fn resolve_api_tool(&self, name: &str) -> Option<serde_json::Value> {
         self.get(name)
             .map(|def| {
+                let description = if def.name == "python" {
+                    crate::python_runtime::render_python_tool_description(&def.description)
+                } else {
+                    def.description.clone()
+                };
                 serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": def.name,
-                        "description": def.description,
+                        "description": description,
                         "parameters": def.parameters,
                     }
                 })
@@ -541,7 +540,7 @@ mod tests {
     #[test]
     fn registry_loads_vision_requirements_from_tool_prompt_config() {
         let registry = ToolRegistry::with_builtins();
-        assert!(registry.requires_vision("view_capture"));
+        assert!(!registry.requires_vision("execute_typescript"));
         assert!(registry.requires_vision("UNITY_CAPTURE_VIEWPORT"));
         assert!(!registry.requires_vision("read"));
     }
@@ -650,6 +649,17 @@ mod tests {
         );
         assert_eq!(registry.default_load_mode("web_fetch"), ToolLoadMode::Lazy);
         assert_eq!(registry.canonical_name("webfetch"), None);
+    }
+
+    #[test]
+    fn frontend_execution_is_one_skill_loaded_tool() {
+        let registry = ToolRegistry::with_builtins();
+        assert_eq!(registry.canonical_name("execute_typescript").as_deref(), Some("execute_typescript"));
+        assert_eq!(registry.default_load_mode("execute_typescript"), ToolLoadMode::Skill);
+        assert!(registry.mutates_workspace("execute_typescript"));
+        for retired in ["view_create", "view_list", "view_run", "view_snapshot", "view_capture", "view_action", "view_wait", "view_console_read", "view_debug_eval"] {
+            assert_eq!(registry.canonical_name(retired), None);
+        }
     }
 
     #[test]

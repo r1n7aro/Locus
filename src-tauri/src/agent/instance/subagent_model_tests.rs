@@ -137,6 +137,7 @@ async fn request(child: &AgentInstance, store: &SessionStore) {
         child.call_llm(
             store,
             None,
+            None,
             LlmRequestOptions::default(),
             &["Test"],
             &[],

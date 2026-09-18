@@ -13,5 +13,5 @@ await locus.send_message("reviewer", message) to send follow-ups, or
 await locus.wait_task("reviewer", timeout=30) to wait. A finished subagent
 receiving a message continues its original conversation and notifies you when
 it finishes. The child receives its own id and parent_id=parent so it can reply.
-Task-control-only Python scripts use readonly=true. For the full API use
-python action=help topic=tasks.
+Task-control-only Python scripts use readonly=true. For the full API, read
+tasks.md in the SDK documentation directory shown by the python tool.

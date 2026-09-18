@@ -67,10 +67,13 @@ fn async_names_are_short_unique_session_scoped_and_survive_restart() {
     let task = manager.create_task(&session, "bash", false);
     manager.prepare_task(&task.task_id, None).unwrap();
     assert_eq!(manager.get_task(&task.task_id).unwrap().public_id(), "t1");
+    let receipt = manager.start_result(&task.task_id).output;
+    assert!(receipt.contains("id=\"t1\""));
+    assert!(receipt.contains("await locus.wait_task(\"t1\", timeout=30)"));
     assert!(manager
-        .start_result(&task.task_id)
+        .start_result(&id)
         .output
-        .contains("id=\"t1\""));
+        .contains("await locus.wait_task(\"reviewer\", timeout=30)"));
     for name in ["reviewer", "parent", "self", "../x", "bad name", ""] {
         let duplicate = manager.create_task(&session, "subagent", false);
         assert!(manager

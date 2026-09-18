@@ -1,50 +1,24 @@
 {
-  "description": "Run Python with the selected runtime and Locus SDK. `locus`, `project`, and `workspace_ref` are injected into an async body; top-level await works. Pass workspace_ref to checkout-scoped runs and tool calls.\n\nUse action=help for SDK topics. Discover with locus.list_agents(), list_sessions(), list_running_sessions(), and list_tools(); running sessions support send_message(). For action=run, readonly=true requires the body and every nested SDK/tool call to be observation-only. Task APIs are built in: await locus.list_tasks() lists only current-session tasks; get_task_status(id), wait_task(id, timeout=30), cancel_task(id), resume_task(id, message=...) and send_message(id, text) use short task ids or assigned subagent names. Resume supports failed/cancelled subagents only. Messages to finished subagents automatically continue their existing conversation; children can message parent. Task-control-only scripts use readonly=true to avoid waiting for the workspace mutation lock. No tool loading is needed. Use action=help topic=tasks for details.",
+  "description": "Run {python_runtime} code. {python_sdk_documentation} CSV tables use the same worksheet/style objects as openpyxl: await locus.csv.load_workbook(path), edit wb.active with normal openpyxl code, then await wb.save(). See csv.md for the supported display subset; CSV has no Excel protection or calculation engine.",
   "parameters": {
     "type": "object",
     "properties": {
-      "action": {
-        "type": "string",
-        "enum": [
-          "run",
-          "help"
-        ],
-        "description": "Run Python code, or progressively load one SDK help topic. Default run.",
-        "default": "run"
-      },
       "code": {
         "type": "string",
-        "description": "Python statements executed inside an async function. `locus`, `project`, and `workspace_ref` are already defined; top-level await is supported. Required for action=run."
-      },
-      "topic": {
-        "type": "string",
-        "enum": [
-          "overview",
-          "agents",
-          "sessions",
-          "tools",
-          "tasks",
-          "unity",
-          "callbacks"
-        ],
-        "description": "SDK documentation topic returned by action=help. Default overview."
-      },
-      "description": {
-        "type": "string",
-        "description": "Briefly describe the Python workflow."
+        "description": "Python code to execute. Top-level await is supported."
       },
       "readonly": {
         "type": "boolean",
-        "description": "Whether the Python body and all nested SDK/tool calls only observe state. Required for action=run; help is always read-only."
+        "description": "Whether the code and all nested calls only observe state."
       },
       "timeout": {
         "type": "integer",
-        "description": "Timeout in milliseconds for sync execution. Default 120000; maximum 1800000. Background async/notify execution has no deadline."
+        "description": "Execution timeout in milliseconds. Default 120000; maximum 1800000."
       }
     },
     "required": [
-      "action",
-      "description"
+      "code",
+      "readonly"
     ],
     "additionalProperties": false
   }

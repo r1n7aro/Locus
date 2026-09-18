@@ -1,13 +1,17 @@
 pub mod asset;
+mod agent_documents;
+pub use agent_documents::*;
 mod auth;
 mod csharp_lsp;
 mod diff;
 mod extra_workdirs;
 mod fonts;
+mod garbage_collection;
 mod git;
 mod knowledge;
 mod log;
 mod mcp;
+mod merge_jobs;
 mod plan;
 mod plugin;
 mod ref_graph;
@@ -20,14 +24,19 @@ mod system;
 mod undo;
 mod unity_embed;
 mod unity_serialized_property;
+mod unity_assets;
 mod update;
 mod view;
 mod workspace;
 mod workspace_explorer;
 mod workspace_service;
+mod worktrees;
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
+pub use merge_jobs::*;
+pub use unity_assets::*;
+pub(crate) use git::git_named_operation_lock;
 
 use crate::error::AppError;
 
@@ -492,11 +501,21 @@ pub struct SessionCacheInvalidation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SessionTimingUsage {
+    pub remote_output_duration_ms: Option<u64>,
+    pub local_tool_duration_ms: Option<u64>,
+    pub total_duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionContextUsageReport {
     pub session_id: String,
     pub session_title: String,
     pub agent_id: String,
     pub model_id: String,
+    #[serde(default)]
+    pub upstream_model: Option<String>,
     pub context_tokens: u32,
     pub context_limit: u32,
     pub raw_estimated_context_tokens: u32,
@@ -504,6 +523,7 @@ pub struct SessionContextUsageReport {
     pub breakdown: SessionContextBreakdown,
     pub tools: Vec<SessionContextToolUsage>,
     pub cache_invalidations: Vec<SessionCacheInvalidation>,
+    pub timing: SessionTimingUsage,
     pub usage: TokenUsage,
 }
 
@@ -550,6 +570,7 @@ pub use plan::*;
 pub use plugin::*;
 pub use ref_graph::*;
 pub use session::*;
+pub use garbage_collection::*;
 pub use skill::*;
 pub use skill_external::*;
 pub use storage::*;
@@ -563,3 +584,4 @@ pub use view::*;
 pub use workspace::*;
 pub use workspace_explorer::*;
 pub use workspace_service::*;
+pub use worktrees::*;

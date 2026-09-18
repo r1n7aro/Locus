@@ -586,7 +586,17 @@ impl AgentDefRegistry {
         }
 
         match Self::load_tool_description_overrides(project_dir) {
-            Ok(overrides) => base.tool_description_overrides.extend(overrides),
+            Ok(overrides) => {
+                for (name, overlay) in overrides {
+                    let target = base.tool_description_overrides.entry(name).or_default();
+                    if overlay.description.is_some() {
+                        target.description = overlay.description;
+                    }
+                    if overlay.parameters.is_some() {
+                        target.parameters = overlay.parameters;
+                    }
+                }
+            }
             Err(error) => eprintln!(
                 "[Locus] failed to load Agent tool description overrides from {:?}: {}",
                 project_dir, error

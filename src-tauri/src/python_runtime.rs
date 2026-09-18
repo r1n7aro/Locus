@@ -413,6 +413,44 @@ pub fn python_prompt_display(app_handle: Option<&AppHandle>) -> String {
     }
 }
 
+/// Resolve at prompt construction so switching runtimes updates every tool surface.
+pub fn render_python_tool_description(description: &str) -> String {
+    if !description.contains("{python_runtime}")
+        && !description.contains("{python_sdk_documentation}")
+    {
+        return description.to_string();
+    }
+    let runtime = resolve_effective_python(None);
+    let docs_dir = locus_python_sdk_docs_dir(None);
+    render_python_tool_description_with_context(description, runtime.as_ref(), docs_dir.as_deref())
+}
+
+fn render_python_tool_description_with_context(
+    description: &str,
+    runtime: Option<&ResolvedPythonRuntime>,
+    docs_dir: Option<&Path>,
+) -> String {
+    let runtime = match runtime {
+        Some(runtime) => format!(
+            "Python {}",
+            runtime.version.as_deref().unwrap_or("(version unknown)")
+        ),
+        None => "Python (runtime unavailable)".to_string(),
+    };
+    let documentation = match docs_dir {
+        Some(path) => format!(
+            "Read Locus SDK documentation as needed from `{}/`.",
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/')
+        ),
+        None => "Locus SDK documentation is unavailable.".to_string(),
+    };
+    description
+        .replace("{python_runtime}", &runtime)
+        .replace("{python_sdk_documentation}", &documentation)
+}
+
 /// Env assignments that let the selected runtime locate its own stdlib and
 /// package dir. Scoped to individual python/pip invocations (shell function
 /// prefix, PATH shims) instead of the whole shell environment so unrelated
@@ -820,7 +858,7 @@ fn managed_python_pip_zipapp_path(app_handle: Option<&AppHandle>) -> Option<Path
         .find(|candidate| candidate.is_file())
 }
 
-fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+fn locus_python_sdk_roots(app_handle: Option<&AppHandle>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(app) = app_handle {
         if let Ok(resource_dir) = app.path().resource_dir() {
@@ -833,11 +871,29 @@ fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
             candidates.push(exe_dir.join("resources").join(LOCUS_SDK_RESOURCE_DIR));
         }
     }
+    candidates
+}
+
+fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    let mut candidates = locus_python_sdk_roots(app_handle);
     #[cfg(debug_assertions)]
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../python"));
     candidates
         .into_iter()
         .find(|root| root.join("locus").join("__init__.py").is_file())
+}
+
+pub(crate) fn locus_python_sdk_docs_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+    let mut candidates = locus_python_sdk_roots(app_handle)
+        .into_iter()
+        .map(|root| root.join("docs"))
+        .collect::<Vec<_>>();
+    #[cfg(debug_assertions)]
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../prompt/python-sdk"));
+    candidates
+        .into_iter()
+        .find(|root| root.join("overview.md").is_file())
+        .map(|root| dunce::canonicalize(&root).unwrap_or(root))
 }
 
 fn find_managed_python_executable(roots: &[PathBuf]) -> Option<PathBuf> {
@@ -1175,6 +1231,56 @@ mod tests {
             source: super::PythonRuntimeSource::Managed,
             pip_zipapp: None,
             sdk_dir: None,
+        }
+    }
+
+    #[test]
+    fn python_tool_description_shows_runtime_version_and_docs_directory_only() {
+        let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::PYTHON);
+        let docs = std::path::Path::new("C:/Locus Resources/locus-python-sdk/docs");
+        let managed = super::render_python_tool_description_with_context(
+            &prompt.description,
+            Some(&managed_runtime("C:/Python/python.exe")),
+            Some(docs),
+        );
+        assert_eq!(managed, "Run Python 3.13.12 code. Read Locus SDK documentation as needed from `C:/Locus Resources/locus-python-sdk/docs/`.");
+        let mut system = system_runtime("C:/System/python.exe");
+        system.version = Some("3.14.1".to_string());
+        let selected = super::render_python_tool_description_with_context(
+            &prompt.description,
+            Some(&system),
+            Some(docs),
+        );
+        assert!(selected.starts_with("Run Python 3.14.1 code."));
+        assert!(!selected.contains("3.13.12"));
+        assert!(!selected.contains("overview.md"));
+        let missing =
+            super::render_python_tool_description_with_context(&prompt.description, None, None);
+        assert_eq!(
+            missing,
+            "Run Python (runtime unavailable) code. Locus SDK documentation is unavailable."
+        );
+    }
+
+    #[test]
+    fn python_sdk_docs_can_be_read_without_an_index_request() {
+        let docs = super::locus_python_sdk_docs_dir(None).expect("SDK docs directory");
+        assert!(docs.is_absolute());
+        for topic in [
+            "agents",
+            "sessions",
+            "tools",
+            "tasks",
+            "unity",
+            "assets",
+            "worktrees",
+            "merges",
+            "callbacks",
+        ] {
+            let content = std::fs::read_to_string(docs.join(format!("{topic}.md")))
+                .expect("read topic directly");
+            assert!(content.starts_with("# "), "{topic}");
+            assert!(!content.contains("action=help"), "{topic}");
         }
     }
 

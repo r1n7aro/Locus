@@ -109,7 +109,7 @@ pub fn augment_tool_schema(tool_name: &str, tool: &mut serde_json::Value) {
         serde_json::json!({
             "type": "string",
             "enum": ["sync", "async", "notify"],
-            "description": "Execution mode. 'sync' waits for the result; 'async' returns a task id with no execution deadline; 'notify' also delivers completion automatically. Use Python await locus.list_tasks(), await locus.get_task_status(task_id), await locus.wait_task(task_id), or await locus.cancel_task(task_id). Subagents accept send_message(task_id, text) and failed/cancelled subagents support resume_task(task_id). Notify delivers results automatically. Startup failures return directly. Default 'sync'.",
+            "description": "Execution mode: 'sync' waits (default); 'async' returns a task id; 'notify' also delivers completion automatically. Background execution has no timeout; startup failures return directly. In Python, use await locus.list_tasks(), await locus.get_task_status(id), await locus.wait_task(id, timeout=30), or await locus.cancel_task(id). IDs/names are scoped to the current session. Subagents accept await locus.send_message(id, text); failed/cancelled subagents accept await locus.resume_task(id, message=...). Task-control-only Python calls use readonly=true. Read tasks.md in the Locus SDK documentation directory for details.",
             "default": "sync"
         }),
     );
@@ -717,17 +717,18 @@ impl AsyncTaskManager {
         let notify = self
             .snapshot(task_id)
             .is_some_and(|snapshot| snapshot.notify);
-        let guidance = if notify {
-            "Completion and the final result will be delivered automatically in a system reminder. For interim progress use Python await locus.get_task_status(task_id); to stop it use await locus.cancel_task(task_id). Task-control-only Python calls use readonly=true."
+        let notification = if notify {
+            "Result sent automatically. "
         } else {
-            "Use Python await locus.get_task_status(task_id) for progress and the final result; use await locus.cancel_task(task_id) to stop it. Task-control-only Python calls use readonly=true."
+            ""
         };
+        let id = crate::tool::output::flat_text(&public_id);
         ToolResult {
             output: format!(
-                "Async task: id={} status=queued notify={}\n{}",
-                crate::tool::output::flat_text(&public_id),
-                notify,
-                guidance
+                "Async task: id={id} status=queued notify={notify}\n\
+                 {notification}Python (readonly=true):\n\
+                 Wait: await locus.wait_task({id}, timeout=30)\n\
+                 Status: await locus.get_task_status({id}); cancel: await locus.cancel_task({id})"
             ),
             is_error: false,
         }
@@ -1096,8 +1097,11 @@ mod tests {
         assert_eq!(
             manager.start_result(&started.task_id).output,
             format!(
-                "Async task: id=\"{}\" status=queued notify=false\nUse Python await locus.get_task_status(task_id) for progress and the final result; use await locus.cancel_task(task_id) to stop it. Task-control-only Python calls use readonly=true.",
-                started.task_id
+                "Async task: id=\"{id}\" status=queued notify=false\n\
+                 Python (readonly=true):\n\
+                 Wait: await locus.wait_task(\"{id}\", timeout=30)\n\
+                 Status: await locus.get_task_status(\"{id}\"); cancel: await locus.cancel_task(\"{id}\")",
+                id = started.task_id
             )
         );
 
@@ -1142,7 +1146,15 @@ mod tests {
 
         let queued = manager.start_result(&started.task_id).output;
         assert!(queued.contains("status=queued notify=true"));
-        assert!(queued.contains("locus.get_task_status(task_id)"));
+        assert!(queued.contains("Result sent automatically. Python (readonly=true):"));
+        assert!(queued.contains(&format!(
+            "Wait: await locus.wait_task(\"{}\", timeout=30)",
+            started.task_id
+        )));
+        assert!(queued.contains(&format!(
+            "Status: await locus.get_task_status(\"{}\"); cancel: await locus.cancel_task(\"{}\")",
+            started.task_id, started.task_id
+        )));
 
         manager.finish(
             &started.task_id,

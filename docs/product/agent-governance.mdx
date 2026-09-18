@@ -15,6 +15,13 @@ Locus 面向的不是一次性问答，而是可持续使用的开发代理。�
 - 每轮文件改动的 undo 跟踪
 - 原始上下文导出
 - Agent system prompt、env、规则、运行时注入、tool schema 的可视化仪表盘
+- 工作区规则可由 Agent 通过 Python SDK 自行添加、更新和启停，无需手动打开设置
+
+## 工作区规则
+
+通过 `await locus.get_agent("unity")` 获取内置 Agent 后，使用 `list_rules()` 查询规则，`read_rule(key)` 读取内容，`save_rule(file_name, content)` 新增或更新规则，`set_rule_enabled(key, False)` 停用规则，传入 `True` 可重新启用。
+
+SDK 默认使用 Python 会话所在的工作区，也可传入 `workspace_ref=` 或 `worktree=`。内容和启停选择保存在该工作区的 `Locus/agent/<agent-id>/` 下。应用默认规则可以在该工作区停用；编辑其内容时会创建工作区覆盖，应用默认文件和其他工作区保持不变。更新会反映到现有 Agent 规则列表，并在下一次模型请求中生效，包括当前运行的下一轮工具调用之后。
 
 ## 这组能力解决什么问题
 
