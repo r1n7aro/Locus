@@ -1,0 +1,34 @@
+{
+  "name": "locus-univer-oss-validation",
+  "private": true,
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "dev": "bun ../../node_modules/vite/bin/vite.js --host 127.0.0.1 --port 14921 --strictPort",
+    "build": "bun ../../node_modules/vite/bin/vite.js build",
+    "verify": "bun verify.ts",
+    "verify:windows": "bun shared-window.ts",
+    "audit": "bun audit.ts",
+    "compare": "bun compare.ts",
+    "compare:summary": "bun summarize-comparison.ts",
+    "compare:window": "bun baseline-window.ts"
+  },
+  "dependencies": {
+    "@univerjs/core": "0.25.1",
+    "@univerjs/design": "0.25.1",
+    "@univerjs/docs": "0.25.1",
+    "@univerjs/docs-ui": "0.25.1",
+    "@univerjs/engine-formula": "0.25.1",
+    "@univerjs/engine-render": "0.25.1",
+    "@univerjs/sheets": "0.25.1",
+    "@univerjs/sheets-formula": "0.25.1",
+    "@univerjs/sheets-formula-ui": "0.25.1",
+    "@univerjs/sheets-numfmt": "0.25.1",
+    "@univerjs/sheets-numfmt-ui": "0.25.1",
+    "@univerjs/sheets-ui": "0.25.1",
+    "@univerjs/ui": "0.25.1",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "rxjs": "7.8.2"
+  }
+}

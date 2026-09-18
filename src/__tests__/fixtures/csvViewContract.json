@@ -1,0 +1,122 @@
+{
+  "documents": [
+    {
+      "name": "comma",
+      "source": "id,name\n1,a\n",
+      "shape": {
+        "rows": 2,
+        "columns": 2,
+        "delimiter": ","
+      },
+      "headers": [
+        "id",
+        "name"
+      ]
+    },
+    {
+      "name": "semicolon",
+      "source": "id;name\n1;a",
+      "shape": {
+        "rows": 2,
+        "columns": 2,
+        "delimiter": ";"
+      },
+      "headers": [
+        "id",
+        "name"
+      ]
+    },
+    {
+      "name": "semicolon preview",
+      "source": "id;name\n0;a\n1;a\n2;a\n3;a\n4;a\n5;a\n6;a\n7;a\n8;a\n9;a\n10;a\n11;a\n",
+      "shape": {
+        "rows": 13,
+        "columns": 2,
+        "delimiter": ";"
+      },
+      "headers": [
+        "id",
+        "name"
+      ]
+    },
+    {
+      "name": "tab",
+      "source": "id\tname\n1\ta",
+      "shape": {
+        "rows": 2,
+        "columns": 2,
+        "delimiter": "\t"
+      },
+      "headers": [
+        "id",
+        "name"
+      ]
+    },
+    {
+      "name": "pipe",
+      "source": "id|name\n1|a",
+      "shape": {
+        "rows": 2,
+        "columns": 2,
+        "delimiter": "|"
+      },
+      "headers": [
+        "id",
+        "name"
+      ]
+    },
+    {
+      "name": "multiline",
+      "source": "﻿id,\"名,称\",note\r\n001,a,\"line1\r\nline2\"\r\n\r\n",
+      "shape": {
+        "rows": 3,
+        "columns": 3,
+        "delimiter": ","
+      },
+      "headers": [
+        "id",
+        "名,称",
+        "note"
+      ]
+    },
+    {
+      "name": "empty",
+      "source": "",
+      "shape": {
+        "rows": 0,
+        "columns": 0,
+        "delimiter": ","
+      },
+      "headers": []
+    },
+    {
+      "name": "ragged",
+      "source": "id\n1,a,\n\n",
+      "shape": {
+        "rows": 3,
+        "columns": 3,
+        "delimiter": ","
+      },
+      "headers": [
+        "id",
+        "",
+        ""
+      ]
+    },
+    {
+      "name": "duplicate",
+      "source": "id,id,\n1,2,3",
+      "shape": {
+        "rows": 2,
+        "columns": 3,
+        "delimiter": ","
+      },
+      "headers": [
+        "id",
+        "id",
+        ""
+      ]
+    }
+  ],
+  "viewYaml": "schema: \"locus.csv-view.v2\"\nheaderRows: 1\nrowHeight: 28\nwrapText: false\nfrozenColumns: 0\ncolumns:\n  c1:\n    sourceIndex: 0\n    header: \"id\"\n    width: 140\n  c2:\n    sourceIndex: 1\n    header: \"name\"\n    width: 220\ncolumnOrder:\n  - \"c1\"\n  - \"c2\"\nstyles:\n  - {\"id\":\"header\",\"rows\":[0,0],\"style\":{\"font\":\"sans\",\"size\":16,\"bold\":true,\"color\":\"accent\",\"background\":\"subtle\",\"border\":{\"color\":\"border\",\"width\":1,\"style\":\"solid\",\"edges\":[\"bottom\"]}}}\n  - {\"id\":\"pending\",\"when\":{\"columnId\":\"c2\",\"op\":\"contains\",\"value\":\"待确认\"},\"style\":{\"background\":\"warning-soft\"}}\n"
+}

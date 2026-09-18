@@ -49,6 +49,7 @@
       "./gen/gh-runtime": "gh-runtime/",
       "./gen/compile-server": "compile-server/",
       "../python/locus": "locus-python-sdk/locus/",
+      "../prompt/python-sdk": "locus-python-sdk/docs/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

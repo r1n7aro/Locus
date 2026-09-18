@@ -756,6 +756,7 @@ fn build_local_document(
     let body = normalize_imported_body(&raw, &planned.source_abs);
     let read_only = !(mode == KnowledgeLocalSourceMode::Snapshot && ai_editable);
     Ok(KnowledgeDocument {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: stable_document_id(source_root, &planned.source_rel),
         doc_type: KnowledgeType::Reference,
         path: join_relative_path(target_path, &planned.target_rel),
@@ -1218,6 +1219,7 @@ fn live_synthetic_document(
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_else(now_millis);
     let document = KnowledgeDocument {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: stable_document_id(&source_root, inner_rel),
         doc_type: KnowledgeType::Reference,
         path: join_relative_path(&link.target_path, inner_rel),

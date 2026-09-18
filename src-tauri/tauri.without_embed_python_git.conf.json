@@ -11,6 +11,7 @@
       "./gen/ort-runtime": "ort-runtime/",
       "./gen/gh-runtime": "gh-runtime/",
       "../python/locus": "locus-python-sdk/locus/",
+      "../prompt/python-sdk": "locus-python-sdk/docs/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",

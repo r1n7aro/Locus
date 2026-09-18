@@ -174,12 +174,21 @@ async function main() {
   const pythonExe = path.join(targetDir, "python.exe");
   const version = verifyPython(pythonExe);
   const pipVersion = verifyPipZipapp(pythonExe, pipZipappOutputPath);
+  const packagesDir = path.join(targetDir, "Lib", "site-packages");
+  run(pythonExe, [pipZipappOutputPath, "install", "--disable-pip-version-check", "--no-compile",
+    "--target", packagesDir, "-r", path.join(repoRoot, "python", "requirements-csv.txt")], {
+    env: { ...process.env, PYTHONHOME: targetDir, PYTHONPATH: "", PYTHONNOUSERSITE: "1" },
+  });
+  run(pythonExe, ["-c", "import openpyxl; assert openpyxl.__version__ == '3.1.5'"], {
+    env: { ...process.env, PYTHONHOME: targetDir, PYTHONPATH: packagesDir, PYTHONNOUSERSITE: "1" },
+  });
   const digest = sha256(archivePath);
   const pipDigest = sha256(pipZipappOutputPath);
   writeManifest({
     id: "windows-x64",
     version,
     sourceUrl: PYTHON_URL,
+    packages: { openpyxl: "3.1.5", "et-xmlfile": "2.0.0" },
     archiveSha256: digest,
     pipZipapp: "pip.pyz",
     pipZipappSourceUrl: PIP_ZIPAPP_URL,

@@ -9,7 +9,8 @@
       "./gen/gh-runtime": "gh-runtime/",
       "./gen/managed-python": "managed-python/",
       "./gen/managed-git": "managed-git/",
-      "../python/locus": "locus-python-sdk/locus/"
+      "../python/locus": "locus-python-sdk/locus/",
+      "../prompt/python-sdk": "locus-python-sdk/docs/"
     }
   }
 }

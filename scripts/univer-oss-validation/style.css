@@ -1,0 +1,6 @@
+:root { color-scheme: dark; --bg-color: #181a1f; --panel-bg: #181a1f; --sidebar-bg: #202227; --border-color: #34373e; --border-strong: #454a55; --text-color: #d6d8dd; --text-secondary: #9ca2ad; --accent-color: #8aa8e4; --accent-soft: #28344c; --font-ui: system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 13px/1.5 system-ui, sans-serif; background: var(--bg-color); color: var(--text-color); }
+body > header { height: 34px; display: flex; align-items: center; gap: 24px; padding: 0 12px; background: var(--sidebar-bg); border-bottom: 1px solid var(--border-color); }
+#status { color: var(--text-secondary); }
+#grid { position: absolute; inset: 34px 0 0; }
