@@ -1,0 +1,103 @@
+if (UnityEditor.EditorApplication.isCompiling || UnityEditor.EditorApplication.isUpdating) throw new System.Exception("Editor is compiling/importing; retry after the barrier");
+if (UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode) throw new System.Exception("Exit Play Mode before merge validation");
+for (int i=0;i<UnityEngine.SceneManagement.SceneManager.sceneCount;i++) if(UnityEngine.SceneManagement.SceneManager.GetSceneAt(i).isDirty) throw new System.Exception("Save dirty scenes before validating an on-disk merge");
+var importErrors=new System.Collections.Generic.List<string>();
+UnityEngine.Application.LogCallback captureImportError=(message,trace,type)=>{
+    if(type==UnityEngine.LogType.Error||type==UnityEngine.LogType.Exception||type==UnityEngine.LogType.Assert) importErrors.Add(message+"\n"+trace);
+};
+UnityEngine.Application.logMessageReceived+=captureImportError;
+try {
+System.Action<string> reportProgress = __LOCUS_PROGRESS__;
+var progressClock=System.Diagnostics.Stopwatch.StartNew();
+long lastProgressMs=-1000;
+System.Action<string,bool> progress=(message,force)=>{
+    long now=progressClock.ElapsedMilliseconds;
+    if(force||now-lastProgressMs>=1000) {
+        reportProgress("LOCUS_MERGE_VALIDATING "+message);
+        lastProgressMs=now;
+    }
+};
+progress("collecting selected assets",true);
+string[] paths = new string[] { __LOCUS_PATHS__ };
+var roots=new System.Collections.Generic.HashSet<string>(System.StringComparer.Ordinal);
+foreach(var requested in paths) {
+    string path=requested.EndsWith(".meta",System.StringComparison.Ordinal)?requested.Substring(0,requested.Length-5):requested;
+    if(path.StartsWith("Assets/",System.StringComparison.Ordinal)&&System.IO.File.Exists(path)) roots.Add(path);
+}
+var validationPaths=new System.Collections.Generic.HashSet<string>(roots,System.StringComparer.Ordinal);
+var dependencyRoots=new System.Collections.Generic.List<string>(roots);
+for(int offset=0;offset<dependencyRoots.Count;offset+=32) {
+    progress("resolving dependencies "+offset+"/"+dependencyRoots.Count,false);
+    string[] batch=dependencyRoots.GetRange(offset,System.Math.Min(32,dependencyRoots.Count-offset)).ToArray();
+    foreach(var dependency in UnityEditor.AssetDatabase.GetDependencies(batch,true)) {
+        if(dependency.StartsWith("Assets/",System.StringComparison.Ordinal)&&System.IO.File.Exists(dependency)) validationPaths.Add(dependency);
+    }
+}
+var orderedPaths=new System.Collections.Generic.List<string>(validationPaths);
+orderedPaths.Sort(System.StringComparer.Ordinal);
+paths=orderedPaths.ToArray();
+var errors = new System.Collections.Generic.List<string>();
+System.Action<UnityEngine.Object,string> checkObject = (obj,path) => {
+    progress("checking "+path,false);
+    if(obj==null) {errors.Add(path+": missing component/object");return;}
+    // Unity logs an error for native objects without a managed-reference host
+    // (for example GameObject, Transform and TextAsset). Their ordinary object
+    // references still require the SerializedObject traversal below.
+    bool managedReferenceHost=obj is UnityEngine.MonoBehaviour||obj is UnityEngine.ScriptableObject||obj is UnityEditor.AssetImporters.ScriptedImporter;
+    if(managedReferenceHost&&UnityEditor.SerializationUtility.HasManagedReferencesWithMissingTypes(obj)) errors.Add(path+": missing managed-reference type on "+obj.name);
+    using(var serialized=new UnityEditor.SerializedObject(obj))
+    using(var iterator=serialized.GetIterator()) {
+        var seenManagedIds=new System.Collections.Generic.HashSet<long>();
+        bool enterChildren=true;
+        int propertyCount=0;
+        while(iterator.Next(enterChildren)) {
+            if(++propertyCount>1000000) throw new System.Exception(path+": serialized property traversal exceeded the validation budget");
+            if((propertyCount&255)==0) progress("checking "+path+": "+propertyCount+" properties",false);
+            enterChildren=true;
+            if(iterator.propertyType==UnityEditor.SerializedPropertyType.ManagedReference) {
+                long rid=iterator.managedReferenceId;
+                if(rid>=0&&!seenManagedIds.Add(rid)) enterChildren=false;
+            }
+            if(iterator.propertyType==UnityEditor.SerializedPropertyType.ObjectReference&&iterator.objectReferenceValue==null&&iterator.objectReferenceEntityIdValue!=UnityEngine.EntityId.None) errors.Add(path+": broken object reference at "+iterator.propertyPath);
+        }
+    }
+};
+System.Action<UnityEngine.GameObject,string> checkHierarchy=(root,path)=>{
+    checkObject(root,path);
+    foreach(var component in root.GetComponentsInChildren<UnityEngine.Component>(true)) checkObject(component,path);
+};
+int assetIndex=0;
+foreach(var path in paths) {
+    if(!path.StartsWith("Assets/",System.StringComparison.Ordinal)||path.EndsWith(".meta")||!System.IO.File.Exists(path)) continue;
+    // Script import/reload was completed by recompile_and_wait outside this call.
+    if(path.EndsWith(".cs")||path.EndsWith(".asmdef")||path.EndsWith(".asmref")) continue;
+    progress("importing "+(++assetIndex)+"/"+paths.Length+" "+path,false);
+    UnityEditor.AssetDatabase.ImportAsset(path,UnityEditor.ImportAssetOptions.ForceUpdate|UnityEditor.ImportAssetOptions.ForceSynchronousImport);
+    // Importer settings live in this asset's .meta and are not returned by
+    // LoadAllAssetsAtPath. Inspect scripted importers within the same scope.
+    var importer=UnityEditor.AssetImporter.GetAtPath(path);
+    if(importer is UnityEditor.AssetImporters.ScriptedImporter) checkObject(importer,path+".meta");
+    if(path.EndsWith(".unity")) {
+        var scene=UnityEditor.SceneManagement.EditorSceneManager.OpenPreviewScene(path);
+        try {foreach(var root in scene.GetRootGameObjects())checkHierarchy(root,path);}
+        finally {UnityEditor.SceneManagement.EditorSceneManager.ClosePreviewScene(scene);}
+    } else if(path.EndsWith(".prefab")) {
+        UnityEngine.GameObject root=null;
+        try {root=UnityEditor.PrefabUtility.LoadPrefabContents(path);checkHierarchy(root,path);}
+        finally {if(root!=null)UnityEditor.PrefabUtility.UnloadPrefabContents(root);}
+    } else {
+        var objects=UnityEditor.AssetDatabase.LoadAllAssetsAtPath(path);
+        if(objects.Length==0) errors.Add(path+": failed to import/load");
+        foreach(var obj in objects) {
+            var hierarchy=obj as UnityEngine.GameObject;
+            if(hierarchy!=null)checkHierarchy(hierarchy,path);else checkObject(obj,path);
+        }
+    }
+}
+if(importErrors.Count>0) errors.Add("Unity reported import/serialization errors:\n"+string.Join("\n",importErrors));
+if(errors.Count>0)throw new System.Exception(string.Join("\n",errors));
+progress("checked "+assetIndex+" assets",true);
+return "LOCUS_MERGE_VALIDATED";
+} finally {
+    UnityEngine.Application.logMessageReceived-=captureImportError;
+}

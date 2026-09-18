@@ -1,0 +1,11 @@
+{
+  "name": "Locus.MergeTesting.Runtime",
+  "rootNamespace": "Locus.MergeTesting",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "autoReferenced": true,
+  "noEngineReferences": false
+}

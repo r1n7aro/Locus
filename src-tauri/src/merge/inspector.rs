@@ -1671,6 +1671,13 @@ pub(crate) fn materialize_merge_target(
         return Ok(inspector.clone());
     }
 
+    if session.core_session.is_some() {
+        let inspector=super::core_adapter::materialize(session,target_id)?;
+        session.inspectors.insert(target_id.into(),inspector.clone());
+        return Ok(inspector);
+    }
+    if !cfg!(test) {return Err(AppError::new("merge.core_required","Reopen this merge session with the current asset engine"));}
+
     let built = rebuild_merge_target_from_locator(cwd, session, target_id, ref_graph_state)?;
     let inspector = built.inspector;
     session
@@ -1684,6 +1691,9 @@ pub(crate) fn materialize_all_merge_targets(
     cwd: &str,
     ref_graph_state: &AssetDbState,
 ) -> AppResult<()> {
+    // The new engine validates its complete catalog directly. Inspector
+    // materialization is presentation-only and stays lazy for large scenes.
+    if session.core_session.is_some(){return Ok(());}
     let target_ids = session
         .targets
         .iter()

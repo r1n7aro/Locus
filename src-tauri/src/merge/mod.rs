@@ -1,4 +1,5 @@
 pub(crate) mod inspector;
+pub(crate) mod core_adapter;
 pub(crate) mod patch;
 pub(crate) mod session;
 pub(crate) mod three_way;

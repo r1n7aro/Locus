@@ -1,0 +1,14 @@
+{
+  "schema": "locus.skill.v1",
+  "id": "merge",
+  "name": "Merge",
+  "version": "1.0.0",
+  "injectMode": "excerpt",
+  "description": "用于合并分支改动、把多个 commit 的修改应用到当前脏工作区，或手工解决 Git/Unity 资产冲突。按用户意图选择只应用修改、Git merge 或 cherry-pick。",
+  "argumentHint": "<来源分支或 commits> [目标、范围与 Git 处理方式]",
+  "command": {
+    "enabled": true,
+    "trigger": "/merge",
+    "argumentHint": "<来源分支或 commits> [目标、范围与 Git 处理方式]"
+  }
+}

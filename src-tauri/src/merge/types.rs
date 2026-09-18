@@ -134,6 +134,10 @@ pub(crate) enum MergeTargetLocator {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MergeSemanticSession {
+    pub(crate) core_session: Option<std::sync::Arc<crate::unity_asset_core::MergeSession>>,
+    pub(crate) snapshot_oids: Option<[String; 3]>,
+    pub(crate) file_path: String,
+    pub(crate) workspace_root: String,
     pub(crate) layout: SemanticLayout,
     pub(crate) asset_kind: UnityAssetKind,
     pub(crate) summary: MergeSummary,

@@ -20,6 +20,82 @@ pub(crate) const WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT: &str =
 static PROCESS_WORKSPACE_EXECUTION_LOCKS: LazyLock<Mutex<HashMap<String, WorkspaceExecutionLock>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static SDK_DELEGATIONS: LazyLock<Mutex<HashMap<String, Weak<SdkExecutionDelegation>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A capability minted only while the Python tool actually owns its run's
+/// exclusive gate. The outer Python process keeps the registration alive.
+pub(crate) struct SdkExecutionDelegation {
+    pub project_id: String,
+    pub repository: Option<String>,
+    pub checkout_id: String,
+    pub epoch: u64,
+    pub generation: u64,
+    pub run_id: String,
+    pub session_id: String,
+    // Sibling checkouts may execute concurrently; one checkout's nested writes
+    // remain ordered while borrowing an outer Python run's exclusive gate.
+    pub operations: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    _gate: Arc<OwnedRwLockWriteGuard<()>>,
+}
+pub(crate) struct SdkDelegationRegistration {
+    pub token: String,
+    _delegation: Arc<SdkExecutionDelegation>,
+}
+impl Drop for SdkDelegationRegistration {
+    fn drop(&mut self) {
+        SDK_DELEGATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.token);
+    }
+}
+pub(crate) fn register_sdk_delegation(
+    runtime: &crate::workspace_service::WorkspaceRuntime,
+    session_id: Option<&str>,
+) -> Option<SdkDelegationRegistration> {
+    let lock = process_workspace_execution_lock(&runtime.root().to_string_lossy());
+    let trace = lock.trace();
+    let (_, holder) = trace.writer.as_ref()?;
+    if !holder.owner.tools.iter().any(|tool| tool == "python")
+        || session_id.is_some_and(|id| id != holder.owner.session_id)
+    {
+        return None;
+    }
+    let gate = holder.exclusive_guard.as_ref()?.upgrade()?;
+    let delegation = Arc::new(SdkExecutionDelegation {
+        project_id: runtime.project_id().to_string(),
+        repository: crate::workspace_service::identity::resolve_git_common_dir(runtime.root())
+            .map(|path| crate::workspace_service::worktrees::path_key(&path)),
+        checkout_id: runtime.checkout_id().to_string(),
+        epoch: runtime.materialization_epoch(),
+        generation: runtime.generation(),
+        run_id: holder.owner.run_id.clone(),
+        session_id: holder.owner.session_id.clone(),
+        operations: AsyncMutex::new(HashMap::new()),
+        _gate: gate,
+    });
+    let token = uuid::Uuid::new_v4().to_string();
+    SDK_DELEGATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(token.clone(), Arc::downgrade(&delegation));
+    Some(SdkDelegationRegistration {
+        token,
+        _delegation: delegation,
+    })
+}
+pub(crate) fn resolve_sdk_delegation(token: &str) -> Result<Arc<SdkExecutionDelegation>, String> {
+    SDK_DELEGATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(token)
+        .and_then(Weak::upgrade)
+        .ok_or_else(|| {
+            "Python execution delegation expired or is invalid; launch a new workflow".into()
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceExecutionLockRequest {
     PathWrite(Vec<String>),
@@ -127,6 +203,7 @@ struct TraceHolder {
     owner: WorkspaceExecutionLockOwner,
     request: WorkspaceExecutionLockRequest,
     acquired_at: Instant,
+    exclusive_guard: Option<Weak<OwnedRwLockWriteGuard<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,7 +252,7 @@ enum OwnedWorkspaceExecutionGuard {
         _path_guards: Vec<OwnedMutexGuard<()>>,
     },
     ParallelOpaque(Arc<OpaqueGroupState>),
-    Exclusive(OwnedRwLockWriteGuard<()>),
+    Exclusive(Arc<OwnedRwLockWriteGuard<()>>),
 }
 
 struct OpaqueGroupState {
@@ -549,7 +626,7 @@ impl WorkspaceExecutionLock {
                     OwnedWorkspaceExecutionGuard::ParallelOpaque(group_state)
                 }),
                 WorkspaceExecutionLockRequest::Exclusive => Box::pin(async move {
-                    OwnedWorkspaceExecutionGuard::Exclusive(gate.write_owned().await)
+                    OwnedWorkspaceExecutionGuard::Exclusive(Arc::new(gate.write_owned().await))
                 }),
             };
         let mut wait_log = tokio::time::interval_at(
@@ -569,6 +646,7 @@ impl WorkspaceExecutionLock {
                             owner: owner.clone(),
                             request: request.clone(),
                             acquired_at,
+                            exclusive_guard: match &guard { OwnedWorkspaceExecutionGuard::Exclusive(guard)=>Some(Arc::downgrade(guard)),_=>None },
                         };
                         match &request {
                             WorkspaceExecutionLockRequest::PathWrite(_)
@@ -861,6 +939,112 @@ mod tests {
             workspace: "test-workspace".to_string(),
             tools: vec!["test".to_string()],
         }
+    }
+
+    #[tokio::test]
+    async fn python_delegation_is_scoped_revocable_and_keeps_admitted_gate_alive() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::config::AppConfig::load_from_path(
+            &temp.path().join("config.json"),
+        ));
+        let policy =
+            Arc::new(crate::resource_policy::ResourcePolicyStore::from_config(config).unwrap());
+        let registry = crate::workspace_service::ProjectRegistry::new(policy, Vec::new());
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let runtime = registry.register(&root).unwrap();
+        assert!(super::register_sdk_delegation(&runtime, Some("session-test")).is_none());
+        let lock = process_workspace_execution_lock(&root.to_string_lossy());
+        let (_cancel, rx) = tokio::sync::watch::channel(false);
+        let mut caller = owner("python-run");
+        caller.tools = vec!["python".into()];
+        let outer = lock
+            .acquire(WorkspaceExecutionLockRequest::Exclusive, caller, rx.clone())
+            .await
+            .unwrap();
+        assert!(super::register_sdk_delegation(&runtime, Some("different-session")).is_none());
+        let registration = super::register_sdk_delegation(&runtime, Some("session-test")).unwrap();
+        let token = registration.token.clone();
+        let admitted = super::resolve_sdk_delegation(&token).unwrap();
+        assert!(crate::merge_jobs::coordination::verify_target(&admitted, &runtime).unwrap());
+        assert_eq!(admitted.checkout_id, runtime.checkout_id().as_str());
+        assert_eq!(admitted.run_id, "python-run");
+        let operation_gate = admitted.operations.lock().await
+            .entry(runtime.checkout_id().to_string()).or_default().clone();
+        let first = operation_gate.clone().lock_owned().await;
+        assert!(operation_gate.try_lock().is_err());
+        let sibling_gate = admitted.operations.lock().await.entry("sibling".into()).or_default().clone();
+        assert!(sibling_gate.try_lock().is_ok());
+        drop(first);
+        drop(registration);
+        assert!(super::resolve_sdk_delegation(&token).is_err());
+        drop(outer);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            lock.acquire(
+                WorkspaceExecutionLockRequest::Exclusive,
+                owner("next"),
+                rx.clone()
+            )
+        )
+        .await
+        .is_err());
+        drop(admitted);
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            lock.acquire(WorkspaceExecutionLockRequest::Exclusive, owner("next"), rx)
+        )
+        .await
+        .unwrap()
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn copied_project_guid_does_not_delegate_into_an_independent_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Arc::new(crate::config::AppConfig::load_from_path(
+            &temp.path().join("config.json"),
+        ));
+        let policy =
+            Arc::new(crate::resource_policy::ResourcePolicyStore::from_config(config).unwrap());
+        let registry = crate::workspace_service::ProjectRegistry::new(policy, Vec::new());
+        let mut runtimes = vec![];
+        for name in ["source", "different-repository"] {
+            let path = temp.path().join(name);
+            std::fs::create_dir_all(path.join("Locus")).unwrap();
+            std::fs::write(
+                path.join("Locus/config.json"),
+                r#"{"workspace_id":"same-copied-project-guid"}"#,
+            )
+            .unwrap();
+            assert!(crate::process_util::command("git")
+                .arg("-C")
+                .arg(&path)
+                .arg("init")
+                .output()
+                .unwrap()
+                .status
+                .success());
+            runtimes.push(registry.register(&path).unwrap());
+        }
+        assert_eq!(runtimes[0].project_id(), runtimes[1].project_id());
+        let lock = process_workspace_execution_lock(&runtimes[0].root().to_string_lossy());
+        let (_cancel, rx) = tokio::sync::watch::channel(false);
+        let mut caller = owner("python-same-guid");
+        caller.tools = vec!["python".into()];
+        let _outer = lock
+            .acquire(WorkspaceExecutionLockRequest::Exclusive, caller, rx)
+            .await
+            .unwrap();
+        let registration =
+            super::register_sdk_delegation(&runtimes[0], Some("session-test")).unwrap();
+        let grant = super::resolve_sdk_delegation(&registration.token).unwrap();
+        assert!(crate::merge_jobs::coordination::verify_target(&grant, &runtimes[0]).unwrap());
+        assert!(
+            crate::merge_jobs::coordination::verify_target(&grant, &runtimes[1])
+                .unwrap_err()
+                .contains("repositories")
+        );
     }
 
     #[tokio::test]

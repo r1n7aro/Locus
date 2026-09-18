@@ -802,6 +802,8 @@ pub(crate) fn assemble_resolved_yaml(
     session: &MergeSemanticSession,
     resolutions: &HashMap<String, FieldResolution>,
 ) -> AppResult<AssembledMerge> {
+    if session.core_session.is_some() {return super::core_adapter::assemble(session,resolutions);}
+    if !cfg!(test) {return Err(AppError::new("merge.core_required","Reopen this merge session with the current asset engine"));}
     let missing_conflicts: Vec<String> = session
         .conflict_field_ids
         .iter()
@@ -1010,6 +1012,10 @@ mod tests {
         };
 
         MergeSemanticSession {
+            core_session:None,
+            snapshot_oids:None,
+            file_path:String::new(),
+            workspace_root:String::new(),
             layout,
             asset_kind,
             summary: MergeSummary::default(),
