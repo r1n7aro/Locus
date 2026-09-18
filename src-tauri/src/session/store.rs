@@ -10705,6 +10705,7 @@ mod tests {
         let mut response_request = response_request;
         response_request["codex_response"] = serde_json::Value::Null;
         response_request["codex_reasoning"] = serde_json::Value::Null;
+        response_request["upstream_model"] = serde_json::Value::Null;
         assert_eq!(restored.get("message-1"), Some(&response_request));
         assert_eq!(restored.get("message-2"), Some(&response_request));
 

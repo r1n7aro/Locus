@@ -27,6 +27,7 @@ fn v45_reasoning_migration_is_repeatable_preserves_prefix_and_exports_empty() {
     let mut expected = original;
     expected["codex_reasoning"] = Value::Null;
     expected["codex_response"]["server_model"] = Value::Null;
+    expected["upstream_model"] = Value::Null;
     assert_eq!(requests["answer"], expected);
     key["effort"] = Value::Null;
     let cached = store
@@ -68,6 +69,7 @@ fn v45_reasoning_migration_is_repeatable_preserves_prefix_and_exports_empty() {
         "empty"
     );
     assert_eq!(yaml["sessions"][0]["messages"][0]["content"], "old answer");
+    assert_eq!(yaml["sessions"][0]["messages"][0]["upstreamModel"], "empty");
 }
 
 #[test]
