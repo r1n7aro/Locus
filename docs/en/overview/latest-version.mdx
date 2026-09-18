@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.8.2 (2026-09-05)"
+description: "Locus v0.8.3 (2026-09-19)"
 sidebarTitle: "Latest Version"
-version: "0.8.2"
-releasedAt: "2026-09-05"
+version: "0.8.3"
+releasedAt: "2026-09-19"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,37 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.8.3 (Added)
+
+- Added global search for Knowledge documents and active or archived sessions. Press `Ctrl+F` in Development to search titles and content across the projects shown in the workspace, with previews, modification times, keyboard navigation, and configurable search sources.
+- Added managed Git worktrees and reusable Unity project pools. The Python SDK can create, import, acquire, release, and target checkouts, and manage their Unity Editor lifecycle, including headless operation.
+- Added selective Unity asset integration through the merge SDK. Plans can choose commits, files, objects, and fields; preview frozen changes; apply them; and validate the result before committing.
+- Added a shared Unity asset API for Python, TypeScript Views, and merge plans, with explicit YAML or live Editor backends, revision checks, batched changes, and serialized array operations.
+- Added a CSV worksheet editor with cell editing, sorting, filtering, formatting, and saved layout. The Python SDK supports openpyxl worksheet and style objects while keeping CSV values as text.
+- Views now run inside the Workbench using Locus components, themes, and services. Single-file Vue Views support bundled compilation, file watching, hot updates, and a shared TypeScript SDK.
+- Added structured Unity profiling through the shared Profiler API: metric discovery, captures, statistics, baseline comparisons, and CSV export.
+- Added session execution timing and upstream model metadata, expanded history search and context exports, and SDK access to workspace Agent rules.
+- Added the local `/garbage-collection` command to reclaim unused space in the session and current project databases while preserving their records.
+
+### v0.8.3 (Fixed)
+
+- Hardened Codex transport, reasoning replay, and compaction handling. Supported Astra requests can accept steering input during a run, and remote compaction has a longer response idle timeout.
+- Kept Workbench panes, previews, Git actions, knowledge operations, and View callbacks bound to their originating checkout and runtime generation.
+- Unified document editing sessions so Markdown controls, drafts, and editor state follow the document across Workbench surfaces.
+- Focused, loaded session tabs are now marked as read even when their saved scroll position is in older history; inactive split panes keep their unread state.
+- Fixed Windows resize synchronization taking ownership of Tauri's resize overlay, which could leave stale borders intercepting input after maximizing the window.
+- Bounded console and View log handling, and added database maintenance checks that preserve message order and context exports.
+
+### v0.8.3 (Removed)
+
+- Removed the separate content WebView path for Workbench Views. Unity external View windows retain an adapter to the shared runtime.
+- Removed View templates and the old `view_*` tool registrations; View creation and operations now use `execute_typescript` and the shared SDK. Existing View packages remain readable.
 
 ### v0.8.2 (Added)
 

@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.8.2 (2026-09-05)"
+description: "Locus v0.8.3 (2026-09-19)"
 sidebarTitle: "当前版本"
-version: "0.8.2"
-releasedAt: "2026-09-05"
+version: "0.8.3"
+releasedAt: "2026-09-19"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,37 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.8.2/locus_0.8.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.8.3（新增）
+
+- 新增知识文档与会话全局搜索。在开发界面按 `Ctrl+F`，可搜索工作区中所显示项目的知识标题、正文，以及活动或已归档会话；支持内容预览、修改时间、键盘选择与搜索范围设置。
+- 新增受管 Git worktree 与可复用 Unity 项目池。Python SDK 可创建、导入、申请、释放并指定 checkout，管理对应 Unity Editor 的启动与关闭，支持无界面运行。
+- 新增 Unity 资源选择性整合流程。通过 merge SDK 按提交、文件、对象或字段制定计划，预览冻结快照中的改动，应用并验证结果后再提交。
+- Python、TypeScript View 与合并计划共用 Unity 资源 API；可显式选择 YAML 或实时 Editor 后端，支持版本校验、批量修改和序列化数组操作。
+- 新增 CSV 工作表编辑器，支持单元格编辑、排序、筛选、格式与布局保存。Python SDK 可使用 openpyxl 的工作表和样式对象，CSV 值继续按文本保存。
+- View 改为在工作台内复用 Locus 组件、主题与服务。单文件 Vue View 支持随应用分发的编译器、文件监听、热更新与共享 TypeScript SDK。
+- 新增结构化 Unity 性能采集，共用 Profiler API 提供指标发现、捕获、统计、基线对比与 CSV 导出。
+- 新增会话执行耗时与上游模型记录，扩展历史搜索和上下文导出；Python SDK 可读取、修改和启停工作区 Agent 规则。
+- 新增本地 `/garbage-collection` 命令，在保留数据记录的前提下回收会话库和当前项目数据库的空闲空间。
+
+### v0.8.3（修复）
+
+- 加固 Codex 传输、思考内容回放与上下文压缩。受支持的 Astra 请求可在运行中接收追加输入，远程压缩使用更长的响应空闲超时。
+- 工作台分屏、预览、Git 操作、知识操作与 View 回调保持绑定原 checkout 及其运行代次。
+- 统一文档编辑会话，使 Markdown 控件、草稿和编辑器状态在不同工作台界面之间保持一致。
+- 已加载且获得焦点的会话标签会直接标为已读，无需滚动到最新消息；未激活的分屏继续保留未读状态。
+- 修复 Windows 缩放同步干预 Tauri 缩放边框，导致窗口最大化后残留边框拦截输入的问题。
+- 为控制台和 View 日志处理增加容量限制，并补充保留消息顺序与上下文导出结果的数据库维护检查。
+
+### v0.8.3（移除）
+
+- 移除工作台 View 的独立内容 WebView 路径；Unity 外部 View 窗口保留连接共享运行时的适配层。
+- 移除 View 模板及旧 `view_*` 工具注册，创建与操作统一由 `execute_typescript` 和共享 SDK 承担；已有 View 包仍可读取。
 
 ### v0.8.2（新增）
 
