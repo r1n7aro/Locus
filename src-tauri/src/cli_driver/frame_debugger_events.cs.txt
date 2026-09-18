@@ -1,0 +1,52 @@
+var events = Locus.Skills.FrameDebuggerApi.Events(new Locus.Skills.FrameEventQuery { MaxEvents = 1000 });
+var selected = events.Events.Where(e => e.Type == "HybridBatch" || e.Type == "SRPBatch"
+    || e.Type == "Mesh" || e.Type == "InstancedMesh" || e.Type.StartsWith("Clear")).Take(8).ToArray();
+if (selected.Length == 0) selected = events.Events.Take(8).ToArray();
+if (selected.Length == 0) throw new System.Exception("No captured events to verify");
+print("FD_EVENTS:" + Locus.Skills.FrameDebuggerApi.Json(new { events.TotalCount, selected }));
+var details = new System.Collections.Generic.List<object>();
+foreach (var item in selected) {
+    var watch = System.Diagnostics.Stopwatch.StartNew();
+    var detail = await Locus.Skills.FrameDebuggerApi.EventAsync(item.Index, timeoutMs: 3000, cancellationToken: cancellationToken);
+    if (detail.Index != item.Index || detail.Type != item.Type)
+        throw new System.Exception("Read the wrong event after selection");
+    details.Add(new { index = item.Index, elapsedMs = watch.ElapsedMilliseconds, detail });
+}
+print("FD_ASYNC_DETAILS:" + Locus.Skills.FrameDebuggerApi.Json(details));
+var parallel = await System.Threading.Tasks.Task.WhenAll(selected.Select(item =>
+    Locus.Skills.FrameDebuggerApi.EventAsync(item.Index, timeoutMs: 5000, cancellationToken: cancellationToken)));
+if (!parallel.Select(d => d.Index).SequenceEqual(selected.Select(item => item.Index)))
+    throw new System.Exception("Concurrent event reads crossed selections");
+print("FD_ASYNC_EVENTS_OK:" + selected.Length);
+print("FD_CONCURRENT_EVENTS_OK:" + parallel.Length);
+
+using (var canceled = new System.Threading.CancellationTokenSource()) {
+    canceled.Cancel();
+    bool sawCancel = false;
+    try { await Locus.Skills.FrameDebuggerApi.EventAsync(selected[0].Index, cancellationToken: canceled.Token); }
+    catch (System.OperationCanceledException) { sawCancel = true; }
+    if (!sawCancel) throw new System.Exception("Canceled event read succeeded");
+}
+var pending = Locus.Skills.FrameDebuggerApi.EventAsync(selected[0].Index, cancellationToken: cancellationToken);
+Locus.Skills.FrameDebuggerApi.Disable();
+bool invalidated = false;
+try { await pending; } catch (System.InvalidOperationException) { invalidated = true; }
+if (!invalidated) throw new System.Exception("Disabled capture returned stale event data");
+await Locus.Skills.FrameDebuggerApi.CaptureAsync(cancellationToken: cancellationToken);
+await Locus.Skills.FrameDebuggerApi.EventAsync(selected[0].Index, cancellationToken: cancellationToken);
+print("FD_EVENT_CANCEL_RECOVERY_OK");
+
+bool exportedAny = false;
+foreach (var item in selected.Reverse()) {
+    try {
+        var exported = await Locus.Skills.FrameDebuggerApi.ExportRenderTargetAsync(item.Index,
+            new Locus.Skills.FrameTextureExportOptions { OutputDirectory = "Library/Locus/FrameDebuggerDriver", TimeoutMs = 3000 }, cancellationToken);
+        if (!System.IO.File.Exists(exported.TexturePath) || new System.IO.FileInfo(exported.TexturePath).Length == 0)
+            throw new System.Exception("Export returned no file");
+        print("FD_EXPORT:" + Locus.Skills.FrameDebuggerApi.Json(exported));
+        exportedAny = true;
+        break;
+    } catch (System.InvalidOperationException ex) { print("FD_EXPORT_UNAVAILABLE:" + item.Index + ":" + ex.Message); }
+}
+if (!exportedAny) throw new System.Exception("No selected rendering event exported a Render Target");
+print("FD_EVENT_DIAGNOSTIC_DONE");

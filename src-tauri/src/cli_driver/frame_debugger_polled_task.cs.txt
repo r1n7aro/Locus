@@ -1,0 +1,4 @@
+var delay = System.Threading.Tasks.Task.Delay(150, cancellationToken);
+ctx.Progress("FD poll task", "await ctx.WaitUntil(delay.IsCompleted)", 0f);
+await ctx.WaitUntil(() => delay.IsCompleted);
+print("FD_POLLED_TASK:" + EditorApplication.isPaused + ":" + delay.Status);

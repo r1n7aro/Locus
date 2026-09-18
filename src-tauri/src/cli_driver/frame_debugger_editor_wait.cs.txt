@@ -1,0 +1,4 @@
+ctx.Progress("FD editor wait", "before ctx.WaitFrames", 0f);
+print("FD_EDITOR_CONTEXT:" + System.Threading.SynchronizationContext.Current?.GetType().FullName);
+await ctx.WaitFrames(5);
+print("FD_EDITOR_WAIT:" + EditorApplication.isPaused);

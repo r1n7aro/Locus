@@ -2,348 +2,188 @@
 id: kd_skill_builtin_profiler
 injectMode: excerpt
 summary: >-
-  Use when a runtime debugging task needs Unity performance data: frame time, GC allocation, memory, rendering, physics, script cost, spike frames, or a specific Unity Profiler marker. Ignore static code-quality questions that need no live runtime data.
+  Profile live Unity Editor / Play Mode CPU, GPU, memory, GC, rendering, physics, audio, animation, UI, loading, 2D and custom metrics. Discover counters, capture samples, compare baselines, inspect hierarchies and save memory snapshots through ctx.Profiler in unity_execute or unity_run_states. Not for static code review.
 aiMaintained: false
 skillEnabled: true
 skillSurface: both
 commandTrigger: /profile
 tools:
+  - unity_execute
   - unity_run_states
 ---
 
 # Unity Profiler Runtime Sampling
 
-Use this skill when a runtime debugging task asks for frame time, GC allocation, memory, rendering, physics, script update cost, spike analysis, or a specific Unity Profiler marker.
+Use for slow frames, stutters, allocations, memory growth, rendering load, simulation cost, or performance before/after an interaction. Prefer state inspection for deterministic logic bugs and static inspection for questions that need no measurements.
 
-## When to use
+## Workflow
 
-- The user asks why Play Mode is slow, stutters, spikes, allocates memory, or drops FPS.
-- The task needs runtime profile data around a specific interaction, scene state, user action, or state transition.
-- The agent needs to compare baseline performance before and after an operation.
-- The agent needs a specific marker, counter, frame hierarchy, or spike-frame breakdown.
+1. Reproduce the relevant scene, interaction and load. Prefer representative Play Mode conditions.
+2. Discover metrics if their names/categories are uncertain. Capture a small overview first, then narrow to the relevant subsystem.
+3. Allow warmup. Collect 120–600 observations or a bounded time window. Keep baseline/candidate conditions and sampling policies comparable.
+4. Check availability and missing counts before interpreting statistics. Use frame exports for call attribution and snapshots for memory ownership.
+5. Print a short finding with evidence, limitations and saved paths. Save raw samples in CSV and hierarchies in JSON.
 
-## When NOT to use
+All helpers are available through **`ctx.Profiler` in both `unity_execute` and `unity_run_states`**. Captures belong to the current call and are cleaned up on success, failure or cancellation. Save before returning. Use `readonly: false` when starting captures or writing artifacts; discovery and reading buffered frames can be read-only. Standalone/remote Player capture is outside this helper's scope.
 
-- The question is about static code quality and does not need live runtime data.
-- The problem is a deterministic logic bug that can be diagnosed from state inspection alone.
-- The task only needs file-level asset, scene, or prefab inspection.
+## unity_execute
 
-## Core model
+For a bounded observation window, use `request_editor_status: "playing"`:
 
-Unity Profiler data is organized around markers and counters.
+```csharp
+var p = ctx.Profiler;
+p.StartProfiler("baseline", p.ProfilerMetrics("overview", "memory"),
+    new Locus.LocusBridge.ProfilerCaptureOptions { WarmupFrames = 30, MaxSamples = 300 });
+await ctx.WaitSeconds(8);
+p.StopProfiler("baseline");
+p.PrintProfilerSummary("baseline");
+printJson(p.GetProfilerSummary("baseline", "main_thread_ms").Statistics);
+printJson(p.GetProfilerBudget("baseline", "main_thread_ms", 16.67));
+p.SaveProfiler("baseline");
+```
 
-- A marker is a named sample scope. Built-in examples include `PlayerLoop`, `BehaviourUpdate`, `Update.ScriptRunBehaviourUpdate`, `GC.Alloc`, and `Physics.Processing`.
-- A counter is a named numeric value. Common examples include memory usage, object count, draw calls, and triangle count.
-- CPU markers form a hierarchy. `Total` time includes children; `Self` time excludes children.
-- Business C# methods do not automatically appear as useful named samples unless Unity already marks them, Deep Profile is active, or the project adds custom `ProfilerMarker` / `Profiler.BeginSample` scopes.
+The duration does not promise 300 rendered frames; inspect sample counts. To wait for the sample cap, use `await ctx.WaitUntil(() => p.IsProfilerStopped("baseline"))` while the scene keeps rendering. Stop explicitly if the scenario pauses or finishes earlier.
 
-Use `ProfilerRecorder` style sampling for trends and known metrics. Use frame hierarchy export when the user needs one frame's function or marker time breakdown.
-
-## Runtime workflow
-
-1. Choose the runtime window to measure.
-   - Wait for the scene, object, or user action that matters.
-   - Start recording immediately before the suspicious behavior.
-   - Stop recording after enough frames to include steady-state or the spike.
-
-2. Record default metrics first.
-   - Main thread time.
-   - Render thread time when available.
-   - GC allocated in frame.
-   - GC reserved memory.
-   - System or total used memory.
-   - Rendering counters when the issue is visual load.
-   - Physics counters when the issue is simulation load.
-
-3. Watch for spike frames.
-   - Keep a threshold such as `main_thread_ms > 30`.
-   - Use `ctx.RecordProfilerSpike(...)` after the profiler has at least one sample.
-   - Read the saved Unity Profiler frame index with `ctx.GetProfilerLastSpikeFrame(...)`.
-   - Export hierarchy rows for that frame with `ctx.SaveProfilerFrame(...)`.
-
-4. Narrow to specific markers.
-   - Enumerate available marker/counter names when the exact name is unknown.
-   - Record the specific marker with its category and unit conversion.
-   - Prefer stable custom marker names for gameplay systems.
-
-5. Return a short summary and save full data.
-   - Print averages, p95, max, last, sample count, and frame range.
-   - Save raw samples, spike records, and frame hierarchy data under `Library/Locus/RunStates`.
-   - Include saved file paths in the `unity_run_states` result.
-
-## Expected ctx profiler helpers
-
-Start the profiler in the state's `start` snippet and stop it in `update`:
+## unity_run_states
 
 ```csharp
 // start
-ctx.StartProfiler("baseline", ctx.DefaultProfilerMetrics());
+ctx.Profiler.StartProfiler("baseline", ctx.Profiler.ProfilerMetrics("overview"),
+    new Locus.LocusBridge.ProfilerCaptureOptions { WarmupFrames = 30, MaxSamples = 300 });
 
 // update
-if (ctx.ElapsedFramesInState < 300) return;
-
-ctx.StopProfiler("baseline");
-ctx.PrintProfilerSummary("baseline");
-ctx.SaveProfiler("baseline");
+if (!ctx.Profiler.IsProfilerStopped("baseline")) return;
+ctx.Profiler.PrintProfilerSummary("baseline");
+ctx.Profiler.SaveProfiler("baseline");
 ctx.Done("profile captured");
 ```
 
-Use explicit metrics in `start` when the task needs a targeted marker:
+Sampling continues while a state sleeps. Existing `ctx.StartProfiler`, `StopProfiler`, `PrintProfilerSummary`, `SaveProfiler`, `GetProfilerSummary`, last-value, spike and frame helpers remain supported. Legacy `ctx.StartProfiler` enables hierarchy capture; prefer `ctx.Profiler.StartProfiler` when only counters are needed.
+
+## Metric discovery and domains
 
 ```csharp
-ctx.StartProfiler("gc_spike", new[] {
-    ctx.ProfilerMetric("gc_alloc", Unity.Profiling.ProfilerCategory.Memory, "GC.Alloc", 1, "bytes"),
-    ctx.ProfilerMetric("gc_reserved_mb", Unity.Profiling.ProfilerCategory.Memory, "GC Reserved Memory", 0.000001, "MB"),
-    ctx.ProfilerMetric("main_thread_ms", Unity.Profiling.ProfilerCategory.Internal, "Main Thread", 0.000001, "ms"),
-});
+var p = ctx.Profiler;
+var page = p.DiscoverMetrics(nameContains: "Texture", categoryContains: "Memory", limit: 40, offset: 0);
+printJson(page);
+// Items have Name, Category, Unit, DataType and Flags; paginate using TotalMatches/HasMore.
+// Use a discovered item in this call: p.ProfilerMetric(page.Items[0], "texture_metric").
 ```
 
-Use last-value reads and spike records after the profiler has sampled at least one frame:
+Filters are case-insensitive substrings. Limit is 1–512. `ProfilerMetric(info, name, options)` converts nanoseconds to ms and preserves other native units. Explicit definitions use `ProfilerMetric(name, category, markerName, scale, unit, options)`.
+
+`ProfilerMetrics(params string[] groups)` composes these domains:
+
+| Group | Data |
+| --- | --- |
+| `overview` | CPU threads, allocation, reserved/system memory, rendering and GPU frame time |
+| `cpu`, `gpu` | Main/render thread time; GPU frame time where supported |
+| `memory` | Used/reserved/managed/system memory, allocation, textures, meshes, graphics memory |
+| `rendering` | Draw calls, batches, SetPass, triangles, vertices, render textures |
+| `physics`, `physics2d` | Registered metrics in the corresponding physics categories |
+| `audio`, `animation`, `ui`, `loading` | Registered subsystem metrics |
+| `2d` | Registered 2D/sprite metrics, including those added by newer Unity versions |
+
+The last three rows use runtime discovery. An empty domain or one with more than 64 metrics asks you to narrow discovery instead of silently substituting data. Registration depends on Unity version, packages and whether the subsystem has run. At most 128 metrics and 1,000,000 stored values are allowed per capture.
+
+`GC Allocated In Frame` is the allocation counter for a frame. `GC.Alloc` is useful for allocation attribution; do not assume a marker's duration is a byte count. Verify discovered units before selecting a scale.
+
+For a custom marker and main-thread-only collection:
 
 ```csharp
-double mainThreadMs;
-if (ctx.TryGetProfilerLastValue("baseline", "main_thread_ms", out mainThreadMs)
-    && ctx.RecordProfilerSpikeTop("baseline", "main_thread_ms", 30.0, "main_thread_spike", 5))
-{
-    int profilerFrame = ctx.GetProfilerLastSpikeFrame("baseline", "main_thread_ms");
-    ctx.SaveProfilerFrame("main_thread_spike_" + profilerFrame, profilerFrame, "Main Thread", 80, 0);
+var metric = ctx.Profiler.ProfilerMetric("combat_ms", Unity.Profiling.ProfilerCategory.Scripts,
+    "Combat.SpawnWave", 0.000001, "ms", Unity.Profiling.ProfilerRecorderOptions.Default
+    | Unity.Profiling.ProfilerRecorderOptions.CollectOnlyOnCurrentThread);
+```
+
+Defaults sum samples across threads in a frame. `GpuRecorder` requests GPU timing for an actual GPU-capable marker; it does not turn C# work into GPU work. Keep default sum/wrap flags unless individual-sample semantics are intended. For project state, use `ProfilerMetric("enemy_count", () => (double?)enemyManager.ActiveCount, "count")`. A reader returns `null` for missing data and should avoid expensive enumeration, allocations or logs on the measured main thread. Add stable project `ProfilerMarker` scopes only when built-in attribution is too coarse.
+
+## Capture policy and analysis
+
+`ProfilerCaptureOptions` fields:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `WarmupFrames` | `0` | Skip initial observed frames/ticks |
+| `SampleEveryFrames` | `1` | Sample latest values every N observed frames/ticks; not an N-frame sum |
+| `MaxSamples` | `3600` | Stop at this row count; range 1–60000 |
+| `Clock` | `"auto"` | Distinct `Time.frameCount` in Play Mode, editor ticks in Edit Mode; explicit `"unity_frame"` / `"editor_update"` also supported |
+| `CaptureHierarchy` | `false` | Temporarily enable Profiler recording/CPU data for frame export |
+| `CaptureGpu` | `false` | Also request GPU Profiler data, subject to hardware/API support |
+
+The API observes latest recorder values; it cannot reconstruct frames missed between editor callbacks. Edit Mode ticks can read the same completed value again. Recorder buffers are not reset every tick: Unity `Reset()` stops collection. No completed data is missing, not zero. The row cap still applies if metrics are missing. Non-positive GPU frame timing is treated as unavailable.
+
+Methods on `ctx.Profiler`:
+
+- `GetProfilerSummary(name, metric)` retains `SampleCount`, `Average`, `P95`, `Max`, `Last`, `Available`, `Error`. `Statistics` adds missing count, min, median, p90, p99, population standard deviation, first and last values, and `Delta = last - first`.
+- `GetProfilerSamples(name, metric, offset, count)` returns nullable observations with frame/timing metadata; default count 600, cap 60000.
+- `GetProfilerBudget(name, metric, threshold)` reports observations strictly above the budget and their percentage among valid samples.
+- `CompareProfilers(baseline, candidate, metric)` reports candidate minus baseline average/p95/max and percentage changes. Incompatible definitions or missing data produce errors; zero baselines have no percentage change.
+- `IsProfilerStopped`, `StopProfiler`, `TryGetProfilerLastValue(name, metric, out value)` support scenario control.
+
+Percentiles use nearest rank and exclude missing/non-finite observations. No-data statistics are `null` in JSON. Memory `Delta` is net change, not proof of a leak. CPU waits may be pacing, synchronization or GPU backpressure; do not add overlapping main/render/job durations or equate a rendering wait with GPU duration.
+
+## Spikes and frame hierarchy
+
+Start with `CaptureHierarchy = true`. Between awaits or in state updates:
+
+```csharp
+var p = ctx.Profiler;
+if (p.RecordProfilerSpikeTop("baseline", "main_thread_ms", 30, "slow", 5)) {
+    int frame = p.GetProfilerLastSpikeFrame("baseline", "main_thread_ms");
+    if (frame >= 0) p.SaveProfilerFrame("slow_" + frame, frame,
+        new Locus.LocusBridge.ProfilerFrameOptions {
+            ThreadName = "Main Thread", SortBy = "self_ms", TopCount = 80
+        }, inlineRows: 0);
 }
 ```
 
-`RecordProfilerSpikeTop` keeps the highest spike records for a metric/label pair and returns `true` when a new saved record was added or replaced. Use the final JSON files for full rows; use `inlineRows=0` or a small value when saving many spike frames.
+Spikes retain observation metadata; repeated checks do not duplicate the observation. Top-N retains the highest values for each metric/label. `GetProfilerSpikes` returns retained records. The legacy spelling `ctx.RecordProfilerSpikeTop` remains available.
 
-Available helper surface:
+`GetProfilerThreads(frame)` lists names/groups/indices/IDs. `GetProfilerFrame(frame, options)` returns CPU rows in memory. Options select `ThreadName` or concrete `ThreadIndex`, `SortBy` (`total_ms`, `self_ms`, `gc_bytes`, `calls`), `NameContains` (path substring), and `TopCount` (0–512). Missing threads produce errors, not another thread's rows. Frame metadata includes GPU duration when available; row durations remain **CPU** durations.
 
-- `ctx.StartProfiler(name)` and `ctx.StartProfiler(name, metrics)`.
-- `ctx.StopProfiler(name)`.
-- `ctx.PrintProfilerSummary(name)`.
-- `ctx.SaveProfiler(name)`.
-- `ctx.TryGetProfilerLastValue(profilerName, metricName, out value)`.
-- `ctx.GetProfilerLastValue(profilerName, metricName)`.
-- `ctx.GetProfilerSummary(profilerName, metricName)`.
-- `ctx.RecordProfilerSpike(profilerName, metricName, threshold, label)`.
-- `ctx.RecordProfilerSpikeTop(profilerName, metricName, threshold, label, maxSpikes)` to keep only the strongest records for that metric and label.
-- `ctx.GetProfilerLastSpikeFrame(profilerName, metricName)`.
-- `ctx.GetProfilerSpikes(profilerName)`.
-- `ctx.LatestProfilerFrameIndex()`.
-- `ctx.SaveProfilerFrame(name, threadName, topCount)` for the latest profiler frame.
-- `ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount)` for a specific profiler frame.
-- `ctx.SaveProfilerFrame(name, threadName, topCount, inlineRows)` and `ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount, inlineRows)` to separate saved hierarchy rows from printed rows.
+Legacy exports remain supported: `ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount)` and `ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount, inlineRows)`. Overloads without the index use the latest buffered frame.
 
-If a metric is unavailable in the current Unity version or scene state, the profiler summary will mark that metric unavailable. Use direct Unity profiling APIs in `unity_run_states` or `unity_execute` only when the helper output is too coarse.
+Unity frames, tool ticks and Profiler indices are different clocks. A sampled row records the latest available Profiler frame as a **candidate**, not guaranteed exact attribution; GPU data can arrive later. Inspect adjacent frames and verify the marker before attributing a spike. Buffers roll over: save promptly. Use the local Editor target; switching targets invalidates frame association. Do not sum hierarchy total-time rows because parent values include children.
 
-## Overall profile data
+## GPU timing and memory snapshots
 
-For an initial profile pass, capture a compact default set:
+Combine render counters, the GPU frame counter, GPU-capable marker recorders and frame metadata. Use the graphics debugger skill for render-pass/resource/overdraw investigation beyond timing counters.
 
-- `Main Thread` time in ms.
-- `Render Thread` time in ms when available.
-- `GC.Alloc` bytes per frame.
-- `GC Reserved Memory` in MB.
-- `System Used Memory` or total used memory in MB.
-- `Batches Count`, `SetPass Calls Count`, `Triangles Count`, and `Vertices Count` for rendering issues.
-- Physics processing markers for simulation issues.
-
-Prefer recording 120 to 600 frames depending on the symptom. Short bursts are useful for spike capture; longer windows are useful for p95 and trend analysis.
-
-## Specific marker data
-
-To capture a specific marker:
-
-1. Find the exact marker or counter name.
-2. Confirm the category when possible.
-3. Start a recording immediately before the relevant behavior.
-4. Stop after the behavior ends.
-5. Print summary and save raw samples.
-
-Examples of useful marker groups:
-
-- Script update: `BehaviourUpdate`, `Update.ScriptRunBehaviourUpdate`, `PreLateUpdate.ScriptRunBehaviourLateUpdate`.
-- GC: `GC.Alloc`, `GC.Collect`, GC reserved or used memory counters.
-- Rendering waits: `WaitForTargetFPS`, `Gfx.WaitForPresentOnGfxThread`.
-- Physics: `Physics.Processing`, `Physics.Simulate`.
-- UI: Canvas rebuild, layout, and render markers when available.
-
-Marker names can vary by Unity version, render pipeline, package, and whether the marker has appeared in the current session. Enumerate available metrics when a name fails.
-
-## One-frame hierarchy data
-
-Use one-frame hierarchy export when the user asks for the kind of data shown in Unity Profiler's Hierarchy table:
-
-- Total time.
-- Self time.
-- Calls.
-- GC allocation.
-- Percent of the selected frame.
-- Thread name.
-- Parent/child depth.
-
-This is the right path for questions like "which function took most of frame 191" or "what occupied the spike frame".
-
-`SaveProfilerFrame` reads Unity `HierarchyFrameDataView` and saves sorted top rows with depth and path. `topCount` controls saved JSON rows and is capped at 512. `inlineRows` controls printed rows only and defaults to 8. `Time.frameCount`, the `unity_run_states` session frame, and the Unity Profiler frame index are separate values. The helpers store all three where available so saved samples, spike records, and hierarchy exports can be matched.
-
-## When to modify project C# scripts
-
-Modify project C# scripts only when the profiler data is too coarse to identify a business-system cause.
-
-Add custom markers when:
-
-- The hot row is only `BehaviourUpdate` or `ScriptRunBehaviourUpdate`.
-- Several systems run inside the same `Update`, coroutine, async continuation, or callback.
-- The analysis needs business context such as wave id, inventory item count, enemy count, scene phase, or asset id.
-- The same performance question is likely to be repeated.
-
-Use stable marker names:
+For CPU/GPU/present-wait records and dynamic resolution scale:
 
 ```csharp
-using Unity.Profiling;
-
-static readonly ProfilerMarker SpawnWaveMarker =
-    new ProfilerMarker("Combat.SpawnWave");
-
-void SpawnWave()
-{
-    using (SpawnWaveMarker.Auto())
-    {
-        // spawn logic
-    }
-}
+if (ctx.Profiler.CaptureFrameTimings()) {
+    await ctx.WaitFrames(8);
+    printJson(ctx.Profiler.GetFrameTimings(4));
+} else print("Frame Timing Stats is disabled or unsupported.");
 ```
 
-Prefer names like `Combat.SpawnWave`, `AI.Navigation.Tick`, `Inventory.Rebuild`, or `UI.Hud.Refresh`. Keep marker scopes around meaningful work, not around every tiny line.
+Frame Timing Manager requires platform support and Frame Timing Stats configuration. The helper does not change Player settings. Records preserve timestamps for deduplication. GPU data may remain missing/delayed when CPU data is available.
 
-## Output expectations
+For retained/native/managed memory investigation, take snapshots separately from timing measurements:
 
-A profiler summary should be concise:
-
-```text
-profiler baseline
-sample_rows=300 frame_span=299 unity_frame_span=299 duration_ms=5120
-main_thread_ms samples=300 avg=12.4 p95=18.9 max=31.6 last=11.8 unit=ms
-gc_alloc_bytes samples=300 avg=384 p95=2048 max=8192 last=0 unit=bytes
-spikes=1
-profiler_file: F:\Project\Library\Locus\RunStates\profiler-baseline.csv
-profiler_summary_file: F:\Project\Library\Locus\RunStates\profiler-baseline-summary.json
+```csharp
+string snapshot = await ctx.Profiler.SaveMemorySnapshotAsync("after_load", cancellationToken);
+print(snapshot);
 ```
 
-`sample_rows` is the number of CSV sample rows. `frame_span` and `unity_frame_span` are the distance between the saved start and end frame numbers, so they can be one lower than `sample_rows` when sampling includes both boundary ticks.
+This saves `.snap` for Unity Memory Profiler. Select the local Editor target in the Profiler; the helper rejects a non-Editor target instead of taking a Player snapshot. Use `includeNativeAllocations: true` for allocation detail. Snapshot capture is intrusive; stop timing capture first. Cancellation ends the wait, but Unity's native operation may still finish writing. Snapshot requests are serialized. The helper does not automatically analyze retained-object graphs.
 
-A frame hierarchy export should be similarly compact:
+## Saved data
 
-```text
-profiler_frame main_thread_spike
-frame=191 session_frame=126 unity_frame=845 thread="Main Thread" thread_matched=true cpu_ms=33.42 rows=80 inline_rows=2
-depth=1 name="PlayerLoop" total_ms=32.99 self_ms=0.05 calls=3 gc_bytes=2867 pct=98.7
-depth=3 name="Update.ScriptRunBehaviourUpdate" total_ms=18.1 self_ms=0.2 calls=1 gc_bytes=2048 pct=54.2
-rows_truncated=78
-profiler_frame_file: F:\Project\Library\Locus\RunStates\profiler-frame-main-thread-spike.json
-```
-
-`SaveProfiler` writes per-frame samples as `locus.profiler.samples_csv.v1` CSV:
+`SaveProfiler(name)` stops the capture, saves full-precision `locus.profiler.samples_csv.v1` CSV and `locus.profiler.summary.v1` JSON under `Library/Locus/RunStates`, prints `profiler_file` / `profiler_summary_file`, and returns the CSV path.
 
 ```csv
-sample_index,session_frame,unity_time_frame_count,profiler_frame_index,elapsed_ms,main_thread_ms,gc_alloc_bytes
-0,1,546,190,16,11.2,0
-1,2,547,191,33,12.4,384
+sample_index,session_frame,unity_time_frame_count,profiler_frame_index,elapsed_ms,main_thread_ms,gpu_frame_ms
+0,31,546,190,517,11.2,
+1,32,547,191,534,12.4,8.6
 ```
 
-The CSV is the primary `profiler_file` output. Each row is one `unity_run_states` sampling tick. `unity_time_frame_count` and `profiler_frame_index` let readers map sampled metric rows back to Unity runtime frames and Profiler hierarchy frames. Metric units and availability are stored in the summary JSON.
+Empty cells mean missing, not zero. Summary JSON includes definitions, units, source/options, availability/statistics/spikes, Unity version, graphics API, Editor/Play Mode, sample policy and stop reason. `sample_rows` counts rows; spans are boundary distances and need not equal row count. Frame JSON retains `locus.profiler.frame_hierarchy.v1` with added filter/sort/GPU metadata.
 
-`SaveProfiler` also writes `locus.profiler.summary.v1` JSON:
+## Unity 6.5
 
-```json
-{
-  "schema": "locus.profiler.summary.v1",
-  "name": "baseline",
-  "start": { "session_frame": 1, "unity_time_frame_count": 546 },
-  "end": { "session_frame": 300, "unity_time_frame_count": 845 },
-  "duration_ms": 5120,
-  "sample_policy": {
-    "clock": "unity_run_states_tick",
-    "sample_rows": 300,
-    "session_frame_span": 299,
-    "unity_frame_span": 299,
-    "distinct_unity_frames": 300,
-    "distinct_profiler_frames": 300
-  },
-  "samples_csv": {
-    "schema": "locus.profiler.samples_csv.v1",
-    "path": "F:\\Project\\Library\\Locus\\RunStates\\profiler-baseline.csv"
-  },
-  "metrics": [
-    {
-      "name": "main_thread_ms",
-      "category": "Internal",
-      "marker": "Main Thread",
-      "scale": 0.000001,
-      "unit": "ms",
-      "available": true,
-      "error": "",
-      "summary": { "sample_count": 300, "avg": 12.4, "p95": 18.9, "max": 31.6, "last": 11.8 }
-    }
-  ],
-  "spikes": [
-    {
-      "label": "main_thread_spike",
-      "metric": "main_thread_ms",
-      "threshold": 30,
-      "value": 31.6,
-      "session_frame": 126,
-      "unity_time_frame_count": 671,
-      "profiler_frame_index": 191
-    }
-  ]
-}
-```
+Unity 6.5 adds a 2D Profiler module for sprites/atlas usage, an experimental USS Stats Profiler, and Profiler AI integration. UI features do not imply public recorder APIs for every detail: discover exposed 2D metrics and use Unity's specific tools for atlas/USS detail absent from the catalog. Ordinary counter sampling does not require Unity Assistant or the Memory Profiler package.
 
-`SaveProfilerFrame` writes `locus.profiler.frame_hierarchy.v1` JSON:
-
-```json
-{
-  "schema": "locus.profiler.frame_hierarchy.v1",
-  "name": "main_thread_spike",
-  "frame": {
-    "profiler_frame_index": 191,
-    "session_frame": 126,
-    "exported_at_unity_time_frame_count": 672,
-    "frame_time_ms": 33.42,
-    "frame_fps": 29.9
-  },
-  "thread": {
-    "requested": "Main Thread",
-    "name": "Main Thread",
-    "group": "Main Thread",
-    "index": 0,
-    "id": 1,
-    "matched": true
-  },
-  "top_count": 40,
-  "sort": { "column": "total_ms", "descending": true },
-  "error": "",
-  "rows": [
-    {
-      "depth": 1,
-      "name": "PlayerLoop",
-      "path": "PlayerLoop",
-      "total_ms": 32.99,
-      "self_ms": 0.05,
-      "total_pct": 98.7,
-      "self_pct": 0.1,
-      "calls": 3,
-      "gc_bytes": 2867,
-      "warning_count": 0
-    }
-  ]
-}
-```
-
-Save per-frame sample data to CSV and hierarchy data to JSON when sample count or hierarchy depth is high.
-
-## Pitfalls
-
-- Deep Profile can significantly distort timings. Use it only for short, targeted diagnosis.
-- Editor overhead appears in Play Mode profiling. Compare similar conditions and avoid over-reading single-frame noise.
-- Some counters are unavailable until the marker appears or the relevant module is active.
-- Unity Profiler keeps a rolling frame buffer. Save hierarchy JSON soon after a spike is detected, and keep `inlineRows` small to avoid oversized tool output.
-- `LastValue` style sampling is good for trends; hierarchy export is better for a single frame's time distribution.
-- GC allocation spikes need both size and call source. Use call stacks or custom markers when the allocation source matters.
+Sources: [Unity 6.5 changes](https://docs.unity3d.com/6000.5/Documentation/Manual/WhatsNewUnity65.html), [ProfilerRecorder](https://docs.unity3d.com/6000.5/Documentation/ScriptReference/Unity.Profiling.ProfilerRecorder.html), [metric discovery](https://docs.unity3d.com/6000.5/Documentation/ScriptReference/Unity.Profiling.LowLevel.Unsafe.ProfilerRecorderHandle.GetAvailable.html), [Frame Timing Manager](https://docs.unity3d.com/6000.5/Documentation/ScriptReference/FrameTimingManager.html).

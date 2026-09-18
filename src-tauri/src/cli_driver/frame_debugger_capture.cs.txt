@@ -1,0 +1,14 @@
+var watch = System.Diagnostics.Stopwatch.StartNew();
+try {
+    var capture = await Locus.Skills.FrameDebuggerApi.CaptureAsync(5000, cancellationToken);
+    print("FD_CAPTURE:" + watch.ElapsedMilliseconds + ":" + Locus.Skills.FrameDebuggerApi.Json(capture));
+} catch (System.Exception ex) { print("FD_CAPTURE_ERROR:" + watch.ElapsedMilliseconds + ":" + ex); }
+var status = Locus.Skills.FrameDebuggerApi.Status();
+print("FD_CAPTURE_STATE:" + Locus.Skills.FrameDebuggerApi.Json(status));
+if (status.Enabled && status.Count > 0) print("FD_CAPTURE_HAS_EVENTS");
+if (status.Enabled && status.Count > 0) {
+    watch.Restart();
+    await ctx.WaitUntil(() => UnityEngine.FrameDebugger.enabled && Locus.Skills.FrameDebuggerApi.Status().Count > 0);
+    print("FD_LOCAL_READY_CONTROL_MS:" + watch.ElapsedMilliseconds);
+}
+print("FD_CAPTURE_RETURNED");

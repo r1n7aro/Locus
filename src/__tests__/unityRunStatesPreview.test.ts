@@ -166,12 +166,12 @@ describe("unityRunStatesPreview", () => {
     expect(runStatesBridge).toContain("session_frame_span");
     expect(runStatesBridge).toContain("inline_rows=");
     expect(runStatesBridge).toContain("value.ToString(\"G17\"");
-    expect(runStatesBridge).toContain("profiler_summary_file");
+    expect(read("locus_unity/Editor/LocusBridge.Profiler.cs")).toContain("profiler_summary_file");
     expect(profilerSkill).toContain("locus.profiler.samples_csv.v1");
     expect(profilerSkill).toContain("locus.profiler.summary.v1");
     expect(profilerSkill).toContain("sample_index,session_frame,unity_time_frame_count,profiler_frame_index,elapsed_ms");
-    expect(profilerSkill).toContain("sample_rows=300 frame_span=299 unity_frame_span=299");
-    expect(profilerSkill).toContain("\"sample_rows\": 300");
+    expect(profilerSkill).toContain("sample_rows");
+    expect(profilerSkill).toContain("missing");
     expect(profilerSkill).toContain("ctx.RecordProfilerSpikeTop");
     expect(profilerSkill).toContain("ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount)");
     expect(profilerSkill).toContain("ctx.SaveProfilerFrame(name, profilerFrameIndex, threadName, topCount, inlineRows)");

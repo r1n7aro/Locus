@@ -49,6 +49,17 @@ namespace Locus.Json
             return value == null ? default(T) : (T)value;
         }
 
+        /// <summary>
+        /// Encodes trusted transport DTOs as JSON values, including repeated arrays
+        /// and metadata by value. Unlike Serialize's object-graph projection, this
+        /// format roundtrips through Deserialize and contains no $id/$ref envelopes.
+        /// Callers must supply DTOs, never arbitrary Unity objects or user getters.
+        /// </summary>
+        public static string SerializeData(object value)
+        {
+            return JsonConvert.SerializeObject(value, Formatting.None, DeserializeSettings);
+        }
+
         public static string Serialize(object value)
         {
             GraphPlan plan = GraphPlan.Build(value);

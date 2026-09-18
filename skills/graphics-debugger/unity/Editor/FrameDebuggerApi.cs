@@ -54,9 +54,19 @@ namespace Locus.Skills
             return FrameDebuggerRuntime.Select(index);
         }
 
+        [Obsolete("Use await FrameDebuggerApi.EventAsync(index, ...) when selecting an event. Event only reads data already available to the Editor.")]
         public static FrameEventDetail Event(int index, FrameEventOptions options = null)
         {
             return FrameDebuggerRuntime.Event(index, options ?? new FrameEventOptions());
+        }
+
+        public static Task<FrameEventDetail> EventAsync(
+            int index,
+            FrameEventOptions options = null,
+            int timeoutMs = 5000,
+            CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return FrameDebuggerRuntime.EventAsync(index, options ?? new FrameEventOptions(), timeoutMs, cancellationToken);
         }
 
         public static Task<FrameTextureExportResult> ExportRenderTargetAsync(
@@ -102,6 +112,7 @@ namespace Locus.Skills
 
     public sealed class FrameTextureExportOptions
     {
+        public int TimeoutMs { get; set; } = 5000;
         public FrameTextureFormat Format { get; set; } = FrameTextureFormat.Png;
         public string OutputDirectory { get; set; }
         public string FileName { get; set; }
@@ -116,6 +127,7 @@ namespace Locus.Skills
     public sealed class FrameDebuggerStatus
     {
         public bool Enabled { get; internal set; }
+        public bool Remote { get; internal set; }
         public bool LocallySupported { get; internal set; }
         public bool ReceivingRemoteData { get; internal set; }
         public int Count { get; internal set; }
@@ -225,6 +237,9 @@ namespace Locus.Skills
 
     internal static class FrameDebuggerRuntime
     {
+        private static readonly SemaphoreSlim SelectionGate = new SemaphoreSlim(1, 1);
+        private static int _captureRevision;
+
         internal static FrameDebuggerStatus Status()
         {
             FrameDebuggerReflection.EnsureAvailable();
@@ -232,8 +247,10 @@ namespace Locus.Skills
             return new FrameDebuggerStatus
             {
                 Enabled = UnityEngine.FrameDebugger.enabled,
+                Remote = FrameDebuggerReflection.IsRemoteEnabled(),
                 LocallySupported = FrameDebuggerReflection.BoolProperty("locallySupported", false),
-                ReceivingRemoteData = FrameDebuggerReflection.BoolProperty("receivingRemoteFrameEventData", false),
+                ReceivingRemoteData = FrameDebuggerReflection.IsRemoteEnabled()
+                    && FrameDebuggerReflection.BoolProperty("receivingRemoteFrameEventData", false),
                 Count = FrameDebuggerReflection.IntProperty("count", 0),
                 SelectedIndex = limit <= 0 ? -1 : limit - 1,
                 EventsHash = FrameDebuggerReflection.IntProperty("eventsHash", 0),
@@ -250,6 +267,7 @@ namespace Locus.Skills
             FrameDebuggerReflection.EnsureAvailable();
             if (UnityEngine.FrameDebugger.enabled)
                 return Status();
+            _captureRevision++;
             if (!remotePlayerId.HasValue && !FrameDebuggerReflection.BoolProperty("locallySupported", false))
                 throw new InvalidOperationException("Unity reports that local Frame Debugger capture is unsupported for the current graphics device.");
             EnsurePlayModeView();
@@ -267,6 +285,7 @@ namespace Locus.Skills
         internal static FrameDebuggerStatus Disable()
         {
             FrameDebuggerReflection.EnsureAvailable();
+            _captureRevision++;
             if (UnityEngine.FrameDebugger.enabled)
             {
                 if (!FrameDebuggerReflection.TryDisableWithBuiltInWindow())
@@ -285,21 +304,38 @@ namespace Locus.Skills
             int timeoutMs,
             CancellationToken cancellationToken)
         {
-            timeoutMs = Math.Max(100, Math.Min(60000, timeoutMs));
-            Enable(null);
-            double deadline = EditorApplication.timeSinceStartup + timeoutMs / 1000.0;
-            await WaitUntilAsync(
-                delegate
-                {
-                    RepaintRenderingViews();
-                    return UnityEngine.FrameDebugger.enabled
-                        && FrameDebuggerReflection.IntProperty("count", 0) > 0
-                        && !FrameDebuggerReflection.BoolProperty("receivingRemoteFrameEventData", false);
-                },
-                deadline,
-                cancellationToken,
-                "Timed out waiting for Unity Frame Debugger events.");
-            return Status();
+            cancellationToken.ThrowIfCancellationRequested();
+            double deadline = Deadline(timeoutMs);
+            await EnterSelectionAsync(deadline, cancellationToken);
+            bool wasEnabled = UnityEngine.FrameDebugger.enabled;
+            int revision = wasEnabled ? _captureRevision : _captureRevision + 1;
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Enable(null);
+                revision = _captureRevision;
+                await WaitUntilAsync(
+                    delegate
+                    {
+                        RequireCaptureRevision(revision);
+                        RepaintRenderingViews();
+                        bool remote = FrameDebuggerReflection.IsRemoteEnabled();
+                        return FrameDebuggerReflection.IntProperty("count", 0) > 0
+                            && (!remote || !FrameDebuggerReflection.BoolProperty("receivingRemoteFrameEventData", false))
+                            && (remote || !FrameDebuggerReflection.IsWindowInitializing());
+                    },
+                    deadline, cancellationToken,
+                    "Timed out waiting for Unity Frame Debugger events.");
+                return Status();
+            }
+            catch
+            {
+                // Release only the capture this call enabled. Keep Play Mode paused.
+                if (!wasEnabled && revision == _captureRevision)
+                    Disable();
+                throw;
+            }
+            finally { SelectionGate.Release(); }
         }
 
         internal static FrameEventList Events(FrameEventQuery query)
@@ -332,22 +368,45 @@ namespace Locus.Skills
 
         internal static FrameEventSummary Select(int index)
         {
-            RequireCapturedFrame();
-            Array events = FrameDebuggerReflection.Events();
-            ValidateEventIndex(index, events.Length);
-            FrameDebuggerReflection.SetProperty("limit", index + 1);
-            SceneView.RepaintAll();
-            return Summary(events, index);
+            RequireSelectionIdle();
+            return SelectCore(index);
         }
 
-        internal static FrameEventDetail Event(int index, FrameEventOptions options)
+        private static FrameEventSummary SelectCore(int index)
         {
             RequireCapturedFrame();
             Array events = FrameDebuggerReflection.Events();
             ValidateEventIndex(index, events.Length);
             FrameDebuggerReflection.SetProperty("limit", index + 1);
+            RepaintRenderingViews();
+            return Summary(events, index);
+        }
+
+        internal static FrameEventDetail Event(int index, FrameEventOptions options)
+        {
+            RequireSelectionIdle();
+            FrameEventSummary summary = SelectCore(index);
             object data = FrameDebuggerReflection.EventData(index);
-            FrameEventSummary summary = Summary(events, index);
+            return DescribeEvent(index, options, summary, data);
+        }
+
+        internal static async Task<FrameEventDetail> EventAsync(
+            int index, FrameEventOptions options, int timeoutMs, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            double deadline = Deadline(timeoutMs);
+            await EnterSelectionAsync(deadline, cancellationToken);
+            try
+            {
+                FrameEventSummary summary = SelectCore(index);
+                object data = await WaitForEventDataAsync(index, null, deadline, cancellationToken);
+                return DescribeEvent(index, options, summary, data);
+            }
+            finally { SelectionGate.Release(); }
+        }
+
+        private static FrameEventDetail DescribeEvent(int index, FrameEventOptions options, FrameEventSummary summary, object data)
+        {
             FrameEventDetail detail = new FrameEventDetail
             {
                 Index = index,
@@ -407,10 +466,20 @@ namespace Locus.Skills
             FrameTextureExportOptions options,
             CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            double deadline = Deadline(options.TimeoutMs);
+            await EnterSelectionAsync(deadline, cancellationToken);
+            try { return await ExportRenderTargetCoreAsync(index, options, deadline, cancellationToken); }
+            finally { SelectionGate.Release(); }
+        }
+
+        private static async Task<FrameTextureExportResult> ExportRenderTargetCoreAsync(
+            int index, FrameTextureExportOptions options, double deadline, CancellationToken cancellationToken)
+        {
             RequireCapturedFrame();
             if (options.WhiteLevel <= options.BlackLevel)
                 throw new ArgumentException("WhiteLevel must be greater than BlackLevel.");
-            Select(index);
+            SelectCore(index);
             Vector4 channels = Channels(options.Channels);
             FrameDebuggerReflection.Invoke(
                 "SetRenderTargetDisplayOptions",
@@ -418,8 +487,8 @@ namespace Locus.Skills
                 channels,
                 options.BlackLevel,
                 options.WhiteLevel);
-            await WaitEditorUpdatesAsync(2, cancellationToken);
-            object data = FrameDebuggerReflection.EventData(index);
+            object data = await WaitForEventDataAsync(index, options.RenderTargetIndex, deadline, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             RenderTexture source = FrameDebuggerReflection.Field(data, "m_RenderTargetRenderTexture") as RenderTexture;
             FrameRenderTargetInfo sourceInfo = RenderTarget(data);
             if (source == null)
@@ -675,66 +744,106 @@ namespace Locus.Skills
             return value;
         }
 
+        private static double Deadline(int timeoutMs)
+        {
+            return EditorApplication.timeSinceStartup + Math.Max(100, Math.Min(60000, timeoutMs)) / 1000.0;
+        }
+
+        private static int RemainingMilliseconds(double deadline)
+        {
+            return Math.Max(0, (int)Math.Ceiling((deadline - EditorApplication.timeSinceStartup) * 1000));
+        }
+
+        private static async Task EnterSelectionAsync(double deadline, CancellationToken cancellationToken)
+        {
+            if (!await SelectionGate.WaitAsync(RemainingMilliseconds(deadline), cancellationToken))
+                throw new TimeoutException("Timed out waiting for the current Frame Debugger operation.");
+        }
+
+        private static void RequireSelectionIdle()
+        {
+            if (SelectionGate.CurrentCount == 0)
+                throw new InvalidOperationException("A Frame Debugger operation is in progress. Await EventAsync() to read events in sequence.");
+        }
+
+        private static void RequireCaptureRevision(int revision)
+        {
+            if (revision != _captureRevision || !UnityEngine.FrameDebugger.enabled)
+                throw new InvalidOperationException("Frame Debugger capture was disabled or replaced while waiting for data.");
+        }
+
+        private static async Task<object> WaitForEventDataAsync(
+            int index, int? renderTargetIndex, double deadline, CancellationToken cancellationToken)
+        {
+            int revision = _captureRevision;
+            int eventsHash = FrameDebuggerReflection.IntProperty("eventsHash", 0);
+            Action validate = delegate
+            {
+                RequireCaptureRevision(revision);
+                if (FrameDebuggerReflection.IntProperty("eventsHash", 0) != eventsHash)
+                    throw new InvalidOperationException("The captured frame changed while reading event " + index + ". Capture the frame again.");
+                if (FrameDebuggerReflection.IntProperty("limit", 0) != index + 1)
+                    throw new InvalidOperationException("Frame Debugger selection changed while reading event " + index + ". Retry EventAsync().");
+            };
+            object data = null;
+            await WaitUntilAsync(
+                delegate
+                {
+                    validate();
+                    RepaintRenderingViews();
+                    object candidate;
+                    if (!FrameDebuggerReflection.TryEventData(index, out candidate)) return false;
+                    if (renderTargetIndex.HasValue && Int(candidate, "m_RTDisplayIndex") != renderTargetIndex.Value)
+                        return false;
+                    data = candidate;
+                    return true;
+                },
+                deadline, cancellationToken,
+                "Timed out waiting for Frame Debugger data for event " + index + ".",
+                false);
+            validate();
+            return data;
+        }
+
         private static async Task WaitUntilAsync(
             Func<bool> predicate,
             double deadline,
             CancellationToken cancellationToken,
-            string timeoutMessage)
+            string timeoutMessage,
+            bool checkImmediately = true)
         {
-            TaskCompletionSource<bool> source = new TaskCompletionSource<bool>();
+            cancellationToken.ThrowIfCancellationRequested();
+            var source = new TaskCompletionSource<bool>();
             EditorApplication.CallbackFunction callback = null;
-            CancellationTokenRegistration registration = default(CancellationTokenRegistration);
             callback = delegate
             {
+                if (source.Task.IsCompleted) return;
                 try
                 {
                     if (cancellationToken.IsCancellationRequested)
-                    {
-                        EditorApplication.update -= callback;
                         source.TrySetCanceled();
-                    }
-                    else if (predicate())
-                    {
-                        EditorApplication.update -= callback;
-                        source.TrySetResult(true);
-                    }
                     else if (EditorApplication.timeSinceStartup >= deadline)
-                    {
-                        EditorApplication.update -= callback;
                         source.TrySetException(new TimeoutException(timeoutMessage));
-                    }
+                    else if (predicate())
+                        source.TrySetResult(true);
                 }
-                catch (Exception exception)
-                {
-                    EditorApplication.update -= callback;
-                    source.TrySetException(exception);
-                }
+                catch (Exception exception) { source.TrySetException(exception); }
             };
-            if (cancellationToken.CanBeCanceled)
+            using (var timeout = new CancellationTokenSource())
+            using (cancellationToken.Register(() => source.TrySetCanceled()))
+            using (timeout.Token.Register(() => source.TrySetException(new TimeoutException(timeoutMessage))))
             {
-                registration = cancellationToken.Register(delegate
+                timeout.CancelAfter(RemainingMilliseconds(deadline));
+                EditorApplication.update += callback;
+                try
                 {
-                    EditorApplication.delayCall += delegate
-                    {
-                        EditorApplication.update -= callback;
-                        source.TrySetCanceled();
-                    };
-                });
+                    if (checkImmediately) callback();
+                    await source.Task;
+                }
+                // Timer/cancellation callbacks only settle the task. Unity API cleanup
+                // happens on the captured Editor context, never on a timer thread.
+                finally { EditorApplication.update -= callback; }
             }
-            EditorApplication.update += callback;
-            callback();
-            try { await source.Task; }
-            finally { registration.Dispose(); }
-        }
-
-        private static async Task WaitEditorUpdatesAsync(int count, CancellationToken cancellationToken)
-        {
-            int remaining = Math.Max(1, count);
-            await WaitUntilAsync(
-                delegate { return --remaining <= 0; },
-                EditorApplication.timeSinceStartup + 5.0,
-                cancellationToken,
-                "Timed out waiting for Frame Debugger Render Target update.");
         }
 
         private static void EnsurePlayModeView()
@@ -762,7 +871,8 @@ namespace Locus.Skills
                     continue;
                 string name = window.GetType().Name;
                 if (name.IndexOf("GameView", StringComparison.OrdinalIgnoreCase) >= 0
-                    || name.IndexOf("PlayModeView", StringComparison.OrdinalIgnoreCase) >= 0)
+                    || name.IndexOf("PlayModeView", StringComparison.OrdinalIgnoreCase) >= 0
+                    || name.IndexOf("FrameDebugger", StringComparison.OrdinalIgnoreCase) >= 0)
                     window.Repaint();
             }
         }
@@ -916,11 +1026,13 @@ namespace Locus.Skills
         {
             if (_utilityType != null)
                 return;
-            _utilityType = FindType("UnityEditorInternal.FrameDebuggerInternal.FrameDebuggerUtility");
-            _eventDataType = FindType("UnityEditorInternal.FrameDebuggerInternal.FrameDebuggerEventData");
-            _helperType = FindType("UnityEditorInternal.FrameDebuggerInternal.FrameDebuggerHelper");
-            if (_utilityType == null || _eventDataType == null)
+            Type utilityType = FindType("UnityEditorInternal.FrameDebuggerInternal.FrameDebuggerUtility");
+            Type eventDataType = FindType("UnityEditorInternal.FrameDebuggerInternal.FrameDebuggerEventData");
+            if (utilityType == null || eventDataType == null)
                 throw new NotSupportedException("Unity Frame Debugger internals were not found. Unity 6000.3 or newer is required.");
+            _utilityType = utilityType;
+            _eventDataType = eventDataType;
+            _helperType = FindType("UnityEditorInternal.FrameDebuggerInternal.FrameDebuggerHelper");
         }
 
         internal static Type FindType(string fullName)
@@ -979,12 +1091,41 @@ namespace Locus.Skills
 
         internal static object EventData(int index)
         {
-            EnsureAvailable();
-            object data = Activator.CreateInstance(_eventDataType, true);
-            object valid = Invoke("GetFrameEventData", index, data);
-            if (valid is bool && !(bool)valid)
-                throw new InvalidOperationException("Unity did not return Frame Debugger data for event " + index + ".");
+            object data;
+            if (!TryEventData(index, out data))
+                throw new InvalidOperationException("Frame Debugger data for event " + index
+                    + " is not ready. Use await FrameDebuggerApi.EventAsync(index, ...) to wait for rendering.");
             return data;
+        }
+
+        internal static bool TryEventData(int index, out object data)
+        {
+            EnsureAvailable();
+            data = Activator.CreateInstance(_eventDataType, true);
+            object valid = Invoke("GetFrameEventData", index, data);
+            if (valid is bool && !(bool)valid) { data = null; return false; }
+            object actualIndex = Field(data, "m_FrameEventIndex");
+            if (actualIndex == null || Convert.ToInt32(actualIndex, CultureInfo.InvariantCulture) != index)
+            { data = null; return false; }
+            return true;
+        }
+
+        internal static bool IsRemoteEnabled()
+        {
+            if (!UnityEngine.FrameDebugger.enabled) return false;
+            MethodInfo method = typeof(UnityEngine.FrameDebugger).GetMethod("IsRemoteEnabled", AllStatic);
+            if (method == null) throw new MissingMethodException("UnityEngine.FrameDebugger", "IsRemoteEnabled");
+            return (bool)method.Invoke(null, null);
+        }
+
+        internal static bool IsWindowInitializing()
+        {
+            Type type = FindType("UnityEditor.FrameDebuggerWindow");
+            if (type == null) return false;
+            PropertyInfo property = type.GetProperty("IsEnablingFrameDebugger", AllInstance);
+            if (property == null) return false;
+            UnityEngine.Object[] windows = Resources.FindObjectsOfTypeAll(type);
+            return windows.Length > 0 && (bool)property.GetValue(windows[0], null);
         }
 
         internal static object Field(object value, string name)

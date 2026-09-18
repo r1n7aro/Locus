@@ -1,0 +1,77 @@
+var locusContext = System.Threading.SynchronizationContext.Current;
+bool nativeBaselineCompleted = UnityEditor.SessionState.GetBool("Locus.FrameDebuggerDriver.NativeTaskDone", false);
+int baselineActiveCount = UnityEditor.SessionState.GetInt("Locus.FrameDebuggerDriver.NativeTaskActiveCount", -1);
+if (nativeBaselineCompleted && baselineActiveCount != 0)
+    throw new System.Exception("The native Task baseline overlapped a Locus invocation");
+print("FD_NATIVE_BASELINE:completed=" + nativeBaselineCompleted + ":activeLocus=" + baselineActiveCount);
+if (nativeBaselineCompleted) print("FD_NATIVE_BASELINE_STACK:" + UnityEditor.SessionState.GetString("Locus.FrameDebuggerDriver.NativeTaskStack", ""));
+int mainThread = System.Threading.Thread.CurrentThread.ManagedThreadId;
+float gameTime = Time.time;
+void CheckLocusThread() {
+    if (System.Threading.Thread.CurrentThread.ManagedThreadId != mainThread)
+        throw new System.Exception("Locus continuation left the Editor thread");
+    if (!object.ReferenceEquals(locusContext, System.Threading.SynchronizationContext.Current))
+        throw new System.Exception("Locus continuation lost its scoped context");
+}
+await System.Threading.Tasks.Task.Yield();
+CheckLocusThread();
+await ctx.WaitFrames(3);
+CheckLocusThread();
+await System.Threading.Tasks.Task.Delay(30, cancellationToken);
+CheckLocusThread();
+int answer = await System.Threading.Tasks.Task.Run(() => 42, cancellationToken);
+CheckLocusThread();
+await System.Threading.Tasks.Task.WhenAll(
+    System.Threading.Tasks.Task.Delay(20, cancellationToken),
+    System.Threading.Tasks.Task.Delay(40, cancellationToken));
+CheckLocusThread();
+await System.Threading.Tasks.Task.Run(() => locusContext.Send(_ => CheckLocusThread(), null), cancellationToken);
+CheckLocusThread();
+using (var cancel = new System.Threading.CancellationTokenSource()) {
+    cancel.CancelAfter(40);
+    bool canceled = false, finalized = false;
+    try { await System.Threading.Tasks.Task.Delay(60000, cancel.Token); }
+    catch (System.OperationCanceledException) { canceled = true; CheckLocusThread(); }
+    finally { finalized = true; CheckLocusThread(); }
+    if (!canceled || !finalized) throw new System.Exception("Task cancellation did not unwind");
+}
+
+// Start outside the Locus scope, from an ordinary Unity callback. This queue
+// owns gameplay continuations too and must not be drained by the Locus runner.
+var producer = new System.Threading.Tasks.TaskCompletionSource<bool>(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);
+System.Threading.Tasks.Task gameOwnedTask = null;
+System.Threading.SynchronizationContext gameContext = null;
+int gameContinuations = 0;
+System.Func<System.Threading.Tasks.Task> gameBody = async () => {
+    gameContext = System.Threading.SynchronizationContext.Current;
+    await producer.Task;
+    System.Threading.Interlocked.Increment(ref gameContinuations);
+};
+EditorApplication.CallbackFunction startGameTask = null;
+startGameTask = () => {
+    EditorApplication.update -= startGameTask;
+    gameOwnedTask = gameBody();
+};
+EditorApplication.update += startGameTask;
+try {
+    await ctx.WaitUntil(() => gameOwnedTask != null);
+    if (gameContext == null || gameContext.GetType().FullName != "UnityEngine.UnitySynchronizationContext")
+        throw new System.Exception("Locus context leaked into the Unity callback: " + gameContext);
+    await System.Threading.Tasks.Task.Run(() => producer.TrySetResult(true), cancellationToken);
+    await System.Threading.Tasks.Task.Delay(300, cancellationToken);
+    CheckLocusThread();
+    if (gameOwnedTask.IsCompleted != nativeBaselineCompleted
+        || gameContinuations != (nativeBaselineCompleted ? 1 : 0))
+        throw new System.Exception("The Unity-owned queue changed behavior while executing Locus tasks");
+    if (!EditorApplication.isPaused || Time.time != gameTime)
+        throw new System.Exception("Gameplay advanced while processing Locus tasks");
+    if (answer != 42) throw new System.Exception("Background task result was lost");
+    print("FD_TASK_ISOLATION:True:gamePending=" + !gameOwnedTask.IsCompleted + ":gameDelta=0");
+    print("FD_TASK_CONTEXT:" + locusContext.GetType().FullName + ":ambient=" + gameContext.GetType().FullName);
+} finally {
+    EditorApplication.update -= startGameTask;
+    producer.TrySetResult(true);
+    UnityEditor.SessionState.EraseBool("Locus.FrameDebuggerDriver.NativeTaskDone");
+    UnityEditor.SessionState.EraseInt("Locus.FrameDebuggerDriver.NativeTaskActiveCount");
+    UnityEditor.SessionState.EraseString("Locus.FrameDebuggerDriver.NativeTaskStack");
+}

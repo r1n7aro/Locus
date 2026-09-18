@@ -31,21 +31,22 @@ tools:
 
 - `Status() -> FrameDebuggerStatus`
 - `CaptureAsync(int timeoutMs = 15000, CancellationToken cancellationToken = default) -> Task<FrameDebuggerStatus>`
-- `Events(FrameEventQuery) -> FrameEventListResult`
-- `Event(int index, FrameEventOptions) -> FrameEventDetail`
-- `Select(int index) -> FrameDebuggerStatus`
+- `Events(FrameEventQuery) -> FrameEventList`
+- `EventAsync(int index, FrameEventOptions options = null, int timeoutMs = 5000, CancellationToken cancellationToken = default) -> Task<FrameEventDetail>`
+- `Select(int index) -> FrameEventSummary`
 - `ExportRenderTargetAsync(int index, FrameTextureExportOptions, CancellationToken) -> Task<FrameTextureExportResult>`
 - `Disable() -> FrameDebuggerStatus`
 - `Json(object) -> string`
 
 捕获 Editor 本地目标时 Play Mode 会暂停在当前帧。事件索引为零基；Unity Frame Debugger 的 event limit 等于 `index + 1`。
+切换事件后使用 `await EventAsync(...)`，等待目标事件的数据就绪。旧的 `Event(...)` 仅即时读取已就绪数据，不会阻塞编辑器等待渲染。异步读取和导出会串行处理选择操作，并支持超时与取消。
 
 ```csharp
 using Locus.Skills;
 
-var capture = await FrameDebuggerApi.CaptureAsync(timeoutMs: 15000);
+var capture = await FrameDebuggerApi.CaptureAsync(timeoutMs: 15000, cancellationToken: cancellationToken);
 var events = FrameDebuggerApi.Events(new FrameEventQuery {
-    TypeContains = "Draw",
+    TypeContains = "Batch",
     MaxEvents = 80
 });
 print(FrameDebuggerApi.Json(new { capture, events.Count, events.Events }));
@@ -55,28 +56,34 @@ print(FrameDebuggerApi.Json(new { capture, events.Count, events.Events }));
 
 ```csharp
 var chosen = events.Events.Count > 0 ? events.Events[events.Events.Count - 1] : null;
-if (chosen == null) throw new Exception("No matching frame event.");
 
-var detail = FrameDebuggerApi.Event(chosen.Index, new FrameEventOptions {
-    IncludeRenderState = true,
-    IncludeShaderProperties = true,
-    MaxShaderProperties = 32
-});
-var exported = await FrameDebuggerApi.ExportRenderTargetAsync(
-    chosen.Index,
-    new FrameTextureExportOptions { Format = FrameTextureFormat.Png });
-print(FrameDebuggerApi.Json(new { chosen, detail, exported }));
+try {
+    if (chosen == null) throw new Exception("No matching frame event.");
+    var detail = await FrameDebuggerApi.EventAsync(chosen.Index, new FrameEventOptions {
+        IncludeRenderState = true,
+        IncludeShaderProperties = true,
+        MaxShaderProperties = 32
+    }, cancellationToken: cancellationToken);
+    var exported = await FrameDebuggerApi.ExportRenderTargetAsync(
+        chosen.Index,
+        new FrameTextureExportOptions { Format = FrameTextureFormat.Png },
+        cancellationToken);
+    print(FrameDebuggerApi.Json(new { chosen, detail, exported }));
+} finally {
+    FrameDebuggerApi.Disable();
+}
 ```
 
 `FrameTextureExportOptions` 支持：
 
 - `Format`：`Png`、`Exr`、`Tga`
+- `TimeoutMs`：等待选择与渲染数据的总时限，默认 `5000`
 - `OutputDirectory`：绝对路径或项目相对路径，默认 `Library/Locus/FrameDebugger`
 - `RenderTargetIndex`：MRT 从 `0` 开始；深度为 `-1`，Stencil 为 `-2`
 - `Channels`：`RGBA`、`RGB`、`R`、`G`、`B`、`A`
 - `BlackLevel`、`WhiteLevel`、`FlipY`、`WriteMetadata`
 
-导出使用 Unity Frame Debugger 的 Render Target 可视化材质处理 backbuffer、MSAA、深度、Cube 与 Texture Array；可用时以 EXR 保留线性/HDR 数据。完成后始终调用 `FrameDebuggerApi.Disable()`。
+导出使用 Unity Frame Debugger 的 Render Target 可视化材质处理 backbuffer、MSAA、深度、Cube 与 Texture Array；可用时以 EXR 保留线性/HDR 数据。完成后始终调用 `FrameDebuggerApi.Disable()`。捕获失败时只清理本次开启的捕获；关闭捕获不会恢复游戏播放。
 
 ### Python 纹理分析
 

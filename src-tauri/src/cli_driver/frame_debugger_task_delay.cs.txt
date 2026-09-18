@@ -1,0 +1,4 @@
+ctx.Progress("FD Task.Delay", "before Task.Delay", 0f);
+print("FD_DELAY_CONTEXT:" + System.Threading.SynchronizationContext.Current?.GetType().FullName);
+await System.Threading.Tasks.Task.Delay(150, cancellationToken);
+print("FD_MANUAL_ASYNC:" + EditorApplication.isPaused);
