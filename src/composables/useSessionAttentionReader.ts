@@ -1,21 +1,11 @@
 import { watch, watchPostEffect } from "vue";
-import { isSessionUnread, markSessionAttentionRead, sessionAttention, type SessionAttentionEntry } from "../services/sessionAttention";
+import { isSessionUnread, markSessionAttentionRead, sessionAttention } from "../services/sessionAttention";
 
-export function sessionResultIsVisible(scrollElement: HTMLElement | null, messageId: string | undefined): boolean {
-  if (!scrollElement || !messageId) return false;
-  const viewport = scrollElement.getBoundingClientRect();
-  return Array.from(scrollElement.querySelectorAll<HTMLElement>("[data-chat-message-id]")).some((element) => {
-    if (element.dataset.chatMessageId !== messageId) return false;
-    const bounds = element.getBoundingClientRect();
-    return bounds.width > 0 && bounds.height > 0 && bounds.bottom > viewport.top && bounds.top < viewport.bottom;
-  });
-}
-
-/** Mounted/selected is not read: the rendered result must be visible in a focused window. */
+/** Read the loaded, active session in a focused window, regardless of its scroll position. */
 export function useSessionAttentionReader(
   sessionId: () => string | null | undefined,
   scrollElement: () => HTMLElement | null,
-  resultRendered: (entry: SessionAttentionEntry) => boolean,
+  canReadSession: () => boolean,
 ): void {
   const saving = new Set<string>();
   function check() {
@@ -24,11 +14,11 @@ export function useSessionAttentionReader(
     const doc = element?.ownerDocument;
     const entry = id ? sessionAttention.value.sessions[id] : undefined;
     if (!id || !entry || !isSessionUnread(id)) return;
-    // Track render readiness even while focus or scroll position prevents reading.
-    const rendered = resultRendered(entry);
-    if (!element || !doc?.hasFocus()
+    // Track tab activation and loading even while the window is unfocused.
+    const ready = canReadSession();
+    if (!ready || !element || !doc?.hasFocus()
       || doc.visibilityState !== "visible" || !element.getClientRects().length || element.clientHeight <= 0
-      || element.scrollHeight - element.scrollTop - element.clientHeight > 32 || !rendered) return;
+    ) return;
     const key = `${id}:${entry.sequence}`;
     if (saving.has(key)) return;
     saving.add(key);
@@ -42,8 +32,8 @@ export function useSessionAttentionReader(
     if (!element) return;
     const doc = element.ownerDocument;
     const ownerWindow = doc.defaultView;
-    element.addEventListener("scroll", check, { passive: true });
     doc.addEventListener("visibilitychange", check);
+    doc.addEventListener("focusin", check);
     ownerWindow?.addEventListener("focus", check);
     const resize = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(check);
     resize?.observe(element);
@@ -51,8 +41,8 @@ export function useSessionAttentionReader(
     mutation.observe(element, { childList: true, subtree: true, attributes: true,
       attributeFilter: ["class", "style", "data-chat-message-id"] });
     onCleanup(() => {
-      element.removeEventListener("scroll", check);
       doc.removeEventListener("visibilitychange", check);
+      doc.removeEventListener("focusin", check);
       ownerWindow?.removeEventListener("focus", check);
       resize?.disconnect();
       mutation.disconnect();

@@ -475,8 +475,9 @@ defineExpose({ scrollToIndex });
 }
 
 .development-session-unread-dot {
-  width: 4px;
-  height: 4px;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--accent-color);

@@ -93,7 +93,7 @@ import {
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
-import { sessionResultIsVisible, useSessionAttentionReader } from "../composables/useSessionAttentionReader";
+import { useSessionAttentionReader } from "../composables/useSessionAttentionReader";
 import { useSessionUndoSettings } from "../composables/useSessionUndoSettings";
 import { useKnowledgeDocumentOpen } from "../composables/useKnowledgeDocumentOpen";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
@@ -294,6 +294,8 @@ const props = defineProps<{
   pendingToolConfirms: PendingToolConfirm[];
   sessions: SessionSummary[];
   activeSessionId: string | null;
+  /** Whether this session is the active tab in the focused pane. */
+  active?: boolean;
   pendingSessionId?: string | null;
   unityConnected?: boolean;
   unityPluginStatus?: "missing" | "outdated" | null;
@@ -2113,16 +2115,12 @@ function getMessagesElement() {
   return transcriptRef.value?.getScrollElement() ?? null;
 }
 
-useSessionAttentionReader(() => props.activeSessionId, getMessagesElement, (entry) => {
-  if (props.pendingSessionId || props.sessionHistoryLoading || pendingRestoreSessionId.value) return false;
-  if (entry.kind === "done" || entry.kind === "knowledgeProposal") {
-    return props.messages.some((message) => message.id === entry.targetId)
-      && sessionResultIsVisible(getMessagesElement(), entry.targetId);
-  }
-  if (entry.kind === "askUser") return props.pendingQuestion?.questionId === entry.targetId;
-  if (entry.kind === "toolConfirm") return props.pendingToolConfirms.some((item) => item.questionId === entry.targetId);
-  return !props.isStreaming && props.messages.length > 0;
-});
+useSessionAttentionReader(() => props.activeSessionId, getMessagesElement, () => (
+  props.active !== false
+  && !props.pendingSessionId
+  && !props.sessionHistoryLoading
+  && !pendingRestoreSessionId.value
+));
 
 function getMessagesContentElement() {
   return transcriptRef.value?.getContentElement?.() ?? null;

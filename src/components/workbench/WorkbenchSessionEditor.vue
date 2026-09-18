@@ -35,6 +35,7 @@ const props = defineProps<{
   workspaceRef: WorkspaceRef | null;
   selectWorktree?: (item: ManagedWorktree) => Promise<void>;
   workspaceChanging?: boolean;
+  active?: boolean;
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   shortcutActive?: boolean;
@@ -600,6 +601,7 @@ defineExpose({
     :composer-value="inputText"
     :sessions="[]"
     :active-session-id="sessionId"
+    :active="active"
     :current-run-id="currentRunId"
     :is-viewing-subagent="!!parentSessionId"
     :pending-session-id="null"

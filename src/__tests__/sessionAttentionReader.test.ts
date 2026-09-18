@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { createApp, h, nextTick, ref } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { sessionResultIsVisible, useSessionAttentionReader } from "../composables/useSessionAttentionReader";
+import { useSessionAttentionReader } from "../composables/useSessionAttentionReader";
 import { applySessionAttentionEvent, emptySessionAttentionState, isSessionUnread, sessionAttention, updateSessionAttention } from "../services/sessionAttention";
 
-describe("visible session read acknowledgement", () => {
+describe("focused session read acknowledgement", () => {
   const cleanups: Array<() => void> = [];
   beforeEach(() => { localStorage.clear(); sessionAttention.value = emptySessionAttentionState(); vi.useFakeTimers(); });
   afterEach(async () => {
@@ -15,7 +15,12 @@ describe("visible session read acknowledgement", () => {
     vi.useRealTimers();
   });
 
-  function mountReader(options: { sessionId?: () => string | null; rendered?: () => boolean; visible?: boolean } = {}) {
+  function mountReader(options: {
+    sessionId?: () => string | null;
+    active?: () => boolean;
+    ready?: () => boolean;
+    visible?: boolean;
+  } = {}) {
     const element = document.createElement("div");
     document.body.append(element);
     Object.defineProperties(element, { clientHeight: { value: 100 }, scrollHeight: { value: 500 } });
@@ -24,7 +29,8 @@ describe("visible session read acknowledgement", () => {
       (options.visible === false ? [] : [{}]) as unknown as DOMRectList,
     );
     const app = createApp({ setup() {
-      useSessionAttentionReader(options.sessionId ?? (() => "a"), () => element, options.rendered ?? (() => true));
+      useSessionAttentionReader(options.sessionId ?? (() => "a"), () => element,
+        () => (options.active?.() ?? true) && (options.ready?.() ?? true));
       return () => h("div");
     } });
     app.mount(element);
@@ -40,42 +46,30 @@ describe("visible session read acknowledgement", () => {
     await nextTick();
   }
 
-  it("does not mistake an older result in the DOM for a visible result", () => {
-    const scroll = document.createElement("div");
-    const message = document.createElement("div");
-    message.dataset.chatMessageId = "result";
-    scroll.append(message);
-    vi.spyOn(scroll, "getBoundingClientRect").mockReturnValue({ top: 100, bottom: 500 } as DOMRect);
-    const bounds = vi.spyOn(message, "getBoundingClientRect").mockReturnValue({ top: 0, bottom: 80, width: 200, height: 80 } as DOMRect);
-    expect(sessionResultIsVisible(scroll, "result")).toBe(false);
-    bounds.mockReturnValue({ top: 300, bottom: 450, width: 200, height: 150 } as DOMRect);
-    expect(sessionResultIsVisible(scroll, "result")).toBe(true);
-  });
-
-  it("requires the actual result, focused window and bottom viewport, without consuming a newer completion", async () => {
+  it("reads a loaded session on window focus even when its saved scroll position is in history", async () => {
     const focused = vi.spyOn(document, "hasFocus").mockReturnValue(false);
-    const rendered = ref(false);
-    const { element } = mountReader({ rendered: () => rendered.value });
+    const ready = ref(false);
+    const { element } = mountReader({ ready: () => ready.value });
     element.scrollTop = 0;
     await complete();
     expect(isSessionUnread("a")).toBe(true);
-    focused.mockReturnValue(true);
-    rendered.value = true;
+    ready.value = true;
     await nextTick();
-    expect(isSessionUnread("a")).toBe(true); // still reading history
-    element.scrollTop = 400;
-    element.dispatchEvent(new Event("scroll"));
+    expect(isSessionUnread("a")).toBe(true);
+    focused.mockReturnValue(true);
+    window.dispatchEvent(new Event("focus"));
     expect(isSessionUnread("a")).toBe(false);
     expect(sessionAttention.value.sessions.a!.completionSequence).toBe(1);
-    rendered.value = false;
+    expect(element.scrollTop).toBe(0);
+    ready.value = false;
     await complete("a", "second");
     expect(isSessionUnread("a")).toBe(true);
-    rendered.value = true;
+    ready.value = true;
     await nextTick();
     expect(isSessionUnread("a")).toBe(false);
   });
 
-  it("acknowledges a selected session after rendering without waiting for a timer", async () => {
+  it("acknowledges a selected session without waiting for a timer", async () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
     await complete("a");
     await complete("b");
@@ -107,16 +101,52 @@ describe("visible session read acknowledgement", () => {
     expect(isSessionUnread("a")).toBe(false);
   });
 
-  it("waits for the actual message DOM when result rendering finishes later", async () => {
+  it("reads only the focused pane and rechecks already mounted tabs on activation", async () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
-    let element: HTMLElement;
-    ({ element } = mountReader({ rendered: () => !!element?.querySelector('[data-chat-message-id="first-reply"]') }));
+    const active = ref<string | null>(null);
+    const { element } = mountReader({ active: () => active.value === "a" });
+    mountReader({ sessionId: () => "b", active: () => active.value === "b" });
+    element.scrollTop = 0;
+    await complete("a");
+    await complete("b");
+    expect(isSessionUnread("a")).toBe(true);
+    expect(isSessionUnread("b")).toBe(true);
+    active.value = "a";
+    await nextTick();
+    expect(isSessionUnread("a")).toBe(false);
+    expect(isSessionUnread("b")).toBe(true);
+    expect(element.querySelector("[data-chat-message-id]")).toBeNull();
+    active.value = "b";
+    await nextTick();
+    expect(isSessionUnread("b")).toBe(false);
+    await complete("a", "second");
+    expect(isSessionUnread("a")).toBe(true);
+    active.value = "a";
+    await nextTick();
+    expect(isSessionUnread("a")).toBe(false);
+  });
+
+  it("waits for loading and scroll restoration after a tab is activated", async () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(true);
+    const active = ref(false);
+    const ready = ref(false);
+    mountReader({ active: () => active.value, ready: () => ready.value });
+    await complete();
+    active.value = true;
+    await nextTick();
+    expect(isSessionUnread("a")).toBe(true);
+    ready.value = true;
+    await nextTick();
+    expect(isSessionUnread("a")).toBe(false);
+  });
+
+  it("rechecks when keyboard focus enters the document", async () => {
+    const focused = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const { element } = mountReader();
     await complete();
     expect(isSessionUnread("a")).toBe(true);
-    const message = document.createElement("div");
-    message.dataset.chatMessageId = "first-reply";
-    element.append(message);
-    await nextTick();
+    focused.mockReturnValue(true);
+    element.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
     expect(isSessionUnread("a")).toBe(false);
   });
 

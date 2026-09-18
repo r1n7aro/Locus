@@ -708,6 +708,7 @@ onUnmounted(() => {
     <ChatView
       ref="chatViewRef"
       v-show="active"
+      :active="active"
       :layout-mode="layoutMode"
       :default-session-panel-collapsed="defaultSessionPanelCollapsed"
       :session-panel-storage-scope="sessionPanelStorageScope"
