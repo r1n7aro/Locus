@@ -64,6 +64,10 @@ test-results/
 .tmp/
 .locus-hr-out/
 codex-artifacts/
+/artifacts/
+/Library/
+/Locus/
+/context_*.yaml
 tmp/
 debug/
 target-check/
