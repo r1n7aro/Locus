@@ -5,9 +5,11 @@ vi.mock("../services/ipc", () => ({
 }));
 
 import { ipcInvoke } from "../services/ipc";
+import { projectKnowledgeList } from "../services/workspaceExplorer";
 import {
   knowledgeEdit,
   knowledgeList,
+  knowledgeMove,
   knowledgeQuery,
   knowledgeRead,
   listSkills,
@@ -26,6 +28,47 @@ describe("knowledge service visibility defaults", () => {
     mockedInvoke.mockResolvedValue([]);
   });
 
+  it.each([true, false])("maps project knowledge update times for aiMaintained=%s", async (aiMaintained) => {
+    const updatedAt = 1_789_623_600_000;
+    const source = {
+      sourceCheckoutId: "checkout-feature",
+      sourceWorkspaceGeneration: 7,
+      sourceRoot: "F:/Project",
+      availableCheckoutIds: ["checkout-main", "checkout-feature"],
+    };
+    mockedInvoke.mockResolvedValueOnce([{
+      id: "kd_combat", type: "design", path: "combat.md", title: "Combat",
+      aiMaintained, updatedAt, ...source,
+    }]);
+
+    const documents = await projectKnowledgeList("project-a", { type: "design", pathPrefix: "combat" });
+
+    expect(mockedInvoke).toHaveBeenCalledWith("project_knowledge_list", {
+      projectId: "project-a", docType: "design", pathPrefix: "combat",
+    });
+    expect(documents).toEqual([{
+      id: "kd_combat", type: "design", path: "combat.md", title: "Combat",
+      aiMaintained, modifiedAt: updatedAt, ...source,
+    }]);
+  });
+
+  it.each([undefined, [], ["unity", "reviewer"]])("preserves injection targets when reading metadata: %j", async (injectAgents) => {
+    mockedInvoke.mockResolvedValueOnce({
+      kind: "document", path: "agents.md",
+      document: { id: "kd_agents", type: "design", path: "agents.md", title: "Agents", injectMode: "full", injectAgents, body: "Body", updatedAt: 0 },
+    });
+    const result = await knowledgeRead({ kind: "document", type: "design", path: "agents.md" }, workspaceRef);
+    expect(result.document?.injectAgents).toEqual(injectAgents ?? ["unity"]);
+  });
+
+  it("sends an empty injection target list instead of omitting the metadata patch", async () => {
+    mockedInvoke.mockResolvedValueOnce({ kind: "document", document: null });
+    await knowledgeEdit({ kind: "document", type: "design", path: "agents.md", document: { injectAgents: [] } }, workspaceRef);
+    expect(mockedInvoke).toHaveBeenCalledWith("knowledge_edit", expect.objectContaining({
+      request: expect.objectContaining({ document: expect.objectContaining({ injectAgents: [] }) }),
+    }));
+  });
+
   it("keeps hidden documents in the management list", async () => {
     await knowledgeList({}, workspaceRef);
 
@@ -34,6 +77,15 @@ describe("knowledge service visibility defaults", () => {
       pathPrefix: undefined,
       includeHidden: true,
       workspaceRef,
+    });
+  });
+
+  it("preserves the destination category of a document move", async () => {
+    mockedInvoke.mockResolvedValueOnce({ kind: "document", type: "memory", path: "note.md", resultPath: "note.md" });
+    await knowledgeMove({ kind: "document", type: "design", path: "note.md", newPath: "memory/note.md" }, workspaceRef);
+    expect(mockedInvoke).toHaveBeenCalledWith("knowledge_move", {
+      workspaceRef,
+      request: { kind: "document", type: "design", path: "design/note.md", newPath: "memory/note.md" },
     });
   });
 

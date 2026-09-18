@@ -129,6 +129,10 @@ impl PluginOperationContext {
 
 fn plugin_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
+        error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
+            "workspace.materialization_stale",
+            "The checkout assignment changed. Reopen the checkout before continuing.",
+        ).detail(error.to_string()),
         WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
             "workspace.registry_unavailable",
             "The workspace registry is unavailable.",
@@ -2895,6 +2899,7 @@ fn emit_checkout_plugins_changed(
             project_id: runtime.project_id().clone(),
             checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             service_instance_id: None,
             service_generation: None,
             payload: (),
@@ -4346,9 +4351,10 @@ mod tests {
                 id: "asset-inspector".to_string(),
                 package_name: None,
                 name: Some("Asset Inspector".to_string()),
-                template: Some("blank".to_string()),
+
                 icon: None,
                 display_path: None,
+                ..Default::default()
             },
         )
         .expect("create view");
@@ -4457,9 +4463,10 @@ mod tests {
                 id: "asset-board".to_string(),
                 package_name: None,
                 name: Some("Asset Board".to_string()),
-                template: Some("blank".to_string()),
+
                 icon: None,
                 display_path: None,
+                ..Default::default()
             },
         )
         .expect("create view");
@@ -4523,9 +4530,10 @@ mod tests {
                 id: "workspace-board".to_string(),
                 package_name: None,
                 name: Some("Workspace Board".to_string()),
-                template: Some("blank".to_string()),
+
                 icon: None,
                 display_path: None,
+                ..Default::default()
             },
         )
         .expect("create view");

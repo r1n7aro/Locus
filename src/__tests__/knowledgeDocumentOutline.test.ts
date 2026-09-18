@@ -46,6 +46,8 @@ describe("knowledge document outline", () => {
       resolve(process.cwd(), "src/components/knowledge/KnowledgePreview.vue"),
       "utf8",
     );
+    const styles = readFileSync(resolve(process.cwd(), "src/components/ui/markdown-document.css"), "utf8");
+    const outline = readFileSync(resolve(process.cwd(), "src/composables/useMarkdownDocumentOutline.ts"), "utf8");
 
     expect(preview).toContain('class="document-workspace"');
     expect(preview).toContain('class="document-outline"');
@@ -53,11 +55,12 @@ describe("knowledge document outline", () => {
     expect(preview).toContain('ref="documentBodyRef"');
     expect(preview).toContain('@click="scrollToDocumentOutlineItem(item)"');
     expect(preview).toContain('@scroll.passive="scheduleDocumentOutlineActiveUpdate"');
-    expect(preview).toMatch(/@container knowledge-document \(min-width: 1120px\)/);
-    expect(preview).toMatch(/\.document-workspace\.has-outline \.document-outline\s*\{[\s\S]*position:\s*sticky;[\s\S]*top:\s*40px;/);
-    expect(preview).toMatch(/\.document-outline\s*\{[\s\S]*overflow:\s*auto;[\s\S]*scrollbar-width:\s*none;/);
-    expect(preview).toMatch(/\.document-outline::\-webkit-scrollbar\s*\{[\s\S]*display:\s*none;/);
-    expect(preview).toContain("bodyRect.top - pageRect.top - DOCUMENT_OUTLINE_BODY_LEAD");
-    expect(preview).toMatch(/\.document-outline-item\s*\{[\s\S]*border:\s*0;[\s\S]*background:\s*transparent;/);
+    expect(preview).toContain('<style scoped src="../ui/markdown-document.css" />');
+    expect(styles).toMatch(/@container knowledge-document \(min-width: 1120px\)/);
+    expect(styles).toMatch(/\.document-workspace\.has-outline \.document-outline\s*\{[\s\S]*position:\s*sticky;[\s\S]*top:\s*40px;/);
+    expect(styles).toMatch(/\.document-outline\s*\{[\s\S]*overflow:\s*auto;[\s\S]*scrollbar-width:\s*none;/);
+    expect(styles).toMatch(/\.document-outline::\-webkit-scrollbar\s*\{[\s\S]*display:\s*none;/);
+    expect(outline).toContain("bodyRect.top - pageRect.top - DOCUMENT_OUTLINE_BODY_LEAD");
+    expect(styles).toMatch(/\.document-outline-item\s*\{[\s\S]*border:\s*0;[\s\S]*background:\s*transparent;/);
   });
 });

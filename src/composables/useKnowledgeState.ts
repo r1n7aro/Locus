@@ -276,7 +276,7 @@ function fullDocumentPath(type: KnowledgeDocumentType, path: string): string {
 }
 
 function ensureMarkdownDocumentPath(path: string): string {
-  return path.toLowerCase().endsWith(".md") ? path : `${path}.md`;
+  return /\.(?:md|csv)$/i.test(path) ? path : `${path}.md`;
 }
 
 function buildCreatePath(
@@ -479,7 +479,7 @@ function ensureFolderNode(
   return folderNode;
 }
 
-function skillPackageIdForDocument(
+export function skillPackageIdForDocument(
   document: KnowledgeDocumentSummary | KnowledgeDocument | null | undefined,
 ): string {
   if (!document || document.type !== "skill") return "";
@@ -768,7 +768,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
   const hasWorkspace = computed(() => !!props.workingDir.trim());
   const notificationStore = useNotificationStore();
   const uiStore = useUiStore();
-  const { loadSkills } = useSkills();
+  const { loadSkills } = useSkills(() => props.workspaceRef);
 
   const error = ref("");
   const sidebarWidth = ref(272);
@@ -887,6 +887,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       ? {
           checkoutId: value.checkoutId,
           expectedGeneration: value.expectedGeneration,
+          expectedMaterializationEpoch: value.expectedMaterializationEpoch,
         }
       : null;
   }
@@ -906,6 +907,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       request.workspaceKey === currentWorkspaceKey() &&
       request.workspaceRef?.checkoutId === props.workspaceRef?.checkoutId &&
       request.workspaceRef?.expectedGeneration === props.workspaceRef?.expectedGeneration &&
+      request.workspaceRef?.expectedMaterializationEpoch === props.workspaceRef?.expectedMaterializationEpoch &&
       request.requestVersion === workspaceRequestVersion
     );
   }
@@ -938,6 +940,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       request.workspaceKey,
       request.workspaceRef?.checkoutId ?? "",
       request.workspaceRef?.expectedGeneration ?? "",
+      request.workspaceRef?.expectedMaterializationEpoch ?? "empty",
       change.docType ?? "*",
       change.targetKind ?? "*",
       normalizeDirectorySelectionPath(change.path ?? ""),
@@ -1471,6 +1474,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
     request?: WorkspaceRequestSnapshot,
   ) {
     if (request?.workspaceRef) {
+      if (previousPath !== updated.path) {
+        invalidateKnowledgeDocumentCache(request.workspaceKey, request.workspaceRef, {
+          type: updated.type,
+          path: previousPath,
+        });
+      }
       cacheKnowledgeDocument(request.workspaceKey, request.workspaceRef, updated);
     }
     if (request && !isCurrentWorkspaceRequest(request)) return;
@@ -2724,6 +2733,22 @@ export function useKnowledgeState(props: KnowledgeProps) {
       return false;
     }
 
+    const selectedPathAtStart = selectedDocument.value?.id === refTarget.id
+      && selectedDocument.value.type === refTarget.type
+      ? selectedDocument.value.path
+      : null;
+    // A local rename preserves the document id and selection sequence. Reads
+    // started before it must neither restore the old path nor report its removal.
+    // Keep the starting path valid so an explicit external rename can still load.
+    const isCurrentRead = () => isCurrentWorkspaceRequest(request)
+      && seq === selectionSeq
+      && (
+        selectedDocument.value?.id !== refTarget.id
+        || selectedDocument.value.type !== refTarget.type
+        || selectedDocument.value.path === selectedPathAtStart
+        || selectedDocument.value.path === refTarget.path
+      );
+
     const silent = options?.silent ?? false;
     const cached = request.workspaceRef && !options?.force
       ? getCachedKnowledgeDocument(
@@ -2733,7 +2758,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
       )
       : null;
     if (cached) {
-      if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) return false;
+      if (!isCurrentRead()) return false;
       // Keep an already visible same-target snapshot in place while the
       // filesystem revalidation runs. A cache entry from another render cycle
       // must never roll the preview backwards.
@@ -2741,7 +2766,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         && !commitSelectedDocument(cached, request, seq)) return false;
       void readDocumentContent(refTarget, request, { force: true })
         .then((fresh) => {
-          if (commitSelectedDocument(fresh, request, seq)) {
+          if (isCurrentRead() && commitSelectedDocument(fresh, request, seq)) {
             scheduleDocumentHistoryEnrichment(fresh, request);
           }
         })
@@ -2758,11 +2783,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
       const doc = await readDocumentContent(refTarget, request, {
         force: options?.force,
       });
-      if (!commitSelectedDocument(doc, request, seq)) return false;
+      if (!isCurrentRead() || !commitSelectedDocument(doc, request, seq)) return false;
       scheduleDocumentHistoryEnrichment(doc, request);
       return true;
     } catch (cause) {
-      if (!isCurrentWorkspaceRequest(request) || seq !== selectionSeq) {
+      if (!isCurrentRead()) {
         return false;
       }
       notifyError("knowledge_read", cause);
@@ -3716,7 +3741,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
     creatingDocument.value = true;
     error.value = "";
     try {
-      const documentTitle = trimmed.replace(/\.md$/i, "");
+      const csv = type !== "skill" && /\.csv$/i.test(trimmed);
+      const documentTitle = trimmed.replace(csv ? /\.csv$/i : /\.md$/i, "");
       const relativeDir = parentDir
         .trim()
         .replace(/\\/g, "/")
@@ -3746,7 +3772,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
         expandAncestors(fullDocumentPath("skill", docPath));
         return;
       }
-      const filePath = buildCreatePath(type, slug, relativeDir);
+      const filePath = buildCreatePath(type, csv ? `${slug}.csv` : slug, relativeDir);
       const defaults = buildKnowledgeCreateDefaults(type);
       const result = await enqueueMutation(() =>
         knowledgeCreate({
@@ -3754,7 +3780,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           type,
           path: filePath,
           document: {
-            body: "",
+            body: /\.csv$/i.test(filePath) ? "id,name\n" : "",
             injectMode: defaults.injectMode,
             aiEditMode: defaults.aiEditMode,
           },
@@ -3827,7 +3853,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
           type,
           path: pathName,
           document: {
-            body: "",
+            body: /\.csv$/i.test(pathName) ? "id,name\n" : "",
             injectMode: defaults.injectMode,
             aiEditMode: defaults.aiEditMode,
           },
@@ -4426,22 +4452,25 @@ export function useKnowledgeState(props: KnowledgeProps) {
     type: KnowledgeDocumentType,
     sourcePath: string,
     targetPath: string,
+    targetType: KnowledgeDocumentType = type,
   ) {
     const selectedType = selectedDocument.value?.type
       ?? selectedDocumentSummary.value?.type
       ?? activeType.value;
     if (selectedType !== type) return;
-    if (pendingSelectionPath.value === sourcePath) {
-      pendingSelectionPath.value = targetPath;
-    } else if (
-      selectedDocument.value?.path === sourcePath ||
-      selectedDocumentSummary.value?.path === sourcePath
-    ) {
-      pendingSelectionPath.value = targetPath;
-    }
+    if (
+      pendingSelectionPath.value !== sourcePath &&
+      selectedDocument.value?.path !== sourcePath &&
+      selectedDocumentSummary.value?.path !== sourcePath
+    ) return;
+    // Reads started before the move must not restore the previous category/path.
+    selectionSeq += 1;
+    pendingSelectionPath.value = targetPath;
+    activeType.value = targetType;
     if (selectedDocument.value?.path === sourcePath) {
       selectedDocument.value = {
         ...selectedDocument.value,
+        type: targetType,
         path: targetPath,
       };
     }
@@ -4653,13 +4682,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
     path: string,
     nextPath: string,
     docType: KnowledgeDocumentType,
+    targetType: KnowledgeDocumentType = docType,
   ) {
     const normalizedPath = path.replace(/\\/g, "/").replace(/^\/+/, "");
     const normalizedNextPath = nextPath.replace(/\\/g, "/").replace(/^\/+/, "");
     if (
       !normalizedPath ||
       !normalizedNextPath ||
-      normalizedPath === normalizedNextPath
+      (docType === targetType && normalizedPath === normalizedNextPath)
     )
       return;
 
@@ -4667,13 +4697,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
     error.value = "";
     try {
       const request = captureWorkspaceRequest();
-      syncSelectedDocumentPath(docType, normalizedPath, normalizedNextPath);
       await enqueueMutation(() =>
         knowledgeMove({
           kind: "document",
           type: docType,
           path: normalizedPath,
-          newPath: normalizedNextPath,
+          newPath: targetType === docType
+            ? normalizedNextPath
+            : fullDocumentPath(targetType, normalizedNextPath),
         }, request.workspaceRef!),
       );
       if (request.workspaceRef) {
@@ -4685,11 +4716,14 @@ export function useKnowledgeState(props: KnowledgeProps) {
         invalidateKnowledgeDocumentCache(
           request.workspaceKey,
           request.workspaceRef,
-          { type: docType, path: normalizedNextPath },
+          { type: targetType, path: normalizedNextPath },
         );
       }
+      if (!isCurrentWorkspaceRequest(request)) return;
+      syncSelectedDocumentPath(docType, normalizedPath, normalizedNextPath, targetType);
       await refreshKnowledgeData();
-      expandAncestors(fullDocumentPath(docType, normalizedNextPath));
+      if (!isCurrentWorkspaceRequest(request)) return;
+      expandAncestors(fullDocumentPath(targetType, normalizedNextPath));
     } catch (cause) {
       notifyError("knowledge_move.document", cause);
     } finally {
@@ -4704,13 +4738,13 @@ export function useKnowledgeState(props: KnowledgeProps) {
   ) {
     if (!hasWorkspace.value) return;
     if (node.kind === "package") return;
-    if (node.type !== targetType) return;
     const normalizedTargetDir = targetDir
       .trim()
       .replace(/\\/g, "/")
       .replace(/^\/+|\/+$/g, "");
 
     if (node.kind === "folder") {
+      if (node.type !== targetType) return;
       const nextPath = joinRelativePath(normalizedTargetDir, node.name);
       await moveDirectoryPath(node.relativePath, nextPath, node.type);
       return;
@@ -4723,7 +4757,7 @@ export function useKnowledgeState(props: KnowledgeProps) {
     const nextPath = normalizedTargetDir
       ? `${normalizedTargetDir}/${fileName}`
       : fileName;
-    await moveDocumentPath(node.document.path, nextPath, node.document.type);
+    await moveDocumentPath(node.document.path, nextPath, node.document.type, targetType);
   }
 
   async function moveExplorerNodes(
@@ -4859,16 +4893,18 @@ export function useKnowledgeState(props: KnowledgeProps) {
       () => props.workingDir,
       () => props.workspaceRef?.checkoutId ?? "",
       () => props.workspaceRef?.expectedGeneration ?? null,
+      () => props.workspaceRef?.expectedMaterializationEpoch ?? null,
     ] as const,
-    ([workingDir, checkoutId, expectedGeneration], previous) => {
-      const [previousWorkingDir, previousCheckoutId, previousExpectedGeneration] = previous;
+    ([workingDir, checkoutId, expectedGeneration, expectedEpoch], previous) => {
+      const [previousWorkingDir, previousCheckoutId, previousExpectedGeneration, previousEpoch] = previous;
       const nextWorkspaceKey = normalizeWorkspacePath(workingDir);
       const previousWorkspaceKey = normalizeWorkspacePath(
         previousWorkingDir ?? "",
       );
       const scopeChanged = nextWorkspaceKey !== previousWorkspaceKey
         || checkoutId !== previousCheckoutId
-        || expectedGeneration !== previousExpectedGeneration;
+        || expectedGeneration !== previousExpectedGeneration
+        || expectedEpoch !== previousEpoch;
       if (!scopeChanged) return;
       if (!nextWorkspaceKey) {
         resetWorkspaceState();

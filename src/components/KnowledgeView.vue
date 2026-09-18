@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch, watchPostEffect } from "vue";
 import type {
   KnowledgeDocumentPatch,
   KnowledgeDocumentEditOperation,
@@ -16,6 +16,7 @@ import KnowledgeRetrievalPanel from "./knowledge/KnowledgeRetrievalPanel.vue";
 import KnowledgeInjectionPreviewPanel from "./knowledge/KnowledgeInjectionPreviewPanel.vue";
 import KnowledgeSearchBar from "./knowledge/KnowledgeSearchBar.vue";
 import KnowledgePreview from "./knowledge/KnowledgePreview.vue";
+import WorkspaceCsvEditor from "./csv/WorkspaceCsvEditor.vue";
 import KnowledgeSkillPackagePreview from "./knowledge/KnowledgeSkillPackagePreview.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
 import {
@@ -45,6 +46,19 @@ import {
 } from "../composables/unityPropertyFence";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "../stores/notification";
+import type { KnowledgeWorkbenchPage } from "../types/workbench";
+import type { WorkbenchEditorTransferSnapshot } from "../types/workbench";
+import type { ToolFilePreviewHighlight } from "../services/toolFilePreviewWindow";
+
+const csvPreview = ref<InstanceType<typeof WorkspaceCsvEditor> | null>(null);
+defineExpose({
+  saveFile: async () => await csvPreview.value?.saveFile() ?? false,
+  discardChanges: () => csvPreview.value?.discardChanges(),
+  refreshIfChanged: async () => { await csvPreview.value?.refreshIfChanged(); },
+  revealToolFileHighlight: async (highlight?: ToolFilePreviewHighlight) => await csvPreview.value?.revealToolFileHighlight(highlight) ?? false,
+  exportTransferSnapshot: (): WorkbenchEditorTransferSnapshot => csvPreview.value?.exportTransferSnapshot() ?? { kind: "resource" },
+  applyTransferSnapshot: async (snapshot: WorkbenchEditorTransferSnapshot) => await csvPreview.value?.applyTransferSnapshot(snapshot) ?? false,
+});
 
 const UNITY_REFERENCE_MANAGED_DIR = "unity-official-docs";
 const KNOWLEDGE_SIDEBAR_WIDTH_KEY = "locus:knowledgeSidebarWidth";
@@ -58,17 +72,27 @@ const props = withDefaults(defineProps<{
   selectedModelId: string;
   modelDefaults: ModelDefaults;
   embedded?: boolean;
+  listOnly?: boolean;
+  knowledgePage?: KnowledgeWorkbenchPage | null;
   active?: boolean;
   selectedDocumentId?: string | null;
   selectedDocumentTarget?: KnowledgeDocumentSummary | null;
+  selectionRequestId?: number;
 }>(), {
   embedded: false,
+  listOnly: false,
+  knowledgePage: null,
   active: true,
   selectedDocumentId: null,
   selectedDocumentTarget: null,
+  selectionRequestId: 0,
 });
 const emit = defineEmits<{
+  (event: "ready"): void;
   (event: "dirtyChange", dirty: boolean): void;
+  (event: "openDocument", document: KnowledgeDocumentSummary): void;
+  (event: "openPage", page: KnowledgeWorkbenchPage): void;
+  (event: "closePage"): void;
 }>();
 const editorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
 const notificationStore = useNotificationStore();
@@ -194,6 +218,7 @@ sidebarWidth.value = readKnowledgeSidebarWidth();
 const deleteDialog = ref<ExplorerNode[] | null>(null);
 const deleteDialogBusy = ref(false);
 const specialPage = ref<null | "retrieval" | "injection">(null);
+const listSelectedPath = ref<string | null>(null);
 const overviewDismissed = ref(false);
 
 const hasWorkspace = computed(() => !!props.workingDir.trim());
@@ -201,16 +226,47 @@ const embeddingRuntimeLoading = computed(
   () => !!embeddingStatus.value?.activating,
 );
 
+watchPostEffect(() => {
+  if (selectedDocumentLoading.value) return;
+  // CSV owns another asynchronous read/parse after the knowledge record loads.
+  if (selectedDocument.value && /\.csv$/i.test(selectedDocument.value.path)) return;
+  emit("ready");
+});
+
+async function revealListDocument(summary: KnowledgeDocumentSummary) {
+  const path = `${summary.type}/${knowledgeDocumentRelativePath(summary.type, summary.path)}`;
+  listSelectedPath.value = path;
+  specialPage.value = null;
+  overviewDismissed.value = false;
+  clearSearch();
+  expandAncestors(path);
+  if (
+    selectedDocument.value?.id === summary.id
+    && selectedDocument.value.type === summary.type
+    && selectedDocument.value.path === summary.path
+  ) return;
+  await selectDocument(summary);
+}
+
 watch(
   [
-    () => props.selectedDocumentTarget,
+    () => props.selectedDocumentTarget?.id,
+    () => props.selectedDocumentTarget?.type,
+    () => props.selectedDocumentTarget?.path,
     () => props.selectedDocumentId,
-    documents,
+    // An explicit workbench target can retain the old path until its catalog
+    // refreshes. Local saves must not reopen that snapshot when the list changes.
+    () => props.selectedDocumentTarget ? null : documents.value,
+    () => props.selectionRequestId,
   ],
-  ([target, documentId, items]) => {
-    const summary = target
-      ?? (documentId ? items.find((item) => item.id === documentId) ?? null : null);
+  ([, , , documentId, items]) => {
+    const summary = props.selectedDocumentTarget
+      ?? (documentId ? items?.find((item) => item.id === documentId) ?? null : null);
     if (!summary) return;
+    if (props.listOnly) {
+      void revealListDocument(summary);
+      return;
+    }
     if (
       selectedDocument.value?.id === summary.id
       && selectedDocument.value.type === summary.type
@@ -257,6 +313,11 @@ function handleSelectType(type: KnowledgeDocumentType) {
   specialPage.value = null;
   overviewDismissed.value = false;
   clearSearch();
+  if (props.listOnly) {
+    listSelectedPath.value = type;
+    emit("openPage", { kind: "directory", type, path: type });
+    return;
+  }
   void selectDirectory(type, type);
 }
 
@@ -275,32 +336,59 @@ function handleSaveSection(section: KnowledgeDocumentSection, value: string) {
 }
 
 function handleSelectDocument(summary: Parameters<typeof selectDocument>[0]) {
+  if (props.listOnly) {
+    listSelectedPath.value = `${summary.type}/${knowledgeDocumentRelativePath(summary.type, summary.path)}`;
+    emit("openDocument", summary);
+    return;
+  }
   specialPage.value = null;
   overviewDismissed.value = false;
   void selectDocument(summary);
 }
 
 function handleSelectPackage(summary: Parameters<typeof selectPackage>[0]) {
+  if (props.listOnly) {
+    handleSelectDocument(summary);
+    return;
+  }
   specialPage.value = null;
   overviewDismissed.value = false;
   void selectPackage(summary);
 }
 
 function handleSelectDirectory(type: KnowledgeDocumentType, path: string) {
+  if (props.listOnly) {
+    listSelectedPath.value = path;
+    emit("openPage", { kind: "directory", type, path });
+    return;
+  }
   specialPage.value = null;
   overviewDismissed.value = false;
   void selectDirectory(type, path);
 }
 
-function handleSelectSearchResult(
+async function handleSelectSearchResult(
   result: Parameters<typeof selectSearchResult>[0],
 ) {
   specialPage.value = null;
   overviewDismissed.value = false;
-  void selectSearchResult(result);
+  await selectSearchResult(result);
+  if (props.listOnly && selectedDocument.value) handleSelectDocument(selectedDocument.value);
+}
+
+async function handleCreateDocument(...args: Parameters<typeof createDocumentAt>) {
+  const previousDocument = selectedDocument.value;
+  await createDocumentAt(...args);
+  if (props.listOnly && selectedDocument.value && selectedDocument.value !== previousDocument) {
+    handleSelectDocument(selectedDocument.value);
+  }
 }
 
 function openRetrievalSettings() {
+  if (props.listOnly) {
+    emit("openPage", { kind: "retrieval" });
+    return;
+  }
   overviewDismissed.value = false;
   clearSelection();
   clearSearch();
@@ -309,11 +397,26 @@ function openRetrievalSettings() {
 }
 
 function openInjectionPreview() {
+  if (props.listOnly) {
+    emit("openPage", { kind: "injection" });
+    return;
+  }
   overviewDismissed.value = false;
   clearSelection();
   clearSearch();
   specialPage.value = "injection";
 }
+
+watch(
+  () => props.knowledgePage,
+  (page) => {
+    if (!page || props.listOnly) return;
+    if (page.kind === "retrieval") openRetrievalSettings();
+    else if (page.kind === "injection") openInjectionPreview();
+    else handleSelectDirectory(page.type, page.path);
+  },
+  { immediate: true },
+);
 
 function normalizeWorkspaceKey(path: string): string {
   return path.trim().replace(/\\/g, "/").replace(/\/+$/g, "").toLowerCase();
@@ -526,6 +629,10 @@ async function handleRevealSearchResult(result: KnowledgeSearchResult) {
 }
 
 function handleClosePreview() {
+  if (props.knowledgePage) {
+    emit("closePage");
+    return;
+  }
   overviewDismissed.value = false;
   clearSelection();
 }
@@ -704,7 +811,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="knowledge-view">
+  <div class="knowledge-view" :class="{ 'is-list-only': props.listOnly }">
     <WorkspaceRequiredState
       v-if="!hasWorkspace"
       :description="t('workspace.required.knowledgeDescription')"
@@ -714,7 +821,7 @@ onUnmounted(() => {
       <div
         v-if="!props.embedded"
         class="kx-side"
-        :style="{ width: sidebarWidth + 'px' }"
+        :style="props.listOnly ? undefined : { width: sidebarWidth + 'px' }"
       >
         <KnowledgeSearchBar
           :query="searchQuery"
@@ -728,7 +835,7 @@ onUnmounted(() => {
           :root-directory-configs="rootDirectoryConfigs"
           :external-directory-sources="referenceExternalDirectorySources"
           :folder-stats="referenceManagedDirectoryStats"
-          :selected-path="selectedPath"
+          :selected-path="props.listOnly ? listSelectedPath : selectedPath"
           :is-path-expanded="isPathExpanded"
           :root-contents-loaded="hasLoadedRootContents"
           :has-more-root-documents="hasMoreRootDocuments"
@@ -752,7 +859,8 @@ onUnmounted(() => {
           "
           @toggle="togglePath"
           @create-folder="createFolder"
-          @create-document="createDocumentAt"
+          @create-document="handleCreateDocument"
+          :working-dir="workingDir"
           @rename-folder="renameExplorerFolder"
           @rename-document="renameExplorerDocument"
           @copy-relative-path="copyExplorerRelativePath"
@@ -792,7 +900,7 @@ onUnmounted(() => {
         </div>
       </div>
       <div
-        v-if="!props.embedded"
+        v-if="!props.embedded && !props.listOnly"
         class="resize-handle"
         :class="{ active: resizingSidebar }"
         role="separator"
@@ -800,7 +908,7 @@ onUnmounted(() => {
         @mousedown="onResizeStart"
       ></div>
 
-      <div class="kx-right">
+      <div v-if="!props.listOnly" class="kx-right">
         <div class="kx-content">
           <div
             v-if="embeddingRuntimeLoading && specialPage !== 'retrieval'"
@@ -813,6 +921,7 @@ onUnmounted(() => {
           <KnowledgeSkillPackagePreview
             v-if="selectedPackageDocument"
             :package-document="selectedPackageDocument"
+            :workspace-ref="props.workspaceRef ?? null"
             :documents="documents"
             :save-loading="savingDocument"
             @select-document="handleSelectDocument"
@@ -820,6 +929,19 @@ onUnmounted(() => {
             @export-package="handleExportPackage"
           />
 
+          <WorkspaceCsvEditor
+            ref="csvPreview"
+            :file-actions="false"
+            v-else-if="selectedDocument && /\.csv$/i.test(selectedDocument.path)"
+            :key="selectedDocument.id"
+            :path="`Locus/knowledge/${selectedDocument.type}/${selectedDocument.path}`"
+            :workspace-ref="props.workspaceRef"
+            :read-only="selectedDocument.readOnly"
+            :content="selectedDocument.readOnly ? selectedDocument.body : undefined"
+            :active="props.active"
+            @ready="emit('ready')"
+            @dirty-change="emit('dirtyChange', $event)"
+          />
           <KnowledgePreview
             v-else-if="selectedDocument"
             :document="selectedDocument"
@@ -981,6 +1103,14 @@ onUnmounted(() => {
   background: color-mix(in srgb, var(--panel-bg) 84%, var(--bg-color) 16%);
   min-width: 220px;
   overflow: hidden;
+}
+
+.is-list-only .kx-side {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  border-right: 0;
+  background: var(--sidebar-bg);
 }
 
 .kx-side-tools {

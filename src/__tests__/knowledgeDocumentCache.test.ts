@@ -41,6 +41,14 @@ beforeEach(() => {
 });
 
 describe("knowledgeDocumentCache", () => {
+  it("does not return previous-assignment content when a generation repeats", () => {
+    const old = { ...workspaceRef, expectedMaterializationEpoch: 1 };
+    cacheKnowledgeDocument("F:/pool/slot", old, document("old assignment"));
+    expect(getCachedKnowledgeDocument("F:/pool/slot", { ...old, expectedMaterializationEpoch: 2 }, {
+      type: "design", path: "combat/core-loop.md",
+    })).toBeNull();
+  });
+
   it("isolates documents by checkout generation", () => {
     cacheKnowledgeDocument("F:/repo", workspaceRef, document("cached"));
 

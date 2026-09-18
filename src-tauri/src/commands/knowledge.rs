@@ -115,6 +115,10 @@ pub struct KnowledgeListPageResponse {
 
 fn knowledge_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
+        error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
+            "workspace.materialization_stale",
+            "The checkout assignment changed. Reopen the checkout before continuing.",
+        ).detail(error.to_string()),
         WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
             "workspace.registry_unavailable",
             "The workspace registry is unavailable.",
@@ -139,7 +143,7 @@ fn knowledge_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     }
 }
 
-fn resolve_knowledge_workspace_scope(
+pub(super) fn resolve_knowledge_workspace_scope(
     registry: &ProjectRegistry,
     workspace_ref: &WorkspaceRef,
 ) -> Result<ResolvedWorkspaceScope, AppError> {
@@ -839,11 +843,11 @@ pub(crate) fn require_knowledge_document_path_suffix(path: &str) -> Result<(), S
         .unwrap_or(normalized)
         .trim_matches('/');
 
-    if stripped.ends_with(".md") {
+    if stripped.to_ascii_lowercase().ends_with(".md") || stripped.to_ascii_lowercase().ends_with(".csv") {
         Ok(())
     } else {
         Err(
-            "knowledge document paths must end with .md; use paths without .md only for directory operations"
+            "knowledge document paths must end with .md or .csv; use extensionless paths only for directory operations"
                 .to_string(),
         )
     }
@@ -1089,6 +1093,23 @@ fn document_mutation_targets(
     ]
 }
 
+fn document_move_targets(
+    result: &KnowledgeMutationResponse,
+    source_type: KnowledgeType,
+) -> Vec<KnowledgeChangedTarget> {
+    if source_type == result.doc_type {
+        return document_mutation_targets(result, "structure");
+    }
+    vec![
+        document_change_target(source_type, &result.path, "structure"),
+        document_change_target(
+            result.doc_type,
+            result.result_path.as_deref().unwrap_or(&result.path),
+            "structure",
+        ),
+    ]
+}
+
 fn directory_mutation_targets(
     result: &KnowledgeMutationResponse,
     default_change_kind: &'static str,
@@ -1123,6 +1144,9 @@ fn merge_document_create_patch(
     }
     if let Some(inject_mode) = patch.inject_mode {
         base.inject_mode = Some(inject_mode);
+    }
+    if let Some(inject_agents) = patch.inject_agents {
+        base.inject_agents = Some(inject_agents);
     }
     if let Some(inherit_inject_mode) = patch.inherit_inject_mode {
         base.inherit_inject_mode = Some(inherit_inject_mode);
@@ -1360,6 +1384,7 @@ pub(crate) fn execute_knowledge_create_request(
                     doc_type: Some(doc_type),
                     title: document_patch.title.take(),
                     inject_mode: document_patch.inject_mode,
+                    inject_agents: document_patch.inject_agents.take(),
                     inherit_inject_mode: document_patch.inherit_inject_mode,
                     summary_enabled: document_patch.summary_enabled,
                     command_enabled: document_patch.command_enabled,
@@ -1541,14 +1566,22 @@ pub(crate) fn execute_knowledge_move_request(
                 resolve_knowledge_document_target(request.doc_type, &request.path)?;
             ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_path)?;
             ensure_memory_builtins_for_type(working_dir, Some(doc_type))?;
+            let target_type = parse_knowledge_type_from_path(&request.new_path).unwrap_or(doc_type);
             let (_, normalized_target_path) =
-                resolve_knowledge_document_target(Some(doc_type), &request.new_path)?;
-            ensure_skill_package_target_mutable(working_dir, doc_type, &normalized_target_path)?;
+                resolve_knowledge_document_target(Some(target_type), &request.new_path)?;
+            ensure_skill_package_target_mutable(working_dir, target_type, &normalized_target_path)?;
+            if target_type != doc_type
+                && knowledge_store::document_path(working_dir, target_type, &normalized_target_path)?
+                    .exists()
+            {
+                return Err("The target knowledge document already exists".to_string());
+            }
             let document = knowledge_store::edit_document(
                 working_dir,
                 &normalized_path,
                 Some(doc_type),
                 KnowledgeDocumentPatch {
+                    doc_type: Some(target_type),
                     new_path: Some(normalized_target_path.clone()),
                     ..Default::default()
                 },
@@ -3150,6 +3183,18 @@ pub async fn knowledge_move(
     let (_scope, working_dir, knowledge_index_state) =
         knowledge_scope_parts(registry.inner().as_ref(), &workspace_ref, &app_handle)?;
     let app_knowledge_dir: State<'_, AppKnowledgeDir> = app_handle.state();
+    let source_type = match request.kind {
+        KnowledgeTargetKind::Document => {
+            resolve_knowledge_document_target(request.doc_type, &request.path)
+                .map_err(AppError::from)?
+                .0
+        }
+        KnowledgeTargetKind::Directory => {
+            resolve_knowledge_directory_target(request.doc_type, &request.path)
+                .map_err(AppError::from)?
+                .0
+        }
+    };
     let result = execute_knowledge_move_request(&working_dir, request).map_err(AppError::from)?;
     match result.kind {
         KnowledgeTargetKind::Document => {
@@ -3173,17 +3218,22 @@ pub async fn knowledge_move(
                     &app_handle,
                     &working_dir,
                     knowledge_index_state.clone(),
-                    document.doc_type,
+                    source_type,
                     &previous_path,
                 )
                 .await?;
             }
+            let source = knowledge_store::document_path(&working_dir, source_type, &result.path).map_err(AppError::from)?;
+            let target = knowledge_store::document_path(&working_dir, result.doc_type, result.result_path.as_deref().unwrap_or(&result.path)).map_err(AppError::from)?;
+            super::workspace_explorer::reconcile_knowledge_file_action(
+                registry.inner().as_ref(), &app_handle, _scope.runtime().project_id(), &working_dir, &source, Some(&target),
+            )?;
             emit_knowledge_changed_with_targets(
                 &app_handle,
                 &knowledge_index_state,
                 &working_dir,
                 "knowledge_move",
-                document_mutation_targets(&result, "structure"),
+                document_move_targets(&result, source_type),
             );
         }
         KnowledgeTargetKind::Directory => {
@@ -3225,6 +3275,10 @@ pub async fn knowledge_delete(
                 )
                 .await?;
             }
+            let source = knowledge_store::document_path(&working_dir, result.doc_type, &result.path).map_err(AppError::from)?;
+            super::workspace_explorer::reconcile_knowledge_file_action(
+                registry.inner().as_ref(), &app_handle, _scope.runtime().project_id(), &working_dir, &source, None,
+            )?;
             emit_knowledge_changed_with_targets(
                 &app_handle,
                 &knowledge_index_state,
@@ -3760,6 +3814,52 @@ pub async fn knowledge_reveal_target(
         &request.path,
     )?;
     reveal_path_native(&reveal_path).map_err(Into::into)
+}
+
+/// Read the physical Markdown source only when a user quotes a selection.
+/// Reuse knowledge path resolution for project, app and installed skill files.
+#[tauri::command]
+pub async fn knowledge_document_source(
+    workspace_ref: WorkspaceRef,
+    request: KnowledgeRevealRequest,
+    registry: State<'_, Arc<ProjectRegistry>>,
+    app_knowledge_dir: State<'_, AppKnowledgeDir>,
+) -> Result<serde_json::Value, AppError> {
+    if request.kind != KnowledgeTargetKind::Document {
+        return Err(AppError::new("knowledge.selection.invalid_target", "Expected a knowledge document"));
+    }
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let doc_type = parse_knowledge_type(&request.doc_type).map_err(AppError::from)?;
+    let path = resolve_knowledge_reveal_path(
+        &working_dir,
+        app_knowledge_dir.0.as_ref().as_ref(),
+        doc_type,
+        KnowledgeTargetKind::Document,
+        &request.path,
+    )?;
+    if !path.is_file() || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")) {
+        // Bundled Unity references expose virtual Markdown files to the agent.
+        // Use the same rendered source as filesystem reads, never the bundle path.
+        if doc_type == KnowledgeType::Reference {
+            let (_, normalized_path) = resolve_knowledge_document_target(Some(doc_type), &request.path)
+                .map_err(AppError::from)?;
+            if let Some(document) = unity_docs::load_managed_document(&working_dir, &normalized_path)
+                .map_err(AppError::from)? {
+                return Ok(serde_json::json!({
+                    "path": format!("{}/Locus/knowledge/reference/{}", working_dir.replace('\\', "/"), normalized_path),
+                    "content": knowledge_store::render_document_for_filesystem_read(&document).map_err(AppError::from)?,
+                }));
+            }
+        }
+        return Err(AppError::new("knowledge.selection.source_unavailable", "Markdown source is unavailable"));
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| AppError::new("knowledge.selection.read_failed", error.to_string()))?;
+    Ok(serde_json::json!({
+        "path": path.to_string_lossy().replace('\\', "/"),
+        "content": content,
+    }))
 }
 
 const BINARY_EXTS: &[&str] = &[
@@ -4579,7 +4679,7 @@ pub struct AgentRuleFileEntry {
 }
 
 impl AgentRuleFileEntry {
-    fn into_item(self) -> RuleItem {
+    pub(crate) fn into_item(self) -> RuleItem {
         RuleItem {
             key: self.key,
             file_name: self.file_name,
@@ -4595,16 +4695,93 @@ impl AgentRuleFileEntry {
     }
 }
 
+// Serialize read/modify/write operations from the UI and Python SDK.
+static RULE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn validate_rule_agent_id(agent_id: &str) -> Result<(), String> {
+    if agent_id.is_empty()
+        || agent_id
+            .chars()
+            .any(|c| c.is_control() || "\\/:*?\"<>|".contains(c))
+        || agent_id.contains("..")
+        || agent_id.ends_with(['.', ' '])
+        || is_removed_agent_id(agent_id)
+    {
+        return Err(format!("Invalid rule Agent id: {agent_id}"));
+    }
+    Ok(())
+}
+
+fn validate_rule_file_name(file_name: &str) -> Result<(), String> {
+    if file_name.trim().is_empty()
+        || file_name
+            .chars()
+            .any(|c| c.is_control() || "\\/:*?\"<>|".contains(c))
+        || file_name.contains("..")
+        || file_name.ends_with(['.', ' '])
+    {
+        return Err("Invalid file name".to_string());
+    }
+    Ok(())
+}
+
+fn load_rule_config_for_write(
+    working_dir: &str,
+    agent_id: &str,
+) -> Result<AgentRuleConfig, String> {
+    let mut configs = AgentRuleConfig::new();
+    for layer_dir in workspace_agent_layer_dirs(working_dir, agent_id) {
+        let path = layer_dir.join("rule_config.json");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                configs.extend(serde_json::from_str::<AgentRuleConfig>(&content).map_err(
+                    |error| format!("Invalid rule config '{}': {error}", path.display()),
+                )?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Failed to read rule config: {error}")),
+        }
+    }
+    Ok(configs)
+}
+
+pub(super) fn ensure_workspace_rule_path(working_dir: &str, path: &std::path::Path) -> Result<(), String> {
+    let root = std::path::Path::new(working_dir);
+    if !root.is_absolute() || !root.is_dir() {
+        return Err("Agent rules require an existing workspace directory".into());
+    }
+    let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let mut ancestor = path;
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let resolved =
+                    std::fs::canonicalize(ancestor).map_err(|error| error.to_string())?;
+                if !resolved.starts_with(&root) {
+                    return Err("Agent rule path is outside the selected workspace".into());
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or("Invalid workspace rule path")?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
 fn rules_dir(working_dir: &str, agent_id: &str) -> Result<std::path::PathBuf, String> {
     if is_removed_agent_id(agent_id) {
         return Err(format!("Unknown agent: {}", agent_id));
     }
     let agent_id = canonical_agent_id(agent_id);
+    validate_rule_agent_id(agent_id)?;
     let dir = std::path::Path::new(working_dir)
         .join("Locus")
         .join("agent")
         .join(agent_id)
         .join("rule");
+    ensure_workspace_rule_path(working_dir, &dir)?;
     if !dir.exists() {
         std::fs::create_dir_all(&dir)
             .map_err(|e| format!("Failed to create rules directory: {}", e))?;
@@ -4641,14 +4818,16 @@ fn save_rule_config(
     if is_removed_agent_id(agent_id) {
         return Err(format!("Unknown agent: {}", agent_id));
     }
+    validate_rule_agent_id(canonical_agent_id(agent_id))?;
     let path = rule_config_path(working_dir, agent_id);
+    ensure_workspace_rule_path(working_dir, &path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create directory: {}", e))?;
     }
     let json = serde_json::to_string_pretty(configs)
         .map_err(|e| format!("Serialization failed: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| format!("Failed to save config: {}", e))?;
+    crate::config::atomic_write_config(&path, json.as_bytes())?;
     Ok(())
 }
 
@@ -4850,6 +5029,7 @@ pub fn collect_agent_rule_files(
         return Err(format!("Unknown agent: {}", agent_id));
     }
     let agent_id = canonical_agent_id(agent_id).to_string();
+    validate_rule_agent_id(&agent_id)?;
     let configs = merged_rule_config_for_agent(app_agent_dir, working_dir, &agent_id);
     let mut items = Vec::new();
     let mut seen_static_names = std::collections::HashSet::new();
@@ -4902,6 +5082,31 @@ pub fn collect_agent_rule_files(
 
     items.sort_by(|a, b| a.order.cmp(&b.order).then(a.key.cmp(&b.key)));
     Ok(items)
+}
+
+/// Hash the effective static rules, including content, so SDK changes, manual
+/// edits and undo all invalidate persisted prompt caches without a DB migration.
+pub(crate) fn agent_rule_prompt_fingerprint(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    working_dir: &str,
+    agent_id: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let entries =
+        collect_agent_rule_files(app_agent_dir, working_dir, agent_id, false).unwrap_or_default();
+    let mut hash = Sha256::new();
+    for entry in entries.into_iter().filter(|entry| entry.enabled) {
+        if let Ok(content) = std::fs::read(&entry.path) {
+            hash.update((entry.key.len() as u64).to_le_bytes());
+            hash.update(entry.key.as_bytes());
+            hash.update((content.len() as u64).to_le_bytes());
+            hash.update(content);
+        }
+    }
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[tauri::command]
@@ -4958,42 +5163,80 @@ pub async fn save_rule(
     agent_id: String,
     file_name: String,
     content: String,
+    expected_content: Option<String>,
     registry: State<'_, Arc<ProjectRegistry>>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<RuleItem, AppError> {
-    if file_name.is_empty()
-        || file_name.contains('/')
-        || file_name.contains('\\')
-        || file_name.contains("..")
-    {
-        return Err("Invalid file name".to_string().into());
-    }
+    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
+    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    save_workspace_agent_rule_checked(
+        app_agent_dir.0.as_ref(),
+        &working_dir,
+        &agent_id,
+        &file_name,
+        &content,
+        expected_content.as_deref(),
+    )
+    .map_err(Into::into)
+}
 
+pub(crate) fn save_workspace_agent_rule(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    working_dir: &str,
+    agent_id: &str,
+    file_name: &str,
+    content: &str,
+) -> Result<RuleItem, String> {
+    save_workspace_agent_rule_checked(app_agent_dir, working_dir, agent_id, file_name, content, None)
+}
+
+fn save_workspace_agent_rule_checked(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    working_dir: &str,
+    agent_id: &str,
+    file_name: &str,
+    content: &str,
+    expected_content: Option<&str>,
+) -> Result<RuleItem, String> {
+    validate_rule_file_name(file_name)?;
+    let agent_id = canonical_agent_id(agent_id);
+    validate_rule_agent_id(agent_id)?;
     let file_name = if file_name.ends_with(".md") {
-        file_name
+        file_name.to_string()
     } else {
         format!("{}.md", file_name)
     };
-
-    let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
-    let working_dir = scope.runtime().root().to_string_lossy().into_owned();
-    let dir = rules_dir(&working_dir, &agent_id)?;
+    let _guard = RULE_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
+    let mut configs = load_rule_config_for_write(working_dir, agent_id)?;
+    let entries = collect_agent_rule_files(app_agent_dir, working_dir, agent_id, false)?;
+    let existing = entries.iter().find(|entry| entry.key == file_name);
+    if let Some(expected) = expected_content {
+        let actual = existing.map(|entry| std::fs::read_to_string(&entry.path)).transpose()
+            .map_err(|error| error.to_string())?;
+        if actual.as_deref() != Some(expected) {
+            return Err("Agent rule changed on disk. Reload it before saving.".into());
+        }
+    }
+    let dir = rules_dir(working_dir, agent_id)?;
     let path = dir.join(&file_name);
+    ensure_workspace_rule_path(working_dir, &path)?;
 
-    let is_new = !path.is_file();
-    std::fs::write(&path, &content).map_err(|e| format!("Failed to save rule: {}", e))?;
-
-    let mut configs = load_rule_config(&working_dir, &agent_id);
-    if is_new && !configs.contains_key(&file_name) {
-        let max_order = configs.values().map(|c| c.order).max().unwrap_or(-1);
+    if !configs.contains_key(&file_name) {
+        let max_order = entries.iter().map(|entry| entry.order).max().unwrap_or(-1);
         configs.insert(
             file_name.clone(),
             RuleConfig {
-                enabled: true,
-                order: max_order + 1,
+                enabled: existing.map(|entry| entry.enabled).unwrap_or(true),
+                order: existing
+                    .map(|entry| entry.order)
+                    .unwrap_or(max_order.saturating_add(1)),
             },
         );
-        save_rule_config(&working_dir, &agent_id, &configs)?;
     }
+    // Publish config first: a failed file write cannot expose a new rule with
+    // the wrong inherited enabled state or ordering.
+    save_rule_config(working_dir, agent_id, &configs)?;
+    crate::config::atomic_write_config(&path, content.as_bytes())?;
 
     let title = extract_title_from_file(&path, &file_name);
     let updated_at = get_updated_at(&path);
@@ -5063,11 +5306,11 @@ pub async fn delete_rule(
     file_name: String,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<(), AppError> {
-    if file_name.contains("..") || file_name.contains('/') || file_name.contains('\\') {
-        return Err("Invalid file name".to_string().into());
-    }
+    validate_rule_file_name(&file_name)?;
     let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
     let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let _guard = RULE_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
+    let mut configs = load_rule_config_for_write(&working_dir, &agent_id)?;
     let dir = rules_dir(&working_dir, &agent_id)?;
     let path = dir.join(&file_name);
     if !path.is_file() {
@@ -5075,7 +5318,6 @@ pub async fn delete_rule(
     }
     std::fs::remove_file(&path).map_err(|e| format!("Failed to delete rule: {}", e))?;
 
-    let mut configs = load_rule_config(&working_dir, &agent_id);
     configs.remove(&file_name);
     save_rule_config(&working_dir, &agent_id, &configs)?;
     Ok(())
@@ -5090,36 +5332,49 @@ pub async fn set_rule_enabled(
     registry: State<'_, Arc<ProjectRegistry>>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
 ) -> Result<(), AppError> {
-    if file_name.trim().is_empty() {
-        return Err("Invalid rule key".to_string().into());
-    }
-    let agent_id = canonical_agent_id(&agent_id).to_string();
     let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
     let working_dir = scope.runtime().root().to_string_lossy().into_owned();
-    let existing_entry =
-        collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?
-            .into_iter()
-            .find(|entry| entry.key == file_name || entry.file_name == file_name);
-    if existing_entry
-        .as_ref()
-        .and_then(|entry| entry.plugin_id.as_ref())
-        .is_some()
-    {
+    set_workspace_agent_rule_enabled(
+        app_agent_dir.0.as_ref(),
+        &working_dir,
+        &agent_id,
+        &file_name,
+        enabled,
+    )
+    .map(|_| ())
+    .map_err(Into::into)
+}
+
+pub(crate) fn set_workspace_agent_rule_enabled(
+    app_agent_dir: &Option<std::path::PathBuf>,
+    working_dir: &str,
+    agent_id: &str,
+    rule_key: &str,
+    enabled: bool,
+) -> Result<RuleItem, String> {
+    let agent_id = canonical_agent_id(agent_id);
+    validate_rule_agent_id(agent_id)?;
+    let _guard = RULE_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
+    let mut entry = collect_agent_rule_files(app_agent_dir, working_dir, agent_id, false)?
+        .into_iter()
+        .find(|entry| entry.key == rule_key)
+        .ok_or_else(|| format!("Rule file not found: {rule_key}"))?;
+    if entry.plugin_id.is_some() {
         return Err("Plugin Rule enablement is controlled by plugin state"
             .to_string()
             .into());
     }
-    let mut configs = load_rule_config(&working_dir, &agent_id);
-    let max_order = configs.values().map(|cfg| cfg.order).max().unwrap_or(-1);
-    let cfg = configs.entry(file_name).or_insert_with(|| RuleConfig {
-        enabled,
-        order: existing_entry
-            .as_ref()
-            .map(|entry| entry.order)
-            .unwrap_or(max_order.saturating_add(1)),
-    });
+    let mut configs = load_rule_config_for_write(working_dir, agent_id)?;
+    let cfg = configs
+        .entry(entry.key.clone())
+        .or_insert_with(|| RuleConfig {
+            enabled,
+            order: entry.order,
+        });
     cfg.enabled = enabled;
-    save_rule_config(&working_dir, &agent_id, &configs).map_err(Into::into)
+    save_rule_config(working_dir, agent_id, &configs)?;
+    entry.enabled = enabled;
+    Ok(entry.into_item())
 }
 
 #[tauri::command]
@@ -5133,9 +5388,10 @@ pub async fn set_rule_order(
     let agent_id = canonical_agent_id(&agent_id).to_string();
     let scope = resolve_knowledge_workspace_scope(registry.inner().as_ref(), &workspace_ref)?;
     let working_dir = scope.runtime().root().to_string_lossy().into_owned();
+    let _guard = RULE_WRITE_LOCK.lock().map_err(|e| e.to_string())?;
     let entries =
         collect_agent_rule_files(app_agent_dir.0.as_ref(), &working_dir, &agent_id, false)?;
-    let mut configs = load_rule_config(&working_dir, &agent_id);
+    let mut configs = load_rule_config_for_write(&working_dir, &agent_id)?;
     for (i, name) in file_names.iter().enumerate() {
         let default_enabled = entries
             .iter()
@@ -5328,6 +5584,136 @@ mod tests {
         assert_eq!(target.target_kind, Some("document"));
         assert_eq!(target.change_kind, Some("content"));
         assert!(!target.subtree);
+    }
+
+    #[test]
+    fn document_move_across_categories_preserves_content_and_targets_both_categories() {
+        for (target_type, target_path) in [
+            (KnowledgeType::Plan, "plan/note.md"),
+            (KnowledgeType::Memory, "memory/note.md"),
+            (KnowledgeType::Memory, "memory/combat/note.md"),
+            (KnowledgeType::Skill, "skill/note.md"),
+            (KnowledgeType::Reference, "reference/note.md"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let working_dir = temp.path().to_string_lossy().to_string();
+            let source = execute_knowledge_create_request(
+                &working_dir,
+                KnowledgeCreateRequest {
+                    path: "design/note.md".to_string(),
+                    document: Some(KnowledgeDocumentPatch {
+                        body: Some(Some("Document body\n第二行".to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .document
+            .unwrap();
+
+            let result = execute_knowledge_move_request(
+                &working_dir,
+                KnowledgeMoveRequest {
+                    path: "design/note.md".to_string(),
+                    doc_type: Some(KnowledgeType::Design),
+                    new_path: target_path.to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let moved = result.document.as_ref().unwrap();
+            assert_eq!(moved.doc_type, target_type);
+            assert_eq!(moved.id, source.id);
+            assert_eq!(moved.body, source.body);
+            assert!(
+                !knowledge_store::document_path(&working_dir, KnowledgeType::Design, "note.md")
+                    .unwrap()
+                    .exists()
+            );
+            let reloaded =
+                knowledge_store::load_document_by_path(&working_dir, target_type, &moved.path).unwrap();
+            assert_eq!(reloaded.body, source.body);
+            assert_eq!(reloaded.doc_type, target_type);
+            assert_eq!(reloaded.id, source.id);
+
+            let targets = document_move_targets(&result, KnowledgeType::Design);
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].doc_type, Some(KnowledgeType::Design));
+            assert_eq!(targets[0].path.as_deref(), Some("note.md"));
+            assert_eq!(targets[1].doc_type, Some(target_type));
+            assert_eq!(targets[1].path.as_deref(), Some(moved.path.as_str()));
+        }
+    }
+
+    #[test]
+    fn document_move_across_categories_rejects_collision_without_changing_either_document() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        for (path, body) in [
+            ("design/note.md", "Source"),
+            ("plan/note.md", "Destination"),
+        ] {
+            execute_knowledge_create_request(
+                &working_dir,
+                KnowledgeCreateRequest {
+                    path: path.to_string(),
+                    document: Some(KnowledgeDocumentPatch {
+                        body: Some(Some(body.to_string())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let error = execute_knowledge_move_request(
+            &working_dir,
+            KnowledgeMoveRequest {
+                path: "design/note.md".to_string(),
+                new_path: "plan/note.md".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("already exists"));
+        assert_eq!(
+            knowledge_store::load_document_by_path(&working_dir, KnowledgeType::Design, "note.md")
+                .unwrap()
+                .body,
+            "Source"
+        );
+        assert_eq!(
+            knowledge_store::load_document_by_path(&working_dir, KnowledgeType::Plan, "note.md")
+                .unwrap()
+                .body,
+            "Destination"
+        );
+    }
+
+    #[test]
+    fn document_move_keeps_unprefixed_destinations_in_the_source_category() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        execute_knowledge_create_request(
+            &working_dir,
+            KnowledgeCreateRequest {
+                path: "design/note.md".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let result = execute_knowledge_move_request(
+            &working_dir,
+            KnowledgeMoveRequest {
+                path: "design/note.md".to_string(),
+                new_path: "nested/note.md".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.doc_type, KnowledgeType::Design);
+        assert_eq!(result.result_path.as_deref(), Some("nested/note.md"));
     }
 
     #[test]

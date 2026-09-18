@@ -57,6 +57,7 @@ interface KnowledgeReadPayload {
   path: string;
   title: string;
   injectMode: KnowledgeInjectMode;
+  injectAgents?: string[];
   inheritInjectMode?: boolean;
   injectModeSource?: KnowledgeConfigSource | null;
   summaryEnabled: boolean;
@@ -252,6 +253,7 @@ function normalizeDocument(payload: KnowledgeReadPayload): KnowledgeDocument {
     title: payload.title,
     injectMode,
     effectiveInjectMode: payload.injectMode,
+    injectAgents: payload.injectAgents ?? ["unity"],
     injectModeSource: payload.injectModeSource ?? { kind: "self", path: null },
     readOnly: payload.readOnly,
     aiEditMode,

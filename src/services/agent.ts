@@ -8,6 +8,21 @@ import type {
 } from "../types";
 import type { WorkspaceRef } from "./project";
 
+export type AgentDocumentKind = "soul" | "env" | "tool";
+export interface AgentDocument {
+  content: string;
+  path: string;
+  revision: string | null;
+}
+
+export function readWorkspaceAgentDocument(workspaceRef: WorkspaceRef, agentId: string, kind: AgentDocumentKind, name = ""): Promise<AgentDocument> {
+  return ipcInvoke("read_workspace_agent_document", { workspaceRef, agentId, kind, name });
+}
+
+export function saveWorkspaceAgentDocument(workspaceRef: WorkspaceRef, agentId: string, kind: AgentDocumentKind, name: string, content: string, expectedRevision: string | null): Promise<AgentDocument> {
+  return ipcInvoke("save_workspace_agent_document", { workspaceRef, agentId, kind, name, content, expectedRevision });
+}
+
 export function listAgents(): Promise<AgentInfo[]> {
   return ipcInvoke<AgentInfo[]>("list_agents");
 }
@@ -135,8 +150,8 @@ export function readAppRule(agentId: string, ruleKey: string): Promise<string> {
   return ipcInvoke<string>("read_app_rule", { agentId, fileName: ruleKey });
 }
 
-export function saveRule(workspaceRef: WorkspaceRef, agentId: string, fileName: string, content: string): Promise<RuleItem> {
-  return ipcInvoke<RuleItem>("save_rule", { workspaceRef, agentId, fileName, content });
+export function saveRule(workspaceRef: WorkspaceRef, agentId: string, fileName: string, content: string, expectedContent?: string): Promise<RuleItem> {
+  return ipcInvoke<RuleItem>("save_rule", { workspaceRef, agentId, fileName, content, expectedContent });
 }
 
 export function deleteRule(workspaceRef: WorkspaceRef, agentId: string, fileName: string): Promise<void> {

@@ -1,9 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import {
-  WORKSPACE_EVENT_NAME,
-  type RoutedWorkspaceEvent,
-} from "./project";
+import type { RoutedWorkspaceEvent } from "./project";
+import { listenWorkspaceEvent } from "./workspaceEventHub";
 
 type WorkspaceEventSubscriber = (event: RoutedWorkspaceEvent) => void;
 type PluginsChangedSubscriber = () => void;
@@ -20,7 +18,7 @@ async function ensureListeners(): Promise<void> {
   if (startPromise) return startPromise;
   const generation = listenerGeneration;
   const pending = Promise.allSettled([
-    listen<RoutedWorkspaceEvent>(WORKSPACE_EVENT_NAME, (event) => {
+    listenWorkspaceEvent<RoutedWorkspaceEvent>("knowledgeWorkspaceEventHub.ensureListeners", (event) => {
       for (const subscriber of [...workspaceSubscribers]) {
         try {
           subscriber(event.payload);

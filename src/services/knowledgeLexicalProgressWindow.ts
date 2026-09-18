@@ -1,3 +1,4 @@
+import { materializationEpochFromParams, appendMaterializationEpoch } from "./project";
 import type { LexicalRebuildStatus } from "../types";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
@@ -24,6 +25,7 @@ export function buildKnowledgeLexicalProgressWindowQuery(workspaceRef?: Workspac
   if (workspaceRef) {
     params.set("checkoutId", workspaceRef.checkoutId);
     params.set("workspaceGeneration", String(requireWindowGeneration(workspaceRef)));
+  appendMaterializationEpoch(params, workspaceRef.expectedMaterializationEpoch);
   }
   return params.toString();
 }
@@ -41,7 +43,7 @@ export function getKnowledgeLexicalProgressWindowWorkspaceRef(
   if (!checkoutId || !/^\d+$/.test(generationText)) return null;
   const expectedGeneration = Number(generationText);
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) return null;
-  return { checkoutId, expectedGeneration };
+  return { checkoutId, expectedGeneration , expectedMaterializationEpoch: materializationEpochFromParams(params) };
 }
 
 export function shouldAutoOpenKnowledgeLexicalProgressWindow(

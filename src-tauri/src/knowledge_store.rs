@@ -8,6 +8,10 @@ use walkdir::WalkDir;
 
 use crate::unity_docs;
 
+mod csv;
+pub(crate) use csv::{is_csv_document, is_knowledge_document_file};
+use csv::{is_csv_view_file, parse_csv_document, csv_document_id, save_moved_document, remove_csv_view};
+
 const KNOWLEDGE_ROOT_DIR: &str = "Locus/knowledge";
 const DOCUMENT_LOAD_PARALLEL_THRESHOLD: usize = 48;
 static KNOWLEDGE_LAYOUT_MIGRATION_LOCK: Mutex<()> = Mutex::new(());
@@ -227,6 +231,8 @@ pub struct KnowledgeDocument {
     pub path: String,
     pub title: String,
     pub inject_mode: KnowledgeInjectMode,
+    #[serde(default = "default_inject_agents")]
+    pub inject_agents: Vec<String>,
     #[serde(default)]
     pub inherit_inject_mode: bool,
     pub inject_mode_source: KnowledgeConfigSource,
@@ -277,6 +283,8 @@ struct KnowledgeFrontmatter {
     pub body_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeFrontmatterInjectMode>,
+    #[serde(default = "default_inject_agents")]
+    pub inject_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_inject_mode: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +406,8 @@ pub struct KnowledgeListItem {
     pub path: String,
     pub title: String,
     pub inject_mode: KnowledgeInjectMode,
+    #[serde(default = "default_inject_agents")]
+    pub inject_agents: Vec<String>,
     pub summary_enabled: bool,
     pub command_enabled: bool,
     pub read_only: bool,
@@ -717,6 +727,8 @@ pub struct KnowledgeDocumentPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeInjectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_agents: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_inject_mode: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_enabled: Option<bool>,
@@ -957,6 +969,8 @@ pub struct KnowledgeUpdateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject_mode: Option<KnowledgeInjectMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_agents: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_inject_mode: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_enabled: Option<bool>,
@@ -994,6 +1008,29 @@ pub struct KnowledgeUpdateRequest {
 
 fn now_millis() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+pub fn default_inject_agents() -> Vec<String> {
+    vec![crate::agent::definition::DEFAULT_AGENT_ID.to_string()]
+}
+
+fn normalize_inject_agents(agents: Vec<String>) -> Vec<String> {
+    let mut result = Vec::new();
+    for agent in agents {
+        let agent = crate::agent::definition::canonical_agent_id(agent.trim());
+        if !agent.is_empty() && !result.iter().any(|existing| existing == agent) {
+            result.push(agent.to_string());
+        }
+    }
+    result
+}
+
+pub fn document_allows_agent_injection(document: &KnowledgeDocument, agent_id: &str) -> bool {
+    !matches!(document.inject_mode, KnowledgeInjectMode::Full | KnowledgeInjectMode::Rule)
+        || document.inject_agents.iter().any(|agent| {
+            crate::agent::definition::canonical_agent_id(agent.trim())
+                == crate::agent::definition::canonical_agent_id(agent_id.trim())
+        })
 }
 
 fn system_time_millis(value: std::time::SystemTime) -> Option<i64> {
@@ -1236,6 +1273,7 @@ fn memory_document_payload_matches(left: &KnowledgeDocument, right: &KnowledgeDo
 fn memory_builtin_documents_match(left: &KnowledgeDocument, right: &KnowledgeDocument) -> bool {
     memory_document_payload_matches(left, right)
         && left.inject_mode == right.inject_mode
+        && left.inject_agents == right.inject_agents
         && left
             .maintenance_rules
             .as_deref()
@@ -1663,6 +1701,7 @@ pub fn ensure_memory_builtin_documents(working_dir: &str) -> Result<(), String> 
         save_document(
             working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: seed.id.to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: seed.path.to_string(),
@@ -2335,7 +2374,7 @@ fn normalize_relative_path(path: &str) -> Result<String, String> {
         .or_else(|| normalized.strip_prefix("reference/"))
         .unwrap_or(normalized);
 
-    Ok(if normalized.ends_with(".md") {
+    Ok(if normalized.to_ascii_lowercase().ends_with(".md") || is_csv_document(&normalized) {
         normalized.to_string()
     } else {
         format!("{}.md", normalized)
@@ -3730,6 +3769,9 @@ pub fn edit_document(
     if let Some(inject_mode) = patch.inject_mode {
         doc.inject_mode = inject_mode;
     }
+    if let Some(inject_agents) = patch.inject_agents {
+        doc.inject_agents = normalize_inject_agents(inject_agents);
+    }
     if let Some(inherit_inject_mode) = patch.inherit_inject_mode {
         doc.inherit_inject_mode = inherit_inject_mode;
     } else if patch.inject_mode.is_some() {
@@ -3822,14 +3864,7 @@ pub fn edit_document(
     ensure_summary_state(&mut doc);
     ensure_maintenance_rules(&mut doc);
     ensure_skill_defaults(&mut doc);
-    let saved = save_document(working_dir, doc)?;
-    if saved.doc_type != old_type || saved.path != old_path {
-        let old_file = document_path(working_dir, old_type, &old_path)?;
-        if old_file.is_file() {
-            let _ = std::fs::remove_file(old_file);
-        }
-    }
-    Ok(saved)
+    save_moved_document(working_dir, doc, old_type, &old_path)
 }
 
 pub fn guess_type_from_path(path: &str) -> Option<KnowledgeType> {
@@ -3876,6 +3911,7 @@ fn parse_frontmatter(content: &str) -> Result<(KnowledgeFrontmatter, &str), Stri
 const CANONICAL_FRONTMATTER_KEYS: &[&str] = &[
     "id",
     "injectMode",
+    "injectAgents",
     "summary",
     "readOnly",
     "aiEditMode",
@@ -4152,6 +4188,7 @@ fn render_frontmatter(doc: &KnowledgeDocument) -> Result<String, String> {
         title: None,
         body_format: None,
         inject_mode: Some(KnowledgeFrontmatterInjectMode::from_document(doc)),
+        inject_agents: doc.inject_agents.clone(),
         inherit_inject_mode: None,
         summary_enabled: None,
         summary_cache: None,
@@ -4192,8 +4229,8 @@ pub struct PreparedGenericKnowledgeWrite {
 }
 
 /// Build the on-disk representation for a generic `write` call targeting a
-/// workspace knowledge document. The caller supplies ordinary Markdown body
-/// content; Locus owns the frontmatter required by the knowledge catalog.
+/// workspace knowledge document. Markdown bodies receive catalog frontmatter;
+/// CSV tables remain raw content without frontmatter.
 pub fn prepare_generic_knowledge_write(
     working_dir: &str,
     doc_type: KnowledgeType,
@@ -4201,7 +4238,18 @@ pub fn prepare_generic_knowledge_write(
     body: &str,
 ) -> Result<PreparedGenericKnowledgeWrite, String> {
     let path = normalize_relative_path(logical_path)?;
+    if is_csv_document(&path) {
+        if doc_type == KnowledgeType::Skill {
+            return Err("CSV documents cannot be executable skills".to_string());
+        }
+        return Ok(PreparedGenericKnowledgeWrite {
+            content: body.to_string(),
+            frontmatter: String::new(),
+            content_start_line: 1,
+        });
+    }
     let mut document = KnowledgeDocument {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: format!("kd_{}", uuid::Uuid::new_v4()),
         doc_type,
         path,
@@ -4258,6 +4306,7 @@ pub fn prepare_generic_knowledge_write(
 }
 
 fn render_document_body(doc: &KnowledgeDocument) -> Result<String, String> {
+    if is_csv_document(&doc.path) { return Ok(doc.body.clone()); }
     if doc.ai_edit_mode == KnowledgeAiEditMode::Auto
         && !doc.inherit_ai_config
         && !has_maintenance_rules_content(doc.maintenance_rules.as_deref())
@@ -4271,6 +4320,7 @@ fn render_document_body(doc: &KnowledgeDocument) -> Result<String, String> {
 }
 
 fn render_document(doc: &KnowledgeDocument) -> Result<String, String> {
+    if is_csv_document(&doc.path) { return Ok(doc.body.clone()); }
     let mut normalized = doc.clone();
     apply_external_source_defaults(&mut normalized);
 
@@ -4345,6 +4395,10 @@ fn parse_document(
     doc_type_hint: Option<KnowledgeType>,
     path_hint: Option<&str>,
 ) -> Result<KnowledgeDocument, String> {
+    if let Some(path) = path_hint.filter(|path| is_csv_document(path)) {
+        let doc_type = doc_type_hint.or_else(|| guess_type_from_path(path)).ok_or("CSV knowledge document requires a type")?;
+        return parse_csv_document(content, doc_type, path);
+    }
     let (frontmatter, body) = parse_frontmatter(content)?;
     let doc_type = doc_type_hint
         .or(frontmatter.doc_type)
@@ -4467,6 +4521,7 @@ fn parse_document(
     let explicit_maintenance_rules = maintenance_rules.is_some();
 
     let mut doc = KnowledgeDocument {
+        inject_agents: normalize_inject_agents(frontmatter.inject_agents),
         id: frontmatter.id,
         doc_type,
         path,
@@ -4523,6 +4578,7 @@ fn convert_plain_markdown_document(
     let normalized_path = normalize_relative_path(path)?;
     let timestamp = now_millis();
     let document = KnowledgeDocument {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: format!("kd_{}", uuid::Uuid::new_v4()),
         doc_type,
         path: normalized_path.clone(),
@@ -4618,19 +4674,17 @@ pub fn move_directory(
             continue;
         }
 
-        let is_markdown = entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("md"))
-            .unwrap_or(false);
-        if !is_markdown && !is_directory_config_file(entry.path()) {
+        let is_markdown = is_knowledge_document_file(entry.path());
+        if !is_markdown && !is_directory_config_file(entry.path()) && !is_csv_view_file(entry.path()) {
             return Err(format!(
-                "Knowledge directory move only supports Markdown files and directory config sidecars: {}",
+                "Knowledge directory move only supports documents and their sidecars: {}",
                 entry.path().display()
             ));
         }
-        if is_directory_config_file(entry.path()) {
+        if is_csv_view_file(entry.path()) && entry.path().with_extension("").is_file() {
+            continue; // The CSV document move carries its view.
+        }
+        if is_directory_config_file(entry.path()) || is_csv_view_file(entry.path()) {
             sidecar_files.push(relative.to_path_buf());
             continue;
         }
@@ -4821,19 +4875,14 @@ fn delete_directory_internal(
             continue;
         }
 
-        let is_markdown = entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| ext.eq_ignore_ascii_case("md"))
-            .unwrap_or(false);
-        if !is_markdown && !is_directory_config_file(entry.path()) {
+        let is_markdown = is_knowledge_document_file(entry.path());
+        if !is_markdown && !is_directory_config_file(entry.path()) && !is_csv_view_file(entry.path()) {
             return Err(format!(
-                "Knowledge directory delete only supports Markdown files and directory config sidecars: {}",
+                "Knowledge directory delete only supports documents and their sidecars: {}",
                 entry.path().display()
             ));
         }
-        if is_directory_config_file(entry.path()) {
+        if is_directory_config_file(entry.path()) || is_csv_view_file(entry.path()) {
             continue;
         }
 
@@ -4973,6 +5022,13 @@ fn load_workspace_document_by_normalized_path(
             e
         )
     })?;
+    if is_csv_document(normalized_path) {
+        let mut doc = parse_csv_document(&content, doc_type, normalized_path)?;
+        resolve_document_inheritance(Some(working_dir), &mut doc)?;
+        ensure_maintenance_rules(&mut doc);
+        apply_file_timestamps(&mut doc, &path);
+        return Ok(doc);
+    }
     if !has_frontmatter_opening(&content) {
         return convert_plain_markdown_document(working_dir, doc_type, normalized_path, content);
     }
@@ -4985,6 +5041,30 @@ fn load_workspace_document_by_normalized_path(
     if (migrate_legacy_layout || normalize_frontmatter) && !document.read_only {
         write_document_preserving_layout(&path, &document, render_document_body(&document)?)?;
     }
+    apply_file_timestamps(&mut document, &path);
+    Ok(document)
+}
+
+/// Inspect effective file-edit policy without migrating or registering the
+/// document on disk. Mutation preflight must not change its own input snapshot.
+pub(crate) fn inspect_workspace_document_policy(
+    working_dir: &str,
+    doc_type: KnowledgeType,
+    rel_path: &str,
+) -> Result<KnowledgeDocument, String> {
+    let normalized_path = normalize_relative_path(rel_path)?;
+    let path = document_path(working_dir, doc_type, &normalized_path)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Failed to read knowledge document '{}': {error}", path.display()))?;
+    let content = if is_csv_document(&normalized_path) || has_frontmatter_opening(&raw) {
+        raw
+    } else {
+        prepare_generic_knowledge_write(working_dir, doc_type, &normalized_path, &raw)?.content
+    };
+    let mut document = parse_document(&content, Some(doc_type), Some(&normalized_path))?;
+    resolve_document_inheritance(Some(working_dir), &mut document)?;
+    ensure_maintenance_rules(&mut document);
+    validate_document(&document)?;
     apply_file_timestamps(&mut document, &path);
     Ok(document)
 }
@@ -5100,6 +5180,7 @@ fn document_to_list_item(doc: KnowledgeDocument) -> KnowledgeListItem {
     let has_body_content_flag = has_body_content(&doc.body);
     let byte_size = rendered_document_size_bytes(&doc).ok();
     KnowledgeListItem {
+        inject_agents: doc.inject_agents,
         id: doc.id,
         doc_type: doc.doc_type,
         path: doc.path,
@@ -5148,7 +5229,7 @@ fn collect_document_snapshots_from_root(
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            if !path.is_file() || !is_knowledge_document_file(path) {
                 return None;
             }
             let relative_path = path
@@ -5420,7 +5501,7 @@ pub fn load_documents_with_app_root_excluding_prefixes(
                 .filter_map(|entry| {
                     let path = entry.path();
                     if !path.is_file()
-                        || path.extension().and_then(|ext| ext.to_str()) != Some("md")
+                        || !is_knowledge_document_file(path)
                     {
                         return None;
                     }
@@ -5618,7 +5699,7 @@ pub fn list_documents(
             .filter_map(Result::ok)
         {
             let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            if !path.is_file() || !is_knowledge_document_file(path) {
                 continue;
             }
             let Ok(relative_path) = path.strip_prefix(&root) else {
@@ -6127,7 +6208,13 @@ fn write_document_file(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create knowledge document directory: {}", e))?;
     }
+    if is_csv_document(&document.path) { document.id = csv_document_id(document.doc_type, &document.path); }
     let rendered = render_document(&document)?;
+    if is_csv_document(&document.path) {
+        crate::config::atomic_write_config(target_path, rendered.as_bytes())?;
+        apply_file_timestamps(&mut document, target_path);
+        return Ok(document);
+    }
     std::fs::write(target_path, rendered).map_err(|e| {
         format!(
             "Failed to write knowledge document '{}': {}",
@@ -6216,6 +6303,9 @@ fn write_document_preserving_layout(
     document: &KnowledgeDocument,
     body_markdown: String,
 ) -> Result<(), String> {
+    if is_csv_document(&document.path) {
+        return crate::config::atomic_write_config(target_path, document.body.as_bytes());
+    }
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create knowledge document directory: {}", e))?;
@@ -6305,6 +6395,7 @@ pub fn update_document(
                 .ok_or_else(|| "create requires body".to_string())?;
             let maintenance_rules = request.maintenance_rules.and_then(|value| value);
             let mut doc = KnowledgeDocument {
+                inject_agents: normalize_inject_agents(request.inject_agents.unwrap_or_else(default_inject_agents)),
                 id: request
                     .id
                     .unwrap_or_else(|| format!("kd_{}", uuid::Uuid::new_v4())),
@@ -6363,6 +6454,7 @@ pub fn update_document(
                 doc_type: request.doc_type,
                 title: request.title,
                 inject_mode: request.inject_mode,
+                inject_agents: request.inject_agents,
                 inherit_inject_mode: request.inherit_inject_mode,
                 summary_enabled: request.summary_enabled,
                 command_enabled: request.command_enabled,
@@ -6389,6 +6481,7 @@ pub fn update_document(
                 return Err("Cannot delete a read-only knowledge document".to_string());
             }
             let path = document_path(working_dir, doc.doc_type, &doc.path)?;
+            if is_csv_document(&doc.path) { remove_csv_view(&path)?; }
             std::fs::remove_file(&path).map_err(|e| {
                 format!(
                     "Failed to delete knowledge document '{}': {}",
@@ -6412,6 +6505,9 @@ pub fn update_document(
             }
             if let Some(inject_mode) = request.inject_mode {
                 doc.inject_mode = inject_mode;
+            }
+            if let Some(inject_agents) = request.inject_agents {
+                doc.inject_agents = normalize_inject_agents(inject_agents);
             }
             if let Some(inherit_inject_mode) = request.inherit_inject_mode {
                 doc.inherit_inject_mode = inherit_inject_mode;
@@ -6494,14 +6590,7 @@ pub fn update_document(
             ensure_summary_state(&mut doc);
             ensure_maintenance_rules(&mut doc);
             ensure_skill_defaults(&mut doc);
-            let saved = save_document(working_dir, doc)?;
-            if saved.doc_type != old_type || saved.path != old_path {
-                let old_file = document_path(working_dir, old_type, &old_path)?;
-                if old_file.is_file() {
-                    let _ = std::fs::remove_file(old_file);
-                }
-            }
-            Ok(saved)
+            save_moved_document(working_dir, doc, old_type, &old_path)
         }
         KnowledgeUpdateOp::UpdateSummary => {
             let mut doc = locate_document(working_dir, &request)?;
@@ -6829,6 +6918,57 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn inject_agents_default_to_unity_and_round_trip_empty_selection() {
+        let source = "---\nid: kd_agents\ninjectMode: full\n---\n\nAgent-specific knowledge";
+        let mut doc = parse_document(source, Some(KnowledgeType::Design), Some("agents.md")).unwrap();
+        assert_eq!(doc.inject_agents, vec!["unity"]);
+        assert!(document_allows_agent_injection(&doc, "unity"));
+        assert!(!document_allows_agent_injection(&doc, "reviewer"));
+
+        doc.inject_agents.clear();
+        let rendered = render_document(&doc).unwrap();
+        assert!(rendered.contains("injectAgents: []"));
+        assert!(!frontmatter_needs_normalization(&rendered));
+        let reloaded = parse_document(&rendered, Some(KnowledgeType::Design), Some("agents.md")).unwrap();
+        assert!(reloaded.inject_agents.is_empty());
+        assert!(!document_allows_agent_injection(&reloaded, "unity"));
+
+        for mode in [KnowledgeInjectMode::Path, KnowledgeInjectMode::Excerpt] {
+            doc.inject_mode = mode;
+            assert!(document_allows_agent_injection(&doc, "reviewer"));
+        }
+    }
+
+    #[test]
+    fn inject_agents_persist_through_edit_and_rename_without_changing_body() {
+        let temp = TempDir::new().unwrap();
+        let working_dir = temp.path().to_str().unwrap();
+        let original = save_document(working_dir, sample_doc()).unwrap();
+        let doc = edit_document(working_dir, &original.path, Some(original.doc_type), KnowledgeDocumentPatch {
+            inject_agents: Some(vec![" unity ".into(), "reviewer".into(), "reviewer".into(), "".into()]),
+            inject_mode: Some(KnowledgeInjectMode::Full),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(doc.inject_agents, vec!["unity", "reviewer"]);
+        let renamed = edit_document(working_dir, &doc.path, Some(doc.doc_type), KnowledgeDocumentPatch {
+            new_path: Some("gameplay/renamed.md".into()),
+            ..Default::default()
+        }).unwrap();
+        let reloaded = load_document_by_path(working_dir, renamed.doc_type, &renamed.path).unwrap();
+        assert_eq!(reloaded.inject_agents, vec!["unity", "reviewer"]);
+        assert_eq!(reloaded.body, original.body);
+        assert_eq!(document_to_list_item(reloaded).inject_agents, vec!["unity", "reviewer"]);
+        let cleared = update_document(working_dir, KnowledgeUpdateRequest {
+            op: KnowledgeUpdateOp::UpdateMeta,
+            path: renamed.path,
+            doc_type: Some(renamed.doc_type),
+            inject_agents: Some(vec![]),
+            ..Default::default()
+        }).unwrap();
+        assert!(load_document_by_path(working_dir, cleared.doc_type, &cleared.path).unwrap().inject_agents.is_empty());
+    }
+
+    #[test]
     fn plan_is_a_builtin_knowledge_root_with_path_injection() {
         let temp = TempDir::new().unwrap();
         let working_dir = temp.path().to_string_lossy().to_string();
@@ -6848,6 +6988,7 @@ mod tests {
 
     fn sample_doc() -> KnowledgeDocument {
         KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: "kd_test".to_string(),
             doc_type: KnowledgeType::Design,
             path: "gameplay/core-loop.md".to_string(),
@@ -7050,6 +7191,7 @@ mod tests {
 
     fn sample_unity_bundle_doc() -> KnowledgeDocument {
         KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: "kd_unity_bundle_doc".to_string(),
             doc_type: KnowledgeType::Reference,
             path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
@@ -7091,6 +7233,7 @@ mod tests {
 
     fn sample_memory_doc() -> KnowledgeDocument {
         KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: "kd_memory_test".to_string(),
             doc_type: KnowledgeType::Memory,
             path: MEMORY_USER_PREFERENCE_PATH.to_string(),
@@ -7930,6 +8073,7 @@ updatedAt: 2
     #[test]
     fn render_and_parse_skill_round_trip_preserves_skill_fields() {
         let doc = KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: "kd_skill".to_string(),
             doc_type: KnowledgeType::Skill,
             path: "create-skill.md".to_string(),
@@ -9145,6 +9289,7 @@ Body content
             save_document(
                 &working_dir,
                 KnowledgeDocument {
+                    inject_agents: crate::knowledge_store::default_inject_agents(),
                     id: id.to_string(),
                     doc_type: KnowledgeType::Memory,
                     path: path.to_string(),
@@ -9213,6 +9358,7 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_builtin_memory_project_mistake_note".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_PROJECT_MISTAKE_NOTE_PATH.to_string(),
@@ -9267,6 +9413,7 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_builtin_memory_user_preference".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_USER_PREFERENCE_LEGACY_PATH.to_string(),
@@ -9326,6 +9473,7 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_builtin_memory_user_preference".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: MEMORY_USER_PREFERENCE_PATH.to_string(),
@@ -9424,6 +9572,7 @@ Body content
             save_document(
                 &working_dir,
                 KnowledgeDocument {
+                    inject_agents: crate::knowledge_store::default_inject_agents(),
                     id: id.to_string(),
                     doc_type: KnowledgeType::Memory,
                     path: path.to_string(),
@@ -9555,6 +9704,7 @@ Body content
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_custom_project_understanding".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: "project-understanding.md".to_string(),

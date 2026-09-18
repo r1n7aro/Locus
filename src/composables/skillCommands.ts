@@ -13,6 +13,7 @@ export const BUILTIN_COMMAND_NAMES = [
   "/fork",
   "/undo",
   "/export-context",
+  "/garbage-collection",
   "/review-context",
   "/unity-console",
   "/console-error",
@@ -66,7 +67,7 @@ export function findSkillCommandConflict(
   const normalizedLower = normalized.toLowerCase();
 
   if (BUILTIN_COMMAND_NAMES.some((name) => name.toLowerCase() === normalizedLower)) {
-    if (currentSkill?.dirName === ACTION_BACKED_SKILL_COMMANDS[normalizedLower]) {
+    if (currentSkill && currentSkill.dirName === ACTION_BACKED_SKILL_COMMANDS[normalizedLower]) {
       return null;
     }
     return {

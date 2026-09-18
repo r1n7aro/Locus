@@ -1,5 +1,5 @@
 {
-  "description": "Search Design, Memory, Reference, and Skill sources, plus plan/ execution documents. Provide lexicalQuery or semanticQuery. Summary results use one line per document: <path> :: <summary>. Detailed results use a single-line header: --- <path> | lines <start>-<end> | summary <line> | body <line> --- followed by optional hit context.\n\nEach header gives a real file path and 1-based physical line range, including frontmatter. Use `read` with that path, offset, and limit. Workspace paths are relative; registered external sources use absolute paths. Result titles are omitted because they match filenames; ranking metadata is also omitted.",
+  "description": "Search Design, Memory, Reference, and Skill sources, plus plan/ execution documents. Includes Markdown documents and CSV tables; CSV headers and cell text are searchable. Provide lexicalQuery or semanticQuery. Summary results use one line per document: <path> :: <summary>. Detailed results use a single-line header: --- <path> | lines <start>-<end> | summary <line> | body <line> --- followed by optional hit context.\n\nEach header gives a real file path and 1-based physical line range, including Markdown frontmatter. CSV has no frontmatter or document summary: summary is empty and body starts at line 1. CSV line ranges count physical lines, not records; quoted cells may span multiple lines. Use `read` with that path, offset, and limit. Workspace paths are relative; registered external sources use absolute paths. Result titles are omitted because they match filenames; ranking metadata is also omitted.",
   "parameters": {
     "type": "object",
     "additionalProperties": false,
@@ -19,7 +19,7 @@
       },
       "pathPrefix": {
         "type": "string",
-        "description": "Optional type-prefixed directory path prefix. Valid roots: `design/`, `plan/`, `memory/`, `skill/`, and `reference/`. Use `skill/` for workflows, SOPs, slash-command skills, tool/package instructions, and reusable execution procedures. Examples: `skill/`, `skill/unity/`, `plan/`, `memory/`, `design/`, `reference/unity/`. Directory prefixes do not end with `.md`."
+        "description": "Optional type-prefixed directory path prefix. Valid roots: `design/`, `plan/`, `memory/`, `skill/`, and `reference/`. Use `skill/` for workflows, SOPs, slash-command skills, tool/package instructions, and reusable execution procedures. Examples: `skill/`, `skill/unity/`, `plan/`, `memory/`, `design/`, `reference/unity/`. Directory prefixes do not end with `.md` or `.csv`."
       },
       "includeSummary": {
         "type": "boolean",

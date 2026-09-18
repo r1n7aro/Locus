@@ -21,6 +21,7 @@ function scopeKey(workingDir: string, workspaceRef: WorkspaceRef): string {
     normalizeWorkspacePath(workingDir),
     workspaceRef.checkoutId,
     workspaceRef.expectedGeneration ?? "",
+    workspaceRef.expectedMaterializationEpoch ?? "empty",
   ].join("|");
 }
 

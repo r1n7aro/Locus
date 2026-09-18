@@ -39,6 +39,7 @@ function workspaceScopeKey(
     normalizePath(workingDir).toLocaleLowerCase(),
     workspaceRef.checkoutId,
     workspaceRef.expectedGeneration ?? "",
+    workspaceRef.expectedMaterializationEpoch ?? "empty",
   ].join("|");
 }
 

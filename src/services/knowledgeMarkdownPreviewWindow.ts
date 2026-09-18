@@ -1,3 +1,4 @@
+import { materializationEpochFromParams } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { KnowledgeDocumentType } from "../types";
@@ -50,7 +51,7 @@ export function getKnowledgeMarkdownPreviewWindowPayload(
           expectedGeneration: Number.isSafeInteger(generation) && generation > 0
             ? generation
             : undefined,
-        },
+         expectedMaterializationEpoch: materializationEpochFromParams(params) },
       }
     : null;
 }
@@ -63,6 +64,7 @@ export function buildKnowledgeMarkdownPreviewWindowQuery(
     docType: payload.docType,
     path: payload.path.trim(),
     checkoutId: payload.workspaceRef.checkoutId,
+    ...(payload.workspaceRef.expectedMaterializationEpoch != null ? { materializationEpoch: String(payload.workspaceRef.expectedMaterializationEpoch) } : {}),
     ...(payload.workspaceRef.expectedGeneration != null
       ? { workspaceGeneration: String(payload.workspaceRef.expectedGeneration) }
       : {}),

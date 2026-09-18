@@ -9,12 +9,12 @@ describe("workspace knowledge document layout", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const knowledgeView = read("src/components/KnowledgeView.vue");
 
-    expect(workbench).toContain(':embedded="editor.resource.kind === \'knowledge\'"');
+    expect(workbench).toContain(':embedded="editor.resource.kind === \'knowledge\' || (editor.resource.kind === \'section\' && !!editor.resource.knowledgePage)"');
     expect(workbench).toContain(':selected-document-id="editorKnowledgeDocument(editor)?.id ?? null"');
     expect(workbench).toContain(':selected-document-target="editorKnowledgeDocument(editor)"');
-    expect(workbench).toContain(':active="group.activeEditorId === editor.editorId"');
+    expect(workbench).toContain(':active="contentActive"');
     expect(knowledgeView).toMatch(/v-if="!props\.embedded"\s+class="kx-side"/);
-    expect(knowledgeView).toMatch(/v-if="!props\.embedded"\s+class="resize-handle"/);
+    expect(knowledgeView).toMatch(/v-if="!props\.embedded && !props\.listOnly"\s+class="resize-handle"/);
     expect(knowledgeView).toContain(':embedded="props.embedded"');
     expect(knowledgeView).toContain(':active="props.active"');
   });
@@ -27,18 +27,28 @@ describe("workspace knowledge document layout", () => {
   });
 
   it("lets the continuous document scroller receive wheels from auto-grow editors", () => {
-    const preview = read("src/components/knowledge/KnowledgePreview.vue");
+    const styles = read("src/components/ui/markdown-document.css");
 
-    expect(preview).toMatch(/\.preview-main\s*\{[\s\S]*overflow:\s*auto;/);
-    expect(preview).toMatch(/\.document-body :deep\(\.base-markdown-editor \.cm-scroller\)\s*\{[\s\S]*overflow:\s*visible;[\s\S]*overscroll-behavior:\s*auto;/);
+    expect(styles).toMatch(/\.document-scroller\s*\{[\s\S]*overflow:\s*auto;/);
+    expect(styles).toMatch(/\.document-body :deep\(\.base-markdown-editor \.cm-scroller\)\s*\{[\s\S]*overflow:\s*visible;[\s\S]*overscroll-behavior:\s*auto;/);
   });
 
   it("keeps rendered tables inside the centered document page", () => {
-    const preview = read("src/components/knowledge/KnowledgePreview.vue");
+    const styles = read("src/components/ui/markdown-document.css");
     const livePreview = read("src/components/ui/markdown-editor/markdownLivePreview.ts");
 
-    expect(preview).toMatch(/\.document-page\s*\{[\s\S]*width:\s*min\(100%, 980px\);[\s\S]*margin:\s*0 auto;/);
+    expect(styles).toMatch(/\.document-page\s*\{[\s\S]*width:\s*min\(100%, 980px\);[\s\S]*margin:\s*0 auto;/);
     expect(livePreview).toMatch(/"\.cm-live-table-row":\s*\{[\s\S]*width:\s*"100%",/);
+  });
+
+  it("keeps the outline visible before there is room for a centered document", () => {
+    const styles = read("src/components/ui/markdown-document.css");
+
+    expect(styles).toMatch(/@container knowledge-document \(min-width: 1120px\)\s*\{[\s\S]*grid-template-columns:\s*210px minmax\(0, 920px\);[\s\S]*justify-content:\s*center;/);
+    expect(styles).toContain("@container knowledge-document (min-width: 1488px)");
+    expect(styles).toMatch(/@container knowledge-document \(min-width: 1488px\)\s*\{[\s\S]*grid-template-columns:\s*minmax\(210px, 1fr\) minmax\(0, 980px\) minmax\(210px, 1fr\);/);
+    expect(styles).toMatch(/\.document-workspace\.has-outline \.document-outline\s*\{[\s\S]*grid-column:\s*1;[\s\S]*justify-self:\s*end;/);
+    expect(styles).toMatch(/\.document-workspace\.has-outline \.document-page\s*\{[\s\S]*grid-column:\s*2;/);
   });
 
   it("uses a physical hit area for the knowledge directory resize handle", () => {

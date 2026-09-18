@@ -3522,6 +3522,7 @@ async fn run_feishu_reference_import(
         )
         .map_err(FeishuReferenceImportRunError::Failed)?;
         let document = KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: stable_document_id(
                 config.space_id.as_deref().unwrap_or_default(),
                 &planned_doc.node_token,

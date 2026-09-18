@@ -15,6 +15,16 @@ export interface ResolveKnowledgeExplorerSelectionResult {
   shouldHandleAsPlainClick: boolean;
 }
 
+export interface KnowledgeExplorerClickSequence {
+  path: string;
+  detail: number;
+}
+
+export interface ResolveKnowledgeExplorerClickActivationResult {
+  current: KnowledgeExplorerClickSequence;
+  shouldActivate: boolean;
+}
+
 export interface ResolveKnowledgeContextSelectionInput {
   visiblePaths: string[];
   selectedPaths: Set<string>;
@@ -24,6 +34,30 @@ export interface ResolveKnowledgeContextSelectionInput {
 export interface KnowledgeDeleteTarget {
   kind: "folder" | "document";
   path: string;
+}
+
+/**
+ * Treat a repeated click on the same row as part of the same activation, while
+ * still accepting a later click when the first click never reached the row or
+ * reached a different row after the tree changed beneath the pointer.
+ */
+export function resolveKnowledgeExplorerClickActivation(
+  previous: KnowledgeExplorerClickSequence | null,
+  path: string,
+  detail: number,
+): ResolveKnowledgeExplorerClickActivationResult {
+  const current = {
+    path,
+    detail: Math.max(1, Math.trunc(detail)),
+  };
+  const repeatedSameRow =
+    current.detail > 1 &&
+    previous?.path === current.path &&
+    previous.detail === current.detail - 1;
+  return {
+    current,
+    shouldActivate: !repeatedSameRow,
+  };
 }
 
 function isDescendantPath(path: string, ancestor: string): boolean {

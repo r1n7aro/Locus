@@ -61,6 +61,32 @@ describe("KnowledgeExplorer contextual selection", () => {
     expect(explorer).toContain('t("knowledge.explorer.importExternalFolder")');
   });
 
+  it("prioritizes creation and separates folder menu action groups", () => {
+    const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
+    const folderMenu = explorer.slice(
+      explorer.indexOf(`<template v-else-if="ctxMenu.kind === 'folder' || ctxMenu.kind === 'root'">`),
+      explorer.indexOf(`<template v-else-if="ctxMenu.kind === 'package'">`),
+    );
+
+    const createDocument = folderMenu.indexOf("openCreateInline('document')");
+    const createFolder = folderMenu.indexOf("openCreateInline('folder')");
+    const rename = folderMenu.indexOf("startRenameSelection");
+    const configure = folderMenu.indexOf("openSelectedFolderConfig");
+    const reveal = folderMenu.indexOf("openSelectedInFileSystem");
+    const copyPath = folderMenu.indexOf("copySelectedRelativePath");
+    const remove = folderMenu.indexOf("requestDeleteSelectedNodes");
+
+    expect(createDocument).toBeGreaterThanOrEqual(0);
+    expect(createDocument).toBeLessThan(createFolder);
+    expect(createFolder).toBeLessThan(rename);
+    expect(rename).toBeLessThan(configure);
+    expect(configure).toBeLessThan(reveal);
+    expect(reveal).toBeLessThan(copyPath);
+    expect(copyPath).toBeLessThan(remove);
+    expect(folderMenu.match(/class="kx-ctx-sep"/g)).toHaveLength(3);
+    expect(folderMenu.match(/role="separator"/g)).toHaveLength(3);
+  });
+
   it("disables drag semantics and button wrapping while a row is being renamed", () => {
     const explorer = read("src/components/knowledge/KnowledgeExplorer.vue");
 

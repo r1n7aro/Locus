@@ -1,4 +1,6 @@
+import { resetWorkspaceEventHubForTests } from "../services/workspaceEventHub";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { snapshotWorkspaceEvents } from "../services/workspaceEventHub";
 import {
   resetKnowledgeWorkspaceEventHubForTests,
   subscribeKnowledgeWorkspaceEvents,
@@ -15,6 +17,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 beforeEach(() => {
+    resetWorkspaceEventHubForTests();
   resetKnowledgeWorkspaceEventHubForTests();
   eventMocks.handlers.clear();
   eventMocks.releases = [];
@@ -58,7 +61,13 @@ describe("knowledgeWorkspaceEventHub", () => {
     releaseFirst();
     expect(eventMocks.releases.every((release) => !release.mock.calls.length)).toBe(true);
     releaseSecond();
-    expect(eventMocks.releases.every((release) => release.mock.calls.length === 1)).toBe(true);
+    expect(eventMocks.releases.reduce((count, release) => count + release.mock.calls.length, 0)).toBe(1);
+    expect(snapshotWorkspaceEvents().nativeListenerCount).toBe(1);
+    expect(snapshotWorkspaceEvents().subscribers).toHaveLength(0);
+
+    const releaseAgain = await subscribeKnowledgeWorkspaceEvents(vi.fn(), vi.fn());
+    expect(eventMocks.listen.mock.calls.filter(([event]) => event === "locus://workspace-event")).toHaveLength(1);
+    releaseAgain();
   });
 
   it("isolates a failing subscriber from the remaining panes", async () => {
@@ -81,7 +90,7 @@ describe("knowledgeWorkspaceEventHub", () => {
     consoleError.mockRestore();
   });
 
-  it("releases a partially-created native listener when startup fails", async () => {
+  it("releases the business subscription but keeps the window listener when plugin startup fails", async () => {
     const releaseWorkspace = vi.fn();
     eventMocks.listen.mockImplementation(async (name: string) => {
       if (name === "plugins-changed") throw new Error("plugins listener failed");
@@ -90,6 +99,7 @@ describe("knowledgeWorkspaceEventHub", () => {
 
     await expect(subscribeKnowledgeWorkspaceEvents(vi.fn(), vi.fn()))
       .rejects.toThrow("plugins listener failed");
-    expect(releaseWorkspace).toHaveBeenCalledTimes(1);
+    expect(releaseWorkspace).not.toHaveBeenCalled();
+    expect(snapshotWorkspaceEvents().subscribers).toHaveLength(0);
   });
 });

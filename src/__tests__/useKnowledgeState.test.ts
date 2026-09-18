@@ -1,3 +1,4 @@
+import { resetWorkspaceEventHubForTests } from "../services/workspaceEventHub";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRenderer, defineComponent, nextTick, reactive } from "vue";
 import { createPinia, setActivePinia } from "pinia";
@@ -367,6 +368,7 @@ function mountKnowledgeState(props: KnowledgeStateProps) {
 
 describe("useKnowledgeState", () => {
   beforeEach(() => {
+    resetWorkspaceEventHubForTests();
     clearKnowledgeDocumentCacheForTests();
     clearKnowledgeCatalogCacheForTests();
     resetKnowledgeWorkspaceEventHubForTests();
@@ -3074,6 +3076,82 @@ describe("useKnowledgeState", () => {
         newPath: "systems/core-loop.md",
       }),
     );
+  });
+
+  it.each(["", "combat", "systems"])("moves the selected document to another category at '%s'", async (targetDir) => {
+    const state = useKnowledgeState(reactive({
+      workingDir: "F:/repo", selectedModelId: "", modelDefaults: {} as any,
+    }));
+    await state.refreshKnowledgeData();
+    const folder = state.currentExplorerRoot.value!.children[0];
+    const node = folder.kind === "folder" ? folder.children[0] : null;
+    if (node?.kind !== "document") throw new Error("missing document");
+    await state.selectDocument(node.document);
+    const nextPath = targetDir ? `${targetDir}/core-loop.md` : "core-loop.md";
+    const moved = { ...node.document, type: "memory" as const, path: nextPath };
+    knowledgeMocks.knowledgeMove.mockImplementationOnce(async (input) => {
+      knowledgeMocks.knowledgeList.mockResolvedValue([moved]);
+      return { kind: "document", type: "memory", path: input.path, resultPath: nextPath,
+        document: { ...moved, body: "正文", maintenanceRules: null } };
+    });
+
+    await state.moveExplorerNode(node, targetDir, "memory");
+
+    expect(knowledgeMocks.knowledgeMove).toHaveBeenCalledWith({
+      kind: "document", type: "design", path: "combat/core-loop.md", newPath: `memory/${nextPath}`,
+    });
+    expect(state.activeType.value).toBe("memory");
+    expect(state.selectedDocument.value).toMatchObject({ id: node.document.id, type: "memory", path: nextPath, body: "正文" });
+    expect(state.documents.value.some((doc) => doc.type === "design" && doc.path === node.document.path)).toBe(false);
+    expect(state.isPathExpanded("memory")).toBe(true);
+    if (targetDir) expect(state.isPathExpanded(`memory/${targetDir}`)).toBe(true);
+  });
+
+  it("keeps the original selection when a cross-category move fails", async () => {
+    const state = useKnowledgeState(reactive({
+      workingDir: "F:/repo", selectedModelId: "", modelDefaults: {} as any,
+    }));
+    await state.refreshKnowledgeData();
+    const folder = state.currentExplorerRoot.value!.children[0];
+    const node = folder.kind === "folder" ? folder.children[0] : null;
+    if (node?.kind !== "document") throw new Error("missing document");
+    await state.selectDocument(node.document);
+    knowledgeMocks.knowledgeMove.mockRejectedValueOnce(new Error("already exists"));
+
+    await state.moveExplorerNode(node, "", "memory");
+
+    expect(state.activeType.value).toBe("design");
+    expect(state.selectedDocument.value).toMatchObject({ type: "design", path: node.document.path });
+    expect(notificationStoreMocks.addNotice).toHaveBeenCalledWith(
+      "error", expect.stringContaining("already exists"), expect.objectContaining({ operation: "knowledge_move.document" }),
+    );
+  });
+
+  it("does not restore an old category when a read finishes after a move", async () => {
+    const state = useKnowledgeState(reactive({
+      workingDir: "F:/repo", selectedModelId: "", modelDefaults: {} as any,
+    }));
+    await state.refreshKnowledgeData();
+    const folder = state.currentExplorerRoot.value!.children[0];
+    const node = folder.kind === "folder" ? folder.children[0] : null;
+    if (node?.kind !== "document") throw new Error("missing document");
+    await state.selectDocument(node.document);
+    let resolveOldRead!: (result: unknown) => void;
+    knowledgeMocks.knowledgeRead.mockImplementationOnce(() => new Promise((resolve) => { resolveOldRead = resolve; }));
+    await state.selectDocument(node.document);
+    await nextTick();
+    const moved = { ...node.document, type: "memory" as const, path: "core-loop.md", body: "正文", maintenanceRules: null };
+    knowledgeMocks.knowledgeMove.mockImplementationOnce(async (input) => {
+      knowledgeMocks.knowledgeList.mockResolvedValue([moved]);
+      return { kind: "document", type: "memory", path: input.path, resultPath: moved.path, document: moved };
+    });
+
+    await state.moveExplorerNode(node, "", "memory");
+    resolveOldRead({ kind: "document", document: { ...node.document, body: "旧正文", maintenanceRules: null } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(state.activeType.value).toBe("memory");
+    expect(state.selectedDocument.value).toMatchObject({ type: "memory", path: moved.path, body: "正文" });
   });
 
   it("moves a folder into another directory", async () => {

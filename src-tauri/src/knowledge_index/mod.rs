@@ -4079,7 +4079,10 @@ struct SanitizedSearchHitContext {
     end_line: u32,
 }
 
-fn frontmatter_end_index(lines: &[&str]) -> Option<usize> {
+fn frontmatter_end_index(physical_path: &Path, lines: &[&str]) -> Option<usize> {
+    if knowledge_store::is_csv_document(&physical_path.to_string_lossy()) {
+        return None;
+    }
     lines
         .first()
         .is_some_and(|line| line.trim_start_matches('\u{feff}').trim() == "---")
@@ -4149,7 +4152,7 @@ fn read_sanitized_search_hit_context(
         return None;
     }
 
-    let Some(frontmatter_end) = frontmatter_end_index(&lines) else {
+    let Some(frontmatter_end) = frontmatter_end_index(physical_path, &lines) else {
         return read_search_hit_context(physical_path, start_line, end_line).map(|text| {
             SanitizedSearchHitContext {
                 text,
@@ -4196,6 +4199,9 @@ fn read_sanitized_search_hit_context(
 }
 
 fn locate_document_section_start_lines(physical_path: &std::path::Path) -> (Option<u32>, u32) {
+    if knowledge_store::is_csv_document(&physical_path.to_string_lossy()) {
+        return (None, 1);
+    }
     let Ok(raw) = std::fs::read_to_string(physical_path) else {
         return (None, 1);
     };
@@ -4777,6 +4783,7 @@ fn build_list_item(
     access: Option<DirectorySearchAccess>,
 ) -> KnowledgeListItem {
     KnowledgeListItem {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: document.id.clone(),
         doc_type: document.doc_type,
         path: document.path.clone(),
@@ -5484,7 +5491,7 @@ fn collect_text_scan_file_candidates_from_root(
         .filter_map(Result::ok)
     {
         let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        if !path.is_file() || !knowledge_store::is_knowledge_document_file(path) {
             continue;
         }
         let Ok(relative) = path.strip_prefix(root) else {
@@ -5538,7 +5545,7 @@ fn count_text_scan_file_candidates_from_root(
             return;
         }
         let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        if !path.is_file() || !knowledge_store::is_knowledge_document_file(path) {
             continue;
         }
         let Ok(relative) = path.strip_prefix(root) else {
@@ -6372,6 +6379,28 @@ mod tests {
     }
 
     #[test]
+    fn csv_search_preserves_frontmatter_like_cells_and_physical_lines() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("values.CSV");
+        let raw = "\u{feff}---\r\nsummary: table cell\r\n---\r\nbody cell\r\n";
+        std::fs::write(&path, raw).expect("write CSV");
+
+        let context = read_sanitized_search_hit_context(
+            &path,
+            1,
+            4,
+            Some(KnowledgeSearchMatchSection::Body),
+        )
+        .expect("CSV context");
+        assert_eq!(context.text, raw.replace("\r\n", "\n").trim());
+        assert_eq!((context.start_line, context.end_line), (1, 4));
+        assert_eq!(locate_document_section_start_lines(&path), (None, 1));
+
+        std::fs::write(&path, "\n\nvalue\n").expect("write CSV with empty rows");
+        assert_eq!(locate_document_section_start_lines(&path), (None, 1));
+    }
+
+    #[test]
     fn search_hit_context_exposes_only_inline_summary_from_frontmatter() {
         let temp = tempdir().expect("temp dir");
         let path = temp.path().join("knowledge.md");
@@ -6597,6 +6626,7 @@ mod tests {
         save_document(
             working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: id.to_string(),
                 doc_type: KnowledgeType::Design,
                 path: path.to_string(),
@@ -6659,6 +6689,7 @@ mod tests {
         save_document(
             working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: id.to_string(),
                 doc_type: KnowledgeType::Skill,
                 path: path.to_string(),
@@ -6705,6 +6736,7 @@ mod tests {
 
     fn memory_document(index: usize, body: String, updated_at: i64) -> KnowledgeDocument {
         KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: format!("kd_test_memory_doc_{:03}", index),
             doc_type: KnowledgeType::Memory,
             path: format!("project/doc-{:03}.md", index),
@@ -6764,6 +6796,7 @@ mod tests {
         crate::unity_docs::seed_managed_documents_for_tests(
             working_dir,
             &[KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_unity_execution_order".to_string(),
                 doc_type: KnowledgeType::Reference,
                 path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
@@ -6856,6 +6889,7 @@ mod tests {
     fn seed_unity_reference_documents(working_dir: &str, document_count: usize) {
         let documents = (0..document_count)
             .map(|index| KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: format!("kd_unity_ref_{:03}", index),
                 doc_type: KnowledgeType::Reference,
                 path: format!(
@@ -6983,6 +7017,126 @@ mod tests {
         assert!(!hit.snippet.contains("id:"));
         assert!(!hit.snippet.contains("injectMode:"));
         assert!(indexed_hits.is_empty());
+    }
+
+    async fn assert_csv_query_and_refresh(lexical_search_enabled: bool) {
+        let workspace = tempdir().expect("workspace");
+        let working_dir = workspace.path().to_string_lossy().to_string();
+        let relative_path = "tables/abilities.CSV";
+        let raw = "\u{feff}ability_key,说明\r\nfrost,\"寒冰箭, slows\r\ntarget\"\r\nspark,\"burst \"\"now\"\"\"\r\n";
+        let types = [
+            KnowledgeType::Design,
+            KnowledgeType::Plan,
+            KnowledgeType::Memory,
+            KnowledgeType::Reference,
+        ];
+        for doc_type in types {
+            let path = crate::knowledge_store::document_path(
+                &working_dir,
+                doc_type,
+                relative_path,
+            )
+            .expect("CSV path");
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create directory");
+            std::fs::write(&path, raw).expect("write CSV");
+            std::fs::write(path.with_file_name("abilities.CSV.view"), "sidecaronlymarker")
+                .expect("write CSV view");
+        }
+        save_test_general_config(&working_dir, lexical_search_enabled, false);
+        let state = create_state(&working_dir);
+
+        for query in ["ability_key", "说明", "寒冰箭"] {
+            let hits = query_documents(
+                &working_dir,
+                None,
+                Some(query),
+                None,
+                Some(&types),
+                None,
+                20,
+                false,
+                state.clone(),
+            )
+            .await
+            .expect("query CSV header and cell text");
+            assert_eq!(hits.len(), types.len(), "query: {query}");
+            for doc_type in types {
+                let hit = hits
+                    .iter()
+                    .find(|hit| hit.doc_type == doc_type)
+                    .expect("CSV hit");
+                assert_eq!(hit.path, relative_path);
+                assert_eq!(hit.summary_start_line, None);
+                assert_eq!(hit.body_start_line, 1);
+                assert_eq!((hit.start_line, hit.end_line), (1, 4));
+                assert!(hit.snippet.contains(query));
+                assert!(hit.snippet.contains("target\""));
+                assert_eq!(std::fs::read_to_string(&hit.physical_path).unwrap(), raw);
+                assert_eq!(
+                    hit.match_kind,
+                    if lexical_search_enabled { "lexical" } else { "grep" }
+                );
+            }
+        }
+
+        let sidecar_hits = query_documents(
+            &working_dir,
+            None,
+            Some("sidecaronlymarker"),
+            None,
+            Some(&types),
+            None,
+            20,
+            false,
+            state.clone(),
+        )
+        .await
+        .expect("query view metadata");
+        assert!(sidecar_hits.is_empty(), "CSV views must not enter search");
+
+        let mut doc = crate::knowledge_store::load_document_by_path(
+            &working_dir,
+            KnowledgeType::Design,
+            relative_path,
+        )
+        .expect("load CSV");
+        doc.body = raw.replace("寒冰箭", "烈焰箭");
+        let saved = save_document(&working_dir, doc).expect("save CSV update");
+        super::upsert_document(state.clone(), &working_dir, None, saved)
+            .await
+            .expect("refresh CSV index");
+        let (doc_type, path_prefix) = crate::commands::resolve_knowledge_path_filter(
+            None,
+            Some("design/tables/"),
+        )
+        .expect("normalize the knowledge_query directory filter");
+        let filtered_types = doc_type.map(|doc_type| vec![doc_type]);
+        for (query, expected_count) in [("烈焰箭", 1), ("寒冰箭", 0)] {
+            let hits = query_documents(
+                &working_dir,
+                None,
+                Some(query),
+                None,
+                filtered_types.as_deref(),
+                path_prefix.as_deref(),
+                5,
+                false,
+                state.clone(),
+            )
+            .await
+            .expect("query updated CSV with directory filter");
+            assert_eq!(hits.len(), expected_count, "query: {query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn csv_query_uses_text_scan_and_refreshes_updated_cells() {
+        assert_csv_query_and_refresh(false).await;
+    }
+
+    #[tokio::test]
+    async fn csv_query_uses_lexical_index_and_refreshes_updated_cells() {
+        assert_csv_query_and_refresh(true).await;
     }
 
     #[tokio::test]
@@ -7764,6 +7918,7 @@ mod tests {
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_test_design_doc_2".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/hit-stop.md".to_string(),

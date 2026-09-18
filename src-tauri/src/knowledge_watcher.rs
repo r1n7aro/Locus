@@ -178,8 +178,35 @@ impl KnowledgeFsWatcher {
         }
 
         let (tx, rx) = mpsc::channel();
-        let mut os_watcher = RecommendedWatcher::new(tx, Config::default())
-            .map_err(|e| format!("Failed to create knowledge watcher: {}", e))?;
+        // File previews must not wait for knowledge indexing/reconciliation.
+        // In particular .csv.view is a presentation sidecar, not an indexed document.
+        let preview_app = app_handle.clone();
+        let preview_scope = event_scope.clone();
+        let preview_root = crate::knowledge_store::knowledge_root(&working_dir);
+        let preview_hub = crate::workspace_changes::hub_for_workspace(Path::new(&working_dir));
+        let mut os_watcher = RecommendedWatcher::new(
+            move |event: notify::Result<Event>| {
+                if let Ok(event) = &event {
+                    for (path, kind) in csv_preview_changes(event, &preview_root) {
+                        if let Some(change) = preview_hub.observe(
+                            &path,
+                            kind,
+                            crate::workspace_changes::WorkspaceChangeSource::OsWatcher,
+                        ) {
+                            crate::workspace_service::event::emit_for_workspace_scope(
+                                &preview_app,
+                                &preview_scope,
+                                crate::workspace_changes::WORKSPACE_FILE_CHANGED_EVENT,
+                                change,
+                            );
+                        }
+                    }
+                }
+                let _ = tx.send(event);
+            },
+            Config::default(),
+        )
+        .map_err(|e| format!("Failed to create knowledge watcher: {}", e))?;
         for root in &roots {
             os_watcher
                 .watch(&root.path, RecursiveMode::Recursive)
@@ -222,6 +249,34 @@ impl KnowledgeFsWatcher {
             let _ = worker.join();
         }
     }
+}
+
+fn csv_preview_changes(
+    event: &Event,
+    knowledge_root: &Path,
+) -> Vec<(String, crate::workspace_changes::WorkspaceChangeKind)> {
+    use crate::workspace_changes::WorkspaceChangeKind;
+    if matches!(event.kind, EventKind::Access(_)) {
+        return Vec::new();
+    }
+    event
+        .paths
+        .iter()
+        .filter_map(|path| {
+            let relative = path.strip_prefix(knowledge_root).ok()?;
+            let relative = path_components_to_slash(relative.components());
+            let lower = relative.to_ascii_lowercase();
+            if !lower.ends_with(".csv") && !lower.ends_with(".csv.view") {
+                return None;
+            }
+            let kind = if path.is_file() {
+                WorkspaceChangeKind::Upsert
+            } else {
+                WorkspaceChangeKind::Delete
+            };
+            Some((format!("Locus/knowledge/{relative}"), kind))
+        })
+        .collect()
 }
 
 fn watched_roots(
@@ -424,7 +479,7 @@ fn classify_change_kind(kind: &EventKind, path: &Path) -> Option<KnowledgeFsChan
             Some(KnowledgeFsChangeKind::Content)
         }
         _ => {
-            if is_markdown_path(path) {
+            if is_knowledge_document_path(path) {
                 Some(KnowledgeFsChangeKind::Content)
             } else {
                 None
@@ -445,7 +500,7 @@ fn resolve_path_change(
             return None;
         }
         let parent_path = parent_directory(&within_root);
-        if is_markdown_path(path) || path.extension().is_some() {
+        if is_knowledge_document_path(path) || path.extension().is_some() {
             return Some(ResolvedKnowledgeChange::Document {
                 doc_type: KnowledgeType::Skill,
                 path: within_root,
@@ -487,7 +542,7 @@ fn resolve_path_change(
         return None;
     }
 
-    if is_markdown_path(path) {
+    if is_knowledge_document_path(path) {
         let parent_path = parent_directory(&within_type);
         return Some(ResolvedKnowledgeChange::Document {
             doc_type,
@@ -565,10 +620,10 @@ fn parse_knowledge_type(value: &str) -> Option<KnowledgeType> {
     }
 }
 
-fn is_markdown_path(path: &Path) -> bool {
+fn is_knowledge_document_path(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("md"))
+        .map(|value| value.eq_ignore_ascii_case("md") || value.eq_ignore_ascii_case("csv"))
         .unwrap_or(false)
 }
 
@@ -731,11 +786,69 @@ fn emit_change_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        directory_path_from_sidecar, parent_directory, parse_knowledge_type, resolve_path_change,
-        KnowledgeFsChangeKind, KnowledgeRootKind, ResolvedKnowledgeChange, WatchedKnowledgeRoot,
+        csv_preview_changes, directory_path_from_sidecar, parent_directory, parse_knowledge_type,
+        resolve_path_change, KnowledgeFsChangeKind, KnowledgeRootKind, ResolvedKnowledgeChange,
+        WatchedKnowledgeRoot,
     };
     use crate::knowledge_store::KnowledgeType;
     use tempfile::tempdir;
+
+    #[test]
+    fn csv_preview_notifications_cover_data_sidecars_and_atomic_renames() {
+        use crate::workspace_changes::WorkspaceChangeKind;
+        use notify::{
+            event::{AccessKind, ModifyKind, RenameMode},
+            Event, EventKind,
+        };
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("Locus/knowledge");
+        std::fs::create_dir_all(root.join("design")).unwrap();
+        let csv = root.join("design/动作.csv");
+        let sidecar = root.join("design/动作.csv.view");
+        std::fs::write(&csv, "id,name\n1,first\n").unwrap();
+        std::fs::write(&sidecar, "schema: locus.csv-view.v1\n").unwrap();
+        let event = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(csv.clone())
+            .add_path(sidecar.clone())
+            .add_path(root.join("design/unrelated.md"))
+            .add_path(temp.path().join("elsewhere.csv"));
+        assert_eq!(
+            csv_preview_changes(&event, &root),
+            vec![
+                (
+                    "Locus/knowledge/design/动作.csv".into(),
+                    WorkspaceChangeKind::Upsert
+                ),
+                (
+                    "Locus/knowledge/design/动作.csv.view".into(),
+                    WorkspaceChangeKind::Upsert
+                ),
+            ]
+        );
+        assert!(csv_preview_changes(
+            &Event::new(EventKind::Access(AccessKind::Any)).add_path(csv.clone()),
+            &root
+        )
+        .is_empty());
+        let renamed = root.join("design/renamed.csv");
+        std::fs::rename(&csv, &renamed).unwrap();
+        let rename = Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(csv)
+            .add_path(renamed);
+        assert_eq!(
+            csv_preview_changes(&rename, &root),
+            vec![
+                (
+                    "Locus/knowledge/design/动作.csv".into(),
+                    WorkspaceChangeKind::Delete
+                ),
+                (
+                    "Locus/knowledge/design/renamed.csv".into(),
+                    WorkspaceChangeKind::Upsert
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn parses_directory_path_from_locus_meta_sidecar() {
@@ -747,6 +860,49 @@ mod tests {
             directory_path_from_sidecar("combat/notes.meta"),
             Some("combat/notes".to_string())
         );
+    }
+
+    #[test]
+    fn csv_preview_receives_real_os_writes_without_knowledge_indexing() {
+        use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+        use std::{
+            collections::HashSet,
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("Locus/knowledge");
+        std::fs::create_dir_all(root.join("design")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watched_root = root.clone();
+        let mut watcher = RecommendedWatcher::new(
+            move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for change in csv_preview_changes(&event, &watched_root) {
+                        let _ = tx.send(change);
+                    }
+                }
+            },
+            Config::default(),
+        )
+        .unwrap();
+        watcher.watch(&root, RecursiveMode::Recursive).unwrap();
+        std::fs::write(root.join("design/items.csv"), "id,name\n1,agent\n").unwrap();
+        std::fs::write(
+            root.join("design/items.csv.view"),
+            "schema: locus.csv-view.v1\n",
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut paths = HashSet::new();
+        while paths.len() < 2 && Instant::now() < deadline {
+            let (path, _) = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("OS CSV notification");
+            paths.insert(path);
+        }
+        assert!(paths.contains("Locus/knowledge/design/items.csv"));
+        assert!(paths.contains("Locus/knowledge/design/items.csv.view"));
     }
 
     #[test]

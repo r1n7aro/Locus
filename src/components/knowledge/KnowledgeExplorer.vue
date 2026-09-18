@@ -34,6 +34,10 @@ import type {
 } from "../../types";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseContextMenu from "../ui/BaseContextMenu.vue";
+import ResourceFileMenuItems from "../explorer/ResourceFileMenuItems.vue";
+import type { ExplorerResourceAction, ExplorerResourceTarget } from "../explorer/explorerResourceActions";
+import { explorerKnowledgeKey, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
+import { knowledgeResourcePath } from "./knowledgeResourceActions";
 import WorkspaceTree, {
   type WorkspaceTreeItem,
   type WorkspaceTreeRow,
@@ -52,8 +56,10 @@ import {
 import { skillSurfaceAllowsCommand } from "../../types";
 import {
   pruneKnowledgeDragNodes,
+  resolveKnowledgeExplorerClickActivation,
   resolveKnowledgeContextSelection,
   resolveKnowledgeExplorerSelection,
+  type KnowledgeExplorerClickSequence,
 } from "./knowledgeExplorerSelection";
 import {
   resolveKnowledgeTreeKeyboardAction,
@@ -84,6 +90,7 @@ type DocumentNode = Extract<ExplorerNode, { kind: "document" }>;
 type BranchNode = FolderNode | PackageNode;
 
 const props = defineProps<{
+  workingDir?: string;
   tree: ExplorerNode[];
   activeType: KnowledgeDocumentType;
   rootDirectoryConfigs: Record<
@@ -105,6 +112,25 @@ const props = defineProps<{
   searchResults: KnowledgeSearchResult[];
   searching: boolean;
 }>();
+
+const { showsFullPath } = useExplorerPathDisplay();
+function documentPathKey(node: DocumentNode | PackageNode): string {
+  return explorerKnowledgeKey(props.workingDir ?? "", node.document.id);
+}
+function nodeDisplayName(node: ExplorerNode): string {
+  return node.kind !== "folder" && showsFullPath(documentPathKey(node))
+    ? knowledgeResourcePath(node.document) : node.name;
+}
+function resourceMenuTarget(node: DocumentNode | PackageNode): ExplorerResourceTarget {
+  return { projectId: "", root: props.workingDir ?? "", path: node.document.path, document: node.document };
+}
+function runResourceMenuAction(action: ExplorerResourceAction) {
+  if (action === "rename") void startRenameSelection();
+  else if (action === "delete") requestDeleteSelectedNodes();
+  else if (action === "copy") copySelectedRelativePath();
+  else if (action === "reveal") openSelectedInFileSystem();
+  else if (action === "export") exportSelectedPackage();
+}
 
 const emit = defineEmits<{
   (e: "selectDocument", document: DocumentNode["document"]): void;
@@ -190,7 +216,7 @@ type ContextMenuState =
     };
 
 interface InlineCreateState {
-  kind: "folder" | "document";
+  kind: "folder" | "document" | "csv";
   type: KnowledgeDocumentType;
   parentDir: string;
   anchorPath: string;
@@ -244,6 +270,7 @@ const lastAnchorPath = ref<string | null>(null);
 const focusedPath = ref<string | null>(null);
 const pendingRevealPath = ref<string | null>(null);
 const searchCollapsedPaths = ref<Set<string>>(new Set());
+let previousPlainRowClick: KnowledgeExplorerClickSequence | null = null;
 const searchCtxMenu = ref<{
   x: number;
   y: number;
@@ -577,7 +604,13 @@ function rowClick(row: FlatRow, event: MouseEvent) {
   closeInlineRename();
   focusedPath.value = row.node.path;
   if (isSearchMode.value) {
-    if (event.detail >= 2) return;
+    const activation = resolveKnowledgeExplorerClickActivation(
+      previousPlainRowClick,
+      row.node.path,
+      event.detail,
+    );
+    previousPlainRowClick = activation.current;
+    if (!activation.shouldActivate) return;
     activateNode(row);
     return;
   }
@@ -594,8 +627,13 @@ function rowClick(row: FlatRow, event: MouseEvent) {
   selectedPaths.value = selection.nextSelectedPaths;
   lastAnchorPath.value = selection.nextLastAnchorPath;
   if (!selection.shouldHandleAsPlainClick) return;
-  // Keep rapid repeated clicks from toggling the same branch twice.
-  if (event.detail >= 2) return;
+  const activation = resolveKnowledgeExplorerClickActivation(
+    previousPlainRowClick,
+    row.node.path,
+    event.detail,
+  );
+  previousPlainRowClick = activation.current;
+  if (!activation.shouldActivate) return;
   activateNode(row);
 }
 
@@ -824,12 +862,12 @@ function canDropOnDir(
   targetDir: string,
   targetType: KnowledgeDocumentType,
 ): boolean {
-  if (node.type !== targetType) return false;
   const normalizedTargetDir = normalizeRelativePath(targetDir);
   if (node.kind === "package") return false;
   if (node.kind === "document") {
-    return parentDirectory(node) !== normalizedTargetDir;
+    return node.type !== targetType || parentDirectory(node) !== normalizedTargetDir;
   }
+  if (node.type !== targetType) return false;
 
   const sourceDir = normalizeRelativePath(node.relativePath);
   if (!sourceDir) return false;
@@ -1104,6 +1142,7 @@ function openSelectedFolderConfig() {
 }
 
 function createActionLabel(kind: InlineCreateState["kind"]): string {
+  if (kind === "csv") return t("csv.new");
   return kind === "folder"
     ? t("knowledge.explorer.createFolder")
     : t("knowledge.explorer.createDoc");
@@ -1292,7 +1331,8 @@ function openSelectedInFileSystem() {
 function submitInlineCreate() {
   const draft = inlineCreate.value;
   if (!draft) return;
-  const name = draft.name.trim();
+  const typedName = draft.name.trim();
+  const name = draft.kind === "csv" && typedName && !/\.csv$/i.test(typedName) ? `${typedName}.csv` : typedName;
   if (!name) return;
   if (draft.kind === "folder") emit("createFolder", draft.parentDir, name, draft.type);
   else emit("createDocument", draft.parentDir, name, draft.type);
@@ -1832,7 +1872,7 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
         <template #name="{ item }">
           <template v-for="entry in [asVisibleEntry(item)]" :key="entry.key">
             <span v-if="entry.type === 'row'" class="kx-name">
-              {{ entry.row.node.name }}
+              {{ nodeDisplayName(entry.row.node) }}
             </span>
             <span v-else-if="entry.type === 'emptyFolder'">
               {{ entry.treeRow.name }}
@@ -2043,59 +2083,23 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
       :z-index="80"
       @close="closeContextMenu"
     >
-          <template v-if="ctxMenu.kind === 'folder' || ctxMenu.kind === 'root'">
+          <template v-if="ctxMenu.kind !== 'root' && ctxMenu.kind !== 'folder' && ctxMenu.targetNodes.length === 1">
+            <ResourceFileMenuItems :target="resourceMenuTarget(ctxMenu.node)" @action="runResourceMenuAction" @close="closeContextMenu" />
+          </template>
+          <template v-else-if="ctxMenu.kind === 'folder' || ctxMenu.kind === 'root'">
             <button
               v-if="
-                ctxMenu.kind === 'folder' &&
-                ctxMenu.targetNodes.length === 1
+                ctxMenu.kind === 'root' ||
+                (ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1)
               "
               type="button"
               class="kx-ctx-item"
-              @click="openSelectedFolderConfig"
+              :disabled="!!createBlockHint(ctxMenu)"
+              :title="createBlockHint(ctxMenu)"
+              @click="openCreateInline('document')"
             >
-              <LucideIcon :icon="FolderCog" :size="13" />
-              {{ t("knowledge.explorer.folderConfig") }}
-            </button>
-            <button
-              v-if="
-                ctxMenu.kind === 'folder' &&
-                !ctxMenu.node.specialRoot &&
-                ctxMenu.targetNodes.length === 1
-              "
-              type="button"
-              class="kx-ctx-item"
-              :disabled="renameBlocked(ctxMenu)"
-              :title="managedHint(ctxMenu.targetNodes)"
-              @click="startRenameSelection"
-            >
-              <LucideIcon :icon="PencilLine" :size="13" />
-              {{ t("knowledge.explorer.rename") }}
-            </button>
-            <button
-              v-if="
-                ctxMenu.kind === 'folder' &&
-                !ctxMenu.node.specialRoot &&
-                ctxMenu.targetNodes.length === 1
-              "
-              type="button"
-              class="kx-ctx-item"
-              @click="copySelectedRelativePath"
-            >
-              <LucideIcon :icon="Copy" :size="13" />
-              {{ t("knowledge.explorer.copyRelativePath") }}
-            </button>
-            <button
-              v-if="
-                ctxMenu.kind === 'folder' &&
-                !ctxMenu.node.specialRoot &&
-                ctxMenu.targetNodes.length === 1
-              "
-              type="button"
-              class="kx-ctx-item"
-              @click="openSelectedInFileSystem"
-            >
-              <LucideIcon :icon="FolderOpen" :size="13" />
-              {{ t("knowledge.explorer.openInFileSystem") }}
+              <LucideIcon :icon="FilePlus" :size="13" />
+              {{ t("knowledge.explorer.createDoc") }}
             </button>
             <button
               v-if="
@@ -2110,6 +2114,22 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
             >
               <LucideIcon :icon="FolderPlus" :size="13" />
               {{ t("knowledge.explorer.createFolder") }}
+            </button>
+            <button
+              v-if="
+                (ctxMenu.kind === 'root' ||
+                  (ctxMenu.kind === 'folder' &&
+                    ctxMenu.targetNodes.length === 1)) &&
+                contextMenuType(ctxMenu) !== 'skill'
+              "
+              type="button"
+              class="kx-ctx-item"
+              :disabled="!!createBlockHint(ctxMenu)"
+              :title="createBlockHint(ctxMenu)"
+              @click="openCreateInline('csv')"
+            >
+              <LucideIcon :icon="FilePlus" :size="13" />
+              {{ t("csv.new") }}
             </button>
             <button
               v-if="
@@ -2134,20 +2154,82 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
               <LucideIcon :icon="PackagePlus" :size="13" />
               {{ t("knowledge.explorer.importSkillPackage") }}
             </button>
+            <div
+              v-if="ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1"
+              class="kx-ctx-sep"
+              role="separator"
+            />
             <button
               v-if="
-                ctxMenu.kind === 'root' ||
-                (ctxMenu.kind === 'folder' && ctxMenu.targetNodes.length === 1)
+                ctxMenu.kind === 'folder' &&
+                !ctxMenu.node.specialRoot &&
+                ctxMenu.targetNodes.length === 1
               "
               type="button"
               class="kx-ctx-item"
-              :disabled="!!createBlockHint(ctxMenu)"
-              :title="createBlockHint(ctxMenu)"
-              @click="openCreateInline('document')"
+              :disabled="renameBlocked(ctxMenu)"
+              :title="managedHint(ctxMenu.targetNodes)"
+              @click="startRenameSelection"
             >
-              <LucideIcon :icon="FilePlus" :size="13" />
-              {{ t("knowledge.explorer.createDoc") }}
+              <LucideIcon :icon="PencilLine" :size="13" />
+              {{ t("knowledge.explorer.rename") }}
             </button>
+            <button
+              v-if="
+                ctxMenu.kind === 'folder' &&
+                ctxMenu.targetNodes.length === 1
+              "
+              type="button"
+              class="kx-ctx-item"
+              @click="openSelectedFolderConfig"
+            >
+              <LucideIcon :icon="FolderCog" :size="13" />
+              {{ t("knowledge.explorer.folderConfig") }}
+            </button>
+            <div
+              v-if="
+                ctxMenu.kind === 'folder' &&
+                !ctxMenu.node.specialRoot &&
+                ctxMenu.targetNodes.length === 1
+              "
+              class="kx-ctx-sep"
+              role="separator"
+            />
+            <button
+              v-if="
+                ctxMenu.kind === 'folder' &&
+                !ctxMenu.node.specialRoot &&
+                ctxMenu.targetNodes.length === 1
+              "
+              type="button"
+              class="kx-ctx-item"
+              @click="openSelectedInFileSystem"
+            >
+              <LucideIcon :icon="FolderOpen" :size="13" />
+              {{ t("knowledge.explorer.openInFileSystem") }}
+            </button>
+            <button
+              v-if="
+                ctxMenu.kind === 'folder' &&
+                !ctxMenu.node.specialRoot &&
+                ctxMenu.targetNodes.length === 1
+              "
+              type="button"
+              class="kx-ctx-item"
+              @click="copySelectedRelativePath"
+            >
+              <LucideIcon :icon="Copy" :size="13" />
+              {{ t("knowledge.explorer.copyRelativePath") }}
+            </button>
+            <div
+              v-if="
+                ctxMenu.kind === 'folder' &&
+                ctxMenu.targetNodes.length === 1 &&
+                canShowDeleteItem(ctxMenu)
+              "
+              class="kx-ctx-sep"
+              role="separator"
+            />
             <button
               v-if="ctxMenu.kind === 'folder' && canShowDeleteItem(ctxMenu)"
               type="button"
@@ -2170,15 +2252,14 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
               <LucideIcon :icon="Download" :size="13" />
               {{ t("knowledge.explorer.exportSkillPackage") }}
             </button>
-            <button
-              v-if="ctxMenu.targetNodes.length === 1"
-              type="button"
-              class="kx-ctx-item"
-              @click="copySelectedRelativePath"
-            >
-              <LucideIcon :icon="Copy" :size="13" />
-              {{ t("knowledge.explorer.copyRelativePath") }}
-            </button>
+            <div
+              v-if="
+                ctxMenu.targetNodes.length === 1 &&
+                !isExternalSkillNode(ctxMenu.node)
+              "
+              class="kx-ctx-sep"
+              role="separator"
+            />
             <button
               v-if="ctxMenu.targetNodes.length === 1"
               type="button"
@@ -2188,6 +2269,20 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
               <LucideIcon :icon="FolderOpen" :size="13" />
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
+            <button
+              v-if="ctxMenu.targetNodes.length === 1"
+              type="button"
+              class="kx-ctx-item"
+              @click="copySelectedRelativePath"
+            >
+              <LucideIcon :icon="Copy" :size="13" />
+              {{ t("knowledge.explorer.copyRelativePath") }}
+            </button>
+            <div
+              v-if="ctxMenu.targetNodes.length === 1"
+              class="kx-ctx-sep"
+              role="separator"
+            />
             <button
               v-if="canShowDeleteItem(ctxMenu)"
               type="button"
@@ -2212,15 +2307,11 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
               <LucideIcon :icon="PencilLine" :size="13" />
               {{ t("knowledge.explorer.rename") }}
             </button>
-            <button
+            <div
               v-if="ctxMenu.targetNodes.length === 1"
-              type="button"
-              class="kx-ctx-item"
-              @click="copySelectedRelativePath"
-            >
-              <LucideIcon :icon="Copy" :size="13" />
-              {{ t("knowledge.explorer.copyRelativePath") }}
-            </button>
+              class="kx-ctx-sep"
+              role="separator"
+            />
             <button
               v-if="ctxMenu.targetNodes.length === 1"
               type="button"
@@ -2230,6 +2321,20 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
               <LucideIcon :icon="FolderOpen" :size="13" />
               {{ t("knowledge.explorer.openInFileSystem") }}
             </button>
+            <button
+              v-if="ctxMenu.targetNodes.length === 1"
+              type="button"
+              class="kx-ctx-item"
+              @click="copySelectedRelativePath"
+            >
+              <LucideIcon :icon="Copy" :size="13" />
+              {{ t("knowledge.explorer.copyRelativePath") }}
+            </button>
+            <div
+              v-if="ctxMenu.targetNodes.length === 1"
+              class="kx-ctx-sep"
+              role="separator"
+            />
             <button
               v-if="canShowDeleteItem(ctxMenu)"
               type="button"
@@ -2475,6 +2580,7 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
 }
 
 .kx-name {
+  display: block;
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -2482,6 +2588,7 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
   white-space: nowrap;
   font-family: var(--font-mono-identifier);
   font-size: 12px;
+  line-height: 18px;
   color: var(--text-color);
 }
 

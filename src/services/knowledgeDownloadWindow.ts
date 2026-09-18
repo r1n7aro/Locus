@@ -1,3 +1,4 @@
+import { materializationEpochFromParams, appendMaterializationEpoch } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { WorkspaceRef } from "./project";
@@ -32,7 +33,7 @@ export function getKnowledgeDownloadWindowWorkspaceRef(
     expectedGeneration: Number.isSafeInteger(generation) && generation > 0
       ? generation
       : undefined,
-  };
+   expectedMaterializationEpoch: materializationEpochFromParams(params) };
 }
 
 export function buildKnowledgeDownloadWindowQuery(modelId: string, workspaceRef?: WorkspaceRef): string {
@@ -44,6 +45,7 @@ export function buildKnowledgeDownloadWindowQuery(modelId: string, workspaceRef?
     params.set("checkoutId", workspaceRef.checkoutId);
     if (workspaceRef.expectedGeneration != null) {
       params.set("workspaceGeneration", String(workspaceRef.expectedGeneration));
+  appendMaterializationEpoch(params, workspaceRef.expectedMaterializationEpoch);
     }
   }
   return params.toString();

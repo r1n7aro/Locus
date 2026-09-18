@@ -23,7 +23,7 @@ import {
   SKILL_COMMAND_NOTICE_OPERATION,
 } from "../../composables/skillCommands";
 import { useNotificationStore } from "../../stores/notification";
-import { useWorkspaceContextStore } from "../../stores/workspaceContext";
+import type { WorkspaceRef } from "../../services/project";
 import {
   buildKnowledgeEditModePatch,
   getKnowledgeEditMode,
@@ -47,6 +47,7 @@ const props = defineProps<{
   packageDocument: KnowledgeDocumentSummary;
   documents: KnowledgeDocumentSummary[];
   saveLoading?: boolean;
+  workspaceRef?: WorkspaceRef | null;
 }>();
 
 const emit = defineEmits<{
@@ -55,9 +56,8 @@ const emit = defineEmits<{
   (e: "exportPackage", packageId: string): void;
 }>();
 
-const { skillItems, loadSkills } = useSkills();
+const { skillItems, loadSkills } = useSkills(() => props.workspaceRef);
 const notificationStore = useNotificationStore();
-const workspaceContextStore = useWorkspaceContextStore();
 const skillCommandDraft = ref("");
 
 function normalizeRelativePath(path: string): string {
@@ -511,7 +511,7 @@ const rescanning = ref(false);
 
 async function onRescanExternalSkills() {
   if (rescanning.value) return;
-  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  const workspaceRef = props.workspaceRef;
   if (!workspaceRef) return;
   rescanning.value = true;
   try {

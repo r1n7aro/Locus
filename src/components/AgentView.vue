@@ -38,6 +38,8 @@ import {
 } from "../services/agent";
 import type { AgentInfo, AgentSystemPromptStats, InjectedPromptItem, InjectedToolLoadMode, RuleItem } from "../types";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
+import BaseMarkdownEditor from "./ui/BaseMarkdownEditor.vue";
+import AgentDocumentEditor, { type AgentDocumentTarget } from "./agent/AgentDocumentEditor.vue";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseCheckbox from "./ui/BaseCheckbox.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
@@ -52,16 +54,30 @@ import { useModelStore } from "../stores/model";
 import type { WorkspaceRef } from "../services/project";
 import { agentProjectTypesLabel } from "../utils/agentProjectTypes";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   active?: boolean;
   workingDir: string;
-  agentList: AgentInfo[];
+  agentList?: AgentInfo[];
   workspaceRef?: WorkspaceRef | null;
-}>();
+  listOnly?: boolean;
+  embedded?: boolean;
+  agentId?: string;
+}>(), { agentList: () => [] });
+const emit = defineEmits<{ openAgent: [agent: AgentInfo]; dirtyChange: [dirty: boolean] }>();
+const documentEditor = ref<InstanceType<typeof AgentDocumentEditor> | null>(null);
+const showDocumentDetails = ref(false);
+defineExpose({ saveFile: () => documentEditor.value?.saveFile() ?? Promise.resolve(true) });
 const modelStore = useModelStore();
 
-const selectedAgentId = ref<string>("");
+const selectedAgentId = ref<string>(props.agentId ?? "");
 const allAgents = ref<AgentInfo[]>([]);
+const agentSearch = ref("");
+const agentListLoading = ref(false);
+const agentListError = ref("");
+const visibleAgents = computed(() => {
+  const query = agentSearch.value.trim().toLocaleLowerCase();
+  return allAgents.value.filter(agent => !query || `${agent.name} ${agent.id} ${agent.description}`.toLocaleLowerCase().includes(query));
+});
 const selectedAgent = computed(() =>
   allAgents.value.find((agent) => agent.id === selectedAgentId.value) ?? null,
 );
@@ -72,6 +88,18 @@ type SelectedKind =
   | { type: "rule"; rule: RuleItem }
   | { type: "injected"; item: InjectedPromptItem };
 const selected = ref<SelectedKind | null>(null);
+const documentTarget = computed<AgentDocumentTarget | null>(() => {
+  if (!props.workspaceRef || showDocumentDetails.value) return null;
+  const item = selected.value;
+  if (item?.type === "prompt") return { kind: "soul", name: "", title: "soul.md" };
+  if (item?.type === "env") return { kind: "env", name: "", title: "env.md" };
+  if (item?.type === "rule" && !item.rule.readOnly) return { kind: "rule", name: item.rule.fileName, title: item.rule.title };
+  if (item?.type === "injected" && item.item.kind === "tools") {
+    return { kind: "tool", name: item.item.title, title: toolItemDisplayTitle(item.item) };
+  }
+  return null;
+});
+watch(selected, () => { showDocumentDetails.value = false; });
 
 // ── System Prompt ──
 const systemPromptContent = ref("");
@@ -666,6 +694,8 @@ let agentListRequestId = 0;
 
 async function loadAllAgents() {
   const requestId = ++agentListRequestId;
+  agentListLoading.value = true;
+  agentListError.value = "";
   try {
     const workspaceRef = props.workspaceRef;
     let nextAgents: AgentInfo[];
@@ -686,7 +716,7 @@ async function loadAllAgents() {
     const selectedStillAvailable = allAgents.value.some(
       (agent) => agent.id === selectedAgentId.value,
     );
-    if (!selectedStillAvailable) {
+    if (!selectedStillAvailable && !props.listOnly && !props.embedded) {
       const nextAgentId = preferredAgentId(allAgents.value);
       if (selectedAgentId.value !== nextAgentId) {
         selectedAgentId.value = nextAgentId;
@@ -699,17 +729,25 @@ async function loadAllAgents() {
       allAgents.value = mergeAgentLists(props.agentList);
     }
     console.error("loadAllAgents failed:", e);
+    agentListError.value = normalizeAppError(e).message;
+  } finally {
+    if (requestId === agentListRequestId) agentListLoading.value = false;
   }
 }
 
 async function switchAgent(agentId: string) {
+  if (props.listOnly) {
+    const agent = allAgents.value.find(item => item.id === agentId);
+    if (agent) emit("openAgent", agent);
+    return;
+  }
   selectedAgentId.value = agentId;
   resetAgentDetailState();
   await loadAgentData();
 }
 
 async function loadAgentData() {
-  if (!selectedAgentId.value) return;
+  if (!selectedAgentId.value || props.listOnly) return;
   await Promise.all([
     loadSystemPrompt(),
     loadEnvTemplate(),
@@ -717,6 +755,7 @@ async function loadAgentData() {
     loadInjectedItems(),
     loadRules(),
   ]);
+  if (props.embedded && !selected.value) selectPrompt();
 }
 
 function selectPrompt() {
@@ -860,6 +899,10 @@ async function loadRules() {
       : await listAppRules(agentId);
     if (requestId !== ruleRequestId) return;
     ruleItems.value = items;
+    if (selected.value?.type === "rule") {
+      const updated = items.find(item => ruleKey(item) === selectedRuleKey());
+      if (updated) selected.value = { type: "rule", rule: updated };
+    }
   } catch (e) {
     if (requestId !== ruleRequestId) return;
     console.error("list_rules failed:", e);
@@ -1098,6 +1141,7 @@ async function removeRule(rule: RuleItem) {
   if (!props.workspaceRef) return;
   try {
     await deleteRule(props.workspaceRef, selectedAgentId.value, rule.fileName);
+    documentEditor.value?.forgetRule(rule.fileName);
     if (selectedRuleKey() === ruleKey(rule)) {
       selected.value = null;
       ruleContent.value = "";
@@ -1287,6 +1331,7 @@ function onResizeEnd() {
 }
 
 function refreshAll() {
+  if (props.listOnly) return;
   closeRuleContextMenu();
   loadSystemPrompt();
   loadEnvTemplate();
@@ -1360,6 +1405,14 @@ onUnmounted(() => {
 });
 
 watch(
+  () => props.agentId,
+  (agentId) => {
+    if (props.listOnly) selectedAgentId.value = agentId ?? "";
+    else if (agentId && agentId !== selectedAgentId.value) void switchAgent(agentId);
+  },
+);
+
+watch(
   () => [
     props.workspaceRef?.checkoutId ?? "",
     props.workspaceRef?.expectedGeneration ?? -1,
@@ -1395,7 +1448,7 @@ watch(
     JSON.stringify(currentSubagentModels()),
   ],
   () => {
-    if (!selectedAgentId.value) return;
+    if (!selectedAgentId.value || props.listOnly) return;
     void loadPromptStats();
     void loadInjectedItems();
     if (envPreviewMode.value === "rendered") {
@@ -1406,33 +1459,38 @@ watch(
 </script>
 
 <template>
-  <div ref="agentViewRef" class="agent-view">
-    <div class="agent-sidebar" :style="{ width: sidebarWidth + 'px' }">
-      <div class="sidebar-title">Agent</div>
-      <div v-if="allAgents.length === 0" class="sidebar-empty">{{ t("common.loading") }}</div>
+  <div ref="agentViewRef" class="agent-view" :class="{ 'agent-list-only': listOnly }">
+    <div v-if="!embedded" class="agent-sidebar" :style="{ width: listOnly ? '100%' : sidebarWidth + 'px' }">
+      <div v-if="!listOnly" class="sidebar-title">Agent</div>
+      <div v-if="listOnly" class="agent-search-wrap">
+        <input v-model="agentSearch" type="search" class="agent-search" :placeholder="t('agent.editor.search')" :aria-label="t('agent.editor.search')" />
+      </div>
+      <div v-if="agentListError" class="sidebar-empty" role="alert">{{ agentListError }}</div>
+      <div v-else-if="visibleAgents.length === 0" class="sidebar-empty">{{ agentListLoading ? t("common.loading") : t("agent.editor.noResults") }}</div>
       <button
-        v-for="ag in allAgents"
+        v-for="ag in visibleAgents"
         :key="ag.id"
         type="button"
         class="agent-tab"
+        :title="ag.description"
         :class="{ active: selectedAgentId === ag.id }"
         @click="switchAgent(ag.id)"
       >
         <div class="agent-tab-head">
           <div class="agent-tab-name">{{ ag.name }}</div>
-          <span v-if="agentProjectTypesLabel(ag)" class="agent-tab-project-types">
+          <span v-if="!listOnly && agentProjectTypesLabel(ag)" class="agent-tab-project-types">
             {{ agentProjectTypesLabel(ag) }}
           </span>
         </div>
-        <div class="agent-tab-desc">{{ ag.description }}</div>
+        <div v-if="!listOnly" class="agent-tab-desc">{{ ag.description }}</div>
       </button>
     </div>
-    <div class="resize-handle" @mousedown="onResizeStart($event, 'sidebar')"></div>
+    <div v-if="!embedded && !listOnly" class="resize-handle" @mousedown="onResizeStart($event, 'sidebar')"></div>
 
-    <template v-if="selectedAgentId">
+    <template v-if="selectedAgentId && !listOnly">
       <div class="dir-panel" :style="{ width: dirPanelWidth + 'px' }">
         <div class="dir-toolbar">
-          <span class="dir-title">Context</span>
+          <BaseButton class="dir-title" size="sm" :title="t('agent.dashboard.title')" @click="selected = null">{{ selectedAgent?.name || selectedAgentId }}</BaseButton>
           <div class="dir-actions">
             <BaseButton class="dir-btn" :aria-label="t('agent.newRule')" @click="startCreateRule" :disabled="!props.workspaceRef" :title="t('agent.newRule')">+</BaseButton>
             <BaseButton class="dir-btn" :aria-label="t('common.refresh')" @click="refreshAll" :disabled="systemPromptLoading || ruleLoading" :title="t('common.refresh')">
@@ -1449,7 +1507,7 @@ watch(
             @click="selectPrompt"
           >
             <span class="prompt-icon">&#9672;</span>
-            <span class="item-title">{{ t("agent.systemPrompt") }}</span>
+            <span class="item-title">soul.md</span>
           </button>
 
           <div class="rule-section" @contextmenu.prevent="onRuleListContextMenu">
@@ -1648,6 +1706,34 @@ watch(
       <div class="resize-handle" @mousedown="onResizeStart($event, 'dir')"></div>
 
 
+      <AgentDocumentEditor
+        ref="documentEditor"
+        v-show="documentTarget"
+        :target="documentTarget"
+        :workspace-ref="workspaceRef ?? null"
+        :working-dir="workingDir"
+        :agent-id="selectedAgentId"
+        :active="active"
+        @dirty-change="emit('dirtyChange', $event)"
+        @saved="refreshAll"
+        @details="showDocumentDetails = true"
+      >
+        <template #actions>
+          <label v-if="selected?.type === 'rule'" class="skill-toggle">
+            <BaseCheckbox :model-value="selected.rule.enabled" :disabled="!canToggleRule(selected.rule)"
+              @update:model-value="selected?.type === 'rule' && setRuleEnabledState(selected.rule, $event)" />
+            <span>{{ t('common.enabled') }}</span>
+          </label>
+          <template v-if="selected?.type === 'rule' && confirmingDeleteRule === selectedRuleKey()">
+            <span class="rule-delete-confirm-text">{{ t('agent.deleteConfirm') }}</span>
+            <BaseButton size="sm" variant="danger" @click="removeRule(selected.rule)">{{ t('common.confirm') }}</BaseButton>
+            <BaseButton size="sm" @click="confirmingDeleteRule = null">{{ t('common.cancel') }}</BaseButton>
+          </template>
+          <BaseButton v-else-if="selected?.type === 'rule' && selected.rule.source === 'project'" size="sm" @click="confirmingDeleteRule = selectedRuleKey()">{{ t('common.delete') }}</BaseButton>
+        </template>
+      </AgentDocumentEditor>
+
+      <template v-if="!documentTarget">
       <div v-if="selected?.type === 'prompt'" class="preview-panel">
         <div class="preview-header">
           <span class="preview-title">{{ selectedAgent?.name || selectedAgentId }}</span>
@@ -1667,6 +1753,7 @@ watch(
         <div class="preview-header">
           <span class="preview-title">{{ selectedAgent?.name || selectedAgentId }}</span>
           <span class="preview-path">env.md</span>
+          <BaseButton v-if="workspaceRef" size="sm" @click="showDocumentDetails = false">{{ t('common.edit') }}</BaseButton>
           <span v-if="sourceBadgeLabel(selectedAgent?.source)" class="source-badge" :class="sourceBadgeClass(selectedAgent?.source)">{{ sourceBadgeLabel(selectedAgent?.source) }}</span>
           <BaseSegmented
             class="env-preview-mode"
@@ -1726,11 +1813,13 @@ watch(
           <BaseButton v-else-if="canEditRule(selectedRule())" class="rule-delete-btn" variant="danger" @click="confirmingDeleteRule = selectedRuleKey()">{{ t("common.delete") }}</BaseButton>
         </div>
         <div v-if="ruleEditing" class="preview-body rule-edit-body">
-          <textarea
+          <BaseMarkdownEditor
             v-model="ruleEditContent"
-            class="rule-edit-textarea"
+            content-path="rule.md"
+            :workspace-ref="workspaceRef"
             :placeholder="t('agent.ruleContentPlaceholder')"
-          ></textarea>
+            @shortcut-save="saveEditRule"
+          />
           <div class="rule-edit-actions">
             <BaseButton class="rule-save-btn" variant="primary" @click="saveEditRule">{{ t("common.save") }}</BaseButton>
             <BaseButton class="rule-cancel-btn" @click="cancelEditRule">{{ t("common.cancel") }}</BaseButton>
@@ -1751,7 +1840,8 @@ watch(
           <span class="preview-title">{{ selectedInjectedItem()?.title }}</span>
           <span class="preview-path">{{ selectedInjectedItem()?.kind === "tools" ? selectedToolLoadLabel : injectedItemMeta(selectedInjectedItem()?.kind || "context") }}</span>
           <span class="source-badge source-runtime">{{ selectedInjectedItem()?.source === "builtIn" ? t("common.builtIn") : t("agent.runtime") }}</span>
-          <span class="source-badge source-readonly">{{ t("agent.readOnly") }}</span>
+          <BaseButton v-if="workspaceRef && selectedInjectedItem()?.kind === 'tools'" size="sm" @click="showDocumentDetails = false">{{ t('common.edit') }}</BaseButton>
+          <span v-else class="source-badge source-readonly">{{ t("agent.readOnly") }}</span>
           <button class="preview-close" :aria-label="t('agent.closePreview')" @click="selected = null" :title="t('common.close')">&times;</button>
         </div>
         <div v-if="selectedInjectedItem()?.kind !== 'tools'" class="rule-action-bar">
@@ -2001,6 +2091,7 @@ watch(
         </div>
       </div>
 
+      </template>
       <BaseContextMenu
         v-if="ruleContextMenu"
         class="agent-rule-ctx-menu"
@@ -2026,7 +2117,7 @@ watch(
       </BaseContextMenu>
     </template>
 
-    <div v-else class="guide-panel" style="flex: 1;">
+    <div v-else-if="!listOnly" class="guide-panel" style="flex: 1;">
       <div class="guide-content static">
         <div class="guide-icon">A</div>
         <div class="guide-title">{{ t("agent.noAgent.title") }}</div>
@@ -2108,6 +2199,12 @@ watch(
   min-width: 0;
 }
 
+.agent-list-only .agent-sidebar { border-right: 0; background: var(--sidebar-bg); }
+.agent-list-only .agent-tab { padding: 8px 12px; border-left-width: 2px; }
+.agent-search-wrap { padding: 8px 10px; border-bottom: 1px solid var(--border-color); }
+.agent-search { box-sizing: border-box; width: 100%; height: 28px; padding: 0 8px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color); font: inherit; font-size: 12px; }
+.agent-search:focus-visible { outline: 1px solid var(--accent-color); outline-offset: -1px; }
+
 .agent-tab-project-types {
   margin-left: auto;
   color: var(--text-tertiary, var(--text-secondary));
@@ -2154,6 +2251,11 @@ watch(
   font-weight: 600;
   color: var(--text-color);
   flex: 1;
+  min-width: 0;
+  justify-content: flex-start;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-color: transparent;
 }
 
 .dir-actions {
@@ -2168,6 +2270,7 @@ watch(
   min-width: 28px;
   padding: 0;
   font-size: 14px;
+  border-color: transparent;
 }
 
 .spinning {

@@ -454,7 +454,12 @@ fn fallback_component_refs(
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            if !path.is_dir() || !path.join(manifest_file).is_file() {
+            let has_manifest = if dir_name == "views" {
+                crate::view::is_view_package_root(&path)
+            } else {
+                path.join(manifest_file).is_file()
+            };
+            if !path.is_dir() || !has_manifest {
                 return None;
             }
             let name = path.file_name()?.to_str()?.to_string();

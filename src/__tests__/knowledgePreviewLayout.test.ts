@@ -46,6 +46,7 @@ describe("KnowledgePreview continuous document layout", () => {
 
   it("keeps summary, maintenance rules, and body in one scroll plane", () => {
     const preview = read("src/components/knowledge/KnowledgePreview.vue");
+    const styles = read("src/components/ui/markdown-document.css");
 
     expect(preview).toContain('class="document-inline-field document-inline-summary"');
     expect(preview).toContain('class="document-inline-field document-inline-rules"');
@@ -54,7 +55,7 @@ describe("KnowledgePreview continuous document layout", () => {
     expect(preview).toContain(':model-value="bodyDraft"');
     expect(preview).not.toContain('class="preview-support-strip"');
     expect(preview).not.toContain('class="preview-main-divider"');
-    expect(preview).toMatch(/\.preview-main\s*\{[\s\S]*overflow:\s*auto;/);
+    expect(styles).toMatch(/\.document-scroller\s*\{[\s\S]*overflow:\s*auto;/);
     expect(preview.match(/\sauto-grow\s/g)).toHaveLength(3);
     expect(preview).not.toContain("defer-rendered-editor");
     expect(preview.match(/:content-key=/g)).toHaveLength(3);
@@ -66,7 +67,7 @@ describe("KnowledgePreview continuous document layout", () => {
     expect(preview).toContain(':min-height="64"');
     expect(preview).toContain(':min-height="104"');
     expect(preview).toContain(':min-height="360"');
-    expect(preview).toMatch(/\.document-body\s*:deep\(\.base-markdown-editor \.cm-scroller\)\s*\{[\s\S]*overflow:\s*visible;[\s\S]*overscroll-behavior:\s*auto;/);
+    expect(styles).toMatch(/\.document-body\s*:deep\(\.base-markdown-editor \.cm-scroller\)\s*\{[\s\S]*overflow:\s*visible;[\s\S]*overscroll-behavior:\s*auto;/);
     expect(preview).not.toMatch(/\.document-body\.is-loading\s*\{[\s\S]*opacity:/);
   });
 

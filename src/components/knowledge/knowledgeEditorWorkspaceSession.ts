@@ -6,6 +6,7 @@ import type {
   KnowledgeDocumentSection,
 } from "../../types";
 import type { WorkspaceRef } from "../../services/project";
+import { documentSessionKey } from "../../document/documentIdentity";
 import type { KnowledgeTextConflict } from "./knowledgeCollaborativeEditing";
 import { createKnowledgeEditorDraftValues } from "./knowledgeEditorDrafts";
 import { KnowledgeEditorSessionCache } from "./knowledgeEditorSessionCache";
@@ -42,22 +43,12 @@ export interface KnowledgeDirectoryEditorSession {
   dirty: boolean;
 }
 
-function workspaceScopeKey(workspaceRef: WorkspaceRef | null | undefined): string {
-  if (!workspaceRef) return "workspace:unbound";
-  return JSON.stringify([
-    "workspace",
-    workspaceRef.checkoutId,
-    workspaceRef.expectedGeneration ?? "current",
-  ]);
-}
-
 export function knowledgeDocumentEditorSessionKey(
   workspaceRef: WorkspaceRef | null | undefined,
   document: KnowledgeDocument | null | undefined,
 ): string {
   if (!document) return "";
-  return JSON.stringify([
-    workspaceScopeKey(workspaceRef),
+  return documentSessionKey(workspaceRef, [
     "document",
     document.type,
     document.id || document.path,
@@ -69,8 +60,7 @@ export function knowledgeDirectoryEditorSessionKey(
   directory: KnowledgeDirectoryConfigRecord | null | undefined,
 ): string {
   if (!directory) return "";
-  return JSON.stringify([
-    workspaceScopeKey(workspaceRef),
+  return documentSessionKey(workspaceRef, [
     "directory",
     directory.type,
     directory.path,

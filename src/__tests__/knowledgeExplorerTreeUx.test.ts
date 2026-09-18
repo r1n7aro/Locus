@@ -59,8 +59,10 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(explorer).toContain('t("knowledge.explorer.folderConfig")');
     expect(workspaceTree).toContain("return row.expanded ? FolderOpen : Folder;");
     expect(workspaceTree).not.toContain("toggleBranch");
-    // Rapid repeated row clicks keep the expanded state stable.
-    expect(explorer).toContain("if (event.detail >= 2) return;");
+    // Repeated clicks are deduplicated only after the first row activation was
+    // observed, so a rerendered or changed target does not swallow the input.
+    expect(explorer).toContain("resolveKnowledgeExplorerClickActivation(");
+    expect(explorer).not.toContain("if (event.detail >= 2) return;");
     expect(explorer).not.toContain("onRowDoubleClick");
     expect(explorer).not.toContain("@double-click");
     expect(explorer).toContain('@click="startRenameSelection"');
@@ -95,7 +97,8 @@ describe("KnowledgeExplorer tree UX", () => {
     expect(explorer).toContain("resolveKnowledgeTreeKeyboardAction({");
     expect(explorer).toContain("function applyKeyboardAction(action: KnowledgeTreeKeyboardAction) {");
     // Roving focus: rows stay out of the tab order.
-    expect(workspaceTree).toContain('tabindex="-1"');
+    expect(workspaceTree).toContain("rowTabIndex: -1");
+    expect(workspaceTree).toContain(':tabindex="item.treeRow.disabled ? -1 : rowTabIndex"');
   });
 
   it("reveals the selection via FileTreeList scrolling", () => {

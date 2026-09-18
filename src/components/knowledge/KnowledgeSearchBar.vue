@@ -109,7 +109,7 @@ onUnmounted(() => {
 
 <style scoped>
 .kx-search-wrap {
-  padding: 8px 14px;
+  padding: var(--explorer-search-padding, 8px 14px);
   border-bottom: 1px solid var(--border-color);
   background: color-mix(in srgb, var(--panel-bg) 82%, var(--bg-color));
   flex-shrink: 0;
@@ -119,11 +119,11 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 8px;
-  height: 32px;
+  height: var(--explorer-search-height, 32px);
   padding: 0 9px 0 10px;
   background: color-mix(in srgb, var(--panel-bg) 74%, var(--input-bg, var(--hover-bg)) 26%);
   border: 1px solid var(--border-color);
-  border-radius: 7px;
+  border-radius: var(--explorer-search-radius, 7px);
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
@@ -166,7 +166,7 @@ onUnmounted(() => {
   background: transparent;
   border: none;
   outline: none;
-  font-size: 12px;
+  font-size: var(--explorer-search-font-size, 12px);
   color: var(--text-color);
   font-family: inherit;
   padding: 0;

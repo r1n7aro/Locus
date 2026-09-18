@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import type { Text } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
-import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import { computed, inject, onUnmounted, ref, watch } from "vue";
+import { KNOWLEDGE_QUOTE_SELECTION_KEY, readKnowledgeDocumentSource } from "../../services/knowledgeSelection";
+import { knowledgeSelectionReference } from "./knowledgeSelectionReference";
+import type { MarkdownEditorSelection } from "../ui/markdown-editor/markdownEditorSelection";
+import { normalizeAppError } from "../../services/errors";
 import type {
   KnowledgeDocument,
   KnowledgeDocumentEditOperation,
@@ -30,6 +34,7 @@ import {
   SKILL_COMMAND_NOTICE_OPERATION,
 } from "../../composables/skillCommands";
 import BaseDropdown from "../ui/BaseDropdown.vue";
+import KnowledgeInjectionAgents from "./KnowledgeInjectionAgents.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
 import {
@@ -79,15 +84,13 @@ import type { WorkspaceRef } from "../../services/project";
 import {
   startWorkbenchReferenceInternalDrag,
 } from "../workbench/workbenchReferenceDrag";
-import {
-  extractKnowledgeDocumentOutline,
-  type KnowledgeDocumentOutlineItem,
-} from "./knowledgeDocumentOutline";
+import { useMarkdownDocumentOutline } from "../../composables/useMarkdownDocumentOutline";
 
 const AUTO_SAVE_DELAY_MS = 700;
 const notificationStore = useNotificationStore();
+const quoteInConversation = inject(KNOWLEDGE_QUOTE_SELECTION_KEY, null);
+const quotingSelection = ref(false);
 const workspaceContextStore = useWorkspaceContextStore();
-const { skillItems, loadSkills } = useSkills();
 type InjectModeSelection = KnowledgeInjectMode | "inherit_parent";
 
 const props = withDefaults(defineProps<{
@@ -106,6 +109,7 @@ const props = withDefaults(defineProps<{
   sessionStore: null,
 });
 const internalDrag = useInternalDragController();
+const { skillItems, loadSkills } = useSkills(() => props.workspaceRef);
 
 const emit = defineEmits<{
   (e: "close"): void;
@@ -116,10 +120,6 @@ const emit = defineEmits<{
   (e: "dirtyChange", dirty: boolean): void;
 }>();
 
-const DOCUMENT_OUTLINE_STICKY_TOP = 40;
-const DOCUMENT_OUTLINE_BODY_LEAD = 16;
-const DOCUMENT_OUTLINE_BOTTOM_GUTTER = 24;
-
 const summaryDraft = ref("");
 const rulesDraft = ref("");
 const bodyDraft = ref("");
@@ -127,10 +127,6 @@ const documentScrollerRef = ref<HTMLElement | null>(null);
 const documentPageRef = ref<HTMLElement | null>(null);
 const documentBodyRef = ref<HTMLElement | null>(null);
 const bodyEditorRef = ref<{ getEditorView: () => EditorView | null } | null>(null);
-const activeOutlineId = ref("");
-const outlineViewportHeight = ref(0);
-const outlineViewportTop = ref(DOCUMENT_OUTLINE_STICKY_TOP);
-const outlineStartOffset = ref(DOCUMENT_OUTLINE_STICKY_TOP);
 const sectionTextBuffers = new Map<KnowledgeDocumentSection, Text>();
 const baseSectionTexts = new Map<KnowledgeDocumentSection, Text>();
 const fileNameDraft = ref("");
@@ -153,9 +149,6 @@ const skillUnityStatusLoading = ref(false);
 const skillUnityActionPending = ref(false);
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 let skillUnityStatusRequestId = 0;
-let outlineUpdateFrame = 0;
-let outlineRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-let outlineResizeObserver: ResizeObserver | null = null;
 
 const localEditorWorkspaceSessions = new KnowledgeEditorWorkspaceSessionStore();
 const editorWorkspaceSessions = props.sessionStore ?? localEditorWorkspaceSessions;
@@ -199,6 +192,30 @@ function onEditorReferenceOpen(reference: MarkdownReferenceToken): void {
   emit("referenceOpen", reference);
 }
 
+async function onQuoteSelection(section: KnowledgeDocumentSection, selection: MarkdownEditorSelection): Promise<void> {
+  const document = props.document;
+  const workspaceRef = props.workspaceRef ? { ...props.workspaceRef } : null;
+  if (!document || !workspaceRef || !quoteInConversation || quotingSelection.value || !selection.ranges.length) return;
+  const savedText = section === "body" ? document.body : section === "summary" ? document.summary ?? "" : document.maintenanceRules ?? "";
+  quotingSelection.value = true;
+  try {
+    const source = await readKnowledgeDocumentSource(workspaceRef, document.type, document.path);
+    const text = knowledgeSelectionReference(source, section, savedText, selection, {
+      draft: t("editor.quoteDraft"),
+      unavailable: t("editor.quoteSourceUnavailable"),
+    });
+    await quoteInConversation(workspaceRef, {
+      path: `${document.type}/${document.path}`,
+      name: documentTitle.value,
+      content: text,
+    });
+  } catch (error) {
+    notificationStore.addNotice("error", `${t("editor.quoteFailed")}: ${normalizeAppError(error).message}`);
+  } finally {
+    quotingSelection.value = false;
+  }
+}
+
 function onEditorReferencePointerDown(payload: {
   reference: MarkdownReferenceToken;
   event: PointerEvent;
@@ -224,6 +241,9 @@ const displayInjectMode = computed<KnowledgeInjectMode>(() => (
 ));
 const injectModeSelection = computed<InjectModeSelection>(() => (
   props.document?.injectMode === "inherit" ? "inherit_parent" : displayInjectMode.value
+));
+const supportsAgentInjection = computed(() => (
+  displayInjectMode.value === "full" || displayInjectMode.value === "rule"
 ));
 const summaryEnabled = computed(() => !!props.document?.summary?.trim());
 const showExtendedDocumentProperties = computed(() => (
@@ -622,9 +642,6 @@ watch(skillPackageId, () => {
 onUnmounted(() => {
   captureEditorSession(activeDocumentSessionKey.value);
   clearAutoSaveTimer();
-  if (outlineUpdateFrame) cancelAnimationFrame(outlineUpdateFrame);
-  if (outlineRefreshTimer !== null) clearTimeout(outlineRefreshTimer);
-  outlineResizeObserver?.disconnect();
   notificationStore.clearByOperation(SKILL_COMMAND_NOTICE_OPERATION);
 });
 
@@ -1028,163 +1045,23 @@ const documentOutlineSource = computed(() => {
   void dirtySections.value;
   return sectionValue("body");
 });
-const documentOutlineItems = ref<KnowledgeDocumentOutlineItem[]>([]);
-const documentOutlineBaseLevel = computed(() =>
-  documentOutlineItems.value.reduce(
-    (lowest, item) => Math.min(lowest, item.level),
-    6,
-  )
-);
-const documentOutlineMarginTop = computed(() => `${outlineStartOffset.value}px`);
-const documentOutlineMaxHeight = computed(() => (
-  outlineViewportHeight.value > 0
-    ? `${Math.max(
-        160,
-        outlineViewportHeight.value
-          - outlineViewportTop.value
-          - DOCUMENT_OUTLINE_BOTTOM_GUTTER,
-      )}px`
-    : undefined
-));
-
-function outlineItemPadding(item: KnowledgeDocumentOutlineItem): string {
-  const depth = Math.max(0, item.level - documentOutlineBaseLevel.value);
-  return `${8 + Math.min(depth, 4) * 12}px`;
-}
-
-function outlineItemScreenTop(
-  view: EditorView,
-  item: KnowledgeDocumentOutlineItem,
-): number {
-  const position = Math.min(view.state.doc.length, Math.max(0, item.from));
-  return view.documentTop + view.lineBlockAt(position).top;
-}
-
-function updateDocumentOutlineActive(): void {
-  outlineUpdateFrame = 0;
-  updateDocumentOutlineLayout();
-  const items = documentOutlineItems.value;
-  if (!items.length) {
-    activeOutlineId.value = "";
-    return;
-  }
-
-  const scroller = documentScrollerRef.value;
-  const view = bodyEditorRef.value?.getEditorView();
-  if (!scroller || !view) {
-    activeOutlineId.value = items[0]?.id ?? "";
-    return;
-  }
-
-  if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2) {
-    activeOutlineId.value = items[items.length - 1]?.id ?? "";
-    return;
-  }
-
-  const activationLine = scroller.getBoundingClientRect().top + 48;
-  let activeItem = items[0];
-  for (const item of items) {
-    if (outlineItemScreenTop(view, item) > activationLine) break;
-    activeItem = item;
-  }
-  activeOutlineId.value = activeItem?.id ?? "";
-}
-
-function scheduleDocumentOutlineActiveUpdate(): void {
-  if (outlineUpdateFrame) return;
-  outlineUpdateFrame = requestAnimationFrame(updateDocumentOutlineActive);
-}
-
-function scrollToDocumentOutlineItem(item: KnowledgeDocumentOutlineItem): void {
-  const scroller = documentScrollerRef.value;
-  const view = bodyEditorRef.value?.getEditorView();
-  if (!scroller || !view) return;
-
-  const targetTop = scroller.scrollTop
-    + outlineItemScreenTop(view, item)
-    - scroller.getBoundingClientRect().top
-    - 28;
-  activeOutlineId.value = item.id;
-  scroller.scrollTo({
-    top: Math.max(0, targetTop),
-    behavior: "smooth",
-  });
-}
-
-function updateDocumentOutlineLayout(): void {
-  const scroller = documentScrollerRef.value;
-  const page = documentPageRef.value;
-  const body = documentBodyRef.value;
-  outlineViewportHeight.value = scroller?.clientHeight ?? 0;
-  if (!scroller || !page || !body) {
-    outlineViewportTop.value = DOCUMENT_OUTLINE_STICKY_TOP;
-    outlineStartOffset.value = DOCUMENT_OUTLINE_STICKY_TOP;
-    return;
-  }
-
-  const scrollerRect = scroller.getBoundingClientRect();
-  const pageRect = page.getBoundingClientRect();
-  const bodyRect = body.getBoundingClientRect();
-  outlineStartOffset.value = Math.max(
-    DOCUMENT_OUTLINE_STICKY_TOP,
-    Math.round(bodyRect.top - pageRect.top - DOCUMENT_OUTLINE_BODY_LEAD),
-  );
-  outlineViewportTop.value = Math.max(
-    DOCUMENT_OUTLINE_STICKY_TOP,
-    Math.round(bodyRect.top - scrollerRect.top - DOCUMENT_OUTLINE_BODY_LEAD),
-  );
-}
-
-function observeDocumentOutlineLayout(
-  scroller: HTMLElement | null,
-  page: HTMLElement | null,
-  body: HTMLElement | null,
-): void {
-  outlineResizeObserver?.disconnect();
-  outlineResizeObserver = null;
-  updateDocumentOutlineLayout();
-  if (!scroller || typeof ResizeObserver === "undefined") return;
-  outlineResizeObserver = new ResizeObserver(() => {
-    scheduleDocumentOutlineActiveUpdate();
-  });
-  outlineResizeObserver.observe(scroller);
-  if (page) outlineResizeObserver.observe(page);
-  if (body) outlineResizeObserver.observe(body);
-}
-
-watch(
-  [documentScrollerRef, documentPageRef, documentBodyRef],
-  ([scroller, page, body]) => observeDocumentOutlineLayout(scroller, page, body),
-  { flush: "post" },
-);
-
-function applyDocumentOutlineSource(source: string): void {
-  outlineRefreshTimer = null;
-  documentOutlineItems.value = extractKnowledgeDocumentOutline(source);
-  if (!documentOutlineItems.value.some((item) => item.id === activeOutlineId.value)) {
-    activeOutlineId.value = documentOutlineItems.value[0]?.id ?? "";
-  }
-  void nextTick(scheduleDocumentOutlineActiveUpdate);
-}
-
-watch(
-  () => [activeDocumentSessionKey.value, documentOutlineSource.value] as const,
-  ([documentKey, source], previous) => {
-    if (outlineRefreshTimer !== null) clearTimeout(outlineRefreshTimer);
-    const documentChanged = !previous || previous[0] !== documentKey;
-    if (documentChanged) {
-      applyDocumentOutlineSource(source);
-      return;
-    }
-    outlineRefreshTimer = setTimeout(() => applyDocumentOutlineSource(source), 120);
-  },
-  { flush: "post", immediate: true },
-);
-watch(
-  () => [activeDocumentSessionKey.value, props.active] as const,
-  () => void nextTick(scheduleDocumentOutlineActiveUpdate),
-  { flush: "post" },
-);
+const {
+  documentOutlineItems,
+  activeOutlineId,
+  documentOutlineMarginTop,
+  documentOutlineMaxHeight,
+  outlineItemPadding,
+  scrollToDocumentOutlineItem,
+  scheduleDocumentOutlineActiveUpdate,
+} = useMarkdownDocumentOutline({
+  documentKey: () => activeDocumentSessionKey.value,
+  source: () => documentOutlineSource.value,
+  active: () => props.active,
+  scroller: documentScrollerRef,
+  page: documentPageRef,
+  body: documentBodyRef,
+  editor: bodyEditorRef,
+});
 
 function onSectionInput(section: KnowledgeDocumentSection, value: string) {
   sectionTextBuffers.delete(section);
@@ -1619,7 +1496,8 @@ function labelForProvider(provider?: string | null): string {
       <div class="preview-main-column">
         <div
           ref="documentScrollerRef"
-          class="preview-main"
+          class="preview-main document-scroller"
+          :class="{ 'is-editable': !isReadOnly }"
           @scroll.passive="scheduleDocumentOutlineActiveUpdate"
         >
           <div v-if="loading && !document" class="preview-empty">{{ t("common.loading") }}</div>
@@ -1715,10 +1593,20 @@ function labelForProvider(provider?: string | null): string {
                   :selected-label="injectModeDropdownLabel"
                   :options="injectModeOptions"
                   teleport
+                  :close-on-select="false"
                   :disabled="documentMetaDisabled"
                   :aria-label="t('knowledge.meta.injectMode')"
                   @update:model-value="onInjectModeChange"
-                />
+                >
+                  <template v-if="supportsAgentInjection" #aside>
+                    <KnowledgeInjectionAgents
+                      :model-value="document.injectAgents"
+                      :workspace-ref="workspaceRef"
+                      :disabled="documentMetaDisabled || saveLoading"
+                      @update:model-value="updateMeta({ injectAgents: $event })"
+                    />
+                  </template>
+                </BaseDropdown>
               </div>
               <div class="document-property-row">
                 <span class="document-property-label">{{ t("knowledge.meta.editMode") }}</span>
@@ -1840,6 +1728,8 @@ function labelForProvider(provider?: string | null): string {
               </div>
               <BaseMarkdownEditor
                 :model-value="summaryDraft"
+                :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
+                @quote-selection="onQuoteSelection('summary', $event)"
                 :active="active"
                 :session-cache="markdownEditorSessions"
                 :session-pinned="isMarkdownEditorSessionPinned('summary')"
@@ -1884,6 +1774,8 @@ function labelForProvider(provider?: string | null): string {
               </div>
               <BaseMarkdownEditor
                 :model-value="rulesPropertyValue"
+                :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
+                @quote-selection="onQuoteSelection('maintenanceRules', $event)"
                 :active="active"
                 :session-cache="markdownEditorSessions"
                 :session-pinned="isMarkdownEditorSessionPinned('maintenanceRules')"
@@ -1930,6 +1822,8 @@ function labelForProvider(provider?: string | null): string {
                 <BaseMarkdownEditor
                   ref="bodyEditorRef"
                   :model-value="bodyDraft"
+                  :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
+                  @quote-selection="onQuoteSelection('body', $event)"
                   :active="active"
                   :session-cache="markdownEditorSessions"
                   :session-pinned="isMarkdownEditorSessionPinned('body')"
@@ -2068,6 +1962,15 @@ function labelForProvider(provider?: string | null): string {
   flex-direction: column;
   overflow: hidden;
   background: var(--panel-bg);
+}
+
+.preview-main.document-scroller {
+  container-type: size;
+}
+
+.document-scroller.is-editable .document-page {
+  /* Keep the final lines near the middle of the editing viewport. */
+  padding-bottom: max(72px, 50cqh);
 }
 
 .preview-pane {
@@ -2661,95 +2564,6 @@ function labelForProvider(provider?: string | null): string {
   }
 }
 
-/* Continuous document workspace. Metadata and content share one scroll plane. */
-.preview-main {
-  display: block;
-  overflow: auto;
-  container-type: inline-size;
-  container-name: knowledge-document;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--text-secondary) 34%, transparent) transparent;
-}
-
-.document-workspace {
-  width: 100%;
-  min-height: 100%;
-}
-
-.document-outline {
-  display: none;
-  min-width: 0;
-  overflow: auto;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-
-.document-outline::-webkit-scrollbar {
-  display: none;
-}
-
-.document-outline-nav {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.document-outline-item {
-  display: block;
-  width: 100%;
-  min-height: 27px;
-  padding-top: 4px;
-  padding-right: 8px;
-  padding-bottom: 4px;
-  border: 0;
-  border-left: 1px solid transparent;
-  border-radius: 0 4px 4px 0;
-  background: transparent;
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 12px;
-  line-height: 1.55;
-  text-align: left;
-  cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
-}
-
-.document-outline-item > span {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.document-outline-item:hover {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-.document-outline-item:focus-visible {
-  outline: 1px solid var(--accent-color);
-  outline-offset: -1px;
-}
-
-.document-outline-item.active {
-  border-left-color: color-mix(in srgb, var(--accent-color) 70%, var(--border-color));
-  background: color-mix(in srgb, var(--accent-color) 7%, transparent);
-  color: var(--text-color);
-}
-
-.document-page {
-  position: relative;
-  width: min(100%, 980px);
-  min-height: 100%;
-  margin: 0 auto;
-  padding: 32px 44px 72px;
-  box-sizing: border-box;
-}
-
-.document-heading {
-  margin: 0 0 22px;
-}
-
 .document-conflict {
   display: flex;
   align-items: center;
@@ -2773,16 +2587,6 @@ function labelForProvider(provider?: string | null): string {
   flex: none;
   align-items: center;
   gap: 4px;
-}
-
-.document-title,
-.document-title-input {
-  margin: 0;
-  color: var(--text-color);
-  font-size: 24px;
-  font-weight: 650;
-  line-height: 1.3;
-  letter-spacing: -0.015em;
 }
 
 .document-title-input-shell {
@@ -2973,25 +2777,6 @@ function labelForProvider(provider?: string | null): string {
   color: var(--status-warn-fg);
 }
 
-.document-body {
-  min-height: 360px;
-  padding-top: 20px;
-  border-top: 1px solid var(--border-color);
-}
-
-.document-body :deep(.base-markdown-editor) {
-  min-height: 360px;
-  height: auto;
-  padding-bottom: 32px;
-}
-
-.document-body :deep(.base-markdown-editor .cm-scroller) {
-  height: auto;
-  min-height: 360px;
-  overflow: visible;
-  overscroll-behavior: auto;
-}
-
 .document-page .preview-search-hit {
   margin: 6px 0 8px;
 }
@@ -3002,37 +2787,11 @@ function labelForProvider(provider?: string | null): string {
   bottom: 10px;
 }
 
-@container knowledge-document (min-width: 1120px) {
-  .document-workspace.has-outline {
-    display: grid;
-    grid-template-columns: 210px minmax(0, 920px);
-    column-gap: 20px;
-    align-items: start;
-    justify-content: center;
-    box-sizing: border-box;
-    padding-inline: 24px;
-  }
-
-  .document-workspace.has-outline .document-outline {
-    position: sticky;
-    top: 40px;
-    display: block;
-    align-self: start;
-  }
-
-  .document-workspace.has-outline .document-page {
-    width: 100%;
-    margin-inline: 0;
-  }
-}
-
 @media (max-width: 860px) {
-  .document-page {
-    padding: 24px 24px 64px;
-  }
-
   .document-property-row {
     grid-template-columns: 96px minmax(0, 1fr);
   }
 }
 </style>
+
+<style scoped src="../ui/markdown-document.css" />

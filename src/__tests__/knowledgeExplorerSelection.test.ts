@@ -3,10 +3,35 @@ import {
   pruneKnowledgeDeleteTargets,
   pruneKnowledgeDragNodes,
   resolveKnowledgeContextSelection,
+  resolveKnowledgeExplorerClickActivation,
   resolveKnowledgeExplorerSelection,
 } from "../components/knowledge/knowledgeExplorerSelection";
 
 describe("knowledgeExplorerSelection", () => {
+  it("deduplicates only consecutive clicks that reached the same row", () => {
+    const first = resolveKnowledgeExplorerClickActivation(null, "design/a", 1);
+    const repeated = resolveKnowledgeExplorerClickActivation(
+      first.current,
+      "design/a",
+      2,
+    );
+    const changedRow = resolveKnowledgeExplorerClickActivation(
+      first.current,
+      "design/b",
+      2,
+    );
+    const missingFirstClick = resolveKnowledgeExplorerClickActivation(
+      null,
+      "design/a",
+      2,
+    );
+
+    expect(first.shouldActivate).toBe(true);
+    expect(repeated.shouldActivate).toBe(false);
+    expect(changedRow.shouldActivate).toBe(true);
+    expect(missingFirstClick.shouldActivate).toBe(true);
+  });
+
   it("seeds ctrl selection with the currently opened item", () => {
     const result = resolveKnowledgeExplorerSelection({
       visiblePaths: ["design/a", "design/b", "design/c.md"],
