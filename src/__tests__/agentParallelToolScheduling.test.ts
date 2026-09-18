@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const root = process.cwd();
-const read = (path: string) => readFileSync(resolve(root, path), "utf8");
+const read = (path: string) => readFileSync(resolve(root, path), "utf8").replace(/\r\n/g, "\n");
 
 describe("agent parallel tool scheduling safety", () => {
   it("type-erases tool futures before cancellation selection", () => {
@@ -67,7 +67,7 @@ describe("agent parallel tool scheduling safety", () => {
     expect(agent).toContain("tool_call_has_unity_execution_barrier");
     expect(unityExecuteTool).toContain('"readonly"');
     expect(sdk).toContain('canonical == "unity_execute"');
-    expect(mcp).toContain('name == "unity_execute"');
+    expect(mcp).toContain("crate::sdk::direct_tool_lock_request(&name, &arguments");
     expect(lock).toContain("ParallelOpaque(Arc<OpaqueGroupState>)");
     expect(lock).toContain("parallel_opaque_group_overlaps_and_blocks_other_groups");
   });
@@ -198,18 +198,23 @@ describe("agent parallel tool scheduling safety", () => {
     expect(lock).toContain("holders=(");
     expect(lock).toContain("PROCESS_WORKSPACE_EXECUTION_LOCKS");
     expect(lock).toContain("normalize_workspace_key");
-    for (const source of [agent, cli, sdk, mcp]) {
+    const coordination = read("src-tauri/src/merge_jobs/coordination.rs");
+    for (const source of [agent, cli, coordination]) {
       expect(source).toContain("acquire_with_diagnostics");
+    }
+    for (const source of [sdk, mcp]) {
+      expect(source).toContain("crate::merge_jobs::coordination::acquire_workspace(");
     }
   });
 
   it("covers the inbound MCP server tool execution path", () => {
     const mcp = read("src-tauri/src/mcp/server/tools.rs");
-    const acquire = mcp.indexOf("process_workspace_execution_lock(");
+    const acquire = mcp.indexOf("crate::merge_jobs::coordination::acquire_workspace(");
     const execute = mcp.indexOf("execute_workspace_tool(", acquire);
     const release = mcp.indexOf("drop(workspace_guard)", execute);
 
-    expect(mcp).toContain("WorkspaceExecutionLockRequest::Exclusive");
+    expect(mcp).toContain("crate::sdk::direct_tool_lock_request(&name, &arguments");
+    expect(read("src-tauri/src/sdk.rs")).toContain("WorkspaceExecutionLockRequest::Exclusive");
     expect(mcp).toContain("let workspace_guard = if let Some(request) = lock_request");
     expect(acquire).toBeGreaterThan(0);
     expect(execute).toBeGreaterThan(acquire);

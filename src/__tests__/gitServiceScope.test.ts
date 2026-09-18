@@ -25,6 +25,7 @@ describe("Git workspace scope", () => {
   });
 
   it("forwards WorkspaceRef on history reads", async () => {
+    mockedInvoke.mockResolvedValueOnce({ head: null, entries: [], branches: [], tags: [] });
     await gitHistorySnapshot(20, 50, workspaceRef);
 
     expect(mockedInvoke).toHaveBeenCalledWith("git_history_snapshot", {

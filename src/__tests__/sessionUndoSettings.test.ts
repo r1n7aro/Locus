@@ -38,7 +38,7 @@ describe("session file undo setting", () => {
     const cli = read("src-tauri/src/agent/instance/claude_code_cli.rs");
 
     expect(session).toContain("instance.set_session_undo_enabled(config.session_undo_enabled())");
-    expect(agent).toContain("self.session_undo_enabled && self.tool_call_needs_undo_tracking");
+    expect(agent).toMatch(/self\.session_undo_enabled\s*&& target_name != "execute_typescript"\s*&& self\.tool_call_needs_undo_tracking\(name, args\)/);
     expect(agent).toContain("&& self.bash_needs_primary_workspace_tracking(&target_args)");
     expect(agent).toContain('matches!(target_name.as_str(), "write" | "edit")');
     expect(agent).toContain("Self::is_unity_execution_barrier_tool(&target_name)");

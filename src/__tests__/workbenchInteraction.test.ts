@@ -105,7 +105,7 @@ describe("development workbench editor groups", () => {
     expect(editor).toContain(':workspace-ref="workspaceRef"');
     expect(preview).toContain("UnityObjectPreview");
     expect(preview).toContain(':workspace-ref="workspaceRef"');
-    expect(unityPreview).toContain("props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef");
+    expect(unityPreview).toContain("props.workspaceRef ?? (viewContext?.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef)");
   });
 
   it("uses VS Code-style preview tabs and keeps one-tab split groups draggable", () => {

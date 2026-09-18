@@ -39,7 +39,7 @@ describe("Agent async task preview", () => {
     const bashTool = readFileSync(resolve(root, "tools/bash.json"), "utf8");
 
     expect(asyncTasks).toContain("Use the result below to continue the task");
-    expect(asyncTasks).toContain("await locus.get_task_status(task_id)");
+    expect(asyncTasks).toContain("Status: await locus.get_task_status({id})");
     expect(agent).toContain("manager.finish_without_notification(&task_id, &result)");
     expect(agent).toContain("manager.enqueue_completion_notification(&snapshot)");
     expect(agent).toContain("manager.deliver_notifications(&self.session_id, store)");

@@ -45,6 +45,14 @@ async function flush() {
   for (let index = 0; index < 12; index += 1) await nextTick();
 }
 
+async function openToolDetails() {
+  const details = [...host.querySelectorAll<HTMLButtonElement>(".document-toolbar button")]
+    .find((button) => button.textContent === "agent.editor.details");
+  expect(details).toBeDefined();
+  details!.click();
+  await flush();
+}
+
 async function mountAgent() {
   app = createApp(defineComponent({
     setup() {
@@ -92,6 +100,9 @@ describe("Agent tool workspace status", () => {
       if (command === "list_workspace_agents") return [unityAgent];
       if (command === "list_workspace_subagent_defs" || command === "list_rules") return [];
       if (command === "get_workspace_agent_system_prompt_stats") return null;
+      if (command === "read_workspace_agent_document") {
+        return { content: "Set play mode", revision: "revision-1", path: "F:/projects/unity/Locus/agent/unity/tools/unity_set_play_mode.json" };
+      }
       if (command === "list_workspace_agent_injected_items") {
         return [toolItem((args?.workspaceRef as { checkoutId: string }).checkoutId)];
       }
@@ -131,6 +142,7 @@ describe("Agent tool workspace status", () => {
     unavailableReason = "unity_service_unavailable";
     active.value = true;
     await flush();
+    await openToolDetails();
     expect(host.querySelector(".tool-availability-reason")?.textContent)
       .toBe("agent.tool.unavailableReason.unityServiceUnavailable");
 
@@ -138,6 +150,7 @@ describe("Agent tool workspace status", () => {
     await flush();
     host.querySelector<HTMLButtonElement>(".tool-item")!.click();
     await flush();
+    await openToolDetails();
     expect(host.querySelector(".tool-availability-reason")?.textContent)
       .toBe("agent.tool.unavailableReason.requiresUnityWorkspace");
   });

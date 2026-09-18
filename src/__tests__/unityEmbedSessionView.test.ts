@@ -39,7 +39,8 @@ describe("Unity embedded session view", () => {
     expect(workspace).toContain("fixedWorkspaceRef?: WorkspaceRef | null;");
     expect(workspace).toContain("initialWorkspaceCheckout()");
     expect(workspace).toContain("openInitialSessionIfRequested()");
-    expect(workspace).toContain("workspaceContextStore.focusedCheckout?.projectId === projects[0].projectId");
+    expect(workspace).toContain('resource: { kind: "newSession", projectId: checkout.projectId }');
+    expect(workspace).toContain("checkoutId: checkout.checkoutId");
     expect(workspace).toContain("<WorkbenchSplitHost");
     expect(workspace).toContain("<WorkspaceTree");
     expect(view).not.toContain("useEmbeddedChatSession");

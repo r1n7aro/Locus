@@ -37,7 +37,11 @@ describe("unity_execute printJson", () => {
     expect(serializer).toContain("NodeKind.DeferredEnumerable");
     expect(serializer).toContain('WriteDescriptor(writer, "$deferredEnumerable"');
     expect(serializer).not.toContain("property.GetValue(");
-    expect(serializer).not.toContain("JsonConvert.SerializeObject");
+    // Trusted transport DTOs have a separate SerializeData entry point. Keep
+    // arbitrary-object graph serialization free of getter-invoking serializers.
+    const graphSerializer = serializer.slice(serializer.indexOf("public static string Serialize(object value)"));
+    expect(graphSerializer).toContain("GraphPlan.Build(value)");
+    expect(graphSerializer).not.toContain("JsonConvert.SerializeObject");
     expect(bridge).not.toContain(".AppendLine(obj.ToString())");
   });
 

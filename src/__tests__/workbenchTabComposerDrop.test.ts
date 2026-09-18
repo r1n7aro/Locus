@@ -100,6 +100,7 @@ async function fixture(resource: WorkbenchResourceRef, split: boolean) {
     WORKSPACE_LAYOUT_INTERNAL_DRAG_TYPE: "layout", VIEW_TREE_INTERNAL_DRAG_TYPE: "view",
     workbenchWindow, workbenchRootRef: ref(host), explorerRootRef: ref(null),
     editorDropIntent, composerDropTarget, layoutDropIntent: ref(null), dropTargetKey: ref(null),
+    pinDropProjectId: ref(null), pinDropInsertion: ref(null),
     workbenchGroup: (paneId: string) => workbenchWindow.value.groups[paneId],
     editorForPane: (paneId: string) => {
       const group = workbenchWindow.value.groups[paneId];

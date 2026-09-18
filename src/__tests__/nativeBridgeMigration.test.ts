@@ -206,7 +206,7 @@ describe("native bridge migration", () => {
     expect(plugin).toContain("Unity closed for plugin update");
     expect(plugin).toContain("PLUGIN_INSTALL_LOCK_RELEASE_SETTLE");
     expect(plugin).toContain("plugin install hit a locked file after Unity close");
-    expect(plugin).toContain("super::launch_project(project_path).await?");
+    expect(plugin).toContain("super::launch_project_with_mode(project_path, previous_mode.unwrap_or(super::UnityLaunchMode::Interactive)).await?");
     expect(process).toContain("taskkill");
     expect(process).toContain("force_close_current_project_unity_processes");
     expect(process).toContain("unity_process_args_are_worker");

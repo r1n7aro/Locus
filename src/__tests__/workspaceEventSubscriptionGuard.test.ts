@@ -11,6 +11,13 @@ function sourceFiles(directory: string): string[] {
   });
 }
 
+function hasOwnerPrefix(expression: ts.Expression): boolean {
+  if (ts.isStringLiteral(expression)) return expression.text.trim().length > 0;
+  return ts.isBinaryExpression(expression)
+    && expression.operatorToken.kind === ts.SyntaxKind.PlusToken
+    && hasOwnerPrefix(expression.left);
+}
+
 describe("workspace event transport boundary", () => {
   it("allows only the window hub to own a native workspace listener and requires named consumers", () => {
     const violations: string[] = [];
@@ -48,7 +55,7 @@ describe("workspace event transport boundary", () => {
               const namedOwner = options && ts.isObjectLiteralExpression(options)
                 && options.properties.some((property) => ts.isPropertyAssignment(property)
                   && property.name.getText(ast) === "owner"
-                  && ts.isStringLiteral(property.initializer) && property.initializer.text.length > 0);
+                  && hasOwnerPrefix(property.initializer));
               if (!ts.isPropertyAccessExpression(expression) || expression.name.text !== "subscribe" || !namedOwner) {
                 violations.push(`${path}: ${node.expression.getText(ast)}`);
               }

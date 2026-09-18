@@ -206,7 +206,7 @@ describe("workspacePageWindow", () => {
     expect(topTabs).toContain('{ id: "development"');
     expect(topTabs).not.toContain('{ id: "views"');
     expect(topTabs).toContain('{ id: "plugins"');
-    expect(topTabs).toContain('{ id: "agent"');
+    expect(topTabs).not.toContain('{ id: "agent"');
     expect(topTabs).not.toContain('{ id: "knowledge"');
     expect(topTabs).not.toContain('{ id: "collab"');
     expect(app).not.toContain("const projectTabs");

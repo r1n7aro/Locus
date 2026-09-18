@@ -25,7 +25,7 @@ describe("Unity Play Mode tool", () => {
     expect(builtin).toContain('name: "unity_set_play_mode".to_string()');
     expect(builtin).toContain("set_editor_status(&project_path, requested_status)");
     expect(agent).toContain('tc.name == "unity_set_play_mode"');
-    expect(agent).toContain('"unity_set_play_mode",\n                tool_call_id');
+    expect(agent).toMatch(/"unity_set_play_mode",\s+tool_call_id/);
     expect(mcp).toContain('"unity_set_play_mode"');
   });
 

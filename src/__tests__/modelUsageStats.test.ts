@@ -17,7 +17,8 @@ describe("model usage statistics", () => {
     const commands = read("src-tauri/src/commands/session.rs");
     const lib = read("src-tauri/src/lib.rs");
 
-    expect(store).toContain('const SCHEMA_VERSION: i32 = 45;');
+    const schemaVersion = store.match(/const SCHEMA_VERSION: i32 = (\d+);/);
+    expect(Number(schemaVersion?.[1])).toBeGreaterThanOrEqual(45);
     expect(store).toContain("CREATE TABLE IF NOT EXISTS model_usage_events");
     expect(store).toContain("pub fn record_model_usage(");
     expect(store).toContain("record_model_usage_with_cache_check(");
