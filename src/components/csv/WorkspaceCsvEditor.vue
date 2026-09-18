@@ -640,7 +640,7 @@ defineExpose({ saveFile, refreshIfChanged, exportTransferSnapshot, applyTransfer
 .csv-options input, .csv-find input { min-width: 0; width: 140px; padding: 4px 6px; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color); font: 12px var(--font-ui); }
 .csv-options input[type=number] { width: 56px; }
 .csv-view-source { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border-color); font-size: 12px; }
-.csv-view-source textarea { height: 180px; resize: vertical; background: var(--bg-color); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; font-family: var(--font-mono-code); }
+.csv-view-source textarea { height: 180px; resize: vertical; background: var(--bg-color); color: var(--text-color); border: 1px solid var(--border-color); border-radius: 4px; font-family: var(--font-mono-editor); }
 .csv-view-source > div { display: flex; gap: 6px; }
 .csv-message { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border-color); color: var(--status-warn-fg); font-size: 12px; }
 .csv-message span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
