@@ -696,54 +696,6 @@ describe("useCollabState", () => {
     ], TEST_WORKSPACE_REF);
   });
 
-  it("resizes the collab git sidebar and persists the width", async () => {
-    gitServiceMocks.gitHistorySnapshot.mockResolvedValue(snapshot([{ hash: "aaaaaaa", shortHash: "aaaaaaa", parents: [], author: "tester", date: 1, message: "repo a", refs: [], isStash: false }], "aaaaaaa"));
-
-    const props = reactive({
-      workingDir: "",
-      workspaceRef: TEST_WORKSPACE_REF,
-      isActive: false,
-      selectedModelId: "",
-      selectedAgentId: "",
-      models: [],
-    });
-
-    const state = useCollabState(props);
-
-    props.workingDir = "F:/repo";
-    await nextTick();
-    await flushPromises();
-
-    const leftAreaEl = {
-      getBoundingClientRect: () => ({
-        width: 560,
-        height: 400,
-        top: 0,
-        right: 560,
-        bottom: 400,
-        left: 0,
-        x: 0,
-        y: 0,
-        toJSON: () => "",
-      }),
-    };
-    state.leftAreaRef.value = leftAreaEl as any;
-    expect(state.gitSidebarWidth.value).toBe(220);
-
-    state.onSidebarSplitterMouseDown({
-      clientX: 220,
-      preventDefault() {},
-      stopPropagation() {},
-    } as MouseEvent);
-    documentMock.dispatch("mousemove", { clientX: 280 });
-
-    expect(state.gitSidebarWidth.value).toBe(280);
-
-    documentMock.dispatch("mouseup");
-
-    expect(localStorage.getItem("locus:collabSidebarWidth")).toBe("280");
-  });
-
   it("dedupes overlapping commits when loading more history", async () => {
     gitServiceMocks.gitHistorySnapshot
       .mockResolvedValueOnce(

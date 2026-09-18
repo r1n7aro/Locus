@@ -110,6 +110,10 @@ struct GitTaskWorkspaceIdentity {
 
 fn git_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
+        error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
+            "workspace.materialization_stale",
+            "The checkout assignment changed. Reopen the checkout before continuing.",
+        ).detail(error.to_string()),
         WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
             "workspace.registry_unavailable",
             "The workspace registry is unavailable.",
@@ -144,7 +148,7 @@ async fn resolve_git_workspace_scope(
         .map_err(git_workspace_resolve_error)
 }
 
-fn git_named_operation_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn git_named_operation_lock(name: &str) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = locks
@@ -5711,6 +5715,7 @@ pub async fn git_merge_semantic_session(
 ) -> Result<crate::merge::types::MergeSessionPayload, AppError> {
     let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
     let cwd = scope.root();
+    crate::merge::core_adapter::checked_path(cwd,&request.file_path)?;
     if cwd.is_empty() {
         return Err(AppError::new(
             "merge.no_workspace",
@@ -5735,17 +5740,21 @@ pub async fn git_merge_semantic_session(
         return Ok(build_merge_payload(&key, &request.file_path, &session));
     }
 
-    // Build new session.
-    let session = match crate::merge::session::build_merge_session(
-        &cwd,
-        &request.file_path,
-        &request.base_oid,
-        &request.left_oid,
-        &request.right_oid,
+    // Git blob I/O and syntax construction must not block async service workers.
+    let build_cwd=cwd.to_owned();
+    let build_request=request.clone();
+    let build_app=app_handle.clone();
+    let build_event_scope=scope.event_scope.clone();
+    let session = match tokio::task::spawn_blocking(move || crate::merge::session::build_merge_session(
+        &build_cwd,
+        &build_request.file_path,
+        &build_request.base_oid,
+        &build_request.left_oid,
+        &build_request.right_oid,
         &scoped_asset_db,
-        Some(&app_handle),
-        Some(&scope.event_scope),
-    ) {
+        Some(&build_app),
+        Some(&build_event_scope),
+    )).await.map_err(|error|AppError::new("merge.build_failed",error.to_string()))? {
         Ok(session) => session,
         Err(error) => {
             return Ok(build_merge_unavailable_payload(
@@ -5768,6 +5777,7 @@ pub async fn git_merge_semantic_target(
     request: crate::merge::types::MergeTargetRequest,
 ) -> Result<crate::merge::types::MergeTargetInspector, AppError> {
     let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    verify_merge_cache_scope(&scope,&request.merge_key)?;
     let cwd = scope.root();
     let scoped_asset_db = scope.asset_db_state();
     if cwd.is_empty() {
@@ -5798,6 +5808,11 @@ fn read_merge_workspace_bytes(cwd: &str, file_path: &str) -> Option<Vec<u8>> {
     std::fs::read(&full_path).ok()
 }
 
+fn verify_merge_cache_scope(scope:&GitWorkspaceScope,key:&str)->Result<(),AppError>{
+    if !key.starts_with(&format!("{}:merge:",scope.cache_namespace())){return Err(AppError::new("merge.scope_mismatch","Merge session belongs to another checkout or runtime generation"));}
+    Ok(())
+}
+
 fn verify_merge_workspace_hash(
     session_lock: &std::sync::Arc<std::sync::RwLock<crate::merge::types::MergeSemanticSession>>,
     workspace_bytes: Option<&[u8]>,
@@ -5822,8 +5837,11 @@ pub async fn git_merge_semantic_validate(
     request: crate::merge::types::MergeApplyRequest,
 ) -> Result<(), AppError> {
     let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    verify_merge_cache_scope(&scope,&request.merge_key)?;
+    let _repository_guard=scope.lock_repository().await;
     let _workspace_guard = scope.lock_workspace_fs().await;
     let cwd = scope.root();
+    crate::merge::core_adapter::checked_path(cwd,&request.file_path)?;
     let scoped_asset_db = scope.asset_db_state();
     if cwd.is_empty() {
         return Err(AppError::new(
@@ -5842,6 +5860,7 @@ pub async fn git_merge_semantic_validate(
     let mut session = session_lock
         .write()
         .map_err(|_| AppError::new("merge.lock_error", "Failed to write merge session"))?;
+    crate::merge::core_adapter::verify_snapshot(&session,&cwd,&request.file_path)?;
     crate::merge::inspector::materialize_all_merge_targets(&mut session, &cwd, &scoped_asset_db)?;
     crate::merge::patch::assemble_resolved_yaml(&session, &request.resolutions)?;
     Ok(())
@@ -5854,8 +5873,11 @@ pub async fn git_merge_semantic_apply(
     request: crate::merge::types::MergeApplyRequest,
 ) -> Result<(), AppError> {
     let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
+    verify_merge_cache_scope(&scope,&request.merge_key)?;
+    let _repository_guard=scope.lock_repository().await;
     let _workspace_guard = scope.lock_workspace_fs().await;
     let cwd = scope.root();
+    crate::merge::core_adapter::checked_path(cwd,&request.file_path)?;
     let scoped_asset_db = scope.asset_db_state();
     if cwd.is_empty() {
         return Err(AppError::new(
@@ -5882,6 +5904,7 @@ pub async fn git_merge_semantic_apply(
         .write()
         .map_err(|_| AppError::new("merge.lock_error", "Failed to write merge session"))?;
 
+    crate::merge::core_adapter::verify_snapshot(&session,&cwd,&request.file_path)?;
     crate::merge::inspector::materialize_all_merge_targets(&mut session, &cwd, &scoped_asset_db)?;
 
     let assembled = crate::merge::patch::assemble_resolved_yaml(&session, &request.resolutions)?;
@@ -5896,21 +5919,15 @@ pub async fn git_merge_semantic_apply(
             )
         }
         crate::merge::patch::AssembledMerge::ResolvedText(resolved_text) => {
-            let workspace_bytes = workspace_bytes.ok_or_else(|| {
-                AppError::new(
-                    "merge.workspace_modified",
-                    "Workspace file has been deleted since the merge session was opened.",
-                )
-            })?;
-
-            // Semantic merge normalizes to LF internally. When writing the resolved
-            // file back, prefer the repository EOL rule and only fall back to the
-            // current worktree style when no explicit rule exists.
-            let workspace_text = String::from_utf8_lossy(&workspace_bytes);
+            // The core preserves snapshot bytes. At the checkout boundary use
+            // the repository EOL rule, then the captured worktree style.
+            // An absent target was captured and guarded as absent. Selecting an
+            // incoming object/file may intentionally restore that missing file.
+            let workspace_text = workspace_bytes.as_deref().map(String::from_utf8_lossy);
             let line_ending = crate::eol::resolve_preferred_line_ending(
                 Some(std::path::Path::new(&cwd)),
                 std::path::Path::new(&request.file_path),
-                Some(&workspace_text),
+                workspace_text.as_deref(),
             );
             let mut final_text = crate::eol::apply_line_ending(&resolved_text, line_ending);
             // Ensure trailing newline — Unity YAML files always end with one.
@@ -6439,6 +6456,18 @@ mod graph_ref_tests {
     }
 }
 
+#[path = "git/context_actions.rs"]
+mod context_actions;
+
+fn context_git_stdout(cwd: &str, args: &[&str]) -> Result<String, AppError> {
+    let output = command("git").args(args).current_dir(cwd).output()
+        .map_err(|error| AppError::new("git.exec", error.to_string()))?;
+    if !output.status.success() {
+        return Err(AppError::new("git.action_failed", String::from_utf8_lossy(&output.stderr).trim().to_owned()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 fn run_git_action(cwd: &str, args: &[&str], label: &str) -> Result<GitActionResult, AppError> {
     let output = command("git")
         .args(args)
@@ -6501,37 +6530,9 @@ pub async fn git_commit_action(
         ));
     }
 
-    match action.as_str() {
-        "cherryPick" => run_git_action(&cwd, &["cherry-pick", &rev], "Cherry-pick"),
-        "checkoutDetached" => {
-            run_git_action(&cwd, &["checkout", "--detach", &rev], "Checkout detached")
-        }
-        "reset" => {
-            let m = mode.as_deref().unwrap_or("mixed");
-            let flag = match m {
-                "soft" => "--soft",
-                "hard" => "--hard",
-                _ => "--mixed",
-            };
-            run_git_action(&cwd, &["reset", flag, &rev], &format!("Reset ({})", m))
-        }
-        "revert" => run_git_action(&cwd, &["revert", "--no-edit", &rev], "Revert"),
-        "createBranchAndCheckout" => {
-            let name = branch_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| AppError::new("git.missing_param", "Branch name is required"))?;
-            run_git_action(
-                &cwd,
-                &["checkout", "-b", name, &rev],
-                &format!("创建并切换到分支 {}", name),
-            )
-        }
-        _ => Err(AppError::new(
-            "git.unknown_action",
-            format!("Unknown commit action: {}", action),
-        )),
-    }
+    let args = context_actions::commit_args(&rev, &action, mode.as_deref(), branch_name.as_deref())
+        .map_err(|error| AppError::new("git.invalid_action", error))?;
+    run_git_action(&cwd, &args.iter().map(String::as_str).collect::<Vec<_>>(), &action)
 }
 
 #[tauri::command]
@@ -6542,6 +6543,7 @@ pub async fn git_branch_action(
     target_kind: String,
     action: String,
     new_name: Option<String>,
+    remote_name: Option<String>,
 ) -> Result<GitActionResult, AppError> {
     let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
     let _repository_guard = scope.lock_repository().await;
@@ -6554,48 +6556,26 @@ pub async fn git_branch_action(
         ));
     }
 
-    match action.as_str() {
-        "switch" => run_git_action(
-            &cwd,
-            &["switch", &target],
-            &format!("已切换到分支 {}", target),
-        ),
-        "checkoutTracking" => run_git_action(
-            &cwd,
-            &["checkout", "--track", &target],
-            &format!("已检出跟踪分支 {}", target),
-        ),
-        "mergeIntoCurrent" => run_git_action(
-            &cwd,
-            &["merge", &target, "--no-edit"],
-            &format!("已将 {} 合并到当前分支", target),
-        ),
-        "rebaseCurrentOnto" => run_git_action(
-            &cwd,
-            &["rebase", &target],
-            &format!("已将当前分支变基到 {}", target),
-        ),
-        "rename" => {
-            let name = new_name
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| AppError::new("git.missing_param", "New branch name is required"))?;
-            run_git_action(
-                &cwd,
-                &["branch", "-m", &target, name],
-                &format!("已重命名分支为 {}", name),
-            )
+
+    if matches!(action.as_str(), "pull" | "push") {
+        let current = context_git_stdout(&cwd, &["symbolic-ref", "--short", "HEAD"])?;
+        if target_kind != "local" || current != target {
+            return Err(AppError::new("git.branch_changed", "The current branch changed. Refresh before trying again."));
         }
-        "delete" => run_git_action(
-            &cwd,
-            &["branch", "-d", &target],
-            &format!("已删除分支 {}", target),
-        ),
-        _ => Err(AppError::new(
-            "git.unknown_action",
-            format!("Unknown branch action: {}", action),
-        )),
+        if action == "push" {
+            let remote = context_git_stdout(&cwd, &["config", "--get", &format!("branch.{}.remote", target)])
+                .map_err(|_| AppError::new("git.no_upstream", "This branch has no upstream. Configure an upstream before pushing."))?;
+            let destination = context_git_stdout(&cwd, &["config", "--get", &format!("branch.{}.merge", target)])
+                .map_err(|_| AppError::new("git.no_upstream", "This branch has no upstream. Configure an upstream before pushing."))?;
+            // Use one explicit refspec, independent of push.default / remote.push.
+            let args = context_actions::push_args(&target, &remote, &destination)
+                .map_err(|error| AppError::new("git.invalid_upstream", error))?;
+            return run_git_action(&cwd, &args.iter().map(String::as_str).collect::<Vec<_>>(), "Push branch");
+        }
     }
+    let args = context_actions::branch_args(&target, &target_kind, &action, new_name.as_deref(), remote_name.as_deref())
+        .map_err(|error| AppError::new("git.invalid_action", error))?;
+    run_git_action(&cwd, &args.iter().map(String::as_str).collect::<Vec<_>>(), &action)
 }
 
 #[tauri::command]
@@ -6604,6 +6584,8 @@ pub async fn git_stash_action(
     workspace_ref: WorkspaceRef,
     ref_name: String,
     action: String,
+    branch_name: Option<String>,
+    expected_hash: Option<String>,
 ) -> Result<GitActionResult, AppError> {
     let scope = resolve_git_workspace_scope(&workspace_ref, &registry).await?;
     let _repository_guard = scope.lock_repository().await;
@@ -6616,39 +6598,43 @@ pub async fn git_stash_action(
         ));
     }
 
-    match action.as_str() {
-        "apply" | "pop" => {
-            let label = if action == "apply" {
-                "已应用 Stash"
-            } else {
-                "已应用并移除 Stash"
-            };
-            crate::vcs::git_merge::prepare_stash_apply_abort_state(
-                &cwd,
-                &format!("stash {} {}", action, ref_name),
-            )
-            .await?;
 
-            let args = if action == "apply" {
-                ["stash", "apply", ref_name.as_str()]
-            } else {
-                ["stash", "pop", ref_name.as_str()]
-            };
-            let result = run_git_action(&cwd, &args, label);
+    let args = context_actions::stash_args(&ref_name, &action)
+        .map_err(|error| AppError::new("git.invalid_stash", error))?;
+    if let Some(expected) = expected_hash.as_deref() {
+        let actual = context_git_stdout(&cwd, &["rev-parse", "--verify", &ref_name])?;
+        if actual != expected {
+            return Err(AppError::new("git.stash_changed", "The stash list changed. Refresh and select the stash again."));
+        }
+    }
+    match action.as_str() {
+        "apply" | "applyIndex" | "pop" | "branch" => {
+            if action == "branch" {
+                let name = branch_name.as_deref().filter(|s| !s.is_empty())
+                    .ok_or_else(|| AppError::new("git.missing_param", "Branch name is required"))?;
+                let status = context_git_stdout(&cwd, &["status", "--porcelain", "--untracked-files=all"])?;
+                if !status.is_empty() {
+                    return Err(AppError::new("git.dirty_stash_branch", "Commit or stash current changes before creating a branch from a stash."));
+                }
+                let base = format!("{}^1", ref_name);
+                let args = context_actions::commit_args(&base, "createBranchAndCheckout", None, Some(name))
+                    .map_err(|error| AppError::new("git.invalid_action", error))?;
+                run_git_action(&cwd, &args.iter().map(String::as_str).collect::<Vec<_>>(), "Create stash branch")?;
+            }
+            // For a stash branch, capture the new branch's clean base so abort
+            // restores that checkout rather than files from the previous branch.
+            crate::vcs::git_merge::prepare_stash_apply_abort_state(&cwd, &format!("stash {} {}", action, ref_name)).await?;
+            let result = run_git_action(&cwd, &args.iter().map(String::as_str).collect::<Vec<_>>(), "Apply stash");
             match &result {
                 Ok(action_result) if action_result.status == "conflict" => {}
                 _ => crate::vcs::git_merge::clear_stash_apply_abort_state(&cwd),
             }
+            if action == "branch" && matches!(&result, Ok(value) if value.status == "success") {
+                return run_git_action(&cwd, &["stash", "drop", &ref_name], "Create branch from stash");
+            }
             result
         }
-        "drop" => run_git_action(
-            &cwd,
-            &["stash", "drop", &ref_name],
-            &format!("已删除 {}", ref_name),
-        ),
-        _ => Err(AppError::new(
-            "git.unknown_action",
-            format!("Unknown stash action: {}", action),
-        )),
+        "drop" => run_git_action(&cwd, &["stash", "drop", &ref_name], "Drop stash"),
+        _ => Err(AppError::new("git.unknown_action", format!("Unknown stash action: {}", action))),
     }
 }

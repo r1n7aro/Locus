@@ -7,7 +7,6 @@ use crate::process_util::command;
 use crate::vcs::undo::ChangedFile;
 use crate::vcs::{Checkpoint, GitProvider, VcsProvider};
 
-const STASH_APPLY_ABORT_REF: &str = "refs/locus/stash-apply-abort";
 const STASH_APPLY_ABORT_STATE: &str = "locus/stash-apply-abort.json";
 
 // ── Types ──
@@ -78,6 +77,8 @@ pub enum MergeActionKind {
 #[serde(rename_all = "camelCase")]
 struct StashApplyAbortState {
     checkpoint: Checkpoint,
+    #[serde(default)]
+    abort_ref: Option<String>,
 }
 
 // ── Conflict block parsing ──
@@ -595,6 +596,43 @@ fn stash_apply_abort_state_path(cwd: &str) -> Option<PathBuf> {
     Some(std::path::Path::new(&git).join(STASH_APPLY_ABORT_STATE))
 }
 
+fn stash_apply_abort_ref_prefix(cwd: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let git = crate::commands::git_dir(cwd)?;
+    let path = dunce::canonicalize(git).ok()?;
+    let key = crate::workspace_service::worktrees::path_key(&path);
+    let hash: String = Sha256::digest(key.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Some(format!("refs/locus/stash-abort/{hash}/"))
+}
+
+fn stash_apply_abort_state_lock(cwd: &str) -> AppResult<std::fs::File> {
+    let path = stash_apply_abort_state_path(cwd).ok_or_else(|| {
+        AppError::new(
+            "merge.no_git_dir",
+            "Unable to resolve checkout metadata directory",
+        )
+    })?;
+    std::fs::create_dir_all(path.parent().unwrap())
+        .map_err(|e| AppError::new("merge.stash_abort_state_locked", e.to_string()))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))
+        .map_err(|e| AppError::new("merge.stash_abort_state_locked", e.to_string()))?;
+    fs4::FileExt::try_lock(&file).map_err(|e| {
+        AppError::new(
+            "merge.stash_abort_state_locked",
+            format!("Another operation owns this checkout's abort checkpoint: {e}"),
+        )
+    })?;
+    Ok(file)
+}
+
 fn load_stash_apply_abort_state(cwd: &str) -> Option<StashApplyAbortState> {
     let path = stash_apply_abort_state_path(cwd)?;
     let content = std::fs::read_to_string(path).ok()?;
@@ -606,21 +644,36 @@ pub fn has_stash_apply_abort_state(cwd: &str) -> bool {
 }
 
 pub fn clear_stash_apply_abort_state(cwd: &str) {
+    let Ok(_lock) = stash_apply_abort_state_lock(cwd) else {
+        return;
+    };
+    clear_stash_apply_abort_state_unlocked(cwd);
+}
+
+fn clear_stash_apply_abort_state_unlocked(cwd: &str) {
+    let state = load_stash_apply_abort_state(cwd);
     if let Some(path) = stash_apply_abort_state_path(cwd) {
         let _ = std::fs::remove_file(path);
     }
-    let _ = run_git(
-        cwd,
-        &["update-ref", "-d", STASH_APPLY_ABORT_REF],
-        "clear stash abort ref",
-    );
+    if let (Some(state), Some(prefix)) = (state, stash_apply_abort_ref_prefix(cwd)) {
+        if let Some(abort_ref) = state.abort_ref.filter(|value| value.starts_with(&prefix)) {
+            let _ = run_git(
+                cwd,
+                &["update-ref", "-d", &abort_ref, &state.checkpoint.id],
+                "clear scoped stash abort ref",
+            );
+        }
+    }
+    // Legacy state still restores from its checkpoint OID. Its shared ref is
+    // deliberately retained: another checkout may still need that old root.
 }
 
 pub async fn prepare_stash_apply_abort_state(
     cwd: &str,
     label: &str,
 ) -> AppResult<Option<Checkpoint>> {
-    clear_stash_apply_abort_state(cwd);
+    let _lock = stash_apply_abort_state_lock(cwd)?;
+    clear_stash_apply_abort_state_unlocked(cwd);
 
     let provider = GitProvider;
     let checkpoint = provider
@@ -632,9 +685,17 @@ pub async fn prepare_stash_apply_abort_state(
         return Ok(None);
     };
 
+    let abort_ref = format!(
+        "{}{}",
+        stash_apply_abort_ref_prefix(cwd).ok_or_else(|| AppError::new(
+            "merge.no_git_dir",
+            "Unable to resolve checkout identity"
+        ))?,
+        uuid::Uuid::new_v4().simple()
+    );
     run_git(
         cwd,
-        &["update-ref", STASH_APPLY_ABORT_REF, &checkpoint.id],
+        &["update-ref", &abort_ref, &checkpoint.id, ""],
         "record stash abort ref",
     )?;
 
@@ -654,6 +715,7 @@ pub async fn prepare_stash_apply_abort_state(
     }
     let state = StashApplyAbortState {
         checkpoint: checkpoint.clone(),
+        abort_ref: Some(abort_ref),
     };
     let json = serde_json::to_string_pretty(&state).map_err(|e| {
         AppError::new(
@@ -661,7 +723,7 @@ pub async fn prepare_stash_apply_abort_state(
             format!("Failed to serialize stash abort state: {}", e),
         )
     })?;
-    std::fs::write(&path, json).map_err(|e| {
+    crate::config::atomic_write_config(&path, json.as_bytes()).map_err(|e| {
         AppError::new(
             "merge.stash_abort_checkpoint_failed",
             format!("Failed to write stash abort state: {}", e),
@@ -700,6 +762,7 @@ fn parse_changed_file(line: &str) -> Option<ChangedFile> {
 }
 
 async fn abort_stash_apply_from_checkpoint(cwd: &str) -> AppResult<String> {
+    let _lock = stash_apply_abort_state_lock(cwd)?;
     let state = load_stash_apply_abort_state(cwd).ok_or_else(|| {
         AppError::new(
             "merge.stash_abort_checkpoint_missing",
@@ -725,7 +788,7 @@ async fn abort_stash_apply_from_checkpoint(cwd: &str) -> AppResult<String> {
     .await
     .map_err(|e| AppError::new("merge.stash_abort_failed", e))?;
 
-    clear_stash_apply_abort_state(cwd);
+    clear_stash_apply_abort_state_unlocked(cwd);
     Ok(format!(
         "Aborted stash apply and restored {} changed path(s)",
         changed_files.len()
@@ -1029,5 +1092,132 @@ mod tests {
             std::fs::read_to_string(repo.path().join("c.txt")).expect("read c"),
             "base c\n"
         );
+    }
+
+    #[tokio::test]
+    async fn sibling_worktree_abort_checkpoints_restore_in_parallel() {
+        let main = setup_repo();
+        let sibling_parent = tempdir().unwrap();
+        let sibling = sibling_parent.path().join("feature");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/abort",
+                &sibling.to_string_lossy(),
+            ],
+        );
+        write_file(&main.path().join("a.txt"), "main staged\n");
+        git(main.path(), &["add", "a.txt"]);
+        write_file(&sibling.join("b.txt"), "sibling staged\n");
+        git(&sibling, &["add", "b.txt"]);
+        let main_root = main.path().to_string_lossy().to_string();
+        let sibling_root = sibling.to_string_lossy().to_string();
+        let (left, right) = tokio::join!(
+            prepare_stash_apply_abort_state(&main_root, "main operation"),
+            prepare_stash_apply_abort_state(&sibling_root, "sibling operation")
+        );
+        left.unwrap();
+        right.unwrap();
+        let left_ref = load_stash_apply_abort_state(&main_root)
+            .unwrap()
+            .abort_ref
+            .unwrap();
+        let right_ref = load_stash_apply_abort_state(&sibling_root)
+            .unwrap()
+            .abort_ref
+            .unwrap();
+        assert_ne!(left_ref, right_ref);
+        write_file(&main.path().join("a.txt"), "incoming main\n");
+        write_file(&sibling.join("b.txt"), "incoming sibling\n");
+        let (left, right) = tokio::join!(
+            abort_stash_apply_from_checkpoint(&main_root),
+            abort_stash_apply_from_checkpoint(&sibling_root)
+        );
+        left.unwrap();
+        right.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(main.path().join("a.txt")).unwrap(),
+            "main staged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(sibling.join("b.txt")).unwrap(),
+            "sibling staged\n"
+        );
+        assert_eq!(git(main.path(), &["status", "--short"]), "M  a.txt");
+        assert_eq!(git(&sibling, &["status", "--short"]), "M  b.txt");
+        assert!(
+            !git_may_fail(main.path(), &["show-ref", "--verify", &left_ref])
+                .status
+                .success()
+        );
+        assert!(
+            !git_may_fail(&sibling, &["show-ref", "--verify", &right_ref])
+                .status
+                .success()
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_one_worktree_abort_preserves_sibling_and_legacy_refs() {
+        let main = setup_repo();
+        let sibling_parent = tempdir().unwrap();
+        let sibling = sibling_parent.path().join("feature");
+        git(
+            main.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/abort-clear",
+                &sibling.to_string_lossy(),
+            ],
+        );
+        let main_root = main.path().to_string_lossy().to_string();
+        let sibling_root = sibling.to_string_lossy().to_string();
+        prepare_stash_apply_abort_state(&main_root, "main operation")
+            .await
+            .unwrap();
+        prepare_stash_apply_abort_state(&sibling_root, "sibling operation")
+            .await
+            .unwrap();
+        let sibling_state = load_stash_apply_abort_state(&sibling_root).unwrap();
+        let sibling_ref = sibling_state.abort_ref.unwrap();
+        git(
+            main.path(),
+            &[
+                "update-ref",
+                "refs/locus/stash-apply-abort",
+                &sibling_state.checkpoint.id,
+            ],
+        );
+        clear_stash_apply_abort_state(&main_root);
+        assert!(has_stash_apply_abort_state(&sibling_root));
+        assert_eq!(
+            git(&sibling, &["rev-parse", &sibling_ref]),
+            sibling_state.checkpoint.id
+        );
+        assert_eq!(
+            git(&sibling, &["rev-parse", "refs/locus/stash-apply-abort"]),
+            sibling_state.checkpoint.id
+        );
+        let legacy = StashApplyAbortState {
+            checkpoint: sibling_state.checkpoint,
+            abort_ref: None,
+        };
+        std::fs::write(
+            stash_apply_abort_state_path(&sibling_root).unwrap(),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        clear_stash_apply_abort_state(&sibling_root);
+        assert!(git_may_fail(
+            &sibling,
+            &["show-ref", "--verify", "refs/locus/stash-apply-abort"]
+        )
+        .status
+        .success());
     }
 }

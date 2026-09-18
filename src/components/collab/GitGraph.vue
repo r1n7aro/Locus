@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from "vue";
 import { acquireSelectionLock } from "../../composables/useSelectionLock";
 import {
   createAnimationFrameResizeObserver,
@@ -8,6 +8,7 @@ import {
 import { t } from "../../i18n";
 import type {
   GitCommitInfo,
+  GitBranchTarget,
   GitGraphRef,
   GitHeadState,
   GitHistorySelection,
@@ -24,6 +25,7 @@ import type {
   HistoryGraphRowLayout,
 } from "./graph/types";
 import { collapseDisplayRefsForRail } from "./graph/refs";
+import { resolveCommitBranchTargets } from "./branchInteraction";
 import {
   HISTORY_GRAPH_AUX_RADIUS as AUX_R,
   HISTORY_GRAPH_DOT_RADIUS as DOT_R,
@@ -61,9 +63,12 @@ const emit = defineEmits<{
   (e: "selectCommit", hash: string | null): void;
   (e: "loadMore"): void;
   (e: "historyContextmenu", event: MouseEvent, target: GitHistoryTarget): void;
+  (e: "branchContextmenu", event: MouseEvent, target: GitBranchTarget): void;
 }>();
 
 const headerRef = ref<HTMLElement | null>(null);
+const graphId = useId();
+const focusedRowId = ref<string | null>(null);
 const scrollRef = ref<HTMLElement | null>(null);
 const scrollTop = ref(0);
 const viewportHeight = ref(0);
@@ -120,7 +125,7 @@ function syncViewport() {
 
 function maybeLoadMore() {
   const el = scrollRef.value;
-  if (!el || !props.hasMoreCommits || props.loadingMore) return;
+  if (!el || props.loading || !props.hasMoreCommits || props.loadingMore) return;
   if (el.scrollTop + el.clientHeight >= el.scrollHeight - 100) {
     emit("loadMore");
   }
@@ -203,6 +208,14 @@ const scene = computed(() =>
 );
 
 const layout = computed(() => layoutHistoryGraph(scene.value, columnWidthOverrides.value));
+const tabStopRowId = computed(() => {
+  const rows = layout.value.rows;
+  const preferred = rows.find(row => row.id === focusedRowId.value)?.id
+    ?? rows.find(row => row.selected)?.id
+    ?? rows[0]?.id;
+  return virtualWindow.value.rows.some(row => row.id === preferred)
+    ? preferred : virtualWindow.value.rows[0]?.id;
+});
 const workspaceSelected = computed(() => scene.value.selectionKind === "workspace");
 watch(() => layout.value.rows.length, () => {
   void nextTick(refreshViewport);
@@ -234,7 +247,8 @@ const virtualWindow = computed(() => {
   }
 
   const rowHeight = layout.value.rails.rowHeight;
-  const bodyScrollTop = Math.max(0, scrollTop.value - headerHeight.value);
+  // The sticky header occupies the same height above the table and viewport.
+  const bodyScrollTop = Math.max(0, scrollTop.value);
   const bodyViewportHeight = Math.max(rowHeight, viewportHeight.value - headerHeight.value);
   const visibleStart = Math.max(
     0,
@@ -247,7 +261,7 @@ const virtualWindow = computed(() => {
       Math.ceil((bodyScrollTop + bodyViewportHeight - contentTopInset.value) / rowHeight) - 1,
     ),
   );
-  const start = Math.max(0, visibleStart - VIRTUAL_ROW_BUFFER);
+  const start = Math.min(totalRows - 1, Math.max(0, visibleStart - VIRTUAL_ROW_BUFFER));
   const end = Math.max(start, Math.min(totalRows - 1, visibleEnd + VIRTUAL_ROW_BUFFER));
 
   return {
@@ -274,8 +288,15 @@ const visibleEdges = computed(() =>
   layout.value.edges.filter(edge =>
     edge.startRowIndex <= virtualWindow.value.end
     && edge.endRowIndex >= virtualWindow.value.start,
-  ),
+  ).map((edge, index) => ({ ...edge, maskId: `${graphId}-edge-${index}` })),
 );
+const visibleCrossingEdges = computed(() => visibleEdges.value
+  .filter(edge => edge.crossings?.length)
+  .map(edge => ({
+    ...edge,
+    maskTop: (layout.value.rows[edge.startRowIndex]?.y ?? 0) - 4,
+    maskHeight: (edge.endRowIndex - edge.startRowIndex) * layout.value.rails.rowHeight + 8,
+  })));
 const visibleRowEntries = computed(() =>
   virtualWindow.value.rows.map(row => ({
     row,
@@ -366,10 +387,8 @@ function findSelectionRow(target: GitGraphSelectionTarget): HistoryGraphRowLayou
 }
 
 function isSelectionActive(target: GitGraphSelectionTarget): boolean {
-  if (target.kind === "workspace") {
-    return workspaceSelected.value;
-  }
-  return selectedHash.value === target.hash;
+  if (target.kind === "workspace") return workspaceSelected.value;
+  return props.selectedHistory?.kind === target.kind && props.selectedHistory.hash === target.hash;
 }
 
 function targetSelectionHash(target: GitGraphSelectionTarget): string | null {
@@ -384,13 +403,15 @@ function scrollToSelectionRow(row: HistoryGraphRowLayout, options: GitGraphScrol
     layout.value.rails.rowHeight,
     el.clientHeight - headerHeight.value,
   );
-  const targetTop = headerHeight.value + row.top + row.height / 2 - bodyViewportHeight / 2;
+  const targetTop = row.top + row.height / 2 - bodyViewportHeight / 2;
   const top = clampScrollTopValue(targetTop);
   el.scrollTo({
     top,
     behavior: options.behavior ?? "auto",
   });
-  scrollTop.value = top;
+  // Smooth scrolling reports its intermediate position through the scroll event.
+  // Jumping the virtual window ahead would briefly leave the viewport empty.
+  if (options.behavior !== "smooth") syncViewport();
   return true;
 }
 
@@ -409,9 +430,17 @@ async function selectHistory(
   target: GitGraphSelectionTarget,
   options: GitGraphSelectOptions = {},
 ): Promise<boolean> {
+  await nextTick();
+  const row = findSelectionRow(target);
+  // Sidebar-only stashes and off-page branch tips can still open their details.
+  const knownTarget = row
+    || (target.kind === "stash" && props.stashes.some(stash => stash.hash === target.hash))
+    || (target.kind === "commit" && props.graphRefs.some(ref => ref.targetHash === target.hash));
+  if (!knownTarget) return false;
   const shouldClear = options.toggle === true && isSelectionActive(target);
   emit("selectCommit", shouldClear ? null : targetSelectionHash(target));
-  if (shouldClear || options.scroll === false) return false;
+  if (row) focusedRowId.value = row.id;
+  if (shouldClear || options.scroll === false) return true;
   return scrollToHistory(target, options);
 }
 
@@ -504,11 +533,41 @@ function onClickAux(node: HistoryGraphAuxLayout) {
 }
 
 function onRowClick(row: HistoryGraphRowLayout) {
+  focusedRowId.value = row.id;
   if (row.kind === "commit") {
     onClickCommit(row.commit.hash);
     return;
   }
   onClickAux(row);
+}
+
+async function onRowKeydown(event: KeyboardEvent, row: HistoryGraphRowLayout) {
+  if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  const rows = layout.value.rows;
+  let index = row.rowIndex;
+  if (event.key === "ArrowDown") index++;
+  else if (event.key === "ArrowUp") index--;
+  else if (event.key === "Home") index = 0;
+  else if (event.key === "End") index = rows.length - 1;
+  else return;
+  event.preventDefault();
+  const target = rows[Math.max(0, Math.min(rows.length - 1, index))];
+  if (!target) return;
+  focusedRowId.value = target.id;
+  emit("selectCommit", target.kind === "commit" ? target.commit.hash : target.hash);
+
+  const el = scrollRef.value;
+  if (!el) return;
+  const visibleHeight = Math.max(target.height, el.clientHeight - headerHeight.value);
+  if (target.top < el.scrollTop) el.scrollTop = clampScrollTopValue(target.top);
+  else if (target.top + target.height > el.scrollTop + visibleHeight) {
+    el.scrollTop = clampScrollTopValue(target.top + target.height - visibleHeight);
+  }
+  syncViewport();
+  await nextTick();
+  const button = [...el.querySelectorAll<HTMLButtonElement>(".graph-row")]
+    .find(element => element.dataset.historyRowId === target.id);
+  button?.focus({ preventScroll: true });
 }
 
 function onCommitContextMenu(event: MouseEvent, row: Extract<HistoryGraphRowLayout, { kind: "commit" }>) {
@@ -526,6 +585,21 @@ function onRowContextMenu(event: MouseEvent, row: HistoryGraphRowLayout) {
     return;
   }
   onAuxContextMenu(event, row);
+}
+
+function onRefContextMenu(event: MouseEvent, ref: HistoryGraphDisplayRef, row: HistoryGraphRowLayout) {
+  if (row.kind === "commit" && (ref.kind === "branch" || ref.kind === "remote")) {
+    const targets = resolveCommitBranchTargets(row.commit, props.graphRefs)
+      .filter(target => target.branch.name === ref.text);
+    const target = targets.find(target => target.kind === "localBranch")
+      ?? (targets.length === 1 ? targets[0] : null);
+    if (target) {
+      emit("branchContextmenu", event, target);
+      return;
+    }
+  }
+  // A badge shared by multiple remotes uses the commit menu to offer each remote explicitly.
+  onRowContextMenu(event, row);
 }
 
 function showRowConnector(row: HistoryGraphRowLayout): boolean {
@@ -583,11 +657,27 @@ function rowRefConnectorStyle(row: HistoryGraphRowLayout) {
             :height="layout.contentHeight"
             aria-hidden="true"
           >
+            <defs>
+              <mask
+                v-for="edge in visibleCrossingEdges"
+                :id="edge.maskId"
+                :key="edge.id"
+                maskUnits="userSpaceOnUse"
+                x="0"
+                :y="edge.maskTop"
+                :width="layout.rails.graphWidth"
+                :height="edge.maskHeight"
+              >
+                <rect x="0" :y="edge.maskTop" :width="layout.rails.graphWidth" :height="edge.maskHeight" fill="white" />
+                <circle v-for="(point, index) in edge.crossings" :key="index" :cx="point.x" :cy="point.y" r="4" fill="black" />
+              </mask>
+            </defs>
             <path
               v-for="edge in visibleEdges"
               :key="edge.id"
               :d="edge.path"
               :stroke="edge.color"
+              :mask="edge.crossings?.length ? `url(#${edge.maskId})` : undefined"
               stroke-width="2"
               fill="none"
               stroke-linecap="round"
@@ -655,6 +745,9 @@ function rowRefConnectorStyle(row: HistoryGraphRowLayout) {
               :key="entry.row.id"
               type="button"
               class="graph-row"
+              :data-history-row-id="entry.row.id"
+              :tabindex="entry.row.id === tabStopRowId ? 0 : -1"
+              :aria-pressed="entry.row.selected"
               :class="[
                 `graph-row-${entry.row.kind}`,
                 {
@@ -665,6 +758,8 @@ function rowRefConnectorStyle(row: HistoryGraphRowLayout) {
               ]"
               :title="rowTitle(entry.row)"
               @click="onRowClick(entry.row)"
+              @focus="focusedRowId = entry.row.id"
+              @keydown="onRowKeydown($event, entry.row)"
               @contextmenu.prevent.stop="onRowContextMenu($event, entry.row)"
             >
               <div class="graph-row-refs">
@@ -684,6 +779,7 @@ function rowRefConnectorStyle(row: HistoryGraphRowLayout) {
                       ]"
                       :style="refStyle(ref, entry.row)"
                       :title="refTitle(ref)"
+                      @contextmenu.prevent.stop="onRefContextMenu($event, ref, entry.row)"
                     >
                       <span v-if="ref.sourceMarkers?.length" class="ref-badge-markers" aria-hidden="true">
                         <span
@@ -757,6 +853,7 @@ function rowRefConnectorStyle(row: HistoryGraphRowLayout) {
                       ]"
                       :style="refStyle(ref, entry.row)"
                       :title="refTitle(ref)"
+                      @contextmenu.prevent.stop="onRefContextMenu($event, ref, entry.row)"
                     >
                       <span v-if="ref.sourceMarkers?.length" class="ref-badge-markers" aria-hidden="true">
                         <span

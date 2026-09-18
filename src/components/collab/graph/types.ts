@@ -110,6 +110,8 @@ export interface HistoryGraphEdgeLayout {
   endRowIndex: number;
   dashed?: boolean;
   opacity?: number;
+  /** Transparent underpasses distinguish crossings from actual junctions. */
+  crossings?: Array<{ x: number; y: number }>;
 }
 
 export interface HistoryGraphColumnWidthOverrides {

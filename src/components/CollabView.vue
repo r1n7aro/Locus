@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
-import { ArchiveRestore, ArrowRightLeft, Copy, FolderOpen, GitBranch, GitBranchPlus, GitCommitHorizontal, GitCompareArrows, GitMerge, Minus, PencilLine, Plus, RotateCcw, Trash2, Undo2 } from "lucide";
+import { X } from "lucide";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { ModelOption, GitFileChange, DiffSource, FileDiffPayload, FileDiffRequest, UnmergedFileEntry, GitHistoryTarget, GitBranchTarget, GitStashEntry, GitGraphRef } from "../types";
 import { gitCommitAction, gitBranchAction, gitStashAction, gitDiscardFile } from "../services/git";
@@ -17,6 +17,7 @@ import MergeResolutionPanel from "./collab/MergeResolutionPanel.vue";
 import WorkspaceRequiredState from "./WorkspaceRequiredState.vue";
 import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import BaseContextMenu from "./ui/BaseContextMenu.vue";
+import BaseButton from "./ui/BaseButton.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import { useCollabState } from "../composables/useCollabState";
 import { useProjectStore } from "../stores/project";
@@ -37,8 +38,8 @@ import {
 } from "./collab/collabViewMode";
 import { resolveHistorySelectionKind } from "./collab/historySelection";
 import { collectUnanchoredStashHashes } from "./collab/graph/normalize";
-import { extractLocalBranchNamesForHash } from "./collab/graph/refs";
-import { resolveBranchDblclickAction, resolveBranchTargetHash } from "./collab/branchInteraction";
+import { branchTargetName, resolveBranchDblclickAction, resolveBranchTargetHash } from "./collab/branchInteraction";
+import { buildGitMenu, validateGitName, type GitContextTarget, type GitMenuItem } from "./collab/gitContextMenu";
 import type { GitGraphPublicApi, GitGraphSelectionTarget, GitGraphSelectOptions } from "./collab/gitGraphSelection";
 import {
   COLLAB_SEARCH_SELECT_EVENT,
@@ -54,6 +55,9 @@ const props = defineProps<{
   selectedModelId: string;
   selectedAgentId: string;
   models: ModelOption[];
+  sidebarTarget?: HTMLElement | null;
+  sidebarToolbarTarget?: HTMLElement | null;
+  activateEditor?: () => Promise<void>;
   headFocusRequest?: {
     id: number;
     checkoutId: string;
@@ -65,6 +69,7 @@ interface CollabViewWorkspaceSnapshot {
   workspaceRef: WorkspaceRef;
   checkoutId: string;
   expectedGeneration: number | null;
+  expectedMaterializationEpoch: number | null;
 }
 
 function captureWorkspaceSnapshot(): CollabViewWorkspaceSnapshot {
@@ -74,19 +79,22 @@ function captureWorkspaceSnapshot(): CollabViewWorkspaceSnapshot {
   const workspaceRef = {
     checkoutId: props.workspaceRef.checkoutId,
     expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+    expectedMaterializationEpoch: props.workspaceRef.expectedMaterializationEpoch ?? undefined,
   };
   return {
     workingDir: props.workingDir,
     workspaceRef,
     checkoutId: workspaceRef.checkoutId,
     expectedGeneration: workspaceRef.expectedGeneration ?? null,
+    expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch ?? null,
   };
 }
 
 function isCurrentWorkspaceSnapshot(snapshot: CollabViewWorkspaceSnapshot) {
   return snapshot.workingDir === props.workingDir
     && snapshot.checkoutId === (props.workspaceRef?.checkoutId ?? null)
-    && snapshot.expectedGeneration === (props.workspaceRef?.expectedGeneration ?? null);
+    && snapshot.expectedGeneration === (props.workspaceRef?.expectedGeneration ?? null)
+    && snapshot.expectedMaterializationEpoch === (props.workspaceRef?.expectedMaterializationEpoch ?? null);
 }
 
 const emit = defineEmits<{
@@ -111,14 +119,15 @@ const {
   pendingStagePaths, pendingUnstagePaths, stageOperationBusy,
   unmergedFiles, mergeOperation, isMerging, hasUnresolvedFiles,
   localBranches, remoteBranches, stashes, tags, submodules,
-  sidebarCollapsed, expandLocal, expandRemotes, expandedRemoteNames, expandStashes, expandTags, expandSubmodules,
-  containerRef, leftAreaRef, leftColRef, gitSidebarWidth, leftColWidth, terminalHeight, draggingClass,
+  expandLocal, expandRemotes, expandedRemoteNames, expandStashes, expandTags, expandSubmodules,
+  containerRef, leftAreaRef, leftColRef, leftColWidth, terminalHeight, draggingClass,
   currentBranch, selectedCommit, totalChanges, workspaceChangeCount,
   initGitUnity, saveGitConfigAndInit, cancelGitConfig, toggleRemote,
   stageFile, unstageFile, stageFiles, unstageFiles, stageAll, unstageAll,
   loadMoreCommits, onCommitted, onTerminalDone, onTerminalTouched, onRefresh,
-  onSidebarSplitterMouseDown, onVSplitterMouseDown, onHSplitterMouseDown,
+  onVSplitterMouseDown, onHSplitterMouseDown,
 } = useCollabState(props, {
+  isSidebarActive: () => !!props.sidebarTarget,
   onGitTerminalOutput(command, output, isError) {
     terminalRef.value?.pushOutput(command, output, isError);
   },
@@ -171,7 +180,8 @@ const activeDiffSource = ref<DiffSource | null>(null);
 const activeDiffCommitHash = ref<string | null>(null);
 const pendingDiscardPaths = ref<Set<string>>(new Set());
 const discardOperationBusy = computed(() => pendingDiscardPaths.value.size > 0);
-const workspaceMutationBusy = computed(() => stageOperationBusy.value || discardOperationBusy.value);
+const gitOperationBusy = ref(false);
+const workspaceMutationBusy = computed(() => stageOperationBusy.value || discardOperationBusy.value || gitOperationBusy.value);
 const diffProgress = useDiffProgress(() => props.workspaceRef ?? null);
 const diffProgressWidth = computed(() => `${diffProgress.progress.value * 100}%`);
 const mergeResolutionRef = ref<{ confirmDiscardChanges?: () => Promise<boolean> } | null>(null);
@@ -360,6 +370,7 @@ watch(
     props.workingDir,
     props.workspaceRef?.checkoutId ?? null,
     props.workspaceRef?.expectedGeneration ?? null,
+    props.workspaceRef?.expectedMaterializationEpoch ?? null,
   ] as const,
   () => {
     closeDiff();
@@ -395,7 +406,9 @@ async function runGitOp<T>(
   command: string,
   fn: (workspaceRef: WorkspaceRef) => Promise<T>,
 ): Promise<T> {
+  if (workspaceMutationBusy.value || hasConflictState.value) throw new Error(t("collab.menu.busy"));
   const workspace = captureWorkspaceSnapshot();
+  gitOperationBusy.value = true;
   const operation = `collabGitOp:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   notificationStore.addNotice("info", label, {
     operation,
@@ -410,7 +423,7 @@ async function runGitOp<T>(
     if (isCurrentWorkspaceSnapshot(workspace)) {
       terminalRef.value?.pushOutput(command, msg, isError);
     }
-    notificationStore.addNotice(isError ? "error" : "success", msg, {
+    notificationStore.addNotice(isError ? "error" : "success", isError ? t("collab.menu.operationConflict") : label, {
       operation,
       ttl: 3000,
       replaceOperation: true,
@@ -418,7 +431,11 @@ async function runGitOp<T>(
     return result;
   } catch (e) {
     const err = normalizeAppError(e);
-    const errMsg = err.message || "Operation failed";
+    const localizedErrors: Record<string, string> = {
+      "git.no_upstream": "noUpstream", "git.branch_changed": "branchChanged",
+      "git.stash_changed": "stashChanged", "git.dirty_stash_branch": "dirtyStashBranch",
+    };
+    const errMsg = localizedErrors[err.code] ? t(`collab.menu.${localizedErrors[err.code]}`) : err.message || t("collab.menu.operationFailed");
     if (isCurrentWorkspaceSnapshot(workspace)) {
       terminalRef.value?.pushOutput(command, errMsg, true);
     }
@@ -429,13 +446,18 @@ async function runGitOp<T>(
       replaceOperation: true,
     });
     throw err;
+  } finally {
+    try {
+      if (isCurrentWorkspaceSnapshot(workspace)) await onRefresh();
+    } finally {
+      gitOperationBusy.value = false;
+    }
   }
 }
 
 // ── Context menu ─────────────────────────────────────────────────
 
-type GitFileTarget = { kind: "file"; file: GitFileChange; source: "gitUnstaged" | "gitStaged"; selectedFiles: GitFileChange[] };
-type CollabContextMenuTarget = GitHistoryTarget | GitBranchTarget | GitFileTarget;
+type CollabContextMenuTarget = GitContextTarget;
 type CollabContextMenuState = {
   x: number;
   y: number;
@@ -448,8 +470,21 @@ const promptDialog = ref<{
   title: string;
   placeholder: string;
   value: string;
+  validate?: (value: string) => string | null;
+  hint?: string;
   action: (val: string) => void;
 } | null>(null);
+const promptError = computed(() => promptDialog.value?.value.trim()
+  ? promptDialog.value.validate?.(promptDialog.value.value.trim()) ?? null : null);
+const gitMenuGroups = computed(() => ctxMenu.value ? buildGitMenu(ctxMenu.value.target, {
+  busy: workspaceMutationBusy.value,
+  conflict: hasConflictState.value,
+  conflictHint: conflictActionHint.value,
+  currentBranch: headState.value?.kind === "attached" ? currentBranch.value : "",
+  localBranches: localBranches.value,
+  graphRefs: graphRefs.value,
+  unityConnected: projectStore.unityConnected,
+}) : []);
 
 const confirmDialog = ref<{
   title: string;
@@ -463,6 +498,18 @@ function closeCtxMenu() { ctxMenu.value = null; }
 
 function openCtxMenu(event: MouseEvent, target: CollabContextMenuTarget) {
   ctxMenu.value = { x: event.clientX, y: event.clientY, target };
+  void nextTick(() => document.querySelector<HTMLButtonElement>(".collab-git-menu button:not(:disabled)")?.focus());
+}
+
+function navigateGitMenu(event: KeyboardEvent) {
+  if (event.key === "Tab") { closeCtxMenu(); return; }
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const buttons = [...(event.currentTarget as HTMLElement).querySelectorAll<HTMLButtonElement>("button:not(:disabled)")];
+  const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+  const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+    : (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+  buttons[next]?.focus();
 }
 
 function addPendingDiscardPaths(paths: string[]) {
@@ -548,17 +595,63 @@ watch(
 );
 
 function onSelectStash(stash: GitStashEntry) {
-  void selectHistoryInGraph({ kind: "stash", hash: stash.hash }, { toggle: true });
+  void revealSidebarHistory({ kind: "stash", hash: stash.hash });
 }
 
 function onSelectTag(tag: GitGraphRef) {
-  void selectHistoryInGraph({ kind: "commit", hash: tag.targetHash });
+  void revealSidebarHistory({ kind: "commit", hash: tag.targetHash });
 }
 
 function onSelectBranch(target: GitBranchTarget) {
   const hash = resolveBranchTargetHash(target, graphRefs.value);
   if (!hash) return;
   void selectHistoryInGraph({ kind: "commit", hash });
+}
+
+let sidebarNavigationRequestId = 0;
+
+watch(() => props.sidebarTarget, (target, previous) => {
+  if (previous && target !== previous) {
+    sidebarNavigationRequestId += 1;
+    closeCtxMenu();
+  }
+});
+
+async function revealSidebarHistory(target: GitGraphSelectionTarget) {
+  const requestId = ++sidebarNavigationRequestId;
+  const workspace = captureWorkspaceSnapshot();
+  try {
+    await props.activateEditor?.();
+    if (requestId !== sidebarNavigationRequestId || !isCurrentWorkspaceSnapshot(workspace)) return;
+    const loaded = target.kind === "commit"
+      ? await ensureSearchCommitLoaded(target.hash)
+      : target.kind === "stash" ? await ensureSearchStashLoaded(target.hash) : true;
+    if (requestId !== sidebarNavigationRequestId || !isCurrentWorkspaceSnapshot(workspace)) return;
+    if (!loaded) {
+      notificationStore.addNotice("warning", t("collab.search.targetMissing"));
+      return;
+    }
+    await nextTick();
+    if (requestId !== sidebarNavigationRequestId || !isCurrentWorkspaceSnapshot(workspace)) return;
+    await selectHistoryInGraph(target, { scroll: true, behavior: "smooth" });
+  } catch (error) {
+    if (requestId === sidebarNavigationRequestId && isCurrentWorkspaceSnapshot(workspace)) {
+      notificationStore.addNotice("error", normalizeAppError(error).message);
+    }
+  }
+}
+
+function onSidebarBranchDblclick(target: GitBranchTarget) {
+  const hash = resolveBranchTargetHash(target, graphRefs.value);
+  if (hash) void revealSidebarHistory({ kind: "commit", hash });
+}
+
+
+async function onSidebarGitConfig() {
+  const workspace = captureWorkspaceSnapshot();
+  await props.activateEditor?.();
+  if (!isCurrentWorkspaceSnapshot(workspace)) return;
+  openGitConfigPopover();
 }
 
 function isCollabSearchSelectionPayload(value: unknown): value is CollabSearchSelectionPayload {
@@ -572,6 +665,7 @@ function isCollabSearchSelectionPayload(value: unknown): value is CollabSearchSe
 }
 
 async function ensureSearchCommitLoaded(hash: string): Promise<boolean> {
+  const workspace = captureWorkspaceSnapshot();
   if (commits.value.some(commit => commit.hash === hash)) return true;
 
   let attempts = 0;
@@ -580,6 +674,7 @@ async function ensureSearchCommitLoaded(hash: string): Promise<boolean> {
     const beforeCount = commits.value.length;
     await loadMoreCommits();
     await nextTick();
+    if (!isCurrentWorkspaceSnapshot(workspace)) return false;
     if (commits.value.some(commit => commit.hash === hash)) return true;
     if (commits.value.length === beforeCount) break;
   }
@@ -635,6 +730,7 @@ onMounted(async () => {
           workspaceRef: event.payload.workspaceRef,
           checkoutId: event.payload.workspaceRef.checkoutId,
           expectedGeneration: event.payload.workspaceRef.expectedGeneration ?? null,
+          expectedMaterializationEpoch: event.payload.workspaceRef.expectedMaterializationEpoch ?? null,
         })) return;
         void selectCollabSearchResult(event.payload);
       },
@@ -645,6 +741,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  sidebarNavigationRequestId += 1;
   collabSearchSelectionUnlisten?.();
   collabSearchSelectionUnlisten = null;
 });
@@ -658,10 +755,17 @@ function onFileContextMenu(e: MouseEvent, file: GitFileChange, source: "gitUnsta
   openCtxMenu(e, { kind: "file", file, source, selectedFiles });
 }
 
+function onCommitFileContextMenu(event: MouseEvent, file: GitFileChange) {
+  event.preventDefault();
+  event.stopPropagation();
+  if (!selectedCommitHash.value) return;
+  openCtxMenu(event, { kind: "file", file, source: "gitCommit", commitHash: selectedCommitHash.value, selectedFiles: [file] });
+}
+
 function confirmDiscardFile() {
   if (workspaceMutationBusy.value) return;
   const target = ctxMenu.value?.target;
-  if (target?.kind !== "file") return;
+  if (target?.kind !== "file" || target.source === "gitCommit" || hasConflictState.value) return;
   const { source, selectedFiles } = target;
   const sourceFiles = source === "gitUnstaged" ? unstagedFiles.value : stagedFiles.value;
   const expandedPaths = withMetaCompanionPaths(
@@ -726,7 +830,7 @@ function confirmDiscardFile() {
 function doFileStage() {
   if (workspaceMutationBusy.value) return;
   const target = ctxMenu.value?.target;
-  if (target?.kind !== "file") return;
+  if (target?.kind !== "file" || target.source !== "gitUnstaged") return;
   closeCtxMenu();
   if (target.selectedFiles.length === 1) {
     stageFile(target.selectedFiles[0].path);
@@ -738,7 +842,7 @@ function doFileStage() {
 function doFileUnstage() {
   if (workspaceMutationBusy.value) return;
   const target = ctxMenu.value?.target;
-  if (target?.kind !== "file") return;
+  if (target?.kind !== "file" || target.source !== "gitStaged") return;
   closeCtxMenu();
   if (target.selectedFiles.length === 1) {
     unstageFile(target.selectedFiles[0].path);
@@ -756,92 +860,27 @@ async function doShowInFolder() {
     await showInFolder(filePath, captureWorkspaceSnapshot().workspaceRef);
   } catch (e) {
     const err = normalizeAppError(e);
-    notificationStore.addNotice("error", err.message || "Failed to show file in folder", {
+    notificationStore.addNotice("error", err.message || t("collab.menu.showInFolderFailed"), {
       code: err.code,
       operation: "collabShowInFolder",
     });
   }
 }
 
-function commitLocalBranches(): string[] {
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "commit") return [];
-  return extractLocalBranchNamesForHash(target.commit.hash, graphRefs.value);
-}
 
-async function doCheckoutBranch(branchName: string) {
-  if (hasConflictState.value) return;
-  closeCtxMenu();
-  try {
-    await runGitOp(`switch ${branchName}`, `git switch ${branchName}`, (workspaceRef) => gitBranchAction(branchName, "local", "switch", undefined, workspaceRef));
-  } catch {}
-  onRefresh();
-}
+type BranchActionName = "switch" | "checkoutTracking" | "mergeIntoCurrent" | "rebaseCurrentOnto" | "pull" | "push" | "fetch";
 
-type BranchActionName = "switch" | "checkoutTracking" | "mergeIntoCurrent" | "rebaseCurrentOnto";
-
-async function performBranchAction(
-  branchName: string,
-  targetKind: "local" | "remote",
-  action: BranchActionName,
-) {
-  if (hasConflictState.value) return;
-  const cmdMap: Record<BranchActionName, string> = {
-    switch: `git switch ${branchName}`,
-    checkoutTracking: `git checkout --track ${branchName}`,
-    mergeIntoCurrent: `git merge ${branchName}`,
-    rebaseCurrentOnto: `git rebase ${branchName}`,
+async function performBranchAction(branchName: string, targetKind: "local" | "remote", action: BranchActionName, remoteName?: string) {
+  if (hasConflictState.value || workspaceMutationBusy.value) return;
+  const commands: Record<BranchActionName, string> = {
+    switch: 'git switch', checkoutTracking: 'git checkout --track', mergeIntoCurrent: 'git merge',
+    rebaseCurrentOnto: 'git rebase', pull: 'git pull --ff-only', push: 'git push', fetch: 'git fetch --prune',
   };
-  const cmd = cmdMap[action];
+  const key = action === 'switch' || action === 'checkoutTracking' ? 'checkoutBranch' : action;
   try {
-    await runGitOp(`${action} ${branchName}`, cmd, (workspaceRef) => gitBranchAction(branchName, targetKind, action, undefined, workspaceRef));
-  } catch {}
-  onRefresh();
-}
-
-async function runBranchAction(target: GitBranchTarget, action: BranchActionName) {
-  if (action === "switch" && target.kind === "localBranch" && target.branch.isCurrent) return;
-  const branchName = target.kind === "localBranch"
-    ? target.branch.name
-    : `${target.remoteName}/${target.branch.name}`;
-  const targetKind = target.kind === "localBranch" ? "local" : "remote";
-  await performBranchAction(branchName, targetKind, action);
-}
-
-async function doCommitAction(action: string, mode?: string) {
-  if (hasConflictState.value) return;
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "commit") return;
-  const rev = target.commit.hash;
-  const shortHash = target.commit.shortHash;
-  closeCtxMenu();
-  const label = mode ? `${action} (${mode}) → ${shortHash}` : `${action} → ${shortHash}`;
-  const cmd = mode ? `git ${action} --${mode} ${shortHash}` : `git ${action} ${shortHash}`;
-  try {
-    await runGitOp(label, cmd, (workspaceRef) => gitCommitAction(rev, action, mode, undefined, workspaceRef));
-  } catch {}
-  onRefresh();
-}
-
-async function doStashAction(action: string) {
-  if (hasConflictState.value) return;
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "stash") return;
-  const selected = target.selectedStashes?.length ? target.selectedStashes : [target.stash];
-  if (selected.length !== 1) return;
-  const refName = selected[0].refName;
-  closeCtxMenu();
-  try {
-    await runGitOp(`stash ${action} ${refName}`, `git stash ${action} ${refName}`, (workspaceRef) => gitStashAction(refName, action, workspaceRef));
-  } catch {}
-  onRefresh();
-}
-
-async function doBranchAction(action: BranchActionName) {
-  const target = ctxMenu.value?.target;
-  if (!target || (target.kind !== "localBranch" && target.kind !== "remoteBranch")) return;
-  closeCtxMenu();
-  await runBranchAction(target, action);
+    await runGitOp(t('collab.menu.' + key, branchName), commands[action] + ' ' + branchName,
+      workspace => gitBranchAction(branchName, targetKind, action, undefined, workspace, remoteName));
+  } catch { /* runGitOp reports errors and refreshes conflict state. */ }
 }
 
 async function onBranchDblclick(target: GitBranchTarget) {
@@ -850,141 +889,188 @@ async function onBranchDblclick(target: GitBranchTarget) {
   await performBranchAction(action.branchName, action.targetKind, action.action);
 }
 
-function confirmResetHard() {
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "commit") return;
-  const hash = target.commit.shortHash;
-  const rev = target.commit.hash;
-  closeCtxMenu();
-  confirmDialog.value = {
-    title: t("collab.resetHardTitle", hash),
-    message: t("collab.resetHardMsg"),
-    danger: true,
-    action: async () => {
-      try {
-        await runGitOp(`reset --hard → ${hash}`, `git reset --hard ${hash}`, (workspaceRef) => gitCommitAction(rev, "reset", "hard", undefined, workspaceRef));
-      } catch {}
-      onRefresh();
-    },
-  };
-}
-
-function confirmDropStash() {
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "stash") return;
-  const selected = target.selectedStashes?.length ? target.selectedStashes : [target.stash];
-  const count = selected.length;
-  closeCtxMenu();
-  confirmDialog.value = {
-    title: count === 1
-      ? t("collab.dropStashTitle", selected[0].refName)
-      : `Drop ${count} stashes?`,
-    message: count === 1
-      ? t("collab.dropStashMsg")
-      : "These stashes will be permanently removed.",
-    danger: true,
-    action: async () => {
-      try {
-        await runGitOp(
-          count === 1 ? `stash drop ${selected[0].refName}` : `stash drop ${count} stashes`,
-          count === 1 ? `git stash drop ${selected[0].refName}` : "git stash drop <selected>",
-          async (workspaceRef) => {
-            const dropOrder = [...selected].sort((left, right) => right.index - left.index);
-            for (const stash of dropOrder) {
-              await gitStashAction(stash.refName, "drop", workspaceRef);
-            }
-            return {
-              status: "success" as const,
-              message: count === 1 ? `Dropped ${selected[0].refName}` : `Dropped ${count} stashes`,
-              stdout: "",
-              stderr: "",
-            };
-          },
-        );
-      } catch {}
-      onRefresh();
-    },
-  };
-}
-
-function confirmDeleteBranch() {
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "localBranch") return;
-  const name = target.branch.name;
-  closeCtxMenu();
-  confirmDialog.value = {
-    title: t("collab.deleteBranchTitle", name),
-    message: t("collab.deleteBranchMsg"),
-    danger: true,
-    action: async () => {
-      try {
-        await runGitOp(`delete branch ${name}`, `git branch -d ${name}`, (workspaceRef) => gitBranchAction(name, "local", "delete", undefined, workspaceRef));
-      } catch {}
-      onRefresh();
-    },
-  };
-}
-
-function promptNewBranch() {
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "commit") return;
-  const hash = target.commit.shortHash;
-  const rev = target.commit.hash;
-  closeCtxMenu();
+function promptGitName(title: string, action: (value: string) => void, value = '') {
   promptDialog.value = {
-    title: t("collab.createBranchTitle", hash),
-    placeholder: t("collab.createBranchPlaceholder", hash),
-    value: "",
-    action: async (val: string) => {
-      try {
-        await runGitOp(`create branch ${val.trim()}`, `git checkout -b ${val.trim()} ${hash}`, (workspaceRef) => gitCommitAction(rev, "createBranchAndCheckout", undefined, val.trim(), workspaceRef));
-      } catch {}
-      onRefresh();
-    },
+    title, placeholder: t('collab.menu.namePlaceholder'), value,
+    validate: name => validateGitName(name) ? null : t('collab.menu.invalidName'), action,
   };
+  void nextTick(() => document.querySelector<HTMLInputElement>('.collab-git-prompt input')?.focus());
 }
 
-function promptRenameBranch() {
-  const target = ctxMenu.value?.target;
-  if (target?.kind !== "localBranch") return;
-  const oldName = target.branch.name;
-  closeCtxMenu();
-  promptDialog.value = {
-    title: t("collab.renameBranch"),
-    placeholder: oldName,
-    value: oldName,
-    action: async (val: string) => {
-      try {
-        await runGitOp(`rename ${oldName} → ${val.trim()}`, `git branch -m ${oldName} ${val.trim()}`, (workspaceRef) => gitBranchAction(oldName, "local", "rename", val.trim(), workspaceRef));
-      } catch {}
-      onRefresh();
-    },
+async function copyGitText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    notificationStore.addNotice('success', t('common.copied'), { operation: 'collabCopy' });
+  } catch {
+    notificationStore.addNotice('error', t('collab.menu.copyFailed'), { operation: 'collabCopy' });
+  }
+}
+
+function targetRevision(target: GitContextTarget): string | null {
+  if (target.kind === 'commit') return target.commit.hash;
+  if (target.kind === 'stash') return target.stash.hash;
+  if (target.kind === 'localBranch') return 'refs/heads/' + target.branch.name;
+  if (target.kind === 'remoteBranch') return 'refs/remotes/' + branchTargetName(target);
+  return null;
+}
+
+async function executeCommitAction(rev: string, action: string, label: string, mode?: string, name?: string) {
+  const commands: Record<string, string> = {
+    checkoutDetached: 'checkout --detach', cherryPick: 'cherry-pick', revert: 'revert --no-edit',
+    createBranch: 'branch', createBranchAndCheckout: 'checkout -b', createTag: 'tag', reset: 'reset',
   };
+  const option = mode ? (action === 'reset' ? ' --' + mode : ' --mainline ' + mode) : '';
+  try {
+    await runGitOp(label, 'git ' + commands[action] + option + (name ? ' ' + name : '') + ' ' + rev,
+      workspace => gitCommitAction(rev, action, mode, name, workspace));
+  } catch { /* reported by runGitOp */ }
+}
+
+function confirmGitAction(title: string, message: string, action: () => void) {
+  confirmDialog.value = { title, message, danger: true, action };
+}
+
+async function onGitMenuAction(item: GitMenuItem) {
+  // Recheck the current model so a pending operation cannot be queued twice.
+  const current = gitMenuGroups.value.flat().find(entry => entry.action === item.action
+    && (!item.branch || (entry.branch && branchTargetName(entry.branch) === branchTargetName(item.branch))));
+  if (!current || current.disabled || !ctxMenu.value) return;
+  const target = ctxMenu.value.target;
+  const action = item.action;
+  if (action === 'stage') { doFileStage(); return; }
+  if (action === 'unstage') { doFileUnstage(); return; }
+  if (action === 'discard') { confirmDiscardFile(); return; }
+  if (action === 'showInFolder') { await doShowInFolder(); return; }
+  closeCtxMenu();
+
+  if (action === 'checkoutBranch' && item.branch) { await onBranchDblclick(item.branch); return; }
+  if (action === 'copyHash') {
+    const hash = target.kind === 'commit' ? target.commit.hash : target.kind === 'stash' ? target.stash.hash
+      : target.kind === 'localBranch' || target.kind === 'remoteBranch' ? resolveBranchTargetHash(target, graphRefs.value) : null;
+    if (hash) await copyGitText(hash);
+    return;
+  }
+  if (action === 'copyMessage') {
+    if (target.kind === 'commit') await copyGitText(target.commit.message);
+    if (target.kind === 'stash') await copyGitText(target.stash.message);
+    return;
+  }
+  const rev = targetRevision(target);
+  if (rev && ['createBranch', 'createBranchAndCheckout', 'createTag'].includes(action)) {
+    promptGitName(item.label, name => {
+      if (action !== 'createTag' && localBranches.value.some(branch => branch.name === name)) {
+        notificationStore.addNotice('error', t('collab.menu.branchExists', name));
+        return;
+      }
+      void executeCommitAction(rev, action, item.label, undefined, name);
+    });
+    return;
+  }
+  if (target.kind === 'commit') {
+    const commit = target.commit;
+    if (action === 'resetHard') {
+      confirmGitAction(t('collab.resetHardTitle', commit.shortHash), t('collab.resetHardMsg'),
+        () => { void executeCommitAction(commit.hash, 'reset', item.label, 'hard'); });
+    } else if (action === 'resetSoft' || action === 'resetMixed') {
+      await executeCommitAction(commit.hash, 'reset', item.label, action === 'resetSoft' ? 'soft' : 'mixed');
+    } else if (action === 'checkoutDetached' || action === 'cherryPick' || action === 'revert') {
+      if (commit.parents.length > 1 && action !== 'checkoutDetached') {
+        promptDialog.value = {
+          title: item.label, placeholder: '1', value: '1', hint: t('collab.menu.mainlineHint', commit.parents.length),
+          validate: value => /^\d+$/.test(value) && Number(value) >= 1 && Number(value) <= commit.parents.length
+            ? null : t('collab.menu.invalidMainline', commit.parents.length),
+          action: value => { void executeCommitAction(commit.hash, action, item.label, value); },
+        };
+        void nextTick(() => document.querySelector<HTMLInputElement>('.collab-git-prompt input')?.focus());
+      } else await executeCommitAction(commit.hash, action, item.label);
+    }
+    return;
+  }
+  if (target.kind === 'localBranch' || target.kind === 'remoteBranch') {
+    const name = branchTargetName(target);
+    const kind = target.kind === 'localBranch' ? 'local' : 'remote';
+    const remote = target.kind === 'remoteBranch' ? target.remoteName : undefined;
+    if (action === 'copyBranch') { await copyGitText(name); return; }
+    if (action === 'renameBranch') {
+      promptGitName(t('collab.renameBranch'), async newName => {
+        if (newName === name) return;
+        try { await runGitOp(item.label, 'git branch -m ' + name + ' ' + newName,
+          workspace => gitBranchAction(name, kind, 'rename', newName, workspace)); } catch {}
+      }, name);
+    } else if (action === 'deleteBranch' || action === 'deleteRemoteBranch') {
+      confirmGitAction(t(action === 'deleteBranch' ? 'collab.deleteBranchTitle' : 'collab.menu.deleteRemoteTitle', name),
+        t(action === 'deleteBranch' ? 'collab.deleteBranchMsg' : 'collab.menu.deleteRemoteMessage'), async () => {
+          try { await runGitOp(item.label, action === 'deleteBranch' ? 'git branch -d ' + name : 'git push --delete ' + remote + ' ' + target.branch.name,
+            workspace => gitBranchAction(name, kind, action === 'deleteBranch' ? 'delete' : 'deleteRemote', undefined, workspace, remote)); } catch {}
+        });
+    } else if (action === 'rebaseCurrentOnto') {
+      confirmGitAction(t('collab.menu.rebaseTitle', currentBranch.value, name), t('collab.menu.rebaseMessage'),
+        () => { void performBranchAction(name, kind, 'rebaseCurrentOnto', remote); });
+    } else if (['mergeIntoCurrent', 'pull', 'push', 'fetch'].includes(action)) {
+      await performBranchAction(name, kind, action as BranchActionName, remote);
+    }
+    return;
+  }
+  if (target.kind === 'stash') {
+    const selected = target.selectedStashes?.length ? target.selectedStashes : [target.stash];
+    const perform = async (stashAction: string, name?: string) => {
+      try {
+        await runGitOp(item.label, 'git stash ' + stashAction + ' ' + (name ? name + ' ' : '') + target.stash.refName,
+          workspace => gitStashAction(target.stash.refName, stashAction, workspace, { branchName: name, expectedHash: target.stash.hash }));
+      } catch {}
+    };
+    if (action === 'stashDrop') {
+      confirmGitAction(selected.length === 1 ? t('collab.dropStashTitle', target.stash.refName) : t('collab.menu.dropStashTitleMulti', selected.length),
+        t(selected.length === 1 ? 'collab.dropStashMsg' : 'collab.menu.dropStashMessageMulti'), async () => {
+          try {
+            await runGitOp(item.label, 'git stash drop', async workspace => {
+              for (const stash of [...selected].sort((a, b) => b.index - a.index)) {
+                await gitStashAction(stash.refName, 'drop', workspace, { expectedHash: stash.hash });
+              }
+            });
+          } catch {}
+        });
+    } else if (action === 'stashBranch') {
+      promptGitName(item.label, name => { void perform('branch', name); });
+    } else if (action === 'stashApply' || action === 'stashApplyIndex' || action === 'stashPop') {
+      await perform(action === 'stashApply' ? 'apply' : action === 'stashApplyIndex' ? 'applyIndex' : 'pop');
+    }
+    return;
+  }
+  if (target.kind === 'file') {
+    if (action === 'copyRelativePath' || action === 'copyAbsolutePath') {
+      const root = props.workingDir.replace(/\\/g, '/').replace(/\/$/, '');
+      await copyGitText(target.selectedFiles.map(file => action === 'copyRelativePath' ? file.path : root + '/' + file.path).join('\n'));
+    } else if (action === 'viewDiff') {
+      // Menu commands open the diff; unlike row clicks they do not toggle it closed.
+      if (activeFilePath.value !== target.file.path || activeDiffSource.value !== target.source
+        || activeDiffCommitHash.value !== (target.commitHash ?? null) || !inlineDiff.value) {
+        await onSelectFile(target.file, target.source, target.commitHash);
+      }
+    } else {
+      try {
+        const workspace = captureWorkspaceSnapshot().workspaceRef;
+        if (action === 'openEditor') await openFileExternal(target.file.path, workspace);
+        if (action === 'selectUnity') await selectUnityAsset(workspace, target.file.path);
+      } catch (error) {
+        notificationStore.addNotice('error', normalizeAppError(error).message || t('collab.menu.operationFailed'));
+      }
+    }
+  }
 }
 
 function submitPrompt() {
-  if (!promptDialog.value || !promptDialog.value.value.trim()) return;
-  promptDialog.value.action(promptDialog.value.value);
+  if (!promptDialog.value || !promptDialog.value.value.trim() || promptError.value || workspaceMutationBusy.value || hasConflictState.value) return;
+  const dialog = promptDialog.value;
   promptDialog.value = null;
+  dialog.action(dialog.value.trim());
 }
 
 function doConfirm() {
-  if (!confirmDialog.value) return;
-  confirmDialog.value.action();
+  if (!confirmDialog.value || workspaceMutationBusy.value || hasConflictState.value) return;
+  const dialog = confirmDialog.value;
   confirmDialog.value = null;
-}
-
-function copyBranchName() {
-  const target = ctxMenu.value?.target;
-  if (!target) return;
-  let name = "";
-  if (target.kind === "localBranch") name = target.branch.name;
-  else if (target.kind === "remoteBranch") name = `${target.remoteName}/${target.branch.name}`;
-  navigator.clipboard.writeText(name);
-  closeCtxMenu();
-  notificationStore.addNotice("success", t("collab.branchCopied"), {
-    operation: "collabCopyBranch",
-  });
+  dialog.action();
 }
 </script>
 
@@ -1019,13 +1105,9 @@ function copyBranchName() {
 
       <template v-if="isRepo">
 
-    <div class="left-area" ref="leftAreaRef" :style="{ flexBasis: leftColWidth + '%' }">
-      <div
-        v-if="displaySettings.showCollabSidebar"
-        class="git-sidebar-shell"
-        :style="!sidebarCollapsed ? { width: gitSidebarWidth + 'px' } : undefined"
-      >
+    <Teleport v-if="props.sidebarTarget" :to="props.sidebarTarget">
         <GitSidebar
+          :key="`${props.workspaceRef?.checkoutId}:${props.workspaceRef?.expectedGeneration}:${props.workspaceRef?.expectedMaterializationEpoch}`"
           :local-branches="localBranches"
           :remote-branches="remoteBranches"
           :stashes="stashes"
@@ -1033,14 +1115,13 @@ function copyBranchName() {
           :tags="tags"
           :submodules="submodules"
           :selected-history-hash="selectedCommitHash"
-          :sidebar-collapsed="sidebarCollapsed"
+          :toolbar-target="props.sidebarToolbarTarget"
           :expand-local="expandLocal"
           :expand-remotes="expandRemotes"
           :expanded-remote-names="expandedRemoteNames"
           :expand-stashes="expandStashes"
           :expand-tags="expandTags"
           :expand-submodules="expandSubmodules"
-          @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
           @toggle-local="expandLocal = !expandLocal"
           @toggle-remotes="expandRemotes = !expandRemotes"
           @toggle-remote-name="toggleRemote"
@@ -1051,18 +1132,14 @@ function copyBranchName() {
           @select-tag="onSelectTag"
           @select-branch="onSelectBranch"
           @branch-contextmenu="onBranchContextMenu"
-          @branch-dblclick="onBranchDblclick"
+          @branch-dblclick="onSidebarBranchDblclick"
           @stash-contextmenu="onStashContextMenu"
-          @open-git-config="openGitConfigPopover"
+          @open-git-config="onSidebarGitConfig"
           @open-search="openCollabSearch"
         />
-      </div>
-      <div
-        v-if="displaySettings.showCollabSidebar && !sidebarCollapsed"
-        class="git-sidebar-divider"
-        @mousedown="onSidebarSplitterMouseDown"
-      ></div>
+    </Teleport>
 
+    <div class="left-area" ref="leftAreaRef" :style="{ flexBasis: leftColWidth + '%' }">
       <div class="left-column" ref="leftColRef">
         <GitGraph
           ref="gitGraphRef"
@@ -1082,6 +1159,7 @@ function copyBranchName() {
           @select-commit="selectedCommitHash = $event"
           @load-more="loadMoreCommits"
           @history-contextmenu="onHistoryContextMenu"
+          @branch-contextmenu="onBranchContextMenu"
         />
 
         <div class="panel-divider-h" @mousedown="onHSplitterMouseDown"></div>
@@ -1109,7 +1187,7 @@ function copyBranchName() {
         @saved="onGitConfigSaved"
       />
 
-      <!-- Merge resolution overlay: covers sidebar + left column -->
+      <!-- Merge resolution overlay: covers the left column -->
       <div v-if="selectedConflictFile" class="inline-diff-panel">
         <MergeResolutionPanel
           ref="mergeResolutionRef"
@@ -1121,7 +1199,7 @@ function copyBranchName() {
         />
       </div>
 
-      <!-- Inline diff overlay: covers sidebar + left column -->
+      <!-- Inline diff overlay: covers the left column -->
       <div v-else-if="inlineDiff || diffLoading" class="inline-diff-panel">
         <template v-if="inlineDiff">
           <div class="inline-diff-header">
@@ -1216,6 +1294,7 @@ function copyBranchName() {
       :active-file-path="activeCommitFilePath"
       :workspace-ref="props.workspaceRef"
       @select-file="(f: GitFileChange) => onSelectFile(f, 'gitCommit', selectedCommitHash ?? undefined)"
+      @file-contextmenu="onCommitFileContextMenu"
     />
 
     <StagingArea
@@ -1248,116 +1327,65 @@ function copyBranchName() {
       </template><!-- end v-if isRepo -->
     </template>
 
-    <!-- Context menu -->
+    <!-- Context menu: shared neutral desktop controls, grouped by operation. -->
     <BaseContextMenu
       v-if="ctxMenu"
-      class="ctx-menu"
+      class="collab-git-menu"
       :x="ctxMenu.x"
       :y="ctxMenu.y"
-      :min-width="180"
+      :min-width="220"
+      max-width="min(420px, calc(100vw - 16px))"
+      :aria-label="t('collab.menu.ariaLabel')"
+      @keydown="navigateGitMenu"
       @close="closeCtxMenu"
     >
-      <!-- disabled reason hint -->
-      <div v-if="hasConflictState" class="ctx-hint">{{ conflictActionHint }}</div>
-      <div v-if="hasConflictState" class="ctx-sep" />
-      <!-- commit -->
-      <template v-if="ctxMenu.target.kind === 'commit'">
-        <template v-for="br in commitLocalBranches()" :key="br">
-          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCheckoutBranch(br)"><LucideIcon :icon="GitBranch" :size="13" />Checkout Branch「{{ br }}」</button>
-        </template>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('checkoutDetached')"><LucideIcon :icon="GitCommitHorizontal" :size="13" />Checkout Detached HEAD</button>
-        <div class="ctx-sep" />
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'soft')"><LucideIcon :icon="RotateCcw" :size="13" />Soft Reset</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('reset', 'mixed')"><LucideIcon :icon="RotateCcw" :size="13" />Mixed Reset</button>
-        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmResetHard()"><LucideIcon :icon="RotateCcw" :size="13" />Hard Reset</button>
-        <div class="ctx-sep" />
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doCommitAction('revert')"><LucideIcon :icon="Undo2" :size="13" />Revert Commit</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptNewBranch()"><LucideIcon :icon="GitBranchPlus" :size="13" />Create Branch…</button>
-      </template>
-      <!-- stash -->
-      <template v-else-if="ctxMenu.target.kind === 'stash'">
-        <template v-if="(ctxMenu.target.selectedStashes?.length ?? 1) <= 1">
-          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('apply')"><LucideIcon :icon="ArchiveRestore" :size="13" />Apply Stash</button>
-          <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doStashAction('pop')"><LucideIcon :icon="ArchiveRestore" :size="13" />Pop Stash</button>
-          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()"><LucideIcon :icon="Trash2" :size="13" />Drop Stash</button>
-        </template>
-        <template v-else>
-          <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState" @click="confirmDropStash()"><LucideIcon :icon="Trash2" :size="13" />Drop {{ ctxMenu.target.selectedStashes?.length }} Stashes</button>
-        </template>
-      </template>
-      <!-- local branch -->
-      <template v-else-if="ctxMenu.target.kind === 'localBranch'">
-        <button type="button" class="ctx-item" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="doBranchAction('switch')"><LucideIcon :icon="ArrowRightLeft" :size="13" />Switch to Branch</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')"><LucideIcon :icon="GitMerge" :size="13" />Merge into Current</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')"><LucideIcon :icon="GitCompareArrows" :size="13" />Rebase Current onto This</button>
-        <div class="ctx-sep" />
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="promptRenameBranch()"><LucideIcon :icon="PencilLine" :size="13" />Rename Branch…</button>
-        <button type="button" class="ctx-item ctx-danger" :disabled="hasConflictState || ctxMenu.target.branch.isCurrent" @click="confirmDeleteBranch()"><LucideIcon :icon="Trash2" :size="13" />Delete Branch</button>
-        <div class="ctx-sep" />
-        <button type="button" class="ctx-item" @click="copyBranchName()"><LucideIcon :icon="Copy" :size="13" />Copy Branch Name</button>
-      </template>
-      <!-- remote branch -->
-      <template v-else-if="ctxMenu.target.kind === 'remoteBranch'">
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('checkoutTracking')"><LucideIcon :icon="GitBranchPlus" :size="13" />Checkout as Local Tracking</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('mergeIntoCurrent')"><LucideIcon :icon="GitMerge" :size="13" />Merge into Current</button>
-        <button type="button" class="ctx-item" :disabled="hasConflictState" @click="doBranchAction('rebaseCurrentOnto')"><LucideIcon :icon="GitCompareArrows" :size="13" />Rebase Current onto This</button>
-        <div class="ctx-sep" />
-        <button type="button" class="ctx-item" @click="copyBranchName()"><LucideIcon :icon="Copy" :size="13" />Copy Remote Branch Name</button>
-      </template>
-      <!-- file -->
-      <template v-else-if="ctxMenu.target.kind === 'file'">
-        <button type="button" class="ctx-item" @click="doShowInFolder()"><LucideIcon :icon="FolderOpen" :size="13" />Show In Folder</button>
-        <div class="ctx-sep" />
+      <template v-for="(group, index) in gitMenuGroups" :key="index">
+        <div v-if="index" class="ctx-sep" role="separator" />
         <button
-          v-if="ctxMenu.target.source === 'gitUnstaged'"
+          v-for="item in group"
+          :key="item.action + (item.branch ? branchTargetName(item.branch) : '')"
           type="button"
-          class="ctx-item"
-          :disabled="workspaceMutationBusy"
-          @click="doFileStage()"
-        ><LucideIcon :icon="Plus" :size="13" />{{ ctxMenu.target.selectedFiles.length > 1 ? `Stage ${ctxMenu.target.selectedFiles.length} Files` : 'Stage' }}</button>
-        <button
-          v-else
-          type="button"
-          class="ctx-item"
-          :disabled="workspaceMutationBusy"
-          @click="doFileUnstage()"
-        ><LucideIcon :icon="Minus" :size="13" />{{ ctxMenu.target.selectedFiles.length > 1 ? `Unstage ${ctxMenu.target.selectedFiles.length} Files` : 'Unstage' }}</button>
-        <div class="ctx-sep" />
-        <button
-          type="button"
-          class="ctx-item ctx-danger"
-          :disabled="workspaceMutationBusy"
-          @click="confirmDiscardFile()"
-        ><LucideIcon :icon="Undo2" :size="13" />{{ ctxMenu.target.selectedFiles.length > 1 ? `Discard ${ctxMenu.target.selectedFiles.length} Files` : 'Discard Changes' }}</button>
+          role="menuitem"
+          :data-action="item.action"
+          :class="{ 'ctx-danger': item.danger }"
+          :disabled="item.disabled"
+          :title="item.title || item.label"
+          @click="onGitMenuAction(item)"
+        >
+          <LucideIcon :icon="item.icon" :size="13" />
+          <span class="git-menu-label">{{ item.label }}</span>
+        </button>
       </template>
     </BaseContextMenu>
 
     <Teleport to="body">
       <!-- Prompt dialog -->
-      <div v-if="promptDialog" class="commit-modal-overlay" @click.self="promptDialog = null">
-        <div class="commit-modal" style="max-width: 400px">
+      <div v-if="promptDialog" class="commit-modal-overlay collab-git-prompt" @click.self="promptDialog = null" @keydown.esc.stop="promptDialog = null">
+        <div class="commit-modal" role="dialog" aria-modal="true" :aria-label="promptDialog.title" style="max-width: 400px">
           <div class="commit-modal-header">
             <span class="commit-modal-title">{{ promptDialog.title }}</span>
-            <button class="commit-modal-close" @click="promptDialog = null">&times;</button>
+            <BaseButton class="git-dialog-close" :aria-label="t('common.close')" @click="promptDialog = null"><LucideIcon :icon="X" :size="14" /></BaseButton>
           </div>
           <div class="commit-modal-body">
-            <input v-model="promptDialog.value" class="commit-input" :placeholder="promptDialog.placeholder" @keyup.enter="submitPrompt" />
+            <input v-model="promptDialog.value" class="commit-input" :placeholder="promptDialog.placeholder" :aria-label="promptDialog.title" :aria-invalid="!!promptError" @keyup.enter="submitPrompt" />
+            <p v-if="promptDialog.hint" class="commit-modal-message">{{ promptDialog.hint }}</p>
+            <p v-if="promptError" class="commit-modal-warning" role="alert">{{ promptError }}</p>
           </div>
           <div class="commit-modal-footer">
             <div class="commit-modal-actions">
-              <button class="commit-cancel-btn" @click="promptDialog = null">{{ t('common.cancel') }}</button>
-              <button class="commit-confirm-btn" :disabled="!promptDialog.value.trim()" @click="submitPrompt">{{ t('common.confirm') }}</button>
+              <BaseButton @click="promptDialog = null">{{ t('common.cancel') }}</BaseButton>
+              <BaseButton variant="primary" :disabled="!promptDialog.value.trim() || !!promptError || workspaceMutationBusy || hasConflictState" @click="submitPrompt">{{ t('common.confirm') }}</BaseButton>
             </div>
           </div>
         </div>
       </div>
 
       <!-- Confirm dialog -->
-      <div v-if="confirmDialog" class="commit-modal-overlay" @click.self="confirmDialog = null">
-        <div class="commit-modal" style="max-width: 380px">
+      <div v-if="confirmDialog" class="commit-modal-overlay" @click.self="confirmDialog = null" @keydown.esc.stop="confirmDialog = null">
+        <div class="commit-modal" role="dialog" aria-modal="true" :aria-label="confirmDialog.title" style="max-width: 380px">
           <div class="commit-modal-header">
             <span class="commit-modal-title">{{ confirmDialog.title }}</span>
-            <button class="commit-modal-close" @click="confirmDialog = null">&times;</button>
+            <BaseButton class="git-dialog-close" :aria-label="t('common.close')" @click="confirmDialog = null"><LucideIcon :icon="X" :size="14" /></BaseButton>
           </div>
           <div class="commit-modal-body">
             <p class="commit-modal-message">{{ confirmDialog.message }}</p>
@@ -1365,8 +1393,8 @@ function copyBranchName() {
           </div>
           <div class="commit-modal-footer">
             <div class="commit-modal-actions">
-              <button class="commit-cancel-btn" @click="confirmDialog = null">{{ t('common.cancel') }}</button>
-              <button class="commit-confirm-btn" :style="confirmDialog.danger ? 'background: var(--danger, #d73a49)' : ''" @click="doConfirm">{{ t('common.confirm') }}</button>
+              <BaseButton @click="confirmDialog = null">{{ t('common.cancel') }}</BaseButton>
+              <BaseButton :variant="confirmDialog.danger ? 'danger' : 'primary'" :disabled="workspaceMutationBusy || hasConflictState" @click="doConfirm">{{ t('common.confirm') }}</BaseButton>
             </div>
           </div>
         </div>
@@ -1377,6 +1405,17 @@ function copyBranchName() {
 </template>
 
 <style scoped>
+.git-menu-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.git-dialog-close {
+  border-color: transparent;
+  width: 28px;
+  padding: 0;
+}
 .collab-view {
   position: relative;
   flex: 1;
@@ -1404,10 +1443,6 @@ function copyBranchName() {
   cursor: col-resize;
 }
 
-:deep(.collab-view.dragging-sidebar) {
-  cursor: col-resize;
-}
-
 :deep(.collab-view.dragging-h) {
   cursor: row-resize;
 }
@@ -1426,14 +1461,6 @@ function copyBranchName() {
   display: flex;
   flex-direction: column;
   flex: 1;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-}
-
-.git-sidebar-shell {
-  display: flex;
-  flex-shrink: 0;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -1679,6 +1706,11 @@ function copyBranchName() {
 
 :deep(.graph-row:hover) {
   background: color-mix(in srgb, var(--hover-bg) 85%, transparent);
+}
+
+:deep(.graph-row:focus-visible) {
+  outline: 1px solid color-mix(in srgb, var(--accent-color) 64%, var(--border-color));
+  outline-offset: -2px;
 }
 
 :deep(.graph-row.current-branch-row) {
@@ -2215,329 +2247,6 @@ function copyBranchName() {
   background: var(--accent-color, #58a6ff);
   border-radius: 2px;
   transition: width 0.3s ease;
-}
-
-:deep(.git-sidebar) {
-  width: 100%;
-  min-width: 0;
-  max-width: none;
-  display: flex;
-  flex-direction: column;
-  border-right: none;
-  background: var(--bg-color);
-  flex-shrink: 0;
-  overflow: hidden;
-}
-
-.git-sidebar-divider {
-  position: relative;
-  width: 6px;
-  flex-shrink: 0;
-  cursor: col-resize;
-}
-
-.git-sidebar-divider::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 50%;
-  width: 1px;
-  transform: translateX(-50%);
-  background: var(--border-color);
-  transition: background 0.15s;
-}
-
-.git-sidebar-divider:hover::before,
-.collab-view.dragging-sidebar .git-sidebar-divider::before {
-  background: var(--text-secondary);
-}
-
-:deep(.sidebar-header) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border-color);
-  flex-shrink: 0;
-}
-
-:deep(.sidebar-title) {
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-secondary);
-}
-
-:deep(.sidebar-header-actions) {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-:deep(.sidebar-collapse-btn),
-:deep(.sidebar-search-btn) {
-  width: 22px;
-  height: 22px;
-  border: none;
-  border-radius: 4px;
-  background: transparent;
-  color: var(--text-secondary);
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.15s;
-}
-
-:deep(.sidebar-collapse-btn:hover),
-:deep(.sidebar-search-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-:deep(.sidebar-scroll) {
-  flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
-}
-
-:deep(.sidebar-footer) {
-  flex-shrink: 0;
-  padding: 6px 8px;
-  border-top: 1px solid var(--border-color);
-}
-
-:deep(.sidebar-config-btn) {
-  width: 100%;
-  min-height: 28px;
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 7px;
-  padding: 0 8px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-
-:deep(.sidebar-config-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--border-color);
-}
-
-:deep(.sidebar-config-icon) {
-  flex-shrink: 0;
-  opacity: 0.7;
-}
-
-:deep(.sidebar-collapsed) {
-  width: 28px;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding-top: 10px;
-  border-right: 1px solid var(--border-color);
-  flex-shrink: 0;
-  cursor: pointer;
-  color: var(--text-secondary);
-  transition: all 0.15s;
-}
-
-:deep(.sidebar-collapsed:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-/* ── Section ── */
-:deep(.sidebar-section) {
-  border-bottom: 1px solid var(--border-color);
-}
-
-:deep(.sidebar-section:last-child) {
-  border-bottom: none;
-}
-
-:deep(.sidebar-section-header) {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 6px 8px;
-  cursor: pointer;
-  transition: background 0.1s;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-  color: var(--text-secondary);
-}
-
-:deep(.sidebar-section-header:hover) {
-  background: var(--hover-bg);
-}
-
-:deep(.chevron) {
-  font-size: 9px;
-  transition: transform 0.15s;
-  flex-shrink: 0;
-  width: 12px;
-  text-align: center;
-  color: var(--text-secondary);
-}
-
-:deep(.chevron.expanded) {
-  transform: rotate(90deg);
-}
-
-:deep(.chevron.small) {
-  font-size: 9px;
-  width: 10px;
-}
-
-:deep(.section-icon) {
-  flex-shrink: 0;
-  opacity: 0.6;
-}
-
-:deep(.section-label) {
-  flex: 1;
-  min-width: 0;
-}
-
-:deep(.section-count) {
-  font-size: 10px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  background: var(--active-bg);
-  padding: 0 5px;
-  border-radius: 8px;
-  min-width: 16px;
-  text-align: center;
-  line-height: 1.5;
-}
-
-:deep(.sidebar-section-body) {
-  padding-bottom: 2px;
-}
-
-/* ── Item ── */
-:deep(.sidebar-item) {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  padding: 3px 8px 3px 24px;
-  font-size: 12px;
-  cursor: default;
-  transition: background 0.1s;
-  color: var(--text-color);
-  min-height: 24px;
-}
-
-:deep(.sidebar-item:hover) {
-  background: var(--hover-bg);
-}
-
-:deep(.sidebar-item.active) {
-  background: var(--active-bg);
-}
-
-:deep(.sidebar-item.stash-item),
-:deep(.sidebar-item.tag-item),
-:deep(.sidebar-item.branch-item) {
-  cursor: pointer;
-}
-
-:deep(.sidebar-item.remote-group) {
-  padding-left: 16px;
-  cursor: pointer;
-  font-weight: 500;
-  color: var(--text-secondary);
-}
-
-:deep(.sidebar-item.nested) {
-  padding-left: 36px;
-}
-
-:deep(.item-icon) {
-  flex-shrink: 0;
-  opacity: 0.5;
-}
-
-:deep(.item-icon.branch-icon) {
-  opacity: 0.6;
-}
-
-:deep(.item-icon.stash-icon) {
-  opacity: 0.4;
-}
-
-:deep(.item-label) {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-:deep(.item-label.stash-label) {
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-:deep(.stash-state-tag) {
-  flex-shrink: 0;
-  font-size: 9px;
-  font-weight: 600;
-  line-height: 1.5;
-  padding: 0 4px;
-  border-radius: 4px;
-  color: var(--text-secondary);
-  background: color-mix(in srgb, var(--sidebar-bg) 78%, var(--hover-bg) 22%);
-  border: 1px solid color-mix(in srgb, var(--border-color) 88%, var(--text-secondary) 12%);
-}
-
-:deep(.current-badge) {
-  font-size: 9px;
-  font-weight: 600;
-  padding: 0 4px;
-  border-radius: 3px;
-  background: #2ea04333;
-  color: #2ea043;
-  border: 1px solid #2ea04355;
-  flex-shrink: 0;
-  line-height: 1.5;
-}
-
-:deep(.submodule-status) {
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-}
-
-:deep(.sub-ok) {
-  color: #2ea043;
-}
-
-:deep(.sub-modified) {
-  color: #d29b00;
-}
-
-:deep(.sub-uninitialized) {
-  color: var(--text-secondary);
-  opacity: 0.5;
-}
-
-:deep(.sidebar-empty) {
-  padding: 6px 24px;
-  font-size: 11px;
-  color: var(--text-secondary);
-  opacity: 0.6;
 }
 
 /* ── Merge Queue Panel ── */

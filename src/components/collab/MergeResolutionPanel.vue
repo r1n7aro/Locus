@@ -32,6 +32,7 @@ function captureWorkspaceRef(): WorkspaceRef {
   return {
     checkoutId: props.workspaceRef.checkoutId,
     expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+    expectedMaterializationEpoch: props.workspaceRef.expectedMaterializationEpoch ?? undefined,
   };
 }
 

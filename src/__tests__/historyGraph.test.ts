@@ -695,8 +695,11 @@ describe("history graph normalize/layout", () => {
 
     expect(shortTip.lane).toBe(1);
     expect(featureTip.lane).toBeGreaterThan(shortTip.lane);
-    expect(layout.edges.some(edge => edge.id === "lane:s1:1:1")).toBe(true);
-    expect(layout.edges.some(edge => edge.id === "lane:s1:1:2")).toBe(false);
+    // The upcoming main tip reserves a slot in the following row. The short
+    // branch must follow that displacement instead of leaving its line detached.
+    expect(shortTip.downEdges).toHaveLength(1);
+    const incomingLane = shortTip.downEdges[0]!.toLane;
+    expect(featureTip.downEdges.some(edge => edge.fromLane === incomingLane)).toBe(true);
   });
 
   it("keeps branch colors stable while freed inner lanes stay reserved", () => {

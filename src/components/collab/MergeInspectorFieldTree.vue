@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import type { MergeField, MergeSide } from "../../types";
 import { t } from "../../i18n";
 import { parseDisplayValue, type ParsedDisplayValue } from "../diff/fieldUtils";
+import { detectMergeVector, formatVectorNumber as fmtNum, type VectorMergeComponent } from "./mergeFieldValues";
 import {
   compactBaseLabel,
   compactMergeSideLabel,
@@ -17,18 +18,6 @@ interface SourceColumn {
   side: MergeSide;
   compactLabel: string;
   fullLabel: string;
-}
-
-interface CompactTuple {
-  label: string;
-  value: string;
-}
-
-interface VectorMergeComponent {
-  label: string;
-  base: string;
-  ours: string;
-  theirs: string;
 }
 
 interface FieldChoiceStats {
@@ -60,70 +49,6 @@ const displayLeftLabel = computed(() => humanizeMergeSideLabel(props.leftLabel, 
 const displayRightLabel = computed(() => humanizeMergeSideLabel(props.rightLabel, "right"));
 const compactLeftLabel = computed(() => compactMergeSideLabel(props.leftLabel, "left"));
 const compactRightLabel = computed(() => compactMergeSideLabel(props.rightLabel, "right"));
-
-const VECTOR_LABELS = new Set(["x", "y", "z", "w", "r", "g", "b", "a"]);
-
-function parseCompoundString(val: string | undefined): CompactTuple[] | null {
-  if (!val) return null;
-  const trimmed = val.trim();
-  const inner = trimmed.match(/^\{(.+)\}$/)?.[1];
-  if (!inner) return null;
-  const pairs = inner.split(",").map((part) => part.trim());
-  if (pairs.length < 2 || pairs.length > 4) return null;
-
-  const result: CompactTuple[] = [];
-  for (const pair of pairs) {
-    const match = pair.match(/^(\w+):\s*(.+)$/);
-    if (!match) return null;
-    result.push({ label: match[1].toUpperCase(), value: match[2].trim() });
-  }
-  return result;
-}
-
-function fmtNum(val: string | undefined): string {
-  if (!val || val === "") return "-";
-  const num = Number.parseFloat(val);
-  if (Number.isNaN(num)) return val;
-  return Number.isInteger(num)
-    ? String(num)
-    : num.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
-}
-
-function detectMergeVector(field: MergeField): VectorMergeComponent[] | null {
-  const children = field.children;
-  if (children.length >= 2 && children.length <= 4) {
-    const allVectorChildren = children.every(
-      (child) => child.children.length === 0 && VECTOR_LABELS.has(child.label.toLowerCase()),
-    );
-    if (allVectorChildren) {
-      return children.map((child) => ({
-        label: child.label.toUpperCase(),
-        base: child.base ?? "",
-        ours: child.ours ?? "",
-        theirs: child.theirs ?? "",
-      }));
-    }
-  }
-
-  if (children.length === 0) {
-    const sample = field.ours ?? field.theirs ?? field.base;
-    const parsed = parseCompoundString(sample);
-    if (!parsed) return null;
-
-    const baseParsed = parseCompoundString(field.base);
-    const oursParsed = parseCompoundString(field.ours);
-    const theirsParsed = parseCompoundString(field.theirs);
-
-    return parsed.map((part, index) => ({
-      label: part.label,
-      base: baseParsed?.[index]?.value ?? "",
-      ours: oursParsed?.[index]?.value ?? "",
-      theirs: theirsParsed?.[index]?.value ?? "",
-    }));
-  }
-
-  return null;
-}
 
 const vectorComponents = computed(() => detectMergeVector(props.field));
 const isVector = computed(() => vectorComponents.value !== null);

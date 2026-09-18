@@ -1,10 +1,10 @@
 import { estimateDisplayRefsRailWidth } from "./refs";
+import { layoutHistoryGraphEdges, type HistoryGraphEdgeRoute } from "./edges";
 import type {
   HistoryGraphAuxLayout,
   HistoryGraphColumnWidthOverrides,
   HistoryGraphCommitLayout,
   HistoryGraphDisplayRef,
-  HistoryGraphEdgeLayout,
   HistoryGraphLaneEdge,
   HistoryGraphLayoutResult,
   HistoryGraphResizableColumn,
@@ -87,12 +87,6 @@ interface RenderSnapshot {
   laneByTrack: Map<number, number>;
 }
 
-interface MergeTarget {
-  fromLane: number;
-  track: number;
-  color: string;
-}
-
 type SparseLane<T extends ActiveLane> = T | null;
 
 function trackColor(track: number): string {
@@ -101,14 +95,6 @@ function trackColor(track: number): string {
 
 function graphLaneX(lane: number): number {
   return GRAPH_PAD_X + lane * LANE_W + LANE_W / 2;
-}
-
-function curvePath(x1: number, y1: number, x2: number, y2: number): string {
-  if (x1 === x2) {
-    return `M${x1},${y1}L${x2},${y2}`;
-  }
-  const midY = (y1 + y2) / 2;
-  return `M${x1},${y1}C${x1},${midY} ${x2},${midY} ${x2},${y2}`;
 }
 
 function fallbackOwner(key: string, color: string): DisplayOwner {
@@ -224,19 +210,6 @@ function insertLaneByPriority<T extends ActiveLane>(lanes: SparseLane<T>[], lane
   return nextActiveIndex;
 }
 
-function shouldCurrentLaneClaimParent(
-  candidate: DisplayOwner | undefined,
-  current: DisplayOwner | undefined,
-  candidateLane: number,
-  currentLane: number,
-): boolean {
-  const ownerDelta = compareOwnerPriority(candidate, current);
-  if (ownerDelta !== 0) {
-    return ownerDelta < 0;
-  }
-  return candidateLane < currentLane;
-}
-
 function resolveUpcomingPreviewCommit(
   scene: HistoryGraphScene,
   commitIndex: number,
@@ -302,7 +275,7 @@ function buildLaneRows(
   commitColors: Map<string, string>,
 ): LaneRow[] {
   const rows: LaneRow[] = [];
-  let lanes: SparseLane<ActiveLane>[] = [];
+  let lanes: SparseLane<PendingLane>[] = [];
   let nextTrackId = 0;
   const workspaceAnchorHash = scene.auxNodes.find(auxNode =>
     auxNode.kind === "workspace" && auxNode.anchorHash,
@@ -313,7 +286,13 @@ function buildLaneRows(
 
   for (let commitIndex = 0; commitIndex < scene.primaryCommits.length; commitIndex++) {
     const commit = scene.primaryCommits[commitIndex];
-    let lane = findLaneIndexByHash(lanes, commit.hash);
+    // Several children may be waiting for this parent. Keep their tracks separate
+    // until this row; a junction above it would imply a commit that does not exist.
+    const incomingLanes = lanes.filter((activeLane): activeLane is PendingLane => activeLane !== null);
+    const matchingLanes = incomingLanes.filter(activeLane => activeLane.hash === commit.hash);
+    matchingLanes.sort(compareActiveLanes);
+    const preferredTrack = matchingLanes[0]?.track;
+    let lane = preferredTrack === undefined ? -1 : lanes.findIndex(activeLane => activeLane?.track === preferredTrack);
     if (lane === -1) {
       const track = nextTrackId++;
       lane = insertLaneByPriority(lanes, {
@@ -321,6 +300,10 @@ function buildLaneRows(
         track,
         owner: resolveCommitOwner(commit.hash, commit.parents, laneOwners, trackColor(track)),
       });
+    }
+
+    for (let index = 0; index < lanes.length; index++) {
+      if (index !== lane && lanes[index]?.hash === commit.hash) lanes[index] = null;
     }
 
     const currentLane = lanes[lane]!;
@@ -336,6 +319,25 @@ function buildLaneRows(
     );
     const renderLane = renderBefore.laneByTrack.get(currentLane.track) ?? lane;
     const rowColor = commitColors.get(commit.hash) ?? currentOwner.color;
+
+    // Resolve destinations against the actual next row, including newly inserted
+    // tips and preview slots. Independent before/after previews can leave gaps.
+    const previousRow = rows[rows.length - 1];
+    if (previousRow) {
+      for (const incoming of incomingLanes) {
+        if (incoming.sourceLane === undefined) continue;
+        const targetLane = incoming.hash === commit.hash
+          ? renderLane
+          : renderBefore.laneByTrack.get(incoming.track);
+        if (targetLane === undefined) continue;
+        previousRow.downEdges.push({
+          fromLane: incoming.sourceLane + COMMIT_LANE_OFFSET,
+          toLane: targetLane + COMMIT_LANE_OFFSET,
+          color: incoming.sourceColor ?? incoming.owner?.color ?? trackColor(incoming.track),
+          kind: incoming.hash === commit.hash && incoming.track !== currentLane.track ? "merge" : "continuation",
+        });
+      }
+    }
     const nextLanes: SparseLane<PendingLane>[] = lanes.map((activeLane, index) => activeLane
       ? {
         ...activeLane,
@@ -345,41 +347,9 @@ function buildLaneRows(
       }
       : null);
     nextLanes[lane] = null;
-    const mergeTargetTracks: MergeTarget[] = [];
-
-    for (let index = 0; index < commit.parents.length; index++) {
-      const parentHash = commit.parents[index];
-      const existingLane = findLaneIndexByHash(nextLanes, parentHash);
-      if (existingLane >= 0) {
-        const existingPendingLane = nextLanes[existingLane]!;
-        if (index === 0 && shouldCurrentLaneClaimParent(currentOwner, existingPendingLane.owner, lane, existingLane)) {
-          nextLanes[lane] = {
-            hash: parentHash,
-            track: currentLane.track,
-            owner: currentOwner,
-            sourceLane: renderLane,
-            sourceColor: rowColor,
-          };
-          nextLanes[existingLane] = null;
-          if (existingPendingLane.sourceLane !== undefined) {
-            mergeTargetTracks.push({
-              fromLane: existingPendingLane.sourceLane,
-              track: currentLane.track,
-              color: existingPendingLane.owner?.color
-                ?? commitColors.get(existingPendingLane.hash)
-                ?? trackColor(existingPendingLane.track),
-            });
-          }
-          continue;
-        }
-
-        mergeTargetTracks.push({
-          fromLane: renderLane,
-          track: existingPendingLane.track,
-          color: rowColor,
-        });
-        continue;
-      }
+    const parents = [...new Set(commit.parents)];
+    for (let index = 0; index < parents.length; index++) {
+      const parentHash = parents[index];
 
       if (index === 0) {
         nextLanes[lane] = {
@@ -393,62 +363,30 @@ function buildLaneRows(
       }
 
       const track = nextTrackId++;
-      insertLaneByPriority(nextLanes, {
+      const parentLane: PendingLane = {
         hash: parentHash,
         track,
         owner: laneOwners.get(parentHash) ?? fallbackOwner(`commit:${parentHash}`, trackColor(track)),
         sourceLane: renderLane,
         sourceColor: rowColor,
-      });
+      };
+      // A fork opens next to its source. Sorting it by branch priority can send
+      // the new edge across every existing track between source and destination.
+      const insertIndex = lane + index;
+      if (!nextLanes[insertIndex]) nextLanes[insertIndex] = parentLane;
+      else nextLanes.splice(insertIndex, 0, parentLane);
     }
 
     trimTrailingEmptyLanes(nextLanes);
-    const renderAfter = buildRenderSnapshot(
-      nextLanes,
-      previewCommit,
-      laneOwners,
-      nextTrackId,
-    );
-    const downEdges: HistoryGraphLaneEdge[] = [];
-    for (let index = 0; index < nextLanes.length; index++) {
-      const activeLane = nextLanes[index];
-      if (!activeLane || activeLane.sourceLane === undefined) continue;
-      downEdges.push({
-        fromLane: activeLane.sourceLane + COMMIT_LANE_OFFSET,
-        toLane: (renderAfter.laneByTrack.get(activeLane.track) ?? index) + COMMIT_LANE_OFFSET,
-        color: activeLane.sourceColor
-          ?? commitColors.get(activeLane.hash)
-          ?? activeLane.owner?.color
-          ?? trackColor(activeLane.track),
-        kind: "continuation",
-      });
-    }
-
-    for (const mergeTarget of mergeTargetTracks) {
-      const mergeLane = renderAfter.laneByTrack.get(mergeTarget.track);
-      if (mergeLane === undefined) continue;
-      downEdges.push({
-        fromLane: mergeTarget.fromLane + COMMIT_LANE_OFFSET,
-        toLane: mergeLane + COMMIT_LANE_OFFSET,
-        color: mergeTarget.color,
-        kind: "merge",
-      });
-    }
 
     rows.push({
       commitHash: commit.hash,
       lane: renderLane + COMMIT_LANE_OFFSET,
       color: rowColor,
-      downEdges,
+      downEdges: [],
     });
 
-    lanes = nextLanes.map(activeLane => activeLane
-      ? {
-        hash: activeLane.hash,
-        track: activeLane.track,
-        owner: activeLane.owner,
-      }
-      : null);
+    lanes = nextLanes;
   }
 
   return rows;
@@ -653,6 +591,24 @@ function buildAnchoredAuxLaneReservations(
   return reservations;
 }
 
+function reserveWorkspaceLane(scene: HistoryGraphScene, laneRows: LaneRow[], reservations: Map<string, Set<number>>): number {
+  const workspace = scene.auxNodes.find(node => node.kind === "workspace");
+  const anchorIndex = laneRows.findIndex(row => row.commitHash === workspace?.anchorHash);
+  if (anchorIndex < 0) return AUX_LANE;
+  const anchorLane = laneRows[anchorIndex]!.lane;
+  const blocked = laneRows.slice(0, anchorIndex).some((row, index) => row.lane === anchorLane
+    || row.downEdges.some(edge => {
+      // A line arriving at HEAD shares only its endpoint with the WIP line.
+      if (index === anchorIndex - 1 && edge.toLane === anchorLane && edge.fromLane !== anchorLane) return false;
+      return Math.min(edge.fromLane, edge.toLane) <= anchorLane && Math.max(edge.fromLane, edge.toLane) >= anchorLane;
+    }));
+  const lane = blocked ? AUX_LANE : anchorLane;
+  for (const row of laneRows.slice(0, anchorIndex + 1)) {
+    reservations.get(row.commitHash)?.add(lane);
+  }
+  return lane;
+}
+
 function pickNearestOpenLane(anchorLane: number, occupied: Set<number>): number {
   for (let distance = 1; distance <= occupied.size + anchorLane + 2; distance++) {
     const leftLane = anchorLane - distance;
@@ -692,6 +648,7 @@ export function layoutHistoryGraph(
   const laneRows = buildLaneRows(scene, displayState.laneOwners, displayState.commitColors);
   const commitLaneByHash = new Map(laneRows.map(row => [row.commitHash, row]));
   const auxLaneReservations = buildAnchoredAuxLaneReservations(scene, laneRows);
+  const workspaceLane = reserveWorkspaceLane(scene, laneRows, auxLaneReservations);
   const auxDisplayColors = buildAuxDisplayColors(scene, displayState.commitColors);
   const anchoredAuxByHash = new Map<string, HistoryGraphScene["auxNodes"]>();
   const topAuxNodes = sortAuxNodes(
@@ -717,8 +674,8 @@ export function layoutHistoryGraph(
     const rowIndex = rows.length;
     const top = TOP_PAD + rowIndex * ROW_HEIGHT;
     const y = top + ROW_HEIGHT / 2;
-    const lane = auxNode.kind === "workspace" && anchorLane !== undefined
-      ? anchorLane
+    const lane = auxNode.kind === "workspace"
+      ? workspaceLane
       : auxNode.kind === "stash" && anchorLane !== undefined
         ? pickNearestOpenLane(anchorLane, reservedLanes ?? new Set([anchorLane]))
         : AUX_LANE;
@@ -779,14 +736,15 @@ export function layoutHistoryGraph(
     pushCommit(commit, laneRow);
   }
 
-  const edges: HistoryGraphEdgeLayout[] = [];
+  const edgeRoutes: HistoryGraphEdgeRoute[] = [];
   for (let index = 0; index < commits.length - 1; index++) {
     const current = commits[index];
     const next = commits[index + 1];
     for (const edge of current.downEdges) {
-      edges.push({
+      edgeRoutes.push({
         id: `lane:${current.commit.hash}:${edge.fromLane}:${edge.toLane}`,
-        path: curvePath(graphLaneX(edge.fromLane), current.y, graphLaneX(edge.toLane), next.y),
+        start: { x: graphLaneX(edge.fromLane), y: current.y },
+        end: { x: graphLaneX(edge.toLane), y: next.y },
         color: edge.color,
         startRowIndex: current.rowIndex,
         endRowIndex: next.rowIndex,
@@ -798,11 +756,27 @@ export function layoutHistoryGraph(
   for (const auxNode of auxNodes) {
     const anchor = auxNode.anchorHash ? commitByHash.get(auxNode.anchorHash) : null;
     if (!anchor) continue;
-    edges.push({
+    const needsWorkspaceStem = auxNode.kind === "workspace" && auxNode.lane !== anchor.lane
+      && anchor.rowIndex - auxNode.rowIndex > 1;
+    const joinY = needsWorkspaceStem ? anchor.y - ROW_HEIGHT : auxNode.y;
+    if (needsWorkspaceStem) {
+      edgeRoutes.push({
+        id: `aux:${auxNode.id}:${anchor.commit.hash}:stem`,
+        start: { x: auxNode.x, y: auxNode.y },
+        end: { x: auxNode.x, y: joinY },
+        color: auxNode.color,
+        startRowIndex: auxNode.rowIndex,
+        endRowIndex: anchor.rowIndex - 1,
+        dashed: true,
+        opacity: 0.78,
+      });
+    }
+    edgeRoutes.push({
       id: `aux:${auxNode.id}:${anchor.commit.hash}`,
-      path: curvePath(auxNode.x, auxNode.y, anchor.x, anchor.y),
+      start: { x: auxNode.x, y: joinY },
+      end: { x: anchor.x, y: anchor.y },
       color: auxNode.color,
-      startRowIndex: Math.min(auxNode.rowIndex, anchor.rowIndex),
+      startRowIndex: needsWorkspaceStem ? anchor.rowIndex - 1 : auxNode.rowIndex,
       endRowIndex: Math.max(auxNode.rowIndex, anchor.rowIndex),
       dashed: auxNode.kind === "workspace" ? true : undefined,
       opacity: auxNode.kind === "workspace" ? 0.78 : 0.58,
@@ -830,7 +804,7 @@ export function layoutHistoryGraph(
     commits,
     auxNodes,
     rows,
-    edges,
+    edges: layoutHistoryGraphEdges(edgeRoutes),
     contentHeight,
     visibleCommitCount: commits.length,
     rails: {

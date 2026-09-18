@@ -81,6 +81,7 @@ function openCommitFile(path: string) {
 
 const emit = defineEmits<{
   (e: "selectFile", file: GitFileChange): void;
+  (e: "fileContextmenu", event: MouseEvent, file: GitFileChange): void;
 }>();
 
 const formattedDate = computed(() => {
@@ -380,6 +381,7 @@ function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
               :style="{ paddingLeft: `${treeIndentPx(row.depth)}px` }"
               :title="row.file.path"
               @click="emit('selectFile', row.file)"
+              @contextmenu.prevent.stop="emit('fileContextmenu', $event, row.file)"
             >
               <span v-if="!displaySettings.mergeGitTreeStatusIcon" class="file-status ui-select-none" :class="fileStatusClass(row.file.status)">{{ fileStatusLabel(row.file.status) }}</span>
               <span v-else class="file-status staging-tree-status-spacer ui-select-none" aria-hidden="true"></span>
@@ -413,6 +415,7 @@ function toggleTreeFolder(chainPaths: readonly string[], expanded: boolean) {
             :class="{ selected: props.activeFilePath === f.path }"
             :title="f.path"
             @click="emit('selectFile', f)"
+            @contextmenu.prevent.stop="emit('fileContextmenu', $event, f)"
           >
             <span class="file-status ui-select-none" :class="fileStatusClass(f.status)">{{ fileStatusLabel(f.status) }}</span>
             <span class="file-name ui-select-text">{{ fileName(f.path) }}</span>

@@ -54,6 +54,7 @@ interface CollabProps {
 
 interface CollabStateOptions {
   onGitTerminalOutput?: (command: string, output: string, isError?: boolean) => void;
+  isSidebarActive?: () => boolean;
 }
 
 interface CollabWorkspaceSnapshot {
@@ -61,6 +62,7 @@ interface CollabWorkspaceSnapshot {
   workspaceRef: WorkspaceRef;
   checkoutId: string;
   expectedGeneration: number | null;
+  expectedMaterializationEpoch: number | null;
 }
 
 function quoteGitPath(path: string) {
@@ -224,7 +226,6 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   );
 
   // ── Sidebar UI toggles ─────────────────────────────────────────
-  const sidebarCollapsed = ref(false);
   const expandLocal = ref(true);
   const expandRemotes = ref(true);
   const expandedRemoteNames = ref<Set<string>>(new Set());
@@ -233,7 +234,6 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   const expandSubmodules = ref(true);
 
   // ── Resize / layout ─────────────────────────────────────────────
-  const STORAGE_KEY_SIDEBAR_W = "locus:collabSidebarWidth";
   const STORAGE_KEY_LEFT_COL = "locus:collabLeftColWidth";
   const STORAGE_KEY_TERMINAL_H = "locus:collabTerminalHeight";
 
@@ -248,14 +248,10 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   const containerRef = ref<HTMLElement | null>(null);
   const leftAreaRef = ref<HTMLElement | null>(null);
   const leftColRef = ref<HTMLElement | null>(null);
-  const gitSidebarWidth = ref(readStoredNumber(STORAGE_KEY_SIDEBAR_W, 180, 360, 220));
-  const isDraggingSidebar = ref(false);
   const leftColWidth = ref(readStoredNumber(STORAGE_KEY_LEFT_COL, 20, 85, 70));
   const isDraggingV = ref(false);
   const terminalHeight = ref(readStoredNumber(STORAGE_KEY_TERMINAL_H, 80, 600, 240));
   const isDraggingH = ref(false);
-  let sidebarResizeMoveHandler: ((event: MouseEvent) => void) | null = null;
-  let sidebarResizeUpHandler: (() => void) | null = null;
   let releaseSelectionLock: (() => void) | null = null;
 
   // ── Data loading ────────────────────────────────────────────────
@@ -298,19 +294,22 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     const workspaceRef = {
       checkoutId: props.workspaceRef.checkoutId,
       expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+      expectedMaterializationEpoch: props.workspaceRef.expectedMaterializationEpoch ?? undefined,
     };
     return {
       workingDir: props.workingDir,
       workspaceRef,
       checkoutId: workspaceRef.checkoutId,
       expectedGeneration: workspaceRef.expectedGeneration ?? null,
+      expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch ?? null,
     };
   }
 
   function isCurrentWorkspaceSnapshot(snapshot: CollabWorkspaceSnapshot) {
     return snapshot.workingDir === props.workingDir
       && snapshot.checkoutId === (props.workspaceRef?.checkoutId ?? null)
-      && snapshot.expectedGeneration === (props.workspaceRef?.expectedGeneration ?? null);
+      && snapshot.expectedGeneration === (props.workspaceRef?.expectedGeneration ?? null)
+      && snapshot.expectedMaterializationEpoch === (props.workspaceRef?.expectedMaterializationEpoch ?? null);
   }
 
   function isCurrentGitRefresh(token: number, snapshot: CollabWorkspaceSnapshot) {
@@ -333,7 +332,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   }
 
   function refreshWhenVisible(delay = 120) {
-    if (!props.isActive) return;
+    if (!props.isActive && !options.isSidebarActive?.()) return;
     if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
     scheduleGitRefresh(delay);
   }
@@ -1058,62 +1057,12 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   });
 
   const draggingClass = computed(() => {
-    if (isDraggingSidebar.value) return "dragging-sidebar";
     if (isDraggingV.value) return "dragging-v";
     if (isDraggingH.value) return "dragging-h";
     return "";
   });
 
   // ── Resize: vertical splitter ───────────────────────────────────
-  function clampSidebarWidth(width: number) {
-    const leftAreaWidth = leftAreaRef.value?.getBoundingClientRect().width ?? 0;
-    const maxWidth = leftAreaWidth > 0
-      ? Math.max(180, Math.min(360, leftAreaWidth - 220))
-      : 360;
-    return Math.max(180, Math.min(maxWidth, width));
-  }
-
-  function stopSidebarResize() {
-    isDraggingSidebar.value = false;
-    if (sidebarResizeMoveHandler) {
-      document.removeEventListener("mousemove", sidebarResizeMoveHandler);
-      sidebarResizeMoveHandler = null;
-    }
-    if (sidebarResizeUpHandler) {
-      document.removeEventListener("mouseup", sidebarResizeUpHandler);
-      sidebarResizeUpHandler = null;
-    }
-    document.body.style.cursor = "";
-    releaseSelectionLock?.();
-    releaseSelectionLock = null;
-  }
-
-  function onSidebarSplitterMouseDown(e: MouseEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    stopSidebarResize();
-    isDraggingSidebar.value = true;
-    const startX = e.clientX;
-    const startWidth = gitSidebarWidth.value;
-
-    sidebarResizeMoveHandler = (event: MouseEvent) => {
-      if (!isDraggingSidebar.value) return;
-      const delta = event.clientX - startX;
-      gitSidebarWidth.value = clampSidebarWidth(startWidth + delta);
-    };
-
-    sidebarResizeUpHandler = () => {
-      try { localStorage.setItem(STORAGE_KEY_SIDEBAR_W, String(Math.round(gitSidebarWidth.value))); } catch {}
-      stopSidebarResize();
-    };
-
-    document.addEventListener("mousemove", sidebarResizeMoveHandler);
-    document.addEventListener("mouseup", sidebarResizeUpHandler);
-    document.body.style.cursor = "col-resize";
-    releaseSelectionLock?.();
-    releaseSelectionLock = acquireSelectionLock();
-  }
-
   function onVSplitterMouseDown(e: MouseEvent) {
     e.preventDefault();
     isDraggingV.value = true;
@@ -1198,6 +1147,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
       props.workingDir,
       props.workspaceRef?.checkoutId ?? null,
       props.workspaceRef?.expectedGeneration ?? null,
+      props.workspaceRef?.expectedMaterializationEpoch ?? null,
     ] as const,
     () => {
       clearScheduledGitRefresh();
@@ -1212,7 +1162,7 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
   );
 
   watch(
-    () => props.isActive,
+    () => props.isActive || !!options.isSidebarActive?.(),
     (active) => {
       if (active) {
         refreshWhenVisible(80);
@@ -1296,7 +1246,6 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
       document.removeEventListener("mouseup", onVSplitterMouseUp);
       document.removeEventListener("mousemove", onHSplitterMouseMove);
       document.removeEventListener("mouseup", onHSplitterMouseUp);
-      stopSidebarResize();
       releaseSelectionLock?.();
       releaseSelectionLock = null;
     });
@@ -1356,7 +1305,6 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     submodules,
 
     // sidebar toggles
-    sidebarCollapsed,
     expandLocal,
     expandRemotes,
     expandedRemoteNames,
@@ -1368,7 +1316,6 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     containerRef,
     leftAreaRef,
     leftColRef,
-    gitSidebarWidth,
     leftColWidth,
     terminalHeight,
     draggingClass,
@@ -1396,7 +1343,6 @@ export function useCollabState(props: CollabProps, options: CollabStateOptions =
     onTerminalTouched,
     loadMoreCommits,
     onRefresh,
-    onSidebarSplitterMouseDown,
     onVSplitterMouseDown,
     onHSplitterMouseDown,
   };

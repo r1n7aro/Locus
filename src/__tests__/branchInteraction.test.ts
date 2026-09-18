@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { resolveBranchDblclickAction, resolveBranchTargetHash } from "../components/collab/branchInteraction";
-import type { GitGraphRef } from "../types";
+import { branchTargetName, resolveBranchDblclickAction, resolveBranchTargetHash, resolveCommitBranchTargets } from "../components/collab/branchInteraction";
+import type { GitCommitInfo, GitGraphRef } from "../types";
 
 const cwd = process.cwd();
 
@@ -35,6 +35,54 @@ function remoteRef(remoteName: string, name: string, targetHash: string): GitGra
 }
 
 describe("branch interaction", () => {
+  const commit: GitCommitInfo = {
+    hash: "abc123456789", shortHash: "abc1234", parents: [], author: "tester",
+    date: 1, message: "branch tip", refs: [], isStash: false,
+  };
+
+  it("offers local and remote branches at the commit, excluding tags and remote HEAD aliases", () => {
+    const refs = [
+      remoteRef("origin", "feature/a", commit.hash),
+      localRef("feature/a", commit.hash),
+      localRef("other-commit", "elsewhere"),
+      remoteRef("origin", "HEAD", commit.hash),
+      { ...localRef("v1", commit.hash), kind: "tag" as const, fullName: "refs/tags/v1" },
+      localRef("feature/a", commit.hash),
+      remoteRef("upstream", "feature/a", commit.hash),
+    ];
+    expect(resolveCommitBranchTargets(commit, refs).map(branchTargetName)).toEqual([
+      "feature/a", "origin/feature/a", "upstream/feature/a",
+    ]);
+    expect(resolveCommitBranchTargets(commit, [])).toEqual([]);
+  });
+
+  it("checks out a remote-only commit as a tracking branch", () => {
+    const [target] = resolveCommitBranchTargets(commit, [remoteRef("origin", "白盒", commit.hash)]);
+    expect(resolveBranchDblclickAction(target!, [])).toEqual({
+      action: "checkoutTracking", branchName: "origin/白盒", targetKind: "remote",
+    });
+  });
+
+  it("preserves the current branch state and does not check it out again", () => {
+    const [target] = resolveCommitBranchTargets(commit, [{ ...localRef("main", commit.hash), isCurrent: true }]);
+    expect(resolveBranchDblclickAction(target!, [])).toBeNull();
+    expect(resolveBranchDblclickAction({
+      kind: "remoteBranch", remoteName: "origin",
+      branch: { name: "main", shortHash: commit.shortHash, message: commit.message },
+    }, [{ name: "main", isCurrent: true, shortHash: commit.shortHash, message: commit.message }])).toBeNull();
+  });
+
+  it("keeps slash-containing remote branch names when optional metadata is absent", () => {
+    const [target] = resolveCommitBranchTargets(commit, [{
+      ...remoteRef("upstream", "feature/nested/name", commit.hash),
+      branchName: null, remoteName: null,
+    }]);
+    expect(branchTargetName(target!)).toBe("upstream/feature/nested/name");
+    expect(resolveBranchDblclickAction(target!, [])).toEqual({
+      action: "checkoutTracking", branchName: "upstream/feature/nested/name", targetKind: "remote",
+    });
+  });
+
   it("switches a local branch on double click when it is not current", () => {
     expect(resolveBranchDblclickAction(
       {

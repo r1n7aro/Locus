@@ -1,3 +1,4 @@
+import { materializationEpochFromParams } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { WorkspaceRef } from "./project";
@@ -30,7 +31,7 @@ export function getCollabSearchWindowWorkspaceRef(
   if (!checkoutId || !generationRaw || !/^\d+$/.test(generationRaw)) return null;
   const expectedGeneration = Number(generationRaw);
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) return null;
-  return { checkoutId, expectedGeneration };
+  return { checkoutId, expectedGeneration , expectedMaterializationEpoch: materializationEpochFromParams(params) };
 }
 
 export function buildCollabSearchWindowQuery(workspaceRef: WorkspaceRef): string {
@@ -39,7 +40,7 @@ export function buildCollabSearchWindowQuery(workspaceRef: WorkspaceRef): string
     [COLLAB_SEARCH_WINDOW_FLAG]: "1",
     checkoutId: workspaceRef.checkoutId,
     workspaceGeneration: String(expectedGeneration),
-  });
+   ...(workspaceRef.expectedMaterializationEpoch != null ? { materializationEpoch: String(workspaceRef.expectedMaterializationEpoch) } : {}) });
   return params.toString();
 }
 

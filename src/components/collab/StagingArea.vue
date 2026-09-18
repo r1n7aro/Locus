@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, watch, onBeforeUnmount } from "vue";
-import { ChevronRight } from "lucide";
+import { ref, computed, watch, nextTick, useId, onBeforeUnmount } from "vue";
+import { ChevronDown, ChevronRight, GitCommitHorizontal, LoaderCircle, Sparkles } from "lucide";
 import type { GitBlockedPath, GitFileChange, ModelOption } from "../../types";
 import { gitCommit, gitGenerateCommitMessage } from "../../services/git";
 import { t } from "../../i18n";
@@ -28,6 +28,7 @@ import {
   type StagingTreeRow,
 } from "./stagingTree";
 import LucideIcon from "../icons/LucideIcon.vue";
+import BaseButton from "../ui/BaseButton.vue";
 import type { WorkspaceRef } from "../../services/project";
 import {
   unityAssetIconClassForPath,
@@ -410,14 +411,23 @@ watch(fileViewMode, (mode) => {
 
 onBeforeUnmount(() => {
   stopSplitDrag();
+  commitRequestGeneration += 1;
 });
 
-const showCommitModal = ref(false);
+const showCommitForm = ref(false);
+const commitFormId = useId();
+const commitContainerRef = ref<HTMLFormElement | null>(null);
+const commitMessageRef = ref<HTMLInputElement | null>(null);
 const commitMessage = ref("");
 const commitDescription = ref("");
 const commitLoading = ref(false);
 const commitError = ref<string | null>(null);
 const aiGenerating = ref(false);
+const commitBusy = computed(() => commitLoading.value || aiGenerating.value);
+const commitUnavailable = computed(() =>
+  commitBusy.value || props.stageOperationBusy || !props.workspaceRef || props.stagedFiles.length === 0,
+);
+const canCommit = computed(() => !commitUnavailable.value && !!commitMessage.value.trim());
 let commitRequestGeneration = 0;
 
 function captureWorkspaceRef(): WorkspaceRef {
@@ -425,16 +435,20 @@ function captureWorkspaceRef(): WorkspaceRef {
   return {
     checkoutId: props.workspaceRef.checkoutId,
     expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+    expectedMaterializationEpoch: props.workspaceRef.expectedMaterializationEpoch ?? undefined,
   };
 }
 
 function isCurrentWorkspaceRef(workspaceRef?: WorkspaceRef) {
   return (workspaceRef?.checkoutId ?? null) === (props.workspaceRef?.checkoutId ?? null)
     && (workspaceRef?.expectedGeneration ?? null)
-      === (props.workspaceRef?.expectedGeneration ?? null);
+      === (props.workspaceRef?.expectedGeneration ?? null)
+    && (workspaceRef?.expectedMaterializationEpoch ?? null)
+      === (props.workspaceRef?.expectedMaterializationEpoch ?? null);
 }
 
 async function aiGenerateCommitMessage() {
+  if (!showCommitForm.value || commitUnavailable.value) return;
   const workspaceRef = captureWorkspaceRef();
   const generation = ++commitRequestGeneration;
   aiGenerating.value = true;
@@ -455,7 +469,7 @@ async function aiGenerateCommitMessage() {
 }
 
 async function doCommit() {
-  if (!commitMessage.value.trim()) return;
+  if (!showCommitForm.value || !canCommit.value) return;
   const workspaceRef = captureWorkspaceRef();
   const generation = ++commitRequestGeneration;
   commitLoading.value = true;
@@ -463,7 +477,7 @@ async function doCommit() {
   try {
     await gitCommit(commitMessage.value, commitDescription.value || null, workspaceRef);
     if (generation !== commitRequestGeneration || !isCurrentWorkspaceRef(workspaceRef)) return;
-    showCommitModal.value = false;
+    showCommitForm.value = false;
     commitMessage.value = "";
     commitDescription.value = "";
     emit("committed");
@@ -477,23 +491,40 @@ async function doCommit() {
   }
 }
 
-function openCommitModal() {
+async function onCommitAction() {
+  if (showCommitForm.value) {
+    await doCommit();
+    return;
+  }
+  if (commitUnavailable.value) return;
   commitError.value = null;
-  showCommitModal.value = true;
+  showCommitForm.value = true;
+  await nextTick();
+  commitMessageRef.value?.focus();
 }
 
-function closeCommitModal() {
-  showCommitModal.value = false;
+function onCommitMessageKeydown(event: KeyboardEvent) {
+  if (!event.isComposing) void doCommit();
+}
+
+async function collapseCommitForm() {
+  if (commitLoading.value) return;
+  commitRequestGeneration += 1;
+  aiGenerating.value = false;
+  showCommitForm.value = false;
+  await nextTick();
+  commitContainerRef.value?.querySelector<HTMLButtonElement>(".commit-btn")?.focus();
 }
 
 watch(
   () => [
     props.workspaceRef?.checkoutId ?? null,
     props.workspaceRef?.expectedGeneration ?? null,
+    props.workspaceRef?.expectedMaterializationEpoch ?? null,
   ] as const,
   () => {
     commitRequestGeneration += 1;
-    showCommitModal.value = false;
+    showCommitForm.value = false;
     commitLoading.value = false;
     aiGenerating.value = false;
     commitError.value = null;
@@ -995,66 +1026,70 @@ function formatBlockedReason(file: GitBlockedPath): string {
       </div>
     </div>
 
-    <div v-if="stagedFiles.length > 0" class="commit-btn-container">
-      <button class="commit-btn" @click="openCommitModal">
-        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-          <path d="M11.75 7.5a3.75 3.75 0 1 0-7.5 0 3.75 3.75 0 0 0 7.5 0zm-2.5 0a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0zM8 12.5a.75.75 0 0 1 .75.75v2a.75.75 0 0 1-1.5 0v-2A.75.75 0 0 1 8 12.5zm0-12a.75.75 0 0 1 .75.75v2a.75.75 0 0 1-1.5 0v-2A.75.75 0 0 1 8 .5z"/>
-        </svg>
-        Commit
-      </button>
-    </div>
-
-    <Teleport to="body">
-      <div v-if="showCommitModal" class="commit-modal-overlay" @click.self="closeCommitModal">
-        <div class="commit-modal">
-          <div class="commit-modal-header">
-            <span class="commit-modal-title">Commit to <strong>{{ currentBranch || 'HEAD' }}</strong></span>
-            <button class="commit-modal-close" @click="closeCommitModal">&times;</button>
-          </div>
-          <div class="commit-modal-body">
-            <div class="commit-input-row">
-              <input
-                v-model="commitMessage"
-                class="commit-input"
-                placeholder="Commit message"
-                @keydown.enter.exact="doCommit"
-                autofocus
-              />
-              <button
-                class="ai-generate-btn"
-                :disabled="aiGenerating"
-                @click="aiGenerateCommitMessage"
-                :title="aiGenerating ? 'Generating...' : 'AI Generate'"
-              >
-                <svg v-if="!aiGenerating" viewBox="0 0 16 16" width="14" height="14" fill="currentColor">
-                  <path d="M8 1a.75.75 0 0 1 .75.75v1.5h1.5a.75.75 0 0 1 0 1.5h-1.5v1.5a.75.75 0 0 1-1.5 0v-1.5h-1.5a.75.75 0 0 1 0-1.5h1.5v-1.5A.75.75 0 0 1 8 1zm4.5 5a.75.75 0 0 1 .75.75v.5h.5a.75.75 0 0 1 0 1.5h-.5v.5a.75.75 0 0 1-1.5 0v-.5h-.5a.75.75 0 0 1 0-1.5h.5v-.5A.75.75 0 0 1 12.5 6zM6 9.5a.75.75 0 0 1 .75.75v1h1a.75.75 0 0 1 0 1.5h-1v1a.75.75 0 0 1-1.5 0v-1h-1a.75.75 0 0 1 0-1.5h1v-1A.75.75 0 0 1 6 9.5z"/>
-                </svg>
-                <span v-else class="ai-spinner"></span>
-              </button>
-            </div>
-            <textarea
-              v-model="commitDescription"
-              class="commit-textarea"
-              placeholder="Description (optional)"
-              rows="4"
-            ></textarea>
-            <div v-if="commitError" class="commit-error">{{ commitError }}</div>
-          </div>
-          <div class="commit-modal-footer">
-            <span class="commit-staged-count">{{ t("collab.stagedCount", stagedFiles.length) }}</span>
-            <div class="commit-modal-actions">
-              <button class="commit-cancel-btn" @click="closeCommitModal">Cancel</button>
-              <button
-                class="commit-confirm-btn"
-                :disabled="!commitMessage.trim() || commitLoading"
-                @click="doCommit"
-              >
-                {{ commitLoading ? 'Committing...' : 'Commit' }}
-              </button>
-            </div>
-          </div>
+    <form
+      v-if="stagedFiles.length > 0 || showCommitForm"
+      ref="commitContainerRef"
+      class="commit-btn-container"
+      :aria-label="t('collab.commit')"
+      :aria-busy="commitBusy"
+      @submit.prevent="onCommitAction"
+      @keydown.esc.stop.prevent="collapseCommitForm"
+    >
+      <div v-if="showCommitForm" :id="commitFormId" class="staging-commit-fields">
+        <div class="staging-commit-input-row">
+          <input
+            ref="commitMessageRef"
+            v-model="commitMessage"
+            class="staging-commit-input"
+            :placeholder="t('collab.commitMessage')"
+            :aria-label="t('collab.commitMessage')"
+            :disabled="commitBusy"
+            @keydown.enter.exact.prevent="onCommitMessageKeydown"
+          />
+          <BaseButton
+            class="staging-commit-icon-btn"
+            :disabled="commitUnavailable"
+            :title="aiGenerating ? t('collab.generating') : t('collab.aiGenerate')"
+            :aria-label="aiGenerating ? t('collab.generating') : t('collab.aiGenerate')"
+            @click="aiGenerateCommitMessage"
+          >
+            <LucideIcon :icon="aiGenerating ? LoaderCircle : Sparkles" :class="{ 'staging-commit-spinner': aiGenerating }" />
+          </BaseButton>
+          <BaseButton
+            class="staging-commit-icon-btn"
+            :disabled="commitLoading"
+            :title="t('collab.collapse')"
+            :aria-label="t('collab.collapse')"
+            :aria-controls="commitFormId"
+            aria-expanded="true"
+            @click="collapseCommitForm"
+          >
+            <LucideIcon :icon="ChevronDown" />
+          </BaseButton>
         </div>
+        <textarea
+          v-model="commitDescription"
+          class="staging-commit-description"
+          :placeholder="t('collab.commitDescription')"
+          :aria-label="t('collab.commitDescription')"
+          :disabled="commitBusy"
+          rows="3"
+        ></textarea>
+        <div v-if="commitError" class="staging-commit-error" role="alert">{{ commitError }}</div>
       </div>
-    </Teleport>
+      <BaseButton
+        class="commit-btn"
+        variant="primary"
+        block
+        type="submit"
+        :disabled="showCommitForm ? !canCommit : commitUnavailable"
+        :title="`${t('collab.commitTo')} ${currentBranch || 'HEAD'}`"
+        :aria-expanded="showCommitForm ? undefined : false"
+        :aria-controls="showCommitForm ? undefined : commitFormId"
+      >
+        <LucideIcon :icon="commitLoading ? LoaderCircle : GitCommitHorizontal" :class="{ 'staging-commit-spinner': commitLoading }" />
+        {{ commitLoading ? t('collab.committing') : showCommitForm ? t('collab.confirmCommit') : t('collab.commit') }}
+      </BaseButton>
+    </form>
   </div>
 </template>

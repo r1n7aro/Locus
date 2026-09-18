@@ -1,10 +1,6 @@
 import { ipcInvoke } from "./ipc";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import {
-  WORKSPACE_EVENT_NAME,
-  type RoutedWorkspaceEvent,
-  type WorkspaceRef,
-} from "./project";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import type { RoutedWorkspaceEvent, WorkspaceRef } from "./project";
 import type {
   MergeSessionRequest,
   MergeSessionPayload,
@@ -12,6 +8,7 @@ import type {
   MergeTargetRequest,
   MergeApplyRequest,
 } from "../types";
+import { listenWorkspaceEvent } from "./workspaceEventHub";
 
 // ── Merge progress events ──
 
@@ -28,6 +25,7 @@ function cloneWorkspaceRef(workspaceRef: WorkspaceRef): WorkspaceRef {
   return {
     checkoutId: workspaceRef.checkoutId,
     expectedGeneration: workspaceRef.expectedGeneration ?? undefined,
+    expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch ?? undefined,
   };
 }
 
@@ -36,8 +34,8 @@ export async function listenMergeProgress(
   workspaceRef: WorkspaceRef,
 ): Promise<UnlistenFn> {
   const scopedRef = cloneWorkspaceRef(workspaceRef);
-  return listen<RoutedWorkspaceEvent<MergeProgressEvent>>(
-    WORKSPACE_EVENT_NAME,
+  return listenWorkspaceEvent<RoutedWorkspaceEvent<MergeProgressEvent>>(
+    "merge.listenMergeProgress",
     ({ payload }) => {
       if (payload.eventName !== "merge-progress") return;
       if (payload.checkoutId !== scopedRef.checkoutId) return;

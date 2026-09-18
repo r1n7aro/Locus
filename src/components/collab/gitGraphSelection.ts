@@ -14,6 +14,7 @@ export interface GitGraphScrollOptions {
 }
 
 export interface GitGraphPublicApi {
+  /** Known off-page refs/stashes remain selectable; returns false if they cannot be revealed. */
   selectHistory(target: GitGraphSelectionTarget, options?: GitGraphSelectOptions): Promise<boolean>;
   scrollToHistory(target: GitGraphSelectionTarget, options?: GitGraphScrollOptions): Promise<boolean>;
 }

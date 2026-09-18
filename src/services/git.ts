@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import { beginWorkspaceGitHeadObservation, rememberWorkspaceGitHead } from "./workspaceGitHead";
 import type { WorkspaceRef } from "./project";
 import type {
   GitActionResult,
@@ -31,8 +32,11 @@ export function gitLog(skip: number, limit: number, workspaceRef: WorkspaceRef):
   return ipcInvoke<GitLogResult>("git_log", { skip, limit, workspaceRef });
 }
 
-export function gitHistorySnapshot(skip: number, limit: number, workspaceRef: WorkspaceRef): Promise<GitHistorySnapshot> {
-  return ipcInvoke<GitHistorySnapshot>("git_history_snapshot", { skip, limit, workspaceRef });
+export async function gitHistorySnapshot(skip: number, limit: number, workspaceRef: WorkspaceRef): Promise<GitHistorySnapshot> {
+  const observation = beginWorkspaceGitHeadObservation();
+  const snapshot = await ipcInvoke<GitHistorySnapshot>("git_history_snapshot", { skip, limit, workspaceRef });
+  rememberWorkspaceGitHead(workspaceRef, snapshot.head, observation);
+  return snapshot;
 }
 
 export function gitHistorySearch(request: GitHistorySearchRequest, workspaceRef: WorkspaceRef): Promise<GitHistorySearchResponse> {
@@ -224,14 +228,16 @@ export function gitBranchAction(
   action: string,
   newName: string | undefined,
   workspaceRef: WorkspaceRef,
+  remoteName?: string,
 ): Promise<GitActionResult> {
-  return ipcInvoke<GitActionResult>("git_branch_action", { target, targetKind, action, newName, workspaceRef });
+  return ipcInvoke<GitActionResult>("git_branch_action", { target, targetKind, action, newName, workspaceRef, remoteName });
 }
 
 export function gitStashAction(
     refName: string,
     action: string,
     workspaceRef: WorkspaceRef,
+    options?: { branchName?: string; expectedHash?: string },
 ): Promise<GitActionResult> {
-  return ipcInvoke<GitActionResult>("git_stash_action", { refName, action, workspaceRef });
+  return ipcInvoke<GitActionResult>("git_stash_action", { refName, action, workspaceRef, ...options });
 }

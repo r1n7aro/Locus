@@ -27,7 +27,7 @@ describe("git graph selection API", () => {
 
     expect(collabView).toContain('ref="gitGraphRef"');
     expect(collabView).toContain('@select-tag="onSelectTag"');
-    expect(collabView).toContain('selectHistoryInGraph({ kind: "commit", hash: tag.targetHash })');
+    expect(collabView).toContain('revealSidebarHistory({ kind: "commit", hash: tag.targetHash })');
     expect(gitSidebar).toContain('(e: "selectTag", tag: GitGraphRef): void');
     expect(gitSidebar).toContain("@click=\"emit('selectTag', tag)\"");
   });

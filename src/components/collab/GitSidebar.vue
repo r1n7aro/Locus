@@ -9,8 +9,6 @@ import {
   FolderGit2,
   GitBranch,
   Globe,
-  PanelLeftClose,
-  PanelLeftOpen,
   Search,
   Settings,
   Tag,
@@ -19,6 +17,7 @@ import {
 import type { GitBranchInfo, GitBranchTarget, GitGraphRef, GitHistoryTarget, GitRemoteBranch, GitStashEntry, GitSubmoduleInfo } from "../../types";
 import { t } from "../../i18n";
 import LucideIcon from "../icons/LucideIcon.vue";
+import BaseButton from "../ui/BaseButton.vue";
 
 const props = defineProps<{
   localBranches: GitBranchInfo[];
@@ -28,7 +27,7 @@ const props = defineProps<{
   tags: GitGraphRef[];
   submodules: GitSubmoduleInfo[];
   selectedHistoryHash: string | null;
-  sidebarCollapsed: boolean;
+  toolbarTarget?: HTMLElement | null;
   expandLocal: boolean;
   expandRemotes: boolean;
   expandedRemoteNames: Set<string>;
@@ -38,7 +37,6 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (e: "toggleSidebar"): void;
   (e: "toggleLocal"): void;
   (e: "toggleRemotes"): void;
   (e: "toggleRemoteName", name: string): void;
@@ -173,79 +171,71 @@ watch(
 </script>
 
 <template>
-  <!-- Expanded sidebar -->
-  <div v-if="!props.sidebarCollapsed" class="git-sidebar">
-    <div class="sidebar-header">
-      <span class="sidebar-title">Git</span>
-      <div class="sidebar-header-actions">
-        <button class="sidebar-collapse-btn" type="button" @click="emit('toggleSidebar')" :title="t('collab.collapse')">
-          <LucideIcon :icon="PanelLeftClose" :size="14" />
-        </button>
-        <button
-          class="sidebar-search-btn"
-          type="button"
-          :title="t('collab.search.open')"
-          :aria-label="t('collab.search.open')"
-          @click="emit('openSearch', $event)"
-        >
-          <LucideIcon :icon="Search" :size="14" />
-        </button>
-      </div>
-    </div>
+  <div class="git-sidebar">
+    <Teleport v-if="props.toolbarTarget" :to="props.toolbarTarget">
+      <BaseButton class="sidebar-toolbar-button" :title="t('collab.search.open')" :aria-label="t('collab.search.open')" @click="emit('openSearch', $event)">
+        <LucideIcon :icon="Search" :size="14" />
+      </BaseButton>
+      <BaseButton class="sidebar-toolbar-button" :title="t('git.config.open')" :aria-label="t('git.config.open')" @click="emit('openGitConfig', $event)">
+        <LucideIcon :icon="Settings" :size="14" />
+      </BaseButton>
+    </Teleport>
     <div class="sidebar-scroll">
 
       <!-- LOCAL -->
       <div class="sidebar-section">
-        <div class="sidebar-section-header" @click="emit('toggleLocal')">
+        <button type="button" class="sidebar-section-header" :aria-expanded="props.expandLocal" @click="emit('toggleLocal')">
           <LucideIcon class="chevron" :class="{ expanded: props.expandLocal }" :icon="ChevronRight" :size="11" />
           <LucideIcon class="section-icon" :icon="GitBranch" :size="14" />
-          <span class="section-label">LOCAL</span>
+          <span class="section-label">{{ t("collab.sidebar.localBranches") }}</span>
           <span class="section-count">{{ props.localBranches.length }}</span>
-        </div>
+        </button>
         <div v-if="props.expandLocal" class="sidebar-section-body">
-          <div
+          <button type="button"
             v-for="b in props.localBranches" :key="b.name"
-            class="sidebar-item branch-item" :class="{ active: b.isCurrent || isSelectedBranch(b) }"
-            :title="b.shortHash + ' ' + b.message"
+            class="sidebar-item branch-item" :class="{ active: isSelectedBranch(b) || (!props.selectedHistoryHash && b.isCurrent) }"
+            :title="b.name + '\n' + b.shortHash + ' ' + b.message"
             @click="emit('selectBranch', { kind: 'localBranch', branch: b })"
             @dblclick="emit('branchDblclick', { kind: 'localBranch', branch: b })"
+            @keydown.enter.prevent="emit('branchDblclick', { kind: 'localBranch', branch: b })"
             @contextmenu.prevent="emit('branchContextmenu', $event, { kind: 'localBranch', branch: b })"
           >
             <LucideIcon class="item-icon branch-icon" :icon="GitBranch" :size="12" />
             <span class="item-label">{{ b.name }}</span>
             <span v-if="b.isCurrent" class="current-badge">HEAD</span>
-          </div>
+          </button>
           <div v-if="props.localBranches.length === 0" class="sidebar-empty">{{ t("collab.noLocalBranch") }}</div>
         </div>
       </div>
 
       <!-- REMOTE -->
       <div class="sidebar-section">
-        <div class="sidebar-section-header" @click="emit('toggleRemotes')">
+        <button type="button" class="sidebar-section-header" :aria-expanded="props.expandRemotes" @click="emit('toggleRemotes')">
           <LucideIcon class="chevron" :class="{ expanded: props.expandRemotes }" :icon="ChevronRight" :size="11" />
           <LucideIcon class="section-icon" :icon="Globe" :size="14" />
-          <span class="section-label">REMOTE</span>
-        </div>
+          <span class="section-label">{{ t("collab.sidebar.remoteBranches") }}</span>
+        </button>
         <div v-if="props.expandRemotes" class="sidebar-section-body">
           <template v-for="[remoteName, branches] in props.remoteBranches" :key="remoteName">
-            <div class="sidebar-item remote-group" @click="emit('toggleRemoteName', remoteName)">
+            <button type="button" class="sidebar-item remote-group" :aria-expanded="props.expandedRemoteNames.has(remoteName)" @click="emit('toggleRemoteName', remoteName)">
               <LucideIcon class="chevron small" :class="{ expanded: props.expandedRemoteNames.has(remoteName) }" :icon="ChevronRight" :size="10" />
               <LucideIcon class="item-icon" :icon="Globe" :size="12" />
               <span class="item-label">{{ remoteName }}</span>
-            </div>
+            </button>
             <template v-if="props.expandedRemoteNames.has(remoteName)">
-              <div
+              <button type="button"
                 v-for="rb in branches" :key="remoteName + '/' + rb.name"
                 class="sidebar-item nested branch-item"
                 :class="{ active: isSelectedBranch(rb) }"
-                :title="rb.shortHash + ' ' + rb.message"
+                :title="remoteName + '/' + rb.name + '\n' + rb.shortHash + ' ' + rb.message"
                 @click="emit('selectBranch', { kind: 'remoteBranch', remoteName, branch: rb })"
                 @dblclick="emit('branchDblclick', { kind: 'remoteBranch', remoteName, branch: rb })"
+                @keydown.enter.prevent="emit('branchDblclick', { kind: 'remoteBranch', remoteName, branch: rb })"
                 @contextmenu.prevent="emit('branchContextmenu', $event, { kind: 'remoteBranch', remoteName, branch: rb })"
               >
                 <LucideIcon class="item-icon branch-icon" :icon="GitBranch" :size="12" />
                 <span class="item-label">{{ rb.name }}</span>
-              </div>
+              </button>
             </template>
           </template>
           <div v-if="props.remoteBranches.length === 0" class="sidebar-empty">{{ t("collab.noRemoteBranch") }}</div>
@@ -254,14 +244,14 @@ watch(
 
       <!-- STASHES -->
       <div class="sidebar-section">
-        <div class="sidebar-section-header" @click="emit('toggleStashes')">
+        <button type="button" class="sidebar-section-header" :aria-expanded="props.expandStashes" @click="emit('toggleStashes')">
           <LucideIcon class="chevron" :class="{ expanded: props.expandStashes }" :icon="ChevronRight" :size="11" />
           <LucideIcon class="section-icon" :icon="Archive" :size="14" />
-          <span class="section-label">STASHES</span>
+          <span class="section-label">{{ t("collab.sidebar.stashes") }}</span>
           <span v-if="props.stashes.length > 0" class="section-count">{{ props.stashes.length }}</span>
-        </div>
+        </button>
         <div v-if="props.expandStashes" class="sidebar-section-body">
-          <div
+          <button type="button"
             v-for="s in props.stashes" :key="s.hash"
             class="sidebar-item ui-select-none"
             :class="{ active: props.selectedHistoryHash === s.hash || selectedStashHashes.has(s.hash), 'stash-item': true }"
@@ -276,21 +266,21 @@ watch(
               class="stash-state-tag"
               :title="unanchoredStashTitle()"
             >{{ t("collab.stash.unanchored") }}</span>
-          </div>
+          </button>
           <div v-if="props.stashes.length === 0" class="sidebar-empty">{{ t("collab.noStash") }}</div>
         </div>
       </div>
 
       <!-- TAGS -->
       <div v-if="props.tags.length > 0" class="sidebar-section">
-        <div class="sidebar-section-header" @click="emit('toggleTags')">
+        <button type="button" class="sidebar-section-header" :aria-expanded="props.expandTags" @click="emit('toggleTags')">
           <LucideIcon class="chevron" :class="{ expanded: props.expandTags }" :icon="ChevronRight" :size="11" />
           <LucideIcon class="section-icon" :icon="Tags" :size="14" />
-          <span class="section-label">TAGS</span>
+          <span class="section-label">{{ t("collab.sidebar.tags") }}</span>
           <span class="section-count">{{ props.tags.length }}</span>
-        </div>
+        </button>
         <div v-if="props.expandTags" class="sidebar-section-body">
-          <div
+          <button type="button"
             v-for="tag in props.tags" :key="tag.fullName"
             class="sidebar-item tag-item"
             :class="{ active: props.selectedHistoryHash === tag.targetHash }"
@@ -299,18 +289,18 @@ watch(
           >
             <LucideIcon class="item-icon tag-icon" :icon="Tag" :size="12" />
             <span class="item-label">{{ tag.shortName }}</span>
-          </div>
+          </button>
         </div>
       </div>
 
       <!-- SUBMODULES -->
       <div v-if="props.submodules.length > 0" class="sidebar-section">
-        <div class="sidebar-section-header" @click="emit('toggleSubmodules')">
+        <button type="button" class="sidebar-section-header" :aria-expanded="props.expandSubmodules" @click="emit('toggleSubmodules')">
           <LucideIcon class="chevron" :class="{ expanded: props.expandSubmodules }" :icon="ChevronRight" :size="11" />
           <LucideIcon class="section-icon" :icon="FolderGit2" :size="14" />
-          <span class="section-label">SUBMODULES</span>
+          <span class="section-label">{{ t("collab.sidebar.submodules") }}</span>
           <span v-if="props.submodules.length > 0" class="section-count">{{ props.submodules.length }}</span>
-        </div>
+        </button>
         <div v-if="props.expandSubmodules" class="sidebar-section-body">
           <div
             v-for="m in props.submodules" :key="m.path"
@@ -329,21 +319,126 @@ watch(
       </div>
 
     </div>
-    <div class="sidebar-footer">
-      <button
-        type="button"
-        class="sidebar-config-btn"
-        :title="t('git.config.open')"
-        @click="emit('openGitConfig', $event)"
-      >
-        <LucideIcon class="sidebar-config-icon" :icon="Settings" :size="13" />
-        <span>{{ t("git.config.open") }}</span>
-      </button>
-    </div>
-  </div>
-
-  <!-- Collapsed sidebar -->
-  <div v-else class="sidebar-collapsed" @click="emit('toggleSidebar')" :title="t('collab.expand')">
-    <LucideIcon :icon="PanelLeftOpen" :size="14" />
   </div>
 </template>
+
+<style scoped>
+.git-sidebar {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--sidebar-bg);
+}
+.sidebar-toolbar-button {
+  width: 26px;
+  min-width: 26px;
+  height: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-color: transparent;
+}
+.sidebar-scroll {
+  flex: 1;
+  min-height: 0;
+  padding: 4px 0;
+  overflow: auto;
+}
+.sidebar-section + .sidebar-section {
+  margin-top: 6px;
+}
+.sidebar-section-header,
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  min-width: 0;
+  min-height: 30px;
+  padding: 2px 10px;
+  border: none;
+  background: transparent;
+  color: color-mix(in srgb, var(--text-color) 78%, var(--text-secondary) 22%);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  transition: background 0.1s ease;
+}
+.sidebar-section-header {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.sidebar-item {
+  padding-left: 28px;
+}
+.sidebar-item.nested {
+  padding-left: 46px;
+}
+.sidebar-section-header:hover,
+.sidebar-item:hover {
+  background: var(--hover-bg);
+}
+.sidebar-item.active {
+  background: var(--active-bg);
+}
+.sidebar-section-header:focus-visible,
+.sidebar-item:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: -2px;
+}
+.chevron,
+.section-icon,
+.item-icon,
+.submodule-status {
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+.chevron {
+  width: 12px;
+  transition: transform 0.15s ease;
+}
+.chevron.expanded {
+  transform: rotate(90deg);
+}
+.section-label,
+.item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.section-count {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+.current-badge,
+.stash-state-tag {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--text-secondary);
+}
+.submodule-status {
+  display: flex;
+  align-items: center;
+}
+.sub-ok {
+  color: var(--status-good-fg);
+}
+.sub-modified {
+  color: var(--status-warn-fg);
+}
+.sidebar-empty {
+  padding: 6px 28px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+</style>

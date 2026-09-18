@@ -17,6 +17,9 @@ import {
   type WorkspaceRef,
 } from "../services/project";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "../services/locusRuntime";
+import { useWorkspaceEventScope } from "../composables/useWorkspaceEventScope";
+
+const workspaceEventSignal = useWorkspaceEventScope();
 
 const props = defineProps<{
   workingDir: string;
@@ -32,6 +35,7 @@ function captureWorkspaceRef(): WorkspaceRef {
   return {
     checkoutId: props.workspaceRef.checkoutId,
     expectedGeneration: props.workspaceRef.expectedGeneration ?? undefined,
+    expectedMaterializationEpoch: props.workspaceRef.expectedMaterializationEpoch ?? undefined,
   };
 }
 
@@ -825,6 +829,7 @@ onMounted(async () => {
       ) return;
       handleStreamEvent(event.payload);
     },
+    { owner: "GitTerminal.stream", signal: workspaceEventSignal },
   );
   if (destroyed) {
     fn();

@@ -1158,35 +1158,111 @@
 
 .commit-btn-container {
   flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  max-height: 65%;
   padding: 10px 14px;
   border-top: 1px solid var(--border-color);
   background: var(--bg-color);
 }
 
-.commit-btn {
+.staging-commit-fields {
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.staging-commit-input-row {
+  display: flex;
+  align-items: stretch;
   gap: 6px;
+}
+
+.staging-commit-input,
+.staging-commit-description {
   width: 100%;
-  padding: 7px 16px;
-  border: none;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
   border-radius: 6px;
-  background: var(--accent-color);
-  color: var(--bg-color);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s;
+  background: var(--input-bg);
+  color: var(--text-color);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  line-height: 1.5;
+  outline: none;
+  box-sizing: border-box;
 }
 
-.commit-btn:hover {
-  filter: brightness(1.15);
+.staging-commit-input:focus,
+.staging-commit-description:focus {
+  border-color: var(--accent-color);
 }
 
-.commit-btn:active {
-  filter: brightness(0.9);
-  transform: scale(0.99);
+.staging-commit-input::placeholder,
+.staging-commit-description::placeholder {
+  color: var(--text-tertiary);
+}
+
+.staging-commit-input:disabled,
+.staging-commit-description:disabled {
+  opacity: 0.6;
+}
+
+.staging-commit-description {
+  flex-shrink: 0;
+  min-height: 68px;
+  max-height: 160px;
+  resize: vertical;
+}
+
+.base-button.staging-commit-icon-btn {
+  flex-shrink: 0;
+  width: 28px;
+  padding: 0;
+  border-color: transparent;
+}
+
+.base-button.staging-commit-icon-btn:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -2px;
+  border-color: var(--border-strong);
+  background: var(--hover-bg);
+}
+
+.base-button.commit-btn:focus-visible {
+  outline: 1px solid var(--text-color);
+  outline-offset: 2px;
+}
+
+.base-button.commit-btn {
+  flex-shrink: 0;
+}
+
+.staging-commit-error {
+  flex-shrink: 0;
+  color: var(--status-danger-fg);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.staging-commit-spinner {
+  animation: staging-commit-spin 0.8s linear infinite;
+}
+
+@keyframes staging-commit-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .staging-commit-spinner {
+    animation: none;
+  }
 }
 
 .merge-badge {

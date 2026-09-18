@@ -1,3 +1,4 @@
+import { resetWorkspaceEventHubForTests } from "../services/workspaceEventHub";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceRef } from "../services/project";
 
@@ -77,6 +78,7 @@ const applyRequest = {
 
 describe("merge service workspace scope", () => {
   beforeEach(() => {
+    resetWorkspaceEventHubForTests();
     eventMocks.handlers.clear();
     eventMocks.listen.mockClear();
     mockedInvoke.mockReset();
