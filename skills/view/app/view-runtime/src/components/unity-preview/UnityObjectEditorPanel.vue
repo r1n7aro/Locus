@@ -70,6 +70,7 @@ const collapsedProperties = ref<Set<string>>(new Set());
 function targetIdForProperty(property: InspectorPropertySnapshot): string {
   const target = property.bindingTarget ?? property.target;
   if (!target) return propertyTreeBinding.value.targetId;
+  if (target.globalObjectId) return `identity|${target.globalObjectId}`;
   return [
     target.kind,
     target.path ?? "",
@@ -198,6 +199,7 @@ function sourceForProperty(property: InspectorPropertySnapshot): InspectorProper
     readonly: binding.readonly,
     editable: binding.editable,
     commit: binding.commit,
+    loadChildren: binding.loadChildren,
   };
 }
 

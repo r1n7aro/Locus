@@ -14,6 +14,7 @@ import type {
 import { normalizeAppError } from "./errors";
 import { ipcInvoke } from "./ipc";
 import type { WorkspaceRef } from "./project";
+import { materializationEpochFromParams, workspaceMaterializationMatches } from "./project";
 import { checkUnityConnectionStatus } from "./unity";
 
 export interface ViewScriptManifest {
@@ -36,20 +37,15 @@ export interface ViewManifest {
   id: string;
   name: string;
   version: string;
-  template: string;
+  /** Historical package metadata; new Views do not use templates. */
+  template?: string;
   displayPath?: string | null;
   icon?: string | null;
   entry: string;
-  style: string;
+  style?: string;
   scripts: ViewScriptManifest[];
   capabilities: ViewCapabilities;
   requirements: ViewRequirements;
-}
-
-export interface ViewTemplateSummary {
-  id: string;
-  name: string;
-  description: string;
 }
 
 export interface ViewPackageSummary {
@@ -57,7 +53,7 @@ export interface ViewPackageSummary {
   name: string;
   apiVersion: string;
   version: string;
-  template: string;
+  template?: string;
   icon?: string | null;
   displayPath: string;
   packageRelPath?: string;
@@ -100,10 +96,17 @@ export interface ViewPackageDetail {
 }
 
 export interface ViewCreateRequest {
-  id: string;
+  /** Defaults to fileName without .vue for single-component Views. */
+  id?: string;
+  fileName?: string | null;
   packageName?: string | null;
   name?: string | null;
-  template?: string | null;
+  /** Complete Vue SFC source; omit to initialize an empty component. */
+  component?: string | null;
+  /** Optional directories inside packageRoot, such as src/components or unity. */
+  directories?: string[];
+  /** Require a connected Unity editor; stored in the optional <view> block. */
+  unity?: boolean | null;
   icon?: string | null;
   displayPath?: string | null;
   temporary?: boolean;
@@ -163,16 +166,6 @@ export interface ViewDetachTabRequest {
   sourceHostLabel?: string | null;
   x?: number | null;
   y?: number | null;
-}
-
-export interface ViewContentMountRequest {
-  viewId: string;
-  hostLabel: string;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  visible?: boolean;
 }
 
 export const VIEW_UNITY_CONNECTION_REQUIRED_ERROR_CODE = "view.unity_connection_required";
@@ -316,6 +309,17 @@ export interface ViewAutomationRequest {
   viewId: string;
   kind: string;
   payload: Record<string, unknown>;
+  workspaceRef?: WorkspaceRef;
+}
+
+export function viewWatch(workspaceRef: WorkspaceRef, viewId: string, token: string, hostLabel: string): Promise<void> {
+  return ipcInvoke("view_watch", { workspaceRef, viewId, token, hostLabel });
+}
+export function viewUnwatch(workspaceRef: WorkspaceRef, viewId: string, token: string, hostLabel: string): Promise<void> {
+  return ipcInvoke("view_unwatch", { workspaceRef, viewId, token, hostLabel });
+}
+export function viewAppendFrontendLogs(workspaceRef: WorkspaceRef, requests: ViewFrontendLogRequest[]): Promise<void> {
+  return ipcInvoke("view_append_frontend_logs", { workspaceRef, requests });
 }
 
 export interface ViewRuntimeSelectionSnapshot {
@@ -448,13 +452,7 @@ export interface ViewLlmCallResult {
 }
 
 export const VIEW_HOST_PATH = "/view-host";
-export const VIEW_CONTENT_PATH = "/view-content";
 export type ViewWorkspaceRef = WorkspaceRef & { expectedGeneration: number };
-
-export function isViewContentWindowLocation(): boolean {
-  return window.location.pathname === VIEW_CONTENT_PATH
-    || new URLSearchParams(window.location.search).get("viewContent") === "1";
-}
 
 export function viewHostIdFromLocation(): string {
   return new URLSearchParams(window.location.search).get("id") || "";
@@ -469,7 +467,7 @@ export function viewWorkspaceRefFromLocation(
   if (checkoutId && /^\d+$/.test(generationText)) {
     const expectedGeneration = Number(generationText);
     if (Number.isSafeInteger(expectedGeneration) && expectedGeneration >= 0) {
-      return { checkoutId, expectedGeneration };
+      return { checkoutId, expectedGeneration, expectedMaterializationEpoch: materializationEpochFromParams(params) };
     }
   }
   return null;
@@ -477,19 +475,16 @@ export function viewWorkspaceRefFromLocation(
 
 export function isExactViewWorkspaceBinding(
   expected: ViewWorkspaceRef,
-  actual: { checkoutId: string; workspaceGeneration: number } | null | undefined,
+  actual: { checkoutId: string; workspaceGeneration: number; materializationEpoch?: number | null } | null | undefined,
 ): boolean {
   return actual?.checkoutId === expected.checkoutId
-    && actual.workspaceGeneration === expected.expectedGeneration;
+    && actual.workspaceGeneration === expected.expectedGeneration
+    && workspaceMaterializationMatches(expected.expectedMaterializationEpoch,actual.materializationEpoch);
 }
 
 export function isViewHostPoolWindowLocation(): boolean {
   const params = new URLSearchParams(window.location.search);
   return params.get("viewHost") === "1" && params.get("pool") === "1";
-}
-
-export function viewTemplates(): Promise<ViewTemplateSummary[]> {
-  return ipcInvoke<ViewTemplateSummary[]>("view_templates");
 }
 
 export function viewList(workspaceRef: WorkspaceRef): Promise<ViewPackageSummary[]> {
@@ -539,8 +534,8 @@ export function viewReload(workspaceRef: WorkspaceRef, viewId: string): Promise<
   return ipcInvoke<ViewPackageSummary>("view_reload", { workspaceRef, viewId });
 }
 
-export function viewRun(workspaceRef: WorkspaceRef, viewId: string): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_run", { workspaceRef, viewId });
+export function viewRun(workspaceRef: WorkspaceRef, viewId: string, windowLabel?: string): Promise<ViewRunResult> {
+  return ipcInvoke<ViewRunResult>("view_run", { workspaceRef, viewId, windowLabel });
 }
 
 export function viewRunInUnity(workspaceRef: WorkspaceRef, viewId: string): Promise<ViewRunResult> {
@@ -551,33 +546,12 @@ export function viewSetTabHost(workspaceRef: WorkspaceRef, request: ViewSetTabHo
   return ipcInvoke<void>("view_set_tab_host", { workspaceRef, request });
 }
 
-export function viewDetachTab(workspaceRef: WorkspaceRef, request: ViewDetachTabRequest): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_detach_tab", { workspaceRef, request });
-}
 
-export function viewHostPoolPrepare(workspaceRef: WorkspaceRef): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_host_pool_prepare", { workspaceRef });
-}
 
-export function viewHostPoolReady(workspaceRef: WorkspaceRef, hostLabel: string): Promise<void> {
-  return ipcInvoke<void>("view_host_pool_ready", { workspaceRef, hostLabel });
-}
 
-export function viewHostRevealed(workspaceRef: WorkspaceRef, hostLabel: string): Promise<void> {
-  return ipcInvoke<void>("view_host_revealed", { workspaceRef, hostLabel });
-}
 
-export function viewContentMount(workspaceRef: WorkspaceRef, request: ViewContentMountRequest): Promise<ViewRunResult> {
-  return ipcInvoke<ViewRunResult>("view_content_mount", { workspaceRef, request });
-}
 
-export function viewContentHide(workspaceRef: WorkspaceRef, viewId: string): Promise<void> {
-  return ipcInvoke<void>("view_content_hide", { workspaceRef, viewId });
-}
 
-export function viewContentDestroy(workspaceRef: WorkspaceRef, viewId: string): Promise<void> {
-  return ipcInvoke<void>("view_content_destroy", { workspaceRef, viewId });
-}
 
 export function viewRequiresUnityConnection(
   view: { requirements?: ViewRequirements | null; capabilities?: ViewCapabilities | null },
@@ -732,8 +706,8 @@ export function viewAutomationRespond(
   ok: boolean,
   result?: unknown,
   error?: string | null,
-): Promise<void> {
-  return ipcInvoke<void>("view_automation_respond", {
+): Promise<boolean> {
+  return ipcInvoke<boolean>("view_automation_respond", {
     workspaceRef,
     requestId,
     ok,

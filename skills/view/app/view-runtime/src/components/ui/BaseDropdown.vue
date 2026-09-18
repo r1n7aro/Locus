@@ -21,6 +21,8 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   ariaLabel?: string;
   disabled?: boolean;
+  /** Keep the menu open while editing controls in the companion panel. */
+  closeOnSelect?: boolean;
   /** Render the menu on <body> with fixed positioning so it escapes
    *  overflow-clipping ancestors (scroll containers, embedded panels). */
   teleport?: boolean;
@@ -31,6 +33,7 @@ const props = withDefaults(defineProps<{
   placeholder: "",
   ariaLabel: "",
   disabled: false,
+  closeOnSelect: true,
   teleport: false,
 });
 
@@ -77,13 +80,14 @@ function close() {
 }
 
 function select(value: string, disabled?: boolean) {
-  if (disabled || value === props.modelValue) {
+  if (disabled) return;
+  if (value !== props.modelValue) emit("update:modelValue", value);
+  if (props.closeOnSelect) {
     close();
-    return;
+    triggerRef.value?.focus();
+  } else {
+    nextTick(repositionMenu);
   }
-  emit("update:modelValue", value);
-  close();
-  triggerRef.value?.focus();
 }
 
 function onDocumentClick(event: MouseEvent) {
@@ -207,6 +211,9 @@ function scrollActiveIntoView() {
 
 function onKeydown(event: KeyboardEvent) {
   if (props.disabled) return;
+  // The companion panel owns its checkbox and button keyboard interactions.
+  const inAside = (event.target as HTMLElement)?.closest(".base-dropdown-aside");
+  if (inAside && event.key !== "Escape") return;
   if (!open.value && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter" || event.key === " ")) {
     event.preventDefault();
     openMenu();
@@ -264,11 +271,24 @@ watch(open, (isOpen) => {
   }
 });
 
+let menuResizeObserver: ResizeObserver | null = null;
+watch(listboxRef, (menu) => {
+  menuResizeObserver?.disconnect();
+  if (!menu || !props.teleport || typeof ResizeObserver === "undefined") return;
+  menuResizeObserver = new ResizeObserver(repositionMenu);
+  menuResizeObserver.observe(menu);
+});
+
+watch(() => props.disabled, (disabled) => {
+  if (disabled) close();
+});
+
 onMounted(() => {
   document.addEventListener("click", onDocumentClick, true);
 });
 
 onUnmounted(() => {
+  menuResizeObserver?.disconnect();
   document.removeEventListener("click", onDocumentClick, true);
   window.removeEventListener("scroll", onWindowScroll, true);
   window.removeEventListener("resize", onWindowResize);
@@ -298,32 +318,35 @@ onUnmounted(() => {
       <Transition name="dropdown">
         <div
           v-if="open"
-          :id="listboxId"
           ref="listboxRef"
           class="base-dropdown-menu"
-          :class="[`align-${menuAlign}`, `size-${size}`, { teleported: teleport }]"
+          :class="[`align-${menuAlign}`, `size-${size}`, { teleported: teleport, 'with-aside': !!$slots.aside }]"
           :style="teleport ? menuFixedStyle : undefined"
-          role="listbox"
-          tabindex="-1"
+          @keydown.capture="teleport && onKeydown($event)"
         >
-          <template v-for="(option, index) in options" :key="option.value">
-            <div v-if="isGroupStart(index)" class="base-dropdown-group-label">{{ option.group }}</div>
-            <button
-              :id="`${listboxId}-option-${option.value}`"
-              type="button"
-              class="base-dropdown-item"
-              :class="{ active: modelValue === option.value, focused: activeIndex === index }"
-              role="option"
-              :aria-selected="modelValue === option.value"
-              :disabled="option.disabled"
-              @click="select(option.value, option.disabled)"
-              @focus="focusOptionAt(index)"
-              @mousemove="focusOptionAt(index)"
-            >
-              <span class="base-dropdown-item-label" :style="option.labelStyle">{{ option.label }}</span>
-              <span v-if="option.hint" class="base-dropdown-item-hint">{{ option.hint }}</span>
-            </button>
-          </template>
+          <div :id="listboxId" class="base-dropdown-options" role="listbox" tabindex="-1" :aria-label="ariaLabel || undefined">
+            <template v-for="(option, index) in options" :key="option.value">
+              <div v-if="isGroupStart(index)" class="base-dropdown-group-label">{{ option.group }}</div>
+              <button
+                :id="`${listboxId}-option-${option.value}`"
+                type="button"
+                class="base-dropdown-item"
+                :class="{ active: modelValue === option.value, focused: activeIndex === index }"
+                role="option"
+                :aria-selected="modelValue === option.value"
+                :disabled="option.disabled"
+                @click="select(option.value, option.disabled)"
+                @focus="focusOptionAt(index)"
+                @mousemove="focusOptionAt(index)"
+              >
+                <span class="base-dropdown-item-label" :style="option.labelStyle">{{ option.label }}</span>
+                <span v-if="option.hint" class="base-dropdown-item-hint">{{ option.hint }}</span>
+              </button>
+            </template>
+          </div>
+          <div v-if="$slots.aside" class="base-dropdown-aside">
+            <slot name="aside" />
+          </div>
         </div>
       </Transition>
     </Teleport>
@@ -405,6 +428,30 @@ onUnmounted(() => {
 
 .base-dropdown-menu.align-start {
   left: 0;
+}
+
+.base-dropdown-menu.with-aside {
+  display: flex;
+  align-items: stretch;
+  overflow: hidden;
+}
+
+.base-dropdown-options {
+  min-width: 0;
+}
+
+.with-aside .base-dropdown-options {
+  flex: 1 1 380px;
+  overflow-y: auto;
+}
+
+.base-dropdown-aside {
+  flex: 0 1 190px;
+  min-width: 120px;
+  overflow-y: auto;
+  border-left: 1px solid var(--border-color);
+  margin-left: 4px;
+  padding: 4px 8px;
 }
 
 .base-dropdown-menu.align-end {

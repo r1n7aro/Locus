@@ -14,8 +14,12 @@ import {
   type UnitySerializedPropertyTargetSnapshot,
 } from "./unitySerializedValue";
 import { useProjectStore } from "../../stores/project";
+import { useUnityPropertyEditingContext, useUnityPropertyWorkspace, propertyEditingMatchesWorkspace } from "./unityPropertyEditingContext";
 
 const projectStore = useProjectStore();
+const propertyWorkspace = useUnityPropertyWorkspace();
+const propertyEditing = useUnityPropertyEditingContext();
+const requireWorkspace = () => propertyWorkspace?.() ?? projectStore.requireWorkspaceRef();
 
 const props = withDefaults(defineProps<{
   modelValue: unknown;
@@ -38,6 +42,7 @@ const props = withDefaults(defineProps<{
 // before the hosting surface re-reads the property.
 const localOverride = ref<unknown>(null);
 let unlistenCommitted: (() => void) | null = null;
+let disposed = false;
 
 watch(
   () => props.modelValue,
@@ -93,7 +98,8 @@ function openEditor() {
   if (!canOpenEditor.value || !target) return;
   void openUnityValueEditorWindow({
     kind: "gradient",
-    workspaceRef: projectStore.requireWorkspaceRef(),
+    workspaceRef: requireWorkspace(),
+    historyOwner: propertyEditingMatchesWorkspace(propertyEditing, requireWorkspace()) ? propertyEditing!.historyOwner : undefined,
     target: target as UnitySerializedPropertyTarget,
     label: props.label || undefined,
   }).catch((error) => {
@@ -110,20 +116,22 @@ function handleFieldKeydown(event: KeyboardEvent) {
 onMounted(() => {
   void listenUnityValueEditorCommitted((event) => {
     if (event.kind !== "gradient" || !props.bindingTarget) return;
-    const workspaceRef = projectStore.requireWorkspaceRef();
+    const workspaceRef = requireWorkspace();
     if (
       event.workspaceRef.checkoutId !== workspaceRef.checkoutId
       || event.workspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
+      || event.workspaceRef.expectedMaterializationEpoch !== workspaceRef.expectedMaterializationEpoch
     ) return;
     const ownKey = unityPropertyTargetKey(props.bindingTarget as UnitySerializedPropertyTarget);
     if (unityPropertyTargetKey(event.target) !== ownKey) return;
     localOverride.value = event.value;
   }).then((dispose) => {
-    unlistenCommitted = dispose;
+    if (disposed) dispose(); else unlistenCommitted = dispose;
   });
 });
 
 onBeforeUnmount(() => {
+  disposed = true;
   unlistenCommitted?.();
   unlistenCommitted = null;
 });

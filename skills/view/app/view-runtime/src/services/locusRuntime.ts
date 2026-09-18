@@ -2,6 +2,12 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
+import {
+  listenWorkspaceEvent,
+  WORKSPACE_EVENT_NAME,
+  type WorkspaceEventSubscriptionOptions,
+} from "./workspaceEventHub";
+import type { RoutedWorkspaceEvent } from "./project";
 
 export type LocusRuntimeKind = "tauri" | "browser";
 export type RuntimeUnsubscribe = () => void;
@@ -20,7 +26,11 @@ export type LocusRuntimeInvokeActivityListener = (
 export interface LocusRuntime {
   kind: LocusRuntimeKind;
   invoke<T>(command: string, args?: Record<string, unknown>): Promise<T>;
-  subscribe<T>(eventName: string, handler: (payload: T) => void): Promise<RuntimeUnsubscribe>;
+  subscribe<T>(
+    eventName: string,
+    handler: (payload: T) => unknown,
+    options?: WorkspaceEventSubscriptionOptions,
+  ): Promise<RuntimeUnsubscribe>;
 }
 
 const invokeActivityListeners = new Set<LocusRuntimeInvokeActivityListener>();
@@ -124,8 +134,19 @@ export function getLocusRuntime(): LocusRuntime {
     invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
       return invokeRuntime<T>(kind, command, args);
     },
-    subscribe<T>(eventName: string, handler: (payload: T) => void): Promise<RuntimeUnsubscribe> {
+    subscribe<T>(
+      eventName: string,
+      handler: (payload: T) => unknown,
+      options?: WorkspaceEventSubscriptionOptions,
+    ): Promise<RuntimeUnsubscribe> {
       if (kind === "tauri") {
+        if (eventName === WORKSPACE_EVENT_NAME) {
+          return listenWorkspaceEvent<RoutedWorkspaceEvent>(
+            options?.owner ?? "LocusRuntime.workspace",
+            (event) => handler(event.payload as T),
+            options,
+          );
+        }
         return tauriListen<T>(eventName, (event) => handler(event.payload))
           .then((release: UnlistenFn) => release);
       }

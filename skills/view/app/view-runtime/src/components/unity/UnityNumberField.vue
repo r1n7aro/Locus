@@ -120,6 +120,11 @@ function updateFromRange(event: Event) {
 
 function commitFromInput() {
   if (props.disabled || props.readonly) return;
+  if (props.propertyType === "Long" || props.propertyType === "UnsignedLong") {
+    const exact = tryParseUnitySerializedEditValue(props.propertyType, text.value);
+    if (exact.ok) { text.value = String(exact.value); emit("update:modelValue", exact.value); emit("commit", exact.value); }
+    return;
+  }
   const parsed = parsedNumber(text.value);
   if (parsed == null) return;
   text.value = formatNumber(parsed);

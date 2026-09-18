@@ -240,14 +240,16 @@ export function unityPropertyTargetKey(
 ): string {
   if (!input) return "";
   const target = resolveUnityPropertyTarget(input);
+  if (target.globalObjectId) return JSON.stringify({ globalObjectId: target.globalObjectId, propertyPath: target.propertyPath ?? "" });
   return JSON.stringify({
+    globalObjectId: target.globalObjectId ?? "",
     kind: target.kind,
     path: target.path ?? "",
     scenePath: target.scenePath ?? "",
     guid: target.guid ?? "",
     objectPath: target.objectPath ?? "",
-    objectFileId: target.objectFileId ?? 0,
-    targetFileId: target.targetFileId ?? 0,
+    objectFileId: String(target.objectFileId ?? 0),
+    targetFileId: String(target.targetFileId ?? 0),
     componentType: target.componentType ?? "",
     componentIndex: target.componentIndex ?? 0,
     propertyPath: target.propertyPath ?? "",

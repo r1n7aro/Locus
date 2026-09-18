@@ -18,6 +18,7 @@ import LucideIcon from "../icons/LucideIcon.vue";
 import { unityAssetIconClassForPath, unityAssetIconNodeForPath } from "../icons/unityAssetIcons";
 import { t } from "../../i18n";
 import { unitySerializedValueToEditText } from "./unitySerializedValue";
+import { useOptionalViewContext } from "../view/viewExecutionScope";
 import { useWorkspaceContextStore } from "../../stores/workspaceContext";
 
 let objectReferenceFieldUid = 0;
@@ -53,6 +54,7 @@ const emit = defineEmits<{
   commit: [value: string];
 }>();
 const workspaceContextStore = useWorkspaceContextStore();
+const viewContext = useOptionalViewContext();
 
 const fieldUid = `unity-object-reference-${++objectReferenceFieldUid}`;
 const listboxId = `${fieldUid}-listbox`;
@@ -93,7 +95,7 @@ const thumbnailPath = computed(() => {
 function loadReferenceThumbnail(path: string): Promise<string> {
   const cached = thumbnailCache.get(path);
   if (cached) return cached;
-  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+  const workspaceRef = (viewContext?.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
   if (!workspaceRef) return Promise.resolve("");
   const request = previewWorkspaceAssetThumbnail(path, workspaceRef)
     .then((thumbnail) => thumbnail.url || "")
@@ -358,7 +360,7 @@ async function runSearch() {
   searching.value = true;
   searchError.value = "";
   try {
-    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    const workspaceRef = (viewContext?.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
     if (!workspaceRef) return;
     const rawResults = await searchWorkspaceAssets(
       query,
