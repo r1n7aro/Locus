@@ -326,8 +326,9 @@ describe("BaseMarkdownEditor runtime", () => {
     expect(root.querySelector("[data-reference-kind='knowledge']")).not.toBeNull();
 
     knowledge.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-    expect(root.querySelector("[data-reference-kind='knowledge']")).toBeNull();
-    expect(root.textContent).toContain("design/editor.md");
+    expect(root.querySelector("[data-reference-kind='knowledge']")).not.toBeNull();
+    await nextTick();
+    expect(document.querySelector<HTMLInputElement>('.md-edit-properties input')?.value).toBe("design/editor.md");
   });
 
   it("restores document-local selection and undo history across content keys", async () => {

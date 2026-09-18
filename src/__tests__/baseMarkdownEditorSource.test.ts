@@ -21,7 +21,7 @@ describe("BaseMarkdownEditor CodeMirror source", () => {
     expect(source).not.toContain(["Vdi", "tor"].join(""));
     expect(source).not.toMatch(/MarkdownRenderer|SemanticCodeRenderer/);
     expect(source).not.toMatch(/<textarea|base-markdown-editor-textarea/);
-    expect(source).not.toContain("v-if=");
+    expect(source).toContain('<div ref="mountRef" class="base-markdown-editor-host"');
   });
 
   it("reconfigures mode, language, read-only, and placeholder through compartments", () => {

@@ -1,7 +1,12 @@
 <script setup lang="ts">
 import { Compartment, EditorState, StateEffect, Transaction, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import MarkdownEditorControls from "./markdown-editor/MarkdownEditorControls.vue";
+import MarkdownEditorContextMenu from "./markdown-editor/MarkdownEditorContextMenu.vue";
+import type { MarkdownEditorSelection } from "./markdown-editor/markdownEditorSelection";
+import { useNotificationStore } from "../../stores/notification";
+import { t } from "../../i18n";
 import {
   markdownEditorBaseExtensions,
   markdownEditorLanguageExtension,
@@ -45,6 +50,7 @@ const props = withDefaults(defineProps<{
   active?: boolean;
   autoGrow?: boolean;
   minHeight?: number;
+  canQuoteSelection?: boolean;
   /**
    * Emits immutable CodeMirror Text/ChangeSet payloads for local edits. This
    * avoids allocating the whole document string on every transaction. The
@@ -63,10 +69,12 @@ const props = withDefaults(defineProps<{
   active: true,
   autoGrow: false,
   minHeight: 80,
+  canQuoteSelection: false,
   transactionModel: false,
 });
 
 const emit = defineEmits<{
+  (e: "quoteSelection", selection: MarkdownEditorSelection): void;
   (e: "update:modelValue", value: string): void;
   (e: "documentChange", value: MarkdownEditorDocumentChange): void;
   (e: "shortcutSave"): void;
@@ -79,6 +87,9 @@ const emit = defineEmits<{
 }>();
 
 const mountRef = ref<HTMLDivElement | null>(null);
+const controlsRef = ref<InstanceType<typeof MarkdownEditorControls> | null>(null);
+const contextMenuRef = ref<InstanceType<typeof MarkdownEditorContextMenu> | null>(null);
+const controlsView = shallowRef<EditorView | null>(null);
 const languageCompartment = new Compartment();
 const modeCompartment = new Compartment();
 const readOnlyCompartment = new Compartment();
@@ -133,6 +144,7 @@ function handleReferencePointerDown(
 function currentLivePreviewOptions(): MarkdownLivePreviewOptions {
   const workspaceRef = props.workspaceRef;
   const options: MarkdownLivePreviewOptions = {
+    onEditTarget: (target) => controlsRef.value?.open(target),
     onReferenceOpen: handleReferenceOpen,
     onReferencePointerDown: handleReferencePointerDown,
   };
@@ -146,6 +158,7 @@ function currentLivePreviewOptions(): MarkdownLivePreviewOptions {
       workspaceRef: {
         checkoutId: workspaceRef.checkoutId,
         expectedGeneration: workspaceRef.expectedGeneration,
+        expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch,
       },
     },
   };
@@ -208,6 +221,8 @@ function editorExtensions(): Extension[] {
       compositionend: handleCompositionEnd,
     }),
     EditorView.updateListener.of((update) => {
+      if (update.docChanged || update.selectionSet) contextMenuRef.value?.close(false);
+      controlsRef.value?.update(update);
       if (!update.docChanged || applyingExternalModel) return;
       if (props.transactionModel) {
         emit("documentChange", {
@@ -361,6 +376,7 @@ function stateWithSessionModel(
 }
 
 function restoreSession(contentKey: string, nextModelValue: string, previousModelValue: string): void {
+  contextMenuRef.value?.close(false);
   const view = editorView;
   if (!view) {
     activeSessionKey = normalizeSessionKey(contentKey);
@@ -412,6 +428,7 @@ function mountEditor(): void {
     state = stateWithFreshConfiguration(state);
   }
   editorView = new EditorView({ state, parent });
+  controlsView.value = editorView;
   startScrollTracking(editorView);
 
   const scrollTop = cached?.scrollTop ?? 0;
@@ -435,9 +452,11 @@ function suspendEditor(): void {
   removeScrollTracking?.();
   editorView.destroy();
   editorView = null;
+  controlsView.value = null;
 }
 
 function reconfigureEditor(): void {
+  contextMenuRef.value?.close(false);
   const view = editorView;
   if (!view) return;
   applyingExternalModel = true;
@@ -454,6 +473,10 @@ function reconfigureEditor(): void {
 
 function handleEditorWheel(event: WheelEvent): void {
   handleTextViewerZoomWheel(event);
+}
+
+function handleContextMenuError(error: unknown): void {
+  useNotificationStore().addNotice("error", `${t("editor.actionFailed")}: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 onMounted(() => {
@@ -563,7 +586,9 @@ defineExpose({
     }"
     @wheel="handleEditorWheel"
   >
-    <div ref="mountRef" class="base-markdown-editor-host" />
+    <div ref="mountRef" class="base-markdown-editor-host" @contextmenu="contextMenuRef?.open($event)" @keydown="contextMenuRef?.onKeydown($event)" />
+    <MarkdownEditorContextMenu v-if="controlsView" ref="contextMenuRef" :view="controlsView" :can-quote="canQuoteSelection" @quote-selection="emit('quoteSelection', $event)" @action-error="handleContextMenuError" />
+    <MarkdownEditorControls v-if="controlsView && viewMode === 'rendered' && currentLanguage() === 'markdown' && !disabled" :key="contentKey" ref="controlsRef" :view="controlsView" :workspace-ref="workspaceRef" />
   </div>
 </template>
 
@@ -622,6 +647,10 @@ defineExpose({
 .base-markdown-editor :deep(.cm-line) {
   /* CodeMirror derives full-line selection bounds from .cm-line padding. */
   padding: 0 var(--markdown-document-padding-right) 0 var(--markdown-document-padding-left);
+}
+
+.base-markdown-editor :deep(.cm-line.cm-live-table-line) {
+  padding: 0;
 }
 
 .base-markdown-editor.disabled,

@@ -48,7 +48,7 @@ function mountComplexEditor(
 }
 
 describe("Markdown complex Live Preview widgets", () => {
-  it("renders table rows and maps a widget click back to the source table", () => {
+  it("keeps table cells editable in place when the editor is focused", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const editor = mountComplexEditor([
       "intro",
@@ -64,10 +64,14 @@ describe("Markdown complex Live Preview widgets", () => {
     expect(rows[1]?.querySelector("[data-align='right']")?.textContent).toBe("42");
     expect(editor.dom.querySelector(".cm-live-collapsed-line")).not.toBeNull();
 
-    rows[1]?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    expect(editor.state.selection.main.head).toBe(editor.state.doc.line(5).from);
-    expect(editor.dom.querySelector(".cm-live-table-row")).toBeNull();
-    expect(editor.contentDOM.textContent).toContain("| Hero | 42 |");
+    editor.focus();
+    const anchor = editor.state.doc.toString().indexOf("Hero") + 2;
+    editor.dispatch({ selection: { anchor } });
+    editor.dispatch({ changes: { from: anchor, insert: "你好" } });
+    expect(editor.dom.querySelectorAll(".cm-live-table-row")).toHaveLength(2);
+    expect(editor.dom.querySelectorAll(".cm-live-table-cell")[2]?.textContent).toBe("He你好ro");
+    expect(editor.state.doc.toString()).toContain("| He你好ro | 42 |");
+    expect(editor.contentDOM.textContent).not.toContain("| He你好ro | 42 |");
     expect(consoleError).not.toHaveBeenCalled();
   });
 
@@ -137,6 +141,7 @@ describe("Markdown complex Live Preview widgets", () => {
   it("renders Locus and Unity references while invalid mixed fences stay source", () => {
     const tick = "`";
     const onReferenceOpen = vi.fn();
+    const onEditTarget = vi.fn();
     const editor = mountComplexEditor([
       "intro",
       "",
@@ -157,7 +162,7 @@ describe("Markdown complex Live Preview widgets", () => {
       "Assets/Prefabs/Hero.prefab",
       "invalid line",
       tick.repeat(3),
-    ].join("\n"), { onReferenceOpen });
+    ].join("\n"), { onReferenceOpen, onEditTarget });
 
     expect(editor.dom.querySelector("[data-reference-kind='knowledge']")?.textContent).toContain("editor.md");
     expect(editor.dom.querySelector("[data-reference-kind='workspace']")?.textContent).toContain("main.ts");
@@ -176,8 +181,8 @@ describe("Markdown complex Live Preview widgets", () => {
 
     editor.dom.querySelector("[data-reference-kind='unity-asset']")
       ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    expect(editor.dom.querySelector("[data-reference-kind='unity-scene-object']")).toBeNull();
-    expect(editor.contentDOM.textContent).toContain("Assets/Scenes/Main.unity/Root/Camera");
+    expect(editor.dom.querySelector("[data-reference-kind='unity-scene-object']")).not.toBeNull();
+    expect(onEditTarget).toHaveBeenCalledWith(expect.objectContaining({ kind: "reference", url: "Assets/Prefabs/Hero.prefab", source: "Assets/Prefabs/Hero.prefab" }));
 
     const knowledge = editor.dom.querySelector("[data-reference-kind='knowledge']");
     expect((knowledge as HTMLElement | null)?.draggable).toBe(true);
@@ -189,24 +194,25 @@ describe("Markdown complex Live Preview widgets", () => {
     }));
     expect(editor.dom.querySelector("[data-reference-kind='knowledge']")).not.toBeNull();
     knowledge?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    expect(editor.dom.querySelector("[data-reference-kind='knowledge']")).toBeNull();
-    expect(editor.contentDOM.textContent).toContain("`design/editor.md`");
+    expect(editor.dom.querySelector("[data-reference-kind='knowledge']")).not.toBeNull();
+    expect(onEditTarget).toHaveBeenCalledWith(expect.objectContaining({ kind: "reference", url: "design/editor.md" }));
   });
 
-  it("falls back to source for unsafe images and expands image widgets on click", () => {
+  it("keeps images rendered and opens their properties on click", () => {
+    const onEditTarget = vi.fn();
     const editor = mountComplexEditor([
       "intro",
       "",
       "![unsafe](javascript:alert(1))",
       "",
       "![safe](https://example.com/image.webp)",
-    ].join("\n"));
+    ].join("\n"), { onEditTarget });
 
     expect(editor.dom.querySelectorAll(".cm-live-image-frame")).toHaveLength(1);
     expect(editor.contentDOM.textContent).toContain("![unsafe](javascript:alert(1))");
     editor.dom.querySelector(".cm-live-image-frame")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    expect(editor.dom.querySelector(".cm-live-image-frame")).toBeNull();
-    expect(editor.contentDOM.textContent).toContain("![safe](https://example.com/image.webp)");
+    expect(editor.dom.querySelector(".cm-live-image-frame")).not.toBeNull();
+    expect(onEditTarget).toHaveBeenCalledWith(expect.objectContaining({ kind: "image", label: "safe", url: "https://example.com/image.webp" }));
   });
 
   it("keeps oversized tables and fences as bounded editable source", () => {

@@ -8,8 +8,9 @@ import {
 } from "../../../composables/markdownImages";
 import type {
   MarkdownReferenceToken,
-  MarkdownTableAlignment,
 } from "./markdownComplexTokens";
+import type { MarkdownEditTarget } from "./markdownEditTarget";
+import { markdownNodeAt } from "./markdownVisualCommands";
 
 export interface MarkdownImageResolution {
   url: string;
@@ -31,6 +32,7 @@ export type MarkdownImageResolver = (
 ) => MarkdownImageResolution | string | null | Promise<MarkdownImageResolution | string | null>;
 
 export interface MarkdownLivePreviewOptions {
+  onEditTarget?: (target: MarkdownEditTarget) => void;
   imageResolver?: MarkdownImageResolver;
   imageContext?: MarkdownImageResolverContext;
   onReferenceOpen?: (reference: MarkdownReferenceToken) => void | Promise<void>;
@@ -69,54 +71,6 @@ function installSourceActivation(
     event.stopPropagation();
     activateSourceRange(view, from, to, anchor);
   });
-}
-
-export class MarkdownTableRowWidget extends WidgetType {
-  constructor(
-    private readonly cells: readonly string[],
-    private readonly alignments: readonly MarkdownTableAlignment[],
-    private readonly header: boolean,
-    private readonly rowIndex: number,
-    private readonly rowCount: number,
-    private readonly sourceFrom: number,
-    private readonly sourceTo: number,
-    private readonly tableFrom: number,
-    private readonly tableTo: number,
-  ) {
-    super();
-  }
-
-  eq(other: MarkdownTableRowWidget): boolean {
-    return other.header === this.header
-      && other.rowIndex === this.rowIndex
-      && other.rowCount === this.rowCount
-      && other.sourceFrom === this.sourceFrom
-      && other.sourceTo === this.sourceTo
-      && other.cells.join("\u0000") === this.cells.join("\u0000")
-      && other.alignments.join("\u0000") === this.alignments.join("\u0000");
-  }
-
-  toDOM(view: EditorView): HTMLElement {
-    const row = document.createElement("span");
-    row.className = [
-      "cm-live-table-row",
-      this.header ? "cm-live-table-header" : "",
-      this.rowIndex === this.rowCount - 1 ? "cm-live-table-last-row" : "",
-    ].filter(Boolean).join(" ");
-    row.style.gridTemplateColumns = `repeat(${Math.max(1, this.cells.length)}, minmax(120px, 1fr))`;
-    row.setAttribute("aria-label", this.header ? "Markdown 表头" : "Markdown 表格行");
-
-    for (let index = 0; index < this.cells.length; index += 1) {
-      const cell = document.createElement("span");
-      cell.className = "cm-live-table-cell";
-      cell.textContent = this.cells[index] ?? "";
-      const alignment = this.alignments[index];
-      if (alignment) cell.dataset.align = alignment;
-      row.appendChild(cell);
-    }
-    installSourceActivation(row, view, this.tableFrom, this.tableTo, this.sourceFrom);
-    return row;
-  }
 }
 
 export class CollapsedSourceWidget extends WidgetType {
@@ -219,7 +173,9 @@ export class MarkdownImageWidget extends WidgetType {
     const image = document.createElement("img");
     image.className = "cm-live-image";
     image.alt = this.alt;
-    image.loading = "lazy";
+    // CodeMirror already limits widgets to the viewport. A lazy image hidden
+    // until its load event would never start loading in Chromium.
+    image.loading = "eager";
     image.decoding = "async";
     image.draggable = false;
 
@@ -228,7 +184,23 @@ export class MarkdownImageWidget extends WidgetType {
     const sourceSegments = this.source.split(/[\\/]/);
     fallback.textContent = this.alt.trim() || sourceSegments[sourceSegments.length - 1] || "Image";
     frame.append(image, fallback);
-    installSourceActivation(frame, view, this.sourceFrom, this.sourceTo, this.sourceFrom + 2);
+    frame.tabIndex = view.state.readOnly ? -1 : 0;
+    frame.setAttribute("role", "button");
+    frame.setAttribute("aria-label", this.alt || "编辑图片");
+    const editImage = () => {
+      if (view.state.readOnly) return;
+      const title = markdownNodeAt(view.state, this.sourceFrom, ["Image"])?.getChild("LinkTitle");
+      this.options.onEditTarget?.({
+        kind: "image", from: this.sourceFrom, to: this.sourceTo,
+        source: view.state.sliceDoc(this.sourceFrom, this.sourceTo),
+        label: this.alt, url: this.source,
+        title: title ? view.state.sliceDoc(title.from + 1, title.to - 1) : "",
+      });
+    };
+    frame.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); editImage(); });
+    frame.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); editImage(); }
+    });
 
     const applyReady = (resolved: MarkdownImageResolution) => {
       if (frame.dataset.disposed === "true") return;
@@ -440,7 +412,7 @@ export class MarkdownReferenceWidget extends WidgetType {
     label.textContent = `${this.reference.label}${this.reference.line ? `:${this.reference.line}` : ""}`;
     ref.append(kind, label);
 
-    ref.tabIndex = -1;
+    ref.tabIndex = view.state.readOnly ? -1 : 0;
     ref.setAttribute("role", "button");
     ref.addEventListener("pointerdown", (event) => {
       this.options.onReferencePointerDown?.(this.reference, event, ref);
@@ -448,11 +420,21 @@ export class MarkdownReferenceWidget extends WidgetType {
     ref.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if ((event.ctrlKey || event.metaKey) && this.options.onReferenceOpen) {
+      if ((event.ctrlKey || event.metaKey || view.state.readOnly) && this.options.onReferenceOpen) {
         void Promise.resolve(this.options.onReferenceOpen(this.reference)).catch(() => undefined);
         return;
       }
-      activateSourceRange(view, this.sourceFrom, this.sourceTo, this.sourceFrom);
+      if (!view.state.readOnly) this.options.onEditTarget?.({
+        kind: "reference", from: this.reference.from, to: this.reference.to,
+        source: view.state.sliceDoc(this.reference.from, this.reference.to),
+        label: this.reference.label, url: this.reference.path, reference: this.reference,
+      });
+    });
+    ref.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        ref.click();
+      }
     });
     return ref;
   }

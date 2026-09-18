@@ -20,7 +20,9 @@ interface FileChangeRevalidationOptions {
   onError?: (error: unknown) => void;
   workspaceRef?: () => WorkspaceRef | null | undefined;
   workspacePath?: () => string | null | undefined;
+  workspacePaths?: () => readonly string[];
   debounceMs?: number;
+  maxWaitMs?: number;
   probeOnMount?: boolean;
 }
 
@@ -74,13 +76,21 @@ export function workspaceFileChangeMatches(
 export function useFileChangeRevalidation(options: FileChangeRevalidationOptions) {
   const checking = ref(false);
   const debounceMs = Math.max(40, options.debounceMs ?? 120);
+  const maxWaitMs = Math.max(debounceMs, options.maxWaitMs ?? 400);
   let destroyed = false;
   let releaseWorkspaceEvents: (() => void) | null = null;
   let scheduledTimer: ReturnType<typeof setTimeout> | null = null;
   let scheduledReason: FileChangeProbeReason | null = null;
+  let scheduledAt: number | null = null;
   let activeRequest: Promise<void> | null = null;
   let queuedAfterRequest = false;
   let pendingWhileInactive = false;
+
+  function identity(): string {
+    const scope = options.workspaceRef?.();
+    return JSON.stringify([scope?.checkoutId, scope?.expectedGeneration, scope?.expectedMaterializationEpoch,
+      options.workspacePath?.(), options.workspacePaths?.()]);
+  }
 
   async function runProbe(reason: FileChangeProbeReason): Promise<void> {
     if (destroyed) return;
@@ -93,11 +103,16 @@ export function useFileChangeRevalidation(options: FileChangeRevalidationOptions
       return activeRequest;
     }
 
+    if (scheduledTimer) clearTimeout(scheduledTimer);
+    scheduledTimer = null; scheduledAt = null; scheduledReason = null;
+    const requestIdentity = identity();
+
     checking.value = true;
     const request = (async () => {
       try {
         const revision = await options.probe();
-        if (destroyed) return;
+        if (destroyed || requestIdentity !== identity()) return;
+        if (!options.active() && reason !== "manual") { pendingWhileInactive = true; return; }
         const current = options.currentRevision();
         if (!current) {
           await options.onBaseline?.(revision);
@@ -131,13 +146,15 @@ export function useFileChangeRevalidation(options: FileChangeRevalidationOptions
       return;
     }
     scheduledReason = reason;
+    scheduledAt ??= Date.now();
     if (scheduledTimer) clearTimeout(scheduledTimer);
     scheduledTimer = setTimeout(() => {
       scheduledTimer = null;
+      scheduledAt = null;
       const nextReason = scheduledReason ?? reason;
       scheduledReason = null;
       void runProbe(nextReason);
-    }, reason === "manual" ? 0 : debounceMs);
+    }, reason === "manual" ? 0 : Math.min(debounceMs, Math.max(0, maxWaitMs - (Date.now() - scheduledAt))));
   }
 
   const handleForegroundProbe: ForegroundProbeListener = (reason) => scheduleProbe(reason);
@@ -146,16 +163,16 @@ export function useFileChangeRevalidation(options: FileChangeRevalidationOptions
     ensureForegroundProbeEvents();
     if (options.active()) activeForegroundProbeListeners.add(handleForegroundProbe);
     void subscribeWorkspaceFileChanges((event) => {
-      if (!workspaceFileChangeMatches(
+      if (!(options.workspacePaths?.() ?? [options.workspacePath?.()]).some((path) => workspaceFileChangeMatches(
         event,
         options.workspaceRef?.(),
-        options.workspacePath?.(),
-      )) return;
+        path,
+      ))) return;
       scheduleProbe("event");
     }).then((release) => {
       if (destroyed) release();
       else releaseWorkspaceEvents = release;
-    });
+    }).catch((error) => options.onError?.(error));
     if (options.probeOnMount) scheduleProbe("activate");
   });
 

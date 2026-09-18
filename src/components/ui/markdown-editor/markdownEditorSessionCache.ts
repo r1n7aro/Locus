@@ -1,4 +1,5 @@
 import type { EditorState } from "@codemirror/state";
+import { DocumentSessionCache } from "../../../document/documentSessionCache";
 
 export const DEFAULT_MARKDOWN_EDITOR_SESSION_LIMIT = 12;
 
@@ -24,35 +25,30 @@ export interface MarkdownEditorSessionStore {
  * history; scroll lives on EditorView and is stored alongside it.
  */
 export class MarkdownEditorSessionCache implements MarkdownEditorSessionStore {
-  private readonly entries = new Map<string, MarkdownEditorSessionSnapshot>();
+  private readonly entries: DocumentSessionCache<MarkdownEditorSessionSnapshot>;
 
   constructor(
-    private readonly limit = DEFAULT_MARKDOWN_EDITOR_SESSION_LIMIT,
-  ) {}
+    limit = DEFAULT_MARKDOWN_EDITOR_SESSION_LIMIT,
+  ) {
+    this.entries = new DocumentSessionCache({ capacity: limit, canEvict: (entry) => !entry.pinned });
+  }
 
   get size(): number {
     return this.entries.size;
   }
 
   get(key: string): MarkdownEditorSessionSnapshot | null {
-    const entry = this.entries.get(key);
-    if (!entry) return null;
-    this.entries.delete(key);
-    this.entries.set(key, entry);
-    return entry;
+    return this.entries.get(key) ?? null;
   }
 
   set(key: string, snapshot: MarkdownEditorSessionSnapshot): void {
-    this.entries.delete(key);
     this.entries.set(key, snapshot);
-    this.evictToLimit();
   }
 
   setPinned(key: string, pinned: boolean): void {
-    const entry = this.entries.get(key);
+    const entry = this.entries.peek(key);
     if (!entry || !!entry.pinned === pinned) return;
-    this.entries.set(key, { ...entry, pinned });
-    this.evictToLimit();
+    this.entries.replace(key, { ...entry, pinned });
   }
 
   has(key: string): boolean {
@@ -68,23 +64,6 @@ export class MarkdownEditorSessionCache implements MarkdownEditorSessionStore {
   }
 
   keys(): string[] {
-    return [...this.entries.keys()];
-  }
-
-  private evictToLimit(): void {
-    const limit = Math.max(1, this.limit);
-    while (this.entries.size > limit) {
-      let evictableKey: string | undefined;
-      for (const [key, entry] of this.entries) {
-        if (!entry.pinned) {
-          evictableKey = key;
-          break;
-        }
-      }
-      // The capacity is a soft bound. Preserving undo for every dirty or
-      // conflicted document takes precedence until one becomes clean.
-      if (evictableKey === undefined) break;
-      this.entries.delete(evictableKey);
-    }
+    return this.entries.keys();
   }
 }

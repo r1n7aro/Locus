@@ -19,7 +19,6 @@ import {
   isUnityPropertyFenceLanguage,
   isUnityReferenceFenceLanguage,
   parseInlineMarkdownReference,
-  parseMarkdownTable,
   type MarkdownReferenceToken,
 } from "./markdownComplexTokens";
 import {
@@ -27,9 +26,14 @@ import {
   MarkdownImageWidget,
   MarkdownMathWidget,
   MarkdownReferenceWidget,
-  MarkdownTableRowWidget,
   type MarkdownLivePreviewOptions,
 } from "./markdownComplexWidgets";
+import { markdownTableEditing, markdownTableLayout } from "./markdownTableEditing";
+import { markdownVisualCommands } from "./markdownVisualCommands";
+import { markdownRichPaste } from "./markdownRichPaste";
+import { decodeMarkdownDestination, markdownLinkTarget } from "./markdownEditTarget";
+import { Prec } from "@codemirror/state";
+import { keymap } from "@codemirror/view";
 
 function selectionTouches(view: EditorView, from: number, to: number): boolean {
   if (!view.hasFocus || view.state.readOnly) return false;
@@ -161,6 +165,7 @@ function syntaxTokenActivationRange(
 }
 
 function syntaxTokenIsActive(view: EditorView, node: MarkdownSyntaxNode): boolean {
+  if (!["CodeMark", "CodeInfo"].includes(node.name) || closestSyntaxNode(node, "InlineCode")) return false;
   const range = syntaxTokenActivationRange(view, node);
   return selectionTouches(view, range.from, range.to);
 }
@@ -229,9 +234,6 @@ class HorizontalRuleWidget extends WidgetType {
   }
 }
 
-const MAX_TABLE_SOURCE_CHARS = 100_000;
-const MAX_TABLE_ROWS = 200;
-const MAX_TABLE_COLUMNS = 40;
 const MAX_FENCE_SOURCE_CHARS = 100_000;
 const MAX_FENCE_LINES = 240;
 const MAX_MATH_BLOCK_LINES = 80;
@@ -287,7 +289,7 @@ function parseImageSyntax(
     && view.state.doc.sliceString(child.from, child.to) === "]"
   ));
   if (!url || !closingAlt || closingAlt.from < node.from + 2) return null;
-  const source = view.state.doc.sliceString(url.from, url.to).trim();
+  const source = decodeMarkdownDestination(view.state.doc.sliceString(url.from, url.to).trim());
   if (!source || /^(?:javascript|vbscript):/i.test(source) || /^data:(?!image\/)/i.test(source)) {
     return null;
   }
@@ -383,61 +385,17 @@ function buildLivePreviewDecorations(
         const { name, from, to } = nodeRef;
 
         if (name === "Table") {
-          if (to - from > MAX_TABLE_SOURCE_CHARS) return false;
-          const source = view.state.doc.sliceString(from, to);
-          const model = parseMarkdownTable(source);
-          if (
-            !model
-            || model.header.length > MAX_TABLE_COLUMNS
-            || model.rows.length + 1 > MAX_TABLE_ROWS
-            || selectionTouches(view, from, to)
-          ) return false;
-
-          const lines: Array<{ from: number; to: number }> = [];
-          let line = view.state.doc.lineAt(from);
-          while (line.from <= to) {
-            lines.push({ from: line.from, to: line.to });
-            if (line.to >= to || line.number >= view.state.doc.lines) break;
-            line = view.state.doc.line(line.number + 1);
-          }
-          const tableRows = [model.header, ...model.rows];
-          if (lines.length !== tableRows.length + 1) return false;
-
+          if (!markdownTableLayout(view.state, node)) return false;
           occupy(from, to);
-          for (let index = 0; index < lines.length; index += 1) {
-            const currentLine = lines[index];
-            if (index === 1) {
-              collapseLine(currentLine.from, currentLine.to, `table-separator:${from}`);
-              continue;
-            }
-            const rowIndex = index === 0 ? 0 : index - 1;
-            addLine(currentLine.from, "cm-live-table-line");
-            add(
-              currentLine.from,
-              currentLine.to,
-              Decoration.replace({
-                widget: new MarkdownTableRowWidget(
-                  tableRows[rowIndex] ?? [],
-                  model.alignments,
-                  rowIndex === 0,
-                  rowIndex,
-                  tableRows.length,
-                  currentLine.from,
-                  currentLine.to,
-                  from,
-                  to,
-                ),
-              }),
-              `table-row:${rowIndex}`,
-            );
-          }
-          return false;
+          // Cell text stays in CodeMirror's document DOM. Continue through the
+          // inline syntax so emphasis, links and code retain the prose styling.
+          return;
         }
 
         if (name === "Paragraph") {
           const raw = view.state.doc.sliceString(from, to);
           const trimmed = raw.trim();
-          if (trimmed && isMarkdownImageSource(trimmed) && !selectionTouches(view, from, to)) {
+          if (trimmed && isMarkdownImageSource(trimmed)) {
             const leading = raw.length - raw.trimStart().length;
             const source = trimmed.replace(/^(["'])([\s\S]+)\1$/, "$2");
             occupy(from, to);
@@ -455,7 +413,7 @@ function buildLivePreviewDecorations(
 
         if (name === "Image") {
           const image = parseImageSyntax(view, node as unknown as MarkdownSyntaxNode);
-          if (!image || selectionTouches(view, from, to)) return false;
+          if (!image) return false;
           occupy(from, to);
           add(
             from,
@@ -470,7 +428,7 @@ function buildLivePreviewDecorations(
 
         if (name === "Link" || name === "Autolink") {
           const image = linkImageSyntax(view, node as unknown as MarkdownSyntaxNode);
-          if (image && !selectionTouches(view, from, to)) {
+          if (image) {
             occupy(from, to);
             add(
               from,
@@ -486,7 +444,7 @@ function buildLivePreviewDecorations(
 
         if (name === "URL" && node.parent?.name === "Paragraph") {
           const source = view.state.doc.sliceString(from, to);
-          if (isMarkdownImageSource(source) && !selectionTouches(view, from, to)) {
+          if (isMarkdownImageSource(source)) {
             occupy(from, to);
             add(
               from,
@@ -507,7 +465,7 @@ function buildLivePreviewDecorations(
           const standaloneView = reference?.kind !== "view"
             || (parent?.name === "Paragraph"
               && view.state.doc.sliceString(parent.from, parent.to).trim() === raw.trim());
-          if (reference && standaloneView && !selectionTouches(view, from, to)) {
+          if (reference && standaloneView) {
             occupy(from, to);
             add(
               from,
@@ -524,6 +482,16 @@ function buildLivePreviewDecorations(
         if (/^ATXHeading[1-6]$/.test(name)) {
           const level = name.slice(-1);
           addLine(from, `cm-live-heading cm-live-heading-${level}`);
+          return;
+        }
+
+        if (/^SetextHeading[12]$/.test(name)) {
+          addLine(from, `cm-live-heading cm-live-heading-${name.slice(-1)}`);
+          const underline = node.getChild("HeaderMark");
+          if (underline) {
+            const line = view.state.doc.lineAt(underline.from);
+            collapseLine(line.from, line.to, `setext:${from}`);
+          }
           return;
         }
 
@@ -549,6 +517,7 @@ function buildLivePreviewDecorations(
         }
 
         if (name === "HeaderMark") {
+          if (node.parent?.name.startsWith("SetextHeading")) return false;
           if (!syntaxTokenIsActive(view, node as unknown as MarkdownSyntaxNode)) {
             add(from, to, Decoration.replace({}), "hide-header-mark");
           }
@@ -630,14 +599,7 @@ function buildLivePreviewDecorations(
         }
 
         if (name === "HorizontalRule") {
-          if (!selectionTouches(view, from, to)) {
-            add(
-              from,
-              to,
-              Decoration.replace({ widget: new HorizontalRuleWidget() }),
-              "horizontal-rule",
-            );
-          }
+          add(from, to, Decoration.replace({ widget: new HorizontalRuleWidget() }), "horizontal-rule");
           return;
         }
 
@@ -660,7 +622,6 @@ function buildLivePreviewDecorations(
 
           if (
             textNode
-            && !selectionTouches(view, from, to)
             && specializedLanguage
           ) {
             const blockLines: Array<{ from: number; to: number; number: number }> = [];
@@ -761,7 +722,7 @@ function buildLivePreviewDecorations(
             return false;
           }
 
-          if (specializedLanguage && !selectionTouches(view, from, to)) return false;
+          if (specializedLanguage) return false;
 
           let line = view.state.doc.lineAt(from);
           let index = 0;
@@ -841,7 +802,6 @@ function buildLivePreviewDecorations(
       if (
         overlapsOccupied(reference.from, reference.to)
         || syntaxRangeIsProtected(tree, reference.from, reference.to)
-        || selectionTouches(view, reference.from, reference.to)
       ) {
         continue;
       }
@@ -888,6 +848,9 @@ function createMarkdownLivePreviewPlugin(options: MarkdownLivePreviewOptions) {
     }
   }, {
     decorations: (plugin) => plugin.decorations,
+    provide: (plugin) => EditorView.atomicRanges.of((view) => view.plugin(plugin)?.decorations.update({
+      filter: (from, to, decoration) => from < to && !decoration.spec.class,
+    }) ?? Decoration.none),
   });
 }
 
@@ -907,10 +870,8 @@ const markdownComplexWidgetTheme = EditorView.theme({
     padding: "0",
   },
   ".cm-live-table-row": {
-    display: "inline-grid",
+    display: "grid",
     boxSizing: "border-box",
-    width: "100%",
-    minWidth: "100%",
     borderRight: "1px solid color-mix(in srgb, var(--border-color) 86%, transparent)",
     borderBottom: "1px solid color-mix(in srgb, var(--border-color) 86%, transparent)",
     borderLeft: "1px solid color-mix(in srgb, var(--border-color) 86%, transparent)",
@@ -929,14 +890,18 @@ const markdownComplexWidgetTheme = EditorView.theme({
   },
   ".cm-live-table-cell": {
     boxSizing: "border-box",
-    minWidth: "120px",
+    minWidth: "0",
+    minHeight: "calc(1em * var(--markdown-document-line-height, 1.68) + 14px)",
     padding: "7px 10px",
     borderRight: "1px solid color-mix(in srgb, var(--border-color) 86%, transparent)",
-    whiteSpace: "normal",
+    whiteSpace: "pre-wrap",
     overflowWrap: "anywhere",
   },
   ".cm-live-table-cell:last-child": {
     borderRight: "none",
+  },
+  ".cm-live-table-row > :not(.cm-live-table-cell)": {
+    display: "none",
   },
   ".cm-live-table-cell[data-align='center']": {
     textAlign: "center",
@@ -1042,6 +1007,28 @@ export function markdownLivePreview(options: MarkdownLivePreviewOptions = {}): E
   return [
     EditorView.editorAttributes.of({ class: "cm-live-preview" }),
     markdownComplexWidgetTheme,
+    markdownTableEditing(),
+    markdownVisualCommands(),
+    markdownRichPaste(),
+    EditorView.domEventHandlers({
+      click(event, view) {
+        if (view.state.readOnly || !(event.target instanceof Element)) return false;
+        const link = event.target.closest(".cm-live-link");
+        if (!link) return false;
+        const target = markdownLinkTarget(view.state, view.posAtDOM(link));
+        if (target) options.onEditTarget?.(target);
+        return false;
+      },
+    }),
+    Prec.high(keymap.of([{ key: "Mod-k", run(view) {
+      if (view.state.readOnly) return false;
+      const range = view.state.selection.main;
+      options.onEditTarget?.(markdownLinkTarget(view.state, range.head) ?? {
+        kind: "link", from: range.from, to: range.to, source: view.state.sliceDoc(range.from, range.to),
+        label: view.state.sliceDoc(range.from, range.to) || "链接", url: "",
+      });
+      return true;
+    } }])),
     createMarkdownLivePreviewPlugin(options),
   ];
 }

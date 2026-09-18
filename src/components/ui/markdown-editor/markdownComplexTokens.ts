@@ -47,23 +47,40 @@ const UNITY_PREFIX_RE = /^(?:asset|unity|ref)(?::([A-Za-z-]+))?\s+(.+)$/i;
 const UNITY_SUFFIX_RE = /^(.+?)\s+\|\s*([A-Za-z-]+)$/;
 const LINE_SUFFIX_RE = /^(.+?)(?::(\d+)|#L(\d+)|#fileID:-?\d+)?$/i;
 
-function splitTableRow(source: string): string[] {
+export interface MarkdownTableCellRange {
+  from: number;
+  to: number;
+  contentFrom: number;
+  contentTo: number;
+}
+
+export function markdownTableCellRanges(source: string): MarkdownTableCellRange[] {
   const trimmed = source.trim();
-  const cells: string[] = [];
-  let cell = "";
+  const offset = source.length - source.trimStart().length;
+  const cells: MarkdownTableCellRange[] = [];
+  let start = 0;
   let escaped = false;
   let codeTicks = 0;
+  const push = (end: number) => {
+    const text = trimmed.slice(start, end);
+    const leading = text.trim() ? text.length - text.trimStart().length : Math.min(1, text.length);
+    cells.push({
+      from: offset + start,
+      to: offset + end,
+      contentFrom: offset + start + leading,
+      contentTo: offset + start + leading + text.trim().length,
+    });
+    start = end + 1;
+  };
 
   for (let index = 0; index < trimmed.length; index += 1) {
     const char = trimmed[index];
     if (escaped) {
-      cell += char;
       escaped = false;
       continue;
     }
     if (char === "\\") {
       escaped = true;
-      cell += char;
       continue;
     }
     if (char === "`") {
@@ -71,22 +88,23 @@ function splitTableRow(source: string): string[] {
       while (trimmed[index + run] === "`") run += 1;
       if (codeTicks === 0) codeTicks = run;
       else if (codeTicks === run) codeTicks = 0;
-      cell += "`".repeat(run);
       index += run - 1;
       continue;
     }
     if (char === "|" && codeTicks === 0) {
-      cells.push(cell.trim());
-      cell = "";
+      push(index);
       continue;
     }
-    cell += char;
   }
-  cells.push(cell.trim());
+  push(trimmed.length);
 
   if (trimmed.startsWith("|")) cells.shift();
-  if (trimmed.endsWith("|") && !trimmed.endsWith("\\|")) cells.pop();
+  if (cells[cells.length - 1]?.from === offset + trimmed.length) cells.pop();
   return cells;
+}
+
+function splitTableRow(source: string): string[] {
+  return markdownTableCellRanges(source).map((cell) => source.slice(cell.contentFrom, cell.contentTo));
 }
 
 function tableAlignment(source: string): MarkdownTableAlignment | undefined {

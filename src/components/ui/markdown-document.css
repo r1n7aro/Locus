@@ -1,0 +1,162 @@
+.document-scroller {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: block;
+  overflow: auto;
+  container-type: inline-size;
+  container-name: knowledge-document;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-secondary) 34%, transparent) transparent;
+}
+
+.document-workspace {
+  width: 100%;
+  min-height: 100%;
+}
+
+.document-outline {
+  display: none;
+  min-width: 0;
+  overflow: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.document-outline::-webkit-scrollbar {
+  display: none;
+}
+
+.document-outline-nav {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.document-outline-item {
+  display: block;
+  width: 100%;
+  min-height: 27px;
+  padding-top: 4px;
+  padding-right: 8px;
+  padding-bottom: 4px;
+  border: 0;
+  border-left: 1px solid transparent;
+  border-radius: 0 4px 4px 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.55;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.document-outline-item > span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-outline-item:hover {
+  background: var(--hover-bg);
+  color: var(--text-color);
+}
+
+.document-outline-item:focus-visible {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
+}
+
+.document-outline-item.active {
+  border-left-color: color-mix(in srgb, var(--accent-color) 70%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-color) 7%, transparent);
+  color: var(--text-color);
+}
+
+.document-page {
+  position: relative;
+  min-width: 0;
+  width: min(100%, 980px);
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 32px 44px 72px;
+  box-sizing: border-box;
+}
+
+.document-heading {
+  margin: 0 0 22px;
+}
+
+.document-title,
+.document-title-input {
+  margin: 0;
+  color: var(--text-color);
+  font-size: 24px;
+  font-weight: 650;
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  overflow-wrap: anywhere;
+}
+
+.document-body {
+  min-height: 360px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border-color);
+}
+
+.document-body :deep(.base-markdown-editor) {
+  min-height: 360px;
+  height: auto;
+  padding-bottom: 32px;
+}
+
+.document-body :deep(.base-markdown-editor .cm-scroller) {
+  height: auto;
+  min-height: 360px;
+  overflow: visible;
+  overscroll-behavior: auto;
+}
+
+@container knowledge-document (min-width: 1120px) {
+  .document-workspace.has-outline {
+    display: grid;
+    grid-template-columns: 210px minmax(0, 920px);
+    column-gap: 20px;
+    align-items: start;
+    justify-content: center;
+    box-sizing: border-box;
+    padding-inline: 24px;
+  }
+
+  .document-workspace.has-outline .document-outline {
+    position: sticky;
+    top: 40px;
+    display: block;
+    grid-column: 1;
+    width: 210px;
+    align-self: start;
+    justify-self: end;
+  }
+
+  .document-workspace.has-outline .document-page {
+    grid-column: 2;
+    width: 100%;
+    margin-inline: 0;
+  }
+}
+
+@container knowledge-document (min-width: 1488px) {
+  .document-workspace.has-outline {
+    grid-template-columns: minmax(210px, 1fr) minmax(0, 980px) minmax(210px, 1fr);
+    justify-content: normal;
+  }
+}
+
+@container knowledge-document (max-width: 860px) {
+  .document-page {
+    padding: 24px 24px 64px;
+  }
+}

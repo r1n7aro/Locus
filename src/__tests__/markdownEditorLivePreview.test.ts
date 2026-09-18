@@ -126,7 +126,7 @@ describe("markdown Live Preview", () => {
     expect(editor.contentDOM.textContent).not.toContain("**bold**");
 
     editor.dispatch({ selection: { anchor: 7 } });
-    expect(editor.contentDOM.textContent).toContain("**bold");
+    expect(editor.contentDOM.textContent).not.toContain("**bold");
     expect(editor.contentDOM.textContent).not.toContain("**bold**");
     expect(editor.contentDOM.textContent).not.toContain("*italic*");
   });
@@ -143,17 +143,17 @@ describe("markdown Live Preview", () => {
     expect(editor.contentDOM.textContent).not.toContain("[ ]");
 
     editor.dispatch({ selection: { anchor: 0 } });
-    expect(editor.dom.querySelector(".cm-live-list-marker")).toBeNull();
-    expect(editor.contentDOM.textContent).toContain("-");
+    expect(editor.dom.querySelector(".cm-live-list-marker")).not.toBeNull();
+    expect(editor.contentDOM.textContent).not.toContain("-");
     expect(editor.dom.querySelector(".cm-live-task-checkbox")).not.toBeNull();
 
     editor.dispatch({ selection: { anchor: 3 } });
     expect(editor.dom.querySelector(".cm-live-list-marker")).not.toBeNull();
-    expect(editor.dom.querySelector(".cm-live-task-checkbox")).toBeNull();
-    expect(editor.contentDOM.textContent).toContain("[ ]");
+    expect(editor.dom.querySelector(".cm-live-task-checkbox")).not.toBeNull();
+    expect(editor.contentDOM.textContent).not.toContain("[ ]");
   });
 
-  it("reveals heading and quote markers only at their source tokens", () => {
+  it("keeps heading and quote markers hidden at their source tokens", () => {
     const doc = "## Heading\n\n> quote";
     const editor = mountLivePreview(doc);
     editor.focus();
@@ -162,17 +162,17 @@ describe("markdown Live Preview", () => {
     expect(editor.contentDOM.textContent).not.toContain("##");
 
     editor.dispatch({ selection: { anchor: 1 } });
-    expect(editor.contentDOM.textContent).toContain("## Heading");
+    expect(editor.contentDOM.textContent).not.toContain("## Heading");
 
     editor.dispatch({ selection: { anchor: doc.indexOf("quote") + 2 } });
     expect(editor.contentDOM.textContent).not.toContain(">");
     expect(editor.contentDOM.textContent).not.toContain("##");
 
     editor.dispatch({ selection: { anchor: doc.indexOf(">") } });
-    expect(editor.contentDOM.textContent).toContain("> quote");
+    expect(editor.contentDOM.textContent).not.toContain("> quote");
   });
 
-  it("keeps link labels rendered and opens only the target source group", () => {
+  it("keeps link labels rendered when a selection lands in the destination", () => {
     const doc = "[label](target \"title\")";
     const editor = mountLivePreview(doc);
     editor.focus();
@@ -181,10 +181,10 @@ describe("markdown Live Preview", () => {
     expect(editor.contentDOM.textContent).toBe("label");
 
     editor.dispatch({ selection: { anchor: doc.indexOf("target") + 2 } });
-    expect(editor.contentDOM.textContent).toBe("label(target \"title\")");
+    expect(editor.contentDOM.textContent).toBe("label");
 
     editor.dispatch({ selection: { anchor: 0 } });
-    expect(editor.contentDOM.textContent).toBe("[label");
+    expect(editor.contentDOM.textContent).toBe("label");
   });
 
   it("keeps inline and fenced code delimiters local to the edited token", () => {
@@ -202,7 +202,7 @@ describe("markdown Live Preview", () => {
     expect(editor.contentDOM.textContent).not.toContain("`inline`");
 
     editor.dispatch({ selection: { anchor: 0 } });
-    expect(editor.contentDOM.textContent).toContain("`inline");
+    expect(editor.contentDOM.textContent).not.toContain("`inline");
     expect(editor.contentDOM.textContent).not.toContain("`inline`");
 
     editor.dispatch({ selection: { anchor: doc.indexOf("const") + 3 } });
