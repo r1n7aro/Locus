@@ -2,6 +2,9 @@ mod auto_review;
 mod async_resume;
 mod backend;
 mod claude_code_cli;
+mod codex_steering;
+mod codex_patch;
+mod compaction;
 mod dangerous_command;
 mod multi_agent;
 mod plan_policy;
@@ -290,6 +293,8 @@ pub struct AgentInstance {
     multi_agent_enabled: bool,
     effort: Option<String>,
     codex_fast_mode: bool,
+    codex_use_apply_patch: AtomicBool,
+    preview_codex_subscription: bool,
     async_tasks_enabled: bool,
     background_task_id: Option<String>,
     resumed_subagent: Option<crate::async_tasks::SubagentResumeInfo>,
@@ -1522,6 +1527,7 @@ fn build_knowledge_document_create_preview(
             .unwrap_or_else(|_| normalized_path.clone()),
     };
     let mut document = crate::knowledge_store::KnowledgeDocument {
+        inject_agents: patch.inject_agents.clone().unwrap_or_else(crate::knowledge_store::default_inject_agents),
         id: patch.id.take().unwrap_or_else(|| "__preview__".to_string()),
         doc_type,
         path: normalized_path.clone(),
@@ -2879,6 +2885,7 @@ fn build_search_section(semantic_search_enabled: bool) -> String {
         lines.push("Use `knowledge_query` with `lexicalQuery` for missing context. Semantic search is disabled.");
     }
     lines.extend([
+        "Search includes Markdown documents and CSV tables (headers and cell text). CSV has no document summary; its body starts at physical line 1, and quoted cells may span multiple lines.",
         "Read returned paths and physical line ranges with `read` (`offset`/`limit`, including frontmatter). Reuse current content already loaded.",
         "`Structure` lists physical directories: workspace-relative inside the checkout, absolute for registered external sources.",
     ]);
@@ -2898,7 +2905,8 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
     [
         "### Access",
         "- Require both source write access and authorization for the knowledge role. Apply the document or folder maintenance rules to every change.",
-        "- For authorized changes, create Markdown with `write`, update with `edit`, and move or delete with `bash`.",
+        "- For authorized changes, create Markdown or CSV with `write`, update with `edit`, and move or delete with `bash`.",
+        "- CSV tables are supported in Design, Memory, Reference, and plan/ directories. Write raw CSV without Markdown fences or YAML frontmatter; preserve delimiters and quoting. Executable Skills remain Markdown.",
     ]
     .join("\n")
 }
@@ -2906,6 +2914,7 @@ fn build_maintenance_section(access_mode: KnowledgeAccessMode) -> String {
 fn build_l2_full_document_section(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
+    agent_id: &str,
 ) -> Result<String, String> {
     crate::knowledge_store::ensure_memory_builtin_documents(working_dir)?;
     let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
@@ -2926,6 +2935,9 @@ fn build_l2_full_document_section(
         )?;
         for doc in docs {
             if doc.inject_mode != crate::knowledge_store::KnowledgeInjectMode::Full {
+                continue;
+            }
+            if !crate::knowledge_store::document_allows_agent_injection(&doc, agent_id) {
                 continue;
             }
 
@@ -3178,6 +3190,7 @@ fn l3_rule_injection_id(entry: &L3RuleEntry) -> String {
 fn build_l3_rule_entries(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
+    agent_id: &str,
 ) -> Result<Vec<L3RuleEntry>, String> {
     crate::knowledge_store::ensure_memory_builtin_documents(working_dir)?;
     let mut entries = Vec::new();
@@ -3205,6 +3218,9 @@ fn build_l3_rule_entries(
             .document;
 
             let title = format_l3_rule_heading(&doc);
+            if !crate::knowledge_store::document_allows_agent_injection(&doc, agent_id) {
+                continue;
+            }
             let body = if doc.body.trim().is_empty() {
                 "<empty>".to_string()
             } else {
@@ -3236,9 +3252,10 @@ fn build_l3_rule_entries(
 fn build_l3_rule_section(
     working_dir: &str,
     app_knowledge_dir: Option<&std::path::PathBuf>,
+    agent_id: &str,
     injection_config: &crate::commands::AgentInjectionConfigLayers,
 ) -> Result<String, String> {
-    let entries = build_l3_rule_entries(working_dir, app_knowledge_dir)?
+    let entries = build_l3_rule_entries(working_dir, app_knowledge_dir, agent_id)?
         .into_iter()
         .filter(|entry| injection_config.state(&l3_rule_injection_id(entry)).enabled)
         .collect::<Vec<_>>();
@@ -3375,6 +3392,7 @@ struct SystemPromptParts {
 struct PromptPrefixCachePolicy {
     provider_key: String,
     cache_key: String,
+    rules_fingerprint: String,
     ttl_seconds: u32,
 }
 
@@ -3832,22 +3850,7 @@ impl AgentInstance {
             | "unity_ref_search"
             | "unity_asset_search"
             | "code_symbol_search"
-            | "view_create"
-            | "view_list"
-            | "view_reload"
-            | "view_run"
-            | "view_compile_script"
-            | "view_call_script"
-            | "view_property_read"
-            | "view_property_discover"
-            | "view_property_write"
-            | "view_property_apply"
-            | "view_capture"
-            | "view_snapshot"
-            | "view_action"
-            | "view_wait"
-            | "view_console_read"
-            | "view_debug_eval"
+            | "execute_typescript"
             | "knowledge_list"
             | "knowledge_query"
             | "knowledge_read"
@@ -3944,6 +3947,7 @@ impl AgentInstance {
             if let Ok(full_document_section) = build_l2_full_document_section(
                 &self.working_dir,
                 self.app_knowledge_dir.as_ref().as_ref(),
+                &self.def.id,
             ) {
                 if !full_document_section.trim().is_empty() {
                     sections.push(full_document_section);
@@ -4013,6 +4017,10 @@ impl AgentInstance {
             multi_agent_enabled: false,
             effort: effective_effort,
             codex_fast_mode: false,
+            codex_use_apply_patch: AtomicBool::new(
+                crate::commands::load_codex_model_config().unwrap_or_default().use_apply_patch,
+            ),
+            preview_codex_subscription: false,
             async_tasks_enabled: false,
             background_task_id: None,
             resumed_subagent: None,
@@ -4219,6 +4227,9 @@ impl AgentInstance {
         tool_name: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
+        if tool_name == "apply_patch" {
+            return self.patch_plan_violation(runtime, args);
+        }
         if plan_policy::allows_observation(tool_name, args) {
             return None;
         }
@@ -4303,6 +4314,7 @@ impl AgentInstance {
     /// silently hiding them.
     async fn resolve_configured_tool_names(&self) -> Vec<String> {
         let mut tools = self.def.tools.clone();
+        self.apply_codex_edit_tool_choice(&mut tools);
         if self.multi_agent_enabled && self.tool_registry.tool_description("subagent").is_some() {
             push_unique_tool_name(&mut tools, "subagent");
         }
@@ -4554,7 +4566,9 @@ impl AgentInstance {
         if !self.can_toggle_enabled_tool(name) {
             return true;
         }
-        overrides.get(name).copied().unwrap_or(true)
+        overrides.get(name)
+            .or_else(|| if name == "apply_patch" { overrides.get("edit") } else { None })
+            .copied().unwrap_or(true)
     }
 
     fn canonical_tool_name(&self, name: &str) -> Option<String> {
@@ -4664,7 +4678,9 @@ impl AgentInstance {
         if !self.tool_registry.is_built_in(name) && !Self::is_mcp_wire_tool(name) {
             return default_mode;
         }
-        match overrides.get(name).copied() {
+        match overrides.get(name)
+            .or_else(|| if name == "apply_patch" { overrides.get("edit") } else { None })
+            .copied() {
             Some(true) => ToolLoadMode::Direct,
             Some(false) => ToolLoadMode::Lazy,
             None => default_mode,
@@ -4905,6 +4921,7 @@ impl AgentInstance {
         {
             self.effective_model = selected_model.to_string();
         }
+        self.preview_codex_subscription = self.effective_model.trim().starts_with("openai/");
 
         let renderer = if dynamic_mode == crate::config::DynamicToolLoadingMode::Native
             && self.effective_model.trim().starts_with("openai/")
@@ -5478,7 +5495,7 @@ impl AgentInstance {
 
         if has_working_dir && self.knowledge_access_mode.allows_context() {
             if let Ok(rule_entries) =
-                build_l3_rule_entries(&self.working_dir, self.app_knowledge_dir.as_ref().as_ref())
+                build_l3_rule_entries(&self.working_dir, self.app_knowledge_dir.as_ref().as_ref(), &self.def.id)
             {
                 items.extend(rule_entries.into_iter().map(|entry| {
                     let id = l3_rule_injection_id(&entry);
@@ -5576,6 +5593,7 @@ impl AgentInstance {
         session_messages: &[ChatMessage],
         session_title: String,
         cache_invalidations: Vec<crate::commands::SessionCacheInvalidation>,
+        timing: crate::commands::SessionTimingUsage,
         usage: crate::commands::TokenUsage,
     ) -> crate::commands::SessionContextUsageReport {
         let dynamic_mode = self.dynamic_tool_loading_mode(app_handle);
@@ -5667,6 +5685,7 @@ impl AgentInstance {
             session_title,
             agent_id: self.def.id.clone(),
             model_id: self.effective_model.clone(),
+            upstream_model: None,
             context_tokens,
             context_limit: if usage.context_limit > 0 {
                 usage.context_limit
@@ -5678,6 +5697,7 @@ impl AgentInstance {
             breakdown,
             tools,
             cache_invalidations,
+            timing,
             usage,
         }
     }
@@ -5731,7 +5751,7 @@ impl AgentInstance {
                 )
             }
         };
-        // Model, reasoning effort, Codex service tier, lazy-tool route, and
+        // Model, effort (except Astra's native updates), Codex service tier, lazy-tool route, and
         // workspace prompt inputs select a new prompt-prefix identity. When one
         // changes, rebuild the locally synthesized prefix on the next turn.
         let extra_workdirs_prompt = if self.has_selected_working_dir() {
@@ -5754,21 +5774,54 @@ impl AgentInstance {
                 .map(|byte| format!("{:02x}", byte))
                 .collect::<String>()
         });
+        let rules_fingerprint = crate::commands::agent_rule_prompt_fingerprint(
+            self.app_agent_dir.as_ref(),
+            &self.working_dir,
+            &self.def.id,
+        );
         let cache_key = serde_json::json!({
             "provider": provider_key.as_str(),
             "model": self.effective_model.as_str(),
-            "effort": self.effort.as_deref(),
+            "effort": if matches!(self.backend, LlmBackend::OpenAiCodex { .. })
+                && codex::supports_reasoning_updates(&self.effective_model) {
+                None
+            } else {
+                self.effort.as_deref()
+            },
             "fastMode": self.codex_fast_mode,
+            "useApplyPatch": self.uses_codex_apply_patch(),
             "multiAgentEnabled": self.multi_agent_enabled,
             "extraWorkdirs": extra_workdirs_fingerprint,
+            "agentRules": rules_fingerprint,
             "lazyToolRenderer": self.cached_lazy_tool_renderer().strategy_label(),
         })
         .to_string();
         PromptPrefixCachePolicy {
             provider_key,
             cache_key,
+            rules_fingerprint,
             ttl_seconds,
         }
+    }
+
+    async fn refresh_changed_agent_rules(
+        &self,
+        store: &SessionStore,
+        parts: &mut SystemPromptParts,
+        policy: &mut PromptPrefixCachePolicy,
+    ) -> Result<bool, String> {
+        let fingerprint = crate::commands::agent_rule_prompt_fingerprint(
+            self.app_agent_dir.as_ref(),
+            &self.working_dir,
+            &self.def.id,
+        );
+        if fingerprint == policy.rules_fingerprint {
+            return Ok(false);
+        }
+        let refreshed = self.resolve_system_prompt_parts(store).await?;
+        *parts = refreshed.parts;
+        *policy = refreshed.policy;
+        Ok(true)
     }
 
     async fn resolve_system_prompt_parts(
@@ -5851,7 +5904,7 @@ impl AgentInstance {
     }
 
     fn knowledge_query_lexical_only_description() -> &'static str {
-        "Search Design, Memory, Reference, and Skill sources, plus plan/ execution documents, with `lexicalQuery`. With lexical indexing off, searches use direct text scanning. Results provide readable paths, physical line ranges, optional summaries, and bounded hit context. Use read for the needed ranges."
+        "Search Design, Memory, Reference, and Skill sources, plus plan/ execution documents, with `lexicalQuery`. Includes Markdown documents and CSV tables; CSV headers and cell text are searchable. With lexical indexing off, searches use direct text scanning. Results provide readable paths, physical line ranges, optional summaries, and bounded hit context. CSV has no frontmatter or document summary: summary is empty and body starts at line 1. CSV line ranges count physical lines, not records; quoted cells may span multiple lines. Use read for the needed ranges."
     }
 
     fn render_unity_recompile_description(
@@ -5951,6 +6004,18 @@ impl AgentInstance {
         description
     }
 
+    fn apply_tool_description_context(&self, name: &str, tool: &mut serde_json::Value) {
+        self.def.apply_tool_description_override(name, tool);
+        if name == "python" {
+            if let Some(description) = tool["function"]["description"].as_str() {
+                tool["function"]["description"] = serde_json::json!(
+                    crate::python_runtime::render_python_tool_description(description)
+                );
+            }
+        }
+        self.apply_multi_agent_guidance(name, tool);
+    }
+
     fn contextualize_tool_description(
         &self,
         name: &str,
@@ -5996,8 +6061,7 @@ impl AgentInstance {
                 }
             });
             crate::async_tasks::augment_tool_schema(name, &mut tool);
-            self.def.apply_tool_description_override(name, &mut tool);
-            self.apply_multi_agent_guidance(name, &mut tool);
+            self.apply_tool_description_context(name, &mut tool);
             let function = &mut tool["function"];
             let description = function["description"]
                 .as_str()
@@ -6013,8 +6077,7 @@ impl AgentInstance {
                 "parameters": parameters,
             }
         });
-        self.def.apply_tool_description_override(name, &mut tool);
-        self.apply_multi_agent_guidance(name, &mut tool);
+        self.apply_tool_description_context(name, &mut tool);
         let function = &mut tool["function"];
         (
             function["description"]
@@ -6102,8 +6165,16 @@ impl AgentInstance {
         if self.async_tasks_enabled {
             crate::async_tasks::augment_tool_schema(&name, &mut tool);
         }
-        self.def.apply_tool_description_override(&name, &mut tool);
-        self.apply_multi_agent_guidance(&name, &mut tool);
+        self.apply_tool_description_context(&name, &mut tool);
+        if name == "write" && self.uses_codex_apply_patch() {
+            if let Some(description) = tool["function"]["description"].as_str() {
+                tool["function"]["description"] = serde_json::json!(
+                    description.replace("`edit`", "`apply_patch`")
+                        .replace("use edit ", "use apply_patch ")
+                        .replace("Use edit ", "Use apply_patch ")
+                );
+            }
+        }
         tool
     }
 
@@ -6651,6 +6722,7 @@ impl AgentInstance {
                 if let Ok(l3_rules) = build_l3_rule_section(
                     &self.working_dir,
                     self.app_knowledge_dir.as_ref().as_ref(),
+                    &self.def.id,
                     &injection_config,
                 ) {
                     if !l3_rules.trim().is_empty() {
@@ -8226,37 +8298,35 @@ impl AgentInstance {
     }
 
     fn is_unity_asset_write_call(&self, tc: &ToolCallInfo, args: &serde_json::Value) -> bool {
-        if tc.name != "write" && tc.name != "edit" {
-            return false;
-        }
-
-        let file_path = match args.get("filePath").and_then(|v| v.as_str()) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let path = std::path::Path::new(file_path);
         let working_dir = std::path::Path::new(&self.working_dir);
         let assets_dir = working_dir.join("Assets");
         let packages_dir = working_dir.join("Packages");
-        path.starts_with(&assets_dir) || path.starts_with(&packages_dir)
+        self.file_write_paths(&tc.name, args).iter().any(|path| {
+            let path = std::path::Path::new(path);
+            path.starts_with(&assets_dir) || path.starts_with(&packages_dir)
+        })
     }
 
-    fn unity_asset_relative_path(
+    fn unity_asset_relative_paths(
         &self,
         tc: &ToolCallInfo,
         args: &serde_json::Value,
         result: &ExecutedToolResult,
-    ) -> Option<String> {
-        if result.outcome != ToolRunOutcome::Done || !self.is_unity_asset_write_call(tc, args) {
-            return None;
+    ) -> Vec<String> {
+        if (result.outcome != ToolRunOutcome::Done && tc.name != "apply_patch")
+            || !self.is_unity_asset_write_call(tc, args)
+        {
+            return Vec::new();
         }
-
-        let file_path = args.get("filePath").and_then(|v| v.as_str())?;
         let working_dir = std::path::Path::new(&self.working_dir);
-        let path = std::path::Path::new(file_path);
-        let relative = path.strip_prefix(working_dir).ok()?;
-        Some(relative.to_string_lossy().replace('\\', "/"))
+        self.file_write_paths(&tc.name, args)
+            .iter()
+            .filter_map(|path| {
+                let relative = std::path::Path::new(path).strip_prefix(working_dir).ok()?;
+                (relative.starts_with("Assets") || relative.starts_with("Packages"))
+                    .then(|| relative.to_string_lossy().replace('\\', "/"))
+            })
+            .collect()
     }
 
     async fn cleanup_unity_edit_session(&self) {
@@ -8353,6 +8423,7 @@ impl AgentInstance {
         &self,
         store: &SessionStore,
         codex_turn_state: Option<&mut codex::TurnState>,
+        steering: Option<&dyn codex::steering::SteeringSource>,
         request_options: LlmRequestOptions,
         system_parts: &[&str],
         messages: &[crate::session::models::ChatMessage],
@@ -8474,7 +8545,7 @@ impl AgentInstance {
                 let (access_token, account_id) = resolve_codex_request_auth(auth, false)
                     .await
                     .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
-                let resp = match codex::stream_chat(
+                let resp = match codex::stream_chat_steerable(
                     &access_token,
                     account_id.as_deref(),
                     *transport,
@@ -8485,11 +8556,12 @@ impl AgentInstance {
                     api_tools,
                     tool_search_description,
                     request_options.thinking_level(self.effort.as_deref()),
-                    self.codex_fast_mode,
                     self.debug,
                     Some(&self.session_id),
                     Some(&response_request_metadata),
                     codex_turn_state,
+                    codex::CodexStreamOptions::default().with_fast_mode(self.codex_fast_mode),
+                    steering,
                     &on_text_delta,
                     &on_thinking_delta,
                     &on_tool_call_start,
@@ -8497,14 +8569,14 @@ impl AgentInstance {
                 .await
                 {
                     Ok(resp) => resp,
-                    Err(error) if is_codex_unauthorized_error(&error) => {
+                    Err(error) if !error.contains("steering outcome unknown") && is_codex_unauthorized_error(&error) => {
                         eprintln!(
                             "[OpenAI Codex] received unauthorized response, refreshing auth and retrying once"
                         );
                         let (access_token, account_id) = resolve_codex_request_auth(auth, true)
                             .await
                             .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
-                        codex::stream_chat(
+                        codex::stream_chat_steerable(
                             &access_token,
                             account_id.as_deref(),
                             *transport,
@@ -8515,11 +8587,12 @@ impl AgentInstance {
                             api_tools,
                             tool_search_description,
                             request_options.thinking_level(self.effort.as_deref()),
-                            self.codex_fast_mode,
                             self.debug,
                             Some(&self.session_id),
                             Some(&response_request_metadata),
                             codex_turn_state,
+                            codex::CodexStreamOptions::default().with_fast_mode(self.codex_fast_mode),
+                            steering,
                             &on_text_delta,
                             &on_thinking_delta,
                             &on_tool_call_start,
@@ -8961,6 +9034,7 @@ impl AgentInstance {
         self.call_llm(
             store,
             None,
+            None,
             LlmRequestOptions::checkpoint_compaction(max_output_tokens),
             system_parts,
             messages,
@@ -9066,11 +9140,11 @@ impl AgentInstance {
         &self,
         store: &SessionStore,
         system_parts: &[&str],
+        request_tools: &PreparedRequestTools,
     ) -> Result<u32, String> {
         let messages = store.get_messages_for_prompt(&self.session_id)?;
         let prepared_messages = compact::prepare_messages_for_llm(&messages);
-        let request_tools = self.build_request_tool_names().await;
-        let api_tools = self.build_api_tools(&request_tools).await;
+        let api_tools = &request_tools.api_tools;
         Ok(compact::estimate_request_tokens(
             system_parts,
             &prepared_messages,
@@ -9082,10 +9156,11 @@ impl AgentInstance {
         &self,
         store: &SessionStore,
         system_parts: &[&str],
+        request_tools: &PreparedRequestTools,
         context_limit: u32,
     ) -> u32 {
         let context_tokens = match self
-            .estimate_current_context_tokens(store, system_parts)
+            .estimate_current_context_tokens(store, system_parts, request_tools)
             .await
         {
             Ok(tokens) => tokens,
@@ -9136,6 +9211,8 @@ impl AgentInstance {
         app_handle: &AppHandle,
         store: &SessionStore,
         system_parts: &[&str],
+        request_tools: &PreparedRequestTools,
+        codex_turn_state: Option<&mut codex::TurnState>,
         context_tokens: u32,
         context_limit: u32,
         run_id: &str,
@@ -9154,8 +9231,9 @@ impl AgentInstance {
         let messages_before = messages.len() as u32;
 
         let mut prepared = compact::prepare_messages_for_llm(&messages);
-        let request_tools = self.build_request_tool_names().await;
-        let api_tools = self.build_api_tools(&request_tools).await;
+        let api_tools = &request_tools.api_tools;
+        let mut standalone_turn_state = codex::TurnState::default();
+        let codex_turn_state = codex_turn_state.unwrap_or(&mut standalone_turn_state);
         let rewritten = compact::trim_tool_outputs_to_fit_context_window(
             &mut prepared,
             system_parts,
@@ -9187,89 +9265,17 @@ impl AgentInstance {
             },
         );
 
-        let compact_result = match &self.backend {
-            LlmBackend::OpenAiCodex {
-                auth,
-                transport,
-                base_url,
-            } => {
-                let model_name = &self.effective_model;
-                let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
-                let (access_token, account_id) = resolve_codex_request_auth(auth, false)
-                    .await
-                    .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
-                match codex::compact_conversation_history_v2(
-                    &access_token,
-                    account_id.as_deref(),
-                    *transport,
-                    base_url.as_deref(),
-                    actual_model,
-                    &system_prompt,
-                    &prepared,
-                    &api_tools,
-                    self.effort.as_deref(),
-                    self.codex_fast_mode,
-                    Some(&self.session_id),
-                    Some(&response_request_metadata),
-                    self.debug,
-                )
-                .await
-                {
-                    Ok(outcome) => Ok(outcome),
-                    Err(error) if is_codex_unauthorized_error(&error.message) => {
-                        eprintln!(
-                            "[OpenAI Codex] compact received unauthorized response, refreshing auth and retrying once"
-                        );
-                        let (access_token, account_id) = resolve_codex_request_auth(auth, true)
-                            .await
-                            .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
-                        codex::compact_conversation_history_v2(
-                            &access_token,
-                            account_id.as_deref(),
-                            *transport,
-                            base_url.as_deref(),
-                            actual_model,
-                            &system_prompt,
-                            &prepared,
-                            &api_tools,
-                            self.effort.as_deref(),
-                            self.codex_fast_mode,
-                            Some(&self.session_id),
-                            Some(&response_request_metadata),
-                            self.debug,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            LlmBackend::Custom {
-                api_key,
-                api_model,
-                endpoint,
-                api_format: crate::commands::ApiFormat::OpenaiResponses,
-                remote_compaction_mode: crate::commands::RemoteCompactionMode::CodexV2,
-                ..
-            } => {
-                codex::compact_conversation_history_v2(
-                    api_key,
-                    None,
-                    crate::commands::CodexTransportMode::Http,
-                    Some(endpoint.as_str()),
-                    api_model,
-                    &system_prompt,
-                    &prepared,
-                    &api_tools,
-                    self.effort.as_deref(),
-                    false,
-                    Some(&self.session_id),
-                    Some(&response_request_metadata),
-                    self.debug,
-                )
-                .await
-            }
-            _ => return Ok(None),
-        };
+        let compact_result = self
+            .request_codex_compaction(
+                &system_prompt,
+                &prepared,
+                request_tools,
+                codex_turn_state,
+                &response_request_metadata,
+                run_id,
+                iteration,
+            )
+            .await;
 
         let outcome = match compact_result {
             Ok(outcome) => {
@@ -9348,12 +9354,7 @@ impl AgentInstance {
             false,
             transcript.as_ref(),
         );
-        let compaction_request = serde_json::json!({
-            "codex_compaction": {
-                "output": outcome.output,
-                "encrypted_content": outcome.encrypted_content,
-            }
-        });
+        let compaction_request = codex::compaction_metadata(&outcome);
         let (count_before, count_after) = store.compact_messages_with_response_request(
             &self.session_id,
             &summary_msg,
@@ -9364,7 +9365,7 @@ impl AgentInstance {
         // V2 already clears the obsolete previous-response baseline while
         // preserving the reusable session WebSocket for the replacement window.
         let compacted_context_tokens = self
-            .persist_compacted_context_usage(store, system_parts, context_limit)
+            .persist_compacted_context_usage(store, system_parts, request_tools, context_limit)
             .await;
         let compacted_messages = store.get_messages_for_display(&self.session_id)?;
         eprintln!(
@@ -9392,6 +9393,8 @@ impl AgentInstance {
         app_handle: &AppHandle,
         store: &SessionStore,
         system_parts: &[&str],
+        request_tools: &PreparedRequestTools,
+        codex_turn_state: Option<&mut codex::TurnState>,
         context_tokens: u32,
         context_limit: u32,
         force_compact: bool,
@@ -9408,6 +9411,8 @@ impl AgentInstance {
                     app_handle,
                     store,
                     system_parts,
+                    request_tools,
+                    codex_turn_state,
                     context_tokens,
                     context_limit,
                     run_id,
@@ -9626,7 +9631,7 @@ impl AgentInstance {
             crate::llm::codex::reset_cached_session_window(&self.session_id).await;
         }
         let compacted_context_tokens = self
-            .persist_compacted_context_usage(store, system_parts, context_limit)
+            .persist_compacted_context_usage(store, system_parts, request_tools, context_limit)
             .await;
         let compacted_messages = store.get_messages_for_display(&self.session_id)?;
 
@@ -10092,7 +10097,12 @@ impl AgentInstance {
         }
         match self.plan_runtime_snapshot() {
             Some(PlanRuntime::Main { plan_file }) => {
-                parts.push(Self::render_plan_reminder(&plan_file));
+                let reminder = Self::render_plan_reminder(&plan_file);
+                parts.push(if self.uses_codex_apply_patch() {
+                    reminder.replace("`edit`", "`apply_patch`")
+                } else {
+                    reminder
+                });
             }
             Some(PlanRuntime::Subagent) => {
                 parts.push(crate::prompt::plan::PLAN_REMINDER_SUBAGENT.to_string());
@@ -10148,6 +10158,72 @@ impl AgentInstance {
             })
     }
 
+    fn persist_pending_input(
+        &self,
+        app_handle: &AppHandle,
+        store: &SessionStore,
+        run_id: &str,
+        env_prompt_prefix: Option<&str>,
+        input: PendingSessionInput,
+        prepared_suffix: Option<Option<String>>,
+    ) -> Result<(), String> {
+        let user_intent_signature = input
+            .user_intent
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Failed to serialize pending user intent: {}", e))?;
+        let effective_mode = Self::pending_input_mode(&input);
+        // A queued /plan message entering an active run must flip
+        // enforcement before its reminder is rendered.
+        self.maybe_enter_plan_mode(app_handle, store, run_id, &effective_mode)?;
+        let user_prompt_suffix = prepared_suffix.unwrap_or_else(|| {
+            self.build_user_prompt_suffix(app_handle, store, input.user_intent.as_ref(), &input.text)
+        });
+        let first_user_message_id = store.first_user_message_id(&self.session_id)?;
+        let current_prompt_prefix = if first_user_message_id.is_none() {
+            env_prompt_prefix
+        } else {
+            None
+        };
+        let message_id = store.add_message_with_images_asset_refs_and_signature(
+            &self.session_id,
+            MessageRole::User,
+            &input.text,
+            input.images.as_deref(),
+            input.asset_refs.as_deref(),
+            user_intent_signature.as_deref(),
+            current_prompt_prefix,
+            user_prompt_suffix.as_deref(),
+        )?;
+        if let Some(first_user_message_id) = first_user_message_id.as_deref() {
+            store.update_message_prompt_prefix(
+                &self.session_id,
+                first_user_message_id,
+                env_prompt_prefix,
+            )?;
+        }
+        let current_user_message = self.persisted_message_by_id(store, &message_id)?;
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::UserMessage {
+                session_id: self.session_id.clone(),
+                message: current_user_message,
+            },
+        );
+        emit_stream(
+            app_handle,
+            run_id,
+            StreamEvent::PendingInputAccepted {
+                session_id: self.session_id.clone(),
+                pending_input_id: input.id,
+                message_id,
+            },
+        );
+        Ok(())
+    }
+
     fn persist_claimed_pending_inputs(
         &self,
         app_handle: &AppHandle,
@@ -10163,63 +10239,7 @@ impl AgentInstance {
         let claimed_inputs = pending_inputs.clone();
         let result = (|| -> Result<(), String> {
             for input in pending_inputs {
-                let user_intent_signature = input
-                    .user_intent
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|e| format!("Failed to serialize pending user intent: {}", e))?;
-                let effective_mode = Self::pending_input_mode(&input);
-                // A queued /plan message entering an active run must flip
-                // enforcement before its reminder is rendered.
-                self.maybe_enter_plan_mode(app_handle, store, run_id, &effective_mode)?;
-                let user_prompt_suffix = self.build_user_prompt_suffix(
-                    app_handle,
-                    store,
-                    input.user_intent.as_ref(),
-                    &input.text,
-                );
-                let first_user_message_id = store.first_user_message_id(&self.session_id)?;
-                let current_prompt_prefix = if first_user_message_id.is_none() {
-                    env_prompt_prefix
-                } else {
-                    None
-                };
-                let message_id = store.add_message_with_images_asset_refs_and_signature(
-                    &self.session_id,
-                    MessageRole::User,
-                    &input.text,
-                    input.images.as_deref(),
-                    input.asset_refs.as_deref(),
-                    user_intent_signature.as_deref(),
-                    current_prompt_prefix,
-                    user_prompt_suffix.as_deref(),
-                )?;
-                if let Some(first_user_message_id) = first_user_message_id.as_deref() {
-                    store.update_message_prompt_prefix(
-                        &self.session_id,
-                        first_user_message_id,
-                        env_prompt_prefix,
-                    )?;
-                }
-                let current_user_message = self.persisted_message_by_id(store, &message_id)?;
-                emit_stream(
-                    app_handle,
-                    run_id,
-                    StreamEvent::UserMessage {
-                        session_id: self.session_id.clone(),
-                        message: current_user_message,
-                    },
-                );
-                emit_stream(
-                    app_handle,
-                    run_id,
-                    StreamEvent::PendingInputAccepted {
-                        session_id: self.session_id.clone(),
-                        pending_input_id: input.id,
-                        message_id,
-                    },
-                );
+                self.persist_pending_input(app_handle, store, run_id, env_prompt_prefix, input, None)?;
             }
             Ok(())
         })();
@@ -10524,6 +10544,11 @@ impl AgentInstance {
                 clear_started_at,
             );
             let run_result: Result<String, String> = async {
+        let _session_budget = if self.subagent_depth == 0 {
+            if let Some(policy) = app_handle.try_state::<Arc<crate::resource_policy::ResourcePolicyStore>>() {
+                Some(policy.acquire_session(self.cancel_waiter()).await?)
+            } else { None }
+        } else { None };
         // Notify frontend of the new run_id
         eprintln!(
             "[Agent {}] emitting RunStart for session {} run {}",
@@ -10533,6 +10558,10 @@ impl AgentInstance {
             session_id: self.session_id.clone(),
         });
 
+        self.codex_use_apply_patch.store(
+            crate::commands::load_codex_model_config().unwrap_or_default().use_apply_patch,
+            Ordering::Relaxed,
+        );
         let dynamic_tool_loading_mode = self.dynamic_tool_loading_mode(app_handle);
         let lazy_tool_renderer = self.refresh_lazy_tool_renderer(
             dynamic_tool_loading_mode,
@@ -10627,6 +10656,8 @@ impl AgentInstance {
                     app_handle,
                     store,
                     &system_parts,
+                    &prepared_tools,
+                    None,
                     estimated_input_tokens,
                     ctx_limit,
                     true,
@@ -10768,9 +10799,9 @@ impl AgentInstance {
             .transpose()
             .map_err(|e| format!("Failed to serialize user intent: {}", e))?;
         let resolved_prompt_parts = self.resolve_system_prompt_parts(store).await?;
-        let prompt_prefix_cache_policy = resolved_prompt_parts.policy;
+        let mut prompt_prefix_cache_policy = resolved_prompt_parts.policy;
         let prompt_prefix_cache_reused = resolved_prompt_parts.reused;
-        let prompt_parts = resolved_prompt_parts.parts;
+        let mut prompt_parts = resolved_prompt_parts.parts;
         eprintln!(
             "[Agent {}] prompt parts ready: session={} run={} elapsed_ms={} cache_reused={} base_chars={} env_chars={} rules_chars={} knowledge_chars={}",
             self.id,
@@ -10957,6 +10988,7 @@ impl AgentInstance {
         // post-compact floor itself does not fit the provider window, so
         // scheduling another compact would only burn a summarization call.
         let mut compact_unverified_since_send = false;
+        let mut upstream_model_warnings = HashSet::new();
         let final_text;
         let final_thinking_text;
         let final_thinking_duration: u32;
@@ -10972,6 +11004,8 @@ impl AgentInstance {
         let mut assistant_round_persisted = false;
         let mut codex_turn_state = matches!(self.backend, LlmBackend::OpenAiCodex { .. })
             .then(codex::TurnState::default);
+        let run_steering = codex_steering::RunSteering::new(
+            self, app_handle, store, &run_id, env_prompt_prefix.as_deref());
         let render_order_tracker = Arc::new(Mutex::new(StreamRenderOrderTracker::default()));
 
         'agent_loop: loop {
@@ -10989,8 +11023,19 @@ impl AgentInstance {
                 return Ok(String::new());
             }
 
-            let injected_async_notifications =
-                self.persist_async_notifications(app_handle, store)?;
+            let native_continuation = codex_turn_state.as_ref()
+                .is_some_and(codex::TurnState::has_steering_continuation);
+            if iteration > 1 {
+                self.refresh_changed_agent_rules(
+                    store,
+                    &mut prompt_parts,
+                    &mut prompt_prefix_cache_policy,
+                )
+                .await?;
+            }
+            let injected_async_notifications = if native_continuation { 0 } else {
+                self.persist_async_notifications(app_handle, store)?
+            };
             if injected_async_notifications > 0 {
                 eprintln!(
                     "[Agent {}] injected {} async completion reminder(s): session={} run={} iteration={}",
@@ -11028,8 +11073,8 @@ impl AgentInstance {
                     &selected_skill_tool_names,
                 )
                 .await;
-            let api_tools = prepared_tools.api_tools;
-            let tool_search_description = prepared_tools.tool_search_description;
+            let api_tools = &prepared_tools.api_tools;
+            let tool_search_description = prepared_tools.tool_search_description.as_deref();
             let estimated_input_tokens =
                 compact::estimate_request_tokens(&system_parts, &prepared_messages, &api_tools);
             // Real usage recorded for the session (API-reported during normal
@@ -11069,7 +11114,7 @@ impl AgentInstance {
             };
             let mut preflight_compact_error: Option<String> = None;
 
-            if !compact_tracker.is_suppressed()
+            if !native_continuation && !compact_tracker.is_suppressed()
                 && should_preflight_compact
             {
                 eprintln!(
@@ -11088,6 +11133,8 @@ impl AgentInstance {
                         app_handle,
                         store,
                         &system_parts,
+                        &prepared_tools,
+                        codex_turn_state.as_mut(),
                         effective_input_tokens,
                         ctx_limit,
                         false,
@@ -11132,7 +11179,7 @@ impl AgentInstance {
                 }
             }
 
-            if is_codex_backend
+            if !native_continuation && is_codex_backend
                 && compact::should_codex_block_normal_send(
                     effective_input_tokens,
                     ctx_limit,
@@ -11220,6 +11267,7 @@ impl AgentInstance {
                     result = self.call_llm(
                         store,
                         codex_turn_state.as_mut(),
+                        Some(&run_steering),
                         LlmRequestOptions::default(),
                         &system_parts,
                         &prepared_messages,
@@ -11550,7 +11598,7 @@ impl AgentInstance {
                             break;
                         }
 
-                        let is_retryable = is_retryable_llm_error(&e);
+                        let is_retryable = !e.contains("steering outcome unknown") && is_retryable_llm_error(&e);
                         let attempt_had_output = attempt_emitted_output.load(Ordering::Relaxed);
 
                         if is_retryable && !attempt_had_output && llm_attempt < LLM_RETRIES {
@@ -11575,7 +11623,7 @@ impl AgentInstance {
                 }
             }
 
-            let response = match response {
+            let mut response = match response {
                 Some(r) => r,
                 None if needs_reactive_compact => {
                     match self
@@ -11583,6 +11631,8 @@ impl AgentInstance {
                             app_handle,
                             store,
                             &system_parts,
+                            &prepared_tools,
+                            codex_turn_state.as_mut(),
                             effective_input_tokens,
                             ctx_limit,
                             false,
@@ -11626,6 +11676,17 @@ impl AgentInstance {
                 }
                 None => return Err(last_llm_error),
             };
+            run_steering.persist_ready(true)?;
+            let upstream_model_pair = crate::llm::upstream_model::record(
+                &mut response.continuation_request,
+                &response.raw_request,
+                &response.raw_response,
+            );
+            if let Some(warning) = crate::llm::upstream_model::mismatch_warning(
+                &mut upstream_model_warnings, upstream_model_pair, &self.session_id,
+            ) {
+                crate::error::AppError::emit_background(app_handle, &warning);
+            }
             // The provider accepted the prompt, so the last compact (if any)
             // demonstrably made the history fit again.
             compact_unverified_since_send = false;
@@ -12714,13 +12775,10 @@ impl AgentInstance {
                     let mut queued_asset_paths = Vec::new();
                     let mut seen_asset_paths = HashSet::new();
                     for ((tool_call, args), completed) in prepared.iter().zip(results.iter()) {
-                        let Some(asset_path) =
-                            self.unity_asset_relative_path(tool_call, args, &completed.executed)
-                        else {
-                            continue;
-                        };
-                        if seen_asset_paths.insert(asset_path.clone()) {
-                            queued_asset_paths.push(asset_path);
+                        for asset_path in self.unity_asset_relative_paths(tool_call, args, &completed.executed) {
+                            if seen_asset_paths.insert(asset_path.clone()) {
+                                queued_asset_paths.push(asset_path);
+                            }
                         }
                     }
                     if !queued_asset_paths.is_empty() {
@@ -12779,11 +12837,7 @@ impl AgentInstance {
                                     confirmation_preapproved.contains(&tc.id),
                                 )
                                 .await;
-                            if let Some(asset_path) =
-                                self.unity_asset_relative_path(tc, args, &result)
-                            {
-                                queued_asset_paths.push(asset_path);
-                            }
+                            queued_asset_paths.extend(self.unity_asset_relative_paths(tc, args, &result));
                             result
                         };
 
@@ -12937,8 +12991,8 @@ impl AgentInstance {
                     let queued_asset_paths: Vec<String> = prepared
                         .iter()
                         .zip(completed_results.iter())
-                        .filter_map(|((tc, args), completed)| {
-                            self.unity_asset_relative_path(tc, args, &completed.executed)
+                        .flat_map(|((tc, args), completed)| {
+                            self.unity_asset_relative_paths(tc, args, &completed.executed)
                         })
                         .collect();
 
@@ -13109,6 +13163,10 @@ impl AgentInstance {
                     return Ok(String::new());
                 }
 
+                run_steering.persist_ready(false)?;
+                if codex_turn_state.as_ref().is_some_and(codex::TurnState::has_steering_continuation) {
+                    continue 'agent_loop;
+                }
                 if self.drain_queued_pending_inputs(
                     app_handle,
                     store,
@@ -13148,7 +13206,11 @@ impl AgentInstance {
                 let mut queue = queue_state
                     .lock()
                     .map_err(|e| format!("Failed to lock pending input queue: {}", e))?;
-                queue.claim_immediate(&self.session_id, &run_id)
+                if codex_turn_state.as_ref().is_some_and(codex::TurnState::has_steering_continuation) {
+                    Vec::new()
+                } else {
+                    queue.claim_immediate(&self.session_id, &run_id)
+                }
             };
             if model_needs_follow_up || !pending_inputs.is_empty() || !store.pending_agent_messages(&self.session_id)?.is_empty() {
                 let thinking_opt = if response.thinking_text.is_empty() {
@@ -13196,6 +13258,7 @@ impl AgentInstance {
                     render_parts: Some(response_render_parts),
                 });
                 self.partial_assistant.reset();
+                run_steering.persist_ready(false)?;
                 self.persist_claimed_pending_inputs(
                     app_handle,
                     store,
@@ -13351,6 +13414,11 @@ impl AgentInstance {
                 run_result.is_ok()
             );
 
+            if run_result.is_err() && self.is_cancel_requested() {
+                self.clear_pending_knowledge_proposal(app_handle).await;
+                self.emit_cancelled(app_handle, store, &run_id, None);
+                return Ok(String::new());
+            }
             if let Err(ref err) = run_result {
                 self.clear_pending_knowledge_proposal(app_handle).await;
                 let interrupted = Self::persist_interrupted_assistant_snapshot(
@@ -13407,11 +13475,7 @@ impl AgentInstance {
                 | "code_diagnostics"
                 | "code_hover"
                 | "unity_code_usages"
-                | "view_capture"
-                | "view_snapshot"
-                | "view_wait"
-                | "view_console_read"
-                | "knowledge_list"
+                                | "knowledge_list"
                 | "knowledge_query"
                 | "knowledge_read"
                 | "skill_list"
@@ -13541,7 +13605,13 @@ impl AgentInstance {
     }
 
     fn should_track_session_undo(&self, name: &str, args: &serde_json::Value) -> bool {
-        self.session_undo_enabled && self.tool_call_needs_undo_tracking(name, args)
+        let (target_name, _) = self.workspace_execution_target(name, args);
+        // Frontend dispatch waits for View callbacks whose asset/merge endpoints
+        // own their mutation transactions. An outer filesystem snapshot would
+        // span unrelated UI work and require the same non-reentrant gate.
+        self.session_undo_enabled
+            && target_name != "execute_typescript"
+            && self.tool_call_needs_undo_tracking(name, args)
     }
 
     fn workspace_execution_target(
@@ -13579,6 +13649,15 @@ impl AgentInstance {
         args: &serde_json::Value,
     ) -> Option<WorkspaceExecutionLockRequest> {
         let (target_name, target_args) = self.workspace_execution_target(name, args);
+        if target_name == "execute_typescript" {
+            // Do not hold a filesystem gate while awaiting frontend callbacks:
+            // their actual asset/merge mutations acquire it at the endpoint.
+            // ToolDef remains mutating for plan-mode and permission policies.
+            return None;
+        }
+        if target_name == "apply_patch" {
+            return Some(WorkspaceExecutionLockRequest::Exclusive);
+        }
         if matches!(target_name.as_str(), "write" | "edit") {
             return Some(
                 target_args
@@ -14303,109 +14382,117 @@ impl AgentInstance {
         let mut knowledge_preview: Option<KnowledgeToolConfirmPreview> = None;
         let mut knowledge_governance_triggered = false;
         let mut dangerous_command = None;
-        if matches!(tool_name, "write" | "edit") {
-            if let Some(file_path) = args.get("filePath").and_then(|value| value.as_str()) {
-                let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
-                    &self.working_dir,
-                    self.app_knowledge_dir.as_ref().as_ref(),
-                );
-                if let Some(target) = registry.classify_path_string(file_path) {
-                    if matches!(
-                        target.kind,
-                        crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
-                            | crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage
-                            | crate::knowledge_source_registry::KnowledgeSourceKind::ProjectSkillPackage
-                    ) {
-                        let document_mode = if tool_name == "edit" {
-                            let loaded_document = if target.kind
-                                == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
-                            {
-                                crate::knowledge_store::load_document_by_path(
-                                    &self.working_dir,
-                                    target.doc_type,
-                                    &target.logical_path,
-                                )
-                            } else {
-                                crate::commands::read_skill_package_document_sync(
-                                    &self.working_dir,
-                                    &target.logical_path,
-                                    "full",
-                                )
-                                .and_then(|direct| {
-                                    if let Some(result) = direct {
-                                        return Ok(result.document);
-                                    }
-                                    let package_id = target
-                                        .logical_path
-                                        .split('/')
-                                        .find(|segment| !segment.is_empty())
-                                        .ok_or_else(|| {
-                                            "Skill package path is missing its package id"
-                                                .to_string()
-                                        })?;
+        let file_policy_targets = match self.patch_policy_targets(tool_name, args) {
+            Ok(targets) => targets,
+            Err(error) => return knowledge_tool_confirm_preflight_error(tool_name, error),
+        };
+        for (policy_tool_name, policy_args) in file_policy_targets {
+            let tool_name = policy_tool_name.as_str();
+            let args = &policy_args;
+            if matches!(tool_name, "write" | "edit") {
+                if let Some(file_path) = args.get("filePath").and_then(|value| value.as_str()) {
+                    let registry = crate::knowledge_source_registry::KnowledgeSourceRegistry::build(
+                        &self.working_dir,
+                        self.app_knowledge_dir.as_ref().as_ref(),
+                    );
+                    if let Some(target) = registry.classify_path_string(file_path) {
+                        if matches!(
+                            target.kind,
+                            crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+                                | crate::knowledge_source_registry::KnowledgeSourceKind::AppSkillPackage
+                                | crate::knowledge_source_registry::KnowledgeSourceKind::ProjectSkillPackage
+                        ) {
+                            let document_mode = if tool_name == "edit" {
+                                let loaded_document = if target.kind
+                                    == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge
+                                {
+                                    crate::knowledge_store::inspect_workspace_document_policy(
+                                        &self.working_dir,
+                                        target.doc_type,
+                                        &target.logical_path,
+                                    )
+                                } else {
                                     crate::commands::read_skill_package_document_sync(
                                         &self.working_dir,
-                                        &format!("{}/SKILL.md", package_id),
+                                        &target.logical_path,
                                         "full",
                                     )
-                                    .and_then(|result| {
-                                        result.map(|value| value.document).ok_or_else(|| {
-                                            "Skill package root document not found".to_string()
+                                    .and_then(|direct| {
+                                        if let Some(result) = direct {
+                                            return Ok(result.document);
+                                        }
+                                        let package_id = target
+                                            .logical_path
+                                            .split('/')
+                                            .find(|segment| !segment.is_empty())
+                                            .ok_or_else(|| {
+                                                "Skill package path is missing its package id"
+                                                    .to_string()
+                                            })?;
+                                        crate::commands::read_skill_package_document_sync(
+                                            &self.working_dir,
+                                            &format!("{}/SKILL.md", package_id),
+                                            "full",
+                                        )
+                                        .and_then(|result| {
+                                            result.map(|value| value.document).ok_or_else(|| {
+                                                "Skill package root document not found".to_string()
+                                            })
                                         })
                                     })
-                                })
-                            };
-                            match loaded_document {
-                                Ok(document) => {
-                                    if let Err(error) =
-                                        ensure_agent_can_edit_knowledge_document(&document)
-                                    {
+                                };
+                                match loaded_document {
+                                    Ok(document) => {
+                                        if let Err(error) =
+                                            ensure_agent_can_edit_knowledge_document(&document)
+                                        {
+                                            return knowledge_tool_confirm_preflight_error(
+                                                tool_name, error,
+                                            );
+                                        }
+                                        match document.ai_edit_mode {
+                                            crate::knowledge_store::KnowledgeAiEditMode::Confirm => {
+                                                Some(KnowledgeToolConfirmDirectoryMode::Approval)
+                                            }
+                                            crate::knowledge_store::KnowledgeAiEditMode::Auto => {
+                                                Some(KnowledgeToolConfirmDirectoryMode::Auto)
+                                            }
+                                            _ => None,
+                                        }
+                                    }
+                                    Err(error) => {
                                         return knowledge_tool_confirm_preflight_error(
                                             tool_name, error,
                                         );
                                     }
-                                    match document.ai_edit_mode {
-                                        crate::knowledge_store::KnowledgeAiEditMode::Confirm => {
-                                            Some(KnowledgeToolConfirmDirectoryMode::Approval)
-                                        }
-                                        crate::knowledge_store::KnowledgeAiEditMode::Auto => {
-                                            Some(KnowledgeToolConfirmDirectoryMode::Auto)
-                                        }
-                                        _ => None,
-                                    }
                                 }
+                            } else {
+                                None
+                            };
+                            let parent_path = parent_knowledge_path(&target.logical_path);
+                            let mode = if let Some(mode) = document_mode {
+                                Ok((String::new(), mode))
+                            } else if tool_name == "write" {
+                                resolve_child_directory_mode(
+                                    &self.working_dir,
+                                    target.doc_type,
+                                    parent_path.as_deref(),
+                                )
+                            } else {
+                                resolve_existing_directory_mode(
+                                    &self.working_dir,
+                                    target.doc_type,
+                                    parent_path.as_deref(),
+                                )
+                            };
+                            match mode {
+                                Ok((_, KnowledgeToolConfirmDirectoryMode::Approval)) => {
+                                    knowledge_governance_triggered = true;
+                                }
+                                Ok(_) => {}
                                 Err(error) => {
-                                    return knowledge_tool_confirm_preflight_error(
-                                        tool_name, error,
-                                    );
+                                    return knowledge_tool_confirm_preflight_error(tool_name, error);
                                 }
-                            }
-                        } else {
-                            None
-                        };
-                        let parent_path = parent_knowledge_path(&target.logical_path);
-                        let mode = if let Some(mode) = document_mode {
-                            Ok((String::new(), mode))
-                        } else if tool_name == "write" {
-                            resolve_child_directory_mode(
-                                &self.working_dir,
-                                target.doc_type,
-                                parent_path.as_deref(),
-                            )
-                        } else {
-                            resolve_existing_directory_mode(
-                                &self.working_dir,
-                                target.doc_type,
-                                parent_path.as_deref(),
-                            )
-                        };
-                        match mode {
-                            Ok((_, KnowledgeToolConfirmDirectoryMode::Approval)) => {
-                                knowledge_governance_triggered = true;
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                return knowledge_tool_confirm_preflight_error(tool_name, error);
                             }
                         }
                     }
@@ -14464,7 +14551,9 @@ impl AgentInstance {
 
         let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
         let perms = perms_state.0.read().await;
-        let tool_mode = perms.get(tool_name).cloned();
+        let tool_mode = perms.get(tool_name)
+            .or_else(|| if tool_name == "apply_patch" { perms.get("edit") } else { None })
+            .cloned();
         let knowledge_governance_requires_confirm = knowledge_governance_triggered
             && Self::permission_setting_requires_confirm(
                 perms
@@ -15675,6 +15764,14 @@ impl AgentInstance {
             .try_state::<Arc<crate::config::AppConfig>>()
             .map(|config| config.file_tool_workspace_boundary_enabled())
             .unwrap_or(false);
+        if tc.name == "apply_patch" {
+            if let Some(error) = self.validate_patch_paths(args, file_workspace_boundary_enabled) {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: error,
+                    is_error: true,
+                });
+            }
+        }
         let registered_knowledge_path_grant = match tc.name.as_str() {
             "read" | "write" | "edit" => args.get("filePath").and_then(|value| value.as_str()),
             "grep" | "list" => args.get("path").and_then(|value| value.as_str()),
@@ -15899,8 +15996,8 @@ impl AgentInstance {
                 args,
             )))
             .await
-        } else if tc.name == "view_capture" {
-            self.await_executed_tool_result(Box::pin(self.execute_view_capture(app_handle, args)))
+        } else if tc.name == "execute_typescript" {
+            self.await_executed_tool_result(Box::pin(self.execute_frontend_typescript(app_handle, args)))
                 .await
         } else if tc.name == "unity_ref_search" {
             let Some(execution) = self.execution_context.as_ref() else {
@@ -19276,36 +19373,14 @@ impl AgentInstance {
             );
         }
 
-        let prefab_source = if path.asset_path.to_ascii_lowercase().ends_with(".prefab") {
-            crate::unity_yaml::extract_prefab_instance_irs(&docs, &lines)
-                .into_iter()
-                .find_map(|instance| {
-                    let source_asset_path = guid_map.get(&instance.source_prefab_guid)?.clone();
-                    let source_absolute_path = project_root.as_ref()?.join(&source_asset_path);
-                    let source_text = std::fs::read_to_string(source_absolute_path).ok()?;
-                    Some((source_asset_path, source_text))
-                })
-        } else {
-            None
-        };
-
-        let tree = if let Some((source_asset_path, source_text)) = prefab_source {
-            crate::unity_serialized_property::property_tree::YamlPropertyTree::parse_prefab_instance(
-                &path.asset_path,
-                &text,
-                &source_asset_path,
-                &source_text,
-                project_root.as_deref(),
-                &guid_paths,
-            )
-        } else {
-            crate::unity_serialized_property::property_tree::YamlPropertyTree::parse(
+        // Prefab inheritance now uses the same recursive dependency graph as
+        // View read/write, including all instances and transitive cache revisions.
+        let tree = crate::unity_serialized_property::property_tree::YamlPropertyTree::parse(
                 &path.asset_path,
                 &text,
                 project_root.as_deref(),
                 &guid_paths,
             )
-        }
         .map_err(|error| ToolResult {
             output: error,
             is_error: true,
@@ -22439,7 +22514,7 @@ mod tests {
             "edit",
             "unity_execute",
             "unity_run_states",
-            "view_create",
+            "execute_typescript",
             "create_skill_package",
             "plugin_install",
             "plugin_uninstall",
@@ -22459,7 +22534,7 @@ mod tests {
             "knowledge_query",
             "plugin_list",
             "unity_recompile",
-            "view_list",
+            "plugin_list",
         ] {
             assert!(
                 !registry.mutates_workspace(tool),
@@ -22497,7 +22572,7 @@ mod tests {
             "web_fetch",
             "unity_execute",
             "unity_get_console_log",
-            "view_snapshot",
+            "execute_typescript",
         ] {
             assert!(
                 !AgentInstance::is_deterministic_pre_ask_tool(tool),
@@ -22510,24 +22585,45 @@ mod tests {
     fn needs_undo_tracking_follows_meta_tool_call_target() {
         let agent = test_agent_instance_with_tools_and_mode(
             String::new(),
-            vec!["view_create".to_string(), "view_list".to_string()],
+            vec!["execute_typescript".to_string(), "plugin_list".to_string()],
             KnowledgeAccessMode::Full,
         );
 
         assert!(agent.tool_call_needs_undo_tracking(
             "tool_call",
             &json!({
-                "toolName": "view_create",
+                "toolName": "execute_typescript",
                 "arguments": {}
             })
         ));
         assert!(!agent.tool_call_needs_undo_tracking(
             "tool_call",
             &json!({
-                "toolName": "view_list",
+                "toolName": "plugin_list",
                 "arguments": {}
             })
         ));
+    }
+
+    #[test]
+    fn frontend_dispatcher_does_not_hold_outer_workspace_gate() {
+        let root = tempdir().expect("temp dir");
+        let mut agent = test_agent_instance_with_tools_and_mode(
+            root.path().to_string_lossy().to_string(),
+            vec!["execute_typescript".to_string()],
+            KnowledgeAccessMode::Full,
+        );
+        let direct = json!({"code": "await locus.assets.apply_batch(entries)"});
+        let wrapped = json!({"toolName": "execute_typescript", "arguments": direct});
+        for enabled in [true, false] {
+            agent.set_session_undo_enabled(enabled);
+            for (name, args) in [("execute_typescript", &direct), ("tool_call", &wrapped)] {
+                assert!(agent.workspace_execution_request_for_tool(name, args).is_none());
+                assert!(agent.background_workspace_execution_request_for_tool(name, args, "frontend-test").is_none());
+                assert!(!agent.should_track_session_undo(name, args));
+            }
+            assert!(agent.tool_registry.mutates_workspace("execute_typescript"));
+        }
     }
 
     #[test]
@@ -22535,7 +22631,7 @@ mod tests {
         let root = tempdir().expect("temp dir");
         let mut agent = test_agent_instance_with_tools_and_mode(
             root.path().to_string_lossy().to_string(),
-            vec!["view_create".to_string()],
+            vec!["execute_typescript".to_string()],
             KnowledgeAccessMode::Full,
         );
         agent.set_session_undo_enabled(false);
@@ -22563,9 +22659,9 @@ mod tests {
             )
             .is_none());
         assert!(agent
-            .workspace_execution_request_for_tool("view_create", &json!({}))
+            .workspace_execution_request_for_tool("execute_typescript", &json!({}))
             .is_none());
-        assert!(!agent.should_track_session_undo("view_create", &json!({})));
+        assert!(!agent.should_track_session_undo("execute_typescript", &json!({})));
 
         assert!(matches!(
             agent
@@ -23384,6 +23480,27 @@ PrefabInstance:
     }
 
     #[test]
+    fn astra_reasoning_updates_keep_the_prompt_prefix_cache_identity() {
+        let mut instance = test_agent_instance(String::new());
+        instance.backend = crate::agent::instance::LlmBackend::OpenAiCodex {
+            auth: Arc::new(tokio::sync::Mutex::new(crate::auth::codex::CodexAuthState::new(std::path::Path::new(".")))),
+            transport: crate::commands::CodexTransportMode::Websocket,
+            base_url: None,
+        };
+        instance.effective_model = "openai/gpt-6-astra".to_string();
+        instance.effort = Some("low".to_string());
+        let initial = instance.prompt_prefix_cache_policy();
+        instance.effort = Some("max".to_string());
+        assert_eq!(initial.cache_key, instance.prompt_prefix_cache_policy().cache_key);
+        instance.codex_fast_mode = true;
+        assert_ne!(initial.cache_key, instance.prompt_prefix_cache_policy().cache_key);
+        instance.effective_model = "openai/gpt-5.6-sol".to_string();
+        let other = instance.prompt_prefix_cache_policy();
+        instance.effort = Some("low".to_string());
+        assert_ne!(other.cache_key, instance.prompt_prefix_cache_policy().cache_key);
+    }
+
+    #[test]
     fn lazy_tool_renderer_changes_prompt_prefix_cache_identity() {
         let mut instance = test_agent_instance(String::new());
         instance.configure_preview_lazy_tool_renderer(
@@ -23459,7 +23576,6 @@ PrefabInstance:
         assert!(!initial.reused);
         assert!(initial.parts.rules_prompt.contains("old route content"));
 
-        std::fs::write(&rule_path, "# Runtime rule\nnew route content").expect("update rule");
         let stable_route = instance
             .resolve_system_prompt_parts(&store)
             .await
@@ -23474,6 +23590,7 @@ PrefabInstance:
             .rules_prompt
             .contains("new route content"));
 
+        std::fs::write(&rule_path, "# Runtime rule\nnew route content").expect("update rule");
         instance.effort = Some("high".to_string());
         let changed_route = instance
             .resolve_system_prompt_parts(&store)
@@ -23484,6 +23601,106 @@ PrefabInstance:
             .parts
             .rules_prompt
             .contains("new route content"));
+    }
+
+    #[tokio::test]
+    async fn workspace_agent_rules_refresh_cached_prompts_during_a_run() {
+        let workspace = tempdir().unwrap();
+        let other_workspace = tempdir().unwrap();
+        let database = tempdir().unwrap();
+        let app = tempdir().unwrap();
+        let app_agent_dir = Some(app.path().join("agent"));
+        let app_rules = app_agent_dir.as_ref().unwrap().join("test/rule");
+        std::fs::create_dir_all(&app_rules).unwrap();
+        std::fs::write(app_rules.join("default.md"), "# Default\nInherited marker").unwrap();
+        let store = SessionStore::new(database.path()).unwrap();
+        let mut instance = test_agent_instance(workspace.path().to_string_lossy().into_owned());
+        instance.app_agent_dir = Arc::new(app_agent_dir.clone());
+        instance.session_id = store
+            .create_session("Rules", None, None, "chat", None)
+            .unwrap();
+        let initial = instance.resolve_system_prompt_parts(&store).await.unwrap();
+        let mut parts = initial.parts;
+        let mut policy = initial.policy;
+        assert!(parts.rules_prompt.contains("Inherited marker"));
+        assert!(!instance
+            .refresh_changed_agent_rules(&store, &mut parts, &mut policy)
+            .await
+            .unwrap());
+
+        crate::commands::set_workspace_agent_rule_enabled(
+            &app_agent_dir,
+            &other_workspace.path().to_string_lossy(),
+            "test",
+            "default.md",
+            false,
+        )
+        .unwrap();
+        assert!(
+            !instance
+                .refresh_changed_agent_rules(&store, &mut parts, &mut policy)
+                .await
+                .unwrap(),
+            "another workspace must not invalidate this prompt"
+        );
+
+        let root = workspace.path().to_string_lossy();
+        crate::commands::set_workspace_agent_rule_enabled(
+            &app_agent_dir,
+            &root,
+            "test",
+            "default.md",
+            false,
+        )
+        .unwrap();
+        assert!(instance
+            .refresh_changed_agent_rules(&store, &mut parts, &mut policy)
+            .await
+            .unwrap());
+        assert!(!parts.rules_prompt.contains("Inherited marker"));
+        crate::commands::save_workspace_agent_rule(
+            &app_agent_dir,
+            &root,
+            "test",
+            "local.md",
+            "# Local\nNew rule marker",
+        )
+        .unwrap();
+        assert!(instance
+            .refresh_changed_agent_rules(&store, &mut parts, &mut policy)
+            .await
+            .unwrap());
+        assert!(parts.rules_prompt.contains("New rule marker"));
+        let persisted = instance.resolve_system_prompt_parts(&store).await.unwrap();
+        assert!(persisted.reused);
+        assert!(persisted.parts.rules_prompt.contains("New rule marker"));
+        assert!(!persisted.parts.rules_prompt.contains("Inherited marker"));
+
+        crate::commands::set_workspace_agent_rule_enabled(
+            &app_agent_dir,
+            &root,
+            "test",
+            "default.md",
+            true,
+        )
+        .unwrap();
+        assert!(instance
+            .refresh_changed_agent_rules(&store, &mut parts, &mut policy)
+            .await
+            .unwrap());
+        assert!(parts.rules_prompt.contains("Inherited marker"));
+        // Direct edits and undo are observed without an SDK-specific signal.
+        std::fs::write(
+            workspace.path().join("Locus/agent/test/rule/local.md"),
+            "# Local\nEdited marker",
+        )
+        .unwrap();
+        assert!(instance
+            .refresh_changed_agent_rules(&store, &mut parts, &mut policy)
+            .await
+            .unwrap());
+        assert!(parts.rules_prompt.contains("Edited marker"));
+        assert!(!parts.rules_prompt.contains("New rule marker"));
     }
 
     #[test]
@@ -23746,50 +23963,17 @@ PrefabInstance:
     }
 
     #[tokio::test]
-    async fn vision_required_tools_stay_visible_in_preview_but_out_of_requests() {
-        let mut instance = test_agent_instance_with_tools_and_mode(
-            String::new(),
-            vec![
-                "read".to_string(),
-                "view_capture".to_string(),
-                "unity_capture_viewport".to_string(),
-            ],
-            KnowledgeAccessMode::Full,
-        );
+    async fn frontend_sdk_is_available_without_vision_while_capture_only_tools_remain_gated() {
+        let mut instance = test_agent_instance_with_tools_and_mode(String::new(), vec!["read".to_string(), "execute_typescript".to_string(), "unity_capture_viewport".to_string()], KnowledgeAccessMode::Full);
         instance.backend = test_custom_backend(false);
-
         let allowed = instance.allowed_tool_set().await;
-        assert!(allowed.contains("read"));
-        assert!(!allowed.contains("view_capture"));
+        assert!(allowed.contains("execute_typescript"));
         assert!(!allowed.contains("unity_capture_viewport"));
-
-        let request_tools = instance.build_request_tool_names().await;
-        assert!(request_tools.contains(&"read".to_string()));
-        assert!(!request_tools.contains(&"view_capture".to_string()));
-        assert!(!request_tools.contains(&"unity_capture_viewport".to_string()));
-
-        let lazy_manifest = instance.lazy_tool_manifest_names().await;
-        assert!(!lazy_manifest.contains(&"unity_capture_viewport".to_string()));
-
-        let preview = instance.available_tool_prompt_items().await;
-        assert!(preview.iter().any(|item| item.title == "read"));
-        assert!(preview.iter().any(|item| item.title == "view_capture"));
-        assert!(preview
-            .iter()
-            .any(|item| item.title == "unity_capture_viewport"));
-        assert_eq!(
-            tool_meta_bool(&preview, "view_capture", "runtimeAvailable"),
-            Some(false)
-        );
-        assert_eq!(
-            tool_meta_string(&preview, "view_capture", "unavailableReason").as_deref(),
-            Some("model_vision_unsupported")
-        );
-
+        assert!(!instance.build_request_tool_names().await.contains(&"execute_typescript".to_string()));
+        let active = HashSet::from(["execute_typescript".to_string()]);
+        assert!(instance.build_request_tool_names_for_mode_and_skills(crate::config::DynamicToolLoadingMode::MetaTool, &active).await.contains(&"execute_typescript".to_string()));
         instance.backend = test_custom_backend(true);
-        let allowed = instance.allowed_tool_set().await;
-        assert!(allowed.contains("view_capture"));
-        assert!(!allowed.contains("unity_capture_viewport"));
+        assert!(instance.allowed_tool_set().await.contains("execute_typescript"));
     }
 
     #[tokio::test]
@@ -24041,7 +24225,7 @@ PrefabInstance:
         );
     }
 
-    fn native_plan_test_instance(temp: &tempfile::TempDir) -> AgentInstance {
+    pub(super) fn native_plan_test_instance(temp: &tempfile::TempDir) -> AgentInstance {
         let (_, cancel_rx) = tokio::sync::watch::channel(false);
         AgentInstance::new(
             Arc::new(AgentDef {
@@ -25787,6 +25971,7 @@ Search, install, audit, and export a plugin.
 
     fn sample_agent_knowledge_document(path: &str, title: &str) -> KnowledgeDocument {
         KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: format!("kd_{}", title.replace(' ', "_").to_lowercase()),
             doc_type: KnowledgeType::Design,
             path: path.to_string(),
@@ -26296,6 +26481,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_combat_move".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -26579,6 +26765,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_combat_rules".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -26633,6 +26820,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_combat".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -26704,6 +26892,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_skill_builtin_create_skill".to_string(),
                 doc_type: KnowledgeType::Skill,
                 path: "builtin/create-skill.md".to_string(),
@@ -26766,6 +26955,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_hidden".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/hidden.md".to_string(),
@@ -26865,6 +27055,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_hidden_dir_doc".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/core-loop.md".to_string(),
@@ -26898,6 +27089,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_hidden_dir_nested_doc".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/sub/chain.md".to_string(),
@@ -26957,6 +27149,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_summary".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/summary.md".to_string(),
@@ -26990,6 +27183,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_body".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/body.md".to_string(),
@@ -27299,6 +27493,7 @@ Search, install, audit, and export a plugin.
         let working_dir = temp.path().to_string_lossy().to_string();
 
         let documents = vec![KnowledgeDocument {
+            inject_agents: crate::knowledge_store::default_inject_agents(),
             id: "kd_unity_execution_order".to_string(),
             doc_type: KnowledgeType::Reference,
             path: "unity-official-docs/manual/ExecutionOrder.md".to_string(),
@@ -27386,12 +27581,40 @@ Search, install, audit, and export a plugin.
         let working_dir = temp.path().to_string_lossy().to_string();
 
         let memory =
-            build_l2_full_document_section(&working_dir, None).expect("build l2 documents");
+            build_l2_full_document_section(&working_dir, None, "unity").expect("build l2 documents");
         assert!(memory.contains("### L2 Full Documents"));
         assert!(memory.contains("#### memory/project-mistake-note.md"));
         assert!(memory.contains("Rules:"));
         assert!(memory.contains("Body:\n<empty>"));
         assert!(!memory.contains("user-preference.md"));
+    }
+
+    #[test]
+    fn inject_agents_filter_l2_and_l3_using_document_metadata() {
+        let temp = tempdir().unwrap();
+        let working_dir = temp.path().to_string_lossy().to_string();
+        let config = crate::commands::AgentInjectionConfigLayers::default();
+        assert!(build_l2_full_document_section(&working_dir, None, "reviewer").unwrap().is_empty());
+        assert!(build_l3_rule_section(&working_dir, None, "reviewer", &config).unwrap().is_empty());
+        for (path, mode, marker) in [
+            ("agents/full.md", KnowledgeInjectMode::Full, "REVIEWER_L2_BODY"),
+            ("agents/rule.md", KnowledgeInjectMode::Rule, "REVIEWER_L3_BODY"),
+        ] {
+            let mut doc = sample_agent_knowledge_document(path, marker);
+            doc.inject_mode = mode;
+            doc.inherit_inject_mode = false;
+            doc.inject_agents = vec!["reviewer".into()];
+            doc.body = marker.into();
+            save_document(&working_dir, doc).unwrap();
+        }
+        let reviewer_l2 = build_l2_full_document_section(&working_dir, None, "reviewer").unwrap();
+        let reviewer_l3 = build_l3_rule_section(&working_dir, None, "reviewer", &config).unwrap();
+        assert!(reviewer_l2.contains("REVIEWER_L2_BODY"));
+        assert!(reviewer_l3.contains("REVIEWER_L3_BODY"));
+        assert!(!build_l2_full_document_section(&working_dir, None, "unity").unwrap().contains("REVIEWER_L2_BODY"));
+        assert!(!build_l3_rule_section(&working_dir, None, "unity", &config).unwrap().contains("REVIEWER_L3_BODY"));
+        // The same entry builder supplies the Agent injection preview.
+        assert!(super::build_l3_rule_entries(&working_dir, None, "unity").unwrap().iter().all(|entry| !entry.content.contains("REVIEWER_L3_BODY")));
     }
 
     #[test]
@@ -27402,6 +27625,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_design_full".to_string(),
                 doc_type: KnowledgeType::Design,
                 path: "combat/full-design.md".to_string(),
@@ -27434,7 +27658,7 @@ Search, install, audit, and export a plugin.
         .expect("save full design");
 
         let section =
-            build_l2_full_document_section(&working_dir, None).expect("build l2 documents");
+            build_l2_full_document_section(&working_dir, None, "unity").expect("build l2 documents");
         assert!(
             section.contains("#### design/combat/full-design.md"),
             "{}",
@@ -27460,6 +27684,7 @@ Search, install, audit, and export a plugin.
         let rules = build_l3_rule_section(
             &working_dir,
             None,
+            "unity",
             &crate::commands::AgentInjectionConfigLayers::default(),
         )
         .expect("build l3 rules");
@@ -27490,7 +27715,7 @@ Search, install, audit, and export a plugin.
             crate::commands::load_agent_injection_config_layers(&None, &working_dir, "test");
 
         let rules =
-            build_l3_rule_section(&working_dir, None, &injection_config).expect("build l3 rules");
+            build_l3_rule_section(&working_dir, None, "unity", &injection_config).expect("build l3 rules");
         assert!(!rules.contains("User Preferences"), "{}", rules);
     }
 
@@ -27502,6 +27727,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_memory_empty".to_string(),
                 doc_type: KnowledgeType::Memory,
                 path: "empty-memory.md".to_string(),
@@ -27536,6 +27762,7 @@ Search, install, audit, and export a plugin.
         let rules = build_l3_rule_section(
             &working_dir,
             None,
+            "unity",
             &crate::commands::AgentInjectionConfigLayers::default(),
         )
         .expect("build l3 rules");
@@ -27552,6 +27779,7 @@ Search, install, audit, and export a plugin.
         save_document(
             &working_dir,
             crate::knowledge_store::KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: "kd_memory_heading_map".to_string(),
                 doc_type: crate::knowledge_store::KnowledgeType::Memory,
                 path: "heading-map.md".to_string(),
@@ -27586,6 +27814,7 @@ Search, install, audit, and export a plugin.
         let rules = build_l3_rule_section(
             &working_dir,
             None,
+            "unity",
             &crate::commands::AgentInjectionConfigLayers::default(),
         )
         .expect("build mapped rules");
@@ -28097,6 +28326,7 @@ Search, install, audit, and export a plugin.
             kind: KnowledgeTargetKind::Document,
             document: Some(KnowledgeReadResult {
                 document: KnowledgeDocument {
+                    inject_agents: crate::knowledge_store::default_inject_agents(),
                     id: "kd_design_test".to_string(),
                     doc_type: KnowledgeType::Design,
                     path: "design/project-overview.md".to_string(),

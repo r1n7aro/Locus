@@ -198,6 +198,15 @@ export function buildToolCallArgsSummary(
         .join(", ");
     }
 
+    if (toolName === "apply_patch") {
+      const patch = getStringArg(args, ["patch"]);
+      const paths = [...new Set(Array.from(
+        patch.matchAll(/^\*\*\* (?:(?:Add|Delete|Update) File|Move to): (.+)$/gm),
+        (match) => summarizePath(match[1]!.trim(), pathContext),
+      ))];
+      return paths.slice(0, 3).join(", ") + (paths.length > 3 ? ", …" : "");
+    }
+
     if (toolName === "read" || toolName === "write" || toolName === "edit" || toolName === "list") {
       const p = getStringArg(args, ["filePath", "file_path", "path"]);
       if (!p) return "";

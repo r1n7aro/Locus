@@ -6,17 +6,6 @@ pub(super) fn allows_observation(tool_name: &str, args: &Value) -> bool {
     match tool_name {
         "bash" | "unity_execute" => args.get("readonly").and_then(Value::as_bool) == Some(true),
         "python" => crate::tool::builtins::python_is_readonly(args),
-        "view_wait" => matches!(
-            args.get("condition").and_then(Value::as_str),
-            Some(
-                "runtimeReady"
-                    | "selectorVisible"
-                    | "selectorHidden"
-                    | "textPresent"
-                    | "textAbsent"
-                    | "noConsoleError"
-            )
-        ),
         "read"
         | "grep"
         | "list"
@@ -36,11 +25,6 @@ pub(super) fn allows_observation(tool_name: &str, args: &Value) -> bool {
         | "unity_capture_viewport"
         | "unity_get_console_log"
         | "unity_test_list"
-        | "view_property_read"
-        | "view_property_discover"
-        | "view_capture"
-        | "view_snapshot"
-        | "view_console_read"
         | "knowledge_query"
         | "skill_list"
         | "config_query"
@@ -70,10 +54,7 @@ mod tests {
             "unity_set_play_mode",
             "unity_test_run",
             "unity_run_states",
-            "view_property_write",
-            "view_property_apply",
-            "view_debug_eval",
-            "view_wait",
+            "execute_typescript",
         ] {
             assert!(
                 !allows_observation(tool, &json!({"readonly": true})),
@@ -95,15 +76,8 @@ mod tests {
             );
             assert!(!allows_observation(tool, &json!({})), "{tool}");
         }
-        assert!(allows_observation("python", &json!({"action": "help"})));
-        assert!(allows_observation(
-            "view_wait",
-            &json!({"condition": "runtimeReady"})
-        ));
-        assert!(!allows_observation(
-            "view_wait",
-            &json!({"condition": "expression", "expression": "location.reload()"})
-        ));
+        assert!(!allows_observation("python", &json!({"action": "help"})));
+        assert!(!allows_observation("execute_typescript", &json!({"code": "return locus.workbench.tabs()"})));
     }
 
     #[test]
@@ -113,8 +87,6 @@ mod tests {
             "unity_yaml_read",
             "unity_get_console_log",
             "unity_test_list",
-            "view_property_read",
-            "view_property_discover",
             "web_fetch",
         ] {
             assert!(allows_observation(tool, &json!({})), "{tool}");

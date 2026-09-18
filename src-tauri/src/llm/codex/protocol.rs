@@ -149,6 +149,24 @@ pub(super) fn local_function_name(item: &Value) -> String {
     }
 }
 
+/// Store custom patch calls in the existing JSON tool-call envelope. The raw
+/// provider item remains in response metadata for lossless Codex replay.
+pub(super) fn local_tool_arguments(item: &Value) -> Option<String> {
+    if item["type"] == "custom_tool_call" {
+        item["input"].as_str().map(|patch| json!({"patch": patch}).to_string())
+    } else {
+        item["arguments"].as_str().map(str::to_owned)
+    }
+}
+
+pub(super) fn patch_tool(func: &Value) -> Value {
+    json!({
+        "type": "custom", "name": "apply_patch",
+        "description": format!("{}\nThis is a FREEFORM tool: pass the patch text directly, without JSON wrapping.", func["description"].as_str().unwrap_or_default()),
+        "format": {"type":"grammar", "syntax":"lark", "definition": include_str!("../../../../tools/apply_patch.lark")}
+    })
+}
+
 fn tool_snapshot(tools: &[ToolCallInfo]) -> Value {
     json!(tools
         .iter()
@@ -166,6 +184,8 @@ pub(super) fn response_metadata(
 ) -> Value {
     request["codex_response"] = json!({"version":1, "output":output,
         "text":text, "tool_calls":tool_snapshot(tools), "events":events});
+    request["codex_response"]["server_model"] =
+        json!(super::server_model::from_saved_response(&request["codex_response"]));
     request
 }
 
@@ -214,6 +234,9 @@ pub(super) fn event_error(event: &Value) -> Option<String> {
         let reason = event["response"]["incomplete_details"]["reason"]
             .as_str()
             .unwrap_or("unknown");
+        if reason == "steered" {
+            return None;
+        }
         return Some(format!("OpenAI Codex incomplete response: {reason}"));
     }
     if !matches!(kind, "response.failed" | "response.cancelled" | "error") {

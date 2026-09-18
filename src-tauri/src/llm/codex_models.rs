@@ -263,7 +263,7 @@ async fn fetch_remote_models(
     base_url: Option<&str>,
     etag: Option<&str>,
 ) -> Result<CodexModelsFetchOutcome, String> {
-    let client = crate::network::reqwest_client(
+    let client = crate::network::rustls_reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .connect_timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS))
             .timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS)),

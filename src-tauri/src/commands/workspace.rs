@@ -409,6 +409,9 @@ pub struct CodexModelConfig {
     /// Route approval requests through the Codex auto-review model.
     #[serde(default)]
     pub auto_review: bool,
+    /// Replace edit with the native patch tool for Codex subscription GPT models.
+    #[serde(default)]
+    pub use_apply_patch: bool,
     /// How long Locus keeps a Codex session's composed prompt prefix stable
     /// after the most recent successful remote response.
     #[serde(default = "default_codex_prefix_cache_ttl_seconds")]
@@ -423,6 +426,7 @@ impl Default for CodexModelConfig {
             extended_context: false,
             generate_session_titles: false,
             auto_review: false,
+            use_apply_patch: false,
             prefix_cache_ttl_seconds: default_codex_prefix_cache_ttl_seconds(),
         }
     }
@@ -2444,6 +2448,7 @@ impl UnityReadyIpcScope {
             project_id: self.execution.project_id.clone(),
             checkout_id: self.execution.checkout_id.clone(),
             workspace_generation: self.execution.workspace_generation,
+            materialization_epoch: Some(self.execution.workspace.materialization_epoch()),
             service_instance_id: None,
             service_generation: None,
         }
@@ -2729,6 +2734,7 @@ pub async fn install_unity_plugin(
         project_id: runtime.project_id().clone(),
         checkout_id: runtime.checkout_id().clone(),
         workspace_generation: runtime.generation(),
+        materialization_epoch: Some(runtime.materialization_epoch()),
         service_instance_id: None,
         service_generation: None,
     };
@@ -3259,6 +3265,7 @@ mod tests {
         assert!(!config.extended_context);
         assert!(!config.generate_session_titles);
         assert!(!config.auto_review);
+        assert!(!config.use_apply_patch);
         assert_eq!(
             config.prefix_cache_ttl_seconds,
             DEFAULT_CODEX_PREFIX_CACHE_TTL_SECONDS

@@ -16,7 +16,6 @@ use std::io;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use tokio_tungstenite::client_async_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
 use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
@@ -33,9 +32,23 @@ use url::Url;
 
 #[cfg(test)]
 mod compatibility_tests;
+mod diagnostics;
 mod prewarm;
+pub(crate) use diagnostics::Capture as CodexCompactionCapture;
+#[cfg(test)]
+mod compaction_tests;
+#[cfg(test)]
+mod idle_timeout_tests;
 mod protocol;
+pub(crate) mod server_model;
+#[cfg(test)]
+#[path = "codex/apply_patch_tests.rs"]
+mod apply_patch_tests;
+mod reasoning;
+pub(crate) use reasoning::compaction_metadata;
 mod retention;
+pub mod steering;
+mod tls;
 
 const DEFAULT_CODEX_PROVIDER_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const RESPONSES_ENDPOINT_PATH: &str = "/responses";
@@ -54,6 +67,30 @@ const MAX_SAFE_STREAM_RECOVERY_RETRIES: u32 = 2;
 const SAFE_STREAM_RECOVERY_DELAY_MS: u64 = 1200;
 const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WEBSOCKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const ASTRA_COMPACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+async fn wait_for_request_cancel(mut cancel: Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(cancel) = cancel.as_mut() {
+        if cancel.wait_for(|value| *value).await.is_ok() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+/// Locus orchestration uses separate single-agent Responses requests, without
+/// the provider's native multi-agent or pro request modes.
+pub fn supports_reasoning_updates(model: &str) -> bool {
+    is_astra_model(model)
+}
+
+fn is_astra_model(model: &str) -> bool {
+    let model = model.strip_prefix("openai/").unwrap_or(model);
+    model == "gpt-6-astra"
+        || model.strip_prefix("gpt-6-astra-")
+            .and_then(|suffix| suffix.chars().next())
+            .is_some_and(|first| first.is_ascii_digit())
+}
 
 trait CodexAsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 
@@ -63,6 +100,7 @@ type BoxedCodexIo = Box<dyn CodexAsyncIo>;
 type CodexWebSocket = tokio_tungstenite::WebSocketStream<BoxedCodexIo>;
 
 struct CodexWebsocketStream {
+    server_model: Option<String>,
     tx_command: mpsc::Sender<CodexWebsocketCommand>,
     rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
     pump_task: tokio::task::JoinHandle<()>,
@@ -137,6 +175,7 @@ impl CodexWebsocketStream {
             tx_command,
             rx_message,
             pump_task,
+            server_model: None,
         }
     }
 
@@ -167,6 +206,7 @@ impl Drop for CodexWebsocketStream {
 #[derive(Debug, Default)]
 pub struct TurnState {
     sticky_routing_token: Option<String>,
+    steering_continuation: Option<steering::Continuation>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +216,10 @@ pub struct CodexStreamOptions {
     pub fast_mode: bool,
     remote_compaction_v2: bool,
     structured_output: Option<CodexStructuredOutput>,
+    idle_timeout: Duration,
+    capture: Option<diagnostics::Capture>,
+    request_context: Option<(String, usize)>,
+    cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +236,10 @@ impl Default for CodexStreamOptions {
             fast_mode: false,
             remote_compaction_v2: false,
             structured_output: None,
+            idle_timeout: WEBSOCKET_STREAM_IDLE_TIMEOUT,
+            capture: None,
+            request_context: None,
+            cancel_rx: None,
         }
     }
 }
@@ -204,6 +252,7 @@ impl CodexStreamOptions {
             fast_mode: false,
             remote_compaction_v2: false,
             structured_output: None,
+            ..Self::default()
         }
     }
 
@@ -218,12 +267,23 @@ impl CodexStreamOptions {
             fast_mode: false,
             remote_compaction_v2: true,
             structured_output: None,
+            ..Self::default()
         }
     }
 
     pub fn with_fast_mode(mut self, enabled: bool) -> Self {
         self.fast_mode = enabled;
         self
+    }
+
+    fn response_idle_timeout(&self, model: &str) -> Duration {
+        // Compaction can generate its encrypted output without intermediate
+        // events. Keep request sends bounded separately from this wait.
+        if self.remote_compaction_v2 && is_astra_model(model) {
+            ASTRA_COMPACTION_IDLE_TIMEOUT
+        } else {
+            self.idle_timeout
+        }
     }
 
     pub fn with_output_schema(
@@ -316,6 +376,10 @@ fn websocket_connection_key(base_url: Option<&str>, account_id: Option<&str>) ->
 }
 
 impl TurnState {
+    pub fn has_steering_continuation(&self) -> bool {
+        self.steering_continuation.is_some()
+    }
+
     fn header_value(&self) -> Option<&str> {
         self.sticky_routing_token
             .as_deref()
@@ -328,7 +392,8 @@ impl TurnState {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        if next.is_some() {
+        // The first routing value owns this turn, including compaction and retries.
+        if self.sticky_routing_token.is_none() && next.is_some() {
             self.sticky_routing_token = next;
         }
     }
@@ -413,11 +478,22 @@ fn build_tool_search_call_item(tc: &ToolCallInfo) -> serde_json::Value {
 fn build_tool_search_output_item(call_id: &str, content: Option<&str>) -> serde_json::Value {
     // Missing or unparsable output (interrupted round, error text) degrades
     // to the empty patch — the same normalization codex itself applies.
-    let tools = content
+    let mut tools = content
         .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
         .and_then(|value| value.get("tools").cloned())
         .filter(|tools| tools.is_array())
         .unwrap_or_else(|| serde_json::json!([]));
+    if let Some(tools) = tools.as_array_mut() {
+        for tool in tools {
+            if tool["type"] == "function" && tool["name"] == "apply_patch" {
+                let mut custom = protocol::patch_tool(tool);
+                if tool["defer_loading"] == true {
+                    custom["defer_loading"] = serde_json::json!(true);
+                }
+                *tool = custom;
+            }
+        }
+    }
     serde_json::json!({
         "type": "tool_search_output",
         "call_id": call_id,
@@ -434,6 +510,14 @@ fn build_input(history: &[ChatMessage]) -> Vec<serde_json::Value> {
 fn build_input_with_metadata(
     history: &[ChatMessage],
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+) -> Vec<serde_json::Value> {
+    build_input_with_reasoning_updates(history, response_request_metadata, false)
+}
+
+fn build_input_with_reasoning_updates(
+    history: &[ChatMessage],
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    replay_reasoning_updates: bool,
 ) -> Vec<serde_json::Value> {
     // Match codex-rs history normalization at the final transport boundary.
     // A historical fork or interrupted run may end with a persisted function
@@ -457,6 +541,12 @@ fn build_input_with_metadata(
         .filter(|msg| msg.role == MessageRole::Tool)
         .filter_map(|msg| msg.tool_call_id.as_deref())
         .collect();
+    let patch_call_ids: std::collections::HashSet<&str> = history.iter()
+        .filter_map(|msg| msg.tool_calls.as_ref())
+        .flatten()
+        .filter(|tc| tc.name == "apply_patch" && !tc.is_server_tool())
+        .map(|tc| tc.id.as_str())
+        .collect();
 
     let mut input = Vec::new();
     for msg in history {
@@ -466,6 +556,12 @@ fn build_input_with_metadata(
             continue;
         }
         if msg.role == MessageRole::Assistant {
+            if replay_reasoning_updates {
+                reasoning::replay_update(
+                    &mut input,
+                    response_request_metadata.and_then(|metadata| metadata.get(&msg.id)),
+                );
+            }
             if let Some(output) = response_request_metadata
                 .and_then(|metadata| metadata.get(&msg.id))
                 .and_then(|metadata| protocol::replay_output(metadata, msg))
@@ -505,6 +601,15 @@ fn build_input_with_metadata(
                             }
                             continue;
                         }
+                        if tc.name == "apply_patch" {
+                            let arguments = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                                .unwrap_or_default();
+                            input.push(serde_json::json!({
+                                "type": "custom_tool_call", "call_id": tc.id,
+                                "name": tc.name, "input": arguments["patch"].as_str().unwrap_or(&tc.arguments),
+                            }));
+                            continue;
+                        }
                         input.push(serde_json::json!({
                             "type": "function_call",
                             "call_id": tc.id,
@@ -521,7 +626,7 @@ fn build_input_with_metadata(
                         continue;
                     }
                     input.push(serde_json::json!({
-                        "type": "function_call_output",
+                        "type": if patch_call_ids.contains(call_id.as_str()) { "custom_tool_call_output" } else { "function_call_output" },
                         "call_id": call_id,
                         "output": build_tool_output_content(&msg.content, msg.images.as_deref()),
                     }));
@@ -594,10 +699,16 @@ fn convert_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
     tools
         .iter()
         .filter_map(|tool| {
+            if tool.get("type").and_then(serde_json::Value::as_str) == Some("custom") {
+                return Some(tool.clone());
+            }
             if tool.get("type")?.as_str()? != "function" {
                 return None;
             }
             let func = tool.get("function")?;
+            if func["name"] == "apply_patch" {
+                return Some(protocol::patch_tool(func));
+            }
             Some(serde_json::json!({
                 "type": "function",
                 "name": func.get("name").cloned().unwrap_or(serde_json::Value::Null),
@@ -644,7 +755,9 @@ fn build_standard_request_body(
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     options: CodexStreamOptions,
 ) -> serde_json::Value {
-    let input = build_input_with_metadata(history, response_request_metadata);
+    let native_reasoning = supports_reasoning_updates(model) && options.use_session_continuation;
+    let input =
+        build_input_with_reasoning_updates(history, response_request_metadata, native_reasoning);
     let mut responses_tools = convert_tools(tools);
 
     if options.include_web_search {
@@ -685,6 +798,9 @@ fn build_standard_request_body(
         model,
         thinking_level.or_else(|| protocol::uses_lite(model).then_some("low")),
     );
+    if native_reasoning {
+        reasoning::prepare(&mut body, history, response_request_metadata);
+    }
     apply_text_verbosity_default(&mut body, model);
     if let Some(output) = options.structured_output.as_ref() {
         body["text"]["format"] = serde_json::json!({
@@ -783,6 +899,8 @@ fn request_without_input(body: &serde_json::Value) -> serde_json::Value {
         map.remove("tools");
         map.remove("tool_choice");
         map.remove("codex_response");
+        map.remove(super::upstream_model::METADATA_KEY);
+        map.remove(reasoning::METADATA_KEY);
     }
     request
 }
@@ -800,6 +918,7 @@ fn websocket_request_signature(body: &serde_json::Value) -> serde_json::Value {
         map.remove("stream_options");
         map.remove("access_programs");
         map.remove("generate");
+        map.remove(reasoning::METADATA_KEY);
     }
     request
 }
@@ -1011,6 +1130,8 @@ fn apply_transport_request_input(
 ) -> serde_json::Value {
     let mut request = body.clone();
     if let Some(map) = request.as_object_mut() {
+        // Local replay bookkeeping is persisted with the response, never sent.
+        map.remove(reasoning::METADATA_KEY);
         map.insert("input".to_string(), serde_json::json!(request_input.input));
         if let Some(input) = map
             .get_mut("input")
@@ -1117,7 +1238,7 @@ pub struct CodexRemoteCompactError {
 }
 
 impl CodexRemoteCompactError {
-    fn new(
+    pub(crate) fn new(
         message: impl Into<String>,
         raw_request: impl Into<String>,
         raw_response: impl Into<String>,
@@ -1311,7 +1432,7 @@ pub async fn compact_conversation_history(
         super::debug::save_request("openai_codex_compact", &api_url, &headers, &raw_request);
     }
 
-    let client = crate::network::reqwest_client(
+    let client = crate::network::rustls_reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .tcp_keepalive(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(30)),
@@ -1391,12 +1512,11 @@ fn validate_remote_compaction_v2_output(
             "Codex remote compaction V2 stream ended without response.completed".to_string(),
         );
     }
-    if response_items.len() != 1
-        || response_items[0]
-            .get("type")
-            .and_then(|value| value.as_str())
-            != Some("compaction")
-    {
+    let compactions: Vec<_> = response_items
+        .iter()
+        .filter(|item| item["type"] == "compaction")
+        .collect();
+    if compactions.len() != 1 {
         return Err(format!(
             "Codex remote compaction V2 expected exactly one compaction output item, got {} output items with types {:?}",
             response_items.len(),
@@ -1406,13 +1526,26 @@ fn validate_remote_compaction_v2_output(
                 .collect::<Vec<_>>()
         ));
     }
-    Ok(response_items[0].clone())
+    Ok(compactions[0].clone())
+}
+
+/// The resolved prompt controls and routing state of the turn being compacted.
+/// Standalone manual compaction supplies a fresh TurnState; inline compaction
+/// borrows the same one used by inference and subsequent tool continuations.
+pub(crate) struct CodexCompactionContext<'a> {
+    pub tools: &'a [serde_json::Value],
+    pub tool_search_description: Option<&'a str>,
+    pub turn_state: &'a mut TurnState,
+    pub run_id: &'a str,
+    pub iteration: usize,
+    pub cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    pub capture: CodexCompactionCapture,
 }
 
 /// Runs Codex main's current stable remote-compaction protocol. V2 uses the
 /// ordinary Responses transport with a terminal `compaction_trigger` instead
 /// of the legacy unary `/responses/compact` endpoint.
-pub async fn compact_conversation_history_v2(
+pub(crate) async fn compact_conversation_history_v2(
     access_token: &str,
     account_id: Option<&str>,
     transport: CodexTransportMode,
@@ -1420,14 +1553,18 @@ pub async fn compact_conversation_history_v2(
     model: &str,
     system_prompt: &str,
     history: &[ChatMessage],
-    tools: &[serde_json::Value],
+    context: CodexCompactionContext<'_>,
     thinking_level: Option<&str>,
     fast_mode: bool,
     session_id: Option<&str>,
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     debug: bool,
 ) -> Result<CodexRemoteCompactOutcome, CodexRemoteCompactError> {
-    let mut turn_state = TurnState::default();
+    let capture = context.capture;
+    let mut options = CodexStreamOptions::remote_compaction_v2().with_fast_mode(fast_mode);
+    options.capture = Some(capture.clone());
+    options.request_context = Some((context.run_id.to_string(), context.iteration));
+    options.cancel_rx = context.cancel_rx;
     let response = stream_chat_with_options(
         access_token,
         account_id,
@@ -1436,20 +1573,23 @@ pub async fn compact_conversation_history_v2(
         model,
         system_prompt,
         history,
-        tools,
-        None,
+        context.tools,
+        context.tool_search_description,
         thinking_level,
         debug,
         session_id,
         response_request_metadata,
-        &mut turn_state,
-        CodexStreamOptions::remote_compaction_v2().with_fast_mode(fast_mode),
+        context.turn_state,
+        options,
         &|_| {},
         &|_| {},
         &|_, _| {},
     )
     .await
-    .map_err(|error| CodexRemoteCompactError::new(error, "", ""))?;
+    .map_err(|error| {
+        let (request, response) = capture.evidence();
+        CodexRemoteCompactError::new(error, request, response)
+    })?;
 
     let compaction_item = match validate_remote_compaction_v2_output(
         &response.response_items,
@@ -1457,13 +1597,14 @@ pub async fn compact_conversation_history_v2(
     ) {
         Ok(compaction_item) => compaction_item,
         Err(error) => {
+            capture.validation_error(&error);
             if let Some(session_id) = session_id {
                 clear_cached_previous_response(session_id).await;
             }
             return Err(CodexRemoteCompactError::new(
                 error,
                 response.raw_request,
-                response.raw_response,
+                capture.evidence().1,
             ));
         }
     };
@@ -1477,7 +1618,7 @@ pub async fn compact_conversation_history_v2(
         output,
         encrypted_content,
         raw_request: response.raw_request,
-        raw_response: response.raw_response,
+        raw_response: capture.evidence().1,
     })
 }
 
@@ -1756,12 +1897,6 @@ fn build_tcp_connector() -> HttpConnector {
     connector
 }
 
-fn tls_connector() -> Result<TokioTlsConnector, String> {
-    let connector = native_tls::TlsConnector::new()
-        .map_err(|e| format!("Failed to create TLS connector: {}", e))?;
-    Ok(TokioTlsConnector::from(connector))
-}
-
 fn ws_io_error(message: impl Into<String>) -> WsError {
     WsError::Io(io::Error::other(message.into()))
 }
@@ -1838,8 +1973,8 @@ async fn connect_via_https_proxy(
     let proxy_config = tungstenite_proxy_config(proxy, TungsteniteProxyScheme::Http)?;
 
     let tcp = connect_tcp_stream(&proxy_uri).await?;
-    let proxy_tls = tls_connector()?
-        .connect(&proxy_host, tcp)
+    let proxy_tls = tls::connector()?
+        .connect(tls::server_name(&proxy_host)?, tcp)
         .await
         .map_err(|e| format!("Failed to establish TLS to HTTPS proxy: {}", e))?;
     let tunneled = connect_via_proxy(proxy_tls, &proxy_config, &target_host, target_port)
@@ -1923,8 +2058,8 @@ async fn wrap_websocket_transport_tls(
                 .uri()
                 .host()
                 .ok_or_else(|| "Websocket endpoint is missing host".to_string())?;
-            let tls_stream = tls_connector()?
-                .connect(host, stream)
+            let tls_stream = tls::connector()?
+                .connect(tls::server_name(host)?, stream)
                 .await
                 .map_err(|e| format!("Failed to establish TLS to websocket endpoint: {}", e))?;
             Ok(Box::new(tls_stream))
@@ -1972,9 +2107,9 @@ async fn connect_codex_websocket(
                 ));
             }
 
-            Ok(WebsocketConnectOutcome::Connected(
-                CodexWebsocketStream::new(socket),
-            ))
+            let mut stream = CodexWebsocketStream::new(socket);
+            stream.server_model = server_model::from_headers(response.headers());
+            Ok(WebsocketConnectOutcome::Connected(stream))
         }
         Ok(Err(WsError::Http(response)))
             if response.status() == http::StatusCode::UPGRADE_REQUIRED =>
@@ -2123,6 +2258,11 @@ fn valid_tool_arguments(arguments: &str) -> bool {
 }
 
 struct CodexStreamState {
+    server_model: Option<String>,
+    response_model: super::upstream_model::Observer,
+    last_event: Option<String>,
+    event_count: u64,
+    routing_token: Option<String>,
     full_text: String,
     text_parts: HashMap<String, String>,
     thinking_text: String,
@@ -2150,6 +2290,9 @@ struct CodexStreamState {
 impl CodexStreamState {
     fn new() -> Self {
         Self {
+            last_event: None,
+            event_count: 0,
+            routing_token: None,
             full_text: String::new(),
             text_parts: HashMap::new(),
             thinking_text: String::new(),
@@ -2171,6 +2314,8 @@ impl CodexStreamState {
             got_terminal_event: false,
             got_completed_event: false,
             metadata_events: serde_json::json!({}),
+            server_model: None,
+            response_model: super::upstream_model::Observer::default(),
         }
     }
 
@@ -2306,6 +2451,18 @@ where
                 }
             };
 
+            state.last_event = event["type"].as_str().map(str::to_owned);
+            state.event_count += 1;
+            state.response_model.observe(&event, event["type"].as_str().unwrap_or_default());
+            if let Some(model) = server_model::from_event(&event) {
+                state.server_model = Some(model);
+            }
+            if state.routing_token.is_none() {
+                state.routing_token = protocol::event_turn_state(&event).map(str::to_owned);
+            }
+            if let Some(id) = event["response"]["id"].as_str() {
+                state.response_id = Some(id.to_string());
+            }
             if let Some(error) = protocol::event_error(&event) {
                 return Err(error);
             }
@@ -2419,7 +2576,7 @@ where
                 Some("response.output_item.added") => {
                     if let Some(item) = event.get("item") {
                         let item_type = item.get("type").and_then(|t| t.as_str());
-                        if item_type == Some("function_call") {
+                        if matches!(item_type, Some("function_call" | "custom_tool_call")) {
                             let call_id = item
                                 .get("call_id")
                                 .and_then(|v| v.as_str())
@@ -2427,11 +2584,7 @@ where
                                 .trim()
                                 .to_string();
                             let name = protocol::local_function_name(item);
-                            let arguments = item
-                                .get("arguments")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
+                            let arguments = protocol::local_tool_arguments(item).unwrap_or_default();
                             let item_id = item
                                 .get("id")
                                 .and_then(|v| v.as_str())
@@ -2506,7 +2659,7 @@ where
                         }
                     }
                 }
-                Some("response.function_call_arguments.delta") => {
+                Some("response.function_call_arguments.delta" | "response.custom_tool_call_input.delta") => {
                     let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
                     let delta = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
                     if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
@@ -2514,6 +2667,14 @@ where
                         if !delta.is_empty() {
                             tc.notify_started(&mut state.next_tool_start_order, on_tool_call_start);
                         }
+                    }
+                }
+                Some("response.custom_tool_call_input.done") => {
+                    let item_id = event["item_id"].as_str().unwrap_or_default();
+                    if let (Some(patch), Some(tc)) = (event["input"].as_str(), state.tool_calls_map.get_mut(item_id)) {
+                        tc.arguments = serde_json::json!({"patch": patch}).to_string();
+                        tc.arguments_done = true;
+                        tc.notify_started(&mut state.next_tool_start_order, on_tool_call_start);
                     }
                 }
                 Some("response.function_call_arguments.done") => {
@@ -2537,7 +2698,7 @@ where
                             state.items_added.push(item.clone());
                         }
                         let item_type = item.get("type").and_then(|t| t.as_str());
-                        if item_type == Some("function_call") {
+                        if matches!(item_type, Some("function_call" | "custom_tool_call")) {
                             let item_id = item
                                 .get("id")
                                 .or_else(|| item.get("call_id"))
@@ -2562,7 +2723,7 @@ where
                             if item["name"].as_str().is_some_and(|name| !name.is_empty()) {
                                 entry.name = protocol::local_function_name(item);
                             }
-                            if let Some(arguments) = item.get("arguments").and_then(|v| v.as_str())
+                            if let Some(arguments) = protocol::local_tool_arguments(item)
                             {
                                 if let Some(tc) = state.tool_calls_map.get_mut(item_id) {
                                     tc.arguments = arguments.to_string();
@@ -2721,6 +2882,9 @@ where
                         }
                     }
                     state.got_terminal_event = true;
+                    // Synthetic output-item reconciliation above must not replace
+                    // the last event received from the transport in diagnostics.
+                    state.last_event = event["type"].as_str().map(str::to_owned);
                     state.got_completed_event = event.get("type").and_then(|value| value.as_str())
                         == Some("response.completed");
                     state.finish_thinking_timing();
@@ -2770,7 +2934,11 @@ where
                         }
                     }
                     if event.get("type").and_then(|t| t.as_str()) == Some("response.incomplete") {
-                        state.finish_reason = "length".to_string();
+                        state.finish_reason = if event["response"]["incomplete_details"]["reason"] == "steered" {
+                            "steered"
+                        } else {
+                            "length"
+                        }.to_string();
                     }
                     return Ok(true);
                 }
@@ -2843,6 +3011,12 @@ fn should_retry_safe_codex_error(error: &str) -> bool {
     if lower.contains("stream ended with no data and no response.completed") {
         return true;
     }
+    if lower.starts_with("codex http ") && lower.contains("timed out") {
+        return true;
+    }
+    if lower.contains("codex compaction stream ended before response.completed") {
+        return true;
+    }
 
     if lower.contains("responses websocket connection limit reached")
         || lower.contains("websocket connection limit reached")
@@ -2878,7 +3052,8 @@ fn should_retry_safe_codex_error(error: &str) -> bool {
             || lower.contains("closed");
     }
 
-    let no_visible_output = lower.contains("text_len=0") && lower.contains("complete_tool_calls=0");
+    let no_visible_output =
+        lower.contains("text_len=0") && lower.contains(", complete_tool_calls=0");
 
     no_visible_output
         && (lower.contains("stream ended without response.completed")
@@ -2989,6 +3164,56 @@ where
     G: Fn(String) + Send + Sync + 'static,
     H: Fn(String, String) + Send + Sync,
 {
+    stream_chat_steerable(
+        access_token,
+        account_id,
+        transport,
+        base_url,
+        model,
+        system_prompt,
+        history,
+        tools,
+        tool_search_description,
+        thinking_level,
+        debug,
+        session_id,
+        response_request_metadata,
+        turn_state,
+        options,
+        None,
+        on_text_delta,
+        on_thinking_delta,
+        on_tool_call_start,
+    )
+    .await
+}
+
+pub async fn stream_chat_steerable<F, G, H>(
+    access_token: &str,
+    account_id: Option<&str>,
+    transport: CodexTransportMode,
+    base_url: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    tools: &[serde_json::Value],
+    tool_search_description: Option<&str>,
+    thinking_level: Option<&str>,
+    debug: bool,
+    session_id: Option<&str>,
+    response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
+    turn_state: &mut TurnState,
+    options: CodexStreamOptions,
+    steering: Option<&dyn steering::SteeringSource>,
+    on_text_delta: &F,
+    on_thinking_delta: &G,
+    on_tool_call_start: &H,
+) -> Result<LlmResponse, String>
+where
+    F: Fn(String) + Send + Sync + 'static,
+    G: Fn(String) + Send + Sync + 'static,
+    H: Fn(String, String) + Send + Sync,
+{
     let transport_session_id = options
         .use_session_continuation
         .then_some(session_id)
@@ -3000,9 +3225,24 @@ where
         active_transport = CodexTransportMode::Http;
     }
     let mut retries = 0u32;
+    let mut attempt_number = 0u32;
 
     loop {
-        match stream_chat_once(
+        attempt_number += 1;
+        let mut trace = diagnostics::Attempt::new(
+            session_id,
+            &options,
+            options
+                .capture
+                .as_ref()
+                .map_or(attempt_number, diagnostics::Capture::next_attempt),
+            active_transport,
+        );
+        let resuming_steering = turn_state.has_steering_continuation();
+        let result = tokio::select! {
+            biased;
+            _ = wait_for_request_cancel(options.cancel_rx.clone()) => Err("Codex request cancelled".to_string()),
+            result = stream_chat_once(
             access_token,
             account_id,
             active_transport,
@@ -3018,12 +3258,21 @@ where
             response_request_metadata,
             turn_state,
             options.clone(),
+            steering,
             on_text_delta,
             on_thinking_delta,
             on_tool_call_start,
-        )
-        .await
-        {
+            &mut trace,
+        ) => result,
+        };
+        if matches!(&result, Ok(CodexTransportAttempt::FallbackToHttp)) {
+            trace.stage("fallback");
+        }
+        trace.finish(
+            result.as_ref().err().map(String::as_str),
+            options.capture.as_ref(),
+        );
+        match result {
             Ok(CodexTransportAttempt::Response(resp)) => return Ok(resp),
             Ok(CodexTransportAttempt::FallbackToHttp) => {
                 active_transport = CodexTransportMode::Http;
@@ -3031,6 +3280,14 @@ where
                 continue;
             }
             Err(err) => {
+                if resuming_steering || steering.is_some_and(|source| source.has_unresolved_input())
+                {
+                    // A lost acknowledgement is not a rejection. Neither transport nor
+                    // the agent may replay this request automatically.
+                    return Err(format!(
+                        "Codex steering outcome unknown; automatic retry disabled: {err}"
+                    ));
+                }
                 if active_transport == CodexTransportMode::Websocket
                     && cached_websocket_http_fallback_enabled(
                         transport_session_id,
@@ -3055,7 +3312,10 @@ where
                             delay,
                             err
                         );
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        tokio::select! {
+                            _ = wait_for_request_cancel(options.cancel_rx.clone()) => return Err("Codex request cancelled".to_string()),
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+                        }
                     }
                     SafeStreamRecoveryAction::FallbackToHttp => {
                         enable_cached_websocket_http_fallback(
@@ -3094,9 +3354,11 @@ async fn stream_chat_once<F, G, H>(
     response_request_metadata: Option<&HashMap<String, serde_json::Value>>,
     turn_state: &mut TurnState,
     options: CodexStreamOptions,
+    steering: Option<&dyn steering::SteeringSource>,
     on_text_delta: &F,
     on_thinking_delta: &G,
     on_tool_call_start: &H,
+    trace: &mut diagnostics::Attempt,
 ) -> Result<CodexTransportAttempt, String>
 where
     F: Fn(String) + Send + Sync + 'static,
@@ -3143,6 +3405,9 @@ where
             on_text_delta,
             on_thinking_delta,
             on_tool_call_start,
+            options.idle_timeout,
+            options.response_idle_timeout(model),
+            trace,
         )
         .await
         .map(CodexTransportAttempt::Response),
@@ -3159,9 +3424,13 @@ where
                 debug,
                 body,
                 turn_state,
+                steering,
                 on_text_delta,
                 on_thinking_delta,
                 on_tool_call_start,
+                options.idle_timeout,
+                options.response_idle_timeout(model),
+                trace,
             )
             .await
         }
@@ -3183,19 +3452,22 @@ async fn stream_chat_http_once<F, G, H>(
     on_text_delta: &F,
     on_thinking_delta: &G,
     on_tool_call_start: &H,
+    request_timeout: Duration,
+    idle_timeout: Duration,
+    trace: &mut diagnostics::Attempt,
 ) -> Result<LlmResponse, String>
 where
     F: Fn(String) + Send + 'static,
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send,
 {
-    let client = crate::network::reqwest_client(
+    let client = crate::network::rustls_reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .tcp_keepalive(Duration::from_secs(20))
             .connect_timeout(Duration::from_secs(30)),
     )?;
 
-    let continuation_request = request_without_input(&body);
+    let continuation_request = reasoning::continuation_metadata(&body);
     let request_body = build_history_transport_request(
         &body,
         history,
@@ -3203,7 +3475,7 @@ where
         /*include_type_field*/ false,
         /*use_previous_response_id*/ false,
     );
-    let raw_request = serde_json::to_string_pretty(&request_body).unwrap_or_default();
+    trace.request(&request_body);
     let api_url = codex_responses_endpoint(base_url);
     let fast_mode = request_body
         .get("service_tier")
@@ -3218,7 +3490,10 @@ where
         tools.len()
     );
     if debug {
-        eprintln!("[DEBUG][OpenAI Codex] request body:\n{}", &raw_request);
+        eprintln!(
+            "[DEBUG][OpenAI Codex] request body:\n{}",
+            trace.request_text()
+        );
         let mut headers: Vec<(&str, &str)> = vec![
             ("Authorization", "Bearer <token>"),
             ("Content-Type", "application/json"),
@@ -3238,7 +3513,7 @@ where
         if let Some(aid) = account_id {
             headers.push(("ChatGPT-Account-ID", aid));
         }
-        super::debug::save_request("openai_codex", &api_url, &headers, &raw_request);
+        super::debug::save_request("openai_codex", &api_url, &headers, trace.request_text());
     }
 
     let mut req = client
@@ -3271,7 +3546,11 @@ where
     if let Some(state) = turn_state.header_value() {
         req = req.header(X_CODEX_TURN_STATE_HEADER, state);
     }
-    let resp = req.send().await.map_err(protocol::http_error)?;
+    trace.stage("response_headers");
+    let resp = tokio::time::timeout(request_timeout, req.send())
+        .await
+        .map_err(|_| "Codex HTTP response headers timed out".to_string())?
+        .map_err(protocol::http_error)?;
 
     turn_state.store_header(
         resp.headers()
@@ -3280,7 +3559,12 @@ where
     );
     let status = resp.status();
     if !status.is_success() {
-        let err_body = resp.text().await.unwrap_or_default();
+        trace.stage("error_body");
+        let err_body = tokio::time::timeout(request_timeout, resp.text())
+            .await
+            .map_err(|_| "Codex HTTP error body timed out".to_string())?
+            .map_err(protocol::http_error)?;
+        trace.push_response(&err_body);
         return Err(format!(
             "OpenAI Codex API error ({} {}): {}",
             status.as_u16(),
@@ -3289,44 +3573,41 @@ where
         ));
     }
 
+    let server_model = server_model::from_headers(resp.headers());
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut stream_state = CodexStreamState::new();
-    let mut raw_response = String::new();
+    stream_state.server_model = server_model;
+    trace.stage("read");
+    trace.activity();
     let mut utf8_decoder = Utf8StreamDecoder::default();
 
     let mut terminal_stream_error: Option<String> = None;
-    let mut consecutive_errors = 0u32;
-    const MAX_STREAM_ERRORS: u32 = 3;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(c) => {
-                consecutive_errors = 0;
-                c
+    let mut observed_events = 0;
+    let mut read_deadline = tokio::time::Instant::now() + idle_timeout;
+    loop {
+        let chunk = match tokio::time::timeout_at(read_deadline, stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                terminal_stream_error =
+                    Some("HTTP SSE idle timeout before response.completed".to_string());
+                break;
             }
+        };
+        let chunk = match chunk {
+            Ok(c) => c,
             Err(e) => {
-                consecutive_errors += 1;
-                eprintln!(
-                    "[OpenAI Codex] stream read error ({}/{}): {}",
-                    consecutive_errors, MAX_STREAM_ERRORS, e
-                );
-                if consecutive_errors >= MAX_STREAM_ERRORS {
-                    if !stream_state.full_text.is_empty() || !stream_state.tool_calls_map.is_empty()
-                    {
-                        terminal_stream_error = Some(format!("Stream read error: {}", e));
-                        break;
-                    }
-                    return Err(format!("Stream read error: {}", e));
-                }
-                continue;
+                terminal_stream_error = Some(format!("Stream read error: {e}"));
+                break;
             }
         };
 
         let chunk_text = utf8_decoder.push(&chunk);
-        raw_response.push_str(&chunk_text);
+        trace.push_response(&chunk_text);
         buffer.push_str(&chunk_text);
-        if drain_sse_buffer(
+        let drained = drain_sse_buffer(
             &mut buffer,
             false,
             debug,
@@ -3334,16 +3615,25 @@ where
             on_text_delta,
             on_thinking_delta,
             on_tool_call_start,
-        )? {
+        );
+        trace.sync_state(&stream_state);
+        turn_state.store_header(stream_state.routing_token.as_deref());
+        // Partial bytes and SSE comments do not extend the Responses event deadline.
+        if stream_state.event_count != observed_events {
+            read_deadline = tokio::time::Instant::now() + idle_timeout;
+            trace.activity();
+            observed_events = stream_state.event_count;
+        }
+        if drained? {
             break;
         }
     }
 
     let trailing_text = utf8_decoder.finish();
-    raw_response.push_str(&trailing_text);
+    trace.push_response(&trailing_text);
     buffer.push_str(&trailing_text);
 
-    let _ = drain_sse_buffer(
+    let drained = drain_sse_buffer(
         &mut buffer,
         true,
         debug,
@@ -3351,12 +3641,20 @@ where
         on_text_delta,
         on_thinking_delta,
         on_tool_call_start,
-    )?;
+    );
+    trace.sync_state(&stream_state);
+    turn_state.store_header(stream_state.routing_token.as_deref());
+    drained?;
 
     let (collected, incomplete_tool_calls) =
         collect_complete_tool_calls(&stream_state.tool_calls_map);
 
     if let Some(stream_error) = terminal_stream_error {
+        if trace.is_compaction() {
+            return Err(format!(
+                "{stream_error}. Codex compaction stream ended before response.completed"
+            ));
+        }
         return Err(format!(
             "{}. OpenAI Codex stream ended before the response finalized (text_len={}, complete_tool_calls={}, incomplete_tool_calls={}). Refusing to execute partial tool arguments.",
             stream_error,
@@ -3378,7 +3676,7 @@ where
         return Err("Stream ended with no data and no response.completed".to_string());
     }
 
-    if incomplete_tool_calls > 0 {
+    if incomplete_tool_calls > 0 && !trace.is_compaction() {
         return Err(format!(
             "Response completed with {} incomplete tool call(s) (text_len={}, complete_tool_calls={}). Refusing to execute partial tool arguments.",
             incomplete_tool_calls,
@@ -3387,6 +3685,7 @@ where
         ));
     }
 
+    trace.stage("validate");
     // Merge server-side web_search_call results into collected tool calls.
     let mut collected = collected;
     collected.extend(stream_state.web_search_tool_calls.drain(..));
@@ -3410,13 +3709,15 @@ where
         );
     }
 
-    let continuation_request = protocol::response_metadata(
+    let mut continuation_request = protocol::response_metadata(
         continuation_request,
         &stream_state.items_added,
         &stream_state.full_text,
         &tool_calls,
         &stream_state.metadata_events,
     );
+    continuation_request["codex_response"]["server_model"] =
+        serde_json::json!(stream_state.server_model.or_else(|| stream_state.response_model.model()));
     let citations = stream_state
         .citation_collector
         .collect(&stream_state.items_added, &stream_state.full_text);
@@ -3432,8 +3733,8 @@ where
         cache_read_tokens: stream_state.cached_tokens,
         cache_write_tokens: 0,
         cost_usd: 0.0,
-        raw_request,
-        raw_response,
+        raw_request: trace.request_text().to_string(),
+        raw_response: trace.response_text().to_string(),
         thinking_text: stream_state.thinking_text,
         thinking_duration_secs: stream_state.thinking_duration_secs,
         thinking_signature: String::new(),
@@ -3453,21 +3754,30 @@ async fn stream_chat_websocket_once<F, G, H>(
     request_session_id: Option<&str>,
     cache_session_id: Option<&str>,
     debug: bool,
-    body: serde_json::Value,
+    mut body: serde_json::Value,
     turn_state: &mut TurnState,
+    steering: Option<&dyn steering::SteeringSource>,
     on_text_delta: &F,
     on_thinking_delta: &G,
     on_tool_call_start: &H,
+    request_timeout: Duration,
+    idle_timeout: Duration,
+    trace: &mut diagnostics::Attempt,
 ) -> Result<CodexTransportAttempt, String>
 where
     F: Fn(String) + Send + 'static,
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send,
 {
-    let continuation_request = request_without_input(&body);
+    trace.stage("connect");
+    let mut continuation_request = reasoning::continuation_metadata(&body);
+    let continuation = turn_state.steering_continuation.take();
+    let resuming = continuation.is_some();
+    let mut resumed_created = None;
+    let mut inherited_submission = steering::Submission::default();
     let ws_url = codex_websocket_url(base_url)?;
     let connection_key = websocket_connection_key(base_url, account_id);
-    let (shared_session, cached_socket, mut last_response, disable_websockets) =
+    let (shared_session, mut cached_socket, mut last_response, disable_websockets) =
         match cache_session_id {
             Some(session_id) => {
                 take_cached_websocket_session_state(session_id, &connection_key).await
@@ -3479,7 +3789,25 @@ where
                 false,
             ),
         };
-    if disable_websockets {
+    if let Some(continuation) = continuation {
+        if continuation.connection_key != connection_key || steering.is_none() {
+            return Err(
+                "Codex steering continuation cannot change connection or owner".to_string(),
+            );
+        }
+        cached_socket = Some(continuation.socket);
+        if let Some(created) = continuation.created {
+            // This successor already exists; its settings are inherited from its parent.
+            continuation_request = reasoning::inherited_metadata(continuation.request);
+            resumed_created = Some(created);
+        } else {
+            inherited_submission.input = Some(continuation.input);
+            inherited_submission.parent_id = Some(continuation.parent.response_id.clone());
+            inherited_submission.accepted_id = Some(continuation.accepted_id);
+        }
+        last_response = Some(continuation.parent);
+    }
+    if disable_websockets && !resuming {
         return Ok(CodexTransportAttempt::FallbackToHttp);
     }
 
@@ -3488,6 +3816,8 @@ where
         last_response.as_ref(),
         /*include_type_field*/ true,
     );
+    trace.request(&ws_request);
+    trace.reused(cached_socket.is_some());
     let cached_turn_state = turn_state.header_value().map(str::to_string);
     let fast_mode = ws_request
         .get("service_tier")
@@ -3571,8 +3901,18 @@ where
         }
     }
     let mut ws_request = build_websocket_transport_request(&body, last_response.as_ref(), true);
+    if inherited_submission.pending() {
+        // Explicit tool continuations retain their own settings, including any changed
+        // tools. Prefix comparison still guards against accidental full replay.
+        let mut parent = last_response.clone().expect("steering parent");
+        parent.request_signature = websocket_request_signature(&body);
+        ws_request = build_websocket_transport_request(&body, Some(&parent), true);
+        if ws_request["previous_response_id"].as_str() != Some(parent.response_id.as_str()) {
+            return Err("Codex steering cannot resume after its history was changed".to_string());
+        }
+    }
     protocol::add_turn_state(&mut ws_request, turn_state.header_value());
-    let raw_request = serde_json::to_string_pretty(&ws_request).unwrap_or_default();
+    trace.request(&ws_request);
     if debug {
         let mut headers: Vec<(&str, &str)> = vec![
             ("Authorization", "Bearer <token>"),
@@ -3601,7 +3941,7 @@ where
             "openai_codex_websocket",
             ws_url.as_str(),
             &headers,
-            &raw_request,
+            trace.request_text(),
         );
     }
 
@@ -3617,7 +3957,20 @@ where
             return Err(format!("Failed to encode websocket request body: {}", e));
         }
     };
-    if let Err(e) = socket.send(Message::Text(request_text.into())).await {
+    trace.stage("send");
+    if let Err(e) = if resumed_created.is_some() {
+        Ok(())
+    } else {
+        match tokio::time::timeout(
+            request_timeout,
+            socket.send(Message::Text(request_text.into())),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| e.to_string()),
+            Err(_) => Err("WebSocket send timed out".to_string()),
+        }
+    } {
         clear_cached_websocket_session_state(
             &shared_session,
             &connection_key,
@@ -3628,39 +3981,66 @@ where
     }
 
     let mut stream_state = CodexStreamState::new();
-    let mut raw_response = String::new();
+    let mut response_created = false;
+    stream_state.server_model = socket.server_model.clone();
+    if let Some(created) = resumed_created.take() {
+        process_sse_event_block(
+            &format!("data: {created}"),
+            debug,
+            &mut stream_state,
+            on_text_delta,
+            on_thinking_delta,
+            on_tool_call_start,
+        )?;
+        response_created = true;
+    }
+    let mut submission = steering::Submission::default();
+    let mut next_created = None;
+    let can_steer = steering.is_some()
+        && steering::supports_steering(model)
+        && cache_session_id.is_some()
+        && !body["input"].as_array().is_some_and(|input| {
+            input
+                .iter()
+                .any(|item| item["type"] == "compaction_trigger")
+        });
+    let mut poll = tokio::time::interval(Duration::from_millis(50));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut read_deadline = tokio::time::Instant::now() + idle_timeout;
+    trace.stage("read");
+    trace.activity();
     let mut terminal_stream_error: Option<String> = None;
-    let mut consecutive_errors = 0u32;
-    const MAX_WEBSOCKET_ERRORS: u32 = 3;
 
     loop {
-        let message = match tokio::time::timeout(WEBSOCKET_STREAM_IDLE_TIMEOUT, socket.next()).await
-        {
+        let incoming = tokio::select! {
+            incoming = tokio::time::timeout_at(read_deadline, socket.next()) => incoming,
+            _ = poll.tick(), if can_steer && response_created
+                && !stream_state.got_terminal_event && submission.input.is_none()
+                && !inherited_submission.pending() => {
+                if let Some(input) = steering.expect("steering source").claim()? {
+                    let event = submission.send(input, stream_state.response_id.as_deref()
+                        .ok_or("Codex steering response has no ID")?);
+                    tokio::time::timeout(request_timeout, socket.send(Message::Text(event.to_string().into()))).await
+                        .map_err(|_| "Codex steering send outcome unknown: WebSocket send timed out".to_string())?
+                        .map_err(|e| format!("Codex steering send outcome unknown: {e}"))?;
+                }
+                continue;
+            }
+        };
+        let message = match incoming {
             Ok(Some(Ok(message))) => {
-                consecutive_errors = 0;
+                // Renew before parsing: metadata, ignored events and even
+                // unrecognized text frames are transport activity. Steering
+                // polling and Ping/Pong (consumed by the pump) do not renew it.
+                read_deadline = tokio::time::Instant::now() + idle_timeout;
+                trace.activity();
                 message
             }
             Ok(Some(Err(e))) => {
-                consecutive_errors += 1;
-                eprintln!(
-                    "[OpenAI Codex] websocket read error ({}/{}): {}",
-                    consecutive_errors, MAX_WEBSOCKET_ERRORS, e
-                );
-                if consecutive_errors >= MAX_WEBSOCKET_ERRORS {
-                    if !stream_state.full_text.is_empty() || !stream_state.tool_calls_map.is_empty()
-                    {
-                        terminal_stream_error = Some(format!("WebSocket read error: {}", e));
-                        break;
-                    }
-                    clear_cached_websocket_session_state(
-                        &shared_session,
-                        &connection_key,
-                        /*disable_websockets*/ false,
-                    )
-                    .await;
-                    return Err(format!("WebSocket read error: {}", e));
-                }
-                continue;
+                // The pump terminates after a read error; another read only
+                // loses this cause behind a generic channel-closed error.
+                terminal_stream_error = Some(format!("WebSocket read error: {e}"));
+                break;
             }
             Ok(None) => {
                 terminal_stream_error =
@@ -3686,11 +4066,75 @@ where
         match message {
             Message::Text(text) => {
                 let payload = text.to_string();
-                raw_response.push_str(&payload);
-                raw_response.push('\n');
+                trace.push_response(&payload);
+                trace.push_response("\n");
                 if let Ok(event) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    trace.observe(&event);
                     if let Some(state) = protocol::event_turn_state(&event) {
                         turn_state.store_header(Some(state));
+                    }
+                    if inherited_submission.pending()
+                        && event["type"] != "response.created"
+                        && inherited_submission.event(&event, steering)?
+                    {
+                        if inherited_submission.rejected {
+                            return Err(
+                                "Codex steering failed while resuming required input".to_string()
+                            );
+                        }
+                        continue;
+                    }
+                    if submission.event(&event, steering)? {
+                        if stream_state.got_terminal_event
+                            && (submission.rejected
+                                || (submission.accepted_id.is_some()
+                                    && !stream_state.tool_calls_map.is_empty()))
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    if event["type"] == "response.created" {
+                        if stream_state.got_terminal_event && submission.pending() {
+                            if submission.accepted_id.is_none() {
+                                return Err("Codex steering successor arrived without acceptance"
+                                    .to_string());
+                            }
+                            if let Some(parent) = event["response"]["previous_response_id"].as_str()
+                            {
+                                if Some(parent) != submission.parent_id.as_deref() {
+                                    return Err("Codex steering successor has a different parent"
+                                        .to_string());
+                                }
+                            }
+                            steering
+                                .expect("steering source")
+                                .committed(&submission.input.as_ref().unwrap().id, false)?;
+                            next_created = Some(event);
+                            break;
+                        }
+                        if inherited_submission.pending() {
+                            let input = inherited_submission.input.take().unwrap();
+                            steering
+                                .expect("steering source")
+                                .committed(&input.id, true)?;
+                            // Cache the local history including the newly committed user
+                            // message. Do not put it in the explicit request sent above.
+                            body["input"]
+                                .as_array_mut()
+                                .unwrap()
+                                .extend(input.input.as_array().cloned().unwrap_or_default());
+                        }
+                        response_created = true;
+                    }
+                    if event["type"] == "response.incomplete"
+                        && event["response"]["incomplete_details"]["reason"] == "steered"
+                        && !submission.pending()
+                    {
+                        return Err(
+                            "Codex received a steered response without a local submission"
+                                .to_string(),
+                        );
                     }
                 }
                 if let Some(error_message) = websocket_event_error_message(&payload) {
@@ -3722,6 +4166,17 @@ where
                         return Err(error);
                     }
                 } {
+                    if submission.pending() {
+                        // Local tools need the ordinary execution loop. The server owns
+                        // accepted input until the next explicit create commits it.
+                        if submission.accepted_id.is_some()
+                            && !stream_state.tool_calls_map.is_empty()
+                        {
+                            break;
+                        }
+                        // Normal completion can also be followed by an automatic successor.
+                        continue;
+                    }
                     break;
                 }
             }
@@ -3733,7 +4188,10 @@ where
             // immediately, so response processing only observes data frames.
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             Message::Close(frame) => {
-                if !stream_state.got_terminal_event {
+                if !stream_state.got_terminal_event
+                    || submission.pending()
+                    || inherited_submission.pending()
+                {
                     terminal_stream_error = Some(match frame {
                         Some(frame) if !frame.reason.is_empty() => {
                             format!("WebSocket closed by server: {}", frame.reason)
@@ -3757,6 +4215,11 @@ where
             /*disable_websockets*/ false,
         )
         .await;
+        if trace.is_compaction() {
+            return Err(format!(
+                "{stream_error}. Codex compaction stream ended before response.completed"
+            ));
+        }
         return Err(format!(
             "{}. OpenAI Codex websocket ended before the response finalized (text_len={}, complete_tool_calls={}, incomplete_tool_calls={}). Refusing to execute partial tool arguments.",
             stream_error,
@@ -3790,7 +4253,7 @@ where
         return Err("WebSocket ended with no data and no response.completed".to_string());
     }
 
-    if incomplete_tool_calls > 0 {
+    if incomplete_tool_calls > 0 && !trace.is_compaction() {
         clear_cached_websocket_session_state(
             &shared_session,
             &connection_key,
@@ -3805,22 +4268,50 @@ where
         ));
     }
 
-    store_cached_websocket_session_state(
-        &shared_session,
-        &connection_key,
-        socket,
-        LastWebsocketResponse {
-            request_signature: websocket_request_signature(&body),
-            input: body
-                .get("input")
-                .and_then(|value| value.as_array())
-                .cloned()
-                .unwrap_or_default(),
-            response_id: stream_state.response_id.clone().unwrap_or_default(),
-            items_added: stream_state.items_added.clone(),
-        },
-    )
-    .await;
+    let parent = LastWebsocketResponse {
+        request_signature: websocket_request_signature(&body),
+        input: body["input"].as_array().cloned().unwrap_or_default(),
+        response_id: stream_state.response_id.clone().unwrap_or_default(),
+        items_added: stream_state.items_added.clone(),
+    };
+    if submission.pending() {
+        stream_state.end_turn = Some(false);
+        if !stream_state.got_completed_event {
+            stream_state.finish_reason = "steered".to_string();
+        }
+        turn_state.steering_continuation = Some(steering::Continuation {
+            socket,
+            parent,
+            request: continuation_request.clone(),
+            input: submission.input.take().unwrap(),
+            accepted_id: submission
+                .accepted_id
+                .take()
+                .ok_or("Codex steering has no acceptance")?,
+            created: next_created,
+            connection_key: connection_key.clone(),
+        });
+    } else {
+        if submission.rejected {
+            stream_state.end_turn = Some(false);
+        }
+        store_cached_websocket_session_state(
+            &shared_session,
+            &connection_key,
+            socket,
+            LastWebsocketResponse {
+                request_signature: websocket_request_signature(&body),
+                input: body
+                    .get("input")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                response_id: stream_state.response_id.clone().unwrap_or_default(),
+                items_added: stream_state.items_added.clone(),
+            },
+        )
+        .await;
+    }
 
     let mut collected = collected;
     collected.extend(stream_state.web_search_tool_calls.drain(..));
@@ -3841,13 +4332,15 @@ where
         );
     }
 
-    let continuation_request = protocol::response_metadata(
+    let mut continuation_request = protocol::response_metadata(
         continuation_request,
         &stream_state.items_added,
         &stream_state.full_text,
         &tool_calls,
         &stream_state.metadata_events,
     );
+    continuation_request["codex_response"]["server_model"] =
+        serde_json::json!(stream_state.server_model.or_else(|| stream_state.response_model.model()));
     let citations = stream_state
         .citation_collector
         .collect(&stream_state.items_added, &stream_state.full_text);
@@ -3863,8 +4356,8 @@ where
         cache_read_tokens: stream_state.cached_tokens,
         cache_write_tokens: 0,
         cost_usd: 0.0,
-        raw_request,
-        raw_response,
+        raw_request: trace.request_text().to_string(),
+        raw_response: trace.response_text().to_string(),
         thinking_text: stream_state.thinking_text,
         thinking_duration_secs: stream_state.thinking_duration_secs,
         thinking_signature: String::new(),
@@ -5003,15 +5496,11 @@ mod tests {
                 .expect_err("incomplete stream must fail")
                 .contains("without response.completed")
         );
-        assert!(validate_remote_compaction_v2_output(
-            &[
-                compaction,
-                serde_json::json!({ "type": "message", "role": "assistant", "content": [] })
-            ],
-            true,
-        )
-        .expect_err("extra output items must fail")
-        .contains("exactly one compaction output item"));
+        assert!(
+            validate_remote_compaction_v2_output(&[compaction.clone(), compaction,], true,)
+                .expect_err("multiple compaction items must fail")
+                .contains("exactly one compaction output item")
+        );
         assert!(validate_remote_compaction_v2_output(&[], true)
             .expect_err("empty output must fail")
             .contains("exactly one compaction output item"));

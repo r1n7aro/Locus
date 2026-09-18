@@ -10,8 +10,11 @@ import {
 } from "../../services/system";
 import { useNotificationStore } from "../../stores/notification";
 import BaseSwitch from "../ui/BaseSwitch.vue";
+import { useDisplaySettings } from "../../composables/useDisplaySettings";
+import WorktreePoolSettings from "./WorktreePoolSettings.vue";
 
 const notificationStore = useNotificationStore();
+const { state: displaySettings, set: setDisplaySetting } = useDisplaySettings();
 const asyncTasksEnabled = ref(true);
 const asyncTasksReady = ref(false);
 const asyncTasksBusy = ref(false);
@@ -108,6 +111,20 @@ onMounted(() => {
     >
       <div class="experimental-row">
         <div class="experimental-info">
+          <span class="experimental-name">Worktree</span>
+          <span class="experimental-desc">{{ t("settings.experimental.worktreeDesc") }}</span>
+        </div>
+        <div class="experimental-control">
+          <span class="experimental-status">{{ t(displaySettings.worktreeEnabled ? "common.enabled" : "common.disabled") }}</span>
+          <BaseSwitch
+            :model-value="displaySettings.worktreeEnabled"
+            aria-label="Worktree"
+            @update:model-value="setDisplaySetting('worktreeEnabled', $event)"
+          />
+        </div>
+      </div>
+      <div class="experimental-row">
+        <div class="experimental-info">
           <span class="experimental-name">{{ t("settings.experimental.asyncTasks") }}</span>
           <span class="experimental-desc">{{ t("settings.experimental.asyncTasksDesc") }}</span>
         </div>
@@ -141,6 +158,7 @@ onMounted(() => {
         </div>
       </div>
     </div>
+    <WorktreePoolSettings />
   </div>
 </template>
 

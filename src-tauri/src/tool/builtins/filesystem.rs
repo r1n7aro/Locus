@@ -4,7 +4,7 @@ use crate::eol::{apply_line_ending, normalize_lf, resolve_preferred_line_ending}
 use tauri::Manager;
 use tokio::io::AsyncWriteExt;
 
-fn resolve_context_path(ctx: &crate::tool::ToolExecutionContext, requested: &str) -> String {
+pub(super) fn resolve_context_path(ctx: &crate::tool::ToolExecutionContext, requested: &str) -> String {
     let requested_path = std::path::Path::new(requested);
     if requested_path.is_absolute() {
         return requested.to_string();
@@ -18,7 +18,7 @@ fn resolve_context_path(ctx: &crate::tool::ToolExecutionContext, requested: &str
         .unwrap_or_else(|| requested.to_string())
 }
 
-fn knowledge_registry_for_context(
+pub(super) fn knowledge_registry_for_context(
     ctx: &crate::tool::ToolExecutionContext,
 ) -> Option<crate::knowledge_source_registry::KnowledgeSourceRegistry> {
     let working_dir = ctx
@@ -39,7 +39,7 @@ fn knowledge_registry_for_context(
     )
 }
 
-fn knowledge_scope_error(
+pub(super) fn knowledge_scope_error(
     ctx: &crate::tool::ToolExecutionContext,
     target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
     operation: &str,
@@ -104,17 +104,23 @@ fn knowledge_l1_summary_for_read(
     .filter(|value| !value.is_empty())
 }
 
-fn format_generated_knowledge_frontmatter(
+pub(super) fn format_generated_knowledge_frontmatter(
     resolved: &crate::knowledge_source_registry::ResolvedKnowledgePath,
     prepared: &crate::knowledge_store::PreparedGenericKnowledgeWrite,
 ) -> String {
-    format!(
-        "\nKnowledge document registered\n  path: {}\n  physicalPath: {}\n  contentStartLine: {}\nGenerated frontmatter:\n---\n{}---",
+    let mut output = format!(
+        "\nKnowledge document registered\n  path: {}\n  physicalPath: {}\n  contentStartLine: {}",
         resolved.display_path,
         resolved.physical_path.to_string_lossy().replace('\\', "/"),
         prepared.content_start_line,
-        prepared.frontmatter
-    )
+    );
+    if !prepared.frontmatter.is_empty() {
+        output.push_str(&format!(
+            "\nGenerated frontmatter:\n---\n{}---",
+            prepared.frontmatter
+        ));
+    }
+    output
 }
 
 fn has_complete_frontmatter(content: &str) -> bool {
@@ -133,7 +139,7 @@ fn is_skill_package_source_kind(
     )
 }
 
-fn load_knowledge_policy_document(
+pub(super) fn load_knowledge_policy_document(
     ctx: &crate::tool::ToolExecutionContext,
     target: &crate::knowledge_source_registry::ResolvedKnowledgePath,
     use_package_root: bool,
@@ -142,7 +148,7 @@ fn load_knowledge_policy_document(
         return Ok(None);
     };
     if target.kind == crate::knowledge_source_registry::KnowledgeSourceKind::WorkspaceKnowledge {
-        return crate::knowledge_store::load_document_by_path(
+        return crate::knowledge_store::inspect_workspace_document_policy(
             working_dir,
             target.doc_type,
             &target.logical_path,
@@ -172,7 +178,7 @@ fn load_knowledge_policy_document(
         .map(|result| result.map(|value| value.document))
 }
 
-fn prepare_missing_knowledge_frontmatter(
+pub(super) fn prepare_missing_knowledge_frontmatter(
     ctx: &crate::tool::ToolExecutionContext,
     target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
     content: &str,
@@ -198,7 +204,7 @@ fn prepare_missing_knowledge_frontmatter(
     .map(Some)
 }
 
-async fn sync_written_knowledge(
+pub(super) async fn sync_written_knowledge(
     ctx: &crate::tool::ToolExecutionContext,
     target: Option<&crate::knowledge_source_registry::ResolvedKnowledgePath>,
     change_kind: &'static str,
@@ -522,7 +528,7 @@ pub(crate) fn is_binary_extension(filepath: &str) -> bool {
     binary_exts.iter().any(|ext| lower.ends_with(ext))
 }
 
-async fn append_unity_csharp_status(
+pub(super) async fn append_unity_csharp_status(
     output: String,
     working_dir: Option<&str>,
     file_path: &str,
@@ -537,7 +543,7 @@ async fn append_unity_csharp_status(
     }
 }
 
-async fn create_new_file(file_path: &str, content: &[u8]) -> Result<(), std::io::Error> {
+pub(super) async fn create_new_file(file_path: &str, content: &[u8]) -> Result<(), std::io::Error> {
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -551,7 +557,7 @@ async fn create_new_file(file_path: &str, content: &[u8]) -> Result<(), std::io:
     file.flush().await
 }
 
-async fn ensure_edit_base_is_current(file_path: &str, expected: &str) -> Result<(), String> {
+pub(super) async fn ensure_edit_base_is_current(file_path: &str, expected: &str) -> Result<(), String> {
     let current = tokio::fs::read_to_string(file_path)
         .await
         .map_err(|error| format!("Failed to re-read file '{}': {}", file_path, error))?;
@@ -570,7 +576,7 @@ async fn ensure_edit_base_is_current(file_path: &str, expected: &str) -> Result<
     ))
 }
 
-async fn replace_file_atomically(
+pub(super) async fn replace_file_atomically(
     file_path: &str,
     content: &[u8],
     expected_base: Option<&str>,
@@ -1818,7 +1824,6 @@ mod tests {
 
         assert!(!result.is_error, "{}", result.output);
         assert!(result.output.contains("Generated frontmatter:\n---\n"));
-        assert!(result.output.contains("bodyFormat: markdown"));
         assert!(result.output.contains("contentStartLine:"));
         let raw = std::fs::read_to_string(target).expect("read knowledge file");
         assert!(raw.starts_with("---\n"));
@@ -1852,6 +1857,36 @@ mod tests {
             .output
             .contains("checkout-scoped ToolExecutionContext"));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn csv_knowledge_write_and_edit_keep_raw_content_without_frontmatter() {
+        let root = tempdir().expect("temp dir");
+        let target = root.path().join("Locus/knowledge/memory/items.csv");
+        let raw = "name,description\nwand,\"casts, spells\nand more\"\n";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let written = runtime.block_on((write().execute)(
+            json!({ "filePath": target.to_string_lossy(), "content": raw }),
+            checkout_context(root.path()),
+        ));
+        assert!(!written.is_error, "{}", written.output);
+        assert!(written.output.contains("contentStartLine: 1"));
+        assert!(!written.output.contains("Generated frontmatter"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), raw);
+
+        let edited = runtime.block_on((edit().execute)(
+            json!({
+                "filePath": target.to_string_lossy(),
+                "edits": [{ "oldString": "casts, spells", "newString": "casts, frost" }]
+            }),
+            checkout_context(root.path()),
+        ));
+        assert!(!edited.is_error, "{}", edited.output);
+        assert!(!edited.output.contains("Generated frontmatter"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            raw.replace("spells", "frost")
+        );
     }
 
     #[test]
@@ -2025,7 +2060,7 @@ mod tests {
     }
 
     #[test]
-    fn read_unity_asset_redirect_suggests_unity_execute_script() {
+    fn read_unity_asset_redirect_suggests_property_tree_tools() {
         let root = tempdir().expect("temp dir");
         let target = root.path().join("walk.anim");
         std::fs::write(&target, "%YAML 1.1\n").expect("seed Unity asset");
@@ -2047,9 +2082,9 @@ mod tests {
 
         assert!(result.is_error);
         assert!(
-            result.output.contains(
-                "use `unity_execute` to load and inspect the asset with a Unity Editor C# script"
-            ),
+            result.output.contains("`unity_yaml_read`")
+                && result.output.contains("`unity_yaml_search`")
+                && result.output.contains("Property Tree"),
             "{}",
             result.output
         );

@@ -32,6 +32,8 @@ const liveStream = computed(() => (props.text ? null : props.stream ?? null));
  * v-for, so a flush re-renders only the active tail span. */
 const liveParts = shallowRef<{ frozen: readonly string[]; active: string } | null>(null);
 let liveFlushTimer: ReturnType<typeof setTimeout> | null = null;
+// The immediate content watcher below also schedules the initial scroll.
+let scrollFrame: number | null = null;
 
 function clearLiveFlushTimer() {
   if (liveFlushTimer === null) return;
@@ -59,8 +61,6 @@ watch(
 // Stream identity or mode changes swap the content outright: flush
 // immediately so stale parts never linger.
 watch([liveStream, () => props.text], flushLiveParts, { immediate: true });
-
-let scrollFrame: number | null = null;
 
 function scheduleScrollToBottom() {
   if (scrollFrame !== null) return;

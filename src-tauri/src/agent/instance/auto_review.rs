@@ -78,7 +78,10 @@ pub(super) fn build_review_payload(
         .map(|value| truncate_utf8_head_tail(value, MAX_USER_CONTEXT_BYTES))
         .unwrap_or_else(|| (String::new(), false));
     let (working_dir_display, _) = truncate_utf8_head_tail(working_dir, MAX_PATH_BYTES);
-    let local_inspection = build_local_inspection(working_dir, dangerous_command);
+    let mut local_inspection = build_local_inspection(working_dir, dangerous_command);
+    if tool_name == "apply_patch" {
+        local_inspection["patch"] = inspect_patch(working_dir, args);
+    }
 
     json!({
         "action": {
@@ -101,6 +104,28 @@ pub(super) fn build_review_payload(
             "workingDirectory": working_dir_display,
         }
     })
+}
+
+fn inspect_patch(working_dir: &str, args: &Value) -> Value {
+    use crate::tool::apply_patch::Change;
+    let files = match crate::tool::apply_patch::from_arguments(args) {
+        Ok(files) => files,
+        Err(error) => return json!({"invalid":true, "error":truncate_utf8_head_tail(&error, MAX_PATH_BYTES).0}),
+    };
+    let changes = files.iter().take(6).map(|file| {
+        let (operation, destination) = match &file.change {
+            Change::Add(_) => ("add", None),
+            Change::Delete => ("delete", None),
+            Change::Update { move_to: Some(path), .. } => ("move", Some(path.as_str())),
+            Change::Update { move_to: None, .. } => ("update", None),
+        };
+        json!({
+            "operation":operation,
+            "source":inspect_target(working_dir, &file.path, false),
+            "destination":destination.map(|path| inspect_target(working_dir, path, false)),
+        })
+    }).collect::<Vec<_>>();
+    json!({"fileCount":files.len(), "truncated":files.len() > changes.len(), "changes":changes})
 }
 
 fn limited_arguments(args: &Value, omit_full_command: bool) -> Value {
@@ -421,6 +446,18 @@ pub(super) fn parse_decision(raw: &str) -> Result<AutoReviewDecision, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_patch_review_describes_file_effects_without_sending_source_content() {
+        let args = json!({"patch":"*** Begin Patch\n*** Update File: old.cs\n*** Move to: new.cs\n@@\n-PRIVATE_SOURCE\n+PRIVATE_NEW_SOURCE\n*** Delete File: removed.txt\n*** Add File: added.txt\n+PRIVATE_ADDED_CONTENT\n*** End Patch"});
+        let payload = build_review_payload("apply_patch", &args, "F:/project", Some("Move the file and update related files"), &[], None);
+        let changes = &payload["localInspection"]["patch"]["changes"];
+        assert_eq!(changes[0]["operation"], "move");
+        assert_eq!(changes[0]["destination"]["raw"], "new.cs");
+        assert_eq!(changes[1]["operation"], "delete");
+        assert_eq!(changes[2]["operation"], "add");
+        assert!(!payload.to_string().contains("PRIVATE_"));
+    }
 
     #[test]
     fn payload_includes_only_one_bounded_user_message_and_limited_arguments() {

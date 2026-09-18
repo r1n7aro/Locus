@@ -50,8 +50,8 @@ ignore = "0.4.33"
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"
 tokio = { version = "1.53.1", features = ["full"] }
-reqwest = { version = "0.13.4", features = ["json", "stream", "blocking", "native-tls", "http2", "gzip", "deflate", "system-proxy", "socks", "form"], default-features = false }
-tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["native-tls", "proxy"] }
+reqwest = { version = "0.13.4", features = ["json", "stream", "blocking", "native-tls", "rustls", "http2", "gzip", "deflate", "system-proxy", "socks", "form"], default-features = false }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["proxy"] }
 tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", features = ["deflate", "proxy"] }
 hyper-util = { version = "0.1.20", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
 # MCP server (expose unity tools to external harnesses): hyper serves the
@@ -61,8 +61,9 @@ hyper-util = { version = "0.1.20", features = ["client-proxy", "client-proxy-sys
 hyper = { version = "1.11.0", features = ["server", "http1"] }
 http-body-util = "0.1.5"
 toml_edit = "0.25.13"
-native-tls = "0.2.18"
-tokio-native-tls = "0.3.1"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8.4"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tower-service = "0.3.3"
 url = "2.5.8"
 http = "1.5.0"
@@ -112,6 +113,7 @@ rodio = "0.22.2"
 # Global allocator (see lib.rs). The Windows system heap scales poorly under
 # multi-threaded small-object churn; mimalloc is the standard replacement.
 mimalloc = "0.1.52"
+tempfile = "3.27.0"
 
 # Keep this pinned to rc.11. fastembed 5.13.2 is the matching upstream
 # release; newer fastembed versions require a newer ort/ort-sys pair.
@@ -127,6 +129,3 @@ winreg = "0.56.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
-
-[dev-dependencies]
-tempfile = "3.27.0"

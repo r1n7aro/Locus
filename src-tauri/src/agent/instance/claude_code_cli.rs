@@ -724,14 +724,11 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         args: &serde_json::Value,
         result: &ExecutedToolResult,
     ) {
-        let Some(asset_path) = self
+        let asset_paths = self
             .agent
-            .unity_asset_relative_path(tool_call, args, result)
-        else {
-            return;
-        };
+            .unity_asset_relative_paths(tool_call, args, result);
         if let Some(round) = self.pending_round.as_mut() {
-            round.queued_unity_asset_paths.push(asset_path);
+            round.queued_unity_asset_paths.extend(asset_paths);
         }
     }
 

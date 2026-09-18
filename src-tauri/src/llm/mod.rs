@@ -15,6 +15,7 @@ pub mod streaming;
 pub mod think_tag_filter;
 pub mod tool_references;
 pub mod utf8_stream;
+pub(crate) mod upstream_model;
 
 pub(crate) const CODEX_CLIENT_VERSION: &str = "0.153.4";
 

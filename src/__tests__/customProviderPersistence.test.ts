@@ -149,6 +149,31 @@ describe("custom provider persistence", () => {
     modelServiceMocks.confirm.mockResolvedValue(true);
   });
 
+  it("persists the Codex patch choice and preserves other subscription settings", async () => {
+    const emit = vi.fn();
+    const state = useSettingsState(emit as never);
+    modelServiceMocks.getCodexModelConfig.mockResolvedValueOnce({ transport: "http", contextWindow: 400000, autoReview: true });
+    await state.loadCodexModelConfig();
+    expect(state.codexModelConfig.value.useApplyPatch).toBe(false);
+    modelServiceMocks.saveCodexModelConfig.mockResolvedValueOnce(undefined);
+    await state.setCodexUseApplyPatch(true);
+    expect(modelServiceMocks.saveCodexModelConfig).toHaveBeenLastCalledWith(expect.objectContaining({
+      transport: "http", contextWindow: 400000, autoReview: true, useApplyPatch: true,
+    }));
+    expect(emit).toHaveBeenCalledWith("codexTransportChanged", expect.objectContaining({ useApplyPatch: true }));
+    await state.setCodexContextWindow(500000);
+    expect(modelServiceMocks.saveCodexModelConfig).toHaveBeenLastCalledWith(expect.objectContaining({ useApplyPatch: true, contextWindow: 500000 }));
+  });
+
+  it("restores the Codex patch choice when saving fails", async () => {
+    const emit = vi.fn();
+    const state = useSettingsState(emit as never);
+    modelServiceMocks.saveCodexModelConfig.mockRejectedValueOnce(new Error("save failed"));
+    await state.setCodexUseApplyPatch(true);
+    expect(state.codexModelConfig.value.useApplyPatch).toBe(false);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
   it("reloads saved providers and refreshes the warmup cache", async () => {
     const emitted: unknown[][] = [];
     const state = useSettingsState(((...args: unknown[]) => {

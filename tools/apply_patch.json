@@ -1,0 +1,11 @@
+{
+  "description": "Apply a text patch to files. Use *** Begin Patch / *** End Patch, *** Add File:, *** Delete File:, or *** Update File: (optionally followed by *** Move to:). Update chunks start with @@ or @@ <context>; prefix unchanged lines with a space, removed lines with -, and added lines with +. Use *** End of File to anchor the final chunk. Read the relevant files first and include sufficient context. All chunks for a file match its original content in source order. Paths may be absolute or relative to the working directory. Files are validated before writing; a later I/O failure can leave earlier files changed and is reported. Existing files are replaced atomically. Knowledge and Unity file handling follow the normal file tools. Move destinations and added files must not already exist.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "patch": { "type": "string", "description": "The complete apply_patch text" }
+    },
+    "required": ["patch"]
+  }
+}

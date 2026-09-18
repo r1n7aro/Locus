@@ -903,9 +903,7 @@ fn build_mock_response_plan(
                     ),
                     name: "python".to_string(),
                     arguments: serde_json::json!({
-                        "action": "run",
                         "code": "status = await locus.get_unity_editor_status(project=project)\nprint(f'LOCUS_PYTHON_TOOL_OK:{status.process_state}:{status.ready}')",
-                        "description": "Probe the injected Locus SDK and Unity lifecycle state",
                         "readonly": true,
                         "timeout": 30_000
                     })

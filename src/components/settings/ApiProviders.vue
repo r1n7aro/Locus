@@ -53,6 +53,7 @@ const props = defineProps<{
   codexContextWindow: number;
   codexSessionTitleGeneration: boolean;
   codexAutoReview: boolean;
+  codexUseApplyPatch?: boolean;
   codexPrefixCacheTtlSeconds: number;
   dynamicToolLoadingMode: DynamicToolLoadingMode;
   dynamicToolLoadingBusy?: boolean;
@@ -95,6 +96,7 @@ const emit = defineEmits<{
   "update:codexContextWindow": [value: number];
   "update:codexSessionTitleGeneration": [value: boolean];
   "update:codexAutoReview": [value: boolean];
+  "update:codexUseApplyPatch": [value: boolean];
   "update:codexPrefixCacheTtlSeconds": [value: number];
   "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
   "update:anthropicNativeLazyEnabled": [value: boolean];
@@ -859,6 +861,21 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
           :model-value="codexSessionTitleGeneration"
           :aria-label="t('settings.codex.sessionTitleTitle')"
           @update:model-value="emit('update:codexSessionTitleGeneration', $event)"
+        />
+      </div>
+
+      <div
+        v-if="codexStep !== 'waiting' && codexStatus.authenticated && !codexStatus.validationFailed"
+        class="provider-detail"
+      >
+        <div class="provider-info">
+          <span class="provider-name">{{ t("settings.codex.applyPatchTitle") }}</span>
+          <span class="provider-desc">{{ t("settings.codex.applyPatchDesc") }}</span>
+        </div>
+        <BaseSwitch
+          :model-value="codexUseApplyPatch === true"
+          :aria-label="t('settings.codex.applyPatchTitle')"
+          @update:model-value="emit('update:codexUseApplyPatch', $event)"
         />
       </div>
 

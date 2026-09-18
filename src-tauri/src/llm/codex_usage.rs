@@ -217,7 +217,7 @@ pub async fn fetch_codex_rate_limits(
     account_id: Option<&str>,
     base_url: Option<&str>,
 ) -> Result<CodexRateLimitsResponse, CodexRateLimitsFetchError> {
-    let client = crate::network::reqwest_client(
+    let client = crate::network::rustls_reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .connect_timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
             .timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
@@ -270,7 +270,7 @@ pub async fn consume_codex_rate_limit_reset_credit(
     redeem_request_id: &str,
     credit_id: Option<&str>,
 ) -> Result<CodexRateLimitResetConsumeResponse, CodexRateLimitsFetchError> {
-    let client = crate::network::reqwest_client(
+    let client = crate::network::rustls_reqwest_client(
         crate::network::ReqwestClientOptions::new()
             .connect_timeout(Duration::from_secs(RESET_CREDIT_CONSUME_TIMEOUT_SECS))
             .timeout(Duration::from_secs(RESET_CREDIT_CONSUME_TIMEOUT_SECS))

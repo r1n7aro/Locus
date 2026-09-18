@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import { buildToolCallArgsSummary } from "../components/toolCallSummary";
 
 describe("toolCallSummary", () => {
+  it("summarizes patch targets and move destinations without exposing the patch body", () => {
+    const patch = "*** Begin Patch\n*** Update File: F:/Project/Assets/Old.cs\n*** Move to: F:/Project/Assets/New.cs\n@@\n-old\n+new\n*** Add File: F:/Project/new.txt\n+*** Delete File: pretend.txt\n*** Delete File: F:/Project/old.txt\n*** End Patch";
+    expect(buildToolCallArgsSummary("apply_patch", JSON.stringify({ patch }), { workingDir: "F:/Project" }))
+      .toBe("Assets/Old.cs, Assets/New.cs, new.txt, …");
+  });
   it("shows unity_yaml_read file and object path before detail mode", () => {
     const summary = buildToolCallArgsSummary("unity_yaml_read", JSON.stringify({
       detail: "components",

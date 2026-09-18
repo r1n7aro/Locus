@@ -1,5 +1,5 @@
 {
-  "description": "Create a new file, creating parent directories as needed. Existing paths are rejected; use edit to change an existing file.\n\nIn a registered writable knowledge directory, provide Markdown body content only. Locus generates frontmatter, updates the index, and reports every generated field plus the final content start line.",
+  "description": "Create a new file, creating parent directories as needed. Existing paths are rejected; use edit to change an existing file.\n\nIn a registered writable knowledge directory, create `.md` documents or `.csv` tables. For `.md`, provide Markdown body content only; Locus generates frontmatter and reports every generated field plus the final content start line. For `.csv`, provide raw CSV content without Markdown fences or YAML frontmatter; content starts at physical line 1. CSV is supported in Design, Memory, Reference, and plan/ directories, not as an executable Skill. Both formats update the knowledge index and can be searched with `knowledge_query`.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,7 +9,7 @@
       },
       "content": {
         "type": "string",
-        "description": "The full file content, or Markdown body only when creating a registered knowledge document"
+        "description": "The full file content. For registered knowledge documents: Markdown body only for `.md`, or raw CSV content for `.csv`."
       }
     },
     "required": ["filePath", "content"]

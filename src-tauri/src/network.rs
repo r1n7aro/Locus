@@ -640,8 +640,19 @@ fn apply_reqwest_proxy_mode_unlocked(builder: reqwest::ClientBuilder) -> reqwest
 }
 
 pub fn reqwest_client(options: ReqwestClientOptions) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder();
+    build_reqwest_client(options, reqwest::Client::builder())
+}
 
+/// Uses rustls explicitly even when other providers also enable native TLS.
+/// Proxy selection and request options remain shared with the default client.
+pub fn rustls_reqwest_client(options: ReqwestClientOptions) -> Result<reqwest::Client, String> {
+    build_reqwest_client(options, reqwest::Client::builder().tls_backend_rustls())
+}
+
+fn build_reqwest_client(
+    options: ReqwestClientOptions,
+    mut builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, String> {
     if let Some(value) = options.connect_timeout {
         builder = builder.connect_timeout(value);
     }

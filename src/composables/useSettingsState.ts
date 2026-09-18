@@ -215,6 +215,7 @@ export function useSettingsState(emit: SettingsEmit) {
       ),
       generateSessionTitles: config?.generateSessionTitles === true,
       autoReview: config?.autoReview === true,
+      useApplyPatch: config?.useApplyPatch === true,
       prefixCacheTtlSeconds: Number.isFinite(prefixCacheTtlSeconds)
         ? Math.max(0, Math.round(prefixCacheTtlSeconds))
         : 30 * 60,
@@ -959,6 +960,26 @@ export function useSettingsState(emit: SettingsEmit) {
     } catch (e) {
       const err = normalizeAppError(e);
       useNotificationStore().addNotice("error", t("settings.codex.sessionTitleSaveFailed", err.message), {
+        code: err.code,
+        operation: "saveCodexModelConfig",
+      });
+      codexModelConfig.value = previous;
+    }
+  }
+
+  async function setCodexUseApplyPatch(enabled: boolean) {
+    const next = normalizeCodexModelConfig({ ...codexModelConfig.value, useApplyPatch: enabled });
+    if (codexModelConfig.value.useApplyPatch === next.useApplyPatch) return;
+    const previous = codexModelConfig.value;
+    codexModelConfig.value = next;
+    try {
+      await serviceSaveCodexModelConfig(next);
+      emit("codexTransportChanged", next);
+      successMsg.value = t("settings.codex.applyPatchSaved");
+      setTimeout(() => { successMsg.value = ""; }, 2000);
+    } catch (e) {
+      const err = normalizeAppError(e);
+      useNotificationStore().addNotice("error", t("settings.codex.applyPatchSaveFailed", err.message), {
         code: err.code,
         operation: "saveCodexModelConfig",
       });
@@ -1786,6 +1807,7 @@ export function useSettingsState(emit: SettingsEmit) {
     setCodexContextWindow,
     setCodexSessionTitleGeneration,
     setCodexAutoReview,
+    setCodexUseApplyPatch,
     setCodexPrefixCacheTtlSeconds,
 
     requestCodexLogin,
