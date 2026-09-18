@@ -21,7 +21,6 @@ use windows::Win32::{
 };
 
 const MAIN_WINDOW_LABEL: &str = "main";
-const RESIZE_BORDERS_CLASS_NAME: &str = "TAURI_DRAG_RESIZE_BORDERS";
 const RENDER_WIDGET_CLASS_NAME: &str = "Chrome_RenderWidgetHostHWND";
 const NATIVE_CLIENT_SIZE_EVENT: &str = "locus-native-window-client-size";
 const SUBCLASS_ID: usize = 0x4c6f63757352537a;
@@ -42,7 +41,6 @@ struct ResizeSyncState {
     controller: ICoreWebView2Controller,
     parent_hwnd: HWND,
     webview_hwnd: HWND,
-    resize_borders_hwnd: HWND,
     render_widget_hwnd: HWND,
     last_x: i32,
     last_y: i32,
@@ -188,7 +186,6 @@ unsafe fn install_subclass(
         controller,
         parent_hwnd,
         webview_hwnd,
-        resize_borders_hwnd: unsafe { find_resize_borders_hwnd(parent_hwnd) },
         render_widget_hwnd: unsafe { find_render_widget_hwnd(parent_hwnd) },
         last_x: 0,
         last_y: 0,
@@ -327,9 +324,6 @@ unsafe extern "system" fn child_sync_subclass_proc(
             let _ = RemoveWindowSubclass(hwnd, Some(child_sync_subclass_proc), CHILD_SUBCLASS_ID);
             if state.webview_hwnd.0 == hwnd.0 {
                 state.webview_hwnd = HWND::default();
-            }
-            if state.resize_borders_hwnd.0 == hwnd.0 {
-                state.resize_borders_hwnd = HWND::default();
             }
             if state.render_widget_hwnd.0 == hwnd.0 {
                 state.render_widget_hwnd = HWND::default();
@@ -561,7 +555,6 @@ unsafe fn sync_webview_bounds_at(
     }
     if !force
         && !state.webview_hwnd.0.is_null()
-        && !state.resize_borders_hwnd.0.is_null()
         && state.last_x == x
         && state.last_y == y
         && state.last_width == width
@@ -594,13 +587,10 @@ unsafe fn sync_webview_bounds_at(
         sync_child_window(state.webview_hwnd, x, y, width, height);
     }
 
-    if state.resize_borders_hwnd.0.is_null() {
-        state.resize_borders_hwnd = unsafe { find_resize_borders_hwnd(state.parent_hwnd) };
-    }
-    unsafe {
-        sync_child_window(state.resize_borders_hwnd, x, y, width, height);
-    }
-
+    // Tauri owns its resize overlay's rectangle and cutout region. In
+    // particular it collapses that overlay to zero size while maximized.
+    // Synchronizing or clamping it to the client bounds here revives a stale
+    // border region inside the WebView and can trap native input hit testing.
     if state.render_widget_hwnd.0.is_null() {
         state.render_widget_hwnd = unsafe { find_render_widget_hwnd(state.parent_hwnd) };
     }
@@ -621,13 +611,6 @@ unsafe fn ensure_child_subclasses(state: &mut ResizeSyncState) {
     }
     unsafe {
         install_child_subclass(state.webview_hwnd, state);
-    }
-
-    if state.resize_borders_hwnd.0.is_null() {
-        state.resize_borders_hwnd = unsafe { find_resize_borders_hwnd(state.parent_hwnd) };
-    }
-    unsafe {
-        install_child_subclass(state.resize_borders_hwnd, state);
     }
 
     if state.render_widget_hwnd.0.is_null() {
@@ -656,7 +639,6 @@ unsafe fn install_child_subclass(hwnd: HWND, state: &mut ResizeSyncState) {
 unsafe fn remove_child_subclasses(state: &ResizeSyncState) {
     unsafe {
         remove_child_subclass(state.webview_hwnd);
-        remove_child_subclass(state.resize_borders_hwnd);
         remove_child_subclass(state.render_widget_hwnd);
     }
 }
@@ -783,19 +765,6 @@ unsafe fn sync_child_window(hwnd: HWND, x: i32, y: i32, width: i32, height: i32)
     };
 }
 
-unsafe fn find_resize_borders_hwnd(parent_hwnd: HWND) -> HWND {
-    let mut found = HWND::default();
-    let found_ptr = &mut found as *mut HWND;
-    let _ = unsafe {
-        EnumChildWindows(
-            Some(parent_hwnd),
-            Some(find_resize_borders_proc),
-            LPARAM(found_ptr as isize),
-        )
-    };
-    found
-}
-
 unsafe fn find_render_widget_hwnd(parent_hwnd: HWND) -> HWND {
     let mut found = HWND::default();
     let found_ptr = &mut found as *mut HWND;
@@ -815,24 +784,6 @@ unsafe extern "system" fn find_render_widget_proc(hwnd: HWND, lparam: LPARAM) ->
     if len > 0 {
         let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
         if class_name == RENDER_WIDGET_CLASS_NAME {
-            let found = lparam.0 as *mut HWND;
-            if !found.is_null() {
-                unsafe {
-                    *found = hwnd;
-                }
-            }
-            return BOOL(0);
-        }
-    }
-    BOOL(1)
-}
-
-unsafe extern "system" fn find_resize_borders_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let mut class_name = [0u16; 128];
-    let len = unsafe { GetClassNameW(hwnd, &mut class_name) };
-    if len > 0 {
-        let class_name = String::from_utf16_lossy(&class_name[..len as usize]);
-        if class_name == RESIZE_BORDERS_CLASS_NAME {
             let found = lparam.0 as *mut HWND;
             if !found.is_null() {
                 unsafe {

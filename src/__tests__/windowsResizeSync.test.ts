@@ -79,7 +79,6 @@ describe("native Windows resize sync", () => {
     expect(sync).toContain("let result = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };");
     expect(sync).toContain("if state.live_resize");
     expect(sync).toContain("notify_parent_position_changed(state)");
-    expect(sync).toContain("TAURI_DRAG_RESIZE_BORDERS");
     expect(sync).toContain("Chrome_RenderWidgetHostHWND");
     expect(sync).toContain("render_widget_hwnd");
     expect(sync).toContain("find_render_widget_hwnd");
