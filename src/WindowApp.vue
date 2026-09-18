@@ -40,7 +40,6 @@ import { isKnowledgeMarkdownPreviewWindowLocation } from "./services/knowledgeMa
 import { isToolFilePreviewWindowLocation } from "./services/toolFilePreviewWindow";
 import { isUnityValueEditorWindowLocation } from "./services/unityValueEditorWindow";
 import { isExtraWorkdirsWindowLocation } from "./services/extraWorkdirsWindow";
-import { isViewContentWindowLocation } from "./services/view";
 import { isWorkbenchWindowLocation } from "./services/workbenchWindow";
 import SubWindowLoading from "./components/SubWindowLoading.vue";
 import InternalDragOverlay from "./components/ui/InternalDragOverlay.vue";
@@ -148,13 +147,6 @@ const WINDOW_KINDS: WindowKindEntry[] = [
     kind: "extra-workdirs",
     matches: isExtraWorkdirsWindowLocation,
     component: asyncWindowComponent(() => import("./components/ExtraWorkdirsConfigWindow.vue")),
-  },
-  {
-    kind: "view-content",
-    matches: isViewContentWindowLocation,
-    component: asyncWindowComponent(() => import("./components/ViewHostWindow.vue")),
-    props: { embedded: true },
-    selfRevealing: true,
   },
 ];
 

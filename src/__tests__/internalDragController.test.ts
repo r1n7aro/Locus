@@ -159,6 +159,8 @@ describe("internal drag controller", () => {
   it("preserves ordinary clicks below the movement threshold", () => {
     const controller = createInternalDragController();
     const sourceElement = document.createElement("button");
+    const hitTest = vi.fn(() => sourceElement);
+    Object.defineProperty(document, "elementFromPoint", { configurable: true, value: hitTest });
     sourceElement.draggable = true;
     document.body.append(sourceElement);
     const activated = vi.fn();
@@ -180,6 +182,7 @@ describe("internal drag controller", () => {
     expect(sourceElement.getAttribute("draggable")).toBe("true");
     sourceElement.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     expect(activated).not.toHaveBeenCalled();
+    expect(hitTest).not.toHaveBeenCalled();
     expect(click).toHaveBeenCalledOnce();
     controller.dispose();
   });
@@ -597,6 +600,90 @@ describe("internal drag controller", () => {
     expect(finished).toHaveBeenCalledWith({ dropped: false, reason: "externalize" });
     controller.dispose();
   });
+
+  it.each(["pointerup", "mouseup", "missed-release"])(
+    "resolves %s at the final point once without restarting auto-scroll",
+    (releaseType) => {
+      const controller = createInternalDragController();
+      const root = document.createElement("div");
+      const sourceElement = document.createElement("button");
+      const hovered = document.createElement("div");
+      const released = document.createElement("div");
+      root.append(sourceElement, hovered, released);
+      document.body.append(root);
+      const hitTest = vi.fn(() => hovered);
+      Object.defineProperty(document, "elementFromPoint", { configurable: true, value: hitTest });
+      const drop = vi.fn();
+      const finished = vi.fn();
+      const externalize = vi.fn();
+      controller.registerTarget({
+        id: "target",
+        root: () => root,
+        accepts: () => true,
+        resolve: ({ hit }) => ({
+          key: hit === released ? "released" : "hovered", operation: "move", intent: null,
+        }),
+        drop,
+      });
+      sourceElement.addEventListener("pointerdown", (event) => controller.start(event as PointerEvent, {
+        id: "source", payload: { type: "test/item", data: null }, preview: { label: "Source" },
+        onFinished: finished, externalize,
+      }));
+      sourceElement.dispatchEvent(pointerEvent("pointerdown", 10, 10));
+      window.dispatchEvent(pointerEvent("pointermove", 40, 40));
+      hitTest.mockClear().mockReturnValue(released);
+      const styleReads = vi.spyOn(window, "getComputedStyle");
+      // Release at the viewport edge must not start a native drag after the
+      // button is already up, even if no final pointermove was delivered.
+      const release = releaseType === "mouseup"
+        ? new MouseEvent("mouseup", { button: 0, clientX: 0, clientY: 60 })
+        : pointerEvent(releaseType === "missed-release" ? "pointermove" : "pointerup", 0, 60, 1, 0);
+      window.dispatchEvent(release);
+      expect(hitTest).toHaveBeenCalledExactlyOnceWith(0, 60);
+      expect(styleReads).not.toHaveBeenCalled();
+      expect(externalize).not.toHaveBeenCalled();
+      expect(drop).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        hit: released, point: { x: 0, y: 60 }, decision: expect.objectContaining({ key: "released" }),
+      }));
+      expect(finished).toHaveBeenCalledExactlyOnceWith({ dropped: true, reason: "drop" });
+      expect(controller.phase.value).toBe("idle");
+      controller.dispose();
+    },
+  );
+
+  it.each(["pointerup", "pointercancel", "escape"])(
+    "does not commit the previous hover target on %s outside the document or cancellation",
+    (releaseType) => {
+      const controller = createInternalDragController();
+      const element = document.createElement("button");
+      document.body.append(element);
+      const hitTest = vi.fn<() => Element | null>(() => element);
+      Object.defineProperty(document, "elementFromPoint", { configurable: true, value: hitTest });
+      const drop = vi.fn();
+      const finished = vi.fn();
+      controller.registerTarget({
+        id: "target", root: () => element, accepts: () => true,
+        resolve: () => ({ key: "hovered", operation: "move", intent: null }), drop,
+      });
+      element.addEventListener("pointerdown", (event) => controller.start(event as PointerEvent, {
+        id: "source", payload: { type: "test/item", data: null }, preview: { label: "Source" },
+        onFinished: finished,
+      }));
+      element.dispatchEvent(pointerEvent("pointerdown", 10, 10));
+      window.dispatchEvent(pointerEvent("pointermove", 40, 40));
+      hitTest.mockClear().mockReturnValue(null);
+      window.dispatchEvent(releaseType === "escape"
+        ? new KeyboardEvent("keydown", { key: "Escape" })
+        : pointerEvent(releaseType, 2000, 2000));
+      expect(hitTest).toHaveBeenCalledTimes(releaseType === "pointerup" ? 1 : 0);
+      expect(drop).not.toHaveBeenCalled();
+      expect(finished).toHaveBeenCalledWith({
+        dropped: false, reason: releaseType === "pointerup" ? "drop" : releaseType,
+      });
+      expect(controller.phase.value).toBe("idle");
+      controller.dispose();
+    },
+  );
 
   it("keeps an opted-in cross-window tab gesture alive across window blur", () => {
     const controller = createInternalDragController();

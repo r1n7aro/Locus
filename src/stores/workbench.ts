@@ -19,10 +19,14 @@ export function isWorkbenchMarkdownPath(path: string): boolean {
   return /\.(?:md|markdown)$/i.test(path.trim());
 }
 
+export function isWorkbenchDocumentPath(path: string): boolean {
+  return isWorkbenchMarkdownPath(path) || /\.csv$/i.test(path.trim());
+}
+
 export function normalizeWorkbenchResource(
   resource: WorkbenchResourceRef,
 ): WorkbenchResourceRef {
-  if (resource.kind === "asset" && isWorkbenchMarkdownPath(resource.path)) {
+  if (resource.kind === "asset" && isWorkbenchDocumentPath(resource.path)) {
     return {
       kind: "workspaceFile",
       projectId: resource.projectId,
@@ -44,7 +48,21 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
     case "project": return `project:${resource.projectId}`;
     case "newSession": return `new-session:${resource.projectId}`;
     case "checkout": return `checkout:${resource.projectId}:${resource.checkoutId}`;
-    case "section": return `section:${resource.projectId}:${resource.section}`;
+    case "section": {
+      if (resource.section === "agents" && resource.agentId) {
+        return `agent:${resource.projectId}:${resource.agentId}`;
+      }
+      if (resource.section === "archived" && resource.sessionId) {
+        return `archived-session:${resource.projectId}:${resource.sessionId}`;
+      }
+      if (resource.section === "knowledge" && resource.knowledgePage) {
+        const page = resource.knowledgePage;
+        return page.kind === "directory"
+          ? `knowledge-page:${resource.projectId}:directory:${page.type}:${page.path}`
+          : `knowledge-page:${resource.projectId}:${page.kind}`;
+      }
+      return `section:${resource.projectId}:${resource.section}`;
+    }
     case "knowledgeRoot": return `knowledge-root:${resource.projectId}`;
     case "collaboration": return `collaboration:${resource.projectId}`;
     case "folder": return `folder:${resource.projectId}:${resource.nodeId}`;
@@ -217,7 +235,7 @@ function isRestorableResource(value: unknown): value is WorkbenchResourceRef {
     case "collaboration":
       return true;
     case "checkout": return typeof resource.checkoutId === "string";
-    case "section": return ["sessions", "archived", "knowledge", "collab", "assets", "views"].includes(
+    case "section": return ["sessions", "archived", "knowledge", "collab", "assets", "views", "agents"].includes(
       String(resource.section),
     );
     case "folder": return typeof resource.nodeId === "string";
@@ -310,7 +328,7 @@ function serializableEditor(editor: WorkbenchEditorInput): WorkbenchEditorInput 
     resource: cloneResource(editor.resource),
     capabilities: { ...editor.capabilities },
     checkoutBinding: editor.checkoutBinding
-      ? { checkoutId: editor.checkoutBinding.checkoutId }
+      ? { checkoutId: editor.checkoutBinding.checkoutId, expectedMaterializationEpoch: editor.checkoutBinding.expectedMaterializationEpoch }
       : null,
   };
 }
@@ -412,7 +430,7 @@ function normalizeRestoredWindow(state: WorkbenchWindowState): WorkbenchWindowSt
         duplicate: editor.capabilities?.duplicate !== false,
       },
       checkoutBinding: editor.checkoutBinding?.checkoutId || legacyCheckoutId
-        ? { checkoutId: editor.checkoutBinding?.checkoutId ?? legacyCheckoutId! }
+        ? { checkoutId: editor.checkoutBinding?.checkoutId ?? legacyCheckoutId!, expectedMaterializationEpoch: editor.checkoutBinding?.expectedMaterializationEpoch }
         : null,
       sourcePath: editor.sourcePath ?? legacyResource.path ?? null,
       availability: editor.availability === "unavailable"
@@ -834,7 +852,9 @@ export const useWorkbenchStore = defineStore("workbench", () => {
     const existing = options.allowDuplicate
       ? undefined
       : target.tabs.find(
-          (editor) => workbenchResourceKey(editor.resource) === resourceKey,
+          (editor) => workbenchResourceKey(editor.resource) === resourceKey
+            && editor.checkoutBinding?.checkoutId === input.checkoutBinding?.checkoutId
+            && (editor.checkoutBinding?.expectedMaterializationEpoch ?? null) === (input.checkoutBinding?.expectedMaterializationEpoch ?? null),
         );
     if (existing) {
       const existingDirty = existing.dirty;
@@ -1073,7 +1093,9 @@ export const useWorkbenchStore = defineStore("workbench", () => {
       const existing = options.allowDuplicate
         ? undefined
         : target.tabs.find(
-            (editor) => workbenchResourceKey(editor.resource) === resourceKey,
+            (editor) => workbenchResourceKey(editor.resource) === resourceKey
+              && editor.checkoutBinding?.checkoutId === input.checkoutBinding?.checkoutId
+              && (editor.checkoutBinding?.expectedMaterializationEpoch ?? null) === (input.checkoutBinding?.expectedMaterializationEpoch ?? null),
           );
       const editor = openEditor(windowId, {
         ...input,

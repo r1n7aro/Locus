@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { t } from "../../i18n";
+import { explorerFileKey, explorerFilePath, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
 import type { AssetSearchResult } from "../../types";
 
 const props = defineProps<{
+  workingDir?: string;
   results: AssetSearchResult[];
   query: string;
   searching: boolean;
@@ -15,9 +17,16 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  (e: "fileContextmenu", result: AssetSearchResult, event: MouseEvent): void;
   (e: "select", result: AssetSearchResult): void;
   (e: "dragPointerDown", result: AssetSearchResult, event: PointerEvent): void;
 }>();
+
+const { showsFullPath } = useExplorerPathDisplay();
+function displayName(result: AssetSearchResult): string {
+  const path = explorerFilePath(props.workingDir ?? "", result.path);
+  return !result.isDirectory && showsFullPath(explorerFileKey(path)) ? path : result.name;
+}
 
 // Parse query into:
 //  - text terms: bare substrings or n=/n^/n$/n: values, used to highlight
@@ -135,11 +144,12 @@ function beginDrag(result: AssetSearchResult, event: PointerEvent) {
       :class="{ selected: selectedKey ? selectedKey === resultKey(r) : selectedPath === r.path }"
       @pointerdown="beginDrag(r, $event)"
       @click="emit('select', r)"
+      @contextmenu="!r.isDirectory && emit('fileContextmenu', r, $event)"
       :title="resultDisplayPath(r)"
     >
       <span class="asr-index">{{ i + 1 }}</span>
       <span class="asr-name">
-        <template v-for="(seg, si) in segments(r.name)" :key="si"
+        <template v-for="(seg, si) in segments(displayName(r))" :key="si"
           ><mark v-if="seg.hit" class="asr-hit">{{ seg.text }}</mark
           ><template v-else>{{ seg.text }}</template></template>
       </span>

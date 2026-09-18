@@ -22,7 +22,10 @@ const assetServiceMocks = vi.hoisted(() => ({
   assetDbScanStart: vi.fn(),
 }));
 
-vi.mock("../services/project", () => projectServiceMocks);
+vi.mock("../services/project", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/project")>(),
+  ...projectServiceMocks,
+}));
 vi.mock("../services/unity", () => unityServiceMocks);
 vi.mock("../services/asset", () => assetServiceMocks);
 

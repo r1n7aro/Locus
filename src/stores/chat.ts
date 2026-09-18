@@ -257,10 +257,13 @@ function mergePendingInputList(
     || (
       item.runId === input.runId
       && item.mergeGroupId === input.mergeGroupId
+      && item.status !== "delivering"
       && item.status !== "accepted"
       && item.status !== "restored"
     ));
   if (index < 0) return [...list, input];
+  // A delayed enqueue acknowledgement must not make sent steering withdrawable.
+  if (list[index]?.id === input.id && list[index]?.status === "delivering" && input.status === "queued") return list;
   const next = [...list];
   next.splice(index, 1, input);
   return next;
@@ -350,13 +353,14 @@ function cloneWorkspaceRef(workspaceRef: WorkspaceRef | null): WorkspaceRef | nu
     ? {
       checkoutId: workspaceRef.checkoutId,
       expectedGeneration: workspaceRef.expectedGeneration,
+      expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch,
     }
     : null;
 }
 
 function workspaceScopeKey(workspaceRef: WorkspaceRef | null): string | null {
   if (!workspaceRef) return null;
-  return `${workspaceRef.checkoutId}\u0000${workspaceRef.expectedGeneration ?? ""}`;
+  return `${workspaceRef.checkoutId}\u0000${workspaceRef.expectedGeneration ?? ""}\u0000${workspaceRef.expectedMaterializationEpoch ?? "empty"}`;
 }
 
 export const useChatStore = defineStore("chat", () => {
@@ -493,6 +497,7 @@ export const useChatStore = defineStore("chat", () => {
       displayText,
       images,
       canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
+      canEdit: inputs.every((input) => input.status === "queued"),
       isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
       imageCount: images.length,
       assetRefCount: inputs.reduce((total, input) => total + (input.assetRefs?.length ?? 0), 0),
@@ -1054,7 +1059,7 @@ export const useChatStore = defineStore("chat", () => {
   ): PendingSessionInput[] {
     const groups = includeServerQueued ? localPendingInputGroups : localFallbackPendingInputGroups;
     const inputs = visiblePendingInputs(pendingInputsBySession.value.get(sessionId))
-      .filter((input) => input.runId === runId);
+      .filter((input) => input.runId === runId && input.status === "queued");
     return inputs.filter((input) =>
       groups.has(
         pendingInputMergeKey(sessionId, runId, input.mergeGroupId),
@@ -1075,7 +1080,7 @@ export const useChatStore = defineStore("chat", () => {
   }): PendingSessionInput {
     const existing = visiblePendingInputs(pendingInputsBySession.value.get(params.sessionId))
       .find((input) =>
-        input.runId === params.runId && input.mergeGroupId === params.mergeGroupId);
+        input.runId === params.runId && input.mergeGroupId === params.mergeGroupId && input.status === "queued");
     const now = Date.now() / 1000;
     const pending: PendingSessionInput = existing
       ? {
@@ -2753,7 +2758,7 @@ export const useChatStore = defineStore("chat", () => {
   async function deleteActiveQueuedFollowUp(): Promise<boolean> {
     const sessionId = activeSessionId.value;
     const targets = activeQueuedFollowUps.value;
-    if (!sessionId || targets.length === 0) return false;
+    if (!sessionId || targets.length === 0 || targets.some((input) => input.status === "delivering")) return false;
 
     try {
       const deleteResults = await Promise.all(

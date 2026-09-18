@@ -110,6 +110,7 @@ export default defineConfig(async () => ({
         "**/debug/**",
         "**/.codex/**",
         "**/codex-artifacts/**",
+        "**/artifacts/**", // CLI driver binaries, profiles and isolated runtimes
         "**/.venv/**",
         "**/.venv-docs/**",
         // build output

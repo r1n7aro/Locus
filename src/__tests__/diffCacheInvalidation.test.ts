@@ -10,6 +10,7 @@ import {
   computeRequestKey,
   diffSingleFile,
   invalidateDiffCacheForFiles,
+  parseDiffWorkspaceRefFromKey,
 } from "../services/diff";
 import type { FileDiffRequest } from "../types";
 import type { WorkspaceRef } from "../services/project";
@@ -78,6 +79,22 @@ describe("invalidateDiffCacheForFiles", () => {
 
     await diffSingleFile(target);
     expect(ipcInvokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("separates repeated generations after reassignment and retains the epoch in parsed handles", async () => {
+    const target = request("Assets/Reassigned.cs");
+    const previous = { checkoutId: "reused-slot", expectedGeneration: 1, expectedMaterializationEpoch: 1 };
+    const replacement = { ...previous, expectedMaterializationEpoch: 2 };
+    await diffSingleFile(target, previous);
+    await diffSingleFile(target, replacement);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(2);
+    expect(parseDiffWorkspaceRefFromKey(computeRequestKey(target, previous))).toEqual(previous);
+    expect(parseDiffWorkspaceRefFromKey(computeRequestKey(target, replacement))).toEqual(replacement);
+    invalidateDiffCacheForFiles([target.filePath], previous);
+    await diffSingleFile(target, replacement);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(2);
+    await diffSingleFile(target, previous);
+    expect(ipcInvokeMock).toHaveBeenCalledTimes(3);
   });
 
   it("namespaces identical relative paths by checkout generation", async () => {

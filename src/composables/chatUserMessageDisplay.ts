@@ -13,6 +13,12 @@ const LOCUS_CONSOLE_BLOCK_RE =
 const LOCUS_LOCAL_FILES_BLOCK_RE =
   /(?:^|\r?\n)[ \t]*<locus-local-files>([\s\S]*?)<\/locus-local-files>[ \t]*(?:\r?\n)?/gi;
 
+const LOCUS_KNOWLEDGE_QUOTES_BLOCK_RE =
+  /(?:^|\r?\n)[ \t]*<locus-knowledge-quotes>([\s\S]*?)<\/locus-knowledge-quotes>[ \t]*(?:\r?\n)?/gi;
+
+const LOCUS_KNOWLEDGE_QUOTE_ENTRY_RE =
+  /<locus-knowledge-quote\s+data="([^"]*)">\r?\n?([\s\S]*?)\r?\n?<\/locus-knowledge-quote>/gi;
+
 const LOCUS_LOCAL_FILE_ENTRY_RE =
   /^[ \t]*-\s*(file|folder):\s*`([^`\r\n]+)`(?:\s*;\s*type:\s*([^\r\n]+?))?[ \t]*$/gim;
 
@@ -31,6 +37,12 @@ export interface UserLocalFileEntryDisplay {
   path: string;
   kind: "file" | "folder";
   typeLabel: string;
+}
+
+export interface UserKnowledgeQuoteDisplay {
+  path: string;
+  name: string;
+  content: string;
 }
 
 function trimInjectedPadding(text: string) {
@@ -55,6 +67,14 @@ function stripLocusConsoleBlocks(text: string) {
 
 function stripLocusLocalFileBlocks(text: string) {
   return text.replace(LOCUS_LOCAL_FILES_BLOCK_RE, "\n");
+}
+
+function stripLocusKnowledgeQuoteBlocks(text: string) {
+  return text.replace(LOCUS_KNOWLEDGE_QUOTES_BLOCK_RE, "\n");
+}
+
+export function stripUserMessageKnowledgeQuoteBlocks(content: string) {
+  return stripLocusKnowledgeQuoteBlocks(content);
 }
 
 function stripKnownLocusPrefixes(text: string) {
@@ -133,6 +153,37 @@ export function userMessageLocalFileEntries(content: string): UserLocalFileEntry
   return entries;
 }
 
+function parseKnowledgeQuoteBlock(block: string): UserKnowledgeQuoteDisplay[] {
+  const entries: UserKnowledgeQuoteDisplay[] = [];
+  for (const match of block.matchAll(LOCUS_KNOWLEDGE_QUOTE_ENTRY_RE)) {
+    try {
+      const metadata = JSON.parse(decodeURIComponent(match[1] ?? "")) as {
+        path?: unknown;
+        name?: unknown;
+      };
+      const path = typeof metadata.path === "string" ? metadata.path.trim() : "";
+      const content = (match[2] ?? "").replace(/^\r?\n|\r?\n$/g, "");
+      if (!path || !content.trim()) continue;
+      entries.push({
+        path,
+        name: typeof metadata.name === "string" ? metadata.name.trim() : "",
+        content,
+      });
+    } catch {
+      // Ignore malformed injected metadata while preserving the user's text.
+    }
+  }
+  return entries;
+}
+
+export function userMessageKnowledgeQuoteEntries(content: string): UserKnowledgeQuoteDisplay[] {
+  const entries: UserKnowledgeQuoteDisplay[] = [];
+  for (const match of content.matchAll(LOCUS_KNOWLEDGE_QUOTES_BLOCK_RE)) {
+    entries.push(...parseKnowledgeQuoteBlock(match[1] ?? ""));
+  }
+  return entries;
+}
+
 export function displayUserMessageContent(content: string) {
   let next = content;
   let previous = "";
@@ -141,9 +192,11 @@ export function displayUserMessageContent(content: string) {
     previous = next;
     next = stripKnownLocusPrefixes(
       stripLocusLocalFileBlocks(
-        stripLocusConsoleBlocks(
-          stripUnityAssetRefBlocks(
-            stripSystemReminderBlocks(next),
+        stripLocusKnowledgeQuoteBlocks(
+          stripLocusConsoleBlocks(
+            stripUnityAssetRefBlocks(
+              stripSystemReminderBlocks(next),
+            ),
           ),
         ),
       ),

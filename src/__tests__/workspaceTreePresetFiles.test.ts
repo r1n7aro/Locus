@@ -116,7 +116,7 @@ describe("workspace tree presets and mounted files", () => {
     expect(command).toContain("workspace.explorer_file_uses_unity_inspector");
     expect(service).toContain('"project_explorer_write_file"');
     expect(fileEditor).toContain("<BaseMarkdownEditor");
-    expect(workbench).toContain("isWorkbenchMarkdownPath(editor.resource.path)");
+    expect(workbench).toContain("isWorkbenchDocumentPath(editor.resource.path)");
     expect(workbench).toContain("editor.resource.kind === 'workspaceFile' || (editor.resource.kind === 'asset'");
     expect(fileEditor).toContain("projectExplorerWriteFile(");
     expect(fileEditor).toContain("workspaceFileWrite(");
@@ -153,19 +153,13 @@ describe("workspace tree presets and mounted files", () => {
 
   it("sorts system entries and resolves blank workspace space as the root tail", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    const store = read("src/stores/workspaceExplorer.ts");
     const tree = read("src-tauri/src/workspace_tree.rs");
-    expect(store).toContain('resourceKind: SYSTEM_RESOURCE_KIND');
-    expect(store).toContain('resourceId: NEW_SESSION_SYSTEM_RESOURCE_ID');
-    expect(store).toContain('resourceId: KNOWLEDGE_SYSTEM_RESOURCE_ID');
-    expect(store).toContain('resourceId: COLLABORATION_SYSTEM_RESOURCE_ID');
-    expect(store).toContain('resourceId: ARCHIVED_SYSTEM_RESOURCE_ID');
     expect(workbench).toContain('node.resourceId === KNOWLEDGE_SYSTEM_RESOURCE_ID');
     expect(workbench).toContain('node.resourceId === COLLABORATION_SYSTEM_RESOURCE_ID');
     expect(workbench).toContain('node.resourceId === ARCHIVED_SYSTEM_RESOURCE_ID');
     expect(workbench).toContain("dragEnabled: true");
     expect(workbench).toContain("position: snapshot.nodes.filter((node) => !node.parentNodeId).length");
-    expect(workbench).toContain("await moveExplorerNodeToIntent((sourceData as WorkspaceLayoutInternalDragData).item, intent.layout)");
+    expect(workbench).toContain("await moveExplorerNodeToIntent(data.item, intent.layout, data.items)");
     expect(tree).toContain('"session" | "knowledge" | "system"');
   });
 
@@ -180,7 +174,10 @@ describe("workspace tree presets and mounted files", () => {
 
   it("keeps knowledge and collaboration views mounted in the workspace", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-    expect(workbench).toContain('v-show="group.activeEditorId === editor.editorId"');
+    expect(workbench).toContain('<WorkbenchEditorStack :group="group">');
+    expect(read("src/components/workbench/WorkbenchEditorStack.vue")).toContain(
+      'v-show="presentedEditor?.editorId === editor.editorId || group.activeEditorId === editor.editorId"',
+    );
     expect(workbench).toMatch(/<KnowledgeView\s+v-else-if="editor\.resource\.kind === 'knowledge'/);
     expect(workbench).toMatch(/<CollabView\s+v-else-if="editor\.resource\.kind === 'collaboration'/);
     expect(workbench).toContain(':workspace-ref="editorWorkspaceRef(editor)"');
@@ -234,6 +231,21 @@ describe("workspace tree presets and mounted files", () => {
     expect(workbench).toMatch(/\.workspace-tree-row-shell\.is-new-session-drop-zone \.workspace-tree-row\)[^{]*\{[\s\S]*border:\s*1px dashed var\(--border-strong\);/);
     expect(workbench).toMatch(/\.workspace-tree-row-shell\.is-new-session-drop-zone \.workspace-tree-name\)[^{]*\{[\s\S]*text-align:\s*center;/);
     expect(zh).toContain('\"development.dropToCreateSession\": \"拖到此处以创建新会话\"');
+  });
+
+  it("fixes New Session above the regular tree while allowing editor drags", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const row = workbench.slice(workbench.indexOf("function appendNewSessionRow("), workbench.indexOf("function appendLayoutChildren("));
+    expect(row).toContain("nodes.find(isNewSessionNode)");
+    expect(row).toContain("dragEnabled: true");
+    expect(workbench).toContain("&& !isNewSessionNode(node)");
+    expect(workbench).toMatch(/appendNewSessionRow\(items, project, resourceDepth\);\s+appendLayoutChildren\(/);
+    const source = workbench.slice(workbench.indexOf("function onDragPointerDown("), workbench.indexOf("function resolveLayoutDropIntent("));
+    expect(source.slice(0, source.indexOf("const items ="))).not.toContain('item.meta.kind === "newSession"');
+    const move = workbench.slice(workbench.indexOf("function canMoveExplorerNodeToIntent("), workbench.indexOf("function activateLayoutDropIntent("));
+    expect(move).toContain('source.meta.kind === "newSession"');
+    const target = workbench.slice(workbench.indexOf("function resolveLayoutDropIntentAt("), workbench.indexOf("function resolveExplorerRootDropIntent("));
+    expect(target).toContain('target.meta.kind === "newSession"');
   });
 
   it("resizes and persists the workspace explorer width", () => {

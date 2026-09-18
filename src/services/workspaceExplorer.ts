@@ -1,4 +1,5 @@
 import { ipcInvoke } from "./ipc";
+import { beginWorkspaceGitHeadObservation, rememberWorkspaceGitHead } from "./workspaceGitHead";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 import {
   WORKSPACE_EVENT_NAME,
@@ -19,6 +20,10 @@ import type {
 
 export const PROJECT_EXPLORER_CHANGED_EVENT = "project-explorer-changed";
 export const WORKSPACE_FILE_CHANGED_EVENT = "workspace-file-changed";
+
+export function explorerFileAction(projectId: string, path: string, newName: string | null, workspaceRef?: WorkspaceRef | null): Promise<string | null> {
+  return ipcInvoke("explorer_file_action", { projectId, path, newName, workspaceRef: workspaceRef ?? null });
+}
 
 export interface WorkspaceFileChangedPayload {
   seq: number;
@@ -47,6 +52,7 @@ function ensureWorkspaceFileChangeSubscription(): void {
         }
       }
     },
+    { owner: "workspaceExplorer.ensureWorkspaceFileChangeSubscription" },
   ).catch(() => {
     workspaceFileChangeSubscriptionStarted = false;
   });
@@ -208,19 +214,39 @@ export function workspaceFileWrite(
   });
 }
 
-export function projectKnowledgeList(
+type ProjectKnowledgeDocumentPayload = Omit<ProjectKnowledgeDocument, "modifiedAt"> & {
+  updatedAt: number;
+};
+
+export async function projectKnowledgeList(
   projectId: string,
   options: { type?: string | null; pathPrefix?: string | null } = {},
 ): Promise<ProjectKnowledgeDocument[]> {
-  return ipcInvoke<ProjectKnowledgeDocument[]>("project_knowledge_list", {
+  const documents = await ipcInvoke<ProjectKnowledgeDocumentPayload[]>("project_knowledge_list", {
     projectId,
     docType: options.type ?? null,
     pathPrefix: options.pathPrefix ?? null,
   });
+  return documents.map(({ updatedAt, ...document }) => ({
+    ...document,
+    modifiedAt: updatedAt,
+  }));
 }
 
-export function projectCollaborationSnapshot(
+export async function projectCollaborationSnapshot(
   projectId: string,
 ): Promise<ProjectCollaborationSnapshot> {
-  return ipcInvoke<ProjectCollaborationSnapshot>("project_collaboration_snapshot", { projectId });
+  const observation = beginWorkspaceGitHeadObservation();
+  const snapshot = await ipcInvoke<ProjectCollaborationSnapshot>("project_collaboration_snapshot", { projectId });
+  for (const checkout of snapshot.checkouts) {
+    rememberWorkspaceGitHead({
+      checkoutId: checkout.checkoutId,
+      expectedGeneration: checkout.workspaceGeneration,
+    }, {
+      kind: checkout.branchRef ? "attached" : "detached",
+      refName: checkout.branchRef ?? null,
+      hash: checkout.headOid ?? null,
+    }, observation);
+  }
+  return snapshot;
 }

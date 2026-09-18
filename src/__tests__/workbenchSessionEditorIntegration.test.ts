@@ -2,7 +2,7 @@
 import { createApp, defineComponent, h, nextTick, reactive, ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceRef } from "../services/project";
-import { saveSessionExecutionState } from "../services/session";
+import { saveSessionExecutionState, unarchiveSession } from "../services/session";
 import { broadcastSessionExecutionState } from "../services/sessionExecutionState";
 import type { WorkbenchEditorInput } from "../types/workbench";
 
@@ -43,6 +43,7 @@ const controller = {
   pendingToolConfirms: ref([]),
   queuedFollowUp: ref(null),
   errorMessage: ref(null),
+  isLoading: ref(false),
   sessionId: ref<string | null>("session-source"),
   currentRunId: ref<string | null>("run-pane"),
   sessionAgentId: ref<string | null>("agent-a"),
@@ -89,9 +90,15 @@ const controller = {
 let chatViewProps: Record<string, unknown> | null = null;
 let thinkingPanelProps: Record<string, unknown> | null = null;
 let sidebarProps: Record<string, unknown> | null = null;
+let requestedSession: { value: string | null } | null = null;
+let beforeSessionLaunch: ((sessionId: string) => Promise<void>) | undefined;
 
 vi.mock("../composables/useEmbeddedChatSession", () => ({
-  useEmbeddedChatSession: () => controller,
+  useEmbeddedChatSession: (options: { initialSessionId: { value: string | null }; beforeSessionLaunch: (sessionId: string) => Promise<void> }) => {
+    requestedSession = options.initialSessionId;
+    beforeSessionLaunch = options.beforeSessionLaunch;
+    return controller;
+  },
 }));
 vi.mock("../composables/useSkills", () => ({
   useSkills: () => ({ skillItems: ref([]) }),
@@ -118,7 +125,7 @@ vi.mock("../composables/useWorkspaceUnityStatus", () => ({
     installPlugin: vi.fn(),
   }),
 }));
-vi.mock("../services/session", () => ({ saveSessionExecutionState: vi.fn() }));
+vi.mock("../services/session", () => ({ saveSessionExecutionState: vi.fn(), unarchiveSession: vi.fn() }));
 vi.mock("../services/sessionExecutionState", () => ({
   broadcastSessionExecutionState: vi.fn(),
 }));
@@ -247,6 +254,10 @@ vi.mock("../components/ChatView.vue", () => ({
           onClick: () => emit("reviewSessionContext", { sessionId: "session-source" }),
         }, "review"),
         h("button", {
+          class: "review-message",
+          onClick: () => emit("reviewSessionContext", { sessionId: "session-source", messageId: "message-1" }),
+        }, "review message"),
+        h("button", {
           class: "thinking",
           onClick: () => emit("openThinking", "Scoped reasoning"),
         }, "thinking"),
@@ -321,6 +332,7 @@ function mountEditor(listeners: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  controller.isLoading.value = false;
   controller.sessionAgentId.value = "agent-a";
   controller.sessionModelId.value = "model-a";
   controller.sessionEffort.value = "high";
@@ -335,6 +347,45 @@ beforeEach(() => {
 });
 
 describe("WorkbenchSessionEditor scoped host", () => {
+  it("loads archived sessions through the same controller and unarchives before continuing", async () => {
+    const restore = vi.fn();
+    const archivedEditor = reactive({
+      ...editor,
+      resource: { kind: "section", section: "archived", projectId: "project-a", sessionId: "session-source" },
+    } as WorkbenchEditorInput);
+    const { app, host } = mountEditor({ editor: archivedEditor, onSessionUnarchived: restore });
+    await flushUi();
+    expect(requestedSession?.value).toBe("session-source");
+    expect(chatViewProps?.scopedSession).toBe(true);
+    expect(chatViewProps?.loadOlderHistory).toBe(loadOlderHistory);
+    expect(chatViewProps?.loadSessionHistoryThroughMessage).toBe(loadSessionHistoryThroughMessage);
+    await beforeSessionLaunch?.("session-source");
+    expect(unarchiveSession).toHaveBeenCalledWith("session-source");
+    expect(restore).toHaveBeenCalledWith("session-source");
+    archivedEditor.resource = { kind: "session", projectId: "project-a", sessionId: "session-source" };
+    await flushUi();
+    expect(requestedSession?.value).toBe("session-source");
+    vi.mocked(unarchiveSession).mockClear();
+    await beforeSessionLaunch?.("session-source");
+    expect(unarchiveSession).not.toHaveBeenCalled();
+    app.unmount();
+    host.remove();
+  });
+  it("reports readiness only after the requested session finishes loading", async () => {
+    controller.isLoading.value = true;
+    const ready = vi.fn();
+    const { app } = mountEditor({ onReady: ready });
+    try {
+      await flushUi();
+      expect(ready).not.toHaveBeenCalled();
+      controller.isLoading.value = false;
+      await flushUi();
+      expect(ready).toHaveBeenCalledOnce();
+    } finally {
+      app.unmount();
+    }
+  });
+
   it("persists multi agent independently of the selected effort", async () => {
     const { app, host } = mountEditor();
     try {
@@ -454,6 +505,12 @@ describe("WorkbenchSessionEditor scoped host", () => {
     expect(reviewSessionContext).toHaveBeenCalledWith({
       editorId: "editor-pane",
       request: { sessionId: "session-source" },
+    });
+    host.querySelector<HTMLButtonElement>(".review-message")?.click();
+    await flushUi();
+    expect(reviewSessionContext).toHaveBeenLastCalledWith({
+      editorId: "editor-pane",
+      request: { sessionId: "session-source", messageId: "message-1" },
     });
 
     app.unmount();

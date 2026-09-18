@@ -23,7 +23,7 @@ export type LegacyAppTab =
 const ACTIVE_PAGE_STORAGE_KEY = "locus:activePage:v1";
 
 export function migrateAppPage(value: unknown): AppPage {
-  if (value === "plugins" || value === "agent" || value === "settings") {
+  if (value === "plugins" || value === "settings") {
     return value;
   }
   return "development";

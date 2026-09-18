@@ -1,5 +1,11 @@
 import type { AssetRefAttachment } from "../../types";
 import type { LocusFileDropRef } from "../../services/unity";
+import type {
+  ProjectExplorerMountEntry,
+  ProjectExplorerNode,
+  ProjectKnowledgeDocument,
+  WorkbenchEditorInput,
+} from "../../types/workbench";
 
 const UNITY_REFERENCE_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\/|$)/i;
 const KNOWLEDGE_REFERENCE_RE = /(?:^|\/)Locus\/knowledge\/(design|plan|memory|skill|reference)\/(.+\.md)$/i;
@@ -13,6 +19,7 @@ export interface WorkbenchComposerFileInput {
   typeLabel?: string | null;
   source?: string | null;
   knowledgeSource?: boolean;
+  isDir?: boolean;
 }
 
 export type WorkbenchComposerFileAttachment =
@@ -61,6 +68,19 @@ export function workbenchComposerFileAttachment(
   const name = input.name?.trim() || undefined;
   const typeLabel = input.typeLabel?.trim() || undefined;
 
+  // Keep directory identity so the composer uses folder previews and list instructions.
+  if (input.isDir) {
+    return {
+      localFile: {
+        path: absolutePath,
+        isDir: true,
+        name,
+        typeLabel,
+        source: input.source?.trim() || "local",
+      },
+    };
+  }
+
   const knowledgePath = knowledgeReferencePath(candidates, input.knowledgeSource === true);
   if (knowledgePath) {
     return {
@@ -96,4 +116,110 @@ export function workbenchComposerFileAttachment(
       source: input.source?.trim() || "local",
     },
   };
+}
+
+export function workbenchComposerTreeFileAttachment(
+  input: {
+    kind: string;
+    explorerNode?: Pick<ProjectExplorerNode, "sourcePath" | "sourceKind">;
+    mountEntry?: Pick<ProjectExplorerMountEntry, "absolutePath" | "relativePath" | "name" | "isDir">;
+    name?: string;
+  },
+  workspaceRoot: string,
+): WorkbenchComposerFileAttachment | null {
+  const mountEntry = input.kind === "mountedFile" || input.kind === "mountedFolder"
+    ? input.mountEntry
+    : undefined;
+  const absolutePath = mountEntry?.absolutePath
+    ?? (input.kind === "localFile" || input.kind === "folder" ? input.explorerNode?.sourcePath : null);
+  if (!absolutePath) return null;
+  return workbenchComposerFileAttachment({
+    absolutePath,
+    workspaceRoot,
+    relativePath: mountEntry?.relativePath,
+    name: input.name ?? mountEntry?.name,
+    source: input.explorerNode?.sourceKind,
+    knowledgeSource: input.explorerNode?.sourceKind === "knowledge",
+    isDir: mountEntry?.isDir ?? input.kind === "folder",
+  });
+}
+
+export function workbenchComposerEditorAttachment(
+  editor: WorkbenchEditorInput,
+  context: {
+    workspaceRoot: string;
+    targetWorkspaceRoot: string;
+    knowledgeDocument?: Pick<ProjectKnowledgeDocument, "type" | "path" | "sourceRoot"> | null;
+  },
+): WorkbenchComposerFileAttachment | null {
+  if (editor.availability !== "available") return null;
+  const resource = editor.resource;
+  const workspaceRoot = normalizePath(context.workspaceRoot);
+  const targetWorkspaceRoot = normalizePath(context.targetWorkspaceRoot);
+  const sameWorkspace = !!workspaceRoot
+    && workspaceRoot.toLocaleLowerCase() === targetWorkspaceRoot.toLocaleLowerCase();
+  const name = editor.title;
+  let path: string;
+  let isDir = false;
+
+  switch (resource.kind) {
+    case "knowledge": {
+      const document = context.knowledgeDocument;
+      if (!document) return null;
+      const documentPath = normalizePath(document.path).replace(/^\/+/, "");
+      if (!documentPath) return null;
+      path = `${document.type}/${documentPath}`;
+      if (sameWorkspace) {
+        return { assetRef: { kind: "knowledge", path, name, source: "manual" } };
+      }
+      const root = normalizePath(document.sourceRoot) || workspaceRoot;
+      if (!root) return null;
+      path = `${root}/Locus/knowledge/${path}`;
+      break;
+    }
+    case "asset":
+      if (sameWorkspace) {
+        return { assetRef: { kind: "asset", path: resource.path, name, source: "manual" } };
+      }
+      path = resource.path;
+      break;
+    case "sceneObject":
+      // Scene objects need their owning Unity workspace; a file cannot identify them.
+      return sameWorkspace ? {
+        assetRef: {
+          kind: "sceneObject",
+          path: `${resource.scenePath}/${resource.objectPath}`,
+          name,
+          source: "manual",
+        },
+      } : null;
+    case "workspaceFile":
+      path = resource.path;
+      break;
+    case "folder":
+    case "localDirectory":
+    case "localFile":
+      path = editor.sourcePath ?? "";
+      isDir = resource.kind !== "localFile";
+      break;
+    default:
+      return null;
+  }
+
+  path = normalizePath(path);
+  if (!path) return null;
+  if (!/^(?:[A-Za-z]:\/|\/)/.test(path)) {
+    if (!workspaceRoot) return null;
+    path = `${workspaceRoot}/${path.replace(/^\.\//, "")}`;
+  }
+  // Preserve the source file when the receiving conversation uses another checkout.
+  if (!sameWorkspace) {
+    return { localFile: { path, isDir, name, source: "local" } };
+  }
+  return workbenchComposerFileAttachment({
+    absolutePath: path,
+    workspaceRoot,
+    name,
+    isDir,
+  });
 }

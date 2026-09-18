@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 interface FileTreeListItem {
   key: string;
@@ -10,9 +10,13 @@ const props = withDefaults(defineProps<{
   items: FileTreeListItem[];
   rowHeight?: number;
   overscan?: number;
+  gapAfterIndex?: number;
+  gapHeight?: number;
 }>(), {
   rowHeight: 30,
   overscan: 8,
+  gapAfterIndex: -1,
+  gapHeight: 0,
 });
 
 const emit = defineEmits<{
@@ -25,6 +29,13 @@ const viewportHeight = ref(0);
 
 let resizeObserver: ResizeObserver | null = null;
 let scrollFrame = 0;
+
+const gapHeight = computed(() => props.gapAfterIndex >= 0 && props.gapAfterIndex < props.items.length
+  ? Math.max(0, props.gapHeight) : 0);
+
+function rowTop(index: number): number {
+  return index * Math.max(1, props.rowHeight) + (index > props.gapAfterIndex ? gapHeight.value : 0);
+}
 
 function updateViewportMetrics() {
   const element = scrollRef.value;
@@ -67,14 +78,16 @@ const virtualWindow = computed(() => {
     ? viewportHeight.value
     : fallbackViewportHeight;
   const visibleCount = Math.max(1, Math.ceil(effectiveViewportHeight / rowHeight));
-  const start = Math.max(0, Math.floor(scrollTop.value / rowHeight) - props.overscan);
+  const gapTop = (props.gapAfterIndex + 1) * rowHeight;
+  const rowsScrollTop = scrollTop.value - Math.min(gapHeight.value, Math.max(0, scrollTop.value - gapTop));
+  const start = Math.max(0, Math.floor(rowsScrollTop / rowHeight) - props.overscan);
   const end = Math.min(total, start + visibleCount + props.overscan * 2);
 
   return {
     start,
     end,
-    topSpacer: start * rowHeight,
-    bottomSpacer: Math.max(0, (total - end) * rowHeight),
+    topSpacer: rowTop(start),
+    bottomSpacer: Math.max(0, (total - end) * rowHeight) + (props.gapAfterIndex >= end ? gapHeight.value : 0),
     items: props.items.slice(start, end),
   };
 });
@@ -91,11 +104,37 @@ watch(
 );
 
 watch(
-  () => props.items.length,
+  () => [props.items.length, props.gapAfterIndex, props.gapHeight],
   () => {
     scheduleViewportMetrics();
   },
 );
+
+// Keep a visible row at the same offset when siblings are reordered. Insertion,
+// deletion and expansion retain their existing scroll behavior.
+watch(() => props.items.map((item) => item.key), (keys, previous) => {
+  const element = scrollRef.value;
+  if (!element || element.scrollTop <= 0 || keys.length !== previous.length
+    || keys.every((key, index) => key === previous[index])) return;
+  const keySet = new Set(keys);
+  if (previous.some((key) => !keySet.has(key))) return;
+  const gapTop = (props.gapAfterIndex + 1) * Math.max(1, props.rowHeight);
+  const position = element.scrollTop - Math.min(gapHeight.value, Math.max(0, element.scrollTop - gapTop));
+  let oldIndex = Math.min(previous.length - 1, Math.floor(position / Math.max(1, props.rowHeight)));
+  // If the first visible item is itself promoted, anchor a following stationary
+  // sibling instead of following the promoted item all the way to the top.
+  const nextIndices = new Map(keys.map((key, index) => [key, index]));
+  while (oldIndex < previous.length - 1 && (nextIndices.get(previous[oldIndex]!) ?? 0) < oldIndex) oldIndex += 1;
+  const anchor = previous[oldIndex];
+  if (!anchor) return;
+  const offset = element.scrollTop - rowTop(oldIndex);
+  const nextTop = rowTop(keys.indexOf(anchor)) + offset;
+  void nextTick(() => {
+    if (scrollRef.value !== element) return;
+    element.scrollTop = Math.max(0, nextTop);
+    updateViewportMetrics();
+  });
+}, { flush: "pre" });
 
 /**
  * Scroll a row into view. "auto" only scrolls when the row is outside the
@@ -106,7 +145,7 @@ function scrollToIndex(index: number, options?: { align?: "auto" | "center" }) {
   if (!element || !props.items.length) return;
   const rowHeight = Math.max(1, props.rowHeight);
   const clamped = Math.max(0, Math.min(index, props.items.length - 1));
-  const top = clamped * rowHeight;
+  const top = rowTop(clamped);
   const bottom = top + rowHeight;
   const align = options?.align ?? "auto";
   if (
@@ -165,6 +204,9 @@ onUnmounted(() => {
           :item="item"
           :index="virtualWindow.start + localIndex"
         ></slot>
+        <slot v-if="gapHeight > 0 && virtualWindow.start + localIndex === gapAfterIndex" name="gap">
+          <div :style="{ height: `${gapHeight}px` }" />
+        </slot>
       </template>
       <div
         v-if="virtualWindow.bottomSpacer > 0"

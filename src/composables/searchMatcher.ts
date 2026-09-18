@@ -39,14 +39,24 @@ function subsequenceGapScore(query: string, candidate: string): number | null {
   return Math.max(0, 260 - gapPenalty * 8);
 }
 
-function scoreSingleField(query: string, field: string): number | null {
-  const queryTerms = splitSearchTerms(query);
-  const compactQuery = queryTerms.join("");
+export interface PreparedSearchText {
+  terms: string[];
+  compact: string;
+}
+
+export function prepareSearchText(text: string): PreparedSearchText {
+  const terms = splitSearchTerms(text);
+  return { terms, compact: terms.join("") };
+}
+
+export function scorePreparedSearchText(query: PreparedSearchText, field: PreparedSearchText): number | null {
+  const queryTerms = query.terms;
+  const compactQuery = query.compact;
   if (!compactQuery) return 0;
 
-  const candidateTerms = splitSearchTerms(field);
+  const candidateTerms = field.terms;
   if (candidateTerms.length === 0) return null;
-  const compactCandidate = candidateTerms.join("");
+  const compactCandidate = field.compact;
 
   if (compactCandidate === compactQuery) {
     return 1000;
@@ -80,9 +90,10 @@ function scoreSingleField(query: string, field: string): number | null {
 
 export function scoreSearchFields(query: string, fields: SearchField[]): number | null {
   let bestScore: number | null = null;
+  const preparedQuery = prepareSearchText(query);
 
   for (const field of fields) {
-    const score = scoreSingleField(query, field.text);
+    const score = scorePreparedSearchText(preparedQuery, prepareSearchText(field.text));
     if (score == null) continue;
     const weighted = score + (field.weight ?? 0);
     if (bestScore == null || weighted > bestScore) {

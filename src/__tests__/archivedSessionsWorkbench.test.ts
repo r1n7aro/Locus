@@ -11,22 +11,25 @@ describe("archived sessions workspace", () => {
     const tree = read("src-tauri/src/workspace_tree.rs");
 
     expect(store).toContain('const ARCHIVED_SYSTEM_RESOURCE_ID = "archived";');
-    expect(store).toContain('resourceId: ARCHIVED_SYSTEM_RESOURCE_ID');
+    expect(store).toContain('ARCHIVED_SYSTEM_RESOURCE_ID,');
     expect(workbench).toContain('labelKey: "app.tab.archived"');
     expect(workbench).toContain('section: "archived"');
     expect(tree).toContain('const DEFAULT_HIDDEN_SYSTEM_RESOURCE_ID: &str = "archived";');
     expect(tree).toContain('resource_id == DEFAULT_HIDDEN_SYSTEM_RESOURCE_ID');
   });
 
-  it("uses a split workbench editor with the shared transcript renderer", () => {
+  it("reuses the workspace session viewer and tree without an archive skin", () => {
     const editor = read("src/components/workbench/WorkbenchArchivedSessionsEditor.vue");
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const settings = read("src/components/SettingsView.vue");
 
     expect(editor).toContain("listArchivedCheckoutSessions(workspaceRef)");
-    expect(editor).toContain('class="archived-sidebar"');
-    expect(editor).toContain('class="archived-conversation"');
-    expect(editor).toContain("<ChatTranscript");
+    expect(editor).toContain("<WorkspaceTree");
+    expect(editor).not.toContain("<style");
+    expect(editor).not.toContain("<ChatTranscript");
+    expect(editor).not.toContain("loadSession(");
+    expect(workbench).toContain('@session-unarchived="handleSessionUnarchived($event, editor.resource.projectId)"');
+    expect(read("src/components/workbench/WorkbenchSessionEditor.vue")).not.toContain("readOnly");
     expect(editor).not.toContain("<ChatComposer");
     expect(editor).not.toContain("<RichChatInput");
     expect(workbench).toContain("<WorkbenchArchivedSessionsEditor");

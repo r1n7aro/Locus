@@ -17,6 +17,7 @@ import {
 import { getLocusRuntime } from "../services/locusRuntime";
 import type { ChangedFile, FileDiffPayload } from "../types";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { useWorkspaceEventScope } from "../composables/useWorkspaceEventScope";
 
 export interface UndoFileRevertedEvent {
   workingDir: string;
@@ -89,6 +90,7 @@ function logChatChangesDebug(message: string, detail?: Record<string, unknown>) 
 }
 
 export const useChatChangesStore = defineStore("chatChanges", () => {
+  const workspaceEventSignal = useWorkspaceEventScope();
   const sessions = ref(new Map<string, ChatChangesSessionState>());
   const inlineDiffSessions = ref(new Map<string, ChatChangesInlineDiffState>());
 
@@ -478,6 +480,7 @@ export const useChatChangesStore = defineStore("chatChanges", () => {
         if (event.eventName !== "undo-file-reverted") return;
         handleUndoFileReverted(event.payload);
       },
+      { owner: "chatChanges.undo", signal: workspaceEventSignal },
     )
     .catch((e) => {
       console.warn("[chat-changes] failed to subscribe to undo-file-reverted", e);

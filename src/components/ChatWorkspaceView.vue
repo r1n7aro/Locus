@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { t } from "../i18n";
@@ -35,6 +35,7 @@ import { useModelStore } from "../stores/model";
 import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
+import type { ManagedWorktree } from "../services/worktrees";
 import { useUiStore } from "../stores/ui";
 import { useSkills } from "../composables/useSkills";
 import type { UserMessageDraft } from "../composables/chatMessageDraft";
@@ -183,6 +184,14 @@ async function createWorkspaceSession() {
   chatStore.newChat({
     persistSelection: props.persistSessionSelection,
   });
+}
+
+async function selectWorkspaceWorktree(item: ManagedWorktree) {
+  if (chatStore.activeSessionId || chatStore.isStreaming) throw new Error(t("worktrees.selector.locked"));
+  const context = await workspaceContextStore.openAndFocus(item.root);
+  if (!context) throw new Error(t("worktrees.selector.unavailable"));
+  await workspaceContextStore.setActiveSession(null);
+  await chatStore.refreshSessions();
 }
 
 function publishSessionExecutionState() {
@@ -550,6 +559,7 @@ async function exportSessionContext(request?: string | SessionContextExportReque
 async function reviewSessionContext(request?: string | SessionContextExportRequest) {
   const sid = resolveContextSessionId(request);
   if (!sid) return;
+  const messageId = typeof request === "object" ? request.messageId : undefined;
 
   const source = chatStore.sessions.find((session) => session.id === sid);
   const sourceTitle = source?.title || sid.slice(0, 8);
@@ -585,7 +595,7 @@ async function reviewSessionContext(request?: string | SessionContextExportReque
     void chatStore.refreshSessions();
 
     try {
-      const result = await exportContext(sid, null);
+      const result = await exportContext(sid, null, messageId);
       const current = contextReviewFiles.value.get(reviewSessionId);
       if (!current || current.id !== fileId) return;
       setContextReviewFile(reviewSessionId, {
@@ -651,6 +661,7 @@ async function handleUnitySendToLocus(payload: UnitySendToLocusEventPayload): Pr
 }
 
 function handleComposerFocus(): void {
+  void loadSkills();
   const currentWorkspace = workspaceContextStore.focusedWorkspaceRef;
   if (!currentWorkspace) return;
   writeLastFocusedComposer({
@@ -675,17 +686,6 @@ onMounted(() => {
     console.warn("[ChatWorkspaceView] Send to Locus subscription failed", error);
   });
 });
-
-watch(
-  () => {
-    const scope = workspaceContextStore.focusedWorkspaceRef;
-    return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}` : "";
-  },
-  (scopeKey) => {
-    if (scopeKey) void loadSkills();
-  },
-  { immediate: true },
-);
 
 onUnmounted(() => {
   disconnectWorkspaceResizeObserver();
@@ -755,6 +755,7 @@ onUnmounted(() => {
       :unity-launch-state="projectStore.unityLaunchState"
       :unity-connection-status="projectStore.unityConnectionStatus"
       :workspace-ref="workspaceContextStore.focusedWorkspaceRef"
+      :select-worktree="selectWorkspaceWorktree"
       :project-services="projectStore.detectedServices"
       :working-dir="projectStore.workingDir"
       :scan-phase="projectStore.scanPhase"

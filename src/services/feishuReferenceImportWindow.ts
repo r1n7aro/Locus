@@ -1,3 +1,4 @@
+import { materializationEpochFromParams, appendMaterializationEpoch } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { WorkspaceRef } from "./project";
@@ -75,6 +76,7 @@ function appendWorkspaceRef(params: URLSearchParams, workspaceRef?: WorkspaceRef
   params.set("checkoutId", workspaceRef.checkoutId);
   if (workspaceRef.expectedGeneration != null) {
     params.set("workspaceGeneration", String(workspaceRef.expectedGeneration));
+  appendMaterializationEpoch(params, workspaceRef.expectedMaterializationEpoch);
   }
 }
 
@@ -87,7 +89,7 @@ function workspaceRefFromParams(params: URLSearchParams): WorkspaceRef | null {
     expectedGeneration: Number.isSafeInteger(generation) && generation > 0
       ? generation
       : undefined,
-  };
+   expectedMaterializationEpoch: materializationEpochFromParams(params) };
 }
 
 function safeWindowScope(value: string): string {

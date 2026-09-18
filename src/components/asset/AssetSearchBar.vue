@@ -169,7 +169,7 @@ function toggleScope() {
 
 <style scoped>
 .asb-wrap {
-  padding: 10px 12px;
+  padding: var(--explorer-search-padding, 10px 12px);
   border-bottom: 1px solid var(--border-color);
   background: color-mix(in srgb, var(--panel-bg) 84%, var(--bg-color) 16%);
   flex-shrink: 0;
@@ -186,11 +186,11 @@ function toggleScope() {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 36px;
+  height: var(--explorer-search-height, 36px);
   padding: 0 10px 0 12px;
   background: color-mix(in srgb, var(--panel-bg) 76%, var(--input-bg, var(--hover-bg)) 24%);
   border: 1px solid var(--border-color);
-  border-radius: 8px;
+  border-radius: var(--explorer-search-radius, 8px);
   transition: border-color 0.15s, box-shadow 0.15s;
   min-width: 0;
   flex: 1;
@@ -235,7 +235,7 @@ function toggleScope() {
   background: transparent;
   border: none;
   outline: none;
-  font-size: 13px;
+  font-size: var(--explorer-search-font-size, 13px);
   color: var(--text-color);
   font-family: inherit;
   padding: 0;
@@ -272,12 +272,12 @@ function toggleScope() {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  height: 36px;
-  width: 36px;
-  min-width: 36px;
+  height: var(--explorer-search-height, 36px);
+  width: var(--explorer-search-height, 36px);
+  min-width: var(--explorer-search-height, 36px);
   padding: 0;
   border: 1px solid var(--border-color);
-  border-radius: 8px;
+  border-radius: var(--explorer-search-radius, 8px);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;

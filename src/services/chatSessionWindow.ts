@@ -1,3 +1,4 @@
+import { materializationEpochFromParams, appendMaterializationEpoch } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { WorkspaceRef } from "./project";
@@ -69,7 +70,7 @@ export function getChatSessionWindowPayload(
     payload.workspaceRef = {
       checkoutId,
       expectedGeneration,
-    };
+     expectedMaterializationEpoch: materializationEpochFromParams(params) };
   }
   return payload;
 }
@@ -90,6 +91,7 @@ export function buildChatSessionWindowQuery(payload: ChatSessionWindowPayload): 
     }
     params.set("checkoutId", workspaceRef.checkoutId.trim());
     params.set("workspaceGeneration", String(workspaceRef.expectedGeneration));
+  appendMaterializationEpoch(params, workspaceRef.expectedMaterializationEpoch);
   }
   return params.toString();
 }

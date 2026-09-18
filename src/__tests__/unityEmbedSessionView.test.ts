@@ -86,7 +86,7 @@ describe("Unity embedded session view", () => {
     expect(app).toContain("<ViewHostWindow v-else embedded");
     expect(app).toContain(":initial-session-id=\"unityEmbedTargetId\"");
     expect(viewHost).toContain("embedded?: boolean");
-    expect(viewHost).toContain("UNITY_EMBED_WINDOW_LABEL_PREFIX");
+    expect(viewHost).toContain("<ViewRuntimeHost");
     expect(viewService).toContain("viewRunInUnity");
     expect(viewCommand).toContain("pub async fn view_run_in_unity");
     expect(viewRuntime).toContain("open_view_unity_embed_window");

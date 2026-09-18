@@ -40,7 +40,7 @@ const CONNECTION_TIMEOUT_MS = 120_000;
 
 function workspaceRefKey(workspaceRef: WorkspaceRef | null): string {
   if (!workspaceRef) return "";
-  return `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`;
+  return `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}:${workspaceRef.expectedMaterializationEpoch ?? "empty"}`;
 }
 
 function pluginNotice(status: PluginStatus): WorkspaceUnityPluginNotice {

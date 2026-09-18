@@ -101,6 +101,8 @@ interface EmbeddedChatState extends StreamState {
   resumeAvailable: boolean;
   planModeActive: boolean;
   planFilePath: string | null;
+  planStateVersion: number;
+  metadataVersion: number;
   historyHasMore: boolean;
   historyOldestRowId: number | null;
   historyLoading: boolean;
@@ -146,6 +148,8 @@ export interface UseEmbeddedChatSessionOptions {
   knowledgeMode?: MaybeRefOrGetter<KnowledgeAccessMode | null | undefined>;
   /** Knowledge document this session is scoped to; injected into the agent env by the backend. */
   knowledgeFocus?: MaybeRefOrGetter<EmbeddedChatKnowledgeFocus | null | undefined>;
+  /** Prepare an existing session before launch; failures use normal draft recovery. */
+  beforeSessionLaunch?: (sessionId: string) => Promise<void>;
   buildRequest: (input: string) => EmbeddedChatRequest | null;
 }
 
@@ -184,6 +188,8 @@ function createState(key: string): EmbeddedChatState {
     resumeAvailable: false,
     planModeActive: false,
     planFilePath: null,
+    planStateVersion: 0,
+    metadataVersion: 0,
     historyHasMore: false,
     historyOldestRowId: null,
     historyLoading: false,
@@ -521,8 +527,9 @@ function mergePendingInputList(
 ): PendingSessionInput[] {
   const index = list.findIndex((item) =>
     item.id === input.id
-    || (item.runId === input.runId && item.mergeGroupId === input.mergeGroupId));
+    || (item.runId === input.runId && item.mergeGroupId === input.mergeGroupId && item.status !== "delivering"));
   if (index < 0) return [...list, input];
+  if (list[index]?.id === input.id && list[index]?.status === "delivering" && input.status === "queued") return list;
   const next = [...list];
   next.splice(index, 1, input);
   return next;
@@ -942,18 +949,14 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       ? {
         checkoutId: workspaceRef.checkoutId,
         expectedGeneration: workspaceRef.expectedGeneration ?? null,
+        expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch ?? undefined,
       }
       : null;
   }
 
-  function applyLoadedSessionState(
+  function applyLoadedSessionSnapshot(
     state: EmbeddedChatState,
     snapshot: Awaited<ReturnType<typeof sessionService.loadSessionView>>,
-    usage: TokenUsage | null,
-    sessionTodos: Awaited<ReturnType<typeof sessionService.getTodos>>,
-    undoEntries: Array<{ assistantMessageId: string }>,
-    resumeAvailable: boolean,
-    planState: Awaited<ReturnType<typeof sessionService.getSessionPlanState>>,
   ): void {
     const detail = snapshot.session;
     state.messages = hydrateChatMessagesIntent(detail.messages);
@@ -965,16 +968,6 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.sessionMultiAgentEnabled = detail.lastMultiAgentEnabled ?? false;
     state.parentSessionId = detail.parentSessionId;
     state.latestCompletedRunId = detail.latestCompletedRunId ?? null;
-    state.todos = sessionTodos.items;
-    state.latestTodoRunId = sessionTodos.latestRunId;
-    if (state.todos.length === 0) state.showTodoPanel = false;
-    state.undoableMessageIds = new Set(
-      undoEntries.map((entry) => entry.assistantMessageId),
-    );
-    if (usage) state.tokenUsage = usage;
-    state.resumeAvailable = resumeAvailable;
-    state.planModeActive = planState.active;
-    state.planFilePath = planState.planFilePath || null;
     state.historyOldestRowId = snapshot.oldestMessageRowId ?? null;
     state.historyHasMore = snapshot.hasMoreHistory;
     state.historyLoading = false;
@@ -986,13 +979,25 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.hydrated = true;
   }
 
-  async function loadEmbeddedSessionState(
+  function applyLoadedSessionMetadata(
+    state: EmbeddedChatState,
+    [usage, sessionTodos, undoEntries, resumeAvailable, planState]: Awaited<ReturnType<typeof loadEmbeddedSessionMetadata>>,
+  ): void {
+    state.todos = sessionTodos.items;
+    state.latestTodoRunId = sessionTodos.latestRunId;
+    if (state.todos.length === 0) state.showTodoPanel = false;
+    state.undoableMessageIds = new Set(undoEntries.map((entry) => entry.assistantMessageId));
+    if (usage) state.tokenUsage = usage;
+    state.resumeAvailable = resumeAvailable;
+    state.planModeActive = planState.active;
+    state.planFilePath = planState.planFilePath || null;
+  }
+
+  function loadEmbeddedSessionMetadata(
     sessionId: string,
     workspaceRef: WorkspaceRef | null,
   ) {
-    const messageLimit = useDisplaySettings().state.sessionMessagePageSize;
     return Promise.all([
-      sessionService.loadSessionView(sessionId, messageLimit),
       sessionService.getSessionUsage(sessionId).catch(() => null),
       sessionService.getTodos(sessionId).catch(() => ({ items: [], latestRunId: null })),
       undoService.undoList(sessionId).catch(() => []),
@@ -1042,22 +1047,51 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     let hydrated = false;
     try {
       const workspaceRef = captureWorkspaceRef();
-      const [snapshot, usage, sessionTodos, undoEntries, resumeAvailable, planState] =
-        await loadEmbeddedSessionState(normalizedSessionId, workspaceRef);
+      const metadataVersion = ++state.metadataVersion;
+      const baseline = {
+        usage: state.tokenUsage, todos: state.todos, todoVersion: state.todoWriteVersion,
+        undo: state.undoableMessageIds, planVersion: state.planStateVersion,
+        resume: state.resumeAvailable,
+      };
+      // Auxiliary IPC requests run concurrently, but only the transcript is on
+      // the critical path to displaying a session.
+      const snapshotRequest = sessionService.loadSessionView(
+        normalizedSessionId, useDisplaySettings().state.sessionMessagePageSize,
+      );
+      const metadata = loadEmbeddedSessionMetadata(normalizedSessionId, workspaceRef);
+      const snapshot = await snapshotRequest;
       if (
         sessionHydrationEpochs.get(state.key) !== epoch
         || state.sessionId !== normalizedSessionId
       ) return;
-      applyLoadedSessionState(
-        state,
-        snapshot,
-        usage,
-        sessionTodos,
-        undoEntries,
-        resumeAvailable,
-        planState,
-      );
+      applyLoadedSessionSnapshot(state, snapshot);
       hydrated = true;
+      const completedRun = state.latestCompletedRunId;
+      void metadata.then(([usage, sessionTodos, undoEntries, resumeAvailable, planState]) => {
+        if (sessionHydrationEpochs.get(state.key) !== epoch || state.sessionId !== normalizedSessionId
+          || state.metadataVersion !== metadataVersion) return;
+        // The user can already interact and receive stream updates. Late
+        // metadata must not roll back any state changed since the snapshot.
+        if (usage && state.tokenUsage === baseline.usage) state.tokenUsage = usage;
+        if (state.todos === baseline.todos && state.todoWriteVersion === baseline.todoVersion) {
+          state.todos = sessionTodos.items;
+          state.latestTodoRunId = sessionTodos.latestRunId;
+          if (state.todos.length === 0) state.showTodoPanel = false;
+        }
+        if (state.undoableMessageIds === baseline.undo) {
+          state.undoableMessageIds = new Set(undoEntries.map((entry) => entry.assistantMessageId));
+        }
+        if (!state.isStreaming && state.latestCompletedRunId === completedRun
+          && state.resumeAvailable === baseline.resume) state.resumeAvailable = resumeAvailable;
+        const currentWorkspace = captureWorkspaceRef();
+        if (state.planStateVersion === baseline.planVersion
+          && currentWorkspace?.checkoutId === workspaceRef?.checkoutId
+          && currentWorkspace?.expectedGeneration === workspaceRef?.expectedGeneration
+          && currentWorkspace?.expectedMaterializationEpoch === workspaceRef?.expectedMaterializationEpoch) {
+          state.planModeActive = planState.active;
+          state.planFilePath = planState.planFilePath || null;
+        }
+      });
     } catch (error) {
       if (
         sessionHydrationEpochs.get(state.key) !== epoch
@@ -1082,20 +1116,16 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   }
 
   async function reloadSessionState(state: EmbeddedChatState, sessionId: string): Promise<boolean> {
+    state.metadataVersion += 1;
     try {
       const workspaceRef = captureWorkspaceRef();
-      const [snapshot, usage, sessionTodos, undoEntries, resumeAvailable, planState] =
-        await loadEmbeddedSessionState(sessionId, workspaceRef);
+      const [snapshot, metadata] = await Promise.all([
+        sessionService.loadSessionView(sessionId, useDisplaySettings().state.sessionMessagePageSize),
+        loadEmbeddedSessionMetadata(sessionId, workspaceRef),
+      ]);
       if (state.sessionId !== sessionId) return false;
-      applyLoadedSessionState(
-        state,
-        snapshot,
-        usage,
-        sessionTodos,
-        undoEntries,
-        resumeAvailable,
-        planState,
-      );
+      applyLoadedSessionSnapshot(state, snapshot);
+      applyLoadedSessionMetadata(state, metadata);
       return true;
     } catch (error) {
       console.warn("[embedded-chat] failed to refresh session state:", error);
@@ -1124,6 +1154,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     // Plan transitions may be emitted by a synthetic command run. They belong
     // to the durable session and must bypass active-run filtering.
     if (event.type === "planModeChanged") {
+      state.planStateVersion += 1;
       state.planModeActive = event.active;
       state.planFilePath = event.planFilePath?.trim() || null;
       return;
@@ -1224,7 +1255,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         : state.localFallbackMergeGroupId;
       if ((event.type === "done" || event.type === "cancelled") && followUpMergeGroupId) {
         const queued = state.pendingInputs.find((input) =>
-          input.runId === event.runId && input.mergeGroupId === followUpMergeGroupId);
+          input.runId === event.runId && input.mergeGroupId === followUpMergeGroupId && input.status === "queued");
         if (queued) {
           state.pendingInputs = state.pendingInputs.filter((input) => input.id !== queued.id);
           state.localMergeGroupId = null;
@@ -1331,6 +1362,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       }
       const userIntent = withClientMessageId(request.userIntent, mergeGroupId);
       try {
+        if (options.beforeSessionLaunch) await options.beforeSessionLaunch(state.sessionId);
         const pending = await sessionService.queueChatInput({
           sessionId: state.sessionId,
           runId: state.currentRunId,
@@ -1363,7 +1395,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         const err = normalizeAppError(error);
         if (isPendingInputFallbackError(err.code)) {
           const existing = state.pendingInputs.find((input) =>
-            input.runId === state.currentRunId && input.mergeGroupId === mergeGroupId);
+            input.runId === state.currentRunId && input.mergeGroupId === mergeGroupId && input.status === "queued");
           const now = Date.now() / 1000;
           const pending: PendingSessionInput = existing
             ? {
@@ -1482,6 +1514,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const selectedAgentId = toValue(options.selectedAgentId) ?? null;
 
     try {
+      if (requestSessionId && options.beforeSessionLaunch) await options.beforeSessionLaunch(requestSessionId);
       const launch = await sessionService.chat({
         workspaceRef,
         sessionId: requestSessionId,
@@ -1623,6 +1656,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.isCancelling = false;
 
     try {
+      if (options.beforeSessionLaunch) await options.beforeSessionLaunch(targetSessionId);
       const launch = await sessionService.chat({
         workspaceRef,
         sessionId: targetSessionId,
@@ -1781,7 +1815,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   async function deleteQueuedFollowUp() {
     const state = activeState.value;
     const targets = visiblePendingInputs(state.pendingInputs);
-    if (!state.sessionId || targets.length === 0) return false;
+    if (!state.sessionId || targets.length === 0 || targets.some((input) => input.status === "delivering")) return false;
 
     try {
       const deleteResults = await Promise.all(
@@ -1849,6 +1883,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     const state = activeState.value;
     const targetSessionId = state.sessionId;
     if (!targetSessionId || state.isStreaming) return false;
+    state.planStateVersion += 1;
     const workspaceRef = captureWorkspaceRef();
     try {
       const planState = await sessionService.setSessionPlanMode(
@@ -2263,6 +2298,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     return {
       inputs,
       canInsert: inputs.some((input) => pendingInputDelivery(input) !== "immediate"),
+      canEdit: inputs.every((input) => input.status === "queued"),
       isInserting: inputs.every((input) => pendingInputDelivery(input) === "immediate"),
       images: inputs.flatMap((input) => input.images ?? []),
       displayText: inputs

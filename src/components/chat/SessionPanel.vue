@@ -52,6 +52,9 @@ import {
   WORKSPACE_EVENT_NAME,
   type RoutedWorkspaceEvent,
 } from "../../services/project";
+import { useWorkspaceEventScope } from "../../composables/useWorkspaceEventScope";
+
+const workspaceEventSignal = useWorkspaceEventScope();
 
 interface VisibleTreeRow {
   node: SessionTreeNode;
@@ -1193,6 +1196,7 @@ onMounted(async () => {
       ) return;
       void loadViews();
     },
+    { owner: "SessionPanel.views", signal: workspaceEventSignal },
   );
   void loadViews();
 });

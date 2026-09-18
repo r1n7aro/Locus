@@ -57,6 +57,7 @@ export const useProjectStore = defineStore("project", () => {
     return {
       checkoutId: workspaceRef.checkoutId,
       expectedGeneration: workspaceRef.expectedGeneration ?? undefined,
+      expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch ?? undefined,
     };
   }
 
@@ -266,6 +267,7 @@ export const useProjectStore = defineStore("project", () => {
       workspaceRefs.push({
         checkoutId: checkout.checkoutId,
         expectedGeneration: checkout.runtime.workspaceGeneration,
+        expectedMaterializationEpoch: checkout.runtime.materializationEpoch ?? 0,
       });
     }
     if (workspaceRefs.length === 0) {

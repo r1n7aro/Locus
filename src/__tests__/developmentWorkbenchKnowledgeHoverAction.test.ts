@@ -18,7 +18,7 @@ describe("development workbench knowledge row actions", () => {
     expect(workbench).toContain('resourceKind: "knowledge"');
     expect(workbench).toContain("resourceId: item.meta.knowledge.id");
     expect(workbench).toContain('@click="removeContextKnowledgeItemFromWorkspace"');
-    expect(workbench).toContain(".workspace-tree-row-shell.is-knowledge-row:hover .development-knowledge-remove-button");
+    expect(workbench).toContain(".workspace-tree-row-shell:hover .development-knowledge-remove-button");
     expect(workbench).toContain("t('development.removeFromWorkspace')");
     expect(workbench).not.toContain("toggleKnowledgeItemHidden");
   });

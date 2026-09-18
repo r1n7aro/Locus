@@ -37,8 +37,8 @@ describe("unityBridgeCompatibility", () => {
 
     expect(transport).toContain("static REQUEST_SEQ: AtomicU64");
     expect(transport).toContain('format!("req-{}", REQUEST_SEQ.fetch_add(1, Ordering::Relaxed))');
-    expect(transport).toContain("pending.insert(request_id.clone(), tx);");
-    expect(transport).toContain("pending.remove(&reply_to)");
+    expect(transport).toContain("pending.insert(request_id.clone(), tx, acceptance_tx);");
+    expect(transport).toContain("resolve(&reply_to, Ok(env))");
     expect(nativeBridge).toContain("response.reply_to = id;");
     expect(transport).toContain("out_of_order_responses_are_dispatched_by_reply_to");
   });

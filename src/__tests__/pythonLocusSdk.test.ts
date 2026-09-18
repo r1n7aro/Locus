@@ -18,6 +18,7 @@ describe("Locus Python API", () => {
 
     for (const config of [baseConfig, embeddedConfig, externalConfig]) {
       expect(config).toContain('"../python/locus": "locus-python-sdk/locus/"');
+      expect(config).toContain('"../prompt/python-sdk": "locus-python-sdk/docs/"');
     }
     expect(runtime).toContain('const LOCUS_SDK_RESOURCE_DIR: &str = "locus-python-sdk"');
     expect(runtime).toContain('("LOCUS_SDK_URL".to_string(), connection.url)');
@@ -102,27 +103,32 @@ describe("Locus Python API", () => {
     expect(example).toContain("project_tree = await locus.call_tool(");
   });
 
-  it("registers Python as a direct checkout-scoped tool with progressive SDK help", () => {
+  it("registers a code-only Python tool with SDK documentation outside its schema", () => {
     const builtins = read("src-tauri/src/tool/builtins/mod.rs");
     const pythonTool = read("src-tauri/src/tool/builtins/python.rs");
-    const prompt = read("tools/python.json");
+    const prompt = JSON.parse(read("tools/python.json"));
     const unityAgent = read("agent/unity/config.json");
-    const unityPrompt = read("agent/unity/tools/python.json");
+    const unityPrompt = JSON.parse(read("agent/unity/tools/python.json"));
     const simpleAgent = read("agent/simple/config.json");
 
     expect(builtins).toContain("registry.register_builtin(python::python())");
     expect(unityAgent).toContain('"python"');
     expect(simpleAgent).toContain('"python"');
-    expect(prompt).not.toContain("get_unity_editor_status");
-    expect(prompt).not.toContain("restart_unity_editor");
-    expect(unityPrompt).toContain("get_unity_editor_status");
-    expect(unityPrompt).toContain("restart_unity_editor");
-    expect(unityPrompt).toContain("status.safe_mode");
-    expect(unityPrompt).toContain("status.editor_log_path");
-    expect(prompt).toContain('"help"');
+    expect(prompt.description).toContain("Run {python_runtime} code. {python_sdk_documentation}");
+    expect(prompt.description).toContain("openpyxl");
+    expect(unityPrompt.description).toBe(prompt.description);
+    expect(Object.keys(prompt.parameters.properties).sort()).toEqual(["code", "readonly", "timeout"]);
+    expect(prompt.parameters.required).toEqual(["code", "readonly"]);
+    expect(prompt.parameters.additionalProperties).toBe(false);
+    expect(JSON.stringify(prompt)).not.toContain("action=run");
+    expect(JSON.stringify(prompt)).not.toContain("action=help");
     expect(pythonTool).toContain("workspace_ref = locus.WorkspaceRef");
-    expect(pythonTool).toContain("HELP_CALLBACKS");
     expect(pythonTool).toContain("python_process_env");
     expect(pythonTool).toContain('command.env("LOCUS_SESSION_ID"');
+    const unityDocs = read("prompt/python-sdk/unity.md");
+    expect(unityDocs).toContain("get_unity_editor_status");
+    expect(unityDocs).toContain("restart_unity_editor");
+    expect(unityDocs).toContain("status.safe_mode");
+    expect(unityDocs).toContain("status.editor_log_path");
   });
 });

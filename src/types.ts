@@ -15,6 +15,7 @@ export interface SessionSummary {
   parentSessionId?: string | null;
   projectId?: string | null;
   defaultCheckoutId?: string | null;
+  defaultMaterializationEpoch?: number | null;
   executionTarget?: SessionExecutionTarget | null;
   updatedAt: number;
   runtimeStatus?: SessionRuntimeStatus | null;
@@ -455,6 +456,7 @@ export interface SessionDetail {
   parentSessionId: string | null;
   projectId?: string | null;
   defaultCheckoutId?: string | null;
+  defaultMaterializationEpoch?: number | null;
   latestCompletedRunId?: string | null;
   createdAt: number;
   updatedAt: number;
@@ -571,6 +573,7 @@ export interface SessionTitleUpdatedEvent {
 
 export interface SessionContextExportRequest {
   sessionId: string;
+  messageId?: string;
 }
 
 export interface ContextExportResult {
@@ -755,6 +758,7 @@ export interface CodexModelConfig {
   extendedContext?: boolean;
   generateSessionTitles: boolean;
   autoReview: boolean;
+  useApplyPatch: boolean;
   prefixCacheTtlSeconds: number;
 }
 
@@ -984,11 +988,18 @@ export interface SessionCacheInvalidation {
   occurredAt: number;
 }
 
+export interface SessionTimingUsage {
+  remoteOutputDurationMs: number | null;
+  localToolDurationMs: number | null;
+  totalDurationMs: number | null;
+}
+
 export interface SessionContextUsageReport {
   sessionId: string;
   sessionTitle: string;
   agentId: string;
   modelId: string;
+  upstreamModel?: string | null;
   contextTokens: number;
   contextLimit: number;
   rawEstimatedContextTokens: number;
@@ -996,6 +1007,7 @@ export interface SessionContextUsageReport {
   breakdown: SessionContextBreakdown;
   tools: SessionContextToolUsage[];
   cacheInvalidations: SessionCacheInvalidation[];
+  timing: SessionTimingUsage;
   usage: TokenUsage;
 }
 
@@ -1547,6 +1559,8 @@ export interface KnowledgeDocumentSummary {
   path: string;
   title: string;
   injectMode: KnowledgeInjectModeSetting;
+  /** L2/L3 injection targets. Missing metadata defaults to Unity; [] disables injection. */
+  injectAgents?: string[];
   effectiveInjectMode: KnowledgeInjectMode;
   injectModeSource?: KnowledgeConfigSource | null;
   readOnly: boolean;
@@ -1911,6 +1925,7 @@ export interface KnowledgeDocumentPatch {
   id?: string;
   type?: KnowledgeDocumentType;
   injectMode?: KnowledgeInjectModeSetting;
+  injectAgents?: string[];
   skillEnabled?: boolean;
   skillSurface?: SkillSurface;
   commandTrigger?: string | null;

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   displayUserMessageContent,
   userMessageConsoleEntries,
+  userMessageKnowledgeQuoteEntries,
   userMessageLocalFileEntries,
 } from "../composables/chatUserMessageDisplay";
 
@@ -46,6 +47,21 @@ describe("displayUserMessageContent", () => {
     expect(displayUserMessageContent(
       "分析这个 PSD\n\n<locus-local-files>\nThese are local paths supplied by drag and drop. Read contents only when needed, using `read` for files and `list` for folders.\n- file: `E:/cache/Mobile Game GUI.psd`; type: psd\n</locus-local-files>",
     )).toBe("分析这个 PSD");
+  });
+
+  it("hides and restores structured knowledge quote attachments", () => {
+    const metadata = encodeURIComponent(JSON.stringify({
+      path: "design/combat/boss.md",
+      name: "boss.md",
+    }));
+    const content = `继续完善攻击反馈\n\n<locus-knowledge-quotes>\nUse these exact excerpts from project knowledge as quoted context.\n\n<locus-knowledge-quote data="${metadata}">\nF:/Project/Locus/knowledge/design/combat/boss.md:7-8\n\`\`\`markdown\n- 连续交锋体验\n\`\`\`\n</locus-knowledge-quote>\n</locus-knowledge-quotes>`;
+
+    expect(displayUserMessageContent(content)).toBe("继续完善攻击反馈");
+    expect(userMessageKnowledgeQuoteEntries(content)).toEqual([{
+      path: "design/combat/boss.md",
+      name: "boss.md",
+      content: "F:/Project/Locus/knowledge/design/combat/boss.md:7-8\n```markdown\n- 连续交锋体验\n```",
+    }]);
   });
 
   it("extracts structured Console entries for attachment display", () => {

@@ -8,7 +8,7 @@ import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import { useChatStore } from "../stores/chat";
 import { useNotificationStore } from "../stores/notification";
 import { useDisplaySettings } from "./useDisplaySettings";
-import { useSkills } from "./useSkills";
+import { invalidateSkills, useSkills } from "./useSkills";
 import { normalizeAppError } from "../services/errors";
 import {
   maybeNotifyStreamEvent,
@@ -68,6 +68,7 @@ import {
 } from "../services/knowledgeLexicalProgressWindow";
 import {
   WORKSPACE_EVENT_NAME,
+  workspaceMaterializationMatches,
   type RoutedWorkspaceEvent,
 } from "../services/project";
 import {
@@ -76,6 +77,7 @@ import {
   publishSessionStreamEvent,
   workspaceStreamEventSource,
 } from "../services/sessionStreamEventHub";
+import { useWorkspaceEventScope } from "./useWorkspaceEventScope";
 
 const WORKSPACE_EXECUTION_LOCK_DIAGNOSTIC_EVENT = "workspace-execution-lock-diagnostic";
 
@@ -145,6 +147,8 @@ async function measureWorkspaceSwitchAsync<T>(
 }
 
 export interface AppBootstrapOptions {
+  /** Started by the window owner before auth/model bootstrap. */
+  workspaceReady?: Promise<void>;
   /** Keep this window pinned to its own session instead of following the
    *  main window's globally persisted active-session selection. */
   syncActiveSessionSelection?: boolean;
@@ -153,6 +157,7 @@ export interface AppBootstrapOptions {
 }
 
 export function useAppBootstrap(options: AppBootstrapOptions = {}) {
+  const workspaceEventSignal = useWorkspaceEventScope();
   const uiStore = useUiStore();
   const authStore = useAuthStore();
   const agentStore = useAgentStore();
@@ -286,6 +291,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       source === "create_skill_scaffold" ||
       source === "delete_skill_package" ||
       source === "import_skill_package" ||
+      source === "refresh_external_skills" ||
       source === "knowledge_create" ||
       source === "knowledge_edit" ||
       source === "knowledge_move" ||
@@ -331,20 +337,23 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     { immediate: true },
   );
 
-  // tab switch -> load skills on chat tab (only once after initial load)
-  let skillsLoaded = false;
+  // Retry failed loads on activation; the cache owns readiness per workspace.
   watch(
     () => uiStore.activeTab,
     (tab) => {
-      if (tab === "chat" && !skillsLoaded) {
-        loadSkills();
-        skillsLoaded = true;
-      }
+      if (tab === "chat") void loadSkills();
     },
   );
 
   // -- Bootstrap: Critical (first-screen minimum) --
   async function bootstrapCritical() {
+    // Establish event subscriptions before loading snapshots. Workspace recovery
+    // runs concurrently with process-level UI/auth/model configuration.
+    const subscriptionsReady = (async () => {
+      await options.workspaceReady;
+      await registerListeners();
+    })();
+    void subscriptionsReady.catch(() => {}); // observed below even if auth is slow
     await measureStartupAsync("bootstrap_ui_init", async () => {
       await uiStore.init();
     });
@@ -389,19 +398,28 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     markStartupPhase("bootstrap_resolve_selected_model_done");
 
     await measureStartupAsync("bootstrap_shell_data", async () => {
+      await subscriptionsReady;
+      // Consumers can prefetch while recovery/auth is in progress. Reconcile
+      // those snapshots once subscriptions exist, closing the startup event gap.
+      invalidateSkills();
       await Promise.all([
-        chatStore.refreshSessions(),
-        agentStore.loadAgents(),
+        loadCurrentAgents(),
         loadSkills(),
+        projectStore.checkUnityConnection(),
+        projectStore.checkUnityPlugin(),
+        projectStore.loadAssetDbStatus(),
       ]);
     });
     await measureStartupAsync("bootstrap_last_effort", async () => {
       await modelStore.loadLastEffort();
     });
+    // Restoring a session writes its Agent/model/effort selection, so defaults
+    // and the scoped Agent list must have settled first.
+    await measureStartupAsync("bootstrap_sessions", () => chatStore.refreshSessions());
     markStartupPhase("bootstrap_sync_effort_start");
     syncEffortForChatContext();
     markStartupPhase("bootstrap_sync_effort_done");
-    skillsLoaded = true;
+    syncFastModeForChatContext();
     markStartupPhase("bootstrap_critical_ready");
   }
 
@@ -537,10 +555,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
 
   let _wpCollab: Promise<void> | null = null;
   function warmupCollab(generation: number): Promise<void> {
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return Promise.resolve();
     if (_wpCollab) return _wpCollab;
     _wpCollab = (async () => {
-      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-      if (!workspaceRef) return;
       const scopeKey = `${workspaceRef.checkoutId}@${workspaceRef.expectedGeneration ?? "current"}`;
       const probe = await gitProbe(workspaceRef);
       setWarmup(`collab:probe:${scopeKey}`, probe, generation);
@@ -562,10 +580,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
 
   let _wpKnowledge: Promise<void> | null = null;
   function warmupKnowledge(generation: number): Promise<void> {
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!workspaceRef) return Promise.resolve();
     if (_wpKnowledge) return _wpKnowledge;
     _wpKnowledge = (async () => {
-      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-      if (!workspaceRef) return;
       const page = await knowledgeListPage({ type: "design", limit: 64 }, workspaceRef);
       setWarmup("knowledge:documents", page.items, generation);
     })();
@@ -574,10 +592,10 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
 
   let _wpAsset: Promise<void> | null = null;
   function warmupAsset(generation: number): Promise<void> {
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    if (!projectStore.isUnityProject || !workspaceRef) return Promise.resolve();
     if (_wpAsset) return _wpAsset;
     _wpAsset = (async () => {
-      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-      if (!projectStore.isUnityProject || !workspaceRef) return;
       const [overview, tuning] = await Promise.all([
         assetDbOverview(workspaceRef),
         getWatcherTuning(),
@@ -601,6 +619,14 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     })();
     return _wpAgent;
   }
+
+  watch(() => {
+    const scope = workspaceContextStore.focusedWorkspaceRef;
+    return scope ? `${scope.checkoutId}:${scope.expectedGeneration ?? ""}:${scope.expectedMaterializationEpoch ?? "empty"}` : "";
+  }, () => {
+    clearWarmup();
+    _wpCollab = _wpKnowledge = _wpAsset = _wpAgent = _wpSettings = null;
+  });
 
   // -- Event listener registration --
   function handleStreamEvent(payload: StreamEvent) {
@@ -644,7 +670,24 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     handleStreamEvent(payload);
   }
 
-  async function registerListeners() {
+  function loadCurrentAgents(): Promise<void> {
+    const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+    return workspaceRef ? agentStore.loadWorkspaceAgents(workspaceRef) : agentStore.loadAgents();
+  }
+
+  let listenersRegistration: Promise<void> | null = null;
+  function registerListeners(): Promise<void> {
+    if (listenersRegistration) return listenersRegistration;
+    const request = registerListenersOnce().catch((error) => {
+      releaseListeners();
+      listenersRegistration = null;
+      throw error;
+    });
+    listenersRegistration = request;
+    return request;
+  }
+
+  async function registerListenersOnce() {
     markStartupPhase("register_listeners_enter");
     const runtime = getLocusRuntime();
     markStartupPhase("register_listeners_runtime_ready", { runtime: runtime.kind });
@@ -699,10 +742,26 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
           });
         }
         const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+        const isFocusedWorkspace = workspaceRef
+          && event.checkoutId === workspaceRef.checkoutId
+          && event.workspaceGeneration === workspaceRef.expectedGeneration
+          && workspaceMaterializationMatches(workspaceRef.expectedMaterializationEpoch, event.materializationEpoch);
+        // A background editor can own a different checkout from the focused
+        // pane. Its active skill consumer must also observe invalidations.
+        if (!isFocusedWorkspace && (
+          event.eventName === "plugins-changed"
+          || (event.eventName === "knowledge-changed"
+            && knowledgeChangeMayAffectSkills(event.payload as KnowledgeChangedEvent))
+        )) {
+          invalidateSkills({
+            checkoutId: event.checkoutId,
+            expectedGeneration: event.workspaceGeneration,
+            expectedMaterializationEpoch: event.materializationEpoch,
+          });
+        }
         if (
           !workspaceRef
-          || event.checkoutId !== workspaceRef.checkoutId
-          || event.workspaceGeneration !== workspaceRef.expectedGeneration
+          || !isFocusedWorkspace
         ) return;
         if (event.eventName === "unity-connection-status") {
           const connected = event.payload as boolean;
@@ -743,6 +802,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
           handleExternalScriptOpen(event.payload as ExternalScriptOpenRequest);
         }
       },
+      { owner: "useAppBootstrap.registerListeners", signal: workspaceEventSignal },
     );
     unlistenLexicalRebuildStatus = null;
     unlistenSessionContentChanged = null;
@@ -751,11 +811,11 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       ({ sessionId, title }) => chatStore.applySessionTitleUpdate(sessionId, title),
     );
     unlistenPluginsChanged = await runtime.subscribe<void>("plugins-changed", () => {
-      void agentStore.loadAgents();
-      void loadSkills({ force: true });
+      void loadCurrentAgents();
+      invalidateSkills();
     });
     unlistenAgentsChanged = await runtime.subscribe<void>("agents-changed", () => {
-      void agentStore.loadAgents();
+      void loadCurrentAgents();
     });
     if (options.handleExternalScriptOpen === true) {
       unlistenExternalScriptOpen = null;
@@ -764,17 +824,9 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     }
     markStartupPhase("register_listeners_subscriptions_ready");
 
-    // Initial Unity/AssetDb state
-    await measureStartupAsync("register_listeners_initial_state", async () => {
-      await Promise.all([
-        projectStore.checkUnityConnection(),
-        projectStore.checkUnityPlugin(),
-        projectStore.loadAssetDbStatus(),
-      ]);
-    });
   }
 
-  function cleanup() {
+  function releaseListeners() {
     unlisten?.();
     unlistenUnity?.();
     unlistenUnityDetail?.();
@@ -790,6 +842,11 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     unlistenPluginsChanged?.();
     unlistenAgentsChanged?.();
     unlistenExternalScriptOpen?.();
+  }
+
+  function cleanup() {
+    releaseListeners();
+    listenersRegistration = null;
     for (const operation of workspaceLockNoticeOperations) {
       notificationStore.clearByOperation(operation);
     }
@@ -824,17 +881,15 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       chatStore.newChat({ persistSelection: false, resetRestoreAttempt: true });
       console.info(`[workspace-switch] phase=new_chat_done target=${path}`);
       await Promise.all([
-        measureWorkspaceSwitchAsync("refresh_sessions", () => chatStore.refreshSessions(), {
+        measureWorkspaceSwitchAsync("refresh_sessions", async () => {
+          await agentStore.loadWorkspaceAgents(projectStore.requireWorkspaceRef());
+          await chatStore.refreshSessions();
+        }, {
           target: path,
         }),
         measureWorkspaceSwitchAsync("load_recent_dirs", () => projectStore.loadRecentDirs(), {
           target: path,
         }),
-        measureWorkspaceSwitchAsync(
-          "load_agents",
-          () => agentStore.loadWorkspaceAgents(projectStore.requireWorkspaceRef()),
-          { target: path },
-        ),
         measureWorkspaceSwitchAsync(
           "check_unity_connection",
           () => projectStore.checkUnityConnection(),
@@ -889,8 +944,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     await modelStore.loadCodexAvailableModels();
     modelStore.resolveSelectedModel(true);
     await Promise.all([
-      chatStore.refreshSessions(),
-      agentStore.loadAgents(),
+      loadCurrentAgents(),
       projectStore.loadRecentDirs(),
       projectStore.checkUnityConnection(),
       projectStore.checkUnityPlugin(),
@@ -898,6 +952,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       loadSkills(),
     ]);
     await modelStore.loadLastEffort();
+    await chatStore.refreshSessions();
     syncEffortForChatContext();
     syncFastModeForChatContext();
   }

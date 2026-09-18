@@ -35,6 +35,21 @@ describe("session stream event hub", () => {
     expect(second).toHaveBeenCalledTimes(2);
   });
 
+  it("retains the captured assignment and rejects a stale stream after restart", () => {
+    const source = workspaceStreamEventSource({
+      eventName: "stream-event", streamRevision: 1, projectId: "project", checkoutId: "slot",
+      workspaceGeneration: 1, materializationEpoch: 1,
+      payload: { type: "runStart", sessionId: "s", runId: "r" },
+    });
+    expect(source).toMatchObject({ materializationEpoch: 1 });
+    expect(sessionStreamSourceMatchesWorkspace(source, {
+      checkoutId: "slot", expectedGeneration: 1, expectedMaterializationEpoch: 2,
+    })).toBe(false);
+    expect(sessionStreamSourceMatchesWorkspace(source, {
+      checkoutId: "slot", expectedGeneration: 1, expectedMaterializationEpoch: 1,
+    })).toBe(true);
+  });
+
   it("preserves workspace scope for pane-level routing", () => {
     const source = workspaceStreamEventSource({
       eventName: "stream-event",

@@ -29,7 +29,7 @@ interface WorkspaceAssetDbStatusOptions {
 
 function workspaceRefKey(workspaceRef: WorkspaceRef | null): string {
   if (!workspaceRef) return "";
-  return `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}`;
+  return `${workspaceRef.checkoutId}:${workspaceRef.expectedGeneration ?? "current"}:${workspaceRef.expectedMaterializationEpoch ?? "empty"}`;
 }
 
 function isRunningPhase(phase: AssetDbScanEvent | null): boolean {

@@ -87,12 +87,14 @@ describe("internal drag architecture", () => {
     expect(viewPackage).toContain("is-drop-preview-row");
   });
 
-  it("keeps the workspace layout gap mounted until an async move snapshot settles", () => {
+  it("renders the released workspace row until an async move snapshot settles", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
     expect(workbench).toContain("interface SettlingLayoutDrop");
-    expect(workbench).toContain("layoutDropIntent.value ?? settlingLayoutDrop.value?.intent");
-    expect(workbench).toContain("settlingLayoutDrop.value?.preview");
+    expect(workbench).toContain("const snapshot = renderedExplorerSnapshot(project.projectId)");
+    expect(workbench).toContain(": previewWorkspaceTreeMove(");
+    expect(workbench).toContain("? previewWorkspaceTreePin(snapshot, workspaceLayoutPinReferences(data)");
+    expect(workbench).not.toContain("settlingLayoutDrop.value?.preview");
     expect(workbench).toMatch(
       /settlingLayoutDrop\.value = \{[\s\S]*?await commitWorkbenchInternalDrop[\s\S]*?finally \{[\s\S]*?settlingLayoutDrop\.value = null;/,
     );

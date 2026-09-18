@@ -3083,6 +3083,7 @@ function openImage(src: string) {
                     <template #default="{ toolCall }">
                       <ToolCallBlock
                         :tool-call="toolCall"
+                        :workspace-ref="workspaceRef"
                         :collapse-enabled="!shouldKeepToolSegmentExpanded(segment)"
                         :initial-expanded="rememberedBlockExpanded(toolCall)"
                         @user-expansion-change="rememberBlockExpanded(toolCall, $event)"
@@ -3236,6 +3237,7 @@ function openImage(src: string) {
                     <template #default="{ toolCall }">
                       <ToolCallBlock
                         :tool-call="toolCall"
+                        :workspace-ref="workspaceRef"
                         :collapse-enabled="segment.collapseEnabled"
                         :initial-expanded="rememberedBlockExpanded(toolCall)"
                         @user-expansion-change="rememberBlockExpanded(toolCall, $event)"

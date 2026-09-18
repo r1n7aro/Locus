@@ -142,6 +142,7 @@ function closeFromContextMenu(scope: WorkbenchTabCloseScope): void {
       :drag-type="WORKBENCH_EDITOR_TAB_INTERNAL_DRAG_TYPE"
       :drag-data="editorDragData"
       :drag-source-id="editorDragSourceId"
+      :allowed-operations="['move', 'copy']"
       :drag-externalize="(tab) => emit('drag-externalize', tab)"
       :cancel-drag-on-window-blur="false"
       :drop-active="dropActive"

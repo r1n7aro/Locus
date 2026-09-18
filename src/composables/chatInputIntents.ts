@@ -10,6 +10,7 @@ export type IntentCommandType =
   | "fork"
   | "undo"
   | "export-context"
+  | "garbage-collection"
   | "review-context"
   | "unity-console"
   | "unity-console-error";
@@ -264,12 +265,19 @@ export function removeTextRange(text: string, start: number, end: number): strin
 }
 
 export function normalizeComposerText(text: string): string {
-  return text
+  const normalizeWhitespace = (value: string) => value
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n[ \t]+/g, "\n")
     .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+    .replace(/\n{3,}/g, "\n\n");
+  const chunks: string[] = [];
+  let cursor = 0;
+  for (const range of fencedCodeRanges(text)) {
+    chunks.push(normalizeWhitespace(text.slice(cursor, range.start)), text.slice(range.start, range.end));
+    cursor = range.end;
+  }
+  chunks.push(normalizeWhitespace(text.slice(cursor)));
+  return chunks.join("").trim();
 }
 
 export function replaceTextRange(text: string, start: number, end: number, replacement: string): string {
@@ -306,6 +314,22 @@ function exactCommandForToken(commands: CommandDef[], token: string): CommandDef
   return commands.find((cmd) => cmd.name.toLowerCase() === normalized) ?? null;
 }
 
+function fencedCodeRanges(text: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  let opening: { start: number; marker: string; length: number } | null = null;
+  for (const match of text.matchAll(/^ {0,3}(`{3,}|~{3,})([^\n]*)$/gm)) {
+    const fence = match[1]!;
+    if (!opening) {
+      opening = { start: match.index, marker: fence[0]!, length: fence.length };
+    } else if (fence[0] === opening.marker && fence.length >= opening.length && !match[2]!.trim()) {
+      ranges.push({ start: opening.start, end: match.index + match[0].length });
+      opening = null;
+    }
+  }
+  if (opening) ranges.push({ start: opening.start, end: text.length });
+  return ranges;
+}
+
 export function parseInlineIntentCommands(
   text: string,
   commands: CommandDef[],
@@ -313,8 +337,18 @@ export function parseInlineIntentCommands(
 ): InlineIntentParseResult {
   const removalRanges: Array<{ start: number; end: number }> = [];
   const intent = emptyComposerIntent();
+  // Document selections are quoted as fenced Markdown. Slash commands in the
+  // source are content, so they must not change the conversation's intent.
+  const codeRanges = fencedCodeRanges(text);
+  let codeRangeIndex = 0;
 
   for (let index = 0; index < text.length; index += 1) {
+    const codeRange = codeRanges[codeRangeIndex];
+    if (codeRange && index >= codeRange.start) {
+      index = codeRange.end - 1;
+      codeRangeIndex += 1;
+      continue;
+    }
     if (text[index] !== "/" || !isTokenBoundary(text[index - 1])) continue;
 
     let end = index + 1;

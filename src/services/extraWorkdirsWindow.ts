@@ -1,3 +1,4 @@
+import { materializationEpochFromParams } from "./project";
 import { emit, listen } from "@tauri-apps/api/event";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
@@ -48,7 +49,7 @@ export function getExtraWorkdirsWindowPayload(
       expectedGeneration: Number.isSafeInteger(expectedGeneration)
         ? expectedGeneration
         : undefined,
-    },
+     expectedMaterializationEpoch: materializationEpochFromParams(params) },
   };
 }
 
@@ -58,7 +59,7 @@ export function buildExtraWorkdirsWindowQuery(payload: ExtraWorkdirsWindowPayloa
     workspacePath: payload.workspacePath,
     checkoutId: payload.workspaceRef.checkoutId,
     workspaceGeneration: String(payload.workspaceRef.expectedGeneration ?? ""),
-  });
+   ...(payload.workspaceRef.expectedMaterializationEpoch != null ? { materializationEpoch: String(payload.workspaceRef.expectedMaterializationEpoch) } : {}) });
   return params.toString();
 }
 

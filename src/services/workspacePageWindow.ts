@@ -1,4 +1,5 @@
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
+import { materializationEpochFromParams, appendMaterializationEpoch } from "./project";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const WORKSPACE_PAGE_WINDOW_FLAG = "workspacePageWindow";
@@ -32,6 +33,7 @@ export interface CheckoutWorkspacePageWindowPayload {
   page: CheckoutWorkspacePageId;
   checkoutId: string;
   workspaceGeneration: number;
+  materializationEpoch?: number | null;
   title: string;
 }
 
@@ -96,6 +98,7 @@ function normalizeCanonicalPayload(
     page: payload.page,
     checkoutId,
     workspaceGeneration: payload.workspaceGeneration,
+    materializationEpoch: payload.materializationEpoch,
     title: normalizedTitle(payload.title, payload.page),
   };
 }
@@ -122,7 +125,7 @@ export function workspacePageWindowKind(payload: WorkspacePageWindowPayload): st
   if (normalized.scope === "app") {
     return `workspace-page-${normalized.page}`;
   }
-  return `workspace-page-${normalized.page}-${safeCheckoutWindowKey(normalized.checkoutId)}-g${normalized.workspaceGeneration.toString(16)}`;
+  return `workspace-page-${normalized.page}-${safeCheckoutWindowKey(normalized.checkoutId)}-g${normalized.workspaceGeneration.toString(16)}${normalized.materializationEpoch == null ? "" : `-e${normalized.materializationEpoch}`}`;
 }
 
 export function isWorkspacePageWindowLocation(
@@ -156,7 +159,7 @@ export function getWorkspacePageWindowPayload(
     if (!isCheckoutWorkspacePageId(page) || !checkoutId || workspaceGeneration === null) {
       return null;
     }
-    return { scope: "checkout", page, checkoutId, workspaceGeneration, title };
+    return { scope: "checkout", page, checkoutId, workspaceGeneration, materializationEpoch: materializationEpochFromParams(params), title };
   }
 
   if (scope !== null) return null;
@@ -184,6 +187,7 @@ export function buildWorkspacePageWindowQuery(payload: WorkspacePageWindowPayloa
   if (normalized.scope === "checkout") {
     params.set("checkoutId", normalized.checkoutId);
     params.set("workspaceGeneration", String(normalized.workspaceGeneration));
+    appendMaterializationEpoch(params,normalized.materializationEpoch);
   }
   return params.toString();
 }

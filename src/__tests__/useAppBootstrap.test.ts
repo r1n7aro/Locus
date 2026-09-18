@@ -1,5 +1,8 @@
+import { resetWorkspaceEventHubForTests } from "../services/workspaceEventHub";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick, reactive } from "vue";
+import { listen } from "@tauri-apps/api/event";
+import { invalidateSkills } from "../composables/useSkills";
 
 let uiStoreMock: any;
 let authStoreMock: any;
@@ -63,6 +66,7 @@ vi.mock("../composables/useDisplaySettings", () => ({
 }));
 
 vi.mock("../composables/useSkills", () => ({
+  invalidateSkills: vi.fn(),
   useSkills: () => ({
     skillItems: [],
     loadSkills: loadSkillsMock,
@@ -159,6 +163,9 @@ async function loadUseAppBootstrap() {
 
 describe("useAppBootstrap onboarding completion", () => {
   beforeEach(() => {
+    resetWorkspaceEventHubForTests();
+    vi.mocked(listen).mockReset().mockResolvedValue(vi.fn());
+    vi.mocked(invalidateSkills).mockClear();
     loadSkillsMock = vi.fn().mockResolvedValue(undefined);
     maybeNotifyStreamEventMock = vi.fn().mockResolvedValue(undefined);
     resetSystemNotificationStateMock = vi.fn();
@@ -183,6 +190,7 @@ describe("useAppBootstrap onboarding completion", () => {
       selectedAgentId: "",
       agents: [],
       loadAgents: vi.fn().mockResolvedValue(undefined),
+      loadWorkspaceAgents: vi.fn().mockResolvedValue(undefined),
     });
 
     modelStoreMock = reactive({
@@ -326,7 +334,106 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(uiStoreMock.completeOnboarding).toHaveBeenCalledTimes(1);
     expect(modelStoreMock.loadLastEffort).toHaveBeenCalledTimes(1);
     expect(chatStoreMock.refreshSessions).toHaveBeenCalledTimes(1);
+    expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs auth alongside workspace recovery, then subscribes before loading scoped state", async () => {
+    let restore!: () => void;
+    const workspaceReady = new Promise<void>((resolve) => { restore = resolve; });
+    workspaceContextStoreMock.focusedWorkspaceRef = null;
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const bootstrap = useAppBootstrap({ workspaceReady });
+    const pending = bootstrap.bootstrapCritical();
+    await vi.waitFor(() => expect(authStoreMock.checkAuth).toHaveBeenCalled());
+    expect(chatStoreMock.refreshSessions).not.toHaveBeenCalled();
+    expect(agentStoreMock.loadAgents).not.toHaveBeenCalled();
+    expect(agentStoreMock.loadWorkspaceAgents).not.toHaveBeenCalled();
+    expect(loadSkillsMock).not.toHaveBeenCalled();
+    expect(listen).not.toHaveBeenCalled();
+    workspaceContextStoreMock.focusedWorkspaceRef = { checkoutId: "restored", expectedGeneration: 1 };
+    restore();
+    await pending;
+    expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledWith(workspaceContextStoreMock.focusedWorkspaceRef);
+    expect(agentStoreMock.loadAgents).not.toHaveBeenCalled();
+    const sessionOrder = chatStoreMock.refreshSessions.mock.invocationCallOrder[0];
+    const listenOrder = vi.mocked(listen).mock.invocationCallOrder;
+    expect(listenOrder[listenOrder.length - 1]).toBeLessThan(sessionOrder);
+    expect(agentStoreMock.loadWorkspaceAgents.mock.invocationCallOrder[0]).toBeLessThan(sessionOrder);
+    expect(modelStoreMock.loadLastEffort.mock.invocationCallOrder[0]).toBeLessThan(sessionOrder);
+    const subscriptions = vi.mocked(listen).mock.calls.length;
+    await bootstrap.registerListeners();
+    expect(vi.mocked(listen).mock.calls).toHaveLength(subscriptions);
+    bootstrap.cleanup();
+  });
+
+  it("does not load business snapshots when workspace recovery fails", async () => {
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const bootstrap = useAppBootstrap({ workspaceReady: Promise.reject(new Error("Restore failed")) });
+    await expect(bootstrap.bootstrapCritical()).rejects.toThrow("Restore failed");
+    expect(chatStoreMock.refreshSessions).not.toHaveBeenCalled();
+    expect(loadSkillsMock).not.toHaveBeenCalled();
+  });
+
+  it("allows first launch without a selected workspace", async () => {
+    workspaceContextStoreMock.focusedWorkspaceRef = null;
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const bootstrap = useAppBootstrap({ workspaceReady: Promise.resolve() });
+    await bootstrap.bootstrapCritical();
     expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
+    expect(agentStoreMock.loadWorkspaceAgents).not.toHaveBeenCalled();
+    bootstrap.cleanup();
+  });
+
+  it("can warm knowledge after a workspace-less startup and after an epoch change", async () => {
+    const callbacks: Array<() => Promise<void>> = [];
+    vi.stubGlobal("window", { requestIdleCallback: (callback: () => Promise<void>) => callbacks.push(callback) });
+    try {
+      const knowledge = await import("../services/knowledge");
+      const git = await import("../services/git");
+      vi.mocked(knowledge.knowledgeListPage).mockClear();
+      vi.mocked(git.gitProbe).mockResolvedValue({ available: false } as any);
+      workspaceContextStoreMock.focusedWorkspaceRef = null;
+      const useAppBootstrap = await loadUseAppBootstrap();
+      const bootstrap = useAppBootstrap();
+      bootstrap.preloadTabsInBackground([async () => {}]);
+      await callbacks.shift()!();
+      expect(knowledge.knowledgeListPage).not.toHaveBeenCalled();
+      workspaceContextStoreMock.focusedWorkspaceRef = {
+        checkoutId: "warmup", expectedGeneration: 1, expectedMaterializationEpoch: 1,
+      };
+      await nextTick();
+      bootstrap.preloadTabsInBackground([async () => {}]);
+      await callbacks.shift()!();
+      expect(knowledge.knowledgeListPage).toHaveBeenCalledTimes(1);
+      workspaceContextStoreMock.focusedWorkspaceRef.expectedMaterializationEpoch = 2;
+      await nextTick();
+      bootstrap.preloadTabsInBackground([async () => {}]);
+      await callbacks.shift()!();
+      expect(knowledge.knowledgeListPage).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("invalidates skill manifests for a background editor's checkout", async () => {
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+    vi.mocked(listen).mockImplementation(async (name, handler) => {
+      handlers.set(name, (event) => handler({ event: name, id: 0, payload: event.payload }));
+      return () => {};
+    });
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const bootstrap = useAppBootstrap();
+    await bootstrap.registerListeners();
+    handlers.get("locus://workspace-event")?.({ payload: {
+      eventName: "knowledge-changed", streamRevision: 1, projectId: "project-background",
+      checkoutId: "background", workspaceGeneration: 3, materializationEpoch: 2,
+      payload: { docType: "skill", workingDir: "F:/Background", source: "knowledge_edit" },
+    } });
+    expect(invalidateSkills).toHaveBeenCalledWith({
+      checkoutId: "background", expectedGeneration: 3, expectedMaterializationEpoch: 2,
+    });
+    expect(loadSkillsMock).not.toHaveBeenCalled();
+    bootstrap.cleanup();
   });
 
   it("shows sticky startup banners when auth restore fails", async () => {
@@ -399,7 +506,7 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(chatStoreMock.loadToolPermissionMode).toHaveBeenCalledTimes(1);
     expect(modelStoreMock.loadLastEffort).toHaveBeenCalledTimes(1);
     expect(
-      agentStoreMock.loadAgents.mock.invocationCallOrder[0],
+      agentStoreMock.loadWorkspaceAgents.mock.invocationCallOrder[0],
     ).toBeLessThan(modelStoreMock.loadLastEffort.mock.invocationCallOrder[0]);
     expect(
       chatStoreMock.loadToolPermissionMode.mock.invocationCallOrder[0],
@@ -658,23 +765,22 @@ describe("useAppBootstrap onboarding completion", () => {
     const useAppBootstrap = await loadUseAppBootstrap();
     const { registerListeners } = useAppBootstrap();
     await registerListeners();
-    agentStoreMock.loadAgents.mockClear();
+    agentStoreMock.loadWorkspaceAgents.mockClear();
     loadSkillsMock.mockClear();
 
     const pluginsChangedHandler = handlers.get("plugins-changed");
     expect(pluginsChangedHandler).toBeTypeOf("function");
 
     pluginsChangedHandler?.({ payload: undefined });
-    expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
-    expect(loadSkillsMock).toHaveBeenCalledTimes(1);
-    expect(loadSkillsMock).toHaveBeenLastCalledWith({ force: true });
+    expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledTimes(1);
+    expect(invalidateSkills).toHaveBeenCalledExactlyOnceWith();
 
-    agentStoreMock.loadAgents.mockClear();
+    agentStoreMock.loadWorkspaceAgents.mockClear();
     loadSkillsMock.mockClear();
     const agentsChangedHandler = handlers.get("agents-changed");
     expect(agentsChangedHandler).toBeTypeOf("function");
     agentsChangedHandler?.({ payload: undefined });
-    expect(agentStoreMock.loadAgents).toHaveBeenCalledTimes(1);
+    expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledTimes(1);
     expect(loadSkillsMock).not.toHaveBeenCalled();
   });
 

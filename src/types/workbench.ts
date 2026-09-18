@@ -1,4 +1,4 @@
-import type { KnowledgeDocumentSummary, SessionSummary } from "../types";
+import type { KnowledgeDocumentSummary, KnowledgeDocumentType, SessionSummary } from "../types";
 
 export type WorkspaceDisplayMode = "single" | "multi";
 
@@ -44,6 +44,16 @@ export interface ProjectExplorerPresetSummary {
   filePath: string;
 }
 
+export interface ProjectExplorerItemRef {
+  nodeId: string;
+  relativePath?: string | null;
+}
+
+export interface ProjectExplorerItemState extends ProjectExplorerItemRef {
+  pinned: boolean;
+  highlighted: boolean;
+}
+
 export interface ProjectExplorerSnapshot {
   projectId: string;
   presetId: string;
@@ -51,6 +61,7 @@ export interface ProjectExplorerSnapshot {
   manifestPath: string;
   revision: number;
   nodes: ProjectExplorerNode[];
+  itemStates?: ProjectExplorerItemState[];
   presets: ProjectExplorerPresetSummary[];
 }
 
@@ -59,10 +70,12 @@ export type ProjectExplorerOperation =
   | { kind: "renameFolder"; nodeId: string; name: string }
   | { kind: "deleteFolder"; nodeId: string }
   | { kind: "moveNode"; nodeId: string; parentNodeId?: string | null; position: number }
-  | { kind: "placeResource"; nodeId?: string | null; resourceKind: "session" | "knowledge" | "system"; resourceId: string; sourceKind?: "knowledge" | string | null; parentNodeId?: string | null; position: number }
+  | { kind: "placeResource"; nodeId?: string | null; resourceKind: "session" | "knowledge" | "system" | "view"; resourceId: string; sourceKind?: "knowledge" | string | null; parentNodeId?: string | null; position: number }
   | { kind: "removeResourcePlacement"; resourceKind: "knowledge"; resourceId: string }
   | { kind: "mountPath"; nodeId?: string | null; parentNodeId?: string | null; path: string; sourceKind?: "local" | "knowledge" | null; name?: string | null; position: number }
   | { kind: "setNodeHidden"; nodeId: string; hidden: boolean }
+  | { kind: "setItemState"; nodeId: string; relativePath?: string | null; pinned?: boolean; highlighted?: boolean }
+  | { kind: "movePinnedItems"; items: ProjectExplorerItemRef[]; before?: ProjectExplorerItemRef | null }
   | { kind: "removeNode"; nodeId: string };
 
 export interface ProjectExplorerMutationResult {
@@ -123,17 +136,24 @@ export interface ProjectExplorerFilePreview {
   editable: boolean;
   checkoutId?: string;
   workspaceGeneration?: number;
+  materializationEpoch?: number;
   workspaceRelativePath?: string;
   revision: ProjectExplorerFileRevision;
 }
 
 export type WorkspaceSectionKind =
+  | "agents"
   | "sessions"
   | "archived"
   | "knowledge"
   | "collab"
   | "assets"
   | "views";
+
+export type KnowledgeWorkbenchPage =
+  | { kind: "retrieval" }
+  | { kind: "injection" }
+  | { kind: "directory"; type: KnowledgeDocumentType; path: string };
 
 /**
  * Stable editor identity. Runtime generations and physical titles are kept on
@@ -143,7 +163,7 @@ export type WorkbenchResourceRef =
   | { kind: "project"; projectId: string }
   | { kind: "newSession"; projectId: string }
   | { kind: "checkout"; projectId: string; checkoutId: string }
-  | { kind: "section"; projectId: string; section: WorkspaceSectionKind }
+  | { kind: "section"; projectId: string; section: WorkspaceSectionKind; sessionId?: string; knowledgePage?: KnowledgeWorkbenchPage; agentId?: string }
   | { kind: "knowledgeRoot"; projectId: string }
   | { kind: "collaboration"; projectId: string }
   | { kind: "folder"; projectId: string; nodeId: string }
@@ -161,6 +181,7 @@ export type DevelopmentResourceRef = WorkbenchResourceRef;
 export interface EditorCheckoutBinding {
   checkoutId: string;
   expectedGeneration?: number | null;
+  expectedMaterializationEpoch?: number | null;
 }
 
 export interface EditorCapabilities {
@@ -240,6 +261,7 @@ export interface WorkbenchWindowDropIntent {
 }
 
 export type WorkbenchEditorTransferSnapshot =
+  | { kind: "view"; state: Record<string, unknown> }
   | {
       kind: "session";
       composerDraft?: unknown;
@@ -249,6 +271,13 @@ export type WorkbenchEditorTransferSnapshot =
       text: string;
       contentHash: string;
       originalLineEnding: "\n" | "\r\n" | "\r";
+      csv?: {
+        view: string;
+        viewBaseline: string;
+        viewHash: string | null;
+        mode: string;
+        grid?: { row: number; column: number; endRow?: number; endColumn?: number; scrollTop: number; scrollLeft: number; zoom?: number };
+      };
       selection?: { anchor: number; head: number } | null;
       scrollTop?: number | null;
     }

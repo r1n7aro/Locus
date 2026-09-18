@@ -287,14 +287,13 @@ export function createInternalDragController(defaultWindow: Window = window): In
     }
   }
 
-  function updatePoint(event: PointerEvent, allowExternalize = true): void {
+  function updatePoint(event: PointerEvent): void {
     const nextPoint = eventPoint(event);
     point.value = nextPoint;
     emitVisualPoint(nextPoint);
     const activeSource = source.value;
     if (
-      allowExternalize
-      && activeSource?.externalize
+      activeSource?.externalize
       && internalDragPointReachedViewportEdge(nextPoint, {
         width: ownerWindow.innerWidth,
         height: ownerWindow.innerHeight,
@@ -310,6 +309,15 @@ export function createInternalDragController(defaultWindow: Window = window): In
     const hit = hitAtPoint();
     updateAutoScroll(hit);
     resolveCurrentState(hit);
+  }
+
+  function dropAtPoint(event: PointerEvent): void {
+    point.value = eventPoint(event);
+    // Resolve the release coordinates once, before cleanup changes the DOM.
+    // There is no preview or auto-scroll frame to update after button release.
+    const hit = hitAtPoint();
+    resolveCurrentState(hit);
+    finish("drop", true, hit);
   }
 
   function scrollableAncestor(hit: Element | null): HTMLElement | null {
@@ -380,8 +388,7 @@ export function createInternalDragController(defaultWindow: Window = window): In
     if (!pendingPointer || event.pointerId !== pendingPointer.pointerId) return;
     if (event.pointerType === "mouse" && (event.buttons & 1) === 0) {
       if (phase.value === "dragging") {
-        updatePoint(event, false);
-        finish("drop", true);
+        dropAtPoint(event);
       } else {
         finish("cancel", false);
       }
@@ -460,14 +467,13 @@ export function createInternalDragController(defaultWindow: Window = window): In
     ownerWindow = defaultWindow;
   }
 
-  function finish(reason: InternalDragFinishReason, dropped: boolean): void {
+  function finish(reason: InternalDragFinishReason, dropped: boolean, hit: Element | null = null): void {
     if (finishing) return;
     finishing = true;
     const completedSource = source.value;
-    const completedTarget = dropped ? resolvedTarget : null;
+    const completedTarget = dropped && hit ? resolvedTarget : null;
     const completedPoint = point.value;
     const completedOwnerWindow = ownerWindow;
-    const hit = ownerDocument.value.elementFromPoint(completedPoint.x, completedPoint.y);
     const wasDragging = phase.value === "dragging";
     resetState();
     if (wasDragging) suppressNextClick(completedOwnerWindow);
@@ -489,8 +495,7 @@ export function createInternalDragController(defaultWindow: Window = window): In
     if (!pendingPointer || event.pointerId !== pendingPointer.pointerId) return;
     if (phase.value === "dragging") {
       event.preventDefault();
-      updatePoint(event);
-      finish("drop", true);
+      dropAtPoint(event);
       return;
     }
     finish("cancel", false);
@@ -504,8 +509,7 @@ export function createInternalDragController(defaultWindow: Window = window): In
   function onMouseUp(event: MouseEvent): void {
     if (!pendingPointer || event.button !== 0) return;
     if (phase.value === "dragging") {
-      updatePoint(event as PointerEvent, false);
-      finish("drop", true);
+      dropAtPoint(event as PointerEvent);
       return;
     }
     finish("cancel", false);

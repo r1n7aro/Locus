@@ -6,17 +6,19 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::session::models::{
-    ProjectExplorerMutationResult, ProjectExplorerNode, ProjectExplorerOperation,
-    ProjectExplorerPresetSummary, ProjectExplorerSnapshot,
+    ProjectExplorerItemRef, ProjectExplorerItemState, ProjectExplorerMutationResult,
+    ProjectExplorerNode, ProjectExplorerOperation, ProjectExplorerPresetSummary,
+    ProjectExplorerSnapshot,
 };
 
-const WORKSPACE_TREE_SCHEMA_VERSION: u32 = 2;
+const WORKSPACE_TREE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_WORKSPACE_TREE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_WORKSPACE_TREE_SCHEMA_VERSION: u32 = 1;
 const WORKSPACE_TREE_DIR: &str = "workspace-trees";
 const WORKSPACE_TREE_INDEX: &str = "index.json";
 const DEFAULT_PRESET_ID: &str = "default";
 const DEFAULT_PRESET_NAME: &str = "Default";
-const WORKSPACE_TREE_V2_MIGRATION_ID: &str = "workspace-tree-migration-v2";
+const WORKSPACE_TREE_MIGRATION_ID: &str = "workspace-tree-migration-v3";
 const DEFAULT_HIDDEN_SYSTEM_RESOURCE_ID: &str = "archived";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +41,8 @@ struct WorkspaceTreePresetFile {
     last_operation_id: Option<String>,
     #[serde(default)]
     nodes: Vec<ProjectExplorerNode>,
+    #[serde(default)]
+    item_states: Vec<ProjectExplorerItemState>,
 }
 
 fn layout_locks() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
@@ -96,6 +100,7 @@ fn default_preset(project_id: &str) -> WorkspaceTreePresetFile {
         revision: 0,
         last_operation_id: None,
         nodes: Vec::new(),
+        item_states: Vec::new(),
     }
 }
 
@@ -138,7 +143,7 @@ fn read_index(root: &Path) -> Result<WorkspaceTreeIndex, String> {
     })?;
     match index.schema_version {
         WORKSPACE_TREE_SCHEMA_VERSION => {}
-        LEGACY_WORKSPACE_TREE_SCHEMA_VERSION => {
+        LEGACY_WORKSPACE_TREE_SCHEMA_VERSION | PREVIOUS_WORKSPACE_TREE_SCHEMA_VERSION => {
             index.schema_version = WORKSPACE_TREE_SCHEMA_VERSION;
             write_json(&path, &index)?;
         }
@@ -152,10 +157,10 @@ fn read_index(root: &Path) -> Result<WorkspaceTreeIndex, String> {
     Ok(index)
 }
 
-fn migrate_preset_to_v2(preset: &mut WorkspaceTreePresetFile) -> Result<bool, String> {
+fn migrate_preset(preset: &mut WorkspaceTreePresetFile) -> Result<bool, String> {
     match preset.schema_version {
         WORKSPACE_TREE_SCHEMA_VERSION => return Ok(false),
-        LEGACY_WORKSPACE_TREE_SCHEMA_VERSION => {}
+        LEGACY_WORKSPACE_TREE_SCHEMA_VERSION | PREVIOUS_WORKSPACE_TREE_SCHEMA_VERSION => {}
         version => {
             return Err(format!(
                 "Unsupported workspace tree preset schema version: {version}"
@@ -165,28 +170,33 @@ fn migrate_preset_to_v2(preset: &mut WorkspaceTreePresetFile) -> Result<bool, St
 
     // Knowledge removal is represented by the absence of a placement. Sessions
     // use their archive state. Visibility remains a property of Locus system nodes.
-    preset
-        .nodes
-        .retain(|node| !(node.hidden && node.resource_kind.as_deref() == Some("knowledge")));
-    for node in &mut preset.nodes {
-        if node.resource_kind.as_deref() != Some("system") {
-            node.hidden = false;
+    if preset.schema_version == LEGACY_WORKSPACE_TREE_SCHEMA_VERSION {
+        preset
+            .nodes
+            .retain(|node| !(node.hidden && node.resource_kind.as_deref() == Some("knowledge")));
+        for node in &mut preset.nodes {
+            if node.resource_kind.as_deref() != Some("system") {
+                node.hidden = false;
+            }
+        }
+        let parents = preset
+            .nodes
+            .iter()
+            .map(|node| node.parent_node_id.clone())
+            .collect::<HashSet<_>>();
+        for parent in parents {
+            normalize_siblings(&mut preset.nodes, parent.as_deref());
         }
     }
-    let parents = preset
-        .nodes
-        .iter()
-        .map(|node| node.parent_node_id.clone())
-        .collect::<HashSet<_>>();
-    for parent in parents {
-        normalize_siblings(&mut preset.nodes, parent.as_deref());
-    }
+    // v1/v2 presets have no item decoration state. Persist the explicit empty
+    // collection once; conversation records and their export schema are untouched.
+    preset.item_states.clear();
     preset.schema_version = WORKSPACE_TREE_SCHEMA_VERSION;
     preset.revision = preset
         .revision
         .checked_add(1)
         .ok_or_else(|| "Workspace tree revision is exhausted".to_string())?;
-    preset.last_operation_id = Some(WORKSPACE_TREE_V2_MIGRATION_ID.to_string());
+    preset.last_operation_id = Some(WORKSPACE_TREE_MIGRATION_ID.to_string());
     Ok(true)
 }
 
@@ -209,7 +219,7 @@ fn read_preset(
             path.display()
         )
     })?;
-    let migrated = migrate_preset_to_v2(&mut preset)?;
+    let migrated = migrate_preset(&mut preset)?;
     if preset.preset_id != preset_id {
         return Err(format!(
             "Workspace tree preset id '{}' does not match its file name '{}'",
@@ -298,6 +308,7 @@ fn snapshot_from_parts(
             .into_owned(),
         revision: preset.revision,
         nodes: preset.nodes,
+        item_states: preset.item_states,
         presets: presets
             .iter()
             .map(|candidate| preset_summary(root, candidate, &index.active_preset_id))
@@ -339,6 +350,77 @@ pub fn list_presets(
     project_id: &str,
 ) -> Result<Vec<ProjectExplorerPresetSummary>, String> {
     Ok(snapshot(root, project_id)?.presets)
+}
+
+/// Preserve placements and per-entry pins in every preset after a file operation.
+/// No schema change: only existing paths and names are updated.
+pub fn relocate_file_references(
+    root: &Path,
+    project_id: &str,
+    source: &Path,
+    target: Option<&Path>,
+) -> Result<ProjectExplorerSnapshot, String> {
+    fn key(path: &Path) -> String {
+        let value = path.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) { value.to_lowercase() } else { value }
+    }
+    let lock = layout_lock(root)?;
+    let _guard = lock.lock().map_err(|error| error.to_string())?;
+    let index = ensure_layout(root, project_id)?;
+    let originals = load_presets(root, project_id, &index)?;
+    let source_key = key(source);
+    let mut updates = Vec::new();
+    for original in &originals {
+        let mut preset = original.clone();
+        let mut removed = HashSet::new();
+        let mut changed = false;
+        for node in &mut preset.nodes {
+            let Some(path) = node.source_path.clone() else { continue };
+            if key(Path::new(&path)) == source_key {
+                changed = true;
+                if let Some(target) = target {
+                    node.source_path = Some(target.to_string_lossy().into_owned());
+                    node.folder_name = target.file_name().map(|name| name.to_string_lossy().into_owned());
+                } else {
+                    removed.insert(node.node_id.clone());
+                }
+            } else {
+                for state in preset.item_states.iter_mut().filter(|state| state.node_id == node.node_id) {
+                    let Some(relative) = &state.relative_path else { continue };
+                    if key(&Path::new(&path).join(relative)) != source_key { continue; }
+                    changed = true;
+                    if let Some(target) = target {
+                        // Rename stays in the same directory, so the mount root is unchanged.
+                        state.relative_path = Some(Path::new(relative).with_file_name(target.file_name().unwrap())
+                            .to_string_lossy().replace('\\', "/"));
+                    } else {
+                        state.pinned = false;
+                        state.highlighted = false;
+                    }
+                }
+            }
+        }
+        if !changed { continue; }
+        preset.nodes.retain(|node| !removed.contains(&node.node_id));
+        preset.item_states.retain(|state| !removed.contains(&state.node_id) && (state.pinned || state.highlighted));
+        preset.revision = preset.revision.checked_add(1).ok_or("Workspace tree revision is exhausted")?;
+        preset.last_operation_id = None;
+        updates.push(preset);
+    }
+    for preset in &updates {
+        if let Err(error) = write_json(&preset_path(root, &preset.preset_id), preset) {
+            let mut rollback_errors = Vec::new();
+            for original in &originals {
+                if updates.iter().any(|item| item.preset_id == original.preset_id) {
+                    if let Err(error) = write_json(&preset_path(root, &original.preset_id), original) {
+                        rollback_errors.push(error);
+                    }
+                }
+            }
+            return Err(format!("{error}; rollback: {}", rollback_errors.join("; ")));
+        }
+    }
+    active_snapshot_unlocked(root, project_id)
 }
 
 fn validate_nodes(project_id: &str, nodes: &[ProjectExplorerNode]) -> Result<(), String> {
@@ -665,6 +747,10 @@ fn apply_operation(
     operation: &ProjectExplorerOperation,
 ) -> Result<(), String> {
     match operation {
+        ProjectExplorerOperation::SetItemState { .. }
+        | ProjectExplorerOperation::MovePinnedItems { .. } => {
+            Err("Item state must be applied to its workspace tree preset".to_string())
+        }
         ProjectExplorerOperation::CreateFolder {
             node_id,
             parent_node_id,
@@ -726,7 +812,10 @@ fn apply_operation(
             parent_node_id,
             position,
         } => {
-            if !matches!(resource_kind.as_str(), "session" | "knowledge" | "system") {
+            if !matches!(
+                resource_kind.as_str(),
+                "session" | "knowledge" | "system" | "view"
+            ) {
                 return Err(format!(
                     "Unsupported workspace tree resource kind: {resource_kind}"
                 ));
@@ -854,6 +943,110 @@ fn apply_operation(
     }
 }
 
+fn set_item_state(
+    preset: &mut WorkspaceTreePresetFile,
+    node_id: &str,
+    relative_path: Option<&str>,
+    pinned: Option<bool>,
+    highlighted: Option<bool>,
+) -> Result<(), String> {
+    let node = preset
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .ok_or_else(|| "Workspace tree node is unavailable".to_string())?;
+    if node.resource_kind.as_deref() == Some("system") {
+        return Err("System entries cannot be pinned or highlighted".to_string());
+    }
+    let relative_path = relative_path
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    if let Some(path) = &relative_path {
+        if node.node_kind != "folder"
+            || node.source_path.is_none()
+            || path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || path.contains(['\\', ':'])
+        {
+            return Err("Item path must be relative to a mounted folder".to_string());
+        }
+    }
+    let index = preset
+        .item_states
+        .iter()
+        .position(|state| state.node_id == node_id && state.relative_path == relative_path);
+    let mut state = index
+        .map(|index| preset.item_states[index].clone())
+        .unwrap_or(ProjectExplorerItemState {
+            node_id: node_id.to_string(),
+            relative_path,
+            pinned: false,
+            highlighted: false,
+        });
+    if let Some(value) = pinned {
+        state.pinned = value;
+    }
+    if let Some(value) = highlighted {
+        state.highlighted = value;
+    }
+    if let Some(index) = index {
+        preset.item_states.remove(index);
+    }
+    if state.pinned || state.highlighted {
+        preset
+            .item_states
+            .insert(index.unwrap_or(preset.item_states.len()), state);
+    }
+    Ok(())
+}
+
+fn move_pinned_items(
+    states: &mut Vec<ProjectExplorerItemState>,
+    items: &[ProjectExplorerItemRef],
+    before: Option<&ProjectExplorerItemRef>,
+) -> Result<(), String> {
+    let matches = |state: &ProjectExplorerItemState, item: &ProjectExplorerItemRef| {
+        state.node_id == item.node_id
+            && state.relative_path.as_deref().unwrap_or_default()
+                == item.relative_path.as_deref().unwrap_or_default()
+    };
+    if items.iter().any(|item| {
+        !states
+            .iter()
+            .any(|state| state.pinned && matches(state, item))
+    }) {
+        return Err("Only pinned workspace items can be reordered".to_string());
+    }
+    if let Some(anchor) = before {
+        if !states
+            .iter()
+            .any(|state| state.pinned && matches(state, anchor))
+        {
+            return Err("Pinned insertion target is unavailable".to_string());
+        }
+        if states
+            .iter()
+            .any(|state| matches(state, anchor) && items.iter().any(|item| matches(state, item)))
+        {
+            return Ok(());
+        }
+    }
+    // Move existing state records so their stars, identities and original tree
+    // locations stay intact. The saved state order already defines the pin order.
+    let moving = states
+        .iter()
+        .filter(|state| items.iter().any(|item| matches(state, item)))
+        .cloned()
+        .collect::<Vec<_>>();
+    states.retain(|state| !items.iter().any(|item| matches(state, item)));
+    let index = before
+        .and_then(|anchor| states.iter().position(|state| matches(state, anchor)))
+        .unwrap_or(states.len());
+    states.splice(index..index, moving);
+    Ok(())
+}
+
 pub fn apply_operations(
     root: &Path,
     project_id: &str,
@@ -885,8 +1078,32 @@ pub fn apply_operations(
         ));
     }
     for operation in operations {
-        apply_operation(project_id, &mut preset.nodes, operation)?;
+        if let ProjectExplorerOperation::SetItemState {
+            node_id,
+            relative_path,
+            pinned,
+            highlighted,
+        } = operation
+        {
+            set_item_state(
+                &mut preset,
+                node_id,
+                relative_path.as_deref(),
+                *pinned,
+                *highlighted,
+            )?;
+        } else if let ProjectExplorerOperation::MovePinnedItems { items, before } = operation {
+            move_pinned_items(&mut preset.item_states, items, before.as_ref())?;
+        } else {
+            apply_operation(project_id, &mut preset.nodes, operation)?;
+        }
     }
+    preset.item_states.retain(|state| {
+        preset
+            .nodes
+            .iter()
+            .any(|node| node.node_id == state.node_id)
+    });
     validate_nodes(project_id, &preset.nodes)?;
     preset.revision = preset
         .revision
@@ -927,6 +1144,7 @@ pub fn create_preset(
         revision: 0,
         last_operation_id: None,
         nodes: source.nodes,
+        item_states: source.item_states,
     };
     write_json(&preset_path(root, &preset_id), &preset)?;
     index.preset_order.push(preset_id.clone());
@@ -1041,6 +1259,88 @@ mod tests {
     }
 
     #[test]
+    fn view_placements_round_trip_move_and_remove() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("view.vue");
+        std::fs::write(&source, "<template>View</template>").unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let placed = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "place-view",
+            &[
+                ProjectExplorerOperation::CreateFolder {
+                    node_id: Some("views-folder".to_string()),
+                    parent_node_id: None,
+                    name: "Tools".to_string(),
+                    position: 0,
+                },
+                ProjectExplorerOperation::PlaceResource {
+                    node_id: None,
+                    resource_kind: "view".to_string(),
+                    resource_id: "test-view".to_string(),
+                    source_kind: None,
+                    parent_node_id: None,
+                    position: 1,
+                },
+            ],
+        )
+        .unwrap();
+        let view_node_id = placed
+            .snapshot
+            .nodes
+            .iter()
+            .find(|node| node.resource_kind.as_deref() == Some("view"))
+            .unwrap()
+            .node_id
+            .clone();
+        let moved = apply_operations(
+            temp.path(),
+            "project-a",
+            placed.snapshot.revision,
+            "move-view",
+            &[ProjectExplorerOperation::PlaceResource {
+                node_id: None,
+                resource_kind: "view".to_string(),
+                resource_id: "test-view".to_string(),
+                source_kind: None,
+                parent_node_id: Some("views-folder".to_string()),
+                position: 0,
+            }],
+        )
+        .unwrap();
+        let restored = snapshot(temp.path(), "project-a").unwrap();
+        let views = restored
+            .nodes
+            .iter()
+            .filter(|node| node.resource_kind.as_deref() == Some("view"))
+            .collect::<Vec<_>>();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].node_id, view_node_id);
+        assert_eq!(views[0].parent_node_id.as_deref(), Some("views-folder"));
+        let removed = apply_operations(
+            temp.path(),
+            "project-a",
+            moved.snapshot.revision,
+            "remove-view",
+            &[ProjectExplorerOperation::RemoveNode {
+                node_id: view_node_id,
+            }],
+        )
+        .unwrap();
+        assert!(!removed
+            .snapshot
+            .nodes
+            .iter()
+            .any(|node| node.resource_kind.as_deref() == Some("view")));
+        assert_eq!(
+            std::fs::read_to_string(source).unwrap(),
+            "<template>View</template>"
+        );
+    }
+
+    #[test]
     fn mounted_paths_round_trip_and_reject_hidden_state() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("notes");
@@ -1118,6 +1418,7 @@ mod tests {
                 project_id: "project-a".to_string(),
                 revision: 7,
                 last_operation_id: Some("legacy-operation".to_string()),
+                item_states: Vec::new(),
                 nodes: vec![
                     resource(
                         "knowledge-user-preference",
@@ -1167,7 +1468,7 @@ mod tests {
         );
         assert_eq!(
             persisted_preset.last_operation_id.as_deref(),
-            Some(WORKSPACE_TREE_V2_MIGRATION_ID)
+            Some(WORKSPACE_TREE_MIGRATION_ID)
         );
         assert_eq!(
             snapshot(temp.path(), "project-a").unwrap().revision,
@@ -1468,6 +1769,347 @@ mod tests {
         .unwrap();
         assert_eq!(replaced.snapshot.nodes.len(), 1);
         assert!(!replaced.snapshot.nodes[0].hidden);
+    }
+
+    #[test]
+    fn pinned_reordering_persists_without_moving_nodes_or_clearing_stars() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let mut operations = Vec::new();
+        for (position, name) in ["a", "b", "c"].iter().enumerate() {
+            operations.push(ProjectExplorerOperation::CreateFolder {
+                node_id: Some(name.to_string()),
+                name: name.to_string(),
+                parent_node_id: None,
+                position: position as i64,
+            });
+            operations.push(ProjectExplorerOperation::SetItemState {
+                node_id: name.to_string(),
+                relative_path: None,
+                pinned: Some(true),
+                highlighted: Some(true),
+            });
+        }
+        let placed = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "seed-pins",
+            &operations,
+        )
+        .unwrap()
+        .snapshot;
+        let reference = |name: &str| ProjectExplorerItemRef {
+            node_id: name.into(),
+            relative_path: None,
+        };
+        let reordered = apply_operations(
+            temp.path(),
+            "project-a",
+            placed.revision,
+            "reorder-pins",
+            &[ProjectExplorerOperation::MovePinnedItems {
+                items: vec![reference("b"), reference("c")],
+                before: Some(reference("a")),
+            }],
+        )
+        .unwrap()
+        .snapshot;
+        assert_eq!(
+            reordered
+                .item_states
+                .iter()
+                .map(|state| state.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
+        );
+        assert!(reordered
+            .item_states
+            .iter()
+            .all(|state| state.highlighted && state.pinned));
+        assert_eq!(reordered.nodes, placed.nodes);
+        assert_eq!(snapshot(temp.path(), "project-a").unwrap(), reordered);
+        let tail = apply_operations(
+            temp.path(),
+            "project-a",
+            reordered.revision,
+            "pin-tail",
+            &[ProjectExplorerOperation::MovePinnedItems {
+                items: vec![reference("b")],
+                before: None,
+            }],
+        )
+        .unwrap()
+        .snapshot;
+        assert_eq!(
+            tail.item_states
+                .iter()
+                .map(|state| state.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "a", "b"]
+        );
+        let invalid = apply_operations(
+            temp.path(),
+            "project-a",
+            tail.revision,
+            "invalid-pin",
+            &[ProjectExplorerOperation::MovePinnedItems {
+                items: vec![reference("a")],
+                before: Some(reference("missing")),
+            }],
+        );
+        assert!(invalid.is_err());
+        assert_eq!(snapshot(temp.path(), "project-a").unwrap(), tail);
+    }
+
+    #[test]
+    fn pinned_reordering_distinguishes_mounted_paths_and_ignores_self_drops() {
+        let reference = |path: &str| ProjectExplorerItemRef {
+            node_id: "mount".into(),
+            relative_path: Some(path.into()),
+        };
+        let mut states = ["first.md", "second.md", "unstarred.md"]
+            .iter()
+            .map(|path| ProjectExplorerItemState {
+                node_id: "mount".into(),
+                relative_path: Some(path.to_string()),
+                pinned: *path != "unstarred.md",
+                highlighted: true,
+            })
+            .collect::<Vec<_>>();
+        move_pinned_items(
+            &mut states,
+            &[reference("second.md")],
+            Some(&reference("first.md")),
+        )
+        .unwrap();
+        assert_eq!(states[0].relative_path.as_deref(), Some("second.md"));
+        let original = states.clone();
+        move_pinned_items(
+            &mut states,
+            &[reference("first.md"), reference("second.md")],
+            Some(&reference("first.md")),
+        )
+        .unwrap();
+        assert_eq!(states, original);
+        assert!(move_pinned_items(&mut states, &[reference("unstarred.md")], None).is_err());
+        assert_eq!(states, original);
+    }
+
+    #[test]
+    fn v2_presets_migrate_item_states_once_without_changing_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        snapshot(temp.path(), "project-a").unwrap();
+        let path = preset_path(temp.path(), DEFAULT_PRESET_ID);
+        let mut previous: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        previous["schemaVersion"] = serde_json::json!(2);
+        previous["revision"] = serde_json::json!(9);
+        previous.as_object_mut().unwrap().remove("itemStates");
+        write_json(&path, &previous).unwrap();
+        let migrated = snapshot(temp.path(), "project-a").unwrap();
+        assert_eq!(migrated.revision, 10);
+        assert!(migrated.item_states.is_empty());
+        assert_eq!(migrated, snapshot(temp.path(), "project-a").unwrap());
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(saved["schemaVersion"], 3);
+        assert_eq!(saved["itemStates"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn item_states_persist_independently_and_copy_with_presets() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        assert!(initial.item_states.is_empty());
+        let placed = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "place",
+            &[
+                ProjectExplorerOperation::CreateFolder {
+                    node_id: Some("folder".into()),
+                    parent_node_id: None,
+                    name: "Notes".into(),
+                    position: 0,
+                },
+                ProjectExplorerOperation::PlaceResource {
+                    node_id: Some("session".into()),
+                    resource_kind: "session".into(),
+                    resource_id: "session-a".into(),
+                    source_kind: None,
+                    parent_node_id: Some("folder".into()),
+                    position: 0,
+                },
+                ProjectExplorerOperation::SetItemState {
+                    node_id: "session".into(),
+                    relative_path: None,
+                    pinned: Some(true),
+                    highlighted: Some(true),
+                },
+            ],
+        )
+        .unwrap()
+        .snapshot;
+        assert_eq!(
+            placed
+                .nodes
+                .iter()
+                .find(|node| node.node_id == "session")
+                .unwrap()
+                .parent_node_id
+                .as_deref(),
+            Some("folder")
+        );
+        assert_eq!(snapshot(temp.path(), "project-a").unwrap(), placed);
+        let copied = create_preset(temp.path(), "project-a", "Copy", None).unwrap();
+        assert_eq!(copied.item_states, placed.item_states);
+        let unpinned = apply_operations(
+            temp.path(),
+            "project-a",
+            copied.revision,
+            "unpin",
+            &[ProjectExplorerOperation::SetItemState {
+                node_id: "session".into(),
+                relative_path: None,
+                pinned: Some(false),
+                highlighted: None,
+            }],
+        )
+        .unwrap()
+        .snapshot;
+        assert!(!unpinned.item_states[0].pinned);
+        assert!(unpinned.item_states[0].highlighted);
+        assert_eq!(unpinned.nodes, placed.nodes);
+        assert_eq!(
+            apply_operations(temp.path(), "project-a", copied.revision, "unpin", &[])
+                .unwrap()
+                .snapshot,
+            unpinned
+        );
+        let restored = switch_preset(temp.path(), "project-a", DEFAULT_PRESET_ID).unwrap();
+        assert_eq!(restored.item_states, placed.item_states);
+        let removed = apply_operations(
+            temp.path(),
+            "project-a",
+            restored.revision,
+            "remove",
+            &[ProjectExplorerOperation::RemoveNode {
+                node_id: "session".into(),
+            }],
+        )
+        .unwrap()
+        .snapshot;
+        assert!(removed.item_states.is_empty());
+    }
+
+    #[test]
+    fn file_actions_preserve_all_preset_placements_and_child_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let source = root.join("before.md");
+        let target = root.join("after.md");
+        std::fs::write(&source, "document").unwrap();
+        let initial = snapshot(&root, "project-a").unwrap();
+        let placed = apply_operations(&root, "project-a", initial.revision, "mount-file", &[
+            ProjectExplorerOperation::MountPath { node_id: Some("file".into()), parent_node_id: None,
+                path: source.to_string_lossy().into_owned(), source_kind: None, name: None, position: 0 },
+            ProjectExplorerOperation::MountPath { node_id: Some("directory".into()), parent_node_id: None,
+                path: root.to_string_lossy().into_owned(), source_kind: None, name: None, position: 1 },
+            ProjectExplorerOperation::SetItemState { node_id: "file".into(), relative_path: None, pinned: Some(true), highlighted: Some(true) },
+            ProjectExplorerOperation::SetItemState { node_id: "directory".into(), relative_path: Some("before.md".into()), pinned: Some(true), highlighted: Some(true) },
+        ]).unwrap().snapshot;
+        let copy = create_preset(&root, "project-a", "Other", None).unwrap();
+        std::fs::rename(&source, &target).unwrap();
+        let renamed = relocate_file_references(&root, "project-a", &source, Some(&target)).unwrap();
+        for preset_id in [copy.preset_id.as_str(), placed.preset_id.as_str()] {
+            let current = switch_preset(&root, "project-a", preset_id).unwrap();
+            assert_eq!(current.nodes.iter().find(|node| node.node_id == "file").unwrap().source_path.as_deref(), target.to_str());
+            assert!(current.item_states.iter().all(|state| state.pinned && state.highlighted));
+            assert_eq!(current.item_states.iter().find(|state| state.node_id == "directory").unwrap().relative_path.as_deref(), Some("after.md"));
+        }
+        assert_eq!(renamed.item_states.len(), 2);
+        let deleted = relocate_file_references(&root, "project-a", &target, None).unwrap();
+        assert!(deleted.nodes.iter().all(|node| node.node_id != "file"));
+        assert!(deleted.item_states.is_empty());
+        let other = switch_preset(&root, "project-a", &copy.preset_id).unwrap();
+        assert!(other.item_states.is_empty());
+        assert_eq!(other.nodes.len(), 1);
+    }
+
+    #[test]
+    fn mounted_child_states_do_not_mark_the_parent_or_escape_the_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let mounted = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "mount",
+            &[
+                ProjectExplorerOperation::MountPath {
+                    node_id: Some("mount".into()),
+                    parent_node_id: None,
+                    path: temp.path().to_string_lossy().into_owned(),
+                    source_kind: None,
+                    name: None,
+                    position: 0,
+                },
+                ProjectExplorerOperation::SetItemState {
+                    node_id: "mount".into(),
+                    relative_path: Some("notes/design.md".into()),
+                    pinned: Some(true),
+                    highlighted: Some(true),
+                },
+            ],
+        )
+        .unwrap()
+        .snapshot;
+        assert_eq!(mounted.item_states.len(), 1);
+        assert_eq!(
+            mounted.item_states[0].relative_path.as_deref(),
+            Some("notes/design.md")
+        );
+        assert_eq!(snapshot(temp.path(), "project-a").unwrap(), mounted);
+        let error = apply_operations(
+            temp.path(),
+            "project-a",
+            mounted.revision,
+            "bad-path",
+            &[
+                ProjectExplorerOperation::SetItemState {
+                    node_id: "mount".into(),
+                    relative_path: None,
+                    pinned: Some(true),
+                    highlighted: None,
+                },
+                ProjectExplorerOperation::SetItemState {
+                    node_id: "mount".into(),
+                    relative_path: Some("../outside.md".into()),
+                    pinned: Some(true),
+                    highlighted: None,
+                },
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("relative to a mounted folder"));
+        assert_eq!(snapshot(temp.path(), "project-a").unwrap(), mounted);
+        let cleared = apply_operations(
+            temp.path(),
+            "project-a",
+            mounted.revision,
+            "clear",
+            &[ProjectExplorerOperation::SetItemState {
+                node_id: "mount".into(),
+                relative_path: Some("notes/design.md".into()),
+                pinned: Some(false),
+                highlighted: Some(false),
+            }],
+        )
+        .unwrap()
+        .snapshot;
+        assert!(cleared.item_states.is_empty());
     }
 
     #[test]

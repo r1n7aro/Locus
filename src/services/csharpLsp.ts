@@ -221,6 +221,7 @@ export function subscribeUnityHotReloadSelfTest(
       ) return;
       handler(event.payload);
     },
+    { owner: "csharpLsp.subscribeUnityHotReloadSelfTest" },
   );
 }
 
@@ -299,6 +300,7 @@ export function subscribeUnityStateProbeSelfTest(
       ) return;
       handler(event.payload);
     },
+    { owner: "csharpLsp.subscribeUnityStateProbeSelfTest" },
   );
 }
 
@@ -354,6 +356,7 @@ export function subscribeUnityNativeBridgeSelfTest(
       ) return;
       handler(event.payload);
     },
+    { owner: "csharpLsp.subscribeUnityNativeBridgeSelfTest" },
   );
 }
 
@@ -372,6 +375,7 @@ export function subscribeCsharpLspStatus(
       ) return;
       handler(event.payload);
     },
+    { owner: "csharpLsp.subscribeCsharpLspStatus" },
   );
 }
 
@@ -390,5 +394,6 @@ export function subscribeUnitySidecarCompilerStatus(
       ) return;
       handler(event.payload);
     },
+    { owner: "csharpLsp.subscribeUnitySidecarCompilerStatus" },
   );
 }

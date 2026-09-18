@@ -61,3 +61,5 @@ async function syncSystemLocale() {
 }
 
 void syncSystemLocale();
+
+void import("./services/frontendExecution").then(({ bootstrapFrontendExecution }) => bootstrapFrontendExecution()).catch((error) => console.warn("[frontend-sdk] bootstrap failed", error));

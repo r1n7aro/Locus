@@ -47,7 +47,7 @@ export const sharedWorkbenchWindowHosts = shallowReactive<SharedWorkbenchWindowH
 let preparedWindow: PreparedSharedWorkbenchWindow | null = null;
 let preparingWindow: Promise<PreparedSharedWorkbenchWindow | null> | null = null;
 let poolSequence = 0;
-let poolReplenishTimer: ReturnType<typeof window.setTimeout> | null = null;
+let poolReplenishTimer: number | null = null;
 
 function scheduleSharedWorkbenchWindowPoolReplenishment(): void {
   if (preparedWindow || preparingWindow || poolReplenishTimer) return;

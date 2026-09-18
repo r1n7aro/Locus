@@ -103,6 +103,7 @@ async fn unity_observable_event_scope(scope: &ResolvedWorkspaceScope) -> Workspa
         project_id: runtime.project_id().clone(),
         checkout_id: runtime.checkout_id().clone(),
         workspace_generation: runtime.generation(),
+        materialization_epoch: Some(runtime.materialization_epoch()),
         service_instance_id: service_identity
             .as_ref()
             .map(|identity| identity.service_instance_id.clone()),

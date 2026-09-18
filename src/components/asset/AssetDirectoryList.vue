@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import { t } from "../../i18n";
+import { explorerFileKey, explorerFilePath, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
 import type { AssetExplorerNode } from "../../composables/useAssetState";
 import FileTreeList from "../explorer/FileTreeList.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
@@ -14,6 +15,7 @@ import {
 type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
 const props = defineProps<{
+  workingDir?: string;
   items: AssetExplorerNode[];
   selectedPath: string | null;
   loading: boolean;
@@ -24,10 +26,17 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  (e: "fileContextmenu", node: AssetExplorerNode, event: MouseEvent): void;
   (e: "select", node: AssetExplorerNode): void;
   (e: "loadMore"): void;
   (e: "dragPointerDown", node: AssetExplorerNode, event: PointerEvent): void;
 }>();
+
+const { showsFullPath } = useExplorerPathDisplay();
+function displayName(node: AssetExplorerNode): string {
+  const path = explorerFilePath(props.workingDir ?? "", node.path);
+  return node.kind === "file" && showsFullPath(explorerFileKey(path)) ? path : node.name;
+}
 
 type VisibleEntry =
   | {
@@ -107,6 +116,7 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
             :title="entry.node.path"
             @pointerdown="beginDrag(entry.node, $event)"
             @click="emit('select', entry.node)"
+            @contextmenu="entry.node.kind === 'file' && emit('fileContextmenu', entry.node, $event)"
           >
             <span
               v-if="isFolder(entry.node)"
@@ -132,7 +142,7 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
             </span>
 
             <span class="adl-name">
-              {{ entry.node.name }}<span v-if="isFolder(entry.node)" class="adl-folder-suffix">/</span>
+              {{ displayName(entry.node) }}<span v-if="isFolder(entry.node)" class="adl-folder-suffix">/</span>
             </span>
           </button>
 

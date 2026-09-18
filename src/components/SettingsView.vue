@@ -57,7 +57,7 @@ const {
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
-  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexContextWindow, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexPrefixCacheTtlSeconds, loadCodexRateLimits, consumeCodexResetCredit,
+  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexContextWindow, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexUseApplyPatch, setCodexPrefixCacheTtlSeconds, loadCodexRateLimits, consumeCodexResetCredit,
   requestCodexLogin,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
@@ -299,6 +299,7 @@ watch(
           :codex-context-window="codexModelConfig.contextWindow"
           :codex-session-title-generation="codexModelConfig.generateSessionTitles"
           :codex-auto-review="codexModelConfig.autoReview"
+          :codex-use-apply-patch="codexModelConfig.useApplyPatch"
           :codex-prefix-cache-ttl-seconds="codexModelConfig.prefixCacheTtlSeconds"
           :dynamic-tool-loading-mode="dynamicToolLoadingMode"
           :dynamic-tool-loading-busy="dynamicToolLoadingBusy"
@@ -337,6 +338,7 @@ watch(
           @update:codex-context-window="setCodexContextWindow"
           @update:codex-session-title-generation="setCodexSessionTitleGeneration"
           @update:codex-auto-review="setCodexAutoReview"
+          @update:codex-use-apply-patch="setCodexUseApplyPatch"
           @update:codex-prefix-cache-ttl-seconds="setCodexPrefixCacheTtlSeconds"
           @update:dynamic-tool-loading-mode="setDynamicToolLoadingMode"
           @update:anthropic-native-lazy-enabled="setAnthropicNativeLazyEnabled"

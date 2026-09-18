@@ -1,3 +1,4 @@
+import { materializationEpochFromParams, appendMaterializationEpoch } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import type { WorkspaceRef } from "./project";
@@ -42,7 +43,7 @@ export function getReferenceExternalImportWindowPayload(
           expectedGeneration: Number.isSafeInteger(generation) && generation > 0
             ? generation
             : undefined,
-        }
+         expectedMaterializationEpoch: materializationEpochFromParams(params) }
       : null,
     parentDir: trimOrEmpty(params.get("parentDir")),
     fixedTargetPath: trimOrEmpty(params.get("fixedTargetPath")),
@@ -62,6 +63,7 @@ export function buildReferenceExternalImportWindowQuery(
     params.set("checkoutId", payload.workspaceRef.checkoutId);
     if (payload.workspaceRef.expectedGeneration != null) {
       params.set("workspaceGeneration", String(payload.workspaceRef.expectedGeneration));
+  appendMaterializationEpoch(params, payload.workspaceRef.expectedMaterializationEpoch);
     }
   }
   if (trimOrEmpty(payload.parentDir)) {

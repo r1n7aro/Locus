@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import { ChevronRight } from "lucide";
 import { t } from "../../i18n";
+import { explorerFileKey, explorerFilePath, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
 import { isMetaFile } from "../../composables/useHideMeta";
 import type { AssetExplorerNode } from "../../composables/useAssetState";
 import FileTreeList from "../explorer/FileTreeList.vue";
@@ -16,18 +17,27 @@ import {
 type AssetFolderNode = Extract<AssetExplorerNode, { kind: "folder" }>;
 
 const props = defineProps<{
+  workingDir?: string;
   tree: AssetExplorerNode[];
   selectedPath: string | null;
   isPathExpanded: (path: string) => boolean;
   dragEnabled?: boolean;
+  workspaceStyle?: boolean;
 }>();
 
 const emit = defineEmits<{
+  (e: "fileContextmenu", node: AssetExplorerNode, event: MouseEvent): void;
   (e: "select", node: AssetExplorerNode): void;
   (e: "toggle", path: string): void;
   (e: "loadMore", path: string): void;
   (e: "dragPointerDown", node: AssetExplorerNode, event: PointerEvent): void;
 }>();
+
+const { showsFullPath } = useExplorerPathDisplay();
+function displayName(node: AssetExplorerNode): string {
+  const path = explorerFilePath(props.workingDir ?? "", node.path);
+  return node.kind === "file" && showsFullPath(explorerFileKey(path)) ? path : node.name;
+}
 
 type VisibleEntry =
   | {
@@ -127,11 +137,11 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
 </script>
 
 <template>
-  <div class="alx-root">
+  <div class="alx-root" :class="{ 'is-workspace-tree': props.workspaceStyle }">
     <FileTreeList
       class="alx-tree"
       :items="visibleRows"
-      :row-height="28"
+      :row-height="props.workspaceStyle ? 30 : 28"
       @visible-range-change="handleVisibleRangeChange"
     >
       <template #item="{ item }">
@@ -147,9 +157,11 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
             :style="{ paddingLeft: `${indentPx(entry.node)}px` }"
             @pointerdown="beginDrag(entry.node, $event)"
             @click="rowClick(entry)"
+            :title="explorerFilePath(workingDir ?? '', entry.node.path)"
+            @contextmenu="entry.node.kind === 'file' && emit('fileContextmenu', entry.node, $event)"
           >
             <span
-              v-if="entry.isFolder"
+              v-if="entry.isFolder && !props.workspaceStyle"
               class="alx-branch"
               :class="{ open: entry.expanded }"
               aria-hidden="true"
@@ -159,7 +171,7 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
                 :size="9"
               />
             </span>
-            <span v-else class="alx-branch-spacer" aria-hidden="true"></span>
+            <span v-else-if="!props.workspaceStyle" class="alx-branch-spacer" aria-hidden="true"></span>
 
             <span
               class="alx-kind-icon"
@@ -177,7 +189,7 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
             </span>
 
             <span class="alx-name" :class="{ 'alx-name-root': entry.node.kind === 'folder' && entry.node.isRoot }">
-              {{ entry.node.name }}
+              {{ displayName(entry.node) }}
             </span>
           </button>
 
@@ -206,6 +218,40 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
 </template>
 
 <style scoped>
+.alx-root.is-workspace-tree {
+  background: var(--sidebar-bg);
+}
+
+.is-workspace-tree .alx-row,
+.is-workspace-tree .alx-load-row {
+  min-height: 30px;
+  padding-right: 8px;
+}
+
+.is-workspace-tree .alx-name {
+  font-family: var(--font-mono-identifier);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.is-workspace-tree .alx-kind-icon {
+  height: 18px;
+}
+
+.is-workspace-tree .alx-kind-icon :deep(svg) {
+  display: block;
+  width: 14px;
+  height: 14px;
+}
+
+.is-workspace-tree .alx-row.selected {
+  box-shadow: inset 2px 0 0 var(--accent-color);
+}
+
+.is-workspace-tree .alx-load-row .alx-branch-spacer {
+  display: none;
+}
+
 .alx-root {
   display: flex;
   flex-direction: column;

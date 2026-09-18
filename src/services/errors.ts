@@ -15,6 +15,16 @@ const PLUGIN_MANAGED_VIEW_ERROR_PATTERN =
   /^View '(.+)' is managed by plugin '(.+)'\. Uninstall the plugin to (remove|rename|move) it\.$/;
 
 function localizeErrorPayload(payload: AppErrorPayload): AppErrorPayload {
+  if (payload.code === "llm.upstream_model_mismatch" && payload.detail) {
+    try {
+      const detail = JSON.parse(payload.detail) as Record<string, unknown>;
+      if (typeof detail.requestedModel === "string" && typeof detail.reportedModel === "string") {
+        return { ...payload, message: t("notifications.upstreamModelMismatch", detail.requestedModel, detail.reportedModel) };
+      }
+    } catch {
+      // Keep the readable backend message when older clients supply plain detail.
+    }
+  }
   const pluginManagedViewMatch = payload.message.match(PLUGIN_MANAGED_VIEW_ERROR_PATTERN);
   if (pluginManagedViewMatch) {
     const [, viewName, pluginId, action] = pluginManagedViewMatch;

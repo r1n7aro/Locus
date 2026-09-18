@@ -69,8 +69,8 @@ describe("chat composer draft persistence", () => {
 
     expect(richInput).toContain('import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../composables/chatAssetRefs";');
     expect(richInput).toContain("const UNITY_ASSET_REF_ROOT_RE = /^(?:Assets|Packages|ProjectSettings)(?:\\/|$)/i;");
-    expect(richInput).toContain("const assetRef = buildManualAssetRef(mentionPath);");
-    expect(richInput).toContain("addAssetRefs([assetRef]);");
+    expect(richInput).toContain("const assetRef = buildManualAssetRef(path);");
+    expect(richInput).toContain("addAssetRefs([attachment.assetRef]);");
     expect(richInput).toContain("const inlineAssetRefs = extractInlineUnityAssetRefs(parsed.cleanedText);");
     expect(richInput).toContain("const cleanedInput = normalizeComposerText(inlineAssetRefs.text);");
     expect(richInput).toContain("dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);");

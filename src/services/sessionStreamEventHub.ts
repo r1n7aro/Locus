@@ -1,6 +1,9 @@
 import type { AsyncTaskUpdatedEvent, StreamEvent } from "../types";
 import type { RoutedWorkspaceEvent, WorkspaceRef } from "./project";
+import { workspaceMaterializationMatches } from "./project";
 import type { SessionExecutionStateChanged } from "./sessionExecutionState";
+import { recordSessionAttention } from "./sessionAttention";
+import { useDisplaySettings } from "../composables/useDisplaySettings";
 
 export type SessionStreamEventSource =
   | { kind: "legacy" }
@@ -9,6 +12,7 @@ export type SessionStreamEventSource =
     projectId: string;
     checkoutId: string;
     workspaceGeneration: number;
+    materializationEpoch?: number | null;
     streamRevision: number;
   };
 
@@ -83,6 +87,7 @@ function rememberPendingDispatch(
  * component remount cannot race asynchronous `listen()` registration.
  */
 export function publishSessionStreamEvent(dispatch: SessionStreamEventDispatch): void {
+  recordSessionAttention(dispatch.event, useDisplaySettings().state.autoPromoteCompletedSessions);
   rememberPendingDispatch(dispatch);
   for (const listener of [...listeners]) listener(dispatch);
   const deliveredConsumers = new Set<object>();
@@ -250,6 +255,7 @@ export function workspaceStreamEventSource(
     projectId: event.projectId,
     checkoutId: event.checkoutId,
     workspaceGeneration: event.workspaceGeneration,
+    materializationEpoch: event.materializationEpoch,
     streamRevision: event.streamRevision,
   };
 }
@@ -260,6 +266,7 @@ export function sessionStreamSourceMatchesWorkspace(
 ): boolean {
   if (source.kind === "legacy") return true;
   if (!workspaceRef || source.checkoutId !== workspaceRef.checkoutId) return false;
+  if (!workspaceMaterializationMatches(workspaceRef.expectedMaterializationEpoch, source.materializationEpoch)) return false;
   return workspaceRef.expectedGeneration == null
     || source.workspaceGeneration === workspaceRef.expectedGeneration;
 }

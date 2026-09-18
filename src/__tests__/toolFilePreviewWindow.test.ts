@@ -132,7 +132,8 @@ describe("toolFilePreviewWindow", () => {
 
     expect(toolBlock).toContain("resolveToolFilePreviewPayload");
     expect(toolBlock).toContain("tool-file-preview-action");
-    expect(toolBlock).toContain("openToolFilePreviewWindow");
+    expect(toolBlock).toContain("openWorkbenchFileTab");
+    expect(toolBlock).not.toContain("openToolFilePreviewWindow");
     expect(diffViewer).toContain("textToolbarActionLabel");
     expect(diffViewer).toContain("emit('textToolbarAction')");
     expect(windowApp).toContain("ToolFilePreviewWindow.vue");

@@ -1,13 +1,25 @@
 <script setup lang="ts">
-import type { Text } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { computed, nextTick, ref, watch } from "vue";
 import { AlertTriangle } from "lucide";
 import { t } from "../../i18n";
+import { useDocumentFileSession } from "../../composables/useDocumentFileSession";
+import { documentSessionKey } from "../../document/documentIdentity";
+import {
+  detectTextDocumentLineEnding,
+  normalizeTextDocumentLineEndings,
+  serializeTextDocumentLineEndings,
+  type TextDocumentLineEnding,
+} from "../../document/textDocumentFormat";
 import { useFileChangeRevalidation } from "../../composables/useFileChangeRevalidation";
+import { useMarkdownDocumentOutline } from "../../composables/useMarkdownDocumentOutline";
 import { normalizeAppError } from "../../services/errors";
 import { previewWorkspaceAsset } from "../../services/asset";
 import type { WorkspaceRef } from "../../services/project";
+import {
+  resolveToolFilePreviewHighlightRanges,
+  type ToolFilePreviewHighlight,
+} from "../../services/toolFilePreviewWindow";
 import {
   projectExplorerPreviewFile,
   projectExplorerFileRevision,
@@ -27,6 +39,7 @@ import AssetTextViewer from "../asset/AssetTextViewer.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import WorkspaceCsvEditor from "../csv/WorkspaceCsvEditor.vue";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 import type { MarkdownEditorViewMode } from "../ui/markdownEditorViewMode";
 
@@ -39,32 +52,63 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: "dirtyChange", dirty: boolean): void;
+  (event: "pathChange", path: string): void;
 }>();
 
-const preview = ref<ProjectExplorerFilePreview | null>(null);
-const loading = ref(false);
-const error = ref("");
-const assetPayload = ref<AssetPreviewPayload | null>(null);
-const sourceText = ref("");
-const editorDocument = ref<Text | null>(null);
-const dirty = ref(false);
-const saving = ref(false);
+const isCsv = computed(() => /\.csv$/i.test(props.path));
+const csvEditor = ref<InstanceType<typeof WorkspaceCsvEditor> | null>(null);
+
+interface FileDocument {
+  preview: ProjectExplorerFilePreview;
+  assetPayload: AssetPreviewPayload | null;
+}
+
+interface FileDocumentDraft {
+  text: string;
+  lineEnding: TextDocumentLineEnding;
+}
+
+const resourceKey = computed(() => documentSessionKey(props.workspaceRef, [
+  "workspaceFile", props.projectId ?? "", props.path,
+]));
+const fileSession = useDocumentFileSession<FileDocument, FileDocumentDraft>({
+  key: () => resourceKey.value,
+  emptyDraft: () => ({ text: "", lineEnding: "\n" }),
+  read: readDocument,
+  write: async (current, draft) => {
+    const text = serializeTextDocumentLineEndings(draft.text, draft.lineEnding);
+    const hash = current.preview.contentHash!;
+    const next = props.workspaceRef
+      ? await workspaceFileWrite(props.path, text, hash, props.workspaceRef)
+      : await projectExplorerWriteFile(props.projectId ?? "", props.path, text, hash);
+    return { preview: next, assetPayload: null };
+  },
+  toDraft: ({ preview }) => ({
+    text: normalizeTextDocumentLineEndings(preview.text ?? ""),
+    lineEnding: detectTextDocumentLineEnding(preview.text ?? ""),
+  }),
+  equals: (left, right) => left.text === right.text && left.lineEnding === right.lineEnding,
+  canSave: ({ preview }) => preview.kind === "text" && preview.editable && !!preview.contentHash,
+  errorMessage: (cause) => normalizeAppError(cause).message,
+});
+const { loading, error, dirty, saving } = fileSession;
+const preview = computed(() => fileSession.document.value?.preview ?? null);
+const assetPayload = computed(() => fileSession.document.value?.assetPayload ?? null);
 const diskChanged = ref(false);
 const observedDiskRevision = ref<ProjectExplorerFileRevision | null>(null);
-const originalLineEnding = ref<"\n" | "\r\n" | "\r">("\n");
 const sourceEditor = ref<InstanceType<typeof BaseMarkdownEditor> | null>(null);
-const pendingPosition = ref<{ line: number; column: number } | null>(null);
-let requestEpoch = 0;
-
-const normalizedSourceText = computed(() => (
-  sourceText.value.replace(/\r\n/g, "\n").replace(/\r/g, "\n")
-));
-const editorContentKey = computed(() => [
-  props.workspaceRef?.checkoutId ?? props.projectId ?? "workspace-file",
-  props.workspaceRef?.expectedGeneration ?? "current",
-  props.path,
-  preview.value?.contentHash ?? "unloaded",
-].join(":"));
+const documentScrollerRef = ref<HTMLElement | null>(null);
+const documentPageRef = ref<HTMLElement | null>(null);
+const documentBodyRef = ref<HTMLElement | null>(null);
+const pendingPosition = ref<{
+  line: number;
+  column: number;
+  highlight?: ToolFilePreviewHighlight;
+} | null>(null);
+const normalizedSourceText = computed(() => fileSession.modelDraft.value.text);
+const editorContentKey = computed(() => JSON.stringify([
+  resourceKey.value, preview.value?.contentHash ?? "unloaded",
+]));
 const language = computed(() => {
   const extension = preview.value?.extension ?? "";
   return ({
@@ -86,6 +130,29 @@ const editorViewMode = computed<MarkdownEditorViewMode>(() => (
     ? "rendered"
     : "native"
 ));
+const isMarkdownDocument = computed(() => (
+  preview.value?.kind === "text" && preview.value.editable && editorViewMode.value === "rendered"
+));
+const documentTitle = computed(() => preview.value?.name.replace(/\.(?:md|markdown)$/iu, "") ?? "");
+const {
+  documentOutlineItems,
+  activeOutlineId,
+  documentOutlineMarginTop,
+  documentOutlineMaxHeight,
+  outlineItemPadding,
+  scrollToDocumentOutlineItem,
+  scheduleDocumentOutlineActiveUpdate,
+} = useMarkdownDocumentOutline({
+  documentKey: () => editorContentKey.value,
+  source: () => isMarkdownDocument.value
+    ? fileSession.draft.value.text
+    : "",
+  active: () => props.active !== false,
+  scroller: documentScrollerRef,
+  page: documentPageRef,
+  body: documentBodyRef,
+  editor: sourceEditor,
+});
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -100,57 +167,31 @@ async function readPreview(): Promise<ProjectExplorerFilePreview> {
     : await projectExplorerPreviewFile(props.projectId ?? "", props.path);
 }
 
-async function loadPreview(options: { keepCurrent?: boolean } = {}): Promise<boolean> {
-  const epoch = ++requestEpoch;
-  loading.value = true;
-  error.value = "";
-  if (!options.keepCurrent) {
-    preview.value = null;
-    assetPayload.value = null;
-    sourceText.value = "";
-    editorDocument.value = null;
-    setDirty(false);
-  }
-  try {
-    const next = await readPreview();
-    if (epoch !== requestEpoch) return false;
-    let nextAssetPayload: AssetPreviewPayload | null = null;
-    if (
-      next.kind === "unity"
-      && next.checkoutId
-      && next.workspaceRelativePath
-    ) {
-      nextAssetPayload = await previewWorkspaceAsset(
-        next.workspaceRelativePath,
-        undefined,
-        {
-          checkoutId: next.checkoutId,
-          expectedGeneration: next.workspaceGeneration,
-        },
-      );
-    }
-    if (epoch !== requestEpoch) return false;
-    preview.value = next;
-    assetPayload.value = nextAssetPayload;
-    sourceText.value = next.text ?? "";
-    editorDocument.value = null;
-    originalLineEnding.value = next.text?.includes("\r\n")
-      ? "\r\n"
-      : next.text?.includes("\r")
-        ? "\r"
-        : "\n";
+async function readDocument(): Promise<FileDocument> {
+  const next = await readPreview();
+  const payload = next.kind === "unity" && next.checkoutId && next.workspaceRelativePath
+    ? await previewWorkspaceAsset(next.workspaceRelativePath, undefined, {
+        checkoutId: next.checkoutId,
+        expectedGeneration: next.workspaceGeneration,
+        expectedMaterializationEpoch: next.materializationEpoch,
+      })
+    : null;
+  return { preview: next, assetPayload: payload };
+}
+
+async function loadPreview(options: { keepCurrent?: boolean; keepDraft?: boolean } = {}): Promise<boolean> {
+  const key = resourceKey.value;
+  const before = fileSession.document.value;
+  const loaded = await fileSession.load(options);
+  if (key !== resourceKey.value) return false;
+  if (loaded) {
     diskChanged.value = false;
     observedDiskRevision.value = null;
-    setDirty(false);
-    if (epoch === requestEpoch) void applyPendingPosition();
-    return true;
-  } catch (cause) {
-    if (epoch !== requestEpoch) return false;
-    error.value = normalizeAppError(cause).message;
-    return false;
-  } finally {
-    if (epoch === requestEpoch) loading.value = false;
+    void applyPendingPosition();
+  } else if (options.keepCurrent && fileSession.document.value === before && dirty.value) {
+    diskChanged.value = true;
   }
+  return loaded;
 }
 
 async function probeFileRevision(): Promise<ProjectExplorerFileRevision> {
@@ -160,14 +201,14 @@ async function probeFileRevision(): Promise<ProjectExplorerFileRevision> {
 }
 
 const { checkNow: refreshIfChanged } = useFileChangeRevalidation({
-  active: () => props.active !== false,
+  active: () => props.active !== false && !isCsv.value,
   currentRevision: () => observedDiskRevision.value ?? preview.value?.revision ?? null,
   probe: probeFileRevision,
   workspaceRef: () => props.workspaceRef,
   workspacePath: () => props.workspaceRef ? props.path : null,
   onChanged: async (revision) => {
     observedDiskRevision.value = revision;
-    if (dirty.value) {
+    if (dirty.value || saving.value) {
       diskChanged.value = true;
       return;
     }
@@ -180,19 +221,17 @@ async function useDiskVersion(): Promise<void> {
 }
 
 async function keepLocalVersion(): Promise<void> {
-  const localText = serializedEditorText();
-  const localLineEnding = originalLineEnding.value;
   const viewBefore = sourceEditor.value?.getEditorView();
   const selection = viewBefore ? {
     anchor: viewBefore.state.selection.main.anchor,
     head: viewBefore.state.selection.main.head,
   } : null;
-  const loaded = await loadPreview({ keepCurrent: true });
+  const loaded = await loadPreview({ keepCurrent: true, keepDraft: true });
   if (!loaded || preview.value?.kind !== "text" || !preview.value.editable) return;
   await nextTick();
   const view = sourceEditor.value?.getEditorView();
   if (!view) return;
-  const normalized = localText.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const normalized = fileSession.draft.value.text;
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: normalized },
     selection: selection ? {
@@ -200,10 +239,6 @@ async function keepLocalVersion(): Promise<void> {
       head: Math.min(normalized.length, selection.head),
     } : undefined,
   });
-  originalLineEnding.value = localLineEnding;
-  diskChanged.value = false;
-  observedDiskRevision.value = null;
-  setDirty(normalized !== normalizedSourceText.value);
 }
 
 async function applyPendingPosition(): Promise<boolean> {
@@ -212,7 +247,10 @@ async function applyPendingPosition(): Promise<boolean> {
   await nextTick();
   const view = sourceEditor.value?.getEditorView();
   if (!view) return false;
-  const lineNumber = Math.min(view.state.doc.lines, Math.max(1, Math.floor(position.line)));
+  const highlight = position.highlight
+    ? resolveToolFilePreviewHighlightRanges(view.state.doc.toString(), 1, position.highlight)[0]
+    : null;
+  const lineNumber = Math.min(view.state.doc.lines, Math.max(1, Math.floor(highlight?.startLine ?? position.line)));
   const line = view.state.doc.line(lineNumber);
   const columnOffset = Math.min(line.length, Math.max(0, Math.floor(position.column) - 1));
   const anchor = line.from + columnOffset;
@@ -226,6 +264,7 @@ async function applyPendingPosition(): Promise<boolean> {
 }
 
 async function revealPosition(line: number, column = 1): Promise<boolean> {
+  if (isCsv.value) return await csvEditor.value?.revealPosition(line, column) ?? false;
   pendingPosition.value = {
     line: Math.max(1, Math.floor(line || 1)),
     column: Math.max(1, Math.floor(column || 1)),
@@ -233,81 +272,47 @@ async function revealPosition(line: number, column = 1): Promise<boolean> {
   return applyPendingPosition();
 }
 
-function setDirty(value: boolean): void {
-  if (dirty.value === value) return;
-  dirty.value = value;
-  emit("dirtyChange", value);
+async function revealToolFileHighlight(highlight?: ToolFilePreviewHighlight): Promise<boolean> {
+  if (isCsv.value) { await nextTick(); return await csvEditor.value?.revealToolFileHighlight(highlight) ?? false; }
+  pendingPosition.value = { line: 1, column: 1, highlight };
+  return applyPendingPosition();
 }
 
 function onEditorDocumentChange(change: MarkdownEditorDocumentChange): void {
-  editorDocument.value = change.doc;
-  setDirty(change.doc.toString() !== normalizedSourceText.value);
+  fileSession.updateDraft({ ...fileSession.draft.value, text: change.doc.toString() });
 }
 
 function serializedEditorText(): string {
-  const normalized = editorDocument.value?.toString() ?? normalizedSourceText.value;
-  if (originalLineEnding.value === "\r\n") return normalized.replace(/\n/g, "\r\n");
-  if (originalLineEnding.value === "\r") return normalized.replace(/\n/g, "\r");
-  return normalized;
+  const draft = fileSession.draft.value;
+  return serializeTextDocumentLineEndings(draft.text, draft.lineEnding);
 }
 
 async function saveFile(): Promise<boolean> {
-  const current = preview.value;
-  if (
-    !current
-    || current.kind !== "text"
-    || !current.editable
-    || !current.contentHash
-    || saving.value
-  ) return false;
-  if (!dirty.value) return true;
-  saving.value = true;
-  error.value = "";
-  try {
-    const next = props.workspaceRef
-      ? await workspaceFileWrite(
-        props.path,
-        serializedEditorText(),
-        current.contentHash,
-        props.workspaceRef,
-      )
-      : await projectExplorerWriteFile(
-        props.projectId ?? "",
-        props.path,
-        serializedEditorText(),
-        current.contentHash,
-      );
-    preview.value = next;
-    sourceText.value = next.text ?? "";
-    editorDocument.value = null;
-    diskChanged.value = false;
-    observedDiskRevision.value = null;
-    setDirty(false);
-    return true;
-  } catch (cause) {
-    error.value = normalizeAppError(cause).message;
-    return false;
-  } finally {
-    saving.value = false;
-  }
+  if (isCsv.value) return await csvEditor.value?.saveFile() ?? false;
+  return fileSession.save();
 }
 
 function exportTransferSnapshot(): WorkbenchEditorTransferSnapshot {
+  if (isCsv.value && csvEditor.value) return csvEditor.value.exportTransferSnapshot();
   const view = sourceEditor.value?.getEditorView();
   return {
     kind: "workspaceFile",
     text: serializedEditorText(),
     contentHash: preview.value?.contentHash ?? "",
-    originalLineEnding: originalLineEnding.value,
+    originalLineEnding: fileSession.draft.value.lineEnding,
     selection: view ? {
       anchor: view.state.selection.main.anchor,
       head: view.state.selection.main.head,
     } : null,
-    scrollTop: view?.scrollDOM.scrollTop ?? null,
+    scrollTop: documentScrollerRef.value?.scrollTop ?? view?.scrollDOM.scrollTop ?? null,
   };
 }
 
 async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean> {
+  if (isCsv.value) {
+    await nextTick();
+    return await csvEditor.value?.applyTransferSnapshot(snapshot) ?? false;
+  }
   if (snapshot.kind !== "workspaceFile") return false;
   const deadline = Date.now() + 4_000;
   while (!sourceEditor.value?.getEditorView() && Date.now() < deadline) {
@@ -319,8 +324,8 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot):
     error.value = t("development.editor.transferConflict");
     return false;
   }
-  originalLineEnding.value = snapshot.originalLineEnding;
-  const normalized = snapshot.text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const normalized = normalizeTextDocumentLineEndings(snapshot.text);
+  fileSession.updateDraft({ text: normalized, lineEnding: snapshot.originalLineEnding });
   const selection = snapshot.selection
     ? {
         anchor: Math.min(normalized.length, Math.max(0, snapshot.selection.anchor)),
@@ -331,35 +336,42 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot):
     changes: { from: 0, to: view.state.doc.length, insert: normalized },
     selection,
   });
-  if (snapshot.scrollTop != null) view.scrollDOM.scrollTop = snapshot.scrollTop;
+  if (snapshot.scrollTop != null) {
+    await nextTick();
+    const scroller = documentScrollerRef.value ?? view.scrollDOM;
+    scroller.scrollTop = snapshot.scrollTop;
+  }
   return true;
 }
 
-watch(
-  () => [
-    props.projectId,
-    props.path,
-    props.workspaceRef?.checkoutId,
-    props.workspaceRef?.expectedGeneration,
-  ] as const,
-  () => void loadPreview(),
-  { immediate: true },
-);
+watch(dirty, (value) => emit("dirtyChange", value));
+watch(fileSession.document, () => {
+  diskChanged.value = false;
+  observedDiskRevision.value = null;
+}, { flush: "sync" });
+watch(resourceKey, () => {
+  diskChanged.value = false;
+  observedDiskRevision.value = null;
+  if (!isCsv.value) void loadPreview();
+}, { immediate: true });
 watch(() => props.active, (active) => {
   if (active) void applyPendingPosition();
 });
 
 defineExpose({
+  discardChanges: () => csvEditor.value?.discardChanges(),
   saveFile,
   revealPosition,
-  refreshIfChanged,
+  revealToolFileHighlight,
+  refreshIfChanged: () => isCsv.value ? csvEditor.value?.refreshIfChanged() : refreshIfChanged(),
   exportTransferSnapshot,
   applyTransferSnapshot,
 });
 </script>
 
 <template>
-  <section class="workspace-file-preview">
+  <WorkspaceCsvEditor v-if="isCsv" ref="csvEditor" :path="path" :project-id="projectId" :workspace-ref="workspaceRef" :active="active" @dirty-change="emit('dirtyChange', $event)" @path-change="emit('pathChange', $event)" />
+  <section v-else class="workspace-file-preview">
     <div v-if="loading && !preview" class="workspace-file-preview-state">
       {{ t("development.preview.loading") }}
     </div>
@@ -370,6 +382,7 @@ defineExpose({
       :workspace-ref="preview.checkoutId ? {
         checkoutId: preview.checkoutId,
         expectedGeneration: preview.workspaceGeneration,
+        expectedMaterializationEpoch: preview.materializationEpoch,
       } : null"
       :path="preview.workspaceRelativePath || preview.path"
       :title="preview.name"
@@ -399,8 +412,62 @@ defineExpose({
       </div>
       <div v-if="error" class="workspace-file-preview-inline-error">{{ error }}</div>
       <div class="workspace-file-preview-body">
+        <div
+          v-if="isMarkdownDocument"
+          ref="documentScrollerRef"
+          class="document-scroller"
+          @scroll.passive="scheduleDocumentOutlineActiveUpdate"
+        >
+          <div class="document-workspace" :class="{ 'has-outline': documentOutlineItems.length > 0 }">
+            <aside
+              v-if="documentOutlineItems.length"
+              class="document-outline"
+              :style="{
+                marginTop: documentOutlineMarginTop,
+                maxHeight: documentOutlineMaxHeight,
+              }"
+            >
+              <nav class="document-outline-nav" :aria-label="t('knowledge.preview.outline')">
+                <button
+                  v-for="item in documentOutlineItems"
+                  :key="item.id"
+                  type="button"
+                  class="document-outline-item"
+                  :class="{ active: activeOutlineId === item.id }"
+                  :style="{ paddingInlineStart: outlineItemPadding(item) }"
+                  :title="item.text"
+                  :aria-current="activeOutlineId === item.id ? 'location' : undefined"
+                  @click="scrollToDocumentOutlineItem(item)"
+                >
+                  <span>{{ item.text }}</span>
+                </button>
+              </nav>
+            </aside>
+            <article ref="documentPageRef" class="document-page">
+              <header class="document-heading">
+                <h1 class="document-title">{{ documentTitle }}</h1>
+              </header>
+              <section ref="documentBodyRef" class="document-body">
+                <BaseMarkdownEditor
+                  ref="sourceEditor"
+                  :model-value="normalizedSourceText"
+                  :content-key="editorContentKey"
+                  :content-path="preview.path"
+                  :workspace-ref="workspaceRef"
+                  :active="active !== false"
+                  :view-mode="editorViewMode"
+                  auto-grow
+                  :min-height="360"
+                  transaction-model
+                  @document-change="onEditorDocumentChange"
+                  @shortcut-save="saveFile"
+                />
+              </section>
+            </article>
+          </div>
+        </div>
         <BaseMarkdownEditor
-          v-if="preview.kind === 'text' && preview.editable"
+          v-else-if="preview.kind === 'text' && preview.editable"
           ref="sourceEditor"
           :model-value="normalizedSourceText"
           :content-key="editorContentKey"
@@ -506,6 +573,7 @@ defineExpose({
 
 .workspace-file-preview-body {
   flex: 1;
+  min-width: 0;
   min-height: 0;
   display: flex;
 }
@@ -571,3 +639,5 @@ defineExpose({
   font-family: var(--font-mono-identifier);
 }
 </style>
+
+<style scoped src="../ui/markdown-document.css" />

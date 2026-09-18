@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const root = process.cwd();
+const tree = read("src/components/explorer/WorkspaceTree.vue");
 
 function read(path: string): string {
   return readFileSync(resolve(root, path), "utf8");
@@ -24,9 +25,9 @@ describe("development workbench session experience", () => {
     expect(workbench).toContain("sessionTreeStatusForSession");
     expect(workbench).toContain("maxSessionTreeStatus");
     expect(workbench).toContain('"is-session-pending": chatStore.pendingSelectionSessionId === session.id');
-    expect(workbench).toContain("development-session-title-scan");
-    expect(workbench).toContain("development-session-spinner");
-    expect(workbench).toContain("!isAnimatedSessionStatus(itemRuntimeStatus(item as DevelopmentTreeItem))");
+    expect(tree).toContain("development-session-title-scan");
+    expect(tree).toContain("development-session-spinner");
+    expect(tree).toContain("!rowActivity(item.treeRow)?.animated");
     expect(workbench).not.toContain("development-session-pulse");
   });
 
@@ -49,7 +50,7 @@ describe("development workbench session experience", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
     expect(workbench).toContain("resolveWorkspaceSessionSelection({");
-    expect(workbench).toContain("visibleWorkspaceSessionTargets()");
+    expect(workbench).toContain("visibleWorkspaceSessionTargets(!!item.meta.archived)");
     expect(workbench).toContain("selected: selected || multiSelected || contextSelected");
     expect(workbench).toContain("resolveWorkspaceSessionContextIds({");
     expect(workbench).toContain('t("chat.session.archiveMany", contextMenu.sessionTargets?.length ?? 0)');
@@ -81,10 +82,10 @@ describe("development workbench session experience", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
     expect(workbench).toContain("editing: sessionInlineRename.value?.sessionId === session.id");
-    expect(workbench).toContain('class="development-session-rename-input"');
-    expect(workbench).toContain('@keydown.enter.prevent="submitSessionRename"');
-    expect(workbench).toContain('@keydown.esc.prevent.stop="cancelSessionRename"');
-    expect(workbench).toContain('@blur="submitSessionRename"');
+    expect(tree).toContain('class="development-session-rename-input"');
+    expect(workbench).toContain('@rename-submit="submitSessionRename"');
+    expect(workbench).toContain('@rename-cancel="cancelSessionRename"');
+    expect(tree).toContain(`@blur="emit('renameSubmit')"`);
     expect(workbench).not.toContain("sessionDialog.mode === 'rename'");
   });
 
@@ -109,19 +110,15 @@ describe("development workbench session experience", () => {
     expect(workbench).toContain('if (item.treeRow?.expandable) toggleItem(item);');
   });
 
-  it("reveals an accessible archive action when a session row is hovered", () => {
+  it("shares the accessible archive and restore action in WorkspaceTree", () => {
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
-
-    expect(workbench).toContain('"is-session-row": kind === "session"');
-    expect(workbench).toContain('class="development-session-archive-button"');
-    expect(workbench).toContain(':aria-label="t(\'chat.session.archive\')"');
-    expect(workbench).toContain('@click.stop="archiveSessionItem(item as DevelopmentTreeItem)"');
-    expect(workbench).toContain(".workspace-tree-row-shell.is-session-row:hover .development-session-archive-button");
-    expect(workbench).toMatch(/\.development-session-archive-button\s*\{[\s\S]*?right:\s*14px;/);
+    expect(tree).toContain('class="development-session-archive-button"');
+    expect(tree).toContain("item.treeRow.session.archived ? 'chat.session.unarchive' : 'chat.session.archive'");
+    expect(workbench).toContain('@session-action="archiveSessionItem($event as DevelopmentTreeItem)"');
+    expect(tree).toContain(".workspace-tree-row-shell:hover .development-session-archive-button");
+    expect(tree).toContain("right: 20px;");
     expect(workbench).toContain("await archiveSessionEntry({");
-    expect(workbench).toContain(".workspace-tree-row-shell.is-session-row:hover .development-branch-label");
-    expect(workbench).toContain(":has(.development-session-archive-button:focus-visible) .development-branch-label");
-    expect(workbench).not.toContain(".workspace-tree-row-shell.is-session-row:focus-within .development-branch-label");
+    expect(tree).toContain(":has(.development-session-archive-button:focus-visible) .development-session-meta");
   });
 
   it("keeps the default cursor across workspace tree rows", () => {

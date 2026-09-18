@@ -1,12 +1,13 @@
 import { reactive, ref } from "vue";
 import { defineStore } from "pinia";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  acknowledgeSessionPromotions, attentionLayoutKey, pendingSessionPromotions,
+  sessionAttention, sessionPromotionOperations, updateSessionAttention,
+} from "../services/sessionAttention";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import { normalizeAppError } from "../services/errors";
-import {
-  WORKSPACE_EVENT_NAME,
-  type RoutedWorkspaceEvent,
-} from "../services/project";
+import { type RoutedWorkspaceEvent } from "../services/project";
 import { listProjectSessions } from "../services/session";
 import {
   projectCollaborationSnapshot,
@@ -27,6 +28,11 @@ import type {
   ProjectExplorerSnapshot,
 } from "../types/workbench";
 import type { KnowledgeChangedEvent } from "../types";
+import { listenWorkspaceEvent } from "../services/workspaceEventHub";
+import { useWorkspaceEventScope } from "../composables/useWorkspaceEventScope";
+import { useWorkspaceContextStore } from "./workspaceContext";
+import { viewList } from "../services/view";
+import type { WorkspaceViewReference } from "../components/view/viewWorkspaceDrag";
 
 const SYSTEM_RESOURCE_KIND = "system" as const;
 const NEW_SESSION_SYSTEM_RESOURCE_ID = "newSession";
@@ -34,6 +40,7 @@ const KNOWLEDGE_SYSTEM_RESOURCE_ID = "knowledge";
 const COLLABORATION_SYSTEM_RESOURCE_ID = "collaboration";
 const ASSETS_SYSTEM_RESOURCE_ID = "assets";
 const VIEWS_SYSTEM_RESOURCE_ID = "views";
+const AGENTS_SYSTEM_RESOURCE_ID = "agents";
 const ARCHIVED_SYSTEM_RESOURCE_ID = "archived";
 
 function emptyResources(): ProjectExplorerResources {
@@ -41,10 +48,13 @@ function emptyResources(): ProjectExplorerResources {
 }
 
 export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => {
+  const workspaceEventSignal = useWorkspaceEventScope();
   const { state: displaySettings } = useDisplaySettings();
   const snapshots = reactive<Record<string, ProjectExplorerSnapshot>>({});
   const mountListings = reactive<Record<string, ProjectExplorerMountListing>>({});
   const resources = reactive<Record<string, ProjectExplorerResources>>({});
+  const viewResources = reactive<Record<string, WorkspaceViewReference[]>>({});
+  const viewRequestEpochs = new Map<string, number>();
   const loading = reactive<Record<string, boolean>>({});
   const errors = reactive<Record<string, string>>({});
   const requestEpochs = new Map<string, number>();
@@ -60,6 +70,13 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
   let knowledgeListenerStarting = false;
   const selectedNodeKey = ref<string | null>(null);
   const expandedNodeKeys = ref<Set<string>>(new Set());
+
+  function acceptSnapshot(projectId: string, snapshot: ProjectExplorerSnapshot): ProjectExplorerSnapshot {
+    const current = snapshots[projectId];
+    if (current?.presetId === snapshot.presetId && current.revision > snapshot.revision) return current;
+    snapshots[projectId] = snapshot;
+    return snapshot;
+  }
 
   function nextEpoch(projectId: string): number {
     const epoch = (requestEpochs.get(projectId) ?? 0) + 1;
@@ -94,13 +111,20 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
   function ensureKnowledgeListener(): void {
     if (knowledgeUnlisten || knowledgeListenerStarting) return;
     knowledgeListenerStarting = true;
-    void listen<RoutedWorkspaceEvent<KnowledgeChangedEvent>>(
-      WORKSPACE_EVENT_NAME,
+    void listenWorkspaceEvent<RoutedWorkspaceEvent<KnowledgeChangedEvent>>(
+      "workspaceExplorer.ensureKnowledgeListener",
       ({ payload: event }) => {
+        if (event.eventName === "view-package-reloaded" || event.eventName === "view-tree-changed") {
+          if (snapshots[event.projectId]?.nodes.some((node) => node.resourceKind === "view")) {
+            void refreshProjectViews(event.projectId);
+          }
+          return;
+        }
         if (event.eventName !== "knowledge-changed") return;
         if (!snapshots[event.projectId] || !resources[event.projectId]) return;
         scheduleProjectKnowledgeRefresh(event.projectId);
       },
+      { signal: workspaceEventSignal },
     ).then((unlisten) => {
       knowledgeUnlisten = unlisten;
     }).catch(() => {
@@ -151,7 +175,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       if (snapshotResult.status === "rejected") throw snapshotResult.reason;
       const previous = resources[projectId] ?? emptyResources();
       const previousPresetId = snapshots[projectId]?.presetId;
-      snapshots[projectId] = snapshotResult.value;
+      acceptSnapshot(projectId, snapshotResult.value);
       if (previousPresetId && previousPresetId !== snapshotResult.value.presetId) {
         clearProjectMounts(projectId);
       }
@@ -168,6 +192,10 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
           ? collaborationResult.value
           : previous.collaboration,
       };
+      if (snapshotResult.value.nodes.some((node) => node.resourceKind === "view")) {
+        await refreshProjectViews(projectId);
+        if (!isCurrent(projectId, epoch)) return;
+      }
       if (
         knowledgeResult.status === "fulfilled"
         && isCurrentKnowledgeRequest(projectId, knowledgeEpoch)
@@ -187,6 +215,39 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     } finally {
       if (isCurrent(projectId, epoch)) loading[projectId] = false;
     }
+  }
+
+  function rememberView(reference: WorkspaceViewReference): void {
+    viewRequestEpochs.set(reference.projectId, (viewRequestEpochs.get(reference.projectId) ?? 0) + 1);
+    const current = viewResources[reference.projectId] ?? [];
+    viewResources[reference.projectId] = [
+      ...current.filter((item) => item.view.id !== reference.view.id
+        || item.workspaceRef.checkoutId !== reference.workspaceRef.checkoutId),
+      reference,
+    ];
+  }
+
+  async function refreshProjectViews(projectId: string): Promise<void> {
+    const contexts = useWorkspaceContextStore();
+    const project = contexts.projectsById[projectId];
+    if (!project) return;
+    const epoch = (viewRequestEpochs.get(projectId) ?? 0) + 1;
+    viewRequestEpochs.set(projectId, epoch);
+    const checkouts = project.checkouts.filter((checkout) => checkout.available !== false && checkout.runtime);
+    const results = await Promise.allSettled(checkouts.map(async (checkout) => {
+      const workspaceRef = {
+        checkoutId: checkout.checkoutId,
+        expectedGeneration: checkout.runtime!.workspaceGeneration,
+        expectedMaterializationEpoch: checkout.runtime!.materializationEpoch,
+      };
+      const views = await viewList(workspaceRef);
+      return views.map((view) => ({ projectId, workspaceRef, view }));
+    }));
+    if (viewRequestEpochs.get(projectId) !== epoch) return;
+    const previous = viewResources[projectId] ?? [];
+    viewResources[projectId] = results.flatMap((result, index) => result.status === "fulfilled"
+      ? result.value
+      : previous.filter((item) => item.workspaceRef.checkoutId === checkouts[index]?.checkoutId));
   }
 
   async function refreshProjectSessions(projectId: string): Promise<void> {
@@ -380,6 +441,29 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
         position,
       });
     }
+    // Include every default special node before choosing the first session's position.
+    for (const resourceId of [
+      COLLABORATION_SYSTEM_RESOURCE_ID,
+      ASSETS_SYSTEM_RESOURCE_ID,
+      VIEWS_SYSTEM_RESOURCE_ID,
+      AGENTS_SYSTEM_RESOURCE_ID,
+      ARCHIVED_SYSTEM_RESOURCE_ID,
+    ]) {
+      if (placed.has(`${SYSTEM_RESOURCE_KIND}:${resourceId}`)) continue;
+      const position = siblingsByParent.get(null)?.length ?? 0;
+      operations.push({
+        kind: "placeResource",
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId,
+        position,
+      });
+      insertPlacementNode(null, position, {
+        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${resourceId}`,
+        resourceKind: SYSTEM_RESOURCE_KIND,
+        resourceId,
+        position,
+      });
+    }
     const sessionParentNodeId = newSessionNode?.parentNodeId ?? null;
     const sessionSiblings = siblingsByParent.get(sessionParentNodeId) ?? [];
     const newSessionPosition = newSessionNode
@@ -391,6 +475,14 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     let nextSessionPosition = firstFollowingSessionPosition >= 0
       ? firstFollowingSessionPosition
       : Math.max(0, newSessionPosition + 1);
+    if (firstFollowingSessionPosition < 0) {
+      // Keep the leading special nodes and knowledge documents together.
+      while (nextSessionPosition < sessionSiblings.length) {
+        const node = sessionSiblings[nextSessionPosition]!;
+        if (node.resourceKind !== SYSTEM_RESOURCE_KIND && node.resourceKind !== "knowledge") break;
+        nextSessionPosition += 1;
+      }
+    }
     const sessionsById = new Map(
       projectResources.sessions
         .filter((session) => session.sessionType !== "folder")
@@ -454,60 +546,6 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       if (!cyclicSession) break;
       placeSession(cyclicSession.id, sessionParentNodeId);
     }
-    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${COLLABORATION_SYSTEM_RESOURCE_ID}`)) {
-      const position = siblingsByParent.get(null)?.length ?? 0;
-      operations.push({
-        kind: "placeResource",
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: COLLABORATION_SYSTEM_RESOURCE_ID,
-        position,
-      });
-      insertPlacementNode(null, position, {
-        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${COLLABORATION_SYSTEM_RESOURCE_ID}`,
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: COLLABORATION_SYSTEM_RESOURCE_ID,
-        position,
-      });
-    }
-    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${ASSETS_SYSTEM_RESOURCE_ID}`)) {
-      const position = siblingsByParent.get(null)?.length ?? 0;
-      operations.push({
-        kind: "placeResource",
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: ASSETS_SYSTEM_RESOURCE_ID,
-        position,
-      });
-      insertPlacementNode(null, position, {
-        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${ASSETS_SYSTEM_RESOURCE_ID}`,
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: ASSETS_SYSTEM_RESOURCE_ID,
-        position,
-      });
-    }
-    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${VIEWS_SYSTEM_RESOURCE_ID}`)) {
-      const position = siblingsByParent.get(null)?.length ?? 0;
-      operations.push({
-        kind: "placeResource",
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: VIEWS_SYSTEM_RESOURCE_ID,
-        position,
-      });
-      insertPlacementNode(null, position, {
-        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${VIEWS_SYSTEM_RESOURCE_ID}`,
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: VIEWS_SYSTEM_RESOURCE_ID,
-        position,
-      });
-    }
-    if (!placed.has(`${SYSTEM_RESOURCE_KIND}:${ARCHIVED_SYSTEM_RESOURCE_ID}`)) {
-      const position = siblingsByParent.get(null)?.length ?? 0;
-      operations.push({
-        kind: "placeResource",
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: ARCHIVED_SYSTEM_RESOURCE_ID,
-        position,
-      });
-    }
     if (operations.length === 0) return;
     try {
       const result = await projectExplorerApplyOperations(
@@ -515,7 +553,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
         snapshot.revision,
         operations,
       );
-      if (isCurrent(projectId, epoch)) snapshots[projectId] = result.snapshot;
+      if (isCurrent(projectId, epoch)) acceptSnapshot(projectId, result.snapshot);
     } catch (error) {
       const normalized = normalizeAppError(error);
       if (normalized.code !== "workspace.explorer_revision_conflict" || conflictRetries <= 0) {
@@ -523,12 +561,73 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       }
       const latest = await projectExplorerSnapshot(projectId);
       if (!isCurrent(projectId, epoch)) return;
-      snapshots[projectId] = latest;
+      acceptSnapshot(projectId, latest);
       await placeMissingResources(projectId, epoch, conflictRetries - 1);
     }
   }
 
   async function applyOperations(
+    projectId: string,
+    operations: ProjectExplorerOperation[],
+  ): Promise<ProjectExplorerSnapshot> {
+    const startedSequence = sessionAttention.value.sequence;
+    const result = await applyOperationsUnlocked(projectId, operations);
+    await updateSessionAttention((attention) => {
+      // Explicit layout changes win over completions already received, including
+      // a moved folder's descendants. A later run can still promote normally.
+      const moved = new Set(operations.flatMap((operation) => (
+        operation.kind === "moveNode" || operation.kind === "setItemState" ? [operation.nodeId] : []
+      )));
+      const sessions = result.nodes.filter((node) => {
+        let current: typeof node | undefined = node;
+        const visited = new Set<string>();
+        while (current && !visited.has(current.nodeId)) {
+          if (moved.has(current.nodeId)) return true;
+          visited.add(current.nodeId);
+          current = result.nodes.find((item) => item.nodeId === current!.parentNodeId);
+        }
+        return false;
+      }).flatMap((node) => node.resourceKind === "session" && node.resourceId ? [node.resourceId] : []);
+      acknowledgeSessionPromotions(attention, result, sessions.filter((id) => (attention.sessions[id]?.completionSequence ?? 0) <= startedSequence));
+    });
+    return result;
+  }
+
+  async function promoteCompletedSessions(projectId: string, canMove: () => boolean): Promise<void> {
+    await updateSessionAttention(async (attention) => {
+      if (!canMove()) return;
+      let snapshot = snapshots[projectId];
+      if (!snapshot) return;
+      const layoutKey = attentionLayoutKey(snapshot);
+      if (!attention.promoted[layoutKey]) {
+        acknowledgeSessionPromotions(attention, snapshot, pendingSessionPromotions(attention, snapshot));
+        return;
+      }
+      if (!pendingSessionPromotions(attention, snapshot).length) return;
+      snapshot = await projectExplorerSnapshot(projectId);
+      if (attentionLayoutKey(snapshot) !== layoutKey || !canMove()) return;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const pending = pendingSessionPromotions(attention, snapshot);
+        const operations = sessionPromotionOperations(snapshot, displaySettings.autoPromoteCompletedSessions
+          ? pending.filter((id) => attention.sessions[id]?.promoteCompletion) : []);
+        try {
+          if (operations.length) {
+            const result = await projectExplorerApplyOperations(projectId, snapshot.revision, operations, crypto.randomUUID());
+            snapshot = result.snapshot;
+          }
+          acknowledgeSessionPromotions(attention, snapshot, pending);
+          acceptSnapshot(projectId, snapshot);
+          return;
+        } catch (error) {
+          if (attempt || normalizeAppError(error).code !== "workspace.explorer_revision_conflict") throw error;
+          snapshot = await projectExplorerSnapshot(projectId);
+          if (!canMove() || attentionLayoutKey(snapshot) !== layoutKey) return;
+        }
+      }
+    });
+  }
+
+  async function applyOperationsUnlocked(
     projectId: string,
     operations: ProjectExplorerOperation[],
   ): Promise<ProjectExplorerSnapshot> {
@@ -543,8 +642,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
         operations,
         operationId,
       );
-      snapshots[projectId] = result.snapshot;
-      return result.snapshot;
+      return acceptSnapshot(projectId, result.snapshot);
     } catch (error) {
       const normalized = normalizeAppError(error);
       if (normalized.code !== "workspace.explorer_revision_conflict") throw error;
@@ -555,8 +653,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
         operations,
         operationId,
       );
-      snapshots[projectId] = result.snapshot;
-      return result.snapshot;
+      return acceptSnapshot(projectId, result.snapshot);
     } finally {
       pendingOperationIds.delete(operationId);
     }
@@ -564,6 +661,27 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
 
   function mountKey(projectId: string, nodeId: string): string {
     return `${projectId}:${snapshots[projectId]?.presetId ?? "unknown"}:${nodeId}`;
+  }
+
+  async function pinResources(projectId: string, placements: ProjectExplorerOperation[]): Promise<ProjectExplorerSnapshot> {
+    const snapshot = snapshots[projectId] ?? await projectExplorerSnapshot(projectId);
+    const operations: ProjectExplorerOperation[] = [];
+    const resolved = new Map<string, string>();
+    const pathKey = (path: string) => path.replace(/\\/g, "/").replace(/\/+$/, "").toLocaleLowerCase();
+    for (const placement of placements) {
+      if (placement.kind !== "placeResource" && placement.kind !== "mountPath") continue;
+      const key = placement.kind === "mountPath" ? `path:${pathKey(placement.path)}`
+        : `${placement.resourceKind}:${placement.resourceId}`;
+      if (resolved.has(key)) continue;
+      const existing = snapshot.nodes.find((node) => placement.kind === "mountPath"
+        ? !!node.sourcePath && pathKey(node.sourcePath) === pathKey(placement.path)
+        : node.resourceKind === placement.resourceKind && node.resourceId === placement.resourceId);
+      const nodeId = existing?.nodeId ?? placement.nodeId ?? `pinned:${crypto.randomUUID()}`;
+      resolved.set(key, nodeId);
+      if (!existing) operations.push({ ...placement, nodeId });
+      operations.push({ kind: "setItemState", nodeId, pinned: true });
+    }
+    return operations.length ? applyOperations(projectId, operations) : snapshot;
   }
 
   function clearProjectMounts(projectId: string): void {
@@ -598,6 +716,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     if (!isCurrent(projectId, epoch)) return snapshots[projectId] ?? snapshot;
     snapshots[projectId] = snapshot;
     clearProjectMounts(projectId);
+    if (snapshot.nodes.some((node) => node.resourceKind === "view")) await refreshProjectViews(projectId);
     await placeMissingResources(projectId, epoch);
     return snapshots[projectId];
   }
@@ -642,6 +761,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     snapshots,
     mountListings,
     resources,
+    viewResources,
     loading,
     errors,
     selectedNodeKey,
@@ -649,7 +769,11 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
     loadProject,
     refreshProjectSessions,
     refreshProjectKnowledge,
+    refreshProjectViews,
+    rememberView,
     applyOperations,
+    promoteCompletedSessions,
+    pinResources,
     loadMount,
     mountListing,
     switchPreset,

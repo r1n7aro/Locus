@@ -38,6 +38,18 @@ describe("chatMessageDraft", () => {
       "",
       "[Warning] Slow call",
       "</locus-console>",
+      "",
+      "<locus-knowledge-quotes>",
+      "Use these exact excerpts from project knowledge as quoted context.",
+      "",
+      `<locus-knowledge-quote data="${encodeURIComponent(JSON.stringify({ path: "design/combat/boss.md", name: "boss.md" }))}">`,
+      "F:/Project/Locus/knowledge/design/combat/boss.md:7-8",
+      "```markdown",
+      "- 连续交锋体验",
+      "- 不应提升内部引用 {@Assets/Quoted.prefab}",
+      "```",
+      "</locus-knowledge-quote>",
+      "</locus-knowledge-quotes>",
     ].join("\n"),
     images: [{ data: "abc", mimeType: "image/png" }],
     assetRefs: [{
@@ -45,6 +57,11 @@ describe("chatMessageDraft", () => {
       kind: "asset",
       name: "store.png",
       source: "unity",
+    }, {
+      path: "design/combat/boss.md",
+      kind: "knowledge",
+      name: "boss.md",
+      source: "manual",
     }],
     intentMeta: {
       kind: "user_intent_v1",
@@ -74,6 +91,11 @@ describe("chatMessageDraft", () => {
       source: "unity-console",
       level: "Warning",
       text: "[Warning] Slow call",
+    }]);
+    expect(draft.knowledgeQuotes).toEqual([{
+      path: "design/combat/boss.md",
+      name: "boss.md",
+      content: "F:/Project/Locus/knowledge/design/combat/boss.md:7-8\n```markdown\n- 连续交锋体验\n- 不应提升内部引用 {@Assets/Quoted.prefab}\n```",
     }]);
     expect(draft.intent.skills).toEqual([{ source: "app", dirName: "view", name: "View" }]);
   });

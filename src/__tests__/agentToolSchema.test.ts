@@ -189,6 +189,8 @@ describe("parseAgentToolDefinition", () => {
     expect(tool?.topLevelRequired).toEqual(["filePath", "content"]);
     expect(definition.description).toContain("provide Markdown body content only");
     expect(definition.description).toContain("reports every generated field");
+    expect(definition.description).toContain("raw CSV content without Markdown fences or YAML frontmatter");
+    expect(definition.description).toContain("knowledge_query");
   });
 
   it("keeps create_skill_package package-only", () => {

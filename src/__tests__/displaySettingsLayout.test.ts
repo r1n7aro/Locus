@@ -104,7 +104,7 @@ describe("display settings transcript alignment", () => {
     expect(displayPanel).toContain("@update:model-value=\"setDisplay('showAgentSelector', $event)\"");
     expect(displayPanel).toContain("const topNavigationToggles = [");
     expect(displayPanel).toContain('{ key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" }');
-    expect(displayPanel).toContain('{ key: "showAgentTab", labelKey: "settings.display.showAgentTab" }');
+    expect(displayPanel).toContain(':model-value="display.showAgentTab"');
     expect(displayPanel).toContain(":model-value=\"display[item.key]\"");
     expect(displayPanel).toContain("@update:model-value=\"setDisplay(item.key, $event)\"");
     expect(displayPanel).toContain("const knowledgeFolderToggles:");
@@ -120,7 +120,7 @@ describe("display settings transcript alignment", () => {
     expect(topTabsSection).not.toContain('{ id: "views"');
     expect(topTabsSection).toContain('{ id: "settings", labelKey: "app.tab.settings", visible: true }');
     expect(topTabsSection).toContain('{ id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab }');
-    expect(topTabsSection).toContain('{ id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab }');
+    expect(topTabsSection).not.toContain('id: "agent"');
     expect(topTabsSection).not.toContain('id: "knowledge"');
     expect(topTabsSection).not.toContain('id: "collab"');
     expect(topTabsSection).not.toContain('id: "asset"');

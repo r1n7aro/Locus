@@ -1,6 +1,9 @@
+import { resetWorkspaceEventHubForTests } from "../services/workspaceEventHub";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useWorkspaceExplorerStore } from "../stores/workspaceExplorer";
+import { useWorkspaceContextStore } from "../stores/workspaceContext";
+import type { ProjectContextDescriptor, WorkspaceCheckoutDescriptor } from "../services/project";
 import type {
   ProjectExplorerMutationResult,
   ProjectExplorerOperation,
@@ -20,6 +23,11 @@ const explorerMocks = vi.hoisted(() => ({
 
 const sessionMocks = vi.hoisted(() => ({
   listProjectSessions: vi.fn(),
+}));
+const viewMocks = vi.hoisted(() => ({ viewList: vi.fn() }));
+vi.mock("../services/view", async (original) => ({
+  ...await original<typeof import("../services/view")>(),
+  viewList: viewMocks.viewList,
 }));
 
 const eventListeners = new Map<string, (event: { payload: unknown }) => void>();
@@ -51,8 +59,10 @@ function snapshot(revision = 0): ProjectExplorerSnapshot {
 
 describe("workspace explorer store", () => {
   beforeEach(() => {
+    resetWorkspaceEventHubForTests();
     setActivePinia(createPinia());
     vi.clearAllMocks();
+    viewMocks.viewList.mockResolvedValue([]);
     eventListeners.clear();
     eventMocks.listen.mockImplementation((
       eventName: string,
@@ -96,7 +106,29 @@ describe("workspace explorer store", () => {
     }));
   });
 
-  it("anchors newly discovered sessions directly below New Session in an empty layout", async () => {
+  it("restores placed view names and icons from their checkout catalog", async () => {
+    const checkout = {
+      checkoutId: "checkout-a", projectId: "project-a", root: "F:/Project",
+      runtime: { workspaceGeneration: 3, materializationEpoch: 7 },
+    } as WorkspaceCheckoutDescriptor;
+    useWorkspaceContextStore().projectsById["project-a"] = {
+      projectId: "project-a", checkouts: [checkout],
+    } as ProjectContextDescriptor;
+    const stored = snapshot();
+    stored.nodes.push({ nodeId: "view-node", projectId: "project-a", nodeKind: "resource", resourceKind: "view", resourceId: "combat", hidden: false, position: 5 });
+    explorerMocks.projectExplorerSnapshot.mockResolvedValue(stored);
+    viewMocks.viewList.mockResolvedValue([{ id: "combat", name: "Combat View", icon: "eye" }]);
+    const store = useWorkspaceExplorerStore();
+    await store.loadProject("project-a");
+    expect(viewMocks.viewList).toHaveBeenCalledWith({ checkoutId: "checkout-a", expectedGeneration: 3, expectedMaterializationEpoch: 7 });
+    expect(store.viewResources["project-a"]).toEqual([{
+      projectId: "project-a",
+      workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 3, expectedMaterializationEpoch: 7 },
+      view: { id: "combat", name: "Combat View", icon: "eye" },
+    }]);
+  });
+
+  it("places newly discovered sessions after all default special nodes in an empty layout", async () => {
     const store = useWorkspaceExplorerStore();
     await store.loadProject("project-a");
 
@@ -123,13 +155,16 @@ describe("workspace explorer store", () => {
       ),
     );
     expect(sessionPlacement?.parentNodeId).toBeUndefined();
-    expect(sessionPlacement?.position).toBe(1);
+    expect(sessionPlacement?.position).toBe(7);
     expect(operations).toContainEqual(expect.objectContaining({
       kind: "placeResource",
       resourceKind: "system",
       resourceId: "collaboration",
-      position: 3,
+      position: 2,
     }));
+    expect(operations.slice(0, operations.indexOf(sessionPlacement!)).map((operation) => (
+      operation.kind === "placeResource" ? operation.resourceId : operation.kind
+    ))).toEqual(["newSession", "knowledge", "collaboration", "assets", "views", "agents", "archived"]);
   });
 
   it("keeps session placement available when the knowledge catalog fails to load", async () => {
@@ -262,7 +297,7 @@ describe("workspace explorer store", () => {
     ]);
   });
 
-  it("places a newly created session directly below New Session when none follows", async () => {
+  it("places a newly created session after consecutive special nodes when none follows", async () => {
     const store = useWorkspaceExplorerStore();
     await store.loadProject("project-a");
     store.snapshots["project-a"] = {
@@ -313,8 +348,70 @@ describe("workspace explorer store", () => {
       resourceKind: "session",
       resourceId: "session-b",
       parentNodeId: undefined,
-      position: 1,
+      position: 7,
     }]);
+  });
+
+  it.each([
+    { boundary: "end", existingSession: false, parentNodeId: undefined },
+    { boundary: "folder", existingSession: false, parentNodeId: undefined },
+    { boundary: "file", existingSession: false, parentNodeId: undefined },
+    { boundary: "view", existingSession: false, parentNodeId: undefined },
+    { boundary: "folder", existingSession: true, parentNodeId: undefined },
+    { boundary: "end", existingSession: false, parentNodeId: "folder:chat" },
+  ])("groups new sessions after knowledge documents: $boundary, existing=$existingSession, parent=$parentNodeId", async ({
+    boundary, existingSession, parentNodeId,
+  }) => {
+    const stored = snapshot();
+    const resources = [
+      ["system", "newSession"],
+      ["system", "archived"],
+      ["system", "knowledge"],
+      ["knowledge", "plan-a"],
+      ["knowledge", "design-a"],
+      ...(boundary === "end" ? [] : [[boundary, "boundary"]]),
+      ...(existingSession ? [["session", "existing"]] : []),
+      ["system", "collaboration"],
+      ["system", "assets"],
+      ["system", "views"],
+      ["system", "agents"],
+    ];
+    stored.nodes = resources.map<ProjectExplorerSnapshot["nodes"][number]>(([resourceKind, resourceId], index) => ({
+      nodeId: `${resourceKind}:${resourceId}`,
+      projectId: "project-a",
+      nodeKind: resourceKind === "folder" ? "folder" : "resource",
+      resourceKind: resourceKind === "folder" ? undefined : resourceKind,
+      resourceId: resourceKind === "folder" ? undefined : resourceId,
+      folderName: resourceKind === "folder" ? "Custom folder" : undefined,
+      sourcePath: resourceKind === "file" ? "F:/Project/notes.md" : undefined,
+      parentNodeId,
+      position: index * 10,
+      hidden: false,
+    })).reverse();
+    if (parentNodeId) {
+      stored.nodes.push({
+        nodeId: parentNodeId, projectId: "project-a", nodeKind: "folder",
+        folderName: "Chat", position: 0, hidden: false,
+      });
+    }
+    explorerMocks.projectExplorerSnapshot.mockResolvedValueOnce(stored);
+    sessionMocks.listProjectSessions.mockResolvedValueOnce([
+      ...(existingSession ? ["existing"] : []), "new-a", "new-b",
+    ].map((id) => ({
+      id, title: id, sessionType: "chat", updatedAt: 1,
+      projectId: "project-a", defaultCheckoutId: "checkout-a",
+    })));
+    const store = useWorkspaceExplorerStore();
+
+    await store.loadProject("project-a");
+
+    const position = boundary === "end" ? resources.length : existingSession ? 6 : 5;
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual(
+      ["new-a", "new-b"].map((resourceId, index) => ({
+        kind: "placeResource", nodeId: expect.any(String), resourceKind: "session",
+        resourceId, parentNodeId, position: position + index,
+      })),
+    );
   });
 
   it("keeps a newly created session beside a nested New Session node", async () => {
@@ -560,5 +657,49 @@ describe("workspace explorer store", () => {
       .toEqual([1, 2]);
     expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[3])
       .toBe(explorerMocks.projectExplorerApplyOperations.mock.calls[1]?.[3]);
+  });
+
+  it("pins existing files and sessions without moving their original placement", async () => {
+    const store = useWorkspaceExplorerStore();
+    store.snapshots["project-a"] = { ...snapshot(4), nodes: [
+      { nodeId: "file", projectId: "project-a", nodeKind: "resource", sourcePath: "F:/Project/notes.md", parentNodeId: "folder", position: 3, hidden: false },
+      { nodeId: "session", projectId: "project-a", nodeKind: "resource", resourceKind: "session", resourceId: "session-a", parentNodeId: "folder", position: 4, hidden: false },
+    ] };
+    await store.pinResources("project-a", [
+      { kind: "mountPath", path: "f:\\Project\\notes.md", position: 0 },
+      { kind: "placeResource", resourceKind: "session", resourceId: "session-a", position: 0 },
+    ]);
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([
+      { kind: "setItemState", nodeId: "file", pinned: true },
+      { kind: "setItemState", nodeId: "session", pinned: true },
+    ]);
+  });
+
+  it("does not overwrite a pin with an earlier mutation response arriving late", async () => {
+    const store = useWorkspaceExplorerStore();
+    store.snapshots["project-a"] = snapshot(1);
+    let finishEarlier!: (result: ProjectExplorerMutationResult) => void;
+    explorerMocks.projectExplorerApplyOperations.mockImplementationOnce(() => new Promise((resolve) => { finishEarlier = resolve; }));
+    const earlier = store.applyOperations("project-a", [{ kind: "renameFolder", nodeId: "folder", name: "Tasks" }]);
+    const pinned = { ...snapshot(3), itemStates: [{ nodeId: "session", pinned: true, highlighted: true }] };
+    explorerMocks.projectExplorerApplyOperations.mockResolvedValueOnce({ operationId: "pin", snapshot: pinned });
+    await store.applyOperations("project-a", [{ kind: "setItemState", nodeId: "session", pinned: true }]);
+    finishEarlier({ operationId: "earlier", snapshot: snapshot(2) });
+    await earlier;
+    expect(store.snapshots["project-a"]).toEqual(pinned);
+  });
+
+  it("creates and pins a new dropped file in one atomic batch and deduplicates it", async () => {
+    const store = useWorkspaceExplorerStore();
+    store.snapshots["project-a"] = snapshot(2);
+    await store.pinResources("project-a", [
+      { kind: "mountPath", path: "F:/Project/new.md", position: 0 },
+      { kind: "mountPath", path: "F:/Project/new.md", position: 1 },
+    ]);
+    const operations = explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2] as ProjectExplorerOperation[];
+    expect(operations).toHaveLength(2);
+    expect(operations[0]).toMatchObject({ kind: "mountPath", path: "F:/Project/new.md", nodeId: expect.any(String) });
+    expect(operations[1]).toEqual({ kind: "setItemState", nodeId: "nodeId" in operations[0]! ? operations[0].nodeId : "", pinned: true });
+    expect(explorerMocks.projectExplorerApplyOperations).toHaveBeenCalledTimes(1);
   });
 });

@@ -46,6 +46,7 @@ export function useWorkspacePageBootstrap() {
     await workspaceContextStore.focusWorkspaceRef({
       checkoutId: payload.checkoutId,
       expectedGeneration: payload.workspaceGeneration,
+      expectedMaterializationEpoch: payload.materializationEpoch,
     });
 
     const focusedRef = workspaceContextStore.focusedWorkspaceRef;

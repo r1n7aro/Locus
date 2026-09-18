@@ -3,7 +3,9 @@
 import { createApp, h, nextTick, ref } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProjectExplorerFilePreview } from "../types/workbench";
+import type { WorkbenchEditorTransferSnapshot } from "../types/workbench";
 import WorkspaceFilePreview from "../components/workbench/WorkspaceFilePreview.vue";
+import { createToolFilePreviewEditHighlight, type ToolFilePreviewHighlight } from "../services/toolFilePreviewWindow";
 
 const workspaceExplorerMocks = vi.hoisted(() => ({
   preview: vi.fn(),
@@ -46,7 +48,15 @@ vi.mock("../components/ui/BaseMarkdownEditor.vue", async () => {
       emits: ["documentChange", "shortcutSave"],
       setup(props, { emit, expose }) {
         const editorView = {
-          state: { doc: Text.of(["line one", "line two"]) },
+          state: {
+            doc: Text.of(props.contentPath.endsWith(".md")
+              ? props.modelValue.split("\n")
+              : ["line one", "line two"]),
+            selection: { main: { anchor: 0, head: 0 } },
+          },
+          documentTop: 120,
+          lineBlockAt: (position: number) => ({ top: position * 2 }),
+          scrollDOM: document.createElement("div"),
           dispatch: workspaceExplorerMocks.editorDispatch,
           focus: workspaceExplorerMocks.editorFocus,
         };
@@ -168,9 +178,13 @@ describe("workspace file editor", () => {
     const editor = host.querySelector<HTMLElement>(".workspace-file-editor-test-change");
     expect(editor?.dataset.contentPath).toBe("F:\\Game\\Docs\\combat.md");
     expect(editor?.dataset.viewMode).toBe("rendered");
+    expect(host.querySelector(".document-page .document-title")?.textContent).toBe("combat");
+    expect(host.querySelector(".document-outline-item")?.textContent).toBe("Combat rules");
     expect(host.querySelector(".document-properties")).toBeNull();
     editor?.click();
     await nextTick();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(host.querySelector(".document-outline-item")?.textContent).toBe("Edited");
     expect(dirtyChanges[dirtyChanges.length - 1]).toBe(true);
     await expect(editorRef.value?.saveFile()).resolves.toBe(true);
     expect(workspaceExplorerMocks.write).toHaveBeenCalledWith(
@@ -203,6 +217,44 @@ describe("workspace file editor", () => {
     expect(
       host.querySelector<HTMLElement>(".workspace-file-editor-test-change")?.dataset.viewMode,
     ).toBe("native");
+    expect(host.querySelector(".document-page")).toBeNull();
+    app.unmount();
+  });
+
+  it("navigates Markdown headings without editing and transfers the outer document scroll position", async () => {
+    const markdown = "# Overview\n\n## Details\n\nBody\n";
+    workspaceExplorerMocks.preview.mockResolvedValue(markdownPreview(markdown, "markdown-scroll"));
+    const editorRef = ref<{
+      exportTransferSnapshot(): WorkbenchEditorTransferSnapshot;
+      applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot): Promise<boolean>;
+    } | null>(null);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup: () => () => h(WorkspaceFilePreview, {
+        ref: editorRef,
+        projectId: "project-a",
+        path: "F:\\Game\\Docs\\combat.md",
+      }),
+    });
+    app.mount(host);
+    await flush();
+
+    const headings = host.querySelectorAll<HTMLButtonElement>(".document-outline-item");
+    headings[1]?.click();
+    const navigation = workspaceExplorerMocks.editorDispatch.mock.lastCall?.[0];
+    expect(navigation?.effects.value.range.head).toBe(markdown.indexOf("## Details"));
+    expect(navigation?.selection).toBeUndefined();
+    expect(navigation?.changes).toBeUndefined();
+    expect(workspaceExplorerMocks.write).not.toHaveBeenCalled();
+
+    const scroller = host.querySelector<HTMLElement>(".document-scroller")!;
+    scroller.scrollTop = 420;
+    const snapshot = editorRef.value!.exportTransferSnapshot();
+    expect(snapshot).toMatchObject({ text: markdown, scrollTop: 420 });
+    scroller.scrollTop = 0;
+    await expect(editorRef.value!.applyTransferSnapshot(snapshot)).resolves.toBe(true);
+    expect(scroller.scrollTop).toBe(420);
     app.unmount();
   });
 
@@ -273,6 +325,42 @@ describe("workspace file editor", () => {
       selection: { anchor: 11 },
     }));
     expect(workspaceExplorerMocks.editorFocus).toHaveBeenCalledOnce();
+    app.unmount();
+  });
+
+  it("locates an edited block after the file finishes loading", async () => {
+    let finishLoad!: (preview: ProjectExplorerFilePreview) => void;
+    workspaceExplorerMocks.workspacePreview.mockReturnValue(new Promise((resolve) => {
+      finishLoad = resolve;
+    }));
+    const editorRef = ref<{
+      revealToolFileHighlight(highlight?: ToolFilePreviewHighlight): Promise<boolean>;
+    } | null>(null);
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp({
+      setup: () => () => h(WorkspaceFilePreview, {
+        ref: editorRef,
+        path: "Assets/Scripts/Player.cs",
+        workspaceRef: { checkoutId: "checkout-a", expectedGeneration: 7 },
+      }),
+    });
+    app.mount(host);
+    const highlight = createToolFilePreviewEditHighlight({ oldText: "old", newText: "line two", startLine: 1 });
+    await expect(editorRef.value?.revealToolFileHighlight({
+      mode: "edit", targets: [highlight!],
+    })).resolves.toBe(false);
+    finishLoad(textPreview("line one\nline two", "tool-file-hash"));
+    await flush();
+    await flush();
+    expect(workspaceExplorerMocks.editorDispatch).toHaveBeenLastCalledWith(expect.objectContaining({
+      selection: { anchor: 9 },
+    }));
+
+    await editorRef.value?.revealToolFileHighlight({ mode: "all" });
+    expect(workspaceExplorerMocks.editorDispatch).toHaveBeenLastCalledWith(expect.objectContaining({
+      selection: { anchor: 0 },
+    }));
     app.unmount();
   });
 

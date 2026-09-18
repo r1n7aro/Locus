@@ -5,10 +5,22 @@ import { describe, expect, it } from "vitest";
 const read = (path: string) => readFileSync(resolve(process.cwd(), path), "utf8");
 
 describe("development workbench editor groups", () => {
-  it("renders an unbounded recursive split tree with accessible separators", () => {
-    const splitHost = read("src/components/workbench/WorkbenchSplitHost.vue");
+  it("restores pane focus through the persisted editor assignment", () => {
+    const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
+    const start = workbench.indexOf("async function restoreWorkbenchPaneContexts(");
+    const end = workbench.indexOf("\nfunction isExpanded(", start);
+    const restore = workbench.slice(start, end);
+    expect(restore).toContain("workspaceRefForEditorBinding(");
+    expect(restore).toContain("editor.checkoutBinding");
+    expect(restore).toContain("focusWorkspaceRefInPane(");
+    expect(restore).not.toContain("focusCheckoutInPane(");
+    expect(restore).toContain('availability: "unavailable"');
+  });
 
-    expect(splitHost.match(/<WorkbenchSplitHost/g)?.length).toBeGreaterThanOrEqual(2);
+  it("renders an unbounded recursive split tree with accessible separators", () => {
+    const splitHost = read("src/components/workbench/WorkbenchSplitLayout.vue");
+
+    expect(splitHost.match(/<WorkbenchSplitLayout/g)?.length).toBeGreaterThanOrEqual(2);
     expect(splitHost).toContain("node.first");
     expect(splitHost).toContain("node.second");
     expect(splitHost).toContain('role="separator"');
@@ -21,7 +33,7 @@ describe("development workbench editor groups", () => {
   });
 
   it("shows one contextual half-group preview and reserves group joins for the tab strip", () => {
-    const splitHost = read("src/components/workbench/WorkbenchSplitHost.vue");
+    const splitHost = read("src/components/workbench/WorkbenchSplitLayout.vue");
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
 
     expect(splitHost).toContain("activeSplitDropDirection");
@@ -70,7 +82,7 @@ describe("development workbench editor groups", () => {
     expect(chatView).toContain(':reference-drop-available="referenceDropAvailable"');
     expect(chatView).toContain(':reference-drop-active="referenceDropActive"');
     expect(chatView).toMatch(/\.input-area\.is-reference-drop-available\s*\{[\s\S]*z-index:\s*41;/);
-    expect(read("src/components/workbench/WorkbenchSplitHost.vue")).toMatch(
+    expect(read("src/components/workbench/WorkbenchSplitLayout.vue")).toMatch(
       /\.workbench-editor-split-preview-layer\s*\{[\s\S]*z-index:\s*40;/,
     );
     expect(richInput).toContain(':drop-available="localFileDragActive || referenceDropAvailable || referenceDropActive"');
@@ -106,7 +118,7 @@ describe("development workbench editor groups", () => {
     expect(store).toContain("showSingleTab && group.tabs.length === 1");
     expect(workbench).toContain(":show-single-tab=\"props.auxiliary || workbenchWindow.layout.kind === 'split'\"");
     expect(workbench).toContain(":show-single-tabs=\"props.auxiliary || workbenchWindow.layout.kind === 'split'\"");
-    expect(read("src/components/workbench/WorkbenchSplitHost.vue")).toContain(
+    expect(read("src/components/workbench/WorkbenchSplitLayout.vue")).toContain(
       "props.showSingleTabs && count === 1",
     );
     expect(store).toContain("candidate.preview && !candidate.pinned && !candidate.dirty");
@@ -324,7 +336,7 @@ describe("development workbench editor groups", () => {
     expect(workbench).toContain('kind: "newSession" as const');
     expect(workbench).toContain('title: t("chat.session.newSession")');
     expect(workbench).toContain('@new-session-requested="handleWorkbenchNewSessionRequested(paneId, $event)"');
-    expect(workbench).toContain(':shortcut-active="focused && group.activeEditorId === editor.editorId"');
+    expect(workbench).toContain(':shortcut-active="focused && interactive"');
     expect(workbench).toContain(':new-chat-shortcut-action="newSessionShortcutAction(group, editor)"');
     expect(chatView).toContain("if (props.shortcutActive === false) return;");
     expect(chatView).toContain('handleNewChatRequest("shortcut")');

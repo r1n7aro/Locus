@@ -17,6 +17,24 @@ pub const PROJECT_EXPLORER_CHANGED_EVENT: &str = "project-explorer-changed";
 
 const MAX_MOUNT_ENTRIES: usize = 5_000;
 const MAX_TEXT_PREVIEW_BYTES: u64 = 1024 * 1024;
+const MAX_CSV_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+use crate::csv_document::CSV_FILE_WRITE_LOCK;
+
+#[path = "csv_document.rs"]
+mod csv_document;
+pub use csv_document::*;
+
+#[path = "explorer_file_actions.rs"]
+mod explorer_file_actions;
+pub use explorer_file_actions::*;
+
+fn text_preview_limit(path: &Path) -> u64 {
+    if path.extension().and_then(|value| value.to_str()).unwrap_or("").eq_ignore_ascii_case("csv") {
+        MAX_CSV_DOCUMENT_BYTES
+    } else {
+        MAX_TEXT_PREVIEW_BYTES
+    }
+}
 const MAX_MEDIA_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,6 +98,8 @@ pub struct ProjectExplorerFilePreview {
     pub checkout_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub materialization_epoch: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_relative_path: Option<String>,
     pub revision: ProjectExplorerFileRevision,
@@ -642,6 +662,7 @@ pub(super) fn is_text_extension(extension: &str) -> bool {
             | "conf"
             | "log"
             | "csv"
+            | "view"
             | "tsv"
             | "asmdef"
             | "asmref"
@@ -659,7 +680,7 @@ fn unity_workspace_binding(
     registry: &ProjectRegistry,
     project_id: &ProjectId,
     canonical: &Path,
-) -> Option<(String, u64, String)> {
+) -> Option<(String, u64, u64, String)> {
     let project = registry.project(project_id)?;
     let mut runtimes = project.runtimes();
     runtimes.sort_by(|left, right| left.checkout_id().cmp(right.checkout_id()));
@@ -675,6 +696,7 @@ fn unity_workspace_binding(
             return Some((
                 runtime.checkout_id().to_string(),
                 runtime.generation(),
+                runtime.materialization_epoch(),
                 relative,
             ));
         }
@@ -706,7 +728,7 @@ fn build_file_preview(
         .unwrap_or("")
         .to_ascii_lowercase();
     if !is_text_extension(&extension) {
-        if let Some((checkout_id, workspace_generation, relative_path)) =
+        if let Some((checkout_id, workspace_generation, materialization_epoch, relative_path)) =
             unity_workspace_binding(registry, project_id, canonical)
         {
             return Ok(ProjectExplorerFilePreview {
@@ -724,6 +746,7 @@ fn build_file_preview(
                 editable: false,
                 checkout_id: Some(checkout_id),
                 workspace_generation: Some(workspace_generation),
+                materialization_epoch: Some(materialization_epoch),
                 workspace_relative_path: Some(relative_path),
                 revision: revision.clone(),
             });
@@ -767,6 +790,7 @@ fn build_file_preview(
                 editable: false,
                 checkout_id: None,
                 workspace_generation: None,
+                materialization_epoch: None,
                 workspace_relative_path: None,
                 revision: revision.clone(),
             });
@@ -781,8 +805,9 @@ fn build_file_preview(
         .detail(error.to_string())
     })?;
     let mut bytes = Vec::new();
+    let preview_limit = text_preview_limit(canonical);
     file.by_ref()
-        .take(MAX_TEXT_PREVIEW_BYTES + 1)
+        .take(preview_limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| {
             AppError::new(
@@ -791,9 +816,9 @@ fn build_file_preview(
             )
             .detail(error.to_string())
         })?;
-    let truncated = bytes.len() as u64 > MAX_TEXT_PREVIEW_BYTES;
+    let truncated = bytes.len() as u64 > preview_limit;
     if truncated {
-        bytes.truncate(MAX_TEXT_PREVIEW_BYTES as usize);
+        bytes.truncate(preview_limit as usize);
     }
     let content_hash = if truncated {
         None
@@ -824,6 +849,7 @@ fn build_file_preview(
                 checkout_id: None,
                 workspace_generation: None,
                 workspace_relative_path: None,
+                materialization_epoch: None,
                 revision: revision.clone(),
             });
         }
@@ -843,6 +869,7 @@ fn build_file_preview(
         editable: false,
         checkout_id: None,
         workspace_generation: None,
+        materialization_epoch: None,
         workspace_relative_path: None,
         revision,
     })
@@ -1005,7 +1032,13 @@ fn validate_text_file_write(
     content: &str,
     expected_content_hash: &str,
 ) -> Result<(), TextFileWriteValidationError> {
-    if current.len() as u64 > MAX_TEXT_PREVIEW_BYTES
+    validate_text_file_write_with_limit(current, content, expected_content_hash, MAX_TEXT_PREVIEW_BYTES)
+}
+
+fn validate_text_file_write_with_limit(
+    current: &[u8], content: &str, expected_content_hash: &str, limit: u64,
+) -> Result<(), TextFileWriteValidationError> {
+    if current.len() as u64 > limit
         || current.contains(&0)
         || std::str::from_utf8(current).is_err()
     {
@@ -1016,7 +1049,7 @@ fn validate_text_file_write(
     if expected_content_hash.is_empty() || expected_content_hash != current_hash {
         return Err(TextFileWriteValidationError::CurrentFileChanged);
     }
-    if content.len() as u64 > MAX_TEXT_PREVIEW_BYTES || content.as_bytes().contains(&0) {
+    if content.len() as u64 > limit || content.as_bytes().contains(&0) {
         return Err(TextFileWriteValidationError::EditedFileTooLarge);
     }
     Ok(())
@@ -1030,6 +1063,10 @@ fn write_text_file(
     expected_content_hash: &str,
     operation: &'static str,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
+    let csv_path = canonical.to_string_lossy().to_ascii_lowercase();
+    let _csv_guard = if csv_path.ends_with(".csv") || csv_path.ends_with(".csv.view") {
+        Some(CSV_FILE_WRITE_LOCK.lock().map_err(|error| AppError::new("csv.write_lock", error.to_string()))?)
+    } else { None };
     let extension = canonical
         .extension()
         .and_then(|extension| extension.to_str())
@@ -1055,7 +1092,7 @@ fn write_text_file(
         .operation(operation)
     })?;
     if let Err(validation_error) =
-        validate_text_file_write(&current, content, expected_content_hash)
+        validate_text_file_write_with_limit(&current, content, expected_content_hash, text_preview_limit(canonical))
     {
         let (code, message) = match validation_error {
             TextFileWriteValidationError::CurrentFileNotEditable => (

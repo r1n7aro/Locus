@@ -1,3 +1,4 @@
+import { materializationEpochFromParams, appendMaterializationEpoch } from "./project";
 import type { FileDiffPayload, FileDiffRequest } from "../types";
 import type { WorkspaceRef } from "./project";
 import { buildSubWindowUrl, openSubWindow } from "./subWindow";
@@ -58,7 +59,7 @@ export function getChatDiffReviewWindowPayload(
     request: parseRequestParam(params.get("request")),
     diffKey: trimOrEmpty(params.get("diffKey")),
     workspaceRef: checkoutId && Number.isSafeInteger(expectedGeneration)
-      ? { checkoutId, expectedGeneration }
+      ? { checkoutId, expectedGeneration , expectedMaterializationEpoch: materializationEpochFromParams(params) }
       : null,
   };
 }
@@ -82,6 +83,7 @@ export function buildChatDiffReviewWindowQuery(
   ) {
     params.set("checkoutId", payload.workspaceRef.checkoutId.trim());
     params.set("workspaceGeneration", String(payload.workspaceRef.expectedGeneration));
+  appendMaterializationEpoch(params, payload.workspaceRef.expectedMaterializationEpoch);
   }
   return params.toString();
 }

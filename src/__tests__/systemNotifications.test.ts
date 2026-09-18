@@ -23,7 +23,9 @@ const translations = {
 
 function createDisplayState(): DisplaySettings {
   return {
-  workspaceDisplayMode: "single",
+    workspaceDisplayMode: "single",
+    showSessionUnreadIndicators: true,
+    autoPromoteCompletedSessions: true,
   workspaceSectionVisibility: {
     knowledge: true,
     collab: true,
@@ -44,7 +46,7 @@ function createDisplayState(): DisplaySettings {
     showPluginsTab: true,
     showAgentTab: true,
     showAgentSelector: false,
-    showCollabSidebar: false,
+    worktreeEnabled: false,
     todoAutoOpen: true,
     changesAutoOpen: true,
     changesAutoClose: true,
@@ -61,7 +63,6 @@ function createDisplayState(): DisplaySettings {
     compactToolCalls: true,
     hideThinkingBlocks: true,
     showViewsInSessionPanel: false,
-    showViewLogBar: false,
     mergeGitTreeStatusIcon: true,
     hideGitCommandSuggestions: false,
     systemNotificationsEnabled: true,

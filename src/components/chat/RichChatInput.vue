@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, useSlots, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, useSlots, watch } from "vue";
 import type { ComponentPublicInstance } from "vue";
 import { FileText, Layers, LoaderCircle, X } from "lucide";
 import { t } from "../../i18n";
@@ -46,6 +46,7 @@ import { buildProjectKnowledgeRefPath, extractChatAssetRefs } from "../../compos
 import {
   readUserMessageDraftFromClipboardData,
   type UserMessageDraft,
+  type UserMessageDraftKnowledgeQuote,
 } from "../../composables/chatMessageDraft";
 import {
   readSharedComposerDraft,
@@ -54,6 +55,7 @@ import {
 } from "../../composables/chatComposerDraftMemory";
 import { rankSearchResults } from "../../composables/searchMatcher";
 import { useCommandRegistry } from "../../composables/useCommandRegistry";
+import { useGarbageCollection } from "../../composables/useGarbageCollection";
 import { normalizeAppError } from "../../services/errors";
 import {
   shouldSelectPopupOnEnter,
@@ -86,18 +88,14 @@ import LucideIcon from "../icons/LucideIcon.vue";
 import MentionPopup from "./MentionPopup.vue";
 import ChatComposer from "./ChatComposer.vue";
 import ChatInputShell from "./ChatInputShell.vue";
-import { mapWorkspaceFolderMentionResults } from "./mentionFolderSearch";
-import { rankMentionSearchResults } from "./mentionSearchRanking";
-
-interface MentionSearchResult {
-  relPath: string;
-  name: string;
-  parentPath: string;
-  isDir: boolean;
-  matchScore: number;
-  meta?: string;
-  entryKind: "asset" | "knowledge" | "sceneObject";
-}
+import {
+  workbenchComposerFileAttachment,
+  type WorkbenchComposerFileAttachment,
+} from "../workbench/workbenchComposerDrop";
+import { mapWorkspaceMentionResults } from "./mentionWorkspaceSearch";
+import { mentionResultKey, rankMentionSearchResults } from "./mentionSearchRanking";
+import { createMentionSearchQueue } from "./mentionSearchQueue";
+import { useMentionWorkspaceCandidates, type MentionSearchResult } from "./useMentionWorkspaceCandidates";
 
 interface MentionDisplayEntry {
   relPath: string;
@@ -108,6 +106,7 @@ interface MentionDisplayEntry {
   canNavigate?: boolean;
   isCurrentPath?: boolean;
   entryKind?: "asset" | "knowledge" | "sceneObject";
+  localFile?: LocusFileDropRef;
 }
 
 const PASTE_THRESHOLD = 500;
@@ -148,6 +147,10 @@ interface ConsoleTextInput {
 }
 
 interface LocalFileAttachment extends LocusFileDropRef {
+  id: string;
+}
+
+interface KnowledgeQuoteAttachment extends UserMessageDraftKnowledgeQuote {
   id: string;
 }
 
@@ -235,6 +238,7 @@ function captureWorkspaceRef(): WorkspaceRef | null {
     ? {
         checkoutId: workspaceRef.checkoutId,
         expectedGeneration: workspaceRef.expectedGeneration ?? undefined,
+        expectedMaterializationEpoch: workspaceRef.expectedMaterializationEpoch ?? undefined,
       }
     : null;
 }
@@ -242,13 +246,15 @@ function captureWorkspaceRef(): WorkspaceRef | null {
 function isCurrentWorkspaceRef(workspaceRef: WorkspaceRef | null) {
   const current = props.workspaceRef;
   return (workspaceRef?.checkoutId ?? null) === (current?.checkoutId ?? null)
-    && (workspaceRef?.expectedGeneration ?? null) === (current?.expectedGeneration ?? null);
+    && (workspaceRef?.expectedGeneration ?? null) === (current?.expectedGeneration ?? null)
+    && (workspaceRef?.expectedMaterializationEpoch ?? null) === (current?.expectedMaterializationEpoch ?? null);
 }
 
 function payloadTargetsCurrentWorkspace(workspaceRef?: WorkspaceRef | null) {
   if (!workspaceRef) return true;
   const current = props.workspaceRef;
   if (!current || workspaceRef.checkoutId !== current.checkoutId) return false;
+  if ((workspaceRef.expectedMaterializationEpoch ?? null) !== (current.expectedMaterializationEpoch ?? null)) return false;
   return workspaceRef.expectedGeneration == null
     || workspaceRef.expectedGeneration === current.expectedGeneration;
 }
@@ -256,7 +262,8 @@ function payloadTargetsCurrentWorkspace(workspaceRef?: WorkspaceRef | null) {
 function payloadMatchesCurrentWorkspace(workspaceRef?: WorkspaceRef | null) {
   const current = props.workspaceRef;
   if (!workspaceRef || !current || workspaceRef.checkoutId !== current.checkoutId) return false;
-  return (workspaceRef.expectedGeneration ?? null) === (current.expectedGeneration ?? null);
+  return (workspaceRef.expectedGeneration ?? null) === (current.expectedGeneration ?? null)
+    && (workspaceRef.expectedMaterializationEpoch ?? null) === (current.expectedMaterializationEpoch ?? null);
 }
 
 const skillsRef = computed(() => props.skills);
@@ -272,6 +279,7 @@ const showPasteEditor = ref(false);
 const imageAttachments = ref<ImageAttachment[]>([]);
 const assetRefAttachments = ref<AssetRefAttachment[]>([]);
 const showAssetRefDetails = ref(false);
+const knowledgeQuoteAttachments = ref<KnowledgeQuoteAttachment[]>([]);
 const consoleTextAttachments = ref<ConsoleTextAttachment[]>([]);
 const showConsoleTextDetails = ref(false);
 const unityConsoleCommandPending = ref(false);
@@ -286,6 +294,10 @@ const composerIntent = ref<ComposerIntentState>(restoredSharedDraft ? {
 if (restoredSharedDraft) {
   imageAttachments.value = restoredSharedDraft.images.map((image) => ({ ...image }));
   assetRefAttachments.value = restoredSharedDraft.assetRefs.map((assetRef) => ({ ...assetRef }));
+  knowledgeQuoteAttachments.value = (restoredSharedDraft.knowledgeQuotes ?? []).map((quote, index) => ({
+    ...quote,
+    id: `restored-knowledge-quote-${index}`,
+  }));
   consoleTextAttachments.value = restoredSharedDraft.consoleTexts.map((entry, index) => ({
     ...entry,
     id: `restored-console-${index}`,
@@ -310,11 +322,12 @@ const consoleTextDetailsRootRef = ref<HTMLElement | null>(null);
 const localFileGroupRootRef = ref<HTMLElement | null>(null);
 const localFileDetailsRootRef = ref<HTMLElement | null>(null);
 const showMentionPopup = ref(false);
+const mentionPopupRef = ref<InstanceType<typeof MentionPopup> | null>(null);
 const mentionHighlightIndex = ref(0);
 const mentionMode = ref<"search" | "browse">("search");
-const mentionEntries = ref<DirEntry[]>([]);
+const mentionEntries = shallowRef<DirEntry[]>([]);
 const mentionEntriesPath = ref<string | null>(null);
-const mentionSearchResults = ref<MentionSearchResult[]>([]);
+const mentionSearchResults = shallowRef<MentionSearchResult[]>([]);
 const mentionAnchor = ref(-1);
 const mentionTokenEnd = ref(-1);
 const mentionSubPath = ref("");
@@ -322,12 +335,37 @@ const mentionLoading = ref(false);
 const mentionSearchSettledQuery = ref("");
 const mentionSelectionPending = ref(false);
 const mentionAllowsSpaces = ref(false);
+const mentionHighlightedKey = ref<string | null>(null);
+const excludedMentionPaths = ref(new Set<string>());
+const localMentionCandidates = useMentionWorkspaceCandidates(
+  computed(() => props.workspaceRef ?? null),
+  computed(() => props.workspaceRoot),
+);
+function createMentionProviderQueues() {
+  return {
+    assets: createMentionSearchQueue(),
+    workspace: createMentionSearchQueue(),
+    knowledge: createMentionSearchQueue(),
+    scenes: createMentionSearchQueue(),
+  };
+}
+let mentionSearchQueues = createMentionProviderQueues();
+function emptyMentionProviderResults() {
+  return {
+    assets: [] as MentionSearchResult[],
+    workspace: [] as MentionSearchResult[],
+    knowledge: [] as MentionSearchResult[],
+    scenes: [] as MentionSearchResult[],
+  };
+}
+let mentionProviderResults = emptyMentionProviderResults();
 const assetRefDrafts = new Map<string, AssetRefAttachment[]>();
 const recentlyRemovedAssetRefKeys = new Map<string, number>();
 
 let mentionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let mentionRequestSeq = 0;
 let lastSearchQuery = "";
+let mentionFetchKey = "";
 let pendingMentionCursor: number | null = null;
 let releaseUnityAssetDrop: (() => void) | null = null;
 let releaseUnityTextDrop: (() => void) | null = null;
@@ -347,6 +385,7 @@ const assetRefSyncSourceId = `rich-chat-input-${Date.now().toString(36)}-${Math.
 const hasTopAttachments = computed(() =>
   imageAttachments.value.length > 0
   || assetRefAttachments.value.length > 0
+  || knowledgeQuoteAttachments.value.length > 0
   || consoleTextAttachments.value.length > 0
   || localFileAttachments.value.length > 0
   || props.managedLocalFiles.length > 0,
@@ -363,6 +402,7 @@ const canSend = computed(() =>
     || !!pastedContent.value
     || imageAttachments.value.length > 0
     || assetRefAttachments.value.length > 0
+    || knowledgeQuoteAttachments.value.length > 0
     || consoleTextAttachments.value.length > 0
     || localFileAttachments.value.length > 0
     || props.managedLocalFiles.some((file) => file.status === "ready" && !!file.path?.trim())
@@ -374,6 +414,7 @@ function isDraftEmpty() {
     && !pastedContent.value
     && imageAttachments.value.length === 0
     && assetRefAttachments.value.length === 0
+    && knowledgeQuoteAttachments.value.length === 0
     && consoleTextAttachments.value.length === 0
     && localFileAttachments.value.length === 0
     && props.managedLocalFiles.length === 0
@@ -549,7 +590,11 @@ function searchableUnityScenePaths(status: {
 }
 
 const rankedMentionSearchResults = computed(() =>
-  rankMentionSearchResults(mentionSearchResults.value, mentionQuery.value),
+  rankMentionSearchResults(
+    [...localMentionCandidates.value, ...mentionSearchResults.value]
+      .filter((entry) => !excludedMentionPaths.value.has(mentionResultKey(entry))),
+    mentionQuery.value,
+  ),
 );
 
 const mentionCurrentFolderEntry = computed<MentionDisplayEntry | null>(() => {
@@ -580,6 +625,7 @@ const filteredMentionEntries = computed(() => {
 });
 
 const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
+  if (!showMentionPopup.value) return [];
   if (mentionMode.value === "search") {
     return rankedMentionSearchResults.value.map((result) => ({
       relPath: result.relPath,
@@ -587,8 +633,9 @@ const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
       parentPath: result.parentPath,
       isDir: result.isDir,
       meta: result.meta,
-      canNavigate: result.isDir,
+      canNavigate: result.isDir && !result.localFile,
       entryKind: result.entryKind,
+      localFile: result.localFile,
     }));
   }
   const entries = filteredMentionEntries.value.map((entry) => ({
@@ -599,10 +646,39 @@ const mentionDisplayList = computed<MentionDisplayEntry[]>(() => {
     canNavigate: entry.isDir,
     entryKind: "asset" as const,
   }));
-  return mentionCurrentFolderEntry.value
-    ? [mentionCurrentFolderEntry.value, ...entries]
-    : entries;
+  const localEntries = rankMentionSearchResults(
+    localMentionCandidates.value.filter((entry) => (
+      !excludedMentionPaths.value.has(mentionResultKey(entry))
+      && (!mentionSubPath.value || entry.parentPath.toLowerCase() === mentionSubPath.value.toLowerCase())
+    )),
+    mentionBrowseFilter.value,
+    mentionSubPath.value ? 120 : 24,
+  ).map((entry) => ({ ...entry, canNavigate: entry.isDir && !entry.localFile }));
+  const unique = new Map<string, MentionDisplayEntry>();
+  for (const entry of [
+    ...(mentionCurrentFolderEntry.value ? [mentionCurrentFolderEntry.value] : []),
+    ...localEntries,
+    ...entries,
+  ]) {
+    const key = mentionResultKey(entry);
+    if (!unique.has(key)) unique.set(key, entry);
+  }
+  return [...unique.values()];
 });
+
+function highlightMentionEntry(index: number) {
+  mentionHighlightIndex.value = index;
+  const entry = mentionDisplayList.value[index];
+  mentionHighlightedKey.value = entry ? mentionResultKey(entry) : null;
+}
+
+watch(mentionDisplayList, (entries) => {
+  const index = mentionHighlightedKey.value
+    ? entries.findIndex((entry) => mentionResultKey(entry) === mentionHighlightedKey.value)
+    : -1;
+  mentionHighlightIndex.value = Math.max(0, index);
+  if (index < 0) mentionHighlightedKey.value = null;
+}, { flush: "sync" });
 
 const mentionPopupLoading = computed(() => {
   if (mentionLoading.value) return true;
@@ -693,6 +769,7 @@ function clearMentionDebounce() {
 
 function invalidateMentionRequests() {
   mentionRequestSeq += 1;
+  for (const queue of Object.values(mentionSearchQueues)) queue.clear();
   mentionLoading.value = false;
 }
 
@@ -725,7 +802,11 @@ function replaceMentionToken(nextQuery: string) {
 
 async function loadDirEntries(subPath: string) {
   const workspaceRef = captureWorkspaceRef();
-  if (!workspaceRef) return;
+  if (!workspaceRef) {
+    mentionEntries.value = [];
+    mentionEntriesPath.value = subPath;
+    return;
+  }
   const requestSeq = ++mentionRequestSeq;
   mentionLoading.value = true;
   mentionEntries.value = [];
@@ -777,12 +858,19 @@ async function searchAssets(query: string) {
   lastSearchQuery = query;
   const requestSeq = ++mentionRequestSeq;
   const workspaceRef = captureWorkspaceRef();
-  if (!workspaceRef) return;
+  if (!workspaceRef) {
+    mentionSearchSettledQuery.value = query;
+    return;
+  }
   mentionLoading.value = true;
-  let assetResults: MentionSearchResult[] = [];
-  let folderResults: MentionSearchResult[] = [];
-  let knowledgeResults: MentionSearchResult[] = [];
-  let sceneObjectResults: MentionSearchResult[] = [];
+  // Keep each provider's previous candidates (filtered by the current query)
+  // until that provider responds, so a fast provider cannot erase slower matches.
+  let {
+    assets: assetResults,
+    workspace: workspaceResults,
+    knowledge: knowledgeResults,
+    scenes: sceneObjectResults,
+  } = mentionProviderResults;
 
   function requestIsCurrent() {
     return requestSeq === mentionRequestSeq
@@ -794,9 +882,17 @@ async function searchAssets(query: string) {
 
   function publishResults() {
     if (!requestIsCurrent()) return;
+    if (mentionProviderResults.assets === assetResults
+      && mentionProviderResults.workspace === workspaceResults
+      && mentionProviderResults.knowledge === knowledgeResults
+      && mentionProviderResults.scenes === sceneObjectResults) return;
+    mentionProviderResults = {
+      assets: assetResults, workspace: workspaceResults,
+      knowledge: knowledgeResults, scenes: sceneObjectResults,
+    };
     mentionSearchResults.value = [
       ...assetResults,
-      ...folderResults,
+      ...workspaceResults,
       ...sceneObjectResults,
       ...knowledgeResults,
     ];
@@ -806,7 +902,11 @@ async function searchAssets(query: string) {
     const status = await checkUnityConnectionStatus(workspaceRef!);
     if (!requestIsCurrent()) return;
     const scenePaths = searchableUnityScenePaths(status);
-    if (scenePaths.length === 0) return;
+    if (scenePaths.length === 0) {
+      sceneObjectResults = [];
+      publishResults();
+      return;
+    }
     const searches = await Promise.allSettled(scenePaths.map((scenePath) => (
       searchWorkspaceSceneObjects(
         scenePath,
@@ -825,50 +925,60 @@ async function searchAssets(query: string) {
   }
 
   try {
-    const assetSearchPromise = searchWorkspaceAssets(query, [
+    const assetSearchPromise = mentionSearchQueues.assets.run(() => searchWorkspaceAssets(query, [
       "Assets",
       "Packages",
       "ProjectSettings",
-    ], undefined, workspaceRef)
+    ], undefined, workspaceRef))
       .then((results) => {
+        if (!results || !requestIsCurrent()) return;
         assetResults = results.map(mapAssetSearchResult);
         publishResults();
         return results;
+      }).catch(() => {
+        assetResults = [];
+        publishResults();
       });
-    const folderSearchPromise = searchWorkspaceEntries(query, workspaceRef)
+    const workspaceSearchPromise = mentionSearchQueues.workspace.run(() => searchWorkspaceEntries(query, workspaceRef))
       .then((results) => {
-        folderResults = mapWorkspaceFolderMentionResults(results);
+        if (!results || !requestIsCurrent()) return;
+        workspaceResults = mapWorkspaceMentionResults(results);
         publishResults();
         return results;
+      }).catch(() => {
+        workspaceResults = [];
+        publishResults();
       });
-    const knowledgeSearchPromise = knowledgeQuery({
+    const knowledgeSearchPromise = mentionSearchQueues.knowledge.run(() => knowledgeQuery({
       query,
-      limit: 16,
+      limit: 32,
       types: KNOWLEDGE_MENTION_TYPES,
-    }, workspaceRef)
+    }, workspaceRef))
       .then((results) => {
+        if (!results || !requestIsCurrent()) return;
         knowledgeResults = results
           .filter((result) => (result.storageSource ?? "project") === "project")
           .map(mapKnowledgeSearchResult);
         publishResults();
         return results;
+      }).catch(() => {
+        knowledgeResults = [];
+        publishResults();
       });
-    const [assetSearch] = await Promise.allSettled([
+    await Promise.allSettled([
       assetSearchPromise,
-      folderSearchPromise,
+      workspaceSearchPromise,
       knowledgeSearchPromise,
-      searchOpenSceneObjectsFromDisk(),
+      mentionSearchQueues.scenes.run(searchOpenSceneObjectsFromDisk).catch(() => {
+        sceneObjectResults = [];
+        publishResults();
+      }),
     ]);
     if (!requestIsCurrent()) return;
 
     publishResults();
     mentionSearchSettledQuery.value = query;
 
-    if (assetSearch.status === "rejected" && mentionSearchResults.value.length === 0) {
-      mentionMode.value = "browse";
-      mentionSubPath.value = "";
-      await loadDirEntries("");
-    }
   } catch {
     if (
       requestSeq !== mentionRequestSeq
@@ -878,10 +988,7 @@ async function searchAssets(query: string) {
     ) {
       return;
     }
-    mentionSearchResults.value = [];
-    mentionMode.value = "browse";
-    mentionSubPath.value = "";
-    await loadDirEntries("");
+    mentionSearchSettledQuery.value = query;
   } finally {
     if (requestSeq === mentionRequestSeq) {
       mentionLoading.value = false;
@@ -899,10 +1006,14 @@ function closeMentionPopup() {
   mentionEntries.value = [];
   mentionEntriesPath.value = null;
   mentionSearchResults.value = [];
+  mentionProviderResults = emptyMentionProviderResults();
   mentionSearchSettledQuery.value = "";
   mentionHighlightIndex.value = 0;
   mentionMode.value = "search";
   mentionAllowsSpaces.value = false;
+  mentionHighlightedKey.value = null;
+  excludedMentionPaths.value = new Set();
+  mentionFetchKey = "";
   lastSearchQuery = "";
   pendingMentionCursor = null;
 }
@@ -911,14 +1022,23 @@ function checkMentionTrigger(operator: ActiveOperator, preserveSelection = false
   mentionAnchor.value = operator.start;
   mentionTokenEnd.value = operator.end;
 
-  clearMentionDebounce();
-
   const lastSlash = operator.query.lastIndexOf("/");
   const browseSubPath = lastSlash >= 0
     ? operator.query.slice(0, lastSlash)
     : operator.query.length === 0
       ? ""
       : null;
+
+  const fetchKey = browseSubPath !== null ? `browse:${browseSubPath}` : `search:${operator.query}`;
+  const fetchChanged = fetchKey !== mentionFetchKey || !showMentionPopup.value;
+  if (fetchChanged) {
+    clearMentionDebounce();
+    invalidateMentionRequests();
+    mentionFetchKey = fetchKey;
+    mentionSearchSettledQuery.value = "";
+  }
+  if (!preserveSelection) mentionHighlightedKey.value = null;
+  showMentionPopup.value = true;
 
   if (browseSubPath !== null) {
     const modeChanged = mentionMode.value !== "browse";
@@ -931,8 +1051,8 @@ function checkMentionTrigger(operator: ActiveOperator, preserveSelection = false
     } else if (mentionDisplayList.value.length > 0) {
       mentionHighlightIndex.value = Math.min(mentionHighlightIndex.value, mentionDisplayList.value.length - 1);
     }
-    if (modeChanged || subPathChanged || (mentionEntriesPath.value !== browseSubPath && !mentionLoading.value)) {
-      scheduleMentionFetch(() => { void loadDirEntries(browseSubPath); }, 120);
+    if (fetchChanged || modeChanged || subPathChanged) {
+      void loadDirEntries(browseSubPath);
     }
   } else {
     mentionMode.value = "search";
@@ -942,7 +1062,9 @@ function checkMentionTrigger(operator: ActiveOperator, preserveSelection = false
     } else if (mentionDisplayList.value.length > 0) {
       mentionHighlightIndex.value = Math.min(mentionHighlightIndex.value, mentionDisplayList.value.length - 1);
     }
-    scheduleMentionFetch(() => { void searchAssets(operator.query); }, 150);
+    if (fetchChanged) {
+      scheduleMentionFetch(() => { void searchAssets(operator.query); }, 60);
+    }
   }
 
   showMentionPopup.value = true;
@@ -1137,6 +1259,24 @@ function notifySceneObjectMentionValidationError(
   notificationStore.addNotice("warning", message, { operation: "sceneObjectMentionValidation" });
 }
 
+function buildMentionAttachment(entry: MentionDisplayEntry): WorkbenchComposerFileAttachment | null {
+  if (entry.localFile) return { localFile: entry.localFile };
+  const path = normalizeUnityAssetRefPath(entry.relPath);
+  const assetRef = buildManualAssetRef(path);
+  if (assetRef) return { assetRef };
+
+  const workspaceRoot = normalizeBoundaryPath(props.workspaceRoot);
+  if (!path || !workspaceRoot) return null;
+  // Workspace search and directory browsing return relative paths. Use the same
+  // attachment conversion as workbench drops to preserve files and directories.
+  return workbenchComposerFileAttachment({
+    absolutePath: `${workspaceRoot}/${path}`,
+    workspaceRoot,
+    name: entry.name.replace(/\/+$/, ""),
+    isDir: entry.isDir,
+  });
+}
+
 async function selectMentionEntry(entry: MentionDisplayEntry) {
   if (mentionSelectionPending.value) return;
   const mentionPath = entry.isDir && !entry.relPath.endsWith("/")
@@ -1155,6 +1295,7 @@ async function selectMentionEntry(entry: MentionDisplayEntry) {
       await validateUnitySceneObject(workspaceRef, target.scenePath, target.objectPath);
     } catch (error) {
       if (!isCurrentWorkspaceRef(workspaceRef)) return;
+      excludedMentionPaths.value = new Set([...excludedMentionPaths.value, mentionResultKey(entry)]);
       mentionSearchResults.value = mentionSearchResults.value.filter(
         (result) => result.relPath !== entry.relPath,
       );
@@ -1176,13 +1317,14 @@ async function selectMentionEntry(entry: MentionDisplayEntry) {
     ) return;
   }
 
-  const assetRef = buildManualAssetRef(mentionPath);
-  if (assetRef) {
+  const attachment = buildMentionAttachment(entry);
+  if (attachment) {
     const nextText = removeTextRange(props.modelValue, mentionAnchor.value, mentionTokenEnd.value);
     const cursor = Math.max(0, Math.min(mentionAnchor.value, nextText.length));
     dismissOperatorPopupForCursor(nextText, cursor);
     setInputValue(nextText);
-    addAssetRefs([assetRef]);
+    if (attachment.localFile) addLocalFileAttachments([attachment.localFile]);
+    else if (attachment.assetRef) addAssetRefs([attachment.assetRef]);
     closeMentionPopup();
     nextTick(() => {
       focusComposerSelection(cursor);
@@ -1486,6 +1628,46 @@ function clearAssetRefs() {
   closeAssetRefDetails();
 }
 
+function normalizeKnowledgeQuoteAttachment(
+  quote: UserMessageDraftKnowledgeQuote,
+): KnowledgeQuoteAttachment | null {
+  const path = quote.path.trim().replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (!path || !quote.content.trim()) return null;
+  return {
+    id: `knowledge-quote-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+    path,
+    name: quote.name?.trim() || undefined,
+    content: quote.content,
+  };
+}
+
+function addKnowledgeQuoteAttachments(quotes: UserMessageDraftKnowledgeQuote[]) {
+  const existing = new Set(
+    knowledgeQuoteAttachments.value.map((quote) => `${quote.path.toLowerCase()}\u{0}${quote.content}`),
+  );
+  const next = quotes
+    .map(normalizeKnowledgeQuoteAttachment)
+    .filter((quote): quote is KnowledgeQuoteAttachment => !!quote)
+    .filter((quote) => {
+      const key = `${quote.path.toLowerCase()}\u{0}${quote.content}`;
+      if (existing.has(key)) return false;
+      existing.add(key);
+      return true;
+    });
+  if (next.length === 0) return;
+  knowledgeQuoteAttachments.value.push(...next);
+  nextTick(() => composerRef.value?.focus());
+}
+
+function removeKnowledgeQuoteAttachment(index: number) {
+  knowledgeQuoteAttachments.value.splice(index, 1);
+}
+
+function knowledgeQuoteDisplayName(quote: UserMessageDraftKnowledgeQuote) {
+  if (quote.name?.trim()) return quote.name.trim();
+  return quote.path.split("/").filter(Boolean).pop() || quote.path;
+}
+
 function toggleAssetRefDetails() {
   if (!shouldCollapseAssetRefs.value) return;
   showCommandPopup.value = false;
@@ -1753,6 +1935,33 @@ function appendConsoleTextPromptBlock(text: string, items: ConsoleTextAttachment
   return text.trim() ? `${text}\n\n${block}` : block;
 }
 
+function buildKnowledgeQuotePromptBlock(items: KnowledgeQuoteAttachment[]) {
+  if (items.length === 0) return "";
+  const entries = items.map((item) => {
+    const metadata = encodeURIComponent(JSON.stringify({
+      path: item.path,
+      name: item.name ?? "",
+    }));
+    return `<locus-knowledge-quote data="${metadata}">\n${item.content}\n</locus-knowledge-quote>`;
+  });
+  return `<locus-knowledge-quotes>\nUse these exact excerpts from project knowledge as quoted context.\n\n${entries.join("\n\n")}\n</locus-knowledge-quotes>`;
+}
+
+function appendKnowledgeQuotePromptBlock(text: string, items: KnowledgeQuoteAttachment[]) {
+  const block = buildKnowledgeQuotePromptBlock(items);
+  if (!block) return text;
+  return text.trim() ? `${text}\n\n${block}` : block;
+}
+
+function knowledgeQuoteAssetRefs(items: KnowledgeQuoteAttachment[]): AssetRefAttachment[] {
+  return items.map((item) => ({
+    kind: "knowledge",
+    path: item.path,
+    name: item.name,
+    source: "manual",
+  }));
+}
+
 function buildConsoleTextDisplayBlock(items: ConsoleTextAttachment[]) {
   if (items.length === 0) return "";
   return items
@@ -1773,7 +1982,7 @@ function buildLocalFilesPromptBlock(files: LocalFileAttachment[]) {
     const type = file.typeLabel ? `; type: ${file.typeLabel}` : "";
     return `- ${kind}: \`${file.path}\`${type}`;
   });
-  return `<locus-local-files>\nThese are local paths supplied by drag and drop. Read contents only when needed, using \`read\` for files and \`list\` for folders.\n${lines.join("\n")}\n</locus-local-files>`;
+  return `<locus-local-files>\nThese are local paths supplied by the user. Read contents only when needed, using \`read\` for files and \`list\` for folders.\n${lines.join("\n")}\n</locus-local-files>`;
 }
 
 function appendLocalFilesPromptBlock(text: string, files: LocalFileAttachment[]) {
@@ -1821,6 +2030,7 @@ function resetDraft() {
   setInputValue("");
   pastedContent.value = "";
   imageAttachments.value = [];
+  knowledgeQuoteAttachments.value = [];
   clearConsoleTextAttachments();
   clearLocalFileAttachments();
   setAssetRefAttachments([]);
@@ -1863,6 +2073,7 @@ function exportDraft(): UserMessageDraft {
     text: props.modelValue,
     images: imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType })),
     assetRefs: assetRefAttachments.value.map((item) => ({ ...item })),
+    knowledgeQuotes: knowledgeQuoteAttachments.value.map(({ id: _id, ...quote }) => ({ ...quote })),
     localFiles: localFileAttachments.value.map((item) => ({ ...item })),
     consoleTexts: consoleTextAttachments.value.map((item) => ({ ...item })),
     intent: JSON.parse(JSON.stringify(composerIntent.value)) as ComposerIntentState,
@@ -1899,6 +2110,7 @@ async function applyUserMessageDraft(draft: UserMessageDraft) {
   }
 
   setAssetRefAttachments([...assetRefAttachments.value, ...draft.assetRefs]);
+  addKnowledgeQuoteAttachments(draft.knowledgeQuotes ?? []);
   const consoleTexts = draft.consoleTexts
     .map((entry) => normalizeConsoleTextAttachment(entry))
     .filter((entry): entry is ConsoleTextAttachment => !!entry);
@@ -2015,10 +2227,13 @@ function canExecuteActionCommand(): boolean {
     && !pastedContent.value
     && imageAttachments.value.length === 0
     && assetRefAttachments.value.length === 0
+    && knowledgeQuoteAttachments.value.length === 0
     && consoleTextAttachments.value.length === 0
     && localFileAttachments.value.length === 0
     && !hasComposerIntent(composerIntent.value);
 }
+
+const { collect: collectDatabaseGarbage } = useGarbageCollection();
 
 function executeActionCommand(command: CommandDef): boolean {
   if (command.commandKind !== "action" || !canExecuteActionCommand()) return false;
@@ -2054,6 +2269,13 @@ function executeActionCommand(command: CommandDef): boolean {
   if (command.commandType === "export-context") {
     resetDraft();
     emit("exportContext");
+    return true;
+  }
+
+  if (command.commandType === "garbage-collection") {
+    const workspaceRef = props.workspaceRef ? { ...props.workspaceRef } : null;
+    resetDraft();
+    void collectDatabaseGarbage(workspaceRef);
     return true;
   }
 
@@ -2110,7 +2332,12 @@ function handleSend() {
   const images: ImageAttachment[] = props.allowImages
     ? imageAttachments.value.map(({ data, mimeType }) => ({ data, mimeType }))
     : [];
-  const assetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
+  const explicitAssetRefs = dedupeAssetRefs([...assetRefAttachments.value, ...inlineAssetRefs.assetRefs]);
+  const quotes = [...knowledgeQuoteAttachments.value];
+  const assetRefs = dedupeAssetRefs([
+    ...explicitAssetRefs,
+    ...knowledgeQuoteAssetRefs(quotes),
+  ]);
   const consoleTexts = [...consoleTextAttachments.value];
   const localFiles = dedupeLocalFileAttachments([
     ...localFileAttachments.value,
@@ -2135,9 +2362,10 @@ function handleSend() {
     ? (cleanedInput ? `${cleanedInput}\n\n${pastedContent.value}` : pastedContent.value)
     : cleanedInput;
 
-  const textWithConsole = appendConsoleTextPromptBlock(text, consoleTexts);
+  const textWithQuotes = appendKnowledgeQuotePromptBlock(text, quotes);
+  const textWithConsole = appendConsoleTextPromptBlock(textWithQuotes, consoleTexts);
   const textWithLocalFiles = appendLocalFilesPromptBlock(textWithConsole, localFiles);
-  const sendText = appendAssetRefsPromptBlock(textWithLocalFiles, assetRefs);
+  const sendText = appendAssetRefsPromptBlock(textWithLocalFiles, explicitAssetRefs);
   const displayText = appendLocalFilesDisplayBlock(
     appendConsoleTextDisplayBlock(text, consoleTexts),
     localFiles,
@@ -2156,6 +2384,7 @@ function mentionCanContinueWithSpace() {
 }
 
 function handleKeydown(event: KeyboardEvent) {
+  if (event.isComposing) return;
   if (
     event.key === "Escape"
     && (showMentionPopup.value || activeOperator.value?.kind === "mention")
@@ -2171,18 +2400,27 @@ function handleKeydown(event: KeyboardEvent) {
 
   if (showMentionPopup.value) {
     const items = mentionDisplayList.value;
+    if (event.key === "PageDown" || event.key === "PageUp") {
+      if (items.length === 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const direction = event.key === "PageDown" ? 1 : -1;
+      const step = mentionPopupRef.value?.pageSize() ?? 10;
+      highlightMentionEntry(Math.max(0, Math.min(items.length - 1, mentionHighlightIndex.value + direction * step)));
+      return;
+    }
     if (event.key === "ArrowDown") {
       if (items.length === 0) return;
       event.preventDefault();
       event.stopPropagation();
-      mentionHighlightIndex.value = (mentionHighlightIndex.value + 1) % items.length;
+      highlightMentionEntry((mentionHighlightIndex.value + 1) % items.length);
       return;
     }
     if (event.key === "ArrowUp") {
       if (items.length === 0) return;
       event.preventDefault();
       event.stopPropagation();
-      mentionHighlightIndex.value = (mentionHighlightIndex.value - 1 + items.length) % items.length;
+      highlightMentionEntry((mentionHighlightIndex.value - 1 + items.length) % items.length);
       return;
     }
     if (
@@ -2508,9 +2746,11 @@ function removeSkillBadge(skill: SkillIntentItem) {
 }
 
 watch(
-  () => `${props.workspaceRef?.checkoutId ?? ""}:${props.workspaceRef?.expectedGeneration ?? ""}`,
+  () => `${props.workspaceRef?.checkoutId ?? ""}:${props.workspaceRef?.expectedGeneration ?? ""}:${props.workspaceRef?.expectedMaterializationEpoch ?? "empty"}`,
   () => {
     closeMentionPopup();
+    // A slow provider in the old checkout must not hold up the new checkout.
+    mentionSearchQueues = createMentionProviderQueues();
     mentionEntries.value = [];
     mentionEntriesPath.value = null;
     mentionSearchResults.value = [];
@@ -2541,6 +2781,7 @@ watch(
   [
     imageAttachments,
     assetRefAttachments,
+    knowledgeQuoteAttachments,
     consoleTextAttachments,
     localFileAttachments,
     composerIntent,
@@ -2846,6 +3087,7 @@ defineExpose({
 
       <Transition name="cmd-popup">
         <MentionPopup
+          ref="mentionPopupRef"
           :visible="showMentionPopup"
           :mode="mentionMode"
           :entries="mentionDisplayList"
@@ -2858,7 +3100,7 @@ defineExpose({
           @open-dir="browseMentionDirectory"
           @navigate-to="mentionNavigateTo"
           @navigate-root="mentionNavigateRoot"
-          @update:selected-index="mentionHighlightIndex = $event"
+          @update:selected-index="highlightMentionEntry"
         />
       </Transition>
     </template>
@@ -3059,6 +3301,25 @@ defineExpose({
               :aria-label="t('chat.fileRefs.remove')"
               :title="t('chat.fileRefs.remove')"
               @click.stop="removeLocalFileAttachment(0)"
+            >
+              <LucideIcon :icon="X" :size="13" />
+            </button>
+          </div>
+          <div
+            v-for="(quote, index) in knowledgeQuoteAttachments"
+            :key="quote.id"
+            class="local-file-chip knowledge-quote-chip"
+            :title="quote.path"
+          >
+            <LucideIcon class="local-file-chip-icon" :icon="FileText" :size="14" />
+            <span class="local-file-chip-name">{{ knowledgeQuoteDisplayName(quote) }}</span>
+            <span class="local-file-chip-meta">{{ t("chat.knowledgeQuote.selection") }}</span>
+            <button
+              type="button"
+              class="local-file-chip-remove ui-select-none"
+              :aria-label="t('chat.knowledgeQuote.remove')"
+              :title="t('chat.knowledgeQuote.remove')"
+              @click.stop="removeKnowledgeQuoteAttachment(index)"
             >
               <LucideIcon :icon="X" :size="13" />
             </button>
@@ -3372,11 +3633,20 @@ defineExpose({
   padding: 4px;
   box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.12);
   z-index: 10;
-  max-height: 320px;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  max-height: 520px;
+  overflow: hidden;
+}
+
+:deep(.mention-results) {
+  flex: 0 1 auto;
+  overscroll-behavior: contain;
 }
 
 :deep(.mention-breadcrumb) {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 2px;
@@ -3390,6 +3660,10 @@ defineExpose({
 }
 
 :deep(.mention-crumb) {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
   cursor: pointer;
   padding: 1px 3px;
   border-radius: 3px;
@@ -3417,6 +3691,7 @@ defineExpose({
   align-items: center;
   gap: 6px;
   padding: 4px;
+  box-sizing: border-box;
   border-radius: 7px;
   transition: background 0.12s ease, box-shadow 0.12s ease;
 }
@@ -3428,8 +3703,6 @@ defineExpose({
 
 :deep(.mention-item.is-current-path) {
   border-bottom: 1px solid color-mix(in srgb, var(--border-color) 76%, transparent);
-  margin-bottom: 2px;
-  padding-bottom: 6px;
 }
 
 :deep(.mention-select) {
@@ -3438,7 +3711,7 @@ defineExpose({
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 6px 8px;
+  padding: 4px 8px;
   border: none;
   border-radius: 6px;
   background: transparent;
@@ -3464,6 +3737,7 @@ defineExpose({
 
 :deep(.mention-name) {
   font-size: 13px;
+  line-height: 16px;
   color: var(--text-color);
   white-space: nowrap;
   overflow: hidden;
@@ -3473,6 +3747,7 @@ defineExpose({
 
 :deep(.mention-path) {
   font-size: 11px;
+  line-height: 14px;
   color: var(--text-secondary);
   white-space: nowrap;
   overflow: hidden;
@@ -3500,6 +3775,7 @@ defineExpose({
 }
 
 :deep(.mention-search-header) {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3542,6 +3818,13 @@ defineExpose({
   background: color-mix(in srgb, var(--hover-bg) 88%, transparent);
   border-color: color-mix(in srgb, var(--border-color) 82%, transparent);
   color: var(--text-color);
+}
+
+:deep(.mention-select:focus-visible),
+:deep(.mention-open:focus-visible),
+:deep(.mention-crumb:focus-visible) {
+  outline: 1px solid var(--accent-color);
+  outline-offset: -1px;
 }
 
 :deep(.mention-loading),

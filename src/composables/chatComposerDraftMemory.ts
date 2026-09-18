@@ -13,6 +13,9 @@ function cloneComposerDraft(draft: UserMessageDraft): UserMessageDraft {
     text: draft.text,
     images: draft.images.map((image) => ({ ...image })),
     assetRefs: draft.assetRefs.map((assetRef) => ({ ...assetRef })),
+    ...(draft.knowledgeQuotes
+      ? { knowledgeQuotes: draft.knowledgeQuotes.map((quote) => ({ ...quote })) }
+      : {}),
     localFiles: draft.localFiles.map((file) => ({ ...file })),
     consoleTexts: draft.consoleTexts.map((entry) => ({ ...entry })),
     intent: {
@@ -27,6 +30,7 @@ function emptyComposerDraft(text = ""): UserMessageDraft {
     text,
     images: [],
     assetRefs: [],
+    knowledgeQuotes: [],
     localFiles: [],
     consoleTexts: [],
     intent: emptyComposerIntent(),
@@ -37,6 +41,7 @@ function composerDraftHasContent(draft: UserMessageDraft): boolean {
   return !!draft.text
     || draft.images.length > 0
     || draft.assetRefs.length > 0
+    || (draft.knowledgeQuotes?.length ?? 0) > 0
     || draft.localFiles.length > 0
     || draft.consoleTexts.length > 0
     || hasComposerIntent(draft.intent);

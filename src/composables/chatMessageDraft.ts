@@ -8,7 +8,9 @@ import type {
 import { extractChatAssetRefs } from "./chatAssetRefs";
 import {
   displayUserMessageContent,
+  stripUserMessageKnowledgeQuoteBlocks,
   userMessageConsoleEntries,
+  userMessageKnowledgeQuoteEntries,
   userMessageLocalFileEntries,
 } from "./chatUserMessageDisplay";
 import {
@@ -42,10 +44,17 @@ export interface UserMessageDraftConsoleText {
   text: string;
 }
 
+export interface UserMessageDraftKnowledgeQuote {
+  path: string;
+  name?: string;
+  content: string;
+}
+
 export interface UserMessageDraft {
   text: string;
   images: ImageAttachment[];
   assetRefs: AssetRefAttachment[];
+  knowledgeQuotes?: UserMessageDraftKnowledgeQuote[];
   localFiles: UserMessageDraftLocalFile[];
   consoleTexts: UserMessageDraftConsoleText[];
   intent: ComposerIntentState;
@@ -67,6 +76,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function normalizePath(path: string) {
   return path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function normalizeKnowledgeRefPath(path: string) {
+  return normalizePath(path).replace(/^Locus\/knowledge\//i, "").toLowerCase();
 }
 
 function pathBaseName(path: string) {
@@ -137,7 +150,7 @@ function dedupeAssetRefs(assetRefs: AssetRefAttachment[]) {
 
 function userMessageAssetRefs(message: ChatMessage) {
   const assetRefs = [...(message.assetRefs ?? [])];
-  const inlineRefs = extractChatAssetRefs(message.content).refs;
+  const inlineRefs = extractChatAssetRefs(stripUserMessageKnowledgeQuoteBlocks(message.content)).refs;
   for (const path of inlineRefs) {
     const assetRef = assetRefFromInlinePath(path);
     if (assetRef) assetRefs.push(assetRef);
@@ -232,6 +245,22 @@ function normalizeUserMessageDraft(value: unknown): UserMessageDraft | null {
   const assetRefs = Array.isArray(value.assetRefs)
     ? dedupeAssetRefs(value.assetRefs)
     : [];
+  const knowledgeQuotes = Array.isArray(value.knowledgeQuotes)
+    ? value.knowledgeQuotes
+      .map((quote): UserMessageDraftKnowledgeQuote | null => {
+        if (!isObject(quote) || typeof quote.path !== "string" || typeof quote.content !== "string") {
+          return null;
+        }
+        const path = normalizePath(quote.path);
+        if (!path || !quote.content.trim()) return null;
+        return {
+          path,
+          name: typeof quote.name === "string" ? quote.name.trim() || undefined : undefined,
+          content: quote.content,
+        };
+      })
+      .filter((quote): quote is UserMessageDraftKnowledgeQuote => !!quote)
+    : [];
   const localFiles = Array.isArray(value.localFiles)
     ? value.localFiles
       .map(normalizeLocalFile)
@@ -247,6 +276,7 @@ function normalizeUserMessageDraft(value: unknown): UserMessageDraft | null {
     text,
     images,
     assetRefs,
+    knowledgeQuotes,
     localFiles,
     consoleTexts,
     intent: normalizeIntent(value.intent),
@@ -392,13 +422,22 @@ async function writeClipboardItem(text: string, serializedDraft: string | null) 
 }
 
 export function buildUserMessageDraft(message: ChatMessage): UserMessageDraft {
+  const knowledgeQuotes = userMessageKnowledgeQuoteEntries(message.content).map((quote) => ({
+    path: quote.path,
+    name: quote.name || undefined,
+    content: quote.content,
+  }));
+  const quotedPaths = new Set(knowledgeQuotes.map((quote) => normalizeKnowledgeRefPath(quote.path)));
   return {
     text: displayUserMessageContent(message.content),
     images: (message.images ?? []).map((image) => ({
       data: image.data,
       mimeType: image.mimeType,
     })),
-    assetRefs: userMessageAssetRefs(message),
+    assetRefs: userMessageAssetRefs(message).filter((assetRef) => (
+      assetRef.kind !== "knowledge" || !quotedPaths.has(normalizeKnowledgeRefPath(assetRef.path))
+    )),
+    knowledgeQuotes,
     localFiles: userMessageLocalFileEntries(message.content).map((file) => ({
       path: file.path,
       isDir: file.kind === "folder",

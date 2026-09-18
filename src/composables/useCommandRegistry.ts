@@ -50,6 +50,12 @@ export function useCommandRegistry(
         commandType: "export-context",
       },
       {
+        name: "/garbage-collection",
+        description: t("chat.command.gcDesc"),
+        commandKind: "action",
+        commandType: "garbage-collection",
+      },
+      {
         name: "/review-context",
         description: t("chat.command.reviewContextDesc"),
         commandKind: "action",

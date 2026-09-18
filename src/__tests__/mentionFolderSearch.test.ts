@@ -1,7 +1,5 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
-import { mapWorkspaceFolderMentionResults } from "../components/chat/mentionFolderSearch";
+import { mapWorkspaceMentionResults } from "../components/chat/mentionWorkspaceSearch";
 import type { WorkspaceSearchEntry } from "../services/project";
 
 function entry(
@@ -21,21 +19,8 @@ function entry(
 }
 
 describe("folder mention search", () => {
-  it("publishes folder matches through the chat mention search", () => {
-    const richInput = readFileSync(
-      resolve(process.cwd(), "src/components/chat/RichChatInput.vue"),
-      "utf8",
-    );
-
-    expect(richInput).toContain(
-      "const folderSearchPromise = searchWorkspaceEntries(query, workspaceRef)",
-    );
-    expect(richInput).toContain("folderResults = mapWorkspaceFolderMentionResults(results);");
-    expect(richInput).toContain("...folderResults,");
-  });
-
   it("maps Unity workspace folders into selectable mention results", () => {
-    expect(mapWorkspaceFolderMentionResults([
+    expect(mapWorkspaceMentionResults([
       entry("Assets/Arts/UI/Characters", true, 1200),
       entry("Packages/com.example.characters/Runtime", true, 900),
       entry("ProjectSettings/Presets", true, 800),
@@ -67,16 +52,20 @@ describe("folder mention search", () => {
     ]);
   });
 
-  it("excludes files and folders outside Unity reference roots", () => {
-    expect(mapWorkspaceFolderMentionResults([
+  it("keeps generic workspace files and folders searchable", () => {
+    expect(mapWorkspaceMentionResults([
       entry("Assets/Characters/Hero.prefab", false, 1000),
       entry("docs/Characters", true, 950),
       entry("agent/Characters", true, 900),
-    ])).toEqual([]);
+    ])).toMatchObject([
+      { relPath: "Assets/Characters/Hero.prefab", isDir: false },
+      { relPath: "docs/Characters", isDir: true },
+      { relPath: "agent/Characters", isDir: true },
+    ]);
   });
 
   it("normalizes Windows separators before creating the mention result", () => {
-    expect(mapWorkspaceFolderMentionResults([
+    expect(mapWorkspaceMentionResults([
       entry("Assets\\Arts\\Characters", true, 700),
     ])[0]).toMatchObject({
       relPath: "Assets/Arts/Characters",

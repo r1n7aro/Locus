@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { listen } from "@tauri-apps/api/event";
+
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import type { CodexModelConfig, CustomProvider, GitProbeResult, ModelDefaults, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
@@ -13,11 +13,7 @@ import { useAuthStore } from "../stores/auth";
 import { useModelStore } from "../stores/model";
 import { useUiStore } from "../stores/ui";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
-import {
-  WORKSPACE_EVENT_NAME,
-  type RoutedWorkspaceEvent,
-  type WorkspaceRef,
-} from "../services/project";
+import { type RoutedWorkspaceEvent, type WorkspaceRef } from "../services/project";
 import { checkUnityPlugin, checkUnityPluginInstallPlan, installUnityPlugin } from "../services/unity";
 import { gitCheckUserConfig, gitInitUnity, gitProbe, gitSetUserConfig } from "../services/git";
 import { assetDbScanStart } from "../services/asset";
@@ -29,6 +25,10 @@ import {
   resolveOnboardingGitInitTargetPath,
   resolveOnboardingVcsStepState,
 } from "./onboarding/onboardingVcs";
+import { listenWorkspaceEvent } from "../services/workspaceEventHub";
+import { useWorkspaceEventScope } from "../composables/useWorkspaceEventScope";
+
+const workspaceEventSignal = useWorkspaceEventScope();
 
 const emit = defineEmits<{ completed: [] }>();
 const uiStore = useUiStore();
@@ -406,8 +406,8 @@ async function startScan() {
   scanDone.value = false;
   try {
     const workspaceRef = requireOnboardingWorkspaceRef();
-    unlistenScan = await listen<RoutedWorkspaceEvent<AssetDbScanEvent>>(
-      WORKSPACE_EVENT_NAME,
+    unlistenScan = await listenWorkspaceEvent<RoutedWorkspaceEvent<AssetDbScanEvent>>(
+      "OnboardingView.startScan",
       (e) => {
         if (
           e.payload.eventName !== "ref-graph-scan"
@@ -422,6 +422,7 @@ async function startScan() {
           scanPhase.value = null;
         }
       },
+      { signal: workspaceEventSignal },
     );
     await assetDbScanStart(workspaceRef);
   } catch (e) {
@@ -434,8 +435,8 @@ watch(step, async (s) => {
     await checkPlugin();
     if (!unlistenPlugin) {
       const workspaceRef = requireOnboardingWorkspaceRef();
-      unlistenPlugin = await listen<RoutedWorkspaceEvent<PluginStatus>>(
-        WORKSPACE_EVENT_NAME,
+      unlistenPlugin = await listenWorkspaceEvent<RoutedWorkspaceEvent<PluginStatus>>(
+        "OnboardingView.plugin",
         (e) => {
           if (
             e.payload.eventName !== "unity-plugin-status"
@@ -444,6 +445,7 @@ watch(step, async (s) => {
           ) return;
           pluginStatus.value = e.payload.payload;
         },
+        { signal: workspaceEventSignal },
       );
     }
   }
@@ -467,7 +469,7 @@ function scanProgressText(): string {
 
 onMounted(async () => {
   try {
-    await workspaceContextStore.initialize("main", "main");
+    await workspaceContextStore.ensureInitialized("main", "main");
     const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
     if (workspaceRef && workspaceContextStore.focusedRoot) {
       projectPath.value = workspaceContextStore.focusedRoot;

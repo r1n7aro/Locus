@@ -2893,6 +2893,46 @@ describe("chat session panel state", () => {
     expect(chatStore.activeQueuedFollowUp).toBeNull();
   });
 
+  it("keeps native steering distinct from new queued input and prevents withdrawal after sending", async () => {
+    const chatStore = useChatStore();
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    const input = {
+      id: "steering-1", sessionId: "s1", runId: "run-1", mergeGroupId: "same-group",
+      status: "delivering", delivery: "immediate", text: "sent update", displayText: "sent update",
+      createdAt: 1, updatedAt: 1,
+    };
+    chatStore.handleStreamEvent({ type: "pendingInputQueued", sessionId: "s1", runId: "run-1", input });
+    chatStore.handleStreamEvent({ type: "pendingInputQueued", sessionId: "s1", runId: "run-1",
+      input: { ...input, id: "pending-2", status: "queued", delivery: "after_run", text: "next update", displayText: "next update" } });
+    expect(chatStore.activeQueuedFollowUp?.displayText).toBe("sent update\nnext update");
+    expect(chatStore.activeQueuedFollowUp?.canEdit).toBe(false);
+    expect(await chatStore.deleteActiveQueuedFollowUp()).toBe(false);
+    expect(await chatStore.reEditActiveQueuedFollowUp()).toBe(false);
+    expect(sessionServiceMocks.deletePendingChatInput).not.toHaveBeenCalled();
+    chatStore.handleStreamEvent({ type: "pendingInputAccepted", sessionId: "s1", runId: "run-1",
+      pendingInputId: "steering-1", messageId: "committed-user" });
+    expect(chatStore.activeQueuedFollowUp?.displayText).toBe("next update");
+    expect(chatStore.activeQueuedFollowUp?.canEdit).toBe(true);
+  });
+
+  it("does not automatically resend an in-flight steering message after cancellation", async () => {
+    const chatStore = useChatStore();
+    chatStore.activeSessionId = "s1";
+    chatStore.currentRunId = "run-1";
+    chatStore.isStreaming = true;
+    await chatStore.sendMessage("update in flight");
+    const input = chatStore.activeQueuedFollowUp!.inputs[0]!;
+    chatStore.handleStreamEvent({ type: "pendingInputQueued", sessionId: "s1", runId: "run-1",
+      input: { ...input, status: "delivering", delivery: "immediate" } });
+    chatStore.handleStreamEvent({ type: "pendingInputQueued", sessionId: "s1", runId: "run-1", input });
+    expect(chatStore.activeQueuedFollowUp?.canEdit).toBe(false);
+    chatStore.handleStreamEvent({ type: "cancelled", sessionId: "s1", runId: "run-1", fullText: "Partial" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(sessionServiceMocks.chat).not.toHaveBeenCalled();
+  });
+
   it("withdraws a queued follow-up and restores its full draft for editing", async () => {
     const chatStore = useChatStore();
     const uiStore = useUiStore();

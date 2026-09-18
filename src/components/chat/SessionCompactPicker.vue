@@ -22,6 +22,9 @@ import {
 } from "../../services/project";
 import LucideIcon from "../icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "../icons/locusViewIcons";
+import { useWorkspaceEventScope } from "../../composables/useWorkspaceEventScope";
+
+const workspaceEventSignal = useWorkspaceEventScope();
 
 const MAX_RECENT_SESSIONS = 12;
 const STORAGE_KEY_VIEW_EXPANDED = "locus:sessionPanelViewExpanded";
@@ -413,6 +416,7 @@ onMounted(async () => {
       ) return;
       void loadViews();
     },
+    { owner: "SessionCompactPicker.views", signal: workspaceEventSignal },
   );
   void loadViews();
 });

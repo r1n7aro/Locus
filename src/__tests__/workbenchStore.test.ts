@@ -43,6 +43,45 @@ describe("workbench store", () => {
     localStorage.clear();
   });
 
+  it("persists the captured assignment across restarts without persisting process generation", () => {
+    const first = useWorkbenchStore();
+    first.ensureWindow("main");
+    const input = sessionEditor("session-old", { preview: false });
+    input.checkoutBinding!.expectedMaterializationEpoch = 2;
+    first.openEditor("main", input);
+    first.persist("main");
+    const persisted = JSON.parse(localStorage.getItem("locus:workbench-window:main")!);
+    expect(persisted.groups.main.tabs[0].checkoutBinding).toEqual({
+      checkoutId: "checkout-a", expectedMaterializationEpoch: 2,
+    });
+    setActivePinia(createPinia());
+    const restored = useWorkbenchStore().ensureWindow("main");
+    expect(restored.groups.main!.tabs[0]!.checkoutBinding).toEqual({
+      checkoutId: "checkout-a", expectedMaterializationEpoch: 2,
+    });
+  });
+
+  it("keeps dirty buffers separate when the same pool checkout is reassigned", () => {
+    const store = useWorkbenchStore();
+    const state = store.ensureWindow("main");
+    const old = sessionEditor("same-resource", { preview: false });
+    old.checkoutBinding!.expectedMaterializationEpoch = 1;
+    old.dirty = true;
+    const original = store.openEditor("main", old);
+    const next = sessionEditor("same-resource", { preview: false });
+    next.checkoutBinding!.expectedMaterializationEpoch = 2;
+    const replacement = store.openEditor("main", next);
+    expect(replacement.editorId).not.toBe(original.editorId);
+    expect(state.groups.main!.tabs).toHaveLength(2);
+    expect(original.dirty).toBe(true);
+    expect(original.checkoutBinding?.expectedMaterializationEpoch).toBe(1);
+    const transferred = sessionEditor("same-resource", { preview: false });
+    transferred.checkoutBinding!.expectedMaterializationEpoch = 3;
+    store.acceptTransferredEditor("main", transferred, "main");
+    expect(state.groups.main!.tabs).toHaveLength(3);
+    expect(original.checkoutBinding?.expectedMaterializationEpoch).toBe(1);
+  });
+
   it("uses project resource identity independently from checkout runtime generations", () => {
     expect(workbenchResourceKey({
       kind: "knowledge",
@@ -150,6 +189,28 @@ describe("workbench store", () => {
       "project-a",
       "project-b",
     ]);
+  });
+
+  it("opens a permanent View beside the current preview and reuses it without losing either tab", () => {
+    const store = useWorkbenchStore();
+    const state = store.ensureWindow("main");
+    const group = state.groups.main!;
+    const chat = store.openEditor("main", sessionEditor("chat"));
+    const viewInput = createWorkbenchEditorInput({ kind: "view", projectId: "project-a", viewId: "asset-panel" }, "Asset Panel", {
+      checkoutBinding: { checkoutId: "checkout-a", expectedGeneration: 7 },
+      preview: false, pinned: true,
+    });
+    const view = store.openEditor("main", viewInput, { preview: false, pinned: true });
+    expect(group.tabs.map((tab) => tab.editorId)).toEqual([chat.editorId, view.editorId]);
+    expect(group.activeEditorId).toBe(view.editorId);
+    expect(shouldShowWorkbenchTabStrip(group)).toBe(true);
+    const reopened = store.openEditor("main", { ...viewInput, editorId: "another-id" }, { preview: false, pinned: true });
+    expect(reopened.editorId).toBe(view.editorId);
+    expect(group.tabs).toHaveLength(2);
+    store.updateEditor("main", "main", view.editorId, { preview: true, pinned: false });
+    store.pinEditor("main", "main", view.editorId);
+    store.openEditor("main", sessionEditor("next-preview"));
+    expect(group.tabs.some((tab) => tab.editorId === view.editorId && tab.pinned && !tab.preview)).toBe(true);
   });
 
   it("closes active tabs within their checkout without activating a foreign project", () => {

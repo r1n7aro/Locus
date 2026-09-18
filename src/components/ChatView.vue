@@ -1,7 +1,7 @@
 
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FolderOpen, GitFork, PanelTopOpen, PencilLine, Undo2 } from "lucide";
+import { BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FileSearch, FolderOpen, GitFork, PanelTopOpen, PencilLine, Undo2 } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -34,6 +34,7 @@ import BaseSegmented from "./ui/BaseSegmented.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import { refetchDiffByKey } from "../services/diff";
 import type { WorkspaceRef } from "../services/project";
+import type { ManagedWorktree } from "../services/worktrees";
 import { openChatDiffReviewWindow } from "../services/chatDiffReviewWindow";
 import { broadcastPlanApprovalResolved, openPlanViewWindow } from "../services/planViewWindow";
 import { openContextCompactionWindow } from "../services/contextCompactionWindow";
@@ -92,6 +93,7 @@ import {
   useChatInputSettings,
 } from "../composables/useChatInputSettings";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { sessionResultIsVisible, useSessionAttentionReader } from "../composables/useSessionAttentionReader";
 import { useSessionUndoSettings } from "../composables/useSessionUndoSettings";
 import { useKnowledgeDocumentOpen } from "../composables/useKnowledgeDocumentOpen";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
@@ -124,6 +126,7 @@ interface ScopedQueuedFollowUp {
   displayText: string;
   images?: ImageAttachment[];
   canInsert: boolean;
+  canEdit?: boolean;
   isInserting: boolean;
 }
 
@@ -184,6 +187,7 @@ const runningSendLabel = computed(() =>
     : t("chat.input.queue"),
 );
 const inputControlsCollapsed = ref(false);
+const worktreeBusy = ref(false);
 const inputControlsSwitching = ref(false);
 const INPUT_CONTROLS_SWITCH_VISIBLE_MS = 120;
 const inputControlsToggleTitle = computed(() => (
@@ -298,6 +302,8 @@ const props = defineProps<{
   unityLaunchState?: "idle" | "starting" | "waitingConnection";
   unityConnectionStatus?: UnityConnectionStatus | null;
   workspaceRef?: WorkspaceRef | null;
+  selectWorktree?: (item: ManagedWorktree) => Promise<void>;
+  workspaceChanging?: boolean;
   projectId?: string;
   projectServices?: string[];
   workingDir?: string;
@@ -373,6 +379,15 @@ function hasRunningUnityRecompile(calls: ToolCallDisplay[] | undefined): boolean
 }
 
 const unityRecompileActive = computed(() => hasRunningUnityRecompile(props.activeToolCalls));
+
+// Status snapshots, popovers and subscriptions belong to one materialization.
+// Rebind the whole status strip before rendering another Worktree's state.
+const statusWorkspaceKey = computed(() => JSON.stringify([
+  props.workspaceRef?.checkoutId ?? null,
+  props.workspaceRef?.expectedGeneration ?? null,
+  props.workspaceRef?.expectedMaterializationEpoch ?? null,
+  props.workingDir ?? "",
+]));
 
 const emit = defineEmits<{
   send: [text: string, images: ImageAttachment[], assetRefs: AssetRefAttachment[], overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null }];
@@ -1292,6 +1307,10 @@ const messageContextCanCopy = computed(() =>
   !!messageContextMessage.value && messageContextMessage.value.role !== "tool",
 );
 
+const messageContextCanReview = computed(() =>
+  !!props.activeSessionId && messageContextCanCopy.value,
+);
+
 const messageContextCanAct = computed(() =>
   !!props.activeSessionId
   && !props.isStreaming
@@ -1422,6 +1441,14 @@ async function doMessageFork() {
     return;
   }
   await chatStore.forkSessionFromMessage(messageId);
+}
+
+function doMessageReview() {
+  const messageId = messageCtxMenu.value?.messageId;
+  const sessionId = props.activeSessionId;
+  if (!sessionId || !messageId || !messageContextCanReview.value) return;
+  closeMessageContextMenu();
+  emit("reviewSessionContext", { sessionId, messageId });
 }
 
 function handleQuestionAnswer(answer: string) {
@@ -2085,6 +2112,17 @@ function readMessageMetrics(el: HTMLElement) {
 function getMessagesElement() {
   return transcriptRef.value?.getScrollElement() ?? null;
 }
+
+useSessionAttentionReader(() => props.activeSessionId, getMessagesElement, (entry) => {
+  if (props.pendingSessionId || props.sessionHistoryLoading || pendingRestoreSessionId.value) return false;
+  if (entry.kind === "done" || entry.kind === "knowledgeProposal") {
+    return props.messages.some((message) => message.id === entry.targetId)
+      && sessionResultIsVisible(getMessagesElement(), entry.targetId);
+  }
+  if (entry.kind === "askUser") return props.pendingQuestion?.questionId === entry.targetId;
+  if (entry.kind === "toolConfirm") return props.pendingToolConfirms.some((item) => item.questionId === entry.targetId);
+  return !props.isStreaming && props.messages.length > 0;
+});
 
 function getMessagesContentElement() {
   return transcriptRef.value?.getContentElement?.() ?? null;
@@ -3029,6 +3067,7 @@ async function handleExitPlanMode() {
 }
 
 function handleComposerSend(payload: ChatComposerSendPayload) {
+  if (worktreeBusy.value || props.workspaceChanging) return;
   emit("send", payload.text, payload.images, payload.assetRefs, {
     displayText: payload.displayText,
     mode: payload.mode ?? undefined,
@@ -3500,6 +3539,7 @@ onUnmounted(() => {
         </BaseButton>
         <BaseButton
           class="queued-follow-up-re-edit"
+          :disabled="activeQueuedFollowUp?.canEdit === false"
           size="sm"
           variant="neutral"
           type="button"
@@ -3509,6 +3549,7 @@ onUnmounted(() => {
         </BaseButton>
         <BaseButton
           class="queued-follow-up-delete"
+          :disabled="activeQueuedFollowUp?.canEdit === false"
           size="sm"
           variant="neutral"
           type="button"
@@ -3610,6 +3651,7 @@ onUnmounted(() => {
         <div v-if="!inputControlsCollapsed" class="input-backdrop-row">
           <div v-if="!inputControlsCollapsed" class="input-backdrop-status">
             <ChatStatusIndicators
+              :key="statusWorkspaceKey"
               :unity-connected="unityConnected"
               :unity-plugin-status="unityPluginStatus"
               :unity-plugin-installing="unityPluginInstalling"
@@ -3649,6 +3691,7 @@ onUnmounted(() => {
         <RichChatInput
           ref="composerPanelRef"
           v-model="inputText"
+          :disabled="worktreeBusy || workspaceChanging"
           :selected-agent-id="selectedAgentId"
           :skills="skills"
           :managed-local-files="managedLocalFiles"
@@ -3697,7 +3740,12 @@ onUnmounted(() => {
               :multi-agent-enabled="multiAgentEnabled"
               :fast-mode-enabled="fastModeEnabled"
               :fast-mode-available="fastModeAvailable"
-              :disabled="isStreaming"
+              :workspace-ref="workspaceRef"
+              :worktree-enabled="displaySettings.worktreeEnabled"
+              :worktree-locked="!!activeSessionId || messages.length > 0 || isStreaming"
+              :select-worktree="selectWorktree"
+              :disabled="isStreaming || workspaceChanging"
+              @worktree-busy="worktreeBusy = $event"
               @select-agent="emit('selectAgent', $event)"
               @select-model="emit('selectModel', $event)"
               @select-effort="emit('selectEffort', $event)"
@@ -3840,6 +3888,16 @@ onUnmounted(() => {
           </button>
           <template v-if="messageCtxMenu.messageId">
             <div class="asset-ref-ctx-sep"></div>
+            <button
+              type="button"
+              class="asset-ref-ctx-item ui-select-none"
+              role="menuitem"
+              :disabled="!messageContextCanReview"
+              @click="doMessageReview"
+            >
+              <LucideIcon :icon="FileSearch" :size="13" />
+              {{ t("chat.messageMenu.reviewMessage") }}
+            </button>
             <button
               type="button"
               class="asset-ref-ctx-item ui-select-none"

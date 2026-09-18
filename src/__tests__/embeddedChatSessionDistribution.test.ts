@@ -150,6 +150,50 @@ describe("embedded chat session distribution", () => {
     mocks.tauriListen.mockClear();
   });
 
+  it.each([true, false])("waits for archive restoration before sending and recovers a failed draft: %s", async (succeeds) => {
+    const id = `archive-prelaunch-${succeeds}`;
+    mocks.loadSession.mockImplementation(async () => ({
+      id, title: id, sessionType: "chat", parentSessionId: null,
+      createdAt: 1, updatedAt: 1, messages: [], pendingInputs: [],
+    }));
+    mocks.chat.mockResolvedValue({ sessionId: id, runId: `${id}-run` });
+    let finish!: () => void;
+    let fail!: (error: Error) => void;
+    const beforeSessionLaunch = vi.fn(() => new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; }));
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const app = createApp(defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: `${id}-pane`, initialSessionId: id,
+          workspaceRef: { checkoutId: "archive-checkout", expectedGeneration: 1 },
+          selectedModelId: "model-a", beforeSessionLaunch,
+          buildRequest: (text) => ({ text }),
+        });
+        return () => h("div");
+      },
+    }));
+    app.mount(document.createElement("div"));
+    try {
+      await vi.waitFor(() => expect(session.isLoading.value).toBe(false));
+      session.inputText.value = "Continue this archived conversation";
+      const sending = session.send();
+      expect(beforeSessionLaunch).toHaveBeenCalledWith(id);
+      expect(mocks.chat).not.toHaveBeenCalled();
+      if (succeeds) finish();
+      else fail(new Error("Restore failed"));
+      await sending;
+      if (succeeds) {
+        expect(mocks.chat).toHaveBeenCalledWith(expect.objectContaining({ sessionId: id, text: "Continue this archived conversation" }));
+      } else {
+        expect(mocks.chat).not.toHaveBeenCalled();
+        expect(session.restoredComposerDraft.value?.text).toBe("Continue this archived conversation");
+        expect(session.isStreaming.value).toBe(false);
+      }
+    } finally {
+      app.unmount();
+    }
+  });
+
   it("restores multi agent per session, synchronizes it, and forwards it to each run", async () => {
     mocks.loadSession.mockImplementation(async (id: string) => ({
       id, title: id, sessionType: "chat", parentSessionId: null,
@@ -1075,6 +1119,58 @@ describe("embedded chat session distribution", () => {
     expect(first.streamingText.value).toBe("first response");
     expect(second.streamingText.value).toBe("second response");
     app.unmount();
+  });
+
+  it.each([false, true])("shows the transcript before slow metadata and preserves newer stream state (%s)", async (streamWhileLoading) => {
+    const sessionId = `transcript-before-metadata-${streamWhileLoading}`;
+    let finishUsage!: (value: null) => void;
+    mocks.getSessionUsage.mockReturnValueOnce(new Promise((resolve) => { finishUsage = resolve; }));
+    mocks.getSessionResumeAvailable.mockResolvedValueOnce(true);
+    mocks.getSessionPlanState.mockResolvedValueOnce({ active: false, planFilePath: "", planFileExists: false });
+    mocks.getTodos.mockResolvedValueOnce({ latestRunId: "completed", items: [
+      { content: "Existing todo", status: "pending", priority: "medium" },
+    ] });
+    mocks.loadSession.mockResolvedValueOnce({
+      id: sessionId, title: "Loaded", sessionType: "chat", parentSessionId: null,
+      createdAt: 1, updatedAt: 2, latestCompletedRunId: "completed", pendingInputs: [],
+      messages: [{ id: "message", role: "user", content: "Visible transcript", createdAt: 1 }],
+    });
+    let session!: ReturnType<typeof useEmbeddedChatSession>;
+    const app = createApp(defineComponent({
+      setup() {
+        session = useEmbeddedChatSession({
+          sessionKey: sessionId, initialSessionId: sessionId,
+          workspaceRef: { checkoutId: "checkout-latency", expectedGeneration: 1 },
+          selectedModelId: "model-a", buildRequest: (text) => ({ text }),
+        });
+        return () => h("div");
+      },
+    }));
+    app.mount(document.createElement("div"));
+    try {
+      await vi.waitFor(() => expect(session.isLoading.value).toBe(false));
+      expect(session.messages.value[0]?.content).toBe("Visible transcript");
+      expect(session.todos.value).toEqual([]);
+      if (streamWhileLoading) {
+        const source = { kind: "workspace" as const, projectId: "project-latency",
+          checkoutId: "checkout-latency", workspaceGeneration: 1, streamRevision: 1 };
+        publishSessionStreamEvent({ event: { type: "runStart", sessionId, runId: "new-run" }, source });
+        publishSessionStreamEvent({ event: { type: "textDelta", sessionId, runId: "new-run", text: "New stream" },
+          source: { ...source, streamRevision: 2 } });
+        publishSessionStreamEvent({ event: { type: "planModeChanged", sessionId, runId: "new-run",
+          active: true, planFilePath: "plan/new.md" }, source: { ...source, streamRevision: 3 } });
+      }
+      finishUsage(null);
+      await vi.waitFor(() => expect(session.todos.value).toHaveLength(1));
+      expect(session.messages.value[0]?.content).toBe("Visible transcript");
+      expect(session.isStreaming.value).toBe(streamWhileLoading);
+      expect(session.canResumeInterrupted.value).toBe(!streamWhileLoading);
+      expect(session.planModeActive.value).toBe(streamWhileLoading);
+      if (streamWhileLoading) await vi.waitFor(() => expect(session.streamingText.value).toBe("New stream"));
+    } finally {
+      finishUsage(null);
+      app.unmount();
+    }
   });
 
   it("hydrates pane-owned Plan, Resume, Todo and Undo state and accepts synthetic Plan events", async () => {

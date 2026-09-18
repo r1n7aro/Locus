@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { ref, computed, nextTick, watch } from "vue";
+import { ref, computed, inject, nextTick, watch } from "vue";
 import { PanelTopOpen } from "lucide";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import ToolCallCollection from "./ToolCallCollection.vue";
@@ -27,12 +27,14 @@ import { parseToolSearchOutput } from "./toolSearchOutput";
 import { parseLegacyTodoWriteOutput, parseTodoWriteArguments } from "../composables/todoWrite";
 import { resolveToolFilePreviewPayload } from "./toolFilePreviewActions";
 import { normalizeAppError } from "../services/errors";
-import { openToolFilePreviewWindow } from "../services/toolFilePreviewWindow";
+import { openWorkbenchFileTab, WORKBENCH_FILE_OPEN_KEY } from "../services/workbenchFile";
+import type { WorkspaceRef } from "../services/project";
 
 import type { ToolCallDisplay, FileDiffPayload } from "../types";
 
 const props = withDefaults(defineProps<{
   toolCall: ToolCallDisplay;
+  workspaceRef?: WorkspaceRef | null;
   collapseEnabled?: boolean;
   initialExpanded?: boolean;
 }>(), {
@@ -61,6 +63,7 @@ const outputPre = ref<HTMLPreElement | null>(null);
 const notificationStore = useNotificationStore();
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
+const openFileInWorkbench = inject(WORKBENCH_FILE_OPEN_KEY, openWorkbenchFileTab);
 
 // Streamed tool output (subagent text, shell chunks) repaints at the shared
 // streaming cadence instead of once per delta event; id/status transitions
@@ -476,12 +479,16 @@ async function openToolFilePreview() {
   if (!payload) return;
   openingFilePreview.value = true;
   try {
-    await openToolFilePreviewWindow(payload);
+    const workspaceRef = props.workspaceRef === undefined
+      ? workspaceContextStore.focusedWorkspaceRef
+      : props.workspaceRef;
+    if (!workspaceRef) throw new Error(t("workbench.unavailable.checkout"));
+    await openFileInWorkbench({ ...payload, workspaceRef });
   } catch (cause) {
     const error = normalizeAppError(cause);
     notificationStore.addNotice("error", error.message, {
       code: error.code,
-      operation: "openToolFilePreviewWindow",
+      operation: "openWorkbenchFileTab",
       replaceOperation: true,
     });
   } finally {
@@ -701,6 +708,7 @@ const highlightedOutput = computed(() => {
                 <template #default="{ toolCall: nestedToolCall }">
                   <ToolCallBlock
                     :tool-call="nestedToolCall"
+                    :workspace-ref="workspaceRef"
                     :collapse-enabled="collapseEnabled"
                     @tool-viewport-anchor-start="emitToolViewportAnchorStart"
                     @tool-viewport-anchor-end="emitToolViewportAnchorEnd"

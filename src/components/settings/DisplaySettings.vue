@@ -140,7 +140,6 @@ const unityEmbedAssetRefClickActionOptions = computed(() => [
 
 const topNavigationToggles = [
   { key: "showPluginsTab", labelKey: "settings.display.showPluginsTab" },
-  { key: "showAgentTab", labelKey: "settings.display.showAgentTab" },
 ] as const;
 
 const fontSlots: { slot: FontSlot; labelKey: string; mono: boolean }[] = [
@@ -243,6 +242,24 @@ onMounted(async () => {
       />
     </div>
 
+    <div class="toggle-row">
+      <BaseCheckbox
+        :model-value="display.showSessionUnreadIndicators"
+        :aria-label="t('settings.display.showSessionUnreadIndicators')"
+        @update:model-value="setDisplay('showSessionUnreadIndicators', $event)"
+      />
+      <span>{{ t("settings.display.showSessionUnreadIndicators") }}</span>
+    </div>
+
+    <div class="toggle-row">
+      <BaseCheckbox
+        :model-value="display.autoPromoteCompletedSessions"
+        :aria-label="t('settings.display.autoPromoteCompletedSessions')"
+        @update:model-value="setDisplay('autoPromoteCompletedSessions', $event)"
+      />
+      <span :title="t('settings.display.autoPromoteCompletedSessionsDesc')">{{ t("settings.display.autoPromoteCompletedSessions") }}</span>
+    </div>
+
     <div v-for="item in knowledgeFolderToggles" :key="item.kind" class="toggle-row">
       <BaseSwitch
         :model-value="display.knowledgeFolderVisibility[item.kind]"
@@ -263,6 +280,15 @@ onMounted(async () => {
 
     <div class="toggle-row">
       <BaseCheckbox
+        :model-value="display.showAgentTab"
+        :aria-label="t('settings.display.showAgentTab')"
+        @update:model-value="setDisplay('showAgentTab', $event)"
+      />
+      <span>{{ t("settings.display.showAgentTab") }}</span>
+    </div>
+
+    <div class="toggle-row">
+      <BaseCheckbox
         :model-value="display.autoPlaceNewPlanDesignKnowledgeDocuments"
         :aria-label="t('settings.display.autoPlaceNewPlanDesignKnowledgeDocuments')"
         @update:model-value="setDisplay('autoPlaceNewPlanDesignKnowledgeDocuments', $event)"
@@ -277,15 +303,6 @@ onMounted(async () => {
         @update:model-value="setDisplay('showAgentSelector', $event)"
       />
       <span>{{ t("settings.display.showAgentSelector") }}</span>
-    </div>
-
-    <div class="toggle-row">
-      <BaseSwitch
-        :model-value="display.showCollabSidebar"
-        :aria-label="t('settings.display.showCollabSidebar')"
-        @update:model-value="setDisplay('showCollabSidebar', $event)"
-      />
-      <span>{{ t("settings.display.showCollabSidebar") }}</span>
     </div>
 
     <div v-for="item in topNavigationToggles" :key="item.key" class="toggle-row">
@@ -407,15 +424,6 @@ onMounted(async () => {
         @update:model-value="setDisplay('showViewsInSessionPanel', $event)"
       />
       <span>{{ t("settings.display.showViewsInSessionPanel") }}</span>
-    </div>
-
-    <div class="toggle-row">
-      <BaseSwitch
-        :model-value="display.showViewLogBar"
-        :aria-label="t('settings.display.showViewLogBar')"
-        @update:model-value="setDisplay('showViewLogBar', $event)"
-      />
-      <span>{{ t("settings.display.showViewLogBar") }}</span>
     </div>
 
   </div>

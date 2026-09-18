@@ -553,7 +553,9 @@ pub fn normalize_workspace_relative_path(path: &str) -> Option<String> {
         || normalized.contains("/../")
         || normalized.starts_with("../")
         || normalized.ends_with("/..")
-        || (!normalized.starts_with("Assets/") && !normalized.starts_with("Packages/"))
+        || (!normalized.starts_with("Assets/")
+            && !normalized.starts_with("Packages/")
+            && !normalized.starts_with("Locus/knowledge/"))
     {
         return None;
     }
@@ -562,6 +564,9 @@ pub fn normalize_workspace_relative_path(path: &str) -> Option<String> {
 
 pub fn is_unity_compile_input(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
+    if normalized.starts_with("Locus/knowledge/") {
+        return false;
+    }
     if is_package_control_path(&normalized) || normalized.ends_with(".meta") {
         return is_package_control_path(&normalized);
     }
@@ -684,6 +689,37 @@ mod tests {
             hub.unity_snapshot(temp.path(), &[]).mode,
             UnityAssetSyncMode::None
         );
+    }
+
+    #[test]
+    fn knowledge_csv_and_view_events_do_not_enter_unity_compile_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let hub = healthy_hub(temp.path());
+        for path in [
+            "Locus/knowledge/design/动作.csv",
+            "Locus/knowledge/design/动作.csv.view",
+            "Locus/knowledge/skill/example.cs",
+        ] {
+            assert_eq!(
+                hub.observe(
+                    path,
+                    WorkspaceChangeKind::Upsert,
+                    WorkspaceChangeSource::LocusWrite
+                )
+                .unwrap()
+                .path,
+                path
+            );
+        }
+        assert_eq!(hub.status().next_seq, 3);
+        assert_eq!(hub.status().pending_count, 0);
+        assert!(hub
+            .observe(
+                "Locus/knowledge/../../outside.csv",
+                WorkspaceChangeKind::Upsert,
+                WorkspaceChangeSource::OsWatcher
+            )
+            .is_none());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
-import { listen } from "@tauri-apps/api/event";
+
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   assetDbOverview,
@@ -14,7 +14,7 @@ import {
   searchWorkspaceEntries,
   statWorkspaceEntries,
 } from "../services/project";
-import { WORKSPACE_EVENT_NAME } from "../services/project";
+
 import type { RoutedWorkspaceEvent, WorkspaceRef } from "../services/project";
 import {
   subscribeWorkspaceFileChanges,
@@ -34,6 +34,8 @@ import type {
   SemanticTargetInspector,
   WatcherTuning,
 } from "../types";
+import { listenWorkspaceEvent } from "../services/workspaceEventHub";
+import { useWorkspaceEventScope } from "./useWorkspaceEventScope";
 
 interface AssetProps {
   workingDir: string;
@@ -83,6 +85,7 @@ function assetPreviewErrorMessage(error: unknown): string {
 }
 
 export function useAssetState(props: AssetProps) {
+  const workspaceEventSignal = useWorkspaceEventScope();
   const { state: displaySettings } = useDisplaySettings();
   // ── Reactive state ────────────────────────────────────────
   const loading = ref(false);
@@ -1165,8 +1168,8 @@ export function useAssetState(props: AssetProps) {
           };
         }
       };
-      unlistenScoped = await listen<RoutedWorkspaceEvent<AssetDbScanEvent>>(
-        WORKSPACE_EVENT_NAME,
+      unlistenScoped = await listenWorkspaceEvent<RoutedWorkspaceEvent<AssetDbScanEvent>>(
+        "useAssetState.useAssetState",
         async (event) => {
           const workspaceRef = props.workspaceRef;
           if (!workspaceRef) return;
@@ -1179,6 +1182,7 @@ export function useAssetState(props: AssetProps) {
           ) return;
           await applyScanPhase(routed.payload);
         },
+        { signal: workspaceEventSignal },
       );
     } catch (e) {
       // listen failure shouldn't break the page
@@ -1208,6 +1212,7 @@ export function useAssetState(props: AssetProps) {
       props.workingDir,
       props.workspaceRef?.checkoutId ?? "",
       props.workspaceRef?.expectedGeneration ?? null,
+      props.workspaceRef?.expectedMaterializationEpoch ?? null,
     ] as const,
     async ([workingDir]) => {
       stopWatcherPoll();

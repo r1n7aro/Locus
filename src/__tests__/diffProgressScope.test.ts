@@ -1,3 +1,4 @@
+import { resetWorkspaceEventHubForTests } from "../services/workspaceEventHub";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const eventMocks = vi.hoisted(() => ({
@@ -17,6 +18,7 @@ import { WORKSPACE_EVENT_NAME } from "../services/project";
 
 describe("diff progress workspace routing", () => {
   beforeEach(() => {
+    resetWorkspaceEventHubForTests();
     eventMocks.listen.mockReset();
   });
 

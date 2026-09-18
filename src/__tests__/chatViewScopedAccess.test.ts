@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { createPinia } from "pinia";
-import { createApp, defineComponent, h, nextTick, ref, type App } from "vue";
+import { createApp, defineComponent, h, nextTick, onUnmounted, reactive, ref, type App, type PropType } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChatMessage } from "../types";
 import type { WorkspaceRef } from "../services/project";
@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => {
   const globalWorkspaceRef = { checkoutId: "global-checkout", expectedGeneration: 1 };
   return {
     globalWorkspaceRef,
+    loadIndicatorState: vi.fn<(scope: WorkspaceRef) => Promise<string>>(),
+    releaseIndicatorState: vi.fn(),
     chatStore: {
       activeSessionPlanMode: false,
       activeQueuedFollowUp: null,
@@ -241,7 +243,17 @@ vi.mock("../components/chat/RichChatInput.vue", () => ({
 }));
 
 vi.mock("../components/chat/ChatStatusIndicators.vue", () => ({
-  default: defineComponent({ name: "ChatStatusIndicatorsStub", setup: () => () => h("div") }),
+  default: defineComponent({
+    name: "ChatStatusIndicatorsStub",
+    props: { workspaceRef: Object as PropType<WorkspaceRef | null> },
+    setup(props) {
+      const binding = props.workspaceRef ? { ...props.workspaceRef } : null;
+      const status = ref("loading");
+      if (binding) void mocks.loadIndicatorState(binding).then(value => { status.value = value; });
+      onUnmounted(() => mocks.releaseIndicatorState(binding));
+      return () => h("div", { class: "test-status-indicators" }, status.value);
+    },
+  }),
 }));
 vi.mock("../components/ModelEffortSelector.vue", () => ({
   default: defineComponent({ name: "ModelEffortSelectorStub", setup: () => () => h("div") }),
@@ -339,6 +351,7 @@ function contextMenuButton(label: string) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.loadIndicatorState.mockReset().mockResolvedValue("ready");
   mocks.chatChangesStore.sessionState.mockReturnValue(null);
   mocks.chatChangesStore.inlineDiffStateForSession.mockReturnValue(null);
   mocks.chatChangesStore.hasChangesForSession.mockReturnValue(false);
@@ -360,6 +373,72 @@ afterEach(() => {
 });
 
 describe("ChatView scoped access boundary", () => {
+  it.each([false, true])("reviews the clicked message in its pane session while streaming=%s", async (isStreaming) => {
+    const reviewSessionContext = vi.fn();
+    const host = mountChat({
+      isStreaming,
+      messages: [{ id: "selected-message", role: "assistant", content: "Selected answer", createdAt: 1 }],
+    }, { onReviewSessionContext: reviewSessionContext });
+    await flushUi();
+    host.querySelector(".test-message")?.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true, clientX: 10, clientY: 10,
+    }));
+    await flushUi();
+    const review = contextMenuButton("chat.messageMenu.reviewMessage");
+    expect(review).not.toBeNull();
+    expect(review?.disabled).toBe(false);
+    review?.click();
+    await flushUi();
+    expect(reviewSessionContext).toHaveBeenCalledExactlyOnceWith({
+      sessionId: "pane-session", messageId: "selected-message",
+    });
+    expect(contextMenuButton("chat.messageMenu.reviewMessage")).toBeNull();
+  });
+
+  it.each([
+    { checkoutId: "another-worktree", expectedGeneration: 7, expectedMaterializationEpoch: 1 },
+    { checkoutId: "pane-checkout", expectedGeneration: 8, expectedMaterializationEpoch: 1 },
+    { checkoutId: "pane-checkout", expectedGeneration: 7, expectedMaterializationEpoch: 2 },
+  ])("clears the previous status immediately when the Worktree binding changes: %j", async (nextScope) => {
+    const previous = { ...paneWorkspaceRef, expectedMaterializationEpoch: 1 };
+    const props = reactive({ workspaceRef: previous });
+    const host = mountChat(props);
+    await flushUi();
+    expect(host.querySelector(".test-status-indicators")?.textContent).toBe("ready");
+
+    let finish!: (status: string) => void;
+    mocks.loadIndicatorState.mockReturnValueOnce(new Promise(resolve => { finish = resolve; }));
+    props.workspaceRef = nextScope;
+    await flushUi();
+    expect(host.querySelector(".test-status-indicators")?.textContent).toBe("loading");
+    expect(mocks.releaseIndicatorState).toHaveBeenCalledExactlyOnceWith(previous);
+    expect(mocks.loadIndicatorState).toHaveBeenLastCalledWith(nextScope);
+    finish("new-worktree-idle");
+    await flushUi();
+    expect(host.querySelector(".test-status-indicators")?.textContent).toBe("new-worktree-idle");
+  });
+
+  it("ignores a late status response from the previously selected Worktree", async () => {
+    let finishOld!: (status: string) => void;
+    mocks.loadIndicatorState.mockReturnValueOnce(new Promise(resolve => { finishOld = resolve; }));
+    const props = reactive<{ workspaceRef: WorkspaceRef | null }>({ workspaceRef: paneWorkspaceRef });
+    const host = mountChat(props);
+    await flushUi();
+    props.workspaceRef = { checkoutId: "new-worktree", expectedGeneration: 1 };
+    await flushUi();
+    finishOld("old-worktree-playing");
+    await flushUi();
+    expect(host.querySelector(".test-status-indicators")?.textContent).toBe("ready");
+
+    props.workspaceRef = { ...props.workspaceRef };
+    await flushUi();
+    expect(mocks.loadIndicatorState).toHaveBeenCalledTimes(2);
+    props.workspaceRef = null;
+    await flushUi();
+    expect(host.querySelector(".test-status-indicators")?.textContent).toBe("loading");
+    expect(mocks.releaseIndicatorState).toHaveBeenCalledTimes(2);
+  });
+
   it("routes re-edit and message fork through the pane controller", async () => {
     const undoConversation = vi.fn(async () => true);
     const restoreComposerDraft = vi.fn(async () => undefined);

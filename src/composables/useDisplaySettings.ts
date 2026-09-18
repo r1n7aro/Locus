@@ -102,6 +102,10 @@ export interface DisplaySettings {
   knowledgeFolderVisibility: Record<KnowledgeFolderKind, boolean>;
   /** Add newly created Plan and Design documents below the Knowledge tree entry. */
   autoPlaceNewPlanDesignKnowledgeDocuments: boolean;
+  /** Show unread results in the workspace tree. */
+  showSessionUnreadIndicators: boolean;
+  /** Move completed sessions to the start of their contiguous sibling block. */
+  autoPromoteCompletedSessions: boolean;
   /** Directory names hidden from the Files page in every workspace. */
   fileExplorerHiddenDirectories: string[];
   /** Additional directory names hidden when the workspace is a Unity project. */
@@ -112,8 +116,8 @@ export interface DisplaySettings {
   showAgentTab: boolean;
   /** Show the Agent column in chat model selectors */
   showAgentSelector: boolean;
-  /** Show the Git sidebar in the Collaboration workspace */
-  showCollabSidebar: boolean;
+  /** Experimental worktree selection before the first chat message. */
+  worktreeEnabled: boolean;
   /** Auto-open TODO panel when todos arrive */
   todoAutoOpen: boolean;
   /** Auto-open file changes panel when changes arrive */
@@ -146,8 +150,6 @@ export interface DisplaySettings {
   hideThinkingBlocks: boolean;
   /** Show View packages in the lower section of the session list */
   showViewsInSessionPanel: boolean;
-  /** Show the frontend log bar at the bottom of View windows */
-  showViewLogBar: boolean;
   /** Merge Git tree status letters into colored file icons */
   mergeGitTreeStatusIcon: boolean;
   /** Hide Git command suggestions in Git terminal */
@@ -221,12 +223,14 @@ const defaults: DisplaySettings = {
   workspaceSectionVisibility: { ...defaultWorkspaceSectionVisibility },
   knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
   autoPlaceNewPlanDesignKnowledgeDocuments: true,
+  showSessionUnreadIndicators: true,
+  autoPromoteCompletedSessions: true,
   fileExplorerHiddenDirectories: [...DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES],
   unityFileExplorerHiddenDirectories: [...DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES],
   showPluginsTab: true,
   showAgentTab: true,
   showAgentSelector: true,
-  showCollabSidebar: false,
+  worktreeEnabled: false,
   todoAutoOpen: true,
   changesAutoOpen: true,
   changesAutoClose: true,
@@ -245,7 +249,6 @@ const defaults: DisplaySettings = {
   compactToolCalls: true,
   hideThinkingBlocks: true,
   showViewsInSessionPanel: false,
-  showViewLogBar: false,
   mergeGitTreeStatusIcon: true,
   hideGitCommandSuggestions: false,
   systemNotificationsEnabled: true,

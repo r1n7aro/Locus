@@ -38,7 +38,7 @@ describe("selector dropdown alignment", () => {
     expect(source).toContain("min-height: 28px;");
     expect(source).toContain("border: 1px solid transparent;");
     expect(source).toContain(".model-effort-dropdown {");
-    expect(source).toContain("right: 0;");
+    expect(source).toContain('props.align === "start" ? bounds.left : bounds.right - width');
     expect(source).toContain("transform-origin: bottom right;");
     expect(source).toContain(".model-effort-dropdown.has-agent.has-effort {");
     expect(source).toContain("grid-template-columns: 150px minmax(0, 1fr) 120px;");

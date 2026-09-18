@@ -78,11 +78,11 @@ async function bindPayloadWorkspace(
     if (workspaceRef && workspaceRef.checkoutId !== session.defaultCheckoutId) {
       throw new Error(t("chat.session.windowUnavailable"));
     }
-    workspaceRef = { checkoutId: session.defaultCheckoutId };
+    workspaceRef = workspaceRef ?? { checkoutId: session.defaultCheckoutId, expectedMaterializationEpoch: session.defaultMaterializationEpoch };
   }
   if (!workspaceRef?.checkoutId) throw new Error(t("chat.session.windowUnavailable"));
 
-  const context = await workspaceContextStore.focusCheckout(workspaceRef.checkoutId);
+  const context = await workspaceContextStore.focusWorkspaceRef(workspaceRef);
   if (!context) throw new Error(t("chat.session.windowUnavailable"));
   if (
     workspaceRef.expectedGeneration != null
@@ -93,6 +93,7 @@ async function bindPayloadWorkspace(
   return {
     checkoutId: context.focusedCheckoutId,
     expectedGeneration: context.workspaceGeneration,
+    expectedMaterializationEpoch: context.materializationEpoch,
   };
 }
 

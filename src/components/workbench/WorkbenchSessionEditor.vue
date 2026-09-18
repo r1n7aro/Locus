@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, ref, watch, watchPostEffect } from "vue";
 import { t } from "../../i18n";
 import { useEmbeddedChatSession } from "../../composables/useEmbeddedChatSession";
 import { useSkills } from "../../composables/useSkills";
@@ -7,7 +7,8 @@ import { useKnowledgeAccessMode } from "../../composables/useKnowledgeAccessMode
 import { useWorkspaceAssetDbStatus } from "../../composables/useWorkspaceAssetDbStatus";
 import { useWorkspaceUnityStatus } from "../../composables/useWorkspaceUnityStatus";
 import type { WorkspaceRef } from "../../services/project";
-import { saveSessionExecutionState } from "../../services/session";
+import type { ManagedWorktree } from "../../services/worktrees";
+import { saveSessionExecutionState, unarchiveSession } from "../../services/session";
 import { broadcastSessionExecutionState } from "../../services/sessionExecutionState";
 import { useAgentStore } from "../../stores/agent";
 import { useAuthStore } from "../../stores/auth";
@@ -32,6 +33,8 @@ import ThinkingPanel from "../ThinkingPanel.vue";
 const props = defineProps<{
   editor: WorkbenchEditorInput;
   workspaceRef: WorkspaceRef | null;
+  selectWorktree?: (item: ManagedWorktree) => Promise<void>;
+  workspaceChanging?: boolean;
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   shortcutActive?: boolean;
@@ -39,6 +42,8 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  (event: "session-unarchived", sessionId: string): void;
+  (event: "ready"): void;
   (event: "session-created", payload: { editorId: string; sessionId: string }): void;
   (event: "new-session-requested", payload: {
     editorId: string;
@@ -72,12 +77,14 @@ const chatChangesStore = useChatChangesStore();
 const modelStore = useModelStore();
 const notificationStore = useNotificationStore();
 const workspaceContextStore = useWorkspaceContextStore();
-const { skillItems } = useSkills();
+const { skillItems, loadSkills } = useSkills(() => props.workspaceRef);
 const { state: knowledgeAccessState } = useKnowledgeAccessMode();
 const chatViewRef = ref<InstanceType<typeof ChatView> | null>(null);
 
 const requestedSessionId = computed(() => (
-  props.editor.resource.kind === "session" ? props.editor.resource.sessionId : null
+  props.editor.resource.kind === "session"
+    || (props.editor.resource.kind === "section" && props.editor.resource.section === "archived")
+    ? props.editor.resource.sessionId ?? null : null
 ));
 const sessionKey = computed(() => `workbench:${props.editor.editorId}`);
 const editorAgentId = ref(agentStore.selectedAgentId?.trim() ?? "");
@@ -174,6 +181,7 @@ const {
   pendingToolConfirms,
   queuedFollowUp,
   errorMessage,
+  isLoading,
   sessionId,
   currentRunId,
   sessionAgentId,
@@ -230,9 +238,18 @@ const {
   fastMode: editorFastMode,
   multiAgentEnabled: editorMultiAgentEnabled,
   knowledgeMode: computed(() => knowledgeAccessState.mode),
+  async beforeSessionLaunch(targetSessionId) {
+    if (props.editor.resource.kind !== "section" || props.editor.resource.section !== "archived") return;
+    await unarchiveSession(targetSessionId);
+    emit("session-unarchived", targetSessionId);
+  },
   buildRequest(input) {
     return { text: input, displayText: input };
   },
+});
+
+watchPostEffect(() => {
+  if (!isLoading.value) emit("ready");
 });
 
 watch(restoredComposerDraft, async (draft) => {
@@ -384,12 +401,20 @@ async function applyDraftPrefill(
   draft: Parameters<NonNullable<InstanceType<typeof ChatView>["applyDraftPrefill"]>>[0],
 ): Promise<void> {
   await chatViewRef.value?.applyDraftPrefill(draft);
+  emit("composer-draft-change", {
+    editorId: props.editor.editorId,
+    hasDraft: !(chatViewRef.value?.isComposerDraftEmpty() ?? true),
+  });
 }
 
 async function appendComposerDraft(
   draft: Parameters<NonNullable<InstanceType<typeof ChatView>["appendComposerDraft"]>>[0],
 ): Promise<void> {
   await chatViewRef.value?.appendComposerDraft(draft);
+  emit("composer-draft-change", {
+    editorId: props.editor.editorId,
+    hasDraft: !(chatViewRef.value?.isComposerDraftEmpty() ?? true),
+  });
 }
 
 function exportTransferSnapshot() {
@@ -401,6 +426,18 @@ function exportTransferSnapshot() {
 
 function exportComposerDraft() {
   return chatViewRef.value?.exportComposerDraft() ?? null;
+}
+
+function exportExecutionSelection() {
+  return { agentId: selectedAgentId.value, modelId: editorModelId.value, effort: editorEffort.value,
+    fastMode: editorFastMode.value, multiAgentEnabled: editorMultiAgentEnabled.value };
+}
+function applyExecutionSelection(selection: ReturnType<typeof exportExecutionSelection>) {
+  editorAgentId.value = selection.agentId;
+  editorModelId.value = selection.modelId;
+  editorEffort.value = selection.effort;
+  editorFastMode.value = selection.fastMode;
+  editorMultiAgentEnabled.value = selection.multiAgentEnabled;
 }
 
 async function focusComposerInput(): Promise<void> {
@@ -510,6 +547,8 @@ function handleNewSessionRequest(request: { source: "control" | "shortcut" }): v
 }
 
 defineExpose({
+  exportExecutionSelection,
+  applyExecutionSelection,
   applyDraftPrefill,
   appendComposerDraft,
   exportComposerDraft,
@@ -571,6 +610,8 @@ defineExpose({
     :unity-launch-state="workspaceUnityLaunchState"
     :unity-connection-status="workspaceUnityConnectionStatus"
     :workspace-ref="workspaceRef"
+    :select-worktree="selectWorktree"
+    :workspace-changing="workspaceChanging"
     :project-id="editor.resource.projectId"
     :reference-drop-available="referenceDropAvailable"
     :reference-drop-active="referenceDropActive"
@@ -622,7 +663,7 @@ defineExpose({
     @request-plan-mode="setPlanMode"
     @export-session-context="handleExportSessionContext"
     @review-session-context="handleReviewSessionContext"
-    @composer-focus="emit('composer-focus', { editorId: props.editor.editorId })"
+    @composer-focus="loadSkills(); emit('composer-focus', { editorId: props.editor.editorId })"
     @open-thinking="handleOpenThinking"
     @open-knowledge-document="handleOpenKnowledgeDocument('editor', $event)"
     @open-knowledge-document-in-knowledge="handleOpenKnowledgeDocument('knowledge', $event)"

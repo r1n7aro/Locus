@@ -6,6 +6,7 @@ import { AppWindow } from "lucide";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { open } from "@tauri-apps/plugin-dialog";
 import { t } from "./i18n";
 import { normalizeAppError } from "./services/errors";
 import { useUiStore, type AppPage } from "./stores/ui";
@@ -61,7 +62,6 @@ import {
   openWorkspacePageWindow,
   WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
 } from "./services/workspacePageWindow";
-import { isViewContentWindowLocation } from "./services/view";
 import {
   canStartWindowDragFromTarget,
   getCurrentTauriWindowLabel,
@@ -69,7 +69,6 @@ import {
   startCurrentWindowDragging,
 } from "./services/tauriRuntime";
 import { markStartupPhase } from "./services/startupPerf";
-import { reloadPluginInspectorDrawers } from "./services/inspectorDrawerExtensions";
 import { currentUnityEmbedWorkspaceRef } from "./services/unity";
 const isUnityEmbedTestWindow = window.location.pathname === "/unity-embed-test";
 const isUnityEmbedWindow = !isUnityEmbedTestWindow && window.location.pathname === "/unity-embed";
@@ -89,7 +88,6 @@ const isWorkspacePageWindow = isWorkspacePageWindowLocation();
 const isPlanViewWindow = isPlanViewWindowLocation();
 const isUnityValueEditorWindow = isUnityValueEditorWindowLocation();
 const isExtraWorkdirsWindow = isExtraWorkdirsWindowLocation();
-const isViewContentWindow = isViewContentWindowLocation();
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
   || isKnowledgeDownloadWindow
@@ -102,8 +100,7 @@ const isStandaloneWindow = isUnityEmbedWindow
   || isWorkspacePageWindow
   || isPlanViewWindow
   || isUnityValueEditorWindow
-  || isExtraWorkdirsWindow
-  || isViewContentWindow;
+  || isExtraWorkdirsWindow;
 
 const KnowledgeDownloadProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeDownloadProgressWindow.vue"));
 const KnowledgeLexicalProgressWindow = defineAsyncComponent(() => import("./components/KnowledgeLexicalProgressWindow.vue"));
@@ -137,6 +134,48 @@ const workspaceContextStore = useWorkspaceContextStore();
 const chatStore = useChatStore();
 const notificationStore = useNotificationStore();
 const appUpdateStore = useAppUpdateStore();
+const mainWorkspaceRestored = ref(false);
+const mainBootstrapError = ref("");
+// Start recovery during setup, before the first mounted hook or auth request.
+// Utility/embedded windows bind their own explicit workspace in their owner.
+const mainWorkspaceReady = isStandaloneWindow ? undefined : (async () => {
+  markStartupPhase("main_workspace_restore_start");
+  await workspaceContextStore.ensureInitialized(getCurrentTauriWindowLabel() || "main", "main");
+  mainWorkspaceRestored.value = true;
+  if (!workspaceContextStore.focusedCheckout
+    && Object.values(workspaceContextStore.checkoutsById).some((checkout) => checkout.available === false)) {
+    notificationStore.addNotice("warning", t("workspace.unavailable"), {
+      operation: "startup-workspace-unavailable",
+      replaceOperation: true,
+    });
+  }
+  markStartupPhase("main_workspace_restore_done");
+})();
+void mainWorkspaceReady?.catch((error) => {
+  mainBootstrapError.value = normalizeAppError(error).message;
+});
+function retryMainStartup() {
+  window.location.reload();
+}
+const openingRecoveryWorkspace = ref(false);
+async function openRecoveryWorkspace() {
+  if (openingRecoveryWorkspace.value) return;
+  openingRecoveryWorkspace.value = true;
+  try {
+    const selected = await open({ directory: true, multiple: false });
+    if (typeof selected !== "string" || !selected.trim()) return;
+    // Retry the catalog/CAS snapshot if its original startup request failed.
+    await workspaceContextStore.ensureInitialized(getCurrentTauriWindowLabel() || "main", "main");
+    const context = await workspaceContextStore.openAndFocusInPane(
+      selected, getCurrentTauriWindowLabel() || "main", "main",
+    );
+    if (context) window.location.reload();
+  } catch (error) {
+    mainBootstrapError.value = normalizeAppError(error).message;
+  } finally {
+    openingRecoveryWorkspace.value = false;
+  }
+}
 const { state: displaySettings } = useDisplaySettings();
 const {
   runtime: agentWorkspaceRuntime,
@@ -165,26 +204,11 @@ const {
   registerListeners,
   cleanup,
   refreshAfterSettings,
-  onOnboardingCompleted: completeOnboarding,
+  onOnboardingCompleted: handleOnboardingCompleted,
 } = useAppBootstrap({
+  workspaceReady: mainWorkspaceReady,
   handleExternalScriptOpen: !isUnityEmbedWindow && !isStandaloneWindow,
 });
-
-async function handleOnboardingCompleted() {
-  await completeOnboarding();
-  await workspaceContextStore.initialize(getCurrentTauriWindowLabel() || "main", "main");
-  const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-  if (workspaceRef) {
-    await Promise.all([
-      chatStore.refreshSessions(),
-      agentStore.loadWorkspaceAgents(workspaceRef),
-      projectStore.checkUnityConnection(),
-      projectStore.checkUnityPlugin(),
-      projectStore.loadAssetDbStatus(),
-    ]);
-    void reloadPluginInspectorDrawers();
-  }
-}
 
 async function bindUnityEmbedWorkspace() {
   const workspaceRef = currentUnityEmbedWorkspaceRef();
@@ -306,7 +330,6 @@ interface TopTabItem {
 const topTabs = computed<TopTabItem[]>(() => [
   { id: "development", labelKey: "app.tab.development", visible: true },
   { id: "plugins", labelKey: "app.tab.plugins", visible: showPluginEntry && displaySettings.showPluginsTab },
-  { id: "agent", labelKey: "app.tab.agent", visible: displaySettings.showAgentTab },
   { id: "settings", labelKey: "app.tab.settings", visible: true },
 ]);
 
@@ -340,6 +363,7 @@ async function openTopTabInWindow(tab: TopTabItem) {
         title: `${shortDir(runtime.root)} · ${t(tab.labelKey)}`,
         checkoutId: runtime.checkoutId,
         workspaceGeneration: runtime.workspaceGeneration,
+        materializationEpoch: runtime.materializationEpoch,
       });
     } else if (isAppWorkspacePageId(tab.id)) {
       await openWorkspacePageWindow({
@@ -680,29 +704,14 @@ onMounted(async () => {
   );
   markStartupPhase("main_dom_listeners_ready");
   markStartupPhase("main_bootstrap_critical_start");
-  await bootstrapCritical();
-  markStartupPhase("main_bootstrap_critical_done");
   try {
-    await workspaceContextStore.initialize(getCurrentTauriWindowLabel() || "main", "main");
-    if (!workspaceContextStore.focusedWorkspaceRef && projectStore.workingDir) {
-      await workspaceContextStore.openAndFocus(projectStore.workingDir);
-    }
-    if (workspaceContextStore.focusedWorkspaceRef) {
-      await Promise.all([
-        chatStore.refreshSessions(),
-        agentStore.loadWorkspaceAgents(workspaceContextStore.focusedWorkspaceRef),
-        projectStore.checkUnityConnection(),
-        projectStore.checkUnityPlugin(),
-        projectStore.loadAssetDbStatus(),
-      ]);
-      void reloadPluginInspectorDrawers();
-    }
+    await bootstrapCritical();
+    markStartupPhase("main_bootstrap_critical_done");
   } catch (error) {
+    mainBootstrapError.value = normalizeAppError(error).message;
     reportWorkingDirSwitchError(error);
+    return;
   }
-  markStartupPhase("main_register_listeners_start");
-  await registerListeners();
-  markStartupPhase("main_register_listeners_done");
   // Development is already interactive. Preload the remaining process-level pages.
   preloadTabsInBackground([
     settingsView.ensureLoaded,
@@ -748,6 +757,9 @@ onUnmounted(() => {
 });
 
 watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
+  if (workspaceContextStore.focusedWorkspaceRef) {
+    notificationStore.clearByOperation("startup-workspace-unavailable");
+  }
   startKnowledgeRuntimeStartupPolling();
 });
 </script>
@@ -777,8 +789,12 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
   <PlanViewWindow v-else-if="isPlanViewWindow" />
   <UnityValueEditorWindow v-else-if="isUnityValueEditorWindow" />
   <ExtraWorkdirsConfigWindow v-else-if="isExtraWorkdirsWindow" />
-  <ViewHostWindow v-else-if="isViewContentWindow" embedded />
-  <div v-else-if="!authStore.authChecked" class="app-startup-state">
+  <div v-else-if="mainBootstrapError" class="app-startup-state">
+    <span>{{ mainBootstrapError }}</span>
+    <BaseButton size="sm" :disabled="openingRecoveryWorkspace" @click="openRecoveryWorkspace">{{ t("development.openWorkspace") }}</BaseButton>
+    <BaseButton size="sm" @click="retryMainStartup">{{ t("common.refresh") }}</BaseButton>
+  </div>
+  <div v-else-if="!authStore.authChecked || !mainWorkspaceRestored" class="app-startup-state">
     <span>{{ t("common.loading") }}</span>
   </div>
   <OnboardingView v-else-if="authStore.authChecked && uiStore.showOnboarding" @completed="handleOnboardingCompleted" />

@@ -4,5 +4,5 @@
     "lib": ["ES2021", "DOM", "DOM.Iterable"],
     "types": ["vite/client", "vitest/globals", "node"]
   },
-  "include": ["src/__tests__/**/*.ts"]
+  "include": ["src/__tests__/**/*.ts", "src/turndown-plugin-gfm.d.ts"]
 }
