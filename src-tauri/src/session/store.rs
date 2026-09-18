@@ -28,8 +28,14 @@ use crate::commands::{
 use crate::compact;
 
 mod async_task_results;
+mod maintenance;
 mod agent_messages;
 mod multi_agent;
+mod codex_reasoning;
+mod upstream_model;
+mod timing;
+mod history_query;
+mod archive_storage;
 
 #[derive(Clone)]
 pub struct SessionStore {
@@ -896,7 +902,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 44;
+    const SCHEMA_VERSION: i32 = 48;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1448,13 +1454,36 @@ impl SessionStore {
         if current < 44 {
             Self::migrate(conn, 44, "persist session multi agent selection", Self::migrate_multi_agent_selection)?;
         }
-        debug_assert_eq!(Self::SCHEMA_VERSION, 44, "add a new migration block above");
+        if current < 45 {
+            Self::migrate(conn, 45, "bind sessions and runs to materialization epochs", Self::migrate_materialization_epochs)?;
+        }
+        if current < 46 {
+            Self::migrate(conn, 46, "persist native Codex reasoning updates", Self::migrate_codex_reasoning_updates)?;
+        }
+        if current < 47 {
+            Self::migrate(conn, 47, "persist upstream response model", Self::migrate_upstream_model)?;
+        }
+        if current < 48 {
+            Self::migrate(conn, 48, "recover upstream response model declarations", Self::migrate_upstream_model_declarations)?;
+        }
+        debug_assert_eq!(Self::SCHEMA_VERSION, 48, "add a new migration block above");
         Ok(())
     }
 
     /// Older clients did not persist canonical response items. Mark their
     /// absence explicitly and re-key content-addressed payloads atomically.
     /// Running this migration twice leaves both references and payloads stable.
+    fn migrate_materialization_epochs(conn: &Connection) -> rusqlite::Result<()> {
+        if !Self::table_has_column(conn, "session_runs", "materialization_epoch")? {
+            conn.execute_batch("ALTER TABLE session_runs ADD COLUMN materialization_epoch INTEGER CHECK(materialization_epoch >= 0);")?;
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS session_checkout_assignments (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            checkout_id TEXT NOT NULL REFERENCES workspace_checkouts(checkout_id),
+            materialization_epoch INTEGER NOT NULL CHECK(materialization_epoch >= 0)
+        );")
+    }
+
     fn migrate_codex_response_replay(conn: &Connection) -> rusqlite::Result<()> {
         let rows = {
             let mut stmt = conn.prepare("SELECT id, payload_json FROM response_request_payloads")?;
@@ -1853,6 +1882,7 @@ impl SessionStore {
             CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);",
         )
         .and_then(|_| Self::create_session_sync_schema(conn))
+        .and_then(|_| Self::migrate_materialization_epochs(conn))
         .and_then(|_| Self::create_context_attempt_schema(conn))
         .and_then(|_| Self::create_model_usage_schema(conn))
         .and_then(|_| Self::create_prompt_prefix_cache_schema(conn))
@@ -2734,6 +2764,7 @@ impl SessionStore {
             manifest_path: String::new(),
             revision,
             nodes,
+            item_states: Vec::new(),
             presets: Vec::new(),
         })
     }
@@ -2929,6 +2960,10 @@ impl SessionStore {
         operation: &ProjectExplorerOperation,
     ) -> Result<(), String> {
         match operation {
+            ProjectExplorerOperation::SetItemState { .. }
+            | ProjectExplorerOperation::MovePinnedItems { .. } => {
+                Err("Workspace tree item state requires a file preset".to_string())
+            }
             ProjectExplorerOperation::CreateFolder {
                 node_id,
                 parent_node_id,
@@ -3412,6 +3447,49 @@ impl SessionStore {
         Ok(updated > 0)
     }
 
+    /// Explicitly rebind future runs; an existing run keeps its immutable
+    /// checkout/epoch snapshot. Project membership is checked atomically.
+    pub fn bind_session_checkout(&self, session_id: &str, checkout_id: &str, epoch: u64) -> Result<(), String> {
+        let epoch = i64::try_from(epoch).map_err(|_| "Materialization epoch exceeds SQLite range")?;
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let valid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sessions s JOIN workspace_checkouts c ON c.project_id = s.workspace_id WHERE s.id = ?1 AND c.checkout_id = ?2)", params![session_id, checkout_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !valid { return Err("Session and checkout must belong to the same logical project".into()); }
+        conn.execute_batch("SAVEPOINT bind_session_checkout").map_err(|e| e.to_string())?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute("UPDATE sessions SET default_checkout_id = ?1 WHERE id = ?2", params![checkout_id, session_id])?;
+            conn.execute("INSERT INTO session_checkout_assignments(session_id, checkout_id, materialization_epoch) VALUES(?1, ?2, ?3) ON CONFLICT(session_id) DO UPDATE SET checkout_id=excluded.checkout_id, materialization_epoch=excluded.materialization_epoch", params![session_id, checkout_id, epoch])?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("RELEASE bind_session_checkout").map_err(|e| e.to_string()),
+            Err(error) => { let _ = conn.execute_batch("ROLLBACK TO bind_session_checkout; RELEASE bind_session_checkout"); Err(error.to_string()) }
+        }
+    }
+
+    pub fn session_materialization_epoch(&self, session_id: &str) -> Result<Option<(String, u64)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row("SELECT checkout_id, materialization_epoch FROM session_checkout_assignments WHERE session_id=?1", params![session_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64)))
+            .optional().map_err(|e| e.to_string())
+    }
+
+    pub fn validate_session_materialization(&self, session_id: &str, checkout_id: &str, epoch: u64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Self::validate_session_materialization_on_conn(&conn, session_id, checkout_id, epoch)
+    }
+
+    fn validate_session_materialization_on_conn(conn: &Connection, session_id: &str, checkout_id: &str, epoch: u64) -> Result<(), String> {
+        let recorded: Option<(String, u64)> = conn.query_row("SELECT checkout_id, materialization_epoch FROM session_checkout_assignments WHERE session_id=?1", params![session_id], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))
+            .optional().map_err(|e| e.to_string())?;
+        if let Some((previous_checkout, previous_epoch)) = recorded {
+            if previous_checkout == checkout_id && previous_epoch != epoch {
+                return Err("The session's physical slot has been assigned to another task; explicitly select a worktree before continuing".into());
+            }
+        } else if epoch > 1 {
+            return Err("This historical session has no materialization binding; explicitly select the reused worktree before continuing".into());
+        }
+        Ok(())
+    }
+
     pub fn get_session_workspace_scope(
         &self,
         session_id: &str,
@@ -3477,24 +3555,33 @@ impl SessionStore {
                 ));
             }
         }
-        conn.execute(
-            "INSERT INTO sessions (
-                id, title, parent_session_id, workspace_id, default_checkout_id,
-                session_type, agent_id, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                id,
-                title,
-                parent_id,
-                project_id,
-                checkout_id,
-                session_type,
-                agent_id,
-                now,
-                now,
-            ],
-        )
-        .map_err(|e| format!("Failed to create session: {}", e))?;
+        let assignment = if let Some(checkout_id) = checkout_id {
+            let root: String = conn.query_row("SELECT root_path FROM workspace_checkouts WHERE checkout_id=?1", params![checkout_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+            let record = crate::workspace_service::worktrees::record_for_root(std::path::Path::new(&root))?;
+            if record.as_ref().is_some_and(|record| record.lifecycle != "active") {
+                return Err("Cannot bind a new session to an unassigned checkout".into());
+            }
+            let epoch = record.map(|record| record.materialization_epoch).unwrap_or(0);
+            let epoch = i64::try_from(epoch).map_err(|_| "Materialization epoch exceeds SQLite range")?;
+            Some((checkout_id, epoch))
+        } else { None };
+        conn.execute_batch("SAVEPOINT create_scoped_session").map_err(|e| e.to_string())?;
+        let result = (|| -> rusqlite::Result<()> {
+            conn.execute(
+                "INSERT INTO sessions (id, title, parent_session_id, workspace_id, default_checkout_id,
+                    session_type, agent_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![id, title, parent_id, project_id, checkout_id, session_type, agent_id, now, now],
+            )?;
+            if let Some((checkout_id, epoch)) = assignment {
+                conn.execute("INSERT INTO session_checkout_assignments(session_id, checkout_id, materialization_epoch) VALUES(?1, ?2, ?3)", params![id, checkout_id, epoch])?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = conn.execute_batch("ROLLBACK TO create_scoped_session; RELEASE create_scoped_session");
+            return Err(format!("Failed to create session: {error}"));
+        }
+        conn.execute_batch("RELEASE create_scoped_session").map_err(|e| e.to_string())?;
         Ok(id)
     }
 
@@ -4355,6 +4442,12 @@ impl SessionStore {
                 return Err(format!("Session already has an active run: {}", active_run));
             }
 
+            if let Some(scope) = scope {
+                if let Some(epoch) = scope.materialization_epoch {
+                    Self::validate_session_materialization_on_conn(&conn, session_id, &scope.checkout_id, epoch)?;
+                }
+            }
+
             let (
                 project_id,
                 checkout_id,
@@ -4457,6 +4550,13 @@ impl SessionStore {
                 ],
             )
             .map_err(|e| format!("Failed to start session run: {}", e))?;
+            if let Some(scope) = scope {
+                if let Some(epoch) = scope.materialization_epoch {
+                    let epoch = i64::try_from(epoch).map_err(|_| "Materialization epoch exceeds SQLite range")?;
+                    conn.execute("UPDATE session_runs SET materialization_epoch=?1 WHERE run_id=?2", params![epoch, run_id]).map_err(|e| e.to_string())?;
+                    conn.execute("INSERT INTO session_checkout_assignments(session_id, checkout_id, materialization_epoch) VALUES(?1, ?2, ?3) ON CONFLICT(session_id) DO UPDATE SET checkout_id=excluded.checkout_id, materialization_epoch=excluded.materialization_epoch", params![session_id, scope.checkout_id, epoch]).map_err(|e| e.to_string())?;
+                }
+            }
             if let Some(checkout_id) = checkout_id {
                 conn.execute(
                     "UPDATE sessions
@@ -4602,7 +4702,7 @@ impl SessionStore {
                 "SELECT run_id, session_id, status, started_at, updated_at,
                         finished_at, error_message, project_id, checkout_id,
                         workspace_generation, service_bindings_json,
-                        git_branch_ref, git_head_oid
+                        git_branch_ref, git_head_oid, materialization_epoch
                  FROM session_runs
                  WHERE session_id = ?1
                  ORDER BY started_at ASC, rowid ASC",
@@ -4620,7 +4720,7 @@ impl SessionStore {
         let row = conn
             .query_row(
                 "SELECT project_id, checkout_id, workspace_generation,
-                        service_bindings_json, git_branch_ref, git_head_oid
+                        service_bindings_json, git_branch_ref, git_head_oid, materialization_epoch
                  FROM session_runs WHERE run_id = ?1",
                 params![run_id],
                 |row| {
@@ -4631,6 +4731,7 @@ impl SessionStore {
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
                     ))
                 },
             )
@@ -4643,6 +4744,7 @@ impl SessionStore {
             bindings_json,
             branch_ref,
             head_oid,
+            materialization_epoch,
         )) = row
         else {
             return Ok(None);
@@ -4659,6 +4761,7 @@ impl SessionStore {
             checkout_id,
             workspace_generation: u64::try_from(generation)
                 .map_err(|_| "Run workspace generation is negative".to_string())?,
+            materialization_epoch,
             branch_ref,
             head_oid,
             service_bindings,
@@ -4710,6 +4813,7 @@ impl SessionStore {
             workspace_generation,
             branch_ref: row.get(11)?,
             head_oid: row.get(12)?,
+            materialization_epoch: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
             service_bindings,
         })
     }
@@ -5277,6 +5381,7 @@ impl SessionStore {
                 updated_at: row.get(5)?,
                 project_id: row.get(6)?,
                 default_checkout_id: row.get(7)?,
+                default_materialization_epoch: None,
                 execution_target: None,
                 runtime_status: None,
             })
@@ -5321,6 +5426,11 @@ impl SessionStore {
         }
         for session in &mut sessions {
             session.execution_target = Self::latest_session_execution_target_with_conn(
+                &conn,
+                &session.id,
+                session.default_checkout_id.as_deref(),
+            )?;
+            session.default_materialization_epoch=Self::default_materialization_epoch_with_conn(
                 &conn,
                 &session.id,
                 session.default_checkout_id.as_deref(),
@@ -5378,6 +5488,7 @@ impl SessionStore {
                     updated_at: row.get(5)?,
                     project_id: row.get(6)?,
                     default_checkout_id: row.get(7)?,
+                    default_materialization_epoch: None,
                     execution_target: None,
                     runtime_status: None,
                 })
@@ -5388,6 +5499,7 @@ impl SessionStore {
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         for session in &mut sessions {
+            session.default_materialization_epoch=Self::default_materialization_epoch_with_conn(&conn,&session.id,session.default_checkout_id.as_deref())?;
             session.execution_target = Self::latest_session_execution_target_with_conn(
                 &conn,
                 &session.id,
@@ -5395,6 +5507,13 @@ impl SessionStore {
             )?;
         }
         Ok(sessions)
+    }
+
+    fn default_materialization_epoch_with_conn(conn:&Connection,session_id:&str,checkout_id:Option<&str>)->Result<Option<u64>,String>{
+        let Some(checkout_id)=checkout_id else{return Ok(None);};
+        conn.query_row("SELECT materialization_epoch FROM session_checkout_assignments WHERE session_id=?1 AND checkout_id=?2",params![session_id,checkout_id],|row|row.get::<_,i64>(0))
+            .optional().map_err(|error|error.to_string())?
+            .map(|epoch|u64::try_from(epoch).map_err(|error|error.to_string())).transpose()
     }
 
     fn latest_session_execution_target_with_conn(
@@ -5546,6 +5665,7 @@ impl SessionStore {
 
         let raw_messages = self.get_messages_with_conn(&conn, id)?;
         let last_multi_agent_enabled = Self::read_multi_agent_selection(&conn, id)?;
+        let default_materialization_epoch=Self::default_materialization_epoch_with_conn(&conn,id,default_checkout_id.as_deref())?;
         // History normalization clones and enriches tool calls. Release the
         // single SQLite connection first so unrelated lightweight reads do not
         // wait behind that CPU work.
@@ -5563,6 +5683,7 @@ impl SessionStore {
             parent_session_id,
             project_id,
             default_checkout_id,
+            default_materialization_epoch,
             latest_completed_run_id,
             created_at,
             updated_at,
@@ -5618,6 +5739,7 @@ impl SessionStore {
         let raw_page = Self::get_message_page_with_conn(&conn, id, None, message_limit)?;
         let last_multi_agent_enabled = Self::read_multi_agent_selection(&conn, id)?;
         let user_message_ids = Self::get_session_user_message_ids_with_conn(&conn, id)?;
+        let default_materialization_epoch=Self::default_materialization_epoch_with_conn(&conn,id,default_checkout_id.as_deref())?;
         drop(conn);
 
         let mut messages = normalize_messages_for_display(&raw_page.messages);
@@ -5635,6 +5757,7 @@ impl SessionStore {
                 parent_session_id,
                 project_id,
                 default_checkout_id,
+                default_materialization_epoch,
                 latest_completed_run_id,
                 created_at,
                 updated_at,
@@ -9027,6 +9150,66 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[test]
+    fn v44_materialization_migration_is_repeatable_and_exports_empty_history() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("locus.db");
+        let conn = Connection::open(&db_path).unwrap();
+        SessionStore::create_latest_schema(&conn).unwrap();
+        conn.execute_batch("INSERT INTO sessions(id,title,workspace_id,session_type,created_at,updated_at) VALUES('old','Old session','project-old','chat',1,1);
+            INSERT INTO session_runs(run_id,session_id,status,started_at,updated_at,finished_at) VALUES('old-run','old','done',1,2,2);
+            DROP TABLE session_checkout_assignments;
+            ALTER TABLE session_runs DROP COLUMN materialization_epoch;
+            PRAGMA user_version=44;").unwrap();
+        drop(conn);
+        let store = SessionStore::new(dir.path()).unwrap();
+        assert_eq!(store.list_persisted_session_runs("old").unwrap()[0].materialization_epoch, None);
+        assert_eq!(store.session_materialization_epoch("old").unwrap(), None);
+        assert_eq!(store.load_session("old").unwrap().default_materialization_epoch, None);
+        assert_eq!(store.list_sessions(Some("project-old")).unwrap()[0].default_materialization_epoch, None);
+        store.add_message("old", MessageRole::User, "Keep old history").unwrap();
+        let output = dir.path().join("old-context.yaml");
+        crate::session::context_export::export_session_context_yaml(&store, "old", "", None, None, &output).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&fs::read_to_string(&output).unwrap()).unwrap();
+        assert_eq!(value["sessions"][0]["runs"][0]["materializationEpoch"].as_str(), Some("empty"));
+        assert_eq!(value["sessions"][0]["metadata"]["defaultMaterializationEpoch"].as_str(), Some("empty"));
+        drop(store);
+        let conn = Connection::open(&db_path).unwrap();
+        SessionStore::migrate_materialization_epochs(&conn).unwrap();
+        SessionStore::migrate_materialization_epochs(&conn).unwrap();
+        assert_eq!(conn.pragma_query_value::<i32, _>(None, "user_version", |r| r.get(0)).unwrap(), SessionStore::SCHEMA_VERSION);
+        drop(conn);
+        let reopened = SessionStore::new(dir.path()).unwrap();
+        assert_eq!(reopened.load_session("old").unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn session_materialization_binding_blocks_reused_slots_until_explicit_rebind() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path()).unwrap();
+        store.upsert_workspace_checkout(&WorkspaceCheckoutRecord {
+            checkout_id: "slot".into(), project_id: "project".into(), root_path: "missing-slot".into(), normalized_root: "missing-slot".into(), last_opened_at: 1,
+        }).unwrap();
+        let session = store.create_session("Pool history", None, Some("project"), "chat", None).unwrap();
+        store.bind_session_checkout(&session, "slot", 1).unwrap();
+        assert!(store.validate_session_materialization(&session, "slot", 1).is_ok());
+        assert!(store.validate_session_materialization(&session, "slot", 2).is_err());
+        assert_eq!(store.load_session(&session).unwrap().default_materialization_epoch, Some(1));
+        assert_eq!(store.list_sessions(Some("project")).unwrap()[0].default_materialization_epoch, Some(1));
+        let scope = SessionRunScopeSnapshot { project_id: "project".into(), checkout_id: "slot".into(), workspace_generation: 1, materialization_epoch: Some(1), branch_ref: Some("refs/heads/old".into()), head_oid: Some("abc".into()), service_bindings: Vec::new() };
+        store.try_start_run_scoped(&session, "epoch-one", Some(&scope)).unwrap();
+        store.update_run_status("epoch-one", RUN_STATUS_DONE, None).unwrap();
+        let next = SessionRunScopeSnapshot { materialization_epoch: Some(2), ..scope };
+        assert!(store.try_start_run_scoped(&session, "stale-run", Some(&next)).is_err());
+        store.bind_session_checkout(&session, "slot", 2).unwrap();
+        assert_eq!(store.load_session(&session).unwrap().default_materialization_epoch, Some(2));
+        assert_eq!(store.list_sessions(Some("project")).unwrap()[0].default_materialization_epoch, Some(2));
+        store.try_start_run_scoped(&session, "epoch-two", Some(&next)).unwrap();
+        assert_eq!(store.get_run_scope("epoch-one").unwrap().unwrap().materialization_epoch, Some(1));
+        assert_eq!(store.get_run_scope("epoch-two").unwrap().unwrap().materialization_epoch, Some(2));
+        assert_eq!(store.list_persisted_session_runs(&session).unwrap()[0].materialization_epoch, Some(1));
+    }
+
     fn table_exists(conn: &Connection, table: &str) -> bool {
         conn.query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -9746,6 +9929,7 @@ mod tests {
                     project_id: "project-shared".to_string(),
                     checkout_id: "checkout-main".to_string(),
                     workspace_generation: 7,
+                    materialization_epoch: Some(0),
                     branch_ref: Some("refs/heads/main".to_string()),
                     head_oid: Some("1111111111111111111111111111111111111111".to_string()),
                     service_bindings: vec![SessionRunServiceBinding {
@@ -9764,6 +9948,7 @@ mod tests {
                     project_id: "project-shared".to_string(),
                     checkout_id: "checkout-worktree".to_string(),
                     workspace_generation: 9,
+                    materialization_epoch: Some(0),
                     branch_ref: Some("refs/heads/feature/worktree".to_string()),
                     head_oid: Some("2222222222222222222222222222222222222222".to_string()),
                     service_bindings: vec![SessionRunServiceBinding {
@@ -10027,6 +10212,7 @@ mod tests {
                     project_id: "project-shared".to_string(),
                     checkout_id: "checkout-main".to_string(),
                     workspace_generation: 2,
+                    materialization_epoch: Some(0),
                     branch_ref: Some("refs/heads/main".to_string()),
                     head_oid: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
                     service_bindings: Vec::new(),
@@ -10044,6 +10230,7 @@ mod tests {
                     project_id: "project-shared".to_string(),
                     checkout_id: "checkout-feature".to_string(),
                     workspace_generation: 4,
+                    materialization_epoch: Some(0),
                     branch_ref: Some("refs/heads/feature/ui".to_string()),
                     head_oid: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()),
                     service_bindings: Vec::new(),
@@ -10517,6 +10704,7 @@ mod tests {
             .expect("load response requests");
         let mut response_request = response_request;
         response_request["codex_response"] = serde_json::Value::Null;
+        response_request["codex_reasoning"] = serde_json::Value::Null;
         assert_eq!(restored.get("message-1"), Some(&response_request));
         assert_eq!(restored.get("message-2"), Some(&response_request));
 

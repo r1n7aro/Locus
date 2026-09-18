@@ -257,6 +257,7 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
             project_id,
             checkout_id,
             workspace_generation: scope.workspace_generation,
+            materialization_epoch: scope.materialization_epoch,
             service_instance_id: None,
             service_generation: None,
             payload: envelope.clone(),

@@ -14,8 +14,13 @@ use crate::session::models::{
 };
 use crate::session::store::SessionStore;
 
+mod message_turn;
+#[cfg(test)]
+mod message_tests;
+use message_turn::MessageTurnSelection;
+
 const EXPORT_FORMAT: &str = "locus.context_review";
-const EXPORT_FORMAT_VERSION: u32 = 9;
+const EXPORT_FORMAT_VERSION: u32 = 10;
 const EMPTY: &str = "empty";
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,6 +87,8 @@ struct SourceMetadata {
     default_checkout_id: Value,
     workspace_path: Value,
     workspace_path_state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection: Option<MessageTurnSelection>,
 }
 
 #[derive(Serialize)]
@@ -169,7 +176,55 @@ pub fn export_session_context_yaml(
     live_snapshot: Option<&ContextExportLiveSnapshot>,
     file_path: &Path,
 ) -> Result<ContextExportResult, String> {
-    let session_tree_ids = store.session_tree_ids(root_session_id)?;
+    export_context_yaml(
+        store,
+        root_session_id,
+        legacy_raw_rounds,
+        live_snapshot,
+        file_path,
+        None,
+    )
+}
+
+pub fn export_message_context_yaml(
+    store: &SessionStore,
+    session_id: &str,
+    message_id: &str,
+    live_snapshot: Option<&ContextExportLiveSnapshot>,
+    file_path: &Path,
+) -> Result<ContextExportResult, String> {
+    export_context_yaml(
+        store,
+        session_id,
+        None,
+        live_snapshot,
+        file_path,
+        Some(message_id),
+    )
+}
+
+fn export_context_yaml(
+    store: &SessionStore,
+    root_session_id: &str,
+    legacy_raw_rounds: Option<&[RawRound]>,
+    live_snapshot: Option<&ContextExportLiveSnapshot>,
+    file_path: &Path,
+    message_id: Option<&str>,
+) -> Result<ContextExportResult, String> {
+    let selection = message_id
+        .map(|message_id| {
+            MessageTurnSelection::resolve(
+                &store.load_session(root_session_id)?.messages,
+                &load_all_events(store, root_session_id)?,
+                message_id,
+            )
+        })
+        .transpose()?;
+    let session_tree_ids = if selection.is_some() {
+        vec![root_session_id.to_string()]
+    } else {
+        store.session_tree_ids(root_session_id)?
+    };
     if session_tree_ids.is_empty() {
         return Err(format!("Session not found: {}", root_session_id));
     }
@@ -192,9 +247,13 @@ pub fn export_session_context_yaml(
         has_missing_session_checkout |= session_scope.default_checkout_id.is_none();
         let live_session = live_snapshot.and_then(|snapshot| snapshot.sessions.get(session_id));
         let usage = store.get_token_usage(session_id).ok();
-        let cache_invalidations = store.list_cache_invalidations(session_id)?;
+        let mut cache_invalidations = store.list_cache_invalidations(session_id)?;
         let todos = store.get_todos(session_id).ok();
         let mut messages = detail.messages.clone();
+        if let Some(selection) = &selection {
+            messages.retain(|message| selection.message_ids.contains(&message.id));
+            cache_invalidations.retain(|entry| selection.message_ids.contains(&entry.message_id));
+        }
         expand_persisted_outputs(store, &mut messages);
         let response_metadata = store.get_response_request_metadata(session_id)?;
         let messages = messages
@@ -203,12 +262,23 @@ pub fn export_session_context_yaml(
                 let response = response_metadata.get(&message.id)
                     .and_then(|value| value.get("codex_response"))
                     .filter(|value| !value.is_null()).cloned().unwrap_or_else(empty_value);
+                let reasoning = response_metadata.get(&message.id)
+                    .and_then(|value| value.get("codex_reasoning"))
+                    .filter(|value| !value.is_null()).cloned().unwrap_or_else(empty_value);
+                let upstream_model = response_metadata.get(&message.id)
+                    .and_then(crate::llm::upstream_model::from_request);
                 let mut exported = export_message(message)?;
+                exported["upstreamModel"] = upstream_model
+                    .map(Value::String).unwrap_or_else(empty_value);
                 exported["codexResponse"] = response;
+                exported["codexReasoning"] = reasoning;
                 Ok::<_, String>(exported)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let compactions = store.list_compacted_context_outputs(session_id)?;
+        let mut compactions = store.list_compacted_context_outputs(session_id)?;
+        if let Some(selection) = &selection {
+            compactions.retain(|entry| selection.message_ids.contains(&entry.message_id));
+        }
         let compactions = if compactions.is_empty() {
             empty_value()
         } else {
@@ -217,6 +287,9 @@ pub fn export_session_context_yaml(
         };
 
         let mut attempts = store.list_context_attempts(session_id)?;
+        if let Some(selection) = &selection {
+            attempts.retain(|attempt| selection.run_ids.contains(&attempt.run_id));
+        }
         if !attempts.is_empty() {
             has_persisted_attempts = true;
         } else if session_id == root_session_id {
@@ -232,8 +305,12 @@ pub fn export_session_context_yaml(
             serde_json::to_value(attempts.into_iter().map(export_attempt).collect::<Vec<_>>())
                 .map_err(|error| format!("Failed to serialize context attempts: {}", error))?
         };
-        let timeline = load_all_events(store, session_id)?;
-        let persisted_runs = store.list_persisted_session_runs(session_id)?;
+        let mut timeline = load_all_events(store, session_id)?;
+        let mut persisted_runs = store.list_persisted_session_runs(session_id)?;
+        if let Some(selection) = &selection {
+            timeline.retain(|event| selection.run_ids.contains(&event.run_id));
+            persisted_runs.retain(|run| selection.run_ids.contains(&run.summary.run_id));
+        }
         has_missing_run_checkout |= persisted_runs.iter().any(|run| run.checkout_id.is_none());
         has_missing_run_generation |= persisted_runs
             .iter()
@@ -259,6 +336,7 @@ pub fn export_session_context_yaml(
             "parentSessionId": non_empty_value(detail.parent_session_id.as_deref()),
             "projectId": non_empty_value(session_scope.project_id.as_deref()),
             "defaultCheckoutId": non_empty_value(session_scope.default_checkout_id.as_deref()),
+            "defaultMaterializationEpoch": store.session_materialization_epoch(session_id)?.map(|(_, epoch)| Value::from(epoch)).unwrap_or_else(empty_value),
             "checkoutRoot": non_empty_value(session_scope.checkout_root.as_deref()),
             "latestCompletedRunId": non_empty_value(detail.latest_completed_run_id.as_deref()),
             "createdAtUnix": detail.created_at,
@@ -286,17 +364,51 @@ pub fn export_session_context_yaml(
         };
         let runtime = live_session
             .and_then(|session| session.runtime.as_ref())
+            .filter(|runtime| {
+                selection.as_ref().is_none_or(|selection| {
+                    selection.run_ids.contains(&runtime.active_run.run_id)
+                })
+            })
             .and_then(|runtime| serde_json::to_value(runtime).ok())
             .unwrap_or_else(empty_value);
 
+        let mut async_tasks = store.export_async_tasks(session_id)?;
+        if let Some(selection) = &selection {
+            if let Some(tasks) = async_tasks.as_array_mut() {
+                tasks.retain(|task| {
+                    task.get("assistantMessageId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| selection.message_ids.contains(id))
+                });
+                if tasks.is_empty() {
+                    async_tasks = empty_value();
+                }
+            }
+        }
         sessions.push(SessionExport {
-            async_tasks: store.export_async_tasks(&session_id)?,
-            agent_messages: store.export_agent_messages(&session_id)?,
+            async_tasks,
+            agent_messages: if selection.is_some() {
+                empty_value()
+            } else {
+                store.export_agent_messages(session_id)?
+            },
             metadata,
-            token_usage,
+            token_usage: if selection.is_some() {
+                empty_value()
+            } else {
+                token_usage
+            },
             cache_invalidations,
-            todos,
-            pending_inputs,
+            todos: if selection.is_some() {
+                empty_value()
+            } else {
+                todos
+            },
+            pending_inputs: if selection.is_some() {
+                empty_value()
+            } else {
+                pending_inputs
+            },
             runtime,
             runs,
             messages,
@@ -306,7 +418,9 @@ pub fn export_session_context_yaml(
         });
     }
 
-    let capture_quality = if has_context_capture_gap {
+    let capture_quality = if selection.is_some() && !has_persisted_attempts {
+        "reconstructed"
+    } else if has_context_capture_gap {
         if has_persisted_attempts || used_legacy_raw_rounds {
             "partial"
         } else {
@@ -339,6 +453,20 @@ pub fn export_session_context_yaml(
     } else {
         Vec::new()
     };
+    if selection.is_some() {
+        missing_fields.push(MissingField {
+            field: "sessions[].{token_usage,todos,pending_inputs,agent_messages}".to_string(),
+            value: EMPTY,
+            reason: "session-wide state is not attributable to the selected message turn; use its context attempts and timeline".to_string(),
+        });
+        if !has_persisted_attempts {
+            missing_fields.push(MissingField {
+                field: "sessions[].context_attempts".to_string(),
+                value: EMPTY,
+                reason: "no persisted provider attempts can be linked to the selected message turn".to_string(),
+            });
+        }
+    }
     if has_missing_session_checkout {
         missing_fields.push(MissingField {
             field: "sessions[].metadata.checkoutId".to_string(),
@@ -417,6 +545,7 @@ pub fn export_session_context_yaml(
             default_checkout_id: non_empty_value(root_scope.default_checkout_id.as_deref()),
             workspace_path,
             workspace_path_state,
+            selection,
         },
         sessions,
         integrity: ExportIntegrity {
@@ -520,6 +649,7 @@ fn export_run(run: PersistedSessionRun) -> Value {
         "branchRef": non_empty_value(run.branch_ref.as_deref()),
         "headOid": non_empty_value(run.head_oid.as_deref()),
         "serviceBindings": service_bindings,
+        "materializationEpoch": run.materialization_epoch.map(|v| Value::from(v)).unwrap_or_else(empty_value),
         "startedAtUnix": run.summary.started_at,
         "startedAt": format_timestamp(run.summary.started_at),
         "updatedAtUnix": run.summary.updated_at,

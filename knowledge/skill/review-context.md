@@ -21,6 +21,7 @@ Analyze the Locus YAML context audit named in the user message. Keep the review 
 ### Evidence procedure
 
 1. Inspect `format`, `format_version`, `export`, `source`, and every session entry before drawing conclusions.
+   When `source.selection.kind` is `message_turn`, review only the selected turn identified by its message and run IDs. History inside provider requests is evidence of what that turn saw, not additional turns to review; session-wide fields marked `empty` are outside this export's scope.
 2. For large files, page with `read` and locate sections with `grep`. Cover every `context_attempts` entry and every compaction boundary; do not silently analyze only the visible prefix.
 3. Use `session_id`, `run_id`, `iteration`, `attempt`, message IDs, tool-call IDs, and YAML field paths as evidence anchors.
 4. Label each material statement as `Fact` or `Inference`. Explain the evidence limit whenever a value is `empty`, capture quality is partial/reconstructed, output is truncated, or an encrypted compaction cannot be inspected.

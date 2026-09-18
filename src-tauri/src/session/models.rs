@@ -13,6 +13,8 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_checkout_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_materialization_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_target: Option<SessionExecutionTarget>,
     pub updated_at: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -59,6 +61,8 @@ pub struct SessionDetail {
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_checkout_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_materialization_epoch: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_completed_run_id: Option<String>,
     pub created_at: i64,
@@ -178,6 +182,8 @@ pub struct SessionRunScopeSnapshot {
     pub checkout_id: String,
     pub workspace_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_oid: Option<String>,
@@ -198,6 +204,8 @@ pub struct PersistedSessionRun {
     pub checkout_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -258,7 +266,29 @@ pub struct ProjectExplorerSnapshot {
     pub manifest_path: String,
     pub revision: i64,
     pub nodes: Vec<ProjectExplorerNode>,
+    #[serde(default)]
+    pub item_states: Vec<ProjectExplorerItemState>,
     pub presets: Vec<ProjectExplorerPresetSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExplorerItemRef {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectExplorerItemState {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub highlighted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +349,20 @@ pub enum ProjectExplorerOperation {
     SetNodeHidden {
         node_id: String,
         hidden: bool,
+    },
+    SetItemState {
+        node_id: String,
+        #[serde(default)]
+        relative_path: Option<String>,
+        #[serde(default)]
+        pinned: Option<bool>,
+        #[serde(default)]
+        highlighted: Option<bool>,
+    },
+    MovePinnedItems {
+        items: Vec<ProjectExplorerItemRef>,
+        #[serde(default)]
+        before: Option<ProjectExplorerItemRef>,
     },
     RemoveNode {
         node_id: String,

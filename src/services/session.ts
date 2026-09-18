@@ -177,6 +177,10 @@ export function loadSession(sessionId: string): Promise<SessionDetail> {
   return ipcInvoke<SessionDetail>("load_session", { sessionId });
 }
 
+export function getArchivedCheckoutStorageBytes(workspaceRef: WorkspaceRef): Promise<number> {
+  return ipcInvoke<number>("get_archived_checkout_storage_bytes", { workspaceRef });
+}
+
 export function saveSessionExecutionState(
   sessionId: string,
   modelId: string,
@@ -314,10 +318,12 @@ export function answerQuestion(questionId: string, answer: string): Promise<void
 export function exportSessionContext(
   sessionId: string,
   filePath?: string | null,
+  messageId?: string | null,
 ): Promise<ContextExportResult> {
   return ipcInvoke<ContextExportResult>("export_session_context", {
     sessionId,
     filePath: filePath ?? null,
+    messageId: messageId ?? null,
   });
 }
 

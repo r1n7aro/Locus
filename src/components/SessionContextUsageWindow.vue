@@ -4,6 +4,7 @@ import { RefreshCw, X } from "lucide";
 import { t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { getSessionContextUsageReport } from "../services/session";
+import { subscribeSessionStreamEvents } from "../services/sessionStreamEventHub";
 import type {
   KnowledgeAccessMode,
   SessionContextUsageReport,
@@ -29,6 +30,7 @@ const loading = ref(false);
 const error = ref("");
 let loadSequence = 0;
 let refreshTimer = 0;
+let unsubscribeStream: (() => void) | undefined;
 
 const numberFormatter = new Intl.NumberFormat();
 const rateFormatter = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
@@ -88,6 +90,18 @@ function formatOutputSpeed(usage: TokenUsage): string {
   return t("chat.contextStats.outputSpeedValue", rateFormatter.format(tokensPerSecond));
 }
 
+function formatDuration(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value) || value < 0) {
+    return t("chat.contextStats.unavailable");
+  }
+  const seconds = Math.round(value / 1_000);
+  if (value > 0 && seconds === 0) return t("chat.contextStats.durationUnderSecond");
+  if (seconds < 60) return t("chat.contextStats.durationSeconds", seconds);
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return t("chat.contextStats.durationMinutes", minutes, seconds % 60);
+  return t("chat.contextStats.durationHours", Math.floor(minutes / 60), minutes % 60, seconds % 60);
+}
+
 const contextPercent = computed(() => {
   const current = report.value;
   if (!current || current.contextLimit <= 0) return 0;
@@ -134,6 +148,15 @@ const toolResultSummary = computed(() => {
     calls: tools.reduce((total, tool) => total + tool.callCount, 0),
     tokens: tools.reduce((total, tool) => total + tool.resultTokens, 0),
   };
+});
+
+const timingMetrics = computed(() => {
+  const timing = report.value?.timing;
+  return [
+    { key: "remote", label: t("chat.contextStats.remoteOutputDuration"), value: timing?.remoteOutputDurationMs, title: t("chat.contextStats.remoteOutputDurationHelp") },
+    { key: "local", label: t("chat.contextStats.localToolDuration"), value: timing?.localToolDurationMs, title: t("chat.contextStats.localToolDurationHelp") },
+    { key: "total", label: t("chat.contextStats.totalDuration"), value: timing?.totalDurationMs, title: t("chat.contextStats.totalDurationHelp") },
+  ];
 });
 
 async function loadReport(silent = false) {
@@ -204,12 +227,19 @@ watch(
 
 onMounted(async () => {
   window.addEventListener("keydown", handleKeydown, true);
+  unsubscribeStream = subscribeSessionStreamEvents(({ event }) => {
+    if (event.sessionId !== props.sessionId) return;
+    if (["toolCallDone", "done", "cancelled", "error", "inputAnswered"].includes(event.type)) {
+      scheduleRefresh();
+    }
+  });
   await loadReport();
   await nextTick();
   panelRef.value?.focus();
 });
 
 onUnmounted(() => {
+  unsubscribeStream?.();
   window.removeEventListener("keydown", handleKeydown, true);
   window.clearTimeout(refreshTimer);
   loadSequence += 1;
@@ -268,9 +298,12 @@ onUnmounted(() => {
       <template v-else-if="report">
         <section class="context-overview" :aria-label="t('chat.contextStats.contextUsage')">
           <div class="context-section-heading">
-            <div>
+            <div class="context-overview-models">
               <h1>{{ t("chat.contextStats.contextUsage") }}</h1>
               <div class="context-section-meta">{{ report.modelId }} · {{ report.agentId }}</div>
+              <div class="context-section-meta context-upstream-model" :title="report.upstreamModel || undefined">
+                {{ t("chat.contextStats.upstreamModel", report.upstreamModel || t("chat.contextStats.modelNotReported")) }}
+              </div>
             </div>
             <div class="context-overview-value">
               <strong>{{ formatCompactTokens(report.contextTokens) }} / {{ formatCompactTokens(report.contextLimit) }}</strong>
@@ -298,6 +331,23 @@ onUnmounted(() => {
             >
               <span>{{ metric.label }}</span>
               <strong>{{ metric.value }}</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="context-timing-section" :aria-label="t('chat.contextStats.sessionTiming')">
+          <div class="context-section-heading">
+            <h2>{{ t("chat.contextStats.sessionTiming") }}</h2>
+          </div>
+          <div class="context-token-metrics context-timing-metrics">
+            <div
+              v-for="metric in timingMetrics"
+              :key="metric.key"
+              class="context-token-metric"
+              :title="metric.title"
+            >
+              <span>{{ metric.label }}</span>
+              <strong>{{ formatDuration(metric.value) }}</strong>
             </div>
           </div>
         </section>
@@ -518,6 +568,7 @@ onUnmounted(() => {
 
 .context-overview,
 .context-token-section,
+.context-timing-section,
 .context-breakdown-section,
 .context-cache-section,
 .context-tools-section {
@@ -526,6 +577,7 @@ onUnmounted(() => {
 }
 
 .context-token-section,
+.context-timing-section,
 .context-breakdown-section,
 .context-cache-section,
 .context-tools-section {
@@ -567,6 +619,15 @@ onUnmounted(() => {
   font-family: var(--font-mono-identifier);
 }
 
+.context-overview-models {
+  min-width: 0;
+}
+
+.context-upstream-model {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .context-overview-value strong {
   font-size: 15px;
   font-weight: 600;
@@ -603,6 +664,10 @@ onUnmounted(() => {
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--sidebar-bg);
+}
+
+.context-timing-metrics {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
 .context-token-metric {

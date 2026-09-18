@@ -430,6 +430,7 @@ fn apply_knowledge_target(
         Err(err) if err.contains("not found") => {
             let now = current_unix_millis();
             let doc = KnowledgeDocument {
+                inject_agents: crate::knowledge_store::default_inject_agents(),
                 id: format!("kd_{}", uuid::Uuid::new_v4()),
                 doc_type,
                 path: rel_path,
@@ -670,7 +671,9 @@ pub(crate) fn resolve_session_workspace_scope(
             .detail(error.to_string())
             .operation(operation)
         })?;
-        WorkspaceRef::new(checkout_id, None)
+        let epoch=store.session_materialization_epoch(session_id).map_err(AppError::from)?
+            .filter(|(id,_)|id==checkout_id.as_str()).map(|(_,epoch)|epoch);
+        WorkspaceRef::new(checkout_id, None).with_materialization_epoch(epoch)
     };
     let runtime = workspace_registry
         .activate_persisted_checkout(&workspace_ref.checkout_id)
@@ -682,8 +685,8 @@ pub(crate) fn resolve_session_workspace_scope(
             .detail(error)
             .operation(operation)
         })?;
-    let active_workspace_ref = WorkspaceRef::for_runtime(runtime.as_ref());
-    let scope = resolve_workspace_scope(workspace_registry, &active_workspace_ref, operation)?;
+    store.validate_session_materialization(session_id, runtime.checkout_id().as_str(), runtime.materialization_epoch()).map_err(AppError::from)?;
+    let scope = resolve_workspace_scope(workspace_registry, &workspace_ref, operation)?;
     validate_session_project_scope(&persisted, scope.runtime().as_ref(), operation)?;
     Ok(scope)
 }
@@ -3049,6 +3052,22 @@ pub async fn list_archived_checkout_sessions(
 }
 
 #[tauri::command]
+pub async fn get_archived_checkout_storage_bytes(
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<u64, AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner().as_ref(), &workspace_ref, "getArchivedCheckoutStorageBytes",
+    )?;
+    let project_id = scope.runtime().project_id().to_string();
+    let store = store.inner().clone();
+    tokio::task::spawn_blocking(move || store.archived_storage_bytes(&project_id))
+        .await.map_err(|error| AppError::from(error.to_string()))?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn rename_session(
     session_id: String,
     title: String,
@@ -3230,16 +3249,21 @@ pub async fn get_session_context_usage_report(
     instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     instance.set_multi_agent_enabled(detail.last_multi_agent_enabled.unwrap_or(false));
-    Ok(instance
+    let timing = store.get_session_timing_usage(&session_id, &session_messages, &usage)?;
+    let upstream_model = store.get_latest_upstream_model(&session_id)?;
+    let mut report = instance
         .session_context_usage_report(
             &app_handle,
             &prompt_messages,
             &session_messages,
             detail.title,
             cache_invalidations,
+            timing,
             usage,
         )
-        .await)
+        .await;
+    report.upstream_model = upstream_model;
+    Ok(report)
 }
 
 #[tauri::command]
@@ -3756,6 +3780,7 @@ pub async fn apply_knowledge_proposal(
 pub async fn export_session_context(
     session_id: String,
     file_path: Option<String>,
+    message_id: Option<String>,
     raw_store: State<'_, RawContextStore>,
     store: State<'_, Arc<SessionStore>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
@@ -3775,7 +3800,10 @@ pub async fn export_session_context(
     let output_path = match file_path {
         Some(path) if !path.trim().is_empty() => PathBuf::from(path),
         _ => {
-            let session_title = store.load_session(&session_id)?.title;
+            let mut session_title = store.load_session(&session_id)?.title;
+            if let Some(message_id) = &message_id {
+                session_title = format!("message-{}-{}", message_id, session_title);
+            }
             crate::session::context_export::default_review_export_path(
                 &super::app_temp_dir()?,
                 &session_id,
@@ -3783,7 +3811,9 @@ pub async fn export_session_context(
             )?
         }
     };
-    let legacy_rounds = {
+    let legacy_rounds = if message_id.is_some() {
+        None
+    } else {
         let raw = raw_store.lock().await;
         raw.get(&session_id)
             .filter(|rounds| !rounds.is_empty())
@@ -3800,7 +3830,11 @@ pub async fn export_session_context(
             .detail(error.to_string())
             .operation("exportSessionContext")
         })??;
-    let session_tree_ids = snapshot_store.session_tree_ids(&session_id)?;
+    let session_tree_ids = if message_id.is_some() {
+        vec![session_id.clone()]
+    } else {
+        snapshot_store.session_tree_ids(&session_id)?
+    };
     let live_snapshot = capture_context_export_live_snapshot(
         &session_tree_ids,
         store.inner().as_ref(),
@@ -3811,6 +3845,15 @@ pub async fn export_session_context(
 
     tokio::task::spawn_blocking(move || {
         let _workspace_scope = workspace_scope;
+        if let Some(message_id) = message_id {
+            return crate::session::context_export::export_message_context_yaml(
+                &snapshot_store,
+                &session_id,
+                &message_id,
+                Some(&live_snapshot),
+                &output_path,
+            );
+        }
         crate::session::context_export::export_session_context_yaml(
             &snapshot_store,
             &session_id,

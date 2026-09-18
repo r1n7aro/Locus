@@ -15,6 +15,7 @@ pub const DELIVERY_IMMEDIATE: &str = "immediate";
 #[derive(Default)]
 pub struct PendingInputQueue {
     inputs: HashMap<(String, String), PendingSessionInput>,
+    delivering: HashMap<String, PendingSessionInput>,
     compact_runs: HashSet<(String, String)>,
 }
 
@@ -107,6 +108,16 @@ impl PendingInputQueue {
         }
     }
 
+    pub fn claim_for_steering(&mut self, session_id: &str, run_id: &str) -> Option<PendingSessionInput> {
+        let input = self.claim_immediate(session_id, run_id).pop()?;
+        self.delivering.insert(input.id.clone(), input.clone());
+        Some(input)
+    }
+
+    pub fn finish_steering(&mut self, id: &str) {
+        self.delivering.remove(id);
+    }
+
     pub fn queue_compact(&mut self, session_id: &str, run_id: &str) -> bool {
         self.compact_runs
             .insert((session_id.to_string(), run_id.to_string()))
@@ -181,8 +192,20 @@ impl PendingInputQueue {
 
     pub fn restore_claimed(&mut self, inputs: Vec<PendingSessionInput>) {
         for mut input in inputs {
+            self.delivering.remove(&input.id);
             input.status = STATUS_QUEUED.to_string();
             input.updated_at = now_ts();
+            let key = (input.session_id.clone(), input.run_id.clone());
+            if let Some(newer) = self.inputs.remove(&key) {
+                input.text = join_pending_text(&input.text, &newer.text);
+                input.display_text = join_pending_text(&input.display_text, &newer.display_text);
+                input.images = merge_optional_vec(input.images, newer.images.unwrap_or_default());
+                input.asset_refs = merge_optional_vec(input.asset_refs, newer.asset_refs.unwrap_or_default());
+                input.mode = merge_pending_mode(input.mode, newer.mode);
+                input.user_intent = merge_user_intents(input.user_intent, newer.user_intent,
+                    input.client_message_id.clone());
+                input.delivery = merge_pending_delivery(&input.delivery, Some(&newer.delivery)).to_string();
+            }
             self.inputs
                 .insert((input.session_id.clone(), input.run_id.clone()), input);
         }
@@ -192,13 +215,15 @@ impl PendingInputQueue {
         let key = (session_id.to_string(), run_id.to_string());
         self.inputs.remove(&key);
         self.compact_runs.remove(&key);
+        self.delivering.retain(|_, input| input.session_id != session_id || input.run_id != run_id);
     }
 
     pub fn list_session(&self, session_id: &str) -> Vec<PendingSessionInput> {
         let mut inputs = self
-            .inputs
+            .delivering
             .values()
-            .filter(|input| input.session_id == session_id && input.status == STATUS_QUEUED)
+            .chain(self.inputs.values())
+            .filter(|input| input.session_id == session_id)
             .cloned()
             .collect::<Vec<_>>();
         inputs.sort_by_key(|input| (input.created_at, input.updated_at));
@@ -457,5 +482,40 @@ mod tests {
                 .id,
             first.id
         );
+    }
+
+    #[test]
+    fn steering_claim_stays_visible_without_being_claimed_or_deleted_again() {
+        let mut queue = PendingInputQueue::default();
+        let mut next = request("run-1", "group-a", "first");
+        next.delivery = Some(DELIVERY_IMMEDIATE.to_string());
+        let original = queue.queue_input(next);
+        let claimed = queue.claim_for_steering("session-1", "run-1").unwrap();
+        assert_eq!(claimed.id, original.id);
+        assert_eq!(queue.list_session("session-1")[0].status, STATUS_DELIVERING);
+        assert!(queue.claim_immediate("session-1", "run-1").is_empty());
+        assert!(queue.delete_input("session-1", "run-1", Some(&original.id)).is_none());
+        assert!(queue.claim_after_run("session-1", "run-1").is_none());
+        queue.finish_steering(&original.id);
+        assert!(queue.list_session("session-1").is_empty());
+    }
+
+    #[test]
+    fn restoring_steering_preserves_newer_input_and_does_not_schedule_automatic_replay() {
+        let mut queue = PendingInputQueue::default();
+        let mut next = request("run-1", "group-a", "first");
+        next.delivery = Some(DELIVERY_IMMEDIATE.to_string());
+        queue.queue_input(next);
+        let claimed = queue.claim_for_steering("session-1", "run-1").unwrap();
+        queue.queue_input(request("run-1", "group-b", "second"));
+        assert_eq!(queue.list_session("session-1").len(), 2);
+        assert_eq!(queue.list_session("session-1")[0].text, "first");
+        queue.restore_claimed(vec![claimed]);
+        let restored = queue.list_session("session-1");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].text, "first\nsecond");
+        assert!(queue.claim_after_run("session-1", "run-1").is_none());
+        queue.clear_run("session-1", "run-1");
+        assert!(queue.list_session("session-1").is_empty());
     }
 }

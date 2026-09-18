@@ -6,10 +6,15 @@ function read(path: string): string {
 }
 
 describe("structured session context export", () => {
-  it("uses schema v44 with session multi agent selection and prior context migrations", () => {
+  it("uses schema v48 with upstream models and prior context migrations", () => {
     const store = read("src-tauri/src/session/store.rs");
 
-    expect(store).toContain("const SCHEMA_VERSION: i32 = 44;");
+    expect(store).toContain("const SCHEMA_VERSION: i32 = 48;");
+    expect(store).toContain('Self::migrate(conn, 48, "recover upstream response model declarations", Self::migrate_upstream_model_declarations)');
+    expect(store).toContain('Self::migrate(conn, 47, "persist upstream response model", Self::migrate_upstream_model)');
+    expect(store).toContain('Self::migrate(conn, 46, "persist native Codex reasoning updates", Self::migrate_codex_reasoning_updates)');
+    expect(store).toContain('Self::migrate(conn, 45, "bind sessions and runs to materialization epochs"');
+    expect(store).toContain("CREATE TABLE IF NOT EXISTS session_checkout_assignments");
     expect(store).toContain('36,\n                "persist project contexts, shared sessions, and scoped runs"');
     expect(store).toContain('37,\n                "backfill unambiguous legacy session checkout bindings"');
     expect(store).toContain('38,\n                "persist explicit citation arrays on assistant text render parts"');
@@ -56,10 +61,11 @@ describe("structured session context export", () => {
     const lib = read("src-tauri/src/lib.rs");
 
     expect(exporter).toContain('const EXPORT_FORMAT: &str = "locus.context_review";');
-    expect(exporter).toContain("const EXPORT_FORMAT_VERSION: u32 = 9;");
+    expect(exporter).toContain("const EXPORT_FORMAT_VERSION: u32 = 10;");
     expect(exporter).toContain('"defaultCheckoutId"');
     expect(exporter).toContain('"branchRef"');
     expect(exporter).toContain('"headOid"');
+    expect(exporter).toContain('"materializationEpoch"');
     expect(exporter).toContain("cache_invalidations: Value");
     expect(exporter).toContain("serde_yaml::to_string");
     expect(exporter).toContain("content_hash");
