@@ -7,6 +7,8 @@ pub mod runtime;
 pub mod scope;
 pub mod service;
 pub mod unity;
+pub mod worktrees;
+pub mod pool;
 
 pub use context::{
     WindowContextError, WindowContextRegistry, WindowIntentEpochSnapshot,

@@ -679,6 +679,13 @@ fn install_or_update_plugin_files(project_path: &str) -> Result<String, String> 
     install_or_update_plugin_with_source_dir(&source_dir, project)
 }
 
+pub(super) fn prepare_headless_plugin(project_path: &str) -> Result<(), String> {
+    if !matches!(check_plugin_status(project_path)?, PluginStatus::UpToDate) {
+        install_or_update_plugin_files(project_path)?;
+    }
+    Ok(())
+}
+
 pub async fn install_or_update_plugin(project_path: &str) -> Result<String, String> {
     install_or_update_plugin_with_force_close(project_path, false).await
 }
@@ -687,6 +694,8 @@ pub async fn install_or_update_plugin_with_force_close(
     project_path: &str,
     force_close_unity: bool,
 ) -> Result<String, String> {
+    let previous_process = super::query_current_project_editor_process(project_path).await;
+    let previous_mode = super::process::query_unity_editor_launch_mode(previous_process.process_id).await;
     super::transport::disconnect_with_reason(project_path, "Unity closed for plugin update").await;
     let close_result = if force_close_unity {
         super::process::force_close_current_project_unity_processes(
@@ -771,7 +780,7 @@ pub async fn install_or_update_plugin_with_force_close(
     };
 
     if restart_after_install {
-        let launch = super::launch_project(project_path).await?;
+        let launch = super::launch_project_with_mode(project_path, previous_mode.unwrap_or(super::UnityLaunchMode::Interactive)).await?;
         eprintln!(
             "[Locus] relaunched Unity after plugin install: editor='{}', project='{}', process_id={}",
             launch.editor_path, launch.project_path, launch.process_id

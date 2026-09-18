@@ -54,6 +54,87 @@ pub fn is_unity_modal_dialog_blocked_error(error: &str) -> bool {
     error.contains(UNITY_MODAL_DIALOG_BLOCKED_CODE)
 }
 
+pub fn format_blocked_error(
+    dialog: &UnityModalDialog,
+    request_state: &str,
+    request_id: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        format!("code={UNITY_MODAL_DIALOG_BLOCKED_CODE}"),
+        "Unity 主线程已被模态弹窗阻塞。".to_string(),
+        format!("request_state={request_state}"),
+        format!("dialog_id={}", dialog.dialog_id),
+        format!("title={}", display_or_empty(&dialog.title)),
+        format!("message={}", display_or_empty(&dialog.message)),
+        "choices:".to_string(),
+    ];
+    for choice in &dialog.choices {
+        lines.push(format!("- {}: {}", choice.id, choice.label));
+    }
+    if let Some(request_id) = request_id {
+        let id_label = if request_state == "test_run_cancel_queued" {
+            "run_id"
+        } else {
+            "request_id"
+        };
+        lines.push(format!("{id_label}={request_id}"));
+    }
+    lines.push(
+        "该恢复接口不使用 Unity 主线程。请根据弹窗语义选择一个 choice_id，并通过内置 python 工具调用："
+            .to_string(),
+    );
+    let project_json =
+        serde_json::to_string(&dialog.project).unwrap_or_else(|_| "\"\"".to_string());
+    let dialog_json =
+        serde_json::to_string(&dialog.dialog_id).unwrap_or_else(|_| "\"\"".to_string());
+    lines.push(format!(
+        "choice = await locus.choose_unity_dialog(project={project_json}, dialog_id={dialog_json}, choice_id=\"choice-0\")\nprint(choice)"
+    ));
+    lines.push(match request_state {
+        "not_sent" => "选择后可安全重试原 Unity 操作。".to_string(),
+        "editor_starting" => "Unity 已启动，正在等待弹窗选择。选择后使用 ensure_unity_editor 继续等待当前进程，不要再次调用 restart_unity_editor。".to_string(),
+        "editor_closing" => "Unity 关闭尚未完成，尚未启动替代进程。选择后先查询 Editor 状态，再决定是否继续原操作。".to_string(),
+        "detached" => {
+            let execution_json = serde_json::to_string(request_id.unwrap_or_default())
+                .unwrap_or_else(|_| "\"\"".to_string());
+            format!(
+                "原请求已发送；选择完成后在同一次 python 工具调用中获取原执行结果，避免重复执行：\noutput = await locus.wait_unity_execution(project={project_json}, execution_id={execution_json})\nprint(output)"
+            )
+        }
+        "test_run_cancel_queued" => "Unity Test 取消请求已提交；处理弹窗后 Unity 将执行取消。当前运行结束前不要重新启动测试。".to_string(),
+        _ => "原请求可能已经发送；选择后先查询原请求状态，避免直接重复执行。".to_string(),
+    });
+    lines.join("\n")
+}
+
+fn display_or_empty(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "<empty>"
+    } else {
+        value
+    }
+}
+
+fn is_native_progress_control_class(class_name: &str) -> bool {
+    class_name.eq_ignore_ascii_case("msctls_progress32")
+}
+
+/// A progress control is structural evidence of running work. Its optional
+/// interrupt buttons are not a request for a decision, and must never be
+/// presented as modal recovery choices. Titles alone are not evidence.
+fn is_native_progress_dialog<'a>(
+    has_progress_control: bool,
+    labels: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    has_progress_control
+        && labels.into_iter().all(|label| {
+            matches!(
+                label.replace('&', "").trim().to_ascii_lowercase().as_str(),
+                "cancel" | "skip transcoding"
+            )
+        })
+}
+
 #[cfg(windows)]
 mod platform {
     use super::*;
@@ -85,7 +166,8 @@ mod platform {
                 Accessibility::{
                     CUIAutomation, IUIAutomation, IUIAutomationInvokePattern, SetWinEventHook,
                     TreeScope_Descendants, UIA_ButtonControlTypeId, UIA_InvokePatternId,
-                    UIA_TextControlTypeId, UnhookWinEvent, HWINEVENTHOOK,
+                    UIA_ProgressBarControlTypeId, UIA_TextControlTypeId, UnhookWinEvent,
+                    HWINEVENTHOOK,
                 },
                 Input::KeyboardAndMouse::IsWindowEnabled,
                 WindowsAndMessaging::{
@@ -160,6 +242,7 @@ mod platform {
         main_hwnd: isize,
         dialog_hwnd: isize,
         fingerprint: String,
+        win32_snapshot: bool,
         choices: Vec<NativeChoice>,
         consumed: bool,
     }
@@ -594,7 +677,10 @@ mod platform {
         }
 
         let mut main_hwnd = entry.main_hwnd.load(Ordering::Acquire);
-        if !window_matches_process(main_hwnd, entry.process_id) {
+        if event.hwnd == 0
+            || !window_matches_process(main_hwnd, entry.process_id)
+            || !window_visible(main_hwnd)
+        {
             main_hwnd = find_unity_main_window(entry.process_id).unwrap_or(0);
             entry.main_hwnd.store(main_hwnd, Ordering::Release);
         }
@@ -602,11 +688,10 @@ mod platform {
             return;
         }
 
-        // Unity 2022 presents "Enter Safe Mode?" before its main editor
-        // window exists. It is an ownerless top-level #32770 window, so model
-        // that startup recovery prompt as both the main and dialog window.
-        if is_ownerless_safe_mode_prompt(main_hwnd) {
-            if let Some(record) = inspect_dialog(entry, main_hwnd, main_hwnd, automation) {
+        // Startup prompts (Safe Mode, scene backup recovery, etc.) can exist
+        // before the editor window, or alongside an unrelated splash window.
+        if is_ownerless_native_dialog(main_hwnd) {
+            if let Some(record) = inspect_dialog(entry, main_hwnd, main_hwnd, None) {
                 publish_dialog(record);
                 return;
             }
@@ -618,7 +703,7 @@ mod platform {
             candidates.push(event_root);
         }
         if event.hwnd == 0 || event_root == main_hwnd || candidates.is_empty() {
-            candidates.extend(owned_top_level_windows(entry.process_id, main_hwnd));
+            candidates.extend(dialog_top_level_windows(entry.process_id, main_hwnd));
         }
         candidates.sort_unstable();
         candidates.dedup();
@@ -646,6 +731,8 @@ mod platform {
         let changed = match records.get(&record.project_key) {
             Some(existing)
                 if existing.dialog_hwnd == record.dialog_hwnd
+                    && existing.process_id == record.process_id
+                    && existing.process_created_at_ms == record.process_created_at_ms
                     && existing.fingerprint == record.fingerprint =>
             {
                 record.public.dialog_id = existing.public.dialog_id.clone();
@@ -668,12 +755,12 @@ mod platform {
         dialog_hwnd: isize,
         automation: Option<&IUIAutomation>,
     ) -> Option<DialogRecord> {
-        let ownerless_safe_mode_prompt =
-            dialog_hwnd == main_hwnd && is_ownerless_safe_mode_prompt(dialog_hwnd);
+        let ownerless_native_dialog = is_ownerless_native_dialog(dialog_hwnd);
         if dialog_hwnd == 0
             || !window_matches_process(dialog_hwnd, entry.process_id)
             || !window_visible(dialog_hwnd)
-            || (!ownerless_safe_mode_prompt
+            || !window_enabled(dialog_hwnd)
+            || (!ownerless_native_dialog
                 && (dialog_hwnd == main_hwnd
                     || window_enabled(main_hwnd)
                     || !owner_chain_reaches(dialog_hwnd, main_hwnd)))
@@ -681,19 +768,52 @@ mod platform {
             return None;
         }
 
+        let main_hwnd = if ownerless_native_dialog {
+            dialog_hwnd
+        } else {
+            main_hwnd
+        };
+        // Keep startup snapshots and their invocation on the same Win32
+        // representation; UIA can normalize the text and button order differently.
+        let automation = if ownerless_native_dialog {
+            None
+        } else {
+            automation
+        };
+
         let title = window_text(dialog_hwnd);
         let class_name = window_class(dialog_hwnd);
-        let (mut message, mut choices) = automation
-            .and_then(|uia| inspect_with_uia(uia, dialog_hwnd, &title).ok())
-            .unwrap_or_else(|| inspect_win32_children(dialog_hwnd, &title));
-        if message.trim().is_empty() || choices.is_empty() {
-            let (win32_message, win32_choices) = inspect_win32_children(dialog_hwnd, &title);
-            if message.trim().is_empty() {
-                message = win32_message;
+        let (mut message, mut choices, uia_progress_control, win32_snapshot) =
+            match automation.and_then(|uia| inspect_with_uia(uia, dialog_hwnd, &title).ok()) {
+                Some((message, choices, progress)) => (message, choices, progress, false),
+                None => (String::new(), Vec::new(), false, true),
+            };
+        // Native progress bars often have neither text nor an accessible name.
+        // Preserve their structural evidence even when UIA supplied the text.
+        let (win32_message, win32_choices, win32_progress_control) =
+            inspect_win32_children(dialog_hwnd, &title);
+        if message.trim().is_empty() {
+            message = win32_message;
+        }
+        if choices.is_empty() {
+            choices = win32_choices;
+        }
+        if is_native_progress_dialog(
+            uia_progress_control || win32_progress_control,
+            choices.iter().map(|choice| choice.public.label.as_str()),
+        ) {
+            // Unity may reuse a dialog HWND while switching from a prompt to
+            // progress. Do not retain the previously published modal record.
+            let mut records = lock_unpoisoned(dialogs());
+            if records
+                .get(&entry.project_key)
+                .is_some_and(|record| record.dialog_hwnd == dialog_hwnd)
+            {
+                records.remove(&entry.project_key);
+                drop(records);
+                notify_dialog_revision();
             }
-            if choices.is_empty() {
-                choices = win32_choices;
-            }
+            return None;
         }
         if choices.is_empty() {
             return None;
@@ -723,6 +843,7 @@ mod platform {
             main_hwnd,
             dialog_hwnd,
             fingerprint,
+            win32_snapshot,
             choices,
             consumed: false,
         })
@@ -732,7 +853,7 @@ mod platform {
         automation: &IUIAutomation,
         dialog_hwnd: isize,
         title: &str,
-    ) -> windows::core::Result<(String, Vec<NativeChoice>)> {
+    ) -> windows::core::Result<(String, Vec<NativeChoice>, bool)> {
         let root = unsafe { automation.ElementFromHandle(hwnd(dialog_hwnd))? };
         let condition = unsafe { automation.CreateTrueCondition()? };
         let elements = unsafe { root.FindAll(TreeScope_Descendants, &condition)? };
@@ -741,11 +862,26 @@ mod platform {
         let mut fallback_parts = Vec::new();
         let mut seen_text = HashSet::new();
         let mut choices = Vec::new();
+        let mut has_progress_control = false;
 
         for index in 0..length {
             let Ok(element) = (unsafe { elements.GetElement(index) }) else {
                 continue;
             };
+            let control_type = unsafe { element.CurrentControlType() }.ok();
+            let class_name = unsafe { element.CurrentClassName() }
+                .ok()
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            if (control_type == Some(UIA_ProgressBarControlTypeId)
+                || is_native_progress_control_class(&class_name))
+                && unsafe { element.CurrentIsOffscreen() }
+                    .map(|offscreen| !offscreen.as_bool())
+                    .unwrap_or(false)
+            {
+                has_progress_control = true;
+                continue;
+            }
             let name = unsafe { element.CurrentName() }
                 .ok()
                 .map(|value| value.to_string())
@@ -755,11 +891,6 @@ mod platform {
             if name.is_empty() {
                 continue;
             }
-            let control_type = unsafe { element.CurrentControlType() }.ok();
-            let class_name = unsafe { element.CurrentClassName() }
-                .ok()
-                .map(|value| value.to_string())
-                .unwrap_or_default();
             let native_hwnd = unsafe { element.CurrentNativeWindowHandle() }
                 .ok()
                 .map(|value| value.0 as isize)
@@ -798,18 +929,23 @@ mod platform {
         } else {
             text_parts.join("\n")
         };
-        Ok((message, choices))
+        Ok((message, choices, has_progress_control))
     }
 
     #[derive(Default)]
     struct Win32ChildSnapshot {
         message_parts: Vec<String>,
         choices: Vec<NativeChoice>,
+        has_progress_control: bool,
     }
 
     unsafe extern "system" fn enum_child_callback(child: HWND, parameter: LPARAM) -> BOOL {
         let snapshot = &mut *(parameter.0 as *mut Win32ChildSnapshot);
         let class_name = window_class(child.0 as isize);
+        if is_native_progress_control_class(&class_name) && window_visible(child.0 as isize) {
+            snapshot.has_progress_control = true;
+            return BOOL(1);
+        }
         let text = control_text(child.0 as isize).trim().to_string();
         if text.is_empty() {
             return BOOL(1);
@@ -831,7 +967,10 @@ mod platform {
         BOOL(1)
     }
 
-    fn inspect_win32_children(dialog_hwnd: isize, title: &str) -> (String, Vec<NativeChoice>) {
+    fn inspect_win32_children(
+        dialog_hwnd: isize,
+        title: &str,
+    ) -> (String, Vec<NativeChoice>, bool) {
         let mut snapshot = Win32ChildSnapshot::default();
         unsafe {
             let _ = EnumChildWindows(
@@ -842,7 +981,11 @@ mod platform {
         }
         snapshot.message_parts.retain(|part| part != title);
         snapshot.message_parts.dedup();
-        (snapshot.message_parts.join("\n"), snapshot.choices)
+        (
+            snapshot.message_parts.join("\n"),
+            snapshot.choices,
+            snapshot.has_progress_control,
+        )
     }
 
     fn dialog_fingerprint(
@@ -871,18 +1014,28 @@ mod platform {
         let same_process = super::super::process::process_created_at_unix_ms(record.process_id)
             == Some(record.process_created_at_ms);
         let modal_relationship_valid = if record.main_hwnd == record.dialog_hwnd
-            && is_ownerless_safe_mode_prompt(record.dialog_hwnd)
+            && is_ownerless_native_dialog(record.dialog_hwnd)
         {
             true
         } else {
             !window_enabled(record.main_hwnd)
                 && owner_chain_reaches(record.dialog_hwnd, record.main_hwnd)
         };
-        same_process
+        let valid = same_process
             && window_matches_process(record.main_hwnd, record.process_id)
             && window_matches_process(record.dialog_hwnd, record.process_id)
             && window_visible(record.dialog_hwnd)
-            && modal_relationship_valid
+            && window_enabled(record.dialog_hwnd)
+            && modal_relationship_valid;
+        if !valid {
+            return false;
+        }
+        let (_, choices, has_progress_control) =
+            inspect_win32_children(record.dialog_hwnd, &record.public.title);
+        !is_native_progress_dialog(
+            has_progress_control,
+            choices.iter().map(|choice| choice.public.label.as_str()),
+        )
     }
 
     pub fn current_dialog(project_path: &str) -> Option<UnityModalDialog> {
@@ -891,21 +1044,34 @@ mod platform {
             let records = lock_unpoisoned(dialogs());
             records.get(&key).cloned()
         };
-        // The Safe Mode startup prompt can appear after the hook's initial
-        // scan without producing a WinEvent on some Unity/Windows versions.
-        // A cache miss therefore performs one cheap synchronous Win32 scan.
+        if record
+            .as_ref()
+            .is_some_and(|record| !record_still_valid(record))
+        {
+            clear_dialog_by_key(&key);
+            record = None;
+        }
+        // Startup prompts can appear without a WinEvent, or replace a cached
+        // dialog. Scan all native candidates, including ownerless prompts next
+        // to a splash window, without relying on a managed bridge connection.
         if record.is_none() {
             let entry = {
                 let entries = lock_unpoisoned(hooks());
                 entries.get(&key).cloned()
             };
             if let Some(entry) = entry {
-                let main_hwnd = find_unity_main_window(entry.process_id).unwrap_or(0);
-                if is_ownerless_safe_mode_prompt(main_hwnd) {
-                    record = inspect_dialog(&entry, main_hwnd, main_hwnd, None);
-                    if let Some(discovered) = record.clone() {
-                        publish_dialog(discovered);
-                    }
+                if !entry.stopped.load(Ordering::Acquire) {
+                    process_window_event(
+                        &entry,
+                        NativeWindowEvent {
+                            event: EVENT_SYSTEM_DIALOGSTART,
+                            hwnd: 0,
+                            id_object: OBJID_WINDOW.0,
+                            id_child: CHILDID_SELF as i32,
+                        },
+                        None,
+                    );
+                    record = lock_unpoisoned(dialogs()).get(&key).cloned();
                 }
             }
         }
@@ -918,6 +1084,21 @@ mod platform {
         }
     }
 
+    pub fn current_dialog_for_process(
+        project_path: &str,
+        process_id: u32,
+        expected_created_at_ms: Option<u64>,
+    ) -> Option<UnityModalDialog> {
+        let dialog = current_dialog(project_path)?;
+        let records = lock_unpoisoned(dialogs());
+        let record = records.get(&project_key(project_path))?;
+        (record.process_id == process_id
+            && expected_created_at_ms
+                .map_or(true, |created| record.process_created_at_ms == created)
+            && record.public.dialog_id == dialog.dialog_id)
+            .then_some(dialog)
+    }
+
     pub fn blocked_error(
         project_path: &str,
         request_state: &str,
@@ -925,65 +1106,6 @@ mod platform {
     ) -> Option<String> {
         current_dialog(project_path)
             .map(|dialog| format_blocked_error(&dialog, request_state, request_id))
-    }
-
-    fn format_blocked_error(
-        dialog: &UnityModalDialog,
-        request_state: &str,
-        request_id: Option<&str>,
-    ) -> String {
-        let mut lines = vec![
-            format!("code={UNITY_MODAL_DIALOG_BLOCKED_CODE}"),
-            "Unity 主线程已被模态弹窗阻塞。".to_string(),
-            format!("request_state={request_state}"),
-            format!("dialog_id={}", dialog.dialog_id),
-            format!("title={}", display_or_empty(&dialog.title)),
-            format!("message={}", display_or_empty(&dialog.message)),
-            "choices:".to_string(),
-        ];
-        for choice in &dialog.choices {
-            lines.push(format!("- {}: {}", choice.id, choice.label));
-        }
-        if let Some(request_id) = request_id {
-            let id_label = if request_state == "test_run_cancel_queued" {
-                "run_id"
-            } else {
-                "request_id"
-            };
-            lines.push(format!("{id_label}={request_id}"));
-        }
-        lines.push(
-            "该恢复接口不使用 Unity 主线程。请根据弹窗语义选择一个 choice_id，并通过内置 python 工具调用："
-                .to_string(),
-        );
-        let project_json =
-            serde_json::to_string(&dialog.project).unwrap_or_else(|_| "\"\"".to_string());
-        let dialog_json =
-            serde_json::to_string(&dialog.dialog_id).unwrap_or_else(|_| "\"\"".to_string());
-        lines.push(format!(
-            "choice = await locus.choose_unity_dialog(project={project_json}, dialog_id={dialog_json}, choice_id=\"choice-0\")\nprint(choice)"
-        ));
-        lines.push(match request_state {
-            "not_sent" => "选择后可安全重试原 Unity 操作。".to_string(),
-            "detached" => {
-                let execution_json = serde_json::to_string(request_id.unwrap_or_default())
-                    .unwrap_or_else(|_| "\"\"".to_string());
-                format!(
-                    "原请求已发送；选择完成后在同一次 python 工具调用中获取原执行结果，避免重复执行：\noutput = await locus.wait_unity_execution(project={project_json}, execution_id={execution_json})\nprint(output)"
-                )
-            }
-            "test_run_cancel_queued" => "Unity Test 取消请求已提交；处理弹窗后 Unity 将执行取消。当前运行结束前不要重新启动测试。".to_string(),
-            _ => "原请求可能已经发送；选择后先查询原请求状态，避免直接重复执行。".to_string(),
-        });
-        lines.join("\n")
-    }
-
-    fn display_or_empty(value: &str) -> &str {
-        if value.trim().is_empty() {
-            "<empty>"
-        } else {
-            value
-        }
     }
 
     pub async fn choose_dialog(
@@ -1151,7 +1273,18 @@ mod platform {
             return Err("Unity dialog title changed before the choice was invoked".to_string());
         }
         let class_name = window_class(record.dialog_hwnd);
-        let (_, current_choices) = inspect_win32_children(record.dialog_hwnd, &record.public.title);
+        let (current_message, current_choices, has_progress_control) =
+            inspect_win32_children(record.dialog_hwnd, &record.public.title);
+        if is_native_progress_dialog(
+            has_progress_control,
+            current_choices
+                .iter()
+                .map(|choice| choice.public.label.as_str()),
+        ) {
+            return Err(
+                "Unity dialog became a progress window before the choice was invoked".into(),
+            );
+        }
         let expected_labels = record
             .choices
             .iter()
@@ -1161,13 +1294,20 @@ mod platform {
             .iter()
             .map(|candidate| normalized_button_label(&candidate.public.label))
             .collect::<Vec<_>>();
-        let ownerless_safe_mode_prompt = record.main_hwnd == record.dialog_hwnd
-            && is_ownerless_safe_mode_prompt(record.dialog_hwnd);
-        // Startup Safe Mode records are discovered through Win32 because no
-        // Unity main window exists yet. Re-inspecting them through UIA changes
-        // text normalization and would create a different fingerprint, so use
-        // the already verified Win32 title/button identity for invocation.
-        let (uia_invoked, uia_verified) = if ownerless_safe_mode_prompt {
+        // Cache-miss scans and startup dialogs use Win32 snapshots. Validate
+        // against the same representation before invoking their native button.
+        let (uia_invoked, uia_verified) = if record.win32_snapshot {
+            if dialog_fingerprint(
+                &record.public.title,
+                &current_message,
+                &class_name,
+                &current_choices,
+            ) != record.fingerprint
+            {
+                return Err(
+                    "Unity dialog content changed before the choice was invoked".to_string()
+                );
+            }
             (false, false)
         } else {
             validate_and_invoke_choice_with_uia(record, choice)?
@@ -1227,20 +1367,29 @@ mod platform {
                     Ok(automation) => automation,
                     Err(_) => return Ok((false, false)),
                 };
-            let (mut message, mut choices) =
+            let (mut message, mut choices, mut has_progress_control) =
                 match inspect_with_uia(&automation, record.dialog_hwnd, &record.public.title) {
                     Ok(snapshot) => snapshot,
                     Err(_) => return Ok((false, false)),
                 };
             if message.trim().is_empty() || choices.is_empty() {
-                let (win32_message, win32_choices) =
+                let (win32_message, win32_choices, win32_progress_control) =
                     inspect_win32_children(record.dialog_hwnd, &record.public.title);
+                has_progress_control |= win32_progress_control;
                 if message.trim().is_empty() {
                     message = win32_message;
                 }
                 if choices.is_empty() {
                     choices = win32_choices;
                 }
+            }
+            if is_native_progress_dialog(
+                has_progress_control,
+                choices.iter().map(|choice| choice.public.label.as_str()),
+            ) {
+                return Err(
+                    "Unity dialog became a progress window before the choice was invoked".into(),
+                );
             }
             for (index, candidate) in choices.iter_mut().enumerate() {
                 candidate.public.id = format!("choice-{index}");
@@ -1313,20 +1462,23 @@ mod platform {
         windows: Vec<isize>,
     }
 
-    unsafe extern "system" fn enum_owned_windows_callback(window: HWND, parameter: LPARAM) -> BOOL {
+    unsafe extern "system" fn enum_dialog_windows_callback(
+        window: HWND,
+        parameter: LPARAM,
+    ) -> BOOL {
         let context = &mut *(parameter.0 as *mut TopLevelContext);
         let value = window.0 as isize;
         if value != context.main_hwnd
             && window_matches_process(value, context.process_id)
             && window_visible(value)
-            && owner_chain_reaches(value, context.main_hwnd)
+            && (owner_chain_reaches(value, context.main_hwnd) || is_ownerless_native_dialog(value))
         {
             context.windows.push(value);
         }
         BOOL(1)
     }
 
-    fn owned_top_level_windows(process_id: u32, main_hwnd: isize) -> Vec<isize> {
+    fn dialog_top_level_windows(process_id: u32, main_hwnd: isize) -> Vec<isize> {
         let mut context = TopLevelContext {
             process_id,
             main_hwnd,
@@ -1334,7 +1486,7 @@ mod platform {
         };
         let _ = unsafe {
             EnumWindows(
-                Some(enum_owned_windows_callback),
+                Some(enum_dialog_windows_callback),
                 LPARAM((&mut context as *mut TopLevelContext) as isize),
             )
         };
@@ -1449,8 +1601,12 @@ mod platform {
         value != 0 && unsafe { IsWindowEnabled(hwnd(value)) }.as_bool()
     }
 
-    fn is_ownerless_safe_mode_prompt(value: isize) -> bool {
-        if value == 0 || !window_visible(value) || window_class(value) != "#32770" {
+    fn is_ownerless_native_dialog(value: isize) -> bool {
+        if value == 0
+            || !window_visible(value)
+            || !window_enabled(value)
+            || window_class(value) != "#32770"
+        {
             return false;
         }
         let ownerless = unsafe { GetWindow(hwnd(value), GW_OWNER) }
@@ -1458,11 +1614,7 @@ mod platform {
             // The windows crate maps a NULL GetWindow result to Err even
             // though NULL is the documented "no owner" result.
             .unwrap_or(true);
-        if !ownerless {
-            return false;
-        }
-        let title = window_text(value).to_ascii_lowercase();
-        title.contains("enter safe mode") || title.contains("进入安全模式")
+        ownerless
     }
 
     fn window_text(value: isize) -> String {
@@ -1514,6 +1666,150 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[tokio::test]
+        #[ignore = "creates native Windows test dialogs; run explicitly on an interactive desktop"]
+        async fn startup_dialog_without_bridge_is_detected_chosen_and_blocks_graceful_close() {
+            use windows::{
+                core::{w, PCWSTR},
+                Win32::UI::WindowsAndMessaging::{
+                    CreateWindowExW, DestroyWindow, MessageBoxW, IDNO, MB_YESNO, WINDOW_EX_STYLE,
+                    WM_COMMAND, WS_POPUP, WS_VISIBLE,
+                },
+            };
+
+            struct Cleanup {
+                project: String,
+                title: String,
+                process_id: u32,
+            }
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    clear_project_by_key(&project_key(&self.project));
+                    for window in dialog_top_level_windows(self.process_id, 0) {
+                        if window_text(window) == self.title {
+                            let _ = unsafe {
+                                PostMessageW(
+                                    Some(hwnd(window)),
+                                    WM_COMMAND,
+                                    WPARAM(IDNO.0 as usize),
+                                    LPARAM(0),
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+
+            let project_dir = tempfile::tempdir().unwrap();
+            let project = project_dir.path().to_string_lossy().to_string();
+            let title = format!("Recovering Scene Backups {}", uuid::Uuid::new_v4());
+            let process_id = std::process::id();
+            let _cleanup = Cleanup {
+                project: project.clone(),
+                title: title.clone(),
+                process_id,
+            };
+            let title_wide = title.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+            let (splash_tx, splash_rx) = mpsc::channel();
+            let (result_tx, result_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                // A larger, enabled splash window must not hide an ownerless
+                // startup dialog from the cache-miss scan.
+                let splash = unsafe {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("STATIC"),
+                        w!("Locus dialog test splash"),
+                        WS_POPUP | WS_VISIBLE,
+                        -32000,
+                        -32000,
+                        900,
+                        700,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                .unwrap();
+                splash_tx.send(splash.0 as isize).unwrap();
+                let choice = unsafe {
+                    MessageBoxW(
+                        None,
+                        w!("Scene backups detected. Preserve them in Assets/_Recovery/?"),
+                        PCWSTR(title_wide.as_ptr()),
+                        MB_YESNO,
+                    )
+                };
+                let _ = unsafe { DestroyWindow(splash) };
+                let _ = result_tx.send(choice.0);
+            });
+            let splash = splash_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let entry = Arc::new(HookEntry {
+                project_key: project_key(&project),
+                project_path: project.clone(),
+                process_id,
+                process_created_at_ms: super::super::super::process::process_created_at_unix_ms(
+                    process_id,
+                )
+                .unwrap(),
+                main_hwnd: AtomicIsize::new(splash),
+                hook_thread_id: AtomicU32::new(0),
+                stopped: AtomicBool::new(false),
+            });
+            // Deliberately install no WinEventHook: startup recovery must also
+            // work when the window appears after the initial scan without an event.
+            lock_unpoisoned(hooks()).insert(project_key(&project), entry);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let dialog = loop {
+                if let Some(dialog) = current_dialog_for_process(&project, process_id, None) {
+                    break dialog;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "startup dialog was not detected"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
+            assert_eq!(dialog.title, title);
+            assert!(dialog.message.contains("Assets/_Recovery/"));
+            assert_eq!(dialog.choices.len(), 2);
+            assert!(dialog.choices.iter().all(|choice| !choice.label.is_empty()));
+            assert_eq!(
+                current_dialog(&project).unwrap().dialog_id,
+                dialog.dialog_id
+            );
+            assert!(
+                current_dialog_for_process(&project, process_id.wrapping_add(1), None).is_none()
+            );
+            assert!(current_dialog_for_process(&project, process_id, Some(0)).is_none());
+
+            let close_error = super::super::super::process::wait_for_graceful_process_exit(
+                &project,
+                &[process_id],
+                Duration::ZERO,
+            )
+            .unwrap_err();
+            assert!(close_error.contains("request_state=editor_closing"));
+            assert!(close_error.contains(&dialog.dialog_id));
+
+            let result = choose_dialog(&project, &dialog.dialog_id, &dialog.choices[1].id)
+                .await
+                .unwrap();
+            assert!(result.invoked);
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                IDNO.0
+            );
+            worker.join().unwrap();
+            assert!(current_dialog(&project).is_none());
+            let repeat = choose_dialog(&project, &dialog.dialog_id, &dialog.choices[1].id)
+                .await
+                .unwrap();
+            assert!(!repeat.invoked);
+            assert_eq!(repeat.status, "dialog_not_found");
+        }
 
         #[test]
         fn blocked_error_contains_dialog_and_on_demand_sdk_usage() {
@@ -1608,6 +1904,14 @@ mod platform {
         None
     }
 
+    pub fn current_dialog_for_process(
+        _project_path: &str,
+        _process_id: u32,
+        _expected_created_at_ms: Option<u64>,
+    ) -> Option<UnityModalDialog> {
+        None
+    }
+
     pub fn blocked_error(
         _project_path: &str,
         _request_state: &str,
@@ -1630,13 +1934,63 @@ mod platform {
 }
 
 pub use platform::{
-    blocked_error, choose_dialog, current_dialog, ensure_project_observed, main_window_title,
-    subscribe, sync_project_process,
+    blocked_error, choose_dialog, current_dialog, current_dialog_for_process,
+    ensure_project_observed, main_window_title, subscribe, sync_project_process,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_and_reload_progress_with_interrupt_buttons_is_not_a_choice_dialog() {
+        // Unity 6.5's native progress resource contains msctls_progress32,
+        // Cancel and Skip Transcoding. The title changes with the current step.
+        assert!(is_native_progress_control_class("msctls_progress32"));
+        assert!(is_native_progress_control_class("MSCTLS_PROGRESS32"));
+        for labels in [
+            vec!["Cancel", "Skip Transcoding"],
+            vec!["&Cancel"],
+            vec![" Skip Transcoding "],
+            vec![],
+        ] {
+            assert!(is_native_progress_dialog(true, labels));
+        }
+    }
+
+    #[test]
+    fn progress_titles_or_interrupt_labels_without_visible_control_remain_modal() {
+        // No title matching participates in this classification. A hidden or
+        // offscreen bar supplies false, just like an absent progress control.
+        assert!(!is_native_progress_dialog(
+            false,
+            ["Cancel", "Skip Transcoding"]
+        ));
+        assert!(!is_native_progress_dialog(false, ["Cancel"]));
+        for class in [
+            "#32770",
+            "UnityContainerWndClass",
+            "ProgressWindow",
+            "Static",
+        ] {
+            assert!(!is_native_progress_control_class(class));
+        }
+    }
+
+    #[test]
+    fn confirmation_and_error_choices_remain_modal_even_with_a_progress_control() {
+        for labels in [
+            vec!["Save", "Don't Save", "Cancel"],
+            vec!["Enter Safe Mode", "Ignore", "Quit"],
+            vec!["OK"],
+            vec!["Retry", "Cancel"],
+            vec!["Yes", "No"],
+            vec!["Continue", "Cancel"],
+            vec!["Skip", "Cancel"],
+        ] {
+            assert!(!is_native_progress_dialog(true, labels));
+        }
+    }
 
     #[test]
     fn main_thread_message_classification_keeps_recovery_channels_available() {

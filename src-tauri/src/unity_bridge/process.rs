@@ -166,6 +166,37 @@ pub async fn close_current_project_unity_processes(
     close_current_project_unity_processes_inner(project_path, timeout, false).await
 }
 
+/// Admission is separate from service monitors: an Editor keeps consuming its
+/// slot until its actual process exits. Lowering the policy never closes it.
+pub(super) async fn admit_editor_launch() -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+    static ADMISSION: Mutex<()> = Mutex::const_new(());
+    let guard = ADMISSION.lock().await;
+    let Some(policy) = crate::resource_policy::application_policy() else { return Ok(guard); };
+    let mut changes = policy.subscribe();
+    loop {
+        let limit = changes.borrow_and_update().limits.max_unity_editors;
+        let count = tokio::task::spawn_blocking(main_editor_process_count).await.map_err(|e| e.to_string())??;
+        if count < limit { return Ok(guard); }
+        tokio::select! {
+            result = changes.changed() => { if result.is_err() { return Err("Editor resource policy closed".into()); } },
+            _ = tokio::time::sleep(Duration::from_millis(500)) => {},
+        }
+    }
+}
+
+#[cfg(windows)]
+fn main_editor_process_count() -> Result<usize, String> {
+    Ok(query_unity_processes()?.iter().filter(|process| {
+        !process.command_line.as_deref().is_some_and(|line| unity_process_args_are_worker(&split_windows_command_line(line)))
+    }).count())
+}
+
+#[cfg(not(windows))]
+fn main_editor_process_count() -> Result<usize, String> {
+    // Windows is the supported launch-budget provider for this release.
+    Ok(0)
+}
+
 pub async fn force_close_current_project_unity_processes(
     project_path: &str,
     timeout: Duration,
@@ -178,6 +209,11 @@ async fn close_current_project_unity_processes_inner(
     timeout: Duration,
     force_first: bool,
 ) -> Result<UnityProjectProcessCloseResult, String> {
+    if !force_first {
+        // Observe before requesting close: save/recovery prompts can block
+        // shutdown while the managed bridge is already unavailable.
+        let _ = super::dialog::ensure_project_observed(project_path).await;
+    }
     let project_path = project_path.to_string();
     let project_path_for_task = project_path.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -189,6 +225,8 @@ async fn close_current_project_unity_processes_inner(
     let key = process_cache_key(project_path.as_str());
     let mut cache = unity_process_probe_cache().lock().await;
     cache.remove(&key);
+    drop(cache);
+    super::invalidate_closed_editor_status(&project_path);
     Ok(result)
 }
 
@@ -287,7 +325,7 @@ pub(crate) fn query_process_identity_liveness(
     Err("Unity process identity detection is only supported on Windows".to_string())
 }
 
-fn normalize_project_identity(path: &str) -> Option<String> {
+pub(super) fn normalize_project_identity(path: &str) -> Option<String> {
     let trimmed = strip_extended_path_prefix(path)
         .trim()
         .trim_matches('"')
@@ -457,7 +495,7 @@ pub(super) async fn cache_project_editor_process(
 }
 
 #[cfg(windows)]
-fn query_current_project_editor_process_uncached(project_path: String) -> UnityEditorProcessInfo {
+pub(crate) fn query_current_project_editor_process_uncached(project_path: String) -> UnityEditorProcessInfo {
     let checked_at_ms = unix_now_ms();
     let target = match normalize_project_identity(&project_path) {
         Some(value) => value,
@@ -569,12 +607,13 @@ fn close_current_project_unity_processes_sync(
         });
     }
 
+    check_project_close_dialog(project_path, &process_ids)?;
     for process_id in &process_ids {
         let _ = request_taskkill(*process_id, false);
     }
 
     let graceful_timeout = timeout.min(Duration::from_secs(20));
-    let mut remaining = wait_for_process_exit(&process_ids, graceful_timeout);
+    let mut remaining = wait_for_graceful_process_exit(project_path, &process_ids, graceful_timeout)?;
     let mut forced_process_ids = Vec::new();
     if !remaining.is_empty() {
         forced_process_ids = remaining.clone();
@@ -617,7 +656,7 @@ fn close_current_project_unity_processes_sync(
 }
 
 #[cfg(not(windows))]
-fn query_current_project_editor_process_uncached(_project_path: String) -> UnityEditorProcessInfo {
+pub(crate) fn query_current_project_editor_process_uncached(_project_path: String) -> UnityEditorProcessInfo {
     UnityEditorProcessInfo::unknown(
         unix_now_ms(),
         "Unity editor process detection is only supported on Windows",
@@ -741,6 +780,41 @@ fn query_unity_processes() -> Result<Vec<Win32UnityProcess>, String> {
 }
 
 #[cfg(windows)]
+pub(super) fn editor_resources() -> Result<Vec<super::managed_editor::EditorResource>, String> {
+    let processes = query_unity_processes()?;
+    let candidates = processes.iter().filter_map(|process| {
+        let args = split_windows_command_line(process.command_line.as_deref()?);
+        let project = project_path_from_args(&args)?.to_string();
+        let identity = normalize_project_identity(&project)?;
+        Some((process, project, identity, args))
+    }).collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for (process, project, identity, args) in &candidates {
+        if unity_process_args_are_worker(args) { continue; }
+        let members = candidates.iter().filter(|(candidate, _, candidate_identity, candidate_args)| {
+            candidate_identity == identity && (candidate.process_id == process.process_id || unity_process_args_are_worker(candidate_args))
+        }).collect::<Vec<_>>();
+        // Working sets include the main Editor and Unity's asset import
+        // workers. Unknown measurements stay unknown, never a misleading 0.
+        let bytes = members.iter().try_fold(0u64, |sum, (member, _, _, _)| {
+            probe_native::working_set_bytes(member.process_id).and_then(|bytes| sum.checked_add(bytes))
+        });
+        result.push(super::managed_editor::EditorResource {
+            project_path: project.clone(), process_id: process.process_id,
+            mode: launch_mode_from_args(args), managed: false,
+            working_set_bytes: bytes, import_worker_count: members.len().saturating_sub(1), last_error: None,
+        });
+    }
+    result.sort_by(|a, b| a.project_path.cmp(&b.project_path).then(a.process_id.cmp(&b.process_id)));
+    Ok(result)
+}
+
+#[cfg(not(windows))]
+pub(super) fn editor_resources() -> Result<Vec<super::managed_editor::EditorResource>, String> {
+    Err("Unity Editor process memory is currently available on Windows".into())
+}
+
+#[cfg(windows)]
 fn query_project_unity_processes(project_path: &str) -> Result<Vec<Win32UnityProcess>, String> {
     let target = normalize_project_identity(project_path)
         .ok_or_else(|| "Current workspace path is empty".to_string())?;
@@ -833,6 +907,35 @@ fn wait_for_process_exit(process_ids: &[u32], timeout: Duration) -> Vec<u32> {
     }
 }
 
+#[cfg(windows)]
+fn check_project_close_dialog(project_path: &str, process_ids: &[u32]) -> Result<(), String> {
+    for process_id in process_ids {
+        if let Some(dialog) = super::dialog::current_dialog_for_process(project_path, *process_id, None) {
+            return Err(super::dialog::format_blocked_error(&dialog, "editor_closing", None));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn wait_for_graceful_process_exit(
+    project_path: &str,
+    process_ids: &[u32],
+    timeout: Duration,
+) -> Result<Vec<u32>, String> {
+    let started = std::time::Instant::now();
+    let mut remaining = process_ids.to_vec();
+    loop {
+        remaining.retain(|process_id| is_process_alive(*process_id).unwrap_or(true));
+        // Check even at the deadline, before the caller can force-close Unity.
+        check_project_close_dialog(project_path, &remaining)?;
+        if remaining.is_empty() || started.elapsed() >= timeout {
+            return Ok(remaining);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Minimal hand-rolled Win32/NT bindings for the Unity process probe,
 /// following the FFI style of `unity_bridge::background_hook`.
 #[cfg(windows)]
@@ -876,6 +979,20 @@ mod probe_native {
     struct Filetime {
         dw_low_date_time: Dword,
         dw_high_date_time: Dword,
+    }
+
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: Dword,
+        page_fault_count: Dword,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
     }
 
     /// `UNICODE_STRING` (winternl.h); `length` is in bytes.
@@ -927,6 +1044,7 @@ mod probe_native {
             dw_process_id: Dword,
         ) -> Handle;
         fn GetExitCodeProcess(h_process: Handle, lp_exit_code: *mut Dword) -> Bool;
+        fn K32GetProcessMemoryInfo(h_process: Handle, counters: *mut ProcessMemoryCounters, cb: Dword) -> Bool;
         fn GetProcessTimes(
             h_process: Handle,
             lp_creation_time: *mut Filetime,
@@ -979,6 +1097,23 @@ mod probe_native {
         pub(super) alive: bool,
         pub(super) image_path: Option<String>,
         pub(super) created_at_unix_ms: Option<u64>,
+    }
+
+    pub(super) fn working_set_bytes(process_id: u32) -> Option<u64> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, process_id) };
+        if handle.is_null() { return None; }
+        let handle = OwnedHandle(handle);
+        let mut counters: ProcessMemoryCounters = unsafe { std::mem::zeroed() };
+        counters.cb = std::mem::size_of::<ProcessMemoryCounters>() as Dword;
+        if unsafe { K32GetProcessMemoryInfo(handle.0, &mut counters, std::mem::size_of::<ProcessMemoryCounters>() as Dword) } == 0 { return None; }
+        Some(counters.working_set_size as u64)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn process_memory_reports_real_bytes_and_preserves_unavailable() {
+        assert!(working_set_bytes(std::process::id()).is_some_and(|bytes| bytes > 0));
+        assert_eq!(working_set_bytes(u32::MAX), None);
     }
 
     /// Queries liveness, image path and creation time through a single

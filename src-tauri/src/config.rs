@@ -11,6 +11,8 @@ const CONFIG_FILE_NAME: &str = "config.json";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WorkspaceServiceResourceLimits {
+    pub max_running_sessions: usize,
+    pub max_unity_editors: usize,
     pub max_running_workspace_services: usize,
     pub max_watched_workspaces: usize,
     pub max_lsp_processes: usize,
@@ -20,7 +22,8 @@ pub struct WorkspaceServiceResourceLimits {
     /// Idle TTL for checkout-owned watchers and lazily opened indexes. The
     /// checkout runtime identity remains registered for the process lifetime.
     pub workspace_idle_timeout_secs: u64,
-    /// Idle TTL for workspace services. ServiceKind currently contains Unity.
+    /// Idle TTL for workspace services and their Locus-owned headless Editor.
+    /// Interactive Editors remain under user control.
     pub service_idle_timeout_secs: u64,
     pub lsp_idle_timeout_secs: u64,
 }
@@ -28,6 +31,8 @@ pub struct WorkspaceServiceResourceLimits {
 impl Default for WorkspaceServiceResourceLimits {
     fn default() -> Self {
         Self {
+            max_running_sessions: 4,
+            max_unity_editors: 4,
             max_running_workspace_services: 4,
             max_watched_workspaces: 2,
             max_lsp_processes: 1,
@@ -110,6 +115,8 @@ impl WorkspaceServiceResourceLimits {
             }
         }
 
+        require_positive_usize(&mut fields, "maxRunningSessions", self.max_running_sessions);
+        require_positive_usize(&mut fields, "maxUnityEditors", self.max_unity_editors);
         require_positive_usize(
             &mut fields,
             "maxRunningWorkspaceServices",
@@ -2228,6 +2235,8 @@ mod tests {
     #[test]
     fn workspace_service_resource_limits_validation_reports_every_invalid_field() {
         let invalid = WorkspaceServiceResourceLimits {
+            max_running_sessions: 0,
+            max_unity_editors: 0,
             max_running_workspace_services: 0,
             max_watched_workspaces: 0,
             max_lsp_processes: 0,
@@ -2247,6 +2256,8 @@ mod tests {
                 .map(|error| error.field.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "maxRunningSessions",
+                "maxUnityEditors",
                 "maxRunningWorkspaceServices",
                 "maxWatchedWorkspaces",
                 "maxLspProcesses",

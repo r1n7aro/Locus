@@ -81,6 +81,10 @@ impl SkillWorkspaceScope {
 
 fn skill_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
+        error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
+            "workspace.materialization_stale",
+            "The checkout assignment changed. Reopen the checkout before continuing.",
+        ).detail(error.to_string()),
         WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
             "workspace.registry_unavailable",
             "The workspace registry is unavailable.",
@@ -3380,6 +3384,7 @@ fn package_to_document(
         .map(|path| package_file_modified_at(path, record.updated_at))
         .unwrap_or(record.updated_at);
     Ok(KnowledgeDocument {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: package_document_id(&manifest.id, doc_rel_path),
         doc_type: KnowledgeType::Skill,
         path: package_document_virtual_path(manifest, doc_rel_path),
@@ -4331,6 +4336,7 @@ fn package_to_list_item(
         .map(|path| package_file_modified_at(path, record.updated_at))
         .unwrap_or(record.updated_at);
     knowledge_store::KnowledgeListItem {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: package_document_id(&manifest.id, doc_rel_path),
         doc_type: KnowledgeType::Skill,
         path: package_document_virtual_path(manifest, doc_rel_path),
@@ -5031,6 +5037,7 @@ pub fn create_skill_document_sync(
     };
 
     let document = knowledge_store::KnowledgeDocument {
+        inject_agents: crate::knowledge_store::default_inject_agents(),
         id: format!("kd_{}", uuid::Uuid::new_v4()),
         doc_type: KnowledgeType::Skill,
         path: document_path.clone(),

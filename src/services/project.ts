@@ -3,6 +3,30 @@ import { ipcInvoke } from "./ipc";
 export interface WorkspaceRef {
   checkoutId: string;
   expectedGeneration?: number | null;
+  expectedMaterializationEpoch?: number | null;
+}
+
+export function workspaceMaterializationMatches(
+  expected: number | null | undefined,
+  actual: number | null | undefined,
+): boolean {
+  const current = actual ?? 0;
+  if (!Number.isSafeInteger(current) || current < 0) return false;
+  return expected == null ? current <= 1 : Number.isSafeInteger(expected) && expected >= 0 && expected === current;
+}
+
+export function materializationEpochFromParams(params: URLSearchParams): number | undefined {
+  const raw = params.get("materializationEpoch");
+  if (raw == null || raw === "") return undefined;
+  const epoch = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(epoch) || epoch < 0) {
+    throw new Error("Invalid checkout materialization epoch.");
+  }
+  return epoch;
+}
+
+export function appendMaterializationEpoch(params: URLSearchParams, epoch: number | null | undefined): void {
+  if (epoch != null) params.set("materializationEpoch", String(epoch));
 }
 
 export interface WorkspaceRuntimeDescriptor {
@@ -10,6 +34,7 @@ export interface WorkspaceRuntimeDescriptor {
   checkoutId: string;
   root: string;
   workspaceGeneration: number;
+  materializationEpoch?: number;
   leaseCount: number;
   detectedServices: string[];
 }
@@ -62,6 +87,7 @@ export interface WorkspaceCheckoutDescriptor {
   root: string;
   normalizedRoot: string;
   lastOpenedAt: number;
+  available?: boolean;
   runtime?: WorkspaceRuntimeDescriptor | null;
 }
 
@@ -76,6 +102,7 @@ export interface WindowPaneWorkspaceContext {
   paneId: string;
   focusedCheckoutId: string;
   workspaceGeneration: number;
+  materializationEpoch?: number | null;
   activeSessionId?: string | null;
   intentEpoch: number;
   revision: number;
@@ -87,7 +114,7 @@ export interface WindowIntentEpochSnapshot {
   intentEpoch: number;
 }
 
-export const WORKSPACE_EVENT_NAME = "locus://workspace-event";
+export { WORKSPACE_EVENT_NAME } from "./workspaceEventHub";
 
 export interface RoutedWorkspaceEvent<T = unknown> {
   eventName: string;
@@ -95,6 +122,7 @@ export interface RoutedWorkspaceEvent<T = unknown> {
   projectId: string;
   checkoutId: string;
   workspaceGeneration: number;
+  materializationEpoch?: number | null;
   serviceInstanceId?: string | null;
   serviceGeneration?: number | null;
   payload: T;

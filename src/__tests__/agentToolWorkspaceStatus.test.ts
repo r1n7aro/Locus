@@ -116,7 +116,7 @@ describe("Agent tool workspace status", () => {
     row.querySelector<HTMLButtonElement>("[role=checkbox]")!.click();
     await flush();
     expect(ipcInvoke).toHaveBeenCalledWith("set_agent_tool_enabled", {
-      workspaceRef: { checkoutId: "unity", expectedGeneration: 7 },
+      workspaceRef: { checkoutId: "unity", expectedGeneration: 7, expectedMaterializationEpoch: 0 },
       agentId: "unity", toolName: "unity_set_play_mode", enabled: false,
     });
     expect(host.querySelector(".tool-item")!.classList.contains("tool-disabled")).toBe(true);

@@ -1,5 +1,5 @@
 import { ipcInvoke } from "./ipc";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
   FileDiffRequest,
   FileDiffPayload,
@@ -10,10 +10,8 @@ import type {
 } from "../types";
 import type { WorkspaceRef } from "./project";
 import { subscribeWorkspaceFileChanges } from "./workspaceExplorer";
-import {
-  WORKSPACE_EVENT_NAME,
-  type RoutedWorkspaceEvent,
-} from "./project";
+import type { RoutedWorkspaceEvent } from "./project";
+import { listenWorkspaceEvent } from "./workspaceEventHub";
 
 // ── Diff progress events ──
 
@@ -32,8 +30,8 @@ export function listenDiffProgress(
   getWorkspaceRef: () => WorkspaceRef | null,
   cb: (evt: DiffProgressEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<RoutedWorkspaceEvent<DiffProgressEvent>>(
-    WORKSPACE_EVENT_NAME,
+  return listenWorkspaceEvent<RoutedWorkspaceEvent<DiffProgressEvent>>(
+    "diff.listenDiffProgress",
     ({ payload }) => {
       if (payload.eventName !== "diff-progress") return;
       const workspaceRef = getWorkspaceRef();
@@ -54,7 +52,8 @@ function diffScopeKey(req: FileDiffRequest, workspaceRef?: WorkspaceRef | null):
     const generation = Number.isSafeInteger(workspaceRef.expectedGeneration)
       ? String(workspaceRef.expectedGeneration)
       : "current";
-    return `w=${workspaceRef.checkoutId.trim()}@${generation}`;
+    const epoch = workspaceRef.expectedMaterializationEpoch;
+    return `w=${workspaceRef.checkoutId.trim()}@${generation}${epoch == null ? "" : `~e${epoch}`}`;
   }
   if (req.sessionId?.trim()) return `s=${req.sessionId.trim()}`;
   return "u";
@@ -99,14 +98,18 @@ export function parseDiffWorkspaceRefFromKey(key: string): WorkspaceRef | undefi
   const separator = scope.lastIndexOf("@");
   if (separator <= 2) return undefined;
   const checkoutId = scope.slice(2, separator).trim();
-  const generationRaw = scope.slice(separator + 1);
+  const [generationRaw = "", epochRaw] = scope.slice(separator + 1).split("~e");
   if (!checkoutId) return undefined;
   const expectedGeneration = /^\d+$/.test(generationRaw)
     ? Number(generationRaw)
     : undefined;
-  return Number.isSafeInteger(expectedGeneration)
-    ? { checkoutId, expectedGeneration }
-    : { checkoutId };
+  const reference: WorkspaceRef = Number.isSafeInteger(expectedGeneration)
+    ? { checkoutId, expectedGeneration } : { checkoutId };
+  if (epochRaw !== undefined) {
+    if (!/^\d+$/.test(epochRaw) || !Number.isSafeInteger(Number(epochRaw))) return undefined;
+    reference.expectedMaterializationEpoch = Number(epochRaw);
+  }
+  return reference;
 }
 
 // ── LRU cache ──
@@ -145,6 +148,7 @@ function ensureDiffWorkspaceChangeSubscription(): void {
     invalidateDiffCacheForFiles([event.payload.path], {
       checkoutId: event.checkoutId,
       expectedGeneration: event.workspaceGeneration,
+      expectedMaterializationEpoch: event.materializationEpoch,
     });
   });
 }
@@ -253,6 +257,8 @@ export function invalidateDiffCacheForFiles(
         workspaceRef.expectedGeneration != null
         && keyWorkspaceRef.expectedGeneration !== workspaceRef.expectedGeneration
       ) return false;
+      if (workspaceRef.expectedMaterializationEpoch != null
+        && keyWorkspaceRef.expectedMaterializationEpoch !== workspaceRef.expectedMaterializationEpoch) return false;
     }
     return targets.has(request.filePath) || (!!request.oldPath && targets.has(request.oldPath));
   };

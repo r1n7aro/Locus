@@ -2247,6 +2247,7 @@ async fn emit_status_with(payload: CsharpLspStatusPayload) {
         project_id: runtime.project_id().clone(),
         checkout_id: runtime.checkout_id().clone(),
         workspace_generation: runtime.generation(),
+        materialization_epoch: Some(runtime.materialization_epoch()),
         service_instance_id: service_identity.as_ref().map(|(id, _)| id.clone()),
         service_generation: service_identity.as_ref().map(|(_, generation)| *generation),
         payload,

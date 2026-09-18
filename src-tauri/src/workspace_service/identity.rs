@@ -86,6 +86,7 @@ impl NormalizedWorkspaceRoot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectIdSource {
+    ManagedWorktree,
     ExistingWorkspaceConfig,
     UnityProjectGuid,
     GitCommonDir,
@@ -165,7 +166,9 @@ impl ProjectIdResolver {
         let git_common_dir = resolve_git_common_dir(root.path());
 
         let (project_id, project_id_source) =
-            if let Some(workspace_id) = read_existing_workspace_id(root.path()) {
+            if let Some(record) = super::worktrees::record_for_root(root.path()).ok().flatten() {
+                (ProjectId::new(record.project_id)?, ProjectIdSource::ManagedWorktree)
+            } else if let Some(workspace_id) = read_existing_workspace_id(root.path()) {
                 (
                     ProjectId::new(workspace_id)?,
                     ProjectIdSource::ExistingWorkspaceConfig,

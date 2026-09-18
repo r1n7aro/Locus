@@ -246,6 +246,7 @@ fn emit_scoped_scan_phase(
             project_id: runtime.project_id().clone(),
             checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             service_instance_id: None,
             service_generation: None,
             payload: phase,
@@ -372,6 +373,7 @@ async fn run_scoped_ref_graph_scan_job(
                     project_id: runtime.project_id().clone(),
                     checkout_id: runtime.checkout_id().clone(),
                     workspace_generation: runtime.generation(),
+                    materialization_epoch: Some(runtime.materialization_epoch()),
                     service_instance_id: None,
                     service_generation: None,
                     payload: ScanPhase::Done {

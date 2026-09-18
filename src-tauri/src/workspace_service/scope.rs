@@ -16,6 +16,10 @@ pub struct WorkspaceRef {
     pub checkout_id: CheckoutId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_generation: Option<u64>,
+    /// Durable checkout assignment identity. Runtime generations can restart
+    /// from the same value in another application process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_materialization_epoch: Option<u64>,
 }
 
 impl WorkspaceRef {
@@ -23,16 +27,43 @@ impl WorkspaceRef {
         Self {
             checkout_id,
             expected_generation,
+            expected_materialization_epoch: None,
         }
     }
 
     pub fn for_runtime(runtime: &WorkspaceRuntime) -> Self {
         Self::new(runtime.checkout_id().clone(), Some(runtime.generation()))
+            .with_materialization_epoch(Some(runtime.materialization_epoch()))
+    }
+
+    pub fn with_materialization_epoch(mut self, epoch: Option<u64>) -> Self {
+        self.expected_materialization_epoch = epoch;
+        self
+    }
+
+    pub fn validate_materialization_epoch(&self, actual: u64) -> Result<(), WorkspaceResolveError> {
+        if self
+            .expected_materialization_epoch
+            .is_some_and(|expected| expected != actual)
+            || (self.expected_materialization_epoch.is_none() && actual > 1)
+        {
+            return Err(WorkspaceResolveError::StaleMaterialization {
+                checkout_id: self.checkout_id.clone(),
+                expected_materialization_epoch: self.expected_materialization_epoch,
+                actual_materialization_epoch: actual,
+            });
+        }
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceResolveError {
+    StaleMaterialization {
+        checkout_id: CheckoutId,
+        expected_materialization_epoch: Option<u64>,
+        actual_materialization_epoch: u64,
+    },
     RegistryUnavailable {
         detail: String,
     },
@@ -49,6 +80,9 @@ pub enum WorkspaceResolveError {
 impl fmt::Display for WorkspaceResolveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StaleMaterialization { checkout_id,expected_materialization_epoch,actual_materialization_epoch } => write!(formatter,
+                "checkout '{checkout_id}' assignment is stale (expected {}, actual {actual_materialization_epoch}); reopen the checkout explicitly",
+                expected_materialization_epoch.map(|value|value.to_string()).unwrap_or_else(||"empty".into())),
             Self::RegistryUnavailable { detail } => {
                 write!(formatter, "workspace registry is unavailable: {detail}")
             }
@@ -107,5 +141,44 @@ mod tests {
         let value = serde_json::to_value(reference).expect("serialize workspace ref");
         assert_eq!(value["checkoutId"], "checkout-test");
         assert_eq!(value["expectedGeneration"], 7);
+    }
+
+    #[test]
+    fn materialization_epoch_rejects_old_handles_after_generation_repeats() {
+        let old = WorkspaceRef::new(CheckoutId::new("reused-slot").unwrap(), Some(1))
+            .with_materialization_epoch(Some(1));
+        let roundtrip: WorkspaceRef =
+            serde_json::from_slice(&serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(roundtrip.expected_generation, Some(1));
+        assert!(matches!(
+            roundtrip.validate_materialization_epoch(2),
+            Err(WorkspaceResolveError::StaleMaterialization {
+                expected_materialization_epoch: Some(1),
+                actual_materialization_epoch: 2,
+                ..
+            })
+        ));
+        assert!(roundtrip
+            .clone()
+            .with_materialization_epoch(Some(2))
+            .validate_materialization_epoch(2)
+            .is_ok());
+    }
+
+    #[test]
+    fn legacy_missing_epoch_is_compatible_only_before_slot_reuse() {
+        let old: WorkspaceRef = serde_json::from_value(
+            serde_json::json!({"checkoutId":"legacy","expectedGeneration":1}),
+        )
+        .unwrap();
+        assert_eq!(old.expected_materialization_epoch, None);
+        assert!(old.validate_materialization_epoch(0).is_ok());
+        assert!(old.validate_materialization_epoch(1).is_ok());
+        assert!(old.validate_materialization_epoch(2).is_err());
+        assert!(old
+            .clone()
+            .with_materialization_epoch(Some(0))
+            .validate_materialization_epoch(1)
+            .is_err());
     }
 }

@@ -927,6 +927,7 @@ mod workspace_scope_tests {
             project_id: ProjectId::new("project-background-hook-test").expect("project id"),
             checkout_id: checkout_id.clone(),
             workspace_generation,
+            materialization_epoch: None,
             service_instance_id: Some(ServiceInstanceId::for_service(&checkout_id, "unity")),
             service_generation: Some(service_generation),
         }

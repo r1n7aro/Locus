@@ -86,9 +86,10 @@ impl WorkspaceLeaseTracker {
             WorkspaceActivityPriority::RunningTask
         } else if visible_pane_leases > 0 {
             WorkspaceActivityPriority::VisiblePane
-        } else if background_open_leases > 0 {
-            WorkspaceActivityPriority::BackgroundOpen
         } else if idle_for >= idle_timeout {
+            // Restored/background panes preserve the checkout identity, not
+            // its optional resources. Only visible panes and running tasks
+            // prevent the idle timeout from releasing watchers/index writers.
             WorkspaceActivityPriority::Idle
         } else {
             WorkspaceActivityPriority::BackgroundOpen
@@ -430,6 +431,8 @@ pub struct WorkspaceRuntime {
     root: PathBuf,
     normalized_root: String,
     generation: AtomicU64,
+    materialization_epoch: u64,
+    materialization_lease: Mutex<Option<std::fs::File>>,
     core: WorkspaceCoreServices,
     services: Arc<WorkspaceServiceHost>,
     leases: Arc<WorkspaceLeaseTracker>,
@@ -449,6 +452,9 @@ impl WorkspaceRuntime {
             root: identity.root.clone(),
             normalized_root: identity.normalized_root.clone(),
             generation: AtomicU64::new(generation),
+            materialization_epoch: super::worktrees::record_for_root(&identity.root)
+                .ok().flatten().map(|record| record.materialization_epoch).unwrap_or(0),
+            materialization_lease: Mutex::new(None),
             core: WorkspaceCoreServices::new(&identity),
             services,
             leases: Arc::new(WorkspaceLeaseTracker::default()),
@@ -478,6 +484,10 @@ impl WorkspaceRuntime {
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn materialization_epoch(&self) -> u64 {
+        self.materialization_epoch
     }
 
     pub fn core(&self) -> &WorkspaceCoreServices {
@@ -709,6 +719,10 @@ impl ProjectSessionCatalog {
                 "checkout {checkout_id} belongs to project {}, not {}",
                 checkout.project_id, self.project_id
             ));
+        }
+        if let Some(record) = super::worktrees::record_for_root(Path::new(&checkout.root_path))? {
+            if record.lifecycle != "active" { return Err("Session checkout is not currently assigned".into()); }
+            self.store()?.validate_session_materialization(session_id, checkout_id.as_str(), record.materialization_epoch)?;
         }
         Ok(scope)
     }
@@ -1091,15 +1105,23 @@ impl ProjectRegistry {
             .get(&identity.checkout_id)
             .and_then(Weak::upgrade)
         {
+            if existing.project_id() != &identity.project_id {
+                return Err(format!(
+                    "Workspace directory now belongs to a different project: {}. Open the project from its new directory.",
+                    identity.root.display()
+                ));
+            }
             self.ensure_runtime_initialized(&existing)?;
             return Ok(existing);
         }
 
+        let materialization_lease = super::worktrees::runtime_lease(&identity.root)?;
         let runtime = WorkspaceRuntime::new(
             identity,
             self.factories.clone(),
             next_workspace_runtime_generation(),
         );
+        *runtime.materialization_lease.lock().map_err(|e| e.to_string())? = materialization_lease;
         if let Err(error) = self.ensure_runtime_initialized(&runtime) {
             runtime.core().stop_background_watchers();
             return Err(error);
@@ -1174,7 +1196,35 @@ impl ProjectRegistry {
             .ok_or_else(|| WorkspaceResolveError::CheckoutUnavailable {
                 checkout_id: workspace_ref.checkout_id.clone(),
             })?;
+        // A runtime can outlive a directory rename/deletion/replacement. Check
+        // the disk identity before handing out a scope to any new operation.
+        let identity = ProjectIdResolver::resolve(runtime.root()).map_err(|_| {
+            WorkspaceResolveError::CheckoutUnavailable {
+                checkout_id: workspace_ref.checkout_id.clone(),
+            }
+        })?;
+        if identity.checkout_id != *runtime.checkout_id()
+            || identity.project_id != *runtime.project_id()
+        {
+            return Err(WorkspaceResolveError::CheckoutUnavailable {
+                checkout_id: workspace_ref.checkout_id.clone(),
+            });
+        }
         let actual_generation = runtime.generation();
+        let record = super::worktrees::record_for_root(runtime.root())
+            .map_err(|detail| WorkspaceResolveError::RegistryUnavailable { detail })?;
+        let actual_epoch = record.as_ref().map(|record| record.materialization_epoch).unwrap_or(0);
+        if runtime.materialization_epoch() != actual_epoch {
+            return Err(WorkspaceResolveError::StaleMaterialization {
+                checkout_id:workspace_ref.checkout_id.clone(),
+                expected_materialization_epoch:Some(runtime.materialization_epoch()),
+                actual_materialization_epoch:actual_epoch,
+            });
+        }
+        if record.as_ref().is_some_and(|record|record.lifecycle != "active") {
+            return Err(WorkspaceResolveError::CheckoutUnavailable {checkout_id:workspace_ref.checkout_id.clone()});
+        }
+        workspace_ref.validate_materialization_epoch(actual_epoch)?;
         if let Some(expected_generation) = workspace_ref.expected_generation {
             if expected_generation != actual_generation {
                 return Err(WorkspaceResolveError::StaleGeneration {
@@ -1191,6 +1241,7 @@ impl ProjectRegistry {
     pub fn runtime_for_root(&self, root: &Path) -> Option<Arc<WorkspaceRuntime>> {
         let identity = ProjectIdResolver::resolve(root).ok()?;
         self.runtime(&identity.checkout_id)
+            .filter(|runtime| runtime.project_id() == &identity.project_id)
     }
 
     pub fn project(&self, project_id: &ProjectId) -> Option<Arc<ProjectContext>> {
@@ -1223,7 +1274,8 @@ impl ProjectRegistry {
         &self,
         checkout_id: &CheckoutId,
     ) -> Result<(Arc<WorkspaceRuntime>, WorkspaceLease), String> {
-        self.resolve_workspace_ref(&WorkspaceRef::new(checkout_id.clone(), None))
+        let runtime=self.runtime(checkout_id).ok_or_else(||format!("checkout '{checkout_id}' is not registered"))?;
+        self.resolve_workspace_ref(&WorkspaceRef::for_runtime(&runtime))
             .map(ResolvedWorkspaceScope::into_parts)
             .map_err(|error| error.to_string())
     }
@@ -1240,8 +1292,18 @@ impl ProjectRegistry {
         runtime: &Arc<WorkspaceRuntime>,
         kind: ServiceKind,
     ) -> Result<(), String> {
+        self.stop_service_with_idle_guard(runtime,kind,false).await
+    }
+
+    async fn stop_service_with_idle_guard(&self,runtime:&Arc<WorkspaceRuntime>,kind:ServiceKind,require_idle:bool)->Result<(),String>{
         let key = Self::service_key(runtime, kind);
         let _operation = self.service_admission.lock_operation(&key).await;
+        if require_idle {
+            if runtime.lease_count()!=0{return Err("Checkout became active during retirement".into());}
+            for (_,_,leases,_) in runtime.services().running_snapshot().await {
+                if leases!=0{return Err("Checkout service became active during retirement".into());}
+            }
+        }
         runtime.services().stop(kind).await?;
         self.service_admission.release(&key);
         Ok(())
@@ -1331,7 +1393,8 @@ impl ProjectRegistry {
                 let limits = policy_updates.borrow().limits.clone();
                 let next_check_secs = limits
                     .workspace_idle_timeout_secs
-                    .min(limits.service_idle_timeout_secs);
+                    .min(limits.service_idle_timeout_secs)
+                    .min(30);
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(next_check_secs)) => {
                         registry.reap_idle_resources().await;
@@ -1426,14 +1489,20 @@ impl ProjectRegistry {
             std::time::Duration::from_secs(limits.workspace_idle_timeout_secs);
         for runtime in self.runtimes() {
             let activity = runtime.activity_snapshot(activity_idle_timeout);
+            // A visible Locus pane is not a user-owned interactive Editor.
+            // Retain its watchers/identity, but let an unused owned headless
+            // process expire even while that pane remains visible.
+            let headless = crate::unity_bridge::managed_editor::has_owned_process(
+                &runtime.root().to_string_lossy(), runtime.materialization_epoch(),
+            );
             for (kind, _, leases, idle_for) in runtime.services().running_snapshot().await {
+                let current_activity = runtime.activity_snapshot(activity_idle_timeout);
                 if leases == 0
-                    && !activity.priority.protects_resources()
+                    && activity.running_task_leases == 0
+                    && (headless || !activity.priority.protects_resources())
                     && idle_for >= std::time::Duration::from_secs(limits.service_idle_timeout_secs)
-                    && !runtime
-                        .activity_snapshot(activity_idle_timeout)
-                        .priority
-                        .protects_resources()
+                    && current_activity.running_task_leases == 0
+                    && (headless || !current_activity.priority.protects_resources())
                 {
                     let _ = self.stop_service(&runtime, kind).await;
                 }
@@ -1516,6 +1585,9 @@ impl ProjectRegistry {
         }
         self.service_admission
             .remove_checkout(removed.checkout_id());
+        if let Ok(mut lease) = removed.materialization_lease.lock() {
+            lease.take();
+        }
         drop(registration);
         drop(registration_gate);
         if let Ok(mut gates) = self.registration_gates.lock() {
@@ -1527,6 +1599,22 @@ impl ProjectRegistry {
             }
         }
         true
+    }
+
+    /// Retire a managed physical directory before changing its assignment.
+    /// Pane/run leases are hard barriers. This stops Locus services, never an
+    /// externally owned Unity Editor; the lifecycle manager verifies its exit.
+    pub async fn retire_managed_checkout(&self, checkout_id: &CheckoutId) -> Result<(), String> {
+        let Some(runtime) = self.runtime(checkout_id) else { return Ok(()); };
+        if runtime.lease_count() != 0 { return Err("Checkout still has open panes or running operations".into()); }
+        for (_, _, leases, _) in runtime.services().running_snapshot().await {
+            if leases != 0 { return Err("Checkout service still has active operations".into()); }
+        }
+        for kind in runtime.services().detected_kinds() { self.stop_service_with_idle_guard(&runtime,kind,true).await?; }
+        if !self.remove_runtime_if_unleased(&runtime) {
+            return Err("Checkout became active during retirement".into());
+        }
+        Ok(())
     }
 
     pub async fn metrics(&self) -> WorkspaceRegistryMetrics {
@@ -1823,6 +1911,42 @@ mod tests {
         policy.update(limits).expect("update resource policy");
         let factory: Arc<dyn WorkspaceServiceFactory> = factory;
         ProjectRegistry::new(policy, vec![factory])
+    }
+
+    #[test]
+    fn workspace_operations_reject_roots_renamed_deleted_or_replaced_after_open() {
+        for scenario in ["renamed", "deleted", "file", "replaced"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("中文工程");
+            std::fs::create_dir_all(root.join("Locus")).unwrap();
+            std::fs::write(root.join("Locus/config.json"), r#"{"workspace_id":"original"}"#).unwrap();
+            let registry = registry(temp.path(), FakeServiceFactory::immediate(), 4);
+            let runtime = registry.open_workspace(&root).unwrap();
+            let reference = WorkspaceRef::for_runtime(&runtime);
+            assert!(registry.resolve_workspace_ref(&reference).is_ok());
+            let moved = temp.path().join("EnglishProject");
+            std::fs::rename(&root, &moved).unwrap();
+            match scenario {
+                "deleted" => std::fs::remove_dir_all(&moved).unwrap(),
+                "file" => std::fs::write(&root, "not a directory").unwrap(),
+                "replaced" => {
+                    std::fs::create_dir_all(root.join("Locus")).unwrap();
+                    std::fs::write(root.join("Locus/config.json"), r#"{"workspace_id":"replacement"}"#).unwrap();
+                }
+                _ => {}
+            }
+            assert!(matches!(registry.resolve_workspace_ref(&reference),
+                Err(WorkspaceResolveError::CheckoutUnavailable { .. })), "{scenario}");
+            assert!(registry.open_workspace(&root).is_err(), "{scenario}");
+            assert!(registry.runtime_for_root(&root).is_none(), "{scenario}");
+            assert_eq!(runtime.lease_count(), 0);
+            if scenario == "renamed" {
+                let reopened = registry.open_workspace(&moved).unwrap();
+                assert_eq!(reopened.project_id(), runtime.project_id());
+                assert_ne!(reopened.checkout_id(), runtime.checkout_id());
+                assert!(registry.resolve_workspace_ref(&WorkspaceRef::for_runtime(&reopened)).is_ok());
+            }
+        }
     }
 
     #[test]
@@ -2650,6 +2774,9 @@ mod tests {
     async fn idle_unity_service_reap_stops_service_and_keeps_workspace_runtime() {
         let temp = tempfile::tempdir().expect("tempdir");
         let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let mut limits = registry.resource_policy().snapshot().limits;
+        limits.service_idle_timeout_secs = 1;
+        registry.resource_policy().update(limits).expect("short idle timeout");
         let runtime = registry
             .register(workspace_dir(temp.path(), "unity-checkout"))
             .expect("register workspace");
@@ -2660,10 +2787,11 @@ mod tests {
         let service_lease = context
             .resolve_service(ServiceKind::Unity)
             .expect("resolve Unity service");
-        let service_tracker = service_lease.service.lease_tracker();
         drop(service_lease);
         drop(context);
-        service_tracker.set_idle_for_test(Duration::from_secs(3601));
+        // Backdating Instant by an hour underflows on a recently booted
+        // Windows host. Exercise the real idle deadline with a short policy.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
 
         registry.reap_idle_resources().await;
 
@@ -2718,6 +2846,60 @@ mod tests {
                 .is_running(ServiceKind::Unity)
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn idle_background_panes_release_index_lock_but_running_tasks_keep_it() {
+        use crate::knowledge_index::{KnowledgeIndexState, KnowledgeRuntime};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let registry = registry(temp.path(), FakeServiceFactory::immediate(), 1);
+        let runtime = registry
+            .register(workspace_dir(temp.path(), "hidden-checkout"))
+            .expect("register workspace");
+        let library_dir = runtime.root().join("Library").join("Locus");
+        let model_dir = temp.path().join("models");
+        let index = KnowledgeRuntime::open(&library_dir, &model_dir).expect("open index");
+        *runtime.core().knowledge_index.lock().unwrap() = Some(Arc::new(
+            KnowledgeIndexState::new(index.db, index.tantivy, index.embedding_mgr),
+        ));
+        let background = runtime.acquire_lease(WorkspaceLeaseKind::BackgroundOpen);
+        let running = runtime.acquire_lease(WorkspaceLeaseKind::RunningTask);
+        let make_idle = || {
+            *runtime.leases.last_used_at.lock().unwrap() =
+                Instant::now() - Duration::from_secs(3601);
+        };
+        make_idle();
+        registry.reap_idle_resources().await;
+        let error = KnowledgeRuntime::open(&library_dir, &model_dir)
+            .err()
+            .expect("running task must retain writer lock");
+        assert!(error.contains("LockBusy"), "{error}");
+
+        drop(running);
+        let visible = runtime.acquire_lease(WorkspaceLeaseKind::VisiblePane);
+        make_idle();
+        registry.reap_idle_resources().await;
+        assert!(runtime.core().knowledge_index.lock().unwrap().is_some());
+
+        drop(visible);
+        assert_eq!(
+            runtime.activity_snapshot(Duration::from_secs(600)).priority,
+            WorkspaceActivityPriority::BackgroundOpen,
+        );
+        make_idle();
+        assert_eq!(
+            runtime.activity_snapshot(Duration::from_secs(600)).priority,
+            WorkspaceActivityPriority::Idle,
+        );
+        registry.reap_idle_resources().await;
+        assert!(runtime.core().knowledge_index.lock().unwrap().is_none());
+        let reopened = KnowledgeRuntime::open(&library_dir, &model_dir)
+            .expect("idle background panes must release the writer lock");
+        assert!(registry.runtime(runtime.checkout_id()).is_some());
+        assert_eq!(runtime.lease_count(), 1);
+        drop(reopened);
+        drop(background);
     }
 
     #[tokio::test]

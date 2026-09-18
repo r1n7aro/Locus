@@ -8,6 +8,7 @@ import type {
   UnityPluginInstallPlan,
 } from "../types";
 import { WORKSPACE_EVENT_NAME, type RoutedWorkspaceEvent, type WorkspaceRef } from "./project";
+import { materializationEpochFromParams } from "./project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
 
 export type UnityServiceReadinessPhase =
@@ -104,20 +105,24 @@ export function subscribeWorkspaceUnityStatus(
   handlers: WorkspaceUnityStatusHandlers,
 ): Promise<RuntimeUnsubscribe> {
   const scopedRef = { ...workspaceRef };
-  return getLocusRuntime().subscribe<RoutedWorkspaceEvent>(WORKSPACE_EVENT_NAME, (event) => {
-    if (event.checkoutId !== scopedRef.checkoutId) return;
-    if (
-      scopedRef.expectedGeneration != null
-      && event.workspaceGeneration !== scopedRef.expectedGeneration
-    ) return;
-    if (event.eventName === "unity-connection-status") {
-      handlers.onConnection?.(event.payload as boolean);
-    } else if (event.eventName === "unity-connection-status-detail") {
-      handlers.onConnectionDetail?.(event.payload as UnityConnectionStatus);
-    } else if (event.eventName === "unity-plugin-status") {
-      handlers.onPluginStatus?.(event.payload as PluginStatus);
-    }
-  });
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.checkoutId !== scopedRef.checkoutId) return;
+      if (
+        scopedRef.expectedGeneration != null
+        && event.workspaceGeneration !== scopedRef.expectedGeneration
+      ) return;
+      if (event.eventName === "unity-connection-status") {
+        handlers.onConnection?.(event.payload as boolean);
+      } else if (event.eventName === "unity-connection-status-detail") {
+        handlers.onConnectionDetail?.(event.payload as UnityConnectionStatus);
+      } else if (event.eventName === "unity-plugin-status") {
+        handlers.onPluginStatus?.(event.payload as PluginStatus);
+      }
+    },
+    { owner: "unity.subscribeWorkspaceUnityStatus" },
+  );
 }
 
 export interface SelectUnityAssetOptions {
@@ -198,7 +203,7 @@ export function currentUnityEmbedWorkspaceRef(): WorkspaceRef | null {
     if (!checkoutId || rawGeneration == null || !/^\d+$/.test(rawGeneration)) return null;
     const expectedGeneration = Number(rawGeneration);
     if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) return null;
-    return { checkoutId, expectedGeneration };
+    return { checkoutId, expectedGeneration, expectedMaterializationEpoch: materializationEpochFromParams(params) };
   } catch {
     return null;
   }
@@ -554,9 +559,11 @@ export function subscribeUnitySendToLocus(
         workspaceRef: {
           checkoutId: event.checkoutId,
           expectedGeneration: event.workspaceGeneration,
+          expectedMaterializationEpoch: event.materializationEpoch,
         },
       });
     },
+    { owner: "unity.subscribeUnitySendToLocus" },
   );
 }
 

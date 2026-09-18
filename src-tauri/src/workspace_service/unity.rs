@@ -78,8 +78,15 @@ async fn run_readiness_observer(
     probe: Arc<dyn UnityReadinessProbe>,
     readiness: Arc<ServiceReadinessGate>,
 ) {
+    let mut lsp_started = false;
     loop {
         let snapshot = observe_readiness_once(&root, probe.as_ref(), &readiness).await;
+        if snapshot.phase == ServiceReadinessPhase::Ready && !lsp_started {
+            // Never race a cold Editor launch with the LSP's one-shot batch
+            // project-file generator for the same project.
+            crate::csharp_lsp::warm_up_in_background(root.clone());
+            lsp_started = true;
+        }
         let interval = if snapshot.phase == ServiceReadinessPhase::Ready {
             UNITY_READY_POLL_INTERVAL
         } else {
@@ -129,6 +136,8 @@ impl WorkspaceServiceFactory for UnityServiceFactory {
         };
         let event_scope = super::event::WorkspaceEventScope::for_service(&workspace, &identity);
         let service: Arc<dyn WorkspaceService> = Arc::new(UnityServiceInstance {
+            workspace: Arc::downgrade(&workspace),
+            materialization_epoch: workspace.materialization_epoch(),
             identity,
             event_scope,
             root: workspace.root().to_path_buf(),
@@ -147,6 +156,8 @@ impl WorkspaceServiceFactory for UnityServiceFactory {
 }
 
 pub struct UnityServiceInstance {
+    workspace: std::sync::Weak<WorkspaceRuntime>,
+    materialization_epoch: u64,
     identity: ServiceRuntimeIdentity,
     event_scope: super::event::WorkspaceEventScope,
     root: std::path::PathBuf,
@@ -172,11 +183,21 @@ impl UnityServiceInstance {
         self.root.to_string_lossy().to_string()
     }
 
+    async fn retire_editor(&self) -> Result<(), String> {
+        if crate::unity_bridge::managed_editor::has_owned_process(&self.root_text(), self.materialization_epoch)
+            && self.workspace.upgrade().is_some_and(|runtime| runtime.activity_snapshot(Duration::ZERO).running_task_leases > 0) {
+            return Err("Unity checkout still has an active task".into());
+        }
+        crate::unity_bridge::managed_editor::retire(
+            &self.root_text(), self.identity.checkout_id.as_str(), self.materialization_epoch,
+        ).await
+    }
+
     fn workspace_ref(&self) -> WorkspaceRef {
         WorkspaceRef::new(
             self.identity.checkout_id.clone(),
             Some(self.event_scope.workspace_generation),
-        )
+        ).with_materialization_epoch(Some(self.materialization_epoch))
     }
 
     async fn start_readiness_observer(&self) {
@@ -243,7 +264,24 @@ impl WorkspaceService for UnityServiceInstance {
         &self,
         timeout: Duration,
     ) -> ServiceFuture<'_, Result<ServiceReadyPermit, ServiceReadinessError>> {
-        Box::pin(async move { self.readiness.await_ready(&self.identity, timeout).await })
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let managed = crate::unity_bridge::managed_editor::ensure_for_tool(
+                &self.root_text(), self.identity.checkout_id.as_str(), self.materialization_epoch,
+            ).await.map_err(|detail| ServiceReadinessError::Timeout {
+                service_instance_id: self.identity.service_instance_id.clone(),
+                checkout_id: self.identity.checkout_id.clone(),
+                runtime_generation: self.identity.runtime_generation,
+                timeout_ms: started.elapsed().as_millis() as u64,
+                phase: ServiceReadinessPhase::Degraded,
+                revision: self.readiness.snapshot().revision,
+                detail: Some(detail),
+            })?;
+            // First import in a fresh worktree can take minutes. The outer
+            // tool deadline/cancellation still bounds the complete request.
+            let timeout = if managed { timeout.max(Duration::from_secs(600)) } else { timeout };
+            self.readiness.await_ready(&self.identity, timeout.saturating_sub(started.elapsed())).await
+        })
     }
 
     fn start(&self) -> ServiceFuture<'_, Result<(), String>> {
@@ -301,7 +339,6 @@ impl WorkspaceService for UnityServiceInstance {
                 &root,
                 &self.event_scope,
             );
-            crate::csharp_lsp::warm_up_in_background(root);
             self.start_readiness_observer().await;
             // Running means the checkout monitor and lifecycle integration are
             // active. Editor commands still cross `await_ready`.
@@ -322,6 +359,7 @@ impl WorkspaceService for UnityServiceInstance {
             if self.leases.count() > 0 {
                 return Err("Unity service has active leases".to_string());
             }
+            self.retire_editor().await?;
             self.set_status(ServiceStatus::Suspending);
             self.stop_readiness_observer("Unity service suspended")
                 .await;
@@ -356,6 +394,7 @@ impl WorkspaceService for UnityServiceInstance {
             if self.leases.count() > 0 {
                 return Err("Unity service has active leases".to_string());
             }
+            self.retire_editor().await?;
             self.set_status(ServiceStatus::Stopping);
             self.stop_readiness_observer("Unity service stopped").await;
             let root = self.root_text();

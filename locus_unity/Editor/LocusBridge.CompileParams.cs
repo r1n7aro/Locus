@@ -50,6 +50,8 @@ namespace Locus
             public string session_id;
             public string domain_generation;
             public int converged_serial;
+            public bool is_compiling;
+            public bool is_updating;
         }
 
         [Serializable]

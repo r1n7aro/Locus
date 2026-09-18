@@ -68,9 +68,9 @@ pub(crate) fn restore_persisted_window_contexts(
                 continue;
             }
         };
-        if !std::path::Path::new(&checkout.root_path).is_dir() {
+        if !checkout_root_available(&checkout) {
             warnings.push(format!(
-                "checkout {checkout_id} root is unavailable: {}",
+                "checkout {checkout_id} root is missing or its project identity changed: {}",
                 checkout.root_path
             ));
             continue;
@@ -218,6 +218,7 @@ pub struct WorkspaceRuntimeDescriptor {
     pub checkout_id: String,
     pub root: String,
     pub workspace_generation: u64,
+    pub materialization_epoch: u64,
     pub lease_count: usize,
     pub detected_services: Vec<String>,
 }
@@ -230,8 +231,18 @@ pub struct WorkspaceCheckoutDescriptor {
     pub root: String,
     pub normalized_root: String,
     pub last_opened_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available: bool,
     pub runtime: Option<WorkspaceRuntimeDescriptor>,
+}
+
+// Inspect before registering: registration opens checkout-owned data and runs
+// persistence hooks, which must never run against a replacement project.
+fn checkout_root_available(checkout: &crate::session::models::WorkspaceCheckoutRecord) -> bool {
+    crate::workspace_service::identity::ProjectIdResolver::resolve(&checkout.root_path)
+        .is_ok_and(|identity| {
+            identity.checkout_id.as_str() == checkout.checkout_id
+                && identity.project_id.as_str() == checkout.project_id
+        })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,6 +281,11 @@ fn policy_update_error(error: WorkspaceServiceResourceLimitsUpdateError) -> AppE
 
 fn workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
+        error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
+            "workspace.materialization_stale",
+            "The checkout assignment changed. Reopen the checkout before continuing.",
+        )
+        .detail(error.to_string()),
         WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
             "workspace.registry_unavailable",
             "The workspace registry is unavailable.",
@@ -296,6 +312,7 @@ fn workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
 
 fn window_context_error(error: WindowContextError) -> AppError {
     let code = match &error {
+        WindowContextError::StaleMaterialization { .. } => "workspace.materialization_stale",
         WindowContextError::EmptyWindowId | WindowContextError::EmptyPaneId => {
             "workspace.focus_context_invalid"
         }
@@ -321,6 +338,7 @@ fn runtime_descriptor(runtime: &WorkspaceRuntime) -> WorkspaceRuntimeDescriptor 
         checkout_id: runtime.checkout_id().to_string(),
         root: runtime.root().display().to_string(),
         workspace_generation: runtime.generation(),
+        materialization_epoch: runtime.materialization_epoch(),
         lease_count: runtime.lease_count(),
         detected_services,
     }
@@ -376,6 +394,11 @@ pub async fn get_workspace_service_resource_metrics(
 }
 
 #[tauri::command]
+pub(crate) async fn get_unity_editor_resources() -> Result<Vec<crate::unity_bridge::managed_editor::EditorResource>, AppError> {
+    crate::unity_bridge::managed_editor::resources().await.map_err(AppError::from)
+}
+
+#[tauri::command]
 pub fn list_workspace_runtimes(
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Vec<WorkspaceRuntimeDescriptor> {
@@ -411,8 +434,10 @@ pub fn list_project_contexts(
     let mut projects =
         std::collections::BTreeMap::<String, Vec<WorkspaceCheckoutDescriptor>>::new();
     for checkout in persisted {
+        let available = checkout_root_available(&checkout);
         let runtime = CheckoutId::new(checkout.checkout_id.clone())
             .ok()
+            .filter(|_| available)
             .and_then(|checkout_id| registry.runtime(&checkout_id))
             .map(|runtime| runtime_descriptor(&runtime));
         projects
@@ -424,6 +449,7 @@ pub fn list_project_contexts(
                 root: checkout.root_path,
                 normalized_root: checkout.normalized_root,
                 last_opened_at: checkout.last_opened_at,
+                available,
                 runtime,
             });
     }
@@ -769,6 +795,7 @@ mod tests {
             pane_id: "main".to_string(),
             focused_checkout_id: CheckoutId::new("checkout-a").expect("checkout id"),
             workspace_generation: 9,
+            materialization_epoch: None,
             active_session_id: Some("session-a".to_string()),
             intent_epoch: 12,
             revision: 4,
@@ -853,6 +880,7 @@ mod tests {
             root: unity_root.display().to_string(),
             normalized_root: unity_root.display().to_string(),
             last_opened_at: 1,
+            available: true,
             runtime: None,
         }];
 
@@ -919,6 +947,7 @@ mod tests {
                 pane_id: "main".to_string(),
                 focused_checkout_id: identities[0].checkout_id.clone(),
                 workspace_generation: 99,
+                materialization_epoch: None,
                 active_session_id: Some(session_a.clone()),
                 intent_epoch: 7,
                 revision: 4,
@@ -928,6 +957,7 @@ mod tests {
                 pane_id: "secondary".to_string(),
                 focused_checkout_id: identities[1].checkout_id.clone(),
                 workspace_generation: 98,
+                materialization_epoch: None,
                 active_session_id: Some(session_b),
                 intent_epoch: 3,
                 revision: 2,
@@ -937,6 +967,7 @@ mod tests {
                 pane_id: "main".to_string(),
                 focused_checkout_id: identities[1].checkout_id.clone(),
                 workspace_generation: 97,
+                materialization_epoch: None,
                 // A checkout-A session must not survive on checkout B.
                 active_session_id: Some(session_a.clone()),
                 intent_epoch: 5,
@@ -995,6 +1026,65 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn startup_recovery_skips_missing_or_replaced_roots_without_registering_them() {
+        for scenario in ["renamed", "deleted", "file", "replaced"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("中文工程");
+            std::fs::create_dir_all(root.join("Locus")).unwrap();
+            std::fs::write(root.join("Locus/config.json"), r#"{"workspace_id":"original-project"}"#).unwrap();
+            let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(&root).unwrap();
+            let store_dir = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(store_dir.path()).unwrap();
+            let record = crate::session::models::WorkspaceCheckoutRecord {
+                checkout_id: identity.checkout_id.to_string(),
+                project_id: identity.project_id.to_string(),
+                root_path: root.display().to_string(),
+                normalized_root: identity.normalized_root,
+                last_opened_at: 1,
+            };
+            store.upsert_workspace_checkout(&record).unwrap();
+            let moved = temp.path().join("EnglishProject");
+            std::fs::rename(&root, &moved).unwrap();
+            match scenario {
+                "deleted" => std::fs::remove_dir_all(&moved).unwrap(),
+                "file" => std::fs::write(&root, "replaced by file").unwrap(),
+                "replaced" => {
+                    std::fs::create_dir_all(root.join("Locus")).unwrap();
+                    std::fs::write(root.join("Locus/config.json"), r#"{"workspace_id":"different-project"}"#).unwrap();
+                }
+                _ => {}
+            }
+            let registry = test_registry(temp.path());
+            registry.add_runtime_registration_hook(Arc::new(|_| {
+                panic!("recovery must inspect disk identity before running registration hooks")
+            })).unwrap();
+            let contexts = WindowContextRegistry::new();
+            let outcome = restore_persisted_window_contexts(
+                vec![WindowPaneWorkspaceContext {
+                    window_id: "main".into(), pane_id: "main".into(),
+                    focused_checkout_id: identity.checkout_id.clone(),
+                    workspace_generation: 1, materialization_epoch: None,
+                    active_session_id: None, intent_epoch: 1, revision: 1,
+                }],
+                None, &[], registry.as_ref(), &contexts, &store,
+            ).unwrap();
+            assert!(outcome.main_runtime.is_none(), "{scenario}");
+            assert_eq!(outcome.restored_panes, 0, "{scenario}");
+            assert_eq!(outcome.warnings.len(), 1, "{scenario}");
+            assert!(contexts.snapshots().unwrap().is_empty());
+            assert_eq!(registry.checkout_count(), 0);
+            assert_eq!(store.get_workspace_checkout(identity.checkout_id.as_str()).unwrap().unwrap().project_id,
+                "original-project");
+            if scenario == "renamed" {
+                let reopened = test_registry(temp.path()).open_workspace(&moved).unwrap();
+                assert_eq!(reopened.project_id(), &identity.project_id);
+                assert_ne!(reopened.checkout_id(), &identity.checkout_id);
+                assert!(reopened.root().ends_with("EnglishProject"));
+            }
+        }
     }
 
     #[test]

@@ -17,9 +17,7 @@ use super::config::McpServerSettings;
 use super::http::ToolCallOutcome;
 use super::protocol::ToolListing;
 use crate::agent::instance::AgentInstance;
-use crate::agent::workspace_execution_lock::{
-    process_workspace_execution_lock, WorkspaceExecutionLockOwner, WorkspaceExecutionLockRequest,
-};
+use crate::agent::workspace_execution_lock::WorkspaceExecutionLockOwner;
 use crate::tool::{ToolExecutionContext, ToolRegistry, ToolResult, ToolRuntimeState};
 
 /// Every tool the MCP server can expose, in tools/list order.
@@ -420,6 +418,7 @@ async fn project_info(
     project_id: Option<&str>,
     checkout_id: Option<&str>,
     workspace_generation: Option<u64>,
+    materialization_epoch: Option<u64>,
 ) -> ToolResult {
     let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
         return ToolResult {
@@ -445,6 +444,7 @@ async fn project_info(
             "project_id": project_id,
             "checkout_id": checkout_id,
             "workspace_generation": workspace_generation,
+            "materialization_epoch":materialization_epoch,
             "unity_editor": {
                 "connected": connected,
                 "editor_status": status,
@@ -478,6 +478,18 @@ pub async fn execute_tool(
     runtime_state: Arc<ToolRuntimeState>,
     workspace_ref: crate::workspace_service::WorkspaceRef,
 ) -> ToolCallOutcome {
+    execute_tool_with_delegation(app, name, arguments, timeout_ms, runtime_state, workspace_ref, None).await
+}
+
+pub(crate) async fn execute_tool_with_delegation(
+    app: AppHandle,
+    name: String,
+    arguments: Value,
+    timeout_ms: u64,
+    runtime_state: Arc<ToolRuntimeState>,
+    workspace_ref: crate::workspace_service::WorkspaceRef,
+    execution_delegation: Option<String>,
+) -> ToolCallOutcome {
     let started = Instant::now();
     let workspace_registry = app
         .state::<Arc<crate::workspace_service::ProjectRegistry>>()
@@ -500,6 +512,7 @@ pub async fn execute_tool(
     let project_id = workspace_scope.runtime().project_id().to_string();
     let checkout_id = workspace_scope.runtime().checkout_id().to_string();
     let workspace_generation = workspace_scope.runtime().generation();
+    let materialization_epoch = workspace_scope.runtime().materialization_epoch();
     let workspace_path = Some(working_dir.clone());
 
     if name == "unity_project_info" {
@@ -508,6 +521,7 @@ pub async fn execute_tool(
             Some(&project_id),
             Some(&checkout_id),
             Some(workspace_generation),
+            Some(materialization_epoch),
         )
         .await;
         return outcome_from_tool_result(result, workspace_path);
@@ -527,11 +541,13 @@ pub async fn execute_tool(
             )
         }
     };
-    if execution.workspace.generation() != workspace_generation {
+    if execution.workspace.generation() != workspace_generation
+        || execution.workspace.materialization_epoch() != materialization_epoch
+    {
         return outcome_from_tool_result(
             err(&format!(
-                "Workspace scope resolution failed: checkout {checkout_id} moved from generation {workspace_generation} to {}",
-                execution.workspace.generation()
+                "Workspace scope resolution failed: checkout {checkout_id} moved from generation {workspace_generation}/epoch {materialization_epoch} to {}/{}",
+                execution.workspace.generation(),execution.workspace.materialization_epoch()
             )),
             workspace_path,
         );
@@ -569,16 +585,8 @@ pub async fn execute_tool(
 
     let request_run_id = format!("mcp-{}", uuid::Uuid::new_v4());
     let fut = async {
-        let lock_request = if name == "unity_execute" {
-            (!AgentInstance::unity_execute_is_readonly(&arguments))
-                .then_some(WorkspaceExecutionLockRequest::Exclusive)
-        } else if tool_registry.mutates_workspace(&name)
-            || AgentInstance::is_unity_execution_barrier_tool(&name)
-        {
-            Some(WorkspaceExecutionLockRequest::Exclusive)
-        } else {
-            None
-        };
+        let lock_request = crate::sdk::direct_tool_lock_request(&name, &arguments, &working_dir,
+            tool_registry.mutates_workspace(&name), app.state::<Arc<crate::config::AppConfig>>().session_undo_enabled());
         let owner = WorkspaceExecutionLockOwner {
             session_id: "mcp-server".to_string(),
             run_id: request_run_id,
@@ -586,32 +594,15 @@ pub async fn execute_tool(
             workspace: working_dir.clone(),
             tools: vec![name.clone()],
         };
-        // The sender stays alive for the acquisition lifetime. If the outer
-        // timeout drops this future, waiter registration and any acquired
-        // guard are both released by Drop and leave an abandoned/released log.
-        let (_lock_cancel_tx, lock_cancel_rx) = tokio::sync::watch::channel(false);
         let workspace_guard = if let Some(request) = lock_request {
-            let workspace_event_scope =
-                crate::workspace_service::event::WorkspaceEventScope::for_runtime(
-                    execution.workspace.as_ref(),
-                );
-            match process_workspace_execution_lock(&working_dir)
-                .acquire_with_diagnostics(
-                    request,
-                    owner,
-                    lock_cancel_rx,
-                    workspace_event_scope,
-                    &app,
-                )
-                .await
+            match crate::merge_jobs::coordination::acquire_workspace(&app, &execution.workspace,
+                request, owner, execution_delegation.as_deref()).await
             {
                 Ok(guard) => Some(guard),
-                Err(_) => {
+                Err(error) => {
                     return outcome_from_tool_result(
-                        err(&format!(
-                            "Tool '{name}' was cancelled while waiting for workspace mutation coordination."
-                        )),
-                        None,
+                        err(&error),
+                        workspace_path.clone(),
                     );
                 }
             }

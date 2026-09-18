@@ -20,6 +20,8 @@ pub struct WorkspaceEventEnvelope<T> {
     pub checkout_id: CheckoutId,
     pub workspace_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_instance_id: Option<ServiceInstanceId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_generation: Option<u64>,
@@ -31,6 +33,7 @@ pub struct WorkspaceEventScope {
     pub project_id: ProjectId,
     pub checkout_id: CheckoutId,
     pub workspace_generation: u64,
+    pub materialization_epoch: Option<u64>,
     pub service_instance_id: Option<ServiceInstanceId>,
     pub service_generation: Option<u64>,
 }
@@ -41,6 +44,7 @@ impl WorkspaceEventScope {
             project_id: runtime.project_id().clone(),
             checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             service_instance_id: None,
             service_generation: None,
         }
@@ -54,6 +58,7 @@ impl WorkspaceEventScope {
             project_id: runtime.project_id().clone(),
             checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             service_instance_id: Some(service.service_instance_id.clone()),
             service_generation: Some(service.runtime_generation),
         }
@@ -247,6 +252,7 @@ impl WorkspaceEventRouter {
                 project_id: envelope.project_id.clone(),
                 checkout_id: envelope.checkout_id.clone(),
                 workspace_generation: envelope.workspace_generation,
+                materialization_epoch: envelope.materialization_epoch,
                 service_instance_id: envelope.service_instance_id.clone(),
                 service_generation: envelope.service_generation,
                 payload: serde_json::to_value(&envelope.payload)?,
@@ -289,6 +295,9 @@ impl WorkspaceEventRouter {
         envelope: &WorkspaceEventEnvelope<T>,
     ) -> bool {
         if runtime.generation() != envelope.workspace_generation
+            || super::scope::WorkspaceRef::new(envelope.checkout_id.clone(), None)
+                .with_materialization_epoch(envelope.materialization_epoch)
+                .validate_materialization_epoch(runtime.materialization_epoch()).is_err()
             || runtime.project_id() != &envelope.project_id
             || runtime.checkout_id() != &envelope.checkout_id
         {
@@ -311,6 +320,7 @@ impl WorkspaceEventRouter {
                 project_id: scope.project_id.clone(),
                 checkout_id: scope.checkout_id.clone(),
                 workspace_generation: scope.workspace_generation,
+                materialization_epoch: scope.materialization_epoch,
                 service_instance_id: scope.service_instance_id.clone(),
                 service_generation: scope.service_generation,
                 payload,
@@ -342,11 +352,15 @@ mod tests {
             project_id: runtime.project_id().clone(),
             checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             service_instance_id: None,
             service_generation: None,
             payload: true,
         };
         assert!(WorkspaceEventRouter::scope_is_current(&runtime, &envelope));
+        let mut previous_assignment = envelope.clone();
+        previous_assignment.materialization_epoch = Some(runtime.materialization_epoch() + 1);
+        assert!(!WorkspaceEventRouter::scope_is_current(&runtime, &previous_assignment));
         let mut stale = envelope.clone();
         stale.workspace_generation = envelope.workspace_generation.saturating_sub(1);
         assert_ne!(stale.workspace_generation, envelope.workspace_generation);
@@ -375,6 +389,7 @@ mod tests {
             project_id: runtime.project_id().clone(),
             checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             service_instance_id: Some(ServiceInstanceId::for_service(
                 runtime.checkout_id(),
                 "unity",
@@ -410,6 +425,7 @@ mod tests {
             envelope.workspace_generation
         );
         assert_eq!(serialized["serviceGeneration"], 7);
+        assert_eq!(serialized["materializationEpoch"], runtime.materialization_epoch());
         assert_eq!(serialized["payload"]["status"], "ready");
         assert!(serialized.get("envelope").is_none());
     }
@@ -443,6 +459,7 @@ mod tests {
                             checkout_id: CheckoutId::new("linearized-checkout")
                                 .expect("checkout id"),
                             workspace_generation: 1,
+                            materialization_epoch: None,
                             service_instance_id: None,
                             service_generation: None,
                             payload: serde_json::json!(payload),
@@ -488,6 +505,7 @@ mod tests {
             project_id: runtime.project_id().clone(),
             checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             service_instance_id: Some(ServiceInstanceId::for_service(
                 runtime.checkout_id(),
                 "unity",

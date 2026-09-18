@@ -45,7 +45,7 @@ describe("main Agent workspace scope", () => {
 
     const scope = useAgentWorkspaceScope();
     expect(contexts.focusedRuntime?.detectedServices).toEqual([]);
-    expect(scope.workspaceRef.value).toEqual({ checkoutId: "unity", expectedGeneration: 7 });
+    expect(scope.workspaceRef.value).toEqual({ checkoutId: "unity", expectedGeneration: 7, expectedMaterializationEpoch: 0 });
     expect(scope.workingDir.value).toBe("F:/projects/unity");
     expect(scope.runtime.value?.detectedServices).toEqual(["unity"]);
   });
@@ -67,7 +67,7 @@ describe("main Agent workspace scope", () => {
     expect(scope.workingDir.value).toBe("F:/projects/general");
     expect(scope.runtime.value?.detectedServices).toEqual([]);
     useWorkspaceContextStore().checkoutsById.general!.runtime!.workspaceGeneration = 8;
-    expect(scope.workspaceRef.value).toEqual({ checkoutId: "general", expectedGeneration: 8 });
+    expect(scope.workspaceRef.value).toEqual({ checkoutId: "general", expectedGeneration: 8, expectedMaterializationEpoch: 0 });
   });
 
   it("uses the restored main pane before the tree has adopted a workspace scope", () => {

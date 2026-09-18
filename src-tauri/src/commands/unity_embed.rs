@@ -16,7 +16,6 @@ use crate::workspace_service::{
 const WINDOW_LABEL_PREFIX: &str = "unity-embed";
 const MAIN_WINDOW_LABEL: &str = "main";
 const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
-const VIEW_CONTENT_WINDOW_LABEL_PREFIX: &str = "view-content-";
 const ASSET_DROP_EVENT: &str = "unity-embed-asset-drop";
 const TEXT_DROP_EVENT: &str = "unity-embed-text-drop";
 const ASSET_DRAG_STATE_EVENT: &str = "unity-embed-asset-drag-state";
@@ -492,7 +491,8 @@ fn unity_embed_scope_key(workspace_ref: &WorkspaceRef) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let generation = workspace_ref.expected_generation.unwrap_or_default();
-    format!("{checkout_hex}-g{generation:x}")
+    let base=format!("{checkout_hex}-g{generation:x}");
+    workspace_ref.expected_materialization_epoch.map(|epoch|format!("{base}-e{epoch:x}")).unwrap_or(base)
 }
 
 fn unity_embed_window_label_for_scope(workspace_ref: &WorkspaceRef, window_id: &str) -> String {
@@ -525,6 +525,7 @@ fn unity_embed_host_url_for_scope(
         query_escape(workspace_ref.checkout_id.as_str()),
         workspace_ref.expected_generation.unwrap_or_default(),
     );
+    if let Some(epoch)=workspace_ref.expected_materialization_epoch{url.push_str(&format!("&materializationEpoch={epoch}"));}
     let target_id = target_id.trim();
     if !target_id.is_empty() {
         url.push_str("&id=");
@@ -600,12 +601,7 @@ fn is_unity_embed_window_for_scope(label: &str, workspace_ref: &WorkspaceRef) ->
 }
 
 fn is_locus_view_window_label(label: &str) -> bool {
-    label.starts_with(VIEW_WINDOW_LABEL_PREFIX)
-        && !label.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX)
-}
-
-fn is_locus_view_content_window_label(label: &str) -> bool {
-    label.starts_with(VIEW_CONTENT_WINDOW_LABEL_PREFIX)
+    label.starts_with(VIEW_WINDOW_LABEL_PREFIX) || label.starts_with("workbench-")
 }
 
 fn unity_embed_window_labels(app_handle: &AppHandle) -> Vec<String> {
@@ -636,22 +632,12 @@ fn locus_view_window_labels(app_handle: &AppHandle) -> Vec<String> {
         .collect()
 }
 
-fn locus_view_content_window_labels(app_handle: &AppHandle) -> Vec<String> {
-    app_handle
-        .webview_windows()
-        .keys()
-        .filter(|label| is_locus_view_content_window_label(label))
-        .cloned()
-        .collect()
-}
-
 fn locus_frontend_drop_window_labels(app_handle: &AppHandle) -> Vec<String> {
     let mut labels = Vec::new();
     let mut seen = HashSet::new();
     for label in std::iter::once(MAIN_WINDOW_LABEL.to_string())
         .chain(unity_embed_window_labels(app_handle))
         .chain(locus_view_window_labels(app_handle))
-        .chain(locus_view_content_window_labels(app_handle))
     {
         if seen.insert(label.clone()) {
             labels.push(label);
@@ -1156,7 +1142,7 @@ fn workspace_ref_for_window_context(
     Ok(WorkspaceRef::new(
         context.focused_checkout_id,
         Some(context.workspace_generation),
-    ))
+    ).with_materialization_epoch(context.materialization_epoch))
 }
 
 pub(crate) fn handle_unity_embed_webview_event(
@@ -1271,7 +1257,6 @@ fn commit_cached_unity_asset_drag_drop_to(app_handle: &AppHandle, label: &str) {
 fn is_locus_drop_target_label(label: &str) -> bool {
     is_unity_embed_window_label(label)
         || is_locus_view_window_label(label)
-        || is_locus_view_content_window_label(label)
         || label == MAIN_WINDOW_LABEL
 }
 
@@ -3392,11 +3377,6 @@ mod windows_impl {
     ) -> Result<UnityAssetDragReleaseTarget, String> {
         if window_label_contains_hwnd(app_handle, MAIN_WINDOW_LABEL, hwnd)? {
             return Ok(UnityAssetDragReleaseTarget::MainWindow);
-        }
-        for label in locus_view_content_window_labels(app_handle) {
-            if window_label_contains_hwnd(app_handle, &label, hwnd)? {
-                return Ok(UnityAssetDragReleaseTarget::ViewWindow(label));
-            }
         }
         for label in locus_view_window_labels(app_handle) {
             if window_label_contains_hwnd(app_handle, &label, hwnd)? {

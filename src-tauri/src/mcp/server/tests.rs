@@ -18,7 +18,10 @@ const TOKEN: &str = "tok-123";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn test_context() -> Arc<ServerContext> {
-    let resolve_checkout: http::CheckoutResolver = Arc::new(|request| {
+    test_context_with_epoch(Arc::new(std::sync::atomic::AtomicU64::new(1)))
+}
+fn test_context_with_epoch(epoch: Arc<std::sync::atomic::AtomicU64>) -> Arc<ServerContext> {
+    let resolve_checkout: http::CheckoutResolver = Arc::new(move |request| {
         let current_generation = match request.checkout_id.as_str() {
             "checkout-a" => 11,
             "checkout-b" => 22,
@@ -33,9 +36,18 @@ fn test_context() -> Arc<ServerContext> {
                 request.checkout_id
             ));
         }
+        let current_epoch = epoch.load(std::sync::atomic::Ordering::SeqCst);
+        if request
+            .expected_materialization_epoch
+            .is_some_and(|expected| expected != current_epoch)
+            || (request.expected_materialization_epoch.is_none() && current_epoch > 1)
+        {
+            return Err("stale materialization epoch".into());
+        }
         Ok(http::CheckoutBinding {
             checkout_id: request.checkout_id,
             workspace_generation: current_generation,
+            materialization_epoch: current_epoch,
         })
     });
     let dispatcher: http::ToolDispatcher = Arc::new(
@@ -164,6 +176,52 @@ async fn dogfood_handshake_list_and_call() {
     assert_eq!(result["isError"], false);
 
     client.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_change_rejects_an_existing_http_session_and_unbound_reconnect() {
+    let epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let (addr, server) = http::start(0, test_context_with_epoch(epoch.clone()))
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let url=format!("http://127.0.0.1:{}/mcp?checkoutId=checkout-a&workspaceGeneration=11&materializationEpoch=1",addr.port());
+    let initialized=client.post(&url).bearer_auth(TOKEN).json(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"epoch-test","version":"1"}}})).send().await.unwrap();
+    let session = initialized
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    epoch.store(2, std::sync::atomic::Ordering::SeqCst);
+    let stale = client
+        .post(&url)
+        .bearer_auth(TOKEN)
+        .header("mcp-session-id", &session)
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status().as_u16(), 409);
+    let fresh = client
+        .post(format!(
+            "http://127.0.0.1:{}/mcp?checkoutId=checkout-a",
+            addr.port()
+        ))
+        .bearer_auth(TOKEN)
+        .json(&json!({"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(fresh["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("materialization"));
     server.abort();
 }
 

@@ -79,6 +79,18 @@ impl McpServerSettings {
     pub fn tool_enabled(&self, name: &str) -> bool {
         !self.disabled_tools.iter().any(|t| t.trim() == name)
     }
+
+    pub fn scoped_endpoint_url_with_epoch(
+        &self,
+        checkout_id: &str,
+        generation: Option<u64>,
+        epoch: u64,
+    ) -> String {
+        format!(
+            "{}&materializationEpoch={epoch}",
+            self.scoped_endpoint_url(checkout_id, generation)
+        )
+    }
 }
 
 pub fn generate_token() -> String {

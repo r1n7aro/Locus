@@ -4,9 +4,12 @@ pub(crate) mod dialog;
 mod editor_log;
 mod flavor;
 mod focus;
+pub(crate) mod managed_editor;
 mod native_selftest;
 mod plugin;
 mod process;
+mod process_markers;
+pub(crate) use process_markers::{cleanup_closed_project_markers, remove_closed_editor_marker};
 mod state_probe;
 mod transport;
 
@@ -40,6 +43,7 @@ pub use plugin::{
     plugin_install_root, plugin_skills_root, PluginInstallPlan, PluginStatus,
 };
 pub(crate) use process::UnityProcessIdentityLiveness;
+pub(crate) use process::query_current_project_editor_process_uncached;
 pub use process::{
     close_current_project_unity_processes, force_close_current_project_unity_processes,
     query_current_project_editor_process, UnityEditorProcessInfo, UnityEditorProcessState,
@@ -1245,8 +1249,14 @@ fn unity_recompile_waits() -> &'static StdMutex<HashMap<String, u32>> {
     WAITS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn unity_connection_status_cache() -> &'static StdMutex<HashMap<String, UnityConnectionStatus>> {
-    static CACHE: OnceLock<StdMutex<HashMap<String, UnityConnectionStatus>>> = OnceLock::new();
+#[derive(Default)]
+struct ConnectionStatusCacheEntry {
+    status: Option<UnityConnectionStatus>,
+    invalidated_at_ms: u64,
+}
+
+fn unity_connection_status_cache() -> &'static StdMutex<HashMap<String, ConnectionStatusCacheEntry>> {
+    static CACHE: OnceLock<StdMutex<HashMap<String, ConnectionStatusCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -1334,7 +1344,9 @@ fn native_pipe_name_part(project_path: &str) -> String {
 
 /// Full client path of the native broker pipe for this project.
 pub(crate) fn get_native_pipe_name(project_path: &str) -> String {
-    format!(r"\\.\pipe\{}", native_pipe_name_part(project_path))
+    let suffix=std::env::var("LOCUS_UNITY_TEST_PIPE_NAMESPACE").ok()
+        .filter(|value| !value.is_empty() && value.len()<=64 && value.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-'));
+    format!(r"\\.\pipe\{}{}", native_pipe_name_part(project_path),suffix.map(|s|format!("_{s}")).unwrap_or_default())
 }
 
 pub fn is_unity_project(path: &str) -> bool {
@@ -1762,9 +1774,13 @@ pub async fn launch_project_with_mode_and_options(
         return Err("Current working directory is not a Unity project".to_string());
     }
 
+    if mode == UnityLaunchMode::Headless {
+        managed_editor::prepare_plugin(project_path).await?;
+    }
     let project_version = read_project_unity_version(project_path)?
         .ok_or_else(|| "Current Unity project is missing ProjectVersion.txt".to_string())?;
     let editor_path = resolve_unity_editor_executable(&project_version)?;
+    let _editor_admission = process::admit_editor_launch().await?;
     let project_path = normalized_project_path_for_launch(project_path);
     let editor_log_path = project_path.join("Logs").join("Editor.log");
     if let Some(parent) = editor_log_path.parent() {
@@ -1840,13 +1856,15 @@ pub async fn launch_project_with_mode_and_options(
         mode.as_str()
     );
 
-    Ok(UnityLaunchResult {
+    let launch = UnityLaunchResult {
         editor_path,
         project_path,
         project_version,
         process_id,
         mode,
-    })
+    };
+    managed_editor::record_launch(&launch);
+    Ok(launch)
 }
 
 pub(crate) fn launched_unity_process_created_at_ms(process_id: u32) -> Option<u64> {
@@ -2055,8 +2073,22 @@ fn unity_process_info_from_status(
 
 fn cache_unity_connection_status(project_path: &str, status: &UnityConnectionStatus) {
     if let Ok(mut cache) = unity_connection_status_cache().lock() {
-        cache.insert(project_runtime_key(project_path), status.clone());
+        let entry = cache.entry(project_runtime_key(project_path)).or_default();
+        if status.checked_at_ms >= entry.invalidated_at_ms
+            && entry.status.as_ref().is_none_or(|old| old.checked_at_ms <= status.checked_at_ms) {
+            entry.status = Some(status.clone());
+        }
     }
+}
+
+fn invalidate_closed_editor_status(project_path: &str) {
+    if let Ok(mut cache) = unity_connection_status_cache().lock() {
+        let entry = cache.entry(project_runtime_key(project_path)).or_default();
+        entry.status = None;
+        entry.invalidated_at_ms = unix_now_ms().saturating_add(1);
+    }
+    state_probe::clear_project_observer_state(project_path);
+    state_probe::clear_editor_status_intent(project_path);
 }
 
 fn cached_running_connection_status_for_transient_failure(
@@ -2069,7 +2101,7 @@ fn cached_running_connection_status_for_transient_failure(
     let mut status = unity_connection_status_cache()
         .lock()
         .ok()
-        .and_then(|cache| cache.get(&project_runtime_key(project_path)).cloned())?;
+        .and_then(|cache| cache.get(&project_runtime_key(project_path)).and_then(|entry| entry.status.clone()))?;
     if !matches!(
         status.editor_process_state,
         UnityEditorProcessState::Running
@@ -3686,6 +3718,18 @@ pub async fn view_binding_discover(
     send_property_tree_message(project_path, "view_binding_discover", request).await
 }
 
+/// Send mutations once: retrying an uncertain array operation is unsafe.
+pub async fn asset_api(project_path: &str, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let lock=project_unity_op_lock(project_path).await;
+    let _guard=lock.lock().await;
+    let payload=serde_json::to_string(request).map_err(|e|e.to_string())?;
+    let response=send_message_with_timeout(project_path,"asset_api",&payload,Duration::from_secs(120)).await
+        .map_err(|e|format!("assets.outcome_unknown: {e}; read the asset before retrying"))?;
+    if !response.ok { return Err(response.error.unwrap_or_else(||"assets.editor_error".into())); }
+    serde_json::from_str(response.message.as_deref().unwrap_or(""))
+        .map_err(|e|format!("assets.invalid_response: {e}"))
+}
+
 pub async fn property_tree_discover(
     project_path: &str,
     request: &serde_json::Value,
@@ -3760,7 +3804,23 @@ async fn send_property_tree_message(
 ) -> Result<String, String> {
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
-    let payload = serde_json::to_string(request)
+    let mut internal_request=request.clone();
+    fn exact_internal_ids(value:&mut serde_json::Value)->Result<(),String> {
+        match value {
+            serde_json::Value::Object(map)=>{
+                for (key,value) in map {
+                    if matches!(key.as_str(),"objectFileId"|"targetFileId"|"managedReferenceId") {
+                        if let Some(id)=value.as_str() {*value=serde_json::json!(id.parse::<i64>().map_err(|_|"Invalid exact Unity identifier")?);}
+                    } else {exact_internal_ids(value)?;}
+                }
+            },
+            serde_json::Value::Array(items)=>{for value in items {exact_internal_ids(value)?;}},
+            _=>{},
+        }
+        Ok(())
+    }
+    exact_internal_ids(&mut internal_request)?;
+    let payload = serde_json::to_string(&internal_request)
         .map_err(|error| format!("Failed to serialize {} request: {}", message_type, error))?;
     let resp =
         send_message_without_timeout_with_transient_retry(project_path, message_type, &payload)
@@ -7639,6 +7699,21 @@ mod tests {
         .expect("recent process metadata should remain available");
         assert!(!disconnected.connected);
         assert_eq!(disconnected.control_channel_state, "error");
+    }
+
+    #[test]
+    fn closed_editor_does_not_reuse_or_republish_an_older_running_sample() {
+        let path = format!("F:/Proj/Game/closed-cache-{}", uuid::Uuid::new_v4());
+        let old = test_connection_status(&path, 1_000);
+        cache_unity_connection_status(&path, &old);
+        super::invalidate_closed_editor_status(&path);
+        cache_unity_connection_status(&path, &old);
+        assert!(cached_running_connection_status_for_transient_failure(&path,
+            super::unix_now_ms(), "pipe closed", false).is_none());
+        let fresh = test_connection_status(&path, super::unix_now_ms() + 1);
+        cache_unity_connection_status(&path, &fresh);
+        assert!(cached_running_connection_status_for_transient_failure(&path,
+            fresh.checked_at_ms, "writer busy", true).is_some());
     }
 
     #[test]

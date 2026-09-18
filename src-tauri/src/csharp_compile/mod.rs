@@ -98,6 +98,7 @@ pub(crate) fn emit_status_in_background() {
                         project_id: runtime.project_id().clone(),
                         checkout_id: runtime.checkout_id().clone(),
                         workspace_generation: runtime.generation(),
+                        materialization_epoch: Some(runtime.materialization_epoch()),
                         service_instance_id: Some(identity.service_instance_id),
                         service_generation: Some(identity.service_generation),
                         payload,
@@ -155,6 +156,7 @@ pub(crate) fn notify_active_scope_loss(reason: &str) {
                         project_id: runtime.project_id().clone(),
                         checkout_id: key.checkout_id.clone(),
                         workspace_generation: key.workspace_generation,
+                        materialization_epoch: Some(runtime.materialization_epoch()),
                         service_instance_id: Some(
                             crate::workspace_service::ServiceInstanceId::for_service(
                                 &key.checkout_id,

@@ -1,0 +1,135 @@
+import asyncio, dataclasses, json, os, pathlib, subprocess, time, uuid
+
+root = pathlib.Path(fixture_root)
+source = pathlib.Path(project)
+original_cwd = pathlib.Path.cwd()
+original_scope = workspace_ref.to_payload()
+checks = []
+owned = []
+report = {"fixture_root": str(root), "checks": checks}
+
+def save():
+    (root / "acceptance.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+def check(value, name):
+    if not value:
+        raise AssertionError(name)
+    checks.append(name)
+    save()
+
+def git(directory, *args):
+    return subprocess.check_output(["git", "-c", "core.longpaths=true", "-C", str(directory), *args],
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_AUTHOR_NAME": "Locus SDK test",
+            "GIT_AUTHOR_EMAIL": "sdk-test@example.invalid", "GIT_COMMITTER_NAME": "Locus SDK test",
+            "GIT_COMMITTER_EMAIL": "sdk-test@example.invalid"}, stderr=subprocess.STDOUT)
+
+async def execute(wt, code, readonly=True):
+    result = await locus.call_tool("unity_execute", {"code": code, "readonly": readonly,
+        "request_editor_status": "editing"}, worktree=wt, timeout=120)
+    result.raise_for_error()
+    return result.output
+
+async def close(wt):
+    result = await locus.close_unity_editor(worktree=wt, timeout=90)
+    report.setdefault("close_attempts", []).append(dataclasses.asdict(result))
+    save()
+    check(result.status.process_state == "not_running", "closed " + wt.checkout_id)
+    return dataclasses.asdict(result)
+
+def seal(wt):
+    # Only suite-owned checkouts: record import-generated source instead of discarding it.
+    git(wt.root, "add", "--all")
+    git(wt.root, "add", "--force", "--all", "--", "Assets", "Packages", "ProjectSettings")
+    git(wt.root, "commit", "--allow-empty", "-m", "Record SDK fixture and Unity import state")
+    return git(wt.root, "rev-parse", "HEAD").decode().strip()
+
+before = [git(source, *args) for args in [("rev-parse", "HEAD"), ("ls-files", "--stage", "-z"), ("diff", "--binary", "HEAD", "--")]]
+try:
+    base = before[0].decode().strip()
+    a = await locus.worktrees.create(destination=str(root / "a"), branch="codex/sdk-" + uuid.uuid4().hex,
+        start_ref=base, include_dirty=False)
+    owned.append(a)
+    pool = root / "pool"
+    pool.mkdir()
+    acquired = await locus.worktrees.acquire(pool_root=str(pool), commit=base, max_slots=1)
+    b = acquired.worktree
+    owned.append(b)
+    report["worktrees"] = [dataclasses.asdict(wt) for wt in owned]
+    check(a.project_id == b.project_id and a.checkout_id != b.checkout_id, "distinct sibling identities")
+    check((await locus.worktrees.get(a.checkout_id)).workspace_ref == a.workspace_ref, "discoverable handle")
+    statuses = await asyncio.gather(*(locus.ensure_unity_editor(worktree=wt, mode="headless", timeout=sdk_timeout) for wt in (a, b)))
+    pids = [s.status.process_id for s in statuses]
+    report["editor_pids"] = pids
+    check(all(s.status.ready for s in statuses) and len(set(pids)) == 2, "two ready Editors")
+    probe = 'print(UnityEngine.Application.dataPath);'
+    outputs = await asyncio.gather(*(execute(wt, probe) for wt in (a, b)))
+    check(all(str(pathlib.Path(wt.root) / "Assets").replace("\\", "/") in output.replace("\\", "/") for wt, output in zip((a, b), outputs)), "parallel analysis routes")
+    # A nested writable Python tool in A exercises borrowed same-checkout and sibling B gates.
+    nested = 'import asyncio\nrefs = ' + repr([wt.workspace_ref.to_payload() for wt in (a, b)]) + '\nresults = await asyncio.gather(*(locus.call_tool("unity_execute", {"code":"print(UnityEngine.Application.dataPath);", "readonly":False, "request_editor_status":"editing"}, workspace_ref=ref, timeout=45) for ref in refs))\nfor result in results:\n    result.raise_for_error()\nprint("NESTED_OK")'
+    nested_result = await locus.call_tool("python", {"readonly":False, "code":nested,
+        "timeout":120000}, worktree=a, timeout=125)
+    nested_result.raise_for_error()
+    check("NESTED_OK" in nested_result.output, "nested writable SDK calls do not deadlock")
+    # Runtime evidence comes from both editors; merge planning remains frozen to the selected commit.
+    marker = ".locus-sdk-analysis.txt"
+    (pathlib.Path(b.root) / marker).write_text("source editor: " + outputs[1], encoding="utf-8")
+    git(b.root, "add", "--", marker)
+    git(b.root, "commit", "-m", "SDK cross-editor merge evidence", "--", marker)
+    commit = git(b.root, "rev-parse", "HEAD").decode().strip()
+    job = await locus.merges.prepare(worktree=a, sources=[{"commits":[commit]}])
+    plan = await job.new_plan()
+    await plan.files.take(marker, version="source", commit=commit)
+    preview = await plan.preview()
+    check(preview.ready_to_apply, "frozen merge plan is ready")
+    await plan.apply(expected_plan_hash=preview.plan_hash)
+    check((pathlib.Path(a.root) / marker).read_bytes() == (pathlib.Path(b.root) / marker).read_bytes(), "merge applied to selected editor checkout")
+    await plan.abort()
+    check(not (pathlib.Path(a.root) / marker).exists(), "merge abort restores destination")
+    report["close"] = await asyncio.gather(close(a), close(b))
+    seal(a)
+    accepted = seal(b)
+    sentinel = pathlib.Path(b.root) / "Library" / "sdk-reuse-sentinel"
+    sentinel.write_bytes(b"private library reuse")
+    await locus.worktrees.release(b)
+    again = await locus.worktrees.acquire(pool_root=str(pool), commit=accepted, max_slots=1)
+    fresh = again.worktree
+    owned[1] = fresh
+    check(again.reused and again.preserved_library and fresh.root == b.root, "private Library reused")
+    check(sentinel.read_bytes() == b"private library reuse" and fresh.materialization_epoch == b.materialization_epoch + 1, "new epoch at same path")
+    for operation in [lambda: locus.get_unity_editor_status(worktree=b),
+        lambda: locus.call_tool("unity_project_info", worktree=b), lambda: locus.worktrees.release(b)]:
+        try:
+            await operation()
+        except locus.LocusRpcError:
+            pass
+        else:
+            raise AssertionError("stale worktree handle was accepted")
+    check(True, "stale lifecycle tool and pool handles rejected")
+    restarted = await locus.ensure_unity_editor(worktree=fresh, mode="headless", timeout=sdk_timeout)
+    check(restarted.status.ready, "reassigned slot starts")
+    await close(fresh)
+    seal(fresh)
+    await locus.worktrees.release(fresh)
+    await locus.worktrees.remove(fresh)
+    owned.pop()
+    await locus.worktrees.remove(a)
+    owned.pop()
+    check(not pathlib.Path(a.root).exists() and not pathlib.Path(fresh.root).exists(), "managed removal")
+    check(pathlib.Path.cwd() == original_cwd and workspace_ref.to_payload() == original_scope, "orchestrator stays in source checkout")
+    after = [git(source, *args) for args in [("rev-parse", "HEAD"), ("ls-files", "--stage", "-z"), ("diff", "--binary", "HEAD", "--")]]
+    check(before == after, "source HEAD index and dirty state preserved")
+    report["passed"] = len(checks)
+    save()
+    print("LOCUS_WORKTREE_SDK_ACCEPTANCE:" + json.dumps(report))
+except BaseException as error:
+    report["error"] = str(error)
+    save()
+    raise
+finally:
+    # Failure retains source/fixture bytes for diagnosis; close only this suite's Editors.
+    for wt in owned:
+        try:
+            await locus.close_unity_editor(worktree=wt, timeout=90)
+        except Exception as error:
+            report.setdefault("cleanup_errors", []).append(str(error))
+    save()

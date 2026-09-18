@@ -29,6 +29,7 @@ export function useAgentWorkspaceScope() {
     return current ? {
       checkoutId: current.checkoutId,
       expectedGeneration: current.workspaceGeneration,
+      expectedMaterializationEpoch: current.materializationEpoch ?? 0,
     } : null;
   });
 

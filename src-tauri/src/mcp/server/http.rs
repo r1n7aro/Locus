@@ -48,6 +48,7 @@ pub struct ToolCallOutcome {
 pub struct CheckoutBindingRequest {
     pub checkout_id: String,
     pub expected_generation: Option<u64>,
+    pub expected_materialization_epoch: Option<u64>,
 }
 
 /// Immutable, authoritative checkout identity captured by an MCP session.
@@ -55,6 +56,7 @@ pub struct CheckoutBindingRequest {
 pub struct CheckoutBinding {
     pub checkout_id: String,
     pub workspace_generation: u64,
+    pub materialization_epoch: u64,
 }
 
 pub type CheckoutResolver =
@@ -221,6 +223,7 @@ fn host_allowed(host: Option<&str>) -> bool {
 fn endpoint_binding_request(uri: &hyper::Uri) -> Result<Option<CheckoutBindingRequest>, String> {
     let mut checkout_id = None;
     let mut expected_generation = None;
+    let mut expected_materialization_epoch = None;
     for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
         match key.as_ref() {
             "checkoutId" => {
@@ -241,6 +244,16 @@ fn endpoint_binding_request(uri: &hyper::Uri) -> Result<Option<CheckoutBindingRe
                         "workspaceGeneration must be an unsigned integer".to_string()
                     })?);
             }
+            "materializationEpoch" => {
+                if expected_materialization_epoch.is_some() {
+                    return Err("materializationEpoch may only be specified once".into());
+                }
+                expected_materialization_epoch = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| "materializationEpoch must be an unsigned integer")?,
+                );
+            }
             _ => {}
         }
     }
@@ -248,9 +261,10 @@ fn endpoint_binding_request(uri: &hyper::Uri) -> Result<Option<CheckoutBindingRe
         Some(checkout_id) => Ok(Some(CheckoutBindingRequest {
             checkout_id,
             expected_generation,
+            expected_materialization_epoch,
         })),
-        None if expected_generation.is_some() => {
-            Err("workspaceGeneration requires checkoutId".to_string())
+        None if expected_generation.is_some() || expected_materialization_epoch.is_some() => {
+            Err("workspaceGeneration/materializationEpoch requires checkoutId".to_string())
         }
         None => Ok(None),
     }
@@ -261,6 +275,10 @@ fn binding_matches_request(binding: &CheckoutBinding, request: &CheckoutBindingR
         && request
             .expected_generation
             .map(|generation| generation == binding.workspace_generation)
+            .unwrap_or(true)
+        && request
+            .expected_materialization_epoch
+            .map(|epoch| epoch == binding.materialization_epoch)
             .unwrap_or(true)
 }
 
@@ -371,6 +389,26 @@ async fn handle_request_inner(
                 StatusCode::CONFLICT,
                 "MCP session checkout binding does not match this endpoint",
             );
+        }
+        let exact = CheckoutBindingRequest {
+            checkout_id: binding.checkout_id.clone(),
+            expected_generation: Some(binding.workspace_generation),
+            expected_materialization_epoch: Some(binding.materialization_epoch),
+        };
+        match (ctx.resolve_checkout)(exact) {
+            Ok(current) if current == binding => {}
+            Ok(_) => {
+                return plain_response(
+                    StatusCode::CONFLICT,
+                    "MCP checkout assignment changed; establish a new session with its exact epoch",
+                )
+            }
+            Err(error) => {
+                return plain_response(
+                    StatusCode::CONFLICT,
+                    &format!("MCP checkout binding is stale: {error}"),
+                )
+            }
         }
     }
 
@@ -500,5 +538,35 @@ mod tests {
         assert!(!host_allowed(Some("evil.example:27121")));
         assert!(!host_allowed(Some("192.168.1.4:27121")));
         assert!(!host_allowed(None));
+    }
+
+    #[test]
+    fn endpoint_epoch_is_parsed_and_cannot_rebind_an_existing_session() {
+        let request = endpoint_binding_request(
+            &"/mcp?checkoutId=a&workspaceGeneration=3&materializationEpoch=7"
+                .parse()
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(request.expected_materialization_epoch, Some(7));
+        let binding = CheckoutBinding {
+            checkout_id: "a".into(),
+            workspace_generation: 3,
+            materialization_epoch: 7,
+        };
+        assert!(binding_matches_request(&binding, &request));
+        let changed = CheckoutBindingRequest {
+            expected_materialization_epoch: Some(8),
+            ..request
+        };
+        assert!(!binding_matches_request(&binding, &changed));
+        assert!(endpoint_binding_request(
+            &"/mcp?checkoutId=a&materializationEpoch=7&materializationEpoch=8"
+                .parse()
+                .unwrap()
+        )
+        .is_err());
+        assert!(endpoint_binding_request(&"/mcp?materializationEpoch=7".parse().unwrap()).is_err());
     }
 }

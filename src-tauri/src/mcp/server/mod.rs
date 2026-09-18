@@ -88,13 +88,15 @@ pub async fn reconcile(app: AppHandle) {
             let workspace_ref = crate::workspace_service::WorkspaceRef::new(
                 checkout_id,
                 request.expected_generation,
-            );
+            )
+            .with_materialization_epoch(request.expected_materialization_epoch);
             let scope = registry
                 .resolve_workspace_ref(&workspace_ref)
                 .map_err(|error| error.to_string())?;
             Ok(http::CheckoutBinding {
                 checkout_id: scope.runtime().checkout_id().to_string(),
                 workspace_generation: scope.runtime().generation(),
+                materialization_epoch: scope.runtime().materialization_epoch(),
             })
         })
     };
@@ -111,7 +113,8 @@ pub async fn reconcile(app: AppHandle) {
                 let workspace_ref = crate::workspace_service::WorkspaceRef::new(
                     checkout_id,
                     Some(binding.workspace_generation),
-                );
+                )
+                .with_materialization_epoch(Some(binding.materialization_epoch));
                 tools::execute_tool(app, name, args, timeout_ms, runtime_state, workspace_ref).await
             })
         })
@@ -125,7 +128,8 @@ pub async fn reconcile(app: AppHandle) {
             let workspace_ref = crate::workspace_service::WorkspaceRef::new(
                 checkout_id,
                 Some(binding.workspace_generation),
-            );
+            )
+            .with_materialization_epoch(Some(binding.materialization_epoch));
             tools::listed_tools(&app, &config::load_settings(), &workspace_ref)
         })
     };
@@ -139,7 +143,8 @@ pub async fn reconcile(app: AppHandle) {
                 let workspace_ref = crate::workspace_service::WorkspaceRef::new(
                     checkout_id,
                     Some(binding.workspace_generation),
-                );
+                )
+                .with_materialization_epoch(Some(binding.materialization_epoch));
                 tools::build_instructions(&app, &workspace_ref).await
             })
         })

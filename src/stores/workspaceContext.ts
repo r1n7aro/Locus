@@ -62,10 +62,12 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
   ));
   const focusedCheckout = computed<WorkspaceCheckoutDescriptor | null>(() => {
     const checkoutId = focusedPaneContext.value?.focusedCheckoutId;
-    return checkoutId ? checkoutsById.value[checkoutId] ?? null : null;
+    const checkout = checkoutId ? checkoutsById.value[checkoutId] : null;
+    return checkout?.available === false ? null : checkout ?? null;
   });
   const focusedRuntime = computed<WorkspaceRuntimeDescriptor | null>(() => (
-    focusedCheckout.value?.runtime ?? null
+    projectService.workspaceMaterializationMatches(focusedPaneContext.value?.materializationEpoch, focusedCheckout.value?.runtime?.materializationEpoch)
+      ? focusedCheckout.value?.runtime ?? null : null
   ));
   const focusedWorkspaceRef = computed<WorkspaceRef | null>(() => {
     const runtime = focusedRuntime.value;
@@ -73,6 +75,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     return {
       checkoutId: runtime.checkoutId,
       expectedGeneration: runtime.workspaceGeneration,
+      expectedMaterializationEpoch: focusedPaneContext.value?.materializationEpoch,
     };
   });
   const focusedRoot = computed(() => focusedCheckout.value?.root ?? "");
@@ -96,7 +99,8 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     targetPaneId: string,
   ): WorkspaceCheckoutDescriptor | null {
     const checkoutId = paneContextAt(targetWindowId, targetPaneId)?.focusedCheckoutId;
-    return checkoutId ? checkoutsById.value[checkoutId] ?? null : null;
+    const checkout = checkoutId ? checkoutsById.value[checkoutId] : null;
+    return checkout?.available === false ? null : checkout ?? null;
   }
 
   function workspaceRefForPane(
@@ -108,6 +112,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     return {
       checkoutId: context.focusedCheckoutId,
       expectedGeneration: context.workspaceGeneration,
+      expectedMaterializationEpoch: context.materializationEpoch,
     };
   }
 
@@ -199,7 +204,8 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     const existing = checkoutsById.value[runtime.checkoutId];
     if (
       existing?.runtime
-      && existing.runtime.workspaceGeneration !== runtime.workspaceGeneration
+      && (existing.runtime.workspaceGeneration !== runtime.workspaceGeneration
+        || existing.runtime.materializationEpoch !== runtime.materializationEpoch)
     ) {
       delete workspaceStateByCheckout.value[runtime.checkoutId];
     }
@@ -209,6 +215,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
       root: runtime.root,
       normalizedRoot: existing?.normalizedRoot ?? runtime.root,
       lastOpenedAt: existing?.lastOpenedAt ?? Date.now(),
+      available: true,
       runtime,
     };
     upsertProjectCheckout(checkout);
@@ -225,7 +232,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
         const knownRuntime = checkoutsById.value[checkout.checkoutId]?.runtime;
         return {
           ...checkout,
-          runtime: checkout.runtime === null
+          runtime: checkout.available === false || checkout.runtime === null
             ? null
             : checkout.runtime ?? knownRuntime ?? null,
         };
@@ -278,6 +285,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
       && (
         context.focusedCheckoutId !== current.focusedCheckoutId
         || context.workspaceGeneration !== current.workspaceGeneration
+        || context.materializationEpoch !== current.materializationEpoch
         || context.activeSessionId !== current.activeSessionId
       )
     ) {
@@ -325,7 +333,33 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     return true;
   }
 
-  async function initialize(
+  let initialization: { key: string; promise: Promise<void> } | null = null;
+
+  function initialize(
+    nextWindowId = DEFAULT_WINDOW_ID,
+    nextPaneId = DEFAULT_PANE_ID,
+  ): Promise<void> {
+    const key = paneContextKey(nextWindowId, nextPaneId);
+    if (initialization?.key === key) return initialization.promise;
+    const promise = restoreWorkspaceContexts(nextWindowId, nextPaneId).finally(() => {
+      if (initialization?.promise === promise) initialization = null;
+    });
+    initialization = { key, promise };
+    return promise;
+  }
+
+  function ensureInitialized(
+    nextWindowId = DEFAULT_WINDOW_ID,
+    nextPaneId = DEFAULT_PANE_ID,
+  ): Promise<void> {
+    if (initialization) return initialize(nextWindowId, nextPaneId);
+    if (initialized.value && windowId.value === nextWindowId && paneId.value === nextPaneId) {
+      return Promise.resolve();
+    }
+    return initialize(nextWindowId, nextPaneId);
+  }
+
+  async function restoreWorkspaceContexts(
     nextWindowId = DEFAULT_WINDOW_ID,
     nextPaneId = DEFAULT_PANE_ID,
   ) {
@@ -382,6 +416,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
       currentRuntime
       && focusedContext?.focusedCheckoutId === checkout.checkoutId
       && focusedContext.workspaceGeneration === currentRuntime.workspaceGeneration
+      && projectService.workspaceMaterializationMatches(focusedContext.materializationEpoch,currentRuntime.materializationEpoch)
     ) {
       upsertRuntime(currentRuntime);
       return currentRuntime;
@@ -419,6 +454,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
       const context = await projectService.focusWorkspace(targetWindowId, targetPaneId, {
         checkoutId: runtime.checkoutId,
         expectedGeneration: runtime.workspaceGeneration,
+        expectedMaterializationEpoch: runtime.materializationEpoch ?? 0,
       }, expectedIntentEpoch);
       if (!applyPaneContext(context, expectedIntentEpoch)) return null;
       if (activate) activatePane(targetWindowId, targetPaneId);
@@ -473,6 +509,9 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     const epoch = nextPaneIntentEpoch(targetWindowId, targetPaneId);
     const runtime = await ensureRuntime(checkout, targetWindowId, targetPaneId);
     if (
+      !projectService.workspaceMaterializationMatches(workspaceRef.expectedMaterializationEpoch,runtime.materializationEpoch)
+    ) throw new Error("The requested checkout assignment is stale. Reopen the checkout explicitly.");
+    if (
       workspaceRef.expectedGeneration != null
       && runtime.workspaceGeneration !== workspaceRef.expectedGeneration
     ) {
@@ -493,6 +532,12 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     return focusWorkspaceRefInPane(workspaceRef, windowId.value, paneId.value);
   }
 
+  async function openCheckout(path: string): Promise<WorkspaceRuntimeDescriptor> {
+    const runtime = await projectService.openWorkspace(path);
+    upsertRuntime(runtime);
+    return runtime;
+  }
+
   async function openAndFocusInPane(
     path: string,
     targetWindowId: string,
@@ -500,8 +545,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     options: { activate?: boolean } = {},
   ): Promise<WindowPaneWorkspaceContext | null> {
     const epoch = nextPaneIntentEpoch(targetWindowId, targetPaneId);
-    const runtime = await projectService.openWorkspace(path);
-    upsertRuntime(runtime);
+    const runtime = await openCheckout(path);
     return focusRuntime(
       runtime,
       targetWindowId,
@@ -526,9 +570,16 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     activeSessionId: string | null,
     targetWindowId: string,
     targetPaneId: string,
-    options: { activate?: boolean } = {},
+    options: { activate?: boolean; expectedIntentEpoch?: number } = {},
   ): Promise<WindowPaneWorkspaceContext | null> {
     const key = paneContextKey(targetWindowId, targetPaneId);
+    // A follow-up to focus must not overtake a newer focus or detach. In
+    // particular, detach can already have removed the backend pane while its
+    // reply (and therefore the local context deletion) is still pending.
+    if (options.expectedIntentEpoch !== undefined && (
+      currentIntentEpoch(key) !== options.expectedIntentEpoch
+      || paneContextAt(targetWindowId, targetPaneId)?.intentEpoch !== options.expectedIntentEpoch
+    )) return null;
     const intentEpoch = nextPaneIntentEpoch(targetWindowId, targetPaneId);
 
     try {
@@ -592,6 +643,20 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     }
   }
 
+  async function reconcileWindowPanes(
+    targetWindowId: string,
+    visiblePaneIds: readonly string[],
+  ): Promise<void> {
+    const visible = new Set(visiblePaneIds);
+    const prefix = `${targetWindowId}\u0000`;
+    // Include pending focus intents: their backend reply may arrive after a
+    // workspace switch, before the pane has entered paneContexts.
+    const keys = new Set([...Object.keys(paneContexts.value), ...mutationIntentEpochs.keys()]);
+    await Promise.all([...keys]
+      .filter((key) => key.startsWith(prefix) && !visible.has(key.slice(prefix.length)))
+      .map((key) => disposePane(targetWindowId, key.slice(prefix.length))));
+  }
+
   return {
     projectsById,
     checkoutsById,
@@ -600,6 +665,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     windowId,
     paneId,
     initialized,
+    ensureInitialized,
     projects,
     focusedPaneContext,
     focusedProject,
@@ -613,6 +679,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     activatePane,
     applyWorkspaceEvent,
     initialize,
+    openCheckout,
     openAndFocus,
     openAndFocusInPane,
     removeProject,
@@ -624,5 +691,6 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
     setActiveSessionInPane,
     disposePane,
     disposeWindow,
+    reconcileWindowPanes,
   };
 });

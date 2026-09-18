@@ -116,13 +116,18 @@ export function buildScopedMcpServerEndpoint(
 ): string {
   const checkoutId = workspaceRef.checkoutId.trim();
   const generation = workspaceRef.expectedGeneration;
+  const epoch = workspaceRef.expectedMaterializationEpoch;
   if (!checkoutId) throw new Error("A checkout ID is required for an MCP endpoint.");
   if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0) {
     throw new Error("A checkout generation is required for an MCP endpoint.");
   }
+  if (typeof epoch !== "number" || !Number.isSafeInteger(epoch) || epoch < 0) {
+    throw new Error("A checkout materialization epoch is required for an MCP endpoint.");
+  }
   const endpoint = new URL(endpointUrl);
   endpoint.searchParams.set("checkoutId", checkoutId);
   endpoint.searchParams.set("workspaceGeneration", String(generation));
+  endpoint.searchParams.set("materializationEpoch", String(epoch));
   return endpoint.toString();
 }
 

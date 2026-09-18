@@ -1,0 +1,59 @@
+import asyncio, dataclasses, json, pathlib, sys, locus
+
+async def main():
+    source, reference_json, phase, target_root = sys.argv[1:5]
+    reference = locus.WorkspaceRef.from_payload(json.loads(reference_json))
+    evidence = {"phase": phase}
+    async def tool(name, arguments=None):
+        result = await locus.call_tool(name, arguments or {}, workspace_ref=reference, timeout=900)
+        result.raise_for_error()
+        evidence[name] = result.output
+        return result
+    async def execute(code, readonly=True):
+        return await tool("unity_execute", {"code":code, "readonly":readonly, "request_editor_status":"editing"})
+    async def compile():
+        return await tool("unity_recompile", {"project_path":target_root, "editor_status":"editing"})
+    async def test(mode, expected_failure=False):
+        result = await locus.call_tool("unity_test_run", {"mode":mode, "categories":["LocusHeadlessLoop"], "result_detail":"all", "timeout_ms":600000}, workspace_ref=reference, timeout=900)
+        if expected_failure:
+            assert result.is_error and "failed=1" in result.output, result.output
+        else:
+            result.raise_for_error()
+            assert "passed=1" in result.output and "failed=0" in result.output, result.output
+        evidence[mode + "_test"] = result.output
+    if phase == "create":
+        wt = await locus.worktrees.create(destination=target_root, branch="codex/headless-loop", workspace_ref=reference)
+        evidence["worktree"] = dataclasses.asdict(wt)
+    elif phase == "start" or phase == "restart":
+        result = await execute('print(UnityEngine.Application.dataPath); print(UnityEngine.Application.isBatchMode);')
+        assert "True" in result.output and target_root.replace("\\", "/") in result.output.replace("\\", "/"), result.output
+    elif phase == "develop":
+        await tool("write", {"filePath":"Assets/Tests/Edit/HeadlessLoop.Edit.asmdef", "content":json.dumps({"name":"HeadlessLoop.Edit", "references":["HeadlessLoop.Runtime"], "includePlatforms":["Editor"], "optionalUnityReferences":["TestAssemblies"]})})
+        await tool("write", {"filePath":"Assets/Tests/Edit/LoopEditTests.cs", "content":'using NUnit.Framework; namespace HeadlessLoop { public class EditTests { [Test, Category("LocusHeadlessLoop")] public void AddsNumbers() { Assert.AreEqual(5, LoopLogic.Add(2, 3)); } } }'})
+        await tool("write", {"filePath":"Assets/Tests/Play/HeadlessLoop.Play.asmdef", "content":json.dumps({"name":"HeadlessLoop.Play", "references":["HeadlessLoop.Runtime"], "optionalUnityReferences":["TestAssemblies"]})})
+        await tool("write", {"filePath":"Assets/Tests/Play/LoopPlayTests.cs", "content":'using NUnit.Framework; using UnityEngine; using UnityEngine.TestTools; using System.Collections; namespace HeadlessLoop { public class PlayTests { [UnityTest, Category("LocusHeadlessLoop")] public IEnumerator AddsNumbersOverFrames() { yield return new WaitForSeconds(6); Assert.AreEqual(5, LoopLogic.Add(2, 3)); } } }'})
+        await compile()
+        listed = await tool("unity_test_list", {"mode":"edit|play", "categories":["LocusHeadlessLoop"]})
+        assert "AddsNumbers" in listed.output and "AddsNumbersOverFrames" in listed.output, listed.output
+        await test("edit", expected_failure=True)
+    elif phase == "repair":
+        await tool("read", {"filePath":"Assets/Runtime/LoopLogic.cs"})
+        await tool("edit", {"filePath":"Assets/Runtime/LoopLogic.cs", "edits":[{"oldString":"return left - right;", "newString":"return left + right;"}]})
+        await compile()
+        await test("edit")
+    elif phase == "play":
+        await test("play")
+    elif phase == "dirty":
+        await execute('var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene(); UnityEditor.SceneManagement.EditorSceneManager.MarkSceneDirty(scene); print("DIRTY");', False)
+    elif phase == "save":
+        await execute('var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene(); if (!UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene, "Assets/HeadlessLoopSaved.unity")) throw new System.Exception("Save failed"); print("SAVED");', False)
+    else:
+        raise ValueError(phase)
+    if phase != "create":
+        status = await locus.get_unity_editor_status(workspace_ref=reference)
+        assert status.headless and status.process_id, dataclasses.asdict(status)
+        evidence["process_id"] = status.process_id
+        evidence["ready"] = status.ready
+    print("LOCUS_HEADLESS_PHASE:" + json.dumps(evidence))
+
+asyncio.run(main())

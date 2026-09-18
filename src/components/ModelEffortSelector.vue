@@ -1,12 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, ref, shallowRef, watch, type CSSProperties } from "vue";
 import type { AgentInfo, EffortLevel, ModelOption } from "../types";
 import { t } from "../i18n";
 import { visibleProviderOrder } from "../config/providerVisibility";
 import { formatModelOptionDisplayName } from "../utils/modelDisplay";
 import { groupModelsForSelector, modelListEntryName, type ModelSelectorGroup } from "../utils/modelGrouping";
 import { agentProjectTypesLabel } from "../utils/agentProjectTypes";
+import { createAnimationFrameResizeObserver } from "../composables/resizeObserver";
 import BaseSwitch from "./ui/BaseSwitch.vue";
+import WorktreeSelectorPanel from "./chat/WorktreeSelectorPanel.vue";
+import type { WorkspaceRef } from "../services/project";
+import type { ManagedWorktree } from "../services/worktrees";
 
 const props = defineProps<{
   models: ModelOption[];
@@ -22,6 +26,10 @@ const props = defineProps<{
   fastModeAvailable?: boolean;
   align?: "start" | "end";
   disabled?: boolean;
+  workspaceRef?: WorkspaceRef | null;
+  worktreeEnabled?: boolean;
+  worktreeLocked?: boolean;
+  selectWorktree?: (item: ManagedWorktree) => Promise<void>;
 }>();
 
 const emit = defineEmits<{
@@ -30,6 +38,7 @@ const emit = defineEmits<{
   selectEffort: [level: EffortLevel];
   selectMultiAgent: [enabled: boolean];
   selectFastMode: [enabled: boolean];
+  worktreeBusy: [busy: boolean];
 }>();
 
 interface LevelOption {
@@ -40,6 +49,55 @@ interface LevelOption {
 
 const open = ref(false);
 const selectorRef = ref<HTMLElement | null>(null);
+const dropdownRef = ref<HTMLElement | null>(null);
+const dropdownTarget = shallowRef<HTMLElement | null>(null);
+const dropdownStyle = ref<CSSProperties>({ visibility: "hidden" });
+const worktreeBusy = ref(false);
+const hasWorktreePanel = computed(() => !!props.worktreeEnabled && !!props.workspaceRef && !!props.selectWorktree);
+function setWorktreeBusy(value: boolean) { worktreeBusy.value = value; emit("worktreeBusy", value); }
+function close() { if (!worktreeBusy.value) open.value = false; }
+function positionDropdown() {
+  if (!open.value || !selectorRef.value || !dropdownRef.value) return;
+  const ownerWindow = selectorRef.value.ownerDocument.defaultView;
+  if (!ownerWindow) return;
+  const bounds = selectorRef.value.getBoundingClientRect();
+  // Inactive workbench tabs stay mounted with v-show. Hide their teleported
+  // menu as well, without interrupting an in-flight worktree operation.
+  if (!bounds.width || !bounds.height) {
+    dropdownStyle.value = { visibility: "hidden" };
+    return;
+  }
+  const width = dropdownRef.value.offsetWidth;
+  const left = props.align === "start" ? bounds.left : bounds.right - width;
+  dropdownStyle.value = {
+    left: `${Math.max(12, Math.min(left, ownerWindow.innerWidth - width - 12))}px`,
+    bottom: `${ownerWindow.innerHeight - bounds.top + 6}px`,
+  };
+}
+
+watch(open, (isOpen, _previous, onCleanup) => {
+  if (!isOpen) return;
+  const ownerDocument = selectorRef.value?.ownerDocument;
+  const ownerWindow = ownerDocument?.defaultView;
+  if (!ownerDocument || !ownerWindow) return;
+  positionDropdown();
+  const observer = createAnimationFrameResizeObserver(positionDropdown);
+  if (dropdownRef.value) observer?.observe(dropdownRef.value);
+  // Follow split resizing and composer height changes, including tab visibility.
+  for (let element = selectorRef.value; element; element = element.parentElement) {
+    observer?.observe(element);
+  }
+  ownerDocument.addEventListener("click", onClickOutside);
+  ownerWindow.addEventListener("resize", positionDropdown);
+  ownerWindow.addEventListener("scroll", positionDropdown, true);
+  onCleanup(() => {
+    observer?.disconnect();
+    ownerDocument.removeEventListener("click", onClickOutside);
+    ownerWindow.removeEventListener("resize", positionDropdown);
+    ownerWindow.removeEventListener("scroll", positionDropdown, true);
+  });
+}, { flush: "post" });
+watch(() => props.align, positionDropdown, { flush: "post" });
 
 const providerLabels = computed<Record<string, string>>(() => ({
   openrouter: "OpenRouter",
@@ -122,17 +180,21 @@ function levelColor(level: EffortLevel) {
 }
 
 function toggle() {
-  if (props.disabled) return;
+  if (props.disabled || worktreeBusy.value) return;
+  // Shared workbench windows keep this component in the opener's Vue runtime.
+  // Pass the actual owner's body so Teleport does not query the opener's document.
+  if (!open.value) dropdownTarget.value = selectorRef.value?.ownerDocument.body ?? null;
   open.value = !open.value;
 }
 
 function selectModel(id: string) {
+  if (worktreeBusy.value || props.disabled) return;
   emit("selectModel", id);
   if (!hasAgentPanel.value || !props.effortSupported) open.value = false;
 }
 
 function selectAgent(id: string) {
-  if (props.agentLocked) return;
+  if (props.agentLocked || worktreeBusy.value || props.disabled) return;
   emit("selectAgent", id);
 }
 
@@ -146,6 +208,7 @@ function optionDisplayName(model: ModelOption): string {
 }
 
 function selectEffort(level: EffortLevel) {
+  if (worktreeBusy.value || props.disabled) return;
   emit("selectEffort", level);
   open.value = false;
 }
@@ -155,17 +218,16 @@ function selectFastMode(enabled: boolean) {
 }
 
 function onClickOutside(event: MouseEvent) {
-  if (selectorRef.value && !selectorRef.value.contains(event.target as Node)) {
-    open.value = false;
+  const path = event.composedPath();
+  if (selectorRef.value && !path.includes(selectorRef.value)
+    && (!dropdownRef.value || !path.includes(dropdownRef.value))) {
+    close();
   }
 }
-
-onMounted(() => document.addEventListener("click", onClickOutside));
-onUnmounted(() => document.removeEventListener("click", onClickOutside));
 </script>
 
 <template>
-  <div class="model-effort-selector" ref="selectorRef">
+  <div class="model-effort-selector" ref="selectorRef" @keydown.esc.stop="close">
     <button
       class="model-effort-trigger ui-select-none"
       :class="{ open, disabled }"
@@ -187,99 +249,115 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
       <span class="model-effort-chevron">&#9662;</span>
     </button>
 
-    <Transition name="dropdown">
-      <div
-        v-if="open"
-        class="model-effort-dropdown"
-        :class="{
-          'has-agent': hasAgentPanel,
-          'has-effort': true,
-          'align-start': align === 'start',
-        }"
-      >
-        <div v-if="hasAgentPanel" class="model-effort-agent-panel">
-          <div class="model-effort-section-label">Agent</div>
-          <button
-            v-for="agent in agents"
-            :key="agent.id"
-            type="button"
-            class="model-effort-option ui-select-none"
-            :class="{ active: agent.id === selectedAgentId }"
-            :disabled="disabled || agentLocked"
-            :title="agent.description"
-            @click="selectAgent(agent.id)"
-          >
-            <span class="model-effort-option-name">{{ agent.name }}</span>
-            <span v-if="agentProjectTypesLabel(agent)" class="model-effort-option-meta">
-              {{ agentProjectTypesLabel(agent) }}
-            </span>
-          </button>
-        </div>
+    <Teleport v-if="dropdownTarget" :to="dropdownTarget">
+      <Transition name="dropdown">
+        <div
+          v-if="open"
+          ref="dropdownRef"
+          class="model-effort-dropdown"
+          :style="dropdownStyle"
+          @keydown.esc.stop="close"
+          :class="{
+            'has-agent': hasAgentPanel,
+            'has-effort': true,
+            'has-worktree': hasWorktreePanel,
+            'align-start': align === 'start',
+          }"
+        >
+          <div v-if="hasAgentPanel" class="model-effort-agent-panel">
+            <div class="model-effort-section-label">Agent</div>
+            <button
+              v-for="agent in agents"
+              :key="agent.id"
+              type="button"
+              class="model-effort-option ui-select-none"
+              :class="{ active: agent.id === selectedAgentId }"
+              :disabled="disabled || worktreeBusy || agentLocked"
+              :title="agent.description"
+              @click="selectAgent(agent.id)"
+            >
+              <span class="model-effort-option-name">{{ agent.name }}</span>
+              <span v-if="agentProjectTypesLabel(agent)" class="model-effort-option-meta">
+                {{ agentProjectTypesLabel(agent) }}
+              </span>
+            </button>
+          </div>
 
-        <div class="model-effort-model-panel">
-          <template v-if="groupedModels.length === 0">
-            <div class="model-effort-empty">{{ t("model.noProvider") }}</div>
-          </template>
-          <template v-for="(group, groupIndex) in groupedModels" :key="group.key">
-            <div v-if="groupIndex > 0" class="model-effort-divider"></div>
-            <div class="model-effort-section-header">
-              <div class="model-effort-section-label">{{ group.label }}</div>
-              <div
-                v-if="group.provider === 'openai_codex'"
-                class="model-effort-fast-toggle"
-                :title="t('model.fastHint')"
-                @click.stop
-              >
-                <span>{{ t("model.fast") }}</span>
-                <BaseSwitch
-                  :model-value="fastModeEnabled === true"
-                  :disabled="disabled || fastModeAvailable !== true"
-                  :aria-label="t('model.fast')"
-                  @update:model-value="selectFastMode"
-                />
+          <div class="model-effort-model-panel">
+            <template v-if="groupedModels.length === 0">
+              <div class="model-effort-empty">{{ t("model.noProvider") }}</div>
+            </template>
+            <template v-for="(group, groupIndex) in groupedModels" :key="group.key">
+              <div v-if="groupIndex > 0" class="model-effort-divider"></div>
+              <div class="model-effort-section-header">
+                <div class="model-effort-section-label">{{ group.label }}</div>
+                <div
+                  v-if="group.provider === 'openai_codex'"
+                  class="model-effort-fast-toggle"
+                  :title="t('model.fastHint')"
+                  @click.stop
+                >
+                  <span>{{ t("model.fast") }}</span>
+                  <BaseSwitch
+                    :model-value="fastModeEnabled === true"
+                    :disabled="disabled || worktreeBusy || fastModeAvailable !== true"
+                    :aria-label="t('model.fast')"
+                    @update:model-value="selectFastMode"
+                  />
+                </div>
               </div>
-            </div>
-            <button
-              v-for="model in group.models"
-              :key="model.id"
-              type="button"
-              class="model-effort-option ui-select-none"
-              :class="{ active: model.id === selectedId }"
-              @click="selectModel(model.id)"
-            >
-              <span class="model-effort-option-name">{{ optionDisplayName(model) }}</span>
-            </button>
-          </template>
-        </div>
+              <button
+                v-for="model in group.models"
+                :key="model.id"
+                type="button"
+                class="model-effort-option ui-select-none"
+                :class="{ active: model.id === selectedId }"
+                :disabled="disabled || worktreeBusy"
+                @click="selectModel(model.id)"
+              >
+                <span class="model-effort-option-name">{{ optionDisplayName(model) }}</span>
+              </button>
+            </template>
+          </div>
 
-        <div class="model-effort-effort-panel">
-          <div class="model-effort-section-label">{{ t("thinking.selector.title") }}</div>
-          <template v-if="effortSupported">
+          <div class="model-effort-effort-panel">
+            <div class="model-effort-section-label">{{ t("thinking.selector.title") }}</div>
+            <template v-if="effortSupported">
+              <button
+                v-for="level in levels"
+                :key="level.value"
+                type="button"
+                class="model-effort-option ui-select-none"
+                :class="{ active: level.value === effort }"
+                :disabled="disabled || worktreeBusy"
+                @click="selectEffort(level.value)"
+              >
+                <span class="model-effort-option-name">{{ level.label }}</span>
+              </button>
+            </template>
+            <div class="model-effort-divider"></div>
             <button
-              v-for="level in levels"
-              :key="level.value"
               type="button"
-              class="model-effort-option ui-select-none"
-              :class="{ active: level.value === effort }"
-              @click="selectEffort(level.value)"
+              class="model-effort-option model-effort-multi-agent ui-select-none"
+              :class="{ active: multiAgentEnabled }"
+              :aria-pressed="multiAgentEnabled === true"
+              :disabled="disabled || worktreeBusy"
+              @click="emit('selectMultiAgent', !multiAgentEnabled)"
             >
-              <span class="model-effort-option-name">{{ level.label }}</span>
+              <span class="model-effort-option-name">Multi-Agent</span>
             </button>
-          </template>
-          <div class="model-effort-divider"></div>
-          <button
-            type="button"
-            class="model-effort-option model-effort-multi-agent ui-select-none"
-            :class="{ active: multiAgentEnabled }"
-            :aria-pressed="multiAgentEnabled === true"
-            :disabled="disabled"
-            @click="emit('selectMultiAgent', !multiAgentEnabled)"
-          >
-            <span class="model-effort-option-name">Multi-Agent</span>
-          </button>
+          </div>
+          <WorktreeSelectorPanel
+            v-if="hasWorktreePanel && workspaceRef && selectWorktree"
+            :workspace-ref="workspaceRef"
+            :locked="worktreeLocked || disabled"
+            :select-worktree="selectWorktree"
+            @busy="setWorktreeBusy"
+            @selected="open = false"
+          />
         </div>
-      </div>
-    </Transition>
+      </Transition>
+    </Teleport>
   </div>
 </template>
 
@@ -367,9 +445,7 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 }
 
 .model-effort-dropdown {
-  position: absolute;
-  right: 0;
-  bottom: calc(100% + 6px);
+  position: fixed;
   min-width: 260px;
   max-width: min(420px, calc(100vw - 24px));
   max-height: min(420px, calc(100vh - 160px));
@@ -379,13 +455,11 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
   border-radius: 10px;
   background: var(--bg-color);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
-  z-index: 100;
+  z-index: 2000;
   transform-origin: bottom right;
 }
 
 .model-effort-dropdown.align-start {
-  left: 0;
-  right: auto;
   transform-origin: bottom left;
 }
 
@@ -405,6 +479,19 @@ onUnmounted(() => document.removeEventListener("click", onClickOutside));
 .model-effort-dropdown.has-agent.has-effort {
   width: min(660px, calc(100vw - 24px));
   grid-template-columns: 150px minmax(0, 1fr) 120px;
+}
+
+.model-effort-dropdown.has-worktree,
+.model-effort-dropdown.has-effort.has-worktree:not(.has-agent) {
+  width: min(740px, calc(100vw - 24px));
+  max-width: calc(100vw - 24px);
+  overflow-x: auto;
+  grid-template-columns: minmax(160px, 1fr) 120px minmax(200px, 240px);
+}
+
+.model-effort-dropdown.has-agent.has-effort.has-worktree {
+  width: min(900px, calc(100vw - 24px));
+  grid-template-columns: minmax(100px, 150px) minmax(160px, 1fr) 120px minmax(200px, 240px);
 }
 
 :root[data-theme="dark"] .model-effort-dropdown {

@@ -30,7 +30,7 @@ describe("model multi agent selection", () => {
         await nextTick();
       };
       await open();
-      const toggle = host.querySelector<HTMLButtonElement>(".model-effort-multi-agent")!;
+      const toggle = document.body.querySelector<HTMLButtonElement>(".model-effort-multi-agent")!;
       expect(toggle.textContent).toBe("Multi-Agent");
       expect(toggle.getAttribute("aria-pressed")).toBe("false");
       expect(toggle.parentElement!.lastElementChild).toBe(toggle);
@@ -38,9 +38,10 @@ describe("model multi agent selection", () => {
       await nextTick();
       expect(toggle.getAttribute("aria-pressed")).toBe("true");
       expect(toggle.classList.contains("active")).toBe(true);
+      expect(document.body.querySelector(".model-effort-dropdown")).not.toBeNull();
       expect(effort.value).toBe("high");
       if (effortSupported) {
-        const max = [...host.querySelectorAll<HTMLButtonElement>(".model-effort-effort-panel button")]
+        const max = [...document.body.querySelectorAll<HTMLButtonElement>(".model-effort-effort-panel button")]
           .find((button) => button.textContent?.trim() === "Max")!;
         max.click();
         await nextTick();
@@ -48,7 +49,7 @@ describe("model multi agent selection", () => {
         expect(enabled.value).toBe(true);
         await open();
       }
-      host.querySelector<HTMLButtonElement>(".model-effort-multi-agent")!.click();
+      document.body.querySelector<HTMLButtonElement>(".model-effort-multi-agent")!.click();
       await nextTick();
       expect(enabled.value).toBe(false);
       expect(fastMode).not.toHaveBeenCalled();

@@ -16,6 +16,8 @@ pub struct WindowPaneWorkspaceContext {
     pub focused_checkout_id: CheckoutId,
     pub workspace_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_session_id: Option<String>,
     /// Client-owned monotonic mutation sequence for this window/pane. This is
     /// persisted with the projection so a restored renderer can continue
@@ -59,6 +61,9 @@ pub struct WindowContextRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WindowContextError {
+    StaleMaterialization {
+        detail: String,
+    },
     EmptyWindowId,
     EmptyPaneId,
     PaneUnavailable {
@@ -85,6 +90,7 @@ pub enum WindowContextError {
 impl fmt::Display for WindowContextError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::StaleMaterialization {detail} => formatter.write_str(detail),
             Self::EmptyWindowId => formatter.write_str("window id cannot be empty"),
             Self::EmptyPaneId => formatter.write_str("pane id cannot be empty"),
             Self::PaneUnavailable { window_id, pane_id } => write!(
@@ -172,9 +178,16 @@ impl WindowContextRegistry {
         if context.focused_checkout_id != *runtime.checkout_id() {
             return Err(WindowContextError::PaneUnavailable { window_id, pane_id });
         }
+        super::scope::WorkspaceRef::new(context.focused_checkout_id.clone(), None)
+            .with_materialization_epoch(context.materialization_epoch)
+            .validate_materialization_epoch(runtime.materialization_epoch())
+            .map_err(|error| WindowContextError::StaleMaterialization {
+                detail: error.to_string(),
+            })?;
         context.window_id = window_id.clone();
         context.pane_id = pane_id.clone();
         context.workspace_generation = runtime.generation();
+        context.materialization_epoch = Some(runtime.materialization_epoch());
         context.intent_epoch = context.intent_epoch.max(1);
         context.revision = context.revision.max(1);
         let lease = runtime.acquire_lease(WorkspaceLeaseKind::BackgroundOpen);
@@ -248,6 +261,7 @@ impl WindowContextRegistry {
         if let Some(current) = window.panes.get_mut(pane_id) {
             if &current.context.focused_checkout_id == runtime.checkout_id()
                 && current.context.workspace_generation == runtime.generation()
+                && current.context.materialization_epoch == Some(runtime.materialization_epoch())
             {
                 current.context.revision =
                     current.context.revision.checked_add(1).ok_or_else(|| {
@@ -283,6 +297,7 @@ impl WindowContextRegistry {
             pane_id: pane_id.to_string(),
             focused_checkout_id: runtime.checkout_id().clone(),
             workspace_generation: runtime.generation(),
+            materialization_epoch: Some(runtime.materialization_epoch()),
             active_session_id: None,
             intent_epoch,
             revision,
@@ -659,6 +674,55 @@ mod tests {
     }
 
     #[test]
+    fn restart_rejects_restored_pane_after_pool_reassignment_even_when_generation_repeats() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("pool-slot");
+        let journal = root.join(".git/locus-worktrees");
+        std::fs::create_dir_all(&journal).unwrap();
+        let identity = ProjectIdResolver::resolve(&root).unwrap();
+        let write_epoch = |epoch: u64| {
+            let record = crate::workspace_service::worktrees::ManagedWorktree {
+                checkout_id: identity.checkout_id.to_string(), project_id: identity.project_id.to_string(),
+                root: root.to_string_lossy().into_owned(), repo_root: root.to_string_lossy().into_owned(),
+                project_relative_path: String::new(), branch: Some(format!("assignment-{epoch}")),
+                head_oid: format!("commit-{epoch}"), materialization_epoch: epoch, managed: true,
+                lifecycle: "active".into(), dirty: false, pool_slot: true,
+                assignment_id: Some(format!("assignment-{epoch}")), editor_version: None, last_error: None,
+            };
+            let records = std::collections::BTreeMap::from([(identity.checkout_id.to_string(), record)]);
+            let state = serde_json::json!({"version":1,"records":records,"operations":[]});
+            std::fs::write(journal.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        };
+        write_epoch(1);
+        let first = WorkspaceRuntime::new(identity.clone(), Vec::new(), 1);
+        let contexts = WindowContextRegistry::new();
+        let original = contexts.focus("main", "pane", Arc::clone(&first), 1).unwrap();
+        assert_eq!(original.materialization_epoch, Some(1));
+        let persisted = serde_json::to_vec(&original).unwrap();
+        drop(contexts);
+        drop(first);
+
+        // A normal process restart refreshes only the transient generation.
+        let same_assignment = WorkspaceRuntime::new(identity.clone(), Vec::new(), 9);
+        let recovered = WindowContextRegistry::new();
+        let restored = recovered.restore_background(serde_json::from_slice(&persisted).unwrap(), Arc::clone(&same_assignment)).unwrap();
+        assert_eq!(restored.workspace_generation, 9);
+        assert_eq!(restored.materialization_epoch, Some(1));
+        drop(recovered);
+        drop(same_assignment);
+
+        write_epoch(2);
+        let replacement = WorkspaceRuntime::new(identity, Vec::new(), 1);
+        let recovered = WindowContextRegistry::new();
+        assert!(matches!(recovered.restore_background(serde_json::from_slice(&persisted).unwrap(), Arc::clone(&replacement)), Err(WindowContextError::StaleMaterialization { .. })));
+        let mut legacy = original;
+        legacy.materialization_epoch = None;
+        assert!(matches!(recovered.restore_background(legacy, Arc::clone(&replacement)), Err(WindowContextError::StaleMaterialization { .. })));
+        assert!(recovered.snapshots().unwrap().is_empty());
+        assert_eq!(replacement.lease_count(), 0);
+    }
+
+    #[test]
     fn pane_focus_intents_are_monotonic_and_revisions_are_isolated() {
         let temp = tempfile::tempdir().expect("tempdir");
         let first = runtime(temp.path(), "first", 1);
@@ -780,6 +844,7 @@ mod tests {
                         pane_id: pane_id.to_string(),
                         focused_checkout_id: runtime.checkout_id().clone(),
                         workspace_generation: 1,
+                        materialization_epoch: None,
                         active_session_id: active_session_id.map(str::to_string),
                         intent_epoch: index as u64 + 1,
                         revision: index as u64 + 3,

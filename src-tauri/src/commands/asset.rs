@@ -75,6 +75,10 @@ use crate::workspace_service::{
 
 fn asset_workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
+        error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
+            "workspace.materialization_stale",
+            "The checkout assignment changed. Reopen the checkout before continuing.",
+        ).detail(error.to_string()),
         WorkspaceResolveError::RegistryUnavailable { detail } => AppError::new(
             "workspace.registry_unavailable",
             "The workspace registry is unavailable.",

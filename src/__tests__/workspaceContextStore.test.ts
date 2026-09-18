@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
+import { effectScope, ref } from "vue";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
+import { useWorkbenchPaneLifecycle } from "../composables/useWorkbenchPaneLifecycle";
 import type {
   ProjectContextDescriptor,
   WindowPaneWorkspaceContext,
@@ -22,7 +24,10 @@ const projectServiceMocks = vi.hoisted(() => ({
   detachWorkspaceWindow: vi.fn(),
 }));
 
-vi.mock("../services/project", () => projectServiceMocks);
+vi.mock("../services/project", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/project")>(),
+  ...projectServiceMocks,
+}));
 
 function runtime(
   checkoutId: string,
@@ -113,6 +118,97 @@ function workspaceEvent(
 }
 
 describe("workspace context store", () => {
+  it("revalidates an explicit open before changing pane focus or cached runtime", async () => {
+    setActivePinia(createPinia());
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([paneContext("active", 1)]);
+    projectServiceMocks.listWindowWorkspaceIntentEpochs.mockResolvedValue([]);
+    projectServiceMocks.listProjectContexts.mockResolvedValue([
+      project(checkout("active", { runtime: runtime("active") })),
+    ]);
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    projectServiceMocks.openWorkspace.mockRejectedValueOnce(new Error("Directory missing"));
+    await expect(store.openCheckout("F:/work/active")).rejects.toThrow("Directory missing");
+    expect(store.focusedRoot).toBe("F:/work/active");
+    expect(projectServiceMocks.focusWorkspace).not.toHaveBeenCalled();
+
+    projectServiceMocks.openWorkspace.mockResolvedValueOnce(runtime("active", "project-1", 2));
+    await store.openCheckout("F:/work/active");
+    expect(store.checkoutsById.active.runtime?.workspaceGeneration).toBe(2);
+    expect(store.focusedPaneContext?.workspaceGeneration).toBe(1);
+    expect(projectServiceMocks.focusWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse a cached runtime when its directory becomes unavailable", async () => {
+    setActivePinia(createPinia());
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([paneContext("old", 1)]);
+    projectServiceMocks.listWindowWorkspaceIntentEpochs.mockResolvedValue([]);
+    projectServiceMocks.listProjectContexts.mockResolvedValue([
+      project(checkout("old", { runtime: runtime("old") })),
+    ]);
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    expect(store.focusedWorkspaceRef?.checkoutId).toBe("old");
+    projectServiceMocks.listProjectContexts.mockResolvedValue([
+      project({ ...checkout("old"), available: false }),
+    ]);
+    await store.initialize();
+    expect(store.checkoutsById.old.runtime).toBeNull();
+    expect(store.focusedWorkspaceRef).toBeNull();
+    expect(store.focusedRoot).toBe("");
+    expect(store.checkoutForPane("main", "main")).toBeNull();
+  });
+
+  it("leaves unavailable startup history unfocused and opens the renamed directory", async () => {
+    setActivePinia(createPinia());
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([]);
+    projectServiceMocks.listWindowWorkspaceIntentEpochs.mockResolvedValue([]);
+    projectServiceMocks.listProjectContexts.mockResolvedValue([
+      project({ ...checkout("中文工程"), available: false, runtime: null }),
+    ]);
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    expect(store.focusedRoot).toBe("");
+    expect(store.focusedWorkspaceRef).toBeNull();
+    projectServiceMocks.openWorkspace.mockResolvedValue(runtime("EnglishProject"));
+    projectServiceMocks.focusWorkspace.mockImplementation((_window, _pane, _ref, intentEpoch) =>
+      Promise.resolve(paneContext("EnglishProject", 1, { intentEpoch })));
+    await store.openAndFocus("F:/work/EnglishProject");
+    expect(store.focusedRoot).toBe("F:/work/EnglishProject");
+    expect(store.focusedWorkspaceRef?.checkoutId).toBe("EnglishProject");
+    expect(store.focusedCheckout?.available).toBe(true);
+  });
+
+  it("shares concurrent startup recovery and reuses the completed binding for onboarding", async () => {
+    setActivePinia(createPinia());
+    const data = deferred<ProjectContextDescriptor[]>();
+    projectServiceMocks.listProjectContexts.mockReturnValue(data.promise);
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([paneContext("startup", 1)]);
+    projectServiceMocks.listWindowWorkspaceIntentEpochs.mockResolvedValue([]);
+    const store = useWorkspaceContextStore();
+    const first = store.ensureInitialized();
+    const second = store.ensureInitialized();
+    expect(projectServiceMocks.listProjectContexts).toHaveBeenCalledTimes(1);
+    expect(store.initialized).toBe(false);
+    data.resolve([project(checkout("startup", { runtime: runtime("startup") }))]);
+    await Promise.all([first, second]);
+    expect(store.focusedWorkspaceRef?.checkoutId).toBe("startup");
+    await store.ensureInitialized();
+    expect(projectServiceMocks.listProjectContexts).toHaveBeenCalledTimes(1);
+    expect(projectServiceMocks.openWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("retries failed context recovery and accepts an empty first-launch workspace", async () => {
+    const store = useWorkspaceContextStore();
+    projectServiceMocks.listProjectContexts.mockRejectedValueOnce(new Error("Database unavailable"));
+    await expect(store.ensureInitialized()).rejects.toThrow("Database unavailable");
+    expect(store.initialized).toBe(false);
+    await store.ensureInitialized();
+    expect(store.initialized).toBe(true);
+    expect(store.focusedWorkspaceRef).toBeNull();
+    expect(projectServiceMocks.listProjectContexts).toHaveBeenCalledTimes(2);
+  });
+
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.clearAllMocks();
@@ -126,6 +222,34 @@ describe("workspace context store", () => {
     });
     projectServiceMocks.detachWorkspacePane.mockResolvedValue(true);
     projectServiceMocks.detachWorkspaceWindow.mockResolvedValue(0);
+  });
+
+  it("rejects restored panes and explicit handles from an earlier slot assignment", async () => {
+    const replacement = { ...runtime("slot"), materializationEpoch: 2 };
+    projectServiceMocks.listProjectContexts.mockResolvedValue([project(checkout("slot", { runtime: replacement }))]);
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([
+      { ...paneContext("slot", 1), materializationEpoch: 1 },
+    ]);
+    projectServiceMocks.openWorkspace.mockResolvedValue(replacement);
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    expect(store.focusedRuntime).toBeNull();
+    expect(store.focusedWorkspaceRef).toBeNull();
+    for (const expectedMaterializationEpoch of [1, undefined]) {
+      await expect(store.focusWorkspaceRefInPane({ checkoutId: "slot", expectedGeneration: 1, expectedMaterializationEpoch }, "main", "main")).rejects.toThrow(/assignment is stale/);
+    }
+    expect(projectServiceMocks.focusWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("captures the verified epoch when focusing a newly selected assignment", async () => {
+    const replacement = { ...runtime("slot"), materializationEpoch: 2 };
+    projectServiceMocks.listProjectContexts.mockResolvedValue([project(checkout("slot", { runtime: replacement }))]);
+    projectServiceMocks.openWorkspace.mockResolvedValue(replacement);
+    projectServiceMocks.focusWorkspace.mockResolvedValue({ ...paneContext("slot", 1), materializationEpoch: 2 });
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    await store.focusWorkspaceRefInPane({ checkoutId: "slot", expectedGeneration: 1, expectedMaterializationEpoch: 2 }, "main", "main");
+    expect(store.focusedWorkspaceRef).toEqual({ checkoutId: "slot", expectedGeneration: 1, expectedMaterializationEpoch: 2 });
   });
 
   it("restores a pane and exposes its checkout runtime through explicit scope", async () => {
@@ -275,11 +399,140 @@ describe("workspace context store", () => {
     expect(projectServiceMocks.focusWorkspace).toHaveBeenCalledWith(
       "main",
       "main",
-      { checkoutId: "checkout-b", expectedGeneration: 1 },
+      { checkoutId: "checkout-b", expectedGeneration: 1, expectedMaterializationEpoch: 0 },
       3,
     );
     expect(store.focusedCheckout?.checkoutId).toBe("checkout-b");
     expect(store.focusedPaneContext?.intentEpoch).toBe(3);
+  });
+
+  it.each([false, true])("does not restore a session after its pane is detached (reply pending: %s)", async (pendingReply) => {
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([
+      paneContext("checkout-a", 1, { paneId: "restored-pane" }),
+    ]);
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    const restored = store.paneContextAt("main", "restored-pane")!;
+    const detaching = deferred<boolean>();
+    projectServiceMocks.detachWorkspacePane.mockReturnValueOnce(detaching.promise);
+    const detach = store.disposePane("main", "restored-pane");
+    if (!pendingReply) { detaching.resolve(true); await detach; }
+
+    expect(await store.setActiveSessionInPane("old-session", "main", "restored-pane", {
+      activate: false, expectedIntentEpoch: restored.intentEpoch,
+    })).toBeNull();
+    expect(projectServiceMocks.setActiveWorkspaceSession).not.toHaveBeenCalled();
+
+    detaching.resolve(true);
+    await detach;
+    expect(store.paneContextAt("main", "restored-pane")).toBeNull();
+  });
+
+  it("only restores the session belonging to the latest focus of a reused pane", async () => {
+    projectServiceMocks.listProjectContexts.mockResolvedValue([
+      project(checkout("checkout-a"), checkout("checkout-b")),
+    ]);
+    projectServiceMocks.focusWorkspace.mockImplementation(async (windowId, paneId, ref, intentEpoch) => (
+      paneContext(ref.checkoutId, intentEpoch, { windowId, paneId, intentEpoch })
+    ));
+    projectServiceMocks.setActiveWorkspaceSession.mockImplementation(async (windowId, paneId, sessionId, intentEpoch) => (
+      paneContext("checkout-b", intentEpoch, { windowId, paneId, intentEpoch, activeSessionId: sessionId })
+    ));
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    const oldFocus = await store.focusCheckoutInPane("checkout-a", "main", "restored-pane");
+    const latestFocus = await store.focusCheckoutInPane("checkout-b", "main", "restored-pane");
+
+    expect(await store.setActiveSessionInPane("session-a", "main", "restored-pane", {
+      activate: false, expectedIntentEpoch: oldFocus!.intentEpoch,
+    })).toBeNull();
+    expect(projectServiceMocks.setActiveWorkspaceSession).not.toHaveBeenCalled();
+    const selected = await store.setActiveSessionInPane("session-b", "main", "restored-pane", {
+      activate: false, expectedIntentEpoch: latestFocus!.intentEpoch,
+    });
+    expect(selected?.activeSessionId).toBe("session-b");
+    expect(store.paneContextAt("main", "restored-pane")?.focusedCheckoutId).toBe("checkout-b");
+  });
+
+  it("reconciles startup recovery and workspace layout switches through the pane lifecycle", async () => {
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([
+      paneContext("hidden", 1, { paneId: "old-pane" }),
+      paneContext("visible", 2, { paneId: "visible-pane" }),
+    ]);
+    const store = useWorkspaceContextStore();
+    const layout = ref(["visible-pane"]);
+    const scope = effectScope();
+    scope.run(() => useWorkbenchPaneLifecycle("main", () => layout.value));
+    try {
+      expect(projectServiceMocks.detachWorkspacePane).not.toHaveBeenCalled();
+      await store.initialize();
+      await vi.waitFor(() => expect(store.paneContextAt("main", "old-pane")).toBeNull());
+      expect(store.paneContextAt("main", "visible-pane")).not.toBeNull();
+
+      layout.value = ["next-workspace-pane"];
+      await vi.waitFor(() => expect(store.paneContextAt("main", "visible-pane")).toBeNull());
+    } finally {
+      scope.stop();
+    }
+  });
+
+  it("releases cached and orphaned panes while retaining visible panes and other windows", async () => {
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([
+      paneContext("hidden", 1, { paneId: "cached", activeSessionId: "old-session" }),
+      paneContext("hidden", 2, { paneId: "orphan" }),
+      paneContext("visible", 3, { paneId: "left" }),
+      paneContext("visible", 4, { paneId: "right" }),
+      paneContext("hidden", 5, { windowId: "secondary", paneId: "other-window" }),
+    ]);
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+
+    await store.reconcileWindowPanes("main", ["left", "right"]);
+
+    expect(projectServiceMocks.detachWorkspacePane.mock.calls.map((call) => call.slice(0, 2)))
+      .toEqual([["main", "cached"], ["main", "orphan"]]);
+    expect(store.paneContextAt("main", "cached")).toBeNull();
+    expect(store.paneContextAt("main", "orphan")).toBeNull();
+    expect(store.paneContextAt("main", "left")?.focusedCheckoutId).toBe("visible");
+    expect(store.paneContextAt("main", "right")?.focusedCheckoutId).toBe("visible");
+    expect(store.paneContextAt("secondary", "other-window")?.focusedCheckoutId).toBe("hidden");
+    expect(projectServiceMocks.setActiveWorkspaceSession).not.toHaveBeenCalled();
+  });
+
+  it("invalidates a pending hidden-pane focus before workspace opening completes", async () => {
+    projectServiceMocks.listProjectContexts.mockResolvedValue([project(checkout("hidden"))]);
+    const opening = deferred<WorkspaceRuntimeDescriptor>();
+    projectServiceMocks.openWorkspace.mockReturnValueOnce(opening.promise);
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    const focus = store.focusCheckoutInPane("hidden", "main", "old-pane");
+
+    await store.reconcileWindowPanes("main", ["new-pane"]);
+    opening.resolve(runtime("hidden"));
+
+    expect(await focus).toBeNull();
+    expect(projectServiceMocks.focusWorkspace).not.toHaveBeenCalled();
+    expect(store.paneContextAt("main", "old-pane")).toBeNull();
+  });
+
+  it("preserves a newer focus when a previous layout's detach finishes late", async () => {
+    projectServiceMocks.listProjectContexts.mockResolvedValue([project(checkout("visible"))]);
+    projectServiceMocks.listWindowWorkspaceContexts.mockResolvedValue([
+      paneContext("hidden", 1, { paneId: "reused-pane" }),
+    ]);
+    const detaching = deferred<boolean>();
+    projectServiceMocks.detachWorkspacePane.mockReturnValueOnce(detaching.promise);
+    projectServiceMocks.focusWorkspace.mockImplementation(async (windowId, paneId, ref, intentEpoch) => (
+      paneContext(ref.checkoutId, 2, { windowId, paneId, intentEpoch })
+    ));
+    const store = useWorkspaceContextStore();
+    await store.initialize();
+    const cleanup = store.reconcileWindowPanes("main", ["different-pane"]);
+    await store.focusCheckoutInPane("visible", "main", "reused-pane");
+    detaching.resolve(true);
+    await cleanup;
+
+    expect(store.paneContextAt("main", "reused-pane")?.focusedCheckoutId).toBe("visible");
   });
 
   it("keeps a pane detached when an older focus response arrives afterwards", async () => {
@@ -338,6 +591,7 @@ describe("workspace context store", () => {
     expect(projectServiceMocks.focusWorkspace).toHaveBeenCalledWith("main", "main", {
       checkoutId: "checkout-a",
       expectedGeneration: 5,
+      expectedMaterializationEpoch: 0,
     }, 1);
     expect(store.focusedRuntime).toEqual(openedRuntime);
   });
@@ -371,7 +625,7 @@ describe("workspace context store", () => {
     expect(projectServiceMocks.focusWorkspace).toHaveBeenCalledWith(
       "main",
       "main",
-      { checkoutId: "checkout-b", expectedGeneration: 9 },
+      { checkoutId: "checkout-b", expectedGeneration: 9, expectedMaterializationEpoch: 0 },
       2,
     );
     expect(store.focusedWorkspaceRef).toEqual({
@@ -408,7 +662,7 @@ describe("workspace context store", () => {
     expect(projectServiceMocks.focusWorkspace).toHaveBeenCalledWith(
       "main",
       "main",
-      { checkoutId: "checkout-a", expectedGeneration: 1 },
+      { checkoutId: "checkout-a", expectedGeneration: 1, expectedMaterializationEpoch: 0 },
       9,
     );
     expect(store.focusedPaneContext?.intentEpoch).toBe(9);

@@ -5,10 +5,15 @@ use tokio::sync::Mutex;
 
 use super::{get_native_pipe_name, native_bridge_enabled, PipeResponse};
 
+#[cfg(target_os = "windows")]
+#[path = "transport/requests.rs"]
+mod requests;
+
 // ── Windows: named-pipe transport ────────────────────────────────────
 
 #[cfg(target_os = "windows")]
 mod windows_impl {
+    use super::requests::PendingRequests;
     use super::*;
     use serde::{Deserialize, Serialize};
     use std::{
@@ -60,8 +65,7 @@ mod windows_impl {
         project_key: String,
         pipe_name: String,
         writer: Mutex<Option<WriteHalf<NamedPipeClient>>>,
-        pending: Mutex<HashMap<String, oneshot::Sender<Result<PipeEnvelope, String>>>>,
-        accepted: Mutex<HashMap<String, oneshot::Sender<()>>>,
+        pending: Mutex<PendingRequests>,
         reader_abort: Mutex<Option<tokio::task::AbortHandle>>,
     }
 
@@ -94,7 +98,6 @@ mod windows_impl {
             let request_id = self.request_id.clone();
             tokio::spawn(async move {
                 conn.pending.lock().await.remove(&request_id);
-                conn.accepted.lock().await.remove(&request_id);
             });
         }
     }
@@ -249,12 +252,7 @@ mod windows_impl {
     }
 
     async fn fail_all_pending(conn: &Arc<UnityPipeConnection>, reason: String) {
-        let mut pending = conn.pending.lock().await;
-        for (_, tx) in pending.drain() {
-            let _ = tx.send(Err(reason.clone()));
-        }
-        drop(pending);
-        conn.accepted.lock().await.clear();
+        conn.pending.lock().await.fail_all(&reason);
     }
 
     async fn close_connection(conn: &Arc<UnityPipeConnection>, reason: String) {
@@ -385,14 +383,12 @@ mod windows_impl {
 
             if env.kind == BROKER_REQUEST_ACCEPTED_EVENT {
                 if let Some(request_id) = broker_accepted_request_id(&env) {
-                    let tx = conn.accepted.lock().await.remove(&request_id);
-                    if let Some(tx) = tx {
-                        let _ = tx.send(());
-                    } else {
+                    if !conn.pending.lock().await.accept(&request_id) {
                         tracing::debug!(
                             log_module = "Locus",
-                            "received broker acceptance for unknown request id: {}",
-                            request_id
+                            "received broker acceptance for untracked request id: {} (pipe: {})",
+                            request_id,
+                            pipe_name
                         );
                     }
                 } else {
@@ -408,15 +404,7 @@ mod windows_impl {
                 .filter(|value| !value.is_empty());
 
             if let Some(reply_to) = reply_to {
-                let tx = {
-                    let mut pending = conn.pending.lock().await;
-                    pending.remove(&reply_to)
-                };
-                conn.accepted.lock().await.remove(&reply_to);
-
-                if let Some(tx) = tx {
-                    let _ = tx.send(Ok(env));
-                } else {
+                if !conn.pending.lock().await.resolve(&reply_to, Ok(env)) {
                     eprintln!(
                         "[Locus] received response for unknown request id: {}",
                         reply_to
@@ -468,8 +456,7 @@ mod windows_impl {
             project_key,
             pipe_name: pipe_name.clone(),
             writer: Mutex::new(Some(writer)),
-            pending: Mutex::new(HashMap::new()),
-            accepted: Mutex::new(HashMap::new()),
+            pending: Mutex::new(PendingRequests::default()),
             reader_abort: Mutex::new(None),
         });
 
@@ -555,13 +542,7 @@ mod windows_impl {
         let (tx, mut response_rx) = oneshot::channel();
         {
             let mut pending = conn.pending.lock().await;
-            pending.insert(request_id.clone(), tx);
-        }
-        if let Some(acceptance_tx) = acceptance_tx {
-            conn.accepted
-                .lock()
-                .await
-                .insert(request_id.clone(), acceptance_tx);
+            pending.insert(request_id.clone(), tx, acceptance_tx);
         }
         let mut pending_guard = PendingRequestGuard::new(conn.clone(), request_id.clone());
         if trace_exit_play_mode {
@@ -597,7 +578,6 @@ mod windows_impl {
                 let mut pending = conn.pending.lock().await;
                 pending.remove(&request_id);
             }
-            conn.accepted.lock().await.remove(&request_id);
             pending_guard.disarm();
             remove_connection_if_same(&conn.pipe_name, &conn).await;
             close_connection(&conn, err.clone()).await;
@@ -651,8 +631,6 @@ mod windows_impl {
                     let err = "Unity response timed out".to_string();
                     let mut pending = conn.pending.lock().await;
                     pending.remove(&request_id);
-                    drop(pending);
-                    conn.accepted.lock().await.remove(&request_id);
                     pending_guard.disarm();
                     return Err(err);
                 }
@@ -730,7 +708,7 @@ mod windows_impl {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = conn.pending.lock().await;
-            pending.insert(request_id.clone(), tx);
+            pending.insert(request_id.clone(), tx, None);
         }
         let mut pending_guard = PendingRequestGuard::new(conn.clone(), request_id.clone());
 
@@ -915,6 +893,139 @@ mod windows_impl {
         }
 
         #[tokio::test]
+        async fn broker_acks_are_quiet_for_known_requests_and_diagnose_untracked_frames() {
+            use tracing::instrument::WithSubscriber;
+
+            #[derive(Clone, Default)]
+            struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+            impl std::io::Write for LogWriter {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let pipe_name = format!(r"\\.\pipe\locus_transport_acks_{}", uuid::Uuid::new_v4());
+                let mut server = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&pipe_name)
+                    .expect("create test pipe");
+                let client = ClientOptions::new()
+                    .open(&pipe_name)
+                    .expect("open test pipe");
+                server.connect().await.expect("accept test client");
+                let (reader, writer) = tokio::io::split(client);
+                let conn = Arc::new(UnityPipeConnection {
+                    project_key: pipe_name.clone(),
+                    pipe_name,
+                    writer: Mutex::new(Some(writer)),
+                    pending: Mutex::new(PendingRequests::default()),
+                    reader_abort: Mutex::new(None),
+                });
+
+                let mut responses = Vec::new();
+                for id in ["poll", "execute", "fast", "cancelled", "barrier"] {
+                    let (tx, rx) = oneshot::channel();
+                    let (acceptance, accepted) = oneshot::channel();
+                    let subscription = (id != "poll").then_some(acceptance);
+                    conn.pending
+                        .lock()
+                        .await
+                        .insert(id.to_string(), tx, subscription);
+                    responses.push((id, rx, accepted));
+                }
+                drop(PendingRequestGuard::new(
+                    conn.clone(),
+                    "cancelled".to_string(),
+                ));
+                // Waiting for the callback to close observes asynchronous guard
+                // cleanup without sleeps or assuming a particular task schedule.
+                let (_, cancelled, cancelled_acceptance) = responses.remove(3);
+                assert!(cancelled_acceptance.await.is_err());
+                assert!(cancelled.await.is_err());
+
+                let logs = LogWriter::default();
+                let capture = logs.clone();
+                let subscriber = tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_writer(move || capture.clone())
+                    .finish();
+                let reader_task =
+                    tokio::spawn(reader_loop(conn.clone(), reader).with_subscriber(subscriber));
+                *conn.reader_abort.lock().await = Some(reader_task.abort_handle());
+
+                let ack = |id: &str| {
+                    serde_json::json!({
+                        "type": BROKER_REQUEST_ACCEPTED_EVENT,
+                        "message": serde_json::json!({ "requestId": id }).to_string(),
+                    })
+                };
+                let response = |id: &str| {
+                    serde_json::json!({
+                        "reply_to": id, "type": "response", "ok": true, "message": id,
+                    })
+                };
+                let frames = [
+                    ack("poll"),
+                    ack("poll"),
+                    ack("execute"),
+                    ack("execute"),
+                    response("poll"),
+                    response("fast"),
+                    ack("fast"),
+                    ack("cancelled"),
+                    response("execute"),
+                    ack("execute"),
+                    ack("never-sent"),
+                    serde_json::json!({ "type": BROKER_REQUEST_ACCEPTED_EVENT, "message": "{}" }),
+                    response("barrier"),
+                ];
+                for frame in frames {
+                    let mut bytes = serde_json::to_vec(&frame).unwrap();
+                    bytes.push(b'\n');
+                    server.write_all(&bytes).await.expect("write broker frame");
+                }
+                server.flush().await.expect("flush broker frames");
+
+                for (id, rx, accepted) in responses {
+                    let response = rx.await.expect("response channel").expect("response");
+                    assert_eq!(response.message.as_deref(), Some(id));
+                    if id == "execute" {
+                        accepted.await.expect("subscribed ACK delivered");
+                    } else {
+                        assert!(accepted.await.is_err(), "no synthetic ACK for {id}");
+                    }
+                }
+                // The barrier response ensures all preceding ACKs were handled.
+                let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+                assert_eq!(
+                    output.matches("received broker acceptance").count(),
+                    1,
+                    "{output}"
+                );
+                assert!(
+                    output.contains("untracked request id: never-sent"),
+                    "{output}"
+                );
+                assert!(
+                    output.contains("malformed broker request acceptance"),
+                    "{output}"
+                );
+                close_connection(&conn, "test complete".to_string()).await;
+            })
+            .await
+            .expect("broker ACK test timed out");
+        }
+
+        #[tokio::test]
         async fn out_of_order_responses_are_dispatched_by_reply_to() {
             let unique = format!(
                 "{}_{}",
@@ -941,8 +1052,8 @@ mod windows_impl {
             let (second_tx, second_rx) = oneshot::channel();
             {
                 let mut pending = conn.pending.lock().await;
-                pending.insert("req-first".to_string(), first_tx);
-                pending.insert("req-second".to_string(), second_tx);
+                pending.insert("req-first".to_string(), first_tx, None);
+                pending.insert("req-second".to_string(), second_tx, None);
             }
 
             server
@@ -980,6 +1091,7 @@ mod windows_impl {
                 project_id: ProjectId::new("project-test").expect("project id"),
                 checkout_id: CheckoutId::new("checkout-test").expect("checkout id"),
                 workspace_generation: 7,
+                materialization_epoch: None,
                 service_instance_id: Some(
                     ServiceInstanceId::new("unity-test").expect("service instance id"),
                 ),

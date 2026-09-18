@@ -297,7 +297,11 @@ fn mcp_server_integration_target(
     let target = mcp_server::install::IntegrationTarget::new(
         runtime.checkout_id().as_str(),
         runtime.generation(),
-        settings.scoped_endpoint_url(runtime.checkout_id().as_str(), Some(runtime.generation())),
+        settings.scoped_endpoint_url_with_epoch(
+            runtime.checkout_id().as_str(),
+            Some(runtime.generation()),
+            runtime.materialization_epoch(),
+        ),
     );
     Ok((target, scope))
 }
