@@ -5,8 +5,13 @@ using System.Threading;
 using System.Threading.Tasks;
 using UnityEditorInternal;
 using UnityEngine;
+#if UNITY_2022_2_OR_NEWER
 using MemoryProfilerApi = Unity.Profiling.Memory.MemoryProfiler;
 using MemoryCaptureFlags = Unity.Profiling.Memory.CaptureFlags;
+#else
+using MemoryProfilerApi = UnityEngine.Profiling.Memory.Experimental.MemoryProfiler;
+using MemoryCaptureFlags = UnityEngine.Profiling.Memory.Experimental.CaptureFlags;
+#endif
 
 namespace Locus
 {

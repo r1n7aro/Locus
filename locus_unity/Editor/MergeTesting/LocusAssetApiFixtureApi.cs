@@ -4,6 +4,11 @@ using UnityEngine;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using Locus.AssetTesting;
+#if UNITY_2022_2_OR_NEWER
+using ManagedReferenceUtility = UnityEngine.Serialization.ManagedReferenceUtility;
+#else
+using ManagedReferenceUtility = UnityEditor.SerializationUtility;
+#endif
 
 namespace Locus
 {
@@ -28,7 +33,7 @@ namespace Locus
                 var node = new FixtureNode(); node.next = node;
                 asset.root = node; asset.alias = node; asset.reference = shared;
                 AssetDatabase.CreateAsset(asset, yaml);
-                UnityEngine.Serialization.ManagedReferenceUtility.SetManagedReferenceIdForObject(asset, node, 9007199254740993L);
+                ManagedReferenceUtility.SetManagedReferenceIdForObject(asset, node, 9007199254740993L);
                 EditorUtility.SetDirty(asset); AssetDatabase.SaveAssetIfDirty(asset);
                 if (!AssetDatabase.CopyAsset(yaml, live)) throw new Exception("Fixture copy failed");
                 string online=folder+"/YamlOnline-"+i+".asset";

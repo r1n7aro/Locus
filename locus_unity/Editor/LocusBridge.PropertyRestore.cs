@@ -2,6 +2,11 @@ using System;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEngine;
+#if UNITY_2022_2_OR_NEWER
+using ManagedReferenceUtility = UnityEngine.Serialization.ManagedReferenceUtility;
+#else
+using ManagedReferenceUtility = UnityEditor.SerializationUtility;
+#endif
 
 namespace Locus
 {
@@ -160,7 +165,7 @@ namespace Locus
                 if (type == null) throw new InvalidOperationException("Managed reference type no longer exists: " + node.managedType);
                 if (!references.TryGetValue(node.managedId, out value) || value.GetType() != type) {
                     value = CreateManagedReferenceInstance(type); references[node.managedId] = value;
-                    if (node.managedId >= 0) UnityEngine.Serialization.ManagedReferenceUtility.SetManagedReferenceIdForObject(prop.serializedObject.targetObject, value, node.managedId);
+                    if (node.managedId >= 0) ManagedReferenceUtility.SetManagedReferenceIdForObject(prop.serializedObject.targetObject, value, node.managedId);
                 }
                 prop.managedReferenceValue = value;
                 if (!restored.Add(node.managedId)) return;

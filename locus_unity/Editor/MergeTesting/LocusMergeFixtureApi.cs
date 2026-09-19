@@ -2,7 +2,11 @@ using System;
 using System.IO;
 using UnityEditor;
 using UnityEngine;
-using UnityEngine.Serialization;
+#if UNITY_2022_2_OR_NEWER
+using ManagedReferenceUtility = UnityEngine.Serialization.ManagedReferenceUtility;
+#else
+using ManagedReferenceUtility = UnityEditor.SerializationUtility;
+#endif
 
 namespace Locus.MergeTesting
 {
