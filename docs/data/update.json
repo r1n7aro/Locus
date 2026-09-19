@@ -49,6 +49,7 @@
         {
           "title": "v0.8.3（修复）",
           "items": [
+            "为内存快照和托管引用 API 补充版本条件编译，修复 Unity 2022.2 之前版本中的插件编译错误。",
             "加固 Codex 传输、思考内容回放与上下文压缩。受支持的 Astra 请求可在运行中接收追加输入，远程压缩使用更长的响应空闲超时。",
             "工作台分屏、预览、Git 操作、知识操作与 View 回调保持绑定原 checkout 及其运行代次。",
             "统一文档编辑会话，使 Markdown 控件、草稿和编辑器状态在不同工作台界面之间保持一致。",
@@ -525,6 +526,7 @@
         {
           "title": "v0.8.3 (Fixed)",
           "items": [
+            "Added version guards for memory snapshot and managed reference APIs to fix plugin compilation errors in Unity versions before 2022.2.",
             "Hardened Codex transport, reasoning replay, and compaction handling. Supported Astra requests can accept steering input during a run, and remote compaction has a longer response idle timeout.",
             "Kept Workbench panes, previews, Git actions, knowledge operations, and View callbacks bound to their originating checkout and runtime generation.",
             "Unified document editing sessions so Markdown controls, drafts, and editor state follow the document across Workbench surfaces.",
