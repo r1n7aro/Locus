@@ -5,6 +5,18 @@ use tokio::sync::Mutex;
 
 use super::{strip_extended_path_prefix, unix_now_ms};
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "process_macos.rs"]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{
+    close_current_project_unity_processes_sync, editor_resources, explicit_editor_log_path,
+    main_editor_process_count, normalize_project_identity,
+    process_created_at_unix_ms, query_current_project_editor_process_uncached,
+    query_process_identity_liveness, query_unity_editor_launch_mode,
+};
+
 const UNITY_RUNNING_PROCESS_PROBE_CACHE_TTL_MS: u64 = 15_000;
 const UNITY_NON_RUNNING_PROCESS_PROBE_CACHE_TTL_MS: u64 = 250;
 const UNITY_PROCESS_PROBE_TIMEOUT_SECS: u64 = 5;
@@ -191,7 +203,7 @@ fn main_editor_process_count() -> Result<usize, String> {
     }).count())
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn main_editor_process_count() -> Result<usize, String> {
     // Windows is the supported launch-budget provider for this release.
     Ok(0)
@@ -230,6 +242,7 @@ async fn close_current_project_unity_processes_inner(
     Ok(result)
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(super) async fn refresh_known_project_editor_process_liveness(
     project_path: &str,
     known_process: Option<UnityEditorProcessInfo>,
@@ -277,12 +290,49 @@ pub(super) async fn refresh_known_project_editor_process_liveness(
     })
 }
 
+#[cfg(target_os = "macos")]
+pub(super) async fn refresh_known_project_editor_process_liveness(
+    project_path: &str,
+    known_process: Option<UnityEditorProcessInfo>,
+) -> Option<UnityProcessLivenessRefresh> {
+    let key = process_cache_key(project_path);
+    let cached = unity_process_probe_cache().lock().await.get(&key).cloned();
+    let previous = known_process.filter(|info| info.process_id.is_some())
+        .or_else(|| cached.filter(|info| info.process_id.is_some()))?;
+    let process_id = previous.process_id?;
+    let checked_at_ms = unix_now_ms();
+    let refreshed = match macos::known_process_is_alive(project_path, &previous, checked_at_ms) {
+        Ok(true) => UnityEditorProcessInfo {
+            state: UnityEditorProcessState::Running,
+            process_id: previous.process_id,
+            executable_path: previous.executable_path.clone(),
+            project_path: previous.project_path.clone(),
+            checked_at_ms,
+            last_error: None,
+        },
+        Ok(false) => UnityEditorProcessInfo::not_running(checked_at_ms),
+        Err(error) => UnityEditorProcessInfo::unknown(checked_at_ms, error),
+    };
+    let mut cache = unity_process_probe_cache().lock().await;
+    let effective = match cache.get(&key) {
+        // A newer observation must not be overwritten by a refresh of an old
+        // same-PID generation (including a restart of this same project).
+        Some(current) if cached_process_is_different_generation(current, process_id)
+            || current.checked_at_ms > previous.checked_at_ms => current.clone(),
+        _ => {
+            cache.insert(key, refreshed.clone());
+            refreshed.clone()
+        },
+    };
+    Some(UnityProcessLivenessRefresh { observed: refreshed, effective })
+}
+
 #[cfg(windows)]
 fn is_process_alive(process_id: u32) -> Result<bool, String> {
     Ok(probe_native::query_process_facts(process_id)?.alive)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn is_process_alive(_process_id: u32) -> Result<bool, String> {
     Err("Unity process liveness detection is only supported on Windows".to_string())
 }
@@ -317,7 +367,7 @@ pub(crate) fn query_process_identity_liveness(
     ))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn query_process_identity_liveness(
     _process_id: u32,
     _expected_created_at_ms: Option<u64>,
@@ -325,6 +375,7 @@ pub(crate) fn query_process_identity_liveness(
     Err("Unity process identity detection is only supported on Windows".to_string())
 }
 
+#[cfg(not(target_os = "macos"))]
 pub(super) fn normalize_project_identity(path: &str) -> Option<String> {
     let trimmed = strip_extended_path_prefix(path)
         .trim()
@@ -411,7 +462,7 @@ pub(crate) fn process_created_at_unix_ms(process_id: u32) -> Option<u64> {
         .and_then(|facts| facts.created_at_unix_ms)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn process_created_at_unix_ms(_process_id: u32) -> Option<u64> {
     None
 }
@@ -465,12 +516,12 @@ pub(crate) fn explicit_editor_log_path(process_id: u32) -> Option<std::path::Pat
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn explicit_editor_log_path(_process_id: u32) -> Option<std::path::PathBuf> {
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) async fn query_unity_editor_launch_mode(
     _process_id: Option<u32>,
 ) -> Option<super::UnityLaunchMode> {
@@ -489,6 +540,10 @@ pub(super) async fn cache_project_editor_process(
     project_path: &str,
     process_info: UnityEditorProcessInfo,
 ) {
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = process_info.process_id {
+        macos::remember_process_generation(pid, project_path, process_info.checked_at_ms);
+    }
     let key = process_cache_key(project_path);
     let mut cache = unity_process_probe_cache().lock().await;
     write_process_cache_if_fresh(&mut cache, key, process_info);
@@ -643,7 +698,7 @@ fn close_current_project_unity_processes_sync(
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn close_current_project_unity_processes_sync(
     _project_path: &str,
     _timeout: Duration,
@@ -655,7 +710,7 @@ fn close_current_project_unity_processes_sync(
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(crate) fn query_current_project_editor_process_uncached(_project_path: String) -> UnityEditorProcessInfo {
     UnityEditorProcessInfo::unknown(
         unix_now_ms(),
@@ -809,7 +864,7 @@ pub(super) fn editor_resources() -> Result<Vec<super::managed_editor::EditorReso
     Ok(result)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn editor_resources() -> Result<Vec<super::managed_editor::EditorResource>, String> {
     Err("Unity Editor process memory is currently available on Windows".into())
 }
@@ -1577,13 +1632,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn normalizes_extended_path_prefixes() {
         let normalized = normalize_project_identity(r#"\\?\D:\Projects\Game\"#).unwrap();
 
         #[cfg(windows)]
         assert_eq!(normalized, r#"d:\projects\game"#);
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         assert_eq!(normalized, r#"D:\Projects\Game"#);
     }
 

@@ -592,6 +592,9 @@ namespace Locus
 
         private static bool NativeBackgroundHookEnabled()
         {
+#if UNITY_EDITOR_OSX
+            return false;
+#else
             try
             {
                 string marker = NativeBackgroundHookMarkerPath();
@@ -601,6 +604,7 @@ namespace Locus
             {
                 return false;
             }
+#endif
         }
 
         private static string NativeBackgroundHookMarkerPath()
@@ -672,6 +676,24 @@ namespace Locus
         /// </summary>
         private static string ResolveNativePipeName()
         {
+#if UNITY_EDITOR_OSX
+            // The desktop writes the canonical, current-user Unix endpoint.
+            // Never fall back to a Windows path hash on a Mac.
+            try
+            {
+                string marker = NativeMarkerPath();
+                if (File.Exists(marker))
+                    foreach (string raw in File.ReadAllLines(marker))
+                    {
+                        string endpoint = raw == null ? "" : raw.Trim();
+                        if (!string.IsNullOrEmpty(endpoint))
+                            return endpoint.StartsWith("/tmp/locus-", StringComparison.Ordinal)
+                                && endpoint.EndsWith(".sock", StringComparison.Ordinal) ? endpoint : "";
+                    }
+            }
+            catch { }
+            return "";
+#else
             try
             {
                 string marker = NativeMarkerPath();
@@ -689,6 +711,7 @@ namespace Locus
             {
             }
             return NormalizeNativePipeName(GenerateNativePipeName());
+#endif
         }
 
         private static string GenerateNativePipeName()

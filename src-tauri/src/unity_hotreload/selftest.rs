@@ -7302,6 +7302,17 @@ fn extract_int(output: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
+#[cfg(target_os = "macos")]
+async fn run_owned(
+    _app: tauri::AppHandle,
+    _project_path: String,
+    _ownership_key: String,
+    _event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+) -> Result<(), String> {
+    Err("Unity hot reload is not supported on macOS. Use unity_recompile.".into())
+}
+
+#[cfg(not(target_os = "macos"))]
 async fn run_owned(
     app: tauri::AppHandle,
     project_path: String,

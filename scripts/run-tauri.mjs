@@ -11,6 +11,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveMacosTarget } from "./macos-build-target.mjs";
 
 const WEBVIEW2_ARGS_KEY = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 const REMOTE_DEBUG_FLAG = "--remote-debugging-port=";
@@ -88,6 +89,13 @@ let tauriArgs = isCustomDevCommand
   ? ["dev", ...isolatedRuntime.remainingArgs]
   : args;
 const env = { ...process.env };
+const macosTarget = resolveMacosTarget(tauriArgs);
+if (macosTarget) {
+  env.VITE_LOCUS_TARGET_OS = "macos";
+  env.VITE_LOCUS_TARGET_ARCH = macosTarget.arch;
+  env.LOCUS_MACOS_TARGET = macosTarget.triple;
+  env.MACOSX_DEPLOYMENT_TARGET ??= "14.0";
+}
 const reuseDevServer = process.env[REUSE_DEV_SERVER_ENV_KEY]?.trim() === "1";
 
 const isHelpOrVersionCommand =
@@ -297,7 +305,7 @@ function shouldInjectDefaultReleaseFlavor(currentArgs) {
   return command === "build" || command === "bundle";
 }
 
-if (shouldInjectDefaultReleaseFlavor(tauriArgs)) {
+if (!macosTarget && shouldInjectDefaultReleaseFlavor(tauriArgs)) {
   tauriArgs = [...tauriArgs, "--config", DEFAULT_RELEASE_FLAVOR_CONFIG];
 }
 
@@ -548,7 +556,7 @@ function formatChildFailure(label, result) {
 }
 
 async function runDevPrerequisites() {
-  for (const scriptName of DEV_PREREQUISITE_SCRIPTS) {
+  for (const scriptName of macosTarget ? ["macos:prepare"] : DEV_PREREQUISITE_SCRIPTS) {
     const managed = spawnManagedChild(process.execPath, ["run", scriptName], {
       cwd: repoRoot,
       stdio: "inherit",

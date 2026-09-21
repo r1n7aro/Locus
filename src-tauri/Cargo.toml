@@ -127,5 +127,8 @@ windows-core = "0.61.2"
 webview2-com = "0.38.2"
 winreg = "0.56.0"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+tar = "0.4"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

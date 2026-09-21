@@ -131,12 +131,18 @@ fn project_key(project_path: &str) -> String {
         .to_ascii_lowercase()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn base_status(enabled: bool) -> UnityBackgroundHookStatus {
     if enabled {
         UnityBackgroundHookStatus::inactive(true)
     } else {
         UnityBackgroundHookStatus::disabled()
     }
+}
+
+#[cfg(target_os = "macos")]
+fn base_status(_enabled: bool) -> UnityBackgroundHookStatus {
+    UnityBackgroundHookStatus::inactive(false)
 }
 
 pub fn bind_workspace_scope(
@@ -237,10 +243,17 @@ pub fn initialize(enabled: bool) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn enabled() -> bool {
     runtime().lock().map(|rt| rt.enabled).unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
+pub fn enabled() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn set_enabled(value: bool) -> Result<UnityBackgroundHookStatus, String> {
     let mut rt = runtime()
         .lock()
@@ -260,6 +273,14 @@ pub fn set_enabled(value: bool) -> Result<UnityBackgroundHookStatus, String> {
     Ok(UnityBackgroundHookStatus::inactive(true))
 }
 
+#[cfg(target_os = "macos")]
+pub fn set_enabled(value: bool) -> Result<UnityBackgroundHookStatus, String> {
+    if value {
+        return Err("Unity background hook is not supported on macOS".into());
+    }
+    Ok(base_status(false))
+}
+
 pub fn restore_runtime_patches() -> Result<(), String> {
     let mut rt = runtime()
         .lock()
@@ -272,6 +293,18 @@ pub fn restore_runtime_patches() -> Result<(), String> {
     restore_result
 }
 
+#[cfg(target_os = "macos")]
+pub fn sync_for_project(
+    project_path: &str,
+    _process_id: u32,
+    _editor_process_path: &str,
+) -> Result<UnityBackgroundHookStatus, String> {
+    let status = base_status(false);
+    record_status_for_project(project_path, status.clone());
+    Ok(status)
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn sync_for_project(
     project_path: &str,
     process_id: u32,

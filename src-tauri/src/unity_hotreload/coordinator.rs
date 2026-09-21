@@ -2692,6 +2692,15 @@ pub(crate) async fn access_probe_run_with_mode(
 
 /// Outcome text for the `unity_hot_reload` tool. `Err` carries agent-facing
 /// errors (compile diagnostics, gating guidance).
+#[cfg(target_os = "macos")]
+pub async fn hot_reload(
+    _project_path: &str,
+    _path_filter: Option<Vec<String>>,
+) -> Result<String, String> {
+    Err("Unity hot reload is not supported on macOS. Use unity_recompile.".into())
+}
+
+#[cfg(not(target_os = "macos"))]
 pub async fn hot_reload(
     project_path: &str,
     path_filter: Option<Vec<String>>,

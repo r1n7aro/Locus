@@ -175,6 +175,7 @@ export interface CsharpCompileStatus {
   fallbacks: number;
   /** Hot reload: feature flag and session counters. */
   hotReloadEnabled: boolean;
+  hotReloadSupported?: boolean;
   hotPatchesApplied: number;
   hotPatchFailures: number;
   hotActivePatches: number;

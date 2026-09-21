@@ -860,6 +860,10 @@ fn managed_python_pip_zipapp_path(app_handle: Option<&AppHandle>) -> Option<Path
 
 fn locus_python_sdk_roots(app_handle: Option<&AppHandle>) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Some(root) = crate::macos_resources::resource_root() {
+        candidates.push(root.join(LOCUS_SDK_RESOURCE_DIR));
+    }
     if let Some(app) = app_handle {
         if let Ok(resource_dir) = app.path().resource_dir() {
             candidates.push(resource_dir.join(LOCUS_SDK_RESOURCE_DIR));
@@ -998,6 +1002,18 @@ fn system_python_candidates() -> Vec<PathBuf> {
     let names: &[&str] = &["python3", "python"];
 
     candidates.extend(find_programs_in_path(names));
+    // Finder-launched apps do not inherit the user's shell PATH.
+    #[cfg(target_os = "macos")]
+    for path in [
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+        "/usr/bin/python3",
+    ] {
+        if Path::new(path).is_file() {
+            candidates.push(PathBuf::from(path));
+        }
+    }
     candidates
 }
 

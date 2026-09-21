@@ -24,6 +24,28 @@ type ParsedVersion = {
   prerelease: string[];
 };
 
+export type AppUpdateTarget = { platform: "macos" | "windows"; arch: "arm64" | "x64" | "unknown" };
+
+export function currentAppUpdateTarget(): AppUpdateTarget {
+  const platform = import.meta.env.VITE_LOCUS_TARGET_OS;
+  const arch = import.meta.env.VITE_LOCUS_TARGET_ARCH;
+  if (platform === "macos" || (!platform && typeof navigator !== "undefined" && /Mac/.test(navigator.platform))) {
+    return { platform: "macos", arch: arch === "arm64" || arch === "x64" ? arch : "unknown" };
+  }
+  return { platform: "windows", arch: "unknown" };
+}
+
+function selectMacosInstaller(installers: AppUpdateInstallerDownload[], target: AppUpdateTarget): AppUpdateInstallerDownload | null {
+  const candidates = installers.filter((installer) =>
+    (installer.platform === "macos" || installer.platform === "darwin")
+    && !/\.(exe|msi)(?:[?#]|$)/i.test(installer.url),
+  );
+  const architecture = (arch: string) => arch === "aarch64" ? "arm64" : arch === "x86_64" ? "x64" : arch;
+  return candidates.find((installer) => target.arch !== "unknown" && architecture(installer.arch) === target.arch)
+    ?? candidates.find((installer) => installer.arch === "universal" || installer.arch === "universal2")
+    ?? null;
+}
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -346,6 +368,7 @@ export function resolveAppUpdateInfo(
   sourceBaseUrl = DOCS_BASE_URL,
   sourceKind: AppUpdateSourceKind = "remote",
   currentReleaseChannel: AppUpdateChannel = STABLE_UPDATE_CHANNEL,
+  target: AppUpdateTarget = currentAppUpdateTarget(),
 ): AppUpdateInfo | null {
   if (compareReleaseVersions(currentVersion, manifest.version) >= 0) {
     return null;
@@ -357,7 +380,9 @@ export function resolveAppUpdateInfo(
   }
 
   const installers = sanitizeInstallers(manifest.installers, sourceBaseUrl);
-  const installer = selectInstaller(installers);
+  const installer = target.platform === "macos"
+    ? selectMacosInstaller(installers, target)
+    : selectInstaller(installers);
   const changelogUrl = resolveUpdateUrl(localeEntry.changelogUrl, sourceBaseUrl);
   const releaseUrl = resolveGitHubReleaseUrl(localeEntry, installers, sourceBaseUrl);
   const currentChannel = normalizeAppUpdateChannel(currentReleaseChannel);

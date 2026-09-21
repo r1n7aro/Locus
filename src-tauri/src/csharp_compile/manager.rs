@@ -66,6 +66,10 @@ fn clear_start_error() {
 /// resource directory next to the executable.
 pub fn find_server_dll() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Some(root) = crate::macos_resources::resource_root() {
+        candidates.push(root.join("compile-server"));
+    }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {

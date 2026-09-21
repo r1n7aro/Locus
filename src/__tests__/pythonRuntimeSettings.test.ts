@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { resolveMacosTarget } from "../../scripts/macos-build-target.mjs";
 
 const cwd = process.cwd();
 
@@ -182,7 +183,10 @@ describe("Python runtime settings", () => {
     expect(pkg).toContain(
       '"release:installers": "bun run scripts/build-release-installers.mjs --mode=release"',
     );
-    expect(pkg).toContain('"build:tauri": "bun run build:tauri:with_embed_python_git"');
+    expect(JSON.parse(pkg).scripts["build:tauri"]).toBe("bun run scripts/build-tauri-platform.mjs");
+    const buildDispatcher = read("scripts/build-tauri-platform.mjs");
+    expect(buildDispatcher).toContain('resolveMacosTarget() ? "build:tauri:macos" : "build:tauri:with_embed_python_git"');
+    expect(resolveMacosTarget([], {}, "win32", "x64")).toBeNull();
     expect(pkg).toContain('"build:tauri:without_embed_python_git"');
     expect(tauriConfig).not.toContain("managed-python");
     expect(tauriConfig).not.toContain("managed-git");

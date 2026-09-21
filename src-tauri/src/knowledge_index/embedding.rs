@@ -495,7 +495,18 @@ fn ensure_ort_runtime_loaded() -> Result<(), String> {
         .clone()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const MACOS_LOCAL_EMBEDDING_UNSUPPORTED: &str =
+    "Local embedding is not supported on macOS yet. Use a remote embedding service.";
+
+#[cfg(target_os = "macos")]
+fn ensure_ort_runtime_loaded() -> Result<(), String> {
+    // This build does not ship an ONNX Runtime dylib. Calling ort's lazy
+    // initializer without one panics before its Result API can report failure.
+    Err(MACOS_LOCAL_EMBEDDING_UNSUPPORTED.to_string())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn ensure_ort_runtime_loaded() -> Result<(), String> {
     Ok(())
 }
@@ -1402,6 +1413,8 @@ impl LocalEmbeddingRuntime {
         config: &EmbeddingConfig,
         model_dir: &Path,
     ) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        ensure_ort_runtime_loaded()?;
         let selection = select_local_model_source(config, model_dir)?;
         match selection.route {
             LocalModelRoute::Preset => {
@@ -1438,6 +1451,8 @@ impl LocalEmbeddingRuntime {
     where
         F: FnMut(EmbeddingActivationProgress),
     {
+        #[cfg(target_os = "macos")]
+        ensure_ort_runtime_loaded()?;
         let runtime_name = config.local_runtime.trim();
         if !runtime_name.is_empty() && !runtime_name.eq_ignore_ascii_case(LOCAL_RUNTIME_FASTEMBED) {
             return Err(format!(
@@ -1899,6 +1914,8 @@ pub fn run_embedding_runtime_self_test(
         });
     }
 
+    #[cfg(target_os = "macos")]
+    ensure_ort_runtime_loaded()?;
     let model_root = managed_model_root(model_storage_dir);
     let current_selection = select_local_model_source(&config, &model_root)?;
     let current_case = run_current_local_embedding_runtime_self_test_case(
@@ -4888,6 +4905,8 @@ pub fn download_local_model_with_progress<F>(
 where
     F: FnMut(EmbeddingActivationProgress),
 {
+    #[cfg(target_os = "macos")]
+    ensure_ort_runtime_loaded().map_err(EmbeddingDownloadError::failed)?;
     let trimmed_model_id = model_id.trim();
     if trimmed_model_id.is_empty() {
         return Err(EmbeddingDownloadError::failed("Local model id is required"));
@@ -5730,6 +5749,36 @@ mod tests {
         LOCAL_MODEL_DOWNLOAD_SOURCE_HF_MIRROR, LOCAL_MODEL_DOWNLOAD_SOURCE_OFFICIAL,
     };
     use tempfile::tempdir;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_local_activation_reports_unsupported_without_model_or_ort_access() {
+        let directory = tempdir().unwrap();
+        let config = EmbeddingConfig { enabled: true, ..EmbeddingConfig::default() };
+        let mut manager = EmbeddingManager::new(config.clone(), directory.path());
+        let error = manager.activate_with_progress(&mut |_| {}).unwrap_err();
+        assert_eq!(error, super::MACOS_LOCAL_EMBEDDING_UNSUPPORTED);
+        assert_eq!(manager.status().error.as_deref(), Some(error.as_str()));
+        assert!(!manager.is_ready());
+        assert_eq!(super::run_embedding_runtime_self_test(&config, directory.path()).unwrap_err(), error);
+        assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_local_download_is_rejected_before_any_network_or_file_work() {
+        let directory = tempdir().unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let mut progress_called = false;
+        let error = super::download_local_model_with_progress(
+            directory.path(), "BAAI/bge-small-en-v1.5", "official", &cancelled,
+            &mut |_| progress_called = true,
+        ).unwrap_err();
+        assert!(matches!(error, super::EmbeddingDownloadError::Failed(ref message)
+            if message == super::MACOS_LOCAL_EMBEDDING_UNSUPPORTED));
+        assert!(!progress_called);
+        assert!(std::fs::read_dir(directory.path()).unwrap().next().is_none());
+    }
 
     struct TempEnvGuard {
         _lock_guard: std::sync::MutexGuard<'static, ()>,

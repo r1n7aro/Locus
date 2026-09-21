@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AppUpdateManifest } from "../types";
 
 vi.mock("../services/ipc", () => ({
@@ -7,6 +7,7 @@ vi.mock("../services/ipc", () => ({
 
 import {
   compareReleaseVersions,
+  currentAppUpdateTarget,
   resolveAppUpdateInfo,
   resolveUpdateUrl,
 } from "../services/appUpdate";
@@ -184,5 +185,65 @@ describe("resolveUpdateUrl", () => {
     expect(resolveUpdateUrl("/overview/latest-version", "http://localhost:3002")).toBe(
       "http://localhost:3002/overview/latest-version",
     );
+  });
+});
+
+describe("macOS installer selection", () => {
+  const macInstaller = (arch: string) => ({
+    ...manifest.installers![0]!,
+    id: `macos-${arch}`, label: `macOS ${arch}`, platform: "macos", arch,
+    url: `https://example.com/locus-${arch}.dmg`,
+    includesManagedPython: false, includesManagedGit: false,
+    requiresSystemPython: true, requiresSystemGit: true,
+  });
+
+  it.each(["arm64", "x64"] as const)("selects %s without downloading the other architecture", (arch) => {
+    const mixed = { ...manifest, installers: [...manifest.installers!, macInstaller("arm64"), macInstaller("x64")] };
+    expect(resolveAppUpdateInfo(mixed, "0.1.0", "zh", undefined, "remote", "stable", { platform: "macos", arch })?.installer?.id)
+      .toBe(`macos-${arch}`);
+  });
+
+  it("falls back only to a universal Mac package", () => {
+    const mixed = { ...manifest, installers: [...manifest.installers!, macInstaller("universal")] };
+    expect(resolveAppUpdateInfo(mixed, "0.1.0", "zh", undefined, "remote", "stable", { platform: "macos", arch: "unknown" })?.installer?.id)
+      .toBe("macos-universal");
+  });
+
+  it("does not offer Windows packages or guess an unknown Mac architecture", () => {
+    for (const installers of [manifest.installers!, [macInstaller("x64")], [{ ...macInstaller("arm64"), url: "https://example.com/windows.exe" }]]) {
+      const info = resolveAppUpdateInfo({ ...manifest, installers }, "0.1.0", "zh", undefined, "remote", "stable", { platform: "macos", arch: "arm64" });
+      expect(info?.installer).toBeNull();
+      expect(info?.downloadUrl).toBe(info?.changelogUrl);
+    }
+    expect(resolveAppUpdateInfo({ ...manifest, installers: [macInstaller("arm64")] }, "0.1.0", "zh", undefined, "remote", "stable", { platform: "macos", arch: "unknown" })?.installer).toBeNull();
+  });
+
+  it("preserves Windows selection when Mac installers are added", () => {
+    const info = resolveAppUpdateInfo({ ...manifest, installers: [macInstaller("arm64"), ...manifest.installers!] }, "0.1.0", "zh", undefined, "remote", "stable", { platform: "windows", arch: "unknown" });
+    expect(info?.installer?.id).toBe("windows-x64");
+  });
+});
+
+describe("update build target", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+
+  it("uses the build target independently of the browser host", () => {
+    vi.stubGlobal("navigator", { platform: "Win32" });
+    vi.stubEnv("VITE_LOCUS_TARGET_OS", "macos");
+    vi.stubEnv("VITE_LOCUS_TARGET_ARCH", "arm64");
+    expect(currentAppUpdateTarget()).toEqual({ platform: "macos", arch: "arm64" });
+  });
+
+  it("does not infer CPU architecture from MacIntel browser identification", () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    vi.stubEnv("VITE_LOCUS_TARGET_OS", "");
+    vi.stubEnv("VITE_LOCUS_TARGET_ARCH", "");
+    expect(currentAppUpdateTarget()).toEqual({ platform: "macos", arch: "unknown" });
+  });
+
+  it("keeps an explicit Windows target on a Mac browser host", () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    vi.stubEnv("VITE_LOCUS_TARGET_OS", "windows");
+    expect(currentAppUpdateTarget().platform).toBe("windows");
   });
 });

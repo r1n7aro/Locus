@@ -424,6 +424,9 @@ pub fn set_unity_multi_agent_editor_enabled(
 pub fn get_unity_background_hook_enabled(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<bool, crate::error::AppError> {
+    #[cfg(target_os = "macos")]
+    return Ok(false);
+
     Ok(config.unity_background_hook_enabled())
 }
 
@@ -438,6 +441,10 @@ pub async fn set_unity_background_hook_enabled(
     crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityBackgroundHookStatus>,
     crate::error::AppError,
 > {
+    #[cfg(target_os = "macos")]
+    if value {
+        return Err(crate::error::AppError::new("unity.background_hook.unsupported", "Unity background hook is not supported on macOS"));
+    }
     let scope = resolve_workspace_scope(
         workspace_registry.inner(),
         &workspace_ref,
@@ -693,6 +700,9 @@ pub fn take_external_script_open_request(
 pub fn get_unity_state_probe_enabled(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<bool, crate::error::AppError> {
+    #[cfg(target_os = "macos")]
+    return Ok(false);
+
     Ok(config.unity_state_probe_enabled())
 }
 
@@ -707,6 +717,10 @@ pub async fn set_unity_state_probe_enabled(
     crate::unity_bridge::UnityWorkspaceStatus<crate::unity_bridge::UnityStateProbeStatus>,
     crate::error::AppError,
 > {
+    #[cfg(target_os = "macos")]
+    if value {
+        return Err(crate::error::AppError::new("unity.state_probe.unsupported", "Unity native state probe is not supported on macOS"));
+    }
     let scope = resolve_workspace_scope(
         workspace_registry.inner(),
         &workspace_ref,

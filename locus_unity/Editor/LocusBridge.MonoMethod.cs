@@ -1,3 +1,4 @@
+#if !UNITY_EDITOR_OSX
 using System;
 using System.Collections.Generic;
 using System.Reflection;
@@ -321,3 +322,5 @@ namespace Locus
         }
     }
 }
+
+#endif

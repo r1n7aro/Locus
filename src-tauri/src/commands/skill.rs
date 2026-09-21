@@ -1092,6 +1092,10 @@ pub(crate) fn app_skill_package_dirs() -> Vec<PathBuf> {
     #[cfg(not(test))]
     let candidates: Vec<PathBuf> = {
         let mut candidates = Vec::new();
+        #[cfg(target_os = "macos")]
+        if let Some(root) = crate::macos_resources::resource_root() {
+            candidates.push(root.join("skills"));
+        }
         if let Ok(config_dir) = super::persistent_config_dir() {
             candidates.push(config_dir.join("skills"));
         }

@@ -160,6 +160,10 @@ pub async fn unity_hot_reload_set_enabled(
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    #[cfg(target_os = "macos")]
+    if value {
+        return Err(AppError::new("unity_hotreload.unsupported", "Unity hot reload is not supported on macOS. Use unity_recompile."));
+    }
     let scope = resolve_scope(
         workspace_registry.inner(),
         &workspace_ref,
@@ -183,6 +187,10 @@ pub async fn unity_inline_force_evaluate_set_enabled(
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
+    #[cfg(target_os = "macos")]
+    if value {
+        return Err(AppError::new("unity_hotreload.unsupported", "Unity hot reload runtime probes are not supported on macOS."));
+    }
     let scope = resolve_scope(
         workspace_registry.inner(),
         &workspace_ref,

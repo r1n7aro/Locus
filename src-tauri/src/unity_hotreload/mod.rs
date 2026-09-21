@@ -45,8 +45,16 @@ pub fn initialize(enabled: bool, inline_force_evaluate: bool) {
     INLINE_FORCE_EVALUATE.store(inline_force_evaluate, Ordering::Relaxed);
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+/// The macOS bridge ships no detour backend. Persisted Windows preferences
+/// must never activate it when the same profile is opened on macOS.
+#[cfg(target_os = "macos")]
+pub fn is_enabled() -> bool {
+    false
 }
 
 pub fn set_enabled(value: bool) {
@@ -56,8 +64,14 @@ pub fn set_enabled(value: bool) {
 
 /// Whether the desktop should ask the plugin to force-evaluate inline risk
 /// (Phase B). Shipped to Unity in each hot_patch_loaded payload.
+#[cfg(not(target_os = "macos"))]
 pub fn inline_force_evaluate_enabled() -> bool {
     INLINE_FORCE_EVALUATE.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "macos")]
+pub fn inline_force_evaluate_enabled() -> bool {
+    false
 }
 
 pub fn set_inline_force_evaluate_enabled(value: bool) {

@@ -88,6 +88,7 @@ src-tauri/gen/gh-runtime/*/
 src-tauri/gen/gh-runtime/.extract/
 src-tauri/gen/gh-runtime/manifest.json
 src-tauri/gen/ort-runtime/windows-*/
+src-tauri/gen/macos/
 src-tauri/gen/compile-server/
 skills/graphics-debugger/runtime/
 

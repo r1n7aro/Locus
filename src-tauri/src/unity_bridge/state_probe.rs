@@ -531,12 +531,18 @@ fn runtime() -> &'static Mutex<ProbeRuntime> {
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn base_status(enabled: bool) -> UnityStateProbeStatus {
     if enabled {
         UnityStateProbeStatus::base(true, UnityStateProbeTier::Inactive)
     } else {
         UnityStateProbeStatus::base(false, UnityStateProbeTier::Disabled)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn base_status(_enabled: bool) -> UnityStateProbeStatus {
+    UnityStateProbeStatus::base(false, UnityStateProbeTier::Unsupported)
 }
 
 pub fn bind_workspace_scope(
@@ -632,10 +638,17 @@ pub fn initialize(enabled: bool) {
     reset_observer_runtime();
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn enabled() -> bool {
     runtime().lock().map(|rt| rt.enabled).unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
+pub fn enabled() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn set_enabled(value: bool) -> UnityStateProbeStatus {
     let mut rt = runtime().lock().expect("state probe runtime poisoned");
     rt.enabled = value;
@@ -654,6 +667,11 @@ pub fn set_enabled(value: bool) -> UnityStateProbeStatus {
     }
     reset_observer_runtime();
     status
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_enabled(_value: bool) -> UnityStateProbeStatus {
+    base_status(false)
 }
 
 #[derive(Default)]
@@ -718,7 +736,14 @@ pub fn stop_observer(project_path: &str) {
 }
 
 fn ensure_observer(project_path: &str) {
+    #[cfg(not(target_os = "macos"))]
     if project_path.trim().is_empty() || !enabled() {
+        return;
+    }
+    // The macOS broker still needs lifecycle observation without a native
+    // memory/stack probe. Its actor is retired by the existing scope cleanup.
+    #[cfg(target_os = "macos")]
+    if project_path.trim().is_empty() {
         return;
     }
 
@@ -836,6 +861,7 @@ fn observer_interval_ms(state: &SemanticState) -> u64 {
 
 async fn observer_loop(project_path: String) {
     loop {
+        #[cfg(not(target_os = "macos"))]
         if !enabled() {
             break;
         }
@@ -2047,6 +2073,7 @@ async fn observe_project_once_with_native_broker_status(
 /// Public state read for commands, UI, and self-test. The observation actor is
 /// the primary plane; this call falls back to one immediate sample only when
 /// the cache is cold.
+#[cfg(not(target_os = "macos"))]
 pub async fn semantic_state_for_project(project_path: &str) -> SemanticState {
     if project_path.trim().is_empty() {
         return observe_project_once(project_path, None).await;
@@ -2079,6 +2106,30 @@ pub async fn semantic_state_for_project(project_path: &str) -> SemanticState {
     } else {
         state
     }
+}
+
+#[cfg(target_os = "macos")]
+pub async fn semantic_state_for_project(project_path: &str) -> SemanticState {
+    if project_path.trim().is_empty() {
+        return observe_project_once(project_path, None).await;
+    }
+    ensure_observer(project_path);
+    if let Some(state) = cached_observer_state(project_path, unix_now_ms()) {
+        match cached_native_broker_decision(project_path, &state).await {
+            CachedNativeBrokerDecision::UseCached => return state,
+            CachedNativeBrokerDecision::Refresh(status) => {
+                let state = observe_project_once_with_native_broker_status(
+                    project_path,
+                    observer_observation(project_path),
+                    status,
+                )
+                .await;
+                return store_observer_state(project_path, state);
+            }
+        }
+    }
+    let state = observe_project_once(project_path, observer_observation(project_path)).await;
+    store_observer_state(project_path, state)
 }
 
 enum CachedNativeBrokerDecision {

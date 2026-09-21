@@ -294,6 +294,7 @@ pub struct CsharpCompileStatusPayload {
     pub fallbacks: u64,
     /// Hot reload (`unity_hotreload`): feature flag and session counters.
     pub hot_reload_enabled: bool,
+    pub hot_reload_supported: bool,
     pub hot_patches_applied: u64,
     pub hot_patch_failures: u64,
     pub hot_active_patches: u64,
@@ -329,6 +330,7 @@ async fn status_with_project(project_path: Option<&str>) -> CsharpCompileStatusP
         compile_errors: SIDECAR_COMPILE_ERRORS.load(Ordering::Relaxed),
         fallbacks: SIDECAR_FALLBACKS.load(Ordering::Relaxed),
         hot_reload_enabled: crate::unity_hotreload::is_enabled(),
+        hot_reload_supported: !cfg!(target_os = "macos"),
         hot_patches_applied: hot_reload.patches_applied,
         hot_patch_failures: hot_reload.patch_failures,
         hot_active_patches: hot_reload.active_patches,

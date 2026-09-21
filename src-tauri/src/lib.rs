@@ -34,7 +34,10 @@ pub mod csharp_compile;
 pub mod csharp_lsp;
 mod csv_document;
 pub(crate) mod diff;
+#[cfg_attr(target_os = "macos", path = "dotnet_runtime_macos.rs")]
 pub mod dotnet_runtime;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos_resources;
 pub(crate) mod eol;
 pub mod error;
 pub mod extra_workdirs;
@@ -819,6 +822,10 @@ pub fn run() {
             );
 
             let mut app_agent_dir_candidates = Vec::new();
+            #[cfg(target_os = "macos")]
+            if let Some(root) = macos_resources::resource_root() {
+                app_agent_dir_candidates.push(root.join("agent"));
+            }
             #[cfg(debug_assertions)]
             app_agent_dir_candidates.extend([
                 std::path::PathBuf::from("../agent"), // dev: src-tauri/../agent

@@ -2372,6 +2372,9 @@ pub async fn unity_embed_status(
 pub fn get_unity_embed_enabled(
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<bool, AppError> {
+    #[cfg(target_os = "macos")]
+    return Ok(false);
+
     Ok(config.unity_embed_enabled())
 }
 
@@ -2429,6 +2432,10 @@ pub async fn set_unity_embed_enabled(
     config: State<'_, Arc<crate::config::AppConfig>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<bool, AppError> {
+    #[cfg(target_os = "macos")]
+    if value {
+        return Err(AppError::new("unity.embed.unsupported", "Unity embedding is not supported on macOS"));
+    }
     let _scope = workspace_registry
         .resolve_workspace_ref(&workspace_ref)
         .map_err(|error| AppError::from(error.to_string()))?;

@@ -10,6 +10,12 @@ import { copyFileSync, existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveMacosTarget } from "./macos-build-target.mjs";
+
+if (resolveMacosTarget()) {
+  await import("./build-locus-native-plugin-macos.mjs");
+  process.exit(0);
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");

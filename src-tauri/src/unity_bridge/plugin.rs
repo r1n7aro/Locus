@@ -32,6 +32,7 @@ const PLUGIN_INSTALL_UNITY_CLOSE_TIMEOUT: Duration = Duration::from_secs(45);
 const PLUGIN_INSTALL_LOCK_RELEASE_SETTLE: Duration = Duration::from_secs(2);
 const PLUGIN_INSTALL_RETRY_SETTLE: Duration = Duration::from_secs(3);
 const PLUGIN_LEGACY_ASSETS_INSTALL_DIRS: &[&str] = &["Assets/Locus", "Assets/Plugins/Locus"];
+#[cfg(not(target_os = "macos"))]
 const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "package.json",
     "Editor/Locus.Editor.asmdef",
@@ -46,12 +47,36 @@ const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "Editor/Native/x86_64/locus_native.dll",
     "Editor/Native/x86_64/locus_native.dll.meta",
 ];
+#[cfg(not(target_os = "macos"))]
 const PLUGIN_REQUIRED_DLL_FILES: &[&str] = &[
     "Editor/Json/Locus.Json.dll",
     "Editor/Roslyn/Locus.Roslyn.dll",
     "Editor/Detour/Locus.Detour.dll",
     "Editor/HotReload/Locus.HotReload.Runtime.dll",
     "Editor/Native/x86_64/locus_native.dll",
+];
+
+// Every Mac application bundle contains both Editor architectures: an arm64
+// Locus process may connect to an Intel Editor running under Rosetta.
+#[cfg(target_os = "macos")]
+const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
+    "package.json",
+    "Editor/Locus.Editor.asmdef",
+    "Editor/Json/Locus.Json.dll",
+    "Editor/Json/Locus.Json.dll.meta",
+    "Editor/Roslyn/Locus.Roslyn.dll",
+    "Editor/Roslyn/Locus.Roslyn.dll.meta",
+    "Editor/Native/macos-arm64/liblocus_native.dylib",
+    "Editor/Native/macos-arm64/liblocus_native.dylib.meta",
+    "Editor/Native/macos-x86_64/liblocus_native.dylib",
+    "Editor/Native/macos-x86_64/liblocus_native.dylib.meta",
+];
+#[cfg(target_os = "macos")]
+const PLUGIN_REQUIRED_DLL_FILES: &[&str] = &[
+    "Editor/Json/Locus.Json.dll",
+    "Editor/Roslyn/Locus.Roslyn.dll",
+    "Editor/Native/macos-arm64/liblocus_native.dylib",
+    "Editor/Native/macos-x86_64/liblocus_native.dylib",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +91,7 @@ struct InstalledPluginDir {
     location: PluginInstallLocation,
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn find_plugin_source_dir() -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
@@ -105,12 +131,33 @@ pub fn find_plugin_source_dir() -> Option<std::path::PathBuf> {
     result
 }
 
+#[cfg(target_os = "macos")]
+pub fn find_plugin_source_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(resources) = crate::macos_resources::resource_root() {
+        candidates.push(resources.join("locus_unity"));
+    }
+    #[cfg(debug_assertions)]
+    {
+        // Only the Mac staging package has the platform-specific asmdef and
+        // complete dual-architecture plugin. Never install the raw Windows tree.
+        candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gen/macos/locus_unity"));
+    }
+    candidates.into_iter().find(|path| validate_plugin_source_dir(path).is_ok())
+}
+
+#[cfg(not(target_os = "macos"))]
 fn normalize_path_key(path: &Path) -> String {
     let normalized = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     normalized
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase()
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_path_key(path: &Path) -> String {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).to_string_lossy().into_owned()
 }
 
 fn expected_install_dir(project_path: &Path) -> PathBuf {
@@ -811,8 +858,14 @@ pub fn emit_plugin_status_scoped(
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
     fn fixture_source_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../locus_unity")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fixture_source_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("gen/macos/locus_unity")
     }
 
     fn create_unity_project(project_root: &Path) {
@@ -827,6 +880,10 @@ mod tests {
     }
 
     fn create_minimal_plugin_source(source_root: &Path) {
+        #[cfg(target_os = "macos")]
+        for relative in PLUGIN_REQUIRED_SOURCE_FILES {
+            write_file(&source_root.join(relative), b"fixture");
+        }
         write_file(&source_root.join("package.json"), b"{}");
         write_file(&source_root.join("Editor/Locus.Editor.asmdef"), b"{}");
         write_file(&source_root.join("Editor/Json/Locus.Json.dll"), b"dll");
@@ -860,6 +917,18 @@ mod tests {
             &source_root.join("Editor/Native/x86_64/locus_native.dll.meta"),
             b"meta",
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plugin_requires_both_editor_architectures() {
+        for missing_arch in ["macos-arm64", "macos-x86_64"] {
+            let source = tempfile::tempdir().unwrap();
+            create_minimal_plugin_source(source.path());
+            std::fs::remove_file(source.path().join(format!("Editor/Native/{missing_arch}/liblocus_native.dylib"))).unwrap();
+            let error = validate_plugin_source_dir(source.path()).unwrap_err();
+            assert!(error.contains(missing_arch));
+        }
     }
 
     #[test]

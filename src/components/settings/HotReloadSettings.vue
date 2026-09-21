@@ -153,6 +153,8 @@ async function toggleNonPublicAccessEnabled() {
 }
 
 const hotReloadEnabled = computed(() => sidecarStatus.value?.hotReloadEnabled ?? false);
+const hotReloadSupported = computed(() => sidecarStatus.value?.hotReloadSupported
+  ?? import.meta.env.VITE_LOCUS_TARGET_OS !== "macos");
 const hotReloadBusy = ref(false);
 
 const hotReloadStatsLabel = computed(() => {
@@ -213,7 +215,7 @@ const {
 );
 
 async function toggleHotReloadEnabled() {
-  if (!sidecarReady.value || hotReloadBusy.value) return;
+  if (!sidecarReady.value || hotReloadBusy.value || !hotReloadSupported.value) return;
   if (hotReloadEnabled.value) {
     await applyHotReloadEnabled(false);
   } else {
@@ -399,7 +401,7 @@ onUnmounted(() => {
       <div class="tool-row">
         <div class="tool-info">
           <span class="tool-name">{{ t("settings.codeAnalysis.hotReloadLabel") }}</span>
-          <span class="tool-desc">{{ t("settings.codeAnalysis.hotReloadDesc") }}</span>
+          <span class="tool-desc">{{ t(hotReloadSupported ? "settings.codeAnalysis.hotReloadDesc" : "settings.codeAnalysis.hotReloadUnsupported") }}</span>
           <span v-if="hotReloadStatsLabel" class="tool-desc">{{ hotReloadStatsLabel }}</span>
           <span v-if="!sidecarEnabled" class="tool-desc tool-dep">
             {{ t("settings.codeAnalysis.hotReloadDepSidecar") }}
@@ -426,7 +428,7 @@ onUnmounted(() => {
           <BaseSwitch
             v-if="sidecarReady"
             :model-value="hotReloadEnabled"
-            :disabled="hotReloadBusy || !sidecarEnabled"
+            :disabled="hotReloadBusy || !sidecarEnabled || !hotReloadSupported"
             :aria-label="t('settings.codeAnalysis.hotReloadLabel')"
             @update:model-value="toggleHotReloadEnabled"
           />

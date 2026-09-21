@@ -1109,6 +1109,13 @@ mod windows_impl {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "transport/macos.rs"]
+mod macos_impl;
+#[cfg(target_os = "macos")]
+#[path = "transport/macos_requests.rs"]
+mod macos_requests;
+
 // ── Public dispatch ──────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
@@ -1116,7 +1123,7 @@ pub fn set_event_app_handle(app_handle: tauri::AppHandle) {
     windows_impl::set_event_app_handle(app_handle);
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn set_event_app_handle(_app_handle: tauri::AppHandle) {}
 
 #[cfg(target_os = "windows")]
@@ -1127,7 +1134,7 @@ pub fn set_service_event_scope(
     windows_impl::set_service_event_scope(project_path, scope);
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn set_service_event_scope(
     _project_path: &str,
     _scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
@@ -1189,7 +1196,7 @@ pub async fn send_message_if_writer_free(
         .await
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn send_message_if_writer_free(
     _project_path: &str,
     _msg_type: &str,
@@ -1199,7 +1206,7 @@ pub async fn send_message_if_writer_free(
     Err("Unity bridge is only supported on Windows (named pipes)".to_string())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn send_message(
     _project_path: &str,
     _msg_type: &str,
@@ -1208,7 +1215,7 @@ pub async fn send_message(
     Err("Unity bridge is only supported on Windows (named pipes)".to_string())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn send_message_with_timeout(
     _project_path: &str,
     _msg_type: &str,
@@ -1218,7 +1225,7 @@ pub async fn send_message_with_timeout(
     Err("Unity bridge is only supported on Windows (named pipes)".to_string())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn send_message_without_timeout(
     _project_path: &str,
     _msg_type: &str,
@@ -1227,7 +1234,7 @@ pub async fn send_message_without_timeout(
     Err("Unity bridge is only supported on Windows (named pipes)".to_string())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn send_message_without_timeout_with_acceptance(
     _project_path: &str,
     _msg_type: &str,
@@ -1247,8 +1254,87 @@ pub async fn disconnect_with_reason(project_path: &str, reason: &str) {
     windows_impl::disconnect_with_reason(project_path, reason).await;
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn disconnect(_project_path: &str) {}
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub async fn disconnect_with_reason(_project_path: &str, _reason: &str) {}
+
+
+#[cfg(target_os = "macos")]
+pub fn set_event_app_handle(app_handle: tauri::AppHandle) {
+    macos_impl::set_event_app_handle(app_handle);
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_service_event_scope(
+    project_path: &str,
+    scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+) {
+    macos_impl::set_service_event_scope(project_path, scope);
+}
+
+#[cfg(target_os = "macos")]
+pub async fn send_message(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+) -> Result<PipeResponse, String> {
+    macos_impl::send_message(project_path, msg_type, message).await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn send_message_with_timeout(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+    timeout: Duration,
+) -> Result<PipeResponse, String> {
+    macos_impl::send_message_with_timeout(project_path, msg_type, message, timeout).await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn send_message_without_timeout(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+) -> Result<PipeResponse, String> {
+    macos_impl::send_message_without_timeout(project_path, msg_type, message).await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn send_message_without_timeout_with_acceptance(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+    acceptance_tx: tokio::sync::oneshot::Sender<()>,
+) -> Result<PipeResponse, String> {
+    macos_impl::send_message_without_timeout_with_acceptance(
+        project_path,
+        msg_type,
+        message,
+        acceptance_tx,
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn send_message_if_writer_free(
+    project_path: &str,
+    msg_type: &str,
+    message: &str,
+    response_timeout: Duration,
+) -> Result<Option<PipeResponse>, String> {
+    macos_impl::send_message_if_writer_free(project_path, msg_type, message, response_timeout)
+        .await
+}
+
+#[cfg(target_os = "macos")]
+pub async fn disconnect(project_path: &str) {
+    macos_impl::disconnect(project_path).await;
+}
+
+#[cfg(target_os = "macos")]
+pub async fn disconnect_with_reason(project_path: &str, reason: &str) {
+    macos_impl::disconnect_with_reason(project_path, reason).await;
+}

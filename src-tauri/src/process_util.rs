@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+#[path = "process_util_macos.rs"]
+mod macos;
+
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const GIT_VERSION_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -912,10 +916,18 @@ fn discover_git() -> Option<ResolvedGit> {
         .or_else(resolve_git_from_managed_resource)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn discover_github_cli() -> Option<ResolvedGithubCli> {
     resolve_github_cli_from_env()
         .or_else(resolve_github_cli_from_managed_resource)
         .or_else(resolve_github_cli_from_path)
+}
+
+#[cfg(target_os = "macos")]
+fn discover_github_cli() -> Option<ResolvedGithubCli> {
+    resolve_github_cli_from_env()
+        .or_else(resolve_github_cli_from_path)
+        .or_else(|| resolve_first_github_cli_candidate(macos::github_cli_candidates(), GithubCliDiscoverySource::Path))
 }
 
 fn git_version_for(path: &Path) -> Option<String> {
@@ -1263,7 +1275,12 @@ fn git_common_location_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn git_common_location_candidates() -> Vec<PathBuf> {
+    macos::git_candidates()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn git_common_location_candidates() -> Vec<PathBuf> {
     Vec::new()
 }

@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+#[path = "../../../locus_native_plugin/src/macos_ipc.rs"]
+mod macos_ipc;
+
 mod background_hook;
 mod capture;
 pub(crate) mod dialog;
@@ -469,11 +473,17 @@ fn read_native_broker_status_payload_from_shared_memory(
     ))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn read_native_broker_status_payload_from_shared_memory(
     _project_path: &str,
 ) -> Option<NativeBrokerStatusPayload> {
     None
+}
+
+#[cfg(target_os = "macos")]
+fn read_native_broker_status_payload_from_shared_memory(project_path: &str) -> Option<NativeBrokerStatusPayload> {
+    let value = macos_ipc::read_snapshot(project_path, &get_native_pipe_name(project_path)).ok()?;
+    serde_json::from_value(value).ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -771,6 +781,16 @@ fn native_bridge_marker_path(project_path: &str) -> PathBuf {
 /// (migration Phase 6). Present means "apply the in-process hook"; absent means
 /// the managed side leaves it to the cross-process Tauri patch. Only meaningful
 /// when the native bridge is enabled (the managed hook code only runs then).
+#[cfg(target_os = "macos")]
+pub fn sync_background_hook_marker(project_path: &str, _enabled: bool) -> Result<(), String> {
+    match std::fs::remove_file(background_hook_marker_path(project_path)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove unsupported macOS background-hook marker: {error}")),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn sync_background_hook_marker(project_path: &str, enabled: bool) -> Result<(), String> {
     let path = background_hook_marker_path(project_path);
     if enabled {
@@ -812,6 +832,16 @@ fn background_hook_marker_path(project_path: &str) -> PathBuf {
 /// Reconcile the marker read by the Unity editor window before it performs
 /// HWND discovery or sends overlay control messages. Absence keeps the default
 /// enabled behavior for existing projects and older Locus installations.
+#[cfg(target_os = "macos")]
+pub fn sync_unity_embed_enabled_marker(project_path: &str, _enabled: bool) -> Result<(), String> {
+    let path = unity_embed_disabled_marker_path(project_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("Failed to create Unity embed marker directory: {error}"))?;
+    }
+    std::fs::write(path, "disabled\n").map_err(|error| format!("Failed to disable unsupported macOS Unity embedding: {error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn sync_unity_embed_enabled_marker(project_path: &str, enabled: bool) -> Result<(), String> {
     let path = unity_embed_disabled_marker_path(project_path);
     if enabled {
@@ -1343,10 +1373,16 @@ fn native_pipe_name_part(project_path: &str) -> String {
 }
 
 /// Full client path of the native broker pipe for this project.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn get_native_pipe_name(project_path: &str) -> String {
     let suffix=std::env::var("LOCUS_UNITY_TEST_PIPE_NAMESPACE").ok()
         .filter(|value| !value.is_empty() && value.len()<=64 && value.bytes().all(|c|c.is_ascii_alphanumeric()||c==b'-'));
     format!(r"\\.\pipe\{}{}", native_pipe_name_part(project_path),suffix.map(|s|format!("_{s}")).unwrap_or_default())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn get_native_pipe_name(project_path: &str) -> String {
+    macos_ipc::endpoint(project_path)
 }
 
 pub fn is_unity_project(path: &str) -> bool {
@@ -7717,6 +7753,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn native_background_hook_markers_require_native_and_hook_markers() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_path = temp.path().to_string_lossy().to_string();
@@ -7734,6 +7771,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn unity_embed_disabled_marker_preserves_default_enabled_behavior() {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_path = temp.path().to_string_lossy().to_string();
@@ -7751,6 +7789,22 @@ mod tests {
 
         super::sync_unity_embed_enabled_marker(&project_path, true).expect("enable embed");
         assert!(!marker.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_never_enables_hook_or_embed_markers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = temp.path().to_string_lossy().to_string();
+        let hook = super::background_hook_marker_path(&project);
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "enabled\n").unwrap();
+        for enabled in [true, false] {
+            super::sync_background_hook_marker(&project, enabled).unwrap();
+            assert!(!hook.exists());
+            super::sync_unity_embed_enabled_marker(&project, enabled).unwrap();
+            assert!(super::unity_embed_disabled_marker_path(&project).is_file());
+        }
     }
 
     #[test]

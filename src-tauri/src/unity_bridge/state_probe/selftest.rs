@@ -1381,6 +1381,17 @@ impl SelfTest {
 }
 
 /// Entry point invoked by the `unity_state_probe_selftest_run` command.
+#[cfg(target_os = "macos")]
+async fn run_owned(
+    _app: tauri::AppHandle,
+    _project: String,
+    _ownership_key: String,
+    _event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
+) -> Result<(), String> {
+    Err("Unity native state probe is not supported on macOS".into())
+}
+
+#[cfg(not(target_os = "macos"))]
 async fn run_owned(
     app: tauri::AppHandle,
     project: String,

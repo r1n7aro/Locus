@@ -536,6 +536,10 @@ pub(crate) async fn sync_visible_documents_for_prefix(
 
 pub fn resolve_app_knowledge_dir(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    if let Some(root) = crate::macos_resources::resource_root() {
+        candidates.push(root.join("knowledge"));
+    }
     // Dev: anchored to Cargo.toml directory (src-tauri/) at compile time
     #[cfg(debug_assertions)]
     {

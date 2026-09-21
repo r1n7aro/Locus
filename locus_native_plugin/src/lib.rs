@@ -32,6 +32,11 @@
 
 use std::os::raw::c_int;
 
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+mod macos_ipc;
+
 // ── Managed lifecycle states (must match the C# `ManagedState` enum) ─────────
 
 /// Native is up; the managed executor has not registered yet (first load).
@@ -2150,7 +2155,16 @@ pub unsafe extern "C" fn locus_init(
         }
         imp::init(project, pipe_name, protocol_version)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let project = string_from_raw(project, project_len);
+        let pipe_name = string_from_raw(pipe, pipe_len);
+        if pipe_name.is_empty() {
+            return -1;
+        }
+        macos::init(project, pipe_name, protocol_version)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (project, project_len, pipe, pipe_len, protocol_version);
         -1
@@ -2165,6 +2179,10 @@ pub extern "C" fn locus_shutdown() {
     {
         imp::shutdown();
         overlay::shutdown();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::shutdown();
     }
 }
 
@@ -2191,7 +2209,16 @@ pub unsafe extern "C" fn locus_set_managed_state(
         };
         imp::set_managed_state(state, generation, status);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let status = if editor_status.is_null() {
+            None
+        } else {
+            Some(string_from_raw(editor_status, editor_status_len))
+        };
+        macos::set_managed_state(state, generation, status);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (state, generation, editor_status, editor_status_len);
     }
@@ -2204,7 +2231,11 @@ pub extern "C" fn locus_managed_heartbeat(generation: i64) {
     {
         imp::managed_heartbeat(generation);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::managed_heartbeat(generation);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = generation;
     }
@@ -2221,7 +2252,11 @@ pub unsafe extern "C" fn locus_set_capabilities(caps: *const u8, caps_len: i32) 
     {
         imp::set_capabilities(string_from_raw(caps, caps_len));
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_capabilities(string_from_raw(caps, caps_len));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (caps, caps_len);
     }
@@ -2243,7 +2278,11 @@ pub unsafe extern "C" fn locus_poll_request(
     {
         imp::poll_request(buffer, buffer_len, out_required_len)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::poll_request(buffer, buffer_len, out_required_len)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (buffer, buffer_len, out_required_len);
         0
@@ -2268,7 +2307,13 @@ pub unsafe extern "C" fn locus_complete_request(
         let response = slice_from_raw(response, response_len).to_vec();
         imp::complete_request(&id, response);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let id = string_from_raw(id, id_len);
+        let response = slice_from_raw(response, response_len).to_vec();
+        macos::complete_request(&id, response);
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (id, id_len, response, response_len);
     }
@@ -2293,7 +2338,15 @@ pub unsafe extern "C" fn locus_emit_event(
         }
         imp::emit_event(&event_type, string_from_raw(payload, payload_len));
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let event_type = string_from_raw(event_type, type_len);
+        if event_type.is_empty() {
+            return;
+        }
+        macos::emit_event(&event_type, string_from_raw(payload, payload_len));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (event_type, type_len, payload, payload_len);
     }
@@ -2312,7 +2365,15 @@ pub extern "C" fn locus_has_connected_client() -> c_int {
             0
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        if macos::connected() {
+            1
+        } else {
+            0
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         0
     }

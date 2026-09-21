@@ -1,7 +1,9 @@
 fn main() {
     tauri_build::build();
 
-    #[cfg(target_os = "windows")]
+    // Build scripts run on the host. Only link the Windows resource when the
+    // application target is Windows (including cross-compilation from Windows).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
     {
         // tauri-build links this resource only into binary targets. The lib
         // unit-test harness still imports comctl32!TaskDialogIndirect through

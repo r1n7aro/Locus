@@ -1,3 +1,4 @@
+#if !UNITY_EDITOR_OSX
 using UnityEngine;
 using UnityEditor.Compilation;
 
@@ -1736,3 +1737,5 @@ namespace Locus
         }
     }
 }
+
+#endif

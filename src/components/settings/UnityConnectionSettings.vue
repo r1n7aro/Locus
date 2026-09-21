@@ -83,6 +83,7 @@ async function toggleExternalEditorDefaultEnabled() {
 }
 
 const unityEmbedEnabled = ref(true);
+const unityEmbedSupported = import.meta.env.VITE_LOCUS_TARGET_OS !== "macos";
 const unityEmbedReady = ref(false);
 const unityEmbedBusy = ref(false);
 
@@ -102,7 +103,7 @@ async function refreshUnityEmbedEnabled() {
 }
 
 async function toggleUnityEmbedEnabled() {
-  if (!unityEmbedReady.value || unityEmbedBusy.value) return;
+  if (!unityEmbedReady.value || unityEmbedBusy.value || !unityEmbedSupported) return;
   unityEmbedBusy.value = true;
   try {
     unityEmbedEnabled.value = await setUnityEmbedEnabled(!unityEmbedEnabled.value);
@@ -600,13 +601,13 @@ onUnmounted(() => {
       <div class="tool-row master-row">
         <div class="tool-info">
           <span class="tool-name">{{ t("settings.unityConnection.embedLabel") }}</span>
-          <span class="tool-desc">{{ t("settings.unityConnection.embedDesc") }}</span>
+          <span class="tool-desc">{{ t(unityEmbedSupported ? "settings.unityConnection.embedDesc" : "settings.codeAnalysis.backgroundHookUnsupported") }}</span>
         </div>
         <div class="master-actions">
           <BaseSwitch
             v-if="unityEmbedReady"
             :model-value="unityEmbedEnabled"
-            :disabled="unityEmbedBusy"
+            :disabled="unityEmbedBusy || !unityEmbedSupported"
             :aria-label="t('settings.unityConnection.embedLabel')"
             @update:model-value="toggleUnityEmbedEnabled"
           />

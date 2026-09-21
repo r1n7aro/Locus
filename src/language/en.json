@@ -2256,6 +2256,7 @@
   "settings.codeAnalysis.nonPublicAccessDesc": "Allow unity_execute and unity_run_states to directly access private and internal APIs and fields without reflection. The tool parameter can disable it for one call.",
   "settings.codeAnalysis.nonPublicAccessDepSidecar": "Requires the snippet compiler above to be on.",
   "settings.codeAnalysis.hotReloadLabel": "Unity hot reload (experimental)",
+  "settings.codeAnalysis.hotReloadUnsupported": "Hot reload is unavailable on macOS. Use Unity recompile.",
   "settings.codeAnalysis.hotReloadDesc": "Method-body C# edits become patch assemblies in the compile server and take effect in the running Editor within 1-2 seconds — no Unity recompile or domain reload. Signature/field changes still go through unity_recompile. Works in Release too: the few methods Mono inlines converge via an automatic recompile, and Debug avoids those recompiles.",
   "settings.codeAnalysis.hotReloadStats": "{0} unapplied · {1} hot patch code · {2} need compile",
   "settings.codeAnalysis.hotReloadSelfTestLabel": "Hot reload self-test",
