@@ -23,7 +23,7 @@ import type { CustomProvider, ModelCatalogModel, ModelCatalogProvider } from "..
 const cwd = process.cwd();
 
 function read(relPath: string) {
-  return readFileSync(resolve(cwd, relPath), "utf8");
+  return readFileSync(resolve(cwd, relPath), "utf8").replace(/\r\n/g, "\n");
 }
 
 const catalogModel: ModelCatalogModel = {

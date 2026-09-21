@@ -2,9 +2,9 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
-const graphSource = readFileSync(resolve(process.cwd(), "src/components/graph/LocusGraphView.ts"), "utf8");
-const graphStylesSource = readFileSync(resolve(process.cwd(), "src/components/graph/graphStyles.ts"), "utf8");
-const canvasSource = readFileSync(resolve(process.cwd(), "src/components/canvas/LocusCanvasView.ts"), "utf8");
+const graphSource = readFileSync(resolve(process.cwd(), "src/components/graph/LocusGraphView.ts"), "utf8").replace(/\r\n/g, "\n");
+const graphStylesSource = readFileSync(resolve(process.cwd(), "src/components/graph/graphStyles.ts"), "utf8").replace(/\r\n/g, "\n");
+const canvasSource = readFileSync(resolve(process.cwd(), "src/components/canvas/LocusCanvasView.ts"), "utf8").replace(/\r\n/g, "\n");
 
 describe("LocusGraphView readonly dragging", () => {
   it("delegates node movement to CanvasView without reporting readonly graph edits", () => {

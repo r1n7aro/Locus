@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import ToolCallBlock from "../components/ToolCallBlock.vue";
 
 const root = process.cwd();
-const read = (path: string) => readFileSync(resolve(root, path), "utf8");
+const read = (path: string) => readFileSync(resolve(root, path), "utf8").replace(/\r\n/g, "\n");
 
 describe("Unity Test Framework tools", () => {
   it("uses the official TestRunnerApi and preserves asynchronous UnityTest execution", () => {
