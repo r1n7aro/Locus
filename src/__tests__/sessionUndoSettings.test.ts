@@ -32,16 +32,23 @@ describe("session file undo setting", () => {
     expect(chatView).toContain("chatChangesStore.hasChangesForSession(props.activeSessionId)");
   });
 
-  it("gates automatic undo tracking while retaining targeted and Unity locks", () => {
+  it("separates targeted file locks from Unity execution when undo is disabled", () => {
     const session = read("src-tauri/src/commands/session.rs");
     const agent = read("src-tauri/src/agent/instance/mod.rs");
     const cli = read("src-tauri/src/agent/instance/claude_code_cli.rs");
+    const policy = read("src-tauri/src/agent/tool_execution_policy.rs");
 
     expect(session).toContain("instance.set_session_undo_enabled(config.session_undo_enabled())");
     expect(agent).toMatch(/self\.session_undo_enabled\s*&& target_name != "execute_typescript"\s*&& self\.tool_call_needs_undo_tracking\(name, args\)/);
-    expect(agent).toContain("&& self.bash_needs_primary_workspace_tracking(&target_args)");
-    expect(agent).toContain('matches!(target_name.as_str(), "write" | "edit")');
-    expect(agent).toContain("Self::is_unity_execution_barrier_tool(&target_name)");
+    expect(policy).toContain('matches!(name, "write" | "edit")');
+    expect(policy).toContain("if !session_undo_enabled");
+    expect(agent).toContain("crate::agent::tool_execution_policy::workspace_request(");
+    expect(agent).toContain("crate::agent::unity_execution_scope::run(");
+    expect(agent).toContain("let _file_guard = if !self.session_undo_enabled");
+    expect(agent).toContain("if !self.session_undo_enabled || !is_active(tc)");
+    expect(cli).toContain("if !self.agent.session_undo_enabled");
+    expect(agent).toContain("if has_unity_asset_writes && !self.session_undo_enabled");
+    expect(cli).toContain("begin_edit_session_in_background");
     expect(cli).toContain("self.agent.should_track_session_undo(tool_name, args)");
   });
 

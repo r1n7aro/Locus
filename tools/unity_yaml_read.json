@@ -14,6 +14,12 @@
         "default": 2,
         "description": "Child levels when non-array expansion exceeds 4,000 characters; otherwise the compact tree expands fully. Default 2, maximum 4. Arrays remain capped by max_array_items."
       },
+      "reader": {
+        "type": "string",
+        "enum": ["auto", "default"],
+        "default": "auto",
+        "description": "auto uses a matching Skill text reader for non-scene/prefab asset roots; child paths always use Property Tree. default bypasses Skill readers. Empty output or reader errors fall back to Property Tree with a Note. Readers receive depth (0–4, default 2) and max_array_items (1–1024, default 4)."
+      },
       "max_array_items": {
         "type": "integer",
         "minimum": 1,

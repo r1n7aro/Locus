@@ -4252,6 +4252,25 @@ pub(crate) fn find_unity_yaml_read_extension_for_working_dir(
     None
 }
 
+pub(crate) fn has_unity_yaml_read_extensions_for_working_dir(working_dir: &str) -> bool {
+    list_skill_packages_sync_for_working_dir(working_dir)
+        .iter()
+        .any(|record| !record.manifest.unity_yaml_read_extensions.is_empty())
+}
+
+fn decode_unity_yaml_read_extension_output(raw: &str) -> Result<String, String> {
+    let response: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("Invalid Skill yaml-read invoke response: {}", error))?;
+    match response.get("result") {
+        Some(serde_json::Value::String(output)) if !output.trim().is_empty() => Ok(output.clone()),
+        Some(serde_json::Value::Null | serde_json::Value::String(_)) => {
+            Err("Skill yaml-read extension returned empty output".to_string())
+        }
+        Some(_) => Err("Skill yaml-read extension must return a string".to_string()),
+        None => Err("Skill yaml-read invoke response is missing result".to_string()),
+    }
+}
+
 pub(crate) async fn run_unity_yaml_read_extension(
     project_path: &str,
     extension: &ResolvedUnityYamlReadExtension,
@@ -4290,14 +4309,7 @@ pub(crate) async fn run_unity_yaml_read_extension(
         args,
     )?;
     let raw = crate::unity_bridge::invoke_skill_package(project_path, &payload).await?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!(
-            "Skill package yaml-read extension '{}' returned empty output",
-            extension.extension_name
-        ));
-    }
-    Ok(trimmed.to_string())
+    decode_unity_yaml_read_extension_output(&raw)
 }
 
 fn package_to_list_item(
@@ -6229,6 +6241,53 @@ pub async fn remove_skill_unity_files(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn yaml_read_extension_unwraps_only_the_reader_text() {
+        let output = "  Action\n  samples: 141\n";
+        let raw = serde_json::json!({ "packageId": "action", "assemblyId": "compiled", "result": output });
+        assert_eq!(
+            super::decode_unity_yaml_read_extension_output(&raw.to_string()).unwrap(),
+            output
+        );
+        let json_text = "{\"custom\":true}";
+        assert_eq!(
+            super::decode_unity_yaml_read_extension_output(
+                &serde_json::json!({ "result": json_text }).to_string()
+            )
+            .unwrap(),
+            json_text
+        );
+    }
+
+    #[test]
+    fn yaml_read_extension_rejects_empty_null_and_invalid_results() {
+        for result in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(" \r\n\t"),
+        ] {
+            let raw = serde_json::json!({ "packageId": "action", "assemblyId": "compiled", "result": result });
+            assert!(
+                super::decode_unity_yaml_read_extension_output(&raw.to_string())
+                    .unwrap_err()
+                    .contains("empty output")
+            );
+        }
+        for raw in [
+            "",
+            "reader text",
+            "{}",
+            "{\"result\":123}",
+            "{\"result\":{\"text\":\"x\"}}",
+            "{\"result\":[]}",
+        ] {
+            assert!(
+                super::decode_unity_yaml_read_extension_output(raw).is_err(),
+                "{raw}"
+            );
+        }
+    }
+
     use super::{
         is_valid_skill_scaffold_name, list_skills_sync, read_skill_manifest_sync,
         SkillPackageManifestFile, SkillPackageRecord, SkillPackageToolManifest,

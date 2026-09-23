@@ -415,22 +415,24 @@ impl ToolRegistry {
         if let Some(execution) = context.execution.as_ref() {
             context.working_dir = Some(execution.root().to_string_lossy().to_string());
         }
-        match self.get(name) {
-            Some(def) => (def.execute)(arguments.clone(), context).await,
-            None => match crate::commands::execute_skill_package_tool_by_api_name(
-                name,
-                arguments.clone(),
-                context,
-            )
-            .await
-            {
-                Some(result) => result,
-                None => ToolResult {
-                    output: format!("Tool '{}' not found", name),
-                    is_error: true,
-                },
+        let project = context.working_dir.clone().unwrap_or_default();
+        let cancel = context.cancel_rx.clone();
+        crate::agent::unity_execution_scope::run(
+            &project, name, arguments, cancel, context.background, async {
+                match self.get(name) {
+                    Some(def) => (def.execute)(arguments.clone(), context).await,
+                    None => match crate::commands::execute_skill_package_tool_by_api_name(
+                        name, arguments.clone(), context,
+                    ).await {
+                        Some(result) => result,
+                        None => ToolResult {
+                            output: format!("Tool '{}' not found", name),
+                            is_error: true,
+                        },
+                    },
+                }
             },
-        }
+        ).await.unwrap_or_else(|error| ToolResult { output: error.into(), is_error: true })
     }
 
     pub fn with_builtins() -> Self {

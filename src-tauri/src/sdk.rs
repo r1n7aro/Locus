@@ -801,6 +801,7 @@ async fn codex_model_values(
                     account_id.as_deref(),
                     config.base_url.as_deref(),
                     &cache_dir,
+                    false,
                 )
                 .await
                 {
@@ -2775,56 +2776,14 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
     Ok(direct_tool_result(&canonical, result.output, result.is_error, Value::Array(Vec::new()), working_dir))
 }
 
-/// Mirrors AgentInstance's foreground policy. Turning session undo off relaxes
-/// opaque writes; path writes and actual Unity execution barriers remain scoped.
+/// All hosts share file coordination; Unity execution has its own scope.
 pub(crate) fn direct_tool_lock_request(
     canonical: &str, arguments: &Value, working_dir: &str,
     mutates_workspace: bool, session_undo_enabled: bool,
 ) -> Option<crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest> {
-    if canonical == "execute_typescript" {
-        // Frontend callbacks re-enter IPC asset/merge endpoints, which acquire
-        // their own transaction scopes. Holding an outer gate until the UI
-        // replies would deadlock those writes; policy still marks this mutating.
-        None
-    } else if matches!(canonical, "write" | "edit") {
-        Some(
-            arguments
-                .get("filePath")
-                .and_then(Value::as_str)
-                .map(|path| {
-                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::PathWrite(
-                        vec![crate::agent::workspace_execution_lock::normalize_workspace_path_key(
-                            working_dir,
-                            path,
-                        )],
-                    )
-                })
-                .unwrap_or(
-                    crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
-                ),
-        )
-    } else if canonical == "bash" {
-        (session_undo_enabled && crate::agent::instance::AgentInstance::bash_needs_primary_workspace_tracking_for(
-            working_dir,
-            arguments,
-        ))
-        .then_some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
-    } else if canonical == "python" {
-        (session_undo_enabled && !crate::tool::builtins::python_is_readonly(arguments)).then_some(
-            crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
-        )
-    } else if canonical == "unity_execute" {
-        (!crate::agent::instance::AgentInstance::unity_execute_is_readonly(arguments))
-            .then_some(
-                crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive,
-            )
-    } else if (session_undo_enabled && mutates_workspace)
-        || crate::agent::instance::AgentInstance::is_unity_execution_barrier_tool(canonical)
-    {
-        Some(crate::agent::workspace_execution_lock::WorkspaceExecutionLockRequest::Exclusive)
-    } else {
-        None
-    }
+    crate::agent::tool_execution_policy::workspace_request(
+        canonical, arguments, working_dir, mutates_workspace, session_undo_enabled,
+    )
 }
 
 /// Start an idle root receiver with its persisted settings. The actual message
@@ -3149,9 +3108,12 @@ mod tests {
             "F:/Project", true, false), Some(Lock::PathWrite(_))));
         assert!(super::direct_tool_lock_request("unity_execute", &json!({"readonly":true}),
             "F:/Project", true, false).is_none());
-        for name in ["unity_execute", "unity_recompile"] {
+        for name in ["unity_execute", "unity_recompile", "unity_test_run", "unity_test_list",
+            "unity_run_states", "unity_hot_reload", "unity_set_play_mode"] {
+            assert!(super::direct_tool_lock_request(name, &json!({"readonly":false}),
+                "F:/Project", true, false).is_none());
             assert!(matches!(super::direct_tool_lock_request(name, &json!({"readonly":false}),
-                "F:/Project", true, false), Some(Lock::Exclusive)));
+                "F:/Project", true, true), Some(Lock::Exclusive)));
         }
         assert!(super::direct_tool_lock_request("python", &json!({"readonly":false}),
             "F:/Project", true, true).is_some());

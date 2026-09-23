@@ -44,6 +44,9 @@ describe("Unity YAML Property Tree", () => {
     ).toContain("rect appears only on RectTransforms");
     expect(schema.parameters.properties.file_path).toBeUndefined();
     expect(schema.parameters.properties.detail).toBeUndefined();
+    expect(schema.parameters.properties.reader).toMatchObject({
+      type: "string", enum: ["auto", "default"], default: "auto",
+    });
     expect(schema.description).toContain("4,000 characters");
     expect(schema.description).toContain("[source: live Editor]");
     expect(schema.description).toContain("[source: disk YAML]");
@@ -118,6 +121,38 @@ describe("Unity YAML Property Tree", () => {
     expect(bridge).toContain("HandlePropertyTreeRead");
     expect(bridge).toContain("property_tree_read");
     expect(bridge).toContain("referenceTarget");
+  });
+
+  it("routes both current and legacy asset reads through extension dispatch before default reads", () => {
+    const agent = read("src-tauri/src/agent/instance/mod.rs");
+    const entry = agent.slice(agent.indexOf("pub(crate) async fn execute_unity_yaml_read("), agent.indexOf("fn build_transform_hierarchy_labels("));
+    const modern = entry.slice(entry.indexOf('if args.get("path").is_some()'), entry.indexOf("let file_path_arg"));
+    const legacy = entry.slice(entry.indexOf("if !is_hierarchical {"), entry.indexOf("if is_hierarchical && object_path.is_none()"));
+    expect(modern).toContain("Self::execute_unity_property_tree_read(");
+    expect(legacy).toContain("Self::execute_unity_property_tree_read(");
+    expect(entry).not.toContain("try_unity_yaml_read_extension(");
+    const dispatch = agent.slice(agent.indexOf("async fn execute_unity_property_tree_read("), agent.indexOf("async fn execute_unity_property_tree_read_default("));
+    expect(dispatch).toContain("unity_yaml_extension::read_with_extension(");
+    expect(dispatch).toContain("Self::try_unity_yaml_read_extension(");
+    expect(dispatch).toContain("Self::execute_unity_property_tree_read_default(");
+    const reader = agent.slice(agent.indexOf("async fn try_unity_yaml_read_extension("), agent.indexOf("fn unity_yaml_live_source_banner("));
+    expect(reader).toContain("Self::unity_property_tree_depth(args)");
+    expect(reader).toContain("Self::unity_property_tree_array_limit(args)");
+    expect(reader).toContain('"depth": depth');
+    expect(reader).toContain('"maxFieldDepth": depth');
+    expect(reader).toContain('"childPath": ""');
+    const skill = read("src-tauri/src/commands/skill.rs");
+    const invoke = skill.slice(skill.indexOf("pub(crate) async fn run_unity_yaml_read_extension("), skill.indexOf("fn package_to_list_item("));
+    expect(invoke).toContain("decode_unity_yaml_read_extension_output(&raw)");
+  });
+
+  it("uses direct live field lookup without changing Inspector visibility", () => {
+    const tree = read("src-tauri/src/unity_serialized_property/property_tree.rs");
+    expect(tree).toContain("resolve_live_property_child(&node, segment, &current_path, &names");
+    const bridge = read("locus_unity/Editor/LocusBridge.PropertyTree.cs");
+    expect(bridge).toContain("serialized.FindProperty(target.propertyPath)");
+    const snapshots = read("locus_unity/Editor/LocusBridge.SerializedProperties.cs");
+    expect(snapshots).toContain("cursor.NextVisible(enterChildren)");
   });
 
   it("keeps GameObject semantics and compact Unity values in the shared tree", () => {

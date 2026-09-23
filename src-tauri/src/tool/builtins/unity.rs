@@ -410,6 +410,10 @@ pub(super) fn unity_test_run() -> ToolDef {
                         .clamp(1_000, 3_600_000);
                     Some(Duration::from_millis(timeout_ms))
                 };
+                let timeout = crate::agent::unity_execution_scope::remaining_test_timeout(timeout);
+                if timeout.is_some_and(|timeout| timeout.is_zero()) {
+                    return ToolResult { output: "Unity Test run timed out before start".into(), is_error: true };
+                }
                 match crate::unity_bridge::unity_test_run_controlled(
                     &project_path,
                     &args,

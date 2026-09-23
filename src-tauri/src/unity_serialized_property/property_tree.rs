@@ -1128,34 +1128,9 @@ async fn read_live_property_tree_from_target(
 
         let mut names = live_child_names(&node);
         names.extend(active_subassets.iter().map(|entry| entry.segment.clone()));
-        let child_index = names
-            .iter()
-            .position(|name| name == segment)
-            .or_else(|| {
-                node.children.iter().position(|child| {
-                    child.name == *segment
-                        || child.display_name == *segment
-                        || property_leaf_name(&child.property_path) == segment
-                })
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Property '{}' was not found below '{}'. Available children: {}",
-                    encode_path_segment(segment),
-                    current_path,
-                    if names.is_empty() {
-                        "<none>".to_string()
-                    } else {
-                        names
-                            .iter()
-                            .take(12)
-                            .map(|name| encode_path_segment(name))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    }
-                )
-            })?;
-        node = node.children[child_index].clone();
+        node = resolve_live_property_child(&node, segment, &current_path, &names, |target| {
+            read_live_target(working_dir, target, 1, array_limit, hierarchy_fields)
+        }).await?;
         if let Some(target) = node.binding_target.clone() {
             active_target = target;
         }
@@ -1203,6 +1178,66 @@ async fn read_live_property_tree_from_target(
         hierarchy_fields,
     )
     .await
+}
+
+/// Visible children are a display projection, not an addressability index.
+/// Probe an exact serialized field on the same live object when it is hidden
+/// from that projection (including nested fields and managed references).
+async fn resolve_live_property_child<F, Fut>(
+    node: &UnitySerializedPropertySnapshot,
+    segment: &str,
+    current_path: &str,
+    names: &[String],
+    read_target: F,
+) -> Result<UnitySerializedPropertySnapshot, String>
+where
+    F: FnOnce(UnitySerializedPropertyTarget) -> Fut,
+    Fut: Future<Output = Result<UnitySerializedPropertySnapshot, String>>,
+{
+    let child_index = names.iter().position(|name| name == segment).or_else(|| {
+        node.children.iter().position(|child| {
+            child.name == segment
+                || child.display_name == segment
+                || property_leaf_name(&child.property_path) == segment
+        })
+    });
+    if let Some(child) = child_index.and_then(|index| node.children.get(index)) {
+        return Ok(child.clone());
+    }
+    let not_found = format!(
+        "Property '{}' was not found below '{}'. Available children: {}",
+        encode_path_segment(segment),
+        current_path,
+        if names.is_empty() {
+            "<none>".to_string()
+        } else {
+            names
+                .iter()
+                .take(12)
+                .map(|name| encode_path_segment(name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    );
+    // A DSL segment is one field, never a native dotted/indexed property path.
+    // Hierarchy names and array indices are resolved separately above.
+    if !node.is_array
+        && node.node_kind != "hierarchy"
+        && !segment.is_empty()
+        && !segment.contains(['.', '[', ']'])
+    {
+        if let Some(mut target) = node.binding_target.clone() {
+            target.property_path = Some(if node.property_path.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{}.{}", node.property_path, segment)
+            });
+            return read_target(target)
+                .await
+                .map_err(|error| format!("{}\n{}", error, not_found));
+        }
+    }
+    Err(not_found)
 }
 
 async fn read_live_target(
@@ -5287,6 +5322,142 @@ fn append_segments<'a>(path: &str, segments: impl Iterator<Item = &'a str>) -> S
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires LOCUS_YAML_READ_LIVE_PROJECT / LOCUS_YAML_READ_LIVE_PATH and a connected Editor"]
+    async fn live_hidden_field_connected_editor_reads_array_and_late_index() {
+        crate::unity_bridge::initialize_native_bridge(true);
+        let project = std::env::var("LOCUS_YAML_READ_LIVE_PROJECT").unwrap();
+        let input = std::env::var("LOCUS_YAML_READ_LIVE_PATH").unwrap();
+        let path = PropertyTreePath::parse(&project, &input).unwrap();
+        let array = read_live_property_tree_with_limits(&project, &path, 2, 4)
+            .await
+            .unwrap();
+        assert!(array.is_array && array.array_size > 4, "{array:?}");
+        assert!(array.children.len() <= 4);
+        let last_path =
+            PropertyTreePath::parse(&project, &format!("{}/{}", input, array.array_size - 1))
+                .unwrap();
+        let last = read_live_property_tree_with_limits(&project, &last_path, 2, 4)
+            .await
+            .unwrap();
+        assert_eq!(last.semantic_path, last_path.full_path());
+        assert!(last
+            .property_path
+            .ends_with(&format!(".Array.data[{}]", array.array_size - 1)));
+        println!(
+            "LIVE_HIDDEN_FIELD path={} samples={} visible={} last={}",
+            input,
+            array.array_size,
+            array.children.len(),
+            last.property_path
+        );
+    }
+
+    #[tokio::test]
+    async fn live_hidden_fields_use_exact_serialized_targets_and_unsaved_values() {
+        for (parent_path, field, expected_path) in [
+            ("", "bakedRootMotion", "bakedRootMotion"),
+            (
+                "events.Array.data[0]",
+                "hiddenSamples",
+                "events.Array.data[0].hiddenSamples",
+            ),
+            (
+                "managedAction",
+                "hiddenSamples",
+                "managedAction.hiddenSamples",
+            ),
+        ] {
+            let target = UnitySerializedPropertyTarget {
+                kind: "asset".to_string(),
+                path: Some("Assets/Action.asset".to_string()),
+                target_file_id: Some(11400000),
+                property_path: Some(parent_path.to_string()),
+                ..Default::default()
+            };
+            let parent = UnitySerializedPropertySnapshot {
+                node_kind: "object".to_string(),
+                property_path: parent_path.to_string(),
+                binding_target: Some(target.clone()),
+                children: vec![],
+                ..Default::default()
+            };
+            let result = resolve_live_property_child(
+                &parent,
+                field,
+                "Assets/Action.asset",
+                &[],
+                |requested| async move {
+                    assert_eq!(requested.property_path.as_deref(), Some(expected_path));
+                    assert_eq!(requested.target_file_id, target.target_file_id);
+                    assert_eq!(requested.path, target.path);
+                    Ok(UnitySerializedPropertySnapshot {
+                        name: field.to_string(),
+                        property_path: expected_path.to_string(),
+                        node_kind: "array".to_string(),
+                        is_array: true,
+                        array_size: 141,
+                        display_value: "unsaved samples".to_string(),
+                        binding_target: Some(requested),
+                        ..Default::default()
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.array_size, 141);
+            assert_eq!(result.display_value, "unsaved samples");
+            assert_eq!(
+                array_element_property_path(&result.property_path, 140),
+                format!("{expected_path}.Array.data[140]")
+            );
+            assert!(
+                parent.children.is_empty(),
+                "hidden fields must not be added to the visible list"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_hidden_field_lookup_keeps_visible_aliases_and_decode_errors() {
+        let parent = UnitySerializedPropertySnapshot {
+            node_kind: "object".to_string(),
+            binding_target: Some(UnitySerializedPropertyTarget {
+                kind: "asset".to_string(),
+                ..Default::default()
+            }),
+            children: vec![UnitySerializedPropertySnapshot {
+                name: "m_Name".to_string(),
+                display_name: "Name".to_string(),
+                property_path: "m_Name".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let visible = resolve_live_property_child(&parent, "Name", "root", &[], |_| async {
+            panic!("visible aliases should use the existing projection")
+        })
+        .await
+        .unwrap();
+        assert_eq!(visible.property_path, "m_Name");
+        let error = resolve_live_property_child(&parent, "hidden", "root", &[], |_| async {
+            Err("Invalid unity_serialized_property_read response: malformed live data".to_string())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.starts_with("Invalid unity_serialized_property_read response:"));
+        assert!(error.contains("Available children:"));
+        for segment in ["nested.field", "Array.data[140]", ""] {
+            assert!(
+                resolve_live_property_child(&parent, segment, "root", &[], |_| async {
+                    panic!("one DSL segment must not inject a native property path")
+                })
+                .await
+                .is_err()
+            );
+        }
+    }
+
     use super::*;
 
     const TIMELINE_YAML: &str = r#"--- !u!114 &11400000

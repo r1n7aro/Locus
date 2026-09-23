@@ -164,6 +164,7 @@ pub(super) fn python() -> ToolDef {
                     crate::agent::workspace_execution_lock::register_sdk_delegation(
                         execution.workspace.as_ref(),
                         owner.session_id.as_deref(),
+                        owner.task_id.as_deref(),
                     );
                 if let Some(delegation) = &_sdk_delegation {
                     command.env(

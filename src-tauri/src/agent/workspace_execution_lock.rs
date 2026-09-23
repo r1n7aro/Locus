@@ -35,7 +35,7 @@ pub(crate) struct SdkExecutionDelegation {
     pub session_id: String,
     // Sibling checkouts may execute concurrently; one checkout's nested writes
     // remain ordered while borrowing an outer Python run's exclusive gate.
-    pub operations: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    pub operations: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     _gate: Arc<OwnedRwLockWriteGuard<()>>,
 }
 pub(crate) struct SdkDelegationRegistration {
@@ -53,15 +53,20 @@ impl Drop for SdkDelegationRegistration {
 pub(crate) fn register_sdk_delegation(
     runtime: &crate::workspace_service::WorkspaceRuntime,
     session_id: Option<&str>,
+    task_id: Option<&str>,
 ) -> Option<SdkDelegationRegistration> {
     let lock = process_workspace_execution_lock(&runtime.root().to_string_lossy());
     let trace = lock.trace();
-    let (_, holder) = trace.writer.as_ref()?;
-    if !holder.owner.tools.iter().any(|tool| tool == "python")
-        || session_id.is_some_and(|id| id != holder.owner.session_id)
-    {
-        return None;
-    }
+    let holder = trace
+        .writer
+        .iter()
+        .map(|(_, holder)| holder)
+        .chain(trace.readers.values().filter(|_| session_id.is_some()))
+        .find(|holder| {
+            holder.owner.tools.iter().any(|tool| tool == "python")
+                && session_id.is_none_or(|id| id == holder.owner.session_id)
+                && task_id.is_none_or(|id| holder.owner.run_id == format!("async:{id}"))
+        })?;
     let gate = holder.exclusive_guard.as_ref()?.upgrade()?;
     let delegation = Arc::new(SdkExecutionDelegation {
         project_id: runtime.project_id().to_string(),
@@ -72,7 +77,7 @@ pub(crate) fn register_sdk_delegation(
         generation: runtime.generation(),
         run_id: holder.owner.run_id.clone(),
         session_id: holder.owner.session_id.clone(),
-        operations: AsyncMutex::new(HashMap::new()),
+        operations: holder.delegated_operations.clone(),
         _gate: gate,
     });
     let token = uuid::Uuid::new_v4().to_string();
@@ -204,6 +209,7 @@ struct TraceHolder {
     request: WorkspaceExecutionLockRequest,
     acquired_at: Instant,
     exclusive_guard: Option<Weak<OwnedRwLockWriteGuard<()>>>,
+    delegated_operations: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,10 +263,11 @@ enum OwnedWorkspaceExecutionGuard {
 
 struct OpaqueGroupState {
     lease: OnceCell<Arc<OpaqueGroupLease>>,
+    delegated_operations: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 struct OpaqueGroupLease {
-    _guard: OwnedRwLockWriteGuard<()>,
+    _guard: Arc<OwnedRwLockWriteGuard<()>>,
 }
 
 pub(crate) struct WorkspaceExecutionGuard {
@@ -341,6 +348,7 @@ impl WorkspaceExecutionLock {
         }
         let state = Arc::new(OpaqueGroupState {
             lease: OnceCell::new(),
+            delegated_operations: Arc::new(AsyncMutex::new(HashMap::new())),
         });
         registry.insert(group_id.to_string(), Arc::downgrade(&state));
         state
@@ -487,7 +495,7 @@ impl WorkspaceExecutionLock {
     }
 
     #[cfg(test)]
-    async fn acquire(
+    pub(crate) async fn acquire(
         &self,
         request: WorkspaceExecutionLockRequest,
         owner: WorkspaceExecutionLockOwner,
@@ -619,7 +627,7 @@ impl WorkspaceExecutionLock {
                         .lease
                         .get_or_init(|| async move {
                             Arc::new(OpaqueGroupLease {
-                                _guard: gate.write_owned().await,
+                                _guard: Arc::new(gate.write_owned().await),
                             })
                         })
                         .await;
@@ -646,7 +654,15 @@ impl WorkspaceExecutionLock {
                             owner: owner.clone(),
                             request: request.clone(),
                             acquired_at,
-                            exclusive_guard: match &guard { OwnedWorkspaceExecutionGuard::Exclusive(guard)=>Some(Arc::downgrade(guard)),_=>None },
+                            exclusive_guard: match &guard {
+                                OwnedWorkspaceExecutionGuard::Exclusive(guard) => Some(Arc::downgrade(guard)),
+                                OwnedWorkspaceExecutionGuard::ParallelOpaque(group) => group.lease.get().map(|lease| Arc::downgrade(&lease._guard)),
+                                _ => None,
+                            },
+                            delegated_operations: match &guard {
+                                OwnedWorkspaceExecutionGuard::ParallelOpaque(group) => group.delegated_operations.clone(),
+                                _ => Arc::new(AsyncMutex::new(HashMap::new())),
+                            },
                         };
                         match &request {
                             WorkspaceExecutionLockRequest::PathWrite(_)
@@ -943,6 +959,80 @@ mod tests {
 
     #[tokio::test]
     async fn python_delegation_is_scoped_revocable_and_keeps_admitted_gate_alive() {
+        for request in [
+            WorkspaceExecutionLockRequest::Exclusive,
+            WorkspaceExecutionLockRequest::ParallelOpaque("python-batch".into()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let config = Arc::new(crate::config::AppConfig::load_from_path(
+                &temp.path().join("config.json"),
+            ));
+            let policy =
+                Arc::new(crate::resource_policy::ResourcePolicyStore::from_config(config).unwrap());
+            let registry = crate::workspace_service::ProjectRegistry::new(policy, Vec::new());
+            let root = temp.path().join("workspace");
+            std::fs::create_dir_all(&root).unwrap();
+            let runtime = registry.register(&root).unwrap();
+            assert!(super::register_sdk_delegation(&runtime, Some("session-test"), None).is_none());
+            let lock = process_workspace_execution_lock(&root.to_string_lossy());
+            let (_cancel, rx) = tokio::sync::watch::channel(false);
+            let mut caller = owner("python-run");
+            caller.tools = vec!["python".into()];
+            let outer = lock.acquire(request, caller, rx.clone()).await.unwrap();
+            assert!(
+                super::register_sdk_delegation(&runtime, Some("different-session"), None).is_none()
+            );
+            let registration =
+                super::register_sdk_delegation(&runtime, Some("session-test"), None).unwrap();
+            let token = registration.token.clone();
+            let admitted = super::resolve_sdk_delegation(&token).unwrap();
+            assert!(crate::merge_jobs::coordination::verify_target(&admitted, &runtime).unwrap());
+            assert_eq!(admitted.checkout_id, runtime.checkout_id().as_str());
+            assert_eq!(admitted.run_id, "python-run");
+            let operation_gate = admitted
+                .operations
+                .lock()
+                .await
+                .entry(runtime.checkout_id().to_string())
+                .or_default()
+                .clone();
+            let first = operation_gate.clone().lock_owned().await;
+            assert!(operation_gate.try_lock().is_err());
+            let sibling_gate = admitted
+                .operations
+                .lock()
+                .await
+                .entry("sibling".into())
+                .or_default()
+                .clone();
+            assert!(sibling_gate.try_lock().is_ok());
+            drop(first);
+            drop(registration);
+            assert!(super::resolve_sdk_delegation(&token).is_err());
+            drop(outer);
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                lock.acquire(
+                    WorkspaceExecutionLockRequest::Exclusive,
+                    owner("next"),
+                    rx.clone()
+                )
+            )
+            .await
+            .is_err());
+            drop(admitted);
+            assert!(tokio::time::timeout(
+                Duration::from_secs(1),
+                lock.acquire(WorkspaceExecutionLockRequest::Exclusive, owner("next"), rx)
+            )
+            .await
+            .unwrap()
+            .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn background_python_siblings_share_sdk_mutation_coordination() {
         let temp = tempfile::tempdir().unwrap();
         let config = Arc::new(crate::config::AppConfig::load_from_path(
             &temp.path().join("config.json"),
@@ -950,53 +1040,42 @@ mod tests {
         let policy =
             Arc::new(crate::resource_policy::ResourcePolicyStore::from_config(config).unwrap());
         let registry = crate::workspace_service::ProjectRegistry::new(policy, Vec::new());
-        let root = temp.path().join("workspace");
-        std::fs::create_dir_all(&root).unwrap();
-        let runtime = registry.register(&root).unwrap();
-        assert!(super::register_sdk_delegation(&runtime, Some("session-test")).is_none());
-        let lock = process_workspace_execution_lock(&root.to_string_lossy());
+        let runtime = registry.register(temp.path()).unwrap();
+        let lock = process_workspace_execution_lock(&temp.path().to_string_lossy());
         let (_cancel, rx) = tokio::sync::watch::channel(false);
-        let mut caller = owner("python-run");
-        caller.tools = vec!["python".into()];
-        let outer = lock
-            .acquire(WorkspaceExecutionLockRequest::Exclusive, caller, rx.clone())
-            .await
-            .unwrap();
-        assert!(super::register_sdk_delegation(&runtime, Some("different-session")).is_none());
-        let registration = super::register_sdk_delegation(&runtime, Some("session-test")).unwrap();
-        let token = registration.token.clone();
-        let admitted = super::resolve_sdk_delegation(&token).unwrap();
-        assert!(crate::merge_jobs::coordination::verify_target(&admitted, &runtime).unwrap());
-        assert_eq!(admitted.checkout_id, runtime.checkout_id().as_str());
-        assert_eq!(admitted.run_id, "python-run");
-        let operation_gate = admitted.operations.lock().await
-            .entry(runtime.checkout_id().to_string()).or_default().clone();
-        let first = operation_gate.clone().lock_owned().await;
-        assert!(operation_gate.try_lock().is_err());
-        let sibling_gate = admitted.operations.lock().await.entry("sibling".into()).or_default().clone();
-        assert!(sibling_gate.try_lock().is_ok());
-        drop(first);
-        drop(registration);
-        assert!(super::resolve_sdk_delegation(&token).is_err());
-        drop(outer);
-        assert!(tokio::time::timeout(
-            Duration::from_millis(20),
-            lock.acquire(
-                WorkspaceExecutionLockRequest::Exclusive,
-                owner("next"),
-                rx.clone()
-            )
-        )
-        .await
-        .is_err());
-        drop(admitted);
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            lock.acquire(WorkspaceExecutionLockRequest::Exclusive, owner("next"), rx)
-        )
-        .await
-        .unwrap()
-        .is_ok());
+        let mut guards = Vec::new();
+        let mut registrations = Vec::new();
+        for id in ["first", "second"] {
+            let mut caller = owner(&format!("async:{id}"));
+            caller.tools = vec!["python".into()];
+            guards.push(
+                lock.acquire(
+                    WorkspaceExecutionLockRequest::ParallelOpaque("batch".into()),
+                    caller,
+                    rx.clone(),
+                )
+                .await
+                .unwrap(),
+            );
+            let registration =
+                super::register_sdk_delegation(&runtime, Some("session-test"), Some(id)).unwrap();
+            assert_eq!(
+                super::resolve_sdk_delegation(&registration.token)
+                    .unwrap()
+                    .run_id,
+                format!("async:{id}")
+            );
+            registrations.push(registration);
+        }
+        assert!(
+            super::register_sdk_delegation(&runtime, Some("session-test"), Some("other-task"))
+                .is_none()
+        );
+        let first = super::resolve_sdk_delegation(&registrations[0].token).unwrap();
+        let second = super::resolve_sdk_delegation(&registrations[1].token).unwrap();
+        assert!(Arc::ptr_eq(&first.operations, &second.operations));
+        assert!(crate::merge_jobs::coordination::verify_target(&first, &runtime).unwrap());
+        assert!(crate::merge_jobs::coordination::verify_target(&second, &runtime).unwrap());
     }
 
     #[tokio::test]
@@ -1037,7 +1116,7 @@ mod tests {
             .await
             .unwrap();
         let registration =
-            super::register_sdk_delegation(&runtimes[0], Some("session-test")).unwrap();
+            super::register_sdk_delegation(&runtimes[0], Some("session-test"), None).unwrap();
         let grant = super::resolve_sdk_delegation(&registration.token).unwrap();
         assert!(crate::merge_jobs::coordination::verify_target(&grant, &runtimes[0]).unwrap());
         assert!(

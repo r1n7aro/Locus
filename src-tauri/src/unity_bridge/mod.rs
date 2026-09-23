@@ -1321,7 +1321,7 @@ fn unity_recompile_waiting(project_path: &str) -> bool {
 }
 
 pub(crate) async fn project_unity_op_lock(project_path: &str) -> ProjectUnityOpLock {
-    let key = project_runtime_key(project_path);
+    let key = crate::agent::workspace_execution_lock::normalize_workspace_path_key(project_path, ".");
     let mut locks = unity_operation_locks().lock().await;
     locks
         .entry(key)
@@ -4267,9 +4267,8 @@ pub async fn unity_test_run_controlled(
     mut cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
     progress: Option<crate::async_tasks::TaskProgressReporter>,
 ) -> Result<UnityTestRunSnapshot, String> {
+    let started = Instant::now();
     require_unity_test_tools_available(project_path)?;
-    require_unity_test_sources_converged(project_path).await?;
-    ensure_unity_test_start_status(project_path).await?;
     if cancel_rx
         .as_ref()
         .is_some_and(|receiver| *receiver.borrow())
@@ -4278,7 +4277,22 @@ pub async fn unity_test_run_controlled(
     }
 
     let op_lock = project_unity_op_lock(project_path).await;
-    let _guard = op_lock.lock().await;
+    let _guard = tokio::select! {
+        biased;
+        _ = async {
+            match cancel_rx.as_mut() {
+                Some(receiver) => { let _ = receiver.wait_for(|cancelled| *cancelled).await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => return Err("Unity Test run cancelled while waiting for the Editor".into()),
+        _ = async {
+            match timeout {
+                Some(limit) => tokio::time::sleep_until(tokio::time::Instant::from_std(started + limit)).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => return Err("Unity Test run timed out while waiting for the Editor".into()),
+        guard = op_lock.lock() => guard,
+    };
     if cancel_rx
         .as_ref()
         .is_some_and(|receiver| *receiver.borrow())
@@ -4286,6 +4300,10 @@ pub async fn unity_test_run_controlled(
         return Err("Unity Test run cancelled before start".to_string());
     }
 
+    // Recheck the source/state after queueing, before changing Play Mode or
+    // starting a run; an earlier check can become stale while another tool runs.
+    require_unity_test_sources_converged(project_path).await?;
+    ensure_unity_test_start_status(project_path).await?;
     let requested_run_id = uuid::Uuid::new_v4().simple().to_string();
     let start_request = unity_test_start_request(request, &requested_run_id)?;
     let payload = serde_json::to_string(&start_request)
@@ -4343,7 +4361,6 @@ pub async fn unity_test_run_controlled(
         .await);
     };
 
-    let started = Instant::now();
     let status_payload = serde_json::json!({ "run_id": snapshot.run_id.clone() }).to_string();
     // The WinEventHook publishes only on native window changes. Waiting on its
     // watch revision adds no polling work during normal test execution and can
@@ -4494,6 +4511,65 @@ pub async fn unity_error(project_path: &str, message: &str) -> Result<(), String
     }
 }
 
+type PendingEditSessionStarts = HashMap<(String, String), tokio::task::JoinHandle<()>>;
+
+fn pending_edit_session_starts() -> &'static StdMutex<PendingEditSessionStarts> {
+    static STARTS: OnceLock<StdMutex<PendingEditSessionStarts>> = OnceLock::new();
+    STARTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// File writes must not wait for the Editor's main thread when snapshots are
+/// disabled. Retain the start task until cleanup so an end request cannot race
+/// ahead of a delayed begin request and leave Auto Refresh suppressed forever.
+pub(crate) fn begin_edit_session_in_background(project_path: &str, owner: &str) {
+    let key = (crate::agent::workspace_execution_lock::normalize_workspace_path_key(project_path, "."), owner.to_string());
+    let mut starts = pending_edit_session_starts().lock().unwrap_or_else(|error| error.into_inner());
+    starts.entry(key).or_insert_with(|| {
+        let project = project_path.to_string();
+        let owner = owner.to_string();
+        tokio::spawn(async move {
+            if let Err(error) = begin_edit_session(&project, &owner).await {
+                eprintln!("[Locus] deferred Unity edit session start failed owner={owner}: {error}");
+            }
+        })
+    });
+}
+
+async fn wait_for_edit_session_starts(project_path: &str, owner: &str) {
+    let project = crate::agent::workspace_execution_lock::normalize_workspace_path_key(project_path, ".");
+    let pending = {
+        let mut starts = pending_edit_session_starts().lock().unwrap_or_else(|error| error.into_inner());
+        let keys = starts.keys().filter(|(path, id)| path == &project && (owner.is_empty() || id == owner)).cloned().collect::<Vec<_>>();
+        keys.into_iter().filter_map(|key| starts.remove(&key)).collect::<Vec<_>>()
+    };
+    for start in pending { let _ = start.await; }
+}
+
+#[cfg(test)]
+mod deferred_edit_session_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cleanup_waits_for_its_queued_begin_and_preserves_other_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().to_string_lossy().to_string();
+        let key = crate::agent::workspace_execution_lock::normalize_workspace_path_key(&project, ".");
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        {
+            let mut starts = pending_edit_session_starts().lock().unwrap();
+            starts.insert((key.clone(), "owner-a".into()), tokio::spawn(async move { wait.await.unwrap(); }));
+            starts.insert((key.clone(), "owner-b".into()), tokio::spawn(async {}));
+        }
+        let mut cleanup = Box::pin(wait_for_edit_session_starts(&project, "owner-a"));
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut cleanup).await.is_err());
+        finish.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), cleanup).await.unwrap();
+        assert!(pending_edit_session_starts().lock().unwrap().contains_key(&(key.clone(), "owner-b".into())));
+        wait_for_edit_session_starts(&project, "").await;
+        assert!(!pending_edit_session_starts().lock().unwrap().keys().any(|(project, _)| project == &key));
+    }
+}
+
 /// Begin a Unity edit session and suppress Auto Refresh until the session ends.
 pub async fn begin_edit_session(project_path: &str, owner: &str) -> Result<String, String> {
     let resp = send_message(project_path, "begin_edit_session", owner).await?;
@@ -4510,7 +4586,15 @@ pub async fn begin_edit_session(project_path: &str, owner: &str) -> Result<Strin
 
 /// End a Unity edit session for the given owner.
 /// Pass an empty owner to release every active session before recompiling.
+pub(crate) async fn end_edit_session_after_execution(project_path: &str, owner: &str) -> Result<String, String> {
+    crate::agent::unity_execution_scope::run(
+        project_path, "unity_edit_session_cleanup", &serde_json::json!({}), None, true,
+        end_edit_session(project_path, owner),
+    ).await.map_err(str::to_string)?
+}
+
 pub async fn end_edit_session(project_path: &str, owner: &str) -> Result<String, String> {
+    wait_for_edit_session_starts(project_path, owner).await;
     let resp = send_message(project_path, "end_edit_session", owner).await?;
     if resp.ok {
         Ok(resp
@@ -4528,6 +4612,14 @@ pub async fn import_assets(project_path: &str, asset_paths: &[String]) -> Result
     if asset_paths.is_empty() {
         return Ok("0 assets queued".to_string());
     }
+
+    crate::agent::unity_execution_scope::run(
+        project_path, "unity_import_assets", &serde_json::json!({}), None, true,
+        import_assets_inner(project_path, asset_paths),
+    ).await.map_err(str::to_string)?
+}
+
+async fn import_assets_inner(project_path: &str, asset_paths: &[String]) -> Result<String, String> {
 
     crate::workspace_changes::record_known_paths(
         Path::new(project_path),
@@ -6934,6 +7026,9 @@ async fn recompile_and_wait_inner(project_path: &str) -> Result<String, String> 
 /// reconnect is connectivity evidence only; completion still requires the
 /// persisted `get_compile_result == ok` state from the reloaded domain.
 pub async fn recompile_and_wait(project_path: &str) -> Result<String, String> {
+    // Recompile releases all Editor edit owners. Consume deferred starts first
+    // so later source-edit rounds can establish a fresh suppression session.
+    wait_for_edit_session_starts(project_path, "").await;
     let op_lock = project_unity_op_lock(project_path).await;
     let _guard = op_lock.lock().await;
     let _recompile_wait_guard = UnityRecompileWaitGuard::new(project_path);

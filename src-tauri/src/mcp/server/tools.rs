@@ -652,6 +652,20 @@ async fn execute_workspace_tool(
     tool_registry: Arc<ToolRegistry>,
     runtime_state: Arc<ToolRuntimeState>,
 ) -> ToolCallOutcome {
+    match crate::agent::unity_execution_scope::run(
+        working_dir, name, arguments, None, false,
+        execute_workspace_tool_inner(app, name, arguments, working_dir, execution, tool_registry, runtime_state),
+    ).await {
+        Ok(outcome) => outcome,
+        Err(error) => outcome_from_tool_result(err(error), None),
+    }
+}
+
+async fn execute_workspace_tool_inner(
+    app: &AppHandle, name: &str, arguments: &Value, working_dir: &str,
+    execution: Arc<crate::workspace_service::AgentExecutionContext>,
+    tool_registry: Arc<ToolRegistry>, runtime_state: Arc<ToolRuntimeState>,
+) -> ToolCallOutcome {
     let requires_ready = crate::workspace_service::service::service_ready_required_for_tool(name);
     let unity_owned = crate::workspace_service::service::owner_service_for_tool(name)
         == Some(crate::workspace_service::ServiceKind::Unity);

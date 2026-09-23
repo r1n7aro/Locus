@@ -12,6 +12,7 @@ mod prompt_context;
 mod read_file;
 mod subagent_model;
 mod unity_capture;
+mod unity_yaml_extension;
 mod view_capture;
 
 pub use backend::resolve_openrouter_model;
@@ -8341,6 +8342,19 @@ impl AgentInstance {
             );
         }
 
+        if !self.session_undo_enabled {
+            let working_dir = self.working_dir.clone();
+            let session_id = self.session_id.clone();
+            let agent_id = self.id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = crate::unity_bridge::end_edit_session_after_execution(&working_dir, &session_id).await {
+                    eprintln!("[Agent {agent_id}] deferred Unity edit cleanup failed: {error}");
+                    Self::retry_unity_edit_session_cleanup(agent_id, working_dir, session_id);
+                }
+            });
+            return;
+        }
+
         match crate::unity_bridge::end_edit_session(&self.working_dir, &self.session_id).await {
             Ok(_) => {}
             Err(e) => {
@@ -8365,7 +8379,7 @@ impl AgentInstance {
                 let delay_secs = if attempt <= 5 { 1 } else { 5 };
                 tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
 
-                match crate::unity_bridge::end_edit_session(&working_dir, &session_id).await {
+                match crate::unity_bridge::end_edit_session_after_execution(&working_dir, &session_id).await {
                     Ok(msg) => {
                         eprintln!(
                             "[Agent {}] Unity edit session cleanup retry succeeded for {} after attempt {}: {}",
@@ -12239,7 +12253,7 @@ impl AgentInstance {
                     }
                 }
 
-                let has_pending_mutation = prepared.iter().any(|(tc, args)| {
+                let has_pending_mutation = self.session_undo_enabled && prepared.iter().any(|(tc, args)| {
                     !blocked_results.contains_key(&tc.id)
                         && !precompleted_results.contains_key(&tc.id)
                         && !self.tool_call_runs_in_background(&effective_name(tc), args)
@@ -12344,7 +12358,7 @@ impl AgentInstance {
                         && self.tool_call_has_unity_execution_barrier(&tc.name, args)
                 });
                 let workspace_lock_request = prepared.iter().fold(None, |current, (tc, args)| {
-                    if !is_active(tc)
+                    if !self.session_undo_enabled || !is_active(tc)
                         || self.tool_call_runs_in_background(&effective_name(tc), args)
                     {
                         return current;
@@ -12481,7 +12495,9 @@ impl AgentInstance {
                     && prepared.iter().any(|(tc, args)| {
                         is_active(tc) && self.is_unity_asset_write_call(tc, args)
                     });
-                if has_unity_asset_writes {
+                if has_unity_asset_writes && !self.session_undo_enabled {
+                    crate::unity_bridge::begin_edit_session_in_background(&self.working_dir, &self.session_id);
+                } else if has_unity_asset_writes {
                     match crate::unity_bridge::begin_edit_session(&self.working_dir, &self.session_id).await {
                         Ok(msg) => eprintln!(
                             "[Agent {}] Unity edit session active for {}: {}",
@@ -13649,49 +13665,10 @@ impl AgentInstance {
         args: &serde_json::Value,
     ) -> Option<WorkspaceExecutionLockRequest> {
         let (target_name, target_args) = self.workspace_execution_target(name, args);
-        if target_name == "execute_typescript" {
-            // Do not hold a filesystem gate while awaiting frontend callbacks:
-            // their actual asset/merge mutations acquire it at the endpoint.
-            // ToolDef remains mutating for plan-mode and permission policies.
-            return None;
-        }
-        if target_name == "apply_patch" {
-            return Some(WorkspaceExecutionLockRequest::Exclusive);
-        }
-        if matches!(target_name.as_str(), "write" | "edit") {
-            return Some(
-                target_args
-                    .get("filePath")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|path| {
-                        WorkspaceExecutionLockRequest::PathWrite(vec![
-                            normalize_workspace_path_key(&self.working_dir, path),
-                        ])
-                    })
-                    .unwrap_or(WorkspaceExecutionLockRequest::Exclusive),
-            );
-        }
-        if target_name == "bash" {
-            return (self.session_undo_enabled
-                && self.bash_needs_primary_workspace_tracking(&target_args))
-            .then_some(WorkspaceExecutionLockRequest::Exclusive);
-        }
-        if target_name == "python" {
-            return (self.session_undo_enabled
-                && !crate::tool::builtins::python_is_readonly(&target_args))
-            .then_some(WorkspaceExecutionLockRequest::Exclusive);
-        }
-        if target_name == "unity_execute" {
-            return (!Self::unity_execute_is_readonly(&target_args))
-                .then_some(WorkspaceExecutionLockRequest::Exclusive);
-        }
-        if (self.session_undo_enabled && self.tool_registry.mutates_workspace(&target_name))
-            || Self::is_unity_execution_barrier_tool(&target_name)
-        {
-            Some(WorkspaceExecutionLockRequest::Exclusive)
-        } else {
-            None
-        }
+        crate::agent::tool_execution_policy::workspace_request(
+            &target_name, &target_args, &self.working_dir,
+            self.tool_registry.mutates_workspace(&target_name), self.session_undo_enabled,
+        )
     }
 
     fn agent_definition_is_workspace_readonly(&self, agent_def: &AgentDef) -> bool {
@@ -13699,8 +13676,9 @@ impl AgentInstance {
             let canonical = self
                 .canonical_tool_name(tool_name)
                 .unwrap_or_else(|| tool_name.clone());
-            self.workspace_execution_request_for_tool(&canonical, &serde_json::json!({}))
-                .is_none()
+            !self.tool_call_needs_undo_tracking(&canonical, &serde_json::json!({}))
+                && !Self::is_unity_execution_barrier_tool(&canonical)
+                && canonical != "execute_typescript"
         })
     }
 
@@ -13732,20 +13710,11 @@ impl AgentInstance {
         parallel_group_id: &str,
     ) -> Option<WorkspaceExecutionLockRequest> {
         let (target_name, target_args) = self.workspace_execution_target(name, args);
-        match target_name.as_str() {
-            "subagent" => None,
-            // An async shell call is an explicit request to detach opaque work.
-            // A model tool-call batch shares one re-entrant opaque lease. Bash
-            // calls in that batch overlap, while other batches and foreground
-            // workspace mutations remain mutually exclusive with the group.
-            "bash" => (self.session_undo_enabled
-                && self.bash_needs_primary_workspace_tracking(&target_args))
-            .then(|| WorkspaceExecutionLockRequest::ParallelOpaque(parallel_group_id.to_string())),
-            "python" => (self.session_undo_enabled
-                && !crate::tool::builtins::python_is_readonly(&target_args))
-            .then(|| WorkspaceExecutionLockRequest::ParallelOpaque(parallel_group_id.to_string())),
-            _ => self.workspace_execution_request_for_tool(&target_name, &target_args),
-        }
+        crate::agent::tool_execution_policy::background_workspace_request(
+            &target_name, &target_args, &self.working_dir,
+            self.tool_registry.mutates_workspace(&target_name), self.session_undo_enabled,
+            parallel_group_id,
+        )
     }
 
     fn merge_workspace_execution_request(
@@ -13801,16 +13770,7 @@ impl AgentInstance {
     }
 
     pub(crate) fn is_unity_execution_barrier_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "unity_execute"
-                | "unity_run_states"
-                | "unity_test_list"
-                | "unity_test_run"
-                | "unity_recompile"
-                | "unity_hot_reload"
-                | "unity_set_play_mode"
-        )
+        crate::agent::tool_execution_policy::is_unity_execution_barrier_tool(name)
     }
 
     fn tool_call_has_unity_execution_barrier(&self, name: &str, args: &serde_json::Value) -> bool {
@@ -15858,6 +15818,31 @@ impl AgentInstance {
             }
         }
 
+        // Without snapshots, hold only this call's file paths. A mixed batch
+        // containing a long Unity operation must not extend an edit's lease.
+        let _file_guard = if !self.session_undo_enabled {
+            if let Some(request) = self.workspace_execution_request_for_tool(&tc.name, args) {
+                let Some(execution) = self.execution_context.as_ref() else {
+                    return ExecutedToolResult::from_tool_result(ToolResult {
+                        output: "File mutation requires a checkout-scoped AgentExecutionContext.".into(),
+                        is_error: true,
+                    });
+                };
+                let owner = WorkspaceExecutionLockOwner {
+                    session_id: self.session_id.clone(), run_id: run_id.into(), iteration: 0,
+                    workspace: self.working_dir.clone(), tools: vec![tc.name.clone()],
+                };
+                match process_workspace_execution_lock(&self.working_dir).acquire_with_diagnostics(
+                    request, owner, self.cancel_waiter(),
+                    crate::workspace_service::event::WorkspaceEventScope::for_runtime(execution.workspace.as_ref()),
+                    app_handle,
+                ).await {
+                    Ok(guard) => Some(guard),
+                    Err(_) => return Self::interrupted_tool_result(),
+                }
+            } else { None }
+        } else { None };
+
         // Keep the Unity execution future out of the generic tool-dispatch
         // state machine. In debug builds the agent loop already owns a large
         // poll frame; nesting the monolithic dispatcher, Unity bridge and a
@@ -15887,6 +15872,19 @@ impl AgentInstance {
         tc: &ToolCallInfo,
         args: &serde_json::Value,
         run_id: &str,
+    ) -> ExecutedToolResult {
+        crate::agent::unity_execution_scope::run(
+            &self.working_dir, &tc.name, args, Some(self.cancel_waiter()),
+            self.background_task_id.is_some(),
+            Box::pin(self.execute_single_tool_dispatch_inner(app_handle, store, tc, args, run_id)),
+        ).await.unwrap_or_else(|error| if self.is_cancel_requested() {
+            Self::interrupted_tool_result()
+        } else { ExecutedToolResult::from_tool_result(ToolResult { output: error.into(), is_error: true }) })
+    }
+
+    async fn execute_single_tool_dispatch_inner(
+        &self, app_handle: &AppHandle, store: &SessionStore,
+        tc: &ToolCallInfo, args: &serde_json::Value, run_id: &str,
     ) -> ExecutedToolResult {
         if tc.name.starts_with(crate::mcp::manager::MCP_TOOL_PREFIX)
             && crate::mcp::manager::resolve_wire_tool(&tc.name).is_some()
@@ -18074,6 +18072,20 @@ impl AgentInstance {
         run_id: &str,
         task_progress: Option<crate::async_tasks::TaskProgressReporter>,
     ) -> ExecutedToolResult {
+        crate::agent::unity_execution_scope::run(
+            &self.working_dir, "unity_execute", args, Some(self.cancel_waiter()),
+            self.background_task_id.is_some(),
+            Box::pin(self.execute_unity_execute_with_task_progress_inner(
+                app_handle, tool_call_id, args, run_id, task_progress,
+            )),
+        ).await.unwrap_or_else(|_| Self::interrupted_tool_result())
+    }
+
+    async fn execute_unity_execute_with_task_progress_inner(
+        &self, app_handle: &AppHandle, tool_call_id: &str,
+        args: &serde_json::Value, run_id: &str,
+        task_progress: Option<crate::async_tasks::TaskProgressReporter>,
+    ) -> ExecutedToolResult {
         if self.is_cancel_requested() {
             return Self::interrupted_tool_result();
         }
@@ -19285,6 +19297,10 @@ impl AgentInstance {
 
     fn apply_unity_property_tree_output_budget(output: String, args: &serde_json::Value) -> String {
         let limit = Self::unity_property_tree_output_char_limit(args);
+        Self::apply_unity_property_tree_char_limit(output, limit)
+    }
+
+    fn apply_unity_property_tree_char_limit(output: String, limit: usize) -> String {
         if output.chars().count() <= limit {
             return output;
         }
@@ -19567,6 +19583,55 @@ impl AgentInstance {
             Ok(fields) => fields,
             Err(result) => return result,
         };
+        unity_yaml_extension::read_with_extension(
+            &path,
+            args,
+            || async {
+                if !crate::commands::has_unity_yaml_read_extensions_for_working_dir(working_dir) {
+                    return Ok(None);
+                }
+                let (_, project_root, _) =
+                    Self::unity_yaml_project_context(working_dir, &path.asset_path, asset_db);
+                let abs_path = &path.absolute_asset_path;
+                // Saved YAML is used only for matcher identity. Failure to load
+                // it must not prevent a live read of an unsaved/new asset.
+                let content = match Self::read_unity_yaml_content(&abs_path) {
+                    Ok(content) if Self::is_unity_yaml_content(&content) => content,
+                    _ => return Ok(None),
+                };
+                let docs = crate::unity_yaml::parse_yaml_docs(&content);
+                Self::try_unity_yaml_read_extension(
+                    working_dir,
+                    &path,
+                    &abs_path,
+                    project_root.as_deref(),
+                    &docs,
+                    args,
+                )
+                .await
+            },
+            || {
+                Self::execute_unity_property_tree_read_default(
+                    app_handle,
+                    working_dir,
+                    asset_db,
+                    args,
+                    &path,
+                    hierarchy_fields,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn execute_unity_property_tree_read_default(
+        app_handle: &AppHandle,
+        working_dir: &str,
+        asset_db: &Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
+        args: &serde_json::Value,
+        path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
+        hierarchy_fields: crate::unity_serialized_property::property_tree::HierarchyFieldSelection,
+    ) -> ToolResult {
         let editor_eligible =
             path.asset_path.starts_with("Assets/") || path.asset_path.starts_with("Packages/");
         let auto_expand_limit = Self::unity_property_tree_auto_expand_char_limit(args);
@@ -20040,7 +20105,7 @@ impl AgentInstance {
     /// matching extension could not run (fall back to the default output).
     async fn try_unity_yaml_read_extension(
         working_dir: &str,
-        file_path_arg: &str,
+        path: &crate::unity_serialized_property::property_tree::PropertyTreePath,
         abs_path: &std::path::Path,
         project_root: Option<&std::path::Path>,
         docs: &[crate::unity_yaml::YamlDoc],
@@ -20080,23 +20145,16 @@ impl AgentInstance {
         let asset_path = project_root
             .and_then(|root| abs_path.strip_prefix(root).ok())
             .map(|rel| rel.to_string_lossy().replace('\\', "/"));
-        let max_field_depth = args
-            .get("max_field_depth")
-            .and_then(|value| value.as_u64())
-            .filter(|value| *value > 0)
-            .map(|value| value.min(6))
-            .unwrap_or(2);
-        let max_array_items = args
-            .get("max_array_items")
-            .and_then(|value| value.as_u64())
-            .filter(|value| *value > 0)
-            .map(|value| value.min(200))
-            .unwrap_or(20);
+        let depth = Self::unity_property_tree_depth(args);
+        let max_array_items = Self::unity_property_tree_array_limit(args);
         let invoke_args = serde_json::json!({
-            "filePath": file_path_arg,
+            "path": path.full_path(),
+            "filePath": path.asset_path,
+            "childPath": "",
             "absPath": abs_path.to_string_lossy().replace('\\', "/"),
             "assetPath": asset_path,
-            "maxFieldDepth": max_field_depth,
+            "depth": depth,
+            "maxFieldDepth": depth,
             "maxArrayItems": max_array_items,
             "matchedClassId": extension.matched_class_id,
             "matchedScriptGuid": extension.matched_script_guid,
@@ -20108,7 +20166,7 @@ impl AgentInstance {
         {
             Ok(output) => Ok(Some(ToolResult {
                 output: format!(
-                    "[unity_yaml_read extension '{}' · Skill package '{}']\n{}",
+                    "[unity_yaml_read extension '{}' · Skill package '{}']\n[source: live Editor]\n{}",
                     label, extension.package_id, output
                 ),
                 is_error: false,
@@ -20412,27 +20470,6 @@ impl AgentInstance {
         let text_shared = String::from_utf8_lossy(&content).into_owned();
         let (docs, raw_refs) = yaml_parser::parse_yaml_docs_with_refs(text_shared.as_bytes());
 
-        let mut yaml_read_extension_note: Option<String> = None;
-        if !is_hierarchical && (detail.is_empty() || detail == "components") {
-            match Self::try_unity_yaml_read_extension(
-                working_dir,
-                &file_path_arg,
-                &abs_path,
-                project_root.as_deref(),
-                &docs,
-                args,
-            )
-            .await
-            {
-                Ok(Some(result)) => return result,
-                Ok(None) => {}
-                Err(note) => {
-                    eprintln!("[unity_yaml_read] {}", note);
-                    yaml_read_extension_note = Some(note);
-                }
-            }
-        }
-
         let lines: Vec<&str> = text_shared.lines().collect();
         let world_transform_map = yaml_parser::build_world_transform_map(&docs, &lines);
 
@@ -20623,10 +20660,6 @@ impl AgentInstance {
                 skipped_fields,
             );
             output.push_str(&resolved);
-        }
-
-        if let Some(note) = yaml_read_extension_note {
-            output.push_str(&format!("\nNote: {}\n", note));
         }
 
         ToolResult {
@@ -22663,15 +22696,18 @@ mod tests {
             .is_none());
         assert!(!agent.should_track_session_undo("execute_typescript", &json!({})));
 
-        assert!(matches!(
-            agent
-                .workspace_execution_request_for_tool("unity_execute", &json!({"readonly": false})),
-            Some(WorkspaceExecutionLockRequest::Exclusive)
-        ));
-        assert!(matches!(
-            agent.workspace_execution_request_for_tool("unity_recompile", &json!({})),
-            Some(WorkspaceExecutionLockRequest::Exclusive)
-        ));
+        for name in ["unity_execute", "unity_test_run", "unity_test_list", "unity_run_states",
+            "unity_recompile", "unity_hot_reload", "unity_set_play_mode"] {
+            let args = json!({"readonly":false});
+            let wrapped = json!({"toolName":name,"arguments":args});
+            for (entry, arguments) in [(name, &args), ("tool_call", &wrapped)] {
+                assert!(agent.workspace_execution_request_for_tool(entry, arguments).is_none(), "{name}");
+                assert!(agent.background_workspace_execution_request_for_tool(entry, arguments, "batch").is_none(), "{name}");
+                assert!(!agent.should_track_session_undo(entry, arguments));
+            }
+            assert!(crate::sdk::direct_tool_lock_request(name, &args, &agent.working_dir,
+                agent.tool_registry.mutates_workspace(name), false).is_none());
+        }
     }
 
     #[test]
@@ -27587,6 +27623,20 @@ Search, install, audit, and export a plugin.
         assert!(memory.contains("Rules:"));
         assert!(memory.contains("Body:\n<empty>"));
         assert!(!memory.contains("user-preference.md"));
+    }
+
+    #[test]
+    fn unity_yaml_read_extension_limits_follow_the_current_tool_contract() {
+        for (args, depth, array_limit) in [
+            (json!({}), 2, 4),
+            (json!({"depth": 0, "max_array_items": 1}), 0, 1),
+            (json!({"depth": 4, "max_array_items": 1024}), 4, 1024),
+            (json!({"max_field_depth": 6, "max_array_items": 2048}), 4, 1024),
+            (json!({"depth": 0, "max_field_depth": 6, "max_array_items": 0}), 0, 1),
+        ] {
+            assert_eq!(AgentInstance::unity_property_tree_depth(&args), depth);
+            assert_eq!(AgentInstance::unity_property_tree_array_limit(&args), array_limit);
+        }
     }
 
     #[test]

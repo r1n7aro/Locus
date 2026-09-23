@@ -27,7 +27,7 @@ describe("agent parallel tool scheduling safety", () => {
     expect(agent).toContain("WorkspaceExecutionLockRequest::Exclusive");
     expect(agent).toContain("let execute_sequentially = workspace_lock_request.is_some()");
     expect(agent).toContain("workspace_execution_request_for_tool");
-    expect(agent).toContain('matches!(target_name.as_str(), "write" | "edit")');
+    expect(read("src-tauri/src/agent/tool_execution_policy.rs")).toContain('matches!(name, "write" | "edit")');
     expect(agent).toContain("if execute_sequentially");
     expect(acquire).toBeGreaterThan(0);
     expect(checkpoint).toBeGreaterThan(acquire);
@@ -53,20 +53,22 @@ describe("agent parallel tool scheduling safety", () => {
     const cli = read("src-tauri/src/agent/instance/claude_code_cli.rs");
     const sdk = read("src-tauri/src/sdk.rs");
     const mcp = read("src-tauri/src/mcp/server/tools.rs");
+    const policy = read("src-tauri/src/agent/tool_execution_policy.rs");
 
     expect(agent).toContain('args.get("readonly")');
     expect(agent).toContain("bash_needs_primary_workspace_tracking");
-    expect(agent).toContain("WorkspaceExecutionLockRequest::ParallelOpaque(parallel_group_id.to_string())");
+    expect(/WorkspaceExecutionLockRequest::ParallelOpaque\(\s*parallel_group_id\.to_string\(\)/.test(policy)).toBe(true);
     expect(agent).toContain("background_workspace_execution_request_for_tool");
     expect(agent).toContain("&assistant_message_id");
     expect(bashTool).toContain('"readonly"');
     expect(bashTool).toContain('"required": ["command", "description", "readonly", "workdir"]');
     expect(cli).toContain('|| tool_call.name == "bash"');
-    expect(sdk).toContain("bash_needs_primary_workspace_tracking_for");
+    expect(policy).toContain("bash_needs_primary_workspace_tracking_for");
+    expect(sdk).toContain("crate::agent::tool_execution_policy::workspace_request(");
     expect(agent).toContain("unity_execute_is_readonly");
     expect(agent).toContain("tool_call_has_unity_execution_barrier");
     expect(unityExecuteTool).toContain('"readonly"');
-    expect(sdk).toContain('canonical == "unity_execute"');
+    expect(policy).toContain('"unity_execute" =>');
     expect(mcp).toContain("crate::sdk::direct_tool_lock_request(&name, &arguments");
     expect(lock).toContain("ParallelOpaque(Arc<OpaqueGroupState>)");
     expect(lock).toContain("parallel_opaque_group_overlaps_and_blocks_other_groups");
@@ -214,7 +216,7 @@ describe("agent parallel tool scheduling safety", () => {
     const release = mcp.indexOf("drop(workspace_guard)", execute);
 
     expect(mcp).toContain("crate::sdk::direct_tool_lock_request(&name, &arguments");
-    expect(read("src-tauri/src/sdk.rs")).toContain("WorkspaceExecutionLockRequest::Exclusive");
+    expect(read("src-tauri/src/sdk.rs")).toContain("crate::agent::tool_execution_policy::workspace_request(");
     expect(mcp).toContain("let workspace_guard = if let Some(request) = lock_request");
     expect(acquire).toBeGreaterThan(0);
     expect(execute).toBeGreaterThan(acquire);

@@ -95,7 +95,8 @@ describe("unityExecuteProgress", () => {
     expect(agentSource).toContain("unity_execute_editor_status_intent");
     expect(agentSource).toContain("let has_unity_execution_barrier = prepared.iter().any");
     expect(agentSource).toContain("Self::is_unity_execution_barrier_tool");
-    expect(agentSource).toContain("|| Self::is_unity_execution_barrier_tool(&target_name)");
+    expect(agentSource).toContain("crate::agent::unity_execution_scope::run(");
+    expect(read("src-tauri/src/agent/tool_execution_policy.rs")).toContain("if !session_undo_enabled");
     expect(agentSource).toContain("unity_execute_code_with_progress_cancellable");
     expect(agentSource).toContain("StreamEvent::ToolCallProgress");
     expect(read("locus_unity/Editor/LocusBridge.cs")).toContain("execute_code_progress");

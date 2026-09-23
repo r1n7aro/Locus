@@ -381,7 +381,9 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             }
             return Ok(None);
         }
-        if current_tool_name == "subagent" || has_external_mcp {
+        // execute_single_tool owns per-call path guards when snapshots are off.
+        // Do not acquire a second guard or retain it until the CLI round ends.
+        if !self.agent.session_undo_enabled || current_tool_name == "subagent" || has_external_mcp {
             return Ok(None);
         }
 
@@ -699,6 +701,11 @@ impl<'a> ClaudeCodeRoundHost<'a> {
         }
         if let Some(round) = self.pending_round.as_mut() {
             round.unity_edit_session_started = true;
+        }
+
+        if !self.agent.session_undo_enabled {
+            crate::unity_bridge::begin_edit_session_in_background(&self.agent.working_dir, &self.agent.session_id);
+            return;
         }
 
         match crate::unity_bridge::begin_edit_session(
