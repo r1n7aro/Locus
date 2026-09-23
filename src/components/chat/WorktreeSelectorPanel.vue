@@ -178,7 +178,8 @@ onUnmounted(() => { disposed = true; requestId++; emit("busy", false); });
 </template>
 
 <style scoped>
-.worktree-selector-panel { min-width: 0; min-height: 0; max-height: min(404px, calc(100vh - 176px)); display: flex; flex-direction: column; border-left: 1px solid var(--border-color); padding-left: 4px; color: var(--text-color); }
+/* Let the adjacent selector columns determine the height, including while branches load. */
+.worktree-selector-panel { min-width: 0; min-height: 0; max-height: min(404px, calc(100vh - 176px)); display: flex; flex-direction: column; border-left: 1px solid var(--border-color); padding-left: 4px; color: var(--text-color); contain: size; overflow-y: auto; }
 .worktree-heading { display: flex; align-items: center; justify-content: space-between; padding: 4px 12px 2px; color: var(--text-secondary); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; }
 .worktree-search { display: flex; align-items: center; gap: 6px; margin: 4px 8px; color: var(--text-secondary); }
 input { min-width: 0; width: 100%; box-sizing: border-box; padding: 5px 7px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--input-bg, var(--bg-color)); color: var(--text-color); font: inherit; font-size: 12px; }
