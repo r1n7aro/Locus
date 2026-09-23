@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.8.3 (2026-09-19)"
+description: "Locus v0.8.4 (2026-09-23)"
 sidebarTitle: "当前版本"
-version: "0.8.3"
-releasedAt: "2026-09-19"
+version: "0.8.4"
+releasedAt: "2026-09-23"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,31 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.8.4（新增）
+
+- `unity_yaml_read` 支持在资产根路径指定 `reader: "default"`，跳过匹配的 Skill 读取器；子路径可从实时 Editor 定位 Inspector 未显示的序列化字段。
+- Codex 订阅信息的手动刷新同时更新额度和可用模型列表。
+
+### v0.8.4（修复）
+
+- Skill YAML 读取器对齐当前字段深度和数组数量限制；返回空内容或执行失败时回退到 Property Tree，并保留默认读取的来源与结果状态。
+- 关闭会话撤回时，Unity Editor 操作不再持续占用工作区文件锁，其他 Agent 可继续编辑源文件。
+- Unity Test 排队期间支持取消和超时；Test Framework 报错后会结束活动测试并记录错误。
+- 编译服务刷新 DLL 时保留旧编译所需引用；调用关系扫描期间可替换 DLL，并正确读取替换前后的结果。
+- Codex 模型刷新失败时保留现有模型列表；更新订阅模型请求的客户端版本。
+- 工作区会话中的模型默认值设置保持显示应用级 Agent 和子 Agent 定义。
+- 知识文档跨文件夹拖拽及悬停展开时，目标行保持稳定。
+- worktree 选择面板在分支加载期间保持稳定高度。
+
+### v0.8.4（移除）
+
+- 本版本没有移除面向用户的工作流或兼容路径。
 
 ### v0.8.3（新增）
 

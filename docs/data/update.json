@@ -1,12 +1,12 @@
 {
-  "version": "0.8.3",
-  "releasedAt": "2026-09-19",
+  "version": "0.8.4",
+  "releasedAt": "2026-09-23",
   "channel": "stable",
   "installers": [
     {
       "id": "windows-x64",
       "label": "Windows x64",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": true,
@@ -17,7 +17,7 @@
     {
       "id": "windows-x64-without-embed-python-git",
       "label": "Windows x64 - system Python/Git",
-      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-without_embed_python_git-setup.exe",
+      "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-without_embed_python_git-setup.exe",
       "platform": "windows",
       "arch": "x64",
       "includesManagedPython": false,
@@ -29,9 +29,35 @@
   "locales": {
     "zh": {
       "title": "发现新版本",
-      "summary": "Locus v0.8.3 (2026-09-19)",
+      "summary": "Locus v0.8.4 (2026-09-23)",
       "changelogUrl": "/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.4（新增）",
+          "items": [
+            "`unity_yaml_read` 支持在资产根路径指定 `reader: \"default\"`，跳过匹配的 Skill 读取器；子路径可从实时 Editor 定位 Inspector 未显示的序列化字段。",
+            "Codex 订阅信息的手动刷新同时更新额度和可用模型列表。"
+          ]
+        },
+        {
+          "title": "v0.8.4（修复）",
+          "items": [
+            "Skill YAML 读取器对齐当前字段深度和数组数量限制；返回空内容或执行失败时回退到 Property Tree，并保留默认读取的来源与结果状态。",
+            "关闭会话撤回时，Unity Editor 操作不再持续占用工作区文件锁，其他 Agent 可继续编辑源文件。",
+            "Unity Test 排队期间支持取消和超时；Test Framework 报错后会结束活动测试并记录错误。",
+            "编译服务刷新 DLL 时保留旧编译所需引用；调用关系扫描期间可替换 DLL，并正确读取替换前后的结果。",
+            "Codex 模型刷新失败时保留现有模型列表；更新订阅模型请求的客户端版本。",
+            "工作区会话中的模型默认值设置保持显示应用级 Agent 和子 Agent 定义。",
+            "知识文档跨文件夹拖拽及悬停展开时，目标行保持稳定。",
+            "worktree 选择面板在分支加载期间保持稳定高度。"
+          ]
+        },
+        {
+          "title": "v0.8.4（移除）",
+          "items": [
+            "本版本没有移除面向用户的工作流或兼容路径。"
+          ]
+        },
         {
           "title": "v0.8.3（新增）",
           "items": [
@@ -492,11 +518,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-setup.exe"
         },
         {
           "label": "Windows x64（系统 Python/Git）",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",
@@ -506,9 +532,35 @@
     },
     "en": {
       "title": "Update available",
-      "summary": "Locus v0.8.3 (2026-09-19)",
+      "summary": "Locus v0.8.4 (2026-09-23)",
       "changelogUrl": "/en/overview/latest-version",
       "changes": [
+        {
+          "title": "v0.8.4 (Added)",
+          "items": [
+            "`unity_yaml_read` accepts `reader: \"default\"` on asset roots to bypass matching Skill readers. Child paths can resolve serialized fields hidden from the Inspector through the live Editor.",
+            "Manually refreshing a Codex subscription now updates usage limits and the available model list together."
+          ]
+        },
+        {
+          "title": "v0.8.4 (Fixed)",
+          "items": [
+            "Skill YAML readers use the current field-depth and array limits. Empty results and reader failures fall back to Property Tree while preserving the default read's source and status.",
+            "With session undo disabled, Unity Editor operations no longer hold the workspace file lock for their duration, allowing other Agents to edit source files.",
+            "Queued Unity Test runs honor cancellation and timeouts. Test Framework errors now end active runs and record the error.",
+            "The compile server preserves references used by earlier compilations when DLLs refresh. DLLs can be replaced during caller scans, which read both the old and new results correctly.",
+            "A failed Codex model refresh preserves the current model list. Subscription model requests use an updated client version.",
+            "Model default settings continue to show app Agent and subagent definitions during workspace sessions.",
+            "Knowledge document drag targets remain stable across folders and hover expansion.",
+            "The worktree selector keeps a stable height while branches load."
+          ]
+        },
+        {
+          "title": "v0.8.4 (Removed)",
+          "items": [
+            "No user-facing workflows or compatibility paths were removed."
+          ]
+        },
         {
           "title": "v0.8.3 (Added)",
           "items": [
@@ -969,11 +1021,11 @@
       "downloadChannels": [
         {
           "label": "Windows x64",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-setup.exe"
         },
         {
           "label": "Windows x64 (system Python/Git)",
-          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-without_embed_python_git-setup.exe"
+          "url": "https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-without_embed_python_git-setup.exe"
         },
         {
           "label": "GitHub Releases",

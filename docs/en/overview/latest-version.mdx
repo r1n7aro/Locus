@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.8.3 (2026-09-19)"
+description: "Locus v0.8.4 (2026-09-23)"
 sidebarTitle: "Latest Version"
-version: "0.8.3"
-releasedAt: "2026-09-19"
+version: "0.8.4"
+releasedAt: "2026-09-23"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,31 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.3/locus_0.8.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.8.4/locus_0.8.4_x64-without_embed_python_git-setup.exe)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.8.4 (Added)
+
+- `unity_yaml_read` accepts `reader: "default"` on asset roots to bypass matching Skill readers. Child paths can resolve serialized fields hidden from the Inspector through the live Editor.
+- Manually refreshing a Codex subscription now updates usage limits and the available model list together.
+
+### v0.8.4 (Fixed)
+
+- Skill YAML readers use the current field-depth and array limits. Empty results and reader failures fall back to Property Tree while preserving the default read's source and status.
+- With session undo disabled, Unity Editor operations no longer hold the workspace file lock for their duration, allowing other Agents to edit source files.
+- Queued Unity Test runs honor cancellation and timeouts. Test Framework errors now end active runs and record the error.
+- The compile server preserves references used by earlier compilations when DLLs refresh. DLLs can be replaced during caller scans, which read both the old and new results correctly.
+- A failed Codex model refresh preserves the current model list. Subscription model requests use an updated client version.
+- Model default settings continue to show app Agent and subagent definitions during workspace sessions.
+- Knowledge document drag targets remain stable across folders and hover expansion.
+- The worktree selector keeps a stable height while branches load.
+
+### v0.8.4 (Removed)
+
+- No user-facing workflows or compatibility paths were removed.
 
 ### v0.8.3 (Added)
 
