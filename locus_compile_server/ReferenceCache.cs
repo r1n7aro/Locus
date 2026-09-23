@@ -7,20 +7,18 @@ namespace Locus.CompileServer;
 ///
 /// References are created with PEStreamOptions.PrefetchMetadata so no file
 /// handle outlives the load: the Unity Editor rewrites Library/ScriptAssemblies
-/// on every recompile and a retained handle (or memory-mapped section, as
-/// MetadataReference.CreateFromFile would create) could block it. The cost is
-/// holding each assembly's metadata blob in memory for the cache lifetime.
+/// on every recompile. Unlike MetadataReference.CreateFromFile, which prefetches
+/// the entire image, only the metadata is retained here. Each returned reference
+/// keeps its snapshot alive; cache eviction must not dispose metadata still
+/// used by a compilation. Unreferenced snapshots are reclaimed by GC.
 /// </summary>
 public sealed class ReferenceCache
 {
-    private sealed class Entry : IDisposable
+    private sealed class Entry
     {
         public long MtimeTicks;
         public long Size;
-        public AssemblyMetadata Metadata = null!;
         public PortableExecutableReference Reference = null!;
-
-        public void Dispose() => Metadata.Dispose();
     }
 
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.OrdinalIgnoreCase);
@@ -53,7 +51,6 @@ public sealed class ReferenceCache
             if (cached.MtimeTicks == mtime && cached.Size == size)
                 return cached.Reference;
             _entries.Remove(path);
-            cached.Dispose();
         }
 
         // One retry: Unity may be swapping the file at this instant
@@ -71,23 +68,20 @@ public sealed class ReferenceCache
         {
             MtimeTicks = mtime,
             Size = size,
-            Metadata = metadata,
             Reference = metadata.GetReference(filePath: path),
         };
         _entries[path] = entry;
         return entry.Reference;
     }
 
-    /// <summary>Drop (and dispose) entries whose path is not in `alive`.</summary>
+    /// <summary>Drop cache entries without invalidating references held by callers.</summary>
     public void PruneExcept(IReadOnlyCollection<string> alive)
     {
         var keep = new HashSet<string>(alive, StringComparer.OrdinalIgnoreCase);
         var stale = _entries.Keys.Where(k => !keep.Contains(k)).ToList();
         foreach (string key in stale)
         {
-            var entry = _entries[key];
             _entries.Remove(key);
-            entry.Dispose();
         }
     }
 

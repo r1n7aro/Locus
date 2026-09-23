@@ -353,7 +353,9 @@ public static class CallerScan
     private static AssemblyCallerIndex BuildIndex(string assemblyPath, DateTime lastWriteUtc, long length)
     {
         using FileStream stream = File.OpenRead(assemblyPath);
-        using var peReader = new PEReader(stream);
+        // Prefetch closes the file before the IL walk. Keep the complete image:
+        // method bodies and embedded PDBs are needed after metadata is read.
+        using var peReader = new PEReader(stream, PEStreamOptions.PrefetchEntireImage);
         MetadataReader reader = peReader.GetMetadataReader();
         ModuleDefinition module = reader.GetModuleDefinition();
 
