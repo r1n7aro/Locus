@@ -500,6 +500,7 @@ pub async fn get_codex_model_config() -> Result<CodexModelConfig, AppError> {
 pub async fn get_codex_available_models(
     codex: State<'_, crate::commands::auth::CodexAuthStateHandle>,
     config: State<'_, Arc<crate::config::AppConfig>>,
+    force_refresh: Option<bool>,
 ) -> Result<Vec<crate::llm::codex_models::CodexAvailableModel>, AppError> {
     let cache_dir = persistent_config_dir().map_err(AppError::from)?;
     let (access_token, account_id) = {
@@ -514,6 +515,7 @@ pub async fn get_codex_available_models(
         account_id.as_deref(),
         config.base_url.as_deref(),
         &cache_dir,
+        force_refresh.unwrap_or(false),
     )
     .await
     .map_err(AppError::from)

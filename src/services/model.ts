@@ -33,8 +33,8 @@ export function getCodexModelConfig(): Promise<CodexModelConfig> {
   return ipcInvoke<CodexModelConfig>("get_codex_model_config");
 }
 
-export function getCodexAvailableModels(): Promise<ModelOption[]> {
-  return ipcInvoke<ModelOption[]>("get_codex_available_models");
+export function getCodexAvailableModels(forceRefresh = false): Promise<ModelOption[]> {
+  return ipcInvoke<ModelOption[]>("get_codex_available_models", { forceRefresh });
 }
 
 export function saveCodexModelConfig(config: CodexModelConfig): Promise<void> {

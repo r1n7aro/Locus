@@ -58,7 +58,7 @@ const {
   dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
   anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
   oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
-  codexStep, codexStatus, codexQuota, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexContextWindow, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexUseApplyPatch, setCodexPrefixCacheTtlSeconds, loadCodexRateLimits, consumeCodexResetCredit,
+  codexStep, codexStatus, codexQuota, codexRefreshing, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexContextWindow, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexUseApplyPatch, setCodexPrefixCacheTtlSeconds, refreshCodexSubscription, consumeCodexResetCredit,
   requestCodexLogin,
   modelDefaults, modelSaveMsg, saveModelDefaults,
   permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
@@ -302,6 +302,7 @@ watch(
           :codex-step="codexStep"
           :codex-status="codexStatus"
           :codex-quota="codexQuota"
+          :codex-refreshing="codexRefreshing"
           :codex-reset-credit-busy-id="codexResetCreditBusyId"
           :codex-retrying="codexRetrying"
           :codex-transport="codexModelConfig.transport"
@@ -340,7 +341,7 @@ watch(
           @cancel-codex-login="cancelCodexLogin"
           @codex-logout="codexLogout"
           @retry-codex-validation="retryCodexValidation"
-          @refresh-codex-quota="loadCodexRateLimits"
+          @refresh-codex-quota="refreshCodexSubscription"
           @consume-codex-reset-credit="consumeCodexResetCredit"
           @copy-code="copyCode"
           @update:codex-transport="setCodexTransportMode"

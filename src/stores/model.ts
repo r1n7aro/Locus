@@ -570,14 +570,16 @@ export const useModelStore = defineStore("model", () => {
     }
   }
 
-  async function loadCodexAvailableModels() {
+  async function loadCodexAvailableModels(forceRefresh = false) {
     if (!authStore.codexAuthenticated) {
       codexRemoteModels.value = [];
       return;
     }
     try {
-      codexRemoteModels.value = normalizeCodexModels(await modelService.getCodexAvailableModels());
+      codexRemoteModels.value = normalizeCodexModels(await modelService.getCodexAvailableModels(forceRefresh));
     } catch (e: unknown) {
+      // An explicit refresh reports failure without replacing the current catalog.
+      if (forceRefresh) throw e;
       console.warn("[model] get_codex_available_models:", e);
       codexRemoteModels.value = [];
     }

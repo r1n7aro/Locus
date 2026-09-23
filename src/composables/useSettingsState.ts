@@ -61,6 +61,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { normalizeAppError } from "../services/errors";
 import { useNotificationStore } from "../stores/notification";
+import { useModelStore } from "../stores/model";
 import type {
   ModelDefaults,
   CustomEndpoint,
@@ -780,6 +781,7 @@ export function useSettingsState(emit: SettingsEmit) {
   const codexStep = ref<CodexStep>("idle");
   const codexStatus = ref<CodexStatusState>(normalizeCodexStatus());
   const codexQuota = ref<CodexQuotaState>(emptyCodexQuota());
+  const codexRefreshing = ref(false);
   const codexResetCreditBusyId = ref<string | null>(null);
   const codexRetrying = ref(false);
   const codexModelConfig = ref<CodexModelConfig>(normalizeCodexModelConfig());
@@ -839,6 +841,33 @@ export function useSettingsState(emit: SettingsEmit) {
         loading: false,
         error: err.message,
       };
+    }
+  }
+
+  async function refreshCodexSubscription() {
+    if (
+      codexRefreshing.value
+      || codexQuota.value.loading
+      || codexResetCreditBusyId.value !== null
+      || !codexStatus.value.authenticated
+      || codexStatus.value.validationFailed
+    ) return;
+
+    codexRefreshing.value = true;
+    try {
+      const [, modelsResult] = await Promise.allSettled([
+        loadCodexRateLimits(),
+        useModelStore().loadCodexAvailableModels(true),
+      ]);
+      if (modelsResult.status === "rejected") {
+        const err = normalizeAppError(modelsResult.reason);
+        useNotificationStore().addNotice("error", err.message, {
+          code: err.code,
+          operation: "codexModelsRefresh",
+        });
+      }
+    } finally {
+      codexRefreshing.value = false;
     }
   }
 
@@ -1784,6 +1813,7 @@ export function useSettingsState(emit: SettingsEmit) {
     codexStep,
     codexStatus,
     codexQuota,
+    codexRefreshing,
     codexResetCreditBusyId,
     codexRetrying,
     codexModelConfig,
@@ -1794,6 +1824,7 @@ export function useSettingsState(emit: SettingsEmit) {
     codexInterval,
     loadCodexStatus,
     loadCodexRateLimits,
+    refreshCodexSubscription,
     consumeCodexResetCredit,
     loadCodexModelConfig,
     startCodexLogin,

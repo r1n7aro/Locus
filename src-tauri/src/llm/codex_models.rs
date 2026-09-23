@@ -227,9 +227,12 @@ pub async fn list_codex_available_models(
     account_id: Option<&str>,
     base_url: Option<&str>,
     cache_dir: &Path,
+    force_refresh: bool,
 ) -> Result<Vec<CodexAvailableModel>, String> {
-    if let Some(cache) = load_fresh_cache(cache_dir) {
-        return Ok(remote_models_to_available(cache.models));
+    if !force_refresh {
+        if let Some(cache) = load_fresh_cache(cache_dir) {
+            return Ok(remote_models_to_available(cache.models));
+        }
     }
 
     let stale_cache = load_cache(cache_dir);
@@ -247,6 +250,10 @@ pub async fn list_codex_available_models(
             Ok(remote_models_to_available(cache.models))
         }
         Err(error) => {
+            // Manual refresh must surface failure while leaving the cache intact.
+            if force_refresh {
+                return Err(error);
+            }
             if let Some(cache) = stale_cache {
                 eprintln!("[OpenAI Codex] using stale model cache after refresh failure: {error}");
                 Ok(remote_models_to_available(cache.models))
@@ -535,6 +542,10 @@ fn now_ms() -> i64 {
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "codex_models_refresh_tests.rs"]
+mod refresh_tests;
 
 #[cfg(test)]
 mod tests {

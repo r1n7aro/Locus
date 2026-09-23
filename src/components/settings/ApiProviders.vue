@@ -47,6 +47,7 @@ const props = defineProps<{
   codexStep: "idle" | "opening" | "waiting" | "success";
   codexStatus: CodexStatusState;
   codexQuota: CodexQuotaState;
+  codexRefreshing?: boolean;
   codexResetCreditBusyId: string | null;
   codexRetrying: boolean;
   codexTransport: CodexTransportMode;
@@ -744,10 +745,10 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
             variant="neutral"
             size="sm"
             type="button"
-            :disabled="codexQuota.loading || codexResetCreditBusyId !== null"
+            :disabled="codexRefreshing || codexQuota.loading || codexResetCreditBusyId !== null"
             @click="emit('refreshCodexQuota')"
           >
-            {{ codexQuota.loading ? t("settings.codex.quotaRefreshing") : t("settings.codex.refreshQuota") }}
+            {{ codexRefreshing || codexQuota.loading ? t("settings.codex.quotaRefreshing") : t("settings.codex.refreshQuota") }}
           </BaseButton>
         </div>
       </div>
