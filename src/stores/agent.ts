@@ -12,6 +12,7 @@ export const useAgentStore = defineStore("agent", () => {
   const workspaceCheckoutId = ref<string | null>(null);
   const selectedAgentId = ref("");
   let agentLoadEpoch = 0;
+  let appAgentLoadEpoch = 0;
 
   function resolveAgentId(id: string) {
     const trimmed = id.trim();
@@ -22,30 +23,41 @@ export const useAgentStore = defineStore("agent", () => {
     return trimmed;
   }
 
-  async function loadAgents() {
-    const epoch = ++agentLoadEpoch;
+  // Settings uses the app catalog even when chat is bound to a checkout.
+  // Loading it must not invalidate or replace the active workspace selection.
+  async function loadAppAgents() {
+    const epoch = ++appAgentLoadEpoch;
     try {
       const [list, subList] = await Promise.all([
         agentService.listAgents(),
         agentService.listSubagentDefs(),
       ]);
-      if (epoch !== agentLoadEpoch) return;
-      agents.value = list;
-      subagents.value = subList;
+      if (epoch !== appAgentLoadEpoch) return null;
       appAgents.value = list;
       appSubagents.value = subList;
-      workspaceCheckoutId.value = null;
-      const resolvedCurrent = resolveAgentId(selectedAgentId.value);
-      if (resolvedCurrent && list.some((agent) => agent.id === resolvedCurrent)) {
-        selectedAgentId.value = resolvedCurrent;
-        return;
-      }
-      const def = list.find((a) => a.isDefault);
-      if (def) selectedAgentId.value = def.id;
-      else if (list.length > 0) selectedAgentId.value = list[0].id;
+      return { list, subList };
     } catch (e) {
       console.error("list_agents failed:", e);
+      return null;
     }
+  }
+
+  async function loadAgents() {
+    const epoch = ++agentLoadEpoch;
+    const catalog = await loadAppAgents();
+    if (!catalog || epoch !== agentLoadEpoch) return;
+    const { list, subList } = catalog;
+    agents.value = list;
+    subagents.value = subList;
+    workspaceCheckoutId.value = null;
+    const resolvedCurrent = resolveAgentId(selectedAgentId.value);
+    if (resolvedCurrent && list.some((agent) => agent.id === resolvedCurrent)) {
+      selectedAgentId.value = resolvedCurrent;
+      return;
+    }
+    const def = list.find((a) => a.isDefault);
+    if (def) selectedAgentId.value = def.id;
+    else if (list.length > 0) selectedAgentId.value = list[0].id;
   }
 
   async function loadWorkspaceAgents(workspaceRef: WorkspaceRef) {
@@ -101,6 +113,7 @@ export const useAgentStore = defineStore("agent", () => {
     appSubagents,
     workspaceCheckoutId,
     selectedAgentId,
+    loadAppAgents,
     loadAgents,
     loadWorkspaceAgents,
     useAppAgents,

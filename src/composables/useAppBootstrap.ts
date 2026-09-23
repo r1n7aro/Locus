@@ -202,7 +202,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       return;
     }
 
-    const mode = payload.mode === "write" || payload.mode === "path_write"
+    const mode = payload.mode === "write" || payload.mode === "path_write" || payload.mode === "parallel_opaque"
       ? t("chat.workspaceLock.mode.write")
       : t("chat.workspaceLock.mode.read");
     const tools = payload.tools.slice(0, 3).join(", ") || t("chat.workspaceLock.noTools");
@@ -670,9 +670,16 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     handleStreamEvent(payload);
   }
 
-  function loadCurrentAgents(): Promise<void> {
+  async function loadCurrentAgents(): Promise<void> {
     const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
-    return workspaceRef ? agentStore.loadWorkspaceAgents(workspaceRef) : agentStore.loadAgents();
+    if (workspaceRef) {
+      await Promise.all([
+        agentStore.loadAppAgents(),
+        agentStore.loadWorkspaceAgents(workspaceRef),
+      ]);
+    } else {
+      await agentStore.loadAgents();
+    }
   }
 
   let listenersRegistration: Promise<void> | null = null;

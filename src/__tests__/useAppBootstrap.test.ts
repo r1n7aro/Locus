@@ -189,6 +189,7 @@ describe("useAppBootstrap onboarding completion", () => {
     agentStoreMock = reactive({
       selectedAgentId: "",
       agents: [],
+      loadAppAgents: vi.fn().mockResolvedValue(undefined),
       loadAgents: vi.fn().mockResolvedValue(undefined),
       loadWorkspaceAgents: vi.fn().mockResolvedValue(undefined),
     });
@@ -334,6 +335,7 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(uiStoreMock.completeOnboarding).toHaveBeenCalledTimes(1);
     expect(modelStoreMock.loadLastEffort).toHaveBeenCalledTimes(1);
     expect(chatStoreMock.refreshSessions).toHaveBeenCalledTimes(1);
+    expect(agentStoreMock.loadAppAgents).toHaveBeenCalledTimes(1);
     expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledTimes(1);
   });
 
@@ -353,6 +355,7 @@ describe("useAppBootstrap onboarding completion", () => {
     workspaceContextStoreMock.focusedWorkspaceRef = { checkoutId: "restored", expectedGeneration: 1 };
     restore();
     await pending;
+    expect(agentStoreMock.loadAppAgents).toHaveBeenCalledTimes(1);
     expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledWith(workspaceContextStoreMock.focusedWorkspaceRef);
     expect(agentStoreMock.loadAgents).not.toHaveBeenCalled();
     const sessionOrder = chatStoreMock.refreshSessions.mock.invocationCallOrder[0];
@@ -772,6 +775,7 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(pluginsChangedHandler).toBeTypeOf("function");
 
     pluginsChangedHandler?.({ payload: undefined });
+    expect(agentStoreMock.loadAppAgents).toHaveBeenCalledTimes(1);
     expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledTimes(1);
     expect(invalidateSkills).toHaveBeenCalledExactlyOnceWith();
 
@@ -780,6 +784,7 @@ describe("useAppBootstrap onboarding completion", () => {
     const agentsChangedHandler = handlers.get("agents-changed");
     expect(agentsChangedHandler).toBeTypeOf("function");
     agentsChangedHandler?.({ payload: undefined });
+    expect(agentStoreMock.loadAppAgents).toHaveBeenCalledTimes(2);
     expect(agentStoreMock.loadWorkspaceAgents).toHaveBeenCalledTimes(1);
     expect(loadSkillsMock).not.toHaveBeenCalled();
   });
