@@ -21,6 +21,15 @@ describe("Unity Test Framework tools", () => {
     expect(service).not.toContain("System.Reflection");
   });
 
+  it("finishes the active run when Unity reports a test runner error", () => {
+    const service = read("locus_unity/Editor/Testing/LocusUnityTestService.cs");
+
+    expect(service).toContain("LocusUnityTestCallbacks : IErrorCallbacks");
+    expect(service).toMatch(
+      /public void OnError\(string message\)[\s\S]*?state\.active = false;[\s\S]*?state\.status = "error";[\s\S]*?state\.error = string\.IsNullOrWhiteSpace\(message\)[\s\S]*?state\.finished_at_ticks = DateTime\.UtcNow\.Ticks;[\s\S]*?state\.Persist\(\);/,
+    );
+  });
+
   it("exposes a typed UnityTestApi for unity_execute without reflection", () => {
     const api = read("locus_unity/Editor/Testing/UnityTestApi.cs");
     const service = read("locus_unity/Editor/Testing/LocusUnityTestService.cs");

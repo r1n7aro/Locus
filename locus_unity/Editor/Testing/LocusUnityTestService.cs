@@ -153,7 +153,7 @@ namespace Locus.UnityTesting
         }
     }
 
-    internal sealed class LocusUnityTestCallbacks : ICallbacks
+    internal sealed class LocusUnityTestCallbacks : IErrorCallbacks
     {
         public void RunStarted(ITestAdaptor testsToRun)
         {
@@ -220,6 +220,25 @@ namespace Locus.UnityTesting
             if (string.Equals(state.result_detail, "all", StringComparison.OrdinalIgnoreCase))
                 state.results.Add(dto);
             state.current_test = "";
+            state.Persist();
+        }
+
+        public void OnError(string message)
+        {
+            LocusUnityTestRunState state = LocusUnityTestRunState.instance;
+            if (!state.active)
+                return;
+
+            state.active = false;
+            state.status = "error";
+            state.current_test = "";
+            state.error = string.IsNullOrWhiteSpace(message)
+                ? "Unity Test run failed before completion."
+                : message;
+            state.finished_at_ticks = DateTime.UtcNow.Ticks;
+            state.duration_ms = Math.Max(
+                state.duration_ms,
+                TimeSpan.FromTicks(state.finished_at_ticks - state.started_at_ticks).Ticks / 10000L);
             state.Persist();
         }
 
