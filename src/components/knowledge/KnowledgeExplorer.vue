@@ -263,7 +263,6 @@ const treeListRef = ref<InstanceType<typeof WorkspaceTree> | null>(null);
 const treeShellRef = ref<HTMLElement | null>(null);
 const draggingNodes = ref<ExplorerNode[]>([]);
 const dragTargetPath = ref<string | null>(null);
-const inlineDropIntent = ref<KnowledgeExplorerDropIntent | null>(null);
 const isSearchMode = computed(() => !!props.searchQuery.trim());
 const selectedPaths = ref<Set<string>>(new Set());
 const lastAnchorPath = ref<string | null>(null);
@@ -311,74 +310,13 @@ function isBranchNode(node: ExplorerNode): node is BranchNode {
   return node.kind === "folder" || node.kind === "package";
 }
 
-function compareKnowledgePreviewNodes(left: ExplorerNode, right: ExplorerNode): number {
-  const rank = (node: ExplorerNode) => node.kind === "folder" ? 0 : node.kind === "package" ? 1 : 2;
-  return rank(left) - rank(right) || left.name.localeCompare(right.name, undefined, {
-    sensitivity: "base",
-    numeric: true,
-  });
-}
-
-function knowledgePreviewParentMatches(parent: BranchNode | null): parent is FolderNode {
-  const intent = inlineDropIntent.value;
-  return !!intent
-    && parent?.kind === "folder"
-    && parent.type === intent.targetType
-    && normalizeRelativePath(parent.relativePath) === normalizeRelativePath(intent.targetDir);
-}
-
-function knowledgeDropPreviewEntry(parent: FolderNode): Extract<VisibleEntry, { type: "row" }> | null {
-  const source = draggingNodes.value[0];
-  const intent = inlineDropIntent.value;
-  if (!source || !intent) return null;
-  const count = draggingNodes.value.length;
-  const name = count > 1 ? `${source.name} +${count - 1}` : source.name;
-  const node = { ...source, name, depth: parent.depth + 1 } as ExplorerNode;
-  const key = `drop-preview:${intent.targetType}:${intent.targetDir || "root"}`;
-  return {
-    type: "row",
-    key,
-    row: {
-      node,
-      expanded: false,
-      directChildCount: isBranchNode(source) ? source.children.length : 0,
-    },
-    treeRow: {
-      key,
-      name,
-      depth: parent.depth + 1,
-      kind: source.kind === "document" ? "file" : source.kind,
-      disabled: true,
-      title: source.path,
-      classes: {
-        "kx-folder": source.kind === "folder",
-        "kx-package": source.kind === "package",
-        "kx-leaf": source.kind === "document",
-        "is-drop-preview": true,
-      },
-    },
-  };
-}
-
 const visibleRows = computed<VisibleEntry[]>(() => {
   const out: VisibleEntry[] = [];
 
-  const walk = (nodes: ExplorerNode[], parent: BranchNode | null = null) => {
-    const preview = knowledgePreviewParentMatches(parent)
-      ? knowledgeDropPreviewEntry(parent)
-      : null;
-    const hiddenPaths = inlineDropIntent.value ? draggingPaths.value : new Set<string>();
-    const visibleNodes = nodes.filter((node) => !hiddenPaths.has(node.path));
-    const previewIndex = preview
-      ? Math.max(0, (() => {
-          const index = visibleNodes.findIndex((node) => compareKnowledgePreviewNodes(preview.row.node, node) < 0);
-          return index < 0 ? visibleNodes.length : index;
-        })())
-      : -1;
-    for (let index = 0; index <= visibleNodes.length; index += 1) {
-      if (preview && index === previewIndex) out.push(preview);
-      const node = visibleNodes[index];
-      if (!node) continue;
+  // A folder move has no insertion position. Keep source rows in place and
+  // highlight the destination so preview changes cannot move it off the pointer.
+  const walk = (nodes: ExplorerNode[]) => {
+    for (const node of nodes) {
       const branch = isBranchNode(node);
       const expanded = branch
         ? isSearchMode.value
@@ -444,12 +382,8 @@ const visibleRows = computed<VisibleEntry[]>(() => {
           treeRow: null,
         });
       }
-      if (branch && !expanded && knowledgePreviewParentMatches(node)) {
-        const collapsedPreview = knowledgeDropPreviewEntry(node);
-        if (collapsedPreview) out.push(collapsedPreview);
-      }
       if (branch && expanded) {
-        walk(node.children, node);
+        walk(node.children);
         if (
           node.kind === "folder"
           && shouldShowKnowledgeEmptyFolder({
@@ -465,9 +399,7 @@ const visibleRows = computed<VisibleEntry[]>(() => {
             hasMoreContents: node.specialRoot
               ? props.hasMoreRootDocuments(node.type)
               : props.hasMoreFolderDocuments(node.type, node.relativePath),
-            hasTransientChild:
-              inlineCreate.value?.anchorPath === node.path
-              || knowledgePreviewParentMatches(node),
+            hasTransientChild: inlineCreate.value?.anchorPath === node.path,
           })
         ) {
           const emptyKey = `${node.path}::empty`;
@@ -827,7 +759,6 @@ function clearDragState() {
   if (draggingNodes.value.length) emit("dragStateChange", false);
   draggingNodes.value = [];
   dragTargetPath.value = null;
-  inlineDropIntent.value = null;
   cancelDragExpand();
 }
 
@@ -923,13 +854,6 @@ function resolveKnowledgeExplorerDrop(
   if (!nodes.length) return null;
   const rowElement = context.hit.closest<HTMLElement>(".workspace-tree-row-shell");
   if (rowElement && treeShellRef.value?.contains(rowElement)) {
-    if (rowElement.dataset.treeKey?.startsWith("drop-preview:") && inlineDropIntent.value) {
-      return {
-        key: inlineDropIntent.value.targetPath,
-        operation: "move",
-        intent: inlineDropIntent.value,
-      };
-    }
     const entry = visibleRows.value.find(
       (candidate) => candidate.key === rowElement.dataset.treeKey,
     );
@@ -978,7 +902,6 @@ const internalDrag = useInternalDropTarget<KnowledgeInternalDragData, KnowledgeE
   resolve: resolveKnowledgeExplorerDrop,
   onTargetChange: (decision) => {
     dragTargetPath.value = decision?.intent.targetPath ?? null;
-    inlineDropIntent.value = decision?.intent ?? null;
     if (decision?.intent.row) scheduleDragExpand(decision.intent.row);
     else cancelDragExpand();
   },
@@ -993,7 +916,7 @@ const internalDrag = useInternalDropTarget<KnowledgeInternalDragData, KnowledgeE
       emit("moveNodes", movable, decision.intent.targetDir, decision.intent.targetType);
     }
   },
-  previewMode: "floating-with-gap",
+  previewMode: "floating",
   priority: 20,
 });
 
@@ -2486,16 +2409,6 @@ function dragPointerDownWorkspaceItem(item: WorkspaceTreeItem, event: PointerEve
 .kx-tree :deep(.workspace-tree-row-shell.drop-target) {
   background: color-mix(in srgb, var(--active-bg) 62%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-color) 32%, var(--border-color));
-}
-
-.kx-tree :deep(.workspace-tree-row-shell.is-drop-preview) {
-  background: color-mix(in srgb, var(--accent-soft) 12%, transparent);
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent-color) 36%, transparent);
-}
-
-.kx-tree :deep(.workspace-tree-row-shell.is-drop-preview .workspace-tree-row.disabled) {
-  opacity: 0;
-  transition: none;
 }
 
 .kx-tree :deep(.workspace-tree-row-shell.is-empty-folder-row),

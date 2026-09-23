@@ -64,7 +64,6 @@ describe("internal drag architecture", () => {
   it("keeps sortable lists floating while reserving only a layout gap", () => {
     const controller = read("src/composables/useInternalDrag.ts");
     const overlay = read("src/components/ui/InternalDragOverlay.vue");
-    const knowledge = read("src/components/knowledge/KnowledgeExplorer.vue");
     const workbench = read("src/components/workbench/DevelopmentWorkbench.vue");
     const agent = read("src/components/AgentView.vue");
     const session = read("src/components/chat/SessionPanel.vue");
@@ -73,10 +72,9 @@ describe("internal drag architecture", () => {
 
     expect(controller).toContain('"floating-with-gap"');
     expect(overlay).toContain("drag.previewMode.value !== 'inline'");
-    for (const source of [knowledge, workbench, agent, session, viewPackage]) {
+    for (const source of [workbench, agent, session, viewPackage]) {
       expect(source).toContain('"floating-with-gap"');
     }
-    expect(knowledge).toContain("opacity: 0;");
     expect(workbench).toContain("opacity: 0;");
     expect(workbench).toContain(".workspace-tree-row-shell.is-drop-preview::before");
     expect(workbench).toContain("background: var(--accent-color);");
