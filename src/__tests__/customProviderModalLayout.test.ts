@@ -282,6 +282,7 @@ describe("custom provider modal layout", () => {
     // First-party creators, official clouds, and openrouter-class brands stay.
     for (const id of [
       "openrouter",
+      "requesty",
       "vercel",
       "togetherai",
       "groq",

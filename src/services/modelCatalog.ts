@@ -501,6 +501,7 @@ export const TRUSTED_CATALOG_PROVIDER_IDS: ReadonlySet<string> = new Set([
   "nebius",
   // Major aggregators and open-model inference brands.
   "openrouter",
+  "requesty",
   "vercel",
   "togetherai",
   "fireworks-ai",
