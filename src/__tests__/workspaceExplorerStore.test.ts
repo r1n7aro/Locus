@@ -164,7 +164,7 @@ describe("workspace explorer store", () => {
       kind: "placeResource",
       resourceKind: "system",
       resourceId: "knowledge",
-      position: 1,
+      position: 6,
     }));
     const sessionPlacement = operations.find(
       (operation): operation is Extract<ProjectExplorerOperation, { kind: "placeResource" }> => (
@@ -177,11 +177,47 @@ describe("workspace explorer store", () => {
       kind: "placeResource",
       resourceKind: "system",
       resourceId: "collaboration",
-      position: 2,
+      position: 1,
     }));
+    // Knowledge closes the special nodes, so its documents precede the sessions.
     expect(operations.slice(0, operations.indexOf(sessionPlacement!)).map((operation) => (
       operation.kind === "placeResource" ? operation.resourceId : operation.kind
-    ))).toEqual(["newSession", "knowledge", "collaboration", "assets", "views", "agents", "archived"]);
+    ))).toEqual(["newSession", "collaboration", "assets", "views", "agents", "archived", "knowledge"]);
+  });
+
+  it("adds missing special nodes to the special block of an existing layout", async () => {
+    const store = useWorkspaceExplorerStore();
+    await store.loadProject("project-a");
+    const layout = (...resourceIds: string[]) => ({
+      ...snapshot(1),
+      nodes: resourceIds.map((resourceId, position) => {
+        const resourceKind = resourceId.startsWith("session-") ? "session" : "system";
+        return {
+          nodeId: `${resourceKind}:${resourceId}`, projectId: "project-a", nodeKind: "resource" as const,
+          resourceKind, resourceId, hidden: false, position,
+        };
+      }),
+    });
+    store.snapshots["project-a"] = layout("newSession", "collaboration", "assets", "agents", "archived", "session-a");
+    explorerMocks.projectExplorerApplyOperations.mockClear();
+
+    await store.refreshProjectSessions("project-a");
+
+    // Views joins the block, and Knowledge enabled later still lands above the sessions.
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([
+      { kind: "placeResource", resourceKind: "system", resourceId: "views", position: 5 },
+      { kind: "placeResource", resourceKind: "system", resourceId: "knowledge", position: 6 },
+    ]);
+
+    // Earlier layouts keep Knowledge where it is; a missing node goes before it.
+    store.snapshots["project-a"] = layout("newSession", "knowledge", "collaboration", "assets", "agents", "archived", "session-a");
+    explorerMocks.projectExplorerApplyOperations.mockClear();
+
+    await store.refreshProjectSessions("project-a");
+
+    expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2]).toEqual([
+      { kind: "placeResource", resourceKind: "system", resourceId: "views", position: 1 },
+    ]);
   });
 
   it("keeps session placement available when the knowledge catalog fails to load", async () => {
@@ -302,6 +338,8 @@ describe("workspace explorer store", () => {
     expect(store.resources["project-a"].sessions.map((session) => session.id))
       .toEqual(["session-a", "session-b"]);
     expect(explorerMocks.projectExplorerApplyOperations).toHaveBeenCalledTimes(1);
+    // The four missing special nodes join the block ahead of Knowledge, so
+    // session-a moves from index 2 to 6 before the new session takes its place.
     expect(explorerMocks.projectExplorerApplyOperations.mock.calls[0]?.[2].filter(
       (operation: { resourceKind?: string }) => operation.resourceKind === "session",
     )).toEqual([
@@ -309,7 +347,7 @@ describe("workspace explorer store", () => {
         kind: "placeResource",
         resourceKind: "session",
         resourceId: "session-b",
-        position: 2,
+        position: 6,
       }),
     ]);
   });

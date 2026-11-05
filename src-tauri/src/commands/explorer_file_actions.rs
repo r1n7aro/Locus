@@ -128,8 +128,8 @@ pub async fn explorer_file_action(
     registry: State<'_, Arc<ProjectRegistry>>,
     app_handle: AppHandle,
 ) -> Result<Option<String>, AppError> {
-    let (project_id, root) =
-        resolve_project(registry.inner().as_ref(), project_id, "explorerFileAction")?;
+    let (project_id, root, layout) =
+        resolve_project_layout(registry.inner().as_ref(), project_id, "explorerFileAction")?;
     if let (Some(name), Some(reference)) = (new_name.as_deref(), workspace_ref.as_ref()) {
         let directory = {
             let scope = workspace_file_scope(reference, registry.inner().as_ref())?;
@@ -152,12 +152,12 @@ pub async fn explorer_file_action(
             if scope.runtime().project_id() != &project_id {
                 return Err(action_error("Workspace does not belong to the project"));
             }
-            delete_workspace_directory(&project_id, &root, reference, scope, directory, registry, app_handle).await?;
+            delete_workspace_directory(&project_id, &layout, reference, scope, directory, registry, app_handle).await?;
             return Ok(None);
         }
     }
     let snapshot =
-        crate::workspace_tree::snapshot(&root, project_id.as_str()).map_err(action_error)?;
+        crate::workspace_tree::snapshot(&layout, project_id.as_str()).map_err(action_error)?;
     let (scope, source) = if let Some(workspace_ref) = workspace_ref.as_ref() {
         let (scope, scoped_project, source) =
             resolve_workspace_file(workspace_ref, &path, registry.inner().as_ref())?;
@@ -264,7 +264,7 @@ pub async fn explorer_file_action(
         return Err(action_error(error));
     }
     let updated = match crate::workspace_tree::relocate_file_references(
-        &root,
+        &layout,
         project_id.as_str(),
         &source,
         target.as_deref(),
@@ -330,7 +330,6 @@ fn workspace_directory(root: &Path, path: &str) -> Result<Option<PathBuf>, AppEr
     if [".git", ".locus", "locus", "locus/knowledge"].contains(&protected.as_str())
         || protected.starts_with(".git/")
         || protected.starts_with(".locus/")
-        || protected.starts_with("locus/workspace-trees")
     {
         return Err(action_error("This workspace configuration folder cannot be deleted"));
     }
@@ -454,9 +453,9 @@ pub(crate) fn reconcile_knowledge_file_action(
     source: &Path,
     target: Option<&Path>,
 ) -> Result<(), AppError> {
-    let (_, root) = resolve_project(registry, project_id.to_string(), "knowledgeFileAction")?;
+    let (_, layout) = resolve_layout(registry, project_id.to_string(), "knowledgeFileAction")?;
     let snapshot =
-        crate::workspace_tree::relocate_file_references(&root, project_id.as_str(), source, target)
+        crate::workspace_tree::relocate_file_references(&layout, project_id.as_str(), source, target)
             .map_err(action_error)?;
     crate::workspace_file_order::relocate(Path::new(working_dir), source, target).map_err(action_error)?;
     emit_file_action(
@@ -501,7 +500,10 @@ mod tests {
         assert_eq!(workspace_directory(dir.path(), "docs/sub").unwrap(), Some(expected));
         assert_eq!(workspace_directory(dir.path(), "docs/a.md").unwrap(), None);
         assert_eq!(workspace_directory(dir.path(), "docs/missing").unwrap(), None);
-        for protected in ["", ".", ".git", ".git/objects", "Locus", "locus/knowledge", "Locus/workspace-trees", "../x"] {
+        // Layouts moved to the data dir; a leftover checkout copy is ordinary content.
+        let leftover = dunce::canonicalize(dir.path().join("Locus/workspace-trees")).unwrap();
+        assert_eq!(workspace_directory(dir.path(), "Locus/workspace-trees").unwrap(), Some(leftover));
+        for protected in ["", ".", ".git", ".git/objects", "Locus", "locus/knowledge", "../x"] {
             assert!(workspace_directory(dir.path(), protected).is_err(), "{protected}");
         }
     }

@@ -15,8 +15,7 @@ fn child_path(root: &Path, directory: &str, name: &str) -> Result<PathBuf, AppEr
     }
     let relative = parent.strip_prefix(&root).map_err(create_error)?.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
     if relative == ".git" || relative.starts_with(".git/")
-        || relative == ".locus" || relative.starts_with(".locus/")
-        || relative == "locus/workspace-trees" || relative.starts_with("locus/workspace-trees/") {
+        || relative == ".locus" || relative.starts_with(".locus/") {
         return Err(create_error("Files cannot be created in workspace configuration folders"));
     }
     super::explorer_file_actions::sibling_file(&parent.join("entry"), name)
@@ -163,7 +162,7 @@ mod tests {
         for directory in ["../", "missing"] {
             assert!(document_path(root.path(), directory, "a.md").is_err());
         }
-        for directory in [".git", ".locus", "Locus/workspace-trees"] {
+        for directory in [".git", ".locus"] {
             std::fs::create_dir_all(root.path().join(directory)).unwrap();
             assert!(document_path(root.path(), directory, "a.md").is_err());
         }
@@ -187,7 +186,7 @@ mod tests {
         for name in ["", "..", "../out", "a\\b", "CON", "a?", "a."] {
             assert!(folder_path(root.path(), ".", name).is_err(), "{name}");
         }
-        for directory in [".git", ".locus", "Locus/workspace-trees"] {
+        for directory in [".git", ".locus"] {
             std::fs::create_dir_all(root.path().join(directory)).unwrap();
             assert!(folder_path(root.path(), directory, "sub").is_err());
         }

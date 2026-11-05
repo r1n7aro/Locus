@@ -3,7 +3,7 @@ import type { WorkspaceRef } from "../services/project";
 import { normalizeAppError } from "../services/errors";
 import { saveWorkspaceFileOrder, subscribeWorkspaceFileOrder, workspaceFileOrder,
   type WorkspaceFileOrder, type WorkspaceFilePlacement } from "../services/workspaceFileOrder";
-import { subscribeExplorerFileActions, subscribeWorkspaceFileChanges, workspaceChangeAffectsPath } from "../services/workspaceExplorer";
+import { subscribeExplorerFileActions } from "../services/workspaceExplorer";
 import { applyWorkspaceFileOrder, minimalWorkspaceFileOrder } from "../components/explorer/workspaceFileOrder";
 
 export function useWorkspaceFileOrder(props: { workingDir: string; workspaceRef: WorkspaceRef }, onError: (message: string) => void) {
@@ -20,15 +20,11 @@ export function useWorkspaceFileOrder(props: { workingDir: string; workspaceRef:
   }
   function refresh() { void reload().catch(error => { if (!disposed) onError(normalizeAppError(error).message); }); }
   watch(identity, () => { order.value = { revision: 0, placements: [] }; refresh(); }, { immediate: true });
+  // The order is per-user state in the data directory, not a workspace file, so
+  // saves and file actions are the only sources of change.
   for (const subscription of [
     subscribeWorkspaceFileOrder(event => { if (rootKey(event.root) === rootKey(props.workingDir)) refresh(); }),
     subscribeExplorerFileActions(event => { if (rootKey(event.root) === rootKey(props.workingDir)) refresh(); }),
-    subscribeWorkspaceFileChanges(event => {
-      // Also reload when the change names a containing directory ("Locus", ".").
-      if (event.checkoutId === props.workspaceRef.checkoutId
-        && (workspaceChangeAffectsPath(event.payload.path, "Locus/workspace-file-order.json")
-          || event.payload.path.replace(/\\/g, "/").endsWith("Locus/workspace-file-order.json"))) refresh();
-    }, () => props.workspaceRef),
   ]) void subscription.then(release => { if (disposed) release(); else releases.push(release); }).catch(() => {});
   onBeforeUnmount(() => { disposed = true; request++; releases.forEach(release => release()); });
 

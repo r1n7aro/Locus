@@ -23,8 +23,9 @@ fn resolve_csv_file(
             (Some(scope), path, root)
         }
     } else {
-        let (id, root) = resolve_project(registry, project_id.unwrap_or_default(), "csvView")?;
-        let tree = crate::workspace_tree::snapshot(&root, id.as_str())
+        let (id, root, layout) =
+            resolve_project_layout(registry, project_id.unwrap_or_default(), "csvView")?;
+        let tree = crate::workspace_tree::snapshot(&layout, id.as_str())
             .map_err(|error| explorer_error(error, "csvView"))?;
         (
             None,

@@ -1,3 +1,8 @@
+//! Workspace tree presets: per-user layout state (session placements, folders,
+//! pins). They live in the data directory rather than the checkout so layout
+//! edits never show up in project version control. Every `root` argument in
+//! this module is a project's layout directory from [`layout_dir`].
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -61,16 +66,89 @@ fn layout_lock(root: &Path) -> Result<Arc<Mutex<()>>, String> {
     ))
 }
 
-fn tree_dir(root: &Path) -> PathBuf {
-    root.join("Locus").join(WORKSPACE_TREE_DIR)
+/// The layout directory of one project: `<data dir>/workspace-trees/<project>`.
+/// Every checkout and worktree of the project shares it.
+pub fn layout_dir(data_dir: &Path, project_id: &str) -> PathBuf {
+    let readable = !project_id.is_empty()
+        && project_id.len() <= 80
+        && project_id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        });
+    let name = if readable {
+        project_id.to_string()
+    } else {
+        let digest = blake3::hash(project_id.as_bytes()).to_hex();
+        format!("project-{}", &digest[..24])
+    };
+    data_dir.join(WORKSPACE_TREE_DIR).join(name)
+}
+
+/// Where versions before user-level layouts kept the tree inside a checkout.
+fn legacy_tree_dir(checkout: &Path) -> PathBuf {
+    checkout.join("Locus").join(WORKSPACE_TREE_DIR)
+}
+
+/// Copies a checkout layout written by an older version into `root` once, from
+/// the first checkout that has one. The checkout files stay untouched and are
+/// never written again.
+pub fn adopt_legacy_layout(root: &Path, checkouts: &[PathBuf]) -> Result<(), String> {
+    if index_path(root).is_file() {
+        return Ok(());
+    }
+    let lock = layout_lock(root)?;
+    let _guard = lock
+        .lock()
+        .map_err(|error| format!("Workspace tree is unavailable: {error}"))?;
+    if index_path(root).is_file() {
+        return Ok(());
+    }
+    let Some(legacy) = checkouts
+        .iter()
+        .map(|checkout| legacy_tree_dir(checkout))
+        .find(|directory| directory.join(WORKSPACE_TREE_INDEX).is_file())
+    else {
+        return Ok(());
+    };
+    let copy = |source: &Path, target: &Path| -> Result<(), String> {
+        let bytes = std::fs::read(source).map_err(|error| {
+            format!(
+                "Failed to read workspace tree '{}': {error}",
+                source.display()
+            )
+        })?;
+        crate::config::atomic_write_config(target, &bytes)
+    };
+    for entry in std::fs::read_dir(&legacy).map_err(|error| {
+        format!(
+            "Failed to list workspace tree presets '{}': {error}",
+            legacy.display()
+        )
+    })? {
+        let path = entry
+            .map_err(|error| format!("Failed to inspect workspace tree preset: {error}"))?
+            .path();
+        if path.file_name().and_then(|name| name.to_str()) == Some(WORKSPACE_TREE_INDEX)
+            || path.extension().and_then(|extension| extension.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if validate_preset_id(id).is_ok() && path.is_file() {
+            copy(&path, &preset_path(root, id))?;
+        }
+    }
+    // The index marks the layout as present, so an interrupted copy is retried.
+    copy(&legacy.join(WORKSPACE_TREE_INDEX), &index_path(root))
 }
 
 fn index_path(root: &Path) -> PathBuf {
-    tree_dir(root).join(WORKSPACE_TREE_INDEX)
+    root.join(WORKSPACE_TREE_INDEX)
 }
 
 fn preset_path(root: &Path, preset_id: &str) -> PathBuf {
-    tree_dir(root).join(format!("{preset_id}.json"))
+    root.join(format!("{preset_id}.json"))
 }
 
 fn validate_preset_id(preset_id: &str) -> Result<&str, String> {
@@ -105,8 +183,8 @@ fn default_preset(project_id: &str) -> WorkspaceTreePresetFile {
 }
 
 fn ensure_layout(root: &Path, project_id: &str) -> Result<WorkspaceTreeIndex, String> {
-    let directory = tree_dir(root);
-    std::fs::create_dir_all(&directory).map_err(|error| {
+    let directory = root;
+    std::fs::create_dir_all(directory).map_err(|error| {
         format!(
             "Failed to create workspace tree directory '{}': {error}",
             directory.display()
@@ -264,8 +342,8 @@ fn load_presets(
     index: &WorkspaceTreeIndex,
 ) -> Result<Vec<WorkspaceTreePresetFile>, String> {
     let mut ids = index.preset_order.clone();
-    let directory = tree_dir(root);
-    for entry in std::fs::read_dir(&directory).map_err(|error| {
+    let directory = root;
+    for entry in std::fs::read_dir(directory).map_err(|error| {
         format!(
             "Failed to list workspace tree presets '{}': {error}",
             directory.display()
@@ -631,24 +709,43 @@ fn delete_folder(nodes: &mut Vec<ProjectExplorerNode>, node_id: &str) -> Result<
         .iter()
         .position(|node| node.node_id == node_id && node.node_kind == "folder")
         .ok_or_else(|| format!("Workspace tree folder does not exist: {node_id}"))?;
-    let parent = nodes[index].parent_node_id.clone();
-    let insertion = nodes
-        .iter()
-        .filter(|node| node.parent_node_id == parent)
-        .filter(|node| node.position < nodes[index].position)
-        .count();
-    let mut children = nodes
-        .iter_mut()
-        .filter(|node| node.parent_node_id.as_deref() == Some(node_id))
-        .collect::<Vec<_>>();
-    children.sort_by_key(|node| node.position);
-    for (offset, child) in children.into_iter().enumerate() {
-        child.parent_node_id = parent.clone();
-        child.position = (insertion + offset) as i64;
-    }
-    nodes.remove(index);
-    normalize_siblings(nodes, parent.as_deref());
+    remove_node_keeping_children(nodes, index);
     Ok(())
+}
+
+/// Children take the removed node's place in its parent, ahead of the siblings
+/// that followed it.
+fn remove_node_keeping_children(nodes: &mut Vec<ProjectExplorerNode>, index: usize) {
+    let removed = nodes.remove(index);
+    let ordered = |nodes: &[ProjectExplorerNode], parent: Option<&str>| {
+        let mut indexes = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.parent_node_id.as_deref() == parent)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        indexes.sort_by(|left, right| {
+            nodes[*left]
+                .position
+                .cmp(&nodes[*right].position)
+                .then_with(|| nodes[*left].node_id.cmp(&nodes[*right].node_id))
+        });
+        indexes
+    };
+    let mut siblings = ordered(nodes, removed.parent_node_id.as_deref());
+    let children = ordered(nodes, Some(removed.node_id.as_str()));
+    let insertion = siblings
+        .iter()
+        .take_while(|sibling| {
+            let node = &nodes[**sibling];
+            (node.position, node.node_id.as_str()) < (removed.position, removed.node_id.as_str())
+        })
+        .count();
+    siblings.splice(insertion..insertion, children);
+    for (position, sibling) in siblings.into_iter().enumerate() {
+        nodes[sibling].parent_node_id = removed.parent_node_id.clone();
+        nodes[sibling].position = position as i64;
+    }
 }
 
 fn normalized_path_key(path: &Path) -> String {
@@ -931,9 +1028,7 @@ fn apply_operation(
                     "Only Locus system resources can be hidden: '{node_id}'"
                 ));
             }
-            if !*hidden {
-                move_node(nodes, node_id, None, 0)?;
-            }
+            // A shown node returns to the place it kept while hidden.
             nodes[node_index].hidden = *hidden;
             Ok(())
         }
@@ -1126,6 +1221,66 @@ pub fn apply_operations(
         operation_id: operation_id.to_string(),
         snapshot,
     })
+}
+
+/// Drops deleted sessions from every preset; surviving children take their
+/// place. Only the deleting instance may call this: a layout adopted from a
+/// checkout can hold sessions of other data directories, so a session missing
+/// from one session list is not proof that it was deleted.
+///
+/// Returns the active snapshot when that preset changed.
+pub fn remove_session_placements(
+    root: &Path,
+    project_id: &str,
+    operation_id: &str,
+    session_ids: &[String],
+) -> Result<Option<ProjectExplorerSnapshot>, String> {
+    if session_ids.is_empty() || !index_path(root).is_file() {
+        return Ok(None);
+    }
+    let lock = layout_lock(root)?;
+    let _guard = lock
+        .lock()
+        .map_err(|error| format!("Workspace tree is unavailable: {error}"))?;
+    let index = read_index(root)?;
+    let deleted = session_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut active_changed = false;
+    for mut preset in load_presets(root, project_id, &index)? {
+        let mut changed = false;
+        while let Some(node_index) = preset.nodes.iter().position(|node| {
+            node.resource_kind.as_deref() == Some("session")
+                && node
+                    .resource_id
+                    .as_deref()
+                    .is_some_and(|id| deleted.contains(id))
+        }) {
+            remove_node_keeping_children(&mut preset.nodes, node_index);
+            changed = true;
+        }
+        if !changed {
+            continue;
+        }
+        let nodes = &preset.nodes;
+        preset
+            .item_states
+            .retain(|state| nodes.iter().any(|node| node.node_id == state.node_id));
+        validate_nodes(project_id, &preset.nodes)?;
+        preset.revision = preset
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| "Workspace tree revision is exhausted".to_string())?;
+        preset.last_operation_id = Some(operation_id.to_string());
+        write_json(&preset_path(root, &preset.preset_id), &preset)?;
+        active_changed |= preset.preset_id == index.active_preset_id;
+    }
+    if active_changed {
+        active_snapshot_unlocked(root, project_id).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn create_preset(
@@ -1394,7 +1549,6 @@ mod tests {
     #[test]
     fn v1_presets_migrate_hidden_state_to_resource_specific_semantics() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tree_dir(temp.path())).unwrap();
         write_json(
             &index_path(temp.path()),
             &WorkspaceTreeIndex {
@@ -1487,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn shown_system_resources_return_to_the_workspace_root_head() {
+    fn shown_system_resources_keep_their_place() {
         let temp = tempfile::tempdir().unwrap();
         let initial = snapshot(temp.path(), "project-a").unwrap();
         let placed = apply_operations(
@@ -1563,10 +1717,94 @@ mod tests {
             .collect::<Vec<_>>();
         roots.sort_by_key(|node| node.position);
 
-        assert_eq!(roots[0].node_id, node_id);
-        assert!(!roots[0].hidden);
-        assert_eq!(roots[0].position, 0);
-        assert_eq!(roots[1].resource_id.as_deref(), Some("session-a"));
+        assert_eq!(roots[0].resource_id.as_deref(), Some("session-a"));
+        assert_eq!(roots[1].node_id, node_id);
+        assert!(!roots[1].hidden);
+        assert_eq!(roots[1].position, 1);
+    }
+
+    #[test]
+    fn deleted_sessions_leave_every_preset_and_children_take_their_place() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(remove_session_placements(
+            temp.path(),
+            "project-a",
+            "remove-without-layout",
+            &["session-a".to_string()],
+        )
+        .unwrap()
+        .is_none());
+        assert!(!index_path(temp.path()).exists());
+
+        let initial = snapshot(temp.path(), "project-a").unwrap();
+        let session = |resource_id: &str, parent: Option<&str>, position: i64| {
+            ProjectExplorerOperation::PlaceResource {
+                node_id: Some(format!("node:{resource_id}")),
+                resource_kind: "session".to_string(),
+                resource_id: resource_id.to_string(),
+                source_kind: None,
+                parent_node_id: parent.map(str::to_string),
+                position,
+            }
+        };
+        let placed = apply_operations(
+            temp.path(),
+            "project-a",
+            initial.revision,
+            "place-sessions",
+            &[
+                session("before", None, 0),
+                session("parent", None, 1),
+                session("after", None, 2),
+                session("child-a", Some("node:parent"), 0),
+                session("child-b", Some("node:parent"), 1),
+                ProjectExplorerOperation::SetItemState {
+                    node_id: "node:parent".to_string(),
+                    relative_path: None,
+                    pinned: Some(true),
+                    highlighted: None,
+                },
+            ],
+        )
+        .unwrap();
+        let other = create_preset(temp.path(), "project-a", "Other", None).unwrap();
+        switch_preset(temp.path(), "project-a", &placed.snapshot.preset_id).unwrap();
+
+        let removed = remove_session_placements(
+            temp.path(),
+            "project-a",
+            "remove-parent",
+            &["parent".to_string(), "missing".to_string()],
+        )
+        .unwrap()
+        .expect("active preset changed");
+        assert_eq!(removed.revision, placed.snapshot.revision + 1);
+        let mut roots = removed.nodes.iter().collect::<Vec<_>>();
+        roots.sort_by_key(|node| node.position);
+        assert!(roots.iter().all(|node| node.parent_node_id.is_none()));
+        assert_eq!(
+            roots
+                .iter()
+                .map(|node| node.resource_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["before", "child-a", "child-b", "after"]
+        );
+        assert!(removed.item_states.is_empty());
+        let other = read_preset(temp.path(), "project-a", &other.preset_id).unwrap();
+        assert!(other
+            .nodes
+            .iter()
+            .all(|node| node.resource_id.as_deref() != Some("parent")));
+        assert_eq!(other.nodes.len(), 4);
+
+        assert!(remove_session_placements(
+            temp.path(),
+            "project-a",
+            "remove-again",
+            &["parent".to_string()],
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -2243,5 +2481,53 @@ mod tests {
         );
         let reloaded = snapshot(temp.path(), "project-a").unwrap();
         assert_eq!(reloaded.nodes, moved.snapshot.nodes);
+    }
+
+    #[test]
+    fn layouts_live_in_the_data_dir_and_adopt_checkout_layouts_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        assert_eq!(
+            layout_dir(&data, "git-0a1b2c"),
+            data.join("workspace-trees").join("git-0a1b2c")
+        );
+        let unsafe_id = layout_dir(&data, "../Shared Project");
+        assert_eq!(unsafe_id.parent(), Some(data.join("workspace-trees").as_path()));
+        assert!(unsafe_id.file_name().unwrap().to_str().unwrap().starts_with("project-"));
+        assert_ne!(unsafe_id, layout_dir(&data, "../shared project"));
+
+        // An older version wrote the tree into the main checkout.
+        let worktree = temp.path().join("worktree");
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let legacy = legacy_tree_dir(&checkout);
+        let created = create_preset(&legacy, "project-a", "Review", None).unwrap();
+        std::fs::write(legacy.join("notes.txt"), "ignored").unwrap();
+        let legacy_files = |name: &str| std::fs::read(legacy.join(name)).unwrap();
+        let legacy_index = legacy_files("index.json");
+
+        let root = layout_dir(&data, "project-a");
+        adopt_legacy_layout(&root, &[worktree.clone(), checkout.clone()]).unwrap();
+        let adopted = snapshot(&root, "project-a").unwrap();
+        assert_eq!(adopted.preset_id, created.preset_id);
+        assert_eq!(adopted.presets.len(), 2);
+        assert!(Path::new(&adopted.manifest_path).starts_with(&root));
+        assert!(!root.join("notes.txt").exists());
+
+        // Later edits stay in the data dir; the checkout copy is never written again.
+        let renamed = rename_preset(&root, "project-a", &created.preset_id, "Mine").unwrap();
+        assert_eq!(renamed.preset_name, "Mine");
+        adopt_legacy_layout(&root, &[checkout.clone()]).unwrap();
+        assert_eq!(snapshot(&root, "project-a").unwrap().preset_name, "Mine");
+        assert_eq!(legacy_files("index.json"), legacy_index);
+        assert_eq!(
+            read_preset(&legacy, "project-a", &created.preset_id).unwrap().name,
+            "Review"
+        );
+
+        // Without a checkout layout nothing is created until first use.
+        let fresh = layout_dir(&data, "project-b");
+        adopt_legacy_layout(&fresh, &[worktree]).unwrap();
+        assert!(!fresh.exists());
     }
 }

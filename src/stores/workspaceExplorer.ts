@@ -459,21 +459,18 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       };
       insertPlacementNode(null, 0, newSessionNode);
     }
-    if (knowledgeEnabled(projectId) && !placed.has(`${SYSTEM_RESOURCE_KIND}:${KNOWLEDGE_SYSTEM_RESOURCE_ID}`)) {
-      const position = Math.min(1, siblingsByParent.get(null)?.length ?? 0);
-      operations.push({
-        kind: "placeResource",
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: KNOWLEDGE_SYSTEM_RESOURCE_ID,
-        position,
-      });
-      insertPlacementNode(null, position, {
-        nodeId: `pending:${SYSTEM_RESOURCE_KIND}:${KNOWLEDGE_SYSTEM_RESOURCE_ID}`,
-        resourceKind: SYSTEM_RESOURCE_KIND,
-        resourceId: KNOWLEDGE_SYSTEM_RESOURCE_ID,
-        position,
-      });
-    }
+    // Missing special nodes join the root special block. Knowledge closes it, so
+    // the documents placed below it sit between the special nodes and sessions.
+    const specialNodeInsertionIndex = (resourceId: string): number => {
+      const roots = siblingsByParent.get(null) ?? [];
+      let end = 0;
+      for (const [index, node] of roots.entries()) {
+        if (node.resourceKind !== SYSTEM_RESOURCE_KIND) continue;
+        if (node.resourceId === KNOWLEDGE_SYSTEM_RESOURCE_ID && resourceId !== KNOWLEDGE_SYSTEM_RESOURCE_ID) return index;
+        end = index + 1;
+      }
+      return end;
+    };
     // Include every default special node before choosing the first session's position.
     for (const resourceId of [
       COLLABORATION_SYSTEM_RESOURCE_ID,
@@ -481,9 +478,10 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       VIEWS_SYSTEM_RESOURCE_ID,
       AGENTS_SYSTEM_RESOURCE_ID,
       ARCHIVED_SYSTEM_RESOURCE_ID,
+      ...(knowledgeEnabled(projectId) ? [KNOWLEDGE_SYSTEM_RESOURCE_ID] : []),
     ]) {
       if (placed.has(`${SYSTEM_RESOURCE_KIND}:${resourceId}`)) continue;
-      const position = siblingsByParent.get(null)?.length ?? 0;
+      const position = specialNodeInsertionIndex(resourceId);
       operations.push({
         kind: "placeResource",
         resourceKind: SYSTEM_RESOURCE_KIND,
@@ -633,7 +631,7 @@ export const useWorkspaceExplorerStore = defineStore("workspaceExplorer", () => 
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const pending = pendingSessionPromotions(attention, snapshot);
         const operations = sessionPromotionOperations(snapshot, displaySettings.autoPromoteCompletedSessions
-          ? pending.filter((id) => attention.sessions[id]?.promoteCompletion) : []);
+          ? pending : []);
         try {
           if (operations.length) {
             const result = await projectExplorerApplyOperations(projectId, snapshot.revision, operations, crypto.randomUUID());

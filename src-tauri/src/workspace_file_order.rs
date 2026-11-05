@@ -1,4 +1,6 @@
 //! Sparse file-mode placement overrides, scoped to one physical checkout.
+//! Like the workspace tree they are per-user layout state, kept in the data
+//! directory so reordering files never changes the project.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -6,7 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 
 const SCHEMA_VERSION: u32 = 1;
-const FILE_NAME: &str = "workspace-file-order.json";
+const DIR_NAME: &str = "workspace-file-order";
+/// Older versions kept the order in `<checkout>/Locus/workspace-file-order.json`.
+const LEGACY_FILE_NAME: &str = "workspace-file-order.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,8 +56,18 @@ fn order_lock(root: &Path) -> Result<Arc<Mutex<()>>, String> {
     Ok(Arc::clone(locks.entry(root).or_default()))
 }
 
-fn path(root: &Path) -> PathBuf {
-    root.join("Locus").join(FILE_NAME)
+/// `<data dir>/workspace-file-order/<checkout id>.json`
+fn path(data_dir: &Path, root: &Path) -> Result<PathBuf, String> {
+    let root = crate::workspace_service::identity::normalize_existing_workspace_root(root)
+        .map_err(|e| e.to_string())?;
+    let checkout = crate::workspace_service::CheckoutId::from_normalized_root(&root);
+    Ok(data_dir
+        .join(DIR_NAME)
+        .join(format!("{}.json", checkout.as_str())))
+}
+
+fn data_dir() -> Result<&'static Path, String> {
+    crate::runtime_paths::active_data_dir()
 }
 
 fn relative(value: &str) -> Result<String, String> {
@@ -125,14 +139,9 @@ fn validate(placements: &mut [FilePlacement]) -> Result<(), String> {
     Ok(())
 }
 
-fn read(root: &Path) -> Result<FileOrder, String> {
-    let bytes = match std::fs::read(path(root)) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileOrder::default()),
-        Err(e) => return Err(format!("Failed to read file order: {e}")),
-    };
+fn parse(bytes: &[u8]) -> Result<FileOrder, String> {
     let mut order: FileOrder =
-        serde_json::from_slice(&bytes).map_err(|e| format!("Failed to parse file order: {e}"))?;
+        serde_json::from_slice(bytes).map_err(|e| format!("Failed to parse file order: {e}"))?;
     if order.schema_version != SCHEMA_VERSION {
         return Err(format!(
             "Unsupported file order schema: {}",
@@ -143,30 +152,61 @@ fn read(root: &Path) -> Result<FileOrder, String> {
     Ok(order)
 }
 
-fn write(root: &Path, order: &mut FileOrder) -> Result<(), String> {
+/// Until the first save the checkout's legacy file seeds the order. That copy
+/// is never written; an unusable one just starts the order empty.
+fn read(file: &Path, root: &Path) -> Result<FileOrder, String> {
+    match std::fs::read(file) {
+        Ok(bytes) => parse(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::fs::read(root.join("Locus").join(LEGACY_FILE_NAME))
+                .ok()
+                .and_then(|bytes| parse(&bytes).ok())
+                .unwrap_or_default())
+        }
+        Err(e) => Err(format!("Failed to read file order: {e}")),
+    }
+}
+
+fn write(file: &Path, order: &mut FileOrder) -> Result<(), String> {
     order.revision = order
         .revision
         .checked_add(1)
         .ok_or("File order revision is exhausted")?;
     let bytes = serde_json::to_vec_pretty(order).map_err(|e| e.to_string())?;
-    crate::config::atomic_write_config(&path(root), &bytes)
+    crate::config::atomic_write_config(file, &bytes)
 }
 
 pub fn snapshot(root: &Path) -> Result<FileOrder, String> {
+    snapshot_in(data_dir()?, root)
+}
+
+fn snapshot_in(data_dir: &Path, root: &Path) -> Result<FileOrder, String> {
+    let file = path(data_dir, root)?;
     let lock = order_lock(root)?;
     let _guard = lock.lock().map_err(|e| e.to_string())?;
-    read(root)
+    read(&file, root)
 }
 
 pub fn save(
     root: &Path,
     expected_revision: i64,
     directory: &str,
+    placements: Vec<FilePlacement>,
+) -> Result<FileOrder, String> {
+    save_in(data_dir()?, root, expected_revision, directory, placements)
+}
+
+fn save_in(
+    data_dir: &Path,
+    root: &Path,
+    expected_revision: i64,
+    directory: &str,
     mut placements: Vec<FilePlacement>,
 ) -> Result<FileOrder, String> {
+    let file = path(data_dir, root)?;
     let lock = order_lock(root)?;
     let _guard = lock.lock().map_err(|e| e.to_string())?;
-    let mut order = read(root)?;
+    let mut order = read(&file, root)?;
     if order.revision != expected_revision {
         return Err("workspace_file_order_revision_conflict".into());
     }
@@ -186,16 +226,26 @@ pub fn save(
         return Ok(order);
     }
     order.placements = next;
-    write(root, &mut order)?;
+    write(&file, &mut order)?;
     Ok(order)
 }
 
 /// Rename anchors and descendants. A cross-folder move drops the moved entry's
 /// sibling relation, while retaining ordering inside the moved folder.
 pub fn relocate(root: &Path, source: &Path, target: Option<&Path>) -> Result<(), String> {
+    relocate_in(data_dir()?, root, source, target)
+}
+
+fn relocate_in(
+    data_dir: &Path,
+    root: &Path,
+    source: &Path,
+    target: Option<&Path>,
+) -> Result<(), String> {
+    let file = path(data_dir, root)?;
     let lock = order_lock(root)?;
     let _guard = lock.lock().map_err(|e| e.to_string())?;
-    let mut order = read(root)?;
+    let mut order = read(&file, root)?;
     if order.placements.is_empty() {
         return Ok(());
     }
@@ -246,7 +296,7 @@ pub fn relocate(root: &Path, source: &Path, target: Option<&Path>) -> Result<(),
         .collect::<Vec<_>>();
     if next != order.placements {
         order.placements = next;
-        write(&root, &mut order)?;
+        write(&file, &mut order)?;
     }
     Ok(())
 }
@@ -266,36 +316,39 @@ mod tests {
     #[test]
     fn lazy_sparse_storage_reloads_and_keeps_directory_scopes() {
         let temp = tempfile::tempdir().unwrap();
-        assert_eq!(snapshot(temp.path()).unwrap(), FileOrder::default());
+        let data = tempfile::tempdir().unwrap();
+        assert_eq!(snapshot_in(data.path(), temp.path()).unwrap(), FileOrder::default());
         assert!(!temp.path().join("Locus").exists());
         let root = vec![placement(".", "file:c.txt", "node:sessions")];
-        let saved = save(temp.path(), 0, ".", root.clone()).unwrap();
-        assert_eq!(saved, snapshot(temp.path()).unwrap());
+        let saved = save_in(data.path(), temp.path(), 0, ".", root.clone()).unwrap();
+        assert_eq!(saved, snapshot_in(data.path(), temp.path()).unwrap());
         let raw: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path(temp.path())).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(path(data.path(), temp.path()).unwrap()).unwrap()).unwrap();
         assert_eq!(raw["schemaVersion"], 1);
         assert_eq!(raw["placements"].as_array().unwrap().len(), 1);
         assert!(raw.get("nodes").is_none());
         assert!(raw["placements"][0].get("position").is_none());
         let nested = placement("Assets", "file:Assets/b.cs", "file:Assets/a.cs");
-        let saved = save(temp.path(), 1, "Assets", vec![nested.clone()]).unwrap();
+        let saved = save_in(data.path(), temp.path(), 1, "Assets", vec![nested.clone()]).unwrap();
         assert_eq!(saved.placements, [root[0].clone(), nested.clone()]);
-        let restored = save(temp.path(), 2, ".", vec![]).unwrap();
+        let restored = save_in(data.path(), temp.path(), 2, ".", vec![]).unwrap();
         assert_eq!(restored.placements, [nested]);
-        assert_eq!(snapshot(temp.path()).unwrap(), restored);
+        assert_eq!(snapshot_in(data.path(), temp.path()).unwrap(), restored);
     }
 
     #[test]
     fn rejects_stale_revisions_bad_scopes_and_cycles_without_overwriting() {
         let temp = tempfile::tempdir().unwrap();
-        let saved = save(
+        let data = tempfile::tempdir().unwrap();
+        let saved = save_in(
+            data.path(),
             temp.path(),
             0,
             ".",
             vec![placement(".", "file:b", "file:a")],
         )
         .unwrap();
-        assert!(save(temp.path(), 0, ".", vec![])
+        assert!(save_in(data.path(), temp.path(), 0, ".", vec![])
             .unwrap_err()
             .contains("revision_conflict"));
         for invalid in [
@@ -310,46 +363,75 @@ mod tests {
                 placement(".", "file:b", "file:a"),
             ],
         ] {
-            assert!(save(temp.path(), 1, ".", invalid).is_err());
+            assert!(save_in(data.path(), temp.path(), 1, ".", invalid).is_err());
         }
-        assert_eq!(snapshot(temp.path()).unwrap(), saved);
-        assert!(!temp
-            .path()
-            .parent()
-            .unwrap()
-            .join("workspace-file-order.json")
-            .exists());
+        assert_eq!(snapshot_in(data.path(), temp.path()).unwrap(), saved);
+        assert!(!temp.path().join("Locus").exists());
     }
 
     #[test]
     fn rename_delete_and_folder_moves_update_sparse_paths() {
         let temp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
         let root = dunce::canonicalize(temp.path()).unwrap();
-        save(&root, 0, ".", vec![placement(".", "file:c", "file:a")]).unwrap();
-        relocate(&root, &root.join("a"), Some(&root.join("b"))).unwrap();
-        assert_eq!(snapshot(&root).unwrap().placements[0].anchor, "file:b");
-        save(&root, 2, "c", vec![placement("c", "file:c/z", "file:c/y")]).unwrap();
-        relocate(&root, &root.join("c"), Some(&root.join("nested/c"))).unwrap();
+        save_in(data.path(), &root, 0, ".", vec![placement(".", "file:c", "file:a")]).unwrap();
+        relocate_in(data.path(), &root, &root.join("a"), Some(&root.join("b"))).unwrap();
+        assert_eq!(snapshot_in(data.path(), &root).unwrap().placements[0].anchor, "file:b");
+        save_in(data.path(), &root, 2, "c", vec![placement("c", "file:c/z", "file:c/y")]).unwrap();
+        relocate_in(data.path(), &root, &root.join("c"), Some(&root.join("nested/c"))).unwrap();
         assert_eq!(
-            snapshot(&root).unwrap().placements,
+            snapshot_in(data.path(), &root).unwrap().placements,
             [placement("nested/c", "file:nested/c/z", "file:nested/c/y")]
         );
-        relocate(&root, &root.join("nested/c/y"), None).unwrap();
-        assert!(snapshot(&root).unwrap().placements.is_empty());
+        relocate_in(data.path(), &root, &root.join("nested/c/y"), None).unwrap();
+        assert!(snapshot_in(data.path(), &root).unwrap().placements.is_empty());
     }
 
     #[test]
     fn incompatible_or_corrupt_files_are_never_replaced() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join("Locus")).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data.path().join(DIR_NAME)).unwrap();
         for raw in [
             r#"{"schemaVersion":99,"revision":0,"placements":[]}"#,
             "not json",
         ] {
-            std::fs::write(path(temp.path()), raw).unwrap();
-            assert!(snapshot(temp.path()).is_err());
-            assert!(save(temp.path(), 0, ".", vec![]).is_err());
-            assert_eq!(std::fs::read_to_string(path(temp.path())).unwrap(), raw);
+            std::fs::write(path(data.path(), temp.path()).unwrap(), raw).unwrap();
+            assert!(snapshot_in(data.path(), temp.path()).is_err());
+            assert!(save_in(data.path(), temp.path(), 0, ".", vec![]).is_err());
+            assert_eq!(std::fs::read_to_string(path(data.path(), temp.path()).unwrap()).unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn checkout_files_seed_the_user_order_and_are_never_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let legacy = temp.path().join("Locus").join(LEGACY_FILE_NAME);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let raw = r#"{"schemaVersion":1,"revision":4,"placements":[{"directory":".","item":"file:b","anchor":"file:a","side":"before"}]}"#;
+        std::fs::write(&legacy, raw).unwrap();
+
+        let seeded = snapshot_in(data.path(), temp.path()).unwrap();
+        assert_eq!(seeded.revision, 4);
+        assert_eq!(seeded.placements, [placement(".", "file:b", "file:a")]);
+        let saved = save_in(data.path(), temp.path(), 4, ".", vec![]).unwrap();
+        assert_eq!(saved.revision, 5);
+        assert_eq!(snapshot_in(data.path(), temp.path()).unwrap(), saved);
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), raw);
+        let file = path(data.path(), temp.path()).unwrap();
+        assert!(file.starts_with(data.path().join(DIR_NAME)));
+        // Each checkout keeps its own order.
+        assert_ne!(path(data.path(), other.path()).unwrap(), file);
+        assert_eq!(snapshot_in(data.path(), other.path()).unwrap(), FileOrder::default());
+
+        // An unusable checkout file starts the order empty and stays as it is.
+        let corrupt = other.path().join("Locus").join(LEGACY_FILE_NAME);
+        std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        std::fs::write(&corrupt, "not json").unwrap();
+        assert_eq!(snapshot_in(data.path(), other.path()).unwrap(), FileOrder::default());
+        save_in(data.path(), other.path(), 0, ".", vec![placement(".", "file:d", "file:c")]).unwrap();
+        assert_eq!(std::fs::read_to_string(&corrupt).unwrap(), "not json");
     }
 }

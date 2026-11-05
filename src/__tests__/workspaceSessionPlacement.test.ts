@@ -55,7 +55,7 @@ describe("new session insertion", () => {
   });
 
   it("starts an empty list after the leading entries and knowledge documents", () => {
-    const nodes = layout("system:newSession", "system:knowledge", "knowledge:plan", "system:collaboration", "folder:notes");
+    const nodes = layout("system:newSession", "system:collaboration", "system:knowledge", "knowledge:plan", "folder:notes");
     expect(insertionIndex(nodes)).toBe(4);
     expect(insertionIndex(layout("system:newSession", "system:collaboration"))).toBe(2);
     expect(newSessionInsertionIndex([], -1, rules)).toBe(0);
