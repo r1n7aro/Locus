@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
-pub const PARSER_VERSION: u32 = 1;
+/// Keys every cache of parse-derived data; v2 reads Unity empty keys and
+/// compact nested sequences.
+pub const PARSER_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
@@ -563,7 +565,7 @@ impl<'a> Parser<'a> {
             ));
         }
         if self.sequence_line(i) {
-            self.sequence(i, end, indent, depth + 1)
+            self.sequence(i, end, indent, None, depth + 1)
         } else {
             self.mapping(i, end, indent, None, depth + 1)
         }
@@ -604,8 +606,14 @@ impl<'a> Parser<'a> {
             })?;
             let key_end = trim_end(self.bytes, key_start, colon);
             let key_span = Span::new(key_start, key_end);
-            let key = decode_key(&self.text[key_start..key_end])
-                .map_err(|m| self.error("mapping_key", m, key_start))?;
+            // Unity writes an empty string key as `: value` (PluginImporter
+            // platform pairs, TextureImporter sprite name tables).
+            let key = if key_start == key_end {
+                String::new()
+            } else {
+                decode_key(&self.text[key_start..key_end])
+                    .map_err(|m| self.error("mapping_key", m, key_start))?
+            };
             if key == "<<" {
                 return Err(self.error(
                     "yaml_merge_key",
@@ -652,23 +660,54 @@ impl<'a> Parser<'a> {
         ))
     }
 
+    /// A block sequence whose `- ` markers sit at column `indent`. `first` is
+    /// the marker of a compact nested sequence (`- - item`), which shares the
+    /// enclosing element's line; its later elements start their own lines.
     fn sequence(
         &mut self,
         mut i: usize,
         end: usize,
         indent: usize,
+        mut first: Option<usize>,
         depth: usize,
     ) -> Result<(Node, usize), CoreError> {
-        let start = self.lines[i].start + indent;
+        if depth > self.limits.max_depth {
+            return Err(self.error(
+                "depth_limit",
+                "asset exceeds parser nesting budget",
+                self.lines[i].start,
+            ));
+        }
+        let start = first.unwrap_or(self.lines[i].start + indent);
         let mut items = Vec::new();
         let mut node_end = start;
         loop {
             i = self.skip(i, end);
-            if i >= end || self.lines[i].indent != indent || !self.sequence_line(i) {
+            if i >= end {
                 break;
             }
             let l = self.lines[i];
-            let value_start = skip_spaces(self.bytes, l.start + indent + 1, l.end);
+            let marker = if let Some(position) = first.take() {
+                position
+            } else {
+                if l.indent != indent || !self.sequence_line(i) {
+                    break;
+                }
+                l.start + indent
+            };
+            let value_start = skip_spaces(self.bytes, marker + 1, l.end);
+            if compact_sequence_marker(self.bytes, value_start, l.end) {
+                let column = value_start - l.start;
+                let (value, next) = self.sequence(i, end, column, Some(value_start), depth + 1)?;
+                node_end = self.lines[next.saturating_sub(1)].full_end;
+                let item_start = if marker == l.start + l.indent { l.start } else { marker };
+                items.push(Item {
+                    span: Span::new(item_start, node_end),
+                    value,
+                });
+                i = next;
+                continue;
+            }
             let mapping_colon = find_colon(self.bytes, value_start, l.end);
             let (value, next) = if mapping_colon.is_some()
                 && !matches!(
@@ -680,8 +719,11 @@ impl<'a> Parser<'a> {
                 self.block_value(i, end, value_start, indent, depth + 1, false)?
             };
             node_end = self.lines[next.saturating_sub(1)].full_end;
+            // A compact nested element begins at its marker, after the
+            // enclosing `- ` on the same line; others own their whole lines.
+            let item_start = if marker == l.start + l.indent { l.start } else { marker };
             items.push(Item {
-                span: Span::new(l.start, node_end),
+                span: Span::new(item_start, node_end),
                 value,
             });
             i = next;
@@ -1090,6 +1132,13 @@ fn scalar_style(s: &str) -> ScalarStyle {
     } else {
         ScalarStyle::Plain
     }
+}
+
+/// `- ` (or a final `-`) opening a compact nested block sequence: Unity writes
+/// `Vector2[][]`/`IntPoint[][]` collider paths as `- - {x: 0, y: 0}`. A
+/// negative number such as `-1` is a scalar, not a marker.
+fn compact_sequence_marker(bytes: &[u8], pos: usize, end: usize) -> bool {
+    pos < end && bytes[pos] == b'-' && (pos + 1 == end || bytes[pos + 1] == b' ')
 }
 
 fn skip_spaces(bytes: &[u8], mut pos: usize, end: usize) -> usize {

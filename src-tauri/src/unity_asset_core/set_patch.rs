@@ -145,7 +145,11 @@ impl<'a> Patcher<'a> {
                     }
                     return Ok(());
                 }
-                if values.is_empty() {
+                // A compact nested sequence's first element shares the
+                // enclosing `- ` line, so element splices cannot address it.
+                if values.is_empty()
+                    || items.iter().any(|item| !starts_line(&self.asset.bytes, item.span.start))
+                {
                     return self.rerender(node, holder, value);
                 }
                 match (sequence_keys(self.asset, node, path), json_sequence_keys(path, values)) {
@@ -269,7 +273,21 @@ impl<'a> Patcher<'a> {
             }
             Holder::Item(item) => {
                 let template = Some(&item.value);
-                let text = self.render_item(value, leading(item.span.start), template)?;
+                let start = item.span.start;
+                let text = if starts_line(&self.asset.bytes, start) {
+                    self.render_item(value, leading(start), template)?
+                } else {
+                    // The first element of a compact nested sequence keeps the
+                    // enclosing `- ` already written before it on the line.
+                    let line_start = self.asset.bytes[..start]
+                        .iter()
+                        .rposition(|b| *b == b'\n')
+                        .map_or(0, |i| i + 1);
+                    let column = start - line_start;
+                    let mut text = self.render_item(value, column, template)?;
+                    text.replace_range(..column, "");
+                    text
+                };
                 self.patches.push((item.span, text.into_bytes(), false));
             }
             Holder::Inline => {
@@ -290,10 +308,28 @@ impl<'a> Patcher<'a> {
     ) -> Result<String, CoreError> {
         let pad = " ".repeat(indent);
         let newline = self.newline();
+        if let (Value::Array(values), Some(template)) = (value, template) {
+            if !values.is_empty() && !template.flow && template.items().is_some() {
+                // Unity's compact nested form: the outer marker takes the
+                // first inner element's indentation (`- - a` / `  - b`).
+                let inner = template.items().and_then(|items| items.first()).map(|item| &item.value);
+                let mut out = String::new();
+                for child in values {
+                    out.push_str(&self.render_item(child, indent + 2, inner)?);
+                }
+                out.replace_range(..indent + 2, &format!("{pad}- "));
+                return Ok(out);
+            }
+        }
         let Value::Object(map) = value else {
             return Ok(format!("{pad}- {}{newline}", json_yaml_unity(value, true)?));
         };
-        if map.is_empty() || json_pptr(value) || is_packed_marker(value) {
+        if map.is_empty()
+            || json_pptr(value)
+            || is_packed_marker(value)
+            || template.is_some_and(|template| template.flow)
+        {
+            // Elements keep their siblings' flow style, e.g. `- {x: 0, y: 0}`.
             return Ok(format!("{pad}- {}{newline}", json_yaml_unity(value, true)?));
         }
         let template_entries = template.and_then(Node::entries).unwrap_or(&[]);

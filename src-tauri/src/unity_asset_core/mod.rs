@@ -7,7 +7,9 @@
 mod edit;
 mod identity;
 mod merge;
+mod ownership;
 mod parser;
+mod reference_scan;
 mod set_patch;
 mod packed;
 mod validation;
@@ -28,10 +30,12 @@ pub use merge::{
     prepare_merge, prepare_merge_with_aliases, Change, ChangeCatalog, ChangeKind, ChangeStatus,
     Conflict, Decision, FieldAlias, MergeOutput, MergeSession, Resolution, ValueSummary,
 };
+pub use ownership::{restore_closure, Restore};
 pub use parser::{
     parse, parse_shared, Asset, CoreError, Diagnostic, Document, Entry, Item, Limits, Node,
     NodeKind, ScalarStyle, Severity, Span, PARSER_VERSION,
 };
+pub use reference_scan::{reference_location, scan_references, ReferenceScan, ScannedReference};
 pub use validation::{validate, AssetReference, ReferenceKind};
 
 #[cfg(test)]

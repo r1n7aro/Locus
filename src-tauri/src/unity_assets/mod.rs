@@ -1,6 +1,7 @@
 //! One asset API for immutable Unity YAML and the live Editor. SDK/IPC adapters
 //! only select a checkout; neither backend is permitted to launch an Editor.
 mod storage;
+pub(crate) mod disk_payload;
 pub(crate) mod schema;
 mod property;
 #[cfg(test)]
@@ -18,7 +19,9 @@ async fn commit_candidates(root:&Path,candidates:storage::Candidates)->Result<se
     let prepared=tokio::task::spawn_blocking(move||storage::execute_candidates(&prepare_root,&serde_json::json!({"action":"apply_batch","_prepare_editor":connected}),Some(candidates))).await.map_err(|e|e.to_string())??;
     if !connected{return Ok(prepared);}
     let id=prepared["transaction_id"].as_str().ok_or("assets.invalid_transaction")?;
-    match crate::unity_bridge::asset_api(&root.to_string_lossy(),&serde_json::json!({"action":"disk_apply","transaction_id":id,"entries":prepared["entries"],"dependencies":prepared["dependencies"]})).await {
+    let response=crate::unity_bridge::asset_api(&root.to_string_lossy(),&serde_json::json!({"action":"disk_apply","transaction_id":id,"entries":prepared["entries"],"dependencies":prepared["dependencies"]})).await;
+    disk_payload::clear(root,id);
+    match response {
         Ok(response)=>{storage::complete_editor(root,id)?;let mut result=prepared["result"].clone();if let Some(timings)=response.get("timings"){result["editorTimings"]=timings.clone();}Ok(result)},
         Err(error)=>{
             if !error.contains("outcome_unknown") {let rollback=storage::confirm_editor_rollback(root,id);return Err(format!("{error}; rollback={rollback:?}; transaction_id={id}"));}
@@ -165,6 +168,7 @@ pub async fn execute(root: &Path, mut request: Value) -> Result<Value, String> {
             let prepared=tokio::task::spawn_blocking(move ||storage::prepare_editor(&prepare_root,&input)).await.map_err(|e|e.to_string())??;
             let id=prepared["transaction_id"].as_str().ok_or("assets.invalid_transaction")?.to_owned();
             let response=crate::unity_bridge::asset_api(&root.to_string_lossy(),&json!({"action":"disk_apply","transaction_id":id,"entries":prepared["entries"]})).await;
+            disk_payload::clear(&root,&id);
             match response {
                 Ok(response) => {
                     let finish_root=root.clone();let finish_id=id.clone();

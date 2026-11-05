@@ -383,12 +383,14 @@ impl MergeSession {
                 catalog.diagnostics.push(diagnostic);
             }
         }
+        let anchors = document_anchors(&target, &source);
         let mut builder = Builder {
             base: &base,
             target: &target,
             source: &source,
             catalog: &mut catalog,
             stored: Vec::new(),
+            anchors,
         };
         let mut seen = HashSet::new();
         for doc in base.documents.iter().chain(source.documents.iter()) {
@@ -398,6 +400,8 @@ impl MergeSession {
             builder.document(&doc.object_id)?;
         }
         let stored = builder.stored;
+        super::ownership::link_deletions(&base, &mut catalog.changes);
+        super::ownership::owner_hints(&source, &mut catalog.changes);
         Ok(Self {
             base,
             target,
@@ -584,10 +588,14 @@ impl MergeSession {
                         0,
                     ));
                 }
+                let insertion = || {
+                    let at = chosen.map_or(self.target.bytes.len(), |(asset, _)| {
+                        document_anchor(&self.target, asset, object_id)
+                    });
+                    Span::new(at, at)
+                };
                 patches.push(Patch {
-                    span: target
-                        .map(|d| d.span)
-                        .unwrap_or(Span::new(self.target.bytes.len(), self.target.bytes.len())),
+                    span: target.map(|d| d.span).unwrap_or_else(insertion),
                     bytes: chosen
                         .map(|(a, d)| d.span.bytes(&a.bytes).to_vec())
                         .unwrap_or_default(),
@@ -711,18 +719,17 @@ impl MergeSession {
                     _ => json_yaml_unity(value, false)?.into_bytes(),
                 }
             } else if let Some((asset, region)) = chosen {
-                let bytes = region.span.bytes(&asset.bytes);
                 if region.kind.lines() {
-                    reindent(bytes, region.indent, indent, self.target.newline)
+                    transplant(asset, region, &self.target.bytes, span.start, indent, self.target.newline)
                 } else {
-                    with_newline(bytes, self.target.newline)
+                    with_newline(region.span.bytes(&asset.bytes), self.target.newline)
                 }
             } else {
                 Vec::new()
             };
             if bytes.is_empty()
                 && stored.target.as_ref().is_some_and(|region| {
-                    matches!(region.kind, RegionKind::Entry)
+                    matches!(region.kind, RegionKind::Entry | RegionKind::Item)
                         && !starts_line(&self.target.bytes, region.span.start)
                 })
             {
@@ -747,7 +754,16 @@ impl MergeSession {
         // Ascending stable order means independent additions at the same end
         // position retain source order. Nonzero overlapping spans never win by
         // accidental call order.
-        patches.sort_by_key(|p| (p.span.start, p.span.end));
+        // Whole documents inserted at one offset of a fileID-ordered target
+        // follow fileID order as well; everything else keeps push order.
+        let ordered = file_id_order(&self.target).is_some();
+        patches.sort_by_key(|p| {
+            let document = ordered && p.span.start == p.span.end && p.path.is_empty() && p.bytes.starts_with(b"--- !u!");
+            (p.span.start, p.span.end, document.then(|| p.object_id.parse::<i64>().ok()).flatten())
+        });
+        // Several elements added to one empty flow sequence each remove its
+        // `[]`; that removal happens once.
+        patches.dedup_by(|a, b| a.span.start == b.span.start && a.span.end == b.span.end && a.span.start < a.span.end && a.bytes == b.bytes);
         let mut end = 0;
         for patch in &patches {
             if patch.span.start < end {
@@ -834,9 +850,9 @@ impl MergeSession {
                         .collect());
                 }
                 let parent = parent.ok_or_else(missing_parent)?;
-                let (at, bytes) =
+                let parts =
                     self.insertion(object_id, parent, &parent_path, &key, Insertion::Value(value))?;
-                Ok(vec![patch(Span::new(at, at), bytes, false)])
+                Ok(parts.into_iter().map(|(span, bytes)| patch(span, bytes, false)).collect())
             }
             Resolution::Delete => {
                 let point = target.ok_or_else(|| {
@@ -862,14 +878,14 @@ impl MergeSession {
                 let chosen_region = chosen.region();
                 let Some(point) = target else {
                     let parent = parent.ok_or_else(missing_parent)?;
-                    let (at, bytes) = self.insertion(
+                    let parts = self.insertion(
                         object_id,
                         parent,
                         &parent_path,
                         &key,
                         Insertion::Copy(asset, chosen_region),
                     )?;
-                    return Ok(vec![patch(Span::new(at, at), bytes, false)]);
+                    return Ok(parts.into_iter().map(|(span, bytes)| patch(span, bytes, false)).collect());
                 };
                 let region = point.region();
                 if region.kind.lines() != chosen_region.kind.lines() {
@@ -880,9 +896,11 @@ impl MergeSession {
                     ));
                 }
                 let bytes = if region.kind.lines() {
-                    reindent(
-                        chosen_region.span.bytes(&asset.bytes),
-                        chosen_region.indent,
+                    transplant(
+                        asset,
+                        &chosen_region,
+                        &self.target.bytes,
+                        region.span.start,
                         region.indent,
                         self.target.newline,
                     )
@@ -940,6 +958,11 @@ impl MergeSession {
                 "this is the first field of a sequence element and shares its '- ' line; delete or replace the element itself (its parent path) instead",
                 region.span.start,
             )),
+            RegionKind::Item => Err(CoreError::new(
+                "delete_scope",
+                "this is the first element of a compact nested sequence and shares the enclosing '- ' line; set the enclosing element (its parent path) instead",
+                region.span.start,
+            )),
             RegionKind::Document => Err(CoreError::new(
                 "delete_scope",
                 "use objects.delete for a complete Unity object",
@@ -953,7 +976,9 @@ impl MergeSession {
         }
     }
 
-    /// Bytes and position for a field/element absent from the target.
+    /// Patches that add a field/element absent from the target: one insertion,
+    /// or for an empty flow sequence (`key: []`) the removal of `[]` plus the
+    /// element as the first item of a block sequence.
     fn insertion(
         &self,
         object_id: &str,
@@ -961,7 +986,7 @@ impl MergeSession {
         parent_path: &str,
         key: &str,
         source: Insertion<'_>,
-    ) -> Result<(usize, Vec<u8>), CoreError> {
+    ) -> Result<Vec<(Span, Vec<u8>)>, CoreError> {
         let newline = self.target.newline;
         let representation = || {
             CoreError::new(
@@ -986,10 +1011,14 @@ impl MergeSession {
                         if !matches!(region.kind, RegionKind::Entry) {
                             return Err(representation());
                         }
-                        reindent(region.span.bytes(&asset.bytes), region.indent, indent, newline)
+                        transplant(asset, &region, &self.target.bytes, parent.node.span.end, indent, newline)
                     }
                 };
-                Ok((parent.node.span.end, bytes))
+                let at = parent.node.span.end;
+                Ok(vec![(Span::new(at, at), bytes)])
+            }
+            NodeKind::Sequence(items) if parent.node.flow && items.is_empty() => {
+                self.empty_flow_insertion(parent, parent_path, key, source)
             }
             NodeKind::Sequence(items) if !parent.node.flow => {
                 let indent = parent.node.indent;
@@ -1070,6 +1099,13 @@ impl MergeSession {
                     }
                     items.get(index).map(|i| i.span.start).unwrap_or(end)
                 };
+                if at < self.target.bytes.len() && !starts_line(&self.target.bytes, at) {
+                    return Err(CoreError::new(
+                        "insert_scope",
+                        "this position is the first element of a compact nested sequence, which shares the enclosing '- ' line; set the enclosing element (its parent path) instead",
+                        at,
+                    ));
+                }
                 let bytes = match source {
                     Insertion::Value(value) => super::set_patch::Patcher::new(&self.target)
                         .render_item(value, indent, items.first().map(|i| &i.value))?
@@ -1078,10 +1114,10 @@ impl MergeSession {
                         if !matches!(region.kind, RegionKind::Item) {
                             return Err(representation());
                         }
-                        reindent(region.span.bytes(&asset.bytes), region.indent, indent, newline)
+                        transplant(asset, &region, &self.target.bytes, at, indent, newline)
                     }
                 };
-                Ok((at, bytes))
+                Ok(vec![(Span::new(at, at), bytes)])
             }
             _ => Err(CoreError::new(
                 "insert_scope",
@@ -1089,6 +1125,66 @@ impl MergeSession {
                 parent.node.span.start,
             )),
         }
+    }
+
+    /// `key: []` closing its line becomes `key:` followed by a block item at
+    /// the key's indent, as Unity writes a non-empty list.
+    fn empty_flow_insertion(
+        &self,
+        parent: Point<'_>,
+        parent_path: &str,
+        key: &str,
+        source: Insertion<'_>,
+    ) -> Result<Vec<(Span, Vec<u8>)>, CoreError> {
+        let bytes = &self.target.bytes;
+        let (start, end) = (parent.node.span.start, parent.node.span.end);
+        let unsupported = || {
+            CoreError::new(
+                "insert_scope",
+                "insertion requires a block mapping or block sequence parent; set the complete flow value instead",
+                start,
+            )
+        };
+        let line_end = bytes[end..].iter().position(|b| *b == b'\n').map(|n| end + n).ok_or_else(unsupported)?;
+        if !bytes[end..line_end].iter().all(|b| matches!(b, b' ' | b'\r')) {
+            return Err(unsupported());
+        }
+        let mut open = start;
+        while open > 0 && bytes[open - 1] == b' ' {
+            open -= 1;
+        }
+        if open == 0 || bytes[open - 1] != b':' {
+            return Err(unsupported());
+        }
+        let line_start = bytes[..open].iter().rposition(|b| *b == b'\n').map_or(0, |n| n + 1);
+        let indent = bytes[line_start..].iter().take_while(|b| **b == b' ').count();
+        let at = line_end + 1;
+        let item = match source {
+            Insertion::Value(value) => {
+                if key.starts_with('@') {
+                    let identity = super::identity::json_sequence_keys(parent_path, std::slice::from_ref(value));
+                    if identity.as_deref().and_then(|keys| keys.first()).map(String::as_str) != Some(key) {
+                        return Err(CoreError::new(
+                            "identity_mismatch",
+                            "the value's own identity (target/propertyPath, rid, or fileID) does not match the addressed element",
+                            start,
+                        ));
+                    }
+                }
+                super::set_patch::Patcher::new(&self.target).render_item(value, indent, None)?.into_bytes()
+            }
+            Insertion::Copy(asset, region) => {
+                if !matches!(region.kind, RegionKind::Item) {
+                    return Err(CoreError::new(
+                        "field_representation",
+                        "field representation differs; choose its parent or provide a typed value",
+                        start,
+                    ));
+                }
+                transplant(asset, &region, bytes, at.min(bytes.len()), indent, self.target.newline)
+            }
+        };
+        Ok(vec![(Span::new(open, end), Vec::new()), (Span::new(at, at), item)])
     }
 
     fn finish(
@@ -1176,6 +1272,71 @@ struct Builder<'a, 'b> {
     source: &'a Asset,
     catalog: &'b mut ChangeCatalog,
     stored: Vec<StoredChange>,
+    /// Insertion offsets of source documents the target lacks.
+    anchors: HashMap<String, usize>,
+}
+
+/// The target's (fileID, start offset) pairs when its documents are in Unity's
+/// own serialization order, ascending signed fileID, which Unity writes for
+/// scenes and prefabs. `None` for any other order or a non-numeric fileID.
+fn file_id_order(asset: &Asset) -> Option<Vec<(i64, usize)>> {
+    let mut order: Vec<(i64, usize)> = Vec::with_capacity(asset.documents.len());
+    for document in &asset.documents {
+        let id: i64 = document.object_id.parse().ok()?;
+        if order.last().is_some_and(|(previous, _)| *previous >= id) {
+            return None;
+        }
+        order.push((id, document.span.start));
+    }
+    Some(order)
+}
+
+/// Where a document absent from the target goes. In a target that follows
+/// Unity's fileID order the document takes its fileID position, so the merged
+/// file is what Unity itself would write and an Editor save does not reorder
+/// it, even when both sides added documents. Otherwise it follows `previous`,
+/// its nearest preceding `order` document that the target has, or precedes the
+/// target's first document.
+fn insertion_point(target: &Asset, ordered: Option<&[(i64, usize)]>, id: &str, previous: Option<usize>) -> usize {
+    let end = target.documents.last().map_or(target.bytes.len(), |document| document.span.end);
+    if let (Some(ordered), Ok(id)) = (ordered, id.parse::<i64>()) {
+        let index = ordered.partition_point(|(existing, _)| *existing < id);
+        return ordered.get(index).map_or(end, |(_, start)| *start);
+    }
+    previous.unwrap_or_else(|| target.documents.first().map_or(target.bytes.len(), |document| document.span.start))
+}
+
+/// Insertion offsets of every source document absent from `target`.
+/// Additions sharing an offset are ordered by `render`.
+fn document_anchors(target: &Asset, source: &Asset) -> HashMap<String, usize> {
+    let ordered = file_id_order(target);
+    let mut previous = None;
+    let mut anchors = HashMap::new();
+    for document in &source.documents {
+        match target.document(&document.object_id) {
+            Some(existing) => previous = Some(existing.span.end),
+            None => {
+                let at = insertion_point(target, ordered.as_deref(), &document.object_id, previous);
+                anchors.insert(document.object_id.clone(), at);
+            }
+        }
+    }
+    anchors
+}
+
+/// The offset `document_anchors` assigns to one document of `order`.
+fn document_anchor(target: &Asset, order: &Asset, id: &str) -> usize {
+    let previous = order
+        .documents
+        .iter()
+        .position(|d| d.object_id == id)
+        .and_then(|index| {
+            order.documents[..index]
+                .iter()
+                .rev()
+                .find_map(|d| target.document(&d.object_id).map(|existing| existing.span.end))
+        });
+    insertion_point(target, file_id_order(target).as_deref(), id, previous)
 }
 
 impl Builder<'_, '_> {
@@ -1243,7 +1404,10 @@ impl Builder<'_, '_> {
             base: base.map(region),
             target: target.map(region),
             source: source.map(region),
-            insertion: Some((self.target.bytes.len(), 0)),
+            insertion: Some((
+                self.anchors.get(id).copied().unwrap_or(self.target.bytes.len()),
+                0,
+            )),
         });
         Ok(())
     }
@@ -1837,6 +2001,37 @@ fn with_newline(bytes: &[u8], newline: &str) -> Vec<u8> {
         text.into_bytes()
     } else {
         text.replace('\n', "\r\n").into_bytes()
+    }
+}
+
+/// Whole-line region bytes from `asset`, placed at `at` in `target`. A region
+/// that starts after `- ` on its line (first field of an element, or first
+/// element of a compact nested sequence) has no leading indentation of its
+/// own; it gains `indent` when placed on a fresh line, and a line-start region
+/// loses its indentation when placed after an existing `- `.
+fn transplant(
+    asset: &Asset,
+    region: &Region,
+    target: &[u8],
+    at: usize,
+    indent: usize,
+    newline: &str,
+) -> Vec<u8> {
+    let mut bytes = reindent(region.span.bytes(&asset.bytes), region.indent, indent, newline);
+    // Appending at an end without a final newline first writes one.
+    let fresh_line = at >= target.len() || starts_line(target, at);
+    match (starts_line(&asset.bytes, region.span.start), fresh_line) {
+        (false, true) => {
+            let mut padded = " ".repeat(indent).into_bytes();
+            padded.append(&mut bytes);
+            padded
+        }
+        (true, false) => {
+            let spaces = bytes.iter().take_while(|b| **b == b' ').count();
+            bytes.drain(..spaces);
+            bytes
+        }
+        _ => bytes,
     }
 }
 

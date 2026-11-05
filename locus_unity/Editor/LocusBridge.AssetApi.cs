@@ -31,7 +31,9 @@ namespace Locus
             public AssetApiRequest[] dependencies;
             public string transaction_id;
             public string expected_sha256;
-            public string bytes_base64;
+            // Replacement bytes staged by Locus in Library/Locus/DiskApply.
+            public string staged_path;
+            public string after_sha256;
             public string[] paths;
         }
 
@@ -159,9 +161,7 @@ namespace Locus
                 byte[] before = File.ReadAllBytes(absolutePath);
                 if (!string.Equals(AssetApiSha256(before), entry.expected_sha256, StringComparison.OrdinalIgnoreCase))
                     throw new Exception("revision_conflict: asset changed before disk apply: " + entry.path);
-                byte[] after;
-                try { after = Convert.FromBase64String(entry.bytes_base64 ?? ""); }
-                catch (FormatException) { throw new Exception("invalid_request: asset bytes are not base64"); }
+                byte[] after = ReadAssetApiDiskBytes(entry);
                 if (after.Length == 0 || after.Length > 128 * 1024 * 1024)
                     throw new Exception("limit_exceeded: disk asset must contain 1 to 134217728 bytes");
                 entries.Add(new AssetApiDiskEntry { path = entry.path, absolutePath = absolutePath, before = before, after = after });
@@ -255,6 +255,33 @@ namespace Locus
                 throw new Exception((recoveryErrors.Count == 0 ? "disk_apply_failed: " : "recovery_required: ") + failure.Message
                     + "; transaction_id=" + request.transaction_id + (recoveryErrors.Count == 0 ? "; rolled_back" : "; " + string.Join("; ", recoveryErrors)));
             }
+        }
+
+        private const string AssetApiStagingRoot = "Library/Locus/DiskApply/";
+
+        // Locus and the Editor share this machine, so replacement bytes arrive as
+        // a staged file named by project-relative path and SHA-256; they never
+        // pass through the size-capped bridge request.
+        private static byte[] ReadAssetApiDiskBytes(AssetApiRequest entry)
+        {
+            string path = entry.staged_path ?? "";
+            string project = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            string root = Path.GetFullPath(Path.Combine(project, AssetApiStagingRoot));
+            string absolute = Path.GetFullPath(Path.Combine(project, path));
+            if (!path.StartsWith(AssetApiStagingRoot, StringComparison.Ordinal) || path.Contains('\\') || path.Contains(':')
+                || path.Split('/').Any(part => part.Length == 0 || part == "." || part == "..")
+                || !absolute.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                throw new Exception("invalid_request: staged bytes must be inside " + AssetApiStagingRoot);
+            if (string.IsNullOrEmpty(entry.after_sha256) || !Regex.IsMatch(entry.after_sha256, "^[a-fA-F0-9]{64}$"))
+                throw new Exception("invalid_request: after_sha256 is required with staged bytes");
+            var info = new FileInfo(absolute);
+            if (!info.Exists) throw new Exception("invalid_request: staged bytes are missing for " + entry.path);
+            if (info.Length == 0 || info.Length > 128L * 1024 * 1024)
+                throw new Exception("limit_exceeded: disk asset must contain 1 to 134217728 bytes");
+            byte[] bytes = File.ReadAllBytes(absolute);
+            if (!string.Equals(AssetApiSha256(bytes), entry.after_sha256, StringComparison.OrdinalIgnoreCase))
+                throw new Exception("invalid_request: staged bytes do not match after_sha256 for " + entry.path);
+            return bytes;
         }
 
         private static AssetApiReloadContext AssetApiPreflightDiskPaths(HashSet<string> paths)

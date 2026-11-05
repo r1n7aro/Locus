@@ -1245,3 +1245,403 @@ fn element_identities_of_unity_lists_agree_for_yaml_and_json() {
     assert_eq!(identity::ListIdentity::of("/MonoBehaviour/m_AddedComponents"), None);
     assert_eq!(identity::ListIdentity::of("/MonoBehaviour/m_Roots"), None);
 }
+
+const PLUGIN_META: &str = "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\nPluginImporter:\n  isPreloaded: 0\n  platformData:\n  - first:\n      : Any\n    second:\n      enabled: 0\n  - first:\n      Editor: Editor\n    second:\n      enabled: 1\n";
+
+#[test]
+fn unity_empty_string_keys_parse_edit_and_merge() {
+    let parsed = parse(PLUGIN_META.as_bytes()).unwrap();
+    assert!(parsed.is_writable());
+    let platforms = parsed.documents[0].root.get("PluginImporter").unwrap().get("platformData").unwrap();
+    let first = platforms.items().unwrap()[0].value.get("first").unwrap();
+    assert_eq!(first.entries().unwrap()[0].key, "");
+    assert_eq!(first.get("").and_then(|node| node.scalar(&parsed)), Some("Any"));
+    // RFC 6901 addresses the empty key as an empty final segment (the typed
+    // edit API takes Unity documents; `.meta` files merge but are not edited).
+    let table = asset("  nameFileIdTable:\n    : -809884777\n    BUTTON EAST: -449862655\n");
+    let edited = edit(
+        &table,
+        &[AssetOperation::Set {
+            object_id: "11400000".into(),
+            property_path: "/MonoBehaviour/nameFileIdTable/".into(),
+            value: serde_json::json!(21300000),
+        }],
+    )
+    .unwrap();
+    assert_eq!(edited.bytes, replace(&table, "    : -809884777\n", "    : 21300000\n"));
+    // Independent changes on both sides merge around the empty-key mapping.
+    let target = PLUGIN_META.replace("isPreloaded: 0", "isPreloaded: 1");
+    let source = PLUGIN_META.replace("      : Any\n    second:\n      enabled: 0", "      : Any\n    second:\n      enabled: 1");
+    let merged = rendered(PLUGIN_META.as_bytes(), target.as_bytes(), source.as_bytes());
+    assert!(merged.ready, "{:?}", merged.conflicts);
+    assert_eq!(
+        String::from_utf8(merged.bytes).unwrap(),
+        target.replace("      : Any\n    second:\n      enabled: 0", "      : Any\n    second:\n      enabled: 1")
+    );
+}
+
+fn collider_paths(first: &str, rest: &str) -> Vec<u8> {
+    asset(&format!(
+        "  m_Paths:\n  - - {first}\n    - {{x: 2, y: 3}}\n  - - X: 1\n      Y: 2\n    - X: 3\n      Y: 4\n  m_Next: {{fileID: 0}}\n{rest}"
+    ))
+}
+
+#[test]
+fn compact_nested_sequences_parse_as_sequences_of_elements() {
+    let bytes = collider_paths("{x: 0, y: 1}", "");
+    let parsed = parse(&bytes).unwrap();
+    assert!(parsed.is_writable());
+    let body = parsed.documents[0].root.get("MonoBehaviour").unwrap();
+    let paths = body.get("m_Paths").unwrap().items().unwrap();
+    assert_eq!(paths.len(), 2);
+    let points = paths[0].value.items().unwrap();
+    assert_eq!(points.len(), 2);
+    assert!(points[0].value.flow && points[0].value.get("y").is_some());
+    let mapped = paths[1].value.items().unwrap();
+    assert_eq!(mapped.len(), 2);
+    assert_eq!(mapped[1].value.get("Y").and_then(|n| n.scalar(&parsed)), Some("4"));
+    assert!(body.get("m_Next").is_some());
+    // `- -1` is a negative scalar element, not a nested marker.
+    let scalar = parse(&asset("  values:\n  - -1\n  - - 2\n")).unwrap();
+    let values = scalar.documents[0].root.get("MonoBehaviour").unwrap().get("values").unwrap().items().unwrap();
+    assert!(values[0].value.is_scalar() && values[1].value.items().is_some());
+}
+
+#[test]
+fn compact_nested_sequence_writes_keep_unity_form() {
+    let bytes = collider_paths("{x: 0, y: 1}", "");
+    let run = |operation: serde_json::Value| {
+        let op: AssetOperation = serde_json::from_value(operation).unwrap();
+        String::from_utf8(edit(&bytes, &[op]).unwrap().bytes).unwrap()
+    };
+    let original = String::from_utf8(bytes.clone()).unwrap();
+    let path = "/MonoBehaviour/m_Paths/0";
+    // A field inside the line-sharing first element is patched in place.
+    let text = run(serde_json::json!({"op":"set","object_id":"11400000","property_path":format!("{path}/0/x"),"value":5}));
+    assert_eq!(text, original.replace("  - - {x: 0, y: 1}", "  - - {x: 5, y: 1}"));
+    // Element insertion/removal re-renders the enclosing element compactly.
+    let text = run(serde_json::json!({"op":"array_insert","object_id":"11400000","property_path":path,"index":0,"value":{"x":7,"y":8}}));
+    assert_eq!(text, original.replace("  - - {x: 0, y: 1}\n", "  - - {x: 7, y: 8}\n    - {x: 0, y: 1}\n"));
+    let text = run(serde_json::json!({"op":"array_remove","object_id":"11400000","property_path":path,"index":0}));
+    assert_eq!(text, original.replace("  - - {x: 0, y: 1}\n    - {x: 2, y: 3}\n", "  - - {x: 2, y: 3}\n"));
+    let text = run(serde_json::json!({"op":"array_insert","object_id":"11400000","property_path":"/MonoBehaviour/m_Paths","index":2,"value":[{"x":9,"y":9},{"x":8,"y":8}]}));
+    assert_eq!(text, original.replace("  m_Next:", "  - - {x: 9, y: 9}\n    - {x: 8, y: 8}\n  m_Next:"));
+}
+
+#[test]
+fn compact_nested_sequences_merge_and_refuse_line_splitting_operations() {
+    let base = collider_paths("{x: 0, y: 1}", "");
+    let source = collider_paths("{x: 0, y: 1}", "  m_Extra: 1\n");
+    let source = replace(&source, "    - X: 3\n      Y: 4\n", "    - X: 30\n      Y: 4\n");
+    let merged = rendered(&base, &base, &source);
+    assert!(merged.ready, "{:?}", merged.conflicts);
+    assert_eq!(merged.bytes, source);
+    let session = prepare_merge(&base, &base, &base).unwrap();
+    let delete = |path: &str| {
+        session.render(&[MergeSession::field_decision("11400000", path, Resolution::Delete)])
+    };
+    let error = delete("/MonoBehaviour/m_Paths/0/0").unwrap_err();
+    assert_eq!(error.code, "delete_scope");
+    let output = delete("/MonoBehaviour/m_Paths/0/1").unwrap();
+    assert!(output.ready);
+    assert_eq!(output.bytes, replace(&base, "    - {x: 2, y: 3}\n", ""));
+}
+
+#[test]
+fn copied_first_field_of_an_element_is_reindented_for_its_new_line() {
+    let list = |element: &str| asset(&format!("  list:\n{element}  after: 1\n"));
+    let take = |target: &[u8], source: &[u8]| {
+        let session = prepare_merge(target, target, source).unwrap();
+        let output = session
+            .render(&[MergeSession::field_decision("11400000", "/MonoBehaviour/list/0/a", Resolution::Source)])
+            .unwrap();
+        assert!(output.ready, "{:?}", output.conflicts);
+        String::from_utf8(output.bytes).unwrap()
+    };
+    let source = list("  - a: 1\n    b: 2\n");
+    // Inserted where the target element lacks it: a fresh line needs indentation.
+    assert_eq!(take(&list("  - b: 2\n"), &source), String::from_utf8(list("  - b: 2\n    a: 1\n")).unwrap());
+    // Replacing a field that starts its own line in the target.
+    assert_eq!(take(&list("  - b: 2\n    a: 9\n"), &source), String::from_utf8(list("  - b: 2\n    a: 1\n")).unwrap());
+    // Replacing a target field that shares the `- ` line, from a line-start source.
+    let source = list("  - b: 2\n    a: 1\n");
+    assert_eq!(take(&list("  - a: 9\n    b: 2\n"), &source), String::from_utf8(list("  - a: 1\n    b: 2\n")).unwrap());
+}
+
+fn scene(docs: &[(i64, &str)]) -> Vec<u8> {
+    let mut text = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+    for (id, name) in docs {
+        text.push_str(&format!("--- !u!1 &{id}\nGameObject:\n  m_Name: {name}\n"));
+    }
+    text.into_bytes()
+}
+
+fn document_ids(bytes: &[u8]) -> Vec<String> {
+    parse(bytes).unwrap().documents.iter().map(|d| d.object_id.clone()).collect()
+}
+
+/// Unity writes scenes in its own document order. Additions go next to their
+/// source neighbours instead of the end of the file, so an Editor save of the
+/// merged scene does not reorder it again.
+#[test]
+fn source_additions_keep_the_source_document_order() {
+    let base = scene(&[(100, "a"), (300, "c"), (500, "e")]);
+    let target = scene(&[(100, "a"), (300, "c"), (500, "E")]);
+    let source = scene(&[(100, "a"), (200, "b"), (300, "C"), (400, "d"), (450, "dd"), (500, "e"), (600, "f")]);
+    let output = rendered(&base, &target, &source);
+    assert!(output.ready, "{:?}", output.conflicts);
+    assert_eq!(document_ids(&output.bytes), ["100", "200", "300", "400", "450", "500", "600"]);
+    let text = String::from_utf8(output.bytes).unwrap();
+    assert!(text.contains("m_Name: C\n") && text.contains("m_Name: E\n"), "{text}");
+
+    // An explicit whole-object add lands at the same place.
+    let session = prepare_merge(&base, &target, &source).unwrap();
+    let added = session
+        .render(&[Decision { change_id: "$object:400".into(), resolution: Resolution::Source }])
+        .unwrap();
+    assert!(added.ready, "{:?}", added.conflicts);
+    assert_eq!(document_ids(&added.bytes), ["100", "300", "400", "500"]);
+
+    // An addition before every shared document precedes the first one.
+    let first = scene(&[(50, "z"), (100, "a"), (300, "c"), (500, "e")]);
+    assert_eq!(document_ids(&rendered(&base, &base, &first).bytes), ["50", "100", "300", "500"]);
+}
+
+/// Both sides added objects to one region. Unity writes scene documents in
+/// ascending fileID order, so the merge interleaves them the same way.
+#[test]
+fn additions_from_both_sides_follow_unity_file_id_order() {
+    let base = scene(&[(-50, "n"), (100, "a"), (300, "c")]);
+    let target = scene(&[(-50, "n"), (100, "a"), (250, "t"), (300, "c")]);
+    let source = scene(&[(-60, "m"), (-50, "n"), (100, "a"), (200, "s"), (260, "u"), (300, "c"), (400, "v")]);
+    let output = rendered(&base, &target, &source);
+    assert!(output.ready, "{:?}", output.conflicts);
+    assert_eq!(document_ids(&output.bytes), ["-60", "-50", "100", "200", "250", "260", "300", "400"]);
+}
+
+/// A target outside Unity's fileID order keeps each addition after its
+/// nearest source neighbour instead.
+#[test]
+fn unordered_targets_place_additions_after_their_source_neighbours() {
+    let base = scene(&[(300, "c"), (100, "a")]);
+    let source = scene(&[(300, "c"), (200, "b"), (100, "a"), (50, "z")]);
+    assert_eq!(document_ids(&rendered(&base, &base, &source).bytes), ["300", "200", "100", "50"]);
+}
+
+/// A scene with one root GameObject 100 (Transform 400, BoxCollider 500);
+/// `box` is the collider's size x, `None` removes the collider.
+fn owned_scene(box_size: Option<u32>, with_object: bool) -> Vec<u8> {
+    let mut text = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+    if with_object {
+        let collider = if box_size.is_some() { "  - component: {fileID: 500}\n" } else { "" };
+        text.push_str(&format!(
+            "--- !u!1 &100\nGameObject:\n  m_Component:\n  - component: {{fileID: 400}}\n{collider}  m_Name: A\n\
+             --- !u!4 &400\nTransform:\n  m_GameObject: {{fileID: 100}}\n  m_Children: []\n  m_Father: {{fileID: 0}}\n"
+        ));
+        if let Some(size) = box_size {
+            text.push_str(&format!("--- !u!65 &500\nBoxCollider:\n  m_GameObject: {{fileID: 100}}\n  m_Size: {{x: {size}, y: 1, z: 1}}\n"));
+        }
+    }
+    let roots = if with_object { "\n  - {fileID: 400}\n" } else { " []\n" };
+    text.push_str(&format!("--- !u!1660057539 &9223372036854775807\nSceneRoots:\n  m_Roots:{roots}"));
+    text.into_bytes()
+}
+
+fn resolve_all(session: &MergeSession, resolution: Resolution) -> MergeOutput {
+    let decisions: Vec<Decision> = session
+        .catalog()
+        .changes
+        .iter()
+        .map(|c| Decision {
+            change_id: c.id.clone(),
+            resolution: if c.status == ChangeStatus::Conflict { resolution.clone() } else { Resolution::Include },
+        })
+        .collect();
+    session.render(&decisions).unwrap()
+}
+
+/// The source deletes a component the destination edited. Its removal from
+/// the GameObject's component list follows the contested deletion, so keeping
+/// the destination's component keeps it attached.
+#[test]
+fn a_contested_component_deletion_takes_its_owner_reference_along() {
+    let base = owned_scene(Some(1), true);
+    let target = owned_scene(Some(2), true);
+    let source = owned_scene(None, true);
+    let session = prepare_merge(&base, &target, &source).unwrap();
+    let conflicts: Vec<&Change> = session.catalog().changes.iter().filter(|c| c.status == ChangeStatus::Conflict).collect();
+    assert_eq!(conflicts.len(), 2, "{conflicts:?}");
+    let reference = conflicts.iter().find(|c| c.property_path.ends_with("@component=500")).expect("owner reference conflict");
+    assert!(reference.reason.as_deref().is_some_and(|r| r.contains("object 500")), "{reference:?}");
+    let kept = resolve_all(&session, Resolution::Target);
+    assert!(kept.ready, "{:?}", kept.conflicts);
+    assert_eq!(String::from_utf8(kept.bytes).unwrap(), String::from_utf8(target).unwrap());
+    let removed = resolve_all(&session, Resolution::Source);
+    assert!(removed.ready, "{:?}", removed.conflicts);
+    assert_eq!(String::from_utf8(removed.bytes).unwrap(), String::from_utf8(source).unwrap());
+}
+
+/// The source deletes a whole GameObject while the destination edited one of
+/// its components: every part of the deletion becomes one decision.
+#[test]
+fn a_contested_part_holds_the_whole_object_deletion() {
+    let base = owned_scene(Some(1), true);
+    let target = owned_scene(Some(2), true);
+    let source = owned_scene(None, false);
+    let session = prepare_merge(&base, &target, &source).unwrap();
+    let clean: Vec<&Change> = session.catalog().changes.iter().filter(|c| c.status == ChangeStatus::Clean).collect();
+    assert!(clean.is_empty(), "the deletion must not be partly clean: {clean:?}");
+    let kept = resolve_all(&session, Resolution::Target);
+    assert!(kept.ready, "{:?}", kept.conflicts);
+    assert_eq!(String::from_utf8(kept.bytes).unwrap(), String::from_utf8(target).unwrap());
+    let removed = resolve_all(&session, Resolution::Source);
+    assert!(removed.ready, "{:?}", removed.conflicts);
+    assert_eq!(document_ids(&removed.bytes), ["9223372036854775807"]);
+}
+
+/// Uncontested deletions stay clean.
+#[test]
+fn an_uncontested_object_deletion_stays_clean() {
+    let base = owned_scene(Some(1), true);
+    let source = owned_scene(None, true);
+    let session = prepare_merge(&base, &base, &source).unwrap();
+    assert!(session.catalog().changes.iter().all(|c| c.status == ChangeStatus::Clean));
+}
+
+/// GameObject `id` with Transform `id+1` under Transform `father` (0 for a
+/// root), the child Transforms `children`, and with `collider` a BoxCollider
+/// `id+2` of that size.
+fn game_object(id: i64, name: &str, father: i64, children: &[i64], collider: Option<u32>) -> String {
+    let (transform, box_id) = (id + 1, id + 2);
+    let mut text = format!("--- !u!1 &{id}\nGameObject:\n  m_Component:\n  - component: {{fileID: {transform}}}\n");
+    if collider.is_some() {
+        text.push_str(&format!("  - component: {{fileID: {box_id}}}\n"));
+    }
+    text.push_str(&format!("  m_Name: {name}\n--- !u!4 &{transform}\nTransform:\n  m_GameObject: {{fileID: {id}}}\n"));
+    if children.is_empty() {
+        text.push_str("  m_Children: []\n");
+    } else {
+        text.push_str("  m_Children:\n");
+        for child in children {
+            text.push_str(&format!("  - {{fileID: {child}}}\n"));
+        }
+    }
+    text.push_str(&format!("  m_Father: {{fileID: {father}}}\n"));
+    if let Some(size) = collider {
+        text.push_str(&format!("--- !u!65 &{box_id}\nBoxCollider:\n  m_GameObject: {{fileID: {id}}}\n  m_Size: {{x: {size}, y: 1, z: 1}}\n"));
+    }
+    text
+}
+
+fn hierarchy(parts: &[String], roots: &[i64]) -> Vec<u8> {
+    let mut text = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+    for part in parts {
+        text.push_str(part);
+    }
+    text.push_str("--- !u!1660057539 &9223372036854775807\nSceneRoots:\n  m_Roots:\n");
+    for root in roots {
+        text.push_str(&format!("  - {{fileID: {root}}}\n"));
+    }
+    text.into_bytes()
+}
+
+/// Kept root K; root R > child C > grandchild D, whose collider the source edits.
+fn restore_scene(r: bool, c: bool, d_collider: Option<u32>) -> Vec<u8> {
+    let mut parts = vec![];
+    if r {
+        parts.push(game_object(100, "R", 0, if c { &[201] } else { &[] }, None));
+    }
+    if c {
+        parts.push(game_object(200, "C", 101, &[301], None));
+        parts.push(game_object(300, "D", 201, &[], d_collider));
+    }
+    parts.push(game_object(1000, "K", 0, &[], None));
+    hierarchy(&parts, if r { &[101, 1001] } else { &[1001] })
+}
+
+fn restored(target: &[u8], source: &[u8], object: &str) -> Restore {
+    restore_closure(&parse(target).unwrap(), &parse(source).unwrap(), object).unwrap()
+}
+
+#[test]
+fn restoring_a_component_of_a_kept_game_object_reattaches_it() {
+    let source = restore_scene(true, true, Some(3));
+    let restore = restored(&restore_scene(true, true, None), &source, "302");
+    assert_eq!(restore.objects, ["302"]);
+    assert_eq!(restore.attach, [("300".to_string(), "/GameObject/m_Component/@component=302".to_string())]);
+}
+
+#[test]
+fn restoring_inside_a_deleted_root_brings_back_the_whole_root_subtree() {
+    let source = restore_scene(true, true, Some(3));
+    let restore = restored(&restore_scene(false, false, None), &source, "302");
+    assert_eq!(restore.objects, ["100", "101", "200", "201", "300", "301", "302"]);
+    assert_eq!(restore.attach, [("9223372036854775807".to_string(), "/SceneRoots/m_Roots/@root=101".to_string())]);
+}
+
+#[test]
+fn restoring_inside_a_deleted_child_stops_at_the_kept_parent() {
+    let source = restore_scene(true, true, Some(3));
+    let restore = restored(&restore_scene(true, false, None), &source, "301");
+    assert_eq!(restore.objects, ["200", "201", "300", "301", "302"]);
+    assert_eq!(restore.attach, [("101".to_string(), "/Transform/m_Children/@child=201".to_string())]);
+}
+
+#[test]
+fn restore_needs_an_object_the_destination_deleted() {
+    let scene = restore_scene(true, true, Some(1));
+    let error = restore_closure(&parse(&scene).unwrap(), &parse(&scene).unwrap(), "302").unwrap_err();
+    assert!(error.contains("still has object 302"), "{error}");
+    let error = restore_closure(&parse(&scene).unwrap(), &parse(&scene).unwrap(), "999").unwrap_err();
+    assert!(error.contains("no object 999"), "{error}");
+}
+
+/// A prefab instance placed under a restored Transform comes back with its
+/// stripped proxies and the components added to it.
+#[test]
+fn restoring_a_subtree_brings_back_prefab_instances_inside_it() {
+    let instance = concat!(
+        "--- !u!1001 &500\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {fileID: 201}\n    m_Modifications: []\n",
+        "    m_AddedGameObjects: []\n    m_AddedComponents:\n    - targetCorrespondingSourceObject: {fileID: 1, guid: 0123456789abcdef0123456789abcdef, type: 3}\n      insertIndex: -1\n      addedObject: {fileID: 520}\n",
+        "  m_SourcePrefab: {fileID: 100100000, guid: 0123456789abcdef0123456789abcdef, type: 3}\n",
+        "--- !u!4 &510 stripped\nTransform:\n  m_CorrespondingSourceObject: {fileID: 2, guid: 0123456789abcdef0123456789abcdef, type: 3}\n  m_PrefabInstance: {fileID: 500}\n",
+        "--- !u!1 &511 stripped\nGameObject:\n  m_CorrespondingSourceObject: {fileID: 1, guid: 0123456789abcdef0123456789abcdef, type: 3}\n  m_PrefabInstance: {fileID: 500}\n",
+        "--- !u!65 &520\nBoxCollider:\n  m_GameObject: {fileID: 511}\n  m_Size: {x: 1, y: 1, z: 1}\n",
+    );
+    let with = |r: bool| {
+        let mut parts = vec![];
+        if r {
+            parts.push(game_object(100, "R", 0, &[201], None));
+            parts.push(game_object(200, "C", 101, &[510], Some(4)));
+            parts.push(instance.to_string());
+        }
+        parts.push(game_object(1000, "K", 0, &[], None));
+        hierarchy(&parts, if r { &[101, 1001] } else { &[1001] })
+    };
+    let source = String::from_utf8(with(true)).unwrap().replace("m_Size: {x: 4,", "m_Size: {x: 5,").into_bytes();
+    let restore = restored(&with(false), &source, "202");
+    for id in ["100", "200", "202", "500", "510", "511", "520"] {
+        assert!(restore.objects.contains(&id.to_string()), "{id}: {restore:?}");
+    }
+}
+
+/// Elements added to an empty flow list (`m_Children: []`, as Unity writes
+/// one) turn it into a block list, one item per element in source order.
+#[test]
+fn elements_taken_into_an_empty_flow_list_make_it_a_block_list() {
+    let parent = |children: &[i64]| game_object(100, "R", 0, children, None);
+    let child = |id: i64| game_object(id, "C", 101, &[], None);
+    let target = hierarchy(&[parent(&[])], &[101]);
+    let source = hierarchy(&[parent(&[201, 301]), child(200), child(300)], &[101]);
+    let session = prepare_merge(&target, &target, &source).unwrap();
+    let mut decisions: Vec<Decision> = ["200", "201", "300", "301"]
+        .iter()
+        .map(|id| MergeSession::object_decision(id, Resolution::Source))
+        .collect();
+    for child in [201, 301] {
+        decisions.push(MergeSession::field_decision("101", &format!("/Transform/m_Children/@child={child}"), Resolution::Source));
+    }
+    let output = session.render(&decisions).unwrap();
+    assert!(output.ready, "{:?}", output.conflicts);
+    assert_eq!(String::from_utf8(output.bytes).unwrap(), String::from_utf8(source).unwrap());
+}

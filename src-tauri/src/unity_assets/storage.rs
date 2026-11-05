@@ -5,7 +5,6 @@ use super::*;
 use crate::merge_jobs::io;
 use crate::merge_jobs::FileState;
 use crate::unity_asset_core as core;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{BTreeMap, HashSet};
@@ -217,9 +216,16 @@ pub(super) fn execute_candidates(root: &Path, request: &Value, candidates: Optio
         journal.state = "applying".into();
         persist_journal(&dir, &journal)?;
         if preparing_editor {
-            for (path, before, output) in &prepared {
-                editor_entries.push(json!({"path":path,"expected_sha256":sha2::Sha256::digest(before).iter().map(|b|format!("{b:02x}")).collect::<String>(),
-                    "bytes_base64":base64::engine::general_purpose::STANDARD.encode(&output.bytes)}));
+            let replacements: Vec<_> = prepared.iter().map(|(path, before, output)| super::disk_payload::Replacement {
+                path: path.clone(), expected_sha256: super::disk_payload::sha256_hex(before), after: &output.bytes,
+            }).collect();
+            match super::disk_payload::entries(root, &id, &replacements) {
+                Ok(entries) => editor_entries = entries,
+                Err(error) => {
+                    super::disk_payload::clear(root, &id);
+                    let rollback = recover(root, &dir, &mut journal);
+                    return Err(format!("assets.editor_staging_failed: {error}; rollback={rollback:?}; transaction_id={id}"));
+                }
             }
         } else {
             if let Err(error)=check_dependencies(){
