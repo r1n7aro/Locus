@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod context_export;
 pub mod gateway;
 pub mod history;

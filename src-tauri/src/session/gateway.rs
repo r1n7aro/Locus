@@ -251,6 +251,11 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
 
     let event_for_persist = event.clone();
     let scope = store.get_run_scope(run_id).ok().flatten();
+    let attention_scope = if crate::session::attention::is_attention_event(&event) {
+        Some(scope.as_ref().and_then(crate::session::attention::run_event_scope))
+    } else {
+        None
+    };
     let envelope = StreamEventEnvelope {
         run_id: run_id.to_string(),
         project_id: scope.as_ref().map(|scope| scope.project_id.clone()),
@@ -314,7 +319,23 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
         }
     }
 
-    match serde_json::to_string(&event_for_persist) {
+    // After the stream event itself, so clients see the result before it is
+    // reported unread.
+    if let Some(attention_scope) = attention_scope {
+        if let Some(attention) =
+            app_handle.try_state::<std::sync::Arc<crate::session::attention::SessionAttentionStore>>()
+        {
+            if let Some(change) = attention.record(run_id, &event_for_persist) {
+                crate::session::attention::publish_change(
+                    app_handle,
+                    attention_scope.as_ref(),
+                    &change,
+                );
+            }
+        }
+    }
+
+    match serde_json::to_string(event_for_persist.for_persistence().as_ref()) {
         Ok(payload_json) => {
             if let Err(error) = store.enqueue_session_event(
                 SessionEventAppend {
@@ -343,6 +364,21 @@ pub fn emit_stream(app_handle: &AppHandle, store: &SessionStore, run_id: &str, e
     if let Some(changes) = settled_inputs {
         emit_pending_input_changes(app_handle, store, run_id, &session_id, changes);
     }
+}
+
+/// Workspace scope of a session's default checkout while it is open, for
+/// session-level events (title, unread results). Never opens a checkout:
+/// callers fall back to a global event for closed ones.
+pub fn live_session_event_scope(
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    session_id: &str,
+) -> Option<crate::workspace_service::event::WorkspaceEventScope> {
+    let registry =
+        app_handle.try_state::<std::sync::Arc<crate::workspace_service::ProjectRegistry>>()?;
+    let checkout_id = store.get_session_workspace_scope(session_id).ok()?.default_checkout_id?;
+    let runtime = registry.runtime(&crate::workspace_service::CheckoutId::new(checkout_id).ok()?)?;
+    Some(crate::workspace_service::event::WorkspaceEventScope::for_runtime(&runtime))
 }
 
 fn with_pending_input_queue<T>(

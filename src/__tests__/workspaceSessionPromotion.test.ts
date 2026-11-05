@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import { createPinia, setActivePinia } from "pinia";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { useWorkspaceExplorerStore } from "../stores/workspaceExplorer";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
-import { applySessionAttentionEvent, emptySessionAttentionState, sessionAttention, updateSessionAttention } from "../services/sessionAttention";
+import { resetSessionAttentionForTests } from "../services/sessionAttention";
+import { createSessionAttentionServer } from "./fixtures/sessionAttentionServer";
 import type { ProjectExplorerSnapshot } from "../types/workbench";
 
 const mocks = vi.hoisted(() => ({ read: vi.fn(), apply: vi.fn() }));
@@ -17,13 +18,16 @@ function snapshot(revision = 1): ProjectExplorerSnapshot {
   return { projectId: "p", presetId: "default", presetName: "Default", revision, manifestPath: "tree.json", presets: [],
     nodes: ["a", "b", "c"].map((id, position) => ({ nodeId: id, projectId: "p", nodeKind: "resource", resourceKind: "session", resourceId: id, hidden: false, position })) };
 }
+let attentionServer: ReturnType<typeof createSessionAttentionServer>;
+beforeAll(() => { attentionServer = createSessionAttentionServer(); });
+afterAll(() => attentionServer.uninstall());
 async function complete(id: string) {
-  await updateSessionAttention((state) => applySessionAttentionEvent(state, { type: "done", sessionId: id, runId: `${id}-run`, messageId: `${id}-reply`, fullText: "Done" }, true));
+  attentionServer.record(id);
 }
 
 describe("workspace completion promotion persistence", () => {
   beforeEach(() => {
-    setActivePinia(createPinia()); localStorage.clear(); sessionAttention.value = emptySessionAttentionState(); vi.clearAllMocks();
+    setActivePinia(createPinia()); localStorage.clear(); resetSessionAttentionForTests(); vi.clearAllMocks();
     useDisplaySettings().set("autoPromoteCompletedSessions", true);
     mocks.read.mockResolvedValue(snapshot());
     mocks.apply.mockImplementation(async (_project, _revision, operations, operationId) => {

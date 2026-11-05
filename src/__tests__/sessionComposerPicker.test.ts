@@ -1,20 +1,23 @@
 // @vitest-environment jsdom
 import { createApp, h, nextTick, reactive, type App } from "vue";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import SessionComposerPicker from "../components/chat/SessionComposerPicker.vue";
 import type { SessionSummary } from "../types";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
 import {
-  applySessionAttentionEvent, emptySessionAttentionState, isSessionUnread,
-  markSessionAttentionRead, sessionAttention, updateSessionAttention,
+  isSessionUnread, markSessionAttentionRead, resetSessionAttentionForTests, sessionAttention,
 } from "../services/sessionAttention";
+import { createSessionAttentionServer } from "./fixtures/sessionAttentionServer";
 
 vi.mock("../i18n", () => ({ t: (key: string, ...args: unknown[]) => [key, ...args].join(" ") }));
 
 let app: App | undefined;
+let attentionServer: ReturnType<typeof createSessionAttentionServer>;
+beforeAll(() => { attentionServer = createSessionAttentionServer(); });
+afterAll(() => attentionServer.uninstall());
 beforeEach(() => {
   localStorage.clear();
-  sessionAttention.value = emptySessionAttentionState();
+  resetSessionAttentionForTests();
   useDisplaySettings().state.showSessionUnreadIndicators = true;
   vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
   vi.setSystemTime(new Date("2026-10-12T04:00:00Z"));
@@ -176,9 +179,7 @@ describe("composer session picker", () => {
 
   it("shares unread state with the workspace without marking sessions read when opening or selecting", async () => {
     const view = mount();
-    await updateSessionAttention(state => applySessionAttentionEvent(state, {
-      type: "done", sessionId: "session-19", runId: "run", messageId: "reply", fullText: "Done",
-    }, false));
+    attentionServer.record("session-19");
     await view.open();
     const row = () => view.options()[0]!;
     expect(row().querySelector('.session-composer-unread-dot')!.getAttribute('aria-label')).toBe("chat.session.unread");
@@ -199,9 +200,7 @@ describe("composer session picker", () => {
   it("reacts to new unread events and the shared display preference while the list is open", async () => {
     const view = mount();
     await view.open();
-    await updateSessionAttention(state => applySessionAttentionEvent(state, {
-      type: "done", sessionId: "session-19", runId: "run", messageId: "reply", fullText: "Done",
-    }, false));
+    attentionServer.record("session-19");
     await flush();
     expect(view.options()[0]!.querySelector('.session-composer-unread-dot')).not.toBeNull();
     useDisplaySettings().state.showSessionUnreadIndicators = false;

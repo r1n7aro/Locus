@@ -8,6 +8,9 @@ export function useSessionAttentionReader(
   canReadSession: () => boolean,
 ): void {
   const saving = new Set<string>();
+  // A refused acknowledgement is not retried for the same result; the next
+  // result (or a remount) tries again.
+  const failed = new Set<string>();
   function check() {
     const id = sessionId();
     const element = scrollElement();
@@ -20,10 +23,13 @@ export function useSessionAttentionReader(
       || doc.visibilityState !== "visible" || !element.getClientRects().length || element.clientHeight <= 0
     ) return;
     const key = `${id}:${entry.sequence}`;
-    if (saving.has(key)) return;
+    if (saving.has(key) || failed.has(key)) return;
     saving.add(key);
     void markSessionAttentionRead(id, entry.sequence)
-      .catch((error) => console.warn("[sessionAttention] Could not mark result read", error))
+      .catch((error) => {
+        failed.add(key);
+        console.warn("[sessionAttention] Could not mark result read", error);
+      })
       .finally(() => saving.delete(key));
   }
 

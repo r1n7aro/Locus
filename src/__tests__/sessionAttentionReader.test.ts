@@ -1,15 +1,19 @@
 // @vitest-environment jsdom
 import { createApp, h, nextTick, ref } from "vue";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionAttentionReader } from "../composables/useSessionAttentionReader";
-import { applySessionAttentionEvent, emptySessionAttentionState, isSessionUnread, sessionAttention, updateSessionAttention } from "../services/sessionAttention";
+import { isSessionUnread, resetSessionAttentionForTests, sessionAttention } from "../services/sessionAttention";
+import { createSessionAttentionServer } from "./fixtures/sessionAttentionServer";
 
 describe("focused session read acknowledgement", () => {
   const cleanups: Array<() => void> = [];
-  beforeEach(() => { localStorage.clear(); sessionAttention.value = emptySessionAttentionState(); vi.useFakeTimers(); });
+  let server: ReturnType<typeof createSessionAttentionServer>;
+  beforeAll(() => { server = createSessionAttentionServer(); });
+  afterAll(() => server.uninstall());
+  beforeEach(() => { localStorage.clear(); resetSessionAttentionForTests(); server.markRead.mockClear(); vi.useFakeTimers(); });
   afterEach(async () => {
     cleanups.splice(0).forEach((dispose) => dispose());
-    await updateSessionAttention(() => {});
+    await vi.runAllTimersAsync();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
@@ -39,10 +43,8 @@ describe("focused session read acknowledgement", () => {
     return { element, rects, dispose };
   }
 
-  async function complete(sessionId = "a", runId = "first") {
-    await updateSessionAttention((state) => applySessionAttentionEvent(state, {
-      type: "done", sessionId, runId, messageId: `${runId}-reply`, fullText: "done",
-    }, true));
+  async function complete(sessionId = "a") {
+    server.record(sessionId);
     await nextTick();
   }
 
@@ -59,10 +61,10 @@ describe("focused session read acknowledgement", () => {
     focused.mockReturnValue(true);
     window.dispatchEvent(new Event("focus"));
     expect(isSessionUnread("a")).toBe(false);
-    expect(sessionAttention.value.sessions.a!.completionSequence).toBe(1);
+    expect(sessionAttention.value.sessions.a!.readSequence).toBe(sessionAttention.value.sessions.a!.sequence);
     expect(element.scrollTop).toBe(0);
     ready.value = false;
-    await complete("a", "second");
+    await complete("a");
     expect(isSessionUnread("a")).toBe(true);
     ready.value = true;
     await nextTick();
@@ -94,7 +96,7 @@ describe("focused session read acknowledgement", () => {
     window.dispatchEvent(new Event("focus"));
     expect(isSessionUnread("a")).toBe(false);
     visibility.mockReturnValue("hidden");
-    await complete("a", "second");
+    await complete("a");
     expect(isSessionUnread("a")).toBe(true);
     visibility.mockReturnValue("visible");
     document.dispatchEvent(new Event("visibilitychange"));
@@ -119,7 +121,7 @@ describe("focused session read acknowledgement", () => {
     active.value = "b";
     await nextTick();
     expect(isSessionUnread("b")).toBe(false);
-    await complete("a", "second");
+    await complete("a");
     expect(isSessionUnread("a")).toBe(true);
     active.value = "a";
     await nextTick();
@@ -153,17 +155,15 @@ describe("focused session read acknowledgement", () => {
   it("restores unread state after a failed save without an immediate retry loop", async () => {
     vi.spyOn(document, "hasFocus").mockReturnValue(true);
     await complete();
-    const request = vi.fn().mockRejectedValue(new Error("lock unavailable"));
-    vi.stubGlobal("navigator", { locks: { request } });
+    server.markRead.mockRejectedValueOnce(new Error("desktop unavailable"));
     const warned = vi.spyOn(console, "warn").mockImplementation(() => {});
     mountReader();
     await nextTick();
     expect(isSessionUnread("a")).toBe(false);
     await vi.advanceTimersByTimeAsync(0);
     expect(isSessionUnread("a")).toBe(true);
-    expect(request).toHaveBeenCalledOnce();
+    expect(server.markRead).toHaveBeenCalledOnce();
     expect(warned).toHaveBeenCalledOnce();
-    vi.unstubAllGlobals();
   });
 
   it("leaves a kept-mounted hidden pane unread until its viewport becomes visible", async () => {
@@ -183,7 +183,7 @@ describe("focused session read acknowledgement", () => {
     expect(isSessionUnread("a")).toBe(false);
     cleanups.pop()!();
     expect(disconnect).toHaveBeenCalledOnce();
-    await complete("a", "second");
+    await complete("a");
     window.dispatchEvent(new Event("focus"));
     document.dispatchEvent(new Event("visibilitychange"));
     expect(isSessionUnread("a")).toBe(true);
