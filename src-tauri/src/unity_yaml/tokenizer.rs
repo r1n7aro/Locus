@@ -123,7 +123,7 @@ pub(super) fn extract_plain_value(line: &str, key: &str) -> Option<String> {
     }
 }
 
-fn decode_yaml_string(s: &str) -> String {
+pub(super) fn decode_yaml_string(s: &str) -> String {
     // Single-quoted scalar — Unity's emitter quotes in this style whenever a
     // string needs quoting at all (`m_Name: '[Managers] '`, `m_Name: '>'`,
     // trailing spaces, leading `-`/`:`), so this is the common quoted form in

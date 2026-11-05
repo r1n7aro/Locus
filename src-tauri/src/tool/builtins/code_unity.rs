@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::code::file_path_arg;
+use super::code_unity_managed::{self, ManagedSnapshot};
+use super::code_unity_plain;
 use super::{make_exec, ToolDef, ToolResult};
 use crate::asset_db::types::{guid_to_hex, AssetKind, Guid};
 use crate::unity_project_config::{load_tag_manager, BUILTIN_TAGS};
@@ -111,7 +113,7 @@ pub(super) fn unity_code_usages() -> ToolDef {
     }
 }
 
-fn run_code_usages(
+pub(super) fn run_code_usages(
     asset_db: std::sync::Arc<std::sync::Mutex<Option<crate::asset_db::AssetDb>>>,
     workspace: &str,
     file_path: &str,
@@ -148,9 +150,14 @@ fn run_code_usages(
     };
 
     // Assets that reference the script GUID, via the asset reference graph,
-    // plus (in member mode) the indexed serialized member bindings. All DB
-    // access stays inside this one guard scope; the lock releases afterwards.
-    let (candidates, member_hits): (Vec<String>, Vec<crate::asset_db::MemberBindingHit>) = {
+    // plus (in member mode) the indexed serialized member bindings and the
+    // managed-reference snapshot. The lock is released before any file is
+    // read or parsed.
+    let (candidates, member_hits, snapshot): (
+        Vec<String>,
+        Vec<crate::asset_db::MemberBindingHit>,
+        ManagedSnapshot,
+    ) = {
         let guard = match asset_db.lock() {
             Ok(guard) => guard,
             Err(error) => return err(format!("Failed to lock AssetDb: {error}")),
@@ -195,11 +202,88 @@ fn run_code_usages(
             },
             None => Vec::new(),
         };
-        (paths, member_hits)
+        let snapshot = match ManagedSnapshot::load(db) {
+            Ok(snapshot) => snapshot,
+            Err(error) => return err(format!("Failed to read managed reference index: {error}")),
+        };
+        (paths, member_hits, snapshot)
+    };
+
+    // `[SerializeReference]` instances carry `{class, ns, asm}` instead of the
+    // script GUID: plan which serialized identities belong to the file's
+    // types (and their subclasses), then fetch exactly those rows.
+    let script_rel = snapshot
+        .script_path(&guid)
+        .map(str::to_string)
+        .unwrap_or_else(|| rel_display(&root, &script_abs));
+    // One catalog (parsed scripts, one-time source scan) serves both the
+    // `[SerializeReference]` planner and the plain `[Serializable]` routes.
+    let mut catalog = code_unity_managed::TypeCatalog::new(&root, &snapshot);
+    let plan = code_unity_managed::plan_usage_query(&mut catalog, &script_rel, &snapshot, member);
+    let plain_plan = match code_unity_plain::plan_plain_routes(
+        &asset_db,
+        &mut catalog,
+        &snapshot,
+        &script_rel,
+        member,
+    ) {
+        Ok(plain_plan) => plain_plan,
+        Err(error) => return err(format!("Failed to plan [Serializable] routes: {error}")),
+    };
+    drop(catalog);
+    // Registry rows plus prefab-instance overrides (type replacements and, in
+    // member mode, `managedReferences[R].<member>` values) — DB lookups only.
+    let (hits, overrides) = if plan.relations.is_empty() {
+        (Vec::new(), code_unity_managed::OverrideFacts::default())
+    } else {
+        let guard = match asset_db.lock() {
+            Ok(guard) => guard,
+            Err(error) => return err(format!("Failed to lock AssetDb: {error}")),
+        };
+        match guard.as_ref() {
+            Some(db) => {
+                let hits = match db.get_managed_refs_by_class_keys(&plan.class_keys()) {
+                    Ok(hits) => hits,
+                    Err(error) => {
+                        return err(format!("Failed to query managed references: {error}"))
+                    }
+                };
+                let overrides =
+                    match code_unity_managed::collect_override_facts(db, &plan, &snapshot) {
+                        Ok(overrides) => overrides,
+                        Err(error) => {
+                            return err(format!("Failed to resolve prefab overrides: {error}"))
+                        }
+                    };
+                (hits, overrides)
+            }
+            None => (Vec::new(), code_unity_managed::OverrideFacts::default()),
+        }
+    };
+    let managed =
+        code_unity_managed::build_usage_report(&root, &plan, &hits, &overrides, &snapshot);
+    let plain_report =
+        match code_unity_plain::search_plain_values(&asset_db, &root, &plain_plan, &snapshot) {
+            Ok(report) => report,
+            Err(error) => return err(format!("Failed to search [Serializable] values: {error}")),
+        };
+    let managed_ctx = ManagedContext {
+        script_rel: &script_rel,
+        plan: &plan,
+        report: &managed,
+        plain: &plain_plan,
+        plain_report: &plain_report,
     };
 
     match member {
-        None => format_attach_points(&root, &candidates, &guid, &class_name, max_results),
+        None => format_attach_points(
+            &root,
+            &candidates,
+            &guid,
+            &class_name,
+            &managed_ctx,
+            max_results,
+        ),
         Some(member) => format_member_usages(
             &root,
             &candidates,
@@ -207,24 +291,187 @@ fn run_code_usages(
             &class_name,
             member,
             &member_hits,
+            &managed_ctx,
             max_results,
         ),
     }
 }
 
-/// Component / asset-object blocks whose `m_Script` points at the script.
+/// Managed-reference results threaded into the two output formatters.
+struct ManagedContext<'a> {
+    script_rel: &'a str,
+    plan: &'a code_unity_managed::UsagePlan,
+    report: &'a code_unity_managed::UsageReport,
+    plain: &'a code_unity_plain::PlainPlan,
+    plain_report: &'a code_unity_plain::PlainReport,
+}
+
+const COVERAGE_NOTE: &str = "Covered: m_Script attach points, [SerializeReference] instances (including prefab-instance type replacements and managedReferences[...] overrides), and plain [Serializable] values reached through serialized fields (T, T[], List<T>, project generics) including their prefab overrides, in text-serialized Assets/ and Packages/ assets. Not covered: binary-serialized assets, Presets, custom serialization (ISerializationCallbackReceiver, dictionaries), and string/reflection-based use.";
+
+/// One line describing the plain `[Serializable]` search for empty results.
+fn plain_summary(ctx: &ManagedContext) -> String {
+    let plain = ctx.plain;
+    if plain.targets.is_empty() {
+        if plain.not_serializable.is_empty() {
+            return String::new();
+        }
+        return format!(
+            " {} lack [Serializable], so Unity never serializes them as plain field values.",
+            capped_list(&plain.not_serializable, 4)
+        );
+    }
+    let routes = plain.route_labels();
+    if routes.is_empty() {
+        return format!(
+            " No serialized field of a MonoBehaviour / ScriptableObject / [SerializeReference] type holds {} (directly, in arrays/lists, or nested in other [Serializable] types).",
+            capped_list(&plain.targets, 4)
+        );
+    }
+    let shown: Vec<&str> = routes.iter().take(6).map(String::as_str).collect();
+    format!(
+        " No assets hold {} values along {} field path{} ({}{}).",
+        capped_list(&plain.targets, 4),
+        routes.len(),
+        if routes.len() == 1 { "" } else { "s" },
+        shown.join(", "),
+        if routes.len() > shown.len() {
+            ", …"
+        } else {
+            ""
+        }
+    )
+}
+
+/// `a, b, c, d, +N more`.
+fn capped_list(items: &[String], cap: usize) -> String {
+    let shown: Vec<&str> = items.iter().take(cap).map(String::as_str).collect();
+    if items.len() > shown.len() {
+        format!("{}, +{} more", shown.join(", "), items.len() - shown.len())
+    } else {
+        shown.join(", ")
+    }
+}
+
+/// Plain `[Serializable]` value listing, `None` when there are none.
+fn plain_value_section(ctx: &ManagedContext, max_results: usize) -> Option<String> {
+    let entries = &ctx.plain_report.entries;
+    if entries.is_empty() {
+        return None;
+    }
+    let routes = ctx.plain.route_labels();
+    let shown: Vec<&str> = routes.iter().take(6).map(String::as_str).collect();
+    let mut output = format!(
+        "{} [Serializable] value{} of {} in {} asset{} via {} field path{} ({}{})\n\n",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" },
+        capped_list(&ctx.plain_report.targets, 4),
+        ctx.plain_report.asset_count,
+        if ctx.plain_report.asset_count == 1 {
+            ""
+        } else {
+            "s"
+        },
+        routes.len(),
+        if routes.len() == 1 { "" } else { "s" },
+        shown.join(", "),
+        if routes.len() > shown.len() {
+            ", …"
+        } else {
+            ""
+        }
+    );
+    push_grouped_entries(&mut output, entries, max_results);
+    Some(output)
+}
+
+fn declared_types_label(ctx: &ManagedContext) -> String {
+    let types = &ctx.plan.declared_types;
+    if types.is_empty() {
+        return "it declares no class/struct/interface".to_string();
+    }
+    let shown: Vec<&str> = types.iter().take(6).map(String::as_str).collect();
+    let more = if types.len() > shown.len() {
+        format!(", +{} more", types.len() - shown.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "{} declared type{} ({}{more}){}",
+        types.len(),
+        if types.len() == 1 { "" } else { "s" },
+        shown.join(", "),
+        ctx.plan
+            .file_assembly
+            .as_deref()
+            .map(|asm| format!(" in assembly '{asm}'"))
+            .unwrap_or_default()
+    )
+}
+
+/// `[SerializeReference]` instance listing, `None` when there are none.
+fn managed_instance_section(ctx: &ManagedContext, max_results: usize) -> Option<String> {
+    let instances = &ctx.report.instances;
+    if instances.is_empty() {
+        return None;
+    }
+    let mut output = format!(
+        "{} [SerializeReference] instance{} of {} serialized type{} in {} asset{} — {}, incl. subclasses/implementers\n\n",
+        instances.len(),
+        if instances.len() == 1 { "" } else { "s" },
+        ctx.report.type_count,
+        if ctx.report.type_count == 1 { "" } else { "s" },
+        ctx.report.asset_count,
+        if ctx.report.asset_count == 1 { "" } else { "s" },
+        declared_types_label(ctx),
+    );
+    push_grouped_entries(&mut output, instances, max_results);
+    Some(output)
+}
+
+/// Component / asset-object blocks whose `m_Script` points at the script,
+/// followed by `[SerializeReference]` instances of the types it declares.
 fn format_attach_points(
     root: &Path,
     candidates: &[String],
     guid: &Guid,
     class_name: &str,
+    managed: &ManagedContext,
     max_results: usize,
 ) -> ToolResult {
-    if candidates.is_empty() {
+    let guid_section = guid_attach_section(root, candidates, guid, class_name, max_results);
+    let managed_section = managed_instance_section(managed, max_results);
+    let plain_section = plain_value_section(managed, max_results);
+    if guid_section.is_none() && managed_section.is_none() && plain_section.is_none() {
         return ok(format!(
-            "No assets reference script '{class_name}' (GUID {}). It is not attached in any indexed scene/prefab/asset.",
-            guid_to_hex(guid)
+            "No serialized usages of '{}': no asset references script '{class_name}' (GUID {}), and no [SerializeReference] instances of its {} or their subclasses/implementers exist in indexed assets.{}\n{COVERAGE_NOTE}",
+            managed.script_rel,
+            guid_to_hex(guid),
+            declared_types_label(managed),
+            plain_summary(managed),
         ));
+    }
+    let mut sections: Vec<String> = Vec::new();
+    match guid_section {
+        Some(section) => sections.push(section),
+        None => sections.push(format!(
+            "No asset references script '{class_name}' by GUID (not attached as a component / ScriptableObject).\n"
+        )),
+    }
+    sections.extend(managed_section);
+    sections.extend(plain_section);
+    ok(sections.join("\n"))
+}
+
+/// GUID attach-point listing, `None` when no asset references the GUID.
+fn guid_attach_section(
+    root: &Path,
+    candidates: &[String],
+    guid: &Guid,
+    class_name: &str,
+    max_results: usize,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
     }
 
     let mut entries: Vec<(String, u32, String)> = Vec::new();
@@ -264,8 +511,8 @@ fn format_attach_points(
     }
 
     if entries.is_empty() {
-        return ok(format!(
-            "{} asset(s) reference script '{class_name}' but contain no component block for it (indirect references only, e.g. via prefab overrides). Candidates:\n{}",
+        return Some(format!(
+            "{} asset(s) reference script '{class_name}' but contain no component block for it (indirect references only, e.g. via prefab overrides). Candidates:\n{}\n",
             candidates.len(),
             candidates
                 .iter()
@@ -287,7 +534,7 @@ fn format_attach_points(
             "\n(Only the first {MAX_CANDIDATE_FILES} referencing assets were scanned.)\n"
         ));
     }
-    ok(output)
+    Some(output)
 }
 
 /// Serialized member usages: UnityEvent bindings, serialized field values and
@@ -302,6 +549,7 @@ fn format_member_usages(
     class_name: &str,
     member: &str,
     member_hits: &[crate::asset_db::MemberBindingHit],
+    managed: &ManagedContext,
     max_results: usize,
 ) -> ToolResult {
     let mut entries: Vec<(String, u32, String)> = Vec::new();
@@ -404,10 +652,20 @@ fn format_member_usages(
         entries.push((hit.path.clone(), hit.line, desc));
     }
 
+    // Field values inside `[SerializeReference]` instance `data:` blocks of
+    // the file's types and their subclasses (incl. [FormerlySerializedAs]
+    // names of the declaring field).
+    entries.extend(managed.report.members.iter().cloned());
+    // Member values inside plain `[Serializable]` values along every route.
+    entries.extend(managed.plain_report.entries.iter().cloned());
+
     if entries.is_empty() {
         return ok(format!(
-            "No serialized usages of '{class_name}.{member}' found in {} referencing asset(s) or indexed UnityEvent/AnimationEvent bindings. Code references are not covered here — use code_find_references for those.",
-            candidates.len().min(files_scanned)
+            "No serialized usages of '{class_name}.{member}' found in {} referencing asset(s), indexed UnityEvent/AnimationEvent bindings, or the data of {} [SerializeReference] instance(s) of its {}.{} Code references are not covered here — use code_find_references for those.\n{COVERAGE_NOTE}",
+            candidates.len().min(files_scanned),
+            managed.report.instances.len(),
+            declared_types_label(managed),
+            plain_summary(managed),
         ));
     }
 

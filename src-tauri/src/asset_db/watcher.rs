@@ -52,6 +52,21 @@ const RECENT_ENQUEUE_RETENTION_MS: u64 = 5 * 60_000;
 const RECENT_ENQUEUE_SAMPLE_LIMIT: usize = 8;
 const RECENT_ENQUEUE_BUFFER_LIMIT: usize = 512;
 const QUEUE_SUMMARY_LOG_INTERVAL_SECS: u64 = 3;
+/// Shortest gap between two busy [`ASSET_DB_WATCHER_STATUS_EVENT`]s. Becoming
+/// idle is always published at once so listeners can reload the overview.
+const WATCHER_STATUS_PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Workspace event carrying the live watcher queue whenever it changes.
+pub const ASSET_DB_WATCHER_STATUS_EVENT: &str = "asset-db-watcher-status";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetDbWatcherStatusEvent {
+    pub watcher_running: bool,
+    pub watcher_queue_len: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watcher_current_file: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct MtimeScanOptions {
@@ -1124,6 +1139,8 @@ fn process_dirty_asset(
     let mut content_hash = [0u8; 16];
     let mut edges: Vec<RefEdge> = Vec::new();
     let mut member_bindings: Vec<MemberBindingRow> = Vec::new();
+    let mut managed_ref_rows: Vec<ManagedRefRow> = Vec::new();
+    let mut prefab_override_rows: Vec<PrefabOverrideRow> = Vec::new();
     let mut asset_mtime = meta_mtime;
     let mut asset_size = 0u64;
     let mut stored_script_meta: Option<db::StoredScriptMetadata> = None;
@@ -1184,11 +1201,17 @@ fn process_dirty_asset(
             }
         }
 
-        // Single parse pass produces the docs, the raw refs and the raw member
-        // bindings; the referenced guids are then resolved with one targeted DB
-        // batch instead of extra line scans over the file.
-        let (docs, raw_refs, raw_bindings) =
-            unity_yaml::parse_yaml_docs_with_refs_and_bindings(&content);
+        // Single parse pass produces the docs, the raw refs, the raw member
+        // bindings and the SerializeReference registry entries; the referenced
+        // guids are then resolved with one targeted DB batch instead of extra
+        // line scans over the file.
+        let unity_yaml::YamlIndexParse {
+            docs,
+            raw_refs,
+            raw_bindings,
+            managed_refs,
+            prefab_overrides,
+        } = unity_yaml::parse_yaml_docs_for_index(&content);
         let guid_to_path = {
             let mut ref_guids: Vec<Guid> = raw_refs.iter().map(|r| r.dst_guid).collect();
             ref_guids.sort_unstable();
@@ -1251,6 +1274,15 @@ fn process_dirty_asset(
                 target_go_name: b.target_go_name,
                 line: b.line,
             })
+            .collect();
+
+        managed_ref_rows = managed_refs
+            .into_iter()
+            .map(|raw| ManagedRefRow::from_raw(guid, raw))
+            .collect();
+        prefab_override_rows = prefab_overrides
+            .into_iter()
+            .filter_map(|raw| PrefabOverrideRow::from_raw(guid, raw))
             .collect();
 
         if kind == AssetKind::GenericAsset {
@@ -1432,8 +1464,12 @@ fn process_dirty_asset(
             &mut graph.conn,
             &node,
             &asset_objects,
-            &edges,
-            &member_bindings,
+            db::DerivedRows {
+                edges: &edges,
+                member_bindings: &member_bindings,
+                managed_refs: &managed_ref_rows,
+                prefab_overrides: &prefab_override_rows,
+            },
             &file_records,
         )?;
         if ext == "cs" {
@@ -2107,11 +2143,44 @@ fn mtime_scan_once_with_options(
     );
 }
 
+/// Publishes the watcher queue to the workspace when it changes, so the asset
+/// page needs no polling. Busy updates are throttled; idle is immediate.
+struct WatcherStatusPublisher {
+    app_handle: tauri::AppHandle,
+    event_scope: crate::workspace_service::event::WorkspaceEventScope,
+    published: Option<AssetDbWatcherStatusEvent>,
+    published_at: Option<std::time::Instant>,
+}
+
+impl WatcherStatusPublisher {
+    fn observe(&mut self, status: AssetDbWatcherStatusEvent) {
+        if self.published.as_ref() == Some(&status) {
+            return;
+        }
+        let idle = status.watcher_queue_len == 0 && status.watcher_current_file.is_none();
+        let throttled = self
+            .published_at
+            .is_some_and(|at| at.elapsed() < WATCHER_STATUS_PUBLISH_MIN_INTERVAL);
+        if throttled && !idle && status.watcher_running {
+            return;
+        }
+        crate::workspace_service::event::emit_for_workspace_scope(
+            &self.app_handle,
+            &self.event_scope,
+            ASSET_DB_WATCHER_STATUS_EVENT,
+            status.clone(),
+        );
+        self.published = Some(status);
+        self.published_at = Some(std::time::Instant::now());
+    }
+}
+
 fn queue_summary_logger_loop(
     queue: Arc<DirtyQueue>,
     current: CurrentFileSlot,
     activity: Arc<RecentQueueActivityLog>,
     stop: Arc<AtomicBool>,
+    mut publisher: WatcherStatusPublisher,
 ) {
     eprintln!("[AssetDb Watcher] queue summary logger started");
     let interval = Duration::from_secs(QUEUE_SUMMARY_LOG_INTERVAL_SECS);
@@ -2123,6 +2192,11 @@ fn queue_summary_logger_loop(
         if stop.load(Ordering::Relaxed) {
             break;
         }
+        publisher.observe(AssetDbWatcherStatusEvent {
+            watcher_running: true,
+            watcher_queue_len: queue.len() as u64,
+            watcher_current_file: current.lock().ok().and_then(|slot| slot.clone()),
+        });
         elapsed += tick;
         if elapsed < interval {
             continue;
@@ -2184,6 +2258,11 @@ fn queue_summary_logger_loop(
             );
         }
     }
+    publisher.observe(AssetDbWatcherStatusEvent {
+        watcher_running: false,
+        watcher_queue_len: 0,
+        watcher_current_file: None,
+    });
     eprintln!("[AssetDb Watcher] queue summary logger stopped");
 }
 
@@ -2573,6 +2652,12 @@ impl AssetDbWatcher {
         let linked_roots_ev = linked_roots.clone();
         let activity_ev = recent_activity.clone();
         let change_hub_ev = change_hub.clone();
+        let status_publisher = WatcherStatusPublisher {
+            app_handle: app_handle.clone(),
+            event_scope: event_scope.clone(),
+            published: None,
+            published_at: None,
+        };
         let event_thread = std::thread::Builder::new()
             .name("refgraph-events".into())
             .spawn(move || {
@@ -2598,7 +2683,13 @@ impl AssetDbWatcher {
         let log_thread = std::thread::Builder::new()
             .name("refgraph-queue-log".into())
             .spawn(move || {
-                queue_summary_logger_loop(queue_log, current_log, activity_log, stop_log);
+                queue_summary_logger_loop(
+                    queue_log,
+                    current_log,
+                    activity_log,
+                    stop_log,
+                    status_publisher,
+                );
             })
             .map_err(|e| format!("Failed to spawn queue summary logger thread: {}", e))?;
         threads.push(log_thread);
@@ -3170,8 +3261,7 @@ mod tests {
             &mut graph.conn,
             &node,
             &[],
-            &[],
-            &[],
+            db::DerivedRows::default(),
             &[(
                 format!("{}.meta", asset_path),
                 FileRole::Meta,
@@ -3234,8 +3324,7 @@ mod tests {
             &mut graph.conn,
             &stale_node,
             &[],
-            &[],
-            &[],
+            db::DerivedRows::default(),
             &[(
                 format!("{}.meta", asset_path),
                 FileRole::Meta,
@@ -3442,6 +3531,58 @@ mod tests {
     }
 
     #[test]
+    fn incremental_yaml_update_replaces_managed_reference_rows() {
+        let root = std::env::temp_dir().join(format!("locus-watcher-managed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("Assets")).expect("create temp assets");
+        let registry = |class: &str| {
+            format!(
+                "%YAML 1.1\n--- !u!114 &11400000\nMonoBehaviour:\n  m_Name: Combo\n  events:\n  - rid: 7\n  references:\n    version: 2\n    RefIds:\n    - rid: 7\n      type: {{class: {class}, ns: Game, asm: Assembly-CSharp}}\n      data:\n        amount: 1\n"
+            )
+        };
+        write_asset(
+            &root,
+            "Assets/Data/Combo.asset",
+            registry("OldEvent").as_bytes(),
+            "abcdef1234567890abcdef12345678aa",
+        );
+
+        let graph = scan_test_graph(&root);
+        assert_eq!(
+            graph
+                .get_managed_refs_by_class_keys(&["oldevent".to_string()])
+                .unwrap()
+                .len(),
+            1
+        );
+        let state = Arc::new(Mutex::new(Some(graph)));
+        let stop = AtomicBool::new(false);
+
+        std::fs::write(
+            root.join("Assets/Data/Combo.asset"),
+            registry("NewEvent").as_bytes(),
+        )
+        .expect("rewrite asset");
+        process_dirty_asset("Assets/Data/Combo.asset", &root, &state, &stop, false)
+            .expect("process asset");
+
+        let guard = state.lock().expect("lock graph");
+        let graph = guard.as_ref().expect("graph exists");
+        assert!(graph
+            .get_managed_refs_by_class_keys(&["oldevent".to_string()])
+            .unwrap()
+            .is_empty());
+        let hits = graph
+            .get_managed_refs_by_class_keys(&["newevent".to_string()])
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rid, 7);
+        assert_eq!(hits[0].path, "Assets/Data/Combo.asset");
+        drop(guard);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn unchanged_content_fast_path_refreshes_mtime_bookkeeping() {
         // A touched-but-identical file (multi-event editor save, mtime
         // resync) takes the unchanged-content fast path, which must still
@@ -3536,8 +3677,7 @@ mod tests {
             &mut graph.conn,
             &node,
             &[],
-            &[],
-            &[],
+            db::DerivedRows::default(),
             &[
                 (
                     format!("{}.meta", asset_path),

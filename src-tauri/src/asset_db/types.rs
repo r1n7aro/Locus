@@ -302,6 +302,93 @@ pub struct MemberBindingRow {
     pub line: u32,
 }
 
+/// One `managed_refs` row: a `[SerializeReference]` registry entry
+/// (`references/RefIds`) stamped with the GUID of the asset that contains it.
+/// The instance type is identified by `{class, ns, asm}` only — no script
+/// GUID — so these usages are invisible to the `edges` graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRefRow {
+    pub src_guid: Guid,
+    /// fileID of the MonoBehaviour / ScriptableObject that owns the registry.
+    pub host_file_id: i64,
+    /// v2 `rid` (v1: the numeric registry key).
+    pub rid: i64,
+    /// Serialized class string (`Outer/Inner`, generic suffix kept).
+    pub class_name: String,
+    pub namespace: String,
+    pub assembly: String,
+    /// Innermost simple class name, ASCII-lowercased (lookup key).
+    pub class_key: String,
+    /// 1-based line of the registry entry.
+    pub line: u32,
+}
+
+impl ManagedRefRow {
+    pub fn from_raw(src_guid: Guid, raw: crate::unity_yaml::managed_refs::RawManagedRef) -> Self {
+        let class_key = crate::unity_yaml::managed_refs::managed_class_key(&raw.class_name);
+        Self {
+            src_guid,
+            host_file_id: raw.host_file_id,
+            rid: raw.rid,
+            class_name: raw.class_name,
+            namespace: raw.namespace,
+            assembly: raw.assembly,
+            class_key,
+            line: raw.line,
+        }
+    }
+}
+
+/// One `prefab_overrides` row: a PrefabInstance `m_Modifications` entry of
+/// the asset `src_guid` (scene or prefab variant / outer prefab).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefabOverrideRow {
+    pub src_guid: Guid,
+    /// fileID of the PrefabInstance document.
+    pub instance_file_id: i64,
+    /// Object of the instance's source prefab being modified.
+    pub target_guid: Guid,
+    pub target_file_id: i64,
+    pub property_path: String,
+    /// First path segment (`tuning`, `managedReferences`).
+    pub path_head: String,
+    /// Value scalar, truncated to [`PrefabOverrideRow::MAX_VALUE_CHARS`].
+    pub value: String,
+    /// 1-based line of `propertyPath:`.
+    pub line: u32,
+}
+
+impl PrefabOverrideRow {
+    pub const MAX_VALUE_CHARS: usize = 200;
+
+    /// `None` for built-in Transform/GameObject paths, which are not indexed.
+    pub fn from_raw(
+        src_guid: Guid,
+        raw: crate::unity_yaml::prefab_overrides::RawPrefabOverride,
+    ) -> Option<Self> {
+        use crate::unity_yaml::prefab_overrides::{is_indexed_override_path, property_path_head};
+        if !is_indexed_override_path(&raw.property_path) {
+            return None;
+        }
+        let path_head = property_path_head(&raw.property_path).to_string();
+        let value = if raw.value.chars().count() > Self::MAX_VALUE_CHARS {
+            raw.value.chars().take(Self::MAX_VALUE_CHARS).collect()
+        } else {
+            raw.value
+        };
+        Some(Self {
+            src_guid,
+            instance_file_id: raw.instance_file_id,
+            target_guid: raw.target_guid,
+            target_file_id: raw.target_file_id,
+            property_path: raw.property_path,
+            path_head,
+            value,
+            line: raw.line,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PrefabSourceRef {
     pub guid: Guid,

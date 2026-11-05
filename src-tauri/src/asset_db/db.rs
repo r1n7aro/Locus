@@ -34,7 +34,17 @@ const CURRENT_PARSER_VERSION: u32 = 1;
 /// assembly-definition files (`AssetKind::OtherFile`) are classified from
 /// their extension instead of `MetaOnly`, which makes them searchable. Older
 /// DBs stored those rows as unsearchable `MetaOnly` and must be rebuilt.
-pub const ASSET_DB_VERSION: u32 = 14;
+///
+/// v15: new `managed_refs` table indexing `[SerializeReference]` registry
+/// entries (`references/RefIds` rid + `{class, ns, asm}`), which carry no
+/// script GUID and were invisible to `unity_code_usages`. Older DBs have no
+/// rows for them and must be rebuilt.
+///
+/// v16: new `prefab_overrides` table indexing PrefabInstance
+/// `m_Modifications` (built-in Transform/GameObject paths excluded), so
+/// managed-reference type replacements and serialized-field overrides on
+/// prefab instances / variants resolve without re-reading scenes.
+pub const ASSET_DB_VERSION: u32 = 16;
 
 pub(crate) fn db_path(project_root: &Path) -> PathBuf {
     project_root.join("Library").join("Locus").join("locus.db")
@@ -240,6 +250,28 @@ fn create_tables(conn: &Connection) -> Result<(), String> {
             target_script_guid BLOB,
             target_go_name TEXT NOT NULL,
             line INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS managed_refs (
+            src_guid BLOB NOT NULL,
+            host_file_id INTEGER NOT NULL,
+            rid INTEGER NOT NULL,
+            class_name TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            assembly TEXT NOT NULL,
+            class_key TEXT NOT NULL,
+            line INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS prefab_overrides (
+            src_guid BLOB NOT NULL,
+            instance_file_id INTEGER NOT NULL,
+            target_guid BLOB NOT NULL,
+            target_file_id INTEGER NOT NULL,
+            property_path TEXT NOT NULL,
+            path_head TEXT NOT NULL,
+            value TEXT NOT NULL,
+            line INTEGER NOT NULL
         );",
     )
     .map_err(|e| format!("Failed to create tables: {}", e))?;
@@ -352,6 +384,31 @@ const SECONDARY_INDEX_DDL: &[(&str, &str)] = &[
         "idx_member_bindings_method",
         "CREATE INDEX IF NOT EXISTS idx_member_bindings_method
             ON member_bindings(method_name)",
+    ),
+    (
+        "idx_managed_refs_class_key",
+        "CREATE INDEX IF NOT EXISTS idx_managed_refs_class_key
+            ON managed_refs(class_key)",
+    ),
+    (
+        "idx_managed_refs_src",
+        "CREATE INDEX IF NOT EXISTS idx_managed_refs_src
+            ON managed_refs(src_guid)",
+    ),
+    (
+        "idx_prefab_overrides_src",
+        "CREATE INDEX IF NOT EXISTS idx_prefab_overrides_src
+            ON prefab_overrides(src_guid)",
+    ),
+    (
+        "idx_prefab_overrides_head",
+        "CREATE INDEX IF NOT EXISTS idx_prefab_overrides_head
+            ON prefab_overrides(path_head)",
+    ),
+    (
+        "idx_prefab_overrides_target",
+        "CREATE INDEX IF NOT EXISTS idx_prefab_overrides_target
+            ON prefab_overrides(target_guid, target_file_id)",
     ),
 ];
 
@@ -524,6 +581,8 @@ pub fn clear_all_in_tx(tx: &Transaction) -> Result<(), String> {
          DELETE FROM files;
          DELETE FROM script_inheritance_terms;
          DELETE FROM member_bindings;
+         DELETE FROM managed_refs;
+         DELETE FROM prefab_overrides;
          DELETE FROM asset_scan_metrics;
          DELETE FROM linked_asset_roots;",
     )
@@ -735,6 +794,21 @@ fn delete_same_path_asset_conflicts(tx: &Transaction, asset: &AssetNode) -> Resu
             params![stale_guid.as_slice()],
         )
         .map_err(|e| format!("Failed to delete stale outgoing edges: {}", e))?;
+        tx.execute(
+            "DELETE FROM member_bindings WHERE src_guid = ?1",
+            params![stale_guid.as_slice()],
+        )
+        .map_err(|e| format!("Failed to delete stale member bindings: {}", e))?;
+        tx.execute(
+            "DELETE FROM managed_refs WHERE src_guid = ?1",
+            params![stale_guid.as_slice()],
+        )
+        .map_err(|e| format!("Failed to delete stale managed references: {}", e))?;
+        tx.execute(
+            "DELETE FROM prefab_overrides WHERE src_guid = ?1",
+            params![stale_guid.as_slice()],
+        )
+        .map_err(|e| format!("Failed to delete stale prefab overrides: {}", e))?;
         tx.execute(
             "DELETE FROM asset_object_type_terms
              WHERE object_key IN (
@@ -1814,6 +1888,537 @@ pub fn get_member_bindings(
         hits.push(row.map_err(|e| format!("Failed to read member binding: {}", e))?);
     }
     Ok(hits)
+}
+
+/// Multi-row insert chunk for `managed_refs` (8 bind params per row, 512 per
+/// statement — under SQLite's default 999-variable limit).
+const MANAGED_REF_INSERT_CHUNK_ROWS: usize = 64;
+
+const MANAGED_REF_COLUMNS: &str =
+    "(src_guid, host_file_id, rid, class_name, namespace, assembly, class_key, line)";
+
+pub fn batch_insert_managed_refs(tx: &Transaction, rows: &[ManagedRefRow]) -> Result<u64, String> {
+    let mut chunks = rows.chunks_exact(MANAGED_REF_INSERT_CHUNK_ROWS);
+    if rows.len() >= MANAGED_REF_INSERT_CHUNK_ROWS {
+        let row_values = std::iter::repeat("(?, ?, ?, ?, ?, ?, ?, ?)")
+            .take(MANAGED_REF_INSERT_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("INSERT INTO managed_refs {MANAGED_REF_COLUMNS} VALUES {row_values}");
+        let mut stmt = tx
+            .prepare_cached(&sql)
+            .map_err(|e| format!("Failed to prepare managed reference batch insert: {}", e))?;
+        for chunk in chunks.by_ref() {
+            for (i, row) in chunk.iter().enumerate() {
+                let base = i * 8;
+                stmt.raw_bind_parameter(base + 1, row.src_guid.as_slice())
+                    .and_then(|_| stmt.raw_bind_parameter(base + 2, row.host_file_id))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 3, row.rid))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 4, row.class_name.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 5, row.namespace.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 6, row.assembly.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 7, row.class_key.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 8, row.line as i64))
+                    .map_err(|e| format!("Failed to bind managed reference batch insert: {}", e))?;
+            }
+            stmt.raw_execute()
+                .map_err(|e| format!("Failed to insert managed reference batch: {}", e))?;
+        }
+    }
+
+    insert_managed_ref_rows(tx, chunks.remainder())?;
+    Ok(rows.len() as u64)
+}
+
+/// Row-at-a-time insert used for the remainder of a bulk batch and for the
+/// watcher's per-asset replace inside `atomic_update_asset`.
+fn insert_managed_ref_rows(tx: &Transaction, rows: &[ManagedRefRow]) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "INSERT INTO managed_refs {MANAGED_REF_COLUMNS} VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ))
+        .map_err(|e| format!("Failed to prepare managed reference insert: {}", e))?;
+    for row in rows {
+        stmt.execute(params![
+            row.src_guid.as_slice(),
+            row.host_file_id,
+            row.rid,
+            row.class_name,
+            row.namespace,
+            row.assembly,
+            row.class_key,
+            row.line as i64,
+        ])
+        .map_err(|e| format!("Failed to insert managed reference: {}", e))?;
+    }
+    Ok(())
+}
+
+/// One `managed_refs` row joined to its host asset path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRefHit {
+    pub path: String,
+    pub host_file_id: i64,
+    pub rid: i64,
+    pub class_name: String,
+    pub namespace: String,
+    pub assembly: String,
+    /// 1-based line of the registry entry.
+    pub line: u32,
+}
+
+/// Every `[SerializeReference]` instance whose innermost class name matches
+/// one of `class_keys` (ASCII-lowercased), ordered by path then line. Callers
+/// apply exact namespace / assembly / nesting identity on top.
+pub fn get_managed_refs_by_class_keys(
+    conn: &Connection,
+    class_keys: &[String],
+) -> Result<Vec<ManagedRefHit>, String> {
+    let mut keys: Vec<&str> = class_keys
+        .iter()
+        .map(String::as_str)
+        .filter(|key| !key.is_empty())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+
+    let mut hits = Vec::new();
+    for chunk in keys.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT a.path, m.host_file_id, m.rid, m.class_name, m.namespace, m.assembly, m.line
+             FROM managed_refs m
+             JOIN assets a ON a.guid = m.src_guid
+             WHERE m.class_key IN ({placeholders})"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare managed reference query: {}", e))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok(ManagedRefHit {
+                    path: row.get(0)?,
+                    host_file_id: row.get(1)?,
+                    rid: row.get(2)?,
+                    class_name: row.get(3)?,
+                    namespace: row.get(4)?,
+                    assembly: row.get(5)?,
+                    line: row.get::<_, i64>(6)? as u32,
+                })
+            })
+            .map_err(|e| format!("Failed to query managed references: {}", e))?;
+        for row in rows {
+            hits.push(row.map_err(|e| format!("Failed to read managed reference: {}", e))?);
+        }
+    }
+    hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    Ok(hits)
+}
+
+/// One distinct serialized `[SerializeReference]` type identity with usage
+/// counts. Produced by [`get_managed_ref_type_summaries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRefTypeSummary {
+    pub class_name: String,
+    pub namespace: String,
+    pub assembly: String,
+    pub instance_count: u64,
+    pub asset_count: u64,
+}
+
+/// Distinct `{class, ns, asm}` identities across all indexed assets.
+pub fn get_managed_ref_type_summaries(
+    conn: &Connection,
+) -> Result<Vec<ManagedRefTypeSummary>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT m.class_name, m.namespace, m.assembly, COUNT(*), COUNT(DISTINCT m.src_guid)
+             FROM managed_refs m
+             JOIN assets a ON a.guid = m.src_guid
+             GROUP BY m.class_name, m.namespace, m.assembly
+             ORDER BY m.assembly, m.namespace, m.class_name",
+        )
+        .map_err(|e| format!("Failed to prepare managed type summary query: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ManagedRefTypeSummary {
+                class_name: row.get(0)?,
+                namespace: row.get(1)?,
+                assembly: row.get(2)?,
+                instance_count: row.get::<_, i64>(3)? as u64,
+                asset_count: row.get::<_, i64>(4)? as u64,
+            })
+        })
+        .map_err(|e| format!("Failed to query managed type summaries: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("Failed to read managed type summary: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// Multi-row insert chunk for `prefab_overrides` (8 bind params per row).
+const PREFAB_OVERRIDE_INSERT_CHUNK_ROWS: usize = 64;
+
+const PREFAB_OVERRIDE_COLUMNS: &str = "(src_guid, instance_file_id, target_guid, target_file_id, \
+     property_path, path_head, value, line)";
+
+pub fn batch_insert_prefab_overrides(
+    tx: &Transaction,
+    rows: &[PrefabOverrideRow],
+) -> Result<u64, String> {
+    let mut chunks = rows.chunks_exact(PREFAB_OVERRIDE_INSERT_CHUNK_ROWS);
+    if rows.len() >= PREFAB_OVERRIDE_INSERT_CHUNK_ROWS {
+        let row_values = std::iter::repeat("(?, ?, ?, ?, ?, ?, ?, ?)")
+            .take(PREFAB_OVERRIDE_INSERT_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("INSERT INTO prefab_overrides {PREFAB_OVERRIDE_COLUMNS} VALUES {row_values}");
+        let mut stmt = tx
+            .prepare_cached(&sql)
+            .map_err(|e| format!("Failed to prepare prefab override batch insert: {}", e))?;
+        for chunk in chunks.by_ref() {
+            for (i, row) in chunk.iter().enumerate() {
+                let base = i * 8;
+                stmt.raw_bind_parameter(base + 1, row.src_guid.as_slice())
+                    .and_then(|_| stmt.raw_bind_parameter(base + 2, row.instance_file_id))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 3, row.target_guid.as_slice()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 4, row.target_file_id))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 5, row.property_path.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 6, row.path_head.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 7, row.value.as_str()))
+                    .and_then(|_| stmt.raw_bind_parameter(base + 8, row.line as i64))
+                    .map_err(|e| format!("Failed to bind prefab override batch insert: {}", e))?;
+            }
+            stmt.raw_execute()
+                .map_err(|e| format!("Failed to insert prefab override batch: {}", e))?;
+        }
+    }
+    insert_prefab_override_rows(tx, chunks.remainder())?;
+    Ok(rows.len() as u64)
+}
+
+fn insert_prefab_override_rows(tx: &Transaction, rows: &[PrefabOverrideRow]) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx
+        .prepare_cached(&format!(
+            "INSERT INTO prefab_overrides {PREFAB_OVERRIDE_COLUMNS} VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ))
+        .map_err(|e| format!("Failed to prepare prefab override insert: {}", e))?;
+    for row in rows {
+        stmt.execute(params![
+            row.src_guid.as_slice(),
+            row.instance_file_id,
+            row.target_guid.as_slice(),
+            row.target_file_id,
+            row.property_path,
+            row.path_head,
+            row.value,
+            row.line as i64,
+        ])
+        .map_err(|e| format!("Failed to insert prefab override: {}", e))?;
+    }
+    Ok(())
+}
+
+/// One `prefab_overrides` row joined to the path of the asset holding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefabOverrideHit {
+    pub path: String,
+    pub src_guid: Guid,
+    pub instance_file_id: i64,
+    pub target_guid: Guid,
+    pub target_file_id: i64,
+    pub property_path: String,
+    pub value: String,
+    pub line: u32,
+}
+
+const PREFAB_OVERRIDE_HIT_SELECT: &str = "SELECT a.path, o.src_guid, o.instance_file_id, \
+     o.target_guid, o.target_file_id, o.property_path, o.value, o.line \
+     FROM prefab_overrides o JOIN assets a ON a.guid = o.src_guid";
+
+fn read_prefab_override_hit(row: &rusqlite::Row) -> rusqlite::Result<PrefabOverrideHit> {
+    let src: Vec<u8> = row.get(1)?;
+    let target: Vec<u8> = row.get(3)?;
+    Ok(PrefabOverrideHit {
+        path: row.get(0)?,
+        src_guid: blob_to_guid(&src),
+        instance_file_id: row.get(2)?,
+        target_guid: blob_to_guid(&target),
+        target_file_id: row.get(4)?,
+        property_path: row.get(5)?,
+        value: row.get(6)?,
+        line: row.get::<_, i64>(7)? as u32,
+    })
+}
+
+/// Overrides whose first path segment is one of `heads` (exact case), ordered
+/// by asset path then line.
+pub fn get_prefab_overrides_by_heads(
+    conn: &Connection,
+    heads: &[String],
+) -> Result<Vec<PrefabOverrideHit>, String> {
+    let mut keys: Vec<&str> = heads.iter().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out = Vec::new();
+    for chunk in keys.chunks(500) {
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!("{PREFAB_OVERRIDE_HIT_SELECT} WHERE o.path_head IN ({placeholders})");
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare prefab override query: {}", e))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(chunk.iter()),
+                read_prefab_override_hit,
+            )
+            .map_err(|e| format!("Failed to query prefab overrides: {}", e))?;
+        for row in rows {
+            out.push(row.map_err(|e| format!("Failed to read prefab override: {}", e))?);
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+    Ok(out)
+}
+
+/// Every override of one source-prefab object, across all assets.
+pub fn get_prefab_overrides_for_target(
+    conn: &Connection,
+    target_guid: &Guid,
+    target_file_id: i64,
+) -> Result<Vec<PrefabOverrideHit>, String> {
+    let mut stmt = conn
+        .prepare_cached(&format!(
+            "{PREFAB_OVERRIDE_HIT_SELECT} WHERE o.target_guid = ?1 AND o.target_file_id = ?2 \
+             ORDER BY a.path, o.line"
+        ))
+        .map_err(|e| format!("Failed to prepare target override query: {}", e))?;
+    let rows = stmt
+        .query_map(
+            params![target_guid.as_slice(), target_file_id],
+            read_prefab_override_hit,
+        )
+        .map_err(|e| format!("Failed to query target overrides: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("Failed to read target override: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// Value of one exact modification of one prefab instance.
+pub fn find_prefab_override_value(
+    conn: &Connection,
+    src_guid: &Guid,
+    instance_file_id: i64,
+    target_guid: &Guid,
+    target_file_id: i64,
+    property_path: &str,
+) -> Result<Option<String>, String> {
+    let result = conn.query_row(
+        "SELECT value FROM prefab_overrides
+         WHERE target_guid = ?3 AND target_file_id = ?4
+           AND src_guid = ?1 AND instance_file_id = ?2 AND property_path = ?5
+         LIMIT 1",
+        params![
+            src_guid.as_slice(),
+            instance_file_id,
+            target_guid.as_slice(),
+            target_file_id,
+            property_path
+        ],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to read prefab override: {}", e)),
+    }
+}
+
+/// Registry type of one `[SerializeReference]` entry, if the asset's host
+/// object holds it directly.
+pub fn find_managed_ref_identity(
+    conn: &Connection,
+    src_guid: &Guid,
+    host_file_id: i64,
+    rid: i64,
+) -> Result<Option<(String, String, String)>, String> {
+    let result = conn.query_row(
+        "SELECT class_name, namespace, assembly FROM managed_refs
+         WHERE src_guid = ?1 AND host_file_id = ?2 AND rid = ?3
+         LIMIT 1",
+        params![src_guid.as_slice(), host_file_id, rid],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    match result {
+        Ok(found) => Ok(Some(found)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to read managed reference: {}", e)),
+    }
+}
+
+/// `(PrefabInstance fileID, source prefab GUID)` of every prefab instance in
+/// an asset, from its indexed `m_SourcePrefab` references.
+pub fn get_prefab_instance_sources(
+    conn: &Connection,
+    src_guid: &Guid,
+) -> Result<Vec<(i64, Guid)>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT src_file_id, dst_guid FROM edges
+             WHERE src_guid = ?1 AND field_hint = 'm_SourcePrefab' AND src_file_id IS NOT NULL",
+        )
+        .map_err(|e| format!("Failed to prepare prefab source query: {}", e))?;
+    let rows = stmt
+        .query_map(params![src_guid.as_slice()], |row| {
+            let dst: Vec<u8> = row.get(1)?;
+            Ok((row.get::<_, i64>(0)?, blob_to_guid(&dst)))
+        })
+        .map_err(|e| format!("Failed to query prefab sources: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("Failed to read prefab source: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// `(asset GUID, asset path, PrefabInstance fileID)` of every instance of
+/// `source_guid` (scenes, variants, outer prefabs).
+pub fn get_prefab_instances_of(
+    conn: &Connection,
+    source_guid: &Guid,
+) -> Result<Vec<(Guid, String, i64)>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT e.src_guid, a.path, e.src_file_id FROM edges e
+             JOIN assets a ON a.guid = e.src_guid
+             WHERE e.dst_guid = ?1 AND e.field_hint = 'm_SourcePrefab' AND e.src_file_id IS NOT NULL
+             ORDER BY a.path, e.src_file_id",
+        )
+        .map_err(|e| format!("Failed to prepare prefab instance query: {}", e))?;
+    let rows = stmt
+        .query_map(params![source_guid.as_slice()], |row| {
+            let src: Vec<u8> = row.get(0)?;
+            Ok((
+                blob_to_guid(&src),
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to query prefab instances: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("Failed to read prefab instance: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// `(guid, path)` of scripts whose indexed inheritance chain contains any of
+/// `terms` (lowercased short or full type names).
+pub fn find_scripts_inheriting(
+    conn: &Connection,
+    terms: &[String],
+) -> Result<Vec<(Guid, String)>, String> {
+    let mut keys: Vec<&str> = terms
+        .iter()
+        .map(String::as_str)
+        .filter(|t| !t.is_empty())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT DISTINCT a.guid, a.path FROM script_inheritance_terms t
+         JOIN assets a ON a.guid = t.script_guid
+         WHERE t.term IN ({placeholders}) AND a.exists_on_disk = 1
+         ORDER BY a.path"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare inheritance query: {}", e))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+            let guid: Vec<u8> = row.get(0)?;
+            Ok((blob_to_guid(&guid), row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("Failed to query inheriting scripts: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("Failed to read inheriting script: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// One indexed `.cs` script with its file-stem primary type (lowercased).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptIndexEntry {
+    pub guid: Guid,
+    pub path: String,
+    pub class_lower: String,
+    pub namespace_lower: String,
+}
+
+/// Every on-disk `.cs` script in the index.
+pub fn list_script_index_entries(conn: &Connection) -> Result<Vec<ScriptIndexEntry>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT guid, path, script_class_lower, script_namespace_lower
+             FROM assets
+             WHERE kind = ?1 AND exists_on_disk = 1
+             ORDER BY path",
+        )
+        .map_err(|e| format!("Failed to prepare script list query: {}", e))?;
+    let rows = stmt
+        .query_map(params![AssetKind::Script as i32], |row| {
+            let guid: Vec<u8> = row.get(0)?;
+            Ok(ScriptIndexEntry {
+                guid: blob_to_guid(&guid),
+                path: row.get(1)?,
+                class_lower: row.get(2)?,
+                namespace_lower: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query scripts: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("Failed to read script row: {}", e))?);
+    }
+    Ok(out)
+}
+
+/// `(guid, path)` of every on-disk asset with the given lowercase extension
+/// (no dot), e.g. `asmdef`.
+pub fn list_assets_by_ext(conn: &Connection, ext: &str) -> Result<Vec<(Guid, String)>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT guid, path FROM assets
+             WHERE ext = ?1 AND exists_on_disk = 1
+             ORDER BY path",
+        )
+        .map_err(|e| format!("Failed to prepare ext query: {}", e))?;
+    let rows = stmt
+        .query_map(params![ext], |row| {
+            let guid: Vec<u8> = row.get(0)?;
+            Ok((blob_to_guid(&guid), row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("Failed to query assets by ext: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| format!("Failed to read asset row: {}", e))?);
+    }
+    Ok(out)
 }
 
 pub fn walk_deps(conn: &Connection, root: &Guid, max_depth: u32) -> Result<Vec<Guid>, String> {
@@ -3167,6 +3772,13 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
             params![g],
         )
         .map_err(|e| format!("Failed to delete member bindings: {}", e))?;
+        tx.execute("DELETE FROM managed_refs WHERE src_guid = ?1", params![g])
+            .map_err(|e| format!("Failed to delete managed references: {}", e))?;
+        tx.execute(
+            "DELETE FROM prefab_overrides WHERE src_guid = ?1",
+            params![g],
+        )
+        .map_err(|e| format!("Failed to delete prefab overrides: {}", e))?;
         tx.execute(
             "DELETE FROM asset_object_type_terms
              WHERE object_key IN (
@@ -3193,14 +3805,29 @@ pub fn delete_missing_asset_path(conn: &mut Connection, asset_path: &str) -> Res
     Ok(canonical_guid.is_some())
 }
 
+/// Rows derived from one asset's content, replaced wholesale by
+/// [`atomic_update_asset`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DerivedRows<'a> {
+    pub edges: &'a [RefEdge],
+    pub member_bindings: &'a [MemberBindingRow],
+    pub managed_refs: &'a [ManagedRefRow],
+    pub prefab_overrides: &'a [PrefabOverrideRow],
+}
+
 pub fn atomic_update_asset(
     conn: &mut Connection,
     asset: &AssetNode,
     objects: &[AssetObject],
-    new_edges: &[RefEdge],
-    new_member_bindings: &[MemberBindingRow],
+    derived: DerivedRows,
     file_records: &[(String, FileRole, u64, u64, [u8; 16])],
 ) -> Result<(), String> {
+    let DerivedRows {
+        edges: new_edges,
+        member_bindings: new_member_bindings,
+        managed_refs: new_managed_refs,
+        prefab_overrides: new_prefab_overrides,
+    } = derived;
     let tx = conn
         .transaction()
         .map_err(|e| format!("Failed to begin tx: {}", e))?;
@@ -3217,6 +3844,16 @@ pub fn atomic_update_asset(
         params![asset.guid.as_slice()],
     )
     .map_err(|e| format!("Failed to delete old member bindings: {}", e))?;
+    tx.execute(
+        "DELETE FROM managed_refs WHERE src_guid = ?1",
+        params![asset.guid.as_slice()],
+    )
+    .map_err(|e| format!("Failed to delete old managed references: {}", e))?;
+    tx.execute(
+        "DELETE FROM prefab_overrides WHERE src_guid = ?1",
+        params![asset.guid.as_slice()],
+    )
+    .map_err(|e| format!("Failed to delete old prefab overrides: {}", e))?;
     asset_fts::delete_by_asset_guid(&tx, asset.guid.as_slice())?;
     tx.execute(
         "DELETE FROM asset_object_type_terms
@@ -3326,6 +3963,9 @@ pub fn atomic_update_asset(
             .map_err(|e| format!("Failed to insert member binding: {}", e))?;
         }
     }
+
+    insert_managed_ref_rows(&tx, new_managed_refs)?;
+    insert_prefab_override_rows(&tx, new_prefab_overrides)?;
 
     for (path, role, mtime, size, hash) in file_records {
         tx.execute(
@@ -4073,6 +4713,173 @@ mod tests {
     }
 
     #[test]
+    fn managed_refs_batch_insert_query_and_delete_with_asset() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let host = test_asset("Assets/Data/Combo.asset", AssetKind::GenericAsset, "");
+        let other = test_asset("Assets/Data/Other.asset", AssetKind::GenericAsset, "");
+        seed_assets(&mut conn, &[host.clone(), other.clone()]);
+
+        let row = |src_guid: Guid, rid: i64, class_name: &str, line: u32| ManagedRefRow {
+            src_guid,
+            host_file_id: 11400000,
+            rid,
+            class_name: class_name.to_string(),
+            namespace: "Game".to_string(),
+            assembly: "Assembly-CSharp".to_string(),
+            class_key: crate::unity_yaml::managed_refs::managed_class_key(class_name),
+            line,
+        };
+        // More rows than one multi-row chunk to exercise both insert paths.
+        let mut rows: Vec<ManagedRefRow> = (0..MANAGED_REF_INSERT_CHUNK_ROWS as i64 + 3)
+            .map(|rid| row(host.guid, rid, "Burn", 10 + rid as u32))
+            .collect();
+        rows.push(row(other.guid, 1, "Outer/Burn", 5));
+        rows.push(row(other.guid, 2, "Freeze", 9));
+
+        let tx = conn.transaction().unwrap();
+        let inserted = batch_insert_managed_refs(&tx, &rows).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(inserted, rows.len() as u64);
+
+        let burn = get_managed_refs_by_class_keys(&conn, &["burn".to_string()]).unwrap();
+        assert_eq!(burn.len(), MANAGED_REF_INSERT_CHUNK_ROWS + 3 + 1);
+        assert_eq!(burn[0].path, "Assets/Data/Combo.asset");
+        assert_eq!(burn.last().unwrap().class_name, "Outer/Burn");
+
+        let summaries = get_managed_ref_type_summaries(&conn).unwrap();
+        let combo_burn = summaries
+            .iter()
+            .find(|s| s.class_name == "Burn")
+            .expect("Burn summary");
+        assert_eq!(
+            combo_burn.instance_count,
+            MANAGED_REF_INSERT_CHUNK_ROWS as u64 + 3
+        );
+        assert_eq!(combo_burn.asset_count, 1);
+
+        assert!(delete_missing_asset_path(&mut conn, "Assets/Data/Combo.asset").unwrap());
+        let burn = get_managed_refs_by_class_keys(&conn, &["burn".to_string()]).unwrap();
+        assert_eq!(burn.len(), 1);
+        assert_eq!(burn[0].path, "Assets/Data/Other.asset");
+
+        // A per-asset rewrite replaces the asset's rows wholesale.
+        atomic_update_asset(
+            &mut conn,
+            &other,
+            &[],
+            DerivedRows {
+                managed_refs: &[row(other.guid, 3, "Shock", 4)],
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        assert!(
+            get_managed_refs_by_class_keys(&conn, &["burn".to_string(), "freeze".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            get_managed_refs_by_class_keys(&conn, &["shock".to_string()])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn prefab_overrides_insert_query_replace_and_delete() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let scene = test_asset("Assets/Scenes/A.unity", AssetKind::Scene, "");
+        let other = test_asset("Assets/Scenes/B.unity", AssetKind::Scene, "");
+        let source = test_asset("Assets/Prefabs/P.prefab", AssetKind::Prefab, "");
+        seed_assets(&mut conn, &[scene.clone(), other.clone(), source.clone()]);
+
+        let row = |src: Guid, path: &str, value: &str, line: u32| {
+            PrefabOverrideRow::from_raw(
+                src,
+                crate::unity_yaml::prefab_overrides::RawPrefabOverride {
+                    instance_file_id: 9,
+                    target_guid: source.guid,
+                    target_file_id: 42,
+                    property_path: path.to_string(),
+                    value: value.to_string(),
+                    line,
+                },
+            )
+        };
+        assert!(row(scene.guid, "m_LocalPosition.x", "0", 1).is_none());
+        let mut rows: Vec<PrefabOverrideRow> = (0..PREFAB_OVERRIDE_INSERT_CHUNK_ROWS as u32 + 2)
+            .map(|i| {
+                row(
+                    scene.guid,
+                    &format!("tuning.steps.Array.data[{i}].max"),
+                    "1",
+                    10 + i,
+                )
+                .unwrap()
+            })
+            .collect();
+        rows.push(row(scene.guid, "managedReferences[7]", "Asm Game.Fx.Burn", 5).unwrap());
+        rows.push(row(other.guid, "managedReferences[7].power", "3", 6).unwrap());
+        let tx = conn.transaction().unwrap();
+        batch_insert_prefab_overrides(&tx, &rows).unwrap();
+        tx.commit().unwrap();
+
+        let managed =
+            get_prefab_overrides_by_heads(&conn, &["managedReferences".to_string()]).unwrap();
+        assert_eq!(managed.len(), 2);
+        assert_eq!(managed[0].path, "Assets/Scenes/A.unity");
+        assert_eq!(managed[0].instance_file_id, 9);
+        assert_eq!(
+            get_prefab_overrides_for_target(&conn, &source.guid, 42)
+                .unwrap()
+                .len(),
+            rows.len()
+        );
+        assert_eq!(
+            find_prefab_override_value(
+                &conn,
+                &scene.guid,
+                9,
+                &source.guid,
+                42,
+                "managedReferences[7]"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("Asm Game.Fx.Burn")
+        );
+        assert_eq!(
+            find_prefab_override_value(
+                &conn,
+                &scene.guid,
+                8,
+                &source.guid,
+                42,
+                "managedReferences[7]"
+            )
+            .unwrap(),
+            None
+        );
+
+        assert!(delete_missing_asset_path(&mut conn, "Assets/Scenes/A.unity").unwrap());
+        assert_eq!(
+            get_prefab_overrides_for_target(&conn, &source.guid, 42)
+                .unwrap()
+                .len(),
+            1
+        );
+        atomic_update_asset(&mut conn, &other, &[], DerivedRows::default(), &[]).unwrap();
+        assert!(get_prefab_overrides_for_target(&conn, &source.guid, 42)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn atomic_update_asset_removes_stale_same_path_guid() {
         let mut conn = Connection::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
@@ -4126,8 +4933,7 @@ mod tests {
             &mut conn,
             &fresh,
             &[],
-            &[],
-            &[],
+            DerivedRows::default(),
             &[(
                 meta_path.clone(),
                 FileRole::Meta,
@@ -4192,7 +4998,14 @@ mod tests {
             "eventchannel scriptableobject",
         );
 
-        atomic_update_asset(&mut conn, &asset, &[sub_a.clone(), sub_b], &[], &[], &[]).unwrap();
+        atomic_update_asset(
+            &mut conn,
+            &asset,
+            &[sub_a.clone(), sub_b],
+            DerivedRows::default(),
+            &[],
+        )
+        .unwrap();
 
         let fts_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM asset_search_fts", [], |row| {
@@ -4205,7 +5018,7 @@ mod tests {
         let mut renamed = sub_a;
         renamed.name = "Heal Event".to_string();
         renamed.name_lower = "heal event".to_string();
-        atomic_update_asset(&mut conn, &asset, &[renamed], &[], &[], &[]).unwrap();
+        atomic_update_asset(&mut conn, &asset, &[renamed], DerivedRows::default(), &[]).unwrap();
 
         let fts_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM asset_search_fts", [], |row| {

@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::asset_db::types::{parse_guid_hex, Guid};
 
+use super::managed_refs;
+use super::prefab_overrides;
 use super::references;
 use super::tokenizer::{
     count_braces, extract_field_name, extract_field_name_ref, extract_internal_file_id,
@@ -85,15 +87,27 @@ struct TransformWorldState {
     rotation: [f64; 4],
 }
 
+/// Everything the asset index extracts from one YAML asset in a single line
+/// scan: documents, guid-bearing reference candidates, serialized member
+/// bindings and `[SerializeReference]` registry entries.
+#[derive(Debug, Default)]
+pub struct YamlIndexParse {
+    pub docs: Vec<YamlDoc>,
+    pub raw_refs: Vec<references::RawYamlRef>,
+    pub raw_bindings: Vec<references::RawMemberBinding>,
+    pub managed_refs: Vec<managed_refs::RawManagedRef>,
+    pub prefab_overrides: Vec<prefab_overrides::RawPrefabOverride>,
+}
+
 pub fn parse_yaml_docs(content: &[u8]) -> Vec<YamlDoc> {
     let text = String::from_utf8_lossy(content);
-    parse_yaml_docs_impl(&text, false, false).0 .0
+    parse_yaml_docs_impl(&text, false, false).docs
 }
 
 /// Parse from an already-decoded string, letting callers that also need the
 /// line-split text pay for `from_utf8_lossy` once instead of twice.
 pub fn parse_yaml_docs_str(text: &str) -> Vec<YamlDoc> {
-    parse_yaml_docs_impl(text, false, false).0 .0
+    parse_yaml_docs_impl(text, false, false).docs
 }
 
 /// Single-pass variant that additionally captures every guid-bearing flow map
@@ -104,13 +118,14 @@ pub fn parse_yaml_docs_str(text: &str) -> Vec<YamlDoc> {
 /// disagreeing about document boundaries or field context).
 pub fn parse_yaml_docs_with_refs(content: &[u8]) -> (Vec<YamlDoc>, Vec<references::RawYamlRef>) {
     let text = String::from_utf8_lossy(content);
-    parse_yaml_docs_impl(&text, true, false).0
+    let parsed = parse_yaml_docs_impl(&text, true, false);
+    (parsed.docs, parsed.raw_refs)
 }
 
 /// Like [`parse_yaml_docs_with_refs`] but also captures raw serialized member
 /// bindings (UnityEvent persistent calls + AnimationEvent function names) in
-/// the same line scan. Indexing callers turn these into `member_bindings`
-/// rows; everyone else keeps using the cheaper two-element variant.
+/// the same line scan. Indexing callers use [`parse_yaml_docs_for_index`],
+/// which additionally returns `[SerializeReference]` registry entries.
 pub fn parse_yaml_docs_with_refs_and_bindings(
     content: &[u8],
 ) -> (
@@ -118,23 +133,32 @@ pub fn parse_yaml_docs_with_refs_and_bindings(
     Vec<references::RawYamlRef>,
     Vec<references::RawMemberBinding>,
 ) {
-    let text = String::from_utf8_lossy(content);
-    let ((docs, raw_refs), bindings) = parse_yaml_docs_impl(&text, true, true);
-    (docs, raw_refs, bindings)
+    let parsed = parse_yaml_docs_for_index(content);
+    (parsed.docs, parsed.raw_refs, parsed.raw_bindings)
 }
 
-fn parse_yaml_docs_impl(
-    text: &str,
-    collect_refs: bool,
-    collect_bindings: bool,
-) -> (
-    (Vec<YamlDoc>, Vec<references::RawYamlRef>),
-    Vec<references::RawMemberBinding>,
-) {
+/// Single-pass parse for the asset index: docs, raw refs, raw member bindings
+/// and managed-reference registry entries.
+pub fn parse_yaml_docs_for_index(content: &[u8]) -> YamlIndexParse {
+    let text = String::from_utf8_lossy(content);
+    parse_yaml_docs_impl(&text, true, true)
+}
+
+fn parse_yaml_docs_impl(text: &str, collect_refs: bool, collect_index: bool) -> YamlIndexParse {
     let mut docs: Vec<YamlDoc> = Vec::new();
     let mut raw_refs: Vec<references::RawYamlRef> = Vec::new();
     let mut raw_seen: references::RawRefSeen = HashSet::new();
     let mut raw_bindings: Vec<references::RawMemberBinding> = Vec::new();
+    let mut managed: Vec<managed_refs::RawManagedRef> = Vec::new();
+    // `[SerializeReference]` registry state: indent of the doc-level
+    // `references:` key while inside it, and the current entry's (rid, line).
+    let mut cur_mr_block_indent: Option<usize> = None;
+    let mut cur_mr_entry: Option<(i64, u32)> = None;
+    // PrefabInstance `m_Modifications` state: the current entry's target and
+    // its `propertyPath` (emitted when `value:` lands).
+    let mut overrides: Vec<prefab_overrides::RawPrefabOverride> = Vec::new();
+    let mut cur_po_target: Option<(Guid, i64)> = None;
+    let mut cur_po_path: Option<(String, u32)> = None;
     // Per persistent-call accumulators: a UnityEvent call serializes
     // `m_Target` then `m_TargetAssemblyTypeName` ahead of `m_MethodName`, so we
     // stash the most recent of each and flush them when `m_MethodName` lands,
@@ -281,6 +305,32 @@ fn parse_yaml_docs_impl(
             if pending_braces <= 0 {
                 let complete = pending_line.take().unwrap();
                 let ct = complete.trim();
+                // `- target: {fileID: …, guid: …,` wraps onto `type: 3}`.
+                if collect_index
+                    && cur_class_id == Some(1001)
+                    && pending_dashed
+                    && ct.starts_with("- target:")
+                {
+                    cur_po_target = prefab_overrides::parse_target(ct);
+                    cur_po_path = None;
+                }
+                // A long registry `type: {class: …}` map wraps onto
+                // continuation lines; capture it once the parser joined it.
+                if collect_index && !pending_dashed {
+                    if let (Some(block_indent), Some((rid, line))) =
+                        (cur_mr_block_indent, cur_mr_entry)
+                    {
+                        if pending_indent == block_indent + 4 {
+                            if let Some(type_value) = ct.strip_prefix("type:") {
+                                if let Some(entry) =
+                                    managed_refs::build_entry(cur_file_id, rid, line, type_value)
+                                {
+                                    managed.push(entry);
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(f) = extract_field_name(ct) {
                     last_field = Some(f);
                 }
@@ -362,6 +412,10 @@ fn parse_yaml_docs_impl(
             cur_transform_children.clear();
             cur_pc_target_file_id = None;
             cur_pc_type_name = None;
+            cur_mr_block_indent = None;
+            cur_mr_entry = None;
+            cur_po_target = None;
+            cur_po_path = None;
             cur_line_start = i;
             first_key = true;
             last_field = None;
@@ -388,6 +442,43 @@ fn parse_yaml_docs_impl(
         // marker. Same-named serialized user fields nested deeper inside a
         // component (or inside list items at indent 2) must not clobber them.
         let doc_level = indent == 2 && !dashed;
+
+        // `[SerializeReference]` registry (`references:` at doc level of a
+        // MonoBehaviour / ScriptableObject). Entries start at block + 2 and
+        // carry their `type:` flow map at block + 4; any line at or above the
+        // block indent ends it. A wrapped `type:` map is completed in the
+        // pending-line branch above.
+        if collect_index {
+            if let Some(block_indent) = cur_mr_block_indent {
+                if indent <= block_indent {
+                    cur_mr_block_indent = None;
+                    cur_mr_entry = None;
+                } else if indent == block_indent + 2 {
+                    cur_mr_entry = managed_refs::registry_entry_id(trimmed, dashed)
+                        .map(|rid| (rid, (i + 1) as u32));
+                } else if indent == block_indent + 4 && !dashed {
+                    if let (Some((rid, line)), Some(type_value)) =
+                        (cur_mr_entry, trimmed.strip_prefix("type:"))
+                    {
+                        if count_braces(type_value) <= 0 {
+                            if let Some(entry) =
+                                managed_refs::build_entry(cur_file_id, rid, line, type_value)
+                            {
+                                managed.push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+            if cur_mr_block_indent.is_none()
+                && doc_level
+                && cur_class_id == Some(114)
+                && trimmed == "references:"
+            {
+                cur_mr_block_indent = Some(indent);
+                cur_mr_entry = None;
+            }
+        }
 
         if let Some(f) = extract_field_name_ref(trimmed) {
             if f == "m_Name" && doc_level {
@@ -488,7 +579,40 @@ fn parse_yaml_docs_impl(
             // `m_TargetAssemblyTypeName` precede its `m_MethodName`, so stash
             // them and emit when the method name (or an anim functionName,
             // which has no target) lands. See `RawMemberBinding`.
-            if collect_bindings {
+            if collect_index && cur_class_id == Some(1001) {
+                if f == "target" && dashed {
+                    cur_po_path = None;
+                    // A wrapped flow map is completed in the pending branch.
+                    cur_po_target = if count_braces(trimmed) <= 0 {
+                        prefab_overrides::parse_target(trimmed)
+                    } else {
+                        None
+                    };
+                } else if f == "propertyPath" {
+                    cur_po_path = cur_po_target
+                        .and(extract_plain_value(trimmed, "propertyPath:"))
+                        .map(|path| (path, (i + 1) as u32));
+                } else if f == "value" || f == "objectReference" {
+                    if let (Some((target_guid, target_file_id)), Some((property_path, line))) =
+                        (cur_po_target, cur_po_path.take())
+                    {
+                        let value = if f == "value" {
+                            extract_plain_value(trimmed, "value:").unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        overrides.push(prefab_overrides::RawPrefabOverride {
+                            instance_file_id: cur_file_id,
+                            target_guid,
+                            target_file_id,
+                            property_path,
+                            value,
+                            line,
+                        });
+                    }
+                }
+            }
+            if collect_index {
                 if f == "m_Target" {
                     // `m_Target: {fileID: N}` — single-line flow map; record the
                     // fileID (None when malformed). Each call resets this.
@@ -579,7 +703,13 @@ fn parse_yaml_docs_impl(
     }
 
     flush_doc!(line_count);
-    ((docs, raw_refs), raw_bindings)
+    YamlIndexParse {
+        docs,
+        raw_refs,
+        raw_bindings,
+        managed_refs: managed,
+        prefab_overrides: overrides,
+    }
 }
 
 pub fn build_world_transform_map(

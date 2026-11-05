@@ -365,7 +365,7 @@ fn normalize_type_name(s: &str) -> String {
     s.trim().trim_end_matches('?').to_string()
 }
 
-fn collect_serialized_fields(source: &[u8], body: Node, out: &mut Vec<ScriptFieldMeta>) {
+pub(super) fn collect_serialized_fields(source: &[u8], body: Node, out: &mut Vec<ScriptFieldMeta>) {
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         match child.kind() {
@@ -505,7 +505,7 @@ fn walk_for_string_literal(source: &[u8], node: Node, out: &mut Option<String>) 
 //
 // If field-rename tracking starts misfiring on more exotic forms, replace
 // this with a real C# string-literal decoder.
-fn unquote_csharp_string(s: &str) -> String {
+pub(super) fn unquote_csharp_string(s: &str) -> String {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('@').and_then(|r| r.strip_prefix('"')) {
         let inner = rest.strip_suffix('"').unwrap_or(rest);
@@ -544,7 +544,7 @@ fn decode_csharp_simple_escapes(s: &str) -> String {
     out
 }
 
-fn collect_modifiers(source: &[u8], node: Node) -> Vec<String> {
+pub(super) fn collect_modifiers(source: &[u8], node: Node) -> Vec<String> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

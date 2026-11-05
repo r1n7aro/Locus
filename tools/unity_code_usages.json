@@ -1,15 +1,15 @@
 {
-  "description": "Find serialized uses of a C# script or member in scenes, prefabs, and assets. Check this alongside code references before renaming or deleting serialized fields, UnityEvent handlers, or AnimationEvent methods; zero code references alone is insufficient.\n\nWithout member, returns component attach points and ScriptableObject instances. With member, searches field values, indexed UnityEvent method bindings (including broken/unbound targets), and project-wide AnimationEvents. Results distinguish resolved and broken bindings.\n\nRequires the asset reference index; rescan from the UI if stale. Class matching uses the exact short name. Check relevant subclasses separately, and account for dynamic/string references the index cannot prove.",
+  "description": "Find serialized uses of a C# script, the types it declares, or one of their members in scenes, prefabs, and assets. Check this alongside code references before renaming, moving, or deleting a type, serialized field, UnityEvent handler, or AnimationEvent method; zero code references alone is insufficient.\n\nWithout member, returns component attach points and ScriptableObject instances (by script GUID); [SerializeReference] instances of every type declared in the file and of their project subclasses/implementers, including instance types set by prefab instances, variants, and nested prefabs; and plain [Serializable] class/struct values reached through serialized fields (T, T[], List<T>, project generics, nested types, derived scripts) together with prefab overrides of those fields. Instances serialized under a [MovedFrom] legacy name, or stranded in a previous assembly (Unity loads those as missing types), are flagged. With member, searches that member's values in all of the above (including [FormerlySerializedAs] names and prefab-instance overrides), indexed UnityEvent method bindings (including broken/unbound targets), and project-wide AnimationEvents.\n\nRequires the asset reference index; rescan from the UI if stale. GUID attach points match this exact script, so query other MonoBehaviour subclasses separately. Not covered: binary-serialized assets, Presets, custom serialization (ISerializationCallbackReceiver, dictionaries), and dynamic/string references.",
   "parameters": {
     "type": "object",
     "properties": {
       "file_path": {
         "type": "string",
-        "description": "Workspace-relative or absolute path to the .cs script file."
+        "description": "Workspace-relative or absolute path to the .cs script file. Every class/struct/interface it declares is matched against [SerializeReference] data and plain [Serializable] field values."
       },
       "member": {
         "type": "string",
-        "description": "Optional method or serialized-field name declared in that script (e.g. 'TakeDamage', 'maxHealth'). Omit to list the script's attach points instead."
+        "description": "Optional method or serialized-field name declared in that script (e.g. 'TakeDamage', 'maxHealth'). Omit to list the script's attach points, [SerializeReference] instances, and [Serializable] values instead."
       },
       "max_results": {
         "type": "integer",

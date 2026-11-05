@@ -9,6 +9,7 @@ pub mod watcher;
 
 pub use db::AssetSearchRowDb;
 pub use db::MemberBindingHit;
+pub use db::{ManagedRefHit, ManagedRefTypeSummary, PrefabOverrideHit, ScriptIndexEntry};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -242,6 +243,8 @@ type YamlParseOk = (
     [u8; 16],
     Option<Guid>,
     Vec<crate::unity_yaml::MemberBinding>,
+    Vec<crate::unity_yaml::managed_refs::RawManagedRef>,
+    Vec<crate::unity_yaml::prefab_overrides::RawPrefabOverride>,
 );
 
 /// Read + parse one yaml asset for the full-scan pipeline. Pure function of
@@ -280,10 +283,16 @@ fn parse_yaml_asset_entry(
         }
     };
 
-    // Single pass: docs, raw refs and raw member bindings come from one line
-    // scan, then refs and bindings are resolved against the docs in place.
-    let (docs, raw_refs, raw_bindings) =
-        crate::unity_yaml::parse_yaml_docs_with_refs_and_bindings(&content);
+    // Single pass: docs, raw refs, raw member bindings and SerializeReference
+    // registry entries come from one line scan, then refs and bindings are
+    // resolved against the docs in place.
+    let crate::unity_yaml::YamlIndexParse {
+        docs,
+        raw_refs,
+        raw_bindings,
+        managed_refs,
+        prefab_overrides,
+    } = crate::unity_yaml::parse_yaml_docs_for_index(&content);
     let refs = crate::unity_yaml::build_refs_from_docs(&docs, raw_refs, Some(guid_to_path));
     let member_bindings = crate::unity_yaml::build_bindings_from_docs(&docs, raw_bindings);
     let content_hash = hash128(&content);
@@ -302,6 +311,8 @@ fn parse_yaml_asset_entry(
         content_hash,
         main_script_guid,
         member_bindings,
+        managed_refs,
+        prefab_overrides,
     ))
 }
 
@@ -758,9 +769,20 @@ impl AssetDb {
         let mut edges: Vec<RefEdge> = Vec::with_capacity(yaml_count * 16);
         let mut asset_objects: Vec<AssetObject> = Vec::new();
         let mut member_bindings: Vec<MemberBindingRow> = Vec::new();
+        let mut managed_ref_rows: Vec<ManagedRefRow> = Vec::new();
+        let mut prefab_override_rows: Vec<PrefabOverrideRow> = Vec::new();
 
-        for (entry, src_guid, extracted_refs, docs, content_hash, main_script_guid, bindings) in
-            yaml_results.into_iter()
+        for (
+            entry,
+            src_guid,
+            extracted_refs,
+            docs,
+            content_hash,
+            main_script_guid,
+            bindings,
+            managed_refs,
+            prefab_overrides,
+        ) in yaml_results.into_iter()
         {
             let mut updated_node: Option<AssetNode> = None;
             if let Some(&idx) = guid_to_node_idx.get(&src_guid) {
@@ -832,6 +854,17 @@ impl AssetDb {
                     line: b.line,
                 });
             }
+
+            managed_ref_rows.extend(
+                managed_refs
+                    .into_iter()
+                    .map(|raw| ManagedRefRow::from_raw(src_guid, raw)),
+            );
+            prefab_override_rows.extend(
+                prefab_overrides
+                    .into_iter()
+                    .filter_map(|raw| PrefabOverrideRow::from_raw(src_guid, raw)),
+            );
 
             file_records.push((
                 entry.rel_path,
@@ -1048,6 +1081,12 @@ impl AssetDb {
                 db::batch_insert_member_bindings(&tx, &member_bindings)?;
 
                 ensure_scan_not_cancelled(cancel)?;
+                db::batch_insert_managed_refs(&tx, &managed_ref_rows)?;
+
+                ensure_scan_not_cancelled(cancel)?;
+                db::batch_insert_prefab_overrides(&tx, &prefab_override_rows)?;
+
+                ensure_scan_not_cancelled(cancel)?;
                 let t0 = std::time::Instant::now();
                 db::create_secondary_indexes(&tx)?;
                 let t_idx_create = t0.elapsed();
@@ -1194,6 +1233,96 @@ impl AssetDb {
         script_guid: &Guid,
     ) -> Result<Vec<db::MemberBindingHit>, String> {
         db::get_member_bindings(&self.conn, member, class_short_lower, script_guid)
+    }
+
+    /// Indexed `[SerializeReference]` instances whose innermost class name
+    /// matches one of `class_keys` (ASCII-lowercased). Callers apply the exact
+    /// `{class, ns, asm}` identity on top.
+    pub fn get_managed_refs_by_class_keys(
+        &self,
+        class_keys: &[String],
+    ) -> Result<Vec<db::ManagedRefHit>, String> {
+        db::get_managed_refs_by_class_keys(&self.conn, class_keys)
+    }
+
+    /// Distinct serialized `[SerializeReference]` type identities with
+    /// instance / asset counts.
+    pub fn get_managed_ref_type_summaries(&self) -> Result<Vec<db::ManagedRefTypeSummary>, String> {
+        db::get_managed_ref_type_summaries(&self.conn)
+    }
+
+    /// Every on-disk `.cs` script with its indexed primary type.
+    pub fn list_script_index_entries(&self) -> Result<Vec<db::ScriptIndexEntry>, String> {
+        db::list_script_index_entries(&self.conn)
+    }
+
+    /// `(guid, path)` of every on-disk asset with the given lowercase
+    /// extension (no dot).
+    pub fn list_assets_by_ext(&self, ext: &str) -> Result<Vec<(Guid, String)>, String> {
+        db::list_assets_by_ext(&self.conn, ext)
+    }
+
+    /// Indexed prefab-instance modifications whose first path segment is one
+    /// of `heads`.
+    pub fn get_prefab_overrides_by_heads(
+        &self,
+        heads: &[String],
+    ) -> Result<Vec<db::PrefabOverrideHit>, String> {
+        db::get_prefab_overrides_by_heads(&self.conn, heads)
+    }
+
+    /// Every indexed modification of one source-prefab object.
+    pub fn get_prefab_overrides_for_target(
+        &self,
+        target_guid: &Guid,
+        target_file_id: i64,
+    ) -> Result<Vec<db::PrefabOverrideHit>, String> {
+        db::get_prefab_overrides_for_target(&self.conn, target_guid, target_file_id)
+    }
+
+    pub fn find_prefab_override_value(
+        &self,
+        src_guid: &Guid,
+        instance_file_id: i64,
+        target_guid: &Guid,
+        target_file_id: i64,
+        property_path: &str,
+    ) -> Result<Option<String>, String> {
+        db::find_prefab_override_value(
+            &self.conn,
+            src_guid,
+            instance_file_id,
+            target_guid,
+            target_file_id,
+            property_path,
+        )
+    }
+
+    pub fn find_managed_ref_identity(
+        &self,
+        src_guid: &Guid,
+        host_file_id: i64,
+        rid: i64,
+    ) -> Result<Option<(String, String, String)>, String> {
+        db::find_managed_ref_identity(&self.conn, src_guid, host_file_id, rid)
+    }
+
+    /// `(PrefabInstance fileID, source prefab GUID)` per instance in an asset.
+    pub fn get_prefab_instance_sources(&self, src_guid: &Guid) -> Result<Vec<(i64, Guid)>, String> {
+        db::get_prefab_instance_sources(&self.conn, src_guid)
+    }
+
+    /// `(guid, path)` of scripts whose inheritance chain contains `terms`.
+    pub fn find_scripts_inheriting(&self, terms: &[String]) -> Result<Vec<(Guid, String)>, String> {
+        db::find_scripts_inheriting(&self.conn, terms)
+    }
+
+    /// `(asset GUID, path, PrefabInstance fileID)` per instance of a prefab.
+    pub fn get_prefab_instances_of(
+        &self,
+        source_guid: &Guid,
+    ) -> Result<Vec<(Guid, String, i64)>, String> {
+        db::get_prefab_instances_of(&self.conn, source_guid)
     }
 
     pub fn get_direct_deps_for_object(
@@ -2403,6 +2532,67 @@ mod tests {
                 .expect("resolve hidden path"),
             None
         );
+    }
+
+    #[test]
+    fn full_scan_indexes_serialize_reference_registry_entries() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("Assets")).expect("create assets dir");
+        let action: &[u8] = b"%YAML 1.1
+--- !u!114 &11400000
+MonoBehaviour:
+  m_Script: {fileID: 11500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01, type: 3}
+  m_Name: ComboStrike
+  events:
+  - rid: 1000
+  - rid: 1001
+  references:
+    version: 2
+    RefIds:
+    - rid: 1000
+      type: {class: BurstEffect, ns: Game.Combat, asm: Game.Combat}
+      data:
+        startTime: 0
+    - rid: 1001
+      type: {class: TurnEffect, ns: Game.Combat, asm: Game.Combat}
+      data:
+        turnMode: 1
+";
+        write_asset_with_guid(
+            &root,
+            "Assets/Actions/ComboStrike.asset",
+            action,
+            "deadbeefdeadbeefdeadbeefdeadbe21",
+        );
+
+        let mut graph = AssetDb::open(&root).expect("open asset db");
+        graph.full_scan(|_| {}).expect("scan asset db");
+
+        let hits = graph
+            .get_managed_refs_by_class_keys(&["turneffect".to_string(), "missing".to_string()])
+            .expect("query managed refs");
+        assert_eq!(
+            hits,
+            vec![ManagedRefHit {
+                path: "Assets/Actions/ComboStrike.asset".into(),
+                host_file_id: 11400000,
+                rid: 1001,
+                class_name: "TurnEffect".into(),
+                namespace: "Game.Combat".into(),
+                assembly: "Game.Combat".into(),
+                line: 16,
+            }]
+        );
+
+        let summaries = graph
+            .get_managed_ref_type_summaries()
+            .expect("type summaries");
+        let names: Vec<&str> = summaries.iter().map(|s| s.class_name.as_str()).collect();
+        assert_eq!(names, vec!["BurstEffect", "TurnEffect"]);
+        assert!(summaries
+            .iter()
+            .all(|s| s.instance_count == 1 && s.asset_count == 1));
     }
 
     #[test]

@@ -37,10 +37,18 @@
 //! - **`[FormerlySerializedAs]` argument decoding is naive.** See the
 //!   `unquote_csharp_string` TODO in `parser.rs`.
 
+pub mod assembly;
+mod declared_types;
+#[cfg(test)]
+mod declared_types_tests;
 mod parser;
 #[cfg(test)]
 mod tests;
 
+pub use declared_types::{
+    parse_cs_declared_types, parse_field_type, parse_type_ref, CsFileTypes, CsTypeRef,
+    DeclaredCsType, DeclaredTypeKind, FieldTypeShape, MovedFromInfo,
+};
 pub use parser::{
     parse_cs_script, parse_cs_script_status, ScriptFieldMeta, ScriptMetadata, ScriptParseStatus,
 };

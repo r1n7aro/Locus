@@ -360,12 +360,76 @@ fn format_code_diagnostic_output(
     output
 }
 
+/// AssetDb handle + checkout root for the `[SerializeReference]` type check.
+pub(super) type ManagedTypeScope = (super::code_unity_managed::SharedAssetDb, std::path::PathBuf);
+
+fn managed_type_scope(ctx: &super::ToolExecutionContext) -> Option<ManagedTypeScope> {
+    let execution = ctx.execution.as_ref()?;
+    let core = execution.workspace.core();
+    core.refresh_asset_db_if_missing(execution.root());
+    Some((core.asset_db(), execution.root().to_path_buf()))
+}
+
+/// Workspace-relative form of `file_path` (input may be absolute).
+fn relative_to_root(root: &std::path::Path, file_path: &str) -> String {
+    let path = std::path::Path::new(file_path);
+    let relative = path
+        .strip_prefix(root)
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|_| {
+            let root_text = root
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            let path_text = file_path.replace('\\', "/");
+            if path_text
+                .to_ascii_lowercase()
+                .starts_with(&format!("{root_text}/"))
+            {
+                std::path::PathBuf::from(&path_text[root_text.len() + 1..])
+            } else {
+                path.to_path_buf()
+            }
+        });
+    relative.to_string_lossy().replace('\\', "/")
+}
+
+/// Append the serialized-type section; silent when no asset index exists.
+async fn push_managed_type_section(
+    output: &mut String,
+    scope: Option<ManagedTypeScope>,
+    scope_file: Option<String>,
+    max_issues: usize,
+) {
+    let Some((asset_db, root)) = scope else {
+        return;
+    };
+    let checked = tokio::task::spawn_blocking(move || {
+        let rel = scope_file.map(|file| relative_to_root(&root, &file));
+        super::code_unity_managed::check_managed_reference_types(&asset_db, &root, rel.as_deref())
+    })
+    .await;
+    match checked {
+        Ok(Ok(Some(report))) => output.push_str(
+            &super::code_unity_managed::format_managed_type_section(&report, max_issues),
+        ),
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => output.push_str(&format!(
+            "\n\n(SerializeReference type check skipped: {error})"
+        )),
+        Err(error) => output.push_str(&format!(
+            "\n\n(SerializeReference type check failed: {error})"
+        )),
+    }
+}
+
 pub(super) async fn file_diagnostics_output(
     workspace: &str,
     file_path: &str,
     min_severity: u8,
     max_results: usize,
     max_project_ref_problems: usize,
+    managed_scope: Option<ManagedTypeScope>,
 ) -> Result<String, String> {
     let all = crate::csharp_lsp::document_diagnostics(workspace, file_path).await?;
     let mut output = format_code_diagnostic_output(file_path, min_severity, max_results, all);
@@ -382,6 +446,17 @@ pub(super) async fn file_diagnostics_output(
     if let Ok(Ok(report)) = scanned {
         push_project_refs_section(&mut output, &report, max_project_ref_problems);
     }
+
+    // `[SerializeReference]` instances in this file's assembly (or naming its
+    // types) whose serialized type no longer resolves — a rename or asmdef
+    // move without [MovedFrom] compiles fine and silently drops data.
+    push_managed_type_section(
+        &mut output,
+        managed_scope,
+        Some(file_path.to_string()),
+        max_project_ref_problems,
+    )
+    .await;
 
     Ok(output)
 }
@@ -473,6 +548,7 @@ pub(super) fn code_diagnostics() -> ToolDef {
                             min_severity,
                             max_results,
                             50,
+                            managed_type_scope(&ctx),
                         )
                         .await
                         {
@@ -495,7 +571,15 @@ pub(super) fn code_diagnostics() -> ToolDef {
                                 };
                             }
                         };
-                        format_code_diagnostic_output("workspace", min_severity, max_results, all)
+                        let mut output = format_code_diagnostic_output(
+                            "workspace",
+                            min_severity,
+                            max_results,
+                            all,
+                        );
+                        push_managed_type_section(&mut output, managed_type_scope(&ctx), None, 50)
+                            .await;
+                        output
                     }
                 };
 
