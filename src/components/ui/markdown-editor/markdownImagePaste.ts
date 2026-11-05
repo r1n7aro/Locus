@@ -2,12 +2,27 @@ import { Prec } from "@codemirror/state";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { isolateHistory } from "@codemirror/commands";
 import type { WorkspaceRef } from "../../../services/project";
-import { importMarkdownImage } from "../../../services/markdownImage";
+import { importMarkdownImage, MARKDOWN_IMAGE_DIRECTORY_UNSET } from "../../../services/markdownImage";
+import { normalizeAppError } from "../../../services/errors";
 import { hasTauriWindowRuntime } from "../../../services/tauriRuntime";
+import type { FloatingAnchorRect } from "./markdownFloating";
+
+/** Asks the user where this project stores pasted images. */
+export interface MarkdownImageFolderRequest {
+  workspaceRef: WorkspaceRef;
+  contentPath: string;
+  /** Caret box at the insertion point, for anchoring the prompt. */
+  anchor: FloatingAnchorRect | null;
+}
 
 export function markdownImagePaste(options: {
   context: () => { workspaceRef: WorkspaceRef; contentPath: string; key: string } | null;
   onError: (error: unknown) => void;
+  /**
+   * Called when the project has no folder for the document yet. Resolves
+   * `true` once a folder is saved; the import is then retried.
+   */
+  chooseFolder?: (request: MarkdownImageFolderRequest) => Promise<boolean>;
 }) {
   return Prec.highest(ViewPlugin.fromClass(class {
     pending = new Set<{ from: number; to: number; cancelled: boolean }>();
@@ -32,6 +47,14 @@ export function markdownImagePaste(options: {
       }
     }
     destroy() { this.disposed = true; this.unlisten?.(); }
+    anchorAt(position: number): FloatingAnchorRect | null {
+      try {
+        const rect = this.view.coordsAtPos(Math.min(position, this.view.state.doc.length));
+        return rect ? { left: rect.left, top: rect.top, bottom: rect.bottom } : null;
+      } catch {
+        return null; // Not laid out; the editor anchors the prompt itself.
+      }
+    }
     receive(event: ClipboardEvent | DragEvent) {
       const data = "clipboardData" in event ? event.clipboardData : event.dataTransfer;
       const files = Array.from(data?.files ?? []).filter(file => file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(file.name));
@@ -48,9 +71,17 @@ export function markdownImagePaste(options: {
       const selection = this.view.state.selection.main;
       const range = { from: position ?? selection.from, to: position ?? selection.to, cancelled: false };
       this.pending.add(range);
-      void Promise.all(files.map(file => importMarkdownImage(context.workspaceRef, context.contentPath, file)))
+      const importAll = () => Promise.all(files.map(file => importMarkdownImage(context.workspaceRef, context.contentPath, file)));
+      void importAll()
+        .catch(async (error: unknown) => {
+          // The first paste of a project without an image folder asks for one.
+          if (!options.chooseFolder || normalizeAppError(error).code !== MARKDOWN_IMAGE_DIRECTORY_UNSET) throw error;
+          if (this.disposed) return null;
+          const chosen = await options.chooseFolder({ workspaceRef: context.workspaceRef, contentPath: context.contentPath, anchor: this.anchorAt(range.from) });
+          return chosen && !this.disposed && !range.cancelled ? importAll() : null;
+        })
         .then(images => {
-          if (this.disposed || range.cancelled || this.view.state.readOnly || options.context()?.key !== context.key) return;
+          if (!images || this.disposed || range.cancelled || this.view.state.readOnly || options.context()?.key !== context.key) return;
           // Images are standalone blocks. A bare insertion at the end of a
           // reference definition/list marker can otherwise change Markdown syntax.
           const doc = this.view.state.doc;

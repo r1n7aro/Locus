@@ -13,6 +13,44 @@ export function resolveMarkdownImage(workspaceRef: WorkspaceRef, source: string,
 }
 
 export interface ImportedMarkdownImage { path: string; relativePath: string }
+
+/** Project settings that choose where pasted Markdown images are stored. */
+export const MARKDOWN_IMAGE_DIRECTORY_KEY = "project.markdownImages.directory";
+export const MARKDOWN_IMAGE_RULES_KEY = "project.markdownImages.rules";
+/** Suggested default folder (where older builds always stored images). */
+export const DEFAULT_MARKDOWN_IMAGE_DIRECTORY = "Locus/attachments/images";
+/** `markdown_import_image` error while the project has no folder for the document. */
+export const MARKDOWN_IMAGE_DIRECTORY_UNSET = "markdown.image_directory_unset";
+
+export interface MarkdownImageTarget {
+  /** Workspace root with `/` separators. */
+  root: string;
+  /** Workspace-relative folder of the document; `""` at the root. */
+  documentFolder: string;
+  /** Folder receiving pasted images; `null` until the project chooses one. */
+  folder: string | null;
+}
+
+export function markdownImageTarget(workspaceRef: WorkspaceRef, contentPath: string): Promise<MarkdownImageTarget> {
+  return ipcInvoke("markdown_image_target", { workspaceRef, contentPath });
+}
+
+/**
+ * Workspace-relative form of a picked folder, or `null` when it is not inside
+ * `root`. The backend normalizes and validates the stored value again.
+ */
+export function workspaceRelativeFolder(root: string, folder: string): string | null {
+  const normalize = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
+  const base = normalize(root);
+  const target = normalize(folder);
+  // Windows paths compare case-insensitively.
+  const caseless = /^[a-z]:\//i.test(base);
+  const same = (left: string, right: string) => caseless ? left.toLowerCase() === right.toLowerCase() : left === right;
+  if (!base || same(target, base)) return null;
+  const prefix = target.slice(0, base.length + 1);
+  return same(prefix, `${base}/`) ? target.slice(base.length + 1) : null;
+}
+
 export function relativeMarkdownResource(workspaceRef: WorkspaceRef, contentPath: string, targetPath: string): Promise<string> {
   return ipcInvoke("markdown_relative_path", { workspaceRef, contentPath, targetPath });
 }

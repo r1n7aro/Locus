@@ -6,14 +6,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { markdownImagePaste } from "../components/ui/markdown-editor/markdownImagePaste";
 
 const mocks = vi.hoisted(() => ({ import: vi.fn() }));
-vi.mock("../services/markdownImage", () => ({ importMarkdownImage: mocks.import }));
+vi.mock("../services/markdownImage", () => ({ importMarkdownImage: mocks.import, MARKDOWN_IMAGE_DIRECTORY_UNSET: "markdown.image_directory_unset" }));
+const unset = { code: "markdown.image_directory_unset", message: "Choose a folder", retryable: false, severity: "error" };
 let view: EditorView | null = null;
 afterEach(() => { view?.destroy(); view = null; document.body.replaceChildren(); mocks.import.mockReset(); });
-function setup() {
+function setup(chooseFolder?: Parameters<typeof markdownImagePaste>[0]["chooseFolder"]) {
   const context = { workspaceRef: { checkoutId: "a" }, contentPath: "Docs/a.md", key: "a" };
   const onError = vi.fn();
   const root = document.createElement("div"); document.body.append(root);
-  view = new EditorView({ parent: root, state: EditorState.create({ doc: "before after", selection: { anchor: 7 }, extensions: [history(), markdownImagePaste({ context: () => context, onError })] }) });
+  view = new EditorView({ parent: root, state: EditorState.create({ doc: "before after", selection: { anchor: 7 }, extensions: [history(), markdownImagePaste({ context: () => context, onError, chooseFolder })] }) });
   return { view, context, onError };
 }
 function paste(view: EditorView) {
@@ -44,6 +45,29 @@ describe("shared Markdown image import", () => {
     paste(view); context.key = "b";
     resolve({ path: "a.png", relativePath: "a.png" }); await flush();
     expect(view.state.doc.toString()).toBe("before after");
+  });
+  it("asks for the project's image folder once and retries the import", async () => {
+    let answer!: (saved: boolean) => void;
+    const chooseFolder = vi.fn(() => new Promise<boolean>(yes => { answer = yes; }));
+    const { view, onError } = setup(chooseFolder);
+    mocks.import.mockRejectedValueOnce(unset).mockResolvedValueOnce({ path: "img/a.png", relativePath: "../img/a.png" });
+    paste(view); await flush();
+    expect(chooseFolder).toHaveBeenCalledWith(expect.objectContaining({ workspaceRef: { checkoutId: "a" }, contentPath: "Docs/a.md" }));
+    expect(view.state.doc.toString()).toBe("before after");
+    answer(true); await flush();
+    expect(mocks.import).toHaveBeenCalledTimes(2);
+    expect(view.state.doc.toString()).toBe("before \n\n![图片](../img/a.png)\n\nafter");
+    expect(onError).not.toHaveBeenCalled();
+  });
+  it("inserts nothing when choosing the folder is cancelled", async () => {
+    const chooseFolder = vi.fn(async () => false);
+    const { view, onError } = setup(chooseFolder);
+    mocks.import.mockRejectedValue(unset);
+    paste(view); await flush();
+    expect(chooseFolder).toHaveBeenCalledOnce();
+    expect(mocks.import).toHaveBeenCalledOnce();
+    expect(view.state.doc.toString()).toBe("before after");
+    expect(onError).not.toHaveBeenCalled();
   });
   it("reports failed imports without deleting the selected text", async () => {
     const { view, onError } = setup();

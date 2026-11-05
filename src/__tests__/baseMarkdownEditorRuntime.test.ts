@@ -259,6 +259,110 @@ describe("BaseMarkdownEditor runtime", () => {
     expect(view.state.doc.toString()).toBe("Agent 返回内容");
   });
 
+  it("keeps IME text when an autosave echo of the placeholder arrives during composition", async () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const editorRef = ref<EditorExpose | null>(null);
+    // Transaction-model parents keep a stale model and the live text in a buffer.
+    const model = ref("前文");
+    let buffer = "前文";
+    app = createApp({
+      setup() {
+        return () => h(BaseMarkdownEditor, {
+          ref: editorRef,
+          modelValue: model.value,
+          viewMode: "native",
+          contentKey: "ime-echo:body",
+          transactionModel: true,
+          onDocumentChange: (change: MarkdownEditorDocumentChange) => { buffer = change.doc.toString(); },
+        });
+      },
+    });
+    app.mount(root);
+    await nextTick();
+    const view = editorRef.value!.getEditorView()!;
+
+    // The IME inserts a placeholder space; autosave then writes that text back.
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    view.dispatch({ changes: { from: 2, insert: " " }, userEvent: "input.type.compose" });
+    model.value = buffer;
+    await nextTick();
+    view.dispatch({ changes: { from: 2, to: 3, insert: "的范德萨放松的方式" }, userEvent: "input.type.compose" });
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    await Promise.resolve();
+    await nextTick();
+
+    expect(view.state.doc.toString()).toBe("前文的范德萨放松的方式");
+    expect(buffer).toBe("前文的范德萨放松的方式");
+  });
+
+  it("merges an external update queued during composition with the committed text", async () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const editorRef = ref<EditorExpose | null>(null);
+    const model = ref("# 标题\n\n正文");
+    const changes: string[] = [];
+    app = createApp({
+      setup() {
+        return () => h(BaseMarkdownEditor, {
+          ref: editorRef,
+          modelValue: model.value,
+          viewMode: "native",
+          contentKey: "ime-merge:body",
+          transactionModel: true,
+          onDocumentChange: (change: MarkdownEditorDocumentChange) => { changes.push(change.doc.toString()); },
+        });
+      },
+    });
+    app.mount(root);
+    await nextTick();
+    const view = editorRef.value!.getEditorView()!;
+
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    model.value = "# 新标题\n\n正文";
+    await nextTick();
+    expect(view.state.doc.toString()).toBe("# 标题\n\n正文");
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "中文输入" }, userEvent: "input.type.compose" });
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    await Promise.resolve();
+    await nextTick();
+
+    expect(view.state.doc.toString()).toBe("# 新标题\n\n正文中文输入");
+    expect(changes[changes.length - 1]).toBe("# 新标题\n\n正文中文输入");
+  });
+
+  it("publishes merged composition text through v-model", async () => {
+    const root = document.createElement("div");
+    document.body.appendChild(root);
+    const editorRef = ref<EditorExpose | null>(null);
+    const model = ref("甲\n乙");
+    app = createApp({
+      setup() {
+        return () => h(BaseMarkdownEditor, {
+          ref: editorRef,
+          modelValue: model.value,
+          viewMode: "native",
+          contentKey: "ime-vmodel:body",
+          "onUpdate:modelValue": (value: string) => { model.value = value; },
+        });
+      },
+    });
+    app.mount(root);
+    await nextTick();
+    const view = editorRef.value!.getEditorView()!;
+
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    model.value = "甲甲\n乙";
+    await nextTick();
+    view.dispatch({ changes: { from: view.state.doc.length, insert: "丙" }, userEvent: "input.type.compose" });
+    view.contentDOM.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true }));
+    await Promise.resolve();
+    await nextTick();
+
+    expect(view.state.doc.toString()).toBe("甲甲\n乙丙");
+    expect(model.value).toBe("甲甲\n乙丙");
+  });
+
   it("materializes transaction-model text before emitting shortcutSave", async () => {
     const root = document.createElement("div");
     document.body.appendChild(root);

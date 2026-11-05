@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Compartment, EditorSelection, EditorState, Prec, StateEffect, Transaction, type Extension, type Text } from "@codemirror/state";
+import { ChangeSet, Compartment, EditorSelection, EditorState, Prec, StateEffect, Transaction, type Extension, type Text } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { openSearchPanel } from "@codemirror/search";
 import { useSearchScope } from "../../composables/useSearchScope";
@@ -14,11 +14,13 @@ import { normalizeExternalMarkdownHref } from "../../composables/markdownExterna
 import "../../styles/markdown-links.css";
 import BaseButton from "./BaseButton.vue";
 import { useDocumentRecovery } from "../../composables/useDocumentRecovery";
-import { markdownImagePaste } from "./markdown-editor/markdownImagePaste";
+import { markdownImagePaste, type MarkdownImageFolderRequest } from "./markdown-editor/markdownImagePaste";
+import MarkdownImageFolderPopover from "./markdown-editor/MarkdownImageFolderPopover.vue";
 import { markdownMentions } from "./markdown-editor/markdownMentions";
 import { getLocusRuntime } from "../../services/locusRuntime";
 import { rebaseDocumentText } from "../../document/documentText";
 import MarkdownEditorControls from "./markdown-editor/MarkdownEditorControls.vue";
+import { openImageLightbox } from "./imageLightboxService";
 import MarkdownCommentPopover from "./markdown-editor/MarkdownCommentPopover.vue";
 import MarkdownFootnotePopover from "./markdown-editor/MarkdownFootnotePopover.vue";
 import { markdownCommentExtensions } from "./markdown-editor/markdownCommentEditing";
@@ -119,6 +121,8 @@ const props = withDefaults(defineProps<{
   autoGrow?: boolean;
   minHeight?: number;
   canQuoteSelection?: boolean;
+  /** Offers to open a new conversation beside the editor with the selection quoted. */
+  canQuoteSelectionInNewSession?: boolean;
   showProperties?: boolean;
   searchPriority?: number;
   /**
@@ -150,12 +154,14 @@ const props = withDefaults(defineProps<{
   autoGrow: false,
   minHeight: 80,
   canQuoteSelection: false,
+  canQuoteSelectionInNewSession: false,
   showProperties: false,
   transactionModel: false,
 });
 
 const emit = defineEmits<{
   (e: "quoteSelection", selection: MarkdownEditorSelection): void;
+  (e: "quoteSelectionInNewSession", selection: MarkdownEditorSelection): void;
   /** Settled user selection; null once it collapses or the editor shows another document. */
   (e: "selectionChange", selection: MarkdownEditorSelection | null): void;
   (e: "update:modelValue", value: string): void;
@@ -215,6 +221,40 @@ interface FootnotePopoverState {
   insertedDoc: Text | null;
 }
 const footnotePopover = shallowRef<FootnotePopoverState | null>(null);
+
+// First image paste of a project without an image folder. One prompt per
+// editor; pastes made while it is open wait for the same answer.
+interface ImageFolderPromptState extends MarkdownImageFolderRequest {
+  anchor: FloatingAnchorRect;
+}
+const imageFolderPrompt = shallowRef<ImageFolderPromptState | null>(null);
+let imageFolderAnswer: { promise: Promise<boolean>; resolve: (saved: boolean) => void } | null = null;
+
+function chooseImageFolder(request: MarkdownImageFolderRequest): Promise<boolean> {
+  if (imageFolderAnswer) return imageFolderAnswer.promise;
+  let resolve!: (saved: boolean) => void;
+  const promise = new Promise<boolean>((done) => { resolve = done; });
+  imageFolderAnswer = { promise, resolve };
+  const rect = request.anchor ?? editorView?.contentDOM.getBoundingClientRect() ?? null;
+  imageFolderPrompt.value = {
+    ...request,
+    anchor: rect ? { left: rect.left, top: rect.top, bottom: rect.bottom } : { left: 16, top: 16, bottom: 16 },
+  };
+  return promise;
+}
+
+/** Closes the prompt; pending pastes continue only when a folder was saved. */
+function cancelImageFolderPrompt(saved = false): void {
+  const answer = imageFolderAnswer;
+  imageFolderAnswer = null;
+  imageFolderPrompt.value = null;
+  answer?.resolve(saved);
+}
+
+function onImageFolderDone(saved: boolean): void {
+  cancelImageFolderPrompt(saved);
+  editorView?.focus();
+}
 
 function annotationExtensions(): Extension {
   if (currentLanguage() !== "markdown") return [];
@@ -280,7 +320,12 @@ let activeSessionCache = props.sessionCache ?? localSessionCache;
 let activeSessionPinned = props.sessionPinned;
 let applyingExternalModel = false;
 let composing = false;
-let pendingExternalModel: string | null = null;
+/**
+ * A model value that arrived during IME composition. `changes` is relative to
+ * the document at arrival; `local` collects the edits made since, so a flush
+ * merges both instead of replacing text committed by the composition.
+ */
+let pendingExternalModel: { changes: ChangeSet; local: ChangeSet } | null = null;
 let compositionFlushToken = 0;
 let currentScrollTop = 0;
 let currentScrollLeft = 0;
@@ -417,6 +462,7 @@ function currentLivePreviewOptions(): MarkdownLivePreviewOptions {
   const workspaceRef = props.workspaceRef;
   const options: MarkdownLivePreviewOptions = {
     onEditTarget: (target) => controlsRef.value?.open(target),
+    onImageOpen: openImageLightbox,
     onReferenceOpen: handleReferenceOpen,
     onReferencePointerDown: handleReferencePointerDown,
     onLinkOpen: openLink,
@@ -438,9 +484,15 @@ function currentLivePreviewOptions(): MarkdownLivePreviewOptions {
   };
 }
 
+/** Model text for `doc`, including a model value still queued behind IME composition. */
+function modelText(doc: Text): string {
+  const pending = pendingExternalModel;
+  return normalizeMarkdown((pending ? pending.changes.map(pending.local).apply(doc) : doc).toString());
+}
+
 function emitCurrentValue(): void {
   if (!editorView) return;
-  emit("update:modelValue", normalizeMarkdown(editorView.state.doc.toString()));
+  emit("update:modelValue", modelText(editorView.state.doc));
 }
 
 function emitShortcutSave(): void {
@@ -451,8 +503,20 @@ function emitShortcutSave(): void {
 function flushPendingExternalModel(): void {
   const pending = pendingExternalModel;
   pendingExternalModel = null;
-  if (pending === null) return;
-  syncExternalModel(pending);
+  const view = editorView;
+  if (pending === null || !view) return;
+  const merged = !pending.local.empty;
+  // Without local edits the document equals the model value afterwards. Merged
+  // text is new to the parent, which only saw the local edits, so publish it.
+  applyingExternalModel = !merged;
+  try {
+    view.dispatch({
+      changes: merged ? pending.changes.map(pending.local) : pending.changes,
+      annotations: Transaction.addToHistory.of(false),
+    });
+  } finally {
+    applyingExternalModel = false;
+  }
 }
 
 function resetCompositionState(flushPending: boolean): void {
@@ -486,6 +550,7 @@ function editorExtensions(): Extension[] {
       context: () => props.workspaceRef && physicalPath.value && currentLanguage() === "markdown"
         ? { workspaceRef: { ...props.workspaceRef }, contentPath: physicalPath.value, key: activeSessionKey } : null,
       onError: handleContextMenuError,
+      chooseFolder: chooseImageFolder,
     }),
     markdownEditorSearch(),
     markdownMentions({
@@ -515,6 +580,7 @@ function editorExtensions(): Extension[] {
       }
       controlsRef.value?.update(update);
       if (!update.docChanged) return;
+      if (pendingExternalModel) pendingExternalModel.local = pendingExternalModel.local.compose(update.changes);
       recovery.changed();
       if (applyingExternalModel) return;
       if (props.transactionModel) {
@@ -524,7 +590,8 @@ function editorExtensions(): Extension[] {
         });
         return;
       }
-      emit("update:modelValue", normalizeMarkdown(update.state.doc.toString()));
+      // A v-model parent stores what it receives, so keep its queued value.
+      emit("update:modelValue", modelText(update.state.doc));
     }),
   ];
 }
@@ -595,8 +662,15 @@ function syncExternalModel(value: string): void {
 
 function syncOrQueueExternalModel(value: string): void {
   const normalized = normalizeMarkdown(value);
-  if (composing && editorView) {
-    pendingExternalModel = normalized;
+  const view = editorView;
+  if (composing && view) {
+    // The newest model value supersedes a queued one. A value equal to the
+    // document, such as an autosave or v-model echo, leaves nothing to apply.
+    const doc = view.state.doc;
+    const change = createMinimalTextChange(doc.toString(), normalized);
+    pendingExternalModel = change
+      ? { changes: ChangeSet.of(change, doc.length), local: ChangeSet.empty(doc.length) }
+      : null;
     return;
   }
   compositionFlushToken += 1;
@@ -750,6 +824,7 @@ function stateWithSessionModel(
 function restoreSession(contentKey: string, nextModelValue: string, previousModelValue: string): void {
   contextMenuRef.value?.close(false);
   footnotePopover.value = null;
+  cancelImageFolderPrompt();
   const view = editorView;
   if (!view) {
     activeSessionKey = normalizeSessionKey(contentKey);
@@ -825,6 +900,7 @@ function mountEditor(): void {
 }
 
 function suspendEditor(): void {
+  cancelImageFolderPrompt();
   if (!editorView) return;
   footnotePopover.value = null;
   // A hidden tab keeps its last selection; deliver one that is still settling.
@@ -1081,7 +1157,7 @@ defineExpose({
       @shortcut-save="emitShortcutSave"
     />
     <div ref="mountRef" class="base-markdown-editor-host" @contextmenu="contextMenuRef?.open($event)" @keydown="contextMenuRef?.onKeydown($event)" />
-    <MarkdownEditorContextMenu v-if="controlsView" ref="contextMenuRef" :view="controlsView" :can-history="!!physicalPath && currentLanguage() === 'markdown'" :can-quote="canQuoteSelection" @history="recovery.openHistory" @quote-selection="emit('quoteSelection', $event)" @action-error="handleContextMenuError" :can-comment="!!comments && currentLanguage() === 'markdown' && !disabled" :can-footnote="currentLanguage() === 'markdown' && !disabled" @comment="startComment" @footnote="insertFootnoteAtCursor" />
+    <MarkdownEditorContextMenu v-if="controlsView" ref="contextMenuRef" :view="controlsView" :can-history="!!physicalPath && currentLanguage() === 'markdown'" :can-quote="canQuoteSelection" :can-quote-in-new-session="canQuoteSelectionInNewSession" @history="recovery.openHistory" @quote-selection="emit('quoteSelection', $event)" @quote-selection-in-new-session="emit('quoteSelectionInNewSession', $event)" @action-error="handleContextMenuError" :can-comment="!!comments && currentLanguage() === 'markdown' && !disabled" :can-footnote="currentLanguage() === 'markdown' && !disabled" @comment="startComment" @footnote="insertFootnoteAtCursor" />
     <MarkdownCommentPopover v-if="comments && controlsView && currentLanguage() === 'markdown'" :controller="comments" />
     <MarkdownFootnotePopover
       v-if="footnotePopover && controlsView"
@@ -1092,6 +1168,13 @@ defineExpose({
       :anchor="footnotePopover.anchor"
       :inserted-doc="footnotePopover.insertedDoc"
       @close="footnotePopover = null"
+    />
+    <MarkdownImageFolderPopover
+      v-if="imageFolderPrompt"
+      :workspace-ref="imageFolderPrompt.workspaceRef"
+      :content-path="imageFolderPrompt.contentPath"
+      :anchor="imageFolderPrompt.anchor"
+      @done="onImageFolderDone"
     />
     <MarkdownEditorControls v-if="controlsView && viewMode === 'rendered' && currentLanguage() === 'markdown' && !disabled" :key="contentKey" ref="controlsRef" :view="controlsView" :workspace-ref="workspaceRef" :content-path="physicalPath" />
   </div>
