@@ -13,7 +13,7 @@ afterEach(() => { app?.unmount(); document.body.innerHTML = ""; });
 async function mount(extension: string, kind: FileHistoryPreview["file"]["kind"] = "text", asset: FileHistoryPreview["asset"] = null) {
   const preview: FileHistoryPreview = { contentHash: "snapshot", csvView: null, asset, file: {
     path: `note.${extension}`, name: `note.${extension}`, extension, kind, text: extension === "csv" ? "a,b\n1,2\n" : "# Snapshot", size: 10,
-    mimeType: "text/plain", dataUrl: "data:application/octet-stream;base64,YQ==", truncated: false, editable: false,
+    mimeType: "text/plain", blobUrl: "http://locus-binary.localhost/blob/snapshot", truncated: false, editable: false,
     revision: { exists: true, size: 10, modifiedAtNanos: "1", key: "1" },
   } };
   const host = document.createElement("div"); document.body.appendChild(host);

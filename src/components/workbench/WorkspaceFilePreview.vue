@@ -2,7 +2,7 @@
 import { EditorView } from "@codemirror/view";
 import { Text } from "@codemirror/state";
 import { markdownEditorTextFromString } from "../ui/markdown-editor/markdownEditorDocumentChange";
-import { computed, inject, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, defineAsyncComponent, inject, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { AlertTriangle } from "lucide";
 import { t } from "../../i18n";
 import { useDocumentFileSession } from "../../composables/useDocumentFileSession";
@@ -28,6 +28,7 @@ import {
   projectExplorerPreviewFile,
   projectExplorerFileRevision,
   projectExplorerWriteFile,
+  releasePreviewBlob,
   workspaceFilePreview,
   workspaceFileRevision,
   workspaceFileWrite,
@@ -44,21 +45,29 @@ import AssetTextViewer from "../asset/AssetTextViewer.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseMarkdownEditor from "../ui/BaseMarkdownEditor.vue";
+import BaseSegmented from "../ui/BaseSegmented.vue";
 import MarkdownCommentRail from "../ui/markdown-editor/MarkdownCommentRail.vue";
 import { createMarkdownCommentController } from "../ui/markdown-editor/markdownCommentController";
 import WorkspaceCsvEditor from "../csv/WorkspaceCsvEditor.vue";
+import ModelViewer from "../model-preview/ModelViewer.vue";
+import { modelFormatFromPath } from "../model-preview/modelFormat";
 import type { MarkdownEditorDocumentChange } from "../ui/markdown-editor/markdownEditorDocumentChange";
 import type { MarkdownEditorSelection } from "../ui/markdown-editor/markdownEditorSelection";
 import type { MarkdownEditorViewMode } from "../ui/markdownEditorViewMode";
 import {
+  DOCUMENT_QUOTE_IN_NEW_SESSION_KEY,
   fileSelectionReference,
   normalizeSelectionFilePath,
   selectionLocationLabel,
   useDocumentSelectionReporter,
 } from "../../composables/documentSelection";
+import { useNotificationStore } from "../../stores/notification";
 import { validResourceName } from "../explorer/explorerResourceActions";
 import { WORKSPACE_FILE_PREVIEW_CACHE } from "./workspaceFilePreviewCache";
 import { isExternalWorkspaceFilePath } from "./workbenchExternalFile";
+
+// Loaded on the first `.tex` file only.
+const LatexPreviewPane = defineAsyncComponent(() => import("./LatexPreviewPane.vue"));
 
 const props = defineProps<{
   projectId?: string;
@@ -77,6 +86,8 @@ const previewCache = inject(WORKSPACE_FILE_PREVIEW_CACHE, null);
 let cachedPreview: ProjectExplorerFilePreview | undefined;
 let disposed = false;
 onBeforeUnmount(() => { disposed = true; });
+// One fresh blob lease per failure streak when an element finds its bytes gone.
+let blobRetried = false;
 
 const isCsv = computed(() => /\.csv$/i.test(props.path));
 const csvEditor = ref<InstanceType<typeof WorkspaceCsvEditor> | null>(null);
@@ -131,6 +142,10 @@ const fileSession = useDocumentFileSession<FileDocument, FileDocumentDraft>({
 const { loading, error, dirty, saving, relocating: renaming } = fileSession;
 const preview = computed(() => fileSession.document.value?.preview ?? null);
 const assetPayload = computed(() => fileSession.document.value?.assetPayload ?? null);
+/** Media and model bytes are parked in the backend binary cache; this preview owns the lease. */
+const previewBlobUrl = computed(() => preview.value?.blobUrl ?? "");
+watch(previewBlobUrl, (_next, previous) => { if (previous) void releasePreviewBlob(previous); });
+onBeforeUnmount(() => { if (previewBlobUrl.value) void releasePreviewBlob(previewBlobUrl.value); });
 const observedDiskRevision = ref<ProjectExplorerFileRevision | null>(null);
 const sourceEditor = ref<InstanceType<typeof BaseMarkdownEditor> | null>(null);
 /** Comments of the rendered document, shown in the page's right margin. */
@@ -172,6 +187,28 @@ const editorViewMode = computed<MarkdownEditorViewMode>(() => (
 const isMarkdownDocument = computed(() => (
   preview.value?.kind === "text" && preview.value.editable && editorViewMode.value === "rendered"
 ));
+/**
+ * `.tex` files open as the rendered preview, or as source when no TeX engine
+ * is installed; either view is one click away. The preview pane and its
+ * services load only for `.tex` files, so other files pay nothing for it.
+ */
+const isLatexDocument = computed(() => (
+  preview.value?.kind === "text" && preview.value.extension?.toLowerCase() === "tex"
+));
+const latexView = ref<"preview" | "source">("preview");
+/** Set once the user picks a view; until then a missing engine switches to source. */
+const latexViewPinned = ref(false);
+function selectLatexView(value: string) {
+  latexViewPinned.value = true;
+  latexView.value = value === "source" ? "source" : "preview";
+}
+function onLatexUnavailable() {
+  if (!latexViewPinned.value) latexView.value = "source";
+}
+const latexViewOptions = computed(() => [
+  { value: "preview", label: t("latexPreview.view.preview") },
+  { value: "source", label: t("latexPreview.view.source") },
+]);
 /** Durable reading position; checkout paths share it across a project's worktrees. */
 const readingTarget = computed<ReadingTarget | null>(() => {
   if (!isMarkdownDocument.value || loading.value) return null;
@@ -215,6 +252,30 @@ function onEditorSelectionChange(selection: MarkdownEditorSelection | null): voi
     location: selectionLocationLabel(path, content),
     content,
   }));
+}
+
+const quoteInNewSession = inject(DOCUMENT_QUOTE_IN_NEW_SESSION_KEY, null);
+const quotingSelection = ref(false);
+
+async function onQuoteSelectionInNewSession(selection: MarkdownEditorSelection): Promise<void> {
+  const current = preview.value;
+  if (!quoteInNewSession || quotingSelection.value || !current || !selection.ranges.length) return;
+  const path = normalizeSelectionFilePath(current.path);
+  quotingSelection.value = true;
+  try {
+    await quoteInNewSession(props.workspaceRef ? { ...props.workspaceRef } : null, {
+      path,
+      name: current.name,
+      source: "file",
+      content: fileSelectionReference(path, selection, {
+        draftLabel: dirty.value ? t("editor.quoteDraft") : undefined,
+      }),
+    });
+  } catch (cause) {
+    useNotificationStore().addNotice("error", `${t("editor.quoteFailed")}: ${normalizeAppError(cause).message}`);
+  } finally {
+    quotingSelection.value = false;
+  }
 }
 
 async function renameDocument(): Promise<void> {
@@ -348,6 +409,17 @@ async function loadPreview(options: { keepCurrent?: boolean; keepDraft?: boolean
     diskChanged.value = true;
   }
   return loaded;
+}
+
+function onBlobLoaded(): void {
+  blobRetried = false;
+}
+
+/** The leased bytes were evicted or expired: read the file again for a new blob. */
+async function onBlobFetchError(): Promise<void> {
+  if (blobRetried || disposed) return;
+  blobRetried = true;
+  await loadPreview({ keepCurrent: true });
 }
 
 async function probeFileRevision(): Promise<ProjectExplorerFileRevision> {
@@ -557,6 +629,7 @@ watch([scopeKey, () => props.path], ([scope, path]) => {
 }, { flush: "sync" });
 watch(resourceKey, async (key) => {
   if (renaming.value && localRename?.scope === scopeKey.value) return;
+  blobRetried = false;
   diskChanged.value = false;
   observedDiskRevision.value = null;
   titleError.value = "";
@@ -578,6 +651,8 @@ watch(() => props.active, (active) => {
 
 defineExpose({
   isRenaming: () => renaming.value,
+  /** Code, Markdown, CSV and other text; false for media, models and Unity previews. */
+  isTextContent: () => isCsv.value || preview.value?.kind === "text",
   discardChanges: () => csvEditor.value?.discardChanges(),
   saveFile,
   revealPosition,
@@ -631,9 +706,25 @@ defineExpose({
         </span>
       </div>
       <div v-if="error" class="workspace-file-preview-inline-error">{{ error }}</div>
+      <div v-if="isLatexDocument" class="workspace-latex-view-bar">
+        <BaseSegmented
+          :model-value="latexView"
+          size="sm"
+          :options="latexViewOptions"
+          @update:model-value="selectLatexView"
+        />
+      </div>
       <div class="workspace-file-preview-body">
+        <LatexPreviewPane
+          v-if="isLatexDocument && latexView === 'preview'"
+          :workspace-ref="workspaceRef ?? null"
+          :path="preview.path"
+          :active="active !== false"
+          :auto-fallback="!latexViewPinned"
+          @unavailable="onLatexUnavailable"
+        />
         <div
-          v-if="isMarkdownDocument"
+          v-else-if="isMarkdownDocument"
           ref="documentScrollerRef"
           class="document-scroller"
           @scroll.passive="scheduleDocumentOutlineActiveUpdate"
@@ -698,6 +789,8 @@ defineExpose({
                   auto-grow
                   :min-height="360"
                   transaction-model
+                  :can-quote-selection-in-new-session="!!quoteInNewSession && !quotingSelection"
+                  @quote-selection-in-new-session="onQuoteSelectionInNewSession"
                   @selection-change="onEditorSelectionChange"
                   @document-change="onEditorDocumentChange"
                   @shortcut-save="saveFile"
@@ -731,21 +824,29 @@ defineExpose({
           :total-lines="preview.totalLines || 1"
           :language="language"
         />
-        <div v-else-if="preview.kind === 'image'" class="workspace-media-preview image">
-          <img :src="preview.dataUrl" :alt="preview.name" />
+        <div v-else-if="preview.kind === 'image' && preview.blobUrl" class="workspace-media-preview image">
+          <img :src="preview.blobUrl" :alt="preview.name" @load="onBlobLoaded" @error="onBlobFetchError" />
         </div>
         <iframe
-          v-else-if="preview.kind === 'pdf'"
+          v-else-if="preview.kind === 'pdf' && preview.blobUrl"
           class="workspace-pdf-preview"
-          :src="preview.dataUrl"
+          :src="preview.blobUrl"
           :title="preview.name"
         />
-        <div v-else-if="preview.kind === 'audio'" class="workspace-media-preview">
-          <audio :src="preview.dataUrl" controls />
+        <div v-else-if="preview.kind === 'audio' && preview.blobUrl" class="workspace-media-preview">
+          <audio :src="preview.blobUrl" controls @loadeddata="onBlobLoaded" @error="onBlobFetchError" />
         </div>
-        <div v-else-if="preview.kind === 'video'" class="workspace-media-preview video">
-          <video :src="preview.dataUrl" controls />
+        <div v-else-if="preview.kind === 'video' && preview.blobUrl" class="workspace-media-preview video">
+          <video :src="preview.blobUrl" controls @loadeddata="onBlobLoaded" @error="onBlobFetchError" />
         </div>
+        <ModelViewer
+          v-else-if="preview.kind === 'model' && preview.blobUrl"
+          :url="preview.blobUrl"
+          :format="modelFormatFromPath(preview.name)"
+          :active="active !== false"
+          @loaded="onBlobLoaded"
+          @fetch-error="onBlobFetchError"
+        />
         <div v-else class="workspace-binary-preview">
           <div>{{ preview.name }}</div>
           <dl>
@@ -842,6 +943,13 @@ defineExpose({
 
 .workspace-media-preview audio {
   width: min(520px, 100%);
+}
+
+.workspace-latex-view-bar {
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-color);
 }
 
 .workspace-pdf-preview {

@@ -222,7 +222,7 @@ describe("file preview cache bounds", () => {
     expect(cache.get("0")).toBeDefined();
     expect(cache.get("1")).toBeUndefined();
     cache.set("large", preview("large.md", "x".repeat(512 * 1024 + 1)));
-    cache.set("image", { ...preview("image.png"), kind: "image", dataUrl: "data:image/png;base64,123" });
+    cache.set("image", { ...preview("image.png"), kind: "image", blobUrl: "http://locus-binary.localhost/blob/123" });
     expect(cache.get("large")).toBeUndefined();
     expect(cache.get("image")).toBeUndefined();
   });

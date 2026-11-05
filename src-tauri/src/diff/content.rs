@@ -159,7 +159,7 @@ fn is_previewable_binary_ext(path: &str) -> bool {
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     matches!(
         ext.as_str(),
-        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tga" | "psd" | "fbx"
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tga" | "psd" | "fbx" | "glb"
     )
 }
 
@@ -177,12 +177,15 @@ pub(crate) fn detect_binary_kind(path: &str, bytes: &[u8]) -> Option<BinaryPrevi
     if bytes.len() >= 11 && &bytes[..11] == b"Kaydara FBX" {
         return Some(BinaryPreviewKind::Model); // FBX ASCII/Binary
     }
+    if bytes.len() >= 4 && &bytes[..4] == b"glTF" {
+        return Some(BinaryPreviewKind::Model); // GLB
+    }
     // Extension fallback
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
         "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "tga" => Some(BinaryPreviewKind::Image),
         "psd" => Some(BinaryPreviewKind::Psd),
-        "fbx" => Some(BinaryPreviewKind::Model),
+        "fbx" | "glb" => Some(BinaryPreviewKind::Model),
         _ => None,
     }
 }
@@ -205,6 +208,7 @@ pub(crate) fn mime_for_ext(path: &str) -> String {
         "webp" => "image/webp",
         "tga" => "image/x-tga",
         "psd" => "application/x-photoshop",
+        "glb" => "model/gltf-binary",
         "fbx" => "application/octet-stream",
         _ => "application/octet-stream",
     }
@@ -220,7 +224,7 @@ fn is_known_binary_ext(path: &str) -> bool {
     matches!(
         ext.as_str(),
         // 3D models
-        "fbx" | "obj" | "blend" | "dae" | "3ds" | "max" | "ma" | "mb"
+        "fbx" | "glb" | "obj" | "blend" | "dae" | "3ds" | "max" | "ma" | "mb"
         // Textures / images
         | "png" | "jpg" | "jpeg" | "psd" | "tga" | "tif" | "tiff"
         | "exr" | "hdr" | "bmp" | "gif" | "ico" | "webp"
@@ -918,5 +922,37 @@ pub(crate) async fn fetch_content(
                 new_content_state: new_lfs.state,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod binary_kind_tests {
+    use super::*;
+
+    #[test]
+    fn glb_is_detected_as_model_by_magic_and_extension() {
+        assert!(matches!(
+            detect_binary_kind("Assets/Any.bin", b"glTF\x02\x00\x00\x00"),
+            Some(BinaryPreviewKind::Model)
+        ));
+        assert!(matches!(
+            detect_binary_kind("Assets/House.GLB", &[]),
+            Some(BinaryPreviewKind::Model)
+        ));
+        assert!(is_previewable_binary_ext("Assets/House.glb"));
+        assert!(is_known_binary_ext("Assets/House.glb"));
+        assert_eq!(mime_for_ext("Assets/House.glb"), "model/gltf-binary");
+    }
+
+    #[test]
+    fn fbx_is_still_detected_as_model() {
+        assert!(matches!(
+            detect_binary_kind("Assets/Any.bin", b"Kaydara FBX Binary  \0"),
+            Some(BinaryPreviewKind::Model)
+        ));
+        assert!(matches!(
+            detect_binary_kind("Assets/Ascii.fbx", b"; FBX 7.4.0 project"),
+            Some(BinaryPreviewKind::Model)
+        ));
     }
 }

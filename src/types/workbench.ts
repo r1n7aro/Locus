@@ -111,6 +111,7 @@ export type ProjectExplorerFilePreviewKind =
   | "pdf"
   | "audio"
   | "video"
+  | "model"
   | "binary"
   | "unity";
 
@@ -130,7 +131,8 @@ export interface ProjectExplorerFilePreview {
   mimeType: string;
   text?: string;
   contentHash?: string;
-  dataUrl?: string;
+  /** Binary cache URL the viewer fetches the file's bytes from (media and models). */
+  blobUrl?: string;
   totalLines?: number;
   truncated: boolean;
   editable: boolean;

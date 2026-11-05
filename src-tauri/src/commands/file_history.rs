@@ -61,9 +61,9 @@ fn resolve_target(
             scope: Some(scope),
         })
     } else {
-        let (project_id, root) = resolve_project(registry, project_id, "fileHistory")?;
+        let (project_id, layout) = resolve_layout(registry, project_id, "fileHistory")?;
         let snapshot =
-            crate::workspace_tree::snapshot(&root, project_id.as_str()).map_err(history_error)?;
+            crate::workspace_tree::snapshot(&layout, project_id.as_str()).map_err(history_error)?;
         let path = ensure_preview_path_authorized(&snapshot, Path::new(path))?;
         Ok(HistoryTarget {
             path,
@@ -354,12 +354,14 @@ pub async fn file_history_preview(
             .ok_or_else(|| history_error("Invalid filename"))?,
     );
     std::fs::write(&snapshot, &bytes).map_err(history_error)?;
-    let mut file = build_file_preview(registry.inner(), &target.project_id, &snapshot)?;
     let asset = super::super::asset::preview_file_history_snapshot(
         &snapshot,
         target.scope.as_ref(),
         binary_cache.inner(),
     );
+    // A snapshot the asset viewer renders needs no second copy of its bytes.
+    let viewer_cache = asset.is_none().then(|| binary_cache.inner().as_ref());
+    let mut file = build_file_preview(registry.inner(), &target.project_id, &snapshot, viewer_cache)?;
     file.path = target.path.to_string_lossy().into_owned();
     file.editable = false;
     Ok(FileHistoryPreview {

@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref, watch } from "vue";
+import { computed, defineAsyncComponent, onBeforeUnmount, ref, watch } from "vue";
 import { t } from "../../i18n";
 import type { FileHistoryPreview } from "../../services/fileHistory";
 import type { WorkspaceRef } from "../../services/project";
 import { previewWorkspaceAssetTarget } from "../../services/asset";
+import { releasePreviewBlob } from "../../services/workspaceExplorer";
 import type { SemanticTargetInspector } from "../../types";
 import { parseCsvDocument } from "../../document/csv/csvDocument";
 import { defaultCsvView, parseCsvView, reconcileCsvView } from "../../document/csv/csvView";
@@ -25,6 +26,10 @@ const csv = computed(() => {
     return { document, view: reconcileCsvView(view, document), error: "" };
   } catch (error) { return { document: null, view: null, error: t(String(error instanceof Error ? error.message : error)) }; }
 });
+// The snapshot's media bytes sit in the backend binary cache; free them with the view.
+const blobUrl = computed(() => file.value.blobUrl ?? "");
+watch(blobUrl, (_next, previous) => { if (previous) void releasePreviewBlob(previous); });
+onBeforeUnmount(() => { if (blobUrl.value) void releasePreviewBlob(blobUrl.value); });
 const targetCache = ref(new Map<string, SemanticTargetInspector>());
 const activeTarget = ref<string | null>(null);
 const targetLoading = ref(false);
@@ -72,10 +77,10 @@ async function loadTarget(previewKey: string, targetId: string): Promise<Semanti
     </div>
     <AssetTextViewer v-else-if="file.kind === 'text'" :snippet="file.text ?? ''" :truncated="file.truncated"
       :total-lines="file.totalLines ?? 0" :language="file.extension" />
-    <img v-else-if="file.kind === 'image' && file.dataUrl" class="history-image" :src="file.dataUrl" :alt="file.name" />
-    <iframe v-else-if="file.kind === 'pdf' && file.dataUrl" class="history-media" :src="file.dataUrl" :title="file.name" />
-    <audio v-else-if="file.kind === 'audio' && file.dataUrl" controls :src="file.dataUrl" />
-    <video v-else-if="file.kind === 'video' && file.dataUrl" class="history-media" controls :src="file.dataUrl" />
+    <img v-else-if="file.kind === 'image' && file.blobUrl" class="history-image" :src="file.blobUrl" :alt="file.name" />
+    <iframe v-else-if="file.kind === 'pdf' && file.blobUrl" class="history-media" :src="file.blobUrl" :title="file.name" />
+    <audio v-else-if="file.kind === 'audio' && file.blobUrl" controls :src="file.blobUrl" />
+    <video v-else-if="file.kind === 'video' && file.blobUrl" class="history-media" controls :src="file.blobUrl" />
     <p v-else class="history-preview-note">{{ t('fileHistory.unsupported') }}</p>
   </div>
 </template>

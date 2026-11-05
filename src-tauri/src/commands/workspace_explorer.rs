@@ -2,11 +2,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use base64::Engine;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
 use super::text_preview::decode_text_preview;
+use crate::binary_cache::BinaryCache;
 use crate::error::AppError;
 use crate::session::models::{
     ProjectExplorerMutationResult, ProjectExplorerOperation, ProjectExplorerPresetSummary,
@@ -37,6 +37,10 @@ pub use workspace_file_move::*;
 mod workspace_file_create;
 pub use workspace_file_create::*;
 
+#[path = "workspace_file_import.rs"]
+mod workspace_file_import;
+pub use workspace_file_import::*;
+
 #[path = "file_history.rs"]
 mod file_history;
 pub use file_history::*;
@@ -49,6 +53,9 @@ fn text_preview_limit(path: &Path) -> u64 {
     }
 }
 const MAX_MEDIA_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+/// Models are parsed in the webview; keep the limit aligned with the Unity
+/// asset preview (`diff::content::within_binary_threshold`).
+const MAX_MODEL_PREVIEW_BYTES: u64 = 25 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,8 +108,10 @@ pub struct ProjectExplorerFilePreview {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// Binary cache URL of the image, PDF, audio, video or model the viewer
+    /// fetches on demand.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_url: Option<String>,
+    pub blob_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_lines: Option<usize>,
     pub truncated: bool,
@@ -164,11 +173,13 @@ fn file_revision(path: &Path) -> Result<ProjectExplorerFileRevision, AppError> {
     Ok(file_revision_from_metadata(&metadata))
 }
 
-fn resolve_project(
+/// Existing checkout roots of a project, main checkouts (with a `.git`
+/// directory) first.
+fn project_checkouts(
     registry: &ProjectRegistry,
     project_id: String,
     operation: &'static str,
-) -> Result<(ProjectId, PathBuf), AppError> {
+) -> Result<(ProjectId, Vec<PathBuf>), AppError> {
     let project_id = ProjectId::new(project_id).map_err(|error| {
         AppError::new(
             "workspace.project_identity_invalid",
@@ -199,33 +210,76 @@ fn resolve_project(
         .map(|checkout| checkout.root)
         .filter(|root| root.is_dir())
         .collect::<Vec<_>>();
-    roots.sort_by(|left, right| {
-        left.to_string_lossy()
-            .to_ascii_lowercase()
-            .cmp(&right.to_string_lossy().to_ascii_lowercase())
+    roots.sort_by_cached_key(|root| {
+        (
+            !root.join(".git").is_dir(),
+            root.to_string_lossy().to_ascii_lowercase(),
+        )
     });
-    let has_manifest = |root: &Path| {
-        root.join("Locus")
-            .join("workspace-trees")
-            .join("index.json")
-            .is_file()
-    };
-    let root = roots
-        .iter()
-        .find(|root| has_manifest(root) && root.join(".git").is_dir())
-        .or_else(|| roots.iter().find(|root| has_manifest(root)))
-        .or_else(|| roots.iter().find(|root| root.join(".git").is_dir()))
-        .or_else(|| roots.first())
-        .cloned()
-        .ok_or_else(|| {
-            AppError::new(
-                "workspace.project_root_unavailable",
-                "The project does not have an available working directory.",
-            )
-            .detail(project_id.to_string())
-            .operation(operation)
-        })?;
+    Ok((project_id, roots))
+}
+
+fn main_checkout(
+    project_id: &ProjectId,
+    roots: &[PathBuf],
+    operation: &'static str,
+) -> Result<PathBuf, AppError> {
+    roots.first().cloned().ok_or_else(|| {
+        AppError::new(
+            "workspace.project_root_unavailable",
+            "The project does not have an available working directory.",
+        )
+        .detail(project_id.to_string())
+        .operation(operation)
+    })
+}
+
+fn resolve_project(
+    registry: &ProjectRegistry,
+    project_id: String,
+    operation: &'static str,
+) -> Result<(ProjectId, PathBuf), AppError> {
+    let (project_id, roots) = project_checkouts(registry, project_id, operation)?;
+    let root = main_checkout(&project_id, &roots, operation)?;
     Ok((project_id, root))
+}
+
+/// The project's workspace tree directory in the user data directory, shared
+/// by all of its checkouts. A tree an older version kept in a checkout
+/// (`Locus/workspace-trees`) is copied over on first use.
+fn layout_for_checkouts(
+    project_id: &ProjectId,
+    checkouts: &[PathBuf],
+    operation: &'static str,
+) -> Result<PathBuf, AppError> {
+    let data_dir =
+        crate::runtime_paths::active_data_dir().map_err(|error| explorer_error(error, operation))?;
+    let layout = crate::workspace_tree::layout_dir(data_dir, project_id.as_str());
+    crate::workspace_tree::adopt_legacy_layout(&layout, checkouts)
+        .map_err(|error| explorer_error(error, operation))?;
+    Ok(layout)
+}
+
+fn resolve_layout(
+    registry: &ProjectRegistry,
+    project_id: String,
+    operation: &'static str,
+) -> Result<(ProjectId, PathBuf), AppError> {
+    let (project_id, roots) = project_checkouts(registry, project_id, operation)?;
+    let layout = layout_for_checkouts(&project_id, &roots, operation)?;
+    Ok((project_id, layout))
+}
+
+/// The main checkout root together with the user-level layout directory.
+fn resolve_project_layout(
+    registry: &ProjectRegistry,
+    project_id: String,
+    operation: &'static str,
+) -> Result<(ProjectId, PathBuf, PathBuf), AppError> {
+    let (project_id, roots) = project_checkouts(registry, project_id, operation)?;
+    let root = main_checkout(&project_id, &roots, operation)?;
+    let layout = layout_for_checkouts(&project_id, &roots, operation)?;
+    Ok((project_id, root, layout))
 }
 
 fn explorer_error(error: String, operation: &'static str) -> AppError {
@@ -272,17 +326,40 @@ fn emit_changed(
         })
 }
 
+/// Removes deleted sessions from the project's shared workspace tree.
+pub(crate) fn remove_deleted_session_placements(
+    app_handle: &AppHandle,
+    registry: &ProjectRegistry,
+    project_id: String,
+    session_ids: &[String],
+) -> Result<(), AppError> {
+    const OPERATION: &str = "removeDeletedSessionPlacements";
+    let (project_id, layout) = resolve_layout(registry, project_id, OPERATION)?;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let snapshot = crate::workspace_tree::remove_session_placements(
+        &layout,
+        project_id.as_str(),
+        &operation_id,
+        session_ids,
+    )
+    .map_err(|error| explorer_error(error, OPERATION))?;
+    if let Some(snapshot) = snapshot {
+        emit_changed(app_handle, &snapshot, operation_id)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn project_explorer_snapshot(
     project_id: String,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerSnapshot, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerSnapshot",
     )?;
-    crate::workspace_tree::snapshot(&root, project_id.as_str())
+    crate::workspace_tree::snapshot(&layout, project_id.as_str())
         .map_err(|error| explorer_error(error, "projectExplorerSnapshot"))
 }
 
@@ -295,13 +372,13 @@ pub async fn project_explorer_apply_operations(
     app_handle: AppHandle,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerMutationResult, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerApplyOperations",
     )?;
     let result = crate::workspace_tree::apply_operations(
-        &root,
+        &layout,
         project_id.as_str(),
         expected_revision,
         &operation_id,
@@ -317,12 +394,12 @@ pub async fn project_explorer_list_presets(
     project_id: String,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<Vec<ProjectExplorerPresetSummary>, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerListPresets",
     )?;
-    crate::workspace_tree::list_presets(&root, project_id.as_str())
+    crate::workspace_tree::list_presets(&layout, project_id.as_str())
         .map_err(|error| explorer_error(error, "projectExplorerListPresets"))
 }
 
@@ -334,13 +411,13 @@ pub async fn project_explorer_create_preset(
     app_handle: AppHandle,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerSnapshot, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerCreatePreset",
     )?;
     let snapshot = crate::workspace_tree::create_preset(
-        &root,
+        &layout,
         project_id.as_str(),
         &name,
         source_preset_id.as_deref(),
@@ -361,12 +438,12 @@ pub async fn project_explorer_switch_preset(
     app_handle: AppHandle,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerSnapshot, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerSwitchPreset",
     )?;
-    let snapshot = crate::workspace_tree::switch_preset(&root, project_id.as_str(), &preset_id)
+    let snapshot = crate::workspace_tree::switch_preset(&layout, project_id.as_str(), &preset_id)
         .map_err(|error| explorer_error(error, "projectExplorerSwitchPreset"))?;
     emit_changed(
         &app_handle,
@@ -384,13 +461,13 @@ pub async fn project_explorer_rename_preset(
     app_handle: AppHandle,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerSnapshot, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerRenamePreset",
     )?;
     let snapshot =
-        crate::workspace_tree::rename_preset(&root, project_id.as_str(), &preset_id, &name)
+        crate::workspace_tree::rename_preset(&layout, project_id.as_str(), &preset_id, &name)
             .map_err(|error| explorer_error(error, "projectExplorerRenamePreset"))?;
     emit_changed(&app_handle, &snapshot, format!("preset-rename:{preset_id}"))?;
     Ok(snapshot)
@@ -403,12 +480,12 @@ pub async fn project_explorer_delete_preset(
     app_handle: AppHandle,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerSnapshot, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerDeletePreset",
     )?;
-    let snapshot = crate::workspace_tree::delete_preset(&root, project_id.as_str(), &preset_id)
+    let snapshot = crate::workspace_tree::delete_preset(&layout, project_id.as_str(), &preset_id)
         .map_err(|error| explorer_error(error, "projectExplorerDeletePreset"))?;
     emit_changed(&app_handle, &snapshot, format!("preset-delete:{preset_id}"))?;
     Ok(snapshot)
@@ -459,12 +536,12 @@ pub async fn project_explorer_list_mount(
     node_id: String,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerMountListing, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerListMount",
     )?;
-    let snapshot = crate::workspace_tree::snapshot(&root, project_id.as_str())
+    let snapshot = crate::workspace_tree::snapshot(&layout, project_id.as_str())
         .map_err(|error| explorer_error(error, "projectExplorerListMount"))?;
     let mounted_root = canonical_mounted_root(&snapshot, &node_id)?;
     let mut entries = Vec::new();
@@ -616,6 +693,7 @@ fn mime_for_extension(extension: &str) -> &'static str {
         "mp4" => "video/mp4",
         "webm" => "video/webm",
         "mov" => "video/quicktime",
+        "glb" => "model/gltf-binary",
         "json" => "application/json",
         "html" | "htm" => "text/html",
         "css" => "text/css",
@@ -624,6 +702,11 @@ fn mime_for_extension(extension: &str) -> &'static str {
         "xml" => "application/xml",
         _ => "application/octet-stream",
     }
+}
+
+/// 3D model formats the webview viewer can render.
+fn is_model_preview_extension(extension: &str) -> bool {
+    matches!(extension, "glb" | "fbx")
 }
 
 pub(super) fn is_text_extension(extension: &str) -> bool {
@@ -717,10 +800,13 @@ fn unity_workspace_binding(
     None
 }
 
+/// `blobs` receives the bytes of previewable media and models. Callers without
+/// a viewer (saves) pass `None` and get the information card instead.
 fn build_file_preview(
     registry: &ProjectRegistry,
     project_id: &ProjectId,
     canonical: &Path,
+    blobs: Option<&BinaryCache>,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
     let metadata = std::fs::metadata(canonical).map_err(|error| {
         AppError::new(
@@ -753,7 +839,7 @@ fn build_file_preview(
                 mime_type: "application/x-unity-asset".to_string(),
                 text: None,
                 content_hash: None,
-                data_url: None,
+                blob_url: None,
                 total_lines: None,
                 truncated: false,
                 editable: false,
@@ -767,19 +853,23 @@ fn build_file_preview(
     }
 
     let mime_type = mime_for_extension(&extension).to_string();
-    let media_kind = if mime_type.starts_with("image/") {
-        Some("image")
+    // The viewer element fetches the bytes from the binary cache by URL; they
+    // never travel through the IPC reply.
+    let blob_kind = if is_model_preview_extension(&extension) {
+        Some(("model", MAX_MODEL_PREVIEW_BYTES))
+    } else if mime_type.starts_with("image/") {
+        Some(("image", MAX_MEDIA_PREVIEW_BYTES))
     } else if mime_type == "application/pdf" {
-        Some("pdf")
+        Some(("pdf", MAX_MEDIA_PREVIEW_BYTES))
     } else if mime_type.starts_with("audio/") {
-        Some("audio")
+        Some(("audio", MAX_MEDIA_PREVIEW_BYTES))
     } else if mime_type.starts_with("video/") {
-        Some("video")
+        Some(("video", MAX_MEDIA_PREVIEW_BYTES))
     } else {
         None
     };
-    if let Some(kind) = media_kind {
-        if size <= MAX_MEDIA_PREVIEW_BYTES {
+    if let (Some(cache), Some((kind, limit))) = (blobs, blob_kind) {
+        if size <= limit {
             let bytes = std::fs::read(canonical).map_err(|error| {
                 AppError::new(
                     "workspace.explorer_file_read_failed",
@@ -787,17 +877,17 @@ fn build_file_preview(
                 )
                 .detail(error.to_string())
             })?;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            let blob_id = cache.insert(bytes, mime_type.clone());
             return Ok(ProjectExplorerFilePreview {
                 path: canonical.to_string_lossy().into_owned(),
                 name,
                 extension,
                 size,
                 kind: kind.to_string(),
-                mime_type: mime_type.clone(),
+                mime_type,
                 text: None,
                 content_hash: None,
-                data_url: Some(format!("data:{mime_type};base64,{encoded}")),
+                blob_url: Some(format!("{}{blob_id}", locus_remote_protocol::BLOB_URL_PREFIX)),
                 total_lines: None,
                 truncated: false,
                 editable: false,
@@ -805,7 +895,7 @@ fn build_file_preview(
                 workspace_generation: None,
                 materialization_epoch: None,
                 workspace_relative_path: None,
-                revision: revision.clone(),
+                revision,
             });
         }
     }
@@ -854,7 +944,7 @@ fn build_file_preview(
             },
             text: Some(text),
             content_hash,
-            data_url: None,
+            blob_url: None,
             total_lines: Some(total_lines),
             truncated,
             editable: !truncated && decoded.utf8,
@@ -874,7 +964,7 @@ fn build_file_preview(
         mime_type,
         text: None,
         content_hash: None,
-        data_url: None,
+        blob_url: None,
         total_lines: None,
         truncated: size > MAX_MEDIA_PREVIEW_BYTES,
         editable: false,
@@ -891,16 +981,17 @@ pub async fn project_explorer_preview_file(
     project_id: String,
     path: String,
     registry: State<'_, Arc<ProjectRegistry>>,
+    binary_cache: State<'_, Arc<BinaryCache>>,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerPreviewFile",
     )?;
-    let snapshot = crate::workspace_tree::snapshot(&root, project_id.as_str())
+    let snapshot = crate::workspace_tree::snapshot(&layout, project_id.as_str())
         .map_err(|error| explorer_error(error, "projectExplorerPreviewFile"))?;
     let canonical = ensure_preview_path_authorized(&snapshot, Path::new(&path))?;
-    build_file_preview(registry.inner().as_ref(), &project_id, &canonical)
+    build_file_preview(registry.inner().as_ref(), &project_id, &canonical, Some(binary_cache.inner()))
 }
 
 #[tauri::command]
@@ -909,12 +1000,12 @@ pub async fn project_explorer_file_revision(
     path: String,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerFileRevision, AppError> {
-    let (project_id, root) = resolve_project(
+    let (project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerFileRevision",
     )?;
-    let snapshot = crate::workspace_tree::snapshot(&root, project_id.as_str())
+    let snapshot = crate::workspace_tree::snapshot(&layout, project_id.as_str())
         .map_err(|error| explorer_error(error, "projectExplorerFileRevision"))?;
     let candidate = ensure_revision_path_authorized(&snapshot, Path::new(&path))?;
     file_revision(&candidate)
@@ -1071,10 +1162,23 @@ pub async fn workspace_file_preview(
     file_path: String,
     workspace_ref: WorkspaceRef,
     registry: State<'_, Arc<ProjectRegistry>>,
+    binary_cache: State<'_, Arc<BinaryCache>>,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
     let (_scope, project_id, canonical) =
         resolve_openable_workspace_file(&workspace_ref, &file_path, registry.inner().as_ref())?;
-    build_file_preview(registry.inner().as_ref(), &project_id, &canonical)
+    build_file_preview(registry.inner().as_ref(), &project_id, &canonical, Some(binary_cache.inner()))
+}
+
+/// Releases the model bytes a preview put in the binary cache once its viewer
+/// no longer needs them. Unknown or foreign URLs are ignored.
+#[tauri::command]
+pub async fn release_preview_blob(
+    blob_url: String,
+    binary_cache: State<'_, Arc<BinaryCache>>,
+) -> Result<bool, AppError> {
+    Ok(blob_url
+        .strip_prefix(locus_remote_protocol::BLOB_URL_PREFIX)
+        .is_some_and(|id| binary_cache.release(id)))
 }
 
 #[tauri::command]
@@ -1195,7 +1299,7 @@ fn write_text_file(
         .operation(operation)
     })?;
 
-    build_file_preview(registry, project_id, canonical)
+    build_file_preview(registry, project_id, canonical, None)
 }
 
 #[tauri::command]
@@ -1206,12 +1310,12 @@ pub async fn project_explorer_write_file(
     expected_content_hash: String,
     registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<ProjectExplorerFilePreview, AppError> {
-    let (resolved_project_id, root) = resolve_project(
+    let (resolved_project_id, layout) = resolve_layout(
         registry.inner().as_ref(),
         project_id,
         "projectExplorerWriteFile",
     )?;
-    let snapshot = crate::workspace_tree::snapshot(&root, resolved_project_id.as_str())
+    let snapshot = crate::workspace_tree::snapshot(&layout, resolved_project_id.as_str())
         .map_err(|error| explorer_error(error, "projectExplorerWriteFile"))?;
     let canonical = ensure_preview_path_authorized(&snapshot, Path::new(&path))?;
     write_text_file(

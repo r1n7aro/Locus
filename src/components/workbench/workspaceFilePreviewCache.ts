@@ -11,7 +11,8 @@ export class WorkspaceFilePreviewCache {
   }
 
   set(key: string, preview: ProjectExplorerFilePreview): void {
-    // Bound retained text as well as entry count; never retain media data URLs.
+    // Bound retained text as well as entry count. Media and model previews are
+    // never retained: their blob lease belongs to the live preview that releases it.
     if (preview.kind !== "text" || (preview.text?.length ?? 0) > 512 * 1024) {
       this.entries.delete(key);
       return;

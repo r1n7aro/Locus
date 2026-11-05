@@ -14,8 +14,8 @@ defineProps<{
 const RasterPreview = defineAsyncComponent(
   () => import("./RasterBinaryPreview.vue"),
 );
-const FbxPreview = defineAsyncComponent(
-  () => import("./FbxBinaryPreview.vue"),
+const ModelPreview = defineAsyncComponent(
+  () => import("./ModelBinaryPreview.vue"),
 );
 </script>
 
@@ -40,7 +40,7 @@ const FbxPreview = defineAsyncComponent(
     :asset-meta="assetMeta"
     :unity-texture-meta="unityTextureMeta"
   />
-  <FbxPreview
+  <ModelPreview
     v-else-if="preview.kind === 'model'"
     :preview="preview"
     :diff-key="diffKey"
