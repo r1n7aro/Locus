@@ -98,6 +98,28 @@ describe("markdown path status cache", () => {
     }
   });
 
+  it("waits for a stat already in flight instead of sending its paths again", async () => {
+    let finishStat!: () => void;
+    projectMocks.statWorkspaceEntries.mockImplementationOnce((paths: string[]) => new Promise((resolve) => {
+      finishStat = () => resolve(paths.map((path) => ({ path, exists: true, entryKind: "file" })));
+    }));
+
+    const prefetch = prefetchMarkdownPathStatuses("F:/repo", ["a.ts"], workspaceRef);
+    await Promise.resolve();
+    expect(projectMocks.statWorkspaceEntries).toHaveBeenCalledTimes(1);
+
+    const render = loadCachedMarkdownPathStatuses("F:/repo", ["a.ts", "b.ts"], workspaceRef);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(projectMocks.statWorkspaceEntries).toHaveBeenCalledTimes(2);
+    expect(projectMocks.statWorkspaceEntries).toHaveBeenLastCalledWith(["b.ts"], workspaceRef);
+
+    finishStat();
+    await prefetch;
+    const statuses = await render;
+    expect([...statuses.keys()]).toEqual(["a.ts", "b.ts"]);
+  });
+
   it("separates statuses by workspace scope", async () => {
     await loadCachedMarkdownPathStatuses("F:/repo", ["a.ts"], workspaceRef);
     const other = { checkoutId: "checkout-b", expectedGeneration: 1 };

@@ -992,6 +992,12 @@ const markdownComplexWidgetTheme = EditorView.theme({
   ".cm-live-table-cell:last-child": {
     borderRight: "none",
   },
+  // drawSelection paints behind the opaque table rows and spans whole content
+  // lines, which do not follow grid cells. Native selection follows the cell
+  // text, so it supplies the visible highlight inside tables instead.
+  ".cm-content .cm-live-table-line .cm-live-table-cell::selection, .cm-content .cm-live-table-line .cm-live-table-cell ::selection": {
+    backgroundColor: "color-mix(in srgb, var(--accent-color) 18%, transparent) !important",
+  },
   ".cm-live-table-row > :not(.cm-live-table-cell)": {
     display: "none",
   },
@@ -1002,6 +1008,7 @@ const markdownComplexWidgetTheme = EditorView.theme({
     textAlign: "right",
   },
   ".cm-live-image-frame": {
+    position: "relative",
     display: "inline-flex",
     boxSizing: "border-box",
     maxWidth: "100%",
@@ -1013,7 +1020,42 @@ const markdownComplexWidgetTheme = EditorView.theme({
     borderRadius: "8px",
     background: "color-mix(in srgb, var(--sidebar-bg) 38%, transparent)",
     overflow: "hidden",
-    cursor: "text",
+    cursor: "pointer",
+  },
+  ".cm-live-image-frame[data-state='ready']": {
+    cursor: "zoom-in",
+  },
+  ".cm-content[contenteditable='false'] .cm-live-image-frame:not([data-state='ready'])": {
+    cursor: "default",
+  },
+  ".cm-live-image-edit": {
+    position: "absolute",
+    top: "6px",
+    right: "6px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "26px",
+    height: "26px",
+    padding: "0",
+    border: "1px solid color-mix(in srgb, var(--border-color) 82%, transparent)",
+    borderRadius: "6px",
+    background: "color-mix(in srgb, var(--panel-bg, var(--bg-color)) 90%, transparent)",
+    boxShadow: "0 2px 8px rgba(0, 0, 0, 0.25)",
+    color: "var(--text-color)",
+    cursor: "pointer",
+    opacity: "0",
+    transition: "opacity 0.12s ease",
+  },
+  ".cm-live-image-frame:hover .cm-live-image-edit, .cm-live-image-frame:focus-visible .cm-live-image-edit": {
+    opacity: "1",
+  },
+  ".cm-live-image-edit:hover": {
+    borderColor: "var(--accent-color)",
+    background: "var(--panel-bg, var(--bg-color))",
+  },
+  ".cm-live-image-frame:not([data-state='ready']) .cm-live-image-edit, .cm-content[contenteditable='false'] .cm-live-image-edit": {
+    display: "none",
   },
   ".cm-live-image": {
     display: "none",

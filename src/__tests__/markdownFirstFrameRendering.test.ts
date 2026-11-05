@@ -2,8 +2,10 @@
 import { describe, expect, it } from "vitest";
 import { markdownEngine } from "../composables/markdownEngine";
 import {
+  collectFileRefPathCandidates,
   collectInlineCodePathCandidates,
   collectMarkdownInlineCodePathCandidates,
+  collectMarkdownPathCandidates,
   injectAssetRefs,
 } from "../composables/markdownInject";
 import { normalizeMarkdownForRender } from "../composables/markdownRender";
@@ -44,6 +46,32 @@ describe("first-frame markdown rendering", () => {
     expect(fromRenderer.length).toBeGreaterThan(0);
     expect(fromSource).toEqual(expect.arrayContaining(fromRenderer));
     expect(fromSource.some((path) => path.includes("fenced"))).toBe(false);
+  });
+
+  it("collects every bare-text path the renderer resolves directly from markdown source", () => {
+    const markdown = [
+      "Edited src/core/Engine.ts:12 and utils/helpers.ts; see Assets/Prefabs/Hero.prefab.",
+      "Timings 6.9/7.0/7.1 ms, docs at https://example.com/a/b.html, and C:/Work/notes.txt.",
+      "",
+      "```ts",
+      "import { marker } from \"src/fenced/Ignored.ts\";",
+      "```",
+      "- `src/inline/Code.ts` next to src/list/Item.vue",
+    ].join("\n");
+    const html = markdownEngine.parse(normalizeMarkdownForRender(markdown)) as string;
+    const fromRenderer = collectFileRefPathCandidates(html);
+    const fromSource = collectMarkdownPathCandidates(markdown, { fileRefs: true });
+
+    expect(fromRenderer).toEqual(expect.arrayContaining([
+      "src/core/Engine.ts",
+      "utils/helpers.ts",
+      "Assets/Prefabs/Hero.prefab",
+      "C:/Work/notes.txt",
+      "src/list/Item.vue",
+    ]));
+    expect(fromSource).toEqual(expect.arrayContaining(fromRenderer));
+    expect(fromSource).toContain("src/inline/Code.ts");
+    expect(fromSource.some((path) => path.includes("fenced") || path.includes("7.1") || path.includes("example.com"))).toBe(false);
   });
 
   it("returns no candidates for markdown without inline code", () => {

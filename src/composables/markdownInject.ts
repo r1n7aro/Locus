@@ -609,7 +609,7 @@ function renderUnityPathRef(
 
 function replaceLooseUnityAssetRefs(
   text: string,
-  render: (path: string) => string,
+  render: (path: string) => string | null,
   startRe: RegExp,
   markerOffset: number,
 ): string {
@@ -631,8 +631,10 @@ function replaceLooseUnityAssetRefs(
       continue;
     }
 
+    const rendered = render(assetPath);
+    if (rendered === null) continue;
     result += text.slice(cursor, markerStart);
-    result += render(assetPath);
+    result += rendered;
     cursor = end;
     startRe.lastIndex = end;
   }
@@ -878,6 +880,80 @@ function collectInlineCodePathCandidatesFromSource(source: string): string[] {
 const MARKDOWN_FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 const MARKDOWN_INLINE_CODE_RE = /(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g;
 
+interface PathCandidateCollector {
+  readonly candidates: string[];
+  add(path: string): void;
+  /** File reference gate that records every path and renders none of them. */
+  gate(path: string): null;
+}
+
+function createPathCandidateCollector(seen = new Set<string>()): PathCandidateCollector {
+  const candidates: string[] = [];
+  const add = (path: string) => {
+    const key = normalizeMarkdownPathStatusKey(path);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    candidates.push(key);
+  };
+  return {
+    candidates,
+    add,
+    gate(path: string) {
+      add(path);
+      return null;
+    },
+  };
+}
+
+function hasPathSeparator(text: string): boolean {
+  return text.includes("/") || text.includes("\\");
+}
+
+interface MarkdownSourceScanOptions {
+  /** Also collect the bare-text paths `injectFileRefs` resolves. */
+  fileRefs?: boolean;
+}
+
+interface MarkdownSourceScanState {
+  fence: string | null;
+}
+
+/**
+ * Collects one markdown source line. `commit: false` scans an incomplete line
+ * (the growing end of a stream) without moving the fence state past it.
+ */
+function scanMarkdownSourceLine(
+  line: string,
+  state: MarkdownSourceScanState,
+  options: MarkdownSourceScanOptions,
+  collector: PathCandidateCollector,
+  commit = true,
+): void {
+  const fenceMatch = line.match(MARKDOWN_FENCE_RE);
+  if (state.fence) {
+    if (commit && fenceMatch && fenceMatch[1][0] === state.fence[0] && fenceMatch[1].length >= state.fence.length) {
+      state.fence = null;
+    }
+    return;
+  }
+  if (fenceMatch) {
+    if (commit) state.fence = fenceMatch[1];
+    return;
+  }
+  const hasInlineCode = line.includes("`");
+  if (hasInlineCode) {
+    for (const match of line.matchAll(MARKDOWN_INLINE_CODE_RE)) {
+      for (const candidate of collectInlineCodePathCandidatesFromSource(escapeAttr(match[2]))) {
+        collector.add(candidate);
+      }
+    }
+  }
+  if (!options.fileRefs || !hasPathSeparator(line)) return;
+  // The renderer sees escaped text outside code spans; mirror that here.
+  const text = hasInlineCode ? line.replace(MARKDOWN_INLINE_CODE_RE, " ") : line;
+  injectFileRefsInText(escapeAttr(text), collector.gate);
+}
+
 /**
  * Collects inline code path candidates directly from markdown source, so their
  * statuses can be resolved before a transcript renders. It is a cheap superset
@@ -885,31 +961,98 @@ const MARKDOWN_INLINE_CODE_RE = /(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)/g;
  * is still resolved by the renderer, only later.
  */
 export function collectMarkdownInlineCodePathCandidates(markdown: string): string[] {
-  if (!markdown.includes("`")) return [];
-  const candidates: string[] = [];
-  const seen = new Set<string>();
-  let fence: string | null = null;
+  return collectMarkdownPathCandidates(markdown);
+}
+
+/**
+ * Source-level counterpart of the renderer's path candidates: inline code
+ * paths, plus the bare-text paths of `injectFileRefs` when `fileRefs` is set.
+ */
+export function collectMarkdownPathCandidates(
+  markdown: string,
+  options: MarkdownSourceScanOptions = {},
+): string[] {
+  if (!markdown.includes("`") && !(options.fileRefs && hasPathSeparator(markdown))) return [];
+  const collector = createPathCandidateCollector();
+  const state: MarkdownSourceScanState = { fence: null };
   for (const line of markdown.split("\n")) {
-    const fenceMatch = line.match(MARKDOWN_FENCE_RE);
-    if (fence) {
-      if (fenceMatch && fenceMatch[1][0] === fence[0] && fenceMatch[1].length >= fence.length) fence = null;
-      continue;
-    }
-    if (fenceMatch) {
-      fence = fenceMatch[1];
-      continue;
-    }
-    if (!line.includes("`")) continue;
-    for (const match of line.matchAll(MARKDOWN_INLINE_CODE_RE)) {
-      for (const candidate of collectInlineCodePathCandidatesFromSource(escapeAttr(match[2]))) {
-        const key = normalizeMarkdownPathStatusKey(candidate);
-        if (!key || seen.has(key)) continue;
-        seen.add(key);
-        candidates.push(key);
-      }
-    }
+    scanMarkdownSourceLine(line, state, options, collector);
   }
-  return candidates;
+  return collector.candidates;
+}
+
+function isTrailingPathRunChar(code: number): boolean {
+  return (code >= 48 && code <= 57) // 0-9
+    || (code >= 65 && code <= 90) // A-Z
+    || (code >= 97 && code <= 122) // a-z
+    || code === 95 // _
+    || code === 46 // .
+    || code === 45 // -
+    || code === 47 // /
+    || code === 92 // \
+    || code === 58 // :
+    || code === 126 // ~
+    || code === 35 // #
+    || code === 64; // @
+}
+
+/** A run this long is not a path that is still being typed; show it. */
+const MAX_HELD_TRAILING_PATH_RUN = 256;
+
+/**
+ * Start of the trailing run of path characters in growing text: the part a
+ * stream may still extend into a file reference. Every such run is held, not
+ * only runs that already contain a slash, so text shown once stays shown when
+ * the next delta turns it into a path (`src` → `src/a.ts`).
+ */
+export function streamingTrailingPathRunStart(text: string): number {
+  let index = text.length;
+  while (index > 0 && isTrailingPathRunChar(text.charCodeAt(index - 1))) {
+    index -= 1;
+    if (text.length - index > MAX_HELD_TRAILING_PATH_RUN) return text.length;
+  }
+  return index;
+}
+
+export interface MarkdownPathCandidateScanner {
+  /** Appends streamed source and returns the candidates not reported before. */
+  feed(chunk: string): string[];
+  reset(): void;
+}
+
+/**
+ * Incremental `collectMarkdownPathCandidates` for append-only streams: each
+ * completed line is scanned once, and the incomplete last line is rescanned
+ * without its trailing path run, which may still grow.
+ */
+export function createMarkdownPathCandidateScanner(
+  options: MarkdownSourceScanOptions = {},
+): MarkdownPathCandidateScanner {
+  let state: MarkdownSourceScanState = { fence: null };
+  let pendingLine = "";
+  let seen = new Set<string>();
+  return {
+    feed(chunk: string) {
+      const collector = createPathCandidateCollector(seen);
+      const text = pendingLine + chunk;
+      let lineStart = 0;
+      let newline = text.indexOf("\n");
+      while (newline >= 0) {
+        scanMarkdownSourceLine(text.slice(lineStart, newline), state, options, collector);
+        lineStart = newline + 1;
+        newline = text.indexOf("\n", lineStart);
+      }
+      pendingLine = text.slice(lineStart);
+      const settled = pendingLine.slice(0, streamingTrailingPathRunStart(pendingLine));
+      if (settled) scanMarkdownSourceLine(settled, state, options, collector, false);
+      return collector.candidates;
+    },
+    reset() {
+      state = { fence: null };
+      pendingLine = "";
+      seen = new Set();
+    },
+  };
 }
 
 export function collectInlineCodePathCandidates(html: string): string[] {
@@ -1056,13 +1199,23 @@ export function injectWorkspaceMentions(html: string): string {
 }
 
 // Match project-relative file paths, optionally with :line or #Lline suffix.
-// Requires at least one slash and a file extension to reduce false positives.
+// Requires at least one slash and never ends with a sentence's period; paths
+// outside the known roots also need an
+// extension that starts with a letter and ends the token, so numbers such as
+// `6.9/7.0/7.1` or `7.1/7.4ms` never become candidates.
 // Does not match if preceded by @ (already handled as an asset/workspace mention) or backticks.
-const FILE_REF_RE = /(?<![@`\/\w])(?:(?:src|src-tauri|Assets|Packages|Library|ProjectSettings|Editor)\/[\w.\/\-]+[\w.\-]|[\w.\-]+\/[\w.\/\-]*\.[\w]+)(?::(\d+)|#L(\d+))?/g;
+const FILE_REF_RE = /(?<![@`\/\w])(?:(?:src|src-tauri|Assets|Packages|Library|ProjectSettings|Editor)\/[\w.\/\-]*[\w\-]|[\w.\-]+\/[\w.\/\-]*\.[A-Za-z]\w*(?!\w|\.\w))(?::(\d+)|#L(\d+))?/g;
 
 // Detects if a match is inside a URL by checking preceding text for ://
 const URL_CONTEXT_RE = /\w+:\/\/\S*$/;
 const URL_PROTOCOL_PREFIX_RE = /\w+:$/;
+
+/**
+ * Decides whether a bare-text path renders as a reference: a status renders it
+ * (with that entry kind), `undefined` renders it from its text alone, and
+ * `null` leaves the text untouched.
+ */
+type FileRefPathGate = (path: string) => MarkdownPathStatus | null | undefined;
 
 function splitTrailingFileRefPunctuation(source: string): { value: string; trailing: string } {
   const match = source.match(TRAILING_FILE_REF_PUNCT_RE);
@@ -1073,64 +1226,123 @@ function splitTrailingFileRefPunctuation(source: string): { value: string; trail
   };
 }
 
-function renderAbsoluteLocalFileRefCandidate(source: string): string | null {
+function renderAbsoluteLocalFileRefCandidate(source: string, gate: FileRefPathGate): string | null {
   const { value, trailing } = splitTrailingFileRefPunctuation(source);
   const parsed = splitInlineCodePathSuffix(value);
   if (!parsed || !isUsableAbsoluteLocalRefPath(parsed.path)) return null;
-  return `${renderLocalFileRef(parsed.path, parsed.line)}${trailing}`;
+  const status = gate(parsed.path);
+  if (status === null) return null;
+  return `${renderLocalFileRef(parsed.path, parsed.line, status?.entryKind)}${trailing}`;
 }
 
-export function injectFileRefs(html: string): string {
+function renderGatedSceneObjectRef(sceneObjectPath: string, gate: FileRefPathGate): string | null {
+  const sceneObjectRef = splitSceneObjectRef(sceneObjectPath);
+  if (!sceneObjectRef) return null;
+  const status = gate(sceneObjectRef.scenePath);
+  if (status === null || status?.entryKind === "folder") return null;
+  return renderUnitySceneObjectRef(`${sceneObjectRef.scenePath}/${sceneObjectRef.objectPath}`);
+}
+
+function renderGatedUnityAssetRef(filePath: string, line: string, gate: FileRefPathGate): string | null {
+  const status = gate(normalizeUnityAssetRefPath(filePath));
+  if (status === null) return null;
+  return renderUnityAssetRef(filePath, line, {}, status);
+}
+
+function renderGatedLooseUnityPathRef(filePath: string, gate: FileRefPathGate): string | null {
+  const normalized = filePath.trim().replace(/\\/g, "/");
+  if (splitSceneObjectRef(normalized)) return renderGatedSceneObjectRef(normalized, gate);
+  return renderGatedUnityAssetRef(normalized, "", gate);
+}
+
+function renderGatedFileRef(filePath: string, line: string, gate: FileRefPathGate): string | null {
+  const knowledgeRef = parseKnowledgeRefPath(filePath);
+  if (knowledgeRef) {
+    return renderKnowledgeRef(knowledgeRef.path);
+  }
+  if (SCENE_OBJECT_ROOT_RE.test(filePath)) {
+    return renderGatedSceneObjectRef(filePath, gate);
+  }
+  if (ASSET_ROOT_RE.test(filePath)) {
+    return renderGatedUnityAssetRef(filePath, line, gate);
+  }
+  const status = gate(filePath);
+  if (status === null) return null;
+  return renderLocalFileRef(filePath, line, status?.entryKind);
+}
+
+/**
+ * Bare-text file references of one HTML text segment. A path the gate rejects
+ * stays text, so later patterns may still match part of it; collecting with a
+ * gate that rejects everything therefore visits every path rendering can ask.
+ */
+function injectFileRefsInText(text: string, gate: FileRefPathGate): string {
+  const refs: string[] = [];
+  const stashRef = (refHtml: string) => {
+    const key = `\u0000mdref:${refs.length}\u0000`;
+    refs.push(refHtml);
+    return key;
+  };
+
+  const looseUnityRefs = replaceLooseUnityAssetRefs(
+    text,
+    (path) => {
+      const rendered = renderGatedLooseUnityPathRef(path, gate);
+      return rendered === null ? null : stashRef(rendered);
+    },
+    BARE_UNITY_ASSET_START_RE,
+    0,
+  );
+
+  const quotedLocalRefs = looseUnityRefs.replace(QUOTED_LOCAL_FILE_REF_RE, (match, _quote, path) => {
+    const rendered = renderAbsoluteLocalFileRefCandidate(path, gate);
+    return rendered ? stashRef(rendered) : match;
+  });
+
+  const localRefs = quotedLocalRefs.replace(ABSOLUTE_LOCAL_FILE_REF_RE, (match, path, offset, fullText) => {
+    const preceding = fullText.slice(0, offset);
+    if (URL_CONTEXT_RE.test(preceding) || URL_PROTOCOL_PREFIX_RE.test(preceding)) return match;
+    const rendered = renderAbsoluteLocalFileRefCandidate(path, gate);
+    return rendered ? stashRef(rendered) : match;
+  });
+
+  const injected = localRefs.replace(FILE_REF_RE, (match, lineColon, lineHash, offset, fullText) => {
+    // Skip matches that are part of a URL
+    const preceding = fullText.slice(0, offset);
+    if (URL_CONTEXT_RE.test(preceding)) return match;
+    const line = lineColon || lineHash || "";
+    // Strip line suffix to get clean file path
+    let filePath = match;
+    if (lineColon) filePath = match.slice(0, match.lastIndexOf(":" + lineColon));
+    else if (lineHash) filePath = match.slice(0, match.lastIndexOf("#L" + lineHash));
+    return renderGatedFileRef(filePath, line, gate) ?? match;
+  });
+  return injected.replace(/\u0000mdref:(\d+)\u0000/g, (_match, index) => refs[Number(index)] ?? "");
+}
+
+/**
+ * Turns bare-text paths into file references. Without status options every
+ * match renders; with `requireInlinePathStatus`, only paths whose status says
+ * they exist do (knowledge document paths are not workspace files and render
+ * from their text).
+ */
+export function injectFileRefs(html: string, options: MarkdownRefInjectOptions = {}): string {
+  const gate: FileRefPathGate = (path) => resolvedInlinePathStatus(path, options);
   return walkHtmlText(html, (text) => {
     // Skip text inside already-injected refs.
     if (text.includes("data-asset-path") || text.includes("data-workspace-path")) return text;
-    const refs: string[] = [];
-    const stashRef = (refHtml: string) => {
-      const key = `\u0000mdref:${refs.length}\u0000`;
-      refs.push(refHtml);
-      return key;
-    };
-
-    const looseUnityRefs = replaceLooseUnityAssetRefs(
-      text,
-      (path) => stashRef(renderUnityPathRef(path)),
-      BARE_UNITY_ASSET_START_RE,
-      0,
-    );
-
-    const quotedLocalRefs = looseUnityRefs.replace(QUOTED_LOCAL_FILE_REF_RE, (match, _quote, path) => {
-      const rendered = renderAbsoluteLocalFileRefCandidate(path);
-      return rendered ? stashRef(rendered) : match;
-    });
-
-    const localRefs = quotedLocalRefs.replace(ABSOLUTE_LOCAL_FILE_REF_RE, (match, path, offset, fullText) => {
-      const preceding = fullText.slice(0, offset);
-      if (URL_CONTEXT_RE.test(preceding) || URL_PROTOCOL_PREFIX_RE.test(preceding)) return match;
-      const rendered = renderAbsoluteLocalFileRefCandidate(path);
-      return rendered ? stashRef(rendered) : match;
-    });
-
-    const injected = localRefs.replace(FILE_REF_RE, (match, lineColon, lineHash, offset, fullText) => {
-      // Skip matches that are part of a URL
-      const preceding = fullText.slice(0, offset);
-      if (URL_CONTEXT_RE.test(preceding)) return match;
-      const line = lineColon || lineHash || "";
-      // Strip line suffix to get clean file path
-      let filePath = match;
-      if (lineColon) filePath = match.slice(0, match.lastIndexOf(":" + lineColon));
-      else if (lineHash) filePath = match.slice(0, match.lastIndexOf("#L" + lineHash));
-      const knowledgeRef = parseKnowledgeRefPath(filePath);
-      if (knowledgeRef) {
-        return renderKnowledgeRef(knowledgeRef.path);
-      }
-      if (SCENE_OBJECT_ROOT_RE.test(filePath)) {
-        return renderUnitySceneObjectRef(filePath);
-      }
-      if (ASSET_ROOT_RE.test(filePath)) {
-        return renderUnityAssetRef(filePath, line);
-      }
-      return renderLocalFileRef(filePath, line);
-    });
-    return injected.replace(/\u0000mdref:(\d+)\u0000/g, (_match, index) => refs[Number(index)] ?? "");
+    if (!hasPathSeparator(text)) return text;
+    return injectFileRefsInText(text, gate);
   });
+}
+
+/** Every path `injectFileRefs` may look up a status for in this HTML. */
+export function collectFileRefPathCandidates(html: string): string[] {
+  const collector = createPathCandidateCollector();
+  walkHtmlText(html, (text) => {
+    if (text.includes("data-asset-path") || text.includes("data-workspace-path")) return text;
+    if (hasPathSeparator(text)) injectFileRefsInText(text, collector.gate);
+    return text;
+  });
+  return collector.candidates;
 }

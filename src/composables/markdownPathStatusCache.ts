@@ -31,6 +31,10 @@ const REVALIDATE_AFTER_MS = 2_000;
 const MAX_CACHED_STATUSES = 20_000;
 const STAT_BATCH_SIZE = 300;
 const statusCache = new Map<string, CachedStatus>();
+// Cache key → the stat that is resolving it. A request for a path already in
+// flight (e.g. a streaming prefetch followed by the renderer) waits for that
+// stat instead of sending the path again.
+const inflightStats = new Map<string, Promise<void>>();
 let pendingRequests: PendingRequest[] = [];
 let flushScheduled = false;
 
@@ -72,6 +76,33 @@ function storeStatus(key: string, value: MarkdownPathStatus, checkedAt: number) 
   }
 }
 
+async function statPaths(scopeKey: string, paths: string[], workspaceRef: WorkspaceRef): Promise<void> {
+  const keys = paths.map((path) => cacheKey(scopeKey, path));
+  let settle!: () => void;
+  const done = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  for (const key of keys) inflightStats.set(key, done);
+  try {
+    const batches = [];
+    for (let index = 0; index < paths.length; index += STAT_BATCH_SIZE) {
+      batches.push(statWorkspaceEntries(paths.slice(index, index + STAT_BATCH_SIZE), workspaceRef));
+    }
+    const entries = (await Promise.all(batches)).flat();
+    const checkedAt = Date.now();
+    for (const entry of entries) {
+      storeStatus(cacheKey(scopeKey, entry.path), statusFromEntry(entry), checkedAt);
+    }
+  } catch {
+    // A failed stat keeps the last known statuses; unknown tokens stay neutral.
+  } finally {
+    for (const key of keys) {
+      if (inflightStats.get(key) === done) inflightStats.delete(key);
+    }
+    settle();
+  }
+}
+
 async function flushPendingRequests() {
   flushScheduled = false;
   const requests = pendingRequests;
@@ -80,30 +111,18 @@ async function flushPendingRequests() {
   if (!latestRequest) return;
   const latestScopeKey = latestRequest.scopeKey;
   const activeRequests = requests.filter((request) => request.scopeKey === latestScopeKey);
-  const paths = [...new Set(activeRequests.flatMap((request) => request.candidates))]
-    .filter((path) => {
-      const entry = cachedEntry(latestScopeKey, path);
-      return !entry || !isFresh(entry);
-    });
-
-  if (paths.length > 0) {
-    try {
-      const batches = [];
-      for (let index = 0; index < paths.length; index += STAT_BATCH_SIZE) {
-        batches.push(statWorkspaceEntries(
-          paths.slice(index, index + STAT_BATCH_SIZE),
-          latestRequest.workspaceRef,
-        ));
-      }
-      const entries = (await Promise.all(batches)).flat();
-      const checkedAt = Date.now();
-      for (const entry of entries) {
-        storeStatus(cacheKey(latestScopeKey, entry.path), statusFromEntry(entry), checkedAt);
-      }
-    } catch {
-      // A failed stat keeps the last known statuses; unknown tokens stay neutral.
-    }
+  const waits = new Set<Promise<void>>();
+  const paths: string[] = [];
+  for (const path of new Set(activeRequests.flatMap((request) => request.candidates))) {
+    const entry = cachedEntry(latestScopeKey, path);
+    if (entry && isFresh(entry)) continue;
+    const inflight = inflightStats.get(cacheKey(latestScopeKey, path));
+    if (inflight) waits.add(inflight);
+    else paths.push(path);
   }
+
+  if (paths.length > 0) waits.add(statPaths(latestScopeKey, paths, latestRequest.workspaceRef));
+  if (waits.size > 0) await Promise.all(waits);
 
   for (const request of requests) {
     if (request.scopeKey !== latestScopeKey) {
@@ -184,4 +203,5 @@ export function prefetchMarkdownPathStatuses(
 
 export function clearMarkdownPathStatusCache() {
   statusCache.clear();
+  inflightStats.clear();
 }

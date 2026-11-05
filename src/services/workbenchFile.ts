@@ -19,6 +19,11 @@ export const WORKBENCH_FILE_OPEN_KEY: InjectionKey<
   (request: WorkbenchFileOpenRequest) => Promise<void>
 > = Symbol("workbench-file-open");
 
+/** Markdown files open in the Workbench document editor instead of the OS default app. */
+export function opensInWorkbenchOnClick(filePath: string): boolean {
+  return /\.(?:md|markdown)$/i.test(filePath.trim());
+}
+
 export async function openWorkbenchFileTab(request: WorkbenchFileOpenRequest): Promise<void> {
   if (!hasTauriWindowRuntime()) throw new Error("Workbench window is unavailable.");
   const currentLabel = getCurrentWindow().label;

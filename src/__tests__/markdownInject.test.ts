@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { TableProperties } from "lucide";
 import {
+  collectFileRefPathCandidates,
   collectInlineCodePathCandidates,
+  collectMarkdownPathCandidates,
+  createMarkdownPathCandidateScanner,
+  streamingTrailingPathRunStart,
+  type MarkdownPathStatus,
   walkHtmlText,
   injectAssetRefs,
   injectFileRefs,
@@ -1000,6 +1005,145 @@ describe("injectFileRefs", () => {
     const result = injectFileRefs(html);
     const matches = result.match(/md-file-ref/g);
     expect(matches).toHaveLength(2);
+  });
+
+  it.each([
+    "同构 24/200/500：6.9/7.0/7.1–7.4 ms",
+    "耗时 7.1/7.4ms",
+    "v1.2/v1.3",
+    "ratio 0.5/1.0 and 3/4.5",
+    "linked lib/libfoo.so.1 at runtime",
+  ])("does not treat numbers and versions as paths: %s", (html) => {
+    expect(injectFileRefs(html)).toBe(html);
+    expect(collectFileRefPathCandidates(html)).toEqual([]);
+  });
+
+  it("keeps generic paths whose extension ends the token", () => {
+    expect(injectFileRefs("Update utils/helpers.ts.")).toContain('data-file-path="utils/helpers.ts"');
+    expect(injectFileRefs("见 utils/helpers.ts。")).toContain('data-file-path="utils/helpers.ts"');
+  });
+});
+
+describe("injectFileRefs with required path statuses", () => {
+  const existing = new Map<string, MarkdownPathStatus>([
+    ["src/main.ts", { path: "src/main.ts", exists: true, entryKind: "file" }],
+    ["src/components", { path: "src/components", exists: true, entryKind: "folder" }],
+    ["utils/helpers.ts", { path: "utils/helpers.ts", exists: true, entryKind: "file" }],
+    ["utils/missing.ts", { path: "utils/missing.ts", exists: false, entryKind: null }],
+    ["Assets/Prefabs/Hero.prefab", { path: "Assets/Prefabs/Hero.prefab", exists: true, entryKind: "file" }],
+    ["Assets/Scenes/Main.unity", { path: "Assets/Scenes/Main.unity", exists: true, entryKind: "file" }],
+    ["C:/Work/notes.txt", { path: "C:/Work/notes.txt", exists: true, entryKind: "file" }],
+  ]);
+  const options = {
+    inlinePathStatus: (path: string) => existing.get(path),
+    requireInlinePathStatus: true,
+  };
+
+  it("renders only paths whose status says they exist", () => {
+    const result = injectFileRefs("Edit src/main.ts:42, utils/helpers.ts, utils/missing.ts and utils/unknown.ts", options);
+    expect(result).toContain('data-file-path="src/main.ts"');
+    expect(result).toContain('data-file-line="42"');
+    expect(result).toContain('data-file-path="utils/helpers.ts"');
+    expect(result).not.toContain("utils/missing.ts\"");
+    expect(result).toContain("utils/missing.ts and utils/unknown.ts");
+  });
+
+  it("uses the resolved entry kind", () => {
+    const result = injectFileRefs("Open src/components when needed", options);
+    expect(result).toContain("md-folder-ref");
+    expect(result).toContain('data-entry-kind="folder"');
+  });
+
+  it("checks Unity assets, scene objects and absolute paths", () => {
+    const result = [
+      "<p>See Assets/Prefabs/Hero.prefab and C:/Work/notes.txt</p>",
+      "<p>Select Assets/Scenes/Main.unity/Env/Spawn</p>",
+      "<p>Removed Assets/Prefabs/Gone.prefab</p>",
+    ].map((html) => injectFileRefs(html, options)).join("");
+    expect(result).toContain('data-asset-path="Assets/Prefabs/Hero.prefab"');
+    expect(result).toContain('data-scene-object-path="Env/Spawn"');
+    expect(result).toContain('data-file-path="C:/Work/notes.txt"');
+    expect(result).not.toContain('data-asset-path="Assets/Prefabs/Gone.prefab"');
+    expect(result).toContain("Assets/Prefabs/Gone.prefab");
+  });
+
+  it("renders knowledge document paths without a workspace status", () => {
+    const result = injectFileRefs("Created skill/review/SKILL.md", options);
+    expect(result).toContain('data-knowledge-path="skill/review/SKILL.md"');
+  });
+
+  it("collects every path rendering looks up", () => {
+    const html = [
+      "<p>Edit src/main.ts:42, utils/helpers.ts and utils/unknown.ts.</p>",
+      "<p>See Assets/Data/Enemy Configs/Elite Guard.asset and Assets/Scenes/Main.unity/Env/Spawn.</p>",
+      "<p>Saved 'C:/Work/My File.txt' and C:/Work/notes.txt; <code>src/inline.ts</code></p>",
+    ].join("");
+    const looked = new Set<string>();
+    injectFileRefs(html, {
+      inlinePathStatus: (path) => {
+        looked.add(path);
+        return undefined;
+      },
+      requireInlinePathStatus: true,
+    });
+    const collected = collectFileRefPathCandidates(html);
+    expect(looked.size).toBeGreaterThan(0);
+    expect(collected).toEqual(expect.arrayContaining([...looked]));
+    expect(collected).not.toContain("src/inline.ts");
+  });
+});
+
+describe("markdown source path candidates", () => {
+  const markdown = [
+    "Updated `src/core/Engine.ts` and src/ui/Panel.vue; numbers 6.9/7.0/7.1 stay text.",
+    "",
+    "```ts",
+    "import { x } from \"src/fenced/Ignored.ts\";",
+    "```",
+    "Final note on src/net/Session.ts.",
+  ].join("\n");
+
+  it("adds bare-text paths only when file references are enabled", () => {
+    expect(collectMarkdownPathCandidates(markdown)).toEqual(["src/core/Engine.ts"]);
+    expect(collectMarkdownPathCandidates(markdown, { fileRefs: true })).toEqual([
+      "src/core/Engine.ts",
+      "src/ui/Panel.vue",
+      "src/net/Session.ts",
+    ]);
+  });
+
+  it("finds bare-text paths without any inline code", () => {
+    expect(collectMarkdownPathCandidates("Edit utils/helpers.ts", { fileRefs: true })).toEqual(["utils/helpers.ts"]);
+  });
+
+  it("scans a stream incrementally, holding the run that may still grow", () => {
+    const scanner = createMarkdownPathCandidateScanner({ fileRefs: true });
+    expect(scanner.feed("Updated src/ui/Pa")).toEqual([]);
+    expect(scanner.feed("nel.vue and `src/core/")).toEqual(["src/ui/Panel.vue"]);
+    expect(scanner.feed("Engine.ts` then\n```ts\nsrc/fenced/Ignored.ts\n")).toEqual(["src/core/Engine.ts"]);
+    expect(scanner.feed("```\nFinal note on src/net/Session.ts.\n")).toEqual(["src/net/Session.ts"]);
+    expect(scanner.feed("Again src/ui/Panel.vue ")).toEqual([]);
+
+    scanner.reset();
+    expect(scanner.feed("Again src/ui/Panel.vue ")).toEqual(["src/ui/Panel.vue"]);
+  });
+
+  it("matches the batch collector once the stream completes", () => {
+    const scanner = createMarkdownPathCandidateScanner({ fileRefs: true });
+    const streamed: string[] = [];
+    for (let index = 0; index < markdown.length; index += 7) {
+      streamed.push(...scanner.feed(markdown.slice(index, index + 7)));
+    }
+    streamed.push(...scanner.feed("\n"));
+    expect(streamed).toEqual(collectMarkdownPathCandidates(markdown, { fileRefs: true }));
+  });
+
+  it("finds where a streamed trailing path run starts", () => {
+    expect(streamingTrailingPathRunStart("see src/comp")).toBe(4);
+    expect(streamingTrailingPathRunStart("见src/a")).toBe(1);
+    expect(streamingTrailingPathRunStart("done. ")).toBe(6);
+    expect(streamingTrailingPathRunStart("中文结尾")).toBe(4);
+    expect(streamingTrailingPathRunStart(`x ${"a".repeat(300)}`)).toBe(302);
   });
 });
 
