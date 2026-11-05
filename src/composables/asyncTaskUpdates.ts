@@ -2,6 +2,7 @@ import type {
   AssistantRenderPart,
   AsyncTaskUpdatedEvent,
   ChatMessage,
+  NestedToolCallUpdatedEvent,
   ToolCallDisplay,
   ToolCallInfo,
 } from "../types";
@@ -75,6 +76,46 @@ export function applyAsyncTaskUpdateToMessages(
       const [next, didChange] = updateRenderPart(part, update, outcome);
       changed ||= didChange;
       return next;
+    });
+    return changed ? { ...message, toolCalls, renderParts } : message;
+  });
+}
+
+function upsertNestedToolCall(
+  toolCall: ToolCallInfo,
+  update: NestedToolCallUpdatedEvent,
+): [ToolCallInfo, boolean] {
+  if (toolCall.id !== update.toolCallId) return [toolCall, false];
+  const nested = toolCall.nestedToolCalls ?? [];
+  const index = nested.findIndex((call) => call.id === update.nestedToolCall.id);
+  const nestedToolCalls = index < 0
+    ? [...nested, update.nestedToolCall]
+    : nested.map((call, position) => (position === index ? { ...call, ...update.nestedToolCall } : call));
+  return [{ ...toolCall, nestedToolCalls }, true];
+}
+
+/**
+ * A background Claude subagent works after its Agent card's run ended: each
+ * of its calls arrives as a persisted record, added to or replacing the
+ * card's nested call with the same id.
+ */
+export function applyNestedToolCallUpdateToMessages(
+  messages: ChatMessage[],
+  update: NestedToolCallUpdatedEvent,
+): ChatMessage[] {
+  return messages.map((message) => {
+    if (message.id !== update.assistantMessageId) return message;
+    let changed = false;
+    const toolCalls = message.toolCalls?.map((toolCall) => {
+      const [next, didChange] = upsertNestedToolCall(toolCall, update);
+      changed ||= didChange;
+      return next;
+    });
+    const renderParts = message.renderParts?.map((part) => {
+      if (part.kind !== "toolCall") return part;
+      const [toolCall, didChange] = upsertNestedToolCall(part.toolCall, update);
+      changed ||= didChange;
+      return didChange ? { ...part, toolCall } : part;
     });
     return changed ? { ...message, toolCalls, renderParts } : message;
   });

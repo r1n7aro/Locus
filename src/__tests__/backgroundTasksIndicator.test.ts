@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { createApp, h, nextTick, reactive, type App } from "vue";
+import { createApp, defineComponent, h, nextTick, reactive, ref, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import BackgroundTasksIndicator from "../components/chat/BackgroundTasksIndicator.vue";
+import { provideSurfaceHidden } from "../composables/surfaceVisibility";
 import { resetBackgroundTaskActivityForTests } from "../components/chat/backgroundTaskActivity";
 import { resetAppTaskActivityForTests } from "../components/chat/appTaskActivity";
 import type { AppTaskInfo } from "../services/appTasks";
@@ -9,9 +10,10 @@ import type { BackgroundTaskInfo } from "../services/asyncTasks";
 import type { AsyncTaskUpdatedEvent } from "../types";
 
 const mocks = vi.hoisted(() => ({
-  list: vi.fn(), cancel: vi.fn(), enabled: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn(),
+  list: vi.fn(), cancel: vi.fn(),
   subscribeUpdates: vi.fn(), unsubscribeUpdates: vi.fn(),
   listApp: vi.fn(), subscribeApp: vi.fn(), unsubscribeApp: vi.fn(),
+  subscribePushes: vi.fn(), unsubscribePushes: vi.fn(),
 }));
 vi.mock("../services/appTasks", () => ({
   listAppTasks: mocks.listApp,
@@ -20,19 +22,24 @@ vi.mock("../services/appTasks", () => ({
 vi.mock("../services/asyncTasks", () => ({
   listBackgroundTasks: mocks.list,
   cancelBackgroundTask: mocks.cancel,
-  subscribeAsyncTasksEnabled: mocks.subscribe,
+  subscribeBackgroundTasksChanged: mocks.subscribePushes,
 }));
 vi.mock("../services/sessionStreamEventHub", () => ({
   subscribeSessionAsyncTaskUpdates: mocks.subscribeUpdates,
 }));
-vi.mock("../services/system", () => ({ getAsyncTasksEnabled: mocks.enabled }));
 vi.mock("../i18n", () => ({ t: (key: string, ...args: unknown[]) => [key, ...args].join(" ") }));
 
 let app: App | undefined;
 let host: HTMLElement;
-let updateEnabled: (value: boolean) => void;
 let publishUpdate: ((update: AsyncTaskUpdatedEvent) => void) | undefined;
 let publishAppTask: ((task: AppTaskInfo) => void) | undefined;
+let pushHandlers: Array<(event: { sessionId: string; tasks: BackgroundTaskInfo[] }) => void> = [];
+
+/** The backend pushes a session's live rows after any of them changes. */
+async function pushTasks(tasks: BackgroundTaskInfo[], sessionId = "session-1") {
+  for (const handler of pushHandlers) handler({ sessionId, tasks });
+  await flush();
+}
 
 function task(overrides: Partial<BackgroundTaskInfo> = {}): BackgroundTaskInfo {
   return {
@@ -96,12 +103,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-09-27T12:00:00Z"));
   vi.resetAllMocks();
-  mocks.enabled.mockResolvedValue(true);
   mocks.list.mockResolvedValue([task()]);
-  mocks.subscribe.mockImplementation(async (handler) => {
-    updateEnabled = handler;
-    return mocks.unsubscribe;
-  });
   mocks.subscribeUpdates.mockImplementation((listener) => {
     publishUpdate = listener;
     return mocks.unsubscribeUpdates;
@@ -110,6 +112,14 @@ beforeEach(() => {
   mocks.subscribeApp.mockImplementation(async (handler) => {
     publishAppTask = handler;
     return mocks.unsubscribeApp;
+  });
+  pushHandlers = [];
+  mocks.subscribePushes.mockImplementation(async (handler) => {
+    pushHandlers.push(handler);
+    return () => {
+      pushHandlers = pushHandlers.filter((item) => item !== handler);
+      mocks.unsubscribePushes();
+    };
   });
 });
 
@@ -126,13 +136,8 @@ afterEach(() => {
 });
 
 describe("background task panel", () => {
-  it("follows the experimental setting, seeds the trigger once, polls only while open, and renders live information", async () => {
-    mocks.enabled.mockResolvedValue(false);
+  it("seeds the trigger once and renders pushed live information without polling", async () => {
     await mount();
-    expect(trigger()).toBeNull();
-    expect(mocks.list).not.toHaveBeenCalled();
-    updateEnabled(true);
-    await flush();
     expect(mocks.list).toHaveBeenCalledOnce();
     expect(countBadge()).toBe("1");
     await open();
@@ -141,7 +146,7 @@ describe("background task panel", () => {
     expect(panel()!.textContent).toContain("chat.backgroundTasks.status.running");
     expect(panel()!.textContent).toContain("1:05");
     expect(document.activeElement).toBe(panel());
-    // The command stays hidden until the task is clicked, and survives polling while shown.
+    // The command stays hidden until the task is clicked, and survives pushes while shown.
     expect(panel()!.textContent).not.toContain("Compiling scripts");
     expect(summary().getAttribute("aria-expanded")).toBe("false");
     summary().click();
@@ -150,25 +155,20 @@ describe("background task panel", () => {
     const detail = panel()!.querySelector(".background-task-detail")!;
     expect(detail.textContent).toContain("Compiling scripts");
     expect(summary().getAttribute("aria-controls")).toBe(detail.id);
-    await vi.advanceTimersByTimeAsync(1000);
+    await pushTasks([task()]);
     expect(panel()!.textContent).toContain("Compiling scripts");
     summary().click();
     await flush();
     expect(panel()!.textContent).not.toContain("Compiling scripts");
 
-    mocks.list.mockResolvedValue([task({ status: "queued", progress: "Queued" })]);
-    await vi.advanceTimersByTimeAsync(1000);
+    await pushTasks([task({ status: "queued", progress: "Queued" })]);
     expect(panel()!.textContent).toContain("chat.backgroundTasks.status.queued");
     // Status-only progress has nothing to reveal.
     expect(summary().disabled).toBe(true);
     expect(summary().hasAttribute("aria-expanded")).toBe(false);
-    updateEnabled(false);
-    await flush();
-    expect(panel()).toBeNull();
-    expect(trigger()).toBeNull();
     await vi.advanceTimersByTimeAsync(20_000);
-    // Seed, first panel load and two polls; nothing after the setting is turned off.
-    expect(mocks.list).toHaveBeenCalledTimes(4);
+    // Seed and the panel load only.
+    expect(mocks.list).toHaveBeenCalledTimes(2);
   });
 
   it("terminates only the selected task and prevents duplicate requests until it stops", async () => {
@@ -185,21 +185,37 @@ describe("background task panel", () => {
     await flush();
     expect(stop().disabled).toBe(true);
     expect(panel()!.textContent).toContain("chat.backgroundTasks.status.cancelling");
-    mocks.list.mockResolvedValue([]);
-    await vi.advanceTimersByTimeAsync(1000);
+    await pushTasks([]);
     expect(panel()!.querySelectorAll(".background-task-row")).toHaveLength(0);
     expect(panel()!.textContent).toContain("chat.backgroundTasks.empty");
   });
 
-  it("does not overwrite a cancellation with an older list response", async () => {
+  it("stops every running agent at once and leaves other tasks running", async () => {
+    mocks.list.mockResolvedValue([
+      task(),
+      task({ taskId: "internal-2", localId: "t2", toolName: "Agent", description: "Scan the repo" }),
+      task({ taskId: "internal-3", localId: "t3", toolName: "subagent", description: "Research" }),
+    ]);
+    mocks.cancel.mockImplementation(async (_session: string, taskId: string) =>
+      task({ taskId, localId: taskId === "internal-2" ? "t2" : "t3", status: "cancelling" }));
     await mount();
     await open();
+    const stopAll = panel()!.querySelector<HTMLButtonElement>(".background-tasks-stop-all")!;
+    expect(stopAll.textContent).toContain("chat.backgroundTasks.stopAllAgents 2");
+    stopAll.click();
+    await flush();
+    expect(mocks.cancel.mock.calls).toEqual([["session-1", "internal-2"], ["session-1", "internal-3"]]);
+    // Nothing more to stop together; the command keeps running.
+    expect(panel()!.querySelector(".background-tasks-stop-all")).toBeNull();
+    expect(panel()!.textContent).toContain("Build project");
+  });
+
+  it("does not overwrite a pushed snapshot or a cancellation with an older list response", async () => {
+    await mount();
     const stale = deferred<BackgroundTaskInfo[]>();
     mocks.list.mockReturnValueOnce(stale.promise);
-    await vi.advanceTimersByTimeAsync(1000);
-    mocks.cancel.mockResolvedValue(task({ status: "cancelling" }));
-    stop().click();
-    await flush();
+    await open();
+    await pushTasks([task({ status: "cancelling" })]);
     stale.resolve([task()]);
     await flush();
     expect(stop().disabled).toBe(true);
@@ -212,7 +228,7 @@ describe("background task panel", () => {
     await open();
     expect(panel()!.querySelector('[role="alert"]')!.textContent).toContain("List unavailable");
     expect(panel()!.textContent).not.toContain("chat.backgroundTasks.empty");
-    await vi.advanceTimersByTimeAsync(1000);
+    await pushTasks([task()]);
     expect(panel()!.querySelector('[role="alert"]')).toBeNull();
     mocks.cancel.mockRejectedValueOnce(new Error("Stop unavailable"));
     stop().click();
@@ -258,7 +274,7 @@ describe("background task panel", () => {
     expect(panel()!.textContent).not.toContain("Old chat failure");
   });
 
-  it("supports Escape and outside dismissal, and releases polling and subscriptions on unmount", async () => {
+  it("supports Escape and outside dismissal, and releases subscriptions on unmount", async () => {
     await mount();
     await open();
     panel()!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -275,8 +291,8 @@ describe("background task panel", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     // One seed plus one load per opening.
     expect(mocks.list).toHaveBeenCalledTimes(4);
-    expect(mocks.unsubscribe).toHaveBeenCalledOnce();
     expect(mocks.unsubscribeUpdates).toHaveBeenCalledOnce();
+    expect(mocks.unsubscribePushes).toHaveBeenCalledOnce();
     expect(panel()).toBeNull();
   });
 
@@ -309,7 +325,7 @@ describe("background task panel", () => {
     expect(panel()!.style.bottom).toBe("");
   });
 
-  it("renders the known setting in the first render of a remounted chat surface", async () => {
+  it("renders the trigger in the first render of a remounted chat surface", async () => {
     await mount();
     expect(trigger()).not.toBeNull();
     // A workbench session switch mounts the next surface while the previous one is still mounted.
@@ -318,25 +334,11 @@ describe("background task panel", () => {
     const next = createApp({ render: () => h(BackgroundTasksIndicator, { sessionId: "session-2" }) });
     next.mount(nextHost);
     expect(nextHost.querySelector(".background-tasks-icon")).not.toBeNull();
-    app!.unmount();
-    app = undefined;
-    host.remove();
-    // The last known value also survives until the following surface revalidates it.
     next.unmount();
-    expect(mocks.unsubscribe).toHaveBeenCalledOnce();
-    const laterHost = document.createElement("div");
-    document.body.append(laterHost);
-    const later = createApp({ render: () => h(BackgroundTasksIndicator, { sessionId: "session-3" }) });
-    later.mount(laterHost);
-    expect(laterHost.querySelector(".background-tasks-icon")).not.toBeNull();
-    await flush();
-    expect(mocks.subscribe).toHaveBeenCalledTimes(2);
-    later.unmount();
     nextHost.remove();
-    laterHost.remove();
   });
 
-  it("does not overlap slow refreshes or restart them after closing", async () => {
+  it("loads once per opening and does not restart a slow load after closing", async () => {
     const pending = deferred<BackgroundTaskInfo[]>();
     mocks.list.mockReturnValue(pending.promise);
     await mount();
@@ -374,8 +376,6 @@ describe("background task trigger", () => {
     await emit({ output: "more output" });
     expect(countBadge()).toBe("2");
 
-    await vi.advanceTimersByTimeAsync(500);
-    expect(mocks.list).toHaveBeenCalledTimes(2);
     await emit({ status: "completed" });
     await emit({ taskId: "tests", status: "cancelling" });
     expect(countBadge()).toBe("1");
@@ -384,32 +384,68 @@ describe("background task trigger", () => {
     expect(countBadge()).toBeNull();
     expect(trigger().classList).toContain("tone-idle");
 
-    // One confirming check after the last task ends, then no polling while idle.
-    mocks.list.mockResolvedValue([]);
+    // Updates and pushes drive the trigger; nothing is listed again.
     await vi.advanceTimersByTimeAsync(120_000);
-    expect(mocks.list).toHaveBeenCalledTimes(3);
+    expect(mocks.list).toHaveBeenCalledOnce();
     expect(countBadge()).toBeNull();
   });
 
-  it("reconciles slowly only while tasks are active and on window focus", async () => {
+  it("follows pushed snapshots without polling and reconciles on window focus", async () => {
     await mount();
     expect(countBadge()).toBe("1");
-    await vi.advanceTimersByTimeAsync(15_000);
-    expect(mocks.list).toHaveBeenCalledTimes(2);
-    mocks.list.mockRejectedValueOnce(new Error("offline"));
-    await vi.advanceTimersByTimeAsync(15_000);
-    expect(countBadge()).toBe("1");
-    mocks.list.mockResolvedValue([]);
-    await vi.advanceTimersByTimeAsync(15_000);
-    expect(mocks.list).toHaveBeenCalledTimes(4);
-    expect(countBadge()).toBeNull();
     await vi.advanceTimersByTimeAsync(120_000);
-    expect(mocks.list).toHaveBeenCalledTimes(4);
+    expect(mocks.list).toHaveBeenCalledOnce();
+    await pushTasks([task(), task({ taskId: "internal-2", localId: "tests", status: "queued" })]);
+    expect(countBadge()).toBe("2");
+    await pushTasks([], "session-2");
+    expect(countBadge()).toBe("2");
+    await pushTasks([]);
+    expect(countBadge()).toBeNull();
+    mocks.list.mockRejectedValueOnce(new Error("offline"));
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(countBadge()).toBeNull();
     mocks.list.mockResolvedValue([task()]);
     window.dispatchEvent(new Event("focus"));
     await vi.advanceTimersByTimeAsync(0);
-    expect(mocks.list).toHaveBeenCalledTimes(5);
+    expect(mocks.list).toHaveBeenCalledTimes(3);
     expect(countBadge()).toBe("1");
+  });
+
+  it("ignores a list response that raced a newer pushed snapshot", async () => {
+    const seed = deferred<BackgroundTaskInfo[]>();
+    mocks.list.mockReturnValueOnce(seed.promise);
+    await mount();
+    await pushTasks([]);
+    seed.resolve([task()]);
+    await flush();
+    expect(countBadge()).toBeNull();
+  });
+
+  it("defers reconciling a hidden workbench tab until it is shown", async () => {
+    const hidden = ref(false);
+    host = document.createElement("div");
+    document.body.append(host);
+    app = createApp(defineComponent({
+      setup() {
+        provideSurfaceHidden(hidden);
+        return () => h(BackgroundTasksIndicator, { sessionId: "session-1" });
+      },
+    }));
+    app.mount(host);
+    await flush();
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+
+    hidden.value = true;
+    await flush();
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+
+    hidden.value = false;
+    await flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mocks.list).toHaveBeenCalledTimes(2);
   });
 
   it("replays updates that race a list request over the older snapshot", async () => {
@@ -480,8 +516,7 @@ describe("background task trigger", () => {
     expect(countBadge()).toBeNull();
   });
 
-  it("shows process tasks without a session or the session setting and hides once they finish", async () => {
-    mocks.enabled.mockResolvedValue(false);
+  it("shows process tasks without a session and returns to the empty state once they finish", async () => {
     mocks.listApp.mockResolvedValue([appTask()]);
     await mount(null);
     expect(trigger().className).toContain("tone-running");
@@ -503,8 +538,11 @@ describe("background task trigger", () => {
     expect(text()).toContain("worktrees.progress.finalizing");
     expect(text()).not.toContain("45%");
     await emitApp({ status: "completed" });
-    expect(panel()).toBeNull();
-    expect(trigger()).toBeNull();
+    // Background tasks are always available, so the trigger and panel stay.
+    expect(text()).not.toContain("chat.backgroundTasks.appGroup");
+    expect(text()).toContain("chat.backgroundTasks.empty");
+    expect(trigger().className).toContain("tone-idle");
+    expect(countBadge()).toBeNull();
   });
 
   it("lists process tasks next to the session's and reports their failures once", async () => {

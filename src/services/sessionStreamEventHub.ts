@@ -1,9 +1,7 @@
-import type { AsyncTaskUpdatedEvent, StreamEvent } from "../types";
+import type { AsyncTaskUpdatedEvent, NestedToolCallUpdatedEvent, StreamEvent } from "../types";
 import type { RoutedWorkspaceEvent, WorkspaceRef } from "./project";
 import { workspaceMaterializationMatches } from "./project";
 import type { SessionExecutionStateChanged } from "./sessionExecutionState";
-import { recordSessionAttention } from "./sessionAttention";
-import { useDisplaySettings } from "../composables/useDisplaySettings";
 
 export type SessionStreamEventSource =
   | { kind: "legacy" }
@@ -109,7 +107,6 @@ function rememberPendingDispatch(
  * component remount cannot race asynchronous `listen()` registration.
  */
 export function publishSessionStreamEvent(dispatch: SessionStreamEventDispatch): void {
-  recordSessionAttention(dispatch.event, useDisplaySettings().state.autoPromoteCompletedSessions);
   rememberPendingDispatch(dispatch);
   for (const listener of [...listeners]) listener(dispatch);
   const deliveredConsumers = new Set<object>();
@@ -212,6 +209,34 @@ export function bindSessionAsyncTaskUpdateConsumer(
   const pending = pendingAsyncTaskUpdatesBySessionId.get(normalizedSessionId) ?? [];
   pendingAsyncTaskUpdatesBySessionId.delete(normalizedSessionId);
   return pending;
+}
+
+const nestedToolCallConsumers = new Set<{
+  resolve: (update: NestedToolCallUpdatedEvent) => object | null;
+  listener: (update: NestedToolCallUpdatedEvent) => void;
+}>();
+
+/**
+ * A background subagent's calls, each already persisted on its Agent card:
+ * an editor mounting later reads them from history, so nothing is buffered.
+ */
+export function publishSessionNestedToolCallUpdate(update: NestedToolCallUpdatedEvent): void {
+  const delivered = new Set<object>();
+  for (const subscription of [...nestedToolCallConsumers]) {
+    const consumer = subscription.resolve(update);
+    if (!consumer || delivered.has(consumer)) continue;
+    delivered.add(consumer);
+    subscription.listener(update);
+  }
+}
+
+export function subscribeSessionNestedToolCallUpdateConsumer(
+  resolve: (update: NestedToolCallUpdatedEvent) => object | null,
+  listener: (update: NestedToolCallUpdatedEvent) => void,
+): () => void {
+  const subscription = { resolve, listener };
+  nestedToolCallConsumers.add(subscription);
+  return () => { nestedToolCallConsumers.delete(subscription); };
 }
 
 /** Publishes persisted model/effort changes to every mounted pane for that session. */

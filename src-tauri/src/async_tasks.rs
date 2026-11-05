@@ -13,6 +13,9 @@ pub const ASYNC_MODE_PARAMETER: &str = "async";
 pub const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
 pub const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
 pub const ASYNC_TASK_UPDATED_EVENT: &str = "async-task-updated";
+/// Launches a run whose only input is delivered task results or agent messages,
+/// both at the end of a run and when an idle session is woken.
+pub const BACKGROUND_RESULTS_REMINDER: &str = "<system-reminder>\nBackground task results or agent messages are ready. Process the delivered items and continue any unfinished work.\n</system-reminder>";
 
 const MAX_RETAINED_TASKS: usize = 256;
 const MAX_RESULT_CHARS: usize = 12_000;
@@ -21,7 +24,7 @@ const MAX_LIVE_OUTPUT_CHARS: usize = 50_000;
 mod communication;
 mod panel;
 mod resume;
-pub(crate) use panel::BackgroundTaskInfo;
+pub(crate) use panel::{start_panel_events, BackgroundTaskInfo};
 pub(crate) use resume::{SubagentResumeHandler, SubagentResumeInfo};
 
 fn first_attempt() -> u32 {
@@ -40,7 +43,7 @@ pub enum AsyncMode {
 }
 
 impl AsyncMode {
-    pub fn parse(args: &serde_json::Value, enabled: bool) -> Result<Self, String> {
+    pub fn parse(args: &serde_json::Value) -> Result<Self, String> {
         let raw = args
             .get(ASYNC_MODE_PARAMETER)
             .and_then(serde_json::Value::as_str)
@@ -56,12 +59,6 @@ impl AsyncMode {
                 ));
             }
         };
-        if !enabled && mode != Self::Sync {
-            return Err(
-                "Async tasks are disabled. Enable them in Settings > Experimental first."
-                    .to_string(),
-            );
-        }
         Ok(mode)
     }
 
@@ -191,6 +188,19 @@ pub struct AsyncTaskUpdatedEvent {
     pub tool_name: String,
     pub status: AsyncTaskStatus,
     pub output: String,
+}
+
+/// App-wide event for a nested call of a background card (a Claude
+/// subagent's tool call), applied like [`AsyncTaskUpdatedEvent`].
+pub(crate) const NESTED_TOOL_CALL_UPDATED_EVENT: &str = "nested-tool-call-updated";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NestedToolCallUpdatedEvent {
+    pub session_id: String,
+    pub assistant_message_id: String,
+    pub tool_call_id: String,
+    pub nested_tool_call: crate::session::models::ToolCallInfo,
 }
 
 pub fn emit_task_updated(
@@ -394,6 +404,7 @@ impl AsyncTaskManager {
             entry.snapshot.local_id = local_id;
         }
         entry.snapshot.description = description.map(|text| truncate_chars(text, 512));
+        panel::note_panel_change(&entry.snapshot.session_id);
         if let Some(store) = &self.store {
             entry.snapshot.output_path = Some(
                 store
@@ -411,10 +422,14 @@ impl AsyncTaskManager {
     }
 
     pub fn discard_task(&self, task_id: &str) {
-        self.tasks
+        let removed = self
+            .tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(task_id);
+        if let Some(entry) = removed {
+            panel::note_panel_change(&entry.snapshot.session_id);
+        }
     }
 
     pub fn suppress_notification(&self, task_id: &str) {
@@ -510,6 +525,7 @@ impl AsyncTaskManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         prune_terminal_tasks(&mut tasks);
         tasks.insert(task_id.clone(), entry);
+        panel::note_panel_change(session_id);
         AsyncTaskStart { task_id, cancel_rx }
     }
 
@@ -584,6 +600,7 @@ impl AsyncTaskManager {
             entry.snapshot.is_error = Some(result.is_error);
             entry.snapshot.finished_at = Some(now_millis());
             entry.snapshot.updated_at = now_millis();
+            panel::note_panel_change(&entry.snapshot.session_id);
             Some(entry.snapshot.clone())
         }
     }
@@ -614,6 +631,7 @@ impl AsyncTaskManager {
             entry.snapshot.is_error = Some(true);
             entry.snapshot.finished_at = Some(now_millis());
             entry.snapshot.updated_at = now_millis();
+            panel::note_panel_change(&entry.snapshot.session_id);
             Some(entry.snapshot.clone())
         }
     }
@@ -659,6 +677,7 @@ impl AsyncTaskManager {
         entry.snapshot.progress = Some("Cancellation requested".to_string());
         entry.snapshot.updated_at = now_millis();
         entry.cancel_tx.send_replace(true);
+        panel::note_panel_change(&entry.snapshot.session_id);
         Ok(entry.snapshot.clone())
     }
 
@@ -679,6 +698,7 @@ impl AsyncTaskManager {
             entry.snapshot.progress = Some("Cancellation requested".to_string());
             entry.snapshot.updated_at = now_millis();
             entry.cancel_tx.send_replace(true);
+            panel::note_panel_change(&entry.snapshot.session_id);
             cancelled.push(entry.snapshot.clone());
         }
         cancelled
@@ -859,6 +879,7 @@ impl AsyncTaskManager {
         };
         update(&mut entry.snapshot);
         entry.snapshot.updated_at = now_millis();
+        panel::note_panel_change(&entry.snapshot.session_id);
     }
 }
 
@@ -977,16 +998,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn async_mode_defaults_to_sync_and_respects_gate() {
+    fn async_mode_defaults_to_sync_and_rejects_unknown_modes() {
         assert_eq!(
-            AsyncMode::parse(&serde_json::json!({}), false).unwrap(),
+            AsyncMode::parse(&serde_json::json!({})).unwrap(),
             AsyncMode::Sync
         );
-        assert!(AsyncMode::parse(&serde_json::json!({ "async": "async" }), false).is_err());
         assert_eq!(
-            AsyncMode::parse(&serde_json::json!({ "async": "notify" }), true).unwrap(),
+            AsyncMode::parse(&serde_json::json!({ "async": "async" })).unwrap(),
+            AsyncMode::Async
+        );
+        assert_eq!(
+            AsyncMode::parse(&serde_json::json!({ "async": "notify" })).unwrap(),
             AsyncMode::Notify
         );
+        assert!(AsyncMode::parse(&serde_json::json!({ "async": "later" })).is_err());
     }
 
     #[test]

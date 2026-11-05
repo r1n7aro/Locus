@@ -32,6 +32,71 @@ impl From<&AsyncTaskSnapshot> for BackgroundTaskInfo {
     }
 }
 
+/// App-wide event: `{ sessionId, tasks }` with the session's live panel rows,
+/// sent after they change so panels and triggers need not poll.
+pub(crate) const BACKGROUND_TASKS_CHANGED_EVENT: &str = "background-tasks-changed";
+/// Progress lines can arrive in bursts; one event per session covers each window.
+const PANEL_CHANGE_COALESCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+#[derive(Default)]
+struct PanelChanges {
+    sessions: std::collections::HashSet<String>,
+    scheduled: bool,
+}
+
+fn panel_app() -> &'static std::sync::OnceLock<tauri::AppHandle> {
+    static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+    &APP
+}
+
+fn panel_changes() -> std::sync::MutexGuard<'static, PanelChanges> {
+    static CHANGES: std::sync::OnceLock<Mutex<PanelChanges>> = std::sync::OnceLock::new();
+    CHANGES
+        .get_or_init(|| Mutex::new(PanelChanges::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Enables [`BACKGROUND_TASKS_CHANGED_EVENT`]; the manager is read from app state.
+pub(crate) fn start_panel_events(app: tauri::AppHandle) {
+    let _ = panel_app().set(app);
+}
+
+/// Record that a session's panel rows changed. Takes only a leaf lock, so it
+/// is safe while the task table is locked.
+pub(super) fn note_panel_change(session_id: &str) {
+    let Some(app) = panel_app().get() else {
+        return;
+    };
+    let mut changes = panel_changes();
+    changes.sessions.insert(session_id.to_string());
+    if changes.scheduled {
+        return;
+    }
+    changes.scheduled = true;
+    drop(changes);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(PANEL_CHANGE_COALESCE).await;
+        let sessions = {
+            let mut changes = panel_changes();
+            changes.scheduled = false;
+            std::mem::take(&mut changes.sessions)
+        };
+        use tauri::Manager;
+        let Some(manager) = app.try_state::<Arc<AsyncTaskManager>>() else {
+            return;
+        };
+        for session_id in sessions {
+            let tasks = manager.list_background_tasks(&session_id);
+            let _ = app.emit(
+                BACKGROUND_TASKS_CHANGED_EVENT,
+                serde_json::json!({ "sessionId": session_id, "tasks": tasks }),
+            );
+        }
+    });
+}
+
 impl AsyncTaskManager {
     pub(crate) fn list_background_tasks(&self, session_id: &str) -> Vec<BackgroundTaskInfo> {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());

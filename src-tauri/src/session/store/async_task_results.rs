@@ -11,14 +11,24 @@ impl SessionStore {
         existing: &[ToolCallInfo],
     ) {
         for call in incoming {
-            let background = serde_json::from_str::<serde_json::Value>(&call.arguments)
-                .ok()
-                .and_then(|args| {
-                    args.get("async")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                })
-                .is_some_and(|mode| matches!(mode.as_str(), "async" | "notify" | "async_notify"));
+            let args = serde_json::from_str::<serde_json::Value>(&call.arguments).ok();
+            let background = args.as_ref()
+                .and_then(|args| args.get("async").and_then(serde_json::Value::as_str))
+                .is_some_and(|mode| matches!(mode, "async" | "notify" | "async_notify"))
+                // A Claude Agent run in the background.
+                || args.as_ref().is_some_and(|args| args["run_in_background"] == true);
+            // A background card's records and outcome are written as they
+            // happen; a later round rewrite keeps them.
+            if let Some(old) = existing.iter().find(|old| old.id == call.id) {
+                if let Some(nested) = old.nested_tool_calls.as_ref().filter(|nested| !nested.is_empty()) {
+                    let calls = call.nested_tool_calls.get_or_insert_with(Vec::new);
+                    for record in nested {
+                        if !calls.iter().any(|call| call.id == record.id) {
+                            calls.push(record.clone());
+                        }
+                    }
+                }
+            }
             if !background {
                 continue;
             }

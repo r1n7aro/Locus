@@ -28,6 +28,7 @@ import {
 } from "./chatMessageDraft";
 import {
   applyAsyncTaskUpdateToMessages,
+  applyNestedToolCallUpdateToMessages,
   asyncTaskDisplayStatus,
 } from "./asyncTaskUpdates";
 import {
@@ -49,6 +50,7 @@ import {
   subscribeSessionAsyncTaskUpdates,
   subscribeSessionExecutionStateConsumer,
   subscribeSessionContentChangeConsumer,
+  subscribeSessionNestedToolCallUpdateConsumer,
   subscribeSessionStreamEventConsumer,
   subscribeSessionStreamEvents,
   type SessionStreamEventDispatch,
@@ -86,6 +88,7 @@ import type {
   SessionTurnPreview,
   SessionViewSnapshot,
 } from "../types";
+import { subagentToolConfirms } from "../types";
 
 export interface EmbeddedChatRequest {
   text: string;
@@ -94,6 +97,8 @@ export interface EmbeddedChatRequest {
   userIntent?: UserIntentMeta | null;
   images?: ImageAttachment[] | null;
   assetRefs?: AssetRefAttachment[] | null;
+  /** Blender target picked in the draft; used only when the send creates the session. */
+  blenderTarget?: string | null;
 }
 
 interface EmbeddedSubmittedUserMessage {
@@ -1000,13 +1005,18 @@ function applyMutation(state: EmbeddedChatState, mutation: StreamMutation) {
       break;
     case "replaceMessages":
       state.messages = [...mutation.messages];
+      if (mutation.history) {
+        state.historyOldestRowId = mutation.history.oldestMessageRowId;
+        state.historyHasMore = mutation.history.hasMoreHistory;
+      }
       break;
     case "resetRound":
       resetRoundState(state);
       break;
     case "clearPendingInputs":
       state.pendingQuestion = null;
-      state.pendingToolConfirms = [];
+      // A background subagent's confirmation outlives the parent's run.
+      state.pendingToolConfirms = subagentToolConfirms(state.pendingToolConfirms);
       break;
     case "clearPendingInput":
       if (state.pendingQuestion?.questionId === mutation.questionId) {
@@ -1456,7 +1466,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         state.submittedUserMessagesByRun.delete(state.currentRunId);
         state.streamSequence = 0;
         state.pendingQuestion = null;
-        state.pendingToolConfirms = [];
+        state.pendingToolConfirms = subagentToolConfirms(state.pendingToolConfirms);
         state.isCompacting = false;
         resetRoundState(state);
       }
@@ -1466,6 +1476,13 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       state.isCancelling = false;
       state.resumeAvailable = false;
       setEmbeddedError(state, null);
+      return;
+    }
+
+    // A background subagent asks outside the run that started it; its
+    // confirmation carries its own question and agent, so it bypasses run gating.
+    if (event.type === "toolConfirm" && event.agent) {
+      for (const mutation of reduceStreamEvent(state, event)) applyMutation(state, mutation);
       return;
     }
 
@@ -1772,7 +1789,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     activeDraft.value.value = "";
     setEmbeddedError(state, null);
     state.pendingQuestion = null;
-    state.pendingToolConfirms = [];
+    state.pendingToolConfirms = subagentToolConfirms(state.pendingToolConfirms);
     state.streamSequence = 0;
     state.isCompacting = false;
     resetRoundState(state);
@@ -1817,6 +1834,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
         knowledgeMode,
         knowledgeDocType: knowledgeFocus?.docType ?? null,
         knowledgeDocPath: knowledgeFocus?.path ?? null,
+        blenderTarget: requestSessionId ? null : request.blenderTarget ?? null,
       });
 
       const boundState = bindSharedEmbeddedChatSession(state, launch.sessionId);
@@ -1889,6 +1907,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       userIntent: payload.userIntent ?? built?.userIntent ?? null,
       images: payload.images.length > 0 ? payload.images : built?.images ?? null,
       assetRefs: payload.assetRefs.length > 0 ? payload.assetRefs : built?.assetRefs ?? null,
+      blenderTarget: payload.blenderTarget ?? null,
     });
   }
 
@@ -1921,7 +1940,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.compactQueued = false;
     setEmbeddedError(state, null);
     state.pendingQuestion = null;
-    state.pendingToolConfirms = [];
+    state.pendingToolConfirms = subagentToolConfirms(state.pendingToolConfirms);
     state.streamSequence = 0;
     state.isCompacting = false;
     state.resumeAvailable = false;
@@ -2432,7 +2451,16 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       await sessionService.answerQuestion(toolConfirm.questionId, answer);
     } catch (error) {
       setEmbeddedError(state, normalizeAppError(error).message);
+      restoreToolConfirms(state, [toolConfirm]);
     }
+  }
+
+  /** A failed answer leaves the run waiting, so the confirmation must stay
+   * answerable. Keeps confirmations a later event already re-delivered. */
+  function restoreToolConfirms(state: EmbeddedChatState, confirms: PendingToolConfirm[]) {
+    const known = new Set(state.pendingToolConfirms.map((item) => item.questionId));
+    const missing = confirms.filter((item) => !known.has(item.questionId));
+    if (missing.length > 0) state.pendingToolConfirms = [...missing, ...state.pendingToolConfirms];
   }
 
   async function answerAllToolConfirms(questionIds: string[], answer: string) {
@@ -2444,6 +2472,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
       toolConfirms.map((item) =>
         sessionService.answerQuestion(item.questionId, answer).catch((error) => {
           setEmbeddedError(state, normalizeAppError(error).message);
+          restoreToolConfirms(state, [item]);
         })),
     );
   }
@@ -2621,6 +2650,15 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     (update) => sessionStates.get(update.sessionId) ?? null,
     (update) => applyAsyncTaskUpdate(update),
   );
+  const unsubscribeNestedToolCallUpdates = subscribeSessionNestedToolCallUpdateConsumer(
+    (update) => sessionStates.get(update.sessionId) ?? null,
+    (update) => {
+      const state = sessionStates.get(update.sessionId);
+      if (state && state.sessionId === update.sessionId) {
+        state.messages = applyNestedToolCallUpdateToMessages(state.messages, update);
+      }
+    },
+  );
   const unsubscribeExecutionState = subscribeSessionExecutionStateConsumer(
     (update) => sessionStates.get(update.sessionId) ?? null,
     (update) => applyExecutionState(
@@ -2659,6 +2697,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     setTimeout(releaseEventInterests, 0);
     unsubscribeStreamEvents();
     unsubscribeAsyncTaskUpdates();
+    unsubscribeNestedToolCallUpdates();
     unsubscribeExecutionState();
     unsubscribeContentChanges();
     releaseSharedEmbeddedChatState(activeState.value);

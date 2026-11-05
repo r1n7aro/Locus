@@ -5,11 +5,13 @@ import { t } from "../../i18n";
 import {
   cancelBackgroundTask,
   listBackgroundTasks,
+  subscribeBackgroundTasksChanged,
   type BackgroundTaskInfo,
+  type BackgroundTasksChangedEvent,
 } from "../../services/asyncTasks";
 import type { AppTaskInfo } from "../../services/appTasks";
 import { normalizeAppError } from "../../services/errors";
-import { useAsyncTasksEnabled } from "../../composables/useAsyncTasksEnabled";
+import { useSurfaceHidden } from "../../composables/surfaceVisibility";
 import type { AsyncTaskStatus, AsyncTaskUpdatedEvent } from "../../types";
 import LucideIcon from "../icons/LucideIcon.vue";
 import BaseButton from "../ui/BaseButton.vue";
@@ -23,16 +25,11 @@ import {
   type BackgroundTaskFailure,
 } from "./backgroundTaskActivity";
 
-const RECONCILE_INTERVAL_MS = 15_000;
-const NEW_TASK_RECONCILE_DELAY_MS = 500;
 const PANEL_WIDTH = 360;
 
 const props = defineProps<{ sessionId: string | null }>();
-const enabled = useAsyncTasksEnabled();
-// Process-level tasks belong to no session and are shown in every surface,
-// independent of the session async-task setting.
+// Process-level tasks belong to no session and are shown in every surface.
 const { tasks: appTasks, failureCount: appFailureCount } = useAppTasks();
-const visible = computed(() => enabled.value || appTasks.value.length > 0 || appFailureCount.value > 0);
 const open = ref(false);
 const root = ref<HTMLElement | null>(null);
 const panel = ref<HTMLElement | null>(null);
@@ -49,15 +46,19 @@ const expanded = ref(new Set<string>());
 const now = ref(Date.now());
 const error = computed(() => actionError.value || loadError.value);
 // With process tasks listed, an empty session list adds nothing.
-const showSessionGroup = computed(() => enabled.value && (loading.value || tasks.value.length > 0 || !appTasks.value.length));
+const showSessionGroup = computed(() => loading.value || tasks.value.length > 0 || !appTasks.value.length);
 let generation = 0;
 let mutation = 0;
-let timer: ReturnType<typeof setTimeout> | undefined;
+// Bumped by every pushed snapshot; a list response that raced one is older.
+let pushSeq = 0;
 let clock: ReturnType<typeof setInterval> | undefined;
+let releasePushes: (() => void) | undefined;
+let unmounted = false;
 
-// Trigger state is kept while the panel is closed: seeded by one list call,
-// then driven by task update events, with a slow reconcile only while tasks
-// are active. Keys are session-local ids, which is what update events carry.
+// Trigger and panel state: seeded by one list call, then driven by pushed
+// session snapshots (`background-tasks-changed`) and task update events. Lists
+// happen only on seeding, opening, window focus and showing a hidden tab. Keys
+// are session-local ids, which is what update events carry.
 const activeStatuses = ref(new Map<string, AsyncTaskStatus>());
 const shownFailures = ref<BackgroundTaskFailure[]>([]);
 const activeCount = computed(() => activeStatuses.value.size + appTasks.value.length);
@@ -116,8 +117,8 @@ function clearReconcile() {
 
 function scheduleReconcile(delay: number) {
   const sessionId = props.sessionId;
-  // While the panel is open its own polling keeps the trigger in sync.
-  if (!enabled.value || !sessionId || open.value) return;
+  // While the panel is open its pushed rows keep the trigger in sync.
+  if (!sessionId || open.value) return;
   const due = Date.now() + delay;
   if (reconcileTimer !== undefined && reconcileDue <= due) return;
   clearReconcile();
@@ -126,29 +127,56 @@ function scheduleReconcile(delay: number) {
   reconcileTimer = setTimeout(() => {
     reconcileTimer = undefined;
     reconcileDue = Number.POSITIVE_INFINITY;
+    // Every mounted workbench tab has an indicator; hidden ones check when shown
+    // instead of each querying on every window focus or reconcile interval.
+    if (surfaceHidden.value) {
+      reconcileWhenShown = true;
+      return;
+    }
     void reconcile(currentGeneration, sessionId);
   }, delay);
 }
 
+const surfaceHidden = useSurfaceHidden();
+let reconcileWhenShown = false;
+watch(surfaceHidden, (hidden) => {
+  if (hidden || !reconcileWhenShown) return;
+  reconcileWhenShown = false;
+  scheduleReconcile(0);
+});
+
 async function reconcile(currentGeneration: number, sessionId: string) {
   if (reconciling || currentGeneration !== activityGeneration) return;
   reconciling = true;
+  const currentPush = pushSeq;
   const log: AsyncTaskUpdatedEvent[] = [];
   recorders.add(log);
-  let failed = false;
   try {
     const result = await listBackgroundTasks(sessionId);
-    if (currentGeneration === activityGeneration) applySnapshot(sessionId, result, log);
+    if (currentGeneration === activityGeneration && currentPush === pushSeq) applySnapshot(sessionId, result, log);
   } catch {
-    // Keep the last known state; the next check retries.
-    failed = true;
+    // Keep the last known state; the next push, focus or showing retries.
   } finally {
     recorders.delete(log);
-    if (currentGeneration === activityGeneration) {
-      reconciling = false;
-      if (failed || activeCount.value) scheduleReconcile(RECONCILE_INTERVAL_MS);
-    }
+    if (currentGeneration === activityGeneration) reconciling = false;
   }
+}
+
+/** Applies a pushed snapshot of the session's live rows to trigger and panel. */
+function applyPushedTasks(event: BackgroundTasksChangedEvent) {
+  const sessionId = props.sessionId;
+  if (!sessionId || event.sessionId !== sessionId) return;
+  pushSeq += 1;
+  const active = event.tasks.filter((task) => task.sessionId === sessionId && isActive(task));
+  activeStatuses.value = new Map(active.map((task) => [task.localId, task.status]));
+  rememberTaskDescriptions(sessionId, active);
+  if (!open.value) return;
+  // Supersedes an in-flight panel load as well.
+  mutation += 1;
+  tasks.value = active;
+  loading.value = false;
+  loadError.value = "";
+  now.value = Date.now();
 }
 
 function resetActivity() {
@@ -199,12 +227,11 @@ function showFailures(sessionId: string | null) {
 
 useBackgroundTaskUpdates((update) => {
   const sessionId = props.sessionId;
-  if (!enabled.value || !sessionId || update.sessionId !== sessionId) return;
+  if (!sessionId || update.sessionId !== sessionId) return;
   for (const log of recorders) log.push(update);
-  const isNew = applyStatus(update.taskId, update.status);
+  applyStatus(update.taskId, update.status);
   if (update.status === "failed" && open.value) showFailures(sessionId);
-  // A new task triggers a quick list so its description is known before it can fail.
-  scheduleReconcile(isNew ? NEW_TASK_RECONCILE_DELAY_MS : RECONCILE_INTERVAL_MS);
+  // The pushed snapshot that follows carries the description and progress.
 });
 
 function handleWindowFocus() {
@@ -213,6 +240,16 @@ function handleWindowFocus() {
 
 function isCancelling(task: BackgroundTaskInfo) {
   return cancelling.value.has(task.taskId) || task.status === "cancelling";
+}
+
+// Background Claude subagents ("Agent") and Locus subagents ("subagent"). A
+// stopped Claude subagent stays stopped in its conversation.
+const AGENT_TASK_TOOLS = new Set(["Agent", "subagent"]);
+const stoppableAgents = computed(() => tasks.value.filter((task) =>
+  AGENT_TASK_TOOLS.has(task.toolName) && isActive(task) && !isCancelling(task)));
+
+function stopAllAgents() {
+  for (const task of stoppableAgents.value) void stopTask(task);
 }
 
 function isExpanded(task: BackgroundTaskInfo) {
@@ -311,8 +348,6 @@ async function refresh(currentGeneration: number, sessionId: string) {
     if (currentGeneration === generation) {
       loading.value = false;
       now.value = Date.now();
-      // Poll only while visible; scheduling after settlement avoids overlapping IPC.
-      timer = setTimeout(() => void refresh(currentGeneration, sessionId), 1000);
     }
   }
 }
@@ -340,14 +375,13 @@ async function stopTask(task: BackgroundTaskInfo) {
   }
 }
 
-watch([() => props.sessionId, enabled], ([sessionId, isEnabled], previous) => {
-  if (!isEnabled || sessionId !== previous?.[0]) close();
+watch(() => props.sessionId, (sessionId, previous) => {
+  if (sessionId !== previous) close();
   resetActivity();
-  if (isEnabled && sessionId) void reconcile(activityGeneration, sessionId);
+  if (sessionId) void reconcile(activityGeneration, sessionId);
 }, { immediate: true, flush: "sync" });
 watch(open, (value) => {
   generation += 1;
-  clearTimeout(timer);
   clearInterval(clock);
   tasks.value = [];
   cancelling.value.clear();
@@ -357,22 +391,19 @@ watch(open, (value) => {
   loading.value = false;
   if (!value) {
     shownFailures.value = [];
-    if (activeCount.value) scheduleReconcile(RECONCILE_INTERVAL_MS);
     return;
   }
   clearReconcile();
   showFailures(props.sessionId);
-  // Session rows refresh with each poll; process rows tick on their own.
+  // Rows change with pushed snapshots; elapsed times tick with this clock.
   now.value = Date.now();
   clock = setInterval(() => { now.value = Date.now(); }, 1000);
-  if (props.sessionId && enabled.value) {
+  if (props.sessionId) {
     loading.value = true;
     void refresh(generation, props.sessionId);
   }
 }, { flush: "sync" });
 watch(appFailureCount, (count) => { if (count && open.value) showFailures(props.sessionId); });
-// The last process task can hide the trigger while the panel is open.
-watch(visible, (value) => { if (!value) close(); });
 
 watch(open, (value) => {
   if (!value) return;
@@ -387,12 +418,19 @@ onMounted(() => {
   window.addEventListener("resize", positionPanel);
   window.addEventListener("scroll", positionPanel, true);
   window.addEventListener("focus", handleWindowFocus);
+  void subscribeBackgroundTasksChanged(applyPushedTasks)
+    .then((release) => { if (unmounted) release(); else releasePushes = release; })
+    .catch(() => {
+      // Seeding, opening and focus still list the tasks.
+    });
 });
 
 onUnmounted(() => {
+  unmounted = true;
+  releasePushes?.();
+  releasePushes = undefined;
   generation += 1;
   activityGeneration += 1;
-  clearTimeout(timer);
   clearInterval(clock);
   clearReconcile();
   recorders.clear();
@@ -406,7 +444,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div v-if="visible" ref="root" class="background-tasks-indicator">
+  <div ref="root" class="background-tasks-indicator">
     <BaseButton
       class="background-tasks-icon"
       :class="[`tone-${tone}`, { active: open }]"
@@ -437,6 +475,15 @@ onUnmounted(() => {
           <LucideIcon class="background-tasks-header-icon" :icon="ListTodo" :size="14" />
           <span class="background-tasks-title">{{ t('chat.backgroundTasks.title') }}</span>
           <span v-if="tasks.length + appTasks.length" class="background-tasks-header-count">{{ tasks.length + appTasks.length }}</span>
+          <BaseButton
+            v-if="stoppableAgents.length > 1"
+            class="background-tasks-stop-all"
+            :aria-label="t('chat.backgroundTasks.stopAllAgents', stoppableAgents.length)"
+            @click="stopAllAgents"
+          >
+            <LucideIcon :icon="Square" :size="10" />
+            <span>{{ t('chat.backgroundTasks.stopAllAgents', stoppableAgents.length) }}</span>
+          </BaseButton>
           <BaseButton class="background-tasks-close" :aria-label="t('common.close')" @click="close(true)">
             <LucideIcon :icon="X" :size="14" />
           </BaseButton>
@@ -745,6 +792,27 @@ onUnmounted(() => {
   padding: 0;
   border-color: transparent;
   border-radius: 5px;
+}
+
+.background-tasks-stop-all.base-button {
+  gap: 4px;
+  min-height: 22px;
+  height: 22px;
+  margin-left: auto;
+  padding: 0 7px;
+  border-color: var(--border-color);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.background-tasks-stop-all.base-button:hover:not(:disabled) {
+  border-color: var(--status-danger-border);
+  background: var(--status-danger-bg);
+  color: var(--status-danger-fg);
+}
+
+.background-tasks-stop-all.base-button + .background-tasks-close.base-button {
+  margin-left: 0;
 }
 
 .background-tasks-body {

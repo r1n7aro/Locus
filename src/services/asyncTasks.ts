@@ -22,6 +22,12 @@ export function cancelBackgroundTask(sessionId: string, taskId: string): Promise
   return ipcInvoke("cancel_background_task", { sessionId, taskId });
 }
 
-export function subscribeAsyncTasksEnabled(handler: (enabled: boolean) => void) {
-  return getLocusRuntime().subscribe<boolean>("async-tasks-enabled-changed", handler);
+/** Live panel rows of one session, pushed (coalesced) after any of them changes. */
+export interface BackgroundTasksChangedEvent {
+  sessionId: string;
+  tasks: BackgroundTaskInfo[];
+}
+
+export function subscribeBackgroundTasksChanged(handler: (event: BackgroundTasksChangedEvent) => void) {
+  return getLocusRuntime().subscribe<BackgroundTasksChangedEvent>("background-tasks-changed", handler);
 }

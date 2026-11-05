@@ -201,6 +201,61 @@ impl AsyncTaskManager {
                 completion_persisted: false,
             },
         );
+        panel::note_panel_change(session_id);
+        self.changes.notify_waiters();
+        Ok((next, cancel_rx))
+    }
+
+    /// A new attempt of a finished task whose work continues elsewhere (a
+    /// resumed Claude subagent): same id and card, fresh status and output.
+    pub(crate) fn restart_task_attempt(
+        &self,
+        session_id: &str,
+        task_id: &str,
+        working_dir: Option<&str>,
+    ) -> Result<(AsyncTaskSnapshot, watch::Receiver<bool>), String> {
+        let previous = self.get_session_task(session_id, task_id)?;
+        let task_id = previous.task_id.as_str();
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(current) = tasks.get(task_id) {
+            if current.snapshot.attempt != previous.attempt || !current.snapshot.status.is_terminal() {
+                return Err("This async task is already running.".into());
+            }
+        }
+        if !previous.status.is_terminal() {
+            return Err("This async task is already running.".into());
+        }
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut next = previous.clone();
+        next.attempt = next.attempt.checked_add(1).ok_or("Task attempt limit reached")?;
+        next.status = AsyncTaskStatus::Queued;
+        next.notify = true;
+        next.started_at = Some(now_millis());
+        next.updated_at = now_millis();
+        next.finished_at = None;
+        next.output = None;
+        next.is_error = None;
+        next.progress = Some("Queued for continuation".into());
+        if let Some(store) = &self.store {
+            next.output_path = Some(
+                store
+                    .async_task_output_path(session_id, &format!("{task_id}_attempt_{}", next.attempt))?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            store.save_async_task(&next, None)?;
+        }
+        tasks.insert(
+            task_id.to_string(),
+            AsyncTaskEntry {
+                snapshot: next.clone(),
+                cancel_tx,
+                working_dir: working_dir.map(str::to_string),
+                completion_ready: false,
+                completion_persisted: false,
+            },
+        );
+        panel::note_panel_change(session_id);
         self.changes.notify_waiters();
         Ok((next, cancel_rx))
     }
