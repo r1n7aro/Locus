@@ -95,7 +95,7 @@ describe("project settings of the focused workspace", () => {
     expect(setting.value.value).toBe(false);
 
     await setting.set(true);
-    expect(calls.at(-1)).toEqual({
+    expect(calls[calls.length - 1]).toEqual({
       command: "settings_set",
       args: { changes: [{ key: KEY, value: true }], workspaceRef: { checkoutId: "a", expectedGeneration: 1 } },
     });

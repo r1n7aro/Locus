@@ -239,13 +239,13 @@ describe("Codex options", () => {
     expect(codex.modelConfig.useApplyPatch).toBe(false);
 
     await codex.setUseApplyPatch(true);
-    expect(backend.writes.at(-1)).toEqual([{ key: "providers.codex.useApplyPatch", value: true }]);
+    expect(backend.writes[backend.writes.length - 1]).toEqual([{ key: "providers.codex.useApplyPatch", value: true }]);
     expect(apply).toHaveBeenLastCalledWith(expect.objectContaining({
       transport: "http", contextWindow: 400000, autoReview: true, useApplyPatch: true,
     }));
 
     await codex.setContextWindow(500000);
-    expect(backend.writes.at(-1)).toEqual([{ key: "providers.codex.contextWindow", value: 500000 }]);
+    expect(backend.writes[backend.writes.length - 1]).toEqual([{ key: "providers.codex.contextWindow", value: 500000 }]);
     expect(codex.modelConfig).toMatchObject({ useApplyPatch: true, contextWindow: 500000 });
   });
 

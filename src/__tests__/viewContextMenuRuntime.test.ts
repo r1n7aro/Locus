@@ -122,7 +122,7 @@ describe("View list context menu", () => {
       .toBe(t("view.tree.pluginProvidedBy", "Example Tools"));
     expect(button(menu, t("view.tree.delete"))).toBeUndefined();
     expect(button(menu, t("view.tree.rename"))).toBeUndefined();
-    expect(button(menu, t("view.action.export"))).toBeDefined();
+    expect(button(menu, t("view.action.export"))).toBeUndefined();
     const folderMenu = await openMenu(host, "folder");
     expect(button(folderMenu, t("view.tree.delete"))).toBeUndefined();
     expect(viewDeleteEntry).not.toHaveBeenCalled();

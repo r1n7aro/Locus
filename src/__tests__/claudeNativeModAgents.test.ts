@@ -199,7 +199,7 @@ describe('Claude native delegation Mod', () => {
     // Locus tasks keep their Locus tools.
     await h.run('tool.call', { tool: 'TaskStop', tool_use_id: 'toolu_task', task_id: 't3' }, next);
     expect(next).not.toHaveBeenCalled();
-    expect(h.sent('/call').at(-1)).toMatchObject({ tool: 'TaskStop', callId: 'toolu_task', input: { task_id: 't3' } });
+    expect(h.sent('/call').slice(-1)[0]).toMatchObject({ tool: 'TaskStop', callId: 'toolu_task', input: { task_id: 't3' } });
   });
 
   it('keeps subagents from delegating or using the parent task list and lets them message the main agent', async () => {
@@ -279,7 +279,7 @@ describe('Claude native delegation Mod', () => {
     const append = vi.fn(async () => ({}));
     await h.run('session.append', { door: 'transcript', uuid: 'u1', agentId: 'a1', origin: { kind: 'model' },
       message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text: 'Found 3 files' }] } }, append);
-    expect(h.events('assistant').at(-1)).toMatchObject({ agentId: 'a1', message: { content: [{ type: 'text', text: 'Found 3 files' }] } });
+    expect(h.events('assistant').slice(-1)[0]).toMatchObject({ agentId: 'a1', message: { content: [{ type: 'text', text: 'Found 3 files' }] } });
     const complete = vi.fn(async () => ({ text: '' }));
     await h.run('turn.complete', { agentId: 'a1', turnId: 'sub-turn', isAborted: false }, complete);
     expect(complete).toHaveBeenCalledOnce();
