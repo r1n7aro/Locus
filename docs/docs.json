@@ -140,7 +140,8 @@
                 "pages": [
                   "settings/models",
                   "settings/general",
-                  "settings/code-analysis"
+                  "settings/code-analysis",
+                  "settings/remote-access"
                 ]
               },
               {
@@ -262,7 +263,8 @@
                 "pages": [
                   "en/settings/models",
                   "en/settings/general",
-                  "en/settings/code-analysis"
+                  "en/settings/code-analysis",
+                  "en/settings/remote-access"
                 ]
               },
               {

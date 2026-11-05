@@ -15,6 +15,10 @@ license = "GPL-3.0-or-later"
 name = "locus_lib"
 crate-type = ["rlib"]
 
+[features]
+default = []
+server-client = ["tokio-tungstenite/rustls-tls-native-roots"]
+
 # Fast installer builds keep release runtime semantics while favoring warm
 # rebuild speed. `lto = "off"` is intentional: Cargo's boolean `lto = false`
 # still enables local ThinLTO when multiple codegen units are used, which can
@@ -30,6 +34,7 @@ codegen-units = 256
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
+locus-remote-core = { path = "../crates/locus-remote-core" }
 # tauri-runtime-wry 2.10.1 leaked one window DC on every DPI lookup for the
 # undecorated resize border. Tauri 2.11.5 resolves to the fixed runtime line.
 tauri = { version = "2.11.5", features = ["tray-icon", "devtools"] }
@@ -61,6 +66,14 @@ hyper-util = { version = "0.1.20", features = ["client-proxy", "client-proxy-sys
 # dependency tree transitively.
 hyper = { version = "1.11.0", features = ["server", "http1"] }
 http-body-util = "0.1.5"
+# Mobile remote access (src/remote_access): shared wire protocol with the
+# Locus Remote app, per-install self-signed TLS certificate, NIC discovery for
+# the listener picker and the pairing QR code (rendered as SVG).
+locus-remote-protocol = { path = "../crates/locus-remote-protocol" }
+locus-native-protocol = { path = "../crates/locus-native-protocol" }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+if-addrs = "0.15.0"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 toml_edit = "0.25.13"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "0.8.4"

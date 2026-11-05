@@ -240,6 +240,21 @@ function buildInstallerDownloads(version) {
       requiresSystemPython: true,
       requiresSystemGit: true,
     },
+    {
+      // Default installer plus the Locus Remote Android app, offered to
+      // phones on the LAN while pairing. Clients that bundle the app pick
+      // this entry so an update keeps it.
+      id: "windows-x64-with-remote-app",
+      label: "Windows x64 - with Locus Remote (Android)",
+      url: releaseAssetUrl(normalizedVersion, `locus_${normalizedVersion}_x64-with_remote_app-setup.exe`),
+      platform: "windows",
+      arch: "x64",
+      includesManagedPython: true,
+      includesManagedGit: true,
+      requiresSystemPython: false,
+      requiresSystemGit: false,
+      includesRemoteApp: true,
+    },
   ];
 }
 

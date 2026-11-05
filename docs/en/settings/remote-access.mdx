@@ -1,0 +1,79 @@
+---
+title: Remote Access
+description: Browse sessions, files and knowledge, send messages and answer questions from your phone with Locus Remote
+---
+
+Remote access lets a paired phone running the **Locus Remote** app connect to Locus on this computer: browse every project's sessions, follow live output, send messages, stop runs, answer the agent's questions, and browse project files and knowledge documents. Sessions keep running on the computer; the phone is just another window.
+
+Remote access is experimental and off by default. While it is off, Locus listens on no port and runs no extra background work.
+
+## Turning it on
+
+Open Settings → `Tools` → `Remote Access`, turn on `Enable remote access`. A security warning first explains what paired devices can do on this computer, and remote access turns on only after you confirm; turning it off needs no confirmation. Then choose under `Network` where your phone connects from:
+
+- **`Direct LAN and Tailscale connections`**: turn on the adapters your phone can reach. Locus serves HTTPS there with a self-signed certificate generated on this computer and accepts only devices on the same LAN (or tailnet). Windows may ask about the firewall the first time; allow Locus on **private networks**. `Open firewall settings` jumps straight there.
+- **`Local address (for tunnels)`**: serves HTTP on `127.0.0.1` for tools that terminate encryption on this computer, such as `tailscale serve`, UU Remote port mapping or frp. The page shows an example `tailscale serve` command.
+- **`HTTPS hostnames`**: when a proxy with a valid certificate such as `tailscale serve` fronts this computer, enter the hostname the phone uses (for example `my-pc.tailnet.ts.net`).
+- **`Port`**: every address shares one port, 47831 by default. Update your tunnels after changing it.
+
+Tunnels are optional: on the same Wi-Fi, direct LAN access is enough.
+
+## Pairing a phone
+
+1. Install and open Locus Remote on the phone (see the next section if it is not installed yet).
+2. Click `Pair a device` on the computer. A QR code appears; it is valid for 2 minutes.
+3. Tap `Scan to pair` on the phone and scan the code.
+4. The computer asks whether the device may pair. Click `Allow` once you have confirmed it is your phone.
+
+The QR code carries this computer's certificate fingerprint and the phone trusts exactly that certificate, so the connection cannot be impersonated even on an untrusted network. Through an `HTTPS hostname` you can also choose `Enter a pairing code` in the app and type the 6 digits shown in the dialog.
+
+A pairing allows at most 5 wrong attempts; after that, or once it expires, generate a new one.
+
+## Downloading the app from the computer
+
+The **Windows x64 - with Locus Remote (Android)** installer bundles the Locus Remote Android app matching this Locus version, so a phone can download it straight from the computer without internet access:
+
+1. Click `Pair a device` on the computer.
+2. Scan the QR code with the phone's **camera** (not the app). The browser opens a download page served by the computer; tap `Download for Android`.
+3. Install and open Locus Remote, tap `Scan to pair` and scan the same QR code again. If it expired, generate a new one on the computer.
+
+The same QR code is a pairing code for the app and a download link for the camera. The download is offered for 10 minutes after a pairing window opens. Over direct LAN addresses it uses plain HTTP, which serves only the download page and the package; tokens and everything else never travel unencrypted. Turn it off with `Offer the app on the local network`.
+
+Without a bundled package, or with the download turned off, a camera scan opens a short page that asks you to scan the code in Locus Remote and links the official release page. The QR code always points at this plain HTTP page, so the browser never shows a certificate warning for the computer's self-signed certificate.
+
+**Note:** A LAN download cannot stop someone on the same network from tampering with the package. Only install this way on a network you trust, such as your home Wi-Fi; on office or public networks, download from the official release page instead. Downloads through a Tailscale address or an `HTTPS hostname` are encrypted and authenticated in transit and are not affected. Once installed, the phone only accepts updates signed with the same key.
+
+WeChat's built-in browser cannot download app packages; open the page in the system browser as it suggests. Locus Remote is only available for Android for now.
+
+## Browsing files and knowledge on the phone
+
+`Files` and `Knowledge` under each project card open the project folder and its knowledge base:
+
+- **Files**: browse folders or search at the top. Markdown is rendered (including the images it embeds), CSV shown as a table, code highlighted, and images, audio and video shown inline; large files show only their beginning.
+- **Knowledge**: browse folders and documents by type (design, plan, memory, reference, skill), or search all knowledge documents at the top. An opened document starts with its source, last update and summary; Markdown and CSV documents can both be read.
+- **Viewer**: relative links, file references and knowledge references inside a document open on the phone as well, and `#heading` links jump to their section; long Markdown documents have a `Contents` button at the top right. Tap an image to view it full screen, then pinch or double-tap to zoom. The menu at the top right refreshes, copies the path or copies the text.
+- **Following changes on the computer**: when an Agent or you change the file, folder or knowledge document the phone is showing, the phone updates it and keeps your reading position.
+- Files, folders and knowledge documents mentioned in a conversation, and the file preview button on tool calls, open the same viewer on the phone.
+
+## Devices and permissions
+
+`Paired devices` shows each phone's online state and when and from where it last connected:
+
+- **`Full control`**: lets the device approve tool calls that need confirmation (running commands, editing files) and use features that change things, such as editing files, git operations, and changing knowledge documents and settings. Off by default: the device can then view and chat, meaning browse sessions, files and knowledge, send messages, stop runs and answer ordinary questions; tool confirmations can only be answered on the computer.
+- **`Revoke`**: disconnects the device immediately and invalidates it; it must pair again to reconnect.
+
+Devices that have not connected for `Expire after idle` days (30 by default) must pair again as well.
+
+## Security
+
+- The computer decides what a phone may do: devices without full control can view and chat, and may only read files inside open project folders; full control allows changes.
+- Some features are always desktop only: managing remote access itself (pairing, revoking, its settings), configuration that contains plain-text secrets (custom model providers, MCP servers), the computer's windows and Unity interface, system actions such as opening Explorer, and imports or exports that pick files on the computer.
+- The computer stores only a hash of the token; the phone keeps it encrypted in the system keystore and excludes it from app backups.
+- Browsers cannot use the remote access service; the computer rejects every request coming from a web page.
+- `Reset certificate` revokes every paired device. Use it if you suspect the certificate or a device was compromised.
+
+## Current limitations
+
+- Files and knowledge documents can be read but not yet edited on the phone; desktop-only features such as the Unity interface and Views are not available.
+- The app receives no push notifications while in the background; it reconnects and refreshes when you return to it.
+- If the computer's LAN address changes and the phone can no longer connect, scan a new pairing code.

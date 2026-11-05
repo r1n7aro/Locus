@@ -47,6 +47,43 @@ fn matches_checkout(scope: &WorkspaceRef, event: &RoutedWorkspaceEvent) -> bool 
         }
 }
 
+impl WindowEventInterests {
+    /// Delivery filter for remote (mobile) connections, which unlike desktop
+    /// windows receive nothing by default: high-frequency stream events follow
+    /// the same session/stream-checkout rule as `targets`, file-change
+    /// notifications never pass through interests (connections forward them
+    /// for watched paths only, see `remote_access::connections`), and every
+    /// other event needs a matching checkout or session.
+    pub fn matches_remote(&self, event: &RoutedWorkspaceEvent) -> bool {
+        if event.event_name == "workspace-file-changed" {
+            return false;
+        }
+        let session = event
+            .envelope
+            .payload
+            .get("sessionId")
+            .and_then(|value| value.as_str());
+        let session_matches = session.is_some_and(|session| self.sessions.contains(session));
+        let stream_checkout_matches = self
+            .stream_checkouts
+            .iter()
+            .any(|scope| matches_checkout(scope, event));
+        let high_frequency = event.event_name == "stream-event"
+            && event
+                .envelope
+                .payload
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(is_high_frequency_stream_type);
+        if high_frequency {
+            return session_matches || stream_checkout_matches;
+        }
+        session_matches
+            || stream_checkout_matches
+            || self.checkouts.iter().any(|scope| matches_checkout(scope, event))
+    }
+}
+
 impl WindowEventInterestRegistry {
     pub fn replace(&self, window: &str, interests: WindowEventInterests) {
         let mut windows = self.0.lock().unwrap_or_else(|error| error.into_inner());
@@ -145,6 +182,43 @@ mod tests {
                 payload,
             },
         }
+    }
+
+    #[test]
+    fn remote_filter_requires_explicit_interest() {
+        let none = WindowEventInterests::default();
+        assert!(!none.matches_remote(&event("stream-event", "a", json!({"type":"done","sessionId":"s"}))));
+
+        let session_only = WindowEventInterests {
+            sessions: ["s".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(session_only.matches_remote(&event(
+            "stream-event",
+            "a",
+            json!({"type":"textDelta","sessionId":"s"})
+        )));
+        assert!(!session_only.matches_remote(&event(
+            "stream-event",
+            "a",
+            json!({"type":"textDelta","sessionId":"other"})
+        )));
+
+        let checkout = WindowEventInterests { checkouts: vec![scope("a")], ..Default::default() };
+        assert!(checkout.matches_remote(&event(
+            "session-title-updated",
+            "a",
+            json!({"sessionId":"x"})
+        )));
+        assert!(checkout.matches_remote(&event("stream-event", "a", json!({"type":"done","sessionId":"x"}))));
+        // Deltas need the session itself (or a stream checkout), not just the checkout.
+        assert!(!checkout.matches_remote(&event(
+            "stream-event",
+            "a",
+            json!({"type":"textDelta","sessionId":"x"})
+        )));
+        assert!(!checkout.matches_remote(&event("session-title-updated", "b", json!({}))));
+        assert!(!checkout.matches_remote(&event("workspace-file-changed", "a", json!({}))));
     }
 
     #[test]

@@ -14,11 +14,11 @@ function sourceFiles(directory: string): string[] {
 // Commands forwarded through a variable are checked at their literal call site.
 const INVOKE_CALL = /(?<![\w$])(?:ipcInvoke|invoke)\s*(?:<[^()]*?>)?\s*\(\s*(["'`])([\w:|-]+)\1/g;
 
-function registeredCommands(): Set<string> {
-  const lib = readFileSync(resolve("src-tauri/src/lib.rs"), "utf8");
+function registeredCommands(libPath = "src-tauri/src/lib.rs"): Set<string> {
+  const lib = readFileSync(resolve(libPath), "utf8");
   const marker = "tauri::generate_handler![";
   const start = lib.indexOf(marker);
-  if (start < 0) throw new Error("generate_handler! not found in src-tauri/src/lib.rs");
+  if (start < 0) throw new Error(`generate_handler! not found in ${libPath}`);
   const body = lib.slice(start + marker.length, lib.indexOf("])", start));
   return new Set(body.replace(/\/\/.*$/gm, "").split(",")
     .map((entry) => entry.trim().split("::").pop() ?? "")
@@ -28,6 +28,9 @@ function registeredCommands(): Set<string> {
 describe("IPC command registration", () => {
   it("registers every command the frontend invokes", () => {
     const registered = registeredCommands();
+    // The mobile page also talks to the Locus Remote app it runs in
+    // (connection, relay); those commands are registered by the app.
+    const remoteApp = registeredCommands("mobile/src-tauri/src/lib.rs");
     const unregistered = new Set<string>();
     let invoked = 0;
     for (const file of sourceFiles(resolve("src"))) {
@@ -37,7 +40,9 @@ describe("IPC command registration", () => {
         // Tauri plugin commands are registered by their plugins.
         if (command.startsWith("plugin:")) continue;
         invoked += 1;
-        if (!registered.has(command)) unregistered.add(`${path}: ${command}`);
+        if (registered.has(command)) continue;
+        if (path.startsWith("src/mobile/") && remoteApp.has(command)) continue;
+        unregistered.add(`${path}: ${command}`);
       }
     }
     // Guard against a parser that silently matches nothing.

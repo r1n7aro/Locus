@@ -3,6 +3,7 @@ import { defineStore } from "pinia";
 import { locale, t } from "../i18n";
 import { normalizeAppError } from "../services/errors";
 import { getAppRuntimeReleaseChannel, getAppRuntimeVersion } from "../services/appVersion";
+import { getBundledRemoteApp } from "../services/remoteAccess";
 import {
   fetchAppUpdateManifest,
   normalizeAppUpdateChannel,
@@ -10,9 +11,11 @@ import {
 } from "../services/appUpdate";
 import type { AppUpdateChannel, AppUpdateInfo, AppUpdateManifest, AppUpdateSourceKind } from "../types";
 import { useNotificationStore } from "./notification";
+import { saveSetting, settingValue } from "../composables/useSettingsStore";
 
 const LAST_CHECKED_AT_STORAGE_KEY = "locus-app-update-last-checked-at";
-const UPDATE_CHANNEL_STORAGE_KEY = "locus-app-update-channel";
+/** `auto` (the default) follows the channel of the installed build. */
+const UPDATE_CHANNEL_SETTING_KEY = "updates.channel";
 
 function loadLastCheckedAt(): number | null {
   try {
@@ -37,28 +40,21 @@ function persistLastCheckedAt(value: number | null) {
   }
 }
 
-function loadPreferredUpdateChannel(): AppUpdateChannel | null {
-  try {
-    const raw = localStorage.getItem(UPDATE_CHANNEL_STORAGE_KEY);
-    return raw ? normalizeAppUpdateChannel(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-function persistPreferredUpdateChannel(value: AppUpdateChannel) {
-  try {
-    localStorage.setItem(UPDATE_CHANNEL_STORAGE_KEY, value);
-  } catch {
-    /* ignore */
-  }
+function readPreferredUpdateChannel(): AppUpdateChannel | null {
+  const value = settingValue(UPDATE_CHANNEL_SETTING_KEY);
+  return value === "stable" || value === "experimental" ? normalizeAppUpdateChannel(value) : null;
 }
 
 export const useAppUpdateStore = defineStore("appUpdate", () => {
   const manifest = ref<AppUpdateManifest | null>(null);
   const currentVersion = ref("");
   const currentChannel = ref<AppUpdateChannel>("stable");
-  const preferredUpdateChannel = ref<AppUpdateChannel | null>(loadPreferredUpdateChannel());
+  /** The running installer flavor bundles the Locus Remote app; updates keep it. */
+  const bundlesRemoteApp = ref(false);
+  const preferredUpdateChannel = computed<AppUpdateChannel | null>({
+    get: readPreferredUpdateChannel,
+    set: (value) => saveSetting(UPDATE_CHANNEL_SETTING_KEY, value ?? "auto"),
+  });
   const sourceKind = ref<AppUpdateSourceKind | null>(null);
   const sourceBaseUrl = ref("");
   const lastCheckedAt = ref<number | null>(loadLastCheckedAt());
@@ -82,6 +78,7 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
       sourceBaseUrl.value || undefined,
       sourceKind.value ?? "remote",
       currentChannel.value,
+      { remoteApp: bundlesRemoteApp.value },
     );
   });
 
@@ -114,7 +111,6 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
   function setUpdateChannel(value: AppUpdateChannel) {
     const nextChannel = normalizeAppUpdateChannel(value);
     preferredUpdateChannel.value = nextChannel;
-    persistPreferredUpdateChannel(nextChannel);
     manifest.value = null;
     sourceKind.value = null;
     sourceBaseUrl.value = "";
@@ -131,10 +127,12 @@ export const useAppUpdateStore = defineStore("appUpdate", () => {
       currentVersionPromise = Promise.all([
         getAppRuntimeVersion(),
         getAppRuntimeReleaseChannel(),
+        getBundledRemoteApp().catch(() => null),
       ])
-        .then(([version, channel]) => {
+        .then(([version, channel, remoteApp]) => {
           currentVersion.value = version;
           currentChannel.value = channel;
+          bundlesRemoteApp.value = remoteApp !== null;
           return version;
         })
         .finally(() => {

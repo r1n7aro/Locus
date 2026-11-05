@@ -1,0 +1,21 @@
+{
+  "name": "locus-remote",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "GPL-3.0-or-later",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "~2.11.1",
+    "@tauri-apps/plugin-barcode-scanner": "~2.4.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "~2.11.4",
+    "typescript": "~6.0.3",
+    "vite": "^8.2.1"
+  }
+}

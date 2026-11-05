@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, inject } from "vue";
 import {
   selectUnityAsset,
   selectUnitySceneObject,
@@ -16,6 +16,12 @@ import { useNotificationStore } from "../stores/notification";
 import { useProjectStore } from "../stores/project";
 import { useWorkspaceContextStore } from "../stores/workspaceContext";
 import type { WorkspaceRef } from "../services/project";
+import { isRemoteClient, openRemoteReference } from "../services/remoteClient";
+import {
+  WORKBENCH_FILE_OPEN_KEY,
+  openWorkbenchFileTab,
+  opensInWorkbenchOnClick,
+} from "../services/workbenchFile";
 import type { AssetRefKind, KnowledgeDocumentType } from "../types";
 import LucideIcon from "./icons/LucideIcon.vue";
 import {
@@ -42,6 +48,7 @@ const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const internalDrag = useInternalDragController();
 const { openDocument: openKnowledgeDocument } = useKnowledgeDocumentOpen();
+const openFileInWorkbench = inject(WORKBENCH_FILE_OPEN_KEY, openWorkbenchFileTab);
 const KNOWLEDGE_REF_ROOT_RE = /^(design|plan|memory|skill|reference)\/.+\.md$/i;
 
 const normalizedPath = computed(() =>
@@ -93,6 +100,16 @@ const iconNode = computed(() => unityAssetIconNodeForKind(iconKind.value));
 const unitySelectableAsset = computed(() => /^(Assets|Packages)\//i.test(normalizedPath.value));
 
 async function handleClick(e: MouseEvent) {
+  // Unity, the workbench and native file handlers live on the desktop; the
+  // phone shows files and knowledge documents in its own viewer.
+  if (isRemoteClient()) {
+    if (knowledgeRef.value) {
+      openRemoteReference({ kind: "knowledge", ...knowledgeRef.value, workspaceRef: props.workspaceRef });
+    } else if (!sceneObjectRef.value) {
+      openRemoteReference({ kind: "file", path: props.path, workspaceRef: props.workspaceRef });
+    }
+    return;
+  }
   try {
     if (knowledgeRef.value) {
       await openKnowledgeDocument(knowledgeRef.value.docType, knowledgeRef.value.path);
@@ -111,6 +128,11 @@ async function handleClick(e: MouseEvent) {
       await selectUnityAsset(projectStore.requireWorkspaceRef(), props.path);
       return;
     }
+    if (opensInWorkbenchOnClick(props.path)) {
+      const workspaceRef = props.workspaceRef ?? projectStore.requireWorkspaceRef();
+      await openFileInWorkbench({ workspaceRef, filePath: props.path });
+      return;
+    }
     await openFileExternal(projectStore.requireWorkspaceRef(), props.path);
   } catch (error) {
     if (knowledgeRef.value) {
@@ -119,8 +141,19 @@ async function handleClick(e: MouseEvent) {
     }
     if (sceneObjectRef.value) {
       notifyUnitySceneObjectError(error, sceneObjectRef.value.scenePath, sceneObjectRef.value.objectPath);
+      return;
     }
+    if (opensInWorkbenchOnClick(props.path)) notifyFileOpenError(error);
   }
+}
+
+function notifyFileOpenError(error: unknown) {
+  const err = normalizeAppError(error);
+  notificationStore.addNotice("warning", t("chat.fileRef.openFailed", err.message || props.path), {
+    code: err.code,
+    operation: "fileRefOpen",
+    replaceOperation: true,
+  });
 }
 
 function notifyKnowledgeRefError(error: unknown) {
@@ -147,7 +180,7 @@ function notifyUnitySceneObjectError(error: unknown, scenePath: string, objectPa
 }
 
 async function handleContextMenu(event: MouseEvent) {
-  if (props.contextMenuMode === "inherit") return;
+  if (props.contextMenuMode === "inherit" || isRemoteClient()) return;
 
   event.preventDefault();
   event.stopPropagation();
@@ -173,7 +206,7 @@ async function handleContextMenu(event: MouseEvent) {
 }
 
 function handlePointerDown(event: PointerEvent) {
-  if (event.button !== 0 || event.isPrimary === false) return;
+  if (event.button !== 0 || event.isPrimary === false || isRemoteClient()) return;
   const workspaceRef = props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef;
   if (!workspaceRef) return;
   const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];

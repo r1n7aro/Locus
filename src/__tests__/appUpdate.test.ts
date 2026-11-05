@@ -116,6 +116,35 @@ describe("resolveAppUpdateInfo", () => {
     );
   });
 
+  it("keeps the installer flavor that bundles the remote app", () => {
+    const withRemoteApp = {
+      ...manifest,
+      installers: [
+        ...manifest.installers!,
+        {
+          id: "windows-x64-with-remote-app",
+          label: "Windows x64 - with Locus Remote",
+          url: "https://github.com/r1n7aro/Locus/releases/download/v0.2.0/locus_0.2.0_x64-with_remote_app-setup.exe",
+          platform: "windows",
+          arch: "x64",
+          includesManagedPython: true,
+          includesManagedGit: true,
+          requiresSystemPython: false,
+          requiresSystemGit: false,
+          includesRemoteApp: true,
+        },
+      ],
+    };
+
+    const plain = resolveAppUpdateInfo(withRemoteApp, "0.1.0", "zh");
+    expect(plain?.downloadLabel).toBe("Windows x64");
+    const bundled = resolveAppUpdateInfo(withRemoteApp, "0.1.0", "zh", undefined, "remote", "stable", { remoteApp: true });
+    expect(bundled?.downloadUrl).toContain("with_remote_app");
+    // Older manifests without the flavor fall back to the default installer.
+    const legacy = resolveAppUpdateInfo(manifest, "0.1.0", "zh", undefined, "remote", "stable", { remoteApp: true });
+    expect(legacy?.downloadLabel).toBe("Windows x64");
+  });
+
   it("returns the requested locale when it exists", () => {
     const info = resolveAppUpdateInfo(manifest, "0.1.0", "en");
 

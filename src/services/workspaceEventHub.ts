@@ -2,6 +2,7 @@ import type { Event, UnlistenFn } from "@tauri-apps/api/event";
 import { listenWindowEvent } from "./windowEventTransport";
 import { getCurrentTauriWindowLabel } from "./tauriRuntime";
 import { flushWindowEventInterests, retainWindowEventInterest, type WindowEventInterest } from "./windowEventInterests";
+import { remoteClientTransport } from "./remoteClient";
 import type { RoutedWorkspaceEvent } from "./project";
 
 export const WORKSPACE_EVENT_NAME = "locus://workspace-event";
@@ -211,8 +212,16 @@ let windowHub: WorkspaceEventHub | undefined = import.meta.hot?.data?.workspaceE
 
 function getWindowHub(): WorkspaceEventHub {
   windowHub ??= createWorkspaceEventHub(
-    (handler) => listenWindowEvent(WORKSPACE_EVENT_NAME, handler),
-    getCurrentTauriWindowLabel() ? 2 : 1,
+    (handler) => {
+      // Mobile remote client: events arrive from the desktop, not Tauri.
+      const remote = remoteClientTransport();
+      if (remote) {
+        return Promise.resolve(remote.subscribeWorkspaceEvents((payload) =>
+          handler({ event: WORKSPACE_EVENT_NAME, id: 0, payload } as Event<WorkspaceEvent>)));
+      }
+      return listenWindowEvent(WORKSPACE_EVENT_NAME, handler);
+    },
+    !remoteClientTransport() && getCurrentTauriWindowLabel() ? 2 : 1,
   );
   return windowHub;
 }

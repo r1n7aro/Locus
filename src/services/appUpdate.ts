@@ -57,6 +57,7 @@ function isAppUpdateInstallerDownload(value: unknown): value is AppUpdateInstall
     && typeof record.includesManagedGit === "boolean"
     && typeof record.requiresSystemPython === "boolean"
     && typeof record.requiresSystemGit === "boolean"
+    && (record.includesRemoteApp === undefined || typeof record.includesRemoteApp === "boolean")
   );
 }
 
@@ -277,8 +278,15 @@ export function resolveUpdateUrl(url: string, baseUrl = DOCS_BASE_URL): string {
   }
 }
 
+/** What the running build bundles, so an update keeps its installer flavor. */
+export interface AppUpdateInstallerPreferences {
+  /** The running build includes the Locus Remote Android app. */
+  remoteApp?: boolean;
+}
+
 function selectInstaller(
   installers: AppUpdateInstallerDownload[],
+  preferences: AppUpdateInstallerPreferences = {},
 ): AppUpdateInstallerDownload | null {
   if (installers.length === 0) {
     return null;
@@ -286,9 +294,14 @@ function selectInstaller(
 
   const platformInstallers = installers.filter((installer) => installer.platform === "windows");
   const candidates = platformInstallers.length > 0 ? platformInstallers : installers;
-  return candidates.find((installer) =>
+  const selfContained = candidates.filter((installer) =>
     !installer.requiresSystemPython && !installer.requiresSystemGit,
-  ) ?? candidates[0] ?? null;
+  );
+  const pool = selfContained.length > 0 ? selfContained : candidates;
+  const wantsRemoteApp = preferences.remoteApp === true;
+  return pool.find((installer) => (installer.includesRemoteApp === true) === wantsRemoteApp)
+    ?? pool[0]
+    ?? null;
 }
 
 function githubReleaseUrlFromUrl(url: string): string | null {
@@ -346,6 +359,7 @@ export function resolveAppUpdateInfo(
   sourceBaseUrl = DOCS_BASE_URL,
   sourceKind: AppUpdateSourceKind = "remote",
   currentReleaseChannel: AppUpdateChannel = STABLE_UPDATE_CHANNEL,
+  installerPreferences: AppUpdateInstallerPreferences = {},
 ): AppUpdateInfo | null {
   if (compareReleaseVersions(currentVersion, manifest.version) >= 0) {
     return null;
@@ -357,7 +371,7 @@ export function resolveAppUpdateInfo(
   }
 
   const installers = sanitizeInstallers(manifest.installers, sourceBaseUrl);
-  const installer = selectInstaller(installers);
+  const installer = selectInstaller(installers, installerPreferences);
   const changelogUrl = resolveUpdateUrl(localeEntry.changelogUrl, sourceBaseUrl);
   const releaseUrl = resolveGitHubReleaseUrl(localeEntry, installers, sourceBaseUrl);
   const currentChannel = normalizeAppUpdateChannel(currentReleaseChannel);

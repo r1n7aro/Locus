@@ -1,7 +1,10 @@
-import { existsSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { assertPublicArguments, assertClientBundle } from "./client-edition.mjs";
+import { assertPublicSourceBoundary } from "./public-source-boundary.mjs";
+import { remoteAppPrerequisiteErrors } from "./prepare-remote-app.mjs";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..");
@@ -9,6 +12,8 @@ const srcTauriDir = path.join(repoRoot, "src-tauri");
 const nsisBundleDir = path.join(srcTauriDir, "target", "release", "bundle", "nsis");
 const withEmbedConfig = path.join(srcTauriDir, "tauri.with_embed_python_git.conf.json");
 const withoutEmbedConfig = path.join(srcTauriDir, "tauri.without_embed_python_git.conf.json");
+// Adds the signed Locus Remote APK (src-tauri/gen/remote-app) on top of a flavor.
+const remoteAppConfig = path.join(srcTauriDir, "tauri.with_remote_app.conf.json");
 // NSIS compression: the base tauri.conf.json uses zlib (fast packaging, used by
 // the official release flow). Passing --compression=lzma layers this overlay on
 // top for a smaller but much slower-to-build installer.
@@ -32,7 +37,7 @@ const buildModes = new Map([
     {
       label: "release",
       outputSuffix: "",
-      defaultFlavors: ["without_embed_python_git", "default"],
+      defaultFlavors: ["without_embed_python_git", "default", "with_remote_app"],
       cargoEnv: {
         CARGO_PROFILE_RELEASE_INCREMENTAL: "false",
         CARGO_PROFILE_RELEASE_LTO: "thin",
@@ -81,6 +86,23 @@ const flavors = new Map([
       ],
     },
   ],
+  [
+    // The default installer plus the Locus Remote Android app, which phones
+    // on the LAN can download while pairing.
+    "with_remote_app",
+    {
+      label: "Windows x64 - with Locus Remote (Android)",
+      suffix: "with_remote_app",
+      remoteApp: true,
+      buildArgs: [
+        "build",
+        "--config",
+        path.relative(repoRoot, withEmbedConfig),
+        "--config",
+        path.relative(repoRoot, remoteAppConfig),
+      ],
+    },
+  ],
 ]);
 
 function readJson(filePath) {
@@ -94,7 +116,8 @@ function usage() {
     "",
     `Flavors: ${names}`,
     "Mode: release (default)",
-    "Default flavors: development = without_embed_python_git; release = without_embed_python_git default",
+    "Default flavors: development = without_embed_python_git; release = without_embed_python_git default with_remote_app",
+    "with_remote_app builds and signs the Android APK first (see scripts/prepare-remote-app.mjs for the required variables)",
     "Compression: zlib (default, fast packaging) or lzma (smaller installer, much slower)",
   ].join("\n");
 }
@@ -228,23 +251,34 @@ function finalizeInstaller(flavor, mode, baseName, startedAtMs) {
 }
 
 function buildFlavor(flavorName, mode, compression, tauriArgs, baseName) {
+  assertPublicArguments(tauriArgs);
+  assertPublicSourceBoundary(repoRoot);
   const flavor = flavors.get(flavorName);
   const startedAtMs = Date.now();
   // Config overlays merge in order, so the compression overlay must come after
   // the flavor config to win.
   const compressionArgs =
     compression === "lzma" ? ["--config", path.relative(repoRoot, nsisLzmaConfig)] : [];
+  if (flavor.remoteApp) {
+    run("bun", ["run", "scripts/prepare-remote-app.mjs"]);
+  }
   console.log(
     `[locus] Building ${mode.label} installer flavor: ${flavorName} (nsis compression: ${compression})`,
   );
-  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs], mode.cargoEnv);
+  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs], { ...mode.cargoEnv, LOCUS_BUILD_EDITION: "public" });
+  assertClientBundle(repoRoot, "public");
   const finalPath = finalizeInstaller(flavor, mode, baseName, startedAtMs);
+  const results = [{ flavor: flavorName, label: flavor.label, path: finalPath }];
+  if (flavor.remoteApp) {
+    // The same signed APK, published on its own for phones that cannot use
+    // the LAN download.
+    const version = readJson(path.join(srcTauriDir, "tauri.conf.json")).version;
+    const apkPath = path.join(nsisBundleDir, `locus-remote_${version}_android-arm64.apk`);
+    copyFileSync(path.join(srcTauriDir, "gen", "remote-app", "locus-remote.apk"), apkPath);
+    results.push({ flavor: "remote_app_apk", label: "Android (Locus Remote)", path: apkPath });
+  }
 
-  return {
-    flavor: flavorName,
-    label: flavor.label,
-    path: finalPath,
-  };
+  return results;
 }
 
 try {
@@ -258,8 +292,18 @@ try {
   }
 
   const mode = buildModes.get(buildMode);
+  // Fail before any installer is built rather than after the first ones.
+  if (requestedFlavors.some((name) => flavors.get(name).remoteApp)) {
+    const errors = remoteAppPrerequisiteErrors();
+    if (errors.length > 0) {
+      throw new Error(
+        `The with_remote_app flavor cannot be built:\n- ${errors.join("\n- ")}\n`
+          + "Set the variables, or pass the flavors to build explicitly (e.g. without_embed_python_git default).",
+      );
+    }
+  }
   const baseName = expectedInstallerBaseName();
-  const results = requestedFlavors.map((flavorName) =>
+  const results = requestedFlavors.flatMap((flavorName) =>
     buildFlavor(flavorName, mode, compression, tauriArgs, baseName),
   );
 
