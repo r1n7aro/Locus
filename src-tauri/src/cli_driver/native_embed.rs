@@ -109,13 +109,7 @@ pub(super) async fn run(
         .state::<Arc<crate::workspace_service::ProjectRegistry>>()
         .register(root)?;
     let reference = WorkspaceRef::for_runtime(&runtime);
-    crate::commands::set_unity_embed_enabled(
-        app.clone(),
-        reference.clone(),
-        true,
-        app.state(),
-        app.state(),
-    )
+    crate::commands::set_unity_embed_enabled(app.clone(), reference.clone(), true, app.state())
     .await
     .map_err(|e| e.to_string())?;
     let mut cases = Vec::new();

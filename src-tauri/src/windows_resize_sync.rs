@@ -112,9 +112,12 @@ fn apply_webview_client_bounds(
         })
         .map_err(|error| format!("failed to access WebView2 during {phase}: {error}"))?;
 
-    webview.set_auto_resize(true).map_err(|error| {
-        format!("failed to enable main webview auto-resize during {phase}: {error}")
-    })
+    // Later resizes are wry's: its parent subclass resizes WebView2 on every
+    // WM_SIZE except SIZE_MINIMIZED. Tauri's auto-resize must stay off, because
+    // it also applies the minimized client size (about 144x20): the page then
+    // relaid out at that size while minimized and showed the tiny render on a
+    // bare window for the first frames after restore.
+    Ok(())
 }
 
 pub fn sync_after_page_load(webview: &tauri::Webview) -> Result<(), String> {
@@ -126,27 +129,32 @@ pub fn sync_after_page_load(webview: &tauri::Webview) -> Result<(), String> {
     let client_size = webview.window().inner_size().map_err(|error| {
         format!("failed to read main window client size after page load: {error}")
     })?;
+    // A page reloaded while minimized sees the iconic client size; wry
+    // resizes the WebView on restore instead.
+    if (client_size.width as i32) < MIN_SYNC_WIDTH_PX
+        || (client_size.height as i32) < MIN_SYNC_HEIGHT_PX
+    {
+        return Ok(());
+    }
     apply_webview_client_bounds(webview, client_size, "page load")
 }
 
+/// Installs the native live-resize shim on the default window. A session that
+/// restored only workspace windows has no default window and needs none.
 pub fn install_for_main_window(app: &tauri::App) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return Ok(());
+    };
     if INSTALLED.swap(true, Ordering::AcqRel) {
         return Ok(());
     }
 
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        INSTALLED.store(false, Ordering::Release);
-        return Err(format!(
-            "main webview window '{MAIN_WINDOW_LABEL}' was not found"
-        ));
-    };
-
     // WebviewWindowBuilder::from_config creates the native window with its
     // configured size, while Tauri's stable webview builder starts without
-    // explicit bounds or auto-resize. That leaves WebView2 at its 800x600
-    // default until some other code happens to resize it. Seed Tauri's own
-    // webview layout state before installing the native live-resize shim so
-    // startup, maximize/restore, and edge resizing all share the same bounds.
+    // explicit bounds. That can leave WebView2 at its 800x600 default until
+    // the first WM_SIZE. Seed the client bounds before installing the native
+    // live-resize shim so startup, maximize/restore, and edge resizing all
+    // share the same bounds.
     let initial_size = window
         .inner_size()
         .map_err(|error| format!("failed to read main window client size: {error}"))?;

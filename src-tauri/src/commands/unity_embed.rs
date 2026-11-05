@@ -17,7 +17,6 @@ use crate::workspace_service::{
 };
 
 const WINDOW_LABEL_PREFIX: &str = "unity-embed";
-const MAIN_WINDOW_LABEL: &str = "main";
 const VIEW_WINDOW_LABEL_PREFIX: &str = "view-";
 const ASSET_DROP_EVENT: &str = "unity-embed-asset-drop";
 const TEXT_DROP_EVENT: &str = "unity-embed-text-drop";
@@ -642,6 +641,15 @@ fn unity_embed_window_labels_for_scope(
         .collect()
 }
 
+fn application_window_labels(app_handle: &AppHandle) -> Vec<String> {
+    app_handle
+        .webview_windows()
+        .keys()
+        .filter(|label| crate::workspace_window::is_application_window(label))
+        .cloned()
+        .collect()
+}
+
 fn locus_view_window_labels(app_handle: &AppHandle) -> Vec<String> {
     app_handle
         .webview_windows()
@@ -654,7 +662,8 @@ fn locus_view_window_labels(app_handle: &AppHandle) -> Vec<String> {
 fn locus_frontend_drop_window_labels(app_handle: &AppHandle) -> Vec<String> {
     let mut labels = Vec::new();
     let mut seen = HashSet::new();
-    for label in std::iter::once(MAIN_WINDOW_LABEL.to_string())
+    for label in application_window_labels(app_handle)
+        .into_iter()
         .chain(unity_embed_window_labels(app_handle))
         .chain(locus_view_window_labels(app_handle))
     {
@@ -1265,8 +1274,7 @@ fn commit_cached_unity_asset_drag_drop_to(app_handle: &AppHandle, label: &str) {
 pub(crate) fn is_locus_drop_target_label(label: &str) -> bool {
     is_unity_embed_window_label(label)
         || is_locus_view_window_label(label)
-        || crate::workspace_window::is_workspace_window(label)
-        || label == MAIN_WINDOW_LABEL
+        || crate::workspace_window::is_application_window(label)
 }
 
 fn emit_to_existing_window<T>(
@@ -1350,9 +1358,9 @@ fn emit_unity_embed_asset_drop(
         match probe.target {
             windows_impl::UnityAssetDragReleaseTarget::NativeWindow { label, generation, x, y } =>
                 emit_native_unity_asset_drop(app_handle, &label, &generation, workspace_ref, refs, x, y),
-            windows_impl::UnityAssetDragReleaseTarget::MainWindow
-                if window_matches_workspace_ref(app_handle, MAIN_WINDOW_LABEL, workspace_ref) =>
-                emit_locus_asset_drop_to(app_handle, MAIN_WINDOW_LABEL, refs),
+            windows_impl::UnityAssetDragReleaseTarget::ApplicationWindow(label)
+                if window_matches_workspace_ref(app_handle, &label, workspace_ref) =>
+                emit_locus_asset_drop_to(app_handle, &label, refs),
             windows_impl::UnityAssetDragReleaseTarget::ViewWindow(label)
                 if window_matches_workspace_ref(app_handle, &label, workspace_ref) =>
                 emit_locus_asset_drop_to(app_handle, &label, refs),
@@ -1561,8 +1569,8 @@ fn finish_unity_asset_drag_release(
     let refs = take_unity_embed_asset_drag_refs(workspace_ref, true);
     if refs.is_empty() { return; }
     let label = match &probe.target {
-        windows_impl::UnityAssetDragReleaseTarget::MainWindow => MAIN_WINDOW_LABEL,
-        windows_impl::UnityAssetDragReleaseTarget::ViewWindow(label)
+        windows_impl::UnityAssetDragReleaseTarget::ApplicationWindow(label)
+        | windows_impl::UnityAssetDragReleaseTarget::ViewWindow(label)
         | windows_impl::UnityAssetDragReleaseTarget::NativeWindow { label, .. } => label,
         _ => {
             clear_unity_embed_asset_drag_after_release(app_handle, workspace_ref);
@@ -2435,7 +2443,7 @@ fn live_unity_embed_runtime_scopes(
         .into_iter()
         .filter_map(|runtime| {
             let root = runtime.root().to_string_lossy().to_string();
-            crate::unity_bridge::is_unity_project(&root)
+            crate::unity_bridge::unity_integration_enabled(&root)
                 .then(|| (WorkspaceRef::for_runtime(&runtime), root))
         })
         .collect::<Vec<_>>();
@@ -2473,35 +2481,24 @@ fn sync_unity_embed_markers_transactionally(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn set_unity_embed_enabled(
-    app_handle: AppHandle,
-    workspace_ref: WorkspaceRef,
+/// Effect of `unity.embed.enabled`: per-checkout markers form one
+/// transaction (a failure rolls them back and the setting reverts); then the
+/// embed control servers and windows of every live Unity checkout follow.
+pub(crate) async fn apply_unity_embed_enabled(
+    app_handle: &AppHandle,
     value: bool,
-    config: State<'_, Arc<crate::config::AppConfig>>,
-    workspace_registry: State<'_, Arc<ProjectRegistry>>,
-) -> Result<bool, AppError> {
-    let _scope = workspace_registry
-        .resolve_workspace_ref(&workspace_ref)
-        .map_err(|error| AppError::from(error.to_string()))?;
+    previous: bool,
+) -> Result<(), String> {
+    let workspace_registry = app_handle.state::<Arc<ProjectRegistry>>().inner().clone();
     let _settings_mutation = super::system::unity_process_settings_mutation_gate()
         .lock()
         .await;
-    let runtime_scopes = live_unity_embed_runtime_scopes(workspace_registry.inner());
+    let runtime_scopes = live_unity_embed_runtime_scopes(&workspace_registry);
     let roots = runtime_scopes
         .iter()
         .map(|(_, root)| root.clone())
         .collect::<Vec<_>>();
-    let previous = config.unity_embed_enabled();
-
-    if let Err(error) = config.set_unity_embed_enabled(value) {
-        let _ = config.set_unity_embed_enabled(previous);
-        return Err(AppError::from(error));
-    }
-    if let Err(error) = sync_unity_embed_markers_transactionally(&roots, value, previous) {
-        let _ = config.set_unity_embed_enabled(previous);
-        return Err(AppError::from(error));
-    }
+    sync_unity_embed_markers_transactionally(&roots, value, previous)?;
 
     for (runtime_ref, root) in &runtime_scopes {
         if value {
@@ -2553,7 +2550,22 @@ pub async fn set_unity_embed_enabled(
         rx.await
             .map_err(|_| "Unity embed disable dispatch was cancelled".to_string())?;
     }
+    Ok(())
+}
 
+#[tauri::command]
+pub async fn set_unity_embed_enabled(
+    app_handle: AppHandle,
+    workspace_ref: WorkspaceRef,
+    value: bool,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<bool, AppError> {
+    let scope = workspace_registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(|error| AppError::from(error.to_string()))?;
+    let context = crate::settings::apply::WriteContext::new(app_handle, Some(&scope));
+    crate::settings::apply::write_one(&context, crate::settings::UNITY_EMBED_ENABLED, value)
+        .await?;
     Ok(value)
 }
 
@@ -3259,7 +3271,7 @@ mod windows_impl {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum UnityAssetDragReleaseTarget {
-        MainWindow,
+        ApplicationWindow(String),
         ViewWindow(String),
         EmbedWindow,
         NativeWindow { label: String, generation: String, x: i32, y: i32 },
@@ -3317,8 +3329,10 @@ mod windows_impl {
         app_handle: &AppHandle,
         hwnd: HWND,
     ) -> Result<UnityAssetDragReleaseTarget, String> {
-        if window_label_contains_hwnd(app_handle, MAIN_WINDOW_LABEL, hwnd)? {
-            return Ok(UnityAssetDragReleaseTarget::MainWindow);
+        for label in application_window_labels(app_handle) {
+            if window_label_contains_hwnd(app_handle, &label, hwnd)? {
+                return Ok(UnityAssetDragReleaseTarget::ApplicationWindow(label));
+            }
         }
         for label in locus_view_window_labels(app_handle) {
             if window_label_contains_hwnd(app_handle, &label, hwnd)? {

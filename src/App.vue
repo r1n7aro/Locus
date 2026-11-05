@@ -2,7 +2,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, nextTick, ref, shallowRef, onMounted, onUnmounted, watch } from "vue";
 import type { Component, ShallowRef } from "vue";
-import { AppWindow } from "lucide";
+import { AppWindow, PanelLeft } from "lucide";
 import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -15,6 +15,7 @@ import { useAuthStore } from "./stores/auth";
 import { useAgentStore } from "./stores/agent";
 import { useModelStore } from "./stores/model";
 import { claudePrewarmSettings, prewarmClaudeSession } from "./services/claudeConnection";
+import { protocolModelId } from "@locus/server-client";
 import { claudeCodeCliEnabled } from "./services/claudeCodeCli";
 import { useProjectStore } from "./stores/project";
 import { useWorkspaceContextStore } from "./stores/workspaceContext";
@@ -24,19 +25,30 @@ import { useAppUpdateStore } from "./stores/appUpdate";
 import { useAppBootstrap } from "./composables/useAppBootstrap";
 import { watchSessionMaintenance } from "./composables/useSessionMaintenanceNotice";
 import { bootstrapWorkspaceWindow } from "./composables/bootstrapWorkspaceWindow";
-import { isWorkspaceWindowLabel, workspaceWindowQuery } from "./services/workspaceWindow";
+import { isWorkspaceWindowLabel, WORKSPACE_WINDOW_TITLE_BAR_SETTING, workspaceWindowQuery } from "./services/workspaceWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAgentWorkspaceScope } from "./composables/useAgentWorkspaceScope";
 import { useUnityAssetDropTarget } from "./composables/useUnityAssetDropTarget";
-import { knowledgeGetEmbeddingStatus } from "./services/knowledge";
+import { KNOWLEDGE_EMBEDDING_STATUS_EVENT, knowledgeGetEmbeddingStatus } from "./services/knowledge";
+import { listenWorkspaceEvent } from "./services/workspaceEventHub";
+import type { RoutedWorkspaceEvent } from "./services/project";
 import { APP_CLOSE_REQUESTED_EVENT, getRunningTaskCount, requestAppExit } from "./services/system";
+import { watchPrimaryWindow } from "./services/primaryWindow";
 
 import TopBannerHost from "./components/TopBannerHost.vue";
+import RemotePairingPrompt from "./components/RemotePairingPrompt.vue";
 import BaseButton from "./components/ui/BaseButton.vue";
 import BaseContextMenu from "./components/ui/BaseContextMenu.vue";
 import LucideIcon from "./components/icons/LucideIcon.vue";
 import AppUpdateModal from "./components/AppUpdateModal.vue";
 import DevelopmentWorkbench from "./components/workbench/DevelopmentWorkbench.vue";
+import {
+  WORKSPACE_TOP_BAR_NODES_SETTING,
+  isTopBarNodeId,
+  topBarLayout,
+  type TopBarEntryId,
+} from "./components/workbench/workspaceTopBarNodes";
+import { settingValue } from "./composables/useSettingsStore";
 import InternalDragOverlay from "./components/ui/InternalDragOverlay.vue";
 import WorkspaceSetupDialog from "./components/WorkspaceSetupDialog.vue";
 import { requestWorkspaceSetup } from "./composables/useWorkspaceSetup";
@@ -100,6 +112,9 @@ const isUnityValueEditorWindow = isUnityValueEditorWindowLocation();
 const isExtraWorkdirsWindow = isExtraWorkdirsWindowLocation();
 const applicationWindowId = getCurrentTauriWindowLabel() || "main";
 const isWorkspaceWindow = isWorkspaceWindowLabel(applicationWindowId);
+// True in exactly one application window, the oldest still open: it hosts the
+// process-wide renderer duties. See services/primaryWindow.ts.
+const isPrimaryWindow = ref(false);
 const isStandaloneWindow = isUnityEmbedWindow
   || isUnityEmbedTestWindow
   || isKnowledgeDownloadWindow
@@ -153,7 +168,7 @@ watch(() => [mainWorkspaceRestored.value, claudeCodeCliEnabled.value && claudePr
   workspaceContextStore.focusedWorkspaceRef, modelStore.selectedModelId, modelStore.allModels] as const,
   ([restored, enabled, workspaceRef, selected, models]) => {
     if (isStandaloneWindow || startupClaudeConnectionRequested || !restored || !enabled || !workspaceRef) return;
-    const model = selected.startsWith("claude_code/") ? selected
+    const model = protocolModelId(selected).startsWith("claude_code/") ? selected
       : (models.find(item => item.provider === "claude_code" && item.isDefault)
         ?? models.find(item => item.provider === "claude_code"))?.id ?? "claude_code/";
     startupClaudeConnectionRequested = true;
@@ -167,6 +182,8 @@ watch(() => [mainWorkspaceRestored.value, claudeCodeCliEnabled.value && claudePr
   }, { immediate: true });
 const mainBootstrapError = ref("");
 const workspaceWindowToolbarTarget = ref<HTMLElement | null>(null);
+const topTabBar = ref<HTMLElement | null>(null);
+const developmentWorkbench = ref<InstanceType<typeof DevelopmentWorkbench> | null>(null);
 let mainBootstrapCompleted = false;
 // Start recovery during setup, before the first mounted hook or auth request.
 // Utility/embedded windows bind their own explicit workspace in their owner.
@@ -230,15 +247,49 @@ const {
 const unityEmbedBootstrapped = ref(false);
 const unityEmbedBootstrapError = ref<string | null>(null);
 const KNOWLEDGE_RUNTIME_LOADING_OPERATION = "knowledgeEmbeddingRuntimeLoading";
-const KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT = 16;
-let knowledgeRuntimeStatusTimer: ReturnType<typeof setTimeout> | null = null;
 let knowledgeRuntimeStatusRequestSeq = 0;
-let knowledgeRuntimeStartupPollsRemaining = 0;
+let knowledgeRuntimeStatusUnlisten: (() => void) | null = null;
+let knowledgeRuntimeStatusListening = false;
 let appCloseRequestUnlisten: UnlistenFn | null = null;
 let unityNativeEmbedRelease: (() => void) | null = null;
 let extraWorkdirsUpdatedUnlisten: UnlistenFn | null = null;
 let workspacePageResetOnboardingUnlisten: UnlistenFn | null = null;
 let sessionMaintenanceRelease: (() => void) | null = null;
+let primaryWindowUnlisten: UnlistenFn | null = null;
+let sessionMaintenanceStarted = false;
+let unityNativeEmbedStarting: Promise<void> | null = null;
+
+function startSessionMaintenance() {
+  if (!isPrimaryWindow.value || sessionMaintenanceStarted) return;
+  sessionMaintenanceStarted = true;
+  void watchSessionMaintenance().then((release) => {
+    sessionMaintenanceRelease = release;
+  });
+}
+
+function startUnityNativeEmbed(): Promise<void> {
+  if (!isPrimaryWindow.value) return Promise.resolve();
+  unityNativeEmbedStarting ??= startUnityNativeEmbedHosts().then(
+    (release) => {
+      unityNativeEmbedRelease = release;
+    },
+    (error) => {
+      unityNativeEmbedStarting = null;
+      throw error;
+    },
+  );
+  return unityNativeEmbedStarting;
+}
+
+// A window promoted after startup (the previous primary closed) picks up the
+// duties it was not running. Before bootstrap completes, startup does it.
+watch(isPrimaryWindow, (primary) => {
+  if (!primary || !mainBootstrapCompleted) return;
+  startSessionMaintenance();
+  void startUnityNativeEmbed().catch((error) => {
+    console.warn("[unity-embed] failed to take over embedded workbench hosting", error);
+  });
+});
 
 // -- Diff overlay provider (must be called in App setup so all children can inject) --
 const diffOverlay = provideDiffOverlay();
@@ -254,7 +305,8 @@ const {
   onOnboardingCompleted: handleOnboardingCompleted,
 } = useAppBootstrap({
   workspaceReady: mainWorkspaceReady,
-  handleExternalScriptOpen: !isUnityEmbedWindow && !isStandaloneWindow && !isWorkspaceWindow,
+  // Follows the primary window, which moves when the first window closes.
+  handleExternalScriptOpen: () => !isUnityEmbedWindow && !isStandaloneWindow && isPrimaryWindow.value,
 });
 
 async function bindUnityEmbedWorkspace() {
@@ -381,10 +433,66 @@ const topTabs = computed<TopTabItem[]>(() => [
 ]);
 
 const visibleTopTabs = computed(() => topTabs.value.filter((tab) => tab.visible));
+// The default window always carries the page tabs. Workspace windows carry
+// them only while they are the primary (oldest open) window, so the tabs stay
+// reachable after the default window closes without pinning a main window.
+// Other workspace windows show them too when the user turns their title bar on.
+const workspaceWindowTitleBarOptional = computed(() => isWorkspaceWindow && !isPrimaryWindow.value);
+const showTopTabs = computed(() => !workspaceWindowTitleBarOptional.value
+  || settingValue(WORKSPACE_WINDOW_TITLE_BAR_SETTING) === true);
 const topTabContextMenu = ref<{ x: number; y: number; tab: TopTabItem } | null>(null);
 
+// Workspace system nodes the workbench moved into the bar (single-workspace
+// mode), shown in the stored order between the page tabs.
+const topBarNodes = computed(() => developmentWorkbench.value?.topBarNodeEntries ?? []);
+const activeTopBarNode = computed(() => (
+  uiStore.activePage === "development" ? topBarNodes.value.find((node) => node.active) ?? null : null
+));
+interface TopBarRenderedEntry {
+  id: TopBarEntryId;
+  tab: TopTabItem | null;
+  node: { id: string; label: string; active: boolean } | null;
+}
+const topBarEntries = computed<TopBarRenderedEntry[]>(() => {
+  const nodes = new Map(topBarNodes.value.map((node) => [node.id, node]));
+  return topBarLayout(settingValue(WORKSPACE_TOP_BAR_NODES_SETTING)).flatMap((id): TopBarRenderedEntry[] => {
+    if (isTopBarNodeId(id)) {
+      const node = nodes.get(id);
+      return node ? [{ id, tab: null, node }] : [];
+    }
+    const tab = visibleTopTabs.value.find((candidate) => candidate.id === id);
+    return tab ? [{ id, tab, node: null }] : [];
+  });
+});
+/** Where a dragged node would land: before this entry, `null` after the last, `undefined` when not over the bar. */
+const topBarDropBefore = computed<TopBarEntryId | null | undefined>(() => developmentWorkbench.value?.topBarDropBefore);
+const topBarNodeContextMenu = ref<{ x: number; y: number; id: string } | null>(null);
+
 function isTopTabActive(tab: TopTabItem) {
-  return uiStore.activePage === tab.id;
+  return uiStore.activePage === tab.id && !(tab.id === "development" && activeTopBarNode.value);
+}
+
+function onTopBarNodeClick(id: string) {
+  const onDevelopment = uiStore.activePage === "development";
+  if (!onDevelopment) uiStore.setPage("development");
+  // From another page, show the node's page without closing it if it was open.
+  void developmentWorkbench.value?.activateTopBarNode(id, onDevelopment);
+}
+
+function onTopBarNodePointerDown(event: PointerEvent, id: string) {
+  developmentWorkbench.value?.startTopBarNodeDrag(id, event);
+}
+
+function openTopBarNodeContextMenu(event: MouseEvent, id: string) {
+  event.preventDefault();
+  event.stopPropagation();
+  topBarNodeContextMenu.value = { x: event.clientX, y: event.clientY, id };
+}
+
+function moveTopBarNodeToTree() {
+  const menu = topBarNodeContextMenu.value;
+  topBarNodeContextMenu.value = null;
+  if (menu) developmentWorkbench.value?.moveTopBarNodeToTree(menu.id);
 }
 
 function topTabWorkspaceRuntime(tab: TopTabItem) {
@@ -434,6 +542,8 @@ function onTopTabClick(event: MouseEvent, tab: TopTabItem) {
     void openTopTabInWindow(tab);
     return;
   }
+  // Development means the editor groups, not a page a top bar node opened over them.
+  if (tab.id === "development") developmentWorkbench.value?.closeTopBarNodePages();
   uiStore.setPage(tab.id);
 }
 
@@ -464,8 +574,14 @@ watch(() => uiStore.settingsMounted, (mounted) => {
   void settingsView.ensureLoaded();
 }, { immediate: true });
 
+// A workspace window that hands the primary role to another window drops its
+// tabs; return it to its workspace instead of leaving a page with no tabs.
+watch(showTopTabs, (shown) => {
+  if (!shown && uiStore.activePage !== "development") uiStore.setPage("development");
+});
+
 watch([() => uiStore.activePage, visibleTopTabs], () => {
-  if (isWorkspaceWindow && uiStore.activePage !== "development") {
+  if (!showTopTabs.value && uiStore.activePage !== "development") {
     const requestedTab = topTabs.value.find((tab) => tab.id === uiStore.activePage);
     uiStore.setPage("development");
     // Keep this window on its workspace. Explicit settings/plugin actions can
@@ -611,26 +727,31 @@ async function openAppUpdateRelease() {
   }
 }
 
-function clearKnowledgeRuntimeStatusTimer() {
-  if (!knowledgeRuntimeStatusTimer) return;
-  clearTimeout(knowledgeRuntimeStatusTimer);
-  knowledgeRuntimeStatusTimer = null;
+function applyKnowledgeRuntimeLoadingStatus(activating: boolean) {
+  if (!activating) {
+    notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
+    return;
+  }
+  notificationStore.addNotice("info", t("knowledge.retrieval.runtimeStarting"), {
+    operation: KNOWLEDGE_RUNTIME_LOADING_OPERATION,
+    replaceOperation: true,
+    spinner: true,
+    sticky: true,
+    skipConsoleLog: true,
+  });
 }
 
-function scheduleKnowledgeRuntimeStatusPoll(delay = 700) {
-  clearKnowledgeRuntimeStatusTimer();
-  knowledgeRuntimeStatusTimer = setTimeout(() => {
-    knowledgeRuntimeStatusTimer = null;
-    void refreshKnowledgeRuntimeLoadingStatus();
-  }, delay);
+function knowledgeRuntimeNoticeApplies(): boolean {
+  return !isStandaloneWindow
+    && !!workspaceContextStore.focusedWorkspaceRef
+    && workspaceContextStore.focusedCheckout?.knowledgeEnabled !== false;
 }
 
 async function refreshKnowledgeRuntimeLoadingStatus() {
   const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
   const requestSeq = ++knowledgeRuntimeStatusRequestSeq;
-  if (isStandaloneWindow || !workspaceRef || workspaceContextStore.focusedCheckout?.knowledgeEnabled === false) {
+  if (!workspaceRef || !knowledgeRuntimeNoticeApplies()) {
     notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
-    clearKnowledgeRuntimeStatusTimer();
     return;
   }
 
@@ -642,35 +763,50 @@ async function refreshKnowledgeRuntimeLoadingStatus() {
       || currentRef?.checkoutId !== workspaceRef.checkoutId
       || currentRef.expectedGeneration !== workspaceRef.expectedGeneration
     ) return;
-    if (status.activating) {
-      notificationStore.addNotice("info", t("knowledge.retrieval.runtimeStarting"), {
-        operation: KNOWLEDGE_RUNTIME_LOADING_OPERATION,
-        replaceOperation: true,
-        spinner: true,
-        sticky: true,
-        skipConsoleLog: true,
-      });
-      scheduleKnowledgeRuntimeStatusPoll();
-      return;
-    }
-
-    notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
-    if (knowledgeRuntimeStartupPollsRemaining > 0) {
-      knowledgeRuntimeStartupPollsRemaining -= 1;
-      scheduleKnowledgeRuntimeStatusPoll();
-    }
+    applyKnowledgeRuntimeLoadingStatus(status.activating);
   } catch {
     if (requestSeq !== knowledgeRuntimeStatusRequestSeq) return;
     notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
-    clearKnowledgeRuntimeStatusTimer();
   }
 }
 
-function startKnowledgeRuntimeStartupPolling() {
+/** One snapshot for the focused workspace, then the backend pushes each
+ * embedding status change (`knowledge-embedding-status`); nothing polls. */
+function startKnowledgeRuntimeStatusUpdates() {
   if (isStandaloneWindow) return;
+  void refreshKnowledgeRuntimeLoadingStatus();
+  if (knowledgeRuntimeStatusListening) return;
+  knowledgeRuntimeStatusListening = true;
+  void listenWorkspaceEvent<RoutedWorkspaceEvent<{ activating: boolean }>>(
+    "App.knowledgeRuntimeStatus",
+    (event) => {
+      const routed = event.payload;
+      if (routed.eventName !== KNOWLEDGE_EMBEDDING_STATUS_EVENT) return;
+      const workspaceRef = workspaceContextStore.focusedWorkspaceRef;
+      if (
+        !workspaceRef
+        || routed.checkoutId !== workspaceRef.checkoutId
+        || (workspaceRef.expectedGeneration != null
+          && routed.workspaceGeneration !== workspaceRef.expectedGeneration)
+        || !knowledgeRuntimeNoticeApplies()
+      ) return;
+      // A pushed state supersedes a snapshot still in flight.
+      knowledgeRuntimeStatusRequestSeq += 1;
+      applyKnowledgeRuntimeLoadingStatus(routed.payload.activating);
+    },
+  ).then((release) => {
+    if (knowledgeRuntimeStatusListening) knowledgeRuntimeStatusUnlisten = release;
+    else release();
+  }).catch(() => {
+    knowledgeRuntimeStatusListening = false;
+  });
+}
+
+function stopKnowledgeRuntimeStatusUpdates() {
+  knowledgeRuntimeStatusListening = false;
   knowledgeRuntimeStatusRequestSeq += 1;
-  knowledgeRuntimeStartupPollsRemaining = KNOWLEDGE_RUNTIME_STARTUP_POLL_COUNT;
-  scheduleKnowledgeRuntimeStatusPoll(120);
+  knowledgeRuntimeStatusUnlisten?.();
+  knowledgeRuntimeStatusUnlisten = null;
 }
 
 async function registerAppCloseRequestListener() {
@@ -695,7 +831,7 @@ async function registerExtraWorkdirsUpdatedListener() {
   }
 }
 
-function revealMainWindow() {
+function revealApplicationWindow() {
   if (isStandaloneWindow) return;
   const currentTauriWindowLabel = getCurrentTauriWindowLabel();
   if (currentTauriWindowLabel && currentTauriWindowLabel !== "main" && !isWorkspaceWindow) return;
@@ -718,7 +854,7 @@ onMounted(async () => {
     path: window.location.pathname,
   });
   await nextTick();
-  setTimeout(revealMainWindow, 0);
+  setTimeout(revealApplicationWindow, 0);
   if (typeof requestAnimationFrame === "function") {
     requestAnimationFrame(() => markStartupPhase("app_next_frame"));
   } else {
@@ -753,17 +889,18 @@ onMounted(async () => {
     markStartupPhase("standalone_window_ready");
     return;
   }
+  // Known before listeners and bootstrap start, so startup requests (an
+  // external script open) reach the right window.
+  primaryWindowUnlisten = await watchPrimaryWindow(applicationWindowId, (primary) => {
+    isPrimaryWindow.value = primary;
+  });
   await registerAppCloseRequestListener();
   await registerExtraWorkdirsUpdatedListener();
   workspacePageResetOnboardingUnlisten = await listen(
     WORKSPACE_PAGE_RESET_ONBOARDING_EVENT,
     onResetOnboarding,
   );
-  if (!isWorkspaceWindow) {
-    void watchSessionMaintenance().then((release) => {
-      sessionMaintenanceRelease = release;
-    });
-  }
+  startSessionMaintenance();
   markStartupPhase("main_dom_listeners_ready");
   markStartupPhase("main_bootstrap_critical_start");
   try {
@@ -784,7 +921,7 @@ onMounted(async () => {
   markStartupPhase("main_preload_tabs_scheduled");
   void bootstrapDeferred();
   markStartupPhase("main_bootstrap_deferred_scheduled");
-  if (!isWorkspaceWindow) unityNativeEmbedRelease = await startUnityNativeEmbedHosts();
+  await startUnityNativeEmbed();
   // Each renderer recreates only the floating windows it originally owned.
   void restoreSharedWorkbenchWindows()
     .then(() => finishWorkStateRestore())
@@ -792,9 +929,9 @@ onMounted(async () => {
     .catch((error) => {
       console.warn("[workbench-window] restore or pool warmup failed", error);
     });
-  if (!isWorkspaceWindow) void appUpdateStore.checkForUpdates({ silent: true });
+  if (isPrimaryWindow.value) void appUpdateStore.checkForUpdates({ silent: true });
   markStartupPhase("main_update_check_scheduled");
-  startKnowledgeRuntimeStartupPolling();
+  startKnowledgeRuntimeStatusUpdates();
   // Pre-warm the shared sub-window pool once startup work settled so the
   // first plan/diff/import window opens from an already-loaded shell.
   window.setTimeout(() => {
@@ -812,6 +949,8 @@ onUnmounted(() => {
     return;
   }
   if (isStandaloneWindow) return;
+  primaryWindowUnlisten?.();
+  primaryWindowUnlisten = null;
   appCloseRequestUnlisten?.();
   appCloseRequestUnlisten = null;
   extraWorkdirsUpdatedUnlisten?.();
@@ -821,7 +960,7 @@ onUnmounted(() => {
   sessionMaintenanceRelease?.();
   sessionMaintenanceRelease = null;
   notificationStore.clearByOperation(KNOWLEDGE_RUNTIME_LOADING_OPERATION);
-  clearKnowledgeRuntimeStatusTimer();
+  stopKnowledgeRuntimeStatusUpdates();
   cleanup();
 });
 
@@ -829,7 +968,7 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
   if (workspaceContextStore.focusedWorkspaceRef) {
     notificationStore.clearByOperation("startup-workspace-unavailable");
   }
-  startKnowledgeRuntimeStartupPolling();
+  startKnowledgeRuntimeStatusUpdates();
 });
 </script>
 
@@ -878,19 +1017,46 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
     @drop.capture="handleMainUnityAssetDrop"
   >
     <div class="main-area">
-      <div class="tab-bar" :class="{ 'is-workspace-window': isWorkspaceWindow }" @pointerdown="onTabBarPointerDown">
+      <div
+        ref="topTabBar"
+        class="tab-bar"
+        :class="{ 'is-workspace-window': !showTopTabs, 'is-node-drop-target': topBarDropBefore !== undefined }"
+        @pointerdown="onTabBarPointerDown"
+      >
         <div class="tab-drag-region" aria-hidden="true"></div>
-        <div v-if="isWorkspaceWindow" ref="workspaceWindowToolbarTarget" class="workspace-window-toolbar-host"></div>
+        <!-- Workspace windows without the page tabs move the explorer toolbar
+             into the title bar; with the tabs it stays in the workspace below. -->
+        <div v-if="!showTopTabs" ref="workspaceWindowToolbarTarget" class="workspace-window-toolbar-host"></div>
         <template v-else>
         <span class="tab-brand">Locus</span>
-        <button
-          v-for="tab in visibleTopTabs"
-          :key="tab.id"
-          class="tab-item"
-          :class="{ active: isTopTabActive(tab) }"
-          @click="onTopTabClick($event, tab)"
-          @contextmenu="openTopTabContextMenu($event, tab)"
-        >{{ t(tab.labelKey) }}</button>
+        <template v-for="(entry, index) in topBarEntries" :key="entry.id">
+          <button
+            v-if="entry.tab"
+            class="tab-item"
+            :class="{
+              active: isTopTabActive(entry.tab),
+              'is-drop-before': topBarDropBefore === entry.id,
+              'is-drop-after': topBarDropBefore === null && index === topBarEntries.length - 1,
+            }"
+            :data-top-bar-entry="entry.id"
+            @click="onTopTabClick($event, entry.tab)"
+            @contextmenu="openTopTabContextMenu($event, entry.tab)"
+          >{{ t(entry.tab.labelKey) }}</button>
+          <button
+            v-else-if="entry.node"
+            type="button"
+            class="tab-item is-workspace-node"
+            :class="{
+              active: activeTopBarNode?.id === entry.id,
+              'is-drop-before': topBarDropBefore === entry.id,
+              'is-drop-after': topBarDropBefore === null && index === topBarEntries.length - 1,
+            }"
+            :data-top-bar-entry="entry.id"
+            @pointerdown="onTopBarNodePointerDown($event, entry.id)"
+            @click="onTopBarNodeClick(entry.id)"
+            @contextmenu="openTopBarNodeContextMenu($event, entry.id)"
+          >{{ entry.node.label }}</button>
+        </template>
         <button
           v-if="projectStore.pluginToast"
           class="tab-plugin-warn"
@@ -941,11 +1107,16 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
         </div>
       </div>
       <TopBannerHost />
+      <RemotePairingPrompt />
       <div class="tab-content">
         <DevelopmentWorkbench
+          ref="developmentWorkbench"
           v-show="uiStore.activePage === 'development'"
           :window-id="applicationWindowId"
           :toolbar-target="workspaceWindowToolbarTarget"
+          :top-bar-target="showTopTabs ? topTabBar : null"
+          :title-bar-optional="workspaceWindowTitleBarOptional"
+          :single-workspace-only="isWorkspaceWindow"
         />
 
         <component
@@ -988,9 +1159,6 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
           :agents="agentStore.appAgents"
           :subagents="agentStore.appSubagents"
           @auth-changed="handleSettingsAuthChanged"
-          @model-defaults-changed="modelStore.applyModelDefaults"
-          @codex-transport-changed="modelStore.applyCodexModelConfig"
-          @custom-providers-changed="modelStore.applyCustomProviders"
           @reset-onboarding="onResetOnboarding"
         />
         <div
@@ -1025,6 +1193,20 @@ watch(() => workspaceContextStore.focusedWorkspaceRef, () => {
     >
       <LucideIcon :icon="AppWindow" :size="13" />
       {{ t("app.tab.openInWindow") }}
+    </button>
+  </BaseContextMenu>
+  <BaseContextMenu
+    v-if="topBarNodeContextMenu"
+    class="top-tab-ctx-menu"
+    :x="topBarNodeContextMenu.x"
+    :y="topBarNodeContextMenu.y"
+    :min-width="170"
+    :z-index="260"
+    @close="topBarNodeContextMenu = null"
+  >
+    <button type="button" class="top-tab-ctx-item" @click="moveTopBarNodeToTree">
+      <LucideIcon :icon="PanelLeft" :size="13" />
+      {{ t("development.moveNodeToSidebar") }}
     </button>
   </BaseContextMenu>
   <Transition name="workspace-switch-modal">

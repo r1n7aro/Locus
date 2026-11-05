@@ -73,7 +73,6 @@ mod imp {
     use tokio_tungstenite::tungstenite::protocol::{Message, Role};
     use tokio_tungstenite::WebSocketStream;
 
-    const MAIN_WINDOW_LABEL: &str = "main";
     const MAIN_TARGET_ID: &str = "main";
     const MAIN_TARGET_SESSION_PREFIX: &str = "locus-main-session";
     const DEBUG_PORT_START: u16 = 19_222;
@@ -720,9 +719,8 @@ mod imp {
         };
         use windows_core::{Interface, BOOL, PWSTR};
 
-        let window = app
-            .get_webview_window(MAIN_WINDOW_LABEL)
-            .ok_or_else(|| "The main WebView2 window is unavailable".to_string())?;
+        let window = crate::workspace_window::primary_application_window(&app)
+            .ok_or_else(|| "No Locus WebView2 window is available".to_string())?;
         let (result_tx, result_rx) = oneshot::channel();
         window
             .with_webview(move |webview| {
@@ -875,7 +873,7 @@ mod imp {
     ) {
         use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
 
-        let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        let Some(window) = crate::workspace_window::primary_application_window(&app) else {
             return;
         };
         let (done_tx, done_rx) = oneshot::channel();
@@ -1056,8 +1054,7 @@ mod imp {
     }
 
     fn target_descriptor(app: &AppHandle, port: u16) -> Value {
-        let (title, url) = app
-            .get_webview_window(MAIN_WINDOW_LABEL)
+        let (title, url) = crate::workspace_window::primary_application_window(&app)
             .map(|window| {
                 let title = window.title().unwrap_or_else(|_| "Locus".to_string());
                 let url = window
@@ -1511,9 +1508,8 @@ mod imp {
         };
         use windows_core::Interface;
 
-        let window = app
-            .get_webview_window(MAIN_WINDOW_LABEL)
-            .ok_or_else(|| "The main WebView2 window is unavailable".to_string())?;
+        let window = crate::workspace_window::primary_application_window(&app)
+            .ok_or_else(|| "No Locus WebView2 window is available".to_string())?;
         let (response_tx, response_rx) = oneshot::channel::<Result<String, String>>();
         let response_tx = Arc::new(Mutex::new(Some(response_tx)));
         let params = params.to_string();
@@ -1602,9 +1598,8 @@ mod imp {
         };
         use windows_core::{Interface, PWSTR};
 
-        let window = app
-            .get_webview_window(MAIN_WINDOW_LABEL)
-            .ok_or_else(|| "The main WebView2 window is unavailable".to_string())?;
+        let window = crate::workspace_window::primary_application_window(&app)
+            .ok_or_else(|| "No Locus WebView2 window is available".to_string())?;
         let (result_tx, result_rx) = oneshot::channel();
 
         window
@@ -1680,7 +1675,7 @@ mod imp {
         if subscriptions.is_empty() {
             return;
         }
-        let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        let Some(window) = crate::workspace_window::primary_application_window(&app) else {
             return;
         };
         let (done_tx, done_rx) = oneshot::channel();

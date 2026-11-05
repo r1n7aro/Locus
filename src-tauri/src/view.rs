@@ -24,7 +24,6 @@ pub const TEMP_VIEW_ROOT_RELATIVE: &str = "view-packages";
 pub const VIEW_RELOAD_EVENT: &str = "view-package-reloaded";
 pub const VIEW_TREE_CHANGED_EVENT: &str = "view-tree-changed";
 
-const MAIN_WINDOW_LABEL: &str = "main";
 // The external Unity adapter loads the lightweight `window.html` entry.
 // Workbench Views render directly in the native Vue subtree.
 const VIEW_HOST_ROUTE: &str = "/window.html?viewHost=1";
@@ -4629,9 +4628,7 @@ fn focus_view_host_window(
 
 
 pub(crate) fn is_view_workbench_window(label: &str) -> bool {
-    label == MAIN_WINDOW_LABEL
-        || label.starts_with("workbench-")
-        || crate::workspace_window::is_workspace_window(label)
+    crate::workspace_window::is_application_window(label) || label.starts_with("workbench-")
 }
 
 pub async fn open_view_in_workbench(
@@ -4664,11 +4661,7 @@ pub async fn open_view_in_workbench_on_window(
             let is_workbench = is_view_workbench_window(label);
             (is_workbench && window.is_focused().unwrap_or(false)).then(|| label.clone())
         }))
-        .or_else(|| {
-            windows
-                .contains_key(MAIN_WINDOW_LABEL)
-                .then(|| MAIN_WINDOW_LABEL.to_string())
-        })
+        .or_else(|| crate::workspace_window::primary_application_window_label(app_handle))
         .or_else(|| {
             windows
                 .keys()
@@ -7726,7 +7719,10 @@ pub async fn request_frontend_execution(app_handle: &AppHandle, working_dir: &st
     if code.trim().is_empty() { return Err("TypeScript code is required".to_string()); }
     if code.len() > 256 * 1024 { return Err("Frontend code exceeds 256 KiB".to_string()); }
     let workspace_ref = view_workspace_ref_for_root(app_handle, working_dir)?;
-    let label = window_label.unwrap_or(MAIN_WINDOW_LABEL);
+    let primary = crate::workspace_window::primary_application_window_label(app_handle);
+    let label = window_label
+        .or(primary.as_deref())
+        .unwrap_or(crate::workspace_window::DEFAULT_WINDOW_LABEL);
     let native = crate::unity_embed_webview::snapshot().into_iter().find(|surface| surface.label == label);
     if let Some(surface) = &native {
         if surface.workspace_ref != workspace_ref { return Err("Frontend target belongs to another workspace generation".into()); }

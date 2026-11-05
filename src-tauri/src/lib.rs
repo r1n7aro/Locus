@@ -10,7 +10,7 @@ mod logging;
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::menu::MenuBuilder;
@@ -24,7 +24,10 @@ mod app_tasks;
 pub mod asset_db;
 mod async_tasks;
 mod auth;
+#[cfg(feature = "server-client")]
+pub(crate) mod server_client;
 pub mod binary_cache;
+pub mod blender;
 mod cdp_debug;
 mod cli_driver;
 pub mod code_tools;
@@ -48,6 +51,7 @@ pub mod knowledge_index;
 pub mod knowledge_source_registry;
 pub mod knowledge_store;
 mod knowledge_watcher;
+pub mod latex_preview;
 mod llm;
 mod local_docs;
 mod markdown_attachments;
@@ -66,8 +70,10 @@ mod runtime_data_lock;
 mod runtime_paths;
 mod sdk;
 mod native_view;
+mod remote_access;
 mod unity_renderer;
 mod session;
+mod settings;
 mod shared_workbench_window;
 mod unity_embed_webview;
 mod skill_runtime_context;
@@ -112,8 +118,10 @@ use agent::definition::AgentDefRegistry;
 use agent::instance::{AssistantStreamState, RawContextStore};
 use commands::AppKnowledgeDir;
 
-const MAIN_WINDOW_LABEL: &str = "main";
-const MAIN_WINDOW_CLOSE_REQUESTED_EVENT: &str = "locus-main-window-close-requested";
+use workspace_window::DEFAULT_WINDOW_LABEL;
+/// Sent to the window whose close would end the session; its renderer confirms
+/// running work and asks for the exit.
+const APP_CLOSE_REQUESTED_EVENT: &str = "locus-app-close-requested";
 const MAIN_TRAY_ID: &str = "locus-main-tray";
 const TRAY_MENU_SHOW_ID: &str = "locus-tray-show";
 const TRAY_MENU_EXIT_ID: &str = "locus-tray-exit";
@@ -190,19 +198,20 @@ impl StartupTrace {
     }
 }
 
-fn emit_main_window_close_request(window: &tauri::Window) {
+fn emit_app_close_request(window: &tauri::Window) {
     if let Err(error) = window
         .app_handle()
-        .emit_to(window.label(), MAIN_WINDOW_CLOSE_REQUESTED_EVENT, ())
+        .emit_to(window.label(), APP_CLOSE_REQUESTED_EVENT, ())
     {
         eprintln!(
-            "[Locus] failed to emit main window close request event: {}",
+            "[Locus] failed to emit app close request event for {}: {}",
+            window.label(),
             error
         );
     }
 }
 
-fn set_main_tray_visible(app_handle: &tauri::AppHandle, visible: bool) -> bool {
+fn set_tray_visible(app_handle: &tauri::AppHandle, visible: bool) -> bool {
     let Some(tray) = app_handle.tray_by_id(MAIN_TRAY_ID) else {
         return false;
     };
@@ -213,36 +222,52 @@ fn set_main_tray_visible(app_handle: &tauri::AppHandle, visible: bool) -> bool {
     true
 }
 
-pub(crate) fn reveal_main_window(app_handle: &tauri::AppHandle) {
-    if let Some(window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
+/// Brings back the windows parked in the tray, or the primary window when the
+/// tray was used while none is parked.
+pub(crate) fn reveal_application_windows(app_handle: &tauri::AppHandle) {
+    let mut labels = workspace_window::take_hidden_to_tray();
+    if labels.is_empty() {
+        labels.extend(workspace_window::primary_application_window_label(app_handle));
+    }
+    for label in labels {
+        let Some(window) = app_handle.get_webview_window(&label) else {
+            continue;
+        };
         if let Err(error) = window.unminimize() {
-            eprintln!("[Locus] failed to restore main window: {}", error);
+            eprintln!("[Locus] failed to restore window {label}: {}", error);
         }
         if let Err(error) = window.show() {
-            eprintln!("[Locus] failed to show main window: {}", error);
+            eprintln!("[Locus] failed to show window {label}: {}", error);
         }
+        shared_workbench_window::show_owned_windows_from_tray(app_handle, &label);
         #[cfg(target_os = "windows")]
         if let Ok(hwnd) = window.hwnd() {
             unity_bridge::restore_foreground(hwnd.0 as isize);
         }
         if let Err(error) = window.set_focus() {
-            eprintln!("[Locus] failed to focus main window: {}", error);
+            eprintln!("[Locus] failed to focus window {label}: {}", error);
         }
     }
-    let _ = set_main_tray_visible(app_handle, false);
+    let _ = set_tray_visible(app_handle, false);
 }
 
-fn hide_main_window_to_tray(window: &tauri::Window) {
+/// Parks the last application window in the tray. Returns false, leaving the
+/// window as it was, when there is no tray to restore it from.
+fn hide_last_window_to_tray(window: &tauri::Window) -> bool {
     let app_handle = window.app_handle();
-    if !set_main_tray_visible(app_handle, true) {
-        emit_main_window_close_request(window);
-        return;
+    if !set_tray_visible(app_handle, true) {
+        return false;
     }
-
+    workspace_window::mark_hidden_to_tray(window.label());
     if let Err(error) = window.hide() {
-        eprintln!("[Locus] failed to hide main window to tray: {}", error);
-        let _ = set_main_tray_visible(app_handle, false);
+        eprintln!("[Locus] failed to hide window to tray: {}", error);
+        workspace_window::clear_hidden_to_tray(window.label());
+        let _ = set_tray_visible(app_handle, false);
+        return false;
     }
+    // Floating windows are not owned natively, so hiding this one leaves them.
+    shared_workbench_window::hide_owned_windows_to_tray(app_handle, window.label());
+    true
 }
 
 fn tray_menu_labels() -> (&'static str, &'static str) {
@@ -275,7 +300,7 @@ fn install_main_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app_handle, event| match event.id().as_ref() {
-            TRAY_MENU_SHOW_ID => reveal_main_window(app_handle),
+            TRAY_MENU_SHOW_ID => reveal_application_windows(app_handle),
             TRAY_MENU_EXIT_ID => commands::exit_app(app_handle),
             _ => {}
         })
@@ -287,7 +312,7 @@ fn install_main_tray(app: &mut tauri::App) -> tauri::Result<()> {
             | TrayIconEvent::DoubleClick {
                 button: MouseButton::Left,
                 ..
-            } => reveal_main_window(tray.app_handle()),
+            } => reveal_application_windows(tray.app_handle()),
             _ => {}
         })
         .build(app)?;
@@ -465,6 +490,18 @@ pub fn run() {
     tauri::Builder::default()
         .on_page_load(move |webview, payload| {
             let page_finished = matches!(payload.event(), PageLoadEvent::Finished);
+            if matches!(payload.event(), PageLoadEvent::Started) {
+                // A reloaded page cannot close the previews it opened.
+                latex_preview::manager::release_webview(webview.label());
+                // Nor drive the floating windows it rendered; it reopens them
+                // from saved work state instead.
+                if workspace_window::is_application_window(webview.label()) {
+                    shared_workbench_window::close_owned_windows_for_reload(
+                        webview.app_handle(),
+                        webview.label(),
+                    );
+                }
+            }
             let event = match payload.event() {
                 PageLoadEvent::Started => "started",
                 PageLoadEvent::Finished => "finished",
@@ -485,39 +522,18 @@ pub fn run() {
             }
         })
         .register_uri_scheme_protocol("locus-binary", move |_ctx, request| {
-            let request_start = Instant::now();
-            let path = request.uri().path(); // "/blob/{uuid}"
-            let blob_id = path.strip_prefix("/blob/").unwrap_or("");
-            match cache_for_protocol.get(blob_id) {
-                Some((bytes, mime)) => {
-                    let byte_len = bytes.len();
-                    let response = tauri::http::Response::builder()
-                        .header("Content-Type", &mime)
-                        .header("Access-Control-Allow-Origin", "*")
-                        .body(bytes)
-                        .unwrap();
-                    if mime == "application/octet-stream" {
-                        eprintln!(
-                            "[perf:locus-binary] blob={} status=200 bytes={} total={}ms",
-                            blob_id,
-                            byte_len,
-                            request_start.elapsed().as_millis()
-                        );
-                    }
-                    response
-                }
-                None => {
-                    eprintln!(
-                        "[perf:locus-binary] blob={} status=404 total={}ms",
-                        blob_id,
-                        request_start.elapsed().as_millis()
-                    );
-                    tauri::http::Response::builder()
-                        .status(404)
-                        .body(Vec::new())
-                        .unwrap()
-                }
+            // "/blob/{uuid}"; Range requests let audio and video seek.
+            let range = request
+                .headers()
+                .get(tauri::http::header::RANGE)
+                .and_then(|value| value.to_str().ok());
+            let path = request.uri().path();
+            // "/latex/{doc}/{revision}/{file}": published LaTeX preview pages
+            // and PDFs. Shares this scheme so the preview adds no handler.
+            if let Some(latex) = path.strip_prefix(latex_preview::manager::PROTOCOL_PATH_PREFIX) {
+                return latex_preview::manager::serve(latex);
             }
+            binary_cache::serve(&cache_for_protocol, path, range)
         })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -528,6 +544,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if matches!(event, WindowEvent::Destroyed) {
                 unity_renderer::release_window(window.label());
+                latex_preview::manager::release_webview(window.label());
             }
             work_state::handle_window_event(window, event);
             if matches!(event, WindowEvent::Destroyed) {
@@ -545,7 +562,11 @@ pub fn run() {
             // Process exit destroys every native window. Preserve the last
             // durable pane projection so the next process can restore all
             // windows/workspaces; interactive closes still detach normally.
-            if matches!(event, WindowEvent::Destroyed) && !commands::app_exit_started() {
+            // So does a floating window its opener's reloaded page reopens.
+            if matches!(event, WindowEvent::Destroyed)
+                && !commands::app_exit_started()
+                && !shared_workbench_window::keeps_state_on_destroy(window.label())
+            {
                 if let Some(contexts) = window
                     .app_handle()
                     .try_state::<Arc<workspace_service::WindowContextRegistry>>()
@@ -573,49 +594,46 @@ pub fn run() {
                     }
                 }
             }
-            if window.label() != MAIN_WINDOW_LABEL
-                && !workspace_window::is_workspace_window(window.label())
-            {
+            // Runs after the handlers above read `keeps_state_on_destroy`.
+            shared_workbench_window::handle_window_event(window, event);
+            if !workspace_window::is_application_window(window.label()) {
+                return;
+            }
+
+            if matches!(event, WindowEvent::Destroyed) {
+                if !commands::app_exit_started() {
+                    workspace_window::unregister_application_window(
+                        window.app_handle(),
+                        window.label(),
+                    );
+                    // Floating windows have no native owner to take them down.
+                    shared_workbench_window::destroy_owned_windows(
+                        window.app_handle(),
+                        window.label(),
+                    );
+                }
                 return;
             }
 
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let config = window.app_handle().state::<Arc<AppConfig>>();
-                let has_other_windows = workspace_window::has_other_application_windows(
+                // Every application window closes the same way. Others keep the
+                // process alive, so this one is destroyed together with the
+                // page and floating windows it owns. Only the last visible
+                // window ends the session.
+                if workspace_window::has_other_application_windows(
                     window.app_handle(),
                     window.label(),
-                );
-                if workspace_window::is_workspace_window(window.label()) {
-                    // Closing one workspace only releases that window's panes.
-                    // The hidden main shell continues to own tray/global services.
-                    if has_other_windows {
-                        return;
-                    }
-                    if config.close_behavior() == AppCloseBehavior::MinimizeToTray
-                        && set_main_tray_visible(window.app_handle(), true)
-                    {
-                        return;
-                    }
-                    api.prevent_close();
-                    emit_main_window_close_request(window);
+                ) {
                     return;
                 }
                 api.prevent_close();
-                if has_other_windows {
-                    // Keep the process shell alive for the other workspaces,
-                    // even on systems where no tray icon is available.
-                    let _ = set_main_tray_visible(window.app_handle(), true);
-                    if let Err(error) = window.hide() {
-                        eprintln!("[Locus] failed to hide main workspace window: {error}");
-                    }
-                    window.app_handle().state::<Arc<work_state::WorkStateStore>>().set_visible(window.label(), false);
+                let config = window.app_handle().state::<Arc<AppConfig>>();
+                if config.close_behavior() == AppCloseBehavior::MinimizeToTray
+                    && hide_last_window_to_tray(window)
+                {
                     return;
                 }
-                if config.close_behavior() == AppCloseBehavior::MinimizeToTray {
-                    hide_main_window_to_tray(window);
-                    return;
-                }
-                emit_main_window_close_request(window);
+                emit_app_close_request(window);
             }
         })
         .setup(move |app| {
@@ -654,6 +672,7 @@ pub fn run() {
                 runtime_data_lock.path().display()
             );
             app.manage(runtime_data_lock);
+            runtime_paths::set_active_data_dir(&data_dir);
             captures::init(app.handle());
             if let Ok(resource_dir) = app.path().resource_dir() {
                 process_util::set_managed_git_resource_dir(resource_dir.clone());
@@ -671,32 +690,39 @@ pub fn run() {
             // intentionally killing/relaunching Unity, so keep embed disabled
             // for this isolated test runtime.
             if cli_driver_for_setup.is_some() {
-                loaded_config
-                    .unity_embed_enabled
-                    .store(false, Ordering::Relaxed);
+                loaded_config.disable_unity_embed_for_process();
             }
-            debug_flag_for_setup.store(loaded_config.debug_enabled(), Ordering::Relaxed);
-            loaded_config.debug = debug_flag_for_setup.clone();
+            loaded_config.share_debug_flag(debug_flag_for_setup.clone());
             let config = Arc::new(loaded_config);
+            settings::mirrors::install(
+                config.settings(),
+                app.handle().clone(),
+                debug_flag_for_setup.clone(),
+            );
             let resource_policy = Arc::new(
                 resource_policy::ResourcePolicyStore::from_config(config.clone())
                     .map_err(|error| format!("Invalid workspace resource policy: {error}"))?,
             );
             let workspace_service_factories: Vec<
                 Arc<dyn workspace_service::service::WorkspaceServiceFactory>,
-            > = vec![Arc::new(
-                workspace_service::unity::UnityServiceFactory::new(
+            > = vec![
+                Arc::new(workspace_service::unity::UnityServiceFactory::new(
                     app.handle().clone(),
                     config.clone(),
-                ),
-            )];
+                )),
+                Arc::new(workspace_service::blender::BlenderServiceFactory),
+            ];
             let workspace_registry = workspace_service::ProjectRegistry::new(
                 resource_policy.clone(),
                 workspace_service_factories,
             );
+            workspace_registry.attach_app_handle(app.handle().clone());
             let window_contexts = Arc::new(workspace_service::WindowContextRegistry::new());
             let window_context_persistence =
                 Arc::new(commands::WindowContextPersistence::default());
+            unity_bridge::set_unity_integration_enabled(config.unity_enabled());
+            blender::set_blender_integration_enabled(config.blender_enabled());
+            blender::hub::attach_app_handle(app.handle().clone());
             unity_bridge::initialize_background_hook(config.unity_background_hook_enabled());
             unity_bridge::initialize_state_probe(config.unity_state_probe_enabled());
             unity_bridge::initialize_native_bridge(config.unity_native_bridge_enabled());
@@ -755,6 +781,7 @@ pub fn run() {
                 .attach_session_store(&store)
                 .map_err(|error| format!("Failed to attach project session catalog: {error}"))?;
             startup_for_setup.mark("setup_session_store_ready");
+            app.manage(session::attention::SessionAttentionStore::load(&data_dir));
             // Purge captures parked by migrations and reclaim file space when
             // most of locus.db is dead freelist pages (SQLite never returns
             // them on its own). Runs in the background and reports progress
@@ -839,7 +866,7 @@ pub fn run() {
             let legacy_active_session_candidates = legacy_active_session_candidates(&data_dir);
             let recovered_main_context = recovered_window_contexts
                 .iter()
-                .find(|context| context.window_id == MAIN_WINDOW_LABEL && context.pane_id == "main")
+                .find(|context| context.window_id == DEFAULT_WINDOW_LABEL && context.pane_id == "main")
                 .cloned();
             let recovered_main_root = recovered_main_context
                 .as_ref()
@@ -923,7 +950,7 @@ pub fn run() {
 
             if let Some(runtime) = initial_workspace_runtime
                 .as_ref()
-                .filter(|runtime| unity_bridge::is_unity_project(&runtime.root().to_string_lossy()))
+                .filter(|runtime| unity_bridge::unity_integration_enabled(&runtime.root().to_string_lossy()))
             {
                 let runtime_root = runtime.root().to_string_lossy();
                 if let Err(error) = unity_bridge::sync_native_bridge_marker(
@@ -1086,6 +1113,8 @@ pub fn run() {
                 session::pending_inputs::PendingInputQueue::default(),
             ));
             let async_task_manager = Arc::new(async_tasks::AsyncTaskManager::new(store.clone())?);
+            // Push live task rows to background-task panels instead of polling.
+            async_tasks::start_panel_events(app.handle().clone());
             let app_task_registry = {
                 let app_handle = app.handle().clone();
                 Arc::new(app_tasks::AppTaskRegistry::new(move |info| {
@@ -1117,40 +1146,13 @@ pub fn run() {
             ));
             let view_automation_store = Arc::new(view::ViewAutomationStore::default());
 
-            let tool_mode_path = data_dir.join("tool_permission_mode.txt");
-            let initial_tool_mode = std::fs::read_to_string(&tool_mode_path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| s == "ask")
-                .unwrap_or_else(|| "auto".to_string());
+            let initial_tool_mode = commands::tool_permission_mode_setting(config.settings());
             println!("[Locus] tool_permission_mode: {}", initial_tool_mode);
             let tool_permission_mode: ToolPermissionMode =
                 ToolPermissionMode(Arc::new(tokio::sync::RwLock::new(initial_tool_mode)));
 
-            let tool_perm_path = data_dir.join("tool_permissions.json");
-            let mut initial_tool_perms: HashMap<String, String> =
-                std::fs::read_to_string(&tool_perm_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
-                    .map(|raw| {
-                        raw.into_iter()
-                            .map(|(key, value)| {
-                                let normalized = if value.trim().eq_ignore_ascii_case("ask") {
-                                    "ask".to_string()
-                                } else {
-                                    "auto".to_string()
-                                };
-                                (key, normalized)
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            if !initial_tool_perms.contains_key("subagent") {
-                if let Some(mode) = initial_tool_perms.get("task").cloned() {
-                    initial_tool_perms.insert("subagent".to_string(), mode);
-                }
-            }
-            initial_tool_perms.remove("task");
+            let initial_tool_perms: HashMap<String, String> =
+                commands::tool_permissions_setting(config.settings());
             println!("[Locus] tool_permissions: {:?}", initial_tool_perms);
             let tool_permissions: ToolPermissions =
                 ToolPermissions(Arc::new(tokio::sync::RwLock::new(initial_tool_perms)));
@@ -1179,6 +1181,7 @@ pub fn run() {
                 cdp_debug::CdpDebugServerHandle::default(),
             ));
             app.manage(std::sync::Arc::new(mcp::server::McpServerHandle::default()));
+            app.manage(std::sync::Arc::new(remote_access::RemoteAccessHandle::default()));
             app.manage(std::sync::Arc::new(sdk::SdkServerHandle::default()));
             app.manage(raw_context_store);
             app.manage(active_tasks);
@@ -1221,51 +1224,83 @@ pub fn run() {
                 }
             }
 
-            let main_window_config = app
-                .config()
-                .app
-                .windows
-                .iter()
-                .find(|window| window.label == MAIN_WINDOW_LABEL)
-                .ok_or_else(|| format!("Missing '{}' window config", MAIN_WINDOW_LABEL))?;
-            startup_for_setup.mark("main_window_build_start");
-            let mut main_window_builder =
-                tauri::WebviewWindowBuilder::from_config(app.handle(), main_window_config)?;
-            let app_handle_for_shared_workbench = app.handle().clone();
-            main_window_builder = main_window_builder.on_new_window(move |url, features| {
-                shared_workbench_window::handle_new_window(
-                    &app_handle_for_shared_workbench,
-                    MAIN_WINDOW_LABEL,
-                    url,
-                    features,
-                )
-            });
-            if skip_onboarding_for_setup
+            // The default window is built like any other application window.
+            // A previous run that closed it leaves only workspace windows, and
+            // recreating it would add a window nobody asked for.
+            let explicit_launch_request = runtime_workspace_for_setup.is_some()
+                || external_script_open_for_setup.is_some()
                 || cli_driver_for_setup
                     .as_ref()
-                    .is_some_and(cli_driver::CliDriverConfig::requires_frontend)
-            {
-                main_window_builder = main_window_builder.initialization_script(
-                    "try { localStorage.setItem('locus-onboarding-completed', '1'); } catch (_) {}",
-                );
-            }
-            let debug_initialization_script = if app.state::<Arc<AppConfig>>().debug_enabled() {
-                "window.__LOCUS_DEBUG_ENABLED__ = true; try { localStorage.setItem('locus:webview-bridge:debug-enabled:v1', '1'); } catch (_) {}"
-            } else {
-                "window.__LOCUS_DEBUG_ENABLED__ = false; try { localStorage.removeItem('locus:webview-bridge:debug-enabled:v1'); } catch (_) {}"
-            };
-            main_window_builder =
-                main_window_builder.initialization_script(debug_initialization_script);
-            main_window_builder.build()?;
-            if let Some(main) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Some(record) = app.state::<Arc<work_state::WorkStateStore>>().snapshot().windows.get(MAIN_WINDOW_LABEL) {
-                    if let Err(error) = work_state::apply_hidden_geometry(&main, record) {
-                        eprintln!("[WorkState] main window geometry restore failed: {error}");
+                    .is_some_and(cli_driver::CliDriverConfig::requires_frontend);
+            let build_default_window = workspace_window::should_build_default_window(
+                &app.state::<Arc<work_state::WorkStateStore>>()
+                    .snapshot()
+                    .windows,
+                explicit_launch_request,
+            );
+            let create_default_window =
+                |handle: &tauri::AppHandle| -> Result<(), Box<dyn std::error::Error>> {
+                    let default_window_config = handle
+                        .config()
+                        .app
+                        .windows
+                        .iter()
+                        .find(|window| window.label == DEFAULT_WINDOW_LABEL)
+                        .ok_or_else(|| {
+                            format!("Missing '{}' window config", DEFAULT_WINDOW_LABEL)
+                        })?;
+                    startup_for_setup.mark("default_window_build_start");
+                    let mut builder = tauri::WebviewWindowBuilder::from_config(
+                        handle,
+                        default_window_config,
+                    )?;
+                    let app_handle_for_shared_workbench = handle.clone();
+                    builder = builder.on_new_window(move |url, features| {
+                        shared_workbench_window::handle_new_window(
+                            &app_handle_for_shared_workbench,
+                            DEFAULT_WINDOW_LABEL,
+                            url,
+                            features,
+                        )
+                    });
+                    if skip_onboarding_for_setup
+                        || cli_driver_for_setup
+                            .as_ref()
+                            .is_some_and(cli_driver::CliDriverConfig::requires_frontend)
+                    {
+                        builder = builder.initialization_script(
+                            "try { localStorage.setItem('locus-onboarding-completed', '1'); } catch (_) {}",
+                        );
                     }
-                }
+                    let debug_initialization_script =
+                        if handle.state::<Arc<AppConfig>>().debug_enabled() {
+                            "window.__LOCUS_DEBUG_ENABLED__ = true; try { localStorage.setItem('locus:webview-bridge:debug-enabled:v1', '1'); } catch (_) {}"
+                        } else {
+                            "window.__LOCUS_DEBUG_ENABLED__ = false; try { localStorage.removeItem('locus:webview-bridge:debug-enabled:v1'); } catch (_) {}"
+                        };
+                    builder = builder.initialization_script(debug_initialization_script);
+                    let window = builder.build()?;
+                    workspace_window::register_application_window(handle, DEFAULT_WINDOW_LABEL);
+                    #[cfg(target_os = "windows")]
+                    if let Err(error) = windows_window_frame::apply_window_frame(&window) {
+                        eprintln!("[Locus] warning: failed to restore window frame: {error}");
+                    }
+                    if let Some(record) = handle
+                        .state::<Arc<work_state::WorkStateStore>>()
+                        .snapshot()
+                        .windows
+                        .get(DEFAULT_WINDOW_LABEL)
+                    {
+                        if let Err(error) = work_state::apply_hidden_geometry(&window, record) {
+                            eprintln!("[WorkState] default window geometry restore failed: {error}");
+                        }
+                    }
+                    startup_for_setup.mark("default_window_build_done");
+                    Ok(())
+                };
+            if build_default_window {
+                create_default_window(app.handle())?;
             }
-            unity_embed_webview::install(app.handle())?;
-            startup_for_setup.mark("main_window_build_done");
             if let Some(cli_driver_config) = cli_driver_for_setup.clone() {
                 cli_driver::spawn(app.handle().clone(), cli_driver_config);
                 startup_for_setup.mark("setup_cli_driver_scheduled");
@@ -1273,6 +1308,18 @@ pub fn run() {
                 return Ok(());
             }
             workspace_window::restore_workspace_windows(app.handle());
+            if !build_default_window {
+                if workspace_window::primary_application_window_label(app.handle()).is_none() {
+                    // No saved window could be rebuilt; never leave a process
+                    // with nothing to show.
+                    create_default_window(app.handle())?;
+                } else if let Err(error) = app
+                    .state::<Arc<work_state::WorkStateStore>>()
+                    .forget(DEFAULT_WINDOW_LABEL)
+                {
+                    eprintln!("[WorkState] failed to drop the closed default window: {error}");
+                }
+            }
             if app.state::<Arc<AppConfig>>().debug_enabled() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -1287,10 +1334,6 @@ pub fn run() {
 
             commands::start_unity_embed_control_server(app.handle().clone());
             #[cfg(target_os = "windows")]
-            if let Err(error) = windows_window_frame::restore_main_window_frame(app) {
-                eprintln!("[Locus] warning: failed to restore main window frame: {error}");
-            }
-            #[cfg(target_os = "windows")]
             if let Err(error) = windows_resize_sync::install_for_main_window(app) {
                 eprintln!("[Locus] warning: failed to install WebView2 resize sync: {error}");
             }
@@ -1301,8 +1344,12 @@ pub fn run() {
             let startup_for_unity = startup_for_setup.clone();
             tauri::async_runtime::spawn(async move {
                 startup_for_unity.mark("unity_monitor_task_start");
+                // Lazy-mode workspaces keep Unity dormant until it is used.
                 if let Some(runtime) = initial_runtime_for_unity.filter(|runtime| {
-                    unity_bridge::is_unity_project(&runtime.root().to_string_lossy())
+                    runtime
+                        .services()
+                        .effective_mode(workspace_service::service::ServiceKind::Unity)
+                        == workspace_service::EffectiveServiceMode::Auto
                 }) {
                     if let Err(error) = workspace_registry_for_unity
                         .execution_context(
@@ -1324,6 +1371,11 @@ pub fn run() {
             // settings write) completes, so startup is never blocked on an
             // external server.
             mcp::manager::set_event_app_handle(app.handle().clone());
+            // Push Claude Code connection changes instead of per-window polling.
+            llm::claude_code_cli::connection_publisher::start(
+                app.handle().clone(),
+                app.state::<Arc<AppConfig>>().inner().clone(),
+            );
             tauri::async_runtime::spawn(async {
                 let reports = mcp::manager::reconcile().await;
                 for report in &reports {
@@ -1347,6 +1399,15 @@ pub fn run() {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     mcp::server::reconcile(app_handle).await;
+                });
+            }
+
+            // Mobile remote access: reads one small settings file and returns
+            // when disabled (the default); otherwise starts the listeners.
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    remote_access::reconcile(app_handle).await;
                 });
             }
 
@@ -1400,7 +1461,20 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            #[cfg(feature = "server-client")]
+            server_client::server_client_login,
+            #[cfg(feature = "server-client")]
+            server_client::server_client_cancel_login,
+            #[cfg(feature = "server-client")]
+            server_client::server_client_status,
+            #[cfg(feature = "server-client")]
+            server_client::server_client_logout,
+            #[cfg(feature = "server-client")]
+            server_client::server_client_models,
+            #[cfg(feature = "server-client")]
+            server_client::server_client_usage,
             captures::capture_unity_attachment,
+            captures::write_clipboard_png,
             commands::inspect_workspace_setup,
             commands::save_workspace_setup,
             commands::create_session,
@@ -1444,6 +1518,12 @@ pub fn run() {
             commands::list_checkout_sessions,
             commands::search_session_titles,
             commands::list_project_sessions,
+            session::attention::get_session_attention,
+            session::attention::mark_session_attention_read,
+            settings::commands::settings_schema,
+            settings::commands::settings_get,
+            settings::commands::settings_set,
+            settings::commands::settings_import_frontend_legacy,
             commands::list_archived_sessions,
             commands::list_archived_checkout_sessions,
             commands::get_archived_checkout_storage_bytes,
@@ -1513,6 +1593,29 @@ pub fn run() {
             commands::detach_workspace_window,
             commands::list_window_workspace_contexts,
             commands::list_window_workspace_intent_epochs,
+            commands::get_service_switches,
+            commands::blender_add_installation,
+            commands::blender_background_instances,
+            commands::blender_close_background,
+            commands::blender_install_addon,
+            commands::blender_launch,
+            commands::blender_list_installations,
+            commands::blender_refresh_installations,
+            commands::blender_reload_hosts,
+            commands::blender_remove_installation,
+            commands::blender_set_default_installation,
+            commands::blender_set_session_target,
+            commands::blender_set_workspace_version,
+            commands::blender_unhide_installation,
+            commands::blender_uninstall_addon,
+            commands::blender_workspace_status,
+            commands::set_service_enabled,
+            commands::start_workspace_service,
+            commands::latex_preview_open,
+            commands::latex_preview_set_visible,
+            commands::latex_preview_rebuild,
+            commands::latex_preview_close,
+            commands::latex_toolchain_status,
             commands::start_workspace_unity_service,
             commands::get_workspace_service_states,
             commands::list_recent_dirs,
@@ -1531,6 +1634,18 @@ pub fn run() {
             commands::mcp_server_wire_tools,
             commands::mcp_server_tools_inventory,
             commands::mcp_server_get_state,
+            remote_access::commands::remote_access_get_state,
+            remote_access::commands::remote_access_app_package,
+            remote_access::commands::remote_access_save_settings,
+            remote_access::commands::remote_access_start_pairing,
+            remote_access::commands::remote_access_cancel_pairing,
+            remote_access::commands::remote_access_resolve_pairing,
+            remote_access::commands::remote_access_set_device_permission,
+            remote_access::commands::remote_access_rename_device,
+            remote_access::commands::remote_access_revoke_device,
+            remote_access::commands::remote_access_revoke_all_devices,
+            remote_access::commands::remote_access_reset_certificate,
+            remote_access::commands::remote_access_open_firewall_settings,
             commands::mcp_server_update_settings,
             commands::mcp_server_regenerate_token,
             commands::mcp_server_tool_inventory,
@@ -1690,6 +1805,7 @@ pub fn run() {
             commands::project_explorer_file_revision,
             commands::project_explorer_write_file,
             commands::workspace_file_preview,
+            commands::release_preview_blob,
             commands::workspace_file_revision,
             commands::workspace_file_write,
             commands::workspace_create_document,
@@ -1699,6 +1815,7 @@ pub fn run() {
             commands::file_history_preview,
             commands::file_history_restore,
             commands::workspace_move_entry,
+            commands::workspace_import_entries,
             commands::workspace_file_order,
             commands::workspace_file_order_save,
             commands::workspace_file_watch_start,
@@ -1775,6 +1892,7 @@ pub fn run() {
             commands::knowledge_document_source,
             commands::resolve_markdown_image,
             commands::markdown_import_image,
+            commands::markdown_image_target,
             commands::markdown_relative_path,
             commands::markdown_rewrite_image_links,
             commands::markdown_recovery_read,
@@ -1810,7 +1928,10 @@ pub fn run() {
             commands::prewarm_claude_session,
             commands::connect_claude_session,
             commands::set_claude_prewarm,
+            commands::set_claude_native_agents,
+            commands::get_claude_native_agents_support,
             commands::get_claude_native_archive,
+            commands::get_claude_agent_routes,
             commands::check_claude_session_transfer,
             commands::backup_claude_native_session,
             commands::restore_claude_native_session,
@@ -1822,6 +1943,7 @@ pub fn run() {
             commands::save_codex_model_config,
             commands::test_custom_endpoint,
             commands::get_custom_providers,
+            commands::get_custom_provider_catalog,
             commands::save_custom_providers,
             model_catalog::get_model_catalog,
             model_catalog::refresh_model_catalog,
@@ -1874,13 +1996,12 @@ pub fn run() {
             commands::get_system_fonts,
             commands::get_system_locale,
             commands::get_close_behavior,
+            workspace_window::get_primary_application_window,
             commands::set_close_behavior,
             commands::get_dynamic_tool_loading_mode,
             commands::set_dynamic_tool_loading_mode,
             commands::get_anthropic_native_lazy_enabled,
             commands::set_anthropic_native_lazy_enabled,
-            commands::get_async_tasks_enabled,
-            commands::set_async_tasks_enabled,
             commands::list_background_tasks,
             commands::cancel_background_task,
             commands::list_app_tasks,

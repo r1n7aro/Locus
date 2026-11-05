@@ -56,21 +56,17 @@ fn project(registry: &ProjectRegistry, reference: &WorkspaceRef) -> Result<Strin
 }
 fn resolve_surface_window(window: &Window, label: Option<&str>) -> Result<String, AppError> {
     let label = label.unwrap_or(window.label());
-    let target = window
+    window
         .app_handle()
         .get_webview_window(label)
         .ok_or_else(|| failure("GPU surface window is unavailable"))?;
     if label != window.label() {
         // Only an opener can host a surface in its shared Workbench child.
         // Never accept a raw HWND or silently fall back to the caller window.
-        #[cfg(windows)]
-        {
-            use windows::Win32::UI::WindowsAndMessaging::{GetWindow, GW_OWNER};
-            let owner =
-                unsafe { GetWindow(target.hwnd().map_err(failure)?, GW_OWNER) }.map_err(failure)?;
-            if !label.starts_with("workbench-") || owner != window.hwnd().map_err(failure)? {
-                return Err(failure("GPU surface window does not belong to this caller"));
-            }
+        // Floating windows have no native owner; the opener table decides.
+        let opener = crate::shared_workbench_window::owner_of(label);
+        if !label.starts_with("workbench-") || opener.as_deref() != Some(window.label()) {
+            return Err(failure("GPU surface window does not belong to this caller"));
         }
         #[cfg(not(windows))]
         return Err(failure("Native GPU surface requires Windows"));

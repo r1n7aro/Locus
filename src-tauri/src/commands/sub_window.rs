@@ -13,7 +13,6 @@ use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 
 use crate::error::AppError;
 
-const MAIN_WINDOW_LABEL: &str = "main";
 const SUB_WINDOW_POOL_LABEL_PREFIX: &str = "sub-pool-";
 const SUB_WINDOW_POOL_ROUTE: &str = "/window.html?subWindowPool=1";
 const SUB_WINDOW_ROUTE_PREFIX: &str = "/window.html?";
@@ -155,11 +154,15 @@ fn pool_background_color() -> String {
         .unwrap_or_else(|| DEFAULT_BACKGROUND_COLOR.to_string())
 }
 
+/// Builds a sub-window. Windows created for a request are owned by the window
+/// that asked for them and close with it; pool windows are built ownerless
+/// because nobody has claimed them yet (see `set_sub_window_owner`).
 fn build_sub_window(
     app_handle: &AppHandle,
     label: &str,
     url: &str,
     request: Option<&SubWindowOpenRequest>,
+    owner: Option<&tauri::WebviewWindow>,
 ) -> Result<(), String> {
     let color = request
         .and_then(|request| request.background_color.clone())
@@ -201,10 +204,10 @@ fn build_sub_window(
             .inner_size(920.0, 720.0)
             .position(-32000.0, -32000.0),
     };
-    if let Some(main_window) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
+    if let Some(owner) = owner {
         builder = builder
-            .parent(&main_window)
-            .map_err(|error| format!("Failed to attach sub-window to main window: {error}"))?;
+            .parent(owner)
+            .map_err(|error| format!("Failed to attach sub-window to its opener: {error}"))?;
     }
     builder
         .build()
@@ -238,7 +241,7 @@ pub fn ensure_sub_window_pool_window(app_handle: &AppHandle) -> Result<(), Strin
         label
     };
 
-    let result = build_sub_window(app_handle, &label, SUB_WINDOW_POOL_ROUTE, None);
+    let result = build_sub_window(app_handle, &label, SUB_WINDOW_POOL_ROUTE, None, None);
     if let Err(error) = result {
         if let Ok(mut state) = sub_window_pool_state().lock() {
             if state.pending_label.as_deref() == Some(&label) {
@@ -282,6 +285,44 @@ fn take_sub_window_pool_window(app_handle: &AppHandle) -> Option<String> {
     None
 }
 
+/// Makes `owner` the Windows owner of an existing sub-window, so it stays above
+/// and closes with the window that opened it. Pool windows are built before
+/// anyone claims them and tao has no setter for the owner, hence the direct
+/// call. Other platforms keep a pooled window ownerless.
+#[cfg(target_os = "windows")]
+fn set_sub_window_owner(window: &tauri::WebviewWindow, owner: &tauri::WebviewWindow) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindow, SetWindowLongPtrW, GWLP_HWNDPARENT, GW_OWNER,
+    };
+
+    if window.label() == owner.label() {
+        return;
+    }
+    let (Ok(window_hwnd), Ok(owner_hwnd)) = (window.hwnd(), owner.hwnd()) else {
+        return;
+    };
+    let (window_raw, owner_raw) = (window_hwnd.0 as isize, owner_hwnd.0 as isize);
+    let label = window.label().to_string();
+    let _ = window.run_on_main_thread(move || unsafe {
+        let window_hwnd = HWND(window_raw as *mut std::ffi::c_void);
+        let owner_hwnd = HWND(owner_raw as *mut std::ffi::c_void);
+        // An owner chain that loops back would leave an unclosable window.
+        let mut ancestor = Some(owner_hwnd);
+        while let Some(current) = ancestor {
+            if current == window_hwnd {
+                eprintln!("[Locus SubWindow] refused circular owner for {label}");
+                return;
+            }
+            ancestor = GetWindow(current, GW_OWNER).ok().filter(|hwnd| !hwnd.0.is_null());
+        }
+        SetWindowLongPtrW(window_hwnd, GWLP_HWNDPARENT, owner_raw);
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_sub_window_owner(_window: &tauri::WebviewWindow, _owner: &tauri::WebviewWindow) {}
+
 fn configure_claimed_sub_window(
     window: &tauri::WebviewWindow,
     request: &SubWindowOpenRequest,
@@ -312,31 +353,46 @@ fn configure_claimed_sub_window(
 fn open_sub_window_inner(
     app_handle: &AppHandle,
     request: SubWindowOpenRequest,
+    opener: &tauri::WebviewWindow,
 ) -> Result<SubWindowOpenResult, String> {
     let kind = normalize_sub_window_kind(&request.kind)?;
     remember_background_color(&request.background_color);
 
-    {
+    let existing = {
         let mut state = sub_window_pool_state()
             .lock()
             .map_err(|_| "Sub-window pool state is unavailable".to_string())?;
-        if let Some(label) = state.claimed.get(&kind).cloned() {
-            if let Some(window) = app_handle.get_webview_window(&label) {
-                if request.focus_existing {
-                    let _ = window.set_focus();
+        match state.claimed.get(&kind).cloned() {
+            Some(label) => match app_handle.get_webview_window(&label) {
+                Some(window) => {
+                    state
+                        .claimed_queries
+                        .insert(kind.clone(), request.query.clone());
+                    Some((label, window))
                 }
-                state
-                    .claimed_queries
-                    .insert(kind.clone(), request.query.clone());
-                return Ok(SubWindowOpenResult {
-                    label,
-                    existing: true,
-                    pooled: false,
-                });
-            }
-            state.claimed.remove(&kind);
-            state.claimed_queries.remove(&kind);
+                None => {
+                    state.claimed.remove(&kind);
+                    state.claimed_queries.remove(&kind);
+                    None
+                }
+            },
+            None => None,
         }
+    };
+    if let Some((label, window)) = existing {
+        // The latest opener keeps it alive: closing the first opener must not
+        // take away a window another one just asked for. Window handle reads
+        // wait for the main thread, which locks the pool state when a window
+        // is destroyed, so this runs outside the lock.
+        set_sub_window_owner(&window, opener);
+        if request.focus_existing {
+            let _ = window.set_focus();
+        }
+        return Ok(SubWindowOpenResult {
+            label,
+            existing: true,
+            pooled: false,
+        });
     }
 
     if let Some(label) = take_sub_window_pool_window(app_handle) {
@@ -344,6 +400,7 @@ fn open_sub_window_inner(
             .get_webview_window(&label)
             .ok_or_else(|| format!("Claimed sub-window pool window vanished: {label}"))?;
         configure_claimed_sub_window(&window, &request)?;
+        set_sub_window_owner(&window, opener);
         // The pool window was built hidden and unfocused, so wry registered no
         // drop targets; its content HWNDs exist once its shell has loaded.
         #[cfg(target_os = "windows")]
@@ -376,7 +433,7 @@ fn open_sub_window_inner(
 
     let label = kind.clone();
     let url = format!("{}{}", SUB_WINDOW_ROUTE_PREFIX, request.query);
-    build_sub_window(app_handle, &label, &url, Some(&request))?;
+    build_sub_window(app_handle, &label, &url, Some(&request), Some(opener))?;
     if let Ok(mut state) = sub_window_pool_state().lock() {
         state
             .claimed_queries
@@ -441,9 +498,10 @@ pub fn handle_sub_window_event(window: &tauri::Window, event: &WindowEvent) {
 #[tauri::command]
 pub async fn sub_window_open(
     request: SubWindowOpenRequest,
+    window: tauri::WebviewWindow,
     app_handle: AppHandle,
 ) -> Result<SubWindowOpenResult, AppError> {
-    open_sub_window_inner(&app_handle, request).map_err(Into::into)
+    open_sub_window_inner(&app_handle, request, &window).map_err(Into::into)
 }
 
 #[tauri::command]

@@ -32,9 +32,57 @@ pub struct Surface {
     pub error: Option<String>,
 }
 
+/// Window whose renderer hosts the embedded workbench documents. It follows
+/// the primary application window, so closing the first window hands the
+/// documents to the next one instead of orphaning them.
+fn owner_state() -> &'static std::sync::Mutex<Option<String>> {
+    static OWNER: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    OWNER.get_or_init(Default::default)
+}
+pub fn owner_label() -> String {
+    owner_state()
+        .lock()
+        .ok()
+        .and_then(|owner| owner.clone())
+        .unwrap_or_else(|| crate::workspace_window::DEFAULT_WINDOW_LABEL.to_string())
+}
+/// Moves hosting to `label` and installs the WebView2 hooks on it. The new
+/// owner's renderer then calls `unity_native_embed_attach`, which regenerates
+/// every surface exactly as it does after a renderer reload.
+pub fn set_owner_window(app: &AppHandle, label: Option<&str>) {
+    let changed = owner_state()
+        .lock()
+        .map(|mut owner| {
+            let changed = owner.as_deref() != label;
+            *owner = label.map(str::to_string);
+            changed
+        })
+        .unwrap_or(false);
+    let Some(label) = label.filter(|_| changed) else {
+        return;
+    };
+    #[cfg(target_os = "windows")]
+    {
+        let app = app.clone();
+        let label = label.to_string();
+        let scheduled = app.clone().run_on_main_thread(move || {
+            if let Err(error) = windows_host::install(&app, &label) {
+                eprintln!("[UnityWebView] failed to install on window '{label}': {error}");
+            }
+        });
+        if let Err(error) = scheduled {
+            eprintln!("[UnityWebView] failed to schedule owner install: {error}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (app, label);
+    }
+}
 fn publish(app: &AppHandle) {
     refresh_snapshot();
-    let _ = app.emit_to("main", EVENT, snapshot());
+    let _ = app.emit_to(owner_label(), EVENT, snapshot());
 }
 fn snapshots() -> &'static std::sync::Mutex<Vec<Surface>> {
     static SNAPSHOTS: std::sync::OnceLock<std::sync::Mutex<Vec<Surface>>> =
@@ -522,7 +570,7 @@ mod windows_host {
                     let _ = app.run_on_main_thread(move || release(&main_app, &generation, false));
                 });
             } else {
-                let _ = app.emit_to("main", DOCUMENT_CLOSED, &entry.surface.document_id);
+                let _ = app.emit_to(super::owner_label(), DOCUMENT_CLOSED, &entry.surface.document_id);
             }
             // Vue first unmounts while its owner document is still alive, then
             // acknowledges release. The bounded timeout also handles a failed renderer.
@@ -537,7 +585,7 @@ mod windows_host {
     ) {
         HOST.with(|h| *h.borrow_mut().closed.entry(reason.into()).or_default() += 1);
         let _ = unsafe { controller.Close() };
-        let _ = app.emit_to("main", DOCUMENT_CLOSED, document_id);
+        let _ = app.emit_to(super::owner_label(), DOCUMENT_CLOSED, document_id);
     }
     pub(super) fn release(app: &AppHandle, generation: &str, acknowledged: bool) {
         let retired = HOST.with(|h| {
@@ -682,10 +730,10 @@ mod windows_host {
         }
         Ok(())
     }
-    pub(super) fn install(app: &AppHandle) -> Result<(), String> {
+    pub(super) fn install(app: &AppHandle, label: &str) -> Result<(), String> {
         let window = app
-            .get_webview_window("main")
-            .ok_or("Locus main WebView is unavailable")?;
+            .get_webview_window(label)
+            .ok_or_else(|| format!("Locus WebView '{label}' is unavailable"))?;
         let app = app.clone();
         window
             .with_webview(move |platform| unsafe {
@@ -716,27 +764,32 @@ mod windows_host {
                             let app = std::sync::Arc::new(recovery_app.clone());
                             tauri::async_runtime::spawn(async move {
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                if let Some(main) = app.get_webview_window("main") {
+                                if let Some(main) = app.get_webview_window(&super::owner_label()) {
                                     let _ = main.with_webview(|platform| { let _ = platform.controller().CoreWebView2().and_then(|web| web.Reload()); });
                                 }
                             });
                         }
                         Ok(())
                     })), &mut process_token)?;
-                    let parking = CreateWindowExW(
-                        WINDOW_EX_STYLE(0),
-                        w!("STATIC"),
-                        w!("Locus embedded WebView parking"),
-                        WS_POPUP,
-                        0,
-                        0,
-                        1,
-                        1,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )?;
+                    // The parking window outlives any one owner; later owners
+                    // reuse it and only swap the WebView2 environment.
+                    let parking = match HOST.with(|h| h.borrow().parking) {
+                        Some(parking) => parking,
+                        None => CreateWindowExW(
+                            WINDOW_EX_STYLE(0),
+                            w!("STATIC"),
+                            w!("Locus embedded WebView parking"),
+                            WS_POPUP,
+                            0,
+                            0,
+                            1,
+                            1,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )?,
+                    };
                     HOST.with(|h| {
                         let mut h = h.borrow_mut();
                         h.parking = Some(parking);
@@ -871,7 +924,7 @@ mod windows_host {
                                         if let Some(controller) = controller.as_ref() {
                                             let _ = controller.Close();
                                         }
-                                        let _ = app.emit_to("main", DOCUMENT_CLOSED, &document_id);
+                                        let _ = app.emit_to(super::owner_label(), DOCUMENT_CLOSED, &document_id);
                                         HOST.with(|h| {
                                             if let Some(entry) =
                                                 h.borrow_mut().entries.get_mut(&label)
@@ -908,14 +961,18 @@ mod windows_host {
                         })),
                         &mut token,
                     )?;
-                    HOST.with(|h| h.borrow_mut().installed = true);
-                    tauri::async_runtime::spawn(async move {
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            let app = watch_app.clone();
-                            if watch_app.run_on_main_thread(move || maintain(&app)).is_err() { break; }
-                        }
-                    });
+                    // One maintenance loop serves every owner.
+                    let first_install =
+                        HOST.with(|h| !std::mem::replace(&mut h.borrow_mut().installed, true));
+                    if first_install {
+                        tauri::async_runtime::spawn(async move {
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                let app = watch_app.clone();
+                                if watch_app.run_on_main_thread(move || maintain(&app)).is_err() { break; }
+                            }
+                        });
+                    }
                     Ok(())
                 })();
                 if let Err(error) = result {
@@ -1095,17 +1152,6 @@ pub fn matches_workspace(label: &str, workspace: &WorkspaceRef) -> bool {
     snapshot()
         .iter()
         .any(|s| s.label == label && &s.workspace_ref == workspace)
-}
-pub fn install(app: &AppHandle) -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        windows_host::install(app)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = app;
-        Ok(())
-    }
 }
 pub fn update(app: &AppHandle, surface: Surface) -> Result<(), String> {
     #[cfg(target_os = "windows")]

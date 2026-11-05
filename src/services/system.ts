@@ -2,7 +2,7 @@ import { ipcInvoke } from "./ipc";
 import type { ProxyConfig, ProxyStatus, PythonRuntimeState, UnityBackgroundHookStatus } from "../types";
 import type { WorkspaceRef } from "./project";
 
-export const APP_CLOSE_REQUESTED_EVENT = "locus-main-window-close-requested";
+export const APP_CLOSE_REQUESTED_EVENT = "locus-app-close-requested";
 export type AppCloseBehavior = "exit" | "minimizeToTray";
 export type DynamicToolLoadingMode = "metaTool" | "direct" | "native";
 
@@ -65,22 +65,6 @@ export function setDynamicToolLoadingMode(value: DynamicToolLoadingMode): Promis
   return ipcInvoke<void>("set_dynamic_tool_loading_mode", {
     value: normalizeDynamicToolLoadingMode(value),
   });
-}
-
-export function getAnthropicNativeLazyEnabled(): Promise<boolean> {
-  return ipcInvoke<boolean>("get_anthropic_native_lazy_enabled");
-}
-
-export function setAnthropicNativeLazyEnabled(value: boolean): Promise<void> {
-  return ipcInvoke<void>("set_anthropic_native_lazy_enabled", { value });
-}
-
-export function getAsyncTasksEnabled(): Promise<boolean> {
-  return ipcInvoke<boolean>("get_async_tasks_enabled");
-}
-
-export function setAsyncTasksEnabled(value: boolean): Promise<void> {
-  return ipcInvoke<void>("set_async_tasks_enabled", { value });
 }
 
 export function getUnityMultiAgentEditorEnabled(): Promise<boolean> {

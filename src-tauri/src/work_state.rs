@@ -518,20 +518,6 @@ impl WorkStateStore {
         self.flush()
     }
 
-    pub fn set_visible(&self, label: &str, visible: bool) {
-        {
-            let mut state = self.state.lock().unwrap();
-            if let Some(record) = state.windows.get_mut(label) {
-                record.visible = visible;
-                let op = Op::window(record);
-                self.record(op);
-            }
-        }
-        if let Err(error) = self.flush() {
-            eprintln!("[WorkState] visibility save failed: {error}");
-        }
-    }
-
     pub fn forget(&self, label: &str) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
         let mut closed = self.closed_windows.lock().unwrap();
@@ -609,8 +595,12 @@ pub fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
         return;
     };
     if matches!(event, WindowEvent::Destroyed) {
-        if let Err(error) = store.forget(window.label()) {
-            eprintln!("[WorkState] close save failed: {error}");
+        // A floating window closed for its opener's page reload is reopened
+        // by that page from this record.
+        if !crate::shared_workbench_window::keeps_state_on_destroy(window.label()) {
+            if let Err(error) = store.forget(window.label()) {
+                eprintln!("[WorkState] close save failed: {error}");
+            }
         }
         store.ready_renderers.lock().unwrap().remove(window.label());
         store.restoring.lock().unwrap().remove(window.label());
@@ -837,7 +827,7 @@ fn save_frontend_patch(
     geometry: bool,
 ) -> Result<(), String> {
     let owner = window.label();
-    if owner != "main" && !crate::workspace_window::is_workspace_window(owner) {
+    if !crate::workspace_window::is_application_window(owner) {
         return Err("Invalid work state owner".into());
     }
     if label != owner && !label.starts_with("workbench-") {
@@ -939,12 +929,7 @@ pub async fn show_work_state_window(
     let target = app
         .get_webview_window(&label)
         .ok_or("Work state window is closed")?;
-    let hide_main = label == "main"
-        && !record.visible
-        && snapshot.windows.keys().any(|id| {
-            crate::workspace_window::is_workspace_window(id) && app.get_webview_window(id).is_some()
-        });
-    if !hide_main && !target.is_visible().unwrap_or(false) {
+    if !target.is_visible().unwrap_or(false) {
         apply_hidden_geometry(&target, record)?;
         reveal_window(&app, &target, record.maximized).await?;
         // Windows built hidden and unfocused can receive their WebView2 content
@@ -976,7 +961,7 @@ pub async fn show_work_state_window(
                 *store.restore_focus.lock().unwrap() = None;
             }
         }
-    } else if !hide_main {
+    } else {
         let _ = target.set_focus();
     }
     Ok(())

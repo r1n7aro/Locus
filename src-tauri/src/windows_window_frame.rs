@@ -1,26 +1,22 @@
-use tauri::Manager;
 use windows::Win32::{
     Foundation::HWND,
     Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND},
 };
 
-const MAIN_WINDOW_LABEL: &str = "main";
 const WINDOWS_11_MIN_BUILD: u32 = 22000;
 
-pub fn restore_main_window_frame(app: &tauri::App) -> Result<(), String> {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        return Err(format!(
-            "main webview window '{MAIN_WINDOW_LABEL}' was not found"
-        ));
-    };
-
+/// Shadow and Windows 11 rounded corners for an undecorated application window.
+pub fn apply_window_frame(window: &tauri::WebviewWindow) -> Result<(), String> {
     if let Err(error) = window.set_shadow(true) {
-        eprintln!("[Locus] warning: failed to enable main window shadow: {error}");
+        eprintln!(
+            "[Locus] warning: failed to enable shadow for window '{}': {error}",
+            window.label()
+        );
     }
 
     let hwnd = window
         .hwnd()
-        .map_err(|error| format!("failed to read main window handle: {error}"))?;
+        .map_err(|error| format!("failed to read window handle: {error}"))?;
     apply_win11_round_corners(hwnd);
     Ok(())
 }

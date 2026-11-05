@@ -5,6 +5,8 @@ import { hasTauriWindowRuntime } from "./tauriRuntime";
 
 export const WORKSPACE_WINDOW_FLAG = "workspaceWindow";
 export const WORKSPACE_WINDOW_LABEL_PREFIX = "workspace-app-";
+/** Setting: workspace windows other than the primary one also show the page tab bar. */
+export const WORKSPACE_WINDOW_TITLE_BAR_SETTING = "appearance.chrome.workspaceWindowTitleBar";
 
 export function isWorkspaceWindowLabel(label: string): boolean {
   return label.startsWith(WORKSPACE_WINDOW_LABEL_PREFIX);
