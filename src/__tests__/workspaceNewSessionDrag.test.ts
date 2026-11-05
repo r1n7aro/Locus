@@ -20,7 +20,7 @@ const names = [
   "makeRow", "isNewSessionNode", "appendNewSessionRow", "onDragPointerDown", "treeEditorDescriptor",
   "canSetTreeItemState", "developmentTreeItemFromHit", "pinnedDividerTarget", "resolveLayoutDropIntentAt",
   "resolveExplorerRootDropIntent", "canMoveExplorerNodeToIntent", "resolveWorkbenchInternalDrop",
-  "commitWorkbenchInternalDrop", "openWorkbenchResource",
+  "commitWorkbenchInternalDrop", "openWorkbenchResource", "isLayoutFileItem",
 ];
 const handlers = parsed.statements.filter((statement) => (
   ts.isFunctionDeclaration(statement) && !!statement.name && names.includes(statement.name.text)
@@ -113,8 +113,8 @@ async function fixture(checkoutScoped = false, initialCheckout = "checkout", dro
     explorerStore: { snapshots: { project: snapshot }, resources: { project: { knowledge: [] } }, applyOperations },
     renderedExplorerSnapshot: () => snapshot, isExplorerNodeVisible: () => true,
     isNewSessionDropAvailable: () => dropAvailable, newSessionDropDraft: () => null,
-    fileOrderDragItem: () => null, isSecondarySessionTreeHit: () => false,
-    secondarySessionItems: ref([]), archivedTreeItems: ref([]),
+    fileOrderDragItem: () => null, isSecondarySessionTreeHit: () => false, topBarAcceptsTreeItem: () => false,
+    secondarySessionItems: ref([]), archivedTreeItems: ref([]), selectedFileKeys: ref(new Set()),
     workspaceNavigation: { getMode: () => "sessions" }, navigationCheckout: () => null,
     isKnowledgeTypeFolder: () => false, itemIcon: () => undefined, itemIconClass: () => undefined,
     workspaceSecondarySection, workbenchSplitDirectionAtPoint, workbenchTabInsertionIndexAtPoint,

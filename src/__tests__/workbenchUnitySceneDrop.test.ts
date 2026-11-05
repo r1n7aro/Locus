@@ -11,7 +11,8 @@ const source = readFileSync("src/components/workbench/DevelopmentWorkbench.vue",
 const parsed = ts.createSourceFile("workbench.ts", source, ts.ScriptTarget.Latest, true);
 const names = ["handleWorkspaceUnityAssetDrop", "handleNativeUnityAssetDrop",
   "nativeAssetReferenceData", "nativeWorkbenchDropDecisionAt", "updateNativeWorkbenchDropTarget",
-  "currentNativeWorkbenchDropIntent", "clearNativeWorkbenchDropTarget", "handleUnityAssetWorkspaceDragState"];
+  "currentNativeWorkbenchDropIntent", "clearNativeWorkbenchDropTarget", "handleUnityAssetWorkspaceDragState",
+  "nativeWorkbenchHit"];
 const code = ts.transpileModule(parsed.statements.filter(statement => ts.isFunctionDeclaration(statement)
   && !!statement.name && names.includes(statement.name.text)).map(statement => statement.getText(parsed)).join("\n"),
 { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -44,6 +45,7 @@ function fixture(scale = 1) {
     commitWorkbenchInternalDrop: commit, WORKBENCH_REFERENCE_INTERNAL_DRAG_TYPE: "reference",
     clearWorkspaceDragPointer: vi.fn(), UNITY_WORKSPACE_DRAG_STATE_TTL_MS: 1200,
     notificationStore: { addNotice: vi.fn() }, normalizeAppError: (error: unknown) => error,
+    nativeWorkspaceFileDrop: { update: vi.fn(() => false), clear: vi.fn(), drop: vi.fn(async () => false) },
   };
   const handlers = new Function(...Object.keys(deps), `let unityWorkspaceDragStateClearTimer = 0; ${code}
     return { drop: handleWorkspaceUnityAssetDrop, nativeDrop: handleNativeUnityAssetDrop, clear: handleUnityAssetWorkspaceDragState };`)(...Object.values(deps));

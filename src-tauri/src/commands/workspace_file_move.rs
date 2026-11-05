@@ -6,10 +6,10 @@ fn move_error(message: impl ToString) -> AppError {
     AppError::new("workspace.file_move_failed", message.to_string())
 }
 
-fn configuration_path(relative: &str) -> bool {
+pub(super) fn configuration_path(relative: &str) -> bool {
     let path = relative.to_ascii_lowercase();
     path == ".git" || path.starts_with(".git/") || path == ".locus" || path.starts_with(".locus/")
-        || path == "locus" || path == "locus/knowledge" || path == "locus/workspace-file-order.json" || path.starts_with("locus/workspace-trees")
+        || path == "locus" || path == "locus/knowledge"
 }
 
 /// Resolve both existing endpoints without following links outside this checkout.
@@ -36,8 +36,7 @@ fn move_paths(root: &Path, source: &str, directory: &str, name: Option<&str>) ->
         return Err(move_error("This workspace configuration path cannot be moved"));
     }
     let destination = directory_relative.to_ascii_lowercase();
-    if destination == ".git" || destination.starts_with(".git/") || destination == ".locus" || destination.starts_with(".locus/")
-        || destination.starts_with("locus/workspace-trees") {
+    if destination == ".git" || destination.starts_with(".git/") || destination == ".locus" || destination.starts_with(".locus/") {
         return Err(move_error("Files cannot be moved into workspace configuration folders"));
     }
     let target = match name {
@@ -84,7 +83,7 @@ pub(super) fn relocate_entry(source: &Path, target: &Path) -> Result<Vec<(PathBu
     Ok(completed)
 }
 
-fn rename_without_replace(from: &Path, to: &Path) -> Result<(), AppError> {
+pub(super) fn rename_without_replace(from: &Path, to: &Path) -> Result<(), AppError> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -204,7 +203,7 @@ async fn relocate_workspace_entry(
                 &project_id, &result.root, &source, Some(&target))?;
         }
     } else {
-        let (_, layout_root) = resolve_project(registry.inner().as_ref(), project_id.to_string(), "workspaceMoveEntry")?;
+        let (_, layout_root) = resolve_layout(registry.inner().as_ref(), project_id.to_string(), "workspaceMoveEntry")?;
         // Keep Markdown and CSV saves out of the move/reference-update transaction.
         let _document_guard = super::super::view_documents::DOCUMENT_WRITE_LOCK.lock().map_err(move_error)?;
         let _guard = CSV_FILE_WRITE_LOCK.lock().map_err(move_error)?;

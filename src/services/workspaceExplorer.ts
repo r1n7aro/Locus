@@ -50,6 +50,23 @@ export function moveWorkspaceFile(workspaceRef: WorkspaceRef, sourcePath: string
   return ipcInvoke("workspace_move_entry", { workspaceRef, sourcePath, targetDirectory });
 }
 
+export interface WorkspaceFileImportResult {
+  /** Workspace-relative paths of the copied entries. */
+  imported: string[];
+  /** Existing workspace-relative destinations; nothing is copied when any are reported. */
+  conflicts: string[];
+}
+
+/** Copies files and folders from outside the checkout, with their Unity `.meta`, into a checkout folder. */
+export function importWorkspaceEntries(
+  workspaceRef: WorkspaceRef,
+  sourcePaths: string[],
+  targetDirectory: string,
+  overwrite = false,
+): Promise<WorkspaceFileImportResult> {
+  return ipcInvoke("workspace_import_entries", { workspaceRef, sourcePaths, targetDirectory, overwrite });
+}
+
 export function workspaceCreateDocument(workspaceRef: WorkspaceRef, directory: string, name: string): Promise<string> {
   return ipcInvoke("workspace_create_document", { workspaceRef, directory, name });
 }
@@ -241,6 +258,11 @@ export function workspaceFilePreview(
     filePath,
     workspaceRef,
   });
+}
+
+/** Frees the model bytes a preview parked in the backend binary cache. */
+export function releasePreviewBlob(blobUrl: string): Promise<boolean> {
+  return ipcInvoke<boolean>("release_preview_blob", { blobUrl }, { throwOnError: false });
 }
 
 export function workspaceFileRevision(
