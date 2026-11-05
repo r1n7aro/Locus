@@ -123,7 +123,7 @@ const engineOptions = computed(() => [
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono-identifier);
   color: var(--text-secondary);
 }
 .latex-toolchain-missing,

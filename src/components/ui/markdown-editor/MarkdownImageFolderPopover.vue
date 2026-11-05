@@ -188,7 +188,7 @@ async function save(): Promise<void> {
   border-radius: 6px;
   background: var(--input-bg, var(--bg-color));
   color: var(--text-color);
-  font-family: var(--font-mono-editor, inherit);
+  font-family: var(--font-mono-editor);
   font-size: 12px;
   outline: none;
   box-sizing: border-box;

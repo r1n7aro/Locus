@@ -458,7 +458,7 @@ function pageStyle(page: LatexPageRef): Record<string, string> {
   padding: 2px 0;
 }
 .latex-preview-location {
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono-identifier);
   color: var(--text-secondary);
 }
 .latex-preview-message {
@@ -466,7 +466,7 @@ function pageStyle(page: LatexPageRef): Record<string, string> {
 }
 .latex-preview-context {
   flex-basis: 100%;
-  font-family: var(--font-mono, monospace);
+  font-family: var(--font-mono-block);
   color: var(--text-secondary);
   white-space: pre-wrap;
 }
