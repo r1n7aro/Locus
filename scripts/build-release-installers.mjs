@@ -265,9 +265,27 @@ function buildFlavor(flavorName, mode, compression, tauriArgs, baseName) {
   console.log(
     `[locus] Building ${mode.label} installer flavor: ${flavorName} (nsis compression: ${compression})`,
   );
-  run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs], { ...mode.cargoEnv, LOCUS_BUILD_EDITION: "public" });
-  assertClientBundle(repoRoot, "public");
-  const finalPath = finalizeInstaller(flavor, mode, baseName, startedAtMs);
+  // Tauri writes every flavor under the base name before it is renamed, so a
+  // suffixed flavor would overwrite an installer that already finished under
+  // that name (the default flavor). Keep it aside until this build is done.
+  const basePath = path.join(nsisBundleDir, baseName);
+  const keepsBaseName = installerNameForFlavor(baseName, [mode.outputSuffix, flavor.suffix]) === baseName;
+  const stashedBasePath = !keepsBaseName && existsSync(basePath) ? `${basePath}.pending` : null;
+  if (stashedBasePath) {
+    if (existsSync(stashedBasePath)) unlinkSync(stashedBasePath);
+    renameSync(basePath, stashedBasePath);
+  }
+  let finalPath;
+  try {
+    run("bun", ["tauri", ...flavor.buildArgs, ...compressionArgs, ...tauriArgs], { ...mode.cargoEnv, LOCUS_BUILD_EDITION: "public" });
+    assertClientBundle(repoRoot, "public");
+    finalPath = finalizeInstaller(flavor, mode, baseName, startedAtMs);
+  } finally {
+    if (stashedBasePath && existsSync(stashedBasePath)) {
+      if (existsSync(basePath)) unlinkSync(basePath);
+      renameSync(stashedBasePath, basePath);
+    }
+  }
   const results = [{ flavor: flavorName, label: flavor.label, path: finalPath }];
   if (flavor.remoteApp) {
     // The same signed APK, published on its own for phones that cannot use
