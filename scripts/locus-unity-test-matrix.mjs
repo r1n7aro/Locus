@@ -177,7 +177,7 @@ Matrix options:
   --project <dir>            Run a specific project; repeat to run multiple projects
   --include <text>           Keep projects whose name, path, or version contains text
   --exclude <text>           Skip projects whose name, path, or version contains text
-  --prepare-native           Build locus_native.dll once before all project runs
+  --prepare-native           Build locus_unity_native.dll once before all project runs
   --prepare-unity-bundle     Rebuild the full locus_unity bundle once before all project runs
   --fail-fast                Stop after the first failed project
   --dry-run                  Print the commands without running Unity

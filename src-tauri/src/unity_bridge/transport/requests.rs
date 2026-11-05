@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
@@ -9,6 +10,7 @@ const RECENT_REQUEST_LIMIT: usize = 1_024;
 struct PendingRequest {
     response: oneshot::Sender<Result<PipeEnvelope, String>>,
     acceptance: Option<oneshot::Sender<()>>,
+    sent_at: Instant,
 }
 
 /// ACK subscriptions are optional, but every request is tracked. Keep a bounded
@@ -32,8 +34,35 @@ impl PendingRequests {
             PendingRequest {
                 response,
                 acceptance,
+                sent_at: Instant::now(),
             },
         );
+    }
+
+    /// Requests that have waited at least `age` for their reply.
+    pub(super) fn waiting_longer_than(&self, age: Duration) -> Vec<String> {
+        let mut ids = self
+            .pending
+            .iter()
+            .filter(|(_, request)| request.sent_at.elapsed() >= age)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    pub(super) fn contains(&self, id: &str) -> bool {
+        self.pending.contains_key(id)
+    }
+
+    /// Fail one request whose reply is known not to come.
+    pub(super) fn fail(&mut self, id: &str, reason: &str) -> bool {
+        let Some(request) = self.retire(id) else {
+            return false;
+        };
+        drop(request.acceptance);
+        let _ = request.response.send(Err(reason.to_string()));
+        true
     }
 
     /// Return whether this ACK belongs to a known request, regardless of whether
@@ -82,6 +111,47 @@ impl PendingRequests {
             drop(request.acceptance);
             let _ = request.response.send(Err(reason.to_string()));
         }
+    }
+}
+
+/// Reply-loss detection from the broker's `request_state` answers. The broker
+/// writes a connection's replies in order, so when its answer reports a
+/// request `none` (no longer queued or running) and the request is still
+/// pending after every earlier frame was read, its reply was lost. A request
+/// is only declared lost on the second such answer in a row, so a request
+/// moving between the broker's queue and its in-flight table, or completing
+/// at the moment of the query, is never failed.
+#[derive(Default)]
+pub(super) struct LostReplies {
+    suspects: HashSet<String>,
+}
+
+impl LostReplies {
+    /// `still_pending`: the queried ids still waiting after the answer was
+    /// read. Returns the ids whose reply was lost.
+    pub(super) fn observe(
+        &mut self,
+        still_pending: &[String],
+        states: &serde_json::Map<String, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut lost = Vec::new();
+        let mut suspects = HashSet::new();
+        for id in still_pending {
+            if states.get(id).and_then(serde_json::Value::as_str) != Some("none") {
+                continue;
+            }
+            if self.suspects.contains(id) {
+                lost.push(id.clone());
+            } else {
+                suspects.insert(id.clone());
+            }
+        }
+        self.suspects = suspects;
+        lost
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.suspects.clear();
     }
 }
 
@@ -237,5 +307,55 @@ mod tests {
         assert!(!requests.accept("req-0"));
         assert!(requests.accept("req-1"));
         assert!(requests.accept(&format!("req-{RECENT_REQUEST_LIMIT}")));
+    }
+
+    #[test]
+    fn a_failed_request_gets_the_reason_and_leaves_the_others_waiting() {
+        let mut requests = PendingRequests::default();
+        let (lost_tx, mut lost_rx) = oneshot::channel();
+        let (kept_tx, mut kept_rx) = oneshot::channel();
+        requests.insert("lost".to_string(), lost_tx, None);
+        requests.insert("kept".to_string(), kept_tx, None);
+        assert_eq!(
+            requests.waiting_longer_than(Duration::ZERO),
+            ["kept", "lost"]
+        );
+        assert!(requests
+            .waiting_longer_than(Duration::from_secs(3600))
+            .is_empty());
+
+        assert!(requests.fail("lost", "Unity response lost"));
+        assert_eq!(
+            lost_rx.try_recv().unwrap().unwrap_err(),
+            "Unity response lost"
+        );
+        assert!(!requests.fail("lost", "again"));
+        assert!(requests.contains("kept"));
+        assert!(matches!(
+            kept_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    fn states(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn a_reply_is_lost_only_after_two_answers_in_a_row_say_none() {
+        let mut lost = LostReplies::default();
+        let pending = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let first = states(serde_json::json!({"a": "none", "b": "inflight", "c": "none"}));
+        assert!(lost.observe(&pending, &first).is_empty());
+
+        // `c` was answered meanwhile; `b` finished just now: only `a` is lost.
+        let second = states(serde_json::json!({"a": "none", "b": "none"}));
+        assert_eq!(lost.observe(&pending[..2], &second), ["a"]);
+        // `b` was reported `none` once; a queued answer resets it.
+        let third = states(serde_json::json!({"b": "queued"}));
+        assert!(lost.observe(&pending[1..2], &third).is_empty());
+        assert!(lost.observe(&pending[1..2], &second).is_empty());
+        lost.clear();
+        assert!(lost.observe(&pending[1..2], &second).is_empty());
     }
 }

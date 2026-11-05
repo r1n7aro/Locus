@@ -27,7 +27,7 @@ namespace Locus.Rendering
     [InitializeOnLoad]
     public sealed class RenderOutput : IDisposable
     {
-        const string Dll="locus_native";
+        const string Dll="locus_unity_native";
         [DllImport(Dll,CallingConvention=CallingConvention.Cdecl)] static extern int locus_render_version();
         [DllImport(Dll,CallingConvention=CallingConvention.Cdecl)] static extern ulong locus_render_create(byte[] id,int length);
         [DllImport(Dll,CallingConvention=CallingConvention.Cdecl)] static extern int locus_render_bind(ulong handle,IntPtr texture);

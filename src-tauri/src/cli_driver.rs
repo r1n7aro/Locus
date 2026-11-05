@@ -2495,6 +2495,7 @@ async fn launch_workspace_mock_chat_with_prompt(
         None,
         None,
         None,
+        None,
         app_handle.clone(),
         app_handle.state(),
         app_handle.state(),
@@ -4400,6 +4401,177 @@ print("E7W:" + marker);"#;
                     }
                 ),
             ),
+        }
+    }
+
+    /// Long synchronous work holds the main thread past the broker's 30s
+    /// heartbeat. While it keeps printing, progress must come from the broker
+    /// and the call must finish instead of detaching as a hang; a silent loop
+    /// stops at the 30s idle limit, a run past `timeout` stops on the budget,
+    /// and `ctx.Progress(string)` reports text-only progress.
+    async fn check_long_main_thread_work(&mut self, project: &str) {
+        #[derive(Default)]
+        struct Seen {
+            native: u32,
+            streamed_output: bool,
+            api_info: bool,
+        }
+        let run_observed = |code: &'static str, timeout_ms: Option<u64>| {
+            let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
+            let observer = Arc::clone(&seen);
+            let (keep, rx) = watch::channel(false);
+            let started = Instant::now();
+            async move {
+                let result = unity_bridge::unity_execute_code_with_options(
+                    project,
+                    code,
+                    unity_bridge::UnityExecuteOptions {
+                        enable_non_public_access: false,
+                        timeout_ms,
+                    },
+                    rx,
+                    move |snapshot| {
+                        if let Ok(mut seen) = observer.lock() {
+                            if snapshot.served_by == "native_broker" {
+                                seen.native += 1;
+                            }
+                            if snapshot.info.contains("last output:") {
+                                seen.streamed_output = true;
+                            }
+                            if snapshot.source == "api_info" && snapshot.info == "E8P step" {
+                                seen.api_info = true;
+                            }
+                        }
+                    },
+                )
+                .await;
+                drop(keep);
+                let seen = std::mem::take(&mut *seen.lock().unwrap());
+                (result, seen, started.elapsed())
+            }
+        };
+
+        let (result, seen, elapsed) = run_observed(
+            r#"var watch = System.Diagnostics.Stopwatch.StartNew();
+int round = 0;
+while (watch.ElapsedMilliseconds < 34000)
+{
+    System.Threading.Thread.Sleep(2500);
+    round++;
+    print("E8M:round " + round);
+}
+print("E8M:done " + round);"#,
+            Some(120_000),
+        )
+        .await;
+        match result {
+            Ok(outcome)
+                if outcome.output.contains("E8M:done")
+                    && outcome.max_main_thread_blocked_ms >= 30_000
+                    && seen.native > 0
+                    && seen.streamed_output =>
+            {
+                self.pass(
+                    "E8M long main-thread work",
+                    format!(
+                        "finished in {}ms; main thread blocked {}ms; {} broker snapshots with streamed output",
+                        elapsed.as_millis(),
+                        outcome.max_main_thread_blocked_ms,
+                        seen.native
+                    ),
+                );
+            }
+            Ok(outcome) => self.fail(
+                "E8M long main-thread work",
+                format!(
+                    "output='{}' blocked={}ms native={} streamed={}",
+                    clip(&outcome.output, 120),
+                    outcome.max_main_thread_blocked_ms,
+                    seen.native,
+                    seen.streamed_output
+                ),
+            ),
+            Err(error) => self.fail(
+                "E8M long main-thread work",
+                format!("after {}ms: {}", elapsed.as_millis(), clip(&error, 240)),
+            ),
+        }
+
+        let (result, _, elapsed) = run_observed(
+            r#"var watch = System.Diagnostics.Stopwatch.StartNew();
+print("E8I:start");
+while (watch.ElapsedMilliseconds < 45000) { System.Threading.Thread.Sleep(200); }
+print("E8I:should-not-finish");"#,
+            None,
+        )
+        .await;
+        let alive = execute_capture(project, r#"print("E8I:alive");"#).await;
+        match (result, alive) {
+            (Err(error), Ok(output))
+                if error.contains("execution timed out after 30 seconds without print/progress output")
+                    && error.contains("held Unity's main thread")
+                    && error.contains("E8I:start")
+                    && output.contains("E8I:alive")
+                    && elapsed < Duration::from_secs(42) =>
+            {
+                self.pass(
+                    "E8I silent main-thread loop",
+                    format!("stopped at the idle limit in {}ms; editor answers again", elapsed.as_millis()),
+                );
+            }
+            (result, alive) => self.fail(
+                "E8I silent main-thread loop",
+                format!(
+                    "after {}ms: execute={} follow-up={}",
+                    elapsed.as_millis(),
+                    match result {
+                        Ok(outcome) => format!("ok '{}'", clip(&outcome.output, 80)),
+                        Err(error) => clip(&error, 240),
+                    },
+                    match alive {
+                        Ok(output) => format!("ok '{}'", clip(&output, 80)),
+                        Err(error) => clip(&error, 160),
+                    }
+                ),
+            ),
+        }
+
+        let (result, _, elapsed) = run_observed(
+            r#"for (int i = 0; i < 40; i++) { System.Threading.Thread.Sleep(250); print("E8B:" + i); }"#,
+            Some(3_000),
+        )
+        .await;
+        match result {
+            Err(error)
+                if error.contains("exceeded the `timeout` budget of 3000 ms")
+                    && elapsed < Duration::from_secs(15) =>
+            {
+                self.pass(
+                    "E8B timeout budget",
+                    format!("stopped on the 3s budget in {}ms", elapsed.as_millis()),
+                );
+            }
+            Err(error) => self.fail("E8B timeout budget", clip(&error, 240)),
+            Ok(outcome) => self.fail(
+                "E8B timeout budget",
+                format!("expected a budget stop, got '{}'", clip(&outcome.output, 120)),
+            ),
+        }
+
+        let (result, seen, _) = run_observed(
+            r#"ctx.Progress("E8P step"); await ctx.WaitSeconds(0.6f); print("E8P:done");"#,
+            None,
+        )
+        .await;
+        match result {
+            Ok(outcome) if outcome.output.contains("E8P:done") && seen.api_info => {
+                self.pass("E8P text progress", "ctx.Progress(string) streamed without a fraction");
+            }
+            Ok(outcome) => self.fail(
+                "E8P text progress",
+                format!("output='{}' api_info={}", clip(&outcome.output, 80), seen.api_info),
+            ),
+            Err(error) => self.fail("E8P text progress", clip(&error, 240)),
         }
     }
 
@@ -7675,6 +7847,7 @@ async fn run_execute_suite(
     run.check_pending_await_diagnostics(project).await;
     run.check_cancellation(project).await;
     run.check_loop_cancellation(project).await;
+    run.check_long_main_thread_work(project).await;
     run.check_concurrency(project).await;
     run.check_player_loop_debugger(project).await;
     if run_cancelled(cancel_rx) {
@@ -7772,6 +7945,9 @@ async fn run_agent_unity_execute_probe(
         || output.contains("failed")
         || output.contains("not connected")
         || output.contains("service binding error")
+        || output.contains("Unknown unity_execute parameter")
+        || output.contains("Missing required parameter")
+        || output.contains("Invalid request_editor_status")
     {
         return Err(format!("unexpected tool result: {output}"));
     }

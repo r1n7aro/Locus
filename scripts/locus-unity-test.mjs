@@ -174,7 +174,7 @@ Frame Debugger diagnostic environment:
 Wrapper options:
   --driver-binary <abs exe>    Run an existing executable directly; skip Tauri build and dev server startup
                               Retains compile-server:ensure, isolated runtime, driver logs and result parsing
-  --prepare-native            Build locus_native.dll before starting Locus
+  --prepare-native            Build locus_unity_native.dll before starting Locus
   --prepare-unity-bundle      Rebuild the full locus_unity bundle before starting Locus
   --reuse-dev-server          Reuse the configured Vite devUrl and skip beforeDevCommand
   --output-dir <dir>          Write driver.log into this directory instead of %TEMP%

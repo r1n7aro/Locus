@@ -1241,6 +1241,7 @@ namespace Locus
 
         private static void PumpMainThreadQueue()
         {
+            MarkEditorPump();
             NativePump();
             PruneYamlPreviewSceneCache(false);
             PumpTickSchedulerEditorUpdate();

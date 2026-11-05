@@ -1,0 +1,21 @@
+[package]
+name = "locus-native-broker"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Host-agnostic in-process native broker shared by the Locus Unity and Blender DLLs"
+publish = false
+
+# Standalone workspace; the host DLL crates (`locus_unity_native`,
+# `locus_blender_native`) depend on it by path. It exports no C symbols
+# itself: each DLL instantiates the common C ABI once through
+# `export_common_ffi!` / `export_host_ffi!`.
+[workspace]
+
+[dependencies]
+locus-native-protocol = { path = "../locus-native-protocol" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }

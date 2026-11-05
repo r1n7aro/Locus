@@ -64,7 +64,7 @@ if ($LASTEXITCODE -ne 0) { Get-Content -LiteralPath (Join-Path $runtime 'compile
 
 $nativeDir = Join-Path $project 'Assets/Plugins/x86_64'
 New-Item -ItemType Directory -Path $nativeDir -Force | Out-Null
-Copy-Item -LiteralPath (Join-Path $repo 'locus_unity/Editor/Native/x86_64/locus_native.dll') -Destination $nativeDir
+Copy-Item -LiteralPath (Join-Path $repo 'locus_unity/Editor/Native/x86_64/locus_unity_native.dll') -Destination $nativeDir
 $log = Join-Path $runtime 'unity.log'
 $proc = Start-Process -FilePath $editor -ArgumentList @('-batchmode','-projectPath',('"' + $project + '"'),'-executeMethod','Locus.LocusBridge.RunProfilerApiChecks','-logFile',('"' + $log + '"')) -WindowStyle Hidden -PassThru
 Write-Output ('LOCUS_PROFILER_RUNTIME_JSON ' + (@{ runtimeRoot = $runtime; project = $project; pid = $proc.Id; started = $proc.StartTime; executable = $editor; log = $log } | ConvertTo-Json -Compress))

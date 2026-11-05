@@ -1,11 +1,11 @@
 //! Main-thread stack capture for hang diagnosis.
 //!
-//! When the Unity main thread stops pumping the editor loop, Locus asks the
-//! broker — which runs on its own thread and keeps answering — where the main
-//! thread is. Capturing from inside the process is what makes the answer
-//! useful: Mono registers unwind data for JIT code with the OS, so an
-//! in-process unwinder walks straight through managed frames, and Mono's own
-//! jit-info table names them.
+//! When the host main thread stops pumping its loop, Locus asks the broker —
+//! which runs on its own thread and keeps answering — where the main thread
+//! is. Capturing from inside the process is what makes the answer useful:
+//! JIT runtimes such as Mono register unwind data with the OS, so an
+//! in-process unwinder walks straight through managed frames, and the host's
+//! [`ManagedNamer`] (Unity: Mono's jit-info table) names them.
 //!
 //! Safety model (the editor must never be made worse by a diagnosis):
 //!   * The suspended window only runs lock-free work: `GetThreadContext`,
@@ -15,11 +15,11 @@
 //!   * Unwinding runs after the thread is resumed, against the private stack
 //!     copy, and every stack read is bounds-checked against that copy. A
 //!     corrupt chain ends the walk instead of faulting.
-//!   * Mono naming runs on a separate, attached helper thread with a deadline.
-//!     If Mono is wedged behind a lock the main thread holds, the capture still
+//!   * Managed naming runs on a separate helper thread with a deadline. If the
+//!     runtime is wedged behind a lock the main thread holds, the capture still
 //!     returns the native frames and reports the naming step as timed out.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 use std::collections::HashMap;
@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+pub use crate::hang_stack_types::{
+    CaptureRequest, CaptureResult, FrameOut, ManagedFrame, ManagedNamer, SampleOut,
+};
 
 type Bool = i32;
 type Dword = u32;
@@ -179,8 +181,6 @@ unsafe extern "system" {
         image_base: *mut u64,
         history_table: *mut c_void,
     ) -> *mut RuntimeFunction;
-    fn GetModuleHandleW(name: *const u16) -> Handle;
-    fn GetProcAddress(module: Handle, name: *const c_char) -> *mut c_void;
 }
 
 struct OwnedHandle(Handle);
@@ -191,72 +191,6 @@ impl Drop for OwnedHandle {
             let _ = CloseHandle(self.0);
         }
     }
-}
-
-// ── Wire model ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CaptureRequest {
-    pub samples: Option<u32>,
-    pub interval_ms: Option<u64>,
-    pub max_frames: Option<usize>,
-    pub resolve_managed: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CaptureResult {
-    pub version: u32,
-    pub thread_id: u32,
-    pub process_id: u32,
-    pub started_at_ms: i64,
-    pub wall_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_start_100ns: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_end_100ns: Option<u64>,
-    pub samples: Vec<SampleOut>,
-    pub managed: Vec<ManagedFrame>,
-    /// `ok` | `skipped` | `unavailable` | `timeout` | `blocked` | `error`.
-    pub managed_status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub managed_error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SampleOut {
-    pub captured_at_ms: i64,
-    pub suspend_us: u64,
-    pub stack_bytes: usize,
-    pub frames: Vec<FrameOut>,
-    /// Why the walk stopped before the thread's root frame, if it did.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unwind_stop: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FrameOut {
-    pub ip: u64,
-    pub sp: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ManagedFrame {
-    pub ip: u64,
-    pub method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub assembly: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-    pub native_offset: u64,
 }
 
 // ── Capture ─────────────────────────────────────────────────────────────────
@@ -279,19 +213,22 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Resolve the Mono entry points while still on the thread that initialized
-/// the broker (the editor main thread), so later captures never need a
-/// loader lookup while the main thread might own the loader lock.
-pub fn prepare() {
-    let _ = mono_api();
+/// Resolve the host's managed-runtime entry points while still on the thread
+/// that initialized the broker (the host main thread), so later captures
+/// never need a loader lookup while the main thread might own the loader lock.
+pub fn prepare(namer: Option<&'static dyn ManagedNamer>) {
+    if let Some(namer) = namer {
+        namer.prepare();
+    }
 }
 
-/// `generation` is the managed domain generation; managed names cached for it
-/// are reused so repeated samples do not attach to Mono again.
+/// `generation` is the managed generation; managed names cached for it are
+/// reused so repeated samples do not attach to the runtime again.
 pub fn capture(
     thread_id: u32,
     request: &CaptureRequest,
     generation: i64,
+    namer: Option<&'static dyn ManagedNamer>,
 ) -> Result<CaptureResult, String> {
     if thread_id == 0 {
         return Err("main thread id is unknown".to_string());
@@ -373,7 +310,7 @@ pub fn capture(
     let (managed, managed_status, managed_error) = if request.resolve_managed == Some(false) {
         (Vec::new(), "skipped".to_string(), None)
     } else {
-        resolve_managed_frames(&out, generation)
+        resolve_managed_frames(&out, generation, namer)
     };
 
     Ok(CaptureResult {
@@ -850,102 +787,7 @@ fn interpret_epilog(
     Err("epilog_too_long")
 }
 
-// ── Mono naming ─────────────────────────────────────────────────────────────
-
-#[repr(C)]
-struct MonoDebugSourceLocation {
-    source_file: *mut c_char,
-    row: u32,
-    column: u32,
-    il_offset: u32,
-}
-
-type DomainFunc = extern "C" fn(*mut c_void, *mut c_void);
-
-struct MonoApi {
-    get_root_domain: unsafe extern "C" fn() -> *mut c_void,
-    thread_attach: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    thread_detach: unsafe extern "C" fn(*mut c_void),
-    domain_foreach: unsafe extern "C" fn(DomainFunc, *mut c_void),
-    jit_info_table_find: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
-    jit_info_get_method: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    jit_info_get_code_start: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    method_full_name: unsafe extern "C" fn(*mut c_void, i32) -> *mut c_char,
-    method_get_class: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    class_get_image: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    image_get_name: unsafe extern "C" fn(*mut c_void) -> *const c_char,
-    free: unsafe extern "C" fn(*mut c_void),
-    debug_lookup_source_location:
-        Option<unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> *mut MonoDebugSourceLocation>,
-    debug_free_source_location: Option<unsafe extern "C" fn(*mut MonoDebugSourceLocation)>,
-}
-
-fn mono_api() -> Option<&'static MonoApi> {
-    static API: OnceLock<Option<MonoApi>> = OnceLock::new();
-    API.get_or_init(load_mono_api).as_ref()
-}
-
-fn load_mono_api() -> Option<MonoApi> {
-    const MODULES: &[&str] = &[
-        "mono-2.0-bdwgc.dll",
-        "mono-2.0-sgen.dll",
-        "mono-2.0.dll",
-        "mono.dll",
-    ];
-    let module = MODULES.iter().find_map(|name| {
-        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-        let handle = unsafe { GetModuleHandleW(wide.as_ptr()) };
-        (!handle.is_null()).then_some(handle)
-    })?;
-    let symbol = |name: &str| -> Option<*mut c_void> {
-        let cname = std::ffi::CString::new(name).ok()?;
-        let address = unsafe { GetProcAddress(module, cname.as_ptr()) };
-        (!address.is_null()).then_some(address)
-    };
-    macro_rules! required {
-        ($name:literal) => {
-            unsafe { std::mem::transmute(symbol($name)?) }
-        };
-    }
-    macro_rules! optional {
-        ($name:literal) => {
-            symbol($name).map(|address| unsafe { std::mem::transmute(address) })
-        };
-    }
-    Some(MonoApi {
-        get_root_domain: required!("mono_get_root_domain"),
-        thread_attach: required!("mono_thread_attach"),
-        thread_detach: required!("mono_thread_detach"),
-        domain_foreach: required!("mono_domain_foreach"),
-        jit_info_table_find: required!("mono_jit_info_table_find"),
-        jit_info_get_method: required!("mono_jit_info_get_method"),
-        jit_info_get_code_start: required!("mono_jit_info_get_code_start"),
-        method_full_name: required!("mono_method_full_name"),
-        method_get_class: required!("mono_method_get_class"),
-        class_get_image: required!("mono_class_get_image"),
-        image_get_name: required!("mono_image_get_name"),
-        free: required!("mono_free"),
-        debug_lookup_source_location: optional!("mono_debug_lookup_source_location"),
-        debug_free_source_location: optional!("mono_debug_free_source_location"),
-    })
-}
-
-extern "C" fn collect_domain(domain: *mut c_void, user_data: *mut c_void) {
-    unsafe {
-        let domains = &mut *(user_data as *mut Vec<usize>);
-        if domains.len() < domains.capacity() {
-            domains.push(domain as usize);
-        }
-    }
-}
-
-unsafe fn owned_c_string(ptr: *const c_char) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    let value = CStr::from_ptr(ptr).to_string_lossy().trim().to_string();
-    (!value.is_empty()).then_some(value)
-}
+// ── Managed naming ──────────────────────────────────────────────────────────
 
 /// `(frame ip, address to look up)`. Return addresses are looked up one byte
 /// back so a call that ends its method still resolves to that method.
@@ -963,10 +805,10 @@ fn managed_lookups(samples: &[SampleOut]) -> Vec<(u64, u64)> {
     lookups
 }
 
-/// Managed names resolved earlier in this domain generation, including
-/// addresses Mono did not own (`None`). JIT code is freed on domain unload, so
-/// a new generation starts empty. Repeated samples of one incident then name
-/// nothing new and never attach a thread to Mono.
+/// Managed names resolved earlier in this managed generation, including
+/// addresses the runtime did not own (`None`). JIT code is freed when the
+/// generation ends, so a new one starts empty. Repeated samples of one
+/// incident then name nothing new and never attach a thread again.
 struct NameCache {
     generation: i64,
     names: HashMap<(u64, u64), Option<ManagedFrame>>,
@@ -985,7 +827,7 @@ fn name_cache() -> &'static Mutex<NameCache> {
 }
 
 /// Split lookups into names already known for `generation` and lookups that
-/// still need Mono.
+/// still need the runtime.
 fn cached_names(
     generation: i64,
     lookups: Vec<(u64, u64)>,
@@ -1026,6 +868,7 @@ fn remember_names(generation: i64, looked_up: &[(u64, u64)], named: &[ManagedFra
 fn resolve_managed_frames(
     samples: &[SampleOut],
     generation: i64,
+    namer: Option<&'static dyn ManagedNamer>,
 ) -> (Vec<ManagedFrame>, String, Option<String>) {
     let lookups = managed_lookups(samples);
     if lookups.is_empty() {
@@ -1035,24 +878,31 @@ fn resolve_managed_frames(
     if lookups.is_empty() {
         return (known, "ok".to_string(), None);
     }
-    if mono_api().is_none() {
-        return (known, "unavailable".to_string(), Some("Mono runtime exports were not found".to_string()));
+    let Some(namer) = namer else {
+        return (
+            known,
+            "unavailable".to_string(),
+            Some("this host has no managed runtime to name frames".to_string()),
+        );
+    };
+    if let Some(reason) = namer.unavailable_reason() {
+        return (known, "unavailable".to_string(), Some(reason.to_string()));
     }
     if MANAGED_NAMING_BUSY.swap(true, Ordering::SeqCst) {
-        // A previous naming thread is still blocked inside Mono.
+        // A previous naming thread is still blocked inside the runtime.
         return (
             known,
             "blocked".to_string(),
-            Some("a previous Mono lookup has not returned; Mono is likely blocked by the main thread".to_string()),
+            Some("a previous managed lookup has not returned; the runtime is likely blocked by the main thread".to_string()),
         );
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let thread_lookups = lookups.clone();
     let spawned = std::thread::Builder::new()
-        .name("locus-hang-mono".to_string())
+        .name("locus-hang-names".to_string())
         .spawn(move || {
             let _busy = BusyGuard(&MANAGED_NAMING_BUSY);
-            let result = unsafe { name_with_mono(&thread_lookups) };
+            let result = unsafe { namer.name(&thread_lookups) };
             let _ = tx.send(result);
         });
     if let Err(error) = spawned {
@@ -1062,7 +912,7 @@ fn resolve_managed_frames(
     match rx.recv_timeout(MANAGED_NAMING_TIMEOUT) {
         Ok(Ok(frames)) => {
             // Only a completed lookup may record misses; a timeout or error
-            // must not hide frames Mono could name later.
+            // must not hide frames the runtime could name later.
             remember_names(generation, &lookups, &frames);
             known.extend(frames);
             (known, "ok".to_string(), None)
@@ -1072,89 +922,11 @@ fn resolve_managed_frames(
             known,
             "timeout".to_string(),
             Some(format!(
-                "Mono did not answer within {}ms; it is likely blocked by the main thread",
+                "the managed runtime did not answer within {}ms; it is likely blocked by the main thread",
                 MANAGED_NAMING_TIMEOUT.as_millis()
             )),
         ),
     }
-}
-
-/// # Safety
-/// Must run on a dedicated thread: it attaches that thread to Mono.
-unsafe fn name_with_mono(lookups: &[(u64, u64)]) -> Result<Vec<ManagedFrame>, String> {
-    let api = mono_api().ok_or("Mono runtime exports were not found")?;
-    let root = (api.get_root_domain)();
-    if root.is_null() {
-        return Err("Mono root domain is not available".to_string());
-    }
-    let attached = (api.thread_attach)(root);
-    let mut domains: Vec<usize> = Vec::with_capacity(32);
-    (api.domain_foreach)(collect_domain, &mut domains as *mut Vec<usize> as *mut c_void);
-    // Editor scripts run in the child domain; search it before the root.
-    domains.sort_by_key(|domain| *domain == root as usize);
-    if domains.is_empty() {
-        domains.push(root as usize);
-    }
-
-    let mut frames = Vec::new();
-    for &(ip, lookup) in lookups {
-        for &domain in &domains {
-            let domain = domain as *mut c_void;
-            let info = (api.jit_info_table_find)(domain, lookup as *mut c_void);
-            if info.is_null() {
-                continue;
-            }
-            let method = (api.jit_info_get_method)(info);
-            if method.is_null() {
-                break;
-            }
-            let name_ptr = (api.method_full_name)(method, 1);
-            let name = owned_c_string(name_ptr);
-            if !name_ptr.is_null() {
-                (api.free)(name_ptr as *mut c_void);
-            }
-            let Some(method_name) = name else { break };
-            let code_start = (api.jit_info_get_code_start)(info) as u64;
-            let native_offset = ip.saturating_sub(code_start);
-            let lookup_offset = lookup.saturating_sub(code_start).min(u64::from(u32::MAX)) as u32;
-            let class = (api.method_get_class)(method);
-            let assembly = if class.is_null() {
-                None
-            } else {
-                let image = (api.class_get_image)(class);
-                if image.is_null() {
-                    None
-                } else {
-                    owned_c_string((api.image_get_name)(image))
-                }
-            };
-            let (mut file, mut line) = (None, None);
-            if let (Some(lookup_location), Some(free_location)) =
-                (api.debug_lookup_source_location, api.debug_free_source_location)
-            {
-                let location = lookup_location(method, lookup_offset, domain);
-                if !location.is_null() {
-                    file = owned_c_string((*location).source_file);
-                    line = ((*location).row > 0).then_some((*location).row);
-                    free_location(location);
-                }
-            }
-            frames.push(ManagedFrame {
-                ip,
-                method: method_name,
-                assembly,
-                file,
-                line,
-                native_offset,
-            });
-            break;
-        }
-    }
-
-    if !attached.is_null() {
-        (api.thread_detach)(attached);
-    }
-    Ok(frames)
 }
 
 #[cfg(test)]
@@ -1188,6 +960,7 @@ mod tests {
                 resolve_managed: Some(false),
             },
             1,
+            None,
         )
         .expect("capture");
         STOP.store(true, Ordering::Relaxed);
@@ -1251,7 +1024,7 @@ mod tests {
     #[test]
     fn refuses_to_capture_the_calling_thread() {
         let tid = unsafe { GetCurrentThreadId() };
-        assert!(capture(tid, &CaptureRequest::default(), 1).is_err());
+        assert!(capture(tid, &CaptureRequest::default(), 1, None).is_err());
     }
 
     #[test]

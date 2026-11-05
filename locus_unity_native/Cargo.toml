@@ -1,5 +1,5 @@
 [package]
-name = "locus_native_plugin"
+name = "locus_unity_native"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
@@ -8,20 +8,24 @@ authors = ["FarLocus"]
 publish = false
 
 # Loaded into the Unity Editor process via P/Invoke. The lib name is the file
-# name the C# `DllImport("locus_native")` resolves, so it must be `locus_native`
-# (→ locus_native.dll on Windows), not the package name.
+# name the C# `DllImport("locus_unity_native")` resolves
+# (→ locus_unity_native.dll on Windows). Before the crate split the DLL was
+# `locus_native.dll`; its exported symbols are unchanged (see exports.txt).
 [lib]
-name = "locus_native"
+name = "locus_unity_native"
 crate-type = ["cdylib"]
 
-# Windows-only: the broker is a Win32 named-pipe server hosted on a background
-# tokio runtime. serde_json frames the envelope protocol shared with the
-# managed pipe. Non-Windows builds compile inert FFI stubs (see lib.rs).
+[dependencies]
+locus-native-broker = { path = "../crates/locus-native-broker" }
+serde_json = "1.0.151"
+
+# Windows-only: the overlay client, WebView2 embedding and GPU output. The
+# broker itself comes from `locus-native-broker`. Non-Windows builds compile
+# inert FFI stubs.
 [target.'cfg(windows)'.dependencies]
 locus_gpu_transport = { path = "../locus_gpu_transport" }
 tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
 sha2 = "0.11.0"
 webview2-com = "=0.38.2"
 windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }

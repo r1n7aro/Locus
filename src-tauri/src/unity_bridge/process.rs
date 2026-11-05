@@ -102,6 +102,7 @@ fn cached_process_is_different_generation(
 fn write_process_cache_if_fresh(
     cache: &mut HashMap<String, UnityEditorProcessInfo>,
     key: String,
+    project_path: &str,
     candidate: UnityEditorProcessInfo,
 ) -> UnityEditorProcessInfo {
     if let Some(cached) = cache.get(&key) {
@@ -109,8 +110,146 @@ fn write_process_cache_if_fresh(
             return cached.clone();
         }
     }
+    ensure_exit_watch(&key, project_path, &candidate);
     cache.insert(key, candidate.clone());
     candidate
+}
+
+/// A kernel wait on one editor process. The cache keeps a Running entry for
+/// `UNITY_RUNNING_PROCESS_PROBE_CACHE_TTL_MS`; the wait turns the process exit
+/// into an immediate `NotRunning` instead of letting that entry outlive it.
+struct ExitWatch {
+    /// `(cache key, project path)` of every project whose entry names the process.
+    projects: Vec<(String, String)>,
+    /// The wait thread is running. `false` once the wait could not be installed
+    /// (e.g. no `SYNCHRONIZE` access); cached reads then re-verify liveness.
+    active: bool,
+}
+
+fn exit_watches() -> std::sync::MutexGuard<'static, HashMap<u32, ExitWatch>> {
+    static WATCHES: OnceLock<std::sync::Mutex<HashMap<u32, ExitWatch>>> = OnceLock::new();
+    WATCHES
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn exit_watch_active(process_id: u32) -> bool {
+    exit_watches()
+        .get(&process_id)
+        .is_some_and(|watch| watch.active)
+}
+
+/// Install the exit wait for a Running entry. Idempotent per process; one
+/// thread per editor process, which lives exactly as long as that process.
+fn ensure_exit_watch(key: &str, project_path: &str, info: &UnityEditorProcessInfo) {
+    let (UnityEditorProcessState::Running, Some(process_id)) = (&info.state, info.process_id)
+    else {
+        return;
+    };
+    {
+        let mut watches = exit_watches();
+        if let Some(watch) = watches.get_mut(&process_id) {
+            if !watch.projects.iter().any(|(watched, _)| watched == key) {
+                watch.projects.push((key.to_string(), project_path.to_string()));
+            }
+            return;
+        }
+        watches.insert(
+            process_id,
+            ExitWatch {
+                projects: vec![(key.to_string(), project_path.to_string())],
+                active: true,
+            },
+        );
+    }
+    super::note_editor_processes_changed();
+    if !spawn_exit_waiter(process_id) {
+        if let Some(watch) = exit_watches().get_mut(&process_id) {
+            watch.active = false;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_exit_waiter(process_id: u32) -> bool {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return false;
+    };
+    // Read before waiting: if the PID is reused by the time the wait opens
+    // it, the creation time differs and the watched editor is already gone.
+    let expected_created_at_ms = process_created_at_unix_ms(process_id);
+    std::thread::Builder::new()
+        .name(format!("unity-exit-{process_id}"))
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            if let Err(error) =
+                probe_native::wait_for_identity_exit(process_id, expected_created_at_ms)
+            {
+                tracing::debug!(
+                    log_module = "Locus",
+                    "Unity process {} exit wait unavailable: {}",
+                    process_id,
+                    error
+                );
+                if let Some(watch) = exit_watches().get_mut(&process_id) {
+                    watch.active = false;
+                }
+                return;
+            }
+            let projects = exit_watches()
+                .remove(&process_id)
+                .map(|watch| watch.projects)
+                .unwrap_or_default();
+            runtime.spawn(on_watched_process_exited(process_id, projects));
+        })
+        .is_ok()
+}
+
+#[cfg(not(windows))]
+fn spawn_exit_waiter(_process_id: u32) -> bool {
+    false
+}
+
+/// Replace the exited process' cache entries and let the observers react now.
+/// An entry that already names another process (a relaunch) is left alone.
+async fn on_watched_process_exited(process_id: u32, projects: Vec<(String, String)>) {
+    super::note_editor_processes_changed();
+    let checked_at_ms = unix_now_ms();
+    for (key, project_path) in projects {
+        let exited = {
+            let mut cache = unity_process_probe_cache().lock().await;
+            let names_process = cache
+                .get(&key)
+                .is_some_and(|current| current.process_id == Some(process_id));
+            if names_process {
+                cache.insert(key, UnityEditorProcessInfo::not_running(checked_at_ms));
+            }
+            names_process
+        };
+        if exited {
+            super::note_editor_process_exited(&project_path);
+        }
+    }
+}
+
+/// A Running entry is trusted for its TTL only while an exit wait covers it.
+/// Without one, a cheap liveness check stops a missed exit from outliving it.
+fn cached_running_process_is_alive(info: &UnityEditorProcessInfo) -> bool {
+    let (UnityEditorProcessState::Running, Some(process_id)) = (&info.state, info.process_id)
+    else {
+        return true;
+    };
+    if exit_watch_active(process_id) {
+        return true;
+    }
+    match is_process_alive(process_id) {
+        Ok(false) => {
+            exit_watches().remove(&process_id);
+            false
+        }
+        _ => true,
+    }
 }
 
 impl UnityEditorProcessInfo {
@@ -259,6 +398,7 @@ pub(super) async fn refresh_known_project_editor_process_liveness(
             current.clone()
         }
         _ => {
+            ensure_exit_watch(&key, project_path, &refreshed);
             cache.insert(key, refreshed.clone());
             refreshed.clone()
         }
@@ -360,12 +500,15 @@ pub async fn query_current_project_editor_process(project_path: &str) -> UnityEd
     {
         let cache = unity_process_probe_cache().lock().await;
         if let Some(cached) = cache.get(&key) {
-            if now.saturating_sub(cached.checked_at_ms) <= process_probe_cache_ttl_ms(cached) {
+            if now.saturating_sub(cached.checked_at_ms) <= process_probe_cache_ttl_ms(cached)
+                && cached_running_process_is_alive(cached)
+            {
                 return cached.clone();
             }
         }
     }
 
+    let original_project_path = project_path;
     let project_path = project_path.to_string();
     let probe = match tokio::time::timeout(
         Duration::from_secs(UNITY_PROCESS_PROBE_TIMEOUT_SECS),
@@ -390,7 +533,7 @@ pub async fn query_current_project_editor_process(project_path: &str) -> UnityEd
     };
 
     let mut cache = unity_process_probe_cache().lock().await;
-    write_process_cache_if_fresh(&mut cache, key, probe)
+    write_process_cache_if_fresh(&mut cache, key, original_project_path, probe)
 }
 
 /// Process creation time (ms since the Unix epoch) for `process_id`, used to
@@ -483,7 +626,7 @@ pub(super) async fn cache_project_editor_process(
 ) {
     let key = process_cache_key(project_path);
     let mut cache = unity_process_probe_cache().lock().await;
-    write_process_cache_if_fresh(&mut cache, key, process_info);
+    write_process_cache_if_fresh(&mut cache, key, project_path, process_info);
 }
 
 #[cfg(windows)]
@@ -1113,6 +1256,63 @@ mod probe_native {
         Ok(())
     }
 
+    /// Block until the process generation `process_id` (created at
+    /// `expected_created_at_ms`, when known) has exited. A process that is
+    /// already gone, or whose PID now names a newer process, counts as exited.
+    pub(super) fn wait_for_identity_exit(
+        process_id: u32,
+        expected_created_at_ms: Option<u64>,
+    ) -> Result<(), String> {
+        const SYNCHRONIZE: Dword = 0x0010_0000;
+        const INFINITE: Dword = 0xFFFF_FFFF;
+        const WAIT_OBJECT_0: Dword = 0;
+        let raw = unsafe {
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, process_id)
+        };
+        if raw.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                return Ok(());
+            }
+            return Err(format!("cannot open process for an exit wait: {error}"));
+        }
+        let handle = OwnedHandle(raw);
+        if let (Some(expected), Some(actual)) =
+            (expected_created_at_ms, query_creation_unix_ms(&handle))
+        {
+            if actual != expected {
+                return Ok(());
+            }
+        }
+        match unsafe { WaitForSingleObject(handle.0, INFINITE) } {
+            WAIT_OBJECT_0 => Ok(()),
+            other => Err(format!(
+                "exit wait returned {other}: {}",
+                std::io::Error::last_os_error()
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn identity_exit_wait_returns_when_the_child_exits_or_the_pid_is_gone() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let created = query_process_facts(pid).ok().and_then(|facts| facts.created_at_unix_ms);
+        let started = std::time::Instant::now();
+        wait_for_identity_exit(pid, created).expect("wait");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        let _ = child.wait();
+        // A creation time from another generation is "already exited".
+        let own = std::process::id();
+        let started = std::time::Instant::now();
+        wait_for_identity_exit(own, Some(1)).expect("reused pid");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
     pub(super) fn working_set_bytes(process_id: u32) -> Option<u64> {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, process_id) };
         if handle.is_null() { return None; }
@@ -1503,6 +1703,22 @@ mod tests {
             &cached,
             &newer_running
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_running_entry_without_an_exit_wait_is_reverified() {
+        let alive = process_info(UnityEditorProcessState::Running, Some(std::process::id()), 100);
+        assert!(super::cached_running_process_is_alive(&alive));
+        let mut child = std::process::Command::new("cmd").args(["/C", "exit 0"]).spawn().expect("child");
+        let pid = child.id();
+        child.wait().expect("child exit");
+        drop(child);
+        let exited = process_info(UnityEditorProcessState::Running, Some(pid), 100);
+        assert!(!super::cached_running_process_is_alive(&exited));
+        // Non-running entries keep their own short TTL.
+        let absent = process_info(UnityEditorProcessState::NotRunning, None, 100);
+        assert!(super::cached_running_process_is_alive(&absent));
     }
 
     #[test]

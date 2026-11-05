@@ -11,7 +11,7 @@ namespace Locus
 {
     internal static class LocusWebViewNative
     {
-        const string Dll = "locus_native";
+        const string Dll = "locus_unity_native";
         internal const string RuntimeDownload = "https://developer.microsoft.com/microsoft-edge/webview2/";
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int locus_webview_start(IntPtr parent, byte[] profile, int n, byte[] url, int un);

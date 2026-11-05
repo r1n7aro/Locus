@@ -3,7 +3,7 @@
 //! When the semantic observer reports `unresponsive`, one capture runs per
 //! incident (process identity + continuous unresponsive interval):
 //!
-//!   1. Preferred: the in-process broker (`locus_native`) walks the main
+//!   1. Preferred: the in-process broker (`locus_unity_native`) walks the main
 //!      thread's stack with the OS unwinder and names managed frames through
 //!      Mono (`main_thread_stack`, capability `broker_main_thread_stack_v1`).
 //!   2. Fallback: an out-of-process stack scan (older plugin or broker
@@ -862,6 +862,40 @@ async fn symbolize_capture(
     .map_err(|error| format!("symbol task failed: {error}"))?
 }
 
+/// Symbolize native frame addresses of another process. Blender reuses the
+/// Unity symbolizer: PDBs beside the loaded modules (`blender.pdb` next to
+/// `blender.exe` in builds that ship one) are found through the module
+/// directories. Frames without symbols fall back to `module+offset`.
+pub(crate) async fn symbolize_native_frames(pid: u32, frames: Vec<u64>) -> Vec<String> {
+    let lookups = frames
+        .iter()
+        .enumerate()
+        .map(|(index, ip)| (*ip, if index == 0 { *ip } else { ip.saturating_sub(1) }))
+        .collect::<Vec<_>>();
+    let symbols = tokio::time::timeout(
+        SYMBOLIZE_TIMEOUT,
+        tauri::async_runtime::spawn_blocking(move || {
+            let modules = super::background_hook::process_modules(pid)?;
+            Ok::<_, String>(symbols_imp::symbolize(&modules, &lookups, None))
+        }),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(Result::ok)
+    .unwrap_or_default();
+    frames
+        .iter()
+        .map(|ip| match symbols.get(ip) {
+            Some(NativeSymbol { module, symbol: Some(name), displacement, .. }) => {
+                format!("{module}!{name}+0x{displacement:x}")
+            }
+            Some(NativeSymbol { module, module_offset, .. }) => format!("{module}+0x{module_offset:x}"),
+            None => format!("0x{ip:x}"),
+        })
+        .collect()
+}
+
 fn find_module<'a>(
     modules: &'a [super::background_hook::ProcessModule],
     address: u64,
@@ -1380,6 +1414,14 @@ fn build_diagnosis(
     }
 }
 
+/// Agent code is running, the thread is busy and its location moves: progress,
+/// not a wedge.
+fn is_long_running_locus_execution(diagnosis: &UnityHangDiagnosis) -> bool {
+    diagnosis.active_executions.is_some_and(|count| count > 0)
+        && diagnosis.verdict == "busy"
+        && diagnosis.stack_stable == Some(false)
+}
+
 /// Plain-text report for agents (tool errors). English, compact, actionable.
 pub(crate) fn format_for_agent(diagnosis: &UnityHangDiagnosis) -> String {
     let mut lines = Vec::new();
@@ -1435,7 +1477,16 @@ pub(crate) fn format_for_agent(diagnosis: &UnityHangDiagnosis) -> String {
     for note in &diagnosis.notes {
         lines.push(format!("- Note: {note}"));
     }
-    if matches!(
+    if is_long_running_locus_execution(diagnosis) {
+        lines.push(
+            "- Hint: a Locus execution is still computing on the main thread (CPU busy, the location changes between \
+samples), so this is most likely long synchronous work rather than a deadlock. Read its result later with \
+`locus.wait_unity_execution`, or stop it with `locus.cancel_unity_execution` (loops stop at their next iteration). \
+For long batches, print or call ctx.Progress per chunk and `await ctx.WaitFrame()` between chunks so the Editor keeps \
+pumping."
+                .to_string(),
+        );
+    } else if matches!(
         diagnosis.location.as_ref().map(|frame| frame.origin.as_str()),
         Some("agent" | "user")
     ) {
@@ -1578,6 +1629,52 @@ mod tests {
         let text = format_for_agent(&diagnosis);
         assert!(text.contains("Likely location: Game.Spawner:Update () (at Assets/Spawner.cs:42) — project code"), "{text}");
         assert!(text.contains("Hint:"));
+    }
+
+    #[test]
+    fn moving_locus_execution_is_reported_as_long_running_work() {
+        let mut managed_names = HashMap::new();
+        for name in [
+            managed(0x20, "DustEcho.ECS.CleanupSystem:OnUpdate ()", "Assembly-CSharp", Some("F:/Proj/Assets/Cleanup.cs"), Some(64)),
+            managed(0x21, "DustEcho.ECS.SimulationPipeline:OnUpdate ()", "Assembly-CSharp", Some("F:/Proj/Assets/Pipeline.cs"), Some(55)),
+            managed(0x50, "Locus.RuntimeSnippets.__LocusAsyncSnippetHost:ExecuteSync ()", "__LocusRuntimeAsync_00000001", None, None),
+        ] {
+            managed_names.insert(name.ip, name);
+        }
+        let raw = RawCapture {
+            source: "native_broker",
+            samples: vec![vec![0x10, 0x20, 0x50], vec![0x10, 0x21, 0x50]],
+            cpu_percent: Some(99.0),
+            managed: managed_names,
+            unwind_stop: None,
+            notes: Vec::new(),
+        };
+        let mut symbols = HashMap::new();
+        symbols.insert(0x10, native("mono-2.0-bdwgc.dll", "mono_jit_runtime_invoke"));
+        let mut executing = target();
+        executing.active_executions = Some(1);
+        let diagnosis = build_diagnosis("F:/Proj", &executing, 1, raw, &symbols, Vec::new());
+        assert_eq!(diagnosis.verdict, "busy");
+        assert_eq!(diagnosis.stack_stable, Some(false));
+        let text = format_for_agent(&diagnosis);
+        assert!(text.contains("most likely long synchronous work"), "{text}");
+        assert!(text.contains("locus.wait_unity_execution"), "{text}");
+        assert!(!text.contains("Fix it before running it again"), "{text}");
+
+        // The same busy stack without a Locus execution keeps the loop hint.
+        let mut managed_names = HashMap::new();
+        let spawner = managed(0x20, "Game.Spawner:Update ()", "Assembly-CSharp", Some("F:/Proj/Assets/Spawner.cs"), Some(42));
+        managed_names.insert(spawner.ip, spawner);
+        let raw = RawCapture {
+            source: "native_broker",
+            samples: vec![vec![0x10, 0x20], vec![0x11, 0x20]],
+            cpu_percent: Some(99.0),
+            managed: managed_names,
+            unwind_stop: None,
+            notes: Vec::new(),
+        };
+        let diagnosis = build_diagnosis("F:/Proj", &target(), 1, raw, &symbols, Vec::new());
+        assert!(format_for_agent(&diagnosis).contains("Fix it before running it again"));
     }
 
     #[test]

@@ -43,6 +43,13 @@ const PLUGIN_REQUIRED_SOURCE_FILES: &[&str] = &[
     "Editor/Detour/Locus.Detour.dll.meta",
     "Editor/HotReload/Locus.HotReload.Runtime.dll",
     "Editor/HotReload/Locus.HotReload.Runtime.dll.meta",
+    "Editor/Native/x86_64/locus_unity_native.dll",
+    "Editor/Native/x86_64/locus_unity_native.dll.meta",
+];
+/// Broker DLL file names used before the native crate split. A plugin update
+/// must not leave them next to `locus_unity_native.dll` (Unity would load
+/// both plugins).
+const PLUGIN_LEGACY_NATIVE_FILES: &[&str] = &[
     "Editor/Native/x86_64/locus_native.dll",
     "Editor/Native/x86_64/locus_native.dll.meta",
 ];
@@ -51,7 +58,7 @@ const PLUGIN_REQUIRED_DLL_FILES: &[&str] = &[
     "Editor/Roslyn/Locus.Roslyn.dll",
     "Editor/Detour/Locus.Detour.dll",
     "Editor/HotReload/Locus.HotReload.Runtime.dll",
-    "Editor/Native/x86_64/locus_native.dll",
+    "Editor/Native/x86_64/locus_unity_native.dll",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,12 +570,34 @@ fn install_or_update_plugin_with_source_dir(
             .map_err(|e| format!("Failed to create directory {}: {}", parent.display(), e))?;
     }
     move_staged_plugin_dir(&staging_dir, &install_dir)?;
+    remove_legacy_native_files(&install_dir)?;
 
     eprintln!(
         "[Locus] locus_unity plugin installed/updated at: {}",
         install_dir.display()
     );
     Ok(hash)
+}
+
+/// The staged swap normally replaces the whole package, but the copy
+/// fallback (rename denied) and hand-edited installs can keep files the new
+/// package does not have. Pre-split broker DLLs must never survive.
+fn remove_legacy_native_files(install_dir: &Path) -> Result<(), String> {
+    for relative in PLUGIN_LEGACY_NATIVE_FILES {
+        let path = install_dir.join(relative);
+        match std::fs::remove_file(&path) {
+            Ok(()) => eprintln!("[Locus] removed legacy native broker file {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Failed to remove legacy native broker file {}: {}",
+                    path.display(),
+                    error
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn move_staged_plugin_dir(staging_dir: &Path, install_dir: &Path) -> Result<(), String> {
@@ -853,13 +882,36 @@ mod tests {
             b"meta",
         );
         write_file(
-            &source_root.join("Editor/Native/x86_64/locus_native.dll"),
+            &source_root.join("Editor/Native/x86_64/locus_unity_native.dll"),
             b"dll",
         );
         write_file(
-            &source_root.join("Editor/Native/x86_64/locus_native.dll.meta"),
+            &source_root.join("Editor/Native/x86_64/locus_unity_native.dll.meta"),
             b"meta",
         );
+    }
+
+    #[test]
+    fn update_removes_the_pre_split_native_broker_dll() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        create_unity_project(temp.path());
+        create_minimal_plugin_source(source.path());
+        install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap();
+        let install_dir = expected_install_dir(temp.path());
+        // An install from before the split, or a copy-fallback leftover.
+        write_file(&install_dir.join("Editor/Native/x86_64/locus_native.dll"), b"old");
+        write_file(&install_dir.join("Editor/Native/x86_64/locus_native.dll.meta"), b"old");
+
+        install_or_update_plugin_with_source_dir(source.path(), temp.path()).unwrap();
+        assert!(install_dir.join("Editor/Native/x86_64/locus_unity_native.dll").is_file());
+        assert!(!install_dir.join("Editor/Native/x86_64/locus_native.dll").exists());
+        assert!(!install_dir.join("Editor/Native/x86_64/locus_native.dll.meta").exists());
+
+        write_file(&install_dir.join("Editor/Native/x86_64/locus_native.dll"), b"old");
+        remove_legacy_native_files(&install_dir).unwrap();
+        assert!(!install_dir.join("Editor/Native/x86_64/locus_native.dll").exists());
+        remove_legacy_native_files(&install_dir).unwrap();
     }
 
     #[test]

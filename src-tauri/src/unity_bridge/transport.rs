@@ -15,7 +15,7 @@ mod requests;
 mod windows_impl {
     use super::requests::PendingRequests;
     use super::*;
-    use serde::{Deserialize, Serialize};
+    use serde::Serialize;
     use std::{
         collections::HashMap,
         sync::{
@@ -30,36 +30,8 @@ mod windows_impl {
         sync::oneshot,
     };
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub(super) struct PipeEnvelope {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub id: Option<String>,
-
-        #[serde(default, rename = "reply_to", skip_serializing_if = "Option::is_none")]
-        pub reply_to: Option<String>,
-
-        #[serde(default, rename = "type")]
-        pub kind: String,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub ok: Option<bool>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub message: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub error: Option<String>,
-
-        #[serde(default, rename = "processId", skip_serializing_if = "Option::is_none")]
-        pub process_id: Option<u32>,
-
-        #[serde(
-            default,
-            rename = "processPath",
-            skip_serializing_if = "Option::is_none"
-        )]
-        pub process_path: Option<String>,
-    }
+    /// Wire envelope shared with every native broker host.
+    pub(super) use locus_native_protocol::envelope::PipeEnvelope;
 
     struct UnityPipeConnection {
         project_key: String,
@@ -159,6 +131,35 @@ mod windows_impl {
         }
     }
 
+    /// Publish an app-wide (unscoped) event to every renderer.
+    pub(super) fn emit_app_event<T: Serialize + Clone>(event_name: &str, payload: T) -> bool {
+        use tauri::Emitter;
+        EVENT_APP_HANDLE
+            .get()
+            .is_some_and(|app_handle| app_handle.emit(event_name, payload).is_ok())
+    }
+
+    /// Publish a scoped workspace event for the project's live Unity service.
+    /// `false` while the project has no service scope or the scope is stale.
+    pub(super) fn emit_project_event<T: Serialize + Clone>(
+        project_path: &str,
+        event_name: &str,
+        payload: T,
+    ) -> bool {
+        let Some(app_handle) = EVENT_APP_HANDLE.get() else {
+            return false;
+        };
+        let Some(scope) = service_event_scope(&project_connection_key(project_path)) else {
+            return false;
+        };
+        matches!(
+            crate::workspace_service::event::emit_for_workspace_scope(
+                app_handle, &scope, event_name, payload,
+            ),
+            crate::workspace_service::event::WorkspaceEventPublishOutcome::PublishedScoped
+        )
+    }
+
     fn service_event_scope(
         project_key: &str,
     ) -> Option<crate::workspace_service::event::WorkspaceEventScope> {
@@ -180,8 +181,14 @@ mod windows_impl {
         value.to_ascii_lowercase()
     }
 
+    /// Unique across Locus processes: several clients may share one broker
+    /// (multi-client), and it routes completions by request id.
     fn next_request_id() -> String {
-        format!("req-{}", REQUEST_SEQ.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "req-{}-{}",
+            std::process::id(),
+            REQUEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     async fn open_client_with_retry(
@@ -470,11 +477,12 @@ mod windows_impl {
 
         let reader_task = tokio::spawn(reader_loop(new_conn.clone(), reader));
         *new_conn.reader_abort.lock().await = Some(reader_task.abort_handle());
+        tokio::spawn(reply_watchdog(Arc::downgrade(&new_conn)));
         Ok(new_conn)
     }
 
     /// Native-only: all desktop Unity traffic goes through the broker pipe
-    /// served by `locus_native`, so a missing broker is surfaced as a
+    /// served by `locus_unity_native`, so a missing broker is surfaced as a
     /// connection error.
     async fn get_or_connect(project_path: &str) -> Result<Arc<UnityPipeConnection>, String> {
         let project_key = project_connection_key(project_path);
@@ -684,11 +692,40 @@ mod windows_impl {
             Err(_) => return Err("Unity pipe connect timed out".to_string()),
         };
 
-        let mut writer_guard = match conn.writer.try_lock() {
+        let writer_guard = match conn.writer.try_lock() {
             Ok(guard) => guard,
             Err(_) => return Ok(None),
         };
+        send_with_writer(&conn, writer_guard, msg_type, message, response_timeout)
+            .await
+            .map(Some)
+    }
 
+    /// Request on one connection, waiting at most `timeout` for the writer
+    /// and as long again for the reply. For background tasks that do not
+    /// drive another request on this connection.
+    async fn request_on_connection(
+        conn: &Arc<UnityPipeConnection>,
+        msg_type: &str,
+        message: &str,
+        timeout: Duration,
+    ) -> Result<PipeResponse, String> {
+        let writer_guard = tokio::time::timeout(timeout, conn.writer.lock())
+            .await
+            .map_err(|_| "Unity pipe writer busy".to_string())?;
+        send_with_writer(conn, writer_guard, msg_type, message, timeout).await
+    }
+
+    /// Write one request with the writer already held, release it, and wait
+    /// for the reply. Only a write that fails after acquiring the writer
+    /// (possible partial frame) closes the connection.
+    async fn send_with_writer(
+        conn: &Arc<UnityPipeConnection>,
+        mut writer_guard: tokio::sync::MutexGuard<'_, Option<WriteHalf<NamedPipeClient>>>,
+        msg_type: &str,
+        message: &str,
+        response_timeout: Duration,
+    ) -> Result<PipeResponse, String> {
         let request_id = next_request_id();
         let env = PipeEnvelope {
             id: Some(request_id.clone()),
@@ -757,7 +794,7 @@ mod windows_impl {
         };
         pending_guard.disarm();
 
-        Ok(Some(PipeResponse {
+        Ok(PipeResponse {
             ok: env.ok.unwrap_or(false),
             error: env.error,
             message: env.message,
@@ -766,7 +803,111 @@ mod windows_impl {
                 .process_path
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-        }))
+        })
+    }
+
+    #[cfg(not(test))]
+    const REPLY_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+    #[cfg(test)]
+    const REPLY_WATCH_INTERVAL: Duration = Duration::from_millis(50);
+    /// Requests waiting less than this are never checked.
+    #[cfg(not(test))]
+    const REPLY_WATCH_MIN_AGE: Duration = Duration::from_secs(15);
+    #[cfg(test)]
+    const REPLY_WATCH_MIN_AGE: Duration = Duration::from_millis(100);
+    const REPLY_WATCH_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Fails requests whose reply the broker already sent but that never
+    /// arrived, so a lost frame becomes an error (an execution then reattaches
+    /// by execution id) instead of a wait that never ends. Brokers without
+    /// `broker_request_state_v1` are not checked.
+    async fn reply_watchdog(conn: std::sync::Weak<UnityPipeConnection>) {
+        use locus_native_protocol::{capabilities, envelope::REQUEST_STATE_REQUEST};
+
+        let mut supported: Option<bool> = None;
+        let mut lost_replies = requests::LostReplies::default();
+        let mut tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + REPLY_WATCH_INTERVAL,
+            REPLY_WATCH_INTERVAL,
+        );
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(conn) = conn.upgrade() else {
+                return;
+            };
+            if conn.writer.try_lock().is_ok_and(|writer| writer.is_none()) {
+                return;
+            }
+            let waiting = conn
+                .pending
+                .lock()
+                .await
+                .waiting_longer_than(REPLY_WATCH_MIN_AGE);
+            if waiting.is_empty() {
+                lost_replies.clear();
+                continue;
+            }
+            if supported.is_none() {
+                supported = match request_on_connection(
+                    &conn,
+                    "bridge_capabilities",
+                    "",
+                    REPLY_WATCH_QUERY_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(resp) => Some(
+                        resp.ok
+                            && resp
+                                .message
+                                .as_deref()
+                                .unwrap_or_default()
+                                .split(',')
+                                .any(|cap| cap.trim() == capabilities::REQUEST_STATE_V1),
+                    ),
+                    Err(_) => None,
+                };
+            }
+            if supported != Some(true) {
+                continue;
+            }
+            let query = serde_json::to_string(&waiting).unwrap_or_else(|_| "[]".to_string());
+            let Ok(resp) = request_on_connection(
+                &conn,
+                REQUEST_STATE_REQUEST,
+                &query,
+                REPLY_WATCH_QUERY_TIMEOUT,
+            )
+            .await
+            else {
+                continue;
+            };
+            let Some(states) = resp
+                .ok
+                .then_some(resp.message)
+                .flatten()
+                .and_then(|message| serde_json::from_str::<serde_json::Value>(&message).ok())
+                .and_then(|value| value.as_object().cloned())
+            else {
+                continue;
+            };
+            let mut pending = conn.pending.lock().await;
+            let still_pending = waiting
+                .into_iter()
+                .filter(|id| pending.contains(id))
+                .collect::<Vec<_>>();
+            for id in lost_replies.observe(&still_pending, &states) {
+                eprintln!(
+                    "[Locus] Unity reply lost: the native broker finished request {} on {} but its reply never arrived; failing the request",
+                    id, conn.pipe_name
+                );
+                pending.fail(
+                    &id,
+                    &format!("Unity response lost: the native broker finished request {id} but its reply never arrived"),
+                );
+            }
+        }
     }
 
     pub async fn send_message_with_timeout(
@@ -1080,6 +1221,123 @@ mod windows_impl {
             close_connection(&conn, "test complete".to_string()).await;
         }
 
+        /// A broker that answers capability and request-state queries itself,
+        /// reporting `running` as in flight and every other id as finished,
+        /// and never replies to anything else.
+        async fn reply_state_broker(
+            server: tokio::net::windows::named_pipe::NamedPipeServer,
+            capabilities: &'static str,
+        ) {
+            use tokio::io::AsyncBufReadExt;
+            let (read, mut write) = tokio::io::split(server);
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).expect("request frame");
+                let message = match request["type"].as_str() {
+                    Some("bridge_capabilities") => capabilities.to_string(),
+                    Some("request_state") => {
+                        let ids: Vec<String> =
+                            serde_json::from_str(request["message"].as_str().unwrap()).unwrap();
+                        let states = ids
+                            .into_iter()
+                            .map(|id| {
+                                let state = if id == "running" { "inflight" } else { "none" };
+                                (id, serde_json::Value::from(state))
+                            })
+                            .collect::<serde_json::Map<_, _>>();
+                        serde_json::Value::Object(states).to_string()
+                    }
+                    _ => continue,
+                };
+                let mut frame = serde_json::to_vec(&serde_json::json!({
+                    "reply_to": request["id"], "type": "response", "ok": true, "message": message,
+                }))
+                .unwrap();
+                frame.push(b'\n');
+                if write.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        async fn connect_to_reply_state_broker(
+            name: &str,
+            capabilities: &'static str,
+        ) -> (
+            String,
+            Arc<UnityPipeConnection>,
+            tokio::task::JoinHandle<()>,
+        ) {
+            let pipe_name = format!(r"\\.\pipe\locus_transport_{name}_{}", uuid::Uuid::new_v4());
+            let server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&pipe_name)
+                .expect("create test pipe");
+            let connect_task = tokio::spawn(connect_pipe(
+                format!("{name}-project"),
+                pipe_name.clone(),
+                1,
+            ));
+            server.connect().await.expect("accept test pipe client");
+            let broker = tokio::spawn(reply_state_broker(server, capabilities));
+            let conn = connect_task
+                .await
+                .expect("connect task")
+                .expect("connect client");
+            (pipe_name, conn, broker)
+        }
+
+        #[tokio::test]
+        async fn a_reply_the_broker_finished_but_never_delivered_fails_the_request() {
+            let (pipe_name, conn, broker) =
+                connect_to_reply_state_broker("lost_reply", "broker_v1,broker_request_state_v1")
+                    .await;
+            let (lost_tx, lost_rx) = oneshot::channel();
+            let (running_tx, mut running_rx) = oneshot::channel();
+            {
+                let mut pending = conn.pending.lock().await;
+                pending.insert("lost".to_string(), lost_tx, None);
+                pending.insert("running".to_string(), running_tx, None);
+            }
+
+            let error = tokio::time::timeout(Duration::from_secs(5), lost_rx)
+                .await
+                .expect("the watchdog fails a lost reply")
+                .expect("response channel")
+                .expect_err("lost reply is an error");
+            assert!(error.starts_with("Unity response lost"), "{error}");
+            // A request the broker still runs keeps waiting.
+            assert!(matches!(
+                running_rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+
+            remove_connection_if_same(&pipe_name, &conn).await;
+            close_connection(&conn, "test complete".to_string()).await;
+            broker.abort();
+        }
+
+        #[tokio::test]
+        async fn brokers_without_request_state_are_not_checked() {
+            let (pipe_name, conn, broker) =
+                connect_to_reply_state_broker("no_request_state", "broker_v1").await;
+            let (tx, mut rx) = oneshot::channel();
+            conn.pending
+                .lock()
+                .await
+                .insert("lost".to_string(), tx, None);
+            tokio::time::sleep(REPLY_WATCH_MIN_AGE + 6 * REPLY_WATCH_INTERVAL).await;
+            assert!(matches!(
+                rx.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+
+            remove_connection_if_same(&pipe_name, &conn).await;
+            close_connection(&conn, "test complete".to_string()).await;
+            broker.abort();
+        }
+
         #[test]
         fn service_scope_is_removed_at_the_service_generation_boundary() {
             use crate::workspace_service::event::WorkspaceEventScope;
@@ -1132,6 +1390,34 @@ pub fn set_service_event_scope(
     _project_path: &str,
     _scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
 ) {
+}
+
+#[cfg(target_os = "windows")]
+pub fn emit_project_event<T: serde::Serialize + Clone>(
+    project_path: &str,
+    event_name: &str,
+    payload: T,
+) -> bool {
+    windows_impl::emit_project_event(project_path, event_name, payload)
+}
+
+#[cfg(target_os = "windows")]
+pub fn emit_app_event<T: serde::Serialize + Clone>(event_name: &str, payload: T) -> bool {
+    windows_impl::emit_app_event(event_name, payload)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn emit_app_event<T: serde::Serialize + Clone>(_event_name: &str, _payload: T) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn emit_project_event<T: serde::Serialize + Clone>(
+    _project_path: &str,
+    _event_name: &str,
+    _payload: T,
+) -> bool {
+    false
 }
 
 #[cfg(target_os = "windows")]

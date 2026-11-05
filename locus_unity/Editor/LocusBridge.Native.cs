@@ -1,6 +1,6 @@
 // Native broker bridge. The command channel that Locus uses to talk to this
 // editor normally lives on a managed named pipe (see LocusBridge.cs), which
-// dies on every domain reload. When the native broker DLL (`locus_native`) is
+// dies on every domain reload. When the native broker DLL (`locus_unity_native`) is
 // present and enabled, that long-lived pipe instead lives in native code that
 // survives reloads; this file is the managed half: it registers lifecycle
 // state with the broker and pumps queued requests through the same
@@ -28,7 +28,7 @@ namespace Locus
     {
         // ───────────────── Native bridge state ─────────────────
 
-        private const string NativeDll = "locus_native";
+        private const string NativeDll = "locus_unity_native";
         private const int NativeProtocolVersion = 1;
         private const int NativeInitialBufferSize = 64 * 1024;
         private const int MaxNativeRequestsPerUpdate = 16;
@@ -37,7 +37,7 @@ namespace Locus
         private const string SessionKey_NativeGeneration = "Locus_NativeGeneration";
         private const string NativePipePrefix = @"\\.\pipe\";
 
-        // Must match the `MANAGED_STATE_*` constants in locus_native (lib.rs).
+        // Must match the `MANAGED_STATE_*` constants in locus_native_protocol::managed_state.
         private const int ManagedStateInitializing = 0;
         private const int ManagedStateReady = 1;
         private const int ManagedStateReloading = 2;
@@ -46,7 +46,7 @@ namespace Locus
         // Capabilities the managed executor advertises (mirrors the managed
         // executor features the broker can route through this domain).
         private const string ManagedCapabilities =
-            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1,recompile_result_idempotent_v1,recompile_operation_id_v1,recompile_in_progress_operation_v1,execute_loop_guard_v1";
+            "managed_executor_v1,status_cached,set_editor_status_async,execute_idempotency_v1,recompile_result_idempotent_v1,recompile_operation_id_v1,recompile_in_progress_operation_v1,execute_loop_guard_v1,execute_progress_publish_v1,execute_timeout_v1";
 
         private static volatile bool _nativeBridgeActive;
         private static long _nativeGeneration;
@@ -112,7 +112,7 @@ namespace Locus
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
         private static extern void locus_overlay_push(byte[] line, int lineLen);
 
-        // Optional exports (newer locus_native). An editor that updated the
+        // Optional exports (newer locus_unity_native). An editor that updated the
         // plugin keeps the previously loaded DLL until restart, so every call
         // below tolerates a missing entry point and falls back.
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
@@ -129,9 +129,21 @@ namespace Locus
         [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
         private static extern long locus_main_thread_stall_ms();
 
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void locus_execution_publish(
+            byte[] executionId, int executionIdLen, byte[] json, int jsonLen);
+
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern void locus_execution_end(byte[] executionId, int executionIdLen);
+
+        [DllImport(NativeDll, CallingConvention = CallingConvention.Cdecl)]
+        private static extern long locus_execution_client_poll_age_ms(
+            byte[] executionId, int executionIdLen);
+
         private static volatile bool _nativeCompileResultAvailable = true;
         private static volatile bool _nativeExecutionCancelAvailable = true;
         private static volatile bool _nativeMainThreadStallAvailable = true;
+        private static volatile bool _nativeExecutionProgressAvailable = true;
 
         private static volatile bool _nativeOverlayConnected;
 
@@ -437,6 +449,24 @@ namespace Locus
             locus_managed_heartbeat(_nativeGeneration);
         }
 
+        /// <summary>
+        /// The main thread just finished agent work and returns to the editor
+        /// loop. Pulse now, before the result goes out, so the broker does not
+        /// keep rejecting the client's next request for a stall that ended.
+        /// </summary>
+        private static void NativePulseMainThread()
+        {
+            if (!_nativeBridgeActive)
+                return;
+            try
+            {
+                locus_managed_heartbeat(_nativeGeneration);
+            }
+            catch
+            {
+            }
+        }
+
         private static void NativeReportExecution(bool active)
         {
             if (!_nativeBridgeActive || !_nativeExecutionTrackingAvailable) return;
@@ -522,6 +552,76 @@ namespace Locus
             catch (EntryPointNotFoundException)
             {
                 _nativeMainThreadStallAvailable = false;
+                return -1;
+            }
+        }
+
+        /// <summary>
+        /// Publish a running execution's progress snapshot to the broker, which
+        /// then answers the client's progress polls without the main thread.
+        /// Called from the thread-pool monitor. Returns false when the broker
+        /// cannot hold snapshots (older locus_unity_native still loaded).
+        /// </summary>
+        internal static bool NativePublishExecutionProgress(byte[] executionId, string json)
+        {
+            if (!_nativeBridgeActive || !_nativeExecutionProgressAvailable || executionId == null)
+                return false;
+            try
+            {
+                byte[] payload = Utf8NoBom.GetBytes(json ?? "");
+                locus_execution_publish(executionId, executionId.Length, payload, payload.Length);
+                return true;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _nativeExecutionProgressAvailable = false;
+                return false;
+            }
+            catch (DllNotFoundException)
+            {
+                _nativeExecutionProgressAvailable = false;
+                return false;
+            }
+        }
+
+        internal static void NativeEndExecutionProgress(byte[] executionId)
+        {
+            if (!_nativeBridgeActive || !_nativeExecutionProgressAvailable || executionId == null)
+                return;
+            try
+            {
+                locus_execution_end(executionId, executionId.Length);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _nativeExecutionProgressAvailable = false;
+            }
+            catch (DllNotFoundException)
+            {
+                _nativeExecutionProgressAvailable = false;
+            }
+        }
+
+        /// <summary>
+        /// Milliseconds since the client last polled this execution through the
+        /// broker; -1 when it never did or the broker cannot tell.
+        /// </summary>
+        internal static long NativeExecutionClientPollAgeMs(byte[] executionId)
+        {
+            if (!_nativeBridgeActive || !_nativeExecutionProgressAvailable || executionId == null)
+                return -1;
+            try
+            {
+                return locus_execution_client_poll_age_ms(executionId, executionId.Length);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                _nativeExecutionProgressAvailable = false;
+                return -1;
+            }
+            catch (DllNotFoundException)
+            {
+                _nativeExecutionProgressAvailable = false;
                 return -1;
             }
         }

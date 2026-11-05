@@ -401,6 +401,9 @@ struct FusionInputs {
     pub pending_editor_intent: Option<PendingEditorIntent>,
     pub native_hook: NativeHookObservation,
     pub observer: Option<ObserverObservation>,
+    /// This process announced its shutdown through the broker. The broker and
+    /// pipe disappear before the process does; the quit must survive that.
+    pub editor_quitting: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +688,56 @@ pub fn set_enabled(value: bool) -> UnityStateProbeStatus {
 struct StateMemory {
     last_known: HashMap<String, LastKnownEditorMode>,
     pending_intents: HashMap<String, PendingEditorIntent>,
+    quitting: HashMap<String, QuittingEditor>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuittingEditor {
+    pid: u32,
+    pid_created_at_ms: Option<u64>,
+}
+
+fn note_editor_quitting(project_path: &str, pid: u32, pid_created_at_ms: Option<u64>) {
+    if let Ok(mut memory) = state_memory().lock() {
+        memory
+            .quitting
+            .insert(project_key(project_path), QuittingEditor { pid, pid_created_at_ms });
+    }
+}
+
+/// Whether the live process is the one that announced its shutdown. A gone or
+/// replaced process drops the marker; an unknown probe result keeps it.
+fn editor_quitting(
+    project_path: &str,
+    process_state: &super::UnityEditorProcessState,
+    process_id: Option<u32>,
+    process_created_at_ms: Option<u64>,
+) -> bool {
+    let key = project_key(project_path);
+    let Ok(mut memory) = state_memory().lock() else {
+        return false;
+    };
+    let Some(marker) = memory.quitting.get(&key).copied() else {
+        return false;
+    };
+    match process_state {
+        super::UnityEditorProcessState::Unknown => false,
+        super::UnityEditorProcessState::Running
+            if process_id == Some(marker.pid)
+                && process_identity_matches(
+                    Some(marker.pid),
+                    marker.pid_created_at_ms,
+                    process_id,
+                    process_created_at_ms,
+                ) =>
+        {
+            true
+        }
+        _ => {
+            memory.quitting.remove(&key);
+            false
+        }
+    }
 }
 
 fn state_memory() -> &'static Mutex<StateMemory> {
@@ -703,6 +756,22 @@ struct ObserverEntry {
     history: VecDeque<SemanticState>,
     last_observed_at_ms: Option<u64>,
     last_accessed_at_ms: u64,
+    /// Cuts the interval short when an event (process exit, dialog) makes the
+    /// cached state stale.
+    wake: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ObserverEntry {
+    fn new(now_ms: u64) -> Self {
+        Self {
+            abort_handle: None,
+            current: None,
+            history: VecDeque::with_capacity(OBSERVER_HISTORY_LIMIT),
+            last_observed_at_ms: None,
+            last_accessed_at_ms: now_ms,
+            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 fn observer_runtime() -> &'static Mutex<ObserverRuntime> {
@@ -749,27 +818,21 @@ fn ensure_observer(project_path: &str) {
 
     let key = project_key(project_path);
     let now_ms = unix_now_ms();
-    let mut should_spawn = false;
+    let mut spawn_wake = None;
     if let Ok(mut runtime) = observer_runtime().lock() {
         let entry = runtime
             .projects
             .entry(key)
-            .or_insert_with(|| ObserverEntry {
-                abort_handle: None,
-                current: None,
-                history: VecDeque::with_capacity(OBSERVER_HISTORY_LIMIT),
-                last_observed_at_ms: None,
-                last_accessed_at_ms: now_ms,
-            });
+            .or_insert_with(|| ObserverEntry::new(now_ms));
         entry.last_accessed_at_ms = now_ms;
         if entry.abort_handle.is_none() {
-            should_spawn = true;
+            spawn_wake = Some(entry.wake.clone());
         }
     }
 
-    if should_spawn {
+    if let Some(wake) = spawn_wake {
         let project = project_path.to_string();
-        let handle = tokio::spawn(observer_loop(project.clone())).abort_handle();
+        let handle = tokio::spawn(observer_loop(project.clone(), wake)).abort_handle();
         if let Ok(mut runtime) = observer_runtime().lock() {
             if let Some(entry) = runtime.projects.get_mut(&project_key(&project)) {
                 entry.abort_handle = Some(handle);
@@ -816,13 +879,7 @@ fn store_observer_state(project_path: &str, mut state: SemanticState) -> Semanti
         let entry = runtime
             .projects
             .entry(key)
-            .or_insert_with(|| ObserverEntry {
-                abort_handle: None,
-                current: None,
-                history: VecDeque::with_capacity(OBSERVER_HISTORY_LIMIT),
-                last_observed_at_ms: None,
-                last_accessed_at_ms: observed_at_ms,
-            });
+            .or_insert_with(|| ObserverEntry::new(observed_at_ms));
         entry.last_accessed_at_ms = observed_at_ms;
         entry.last_observed_at_ms = Some(observed_at_ms);
         if entry.history.len() >= OBSERVER_HISTORY_LIMIT {
@@ -859,15 +916,25 @@ fn observer_interval_ms(state: &SemanticState) -> u64 {
     }
 }
 
-async fn observer_loop(project_path: String) {
+async fn observer_loop(project_path: String, wake: std::sync::Arc<tokio::sync::Notify>) {
+    let mut dialog_events = super::dialog::subscribe();
+    let mut dialog_events_open = true;
+    let mut publisher = super::SemanticStatePublisher::default();
     loop {
         if !enabled() {
             break;
         }
         let state = observe_project_once(&project_path, observer_observation(&project_path)).await;
         let interval_ms = observer_interval_ms(&state);
-        store_observer_state(&project_path, state);
-        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+        let state = store_observer_state(&project_path, state);
+        publisher.publish(&project_path, state);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(interval_ms)) => {}
+            _ = wake.notified() => {}
+            changed = dialog_events.changed(), if dialog_events_open => {
+                dialog_events_open = changed.is_ok();
+            }
+        }
     }
 
     if let Ok(mut runtime) = observer_runtime().lock() {
@@ -879,6 +946,21 @@ async fn observer_loop(project_path: String) {
 
 fn project_key(project_path: &str) -> String {
     super::project_runtime_key(project_path)
+}
+
+/// Re-sample now. Matches path spellings that differ only in case, slashes or
+/// a trailing separator, since callers reach this from the process cache.
+pub(crate) fn wake_observer(project_path: &str) {
+    let wanted = super::normalize_project_path_for_state_plane(project_path);
+    let Ok(runtime) = observer_runtime().lock() else {
+        return;
+    };
+    for (key, entry) in &runtime.projects {
+        if super::normalize_project_path_for_state_plane(key) == wanted {
+            // `notify_one` keeps a permit when the loop is mid-sample.
+            entry.wake.notify_one();
+        }
+    }
 }
 
 fn process_identity_matches(
@@ -1156,6 +1238,36 @@ fn main_thread_unresponsive(inputs: &FusionInputs) -> bool {
         && input_heartbeat_age(inputs).is_some_and(|age| age >= MAIN_THREAD_UNRESPONSIVE_MS)
 }
 
+/// A Locus execution that keeps publishing progress while it holds the main
+/// thread: the Editor is busy on purpose, not hung. The publication age is
+/// measured at the broker snapshot, so add the snapshot's own age.
+fn live_locus_execution(inputs: &FusionInputs) -> Option<super::NativeBrokerExecution> {
+    let status = inputs.native_broker_status.as_ref()?;
+    let snapshot_age = u64::try_from(status.observed_at_ms)
+        .ok()
+        .map(|observed| unix_now_ms().saturating_sub(observed))
+        .unwrap_or(u64::MAX);
+    status
+        .executions
+        .iter()
+        .map(|execution| super::NativeBrokerExecution {
+            published_age_ms: execution.published_age_ms.saturating_add(snapshot_age),
+            ..execution.clone()
+        })
+        .find(super::NativeBrokerExecution::is_live)
+}
+
+fn live_execution_detail(execution: &super::NativeBrokerExecution, away_secs: u64) -> String {
+    let mut detail = format!(
+        "Unity main thread is running Locus execution {} and has not returned to the editor loop for {away_secs}s",
+        execution.execution_id
+    );
+    if let Some(idle) = execution.idle_ms {
+        detail.push_str(&format!("; last output {}s ago", idle / 1_000));
+    }
+    detail
+}
+
 fn select_editor_mode(inputs: &FusionInputs, now_ms: u64) -> ObservedEditorMode {
     if let Some(status) = inputs.native_broker_status.as_ref().filter(|status| status.managed_state == "ready") {
         let age = broker_heartbeat_age(status, now_ms);
@@ -1382,7 +1494,11 @@ fn main_thread_state_for_inputs(
         let age = input_heartbeat_age(inputs);
         let cpu = inputs.native.as_ref().map(|sample| sample.cpu_active);
         let state = if main_thread_unresponsive(inputs) {
-            match cpu { Some(true) => "unresponsive_busy", Some(false) => "unresponsive_waiting", None => "unresponsive" }
+            if live_locus_execution(inputs).is_some() {
+                "unresponsive_executing"
+            } else {
+                match cpu { Some(true) => "unresponsive_busy", Some(false) => "unresponsive_waiting", None => "unresponsive" }
+            }
         } else if age.is_some_and(|age| age >= MAIN_THREAD_DELAYED_MS) {
             "stalled"
         } else if age.is_some() && broker.managed_state == "ready" {
@@ -1456,6 +1572,9 @@ fn safety_for_state(
     let can_modify_assets_safely = can_call_unity_api && editor_mode.value == "editing";
     let recommended_action = if domain.phase == "reloading" {
         "wait_reload"
+    } else if main_thread.state == "unresponsive_executing" {
+        // Restarting would kill healthy agent work; wait or cancel it instead.
+        "wait_execution"
     } else if main_thread.state == "hung" || main_thread.state.starts_with("unresponsive") {
         "diagnose_hang"
     } else if !main_thread_usable {
@@ -1567,10 +1686,31 @@ fn fuse(inputs: &FusionInputs) -> SemanticState {
         );
     }
 
-    if main_thread_unresponsive(inputs) {
+    // 1b. The editor announced its shutdown. Its broker and pipe go away
+    //     before the process exits; neither that silence nor the stopped
+    //     heartbeat may turn the quit back into the last known mode or a hang.
+    if inputs.editor_quitting {
         return decorate_state(
-            SemanticState::new(SemanticPhase::Unresponsive, "native_broker", "high", None,
-                Some(format!("Unity main thread has not returned to the editor loop for {}s", input_heartbeat_age(inputs).unwrap_or(0) / 1_000))),
+            SemanticState::new(
+                SemanticPhase::Quit,
+                "native_broker",
+                "high",
+                None,
+                Some("Unity editor is shutting down".to_string()),
+            ),
+            inputs,
+            now_ms,
+        );
+    }
+
+    if main_thread_unresponsive(inputs) {
+        let away_secs = input_heartbeat_age(inputs).unwrap_or(0) / 1_000;
+        let detail = match live_locus_execution(inputs) {
+            Some(execution) => live_execution_detail(&execution, away_secs),
+            None => format!("Unity main thread has not returned to the editor loop for {away_secs}s"),
+        };
+        return decorate_state(
+            SemanticState::new(SemanticPhase::Unresponsive, "native_broker", "high", None, Some(detail)),
             inputs, now_ms,
         );
     }
@@ -2056,6 +2196,13 @@ async fn observe_project_once_with_native_broker_status(
         pipe_connected = false;
         control_channel_state = "disconnected".to_string();
     }
+    if let (Some(status), Some(pid)) = (&native_broker_status, process_id) {
+        if status.managed_state == "quitting" && process_alive {
+            note_editor_quitting(project_path, pid, process_created_at_ms);
+        }
+    }
+    let editor_quitting =
+        editor_quitting(project_path, &process_state, process_id, process_created_at_ms);
     if let Some(status) = &native_broker_status {
         match status.managed_state.as_str() {
             "ready" => {
@@ -2149,6 +2296,7 @@ async fn observe_project_once_with_native_broker_status(
         pending_editor_intent: lookup_pending_editor_intent(project_path, unix_now_ms()),
         native_hook,
         observer,
+        editor_quitting,
     };
     let mut state = fuse(&inputs);
     let allow_log_safe_mode_fallback = process_alive
@@ -3263,6 +3411,7 @@ mod workspace_scope_tests {
             pending_editor_intent: None,
             native_hook: NativeHookObservation::default(),
             observer: None,
+            editor_quitting: false,
         }
     }
 
@@ -3294,12 +3443,90 @@ mod workspace_scope_tests {
     }
 
     #[test]
+    fn live_locus_execution_is_busy_work_not_a_restartable_hang() {
+        let execution = |published_age_ms: u64, idle_ms: u64, stop: bool| super::super::NativeBrokerExecution {
+            execution_id: "exec-live".to_string(),
+            published_age_ms,
+            idle_ms: Some(idle_ms),
+            idle_limit_ms: Some(30_000),
+            main_thread_blocked_ms: Some(44_000),
+            stop_requested: Some(stop),
+        };
+        let mut inputs = heartbeat_inputs(Some(45_000));
+        inputs.native = Some(NativeSample { reloading: None, rip_in_unity: true, cpu_active: true,
+            quiescent_for_ms: 0, suspended: false, suspend_window_us: 0 });
+        inputs.native_broker_status.as_mut().unwrap().executions = vec![execution(250, 1_200, false)];
+        let state = fuse(&inputs);
+        assert_eq!(state.phase, "unresponsive");
+        assert_eq!(state.main_thread.state, "unresponsive_executing");
+        assert_eq!(state.safety.recommended_action, "wait_execution");
+        assert!(!state.safety.can_call_unity_api);
+        assert!(!state.can_restart_process(42, 1));
+        let detail = state.detail.clone().unwrap_or_default();
+        assert!(detail.contains("exec-live"), "{detail}");
+        assert!(detail.contains("last output 1s ago"), "{detail}");
+
+        // A silent, stopping, or no longer publishing execution is a hang again.
+        for stale in [execution(250, 31_000, false), execution(250, 1_000, true), execution(9_000, 1_000, false)] {
+            inputs.native_broker_status.as_mut().unwrap().executions = vec![stale];
+            let state = fuse(&inputs);
+            assert_eq!(state.main_thread.state, "unresponsive_busy");
+            assert_eq!(state.safety.recommended_action, "diagnose_hang");
+            assert!(state.can_restart_process(42, 1));
+        }
+
+        // A responsive Editor with a live execution is simply responsive.
+        let mut responsive = heartbeat_inputs(Some(0));
+        responsive.native_broker_status.as_mut().unwrap().executions = vec![execution(250, 0, false)];
+        assert_eq!(fuse(&responsive).main_thread.state, "responsive");
+    }
+
+    #[test]
     fn fresh_heartbeat_recovers_without_cpu_or_stack_sampling() {
         let state = fuse(&heartbeat_inputs(Some(0)));
         assert_eq!(state.phase, "editing");
         assert_eq!(state.main_thread.state, "responsive");
         assert!(state.safety.can_call_unity_api);
         assert_eq!(state.main_thread.suspend_window_us, None);
+    }
+
+    #[test]
+    fn announced_shutdown_stays_quit_after_the_broker_and_pipe_go_away() {
+        // The broker is gone, the pipe is down, and the last known mode says
+        // editing: without the quit marker this fused to "editing" until the
+        // process cache noticed the exit.
+        let mut inputs = connected_recompile_inputs(false);
+        inputs.recompile_inflight = false;
+        inputs.last_known_editor_mode = Some(LastKnownEditorMode {
+            pid: Some(42), pid_created_at_ms: Some(1), mode: "editing".to_string(),
+            source: "pipe".to_string(), observed_at_ms: unix_now_ms(),
+        });
+        assert_eq!(fuse(&inputs).phase, "editing");
+        inputs.editor_quitting = true;
+        let state = fuse(&inputs);
+        assert_eq!(state.phase, "quit");
+        assert!(!state.safety.can_call_unity_api);
+        // A stopped heartbeat during shutdown is not reported as a hang.
+        let mut stalled = heartbeat_inputs(Some(45_000));
+        stalled.editor_quitting = true;
+        assert_eq!(fuse(&stalled).phase, "quit");
+    }
+
+    #[test]
+    fn quit_marker_follows_the_announcing_process_identity() {
+        use super::super::UnityEditorProcessState as Process;
+        let project = format!("F:/QuitMarker/{}", uuid::Uuid::new_v4());
+        note_editor_quitting(&project, 42, Some(1_000));
+        assert!(editor_quitting(&project, &Process::Running, Some(42), Some(1_000)));
+        // An unknown probe result keeps the marker.
+        assert!(!editor_quitting(&project, &Process::Unknown, None, None));
+        assert!(editor_quitting(&project, &Process::Running, Some(42), Some(1_000)));
+        // A replacement process clears it; it does not inherit the quit.
+        assert!(!editor_quitting(&project, &Process::Running, Some(43), Some(2_000)));
+        assert!(!editor_quitting(&project, &Process::Running, Some(42), Some(1_000)));
+        note_editor_quitting(&project, 42, Some(1_000));
+        assert!(!editor_quitting(&project, &Process::NotRunning, None, None));
+        assert!(!editor_quitting(&project, &Process::Running, Some(42), Some(1_000)));
     }
 
     #[test]

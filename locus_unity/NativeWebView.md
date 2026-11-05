@@ -1,6 +1,6 @@
 # Unity 原生 Locus View
 
-Windows x64、Unity 6.5 编辑器使用 `locus_native.dll` 创建 WebView2 子窗口。一个 Unity 项目共享一个 Environment、一个隐藏的 Vue 主宿主和一个 `Library/Locus/WebView2/Shared` profile。网页直接显示在原生 HWND 中，不进入 Unity 纹理管线。
+Windows x64、Unity 6.5 编辑器使用 `locus_unity_native.dll` 创建 WebView2 子窗口。一个 Unity 项目共享一个 Environment、一个隐藏的 Vue 主宿主和一个 `Library/Locus/WebView2/Shared` profile。网页直接显示在原生 HWND 中，不进入 Unity 纹理管线。
 
 ## 打开和嵌入
 

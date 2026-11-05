@@ -146,13 +146,80 @@ pub fn stop_unity_semantic_state_observers() {
 /// Fuse pipe + process + native signals into one semantic editor state.
 pub async fn unity_semantic_state(project_path: &str) -> SemanticState {
     let mut state = state_probe::semantic_state_for_project(project_path).await;
+    let _ = dialog::ensure_project_observed(project_path).await;
+    fold_semantic_overlays(project_path, &mut state);
+    state
+}
+
+/// Workspace event carrying the full [`SemanticState`] whenever it changes.
+pub const UNITY_SEMANTIC_STATE_EVENT: &str = "unity-semantic-state";
+
+/// App-wide event: an observed project's editor process started or exited.
+/// Lets resource views refresh instead of polling the process table.
+pub const UNITY_EDITOR_PROCESSES_CHANGED_EVENT: &str = "unity-editor-processes-changed";
+
+pub(super) fn note_editor_processes_changed() {
+    let _ = transport::emit_app_event(UNITY_EDITOR_PROCESSES_CHANGED_EVENT, ());
+}
+
+/// Pushes [`UNITY_SEMANTIC_STATE_EVENT`] from the observer loop. Fields that
+/// change on every sample without a state change (ages, latencies, check and
+/// log timestamps, observer bookkeeping) do not count as a change.
+#[derive(Default)]
+pub(super) struct SemanticStatePublisher {
+    last_signature: Option<String>,
+}
+
+impl SemanticStatePublisher {
+    pub(super) fn publish(&mut self, project_path: &str, mut state: SemanticState) {
+        fold_semantic_overlays(project_path, &mut state);
+        let signature = semantic_state_signature(&state);
+        if self.last_signature.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+        // Without a live service scope nothing was delivered; retry next sample.
+        if transport::emit_project_event(project_path, UNITY_SEMANTIC_STATE_EVENT, state) {
+            self.last_signature = Some(signature);
+        }
+    }
+}
+
+fn semantic_state_signature(state: &SemanticState) -> String {
+    const VOLATILE_KEYS: &[&str] = &[
+        "checkedAtMs",
+        "lastLatencyMs",
+        "staleMs",
+        "heartbeatAgeMs",
+        "quiescentForMs",
+        "suspendWindowUs",
+        "modifiedAtMs",
+        "statePlane",
+    ];
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for key in VOLATILE_KEYS {
+                    map.remove(*key);
+                }
+                map.values_mut().for_each(strip);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(state).unwrap_or_default();
+    strip(&mut value);
+    value.to_string()
+}
+
+/// Signals observed outside the fusion: the hang capture and native dialogs.
+fn fold_semantic_overlays(project_path: &str, state: &mut SemanticState) {
     // The cached observer state may predate the capture finishing.
-    hang_diagnosis::attach(project_path, &mut state);
+    hang_diagnosis::attach(project_path, state);
     // A native Unity dialog can keep the status/ping channel responsive while
     // the managed editor main thread is unavailable for normal API work. Fold
     // that independent window signal into the semantic surface so callers do
     // not mistake "pipe ready" for "Unity API ready".
-    let _ = dialog::ensure_project_observed(project_path).await;
     if let Some(dialog) = dialog::current_dialog(project_path) {
         // Publish observable blocking and recovery capabilities. The Agent
         // decides whether to choose a dialog action, wait, or restart Unity.
@@ -168,7 +235,6 @@ pub async fn unity_semantic_state(project_path: &str) -> SemanticState {
             format!("Unity main thread is blocked by dialog: {}", dialog.title)
         });
     }
-    state
 }
 
 pub async fn enrich_unity_tool_error(project_path: &str, original: &str) -> String {
@@ -310,7 +376,7 @@ pub fn external_script_open_request_from_env_args() -> Option<ExternalScriptOpen
 // ── Native broker bridge ─────────────────────────────────────────────
 //
 // When enabled, the Tauri↔Unity command channel is served by the native
-// broker DLL (`locus_native`) loaded inside the Unity process. The broker's
+// broker DLL (`locus_unity_native`) loaded inside the Unity process. The broker's
 // pipe outlives domain reloads, so the connection no longer drops every time
 // the editor recompiles. The toggle is global (a config flag) but takes effect
 // per project via a marker file the Unity plugin checks before loading the DLL;
@@ -405,6 +471,37 @@ pub struct NativeBrokerStatus {
     pub background_patched: bool,
     #[serde(default)]
     pub background_symbols: u32,
+    /// Executions currently publishing progress through the broker.
+    #[serde(default)]
+    pub executions: Vec<NativeBrokerExecution>,
+}
+
+/// Liveness of one running execution as last published to the broker.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeBrokerExecution {
+    #[serde(default)]
+    pub execution_id: String,
+    #[serde(default)]
+    pub published_age_ms: u64,
+    #[serde(default)]
+    pub idle_ms: Option<u64>,
+    #[serde(default)]
+    pub idle_limit_ms: Option<u64>,
+    #[serde(default)]
+    pub main_thread_blocked_ms: Option<u64>,
+    #[serde(default)]
+    pub stop_requested: Option<bool>,
+}
+
+impl NativeBrokerExecution {
+    /// Managed code is still publishing and the snippet has not hit its idle
+    /// limit or a stop request: the main thread is busy on purpose.
+    pub fn is_live(&self) -> bool {
+        self.published_age_ms < 5_000
+            && self.stop_requested != Some(true)
+            && self.idle_ms.unwrap_or(0) < self.idle_limit_ms.unwrap_or(30_000)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,17 +558,8 @@ struct NativeBrokerStatusPayload {
     cursor: u64,
 }
 
-const NATIVE_BROKER_STATE_MMF_MAGIC: u32 = 0x424e_434c; // "LCNB" little-endian.
-const NATIVE_BROKER_STATE_MMF_VERSION: u16 = 1;
-const NATIVE_BROKER_STATE_MMF_HEADER_SIZE: usize = 64;
-const NATIVE_BROKER_STATE_MMF_SLOT_COUNT: usize = 8;
-const NATIVE_BROKER_STATE_MMF_SLOT_SIZE: usize = 128 * 1024;
-
 fn native_broker_state_mmf_name(project_path: &str) -> String {
-    format!(
-        r"Local\LocusNativeBrokerState_{}",
-        project_state_plane_key(project_path)
-    )
+    locus_native_protocol::names::unity_state_plane_name(project_path)
 }
 
 #[cfg(target_os = "windows")]
@@ -495,11 +583,8 @@ mod native_state_plane_imp {
     use std::ffi::{c_void, OsStr};
     use std::os::windows::ffi::OsStrExt;
 
-    use super::{
-        NativeBrokerStatusPayload, NATIVE_BROKER_STATE_MMF_HEADER_SIZE,
-        NATIVE_BROKER_STATE_MMF_MAGIC, NATIVE_BROKER_STATE_MMF_SLOT_COUNT,
-        NATIVE_BROKER_STATE_MMF_SLOT_SIZE, NATIVE_BROKER_STATE_MMF_VERSION,
-    };
+    use super::NativeBrokerStatusPayload;
+    use locus_native_protocol::state_plane;
 
     type Bool = i32;
     type Dword = u32;
@@ -577,81 +662,18 @@ mod native_state_plane_imp {
     pub(super) fn read_native_broker_status_payload(
         mapping_name: &str,
     ) -> Option<NativeBrokerStatusPayload> {
-        let total_size = NATIVE_BROKER_STATE_MMF_HEADER_SIZE.saturating_add(
-            NATIVE_BROKER_STATE_MMF_SLOT_COUNT.saturating_mul(NATIVE_BROKER_STATE_MMF_SLOT_SIZE),
-        );
+        let total_size = state_plane::total_size();
         let name = wide_null(mapping_name);
         let handle = unsafe { OpenFileMappingW(FILE_MAP_READ, FALSE, name.as_ptr()) };
         let handle = OwnedHandle::new(handle)?;
         let view = MappedView::new(handle.raw(), total_size)?;
-        let bytes = view.bytes(total_size);
-
-        let magic = read_u32(bytes, 0)?;
-        let version = read_u16(bytes, 4)?;
-        let slot_count = read_u16(bytes, 6)? as usize;
-        let slot_size = read_u32(bytes, 8)? as usize;
-        let writer_seq = read_u64(bytes, 16)?;
-        if magic != NATIVE_BROKER_STATE_MMF_MAGIC
-            || version != NATIVE_BROKER_STATE_MMF_VERSION
-            || slot_count == 0
-            || slot_count > NATIVE_BROKER_STATE_MMF_SLOT_COUNT
-            || slot_size < 64
-            || slot_size > NATIVE_BROKER_STATE_MMF_SLOT_SIZE
-            || writer_seq == 0
-        {
-            return None;
-        }
-
-        let slot_index = ((writer_seq - 1) as usize) % slot_count;
-        let slot_offset =
-            NATIVE_BROKER_STATE_MMF_HEADER_SIZE.checked_add(slot_index.checked_mul(slot_size)?)?;
-        let slot_end = slot_offset.checked_add(slot_size)?;
-        if slot_end > bytes.len() {
-            return None;
-        }
-        let slot = &bytes[slot_offset..slot_end];
-        let slot_seq_before = read_u64(slot, 0)?;
-        if slot_seq_before != writer_seq {
-            return None;
-        }
-        let observed_at_ms = read_u64(slot, 8)?;
-        let payload_len = read_u32(slot, 20)? as usize;
-        let payload_offset = 24;
-        if payload_len == 0 || payload_len > slot_size.saturating_sub(payload_offset) {
-            return None;
-        }
-        let payload_bytes = slot
-            .get(payload_offset..payload_offset + payload_len)?
-            .to_vec();
-        let slot_seq_after = read_u64(slot, 0)?;
-        let writer_seq_after = read_u64(bytes, 16)?;
-        if slot_seq_after != slot_seq_before || writer_seq_after != writer_seq {
-            return None;
-        }
-        let payload = std::str::from_utf8(&payload_bytes).ok()?;
+        let snapshot = state_plane::read_latest(view.bytes(total_size))?;
+        let payload = std::str::from_utf8(&snapshot.payload).ok()?;
         let mut parsed = serde_json::from_str::<NativeBrokerStatusPayload>(payload).ok()?;
         if parsed.status.observed_at_ms <= 0 {
-            parsed.status.observed_at_ms = observed_at_ms.min(i64::MAX as u64) as i64;
+            parsed.status.observed_at_ms = snapshot.observed_at_ms.min(i64::MAX as u64) as i64;
         }
         Some(parsed)
-    }
-
-    fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-        Some(u16::from_le_bytes(
-            bytes.get(offset..offset + 2)?.try_into().ok()?,
-        ))
-    }
-
-    fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
-        Some(u32::from_le_bytes(
-            bytes.get(offset..offset + 4)?.try_into().ok()?,
-        ))
-    }
-
-    fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
-        Some(u64::from_le_bytes(
-            bytes.get(offset..offset + 8)?.try_into().ok()?,
-        ))
     }
 
     fn wide_null(value: &str) -> Vec<u16> {
@@ -1038,6 +1060,11 @@ pub const UNITY_EDITOR_STATUS_PLAYING: &str = "playing";
 pub const UNITY_EDITOR_STATUS_PLAYING_PAUSED: &str = "playing_paused";
 pub const UNITY_EDITOR_STATUS_SCHEMA: &str = "disconnected | editing | playing | playing_paused";
 const UNITY_STATUS_POLL_TIMEOUT: Duration = Duration::from_millis(800);
+/// Connection monitor cadence; process exits and lifecycle events wake it early.
+const UNITY_MONITOR_INTERVAL: Duration = Duration::from_secs(3);
+/// Longest gap between `unity-connection-status-detail` events while nothing
+/// but timing changes.
+const UNITY_CONNECTION_DETAIL_HEARTBEAT_MS: u64 = 30_000;
 const UNITY_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const UNITY_PROCESS_STATUS_TIMEOUT: Duration = Duration::from_millis(1_000);
 const UNITY_CONNECTION_STATUS_STALE_MS: u64 = 10_000;
@@ -1098,6 +1125,156 @@ const UNITY_EXECUTE_START_TIMEOUT_SECS: u64 = 15;
 const UNITY_EXECUTE_REATTACH_MAX_ATTEMPTS: u32 = 3;
 const UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS: u64 = 120;
 const UNITY_EXECUTE_WAITING_STATUS_INTERVAL_MS: u64 = 2_000;
+/// Total run budget of one execution (`unity_execute` `timeout`). Unity
+/// enforces it; the host only keeps a backstop past it.
+pub const UNITY_EXECUTE_DEFAULT_TIMEOUT_MS: u64 = 600_000;
+pub const UNITY_EXECUTE_MIN_TIMEOUT_MS: u64 = 1_000;
+pub const UNITY_EXECUTE_MAX_TIMEOUT_MS: u64 = 3_600_000;
+const UNITY_EXECUTE_TIMEOUT_MARKER: &str = "//__LOCUS_TIMEOUT_MS__:";
+/// How long past its budget the host waits for Unity's own stop before it
+/// detaches from the execution.
+const UNITY_EXECUTE_BUDGET_GRACE: Duration = Duration::from_secs(30);
+/// The broker's snapshot is this old and the main thread is this far away:
+/// managed code is frozen as a whole, not just busy running the snippet.
+const UNITY_EXECUTE_PUBLISHER_STALE_MS: u64 = 30_000;
+const UNITY_EXECUTE_MAIN_THREAD_STALL_MS: i64 = 30_000;
+/// A result note mentions main-thread blocks at least this long.
+pub const UNITY_EXECUTE_LONG_BLOCK_NOTE_MS: u64 = 15_000;
+pub const UNITY_EXECUTE_BUDGET_EXCEEDED: &str = "unity_execute_timeout_exceeded";
+
+/// Options of an agent-facing `unity_execute` call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnityExecuteOptions {
+    pub enable_non_public_access: bool,
+    /// Total run budget in milliseconds; `None` keeps Unity's default.
+    pub timeout_ms: Option<u64>,
+}
+
+/// Result of a successful execution plus what the host observed of it.
+#[derive(Debug, Clone, Default)]
+pub struct UnityExecuteOutcome {
+    pub output: String,
+    /// Longest reported stretch the snippet kept Unity's main thread away
+    /// from the editor loop (the Editor was frozen meanwhile).
+    pub max_main_thread_blocked_ms: u64,
+}
+
+pub fn clamp_unity_execute_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.clamp(UNITY_EXECUTE_MIN_TIMEOUT_MS, UNITY_EXECUTE_MAX_TIMEOUT_MS)
+}
+
+/// Parameters of `tools/unity_execute.json` (the async mode parameter is
+/// added by the async task runtime and accepted separately).
+pub const UNITY_EXECUTE_PARAMETERS: &[&str] = &[
+    "code",
+    "readonly",
+    "request_editor_status",
+    "enable_non_public_access",
+    "timeout",
+];
+
+fn camel_to_snake_case(key: &str) -> String {
+    let mut snake = String::with_capacity(key.len() + 4);
+    for (index, ch) in key.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                snake.push('_');
+            }
+            snake.push(ch.to_ascii_lowercase());
+        } else {
+            snake.push(ch);
+        }
+    }
+    snake
+}
+
+/// Validated `unity_execute` arguments shared by the agent loop, the tool
+/// registry and the MCP server.
+#[derive(Debug, Clone)]
+pub struct UnityExecuteArgs {
+    pub code: String,
+    pub requested_status: String,
+    pub options: UnityExecuteOptions,
+}
+
+pub fn parse_unity_execute_args(args: &serde_json::Value) -> Result<UnityExecuteArgs, String> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| "unity_execute arguments must be a JSON object".to_string())?;
+    // An unknown key is a guess the model expects to matter (e.g. a timeout
+    // under another name); ignoring it silently hides the mistake. The agent
+    // loop mirrors some keys in camelCase (`requestEditorStatus`), so the
+    // camelCase spelling of a known parameter is not a guess.
+    let unknown = object
+        .keys()
+        .map(String::as_str)
+        .filter(|key| {
+            let snake = camel_to_snake_case(key);
+            !UNITY_EXECUTE_PARAMETERS.contains(&snake.as_str())
+                && *key != crate::async_tasks::ASYNC_MODE_PARAMETER
+        })
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "Unknown unity_execute parameter(s): {}. Allowed parameters: code, readonly, request_editor_status, enable_non_public_access, timeout (total run budget in milliseconds).",
+            unknown.join(", ")
+        ));
+    }
+    let code = object
+        .get("code")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Missing required parameter: code".to_string())?;
+    let requested_status = object
+        .get("request_editor_status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Missing required parameter: request_editor_status".to_string())?;
+    if requested_status == UNITY_EDITOR_STATUS_DISCONNECTED
+        || !is_known_editor_status(requested_status)
+    {
+        return Err(format!(
+            "Invalid request_editor_status: '{requested_status}'. Allowed values: editing, playing, playing_paused."
+        ));
+    }
+    let enable_non_public_access = crate::csharp_compile::resolve_tool_non_public_access(args)?;
+    let timeout_ms = match object.get("timeout") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .or_else(|| {
+                    value
+                        .as_f64()
+                        .filter(|number| number.is_finite() && *number >= 0.0)
+                        .map(|number| number as u64)
+                })
+                .ok_or_else(|| {
+                    "Parameter 'timeout' must be a number of milliseconds (1000 to 3600000).".to_string()
+                })?,
+        ),
+    };
+    Ok(UnityExecuteArgs {
+        code: code.to_string(),
+        requested_status: requested_status.to_string(),
+        options: UnityExecuteOptions {
+            enable_non_public_access,
+            timeout_ms: timeout_ms.map(clamp_unity_execute_timeout_ms),
+        },
+    })
+}
+
+/// Agent-facing note for a successful run that froze the Editor for long.
+pub fn unity_execute_long_block_note(max_main_thread_blocked_ms: u64) -> Option<String> {
+    (max_main_thread_blocked_ms >= UNITY_EXECUTE_LONG_BLOCK_NOTE_MS).then(|| {
+        format!(
+            "[Locus] Unity's main thread stayed busy for {:.1}s in one stretch while this snippet ran (the Editor was frozen). \
+Locus stops a snippet after 30s without print/printJson/ctx.Progress output; for longer batches, print or call ctx.Progress per chunk \
+and `await ctx.WaitFrame()` between chunks.",
+            max_main_thread_blocked_ms as f64 / 1000.0
+        )
+    })
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1168,7 +1345,7 @@ pub struct UnityConnectionStatus {
     pub checked_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UnityExecuteProgressSnapshot {
     #[serde(default)]
     pub active: bool,
@@ -1194,6 +1371,36 @@ pub struct UnityExecuteProgressSnapshot {
     pub source_text: String,
     #[serde(default, rename = "waitedMs")]
     pub waited_ms: u64,
+    // Liveness published by Unity's thread-pool monitor and served by the
+    // native broker without the main thread. Absent from older plugins.
+    #[serde(default, rename = "executing", skip_serializing_if = "Option::is_none")]
+    pub executing: Option<bool>,
+    #[serde(default, rename = "elapsedMs", skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default, rename = "timeoutMs", skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, rename = "idleMs", skip_serializing_if = "Option::is_none")]
+    pub idle_ms: Option<u64>,
+    #[serde(default, rename = "idleLimitMs", skip_serializing_if = "Option::is_none")]
+    pub idle_limit_ms: Option<u64>,
+    #[serde(default, rename = "mainThreadBlockedMs", skip_serializing_if = "Option::is_none")]
+    pub main_thread_blocked_ms: Option<u64>,
+    #[serde(default, rename = "maxMainThreadBlockedMs", skip_serializing_if = "Option::is_none")]
+    pub max_main_thread_blocked_ms: Option<u64>,
+    #[serde(default, rename = "outputChars", skip_serializing_if = "Option::is_none")]
+    pub output_chars: Option<u64>,
+    #[serde(default, rename = "lastOutput", skip_serializing_if = "String::is_empty")]
+    pub last_output: String,
+    #[serde(default, rename = "stopRequested", skip_serializing_if = "Option::is_none")]
+    pub stop_requested: Option<bool>,
+    #[serde(default, rename = "stopReason", skip_serializing_if = "String::is_empty")]
+    pub stop_reason: String,
+    #[serde(default, rename = "publishedAgeMs", skip_serializing_if = "Option::is_none")]
+    pub published_age_ms: Option<u64>,
+    #[serde(default, rename = "mainThreadStallMs", skip_serializing_if = "Option::is_none")]
+    pub main_thread_stall_ms: Option<i64>,
+    #[serde(default, rename = "servedBy", skip_serializing_if = "String::is_empty")]
+    pub served_by: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1279,23 +1486,11 @@ fn project_runtime_key(project_path: &str) -> String {
 }
 
 fn normalize_project_path_for_state_plane(project_path: &str) -> String {
-    let trimmed = strip_extended_path_prefix(project_path).trim();
-    let mut value = trimmed.replace('/', "\\");
-    while value.ends_with('\\') && value.len() > 3 {
-        value.pop();
-    }
-    value.to_ascii_lowercase()
+    locus_native_protocol::names::normalize_project_path(project_path)
 }
 
 pub(crate) fn project_state_plane_key(project_path: &str) -> String {
-    let normalized = normalize_project_path_for_state_plane(project_path);
-    let digest = Sha256::digest(normalized.as_bytes());
-    let mut out = String::with_capacity(32);
-    for byte in digest.iter().take(16) {
-        use std::fmt::Write;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
+    locus_native_protocol::names::project_key(project_path)
 }
 
 struct UnityRecompileWaitGuard {
@@ -1350,10 +1545,7 @@ fn strip_extended_path_prefix(path: &str) -> &str {
 /// Pipe name part (without the `\\.\pipe\` prefix) the native broker serves.
 /// Mirrors `LocusBridge.GenerateNativePipeName` on the Unity side.
 fn native_pipe_name_part(project_path: &str) -> String {
-    format!(
-        "locus_unity_native_{}",
-        project_state_plane_key(project_path)
-    )
+    locus_native_protocol::names::unity_pipe_name_part(project_path)
 }
 
 /// Full client path of the native broker pipe for this project.
@@ -1366,6 +1558,27 @@ pub(crate) fn get_native_pipe_name(project_path: &str) -> String {
 pub fn is_unity_project(path: &str) -> bool {
     let p = Path::new(strip_extended_path_prefix(path));
     p.join("Assets").is_dir() && p.join("ProjectSettings").is_dir()
+}
+
+/// Mirror of `AppConfig::unity_enabled`, readable from free functions that
+/// have no config handle. Defaults to on so code paths that run before setup
+/// (tests, CLI drivers) keep the historical behavior.
+static UNITY_INTEGRATION_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_unity_integration_enabled(enabled: bool) {
+    UNITY_INTEGRATION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn unity_integration_globally_enabled() -> bool {
+    UNITY_INTEGRATION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Entry check for Unity features: the app-level switch is on and `path` is a
+/// Unity project. Code that only describes directory layout (knowledge storage
+/// location, merge asset handling) keeps using [`is_unity_project`].
+pub fn unity_integration_enabled(path: &str) -> bool {
+    unity_integration_globally_enabled() && is_unity_project(path)
 }
 
 pub fn read_project_unity_version(project_path: &str) -> Result<Option<String>, String> {
@@ -1784,7 +1997,7 @@ pub async fn launch_project_with_mode_and_options(
     mode: UnityLaunchMode,
     code_optimization: Option<UnityLaunchCodeOptimization>,
 ) -> Result<UnityLaunchResult, String> {
-    if !is_unity_project(project_path) {
+    if !unity_integration_enabled(project_path) {
         return Err("Current working directory is not a Unity project".to_string());
     }
 
@@ -2094,6 +2307,59 @@ fn cache_unity_connection_status(project_path: &str, status: &UnityConnectionSta
     }
 }
 
+/// The kernel exit wait saw the project's editor process end. Drop state that
+/// assumed a live editor; the observers publish the exit now instead of on
+/// their next interval.
+pub(super) fn note_editor_process_exited(project_path: &str) {
+    invalidate_closed_editor_status(project_path);
+}
+
+/// Re-sample the project's semantic state and connection status immediately.
+pub(crate) fn wake_project_observers(project_path: &str) {
+    state_probe::wake_observer(project_path);
+    wake_unity_monitor(project_path);
+}
+
+fn unity_monitor_wakers() -> std::sync::MutexGuard<'static, HashMap<String, Arc<tokio::sync::Notify>>> {
+    static WAKERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>> =
+        std::sync::OnceLock::new();
+    WAKERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn register_unity_monitor_waker(project_path: &str) -> Arc<tokio::sync::Notify> {
+    let wake = Arc::new(tokio::sync::Notify::new());
+    unity_monitor_wakers().insert(normalize_project_path_for_state_plane(project_path), wake.clone());
+    wake
+}
+
+fn unregister_unity_monitor_waker(project_path: &str) {
+    unity_monitor_wakers().remove(&normalize_project_path_for_state_plane(project_path));
+}
+
+fn wake_unity_monitor(project_path: &str) {
+    let wake = unity_monitor_wakers()
+        .get(&normalize_project_path_for_state_plane(project_path))
+        .cloned();
+    // `notify_one` stores a permit, so a wake during a tick is not lost.
+    if let Some(wake) = wake {
+        wake.notify_one();
+    }
+}
+
+/// Connection status without per-check timing, for change detection.
+fn connection_status_signature(status: &UnityConnectionStatus) -> String {
+    let mut stable = status.clone();
+    stable.checked_at_ms = 0;
+    stable.process_checked_at_ms = None;
+    stable.latency_ms = None;
+    stable.reconnect_attempts = 0;
+    stable.background_hook.updated_at_ms = 0;
+    serde_json::to_string(&stable).unwrap_or_default()
+}
+
 fn invalidate_closed_editor_status(project_path: &str) {
     if let Ok(mut cache) = unity_connection_status_cache().lock() {
         let entry = cache.entry(project_runtime_key(project_path)).or_default();
@@ -2102,6 +2368,7 @@ fn invalidate_closed_editor_status(project_path: &str) {
     }
     state_probe::clear_project_observer_state(project_path);
     state_probe::clear_editor_status_intent(project_path);
+    wake_project_observers(project_path);
 }
 
 fn cached_running_connection_status_for_transient_failure(
@@ -2292,7 +2559,11 @@ async fn query_process_info_for_connection_status(
 ) -> UnityEditorProcessInfo {
     if !connected && unity_recompile_waiting(project_path) {
         if let Some(cached) = process::cached_project_editor_process(project_path).await {
-            if cached.process_id.is_some() {
+            // An exit recorded during the recompile window (the exit wait or a
+            // probe; a reload keeps the process alive) is a crash, not a reload.
+            if cached.process_id.is_some()
+                || cached.state == UnityEditorProcessState::NotRunning
+            {
                 return cached;
             }
         }
@@ -4800,13 +5071,133 @@ fn rust_unity_execute_progress(
         progress: 0.0,
         revision,
         source: "rust".to_string(),
-        wait_kind: String::new(),
-        wait_target: String::new(),
-        wait_condition: String::new(),
-        source_line: 0,
-        source_text: String::new(),
-        waited_ms: 0,
+        ..Default::default()
     }
+}
+
+/// Readable text for a failed progress poll in the waiting status line. A
+/// timed-out poll only means Unity's main thread has not served it yet.
+fn describe_progress_poll_error(error: &str) -> String {
+    match error.trim() {
+        "Unity response timed out" | "Unity request timed out" => {
+            "Unity's main thread has not picked up the request yet".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn truncate_progress_text(text: &str, max_chars: usize) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(max_chars) {
+        Some((index, _)) => format!("{}…", &text[..index]),
+        None => text.to_string(),
+    }
+}
+
+/// Fill the status line from liveness fields when the snippet itself did not
+/// report anything: how long the main thread has been busy, the last printed
+/// line, what an await is waiting for, or why the snippet is stopping.
+fn presentable_unity_execute_progress(
+    mut snapshot: UnityExecuteProgressSnapshot,
+) -> UnityExecuteProgressSnapshot {
+    if snapshot.stop_requested == Some(true) && snapshot.source != "await" {
+        snapshot.title = "Stopping snippet".to_string();
+        snapshot.info = match snapshot.stop_reason.as_str() {
+            "idle_timeout" => "no print/ctx.Progress output for 30s".to_string(),
+            "timeout" => "timeout budget reached".to_string(),
+            "cancelled" => "cancel requested".to_string(),
+            other => other.to_string(),
+        };
+        return snapshot;
+    }
+    if !snapshot.info.trim().is_empty() {
+        return snapshot;
+    }
+    if snapshot.source == "await" {
+        let target = snapshot.wait_target.trim();
+        if !target.is_empty() {
+            snapshot.info = format!("{target} · {}s", snapshot.waited_ms / 1_000);
+        }
+        return snapshot;
+    }
+    if snapshot.executing == Some(true) {
+        let mut parts = Vec::new();
+        if let Some(blocked) = snapshot.main_thread_blocked_ms.filter(|ms| *ms >= 2_000) {
+            parts.push(format!("Unity main thread busy {}s", blocked / 1_000));
+        }
+        if !snapshot.last_output.trim().is_empty() {
+            parts.push(format!(
+                "last output: {}",
+                truncate_progress_text(&snapshot.last_output, 160)
+            ));
+        }
+        snapshot.info = parts.join("; ");
+    }
+    snapshot
+}
+
+/// What the host learns from Unity's progress snapshots during one call.
+#[derive(Default)]
+struct UnityExecuteProgressTracker {
+    max_main_thread_blocked_ms: u64,
+    last_emitted: Option<(u64, String, String, u32)>,
+}
+
+impl UnityExecuteProgressTracker {
+    fn observe(&mut self, snapshot: &UnityExecuteProgressSnapshot) {
+        let current = if snapshot.executing == Some(true) {
+            snapshot.main_thread_blocked_ms.unwrap_or(0)
+        } else {
+            0
+        };
+        self.max_main_thread_blocked_ms = self
+            .max_main_thread_blocked_ms
+            .max(snapshot.max_main_thread_blocked_ms.unwrap_or(0))
+            .max(current);
+    }
+
+    /// Liveness text changes without a new revision, so deduplicate on the
+    /// visible fields instead.
+    fn should_emit(&mut self, snapshot: &UnityExecuteProgressSnapshot) -> bool {
+        let key = (
+            snapshot.revision,
+            snapshot.title.clone(),
+            snapshot.info.clone(),
+            (snapshot.progress.clamp(0.0, 1.0) * 1000.0) as u32,
+        );
+        if self.last_emitted.as_ref() == Some(&key) {
+            return false;
+        }
+        self.last_emitted = Some(key);
+        true
+    }
+}
+
+/// `Some(error)` when the snapshot proves Unity cannot finish the call by
+/// itself: the broker still serves the last snapshot, but managed code stopped
+/// publishing and the main thread is away (the whole runtime is frozen).
+fn unity_execute_frozen_error(
+    snapshot: &UnityExecuteProgressSnapshot,
+    execution_id: &str,
+) -> Option<String> {
+    let published_age = snapshot.published_age_ms?;
+    let stall = snapshot.main_thread_stall_ms?;
+    (published_age >= UNITY_EXECUTE_PUBLISHER_STALE_MS && stall >= UNITY_EXECUTE_MAIN_THREAD_STALL_MS)
+        .then(|| {
+            format!(
+                "native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; Unity stopped reporting progress {}s ago and its main thread has not returned to the editor loop for {}s, so Locus can no longer track this execution. If this snippet should not finish, stop it with `await locus.cancel_unity_execution(project=..., execution_id=\"{execution_id}\")` (loops in unity_execute code stop at their next iteration); otherwise read its result later with `locus.wait_unity_execution`.",
+                published_age / 1_000,
+                stall / 1_000
+            )
+        })
+}
+
+fn unity_execute_budget_exceeded_error(execution_id: &str, budget_ms: u64) -> String {
+    format!(
+        "{UNITY_EXECUTE_BUDGET_EXCEEDED}; execution_id={execution_id}; request_state=detached; the execution ran past its {}s timeout plus {}s and Unity has not returned a result, so it has not reached a cancellation point yet (loops stop at their next iteration). Stop it with `await locus.cancel_unity_execution(project=..., execution_id=\"{execution_id}\")` or read its result later with `locus.wait_unity_execution`.",
+        budget_ms / 1_000,
+        UNITY_EXECUTE_BUDGET_GRACE.as_secs()
+    )
 }
 
 async fn query_unity_execute_progress(
@@ -5493,19 +5884,30 @@ async fn prepare_unity_run_states_request_for_send(
 
 const UNITY_EXECUTE_EXECUTION_ID_MARKER: &str = "//__LOCUS_EXECUTION_ID__:";
 
-fn unity_execute_code_with_execution_id(code: &str, execution_id: &str) -> String {
-    format!(
+fn unity_execute_code_with_markers(
+    code: &str,
+    execution_id: &str,
+    timeout_ms: Option<u64>,
+) -> String {
+    let mut prepared = format!(
         "{}\n{}{}",
         code.trim_end(),
         UNITY_EXECUTE_EXECUTION_ID_MARKER,
         execution_id
-    )
+    );
+    if let Some(timeout_ms) = timeout_ms {
+        prepared.push('\n');
+        prepared.push_str(UNITY_EXECUTE_TIMEOUT_MARKER);
+        prepared.push_str(&timeout_ms.to_string());
+    }
+    prepared
 }
 
 fn unity_execute_loaded_payload_with_execution_id(
     payload: String,
     execution_id: &str,
     source_code: &str,
+    timeout_ms: Option<u64>,
 ) -> Result<String, String> {
     let mut value: serde_json::Value = serde_json::from_str(&payload)
         .map_err(|error| format!("Failed to parse execute_loaded payload: {error}"))?;
@@ -5520,6 +5922,9 @@ fn unity_execute_loaded_payload_with_execution_id(
         "source_code".to_string(),
         serde_json::Value::String(source_code.to_string()),
     );
+    if let Some(timeout_ms) = timeout_ms {
+        object.insert("timeout_ms".to_string(), serde_json::Value::from(timeout_ms));
+    }
     serde_json::to_string(&value)
         .map_err(|error| format!("Failed to serialize execute_loaded payload: {error}"))
 }
@@ -5570,361 +5975,25 @@ async fn unity_execute_code_with_progress_mode<F>(
     code: &str,
     non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
     require_sidecar: bool,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<String, String>
 where
     F: FnMut(UnityExecuteProgressSnapshot) + Send,
 {
-    let execution_id = format!("exec-{}", uuid::Uuid::new_v4().simple());
-    let mut rust_progress_revision = 1u64;
-    on_progress(rust_unity_execute_progress(
-        "Waiting for Locus Unity operation lock",
-        "",
-        rust_progress_revision,
-    ));
-    rust_progress_revision += 1;
-
-    let op_lock = project_unity_op_lock(project_path).await;
-    let _guard = op_lock.lock().await;
-
-    on_progress(rust_unity_execute_progress(
-        "Preparing Unity type index",
-        "",
-        rust_progress_revision,
-    ));
-    rust_progress_revision += 1;
-
-    let prepared = prepare_unity_execute_code_for_send(project_path, code).await;
-    let prepared_code = unity_execute_code_with_execution_id(&prepared.code, &execution_id);
-
-    let mut execute_msg_type = "execute_code";
-    let mut execute_payload = prepared_code.clone();
-    if crate::csharp_compile::is_enabled() {
-        on_progress(rust_unity_execute_progress(
-            "Compiling snippet in compile server",
-            "",
-            rust_progress_revision,
-        ));
-        rust_progress_revision += 1;
-        match sidecar_compile_for_execute(
-            project_path,
-            &prepared_code,
-            non_public_access_probe_mode,
-        )
-        .await
-        {
-            SidecarCompileAttempt::Compiled { payload } => {
-                let payload = unity_execute_loaded_payload_with_execution_id(
-                    payload,
-                    &execution_id,
-                    &prepared_code,
-                )?;
-                on_progress(rust_unity_execute_progress(
-                    "Compile server returned snippet assembly",
-                    format!("{} bytes execute_loaded payload", payload.len()),
-                    rust_progress_revision,
-                ));
-                rust_progress_revision += 1;
-                execute_msg_type = "execute_loaded";
-                execute_payload = payload;
-            }
-            SidecarCompileAttempt::CompileError(message) => {
-                return Err(crate::unity_type_index::append_auto_using_notes(
-                    message, &prepared,
-                ));
-            }
-            SidecarCompileAttempt::Unavailable(reason) => {
-                if require_sidecar {
-                    return Err(format!(
-                        "non-public access probe requires the sidecar compiler: {reason}"
-                    ));
-                }
-                crate::csharp_compile::note_fallback(&reason);
-            }
-        }
-    } else if require_sidecar {
-        return Err("non-public access probe requires the sidecar compiler".to_string());
-    }
-
-    // Compilation and request bootstrap are serialized. The async Unity
-    // execution owns its own execution id, progress, heartbeat and cancellation
-    // state, so it no longer occupies the project-wide operation lock while it
-    // waits across frames.
-    drop(_guard);
-
-    let mut send_attempt = 1u32;
-    let mut reattach_attempts = 0u32;
-    let resp = loop {
-        on_progress(rust_unity_execute_progress(
-            if execute_msg_type == "execute_code_wait" {
-                "Reattaching to the original Unity execution".to_string()
-            } else if send_attempt == 1 {
-                format!("Sending {execute_msg_type} to Unity")
-            } else {
-                format!("Retrying {execute_msg_type} after Unity pipe reconnect")
-            },
-            "",
-            rust_progress_revision,
-        ));
-        rust_progress_revision += 1;
-
-        // Owned per-attempt copy: the pinned send future must not borrow
-        // `execute_payload`, which the old-plugin fallback arm reassigns.
-        let attempt_payload = execute_payload.clone();
-        eprintln!(
-            "[Locus] unity_execute sending {} ({} bytes, attempt {})",
-            execute_msg_type,
-            attempt_payload.len(),
-            send_attempt
-        );
-        let (acceptance_tx, mut acceptance_rx) = tokio::sync::oneshot::channel();
-        let execute = send_message_without_timeout_with_acceptance(
-            project_path,
-            execute_msg_type,
-            &attempt_payload,
-            acceptance_tx,
-        );
-        tokio::pin!(execute);
-
-        let mut progress_tick =
-            tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
-        progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_progress_revision = 0u64;
-        let mut saw_unity_progress = false;
-        let execute_started_at = std::time::Instant::now();
-        let mut last_waiting_status_at = execute_started_at;
-        let mut last_progress_poll_error: Option<String> = None;
-        let mut progress_unavailable_since: Option<std::time::Instant> = None;
-        let mut broker_accepted = false;
-        let mut acceptance_pending = true;
-
-        let attempt_result: Result<PipeResponse, String> = loop {
-            tokio::select! {
-                biased;
-                accepted = &mut acceptance_rx, if acceptance_pending => {
-                    acceptance_pending = false;
-                    if accepted.is_ok() {
-                        broker_accepted = true;
-                        eprintln!(
-                            "[Locus] native Broker accepted {} for execution_id={}",
-                            execute_msg_type, execution_id
-                        );
-                        on_progress(rust_unity_execute_progress(
-                            "Broker accepted Unity execute request",
-                            format!("{}; execution_id={}", execute_msg_type, execution_id),
-                            rust_progress_revision,
-                        ));
-                        rust_progress_revision += 1;
-                    }
-                },
-                result = &mut execute => break result,
-                _ = progress_tick.tick() => {
-                    match query_unity_execute_progress(project_path, &execution_id).await {
-                        Ok(Some(snapshot)) => {
-                            last_progress_poll_error = None;
-                            progress_unavailable_since = None;
-                            if snapshot.active {
-                                if !saw_unity_progress {
-                                    eprintln!(
-                                        "[Locus] unity_execute first Unity progress after {}ms",
-                                        execute_started_at.elapsed().as_millis()
-                                    );
-                                }
-                                saw_unity_progress = true;
-                            }
-                            if snapshot.revision != last_progress_revision {
-                                last_progress_revision = snapshot.revision;
-                                on_progress(snapshot);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            if error.contains("native_main_thread_unresponsive") {
-                                break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped. If this snippet should not finish, stop it with `await locus.cancel_unity_execution(project=..., execution_id=\"{execution_id}\")` (loops in unity_execute code stop at their next iteration); otherwise read its result later with `locus.wait_unity_execution`."));
-                            }
-                            last_progress_poll_error = Some(error);
-                            if saw_unity_progress {
-                                let unavailable_since = progress_unavailable_since
-                                    .get_or_insert_with(std::time::Instant::now);
-                                if unavailable_since.elapsed()
-                                    > Duration::from_secs(UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS)
-                                {
-                                    let reason = format!(
-                                        "Unity execute progress was unavailable for {}s; reconnecting Unity pipe",
-                                        UNITY_EXECUTE_PROGRESS_LOST_TIMEOUT_SECS
-                                    );
-                                    break Err(reason);
-                                }
-                            }
-                        }
-                    }
-
-                    if !saw_unity_progress
-                        && last_waiting_status_at.elapsed()
-                            >= Duration::from_millis(UNITY_EXECUTE_WAITING_STATUS_INTERVAL_MS)
-                    {
-                        let elapsed_ms = execute_started_at.elapsed().as_millis();
-                        let detail = last_progress_poll_error
-                            .as_deref()
-                            .unwrap_or("no active Unity execute progress yet");
-                        eprintln!(
-                            "[Locus] unity_execute still waiting for Unity progress after {}ms while sending {}: {}",
-                            elapsed_ms, execute_msg_type, detail
-                        );
-                        on_progress(rust_unity_execute_progress(
-                            if broker_accepted {
-                                "Waiting for Unity main thread after Broker acceptance".to_string()
-                            } else {
-                                format!("Waiting for Unity progress after sending {execute_msg_type}")
-                            },
-                            format!("{}ms elapsed; {}", elapsed_ms, detail),
-                            rust_progress_revision,
-                        ));
-                        rust_progress_revision += 1;
-                        last_waiting_status_at = std::time::Instant::now();
-                    }
-
-                    if !broker_accepted
-                        && !saw_unity_progress
-                        && execute_started_at.elapsed()
-                            > Duration::from_secs(UNITY_EXECUTE_START_TIMEOUT_SECS)
-                    {
-                        eprintln!(
-                            "[Locus] unity_execute saw no Unity progress within {}s after sending {}; resetting pipe",
-                            UNITY_EXECUTE_START_TIMEOUT_SECS, execute_msg_type
-                        );
-                        break Err(format!(
-                            "Unity execute did not leave the sending stage within {}s",
-                            UNITY_EXECUTE_START_TIMEOUT_SECS
-                        ));
-                    }
-                }
-            }
-        };
-
-        match attempt_result {
-            // The user restarted the hung Editor: the execution is gone with
-            // it, so never reattach to the replacement process.
-            Err(error) if hang_diagnosis::is_user_restart_interrupt(&error) => return Err(error),
-            Err(error) if error.contains("native_main_thread_unresponsive") => {
-                return Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await)
-            }
-            Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
-                let request_state = if broker_accepted || saw_unity_progress {
-                    "detached"
-                } else if error.contains("request_state=not_sent") {
-                    "not_sent"
-                } else {
-                    "unknown"
-                };
-                return Err(dialog::blocked_error(
-                    project_path,
-                    request_state,
-                    Some(&execution_id),
-                )
-                .unwrap_or(error));
-            }
-            // An older Unity plugin without the execute_loaded handler:
-            // retry the same request through the legacy compile path.
-            Ok(resp)
-                if execute_msg_type == "execute_loaded" && unity_plugin_lacks_message(&resp) =>
-            {
-                if require_sidecar {
-                    return Err(
-                        "non-public access probe requires a Unity plugin with execute_loaded support"
-                            .to_string(),
-                    );
-                }
-                crate::csharp_compile::note_fallback(
-                    "Unity plugin lacks execute_loaded; update the Locus Unity plugin",
-                );
-                execute_msg_type = "execute_code";
-                execute_payload = prepared_code.clone();
-            }
-            Ok(resp)
-                if pipe_response_transient_broker_error(&resp)
-                    && !broker_accepted
-                    && !saw_unity_progress
-                    && send_attempt == 1 =>
-            {
-                let error = resp
-                    .error
-                    .unwrap_or_else(|| "native broker managed executor unavailable".to_string());
-                on_progress(rust_unity_execute_progress(
-                    "Reconnecting Unity pipe",
-                    &error,
-                    rust_progress_revision,
-                ));
-                rust_progress_revision += 1;
-                if let Err(reconnect_error) =
-                    reconnect_unity_pipe_for_execute(project_path, &error).await
-                {
-                    return Err(format!(
-                        "{}; Unity pipe reconnect failed: {}",
-                        error, reconnect_error
-                    ));
-                }
-                send_attempt += 1;
-            }
-            Ok(resp) => break resp,
-            Err(error)
-                if (broker_accepted || saw_unity_progress)
-                    && reattach_attempts < UNITY_EXECUTE_REATTACH_MAX_ATTEMPTS =>
-            {
-                on_progress(rust_unity_execute_progress(
-                    "Reconnecting to the original Unity execution",
-                    &error,
-                    rust_progress_revision,
-                ));
-                rust_progress_revision += 1;
-                if let Err(reconnect_error) =
-                    reconnect_unity_pipe_for_execute(project_path, &error).await
-                {
-                    return Err(format!(
-                        "{}; Unity pipe reconnect failed: {}",
-                        error, reconnect_error
-                    ));
-                }
-                execute_msg_type = "execute_code_wait";
-                execute_payload = execution_id.clone();
-                send_attempt += 1;
-                reattach_attempts += 1;
-            }
-            Err(error) if !broker_accepted && !saw_unity_progress && send_attempt == 1 => {
-                on_progress(rust_unity_execute_progress(
-                    "Reconnecting Unity pipe",
-                    &error,
-                    rust_progress_revision,
-                ));
-                rust_progress_revision += 1;
-                if let Err(reconnect_error) =
-                    reconnect_unity_pipe_for_execute(project_path, &error).await
-                {
-                    return Err(format!(
-                        "{}; Unity pipe reconnect failed: {}",
-                        error, reconnect_error
-                    ));
-                }
-                send_attempt += 1;
-            }
-            Err(error) => {
-                return Err(append_execute_reconnect_result(
-                    &error,
-                    reconnect_unity_pipe_for_execute(project_path, &error).await,
-                ));
-            }
-        }
-    };
-
-    if resp.ok {
-        Ok(resp.message.unwrap_or_default())
-    } else {
-        let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
-        if error.contains("native_main_thread_unresponsive") {
-            return Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await);
-        }
-        Err(crate::unity_type_index::append_auto_using_notes(error, &prepared))
-    }
+    // Never cancelled; the sender must outlive the call or `changed()` would
+    // report a cancellation.
+    let (_never_cancelled, cancel_rx) = tokio::sync::watch::channel(false);
+    unity_execute_code_core(
+        project_path,
+        code,
+        non_public_access_probe_mode,
+        require_sidecar,
+        None,
+        cancel_rx,
+        on_progress,
+    )
+    .await
+    .map(|outcome| outcome.output)
 }
 
 pub async fn unity_execute_code_with_progress_cancellable<F>(
@@ -5936,15 +6005,9 @@ pub async fn unity_execute_code_with_progress_cancellable<F>(
 where
     F: FnMut(UnityExecuteProgressSnapshot) + Send,
 {
-    unity_execute_code_with_progress_cancellable_mode(
-        project_path,
-        code,
-        None,
-        false,
-        cancel_rx,
-        on_progress,
-    )
-    .await
+    unity_execute_code_core(project_path, code, None, false, None, cancel_rx, on_progress)
+        .await
+        .map(|outcome| outcome.output)
 }
 
 pub async fn unity_execute_code_with_progress_cancellable_non_public_access<F>(
@@ -5957,25 +6020,53 @@ pub async fn unity_execute_code_with_progress_cancellable_non_public_access<F>(
 where
     F: FnMut(UnityExecuteProgressSnapshot) + Send,
 {
-    unity_execute_code_with_progress_cancellable_mode(
+    unity_execute_code_with_options(
         project_path,
         code,
-        production_non_public_access_mode(enable_non_public_access),
+        UnityExecuteOptions {
+            enable_non_public_access,
+            timeout_ms: None,
+        },
+        cancel_rx,
+        on_progress,
+    )
+    .await
+    .map(|outcome| outcome.output)
+}
+
+/// Agent-facing execution: explicit run budget, cancellation, and what the
+/// host observed (for result notes).
+pub async fn unity_execute_code_with_options<F>(
+    project_path: &str,
+    code: &str,
+    options: UnityExecuteOptions,
+    cancel_rx: tokio::sync::watch::Receiver<bool>,
+    on_progress: F,
+) -> Result<UnityExecuteOutcome, String>
+where
+    F: FnMut(UnityExecuteProgressSnapshot) + Send,
+{
+    unity_execute_code_core(
+        project_path,
+        code,
+        production_non_public_access_mode(options.enable_non_public_access),
         false,
+        options.timeout_ms,
         cancel_rx,
         on_progress,
     )
     .await
 }
 
-async fn unity_execute_code_with_progress_cancellable_mode<F>(
+async fn unity_execute_code_core<F>(
     project_path: &str,
     code: &str,
     non_public_access_probe_mode: Option<crate::csharp_compile::NonPublicAccessProbeMode>,
     require_sidecar: bool,
+    timeout_ms: Option<u64>,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
     mut on_progress: F,
-) -> Result<String, String>
+) -> Result<UnityExecuteOutcome, String>
 where
     F: FnMut(UnityExecuteProgressSnapshot) + Send,
 {
@@ -5983,6 +6074,7 @@ where
         return Err(UNITY_EXECUTE_CANCELLED.to_string());
     }
 
+    let timeout_ms = timeout_ms.map(clamp_unity_execute_timeout_ms);
     let execution_id = format!("exec-{}", uuid::Uuid::new_v4().simple());
     let mut rust_progress_revision = 1u64;
     on_progress(rust_unity_execute_progress(
@@ -6009,7 +6101,8 @@ where
         prepared = prepare_unity_execute_code_for_send(project_path, code) => prepared,
         _ = cancel_rx.changed() => return Err(UNITY_EXECUTE_CANCELLED.to_string()),
     };
-    let prepared_code = unity_execute_code_with_execution_id(&prepared.code, &execution_id);
+    let prepared_code =
+        unity_execute_code_with_markers(&prepared.code, &execution_id, timeout_ms);
 
     let mut execute_msg_type = "execute_code";
     let mut execute_payload = prepared_code.clone();
@@ -6034,6 +6127,7 @@ where
                     payload,
                     &execution_id,
                     &prepared_code,
+                    timeout_ms,
                 )?;
                 on_progress(rust_unity_execute_progress(
                     "Compile server returned snippet assembly",
@@ -6067,6 +6161,13 @@ where
     // project-wide operation lock.
     drop(guard);
 
+    // Unity enforces the run budget itself and answers with a timeout error;
+    // this backstop only detaches when Unity cannot even do that.
+    let budget_ms = timeout_ms.unwrap_or(UNITY_EXECUTE_DEFAULT_TIMEOUT_MS);
+    let backstop = Duration::from_millis(budget_ms) + UNITY_EXECUTE_BUDGET_GRACE;
+    let run_started_at = std::time::Instant::now();
+    let mut tracker = UnityExecuteProgressTracker::default();
+
     let mut send_attempt = 1u32;
     let mut reattach_attempts = 0u32;
     let resp = loop {
@@ -6104,7 +6205,6 @@ where
         let mut progress_tick =
             tokio::time::interval(Duration::from_millis(UNITY_EXECUTE_PROGRESS_POLL_MS));
         progress_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_progress_revision = 0u64;
         let mut saw_unity_progress = false;
         let execute_started_at = std::time::Instant::now();
         let mut last_waiting_status_at = execute_started_at;
@@ -6163,8 +6263,8 @@ where
                             },
                             _ = progress_tick.tick() => {
                                 if let Ok(Some(snapshot)) = query_unity_execute_progress(project_path, &execution_id).await {
-                                    if snapshot.revision != last_progress_revision {
-                                        last_progress_revision = snapshot.revision;
+                                    let snapshot = presentable_unity_execute_progress(snapshot);
+                                    if tracker.should_emit(&snapshot) {
                                         on_progress(snapshot);
                                     }
                                 }
@@ -6188,13 +6288,19 @@ where
                                 }
                                 saw_unity_progress = true;
                             }
-                            if snapshot.revision != last_progress_revision {
-                                last_progress_revision = snapshot.revision;
+                            tracker.observe(&snapshot);
+                            if let Some(error) = unity_execute_frozen_error(&snapshot, &execution_id) {
+                                break Err(error);
+                            }
+                            let snapshot = presentable_unity_execute_progress(snapshot);
+                            if tracker.should_emit(&snapshot) {
                                 on_progress(snapshot);
                             }
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            // Only brokers that cannot serve progress without
+                            // the main thread get here while a snippet holds it.
                             if error.contains("native_main_thread_unresponsive") {
                                 break Err(format!("native_main_thread_unresponsive; execution_id={execution_id}; request_state=detached; execution has not been confirmed stopped. If this snippet should not finish, stop it with `await locus.cancel_unity_execution(project=..., execution_id=\"{execution_id}\")` (loops in unity_execute code stop at their next iteration); otherwise read its result later with `locus.wait_unity_execution`."));
                             }
@@ -6222,7 +6328,8 @@ where
                         let elapsed_ms = execute_started_at.elapsed().as_millis();
                         let detail = last_progress_poll_error
                             .as_deref()
-                            .unwrap_or("no active Unity execute progress yet");
+                            .map(describe_progress_poll_error)
+                            .unwrap_or_else(|| "no active Unity execute progress yet".to_string());
                         eprintln!(
                             "[Locus] unity_execute still waiting for Unity progress after {}ms while sending {}: {}",
                             elapsed_ms, execute_msg_type, detail
@@ -6233,7 +6340,7 @@ where
                             } else {
                                 format!("Waiting for Unity progress after sending {execute_msg_type}")
                             },
-                            format!("{}ms elapsed; {}", elapsed_ms, detail),
+                            format!("{}s elapsed; {}", elapsed_ms / 1_000, detail),
                             rust_progress_revision,
                         ));
                         rust_progress_revision += 1;
@@ -6254,6 +6361,10 @@ where
                             UNITY_EXECUTE_START_TIMEOUT_SECS
                         ));
                     }
+
+                    if run_started_at.elapsed() > backstop {
+                        break Err(unity_execute_budget_exceeded_error(&execution_id, budget_ms));
+                    }
                 }
             }
         };
@@ -6262,7 +6373,10 @@ where
             // The user restarted the hung Editor: the execution is gone with
             // it, so never reattach to the replacement process.
             Err(error) if hang_diagnosis::is_user_restart_interrupt(&error) => return Err(error),
-            Err(error) if error.contains("native_main_thread_unresponsive") => {
+            Err(error)
+                if error.contains("native_main_thread_unresponsive")
+                    || error.starts_with(UNITY_EXECUTE_BUDGET_EXCEEDED) =>
+            {
                 return Err(hang_diagnosis::append_to_unresponsive_error(project_path, error).await)
             }
             Err(error) if dialog::is_unity_modal_dialog_blocked_error(&error) => {
@@ -6296,6 +6410,25 @@ where
                 );
                 execute_msg_type = "execute_code";
                 execute_payload = prepared_code.clone();
+            }
+            // An older broker reclaims long requests after 10 minutes while
+            // the execution keeps running; the managed side still holds its
+            // result under the execution id.
+            Ok(resp)
+                if pipe_response_is_request_deadline(&resp)
+                    && (broker_accepted || saw_unity_progress)
+                    && reattach_attempts < UNITY_EXECUTE_REATTACH_MAX_ATTEMPTS =>
+            {
+                on_progress(rust_unity_execute_progress(
+                    "Reattaching to the original Unity execution",
+                    "the native broker request deadline expired",
+                    rust_progress_revision,
+                ));
+                rust_progress_revision += 1;
+                execute_msg_type = "execute_code_wait";
+                execute_payload = execution_id.clone();
+                send_attempt += 1;
+                reattach_attempts += 1;
             }
             Ok(resp)
                 if pipe_response_transient_broker_error(&resp)
@@ -6420,7 +6553,10 @@ where
     };
 
     if resp.ok {
-        Ok(resp.message.unwrap_or_default())
+        Ok(UnityExecuteOutcome {
+            output: resp.message.unwrap_or_default(),
+            max_main_thread_blocked_ms: tracker.max_main_thread_blocked_ms,
+        })
     } else {
         let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
         if error.contains("native_main_thread_unresponsive") {
@@ -6428,6 +6564,10 @@ where
         }
         Err(crate::unity_type_index::append_auto_using_notes(error, &prepared))
     }
+}
+
+fn pipe_response_is_request_deadline(response: &PipeResponse) -> bool {
+    !response.ok && response.error.as_deref().map(str::trim) == Some("native_request_timed_out")
 }
 
 pub async fn unity_execute_code(project_path: &str, code: &str) -> Result<String, String> {
@@ -6916,15 +7056,44 @@ async fn finish_recompile_success(
             error
         );
     }
-    let state = unity_semantic_state(project_path).await;
-    Ok(format!(
-        "Unity recompile status:\n- status: compiled\n- compilation: completed\n- detection: rebuilt_assembly_output\n- asset_sync: {}\n- asset_sync_reason: {}\n- domain_reload: completed\n- bridge: ready\n- editor: {}\n- phase: {}\n- action: {}",
+    // Post-reload work (initializers, Burst, imports) can occupy the main
+    // thread again after the bridge first answered; give it a short window so
+    // the reported bridge state and action agree.
+    let mut state = unity_semantic_state(project_path).await;
+    if !state.safety.can_call_unity_api {
+        let _ = wait_for_unity_bridge_ready(
+            project_path,
+            RECOMPILE_FINAL_READY_WAIT,
+            "after the recompile type index refresh",
+        )
+        .await;
+        state = unity_semantic_state(project_path).await;
+    }
+    Ok(format_compiled_recompile_status(asset_sync, &state))
+}
+
+const RECOMPILE_FINAL_READY_WAIT: Duration = Duration::from_secs(10);
+
+fn format_compiled_recompile_status(
+    asset_sync: &crate::workspace_changes::UnitySyncSnapshot,
+    state: &SemanticState,
+) -> String {
+    let mut status = format!(
+        "Unity recompile status:\n- status: compiled\n- compilation: completed\n- detection: rebuilt_assembly_output\n- asset_sync: {}\n- asset_sync_reason: {}\n- domain_reload: completed\n- bridge: {}\n- editor: {}\n- phase: {}\n- action: {}",
         asset_sync.mode.as_str(),
         asset_sync.reason,
+        if state.safety.can_call_unity_api { "ready" } else { "busy" },
         state.editor_mode.value,
         state.phase,
         state.safety.recommended_action
-    ))
+    );
+    if !state.safety.can_call_unity_api {
+        status.push_str(&format!(
+            "\n- detail: The rebuilt assemblies are loaded, but Unity's main thread is still busy after the reload (main thread: {}). The next Unity call waits for it.",
+            state.main_thread.state
+        ));
+    }
+    status
 }
 
 #[derive(Debug, Default)]
@@ -7813,6 +7982,7 @@ pub async fn start_unity_monitor(
     );
     state_probe::start_observer(&project_path);
     let monitor_project_path = project_path.clone();
+    let wake = register_unity_monitor_waker(&project_path);
 
     let handle = tauri::async_runtime::spawn(async move {
         let mut last_status: Option<bool> = None;
@@ -7824,8 +7994,16 @@ pub async fn start_unity_monitor(
         // connect-time probe keeps retrying every poll instead of leaving the
         // first successful sample to coincide with a post-edit state.
         let mut reload_state_seeded = false;
+        // Editor process whose exit bookkeeping already ran, so the disconnect
+        // transition and a later process-exit tick never both run it.
+        let mut exit_handled_process_id: Option<u32> = None;
+        let mut last_published_detail: Option<(String, u64)> = None;
 
         loop {
+            let previous_running_process_id = last_detected_editor_process
+                .as_ref()
+                .filter(|info| info.state == UnityEditorProcessState::Running)
+                .and_then(|info| info.process_id);
             let mut status = query_unity_connection_status(&project_path).await;
             let connected = status.connected;
             let disconnected_transition = last_status == Some(true) && !connected;
@@ -7998,6 +8176,7 @@ pub async fn start_unity_monitor(
                         // the next reload-state sample converges them then (or
                         // keeps them if that compile fails).
                         crate::unity_hotreload::coordinator::on_editor_exited(&project_path).await;
+                        exit_handled_process_id = previous_running_process_id;
                     } else if recompile_waiting {
                         // Alive mid-recompile: keep the hook sync the
                         // recompile-waiting branch below would have run on this
@@ -8016,6 +8195,21 @@ pub async fn start_unity_monitor(
                 }
             }
 
+            // Unity closes the pipe before its native shutdown finishes, so the
+            // process usually exits after the disconnect transition. The kernel
+            // exit wait wakes this loop; run the exit bookkeeping once then.
+            if !connected
+                && status.editor_process_state == UnityEditorProcessState::NotRunning
+            {
+                if let Some(process_id) = previous_running_process_id
+                    .filter(|process_id| exit_handled_process_id != Some(*process_id))
+                {
+                    sync_background_hook_for_status(&mut status, &project_path).await;
+                    crate::unity_hotreload::coordinator::on_editor_exited(&project_path).await;
+                    exit_handled_process_id = Some(process_id);
+                }
+            }
+
             if connected {
                 status.reconnect_attempts = 0;
             }
@@ -8031,12 +8225,26 @@ pub async fn start_unity_monitor(
                 ),
             );
 
-            crate::workspace_service::event::emit_for_workspace_scope(
-                &app_handle,
-                &event_scope,
-                "unity-connection-status-detail",
-                status.clone(),
+            // Push on change; timing-only updates (check timestamps, latency,
+            // reconnect counters) ride along at most every heartbeat interval.
+            let signature = connection_status_signature(&status);
+            let now_ms = unix_now_ms();
+            let publish_detail = last_published_detail.as_ref().is_none_or(
+                |(previous, published_at_ms)| {
+                    *previous != signature
+                        || now_ms.saturating_sub(*published_at_ms)
+                            >= UNITY_CONNECTION_DETAIL_HEARTBEAT_MS
+                },
             );
+            if publish_detail {
+                crate::workspace_service::event::emit_for_workspace_scope(
+                    &app_handle,
+                    &event_scope,
+                    "unity-connection-status-detail",
+                    status.clone(),
+                );
+                last_published_detail = Some((signature, now_ms));
+            }
 
             if last_status != Some(connected) {
                 crate::workspace_service::event::emit_for_workspace_scope(
@@ -8048,7 +8256,10 @@ pub async fn start_unity_monitor(
             }
             last_status = Some(connected);
 
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(UNITY_MONITOR_INTERVAL) => {}
+                _ = wake.notified() => {}
+            }
         }
     });
 
@@ -8071,6 +8282,7 @@ pub async fn stop_unity_monitor_for_project(monitor: &UnityMonitorHandle, projec
         );
         crate::unity_hotreload::coordinator::on_monitor_stopped_background(project_path);
     }
+    unregister_unity_monitor_waker(project_path);
     state_probe::stop_observer(project_path);
 }
 
@@ -8081,6 +8293,7 @@ pub async fn stop_unity_monitor(monitor: &UnityMonitorHandle) {
     };
     for (_, (project, handle)) in handles {
         handle.abort();
+        unregister_unity_monitor_waker(&project);
         eprintln!("[Locus] Unity connection monitor stopped for {}", project);
         crate::unity_hotreload::coordinator::on_monitor_stopped_background(project);
     }
@@ -8463,6 +8676,51 @@ mod tests {
         .expect("recent process metadata should remain available");
         assert!(!disconnected.connected);
         assert_eq!(disconnected.control_channel_state, "error");
+    }
+
+    #[test]
+    fn connection_detail_signature_ignores_check_timing_only() {
+        let path = "F:/Proj/Game/signature";
+        let first = test_connection_status(path, 1_000);
+        let mut later = test_connection_status(path, 9_000);
+        later.latency_ms = Some(80);
+        later.reconnect_attempts = 3;
+        assert_eq!(
+            super::connection_status_signature(&first),
+            super::connection_status_signature(&later)
+        );
+        later.editor_process_state = UnityEditorProcessState::NotRunning;
+        assert_ne!(
+            super::connection_status_signature(&first),
+            super::connection_status_signature(&later)
+        );
+    }
+
+    #[test]
+    fn semantic_push_signature_ignores_sample_timing_but_not_the_state() {
+        let state = |phase: &str, checked_at_ms: u64, heartbeat: u64| {
+            let mut value = serde_json::json!({
+                "phase": phase, "source": "pipe", "confidence": "high", "transient": false,
+                "checkedAtMs": checked_at_ms,
+                "process": { "state": "running" },
+                "channel": { "controlPipe": "ready", "lastLatencyMs": heartbeat },
+                "domain": { "phase": "none", "source": "pipe", "confidence": "high" },
+                "editorMode": { "value": "editing", "source": "pipe", "confidence": "high" },
+                "mainThread": { "state": "responsive", "cpuActive": false, "quiescentForMs": heartbeat,
+                    "heartbeatAgeMs": heartbeat },
+                "safety": { "canCallUnityApi": true, "canModifyAssetsSafely": true, "recommendedAction": "proceed" },
+                "statePlane": { "observer": "cache", "dataPlane": "native", "nativeBroker": format!("ready:{checked_at_ms}"),
+                    "nativeHook": "available", "historySamples": checked_at_ms },
+                "editorLog": { "source": "editor_log", "safeMode": false, "modifiedAtMs": checked_at_ms },
+            });
+            if phase == "quit" {
+                value["process"]["state"] = serde_json::json!("not_running");
+            }
+            serde_json::from_value::<super::SemanticState>(value).expect("semantic state")
+        };
+        let signature = super::semantic_state_signature;
+        assert_eq!(signature(&state("editing", 1, 10)), signature(&state("editing", 2, 900)));
+        assert_ne!(signature(&state("editing", 1, 10)), signature(&state("quit", 1, 10)));
     }
 
     #[test]
@@ -8891,5 +9149,265 @@ mod tests {
                 r"D:\Apps\Unity\Hub\Editor\2022.3.2f1\Editor\Unity.exe"
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod unity_execute_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn args(extra: serde_json::Value) -> serde_json::Value {
+        let mut value = json!({
+            "code": "print(1);",
+            "readonly": true,
+            "request_editor_status": "editing",
+        });
+        for (key, item) in extra.as_object().unwrap() {
+            value[key] = item.clone();
+        }
+        value
+    }
+
+    #[test]
+    fn parameters_match_the_published_tool_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(crate::prompt::tools::UNITY_EXECUTE).unwrap();
+        let mut published = schema["parameters"]["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        published.sort();
+        let mut accepted = UNITY_EXECUTE_PARAMETERS
+            .iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        accepted.sort();
+        assert_eq!(published, accepted);
+        assert_eq!(schema["parameters"]["additionalProperties"], false);
+        assert_eq!(
+            schema["parameters"]["properties"]["timeout"]["default"],
+            UNITY_EXECUTE_DEFAULT_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn unknown_parameters_are_rejected_with_the_allowed_list() {
+        let error = parse_unity_execute_args(&args(json!({"timeout_ms": 5000}))).unwrap_err();
+        assert!(error.contains("Unknown unity_execute parameter(s): timeout_ms"), "{error}");
+        assert!(error.contains("timeout (total run budget in milliseconds)"), "{error}");
+        // The async task runtime adds its own parameter.
+        assert!(parse_unity_execute_args(&args(json!({"async": "sync"}))).is_ok());
+        // The agent loop mirrors known keys in camelCase.
+        let mirrored = args(json!({"requestEditorStatus": "editing", "enableNonPublicAccess": true}));
+        assert_eq!(parse_unity_execute_args(&mirrored).unwrap().requested_status, "editing");
+        let error = parse_unity_execute_args(&args(json!({"timeoutMs": 5000}))).unwrap_err();
+        assert!(error.contains("timeoutMs"), "{error}");
+    }
+
+
+    #[test]
+    fn timeout_is_optional_clamped_and_numeric() {
+        let parsed = parse_unity_execute_args(&args(json!({}))).unwrap();
+        assert_eq!(parsed.options.timeout_ms, None);
+        assert_eq!(parsed.code, "print(1);");
+        assert_eq!(parsed.requested_status, "editing");
+        for (given, expected) in [
+            (json!(120000), 120_000),
+            (json!(1500000.0), 1_500_000),
+            (json!(10), UNITY_EXECUTE_MIN_TIMEOUT_MS),
+            (json!(99_000_000), UNITY_EXECUTE_MAX_TIMEOUT_MS),
+        ] {
+            let parsed = parse_unity_execute_args(&args(json!({"timeout": given}))).unwrap();
+            assert_eq!(parsed.options.timeout_ms, Some(expected));
+        }
+        assert!(parse_unity_execute_args(&args(json!({"timeout": null})))
+            .unwrap()
+            .options
+            .timeout_ms
+            .is_none());
+        for invalid in [json!("600000"), json!(-1), json!(true)] {
+            let error = parse_unity_execute_args(&args(json!({"timeout": invalid}))).unwrap_err();
+            assert!(error.contains("'timeout'"), "{error}");
+        }
+    }
+
+    #[test]
+    fn required_arguments_and_status_are_validated() {
+        assert_eq!(
+            parse_unity_execute_args(&json!({"request_editor_status": "editing"})).unwrap_err(),
+            "Missing required parameter: code"
+        );
+        assert_eq!(
+            parse_unity_execute_args(&json!({"code": "x"})).unwrap_err(),
+            "Missing required parameter: request_editor_status"
+        );
+        let error =
+            parse_unity_execute_args(&args(json!({"request_editor_status": "disconnected"})))
+                .unwrap_err();
+        assert!(error.starts_with("Invalid request_editor_status"), "{error}");
+        assert!(parse_unity_execute_args(&json!("print(1);")).is_err());
+    }
+
+    #[test]
+    fn payloads_carry_the_execution_id_and_optional_budget() {
+        let code = unity_execute_code_with_markers("print(1);\n\n", "exec-1", Some(90_000));
+        assert_eq!(
+            code,
+            "print(1);\n//__LOCUS_EXECUTION_ID__:exec-1\n//__LOCUS_TIMEOUT_MS__:90000"
+        );
+        assert_eq!(
+            unity_execute_code_with_markers("print(1);", "exec-1", None),
+            "print(1);\n//__LOCUS_EXECUTION_ID__:exec-1"
+        );
+
+        let payload = unity_execute_loaded_payload_with_execution_id(
+            r#"{"assembly_b64":"AA=="}"#.to_string(),
+            "exec-2",
+            "print(2);",
+            Some(30_000),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["execution_id"], "exec-2");
+        assert_eq!(value["source_code"], "print(2);");
+        assert_eq!(value["timeout_ms"], 30_000);
+        let payload =
+            unity_execute_loaded_payload_with_execution_id("{}".to_string(), "exec-3", "", None)
+                .unwrap();
+        assert!(!payload.contains("timeout_ms"));
+    }
+
+    fn native_snapshot(json: serde_json::Value) -> UnityExecuteProgressSnapshot {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn native_snapshots_parse_and_explain_a_busy_main_thread() {
+        let snapshot = native_snapshot(json!({
+            "active": true, "title": "Executing snippet", "info": "", "progress": 0,
+            "revision": 9, "source": "stage", "executing": true, "elapsedMs": 21000,
+            "timeoutMs": 600000, "idleMs": 1800, "idleLimitMs": 30000,
+            "mainThreadBlockedMs": 20500, "maxMainThreadBlockedMs": 20500,
+            "outputChars": 512, "lastOutput": "[walk-in s=7] maxGap avg=95",
+            "stopRequested": false, "stopReason": "", "publishedAgeMs": 120,
+            "mainThreadStallMs": 20000, "servedBy": "native_broker",
+        }));
+        assert_eq!(snapshot.main_thread_blocked_ms, Some(20_500));
+        assert_eq!(snapshot.served_by, "native_broker");
+        let shown = presentable_unity_execute_progress(snapshot.clone());
+        assert_eq!(shown.title, "Executing snippet");
+        assert_eq!(
+            shown.info,
+            "Unity main thread busy 20s; last output: [walk-in s=7] maxGap avg=95"
+        );
+        assert!(unity_execute_frozen_error(&snapshot, "exec-1").is_none());
+
+        // Snippet-reported progress is shown as written.
+        let api = native_snapshot(json!({
+            "active": true, "title": "Locus", "info": "seed 3/12", "source": "api_info",
+            "executing": true, "mainThreadBlockedMs": 9000,
+        }));
+        assert_eq!(presentable_unity_execute_progress(api).info, "seed 3/12");
+
+        // Await snapshots name what they wait for.
+        let await_snapshot = native_snapshot(json!({
+            "active": true, "title": "Awaiting Unity", "source": "await",
+            "waitTarget": "next EditorApplication.update", "waitedMs": 3400,
+        }));
+        assert_eq!(
+            presentable_unity_execute_progress(await_snapshot).info,
+            "next EditorApplication.update · 3s"
+        );
+
+        let stopping = native_snapshot(json!({
+            "active": true, "title": "Executing snippet", "source": "stage",
+            "executing": true, "stopRequested": true, "stopReason": "idle_timeout",
+        }));
+        let shown = presentable_unity_execute_progress(stopping);
+        assert_eq!(shown.title, "Stopping snippet");
+        assert_eq!(shown.info, "no print/ctx.Progress output for 30s");
+
+        // Older plugins publish only the classic fields.
+        let legacy: UnityExecuteProgressSnapshot = serde_json::from_str(
+            r#"{"active":true,"title":"Executing snippet","info":"","progress":0,"revision":3,"source":"stage"}"#,
+        )
+        .unwrap();
+        assert_eq!(presentable_unity_execute_progress(legacy).info, "");
+    }
+
+    #[test]
+    fn tracker_keeps_the_longest_block_and_emits_liveness_changes() {
+        let mut tracker = UnityExecuteProgressTracker::default();
+        let mut snapshot = native_snapshot(json!({
+            "active": true, "title": "Executing snippet", "revision": 4, "source": "stage",
+            "executing": true, "mainThreadBlockedMs": 3000, "maxMainThreadBlockedMs": 2000,
+        }));
+        tracker.observe(&snapshot);
+        assert_eq!(tracker.max_main_thread_blocked_ms, 3000);
+        let shown = presentable_unity_execute_progress(snapshot.clone());
+        assert!(tracker.should_emit(&shown));
+        assert!(!tracker.should_emit(&shown));
+
+        snapshot.main_thread_blocked_ms = Some(5_000);
+        tracker.observe(&snapshot);
+        assert!(tracker.should_emit(&presentable_unity_execute_progress(snapshot.clone())));
+
+        snapshot.executing = Some(false);
+        snapshot.main_thread_blocked_ms = Some(90_000);
+        snapshot.max_main_thread_blocked_ms = Some(4_000);
+        tracker.observe(&snapshot);
+        assert_eq!(tracker.max_main_thread_blocked_ms, 5_000);
+    }
+
+    #[test]
+    fn only_a_frozen_runtime_detaches_and_says_why() {
+        let snapshot = |published_age: u64, stall: i64| {
+            native_snapshot(json!({
+                "active": true, "publishedAgeMs": published_age, "mainThreadStallMs": stall,
+            }))
+        };
+        assert!(unity_execute_frozen_error(&snapshot(500, 120_000), "exec-1").is_none());
+        assert!(unity_execute_frozen_error(&snapshot(40_000, 5_000), "exec-1").is_none());
+        let error = unity_execute_frozen_error(&snapshot(31_000, 45_000), "exec-1").unwrap();
+        assert!(error.starts_with(
+            "native_main_thread_unresponsive; execution_id=exec-1; request_state=detached"
+        ));
+        assert!(error.contains("stopped reporting progress 31s ago"), "{error}");
+        // Managed-served snapshots carry no broker timing.
+        assert!(
+            unity_execute_frozen_error(&native_snapshot(json!({"active": true})), "exec-1")
+                .is_none()
+        );
+
+        let budget = unity_execute_budget_exceeded_error("exec-2", 600_000);
+        assert!(budget.starts_with(UNITY_EXECUTE_BUDGET_EXCEEDED));
+        assert!(budget.contains("600s timeout"), "{budget}");
+        assert!(budget.contains("locus.wait_unity_execution"), "{budget}");
+    }
+
+    #[test]
+    fn notes_and_waiting_text_are_readable() {
+        assert!(unity_execute_long_block_note(14_999).is_none());
+        let note = unity_execute_long_block_note(23_400).unwrap();
+        assert!(note.contains("23.4s"), "{note}");
+        assert!(note.contains("await ctx.WaitFrame()"), "{note}");
+        assert_eq!(
+            describe_progress_poll_error("Unity response timed out"),
+            "Unity's main thread has not picked up the request yet"
+        );
+        assert_eq!(describe_progress_poll_error("pipe closed"), "pipe closed");
+        assert_eq!(truncate_progress_text("  abcdef ", 3), "abc…");
+        assert_eq!(truncate_progress_text("ab", 3), "ab");
+
+        let deadline: PipeResponse =
+            serde_json::from_value(json!({"ok": false, "error": "native_request_timed_out"}))
+                .unwrap();
+        assert!(pipe_response_is_request_deadline(&deadline));
+        let reloading: PipeResponse =
+            serde_json::from_value(json!({"ok": false, "error": "managed_reloading"})).unwrap();
+        assert!(!pipe_response_is_request_deadline(&reloading));
     }
 }
