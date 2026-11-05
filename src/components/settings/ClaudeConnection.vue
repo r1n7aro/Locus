@@ -7,7 +7,11 @@ import BaseButton from '../ui/BaseButton.vue';
 import BaseSegmented from '../ui/BaseSegmented.vue';
 import BaseCheckbox from '../ui/BaseCheckbox.vue';
 import BaseDropdown from '../ui/BaseDropdown.vue';
-import { setClaudePrewarm, setClaudeRuntimeSettings } from '../../services/claudeConnection';
+import { CLAUDE_CONFIGURABLE_BUILTIN_AGENTS, CLAUDE_NATIVE_AGENTS_MIN_VERSION, getClaudeNativeAgentsSupport, setClaudeNativeAgents, setClaudePrewarm,
+  setClaudeRuntimeSettings, type ClaudeNativeAgentsSupport } from '../../services/claudeConnection';
+import { listAgents, listSubagentDefs } from '../../services/agent';
+import { agentProjectTypesLabel } from '../../utils/agentProjectTypes';
+import type { AgentInfo } from '../../types';
 import { authorizeClaudeSsh, clearClaudeSshUnlockPassword, getClaudeConnection, inspectClaudeSsh, useLocalClaude, setClaudePermissionMode,
   type ClaudeSshConfig, type ClaudeRemoteInfo, type ClaudePermissionMode } from '../../services/claudeConnection';
 
@@ -20,6 +24,64 @@ const autoCompactWindow = ref<number | null>(null);
 const prewarm = ref(false);
 const poolCapacity = ref(1);
 const idleMinutes = ref(15);
+const nativeMultiAgent = ref(true);
+const builtinAgents = ref<string[]>(['general-purpose', 'Explore', 'Plan']);
+/** Locus agent types left out of native conversations; the rest are offered. */
+const excludedLocusAgents = ref<string[]>([]);
+/** Delegatable Locus agents of the app catalog, in the Agent list order. */
+const locusAgents = ref<AgentInfo[]>([]);
+async function updateNativeAgents(enabled: boolean, builtins: readonly string[] = builtinAgents.value,
+  excluded: readonly string[] = excludedLocusAgents.value) {
+  if (busy.value) return;
+  await action(async () => {
+    const saved = await setClaudeNativeAgents(enabled, builtins, excluded);
+    nativeMultiAgent.value = saved.nativeMultiAgent !== false;
+    builtinAgents.value = saved.nativeAgents?.builtins ?? [];
+    excludedLocusAgents.value = saved.nativeAgents?.excludedLocusAgents ?? [];
+  });
+}
+function toggleBuiltinAgent(name: string, enabled: boolean) {
+  const next = CLAUDE_CONFIGURABLE_BUILTIN_AGENTS.filter(agent => agent === name ? enabled : builtinAgents.value.includes(agent));
+  void updateNativeAgents(nativeMultiAgent.value, next);
+}
+// Ids of agents that are no longer listed stay excluded if they come back.
+function toggleLocusAgent(id: string, enabled: boolean) {
+  const rest = excludedLocusAgents.value.filter(agent => agent !== id);
+  void updateNativeAgents(nativeMultiAgent.value, builtinAgents.value, enabled ? rest : [...rest, id]);
+}
+/** Version check of the saved connection; new conversations fall back to Locus subagents when it fails. */
+const nativeSupport = ref<ClaudeNativeAgentsSupport | null>(null);
+async function loadNativeSupport() {
+  try {
+    nativeSupport.value = await getClaudeNativeAgentsSupport();
+  } catch (cause) {
+    console.error('Claude native agent support check failed:', cause);
+  }
+}
+const nativeUnsupported = computed(() => nativeMultiAgent.value && !!nativeSupport.value && !nativeSupport.value.supported);
+const nativeUnsupportedMessage = computed(() => {
+  const support = nativeSupport.value;
+  if (!support) return '';
+  const version = support.cliVersion?.match(/\d+\.\d+\.\d+/)?.[0];
+  const action = !support.remote ? t('settings.claudeCode.nativeUpgradeLocal')
+    : support.installable ? t('settings.claudeCode.nativeUpgradeRemote', CLAUDE_NATIVE_AGENTS_MIN_VERSION)
+    : t('settings.claudeCode.nativeUpgradeCustomPath');
+  return version
+    ? t('settings.claudeCode.nativeUnsupportedVersion', version, CLAUDE_NATIVE_AGENTS_MIN_VERSION, action)
+    : t('settings.claudeCode.nativeUnsupportedUnknown', CLAUDE_NATIVE_AGENTS_MIN_VERSION, action);
+});
+/** The saved SSH connection was just tested and can be upgraded for native agents by "Connect and save". */
+const nativeUpgrade = computed(() => nativeUnsupported.value && !!nativeSupport.value?.installable
+  && mode.value === 'ssh' && !!authorized.value && authorized.value === signature.value);
+async function loadLocusAgents() {
+  try {
+    const [agents, subagents] = await Promise.all([listAgents(), listSubagentDefs()]);
+    const seen = new Set<string>();
+    locusAgents.value = [...agents, ...subagents].filter(agent => agent.delegatable && !seen.has(agent.id) && !!seen.add(agent.id));
+  } catch (cause) {
+    console.error('Locus agent list failed:', cause);
+  }
+}
 async function updatePrewarm(enabled: boolean, capacity = poolCapacity.value, idle = idleMinutes.value) {
   if (busy.value) return;
   await action(async () => {
@@ -53,10 +115,12 @@ const needsUnlock = computed(() => !needsSetup.value && info.value?.platform ===
 const showPassword = computed(() => needsUnlock.value || (info.value?.platform === 'darwin' && editPassword.value));
 const ready = computed(() => !!info.value?.authenticated && !needsSetup.value);
 const canAuthorize = computed(() => inspected.value === signature.value && (needsSetup.value || ready.value || (needsUnlock.value && (!!unlockPassword.value || hasUnlockPassword.value))));
-const showAuthorize = computed(() => !!info.value && (needsSetup.value || needsUnlock.value || editPassword.value || (ready.value && authorized.value !== signature.value)));
+const showAuthorize = computed(() => !!info.value && (needsSetup.value || needsUnlock.value || editPassword.value
+  || (ready.value && (authorized.value !== signature.value || nativeUpgrade.value))));
 const platformLabel = computed(() => info.value?.platform === 'darwin' ? 'macOS' : info.value?.platform?.startsWith('linux') ? 'Linux' : info.value?.platform);
 const statusLabel = computed(() => t(needsSetup.value ? 'settings.claudeSsh.setupRequired' : needsUnlock.value ? 'settings.claudeSsh.keychainLocked' : !info.value?.authenticated ? 'settings.claudeSsh.loginRequired' : 'settings.claudeSsh.ready'));
-const authorizeLabel = computed(() => t(needsSetup.value ? 'settings.claudeSsh.installContinue' : showPassword.value ? 'settings.claudeSsh.unlockSave' : 'settings.claudeSsh.authorize'));
+const authorizeLabel = computed(() => t(needsSetup.value ? 'settings.claudeSsh.installContinue' : showPassword.value ? 'settings.claudeSsh.unlockSave'
+  : nativeUpgrade.value ? 'settings.claudeSsh.upgradeSave' : 'settings.claudeSsh.authorize'));
 
 watch(signature, () => { inspected.value = ''; info.value = null; error.value = ''; unlockPassword.value = ''; editPassword.value = false; });
 watch(address, () => { attempted.value = false; });
@@ -69,7 +133,7 @@ async function updateMode(value: string) {
   if (busy.value) return;
   unlockPassword.value = ''; editPassword.value = false;
   if (value === 'local') {
-    await action(async () => { await useLocalClaude(); mode.value = 'local'; authorized.value = ''; emit('changed'); });
+    await action(async () => { await useLocalClaude(); mode.value = 'local'; authorized.value = ''; emit('changed'); void loadNativeSupport(); });
   } else if (value === 'ssh') { mode.value = value; }
 }
 async function updatePermissionMode(value: string) {
@@ -104,7 +168,8 @@ async function inspect() {
     const result = await inspectClaudeSsh(connection);
     if (signature.value !== snapshot) return;
     info.value = result; inspected.value = snapshot;
-    if (authorized.value === snapshot) emit('changed');
+    // Testing the saved connection records its current CLI version.
+    if (authorized.value === snapshot) { emit('changed'); await loadNativeSupport(); }
   });
 }
 async function authorize() {
@@ -117,6 +182,7 @@ async function authorize() {
       authorized.value = snapshot; info.value = result.info; editPassword.value = false;
       savedPasswordFor.value = result.hasUnlockPassword ? snapshot : '';
       emit('changed');
+      await loadNativeSupport();
     } catch (failure) {
       // Setup may succeed while native login still needs the user's action.
       if (installing) {
@@ -145,6 +211,11 @@ onMounted(() => action(async () => {
   telemetry.value = !!saved.telemetry;
   autoCompactWindow.value = saved.autoCompactWindow ?? null;
   prewarm.value = !!saved.prewarm; poolCapacity.value = saved.poolCapacity ?? 1; idleMinutes.value = saved.idleMinutes ?? 15;
+  nativeMultiAgent.value = saved.nativeMultiAgent !== false;
+  builtinAgents.value = saved.nativeAgents?.builtins ?? ['general-purpose', 'Explore', 'Plan'];
+  excludedLocusAgents.value = saved.nativeAgents?.excludedLocusAgents ?? [];
+  void loadLocusAgents();
+  void loadNativeSupport();
   if (saved.remote) {
     address.value = formatClaudeSshAddress(saved.remote);
     identityFile.value = saved.remote.identityFile || ''; knownHostsFile.value = saved.remote.knownHostsFile || '';
@@ -258,6 +329,38 @@ onMounted(() => action(async () => {
       <BaseCheckbox :model-value="telemetry" :disabled="busy" :aria-label="t('settings.claudeCode.telemetry')"
         @update:model-value="updateRuntimeSettings(idleCompaction, $event)" />
     </div>
+    <div class="connection-field connection-native-agents">
+      <span>{{ t('settings.claudeCode.nativeMultiAgent') }}</span>
+      <BaseCheckbox :model-value="nativeMultiAgent" :disabled="busy" :aria-label="t('settings.claudeCode.nativeMultiAgent')"
+        aria-describedby="claude-native-agents-hint" @update:model-value="updateNativeAgents($event)" />
+    </div>
+    <p id="claude-native-agents-hint" class="connection-hint">{{ t('settings.claudeCode.nativeMultiAgentHint') }}</p>
+    <p v-if="nativeUnsupported" class="connection-warning">{{ nativeUnsupportedMessage }}</p>
+    <template v-if="nativeMultiAgent">
+      <div class="connection-field">
+        <span id="claude-builtin-agents-label">{{ t('settings.claudeCode.builtinAgents') }}</span>
+        <div class="connection-builtin-agents" role="group" aria-labelledby="claude-builtin-agents-label" aria-describedby="claude-builtin-agents-hint">
+          <label v-for="agent in CLAUDE_CONFIGURABLE_BUILTIN_AGENTS" :key="agent" class="connection-pool-toggle">
+            <BaseCheckbox :model-value="builtinAgents.includes(agent)" :disabled="busy" :aria-label="agent"
+              @update:model-value="toggleBuiltinAgent(agent, $event)" /><span>{{ agent }}</span>
+          </label>
+        </div>
+      </div>
+      <p id="claude-builtin-agents-hint" class="connection-hint">{{ t('settings.claudeCode.builtinAgentsHint') }}</p>
+      <div class="connection-field">
+        <span id="claude-locus-agents-label">{{ t('settings.claudeCode.locusAgents') }}</span>
+        <div v-if="locusAgents.length" class="connection-locus-agents" role="group"
+          aria-labelledby="claude-locus-agents-label" aria-describedby="claude-locus-agents-hint">
+          <label v-for="agent in locusAgents" :key="agent.id" class="connection-pool-toggle" :title="agent.description || undefined">
+            <BaseCheckbox :model-value="!excludedLocusAgents.includes(agent.id)" :disabled="busy" :aria-label="agent.id"
+              @update:model-value="toggleLocusAgent(agent.id, $event)" /><span>{{ agent.name || agent.id }}</span>
+            <span v-if="agentProjectTypesLabel(agent)" class="connection-agent-scope">{{ agentProjectTypesLabel(agent) }}</span>
+          </label>
+        </div>
+        <span v-else class="connection-hint">{{ t('settings.claudeCode.locusAgentsNone') }}</span>
+      </div>
+      <p id="claude-locus-agents-hint" class="connection-hint">{{ t('settings.claudeCode.locusAgentsHint') }}</p>
+    </template>
   </div>
 </template>
 
@@ -272,6 +375,9 @@ onMounted(() => action(async () => {
 .connection-compact-window { display: flex; align-items: center; gap: 8px; }
 .connection-compact-window input { width: 160px; max-width: 100%; }
 .connection-pool-options { width: 120px; justify-self: start; }
+.connection-native-agents { padding-top: 12px; border-top: 1px solid var(--border-color); }
+.connection-builtin-agents, .connection-locus-agents { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.connection-agent-scope { color: var(--text-secondary); font-size: 12px; }
 .connection-server { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--border-color); padding-top: 12px; }
 .connection-server .connection-field { flex: 1; min-width: 0; }
 .connection-field { display: grid; grid-template-columns: 80px minmax(0, 1fr); align-items: center; gap: 12px; }
@@ -287,6 +393,7 @@ summary { cursor: pointer; font-size: 12px; }
 .connection-permission-options { justify-self: start; }
 .connection-permissions.is-local { padding-top: 12px; border-top: 1px solid var(--border-color); }
 .connection-error { margin: 0; font-size: 12px; color: var(--status-danger-fg); overflow-wrap: anywhere; }
+.connection-warning { margin: 0; font-size: 12px; line-height: 1.6; color: var(--status-warn-fg); overflow-wrap: anywhere; }
 @media (max-width: 600px) {
   .connection-header { flex-wrap: wrap; }
   .connection-server { flex-wrap: wrap; }

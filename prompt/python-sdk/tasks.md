@@ -1,6 +1,6 @@
 # Tasks and agent messages
 
-When asynchronous execution is enabled, the `python` tool accepts `async="sync"` (wait for the result), `async="async"` (return a task id), or `async="notify"` (also deliver completion automatically). Background execution has no timeout; startup failures return directly. Python code supports top-level `await` in every mode. The task APIs below use the pre-injected `locus` module.
+The `python` tool accepts `async="sync"` (wait for the result), `async="async"` (return a task id), or `async="notify"` (also deliver completion automatically). Background execution has no timeout; startup failures return directly. Python code supports top-level `await` in every mode. The task APIs below use the pre-injected `locus` module.
 
 These SDK methods are built in and require no tool discovery or loading. Task
 queries and controls use the current Python session automatically; they never
@@ -55,6 +55,10 @@ await locus.send_message("parent", "Found a race; checking the fix now.")
 await locus.send_message("parent/tester", "Please verify the cancellation path.")
 ```
 
+With Multi-Agent enabled, agents also receive a `send_message` tool
+(`to`, `message`) that uses the same addresses and delivery; prefer it over a
+Python call when only a message is needed.
+
 `send_message` durably queues collaboration data. Its `TaskMessageDelivery`
 contains `message_id`, `task_id` and `status="queued"`; this acknowledges storage,
 not that the receiver has read it. Running agents receive messages before the
@@ -76,7 +80,10 @@ Task-control-only Python scripts use `readonly=true`: list/get/wait/cancel/resum
 and send_message do not acquire the workspace mutation lock. Resumed children
 run through their own permission and workspace execution checks. Any additional
 file or editor mutation in the Python script still requires `readonly=false`.
-Notify-mode tasks automatically deliver results, including failures. Async-mode
+Notify-mode tasks automatically deliver results, including failures. A running
+task does not keep the turn open: if the session is idle when the result
+arrives, it starts a new run to process it. Cancelled tasks do not wake the
+session. Async-mode
 tasks are pull-only until resumed or messaged after completion. Each attempt's
 notification is preserved independently. An asynchronous Python task completes
 when its Python process finishes; await remote work whose result the parent

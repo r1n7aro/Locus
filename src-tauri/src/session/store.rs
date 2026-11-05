@@ -46,6 +46,9 @@ mod captures;
 mod connections;
 mod usage_retry;
 mod prompt_cache;
+mod service_policy;
+mod tool_contracts;
+pub(crate) use tool_contracts::SessionToolContract;
 pub(crate) use prompt_cache::{PromptCacheRequest, PromptCacheCheckOutcome, claude_prompt_usage_complete};
 #[cfg(test)]
 mod isolation_tests;
@@ -824,8 +827,15 @@ fn historical_fork_prompt_start<'a>(
     }
 }
 
+/// A task result or agent message delivered to the agent. The transcript shows
+/// it as a one-line system notice, never as user input.
+fn is_delivered_notification_message(message: &ChatMessage) -> bool {
+    message.id.starts_with("async-result:") || message.id.starts_with("agent-message:")
+}
+
 fn is_internal_system_reminder_message(message: &ChatMessage) -> bool {
     message.role == MessageRole::User
+        && !is_delivered_notification_message(message)
         && message.content.trim().is_empty()
         && message.images.as_ref().map_or(true, Vec::is_empty)
         && message.asset_refs.as_ref().map_or(true, Vec::is_empty)
@@ -843,6 +853,9 @@ fn normalize_messages_for_display(raw_messages: &[ChatMessage]) -> Vec<ChatMessa
     let mut messages = crate::session::history::normalize_tool_round_history(raw_messages);
     remove_internal_system_reminders_from_display(&mut messages);
     SessionStore::mark_missing_persisted_outputs_for_display(&mut messages);
+    for message in &mut messages {
+        redact_context_handoff_for_display(message);
+    }
     messages
 }
 
@@ -877,6 +890,23 @@ fn strip_top_level_recorded_output(tool_calls: &[ToolCallInfo]) -> Vec<ToolCallI
             tool_call
         })
         .collect()
+}
+
+fn upsert_nested_record(tool_calls: &mut [ToolCallInfo], parent_id: &str, nested: &ToolCallInfo) -> bool {
+    for tool_call in tool_calls {
+        if tool_call.id == parent_id {
+            let calls = tool_call.nested_tool_calls.get_or_insert_with(Vec::new);
+            match calls.iter_mut().find(|call| call.id == nested.id) {
+                Some(existing) => *existing = nested.clone(),
+                None => calls.push(nested.clone()),
+            }
+            return true;
+        }
+        if tool_call.nested_tool_calls.as_mut().is_some_and(|calls| upsert_nested_record(calls, parent_id, nested)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn update_tool_call_display_record(
@@ -1010,7 +1040,7 @@ impl SessionStore {
     ///
     /// Do not rely on ad-hoc `ALTER TABLE ... .ok()` fallbacks or silent
     /// schema drift. Session data must migrate deterministically.
-    const SCHEMA_VERSION: i32 = 53;
+    const SCHEMA_VERSION: i32 = 56;
 
     pub const fn schema_version() -> i32 {
         Self::SCHEMA_VERSION
@@ -1576,7 +1606,16 @@ impl SessionStore {
         if current < 53 {
             Self::migrate(conn, 53, "drop context attempt captures recorded outside debug mode", Self::migrate_drop_context_attempt_captures)?;
         }
-        debug_assert_eq!(Self::SCHEMA_VERSION, 53, "add a new migration block above");
+        if current < 54 {
+            Self::migrate(conn, 54, "version Claude server connection references", Self::migrate_claude_connection_references)?;
+        }
+        if current < 55 {
+            Self::migrate(conn, 55, "keep Unity workspace services starting automatically", Self::migrate_unity_service_auto_policy)?;
+        }
+        if current < 56 {
+            Self::migrate(conn, 56, "pin contextual tool definitions per session", Self::create_tool_contract_schema)?;
+        }
+        debug_assert_eq!(Self::SCHEMA_VERSION, 56, "add a new migration block above");
         Ok(())
     }
 
@@ -2020,6 +2059,8 @@ impl SessionStore {
         .and_then(|_| Self::create_async_task_schema(conn))
         .and_then(|_| Self::create_capture_schema(conn))
         .and_then(|_| Self::migrate_claude_native_identity(conn))
+        .and_then(|_| Self::migrate_claude_connection_references(conn))
+        .and_then(|_| Self::create_tool_contract_schema(conn))
     }
 
     fn create_workspace_persistence_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -3962,6 +4003,8 @@ impl SessionStore {
                 "UPDATE sessions SET last_multi_agent_enabled = (SELECT last_multi_agent_enabled FROM sessions WHERE id = ?1) WHERE id = ?2",
                 params![source_id, new_id],
             ).map_err(|e| format!("Failed to copy multi agent selection: {}", e))?;
+            let tool_contracts = Self::tool_contract_rows(&conn, source_id)?;
+            Self::insert_tool_contract_rows(&conn, &new_id, &tool_contracts)?;
 
             let message_rows = {
                 let mut stmt = conn
@@ -4180,6 +4223,10 @@ impl SessionStore {
             Option<String>,
         );
         let multi_agent_enabled = snapshot.get_session_multi_agent_enabled(source_id)?;
+        let tool_contracts = {
+            let conn = snapshot.conn.lock().map_err(|e| e.to_string())?;
+            Self::tool_contract_rows(&conn, source_id)?
+        };
         type SnapshotUsageRow = (i64, i64, i64, i64, i64, i64, f64, i64, i64, i64);
         type SnapshotTodoRow = (i64, String, String, String);
 
@@ -4354,6 +4401,7 @@ impl SessionStore {
                 "UPDATE sessions SET last_multi_agent_enabled = ?1 WHERE id = ?2",
                 params![multi_agent_enabled, new_id],
             ).map_err(|e| format!("Failed to copy snapshot multi agent selection: {}", e))?;
+            Self::insert_tool_contract_rows(&conn, &new_id, &tool_contracts)?;
 
             for message in messages {
                 let content = if copied_tool_results {
@@ -5968,6 +6016,27 @@ impl SessionStore {
         })
     }
 
+    /// Newest display page, as `load_session_view` returns it. Stream events
+    /// that replace the transcript carry this bounded page plus its paging
+    /// cursor instead of the whole history.
+    pub fn load_session_tail_page(
+        &self,
+        id: &str,
+        message_limit: u32,
+    ) -> Result<SessionMessagePage, String> {
+        let conn = self.read_conn()?;
+        let raw_page = Self::get_message_page_with_conn(&conn, id, None, message_limit)?;
+        drop(conn);
+
+        let mut messages = normalize_messages_for_display(&raw_page.messages);
+        Self::defer_tool_result_images_for_display(&mut messages);
+        Ok(SessionMessagePage {
+            messages,
+            oldest_message_row_id: raw_page.oldest_message_row_id,
+            has_more_history: raw_page.has_more_history,
+        })
+    }
+
     fn defer_tool_result_images_for_display(messages: &mut [ChatMessage]) {
         for message in messages {
             if message.role != MessageRole::Tool {
@@ -6769,6 +6838,58 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Adds or replaces one nested call under a persisted tool call: a
+    /// background Claude subagent's call under its `Agent` card.
+    pub fn upsert_nested_tool_call(
+        &self,
+        message_id: &str,
+        parent_tool_call_id: &str,
+        nested: &ToolCallInfo,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let row: Option<(Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT tool_calls, metadata_json FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to load the agent message: {error}"))?;
+        let Some((tool_calls_json, metadata_json)) = row else {
+            return Err(format!("Assistant message '{message_id}' was not found"));
+        };
+        let mut tool_calls: Vec<ToolCallInfo> = tool_calls_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| format!("Failed to parse tool calls: {error}"))?
+            .unwrap_or_default();
+        if !upsert_nested_record(&mut tool_calls, parent_tool_call_id, nested) {
+            return Err(format!("Tool call '{parent_tool_call_id}' was not found in assistant message '{message_id}'"));
+        }
+        let mut metadata: MessageMetadata = metadata_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| format!("Failed to parse message metadata: {error}"))?
+            .unwrap_or_default();
+        if let Some(render_parts) = metadata.render_parts.as_mut() {
+            for part in render_parts {
+                if let AssistantRenderPart::ToolCall { tool_call, .. } = part {
+                    upsert_nested_record(std::slice::from_mut(tool_call), parent_tool_call_id, nested);
+                }
+            }
+        }
+        let tool_calls_json = serde_json::to_string(&tool_calls).map_err(|e| e.to_string())?;
+        let metadata_json = serde_json::to_string(&metadata).map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?1, metadata_json = ?2 WHERE id = ?3",
+            params![tool_calls_json, metadata_json, message_id],
+        )
+        .map_err(|error| format!("Failed to persist the nested call: {error}"))?;
+        Ok(())
+    }
+
     pub fn update_message_tool_calls_and_render_parts(
         &self,
         message_id: &str,
@@ -7463,18 +7584,53 @@ impl SessionStore {
                 .or_else(|| (provider["claude_native"]["compactSummary"] == true).then(||
                     crate::llm::claude_code_cli::recovery::text_content(&provider["claude_native"]["content"]))
                     .filter(|text| !text.trim().is_empty()));
+            let mut snapshot_status = if summary.is_some() { "complete" } else { "partial" }.to_string();
+            // Locus's carry-forward reaches Claude as SessionStart context
+            // after the summary; show it with the summary it extends.
+            let summary = match (summary, provider["claude_compaction"]["carryForward"].as_str().filter(|text| !text.trim().is_empty())) {
+                (Some(summary), Some(carry)) => Some(format!("{}\n\n{carry}", summary.trim_end())),
+                (summary, _) => summary,
+            };
+            let mut messages = vec![CompactedContextMessageOutput {
+                id: message_id.to_string(), role: MessageRole::User,
+                content: summary.unwrap_or_else(|| "empty".to_string()),
+                images: None, asset_refs: None,
+                prompt_prefix_placeholder: false, prompt_suffix_placeholder: false,
+            }];
+            // Claude keeps its most recent messages verbatim after the summary.
+            // The receipt names their local rows. (A synchronized snapshot also
+            // lists later rows up to the next compaction, so it is not used.)
+            let kept: Vec<&str> = provider["claude_compaction"]["keptMessageIds"].as_array()
+                .into_iter().flatten().filter_map(serde_json::Value::as_str)
+                .filter(|id| *id != message_id).collect();
+            if !kept.is_empty() {
+                let placeholders: HashMap<&str, (bool, bool)> = metadata.compacted_context.as_ref()
+                    .and_then(|snapshot| snapshot.entries.as_ref()).into_iter().flatten()
+                    .map(|entry| (entry.message_id.as_str(), (entry.prompt_prefix_placeholder, entry.prompt_suffix_placeholder)))
+                    .collect();
+                let mut by_id = Self::get_messages_with_conn_filtered_static(&conn, session_id, false)?
+                    .into_iter().map(|message| (message.id.clone(), message)).collect::<HashMap<_, _>>();
+                for kept_id in kept {
+                    let Some(message) = by_id.remove(kept_id) else {
+                        snapshot_status = "partial".to_string();
+                        continue;
+                    };
+                    let (prefix, suffix) = placeholders.get(kept_id).copied().unwrap_or((false, false));
+                    messages.push(CompactedContextMessageOutput {
+                        id: message.id, role: message.role, content: message.content,
+                        images: message.images, asset_refs: message.asset_refs,
+                        prompt_prefix_placeholder: prefix,
+                        prompt_suffix_placeholder: suffix,
+                    });
+                }
+            }
             return Ok(Some(CompactedContextOutput {
                 message_id: message_id.to_string(),
-                snapshot_status: if summary.is_some() { "complete" } else { "partial" }.to_string(),
+                snapshot_status,
                 compaction_kind: "claudeNative".to_string(),
                 encrypted_content_chars: None,
                 checkpoint: serde_json::Value::String("empty".to_string()),
-                messages: vec![CompactedContextMessageOutput {
-                    id: message_id.to_string(), role: MessageRole::User,
-                    content: summary.unwrap_or_else(|| "empty".to_string()),
-                    images: None, asset_refs: None,
-                    prompt_prefix_placeholder: false, prompt_suffix_placeholder: false,
-                }],
+                messages,
             }));
         }
 
@@ -8548,6 +8704,30 @@ impl SessionStore {
         retained_user_budget_tokens: u32,
         response_request: Option<&serde_json::Value>,
     ) -> Result<(u32, u32), String> {
+        self.compact_messages_retaining(
+            session_id,
+            summary_msg,
+            keep_from_message_id,
+            retained_user_budget_tokens,
+            &[],
+            response_request,
+        )
+    }
+
+    /// Like `compact_messages_with_response_request`, additionally keeping the
+    /// listed messages in the prompt mirror. Claude Code's native compaction
+    /// keeps its most recent messages verbatim after the summary; the mirror
+    /// must keep exactly those rows so context views and exports match what
+    /// Claude actually reads.
+    pub fn compact_messages_retaining(
+        &self,
+        session_id: &str,
+        summary_msg: &ChatMessage,
+        keep_from_message_id: &str,
+        retained_user_budget_tokens: u32,
+        retained_message_ids: &[String],
+        response_request: Option<&serde_json::Value>,
+    ) -> Result<(u32, u32), String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
 
         let count_before: u32 = conn
@@ -8629,6 +8809,17 @@ impl SessionStore {
                     "Failed to restore retained user message after compact: {}",
                     e
                 )
+            })?;
+        }
+
+        for message_id in retained_message_ids {
+            conn.execute(
+                "UPDATE messages SET include_in_prompt = 1 WHERE session_id = ?1 AND id = ?2",
+                params![session_id, message_id],
+            )
+            .map_err(|e| {
+                let _ = conn.execute("ROLLBACK", []);
+                format!("Failed to keep retained message after compact: {}", e)
             })?;
         }
 
@@ -11041,6 +11232,34 @@ mod tests {
     }
 
     #[test]
+    fn session_view_pages_redact_checkpoints_without_changing_prompt_or_compaction_preview() {
+        let dir = tempdir().unwrap();
+        let store = SessionStore::new(dir.path()).unwrap();
+        let id = store.create_session("checkpoint pages", None, None, "chat", None).unwrap();
+        store.add_message(&id, MessageRole::User, "original request").unwrap();
+        let mut checkpoint_ids = Vec::new();
+        for summary in ["first summary", "second summary"] {
+            let content = compact::build_conversation_checkpoint_content(summary, "recent messages");
+            checkpoint_ids.push(store.add_message(&id, MessageRole::User, &content).unwrap());
+            store.add_message(&id, MessageRole::Assistant, "answer").unwrap();
+        }
+        let view = store.load_session_view(&id, 2).unwrap();
+        let tail = store.load_session_tail_page(&id, 2).unwrap();
+        assert_eq!(serde_json::to_value(&view.session.messages).unwrap(), serde_json::to_value(&tail.messages).unwrap());
+        let older = store.load_session_message_page(&id, view.oldest_message_row_id.unwrap(), 2).unwrap();
+        for (page, checkpoint) in [(&older.messages, &checkpoint_ids[0]), (&tail.messages, &checkpoint_ids[1])] {
+            let marker = page.iter().find(|m| &m.id == checkpoint).unwrap();
+            assert_eq!(marker.content, CONTEXT_COMPACTED_DISPLAY_MARKER);
+            let full = store.load_session(&id).unwrap();
+            assert_eq!(serde_json::to_value(marker).unwrap(), serde_json::to_value(full.messages.iter().find(|m| &m.id == checkpoint).unwrap()).unwrap());
+        }
+        let prompt = store.get_messages_for_prompt(&id).unwrap();
+        assert!(prompt.iter().filter(|m| checkpoint_ids.contains(&m.id)).all(|m| m.content.starts_with("<conversation-checkpoint>")));
+        let preview = store.get_compacted_context_output(&id, &checkpoint_ids[0]).unwrap().unwrap();
+        assert!(preview.messages.iter().any(|m| m.content.contains("first summary")));
+    }
+
+    #[test]
     fn session_view_pages_reconstruct_history_without_duplicates() {
         let dir = tempdir().expect("create temp dir");
         let store = SessionStore::new(dir.path()).expect("initialize store");
@@ -11085,6 +11304,19 @@ mod tests {
             .map(|message| message.id)
             .collect::<Vec<_>>();
         assert_eq!(actual_ids, expected_ids);
+
+        // Live history events carry the same newest page and cursor.
+        let tail = store.load_session_tail_page(&session_id, 3).expect("load tail page");
+        let view = store.load_session_view(&session_id, 3).expect("load view");
+        assert_eq!(
+            tail.messages.iter().map(|message| &message.id).collect::<Vec<_>>(),
+            view.session.messages.iter().map(|message| &message.id).collect::<Vec<_>>(),
+        );
+        assert_eq!(tail.oldest_message_row_id, view.oldest_message_row_id);
+        assert!(tail.has_more_history);
+        let all = store.load_session_tail_page(&session_id, 100).expect("load whole history");
+        assert_eq!(all.messages.len(), 10);
+        assert!(!all.has_more_history);
     }
 
     #[test]
@@ -11171,6 +11403,50 @@ mod tests {
             .find(|message| message.id == checkpoint_id)
             .expect("keep compact divider in display history");
         assert_eq!(display_checkpoint.content, CONTEXT_COMPACTED_DISPLAY_MARKER);
+    }
+
+    #[test]
+    fn delivered_task_results_and_agent_messages_stay_in_display_history() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let session_id = store
+            .create_session("delivered notices", None, None, "chat", None)
+            .expect("create session");
+        store
+            .add_message(&session_id, MessageRole::User, "prompt")
+            .expect("add user");
+        let internal_reminder_id = store
+            .add_message_with_images_asset_refs_and_signature(
+                &session_id,
+                MessageRole::User,
+                "",
+                None,
+                None,
+                None,
+                None,
+                Some("<system-reminder>internal</system-reminder>"),
+            )
+            .expect("add internal reminder");
+        // The rows delivery writes: empty content, the reminder as suffix.
+        {
+            let conn = store.conn.lock().unwrap();
+            for id in ["async-result:t1", "agent-message:m1"] {
+                conn.execute(
+                    "INSERT INTO messages(id, session_id, role, content, created_at, prompt_suffix) VALUES(?1, ?2, 'user', '', ?3, ?4)",
+                    params![id, session_id, SessionStore::now_ts(), "<system-reminder>\nAgent \"probe\" finished\n</system-reminder>"],
+                )
+                .expect("insert delivered row");
+            }
+        }
+        let display: Vec<String> = store
+            .get_messages_for_display(&session_id)
+            .expect("load display messages")
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        assert!(display.iter().any(|id| id == "async-result:t1"), "{display:?}");
+        assert!(display.iter().any(|id| id == "agent-message:m1"), "{display:?}");
+        assert!(!display.contains(&internal_reminder_id), "{display:?}");
     }
 
     #[test]

@@ -108,7 +108,7 @@ async fn real_tui_four_searches_survive_a_twenty_second_first_search() {
     ]);
     let id=uuid::Uuid::new_v4().to_string();
     let options=ClaudeCodeCliOptions { remote:None,locus_session_id:id.clone(),cwd:root.path().to_string_lossy().into_owned(),
-        system_prompt:"LOCUS_SEARCH_LIFECYCLE".into(), model:"claude-sonnet-4-6".into(),effort:None,resume_session_id:None,tools:vec![],native_tool_search:false };
+        system_prompt:"LOCUS_SEARCH_LIFECYCLE".into(), model:"claude-sonnet-4-6".into(),effort:None,resume_session_id:None,tools:vec![],native_tool_search:false,native_agents:false,agents:serde_json::Value::Null };
     let mut host=Host::default();
     let result=tokio::time::timeout(Duration::from_secs(90),run_turn(options,json!({"role":"user","content":"Run the four fixture searches."}),&mut host)).await;
     tui::close_session(&id); server.abort();

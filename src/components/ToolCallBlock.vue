@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { ref, computed, inject, nextTick, watch } from "vue";
+import { ref, shallowRef, computed, inject, nextTick, watch } from "vue";
 import { PanelTopOpen } from "lucide";
 import MarkdownRenderer from "./MarkdownRenderer.vue";
 import ToolCallCollection from "./ToolCallCollection.vue";
@@ -11,10 +11,11 @@ import FileDiffViewer from "./diff/FileDiffViewer.vue";
 import LucideIcon from "./icons/LucideIcon.vue";
 import hljs, { langFromPath } from "../hljs";
 import { useThrottledStreamingText } from "../composables/streamingRenderThrottle";
-import { diffStrings } from "../services/diff";
 import { t } from "../i18n";
 import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverrides";
 import { buildToolCallArgsSummary, toolCallDisplayName } from "./toolCallSummary";
+import { delegationDisplayName, delegationRoute, isDelegationToolName } from "./agentToolCall";
+import { AGENT_ROUTES_SESSION_KEY, claudeAgentRoutes } from "../services/claudeAgentRoutes";
 import { persistedOutputDisplay } from "./toolPersistedOutput";
 import { normalizeViewError } from "../services/view";
 import { useOpenView } from "../composables/useOpenView";
@@ -28,7 +29,14 @@ import { parseToolSearchOutput } from "./toolSearchOutput";
 import { todoToolItems, todoToolOutput } from "../composables/todoWrite";
 import { nativeToolOutputDisplay } from "./nativeToolOutput";
 import { resolveToolFilePreviewPayload } from "./toolFilePreviewActions";
+import {
+  loadEditDiffPayload,
+  peekEditDiffPayload,
+  sameEditDiffSources,
+  type EditDiffSource,
+} from "./toolEditDiffPayloads";
 import { normalizeAppError } from "../services/errors";
+import { canOpenRemoteReferences, isRemoteClient, openRemoteReference } from "../services/remoteClient";
 import { openWorkbenchFileTab, WORKBENCH_FILE_OPEN_KEY } from "../services/workbenchFile";
 import type { WorkspaceRef } from "../services/project";
 
@@ -49,7 +57,7 @@ const emit = defineEmits<{
 }>();
 
 function isSubagentToolName(name: string) {
-  return name === "explore" || name === "subagent" || name === "task";
+  return isDelegationToolName(name);
 }
 
 function shouldAutoExpandSubagentTool(toolCall: ToolCallDisplay) {
@@ -209,15 +217,31 @@ const statusIcon = computed(() => {
 });
 
 const displayName = computed(() => {
-  if (props.toolCall.name === "subagent" || props.toolCall.name === "task") {
-    try {
-      const args = JSON.parse(props.toolCall.arguments);
-      return args.subagent_type || props.toolCall.name;
-    } catch {
-      return props.toolCall.name;
-    }
+  if (props.toolCall.name === "subagent" || props.toolCall.name === "task" || props.toolCall.name === "Agent") {
+    return delegationDisplayName(props.toolCall.name, props.toolCall.arguments);
   }
   return toolCallDisplayName(props.toolCall.name);
+});
+const agentRoutesSessionId = inject(AGENT_ROUTES_SESSION_KEY, null);
+const delegationRouteInfo = computed(() => {
+  if (!isDelegationToolName(props.toolCall.name)) return null;
+  const routes = props.toolCall.name === "Agent" ? claudeAgentRoutes(agentRoutesSessionId?.value) : null;
+  const route = delegationRoute(props.toolCall, routes);
+  // Locus subagent cards always run in Locus; only a chosen model is news.
+  return route && (props.toolCall.name === "Agent" || route.model) ? route : null;
+});
+const agentBackendLabel = computed(() => {
+  const route = delegationRouteInfo.value;
+  if (!route) return "";
+  const backend = route.backend === "claude" ? t("tool.agent.backendClaude") : t("tool.agent.backendLocus");
+  const model = route.model ?? (route.builtin ? t("tool.agent.builtin") : "");
+  return model ? `${backend} · ${model}` : backend;
+});
+const agentBackendTitle = computed(() => {
+  const route = delegationRouteInfo.value;
+  if (!route) return "";
+  if (!route.modelId) return route.builtin ? `${agentBackendLabel.value}: ${t("tool.agent.builtinModel")}` : agentBackendLabel.value;
+  return `${agentBackendLabel.value} (${route.modelId})`;
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
@@ -242,7 +266,9 @@ const toolFilePreviewPayload = computed(() => resolveToolFilePreviewPayload({
   status: props.toolCall.status,
   output: displayedToolOutput.value || props.toolCall.output,
 }));
-const showToolFilePreviewButton = computed(() => toolFilePreviewPayload.value !== null);
+// The phone client opens files in its own viewer; it has no View host.
+const showToolFilePreviewButton = computed(() =>
+  toolFilePreviewPayload.value !== null && (!isRemoteClient() || canOpenRemoteReferences()));
 const viewToolOpenId = computed(() =>
   resolveViewToolOpenId({
     name: props.toolCall.name,
@@ -251,7 +277,7 @@ const viewToolOpenId = computed(() =>
     status: props.toolCall.status,
   }),
 );
-const showViewOpenButton = computed(() => viewToolOpenId.value.length > 0);
+const showViewOpenButton = computed(() => !isRemoteClient() && viewToolOpenId.value.length > 0);
 
 interface EditDiffItem {
   oldStr: string;
@@ -306,36 +332,64 @@ const editDiffData = computed((): EditDiffResult | null => {
   }
 });
 
-// Compute diff payloads for each edit item using backend diff_strings
-const editDiffPayloads = ref<Map<number, FileDiffPayload>>(new Map());
+// Diff payloads for each edit item, computed by the backend diff_strings.
+// Re-renders pass a new toolCall object with the same edits, so payloads are
+// keyed by edit content: an unchanged edit keeps its payload object, and a
+// changed edit keeps showing the previous diff until the new one is ready.
+// Payloads come from a shared content cache, so a remounted block renders
+// its diff synchronously instead of flashing the fallback and a reload.
+const editDiffPayloads = shallowRef<ReadonlyMap<number, FileDiffPayload>>(new Map());
+const editDiffSources = computed((): EditDiffSource[] => {
+  const data = editDiffData.value;
+  if (!data) return [];
+  return data.items.map((item, index) => ({
+    filePath: data.filePath,
+    oldStr: item.oldStr,
+    newStr: item.newStr,
+    index,
+  }));
+});
+let appliedEditDiffSources: EditDiffSource[] | null = null;
+let appliedEditDiffToolCallId: string | null = null;
+let editDiffPayloadGeneration = 0;
 
-watch(editDiffData, async (data) => {
-  editDiffPayloads.value = new Map();
-  if (!data) return;
-  for (let i = 0; i < data.items.length; i++) {
-    const item = data.items[i];
-    try {
-      const hunks = await diffStrings(item.oldStr, item.newStr, 3);
-      const additions = hunks.reduce((sum, h) => sum + h.lines.filter(l => l.kind === "add").length, 0);
-      const deletions = hunks.reduce((sum, h) => sum + h.lines.filter(l => l.kind === "delete").length, 0);
-      const payload: FileDiffPayload = {
-        key: `edit-${i}`,
-        filePath: data.filePath,
-        status: "M",
-        language: langFromPath(data.filePath) || undefined,
-        isBinary: false,
-        isLarge: false,
-        contentState: { type: 'normal' },
-        stats: { additions, deletions, changedHunks: hunks.length },
-        previewSummary: [`+${additions} -${deletions}`],
-        text: { hunks },
-      };
-      editDiffPayloads.value.set(i, payload);
-    } catch {
-      // Fall through to old rendering if diff fails
-    }
+async function refreshEditDiffPayloads(sources: EditDiffSource[]) {
+  const toolCallId = props.toolCall.id;
+  if (
+    appliedEditDiffSources
+    && appliedEditDiffToolCallId === toolCallId
+    && sameEditDiffSources(appliedEditDiffSources, sources)
+  ) return;
+  const sameToolCall = appliedEditDiffToolCallId === toolCallId;
+  appliedEditDiffSources = sources;
+  appliedEditDiffToolCallId = toolCallId;
+  const generation = ++editDiffPayloadGeneration;
+
+  const ready = new Map<number, FileDiffPayload>();
+  for (const source of sources) {
+    const payload = peekEditDiffPayload(source);
+    if (payload) ready.set(source.index, payload);
   }
-}, { immediate: true });
+  if (ready.size === sources.length) {
+    editDiffPayloads.value = ready;
+    return;
+  }
+  // A different tool call never shows the previous call's diff.
+  if (!sameToolCall) editDiffPayloads.value = ready;
+
+  const loaded = await Promise.all(
+    sources.map((source) => ready.get(source.index) ?? loadEditDiffPayload(source)),
+  );
+  if (generation !== editDiffPayloadGeneration) return;
+  const next = new Map<number, FileDiffPayload>();
+  loaded.forEach((payload, position) => {
+    // Failed diffs fall through to the plain old/new rendering.
+    if (payload) next.set(sources[position]!.index, payload);
+  });
+  editDiffPayloads.value = next;
+}
+
+watch(editDiffSources, (sources) => { void refreshEditDiffPayloads(sources); }, { immediate: true });
 
 /** Syntax-highlight diff content and return HTML with line numbers.
  *  startLine: 1-based line number in the source file, 0 means start from 1
@@ -369,7 +423,7 @@ const parsedArgs = computed(() => {
   try {
     const args = JSON.parse(props.toolCall.arguments);
     if (typeof args !== "object" || args === null || Array.isArray(args)) return [];
-    const isSubagent = props.toolCall.name === "subagent" || props.toolCall.name === "task";
+    const isSubagent = props.toolCall.name === "subagent" || props.toolCall.name === "task" || props.toolCall.name === "Agent";
     const isEdit = props.toolCall.name === "edit";
     const isUnityTestTool = props.toolCall.name === "unity_test_list";
     const editDiffKeys = ["oldString", "old_string", "newString", "new_string", "edits"];
@@ -478,6 +532,10 @@ async function openToolFilePreview() {
   if (openingFilePreview.value) return;
   const payload = toolFilePreviewPayload.value;
   if (!payload) return;
+  if (isRemoteClient()) {
+    openRemoteReference({ kind: "file", path: payload.filePath, workspaceRef: props.workspaceRef });
+    return;
+  }
   openingFilePreview.value = true;
   try {
     const workspaceRef = props.workspaceRef === undefined
@@ -604,6 +662,11 @@ const highlightedOutput = computed(() => {
           <span v-else class="tool-call-status-dot"></span>
         </span>
         <span class="tool-call-name">{{ displayName }}</span>
+        <span
+          v-if="agentBackendLabel"
+          class="tool-call-backend-badge"
+          :title="agentBackendTitle"
+        >{{ agentBackendLabel }}</span>
         <span
           v-if="headerSummary"
           class="tool-call-summary"
@@ -909,6 +972,20 @@ const highlightedOutput = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
+}
+
+.tool-call-backend-badge {
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 5px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 15px;
+  white-space: nowrap;
 }
 
 .tool-call-inline-note {

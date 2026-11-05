@@ -492,6 +492,7 @@ fn apply_event_to_snapshot(
             question_id,
             tool_call_id,
             display,
+            agent,
             ..
         } => {
             snapshot
@@ -501,6 +502,7 @@ fn apply_event_to_snapshot(
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.clone(),
                 display: display.clone(),
+                agent: agent.clone(),
             });
         }
         StreamEvent::InputAnswered { question_id, .. } => {
@@ -1136,7 +1138,7 @@ mod tests {
             arguments: "{}".into(), order: Some(1), part_id: None, render_seq: None,
         });
         registry.apply_stream_event("run", &StreamEvent::ClaudeCodePhase { session_id: "s1".into(), phase: ClaudeCodePhase::Recovering });
-        registry.apply_stream_event("run", &StreamEvent::HistorySynchronized { session_id: "s1".into(), messages: vec![] });
+        registry.apply_stream_event("run", &StreamEvent::HistorySynchronized { session_id: "s1".into(), messages: Some(vec![]), oldest_message_row_id: None, has_more_history: Some(false) });
         let snapshot = registry.snapshot("s1").unwrap();
         assert_eq!(snapshot.active_run.run_id, "run");
         assert_eq!(snapshot.claude_code_phase, Some(ClaudeCodePhase::Recovering));

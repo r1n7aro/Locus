@@ -2,6 +2,8 @@ mod auto_review;
 mod async_resume;
 mod backend;
 mod claude_code_cli;
+mod claude_native_agents;
+pub(crate) use claude_native_agents::claude_agent_routes;
 mod codex_steering;
 mod codex_web;
 mod custom_codex;
@@ -12,7 +14,9 @@ mod multi_agent;
 mod plan_policy;
 mod prompt_context;
 mod read_file;
+mod subagent_contract;
 mod subagent_model;
+mod blender_execute;
 mod unity_capture;
 mod unity_yaml_extension;
 mod view_capture;
@@ -120,6 +124,7 @@ impl LlmRequestOptions {
 }
 
 fn is_codex_unauthorized_error(error: &str) -> bool {
+    if error.starts_with(locus_remote_core::network::UPSTREAM_ERROR_MARKER) { return false; }
     let lower = error.to_ascii_lowercase();
     lower.contains("401 unauthorized")
         || lower.contains("http error: 401")
@@ -190,6 +195,16 @@ async fn resolve_codex_request_auth(
 }
 
 /// Emit a StreamEvent through the session gateway with the given run_id.
+tokio::task_local! {
+    /// The Claude subagent on whose behalf a call runs (its confirmations
+    /// name it, and may arrive while no turn is running).
+    pub(super) static CONFIRM_AGENT_LABEL: String;
+}
+
+fn confirm_agent_label() -> Option<String> {
+    CONFIRM_AGENT_LABEL.try_with(Clone::clone).ok()
+}
+
 fn emit_stream(handle: &AppHandle, run_id: &str, event: StreamEvent) {
     let store: tauri::State<'_, Arc<SessionStore>> = handle.state();
     crate::session::gateway::emit_stream(handle, store.inner().as_ref(), run_id, event);
@@ -298,7 +313,6 @@ pub struct AgentInstance {
     codex_fast_mode: bool,
     codex_use_apply_patch: AtomicBool,
     preview_codex_subscription: bool,
-    async_tasks_enabled: bool,
     background_task_id: Option<String>,
     resumed_subagent: Option<crate::async_tasks::SubagentResumeInfo>,
     app_knowledge_dir: Arc<Option<std::path::PathBuf>>,
@@ -307,9 +321,12 @@ pub struct AgentInstance {
     knowledge_focus: Option<KnowledgeFocusDoc>,
     undo_manager: Option<Arc<crate::vcs::UndoManager>>,
     session_undo_enabled: bool,
-    subagent_model_overrides: std::collections::HashMap<String, String>,
+    subagent_model_overrides: crate::agent::subagent_models::SubagentModelChoices,
     subagent_effort_overrides: std::collections::HashMap<String, String>,
     subagent_fast_mode_overrides: std::collections::HashMap<String, bool>,
+    /// The `subagent` definition this session first offered (see
+    /// `subagent_contract`); `None` renders the current settings.
+    pinned_subagent_tool: Mutex<Option<crate::session::store::SessionToolContract>>,
     tool_runtime_state: Arc<ToolRuntimeState>,
     loaded_tool_names: Mutex<HashSet<String>>,
     document_skill_tool_names: Mutex<HashSet<String>>,
@@ -322,6 +339,9 @@ pub struct AgentInstance {
     /// prompt assembly, tool handlers) can branch on it; `ToolLoadFallback`
     /// outside runs.
     lazy_tool_renderer: Mutex<LazyToolRenderer>,
+    /// Pinned delegation directory while this run uses the Claude-native
+    /// multi-agent route (see `claude_native_agents`); `None` otherwise.
+    claude_delegation: Mutex<Option<Arc<claude_native_agents::DelegationDirectory>>>,
     partial_assistant: Arc<AssistantStreamState>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     /// Run-scoped view of the session's sticky plan mode. Initialized from
@@ -807,6 +827,9 @@ pub struct AssistantStreamSnapshot {
     pub thinking_content: String,
     pub thinking_duration: Option<u32>,
     pub persisted_message_id: Option<String>,
+    /// Provenance of the producer, not proof that this partial text was
+    /// committed upstream. Native checkpoints must come from native receipts.
+    pub response_metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default)]
@@ -823,6 +846,12 @@ pub struct InterruptedAssistantMessage {
 }
 
 impl AssistantStreamState {
+    pub fn set_response_metadata(&self, metadata: serde_json::Value) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.response_metadata = Some(metadata);
+        }
+    }
+
     pub fn append_text(&self, delta: &str) {
         if delta.is_empty() {
             return;
@@ -1268,6 +1297,8 @@ enum ToolConfirmReason {
     UserPermission,
     KnowledgeGovernance,
     DangerousCommand,
+    SettingsChange,
+    SensitiveSettingsChange,
 }
 
 impl ToolConfirmReason {
@@ -1276,6 +1307,8 @@ impl ToolConfirmReason {
             Self::UserPermission => "user_permission",
             Self::KnowledgeGovernance => "knowledge_governance",
             Self::DangerousCommand => "dangerous_command",
+            Self::SettingsChange => "settings_change",
+            Self::SensitiveSettingsChange => "sensitive_settings_change",
         }
     }
 }
@@ -3311,6 +3344,8 @@ fn env_block_position(env_template: &str, tags: &[&str]) -> usize {
 
 fn injected_item_prompt_sort_key(env_template: &str, item_id: &str) -> (u8, usize) {
     match item_id {
+        // Service usage notes render before the extra workdirs block.
+        crate::workspace_service::blender::PROMPT_INJECTION_ID => (0, usize::MAX - 1),
         // Extra workdirs render inside the env block right after the working
         // directory, so the item sorts directly behind the env.md entry.
         "extra_workdirs" => (0, usize::MAX),
@@ -3836,6 +3871,7 @@ impl AgentInstance {
                 }
             }
             "python"
+            | "blender_execute"
             | "unity_set_play_mode"
             | "unity_execute"
             | "unity_run_states"
@@ -3907,6 +3943,7 @@ impl AgentInstance {
         &self,
         _include_index: bool,
         _include_memory: bool,
+        agent_id: &str,
     ) -> Option<String> {
         if !self.has_selected_working_dir() {
             return None;
@@ -3943,7 +3980,7 @@ impl AgentInstance {
             if let Ok(full_document_section) = build_l2_full_document_section(
                 &self.working_dir,
                 self.app_knowledge_dir.as_ref().as_ref(),
-                &self.def.id,
+                agent_id,
             ) {
                 if !full_document_section.trim().is_empty() {
                     sections.push(full_document_section);
@@ -3989,7 +4026,7 @@ impl AgentInstance {
         app_agent_dir: Arc<Option<std::path::PathBuf>>,
         knowledge_access_mode: KnowledgeAccessMode,
         undo_manager: Option<Arc<crate::vcs::UndoManager>>,
-        subagent_model_overrides: std::collections::HashMap<String, String>,
+        subagent_model_overrides: crate::agent::subagent_models::SubagentModelChoices,
         cancel_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         let effective_effort = effort.or_else(|| def.default_effort.clone());
@@ -4020,7 +4057,6 @@ impl AgentInstance {
                 crate::commands::load_codex_model_config().unwrap_or_default().use_apply_patch,
             ),
             preview_codex_subscription: false,
-            async_tasks_enabled: false,
             background_task_id: None,
             resumed_subagent: None,
             app_knowledge_dir,
@@ -4032,11 +4068,13 @@ impl AgentInstance {
             subagent_model_overrides,
             subagent_effort_overrides: std::collections::HashMap::new(),
             subagent_fast_mode_overrides: std::collections::HashMap::new(),
+            pinned_subagent_tool: Mutex::new(None),
             tool_runtime_state: Arc::new(ToolRuntimeState::default()),
             loaded_tool_names: Mutex::new(HashSet::new()),
             document_skill_tool_names: Mutex::new(HashSet::new()),
             active_skill_package_ids: Mutex::new(HashSet::new()),
             lazy_tool_renderer: Mutex::new(LazyToolRenderer::default()),
+            claude_delegation: Mutex::new(None),
             partial_assistant: Arc::new(AssistantStreamState::default()),
             cancel_rx,
             plan_runtime: Mutex::new(None),
@@ -4074,10 +4112,6 @@ impl AgentInstance {
     ) {
         self.subagent_effort_overrides = efforts;
         self.subagent_fast_mode_overrides = fast_modes;
-    }
-
-    pub fn set_async_tasks_enabled(&mut self, enabled: bool) {
-        self.async_tasks_enabled = enabled;
     }
 
     /// Marks this instance as a subagent whose parent session is in plan
@@ -4321,6 +4355,9 @@ impl AgentInstance {
         if self.multi_agent_enabled && self.tool_registry.tool_description("subagent").is_some() {
             push_unique_tool_name(&mut tools, "subagent");
         }
+        if self.multi_agent_enabled {
+            push_unique_tool_name(&mut tools, multi_agent::SEND_MESSAGE_TOOL);
+        }
         if crate::unity_editor_lock::is_enabled() {
             push_unique_tool_name(&mut tools, "unity_lock");
             push_unique_tool_name(&mut tools, "unity_release");
@@ -4347,30 +4384,24 @@ impl AgentInstance {
         if let Some(owner) = crate::workspace_service::service::owner_service_for_tool(name) {
             match self.execution_context.as_ref() {
                 Some(execution) => {
+                    // Only an off or undetected service hides its tools.
+                    // Lazy-mode services bind on the first actual call.
                     if !execution
                         .workspace
                         .services()
                         .detected_kinds()
                         .contains(&owner)
                     {
-                        return Some(match owner {
-                            crate::workspace_service::ServiceKind::Unity => {
-                                "requires_unity_workspace"
-                            }
-                        });
+                        return Some(owner.missing_reason());
                     }
-                    if execution.binding(owner).is_none() {
-                        return Some(match owner {
-                            crate::workspace_service::ServiceKind::Unity => {
-                                "unity_service_unavailable"
-                            }
-                        });
+                    if execution.effective_mode(owner)
+                        == crate::workspace_service::EffectiveServiceMode::Off
+                    {
+                        return Some(owner.workspace_disabled_reason());
                     }
                 }
                 None if !self.has_selected_working_dir() => {
-                    return Some(match owner {
-                        crate::workspace_service::ServiceKind::Unity => "requires_unity_workspace",
-                    });
+                    return Some(owner.missing_reason());
                 }
                 // Legacy execution paths with an explicit working directory
                 // predate checkout-scoped bindings. Preserve their runtime
@@ -4386,7 +4417,7 @@ impl AgentInstance {
             }
             "unity_lock" | "unity_release"
                 if !self.has_selected_working_dir()
-                    || !crate::unity_bridge::is_unity_project(&self.working_dir) =>
+                    || !crate::unity_bridge::unity_integration_enabled(&self.working_dir) =>
             {
                 Some("requires_unity_workspace")
             }
@@ -4435,7 +4466,7 @@ impl AgentInstance {
     }
 
     fn tool_runtime_unavailable_reason(&self, name: &str) -> Option<&'static str> {
-        (name == "subagent" && !self.multi_agent_enabled)
+        (multi_agent::requires_multi_agent(name) && !self.multi_agent_enabled)
             .then_some("multi_agent_disabled")
             .or_else(|| self.tool_environment_unavailable_reason(name))
             .or_else(|| (!self.tool_supported_by_model(name)).then_some("model_vision_unsupported"))
@@ -4599,9 +4630,11 @@ impl AgentInstance {
     }
 
     fn resolve_api_tool(&self, name: &str) -> Option<serde_json::Value> {
-        if self.canonical_tool_name(name).as_deref() == Some("subagent")
-            && (!self.multi_agent_enabled || self.subagent_tool_suppressed)
-        {
+        let canonical = self.canonical_tool_name(name);
+        if canonical.as_deref().is_some_and(|canonical| {
+            (multi_agent::requires_multi_agent(canonical) && !self.multi_agent_enabled)
+                || (canonical == "subagent" && self.subagent_tool_suppressed)
+        }) {
             return None;
         }
         self.resolve_tool_schema(name)
@@ -4676,6 +4709,11 @@ impl AgentInstance {
         if self.disables_tool_load_configuration() {
             return default_mode;
         }
+        // A lazy-mode service stays out of the prompt until it is used: its
+        // tools are always deferred, ahead of per-agent direct overrides.
+        if self.service_tool_in_lazy_mode(name) {
+            return ToolLoadMode::Lazy;
+        }
         // Built-ins and MCP wire tools accept per-agent direct/lazy
         // overrides; skill-package tools stay on their manifest default.
         if !self.tool_registry.is_built_in(name) && !Self::is_mcp_wire_tool(name) {
@@ -4688,6 +4726,15 @@ impl AgentInstance {
             Some(false) => ToolLoadMode::Lazy,
             None => default_mode,
         }
+    }
+
+    fn service_tool_in_lazy_mode(&self, name: &str) -> bool {
+        let Some(owner) = crate::workspace_service::service::owner_service_for_tool(name) else {
+            return false;
+        };
+        self.execution_context.as_ref().is_some_and(|execution| {
+            execution.effective_mode(owner) == crate::workspace_service::EffectiveServiceMode::Lazy
+        })
     }
 
     fn default_direct_load_for_tool(&self, name: &str) -> bool {
@@ -4721,6 +4768,10 @@ impl AgentInstance {
         // set, so the model is never offered a tool it cannot use.
         if !self.multi_agent_enabled || self.subagent_tool_suppressed {
             allowed.remove("subagent");
+        }
+        // Depth-capped children keep send_message so they can still reply.
+        if !self.multi_agent_enabled {
+            allowed.remove(multi_agent::SEND_MESSAGE_TOOL);
         }
         // Native providers own web retrieval. This also closes legacy tool_load and
         // tool_call paths instead of only hiding the model-facing MCP alias.
@@ -4822,11 +4873,7 @@ impl AgentInstance {
     /// `tool_search` protocol (verified against the codex models manifest);
     /// there is no runtime strip-retry on this path, so gate conservatively.
     fn codex_model_supports_tool_search(model: &str) -> bool {
-        let normalized = model
-            .trim()
-            .strip_prefix("openai/")
-            .unwrap_or(model.trim())
-            .to_ascii_lowercase();
+        let normalized = codex::protocol_model_name(model.trim()).to_ascii_lowercase();
         if normalized == "codex-auto-review" {
             return true;
         }
@@ -4851,6 +4898,8 @@ impl AgentInstance {
     /// `api.openai.com`/custom endpoints stay on the fallback until probed
     /// (plan T4).
     fn codex_backend_supports_tool_search(base_url: Option<&str>) -> bool {
+        #[cfg(feature = "server-client")]
+        if base_url.is_some_and(crate::server_client::is_codex_proxy_url) { return true; }
         match base_url.map(str::trim).filter(|value| !value.is_empty()) {
             None => true,
             Some(url) => url.contains("chatgpt.com"),
@@ -4934,10 +4983,13 @@ impl AgentInstance {
         {
             self.effective_model = selected_model.to_string();
         }
-        self.preview_codex_subscription = self.effective_model.trim().starts_with("openai/");
+        let preview_model = self.effective_model.trim();
+        #[cfg(feature = "server-client")]
+        let preview_model = crate::server_client::protocol_model_id(preview_model);
+        self.preview_codex_subscription = preview_model.starts_with("openai/");
 
         let renderer = if dynamic_mode == crate::config::DynamicToolLoadingMode::Native
-            && self.effective_model.trim().starts_with("openai/")
+            && preview_model.starts_with("openai/")
             && Self::codex_backend_supports_tool_search(base_url)
             && Self::codex_model_supports_tool_search(&self.effective_model)
         {
@@ -5223,12 +5275,15 @@ impl AgentInstance {
 
     async fn lazy_tool_manifest_names(&self) -> Vec<String> {
         let direct_overrides = self.tool_direct_load_overrides();
+        // The Claude-native route delegates through Agent, not these tools.
+        let unified = self.claude_delegation().is_some();
         let mut names: Vec<_> = self
             .allowed_tool_set()
             .await
             .into_iter()
             .filter(|name| {
                 !Self::is_meta_tool(name)
+                    && !(unified && multi_agent::requires_multi_agent(name))
                     && self.configured_tool_load_mode(name, &direct_overrides) == ToolLoadMode::Lazy
             })
             .collect();
@@ -5482,6 +5537,28 @@ impl AgentInstance {
             .collect()
     }
 
+    /// Blender usage note for `def`, with the workspace mode that selected
+    /// its text. Present only when the workspace turned the service on and
+    /// `def` has an enabled `blender_execute`. The mode is a workspace
+    /// setting, not run state, so the note is the same before and after a
+    /// lazy service binds mid-session and never moves the prompt prefix.
+    async fn blender_prompt_fragment(
+        &self,
+        def: &AgentDef,
+    ) -> Option<(
+        crate::workspace_service::EffectiveServiceMode,
+        crate::workspace_service::service::PromptFragment,
+    )> {
+        let execution = self.execution_context.as_ref()?;
+        if !def.tools.iter().any(|tool| tool == "blender_execute")
+            || !self.allowed_tool_set().await.contains("blender_execute")
+        {
+            return None;
+        }
+        let mode = execution.effective_mode(crate::workspace_service::ServiceKind::Blender);
+        crate::workspace_service::blender::prompt_fragment(mode).map(|fragment| (mode, fragment))
+    }
+
     pub async fn list_injected_prompt_items(&self) -> Vec<InjectedPromptItem> {
         let mut items = Vec::new();
         let has_working_dir = self.has_selected_working_dir();
@@ -5500,6 +5577,21 @@ impl AgentInstance {
             source: "system".to_string(),
             meta: Some(injection_item_meta(&injection_config, "env", None)),
         });
+
+        if let Some((mode, fragment)) = self.blender_prompt_fragment(&self.def).await {
+            items.push(InjectedPromptItem {
+                id: fragment.id.clone(),
+                title: "Blender".to_string(),
+                kind: "context".to_string(),
+                content: fragment.content,
+                source: "workspace".to_string(),
+                meta: Some(injection_item_meta(
+                    &injection_config,
+                    &fragment.id,
+                    Some(serde_json::json!({ "serviceMode": mode })),
+                )),
+            });
+        }
 
         if has_working_dir {
             if let Some(content) = crate::extra_workdirs::build_env_prompt_block(&self.working_dir)
@@ -5545,7 +5637,7 @@ impl AgentInstance {
             let include_memory = env_template.contains("{{#knowledge_memory}}");
             if env_template.contains("{{#knowledge}}") {
                 if let Some(content) = self
-                    .build_runtime_knowledge_block(include_index, include_memory)
+                    .build_runtime_knowledge_block(include_index, include_memory, &self.def.id)
                     .await
                 {
                     items.push(InjectedPromptItem {
@@ -5701,7 +5793,10 @@ impl AgentInstance {
         // Keep the detail window aligned with the ring's provider-reported
         // occupancy. A locally estimated growth after the last completed
         // request may raise the current value further.
-        let context_tokens = if self.effective_model.starts_with("claude_code/") && usage.context_tokens > 0 {
+        let context_model = self.effective_model.as_str();
+        #[cfg(feature = "server-client")]
+        let context_model = crate::server_client::provider_model_id(context_model);
+        let context_tokens = if context_model.starts_with("claude_code/") && usage.context_tokens > 0 {
             // The CLI owns compaction and its prompt; the Locus transcript
             // includes historical tool results outside that live window.
             usage.context_tokens
@@ -6062,7 +6157,7 @@ impl AgentInstance {
             );
         }
         let contextualized = if name == "subagent" {
-            (self.render_subagent_tool_description(), parameters)
+            self.subagent_tool_contract(parameters)
         } else if name == "knowledge_query" && !self.knowledge_semantic_search_enabled() {
             Self::remove_knowledge_query_semantic_parameter(&mut parameters);
             (
@@ -6084,7 +6179,7 @@ impl AgentInstance {
             (description, parameters)
         };
         let (description, mut parameters) = contextualized;
-        if self.async_tasks_enabled && crate::async_tasks::supports_async_mode(name) {
+        if crate::async_tasks::supports_async_mode(name) {
             let mut tool = serde_json::json!({
                 "function": {
                     "name": name,
@@ -6154,10 +6249,12 @@ impl AgentInstance {
                 .get_mut("function")
                 .and_then(serde_json::Value::as_object_mut)
             {
-                function.insert(
-                    "description".to_string(),
-                    serde_json::json!(self.render_subagent_tool_description()),
-                );
+                let parameters = function
+                    .remove("parameters")
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let (description, parameters) = self.subagent_tool_contract(parameters);
+                function.insert("description".to_string(), serde_json::json!(description));
+                function.insert("parameters".to_string(), parameters);
             }
         } else if name == "knowledge_query" && !self.knowledge_semantic_search_enabled() {
             if let Some(function) = tool
@@ -6194,9 +6291,7 @@ impl AgentInstance {
                 );
             }
         }
-        if self.async_tasks_enabled {
-            crate::async_tasks::augment_tool_schema(&name, &mut tool);
-        }
+        crate::async_tasks::augment_tool_schema(&name, &mut tool);
         self.apply_tool_description_context(&name, &mut tool);
         if name == "write" && self.uses_codex_apply_patch() {
             if let Some(description) = tool["function"]["description"].as_str() {
@@ -6406,12 +6501,19 @@ impl AgentInstance {
 
     ///
     async fn build_system_prompt_parts(&self) -> SystemPromptParts {
+        self.build_system_prompt_parts_for(&self.def, false).await
+    }
+
+    /// `def`'s prompt in this agent's workspace. A native Claude subagent's
+    /// copy omits what belongs to this agent's own run: its delegation
+    /// guidance, the lazy-tool manifest and the session's document focus.
+    async fn build_system_prompt_parts_for(&self, def: &AgentDef, native_subagent: bool) -> SystemPromptParts {
         let started_at = Instant::now();
         let has_working_dir = self.has_selected_working_dir();
         let injection_config = crate::commands::load_agent_injection_config_layers(
             self.app_agent_dir.as_ref(),
             &self.working_dir,
-            &self.def.id,
+            &def.id,
         );
         let os = std::env::consts::OS.to_string();
         let arch = std::env::consts::ARCH.to_string();
@@ -6448,10 +6550,10 @@ impl AgentInstance {
 
         // ── Unity-specific data ──────────────────────────────────
         let unity_started_at = Instant::now();
-        if unity_version.is_some() && self.def.env_template.contains("{{#unity}}") {
+        if unity_version.is_some() && def.env_template.contains("{{#unity}}") {
             // Editor status placeholders are optional: agents without them get
             // status through the per-run conversation announcements instead.
-            if self.def.env_template.contains("<unity_status>") {
+            if def.env_template.contains("<unity_status>") {
                 let (connected, status, active_scene) =
                     crate::unity_bridge::query_unity_status(&self.working_dir).await;
                 eprintln!(
@@ -6499,7 +6601,7 @@ impl AgentInstance {
             physics_config.len()
         );
 
-        let source_env_template = self.def.env_template.clone();
+        let source_env_template = def.env_template.clone();
         let mut env = if injection_config.state("env").enabled {
             source_env_template.clone()
         } else {
@@ -6608,7 +6710,7 @@ impl AgentInstance {
             && injection_config.state("knowledge_context").enabled
         {
             if let Some(knowledge_block) = self
-                .build_runtime_knowledge_block(include_index, include_memory)
+                .build_runtime_knowledge_block(include_index, include_memory, &def.id)
                 .await
             {
                 knowledge_prompt = knowledge_block.trim().to_string();
@@ -6628,7 +6730,7 @@ impl AgentInstance {
 
         // Session-scoped document focus (embedded knowledge chat). Loaded
         // fresh every run so the env always reflects the document's latest state.
-        if let Some(focus) = &self.knowledge_focus {
+        if let Some(focus) = self.knowledge_focus.as_ref().filter(|_| !native_subagent) {
             if has_working_dir && self.knowledge_access_mode.allows_context() {
                 match crate::knowledge_store::load_document_by_path_with_app_root(
                     &self.working_dir,
@@ -6682,7 +6784,7 @@ impl AgentInstance {
         }
 
         if let Some(execution) = self.execution_context.as_ref() {
-            for binding in execution.service_bindings.values() {
+            for binding in execution.bindings() {
                 if let Ok(resolved) = binding.resolve() {
                     for fragment in resolved
                         .service
@@ -6695,6 +6797,15 @@ impl AgentInstance {
                         }
                     }
                 }
+            }
+        }
+
+        // Mode-driven notes: unlike binding fragments they exist before a lazy
+        // service binds, so they come from the workspace setting alone.
+        if let Some((_, fragment)) = self.blender_prompt_fragment(def).await {
+            if injection_config.state(&fragment.id).enabled && !fragment.content.is_empty() {
+                env.push_str("\n\n");
+                env.push_str(&fragment.content);
             }
         }
 
@@ -6727,6 +6838,7 @@ impl AgentInstance {
         if (has_working_dir || lazy_renderer == LazyToolRenderer::CodexNative)
             && lazy_renderer != LazyToolRenderer::AnthropicNative
             && injection_config.state("lazy_tool_names").enabled
+            && !native_subagent
         {
             if let Some(lazy_tool_manifest) = self.lazy_tool_manifest_prompt().await {
                 env.push_str("\n\n");
@@ -6739,7 +6851,7 @@ impl AgentInstance {
             let rule_entries = crate::commands::collect_agent_rule_files(
                 self.app_agent_dir.as_ref(),
                 &self.working_dir,
-                &self.def.id,
+                &def.id,
                 false,
             )
             .unwrap_or_default();
@@ -6764,7 +6876,7 @@ impl AgentInstance {
                 if let Ok(l3_rules) = build_l3_rule_section(
                     &self.working_dir,
                     self.app_knowledge_dir.as_ref().as_ref(),
-                    &self.def.id,
+                    &def.id,
                     &injection_config,
                 ) {
                     if !l3_rules.trim().is_empty() {
@@ -6773,7 +6885,7 @@ impl AgentInstance {
                 }
             }
 
-            if let Some(guidance) = self.explicit_delegation_guidance() {
+            if let Some(guidance) = self.explicit_delegation_guidance().filter(|_| !native_subagent) {
                 sections.push(format!("<multi_agent_mode>\n{guidance}\n</multi_agent_mode>"));
             }
             sections.join("\n\n")
@@ -6795,14 +6907,14 @@ impl AgentInstance {
             self.id,
             self.session_id,
             started_at.elapsed().as_millis(),
-            self.def.system_prompt.len(),
+            def.system_prompt.len(),
             env.len(),
             rules_prompt.len(),
             knowledge_prompt.len()
         );
 
         SystemPromptParts {
-            base_prompt: self.def.system_prompt.clone(),
+            base_prompt: def.system_prompt.clone(),
             rules_prompt,
             knowledge_prompt,
             env_prompt: env,
@@ -8372,7 +8484,7 @@ impl AgentInstance {
     }
 
     async fn cleanup_unity_edit_session(&self) {
-        if !crate::unity_bridge::is_unity_project(&self.working_dir) {
+        if !crate::unity_bridge::unity_integration_enabled(&self.working_dir) {
             return;
         }
 
@@ -8469,6 +8581,7 @@ impl AgentInstance {
             store,
             child_def.clone(),
             &child_session_id,
+            None,
             self.cancel_waiter(),
         )
         .await
@@ -8600,7 +8713,7 @@ impl AgentInstance {
             } => {
                 let system_prompt = system_parts.join("\n\n");
                 let model_name = &self.effective_model;
-                let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
+                let actual_model = codex::protocol_model_name(model_name);
                 let mut owned_turn_state = codex::TurnState::default();
                 let codex_turn_state = codex_turn_state.unwrap_or(&mut owned_turn_state);
                 let response_request_metadata =
@@ -9053,7 +9166,7 @@ impl AgentInstance {
         {
             let system_prompt = system_parts.join("\n\n");
             let model_name = &self.effective_model;
-            let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
+            let actual_model = codex::protocol_model_name(model_name);
             let mut compact_turn_state = codex::TurnState::default();
             let (access_token, account_id) = resolve_codex_request_auth(auth, false)
                 .await
@@ -9474,7 +9587,7 @@ impl AgentInstance {
         let compacted_context_tokens = self
             .persist_compacted_context_usage(store, system_parts, request_tools, context_limit)
             .await;
-        let compacted_messages = store.get_messages_for_display(&self.session_id)?;
+        let page = crate::commands::StreamHistoryPage::load(store, &self.session_id)?;
         eprintln!(
             "[Agent {}] codex remote compact done: {} → {} messages",
             self.id, count_before, count_after
@@ -9488,7 +9601,9 @@ impl AgentInstance {
                 messages_after: count_after,
                 context_tokens: compacted_context_tokens,
                 context_limit,
-                messages: compacted_messages,
+                messages: page.messages,
+                oldest_message_row_id: page.oldest_message_row_id,
+                has_more_history: page.has_more_history,
             },
         );
 
@@ -9740,7 +9855,7 @@ impl AgentInstance {
         let compacted_context_tokens = self
             .persist_compacted_context_usage(store, system_parts, request_tools, context_limit)
             .await;
-        let compacted_messages = store.get_messages_for_display(&self.session_id)?;
+        let page = crate::commands::StreamHistoryPage::load(store, &self.session_id)?;
 
         eprintln!(
             "[Agent {}] checkpoint compact done: {} → {} messages, summary_len={}, recent_tokens={}",
@@ -9760,7 +9875,9 @@ impl AgentInstance {
                 messages_after: count_after,
                 context_tokens: compacted_context_tokens,
                 context_limit,
-                messages: compacted_messages,
+                messages: page.messages,
+                oldest_message_row_id: page.oldest_message_row_id,
+                has_more_history: page.has_more_history,
             },
         );
 
@@ -10515,7 +10632,7 @@ impl AgentInstance {
             snapshot.thinking_duration,
             None,
             None,
-            None,
+            snapshot.response_metadata.as_ref(),
         ) {
             Ok(message_id) => Some(InterruptedAssistantMessage {
                 message_id,
@@ -10681,6 +10798,9 @@ impl AgentInstance {
             crate::commands::load_codex_model_config().unwrap_or_default().use_apply_patch,
             Ordering::Relaxed,
         );
+        // Before any tool is rendered: an existing session keeps the subagent
+        // definition it first offered, whatever the current Agent settings.
+        self.pin_session_tool_contracts(store);
         let dynamic_tool_loading_mode = self.dynamic_tool_loading_mode(app_handle);
         let renderer_mode = if matches!(self.backend, LlmBackend::ClaudeCodeCli)
             && dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Native
@@ -10700,6 +10820,9 @@ impl AgentInstance {
             renderer_mode,
             Self::anthropic_native_lazy_enabled_from_app_handle(app_handle),
         );
+        // Claude Code conversations pin their multi-agent route on the first
+        // turn; tools and the system prompt below depend on it.
+        self.prepare_claude_delegation(app_handle, store).await?;
         if dynamic_tool_loading_mode == crate::config::DynamicToolLoadingMode::Direct {
             let messages = store.get_messages_for_prompt(&self.session_id)?;
             self.seed_loaded_tools_from_history(&messages).await;
@@ -10860,7 +10983,7 @@ impl AgentInstance {
         if internal_system_reminder.is_some() {
             actual_user_text = String::new();
         } else if self.agent_uses_unity_service_tools()
-            && crate::unity_bridge::is_unity_project(&self.working_dir)
+            && crate::unity_bridge::unity_integration_enabled(&self.working_dir)
         {
             // The status probe can stall on a busy editor; race it against the
             // cancel signal so a cancel during prep reacts immediately.
@@ -12636,7 +12759,7 @@ impl AgentInstance {
                     } else { None }
                 } else { None };
 
-                let has_unity_asset_writes = crate::unity_bridge::is_unity_project(&self.working_dir)
+                let has_unity_asset_writes = crate::unity_bridge::unity_integration_enabled(&self.working_dir)
                     && prepared.iter().any(|(tc, args)| {
                         is_active(tc) && self.is_unity_asset_write_call(tc, args)
                     });
@@ -13621,6 +13744,7 @@ impl AgentInstance {
                 | "list"
                 | "ask_user_question"
                 | "todowrite"
+                | "send_message"
                 | "web.run"
                 | "unity_lock"
                 | "unity_release"
@@ -13676,6 +13800,9 @@ impl AgentInstance {
         }
         if name == "unity_execute" {
             return Self::unity_execute_is_readonly(args);
+        }
+        if name == "blender_execute" {
+            return crate::blender::tool::is_readonly(args);
         }
         Self::is_readonly_tool(name)
     }
@@ -13996,6 +14123,8 @@ impl AgentInstance {
     fn default_tool_requires_confirm(name: &str, args: &serde_json::Value) -> bool {
         match name {
             "knowledge_create" | "knowledge_edit" | "knowledge_move" | "knowledge_delete" => false,
+            // Governed by behavior.settings_change / behavior.sensitive_settings_change.
+            "config_set" => false,
             _ => !Self::is_readonly_tool_call(name, args),
         }
     }
@@ -14660,6 +14789,33 @@ impl AgentInstance {
             }
         }
 
+        let mut settings_preview: Option<String> = None;
+        let mut settings_sensitive = false;
+        if tool_name == "config_set" {
+            let request = match crate::settings::agent::parse_config_set(args) {
+                Ok(request) => request,
+                Err(error) => {
+                    return ToolConfirmDecision::PreflightError {
+                        output: format!("Error: {error}"),
+                    }
+                }
+            };
+            let scope = match self.settings_workspace_scope(app_handle) {
+                Ok(scope) => scope,
+                Err(error) => return ToolConfirmDecision::PreflightError { output: error },
+            };
+            let workspace_root = scope
+                .as_ref()
+                .map(|scope| scope.runtime().root().to_string_lossy().to_string());
+            let config = app_handle.state::<Arc<crate::config::AppConfig>>();
+            settings_sensitive = request.is_sensitive();
+            settings_preview = Some(crate::settings::agent::confirmation_preview(
+                &config,
+                workspace_root.as_deref(),
+                &request,
+            ));
+        }
+
         let perms_state: tauri::State<crate::ToolPermissions> = app_handle.state();
         let perms = perms_state.0.read().await;
         let tool_mode = perms.get(tool_name)
@@ -14679,11 +14835,27 @@ impl AgentInstance {
                     .map(String::as_str),
                 true,
             );
+        let settings_change_requires_confirm = settings_preview.is_some()
+            && Self::permission_setting_requires_confirm(
+                perms
+                    .get(crate::settings::agent::BEHAVIOR_SETTINGS_CHANGE)
+                    .map(String::as_str),
+                false,
+            );
+        let sensitive_settings_change_requires_confirm = settings_sensitive
+            && Self::permission_setting_requires_confirm(
+                perms
+                    .get(crate::settings::agent::BEHAVIOR_SENSITIVE_SETTINGS_CHANGE)
+                    .map(String::as_str),
+                true,
+            );
         drop(perms);
 
         if normalized_global_mode == PermissionModeSetting::Auto
             && !knowledge_governance_requires_confirm
             && !dangerous_command_requires_confirm
+            && !settings_change_requires_confirm
+            && !sensitive_settings_change_requires_confirm
         {
             eprintln!(
                 "[Agent {}] tool confirm skipped for '{}' (global_mode=auto)",
@@ -14696,13 +14868,21 @@ impl AgentInstance {
             &global_mode,
             tool_mode.as_deref(),
             tool_name,
-            arguments,
+            settings_preview.as_deref().unwrap_or(arguments),
             args,
             knowledge_preview,
             knowledge_governance_requires_confirm,
         );
         if dangerous_command_requires_confirm {
             assessment.reasons.push(ToolConfirmReason::DangerousCommand);
+        }
+        if settings_change_requires_confirm {
+            assessment.reasons.push(ToolConfirmReason::SettingsChange);
+        }
+        if sensitive_settings_change_requires_confirm {
+            assessment
+                .reasons
+                .push(ToolConfirmReason::SensitiveSettingsChange);
         }
 
         if assessment.reasons.is_empty() {
@@ -14726,7 +14906,10 @@ impl AgentInstance {
             && matches!(&assessment.display, ToolConfirmDisplay::Basic(_))
             && !assessment
                 .reasons
-                .contains(&ToolConfirmReason::KnowledgeGovernance);
+                .contains(&ToolConfirmReason::KnowledgeGovernance)
+            && !assessment
+                .reasons
+                .contains(&ToolConfirmReason::SensitiveSettingsChange);
         if auto_review_eligible {
             eprintln!(
                 "[Agent {}] Codex auto review started for '{}' (id={})",
@@ -14805,6 +14988,7 @@ impl AgentInstance {
                 question_id: question_id.clone(),
                 tool_call_id: tool_call_id.to_string(),
                 display,
+                agent: confirm_agent_label(),
             },
         );
 
@@ -15028,6 +15212,7 @@ impl AgentInstance {
                         requested_status: requested_status.to_string(),
                     },
                 ),
+                agent: confirm_agent_label(),
             },
         );
 
@@ -15147,7 +15332,14 @@ impl AgentInstance {
         instance.codex_fast_mode = self.codex_fast_mode;
         instance.subagent_effort_overrides = self.subagent_effort_overrides.clone();
         instance.subagent_fast_mode_overrides = self.subagent_fast_mode_overrides.clone();
-        instance.async_tasks_enabled = self.async_tasks_enabled;
+        *instance
+            .pinned_subagent_tool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = self
+            .pinned_subagent_tool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         instance.background_task_id = self.background_task_id.clone();
         instance.resumed_subagent = self.resumed_subagent.clone();
         instance.knowledge_focus = self.knowledge_focus.clone();
@@ -15156,9 +15348,8 @@ impl AgentInstance {
     }
 
     fn tool_call_runs_in_background(&self, tool_name: &str, args: &serde_json::Value) -> bool {
-        (self.async_tasks_enabled || crate::llm::claude_code_cli::native_scope::current().is_some_and(|scope|scope.call.tool=="Bash"))
-            && crate::async_tasks::supports_async_mode(tool_name)
-            && crate::async_tasks::AsyncMode::parse(args, true)
+        crate::async_tasks::supports_async_mode(tool_name)
+            && crate::async_tasks::AsyncMode::parse(args)
                 .map(crate::async_tasks::AsyncMode::is_background)
                 .unwrap_or(false)
     }
@@ -15682,6 +15873,19 @@ impl AgentInstance {
                     });
                 }
             }
+            // Lazy-mode services start here, on their first real call; a
+            // binding reaped while the run waited is replaced the same way.
+            if let Err(error) = execution.ensure_service(owner).await {
+                return ExecutedToolResult::from_tool_result(ToolResult {
+                    output: format!(
+                        "Tool '{}' could not start the {} service: {}",
+                        tc.name,
+                        owner.as_str(),
+                        error
+                    ),
+                    is_error: true,
+                });
+            }
             let resolved = if requires_ready {
                 execution
                     .resolve_service_ready(owner, UNITY_SERVICE_READY_TIMEOUT)
@@ -15955,7 +16159,7 @@ impl AgentInstance {
 
         if crate::async_tasks::supports_async_mode(&tc.name) {
             let async_mode =
-                match crate::async_tasks::AsyncMode::parse(args, self.async_tasks_enabled || crate::llm::claude_code_cli::native_scope::current().is_some_and(|scope|scope.call.tool=="Bash")) {
+                match crate::async_tasks::AsyncMode::parse(args) {
                     Ok(mode) => mode,
                     Err(output) => {
                         return ExecutedToolResult::from_tool_result(ToolResult {
@@ -16012,6 +16216,8 @@ impl AgentInstance {
         // preflight future's state and poll frame.
         let mut result = if tc.name == "unity_execute" {
             Box::pin(self.execute_unity_execute(app_handle, &tc.id, args, run_id)).await
+        } else if tc.name == "blender_execute" {
+            Box::pin(self.execute_blender_execute(app_handle, &tc.id, args, run_id)).await
         } else {
             Box::pin(self.execute_single_tool_dispatch(app_handle, store, tc, args, run_id)).await
         };
@@ -16117,8 +16323,13 @@ impl AgentInstance {
                 .await
         } else if tc.name == "todowrite" {
             ExecutedToolResult::from_tool_result(self.execute_todowrite(store, args, run_id))
+        } else if tc.name == multi_agent::SEND_MESSAGE_TOOL {
+            self.execute_send_message(app_handle, args)
         } else if tc.name == "config_query" {
             ExecutedToolResult::from_tool_result(self.execute_config_query(app_handle, args))
+        } else if tc.name == "config_set" {
+            // Not cancellable: a settings batch is persisted and applied as a unit.
+            ExecutedToolResult::from_tool_result(self.execute_config_set(app_handle, args).await)
         } else if tc.name == "knowledge_list" {
             ExecutedToolResult::from_tool_result(self.execute_knowledge_list(args))
         } else if tc.name == "knowledge_query" {
@@ -16305,6 +16516,18 @@ impl AgentInstance {
                 } else {
                     ExecutedToolResult::from_tool_result(tool_result)
                 }
+            } else if tc.name == "python" {
+                // `locus.attach_image` images reach the result through the
+                // task-local sink the tool fills.
+                let registry = Arc::clone(&self.tool_registry);
+                self.await_executed_tool_result(Box::pin(async move {
+                    let (result, images) = crate::tool::python_call::with_image_sink(
+                        registry.execute_with_context("python", args, tool_context),
+                    )
+                    .await;
+                    ExecutedToolResult::from_tool_result(result).with_images(images)
+                }))
+                .await
             } else {
                 self.await_tool_result(Box::pin(self.tool_registry.execute_with_context(
                     &tc.name,
@@ -16838,67 +17061,77 @@ impl AgentInstance {
         Ok(Some(message))
     }
 
-    // ─── config_query ────────────────────────────────────────────────────────
+    // ─── config_query / config_set ───────────────────────────────────────────
+
+    /// Checkout whose project settings (`Locus/config.json`) the agent reads
+    /// and writes; `None` for runs without a workspace.
+    fn settings_workspace_scope(
+        &self,
+        app_handle: &AppHandle,
+    ) -> Result<Option<crate::workspace_service::ResolvedWorkspaceScope>, String> {
+        let Some(execution) = self.execution_context.as_ref() else {
+            return Ok(None);
+        };
+        let registry = app_handle
+            .state::<Arc<crate::workspace_service::ProjectRegistry>>()
+            .inner()
+            .clone();
+        registry
+            .resolve_workspace_ref(&crate::workspace_service::WorkspaceRef::for_runtime(
+                &execution.workspace,
+            ))
+            .map(Some)
+            .map_err(|error| format!("Failed to resolve settings checkout scope: {error}"))
+    }
 
     fn execute_config_query(&self, app_handle: &AppHandle, args: &serde_json::Value) -> ToolResult {
-        let category = args.get("category").and_then(|v| v.as_str());
-        let workspace_scope = match self.execution_context.as_ref() {
-            Some(execution) => {
-                let registry = app_handle
-                    .state::<Arc<crate::workspace_service::ProjectRegistry>>()
-                    .inner()
-                    .clone();
-                match registry.resolve_workspace_ref(
-                    &crate::workspace_service::WorkspaceRef::for_runtime(&execution.workspace),
-                ) {
-                    Ok(scope) => Some(scope),
-                    Err(error) => {
-                        return ToolResult {
-                            output: format!("Failed to resolve config checkout scope: {error}"),
-                            is_error: true,
-                        }
-                    }
+        let result = self.settings_workspace_scope(app_handle).and_then(|scope| {
+            let config = app_handle.state::<Arc<crate::config::AppConfig>>();
+            crate::settings::agent::query(&config, scope.as_ref(), args)
+        });
+        match result {
+            Ok(output) => ToolResult {
+                output,
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                output: format!("Error querying settings: {error}"),
+                is_error: true,
+            },
+        }
+    }
+
+    async fn execute_config_set(
+        &self,
+        app_handle: &AppHandle,
+        args: &serde_json::Value,
+    ) -> ToolResult {
+        let request = match crate::settings::agent::parse_config_set(args) {
+            Ok(request) => request,
+            Err(error) => {
+                return ToolResult {
+                    output: format!("Error: {error}"),
+                    is_error: true,
                 }
             }
-            None => None,
         };
-
-        let entries = match category {
-            Some(cat) => crate::config_registry::collect_by_category(
-                app_handle,
-                cat,
-                workspace_scope.as_ref(),
-            ),
-            None => crate::config_registry::collect_all(app_handle, workspace_scope.as_ref()),
-        };
-
-        match entries {
-            Ok(items) => {
-                let mut out = String::new();
-                let mut current_cat = String::new();
-                for e in &items {
-                    if e.category != current_cat {
-                        if !out.is_empty() {
-                            out.push('\n');
-                        }
-                        out.push_str(&format!("## {}\n\n", e.category));
-                        current_cat = e.category.clone();
-                    }
-                    out.push_str(&format!(
-                        "**{}** (`{}`)\n  {}\n  Storage: `{}`\n  Value: {}\n\n",
-                        e.label, e.key, e.description, e.storage, e.current_value
-                    ));
-                }
-                if out.is_empty() {
-                    out = "No configuration entries found.".to_string();
-                }
-                ToolResult {
-                    output: out,
-                    is_error: false,
+        let scope = match self.settings_workspace_scope(app_handle) {
+            Ok(scope) => scope,
+            Err(error) => {
+                return ToolResult {
+                    output: error,
+                    is_error: true,
                 }
             }
-            Err(err) => ToolResult {
-                output: format!("Error querying config: {}", err.message),
+        };
+        let context = crate::settings::apply::WriteContext::new(app_handle.clone(), scope.as_ref());
+        match crate::settings::apply::write(&context, &request.changes).await {
+            Ok(changes) => ToolResult {
+                output: crate::settings::agent::describe_changes(&changes),
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                output: format!("Settings unchanged: {}", error.message),
                 is_error: true,
             },
         }
@@ -17973,16 +18206,10 @@ impl AgentInstance {
         }
     }
 
-    fn resolve_subagent_model_name(&self, subagent_type: &str) -> Option<String> {
-        self.registry.get(subagent_type)?;
-        match self.subagent_model_overrides.get(subagent_type) {
-            Some(override_model) if !override_model.is_empty() => Some(override_model.clone()),
-            _ => Some(self.effective_model.clone()),
-        }
-    }
-
-    fn subagent_model_display_name(model: &str) -> &str {
+    pub(super) fn subagent_model_display_name(model: &str) -> &str {
         let model = model.trim();
+        #[cfg(feature = "server-client")]
+        let model = crate::server_client::provider_model_id(model);
         model
             .strip_prefix("openai/")
             .or_else(|| model.strip_prefix("openrouter/"))
@@ -17992,7 +18219,7 @@ impl AgentInstance {
 
     /// Project type of the session's workspace, or `None` without a selected
     /// working directory.
-    fn workspace_project_type(&self) -> Option<&'static str> {
+    pub(super) fn workspace_project_type(&self) -> Option<&'static str> {
         if let Some(execution) = self.execution_context.as_ref() {
             return Some(crate::agent::definition::project_type_for_workspace(
                 execution
@@ -18004,7 +18231,7 @@ impl AgentInstance {
         }
         self.has_selected_working_dir().then(|| {
             crate::agent::definition::project_type_for_workspace(
-                crate::unity_bridge::is_unity_project(&self.working_dir),
+                crate::unity_bridge::unity_integration_enabled(&self.working_dir),
             )
         })
     }
@@ -18024,19 +18251,32 @@ impl AgentInstance {
             .list_subagent_descriptions_for_project_type(self.workspace_project_type())
             .into_iter()
             .map(|(id, description)| {
-                let model = self
-                    .resolve_subagent_model_name(&id)
-                    .unwrap_or_else(|| self.effective_model.clone());
-                format!(
-                    "- {}: {} Uses model `{}`.",
-                    id,
-                    description.trim(),
-                    Self::subagent_model_display_name(&model)
-                )
+                let labels = Self::subagent_model_labels(&self.subagent_model_choices(&id));
+                let models = match labels.split_first() {
+                    Some((default, others)) if !others.is_empty() => format!(
+                        "Models: `{}` (default), {}.",
+                        default,
+                        others
+                            .iter()
+                            .map(|label| format!("`{label}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    Some((only, _)) => format!("Uses model `{only}`."),
+                    None => String::new(),
+                };
+                format!("- {}: {} {}", id, description.trim(), models)
             })
             .collect::<Vec<_>>()
             .join("\n");
-        crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list)
+        let model_choice = if self.subagent_model_choice_available() {
+            subagent_model::SUBAGENT_MODEL_CHOICE_GUIDANCE
+        } else {
+            ""
+        };
+        crate::prompt::tools::SUBAGENT
+            .replace("{agent_list}", &agent_list)
+            .replace("{model_choice}", model_choice)
     }
 
     fn resolve_subagent_effort(&self, subagent_type: &str) -> Option<String> {
@@ -18291,52 +18531,18 @@ impl AgentInstance {
             return Self::interrupted_tool_result();
         }
 
-        let code = match args.get("code").and_then(|value| value.as_str()) {
-            Some(code) => code,
-            None => {
+        let parsed = match crate::unity_bridge::parse_unity_execute_args(args) {
+            Ok(parsed) => parsed,
+            Err(output) => {
                 return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: "Missing required parameter: code".to_string(),
+                    output,
                     is_error: true,
                 });
             }
         };
-        let enable_non_public_access =
-            match crate::csharp_compile::resolve_tool_non_public_access(args) {
-                Ok(value) => value,
-                Err(output) => {
-                    return ExecutedToolResult::from_tool_result(ToolResult {
-                        output,
-                        is_error: true,
-                    });
-                }
-            };
-
-        let requested_status = match args
-            .get("request_editor_status")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(status) => status,
-            None => {
-                return ExecutedToolResult::from_tool_result(ToolResult {
-                    output: "Missing required parameter: request_editor_status".to_string(),
-                    is_error: true,
-                });
-            }
-        };
-
-        if requested_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
-            || !crate::unity_bridge::is_known_editor_status(requested_status)
-        {
-            return ExecutedToolResult::from_tool_result(ToolResult {
-                output: format!(
-                    "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
-                    requested_status
-                ),
-                is_error: true,
-            });
-        }
+        let code = parsed.code.as_str();
+        let requested_status = parsed.requested_status.as_str();
+        let execute_options = parsed.options;
 
         if !self.has_selected_working_dir() {
             return ExecutedToolResult::from_tool_result(ToolResult {
@@ -18475,10 +18681,10 @@ impl AgentInstance {
         let background_progress = task_progress.clone();
 
         let cancel_rx = self.cancel_waiter();
-        match crate::unity_bridge::unity_execute_code_with_progress_cancellable_non_public_access(
+        match crate::unity_bridge::unity_execute_code_with_options(
             &self.working_dir,
             code,
-            enable_non_public_access,
+            execute_options,
             cancel_rx,
             move |snapshot| {
                 if !snapshot.active {
@@ -18506,14 +18712,21 @@ impl AgentInstance {
         )
         .await
         {
-            Ok(output) => {
-                let trimmed = output.trim();
+            Ok(outcome) => {
+                let trimmed = outcome.output.trim();
+                let mut output = if trimmed.is_empty() {
+                    "Code executed successfully (no output).".to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                if let Some(note) = crate::unity_bridge::unity_execute_long_block_note(
+                    outcome.max_main_thread_blocked_ms,
+                ) {
+                    output.push_str("\n\n");
+                    output.push_str(&note);
+                }
                 ExecutedToolResult::from_tool_result(ToolResult {
-                    output: if trimmed.is_empty() {
-                        "Code executed successfully (no output).".to_string()
-                    } else {
-                        trimmed.to_string()
-                    },
+                    output,
                     is_error: false,
                 })
             }
@@ -21484,30 +21697,15 @@ impl AgentInstance {
         description: &str,
         prompt: &str,
         subagent_type: &str,
+        requested_model: Option<&str>,
         tool_call_id: &str,
         run_id: &str,
     ) -> Result<SubagentRunResult, String> {
-        let project_type = self.workspace_project_type();
-        let agent_def = match self.registry.get(subagent_type) {
-            Some(def) if def.is_delegation_target_for_project_type(project_type) => def.clone(),
-            found => {
-                let available = self
-                    .registry
-                    .list_subagent_descriptions_for_project_type(project_type)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect::<Vec<_>>();
-                let reason = if found.is_some() {
-                    "is not available for delegation in this workspace"
-                } else {
-                    "is unknown"
-                };
-                return Err(format!(
-                    "Agent type '{}' {}. Available: {:?}",
-                    subagent_type, reason, available
-                ));
-            }
-        };
+        // The session's subagent description may predate the current Agent
+        // settings, so the type and model are checked against the current ones.
+        let agent_def = self.resolve_delegation_target(subagent_type)?;
+        // Reject a disallowed model before a child session is created.
+        let model = self.subagent_launch_model(subagent_type, requested_model)?;
 
         eprintln!(
             "[Agent {}] spawning subagent '{}' (type={}): {}",
@@ -21540,7 +21738,14 @@ impl AgentInstance {
         let (child_cancel_tx, child_cancel_rx) = tokio::sync::watch::channel(false);
         let child_cancel_state = child_cancel_rx.clone();
         let mut child = self
-            .new_subagent_instance(app_handle, store, agent_def, &child_session_id, child_cancel_rx)
+            .new_subagent_instance(
+                app_handle,
+                store,
+                agent_def,
+                &child_session_id,
+                Some(&model),
+                child_cancel_rx,
+            )
             .await?;
         child.parent_tool_call = Some(ParentToolCall::new(
             self.session_id.clone(),
@@ -21862,6 +22067,7 @@ impl AgentInstance {
                 });
             }
         };
+        let requested_model = args["model"].as_str();
 
         if self.is_cancel_requested() {
             return Self::interrupted_tool_result();
@@ -21914,6 +22120,7 @@ impl AgentInstance {
                 description,
                 prompt,
                 subagent_type,
+                requested_model,
                 tool_call_id,
                 run_id,
             )
@@ -23676,7 +23883,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         )
     }
@@ -24047,7 +24254,7 @@ PrefabInstance:
         instance.effective_model = "openai/gpt-5.6-sol".to_string();
         instance
             .subagent_model_overrides
-            .insert("explorer".to_string(), "openai/gpt-5.6-luna".to_string());
+            .set("explorer", ["openai/gpt-5.6-luna"]);
 
         let direct_tools = instance.build_api_tools(&["subagent".to_string()]).await;
         let direct_description = direct_tools[0]["function"]["description"]
@@ -24071,13 +24278,45 @@ PrefabInstance:
             .find(|line| line.starts_with("- unity:"))
             .expect("unity model line");
         assert!(unity.contains("Uses model `gpt-5.6-sol`."));
+        // Without a choice the schema and guidance stay as before.
+        assert!(direct_tools[0]["function"]["parameters"]["properties"]
+            .get("model")
+            .is_none());
+        assert!(!direct_description.contains("{model_choice}"));
+        assert!(!direct_description.contains("set model"));
 
         let (description, parameters) = instance
             .tool_description("subagent")
             .expect("registered subagent tool");
-        let (loaded_description, _) =
+        let (loaded_description, loaded_parameters) =
             instance.contextualize_tool_description("subagent", description, parameters);
         assert_eq!(loaded_description, direct_description);
+        assert_eq!(loaded_parameters, direct_tools[0]["function"]["parameters"]);
+
+        instance
+            .subagent_model_overrides
+            .set("explorer", ["openai/gpt-5.6-luna", "openai/gpt-5.6-sol"]);
+        let direct_tools = instance.build_api_tools(&["subagent".to_string()]).await;
+        let direct_description = direct_tools[0]["function"]["description"]
+            .as_str()
+            .expect("direct subagent description");
+        assert!(direct_description
+            .lines()
+            .any(|line| line.starts_with("- explorer:")
+                && line.ends_with("Models: `gpt-5.6-luna` (default), `gpt-5.6-sol`.")));
+        assert!(direct_description
+            .contains(super::subagent_model::SUBAGENT_MODEL_CHOICE_GUIDANCE));
+        assert_eq!(
+            direct_tools[0]["function"]["parameters"]["properties"]["model"]["type"],
+            "string"
+        );
+        let (description, parameters) = instance
+            .tool_description("subagent")
+            .expect("registered subagent tool");
+        let (loaded_description, loaded_parameters) =
+            instance.contextualize_tool_description("subagent", description, parameters);
+        assert_eq!(loaded_description, direct_description);
+        assert_eq!(loaded_parameters, direct_tools[0]["function"]["parameters"]);
     }
 
     #[test]
@@ -24180,7 +24419,7 @@ PrefabInstance:
             Arc::new(None),
             knowledge_access_mode,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         )
     }
@@ -24367,18 +24606,12 @@ PrefabInstance:
     }
 
     #[tokio::test]
-    async fn async_task_schema_is_hidden_until_experimental_gate_is_enabled() {
-        let mut instance = test_agent_instance_with_tools_and_mode(
+    async fn async_task_schema_is_always_offered_to_async_capable_tools() {
+        let instance = test_agent_instance_with_tools_and_mode(
             String::new(),
             vec!["bash".to_string()],
             KnowledgeAccessMode::Full,
         );
-        let off = instance.build_api_tools(&["bash".to_string()]).await;
-        assert!(off[0]["function"]["parameters"]["properties"]
-            .get("async")
-            .is_none());
-
-        instance.set_async_tasks_enabled(true);
         let on = instance.build_api_tools(&["bash".to_string()]).await;
         assert_eq!(
             on[0]["function"]["parameters"]["properties"]["async"]["enum"],
@@ -24463,6 +24696,146 @@ PrefabInstance:
             tool_meta_string(&preview, "unity_execute", "unavailableReason").as_deref(),
             Some("requires_unity_workspace")
         );
+    }
+
+    /// Registers a Blender slot without touching the app-wide Blender switch;
+    /// the slot is never started in these prompt tests.
+    struct PromptTestBlenderFactory;
+
+    impl crate::workspace_service::service::WorkspaceServiceFactory for PromptTestBlenderFactory {
+        fn kind(&self) -> crate::workspace_service::ServiceKind {
+            crate::workspace_service::ServiceKind::Blender
+        }
+
+        fn detect(
+            &self,
+            _workspace: &crate::workspace_service::WorkspaceRuntime,
+        ) -> crate::workspace_service::service::DetectionResult {
+            crate::workspace_service::service::DetectionResult::detected(
+                crate::workspace_service::service::ServiceActivationPolicy::Disabled,
+            )
+        }
+
+        fn create<'a>(
+            &'a self,
+            _workspace: Arc<crate::workspace_service::WorkspaceRuntime>,
+            _generation: u64,
+        ) -> crate::workspace_service::service::ServiceFuture<
+            'a,
+            Result<Arc<dyn crate::workspace_service::WorkspaceService>, String>,
+        > {
+            Box::pin(async { Err("not started in prompt tests".to_string()) })
+        }
+    }
+
+    fn blender_prompt_test_instance(
+        root: &std::path::Path,
+        tools: &[&str],
+        policy: crate::workspace_service::service::ServiceActivationPolicy,
+    ) -> AgentInstance {
+        let mut instance = test_agent_instance_with_tools_and_mode(
+            root.to_string_lossy().to_string(),
+            tools.iter().map(|tool| tool.to_string()).collect(),
+            KnowledgeAccessMode::Full,
+        );
+        let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(root)
+            .expect("workspace identity");
+        let runtime = crate::workspace_service::WorkspaceRuntime::new(
+            identity,
+            vec![Arc::new(PromptTestBlenderFactory)],
+            1,
+        );
+        runtime.services().detect(&runtime);
+        runtime
+            .services()
+            .set_activation_policy(crate::workspace_service::ServiceKind::Blender, policy)
+            .expect("blender slot");
+        instance.set_execution_context(Arc::new(
+            crate::workspace_service::AgentExecutionContext::new(runtime, HashMap::new()),
+        ));
+        instance
+    }
+
+    #[tokio::test]
+    async fn blender_note_follows_the_workspace_service_mode() {
+        use crate::workspace_service::service::ServiceActivationPolicy as Policy;
+        let temp = tempdir().expect("temp dir");
+        let tools = ["read", "blender_execute"];
+
+        let auto = blender_prompt_test_instance(temp.path(), &tools, Policy::Auto);
+        let auto_env = auto.build_system_prompt_parts().await.env_prompt;
+        assert!(auto_env.contains("## Blender"));
+        assert!(auto_env.contains("starts with it"));
+        assert!(!auto_env.contains("deferred tool"));
+        let items = auto.list_injected_prompt_items().await;
+        let item = items
+            .iter()
+            .find(|item| item.id == "blender_service")
+            .expect("Blender note is listed as an injection item");
+        assert_eq!(item.meta.as_ref().unwrap()["serviceMode"], "auto");
+        assert_eq!(item.meta.as_ref().unwrap()["enabled"], true);
+        assert!(item.content.starts_with("## Blender"));
+
+        let lazy = blender_prompt_test_instance(temp.path(), &tools, Policy::Lazy);
+        let lazy_env = lazy.build_system_prompt_parts().await.env_prompt;
+        assert!(lazy_env.contains("## Blender"));
+        assert!(lazy_env.contains("on demand"));
+        assert!(lazy_env.contains("deferred tool"));
+        assert_ne!(auto_env, lazy_env);
+        let items = lazy.list_injected_prompt_items().await;
+        let item = items
+            .iter()
+            .find(|item| item.id == "blender_service")
+            .expect("Blender note is listed as an injection item");
+        assert_eq!(item.meta.as_ref().unwrap()["serviceMode"], "lazy");
+
+        // Prompt content depends on the setting only, not on prompt builds.
+        assert_eq!(lazy_env, lazy.build_system_prompt_parts().await.env_prompt);
+    }
+
+    #[tokio::test]
+    async fn blender_note_is_absent_when_off_or_without_the_tool() {
+        use crate::workspace_service::service::ServiceActivationPolicy as Policy;
+        let temp = tempdir().expect("temp dir");
+
+        let off = blender_prompt_test_instance(temp.path(), &["read", "blender_execute"], Policy::Disabled);
+        assert!(!off.build_system_prompt_parts().await.env_prompt.contains("## Blender"));
+        assert!(off
+            .list_injected_prompt_items()
+            .await
+            .iter()
+            .all(|item| item.id != "blender_service"));
+
+        let no_tool = blender_prompt_test_instance(temp.path(), &["read"], Policy::Auto);
+        assert!(!no_tool.build_system_prompt_parts().await.env_prompt.contains("## Blender"));
+        assert!(no_tool
+            .list_injected_prompt_items()
+            .await
+            .iter()
+            .all(|item| item.id != "blender_service"));
+    }
+
+    #[tokio::test]
+    async fn blender_note_can_be_toggled_off_per_workspace() {
+        use crate::workspace_service::service::ServiceActivationPolicy as Policy;
+        let temp = tempdir().expect("temp dir");
+        let config_dir = temp.path().join("Locus").join("agent").join("test");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("injection_config.json"),
+            r#"{"blender_service":{"enabled":false}}"#,
+        )
+        .expect("injection config");
+
+        let instance =
+            blender_prompt_test_instance(temp.path(), &["read", "blender_execute"], Policy::Auto);
+        assert!(!instance.build_system_prompt_parts().await.env_prompt.contains("## Blender"));
+        let items = instance.list_injected_prompt_items().await;
+        let item = items
+            .iter()
+            .find(|item| item.id == "blender_service")
+            .expect("a disabled note stays listed so it can be re-enabled");
+        assert_eq!(item.meta.as_ref().unwrap()["enabled"], false);
     }
 
     #[tokio::test]
@@ -24562,7 +24935,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -24634,7 +25007,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         )
     }
@@ -24879,8 +25252,7 @@ PrefabInstance:
     #[tokio::test]
     async fn lazy_tool_manifest_matches_preview_and_provider_call_path() {
         let temp = tempdir().expect("temp dir");
-        let mut instance = native_plan_test_instance(&temp);
-        instance.set_async_tasks_enabled(true);
+        let instance = native_plan_test_instance(&temp);
 
         for renderer in [
             LazyToolRenderer::CodexNative,
@@ -25308,7 +25680,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -25414,7 +25786,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -25502,7 +25874,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -25581,7 +25953,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -25654,7 +26026,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -25723,7 +26095,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
         let active_skill_tool_names = HashSet::from(["skill_special".to_string()]);
@@ -25959,7 +26331,7 @@ PrefabInstance:
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -26271,7 +26643,7 @@ Create a reusable Skill.
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
         let intent = UserIntentPayload {
@@ -26386,7 +26758,7 @@ Search, install, audit, and export a plugin.
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 
@@ -27234,6 +27606,23 @@ Search, install, audit, and export a plugin.
     }
 
     #[test]
+    fn unity_execute_accepts_agent_loop_argument_aliases() {
+        let mut args = serde_json::json!({
+            "code": "print(1);",
+            "readonly": true,
+            "request_editor_status": "editing",
+            "enable_non_public_access": true,
+            "timeout": 120000,
+        });
+        super::backend::normalize_tool_args(&mut args);
+        assert!(args.get("requestEditorStatus").is_some());
+        let parsed = crate::unity_bridge::parse_unity_execute_args(&args)
+            .expect("normalized unity_execute arguments must be accepted");
+        assert_eq!(parsed.requested_status, "editing");
+        assert_eq!(parsed.options.timeout_ms, Some(120_000));
+    }
+
+    #[test]
     fn unity_execute_background_progress_explains_pending_await() {
         let progress = crate::unity_bridge::UnityExecuteProgressSnapshot {
             active: true,
@@ -27248,6 +27637,7 @@ Search, install, audit, and export a plugin.
             source_line: 7,
             source_text: "await ctx.BreakWhen(...);".to_string(),
             waited_ms: 1250,
+            ..Default::default()
         };
 
         let output = AgentInstance::format_unity_execute_task_progress(&progress);
@@ -29184,7 +29574,7 @@ Search, install, audit, and export a plugin.
             Arc::new(None),
             KnowledgeAccessMode::Full,
             None,
-            HashMap::new(),
+            Default::default(),
             cancel_rx,
         );
 

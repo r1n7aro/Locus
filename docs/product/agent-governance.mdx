@@ -27,6 +27,26 @@ Locus 面向的不是一次性问答，而是可持续使用的开发代理。�
 
 子 Agent 不出现在新建会话的 Agent 列表中：Unity 使用 Explorer（`explorer`）调查代码、资产和实时 Unity 数据；General 使用 Researcher（`researcher`）只读调查工作区文件、项目知识和外部文档。`subagent` 工具只列出支持当前工作区类型的 Agent，General 不作为子 Agent 被调用。
 
+会话开启 Multi-Agent 后，Agent 还会获得 `send_message` 工具，可按 Agent ID 给其他 Agent 发消息：自己的子 Agent 使用 `subagent` 返回的任务 ID（如 `reviewer`、`t1`），父 Agent 使用 `parent`，同级 Agent 使用 `parent/<ID>`。消息先持久化排队，接收方在两次工具调用之间、下一次模型请求前收到，内容包含发信 Agent 的 ID（`from`）和正文（`message`）；已结束的子 Agent 收到消息后会在原会话中继续运行。达到最大嵌套深度的子 Agent 不能再创建子 Agent，但仍可用 `send_message` 回信。
+
+## Claude Code 原生多 Agent
+
+主模型是 Claude Code 且会话开启 Multi-Agent 时，Locus 改用 Claude Code 自带的 `Agent` 和 `SendMessage` 工具委派，不再提供 `subagent` 与 `send_message`。`Agent` 是唯一的委派入口，按目标模型分流：
+
+- 与对话同一连接的 Claude Code 模型作为原生子 Agent 在 Claude Code 中运行。它的系统提示词由 Locus 按该 Agent 定义渲染，与 Locus 子 Agent 一样包含提示词正文、启用的规则、知识库上下文（定义的环境模板包含时）和工作环境，在对话开始时固定，之后修改规则只影响新对话。原生子 Agent 没有独立会话，不加载 Skill，也不使用定义中的工具描述覆盖和思考强度。它的工具仍由 Locus 在本机执行，调用显示在对应的 Agent 卡片中。
+- 其他模型作为 Locus 子 Agent 运行，使用同名 Agent 定义的全部设置，行为与 `subagent` 相同。
+- 默认提供全部可委派的 Locus Agent，包括之后新建的；可在 Claude Code 配置的`Locus Agent`中取消不需要的类型。Claude Code 内置类型默认提供 `general-purpose`、`Explore`、`Plan`。调用未提供的类型会被拒绝，并列出当前可用的类型。
+
+其他主模型的会话（以及关闭原生多 Agent 时的 Claude Code 会话）使用 `subagent` 委派，只能选择 Locus Agent，没有 Claude Code 内置类型。为某个 Locus Agent 选择 Claude Code 模型时，它作为独立的 Claude Code 子会话运行，而不是原生子 Agent。
+
+Agent 卡片标出执行后端和模型，如「Claude 原生 · sonnet」「Locus · gpt-5」；Claude Code 内置类型显示「Claude 原生 · 内置」，模型由 Claude Code 决定。
+
+`Agent` 默认在前台运行，调用时设置 `run_in_background: true` 才转入后台，主 Agent 可继续工作。后台 Agent 结束后，对话中先显示一行提示（如「后台 Agent『名称』已完成」），主 Agent 随后收到结果并继续。主 Agent 用 `SendMessage` 按 `Agent` 返回的 agentId 给子 Agent 补充指示，已结束的 Agent 收到消息后继续运行；原生子 Agent 用 `main` 给主 Agent 发消息；Locus 子 Agent 的地址为 `locus:<任务 ID>`。后台任务面板可以停止单个或全部 Agent。被用户停止的原生子 Agent 在本对话中不再继续，仍需要这项工作时由主 Agent 新建 Agent。Claude Code 退出时仍在运行的后台 Agent 会标记为已停止，之后可用 `SendMessage` 继续。
+
+原生多 Agent 对话始终以 `bypassPermissions` 模式启动 Claude Code，不使用 auto 模式；工具确认仍由 Locus 负责，后台子 Agent 的确认同样显示在当前对话中，并标注「子 Agent · 名称」。子 Agent 的用量计入当前会话的用量统计，不占用主对话的上下文。
+
+该模式需要 Claude Code 2.1.312 或更高版本，版本较低时新对话改用 Locus 子 Agent。SSH 连接未指定`Claude 路径`时，开启原生多 Agent 后点击`连接并保存`，Locus 会在服务器上自动安装 2.1.312（已有更新的版本则不变）；安装失败时连接照常保存，新对话改用 Locus 子 Agent。版本过低时，`原生多 Agent`开关下方会显示当前版本和处理方式：已保存的 SSH 连接点击`测试连接`后再点击`升级并保存`即可升级；本机 Claude Code 在终端运行 `claude update` 后，新对话即可使用。指定了`Claude 路径`时 Locus 不会替换该程序，按它的版本判断。委派方式与可用类型在对话开始时固定，之后修改设置只影响新对话。开关、内置类型和 Locus Agent 的位置见[模型配置](/settings/models)。
+
 ## 工作区规则
 
 通过 `await locus.get_agent("unity")`（通用工作区可用 `"general"`）获取内置 Agent 后，使用 `list_rules()` 查询规则，`read_rule(key)` 读取内容，`save_rule(file_name, content)` 新增或更新规则，`set_rule_enabled(key, False)` 停用规则，传入 `True` 可重新启用。

@@ -206,6 +206,7 @@ function handlePlanFeedbackEnter(event: KeyboardEvent) {
         </svg>
       </span>
       <span class="tool-confirm-title">{{ title }}</span>
+      <span v-if="toolConfirm.agent" class="tool-confirm-agent">{{ t("chat.toolConfirm.fromAgent", toolConfirm.agent) }}</span>
     </div>
     <template v-if="basicDisplay">
       <div class="tool-confirm-body">
@@ -418,6 +419,21 @@ function handlePlanFeedbackEnter(event: KeyboardEvent) {
   flex-direction: column;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+/* The background subagent asking; its confirmation outlives the parent's turn. */
+.tool-confirm-agent {
+  margin-left: 6px;
+  padding: 1px 7px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
 }
 
 .tool-confirm-mcp-origin {

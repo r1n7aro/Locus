@@ -499,6 +499,8 @@ pub struct PendingToolConfirm {
     pub question_id: String,
     pub tool_call_id: String,
     pub display: crate::commands::ToolConfirmDisplay,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -6,6 +6,8 @@ import { visibleProviderOrder } from "../../config/providerVisibility";
 import { formatModelDisplayName, modelSupportsFastMode } from "../../utils/modelDisplay";
 import { groupModelsForSelector, modelListEntryName } from "../../utils/modelGrouping";
 import { isRemoteClaudeCode } from "../../services/claudeConnection";
+import { makeDefaultSubagentModel, toggleSubagentModel, withSubagentModels } from "../../utils/subagentModels";
+import BaseButton from "../ui/BaseButton.vue";
 import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 
 const props = defineProps<{
@@ -68,15 +70,45 @@ const effortLabels: Record<EffortLevel, string> = {
   max: "Max",
 };
 
-function selectedSubagentModel(agentId: string): ModelOption | null {
-  const modelId = props.modelDefaults.subagentModels[agentId];
-  if (!modelId) return null;
-  return props.allModels.find((model) => model.id === modelId) ?? null;
+/** Models the delegating agent may choose for this sub-agent, default first. */
+function allowedModels(agentId: string): string[] {
+  return props.modelDefaults.subagentModels[agentId] ?? [];
 }
 
+function knownAllowedModels(agentId: string): ModelOption[] {
+  return allowedModels(agentId)
+    .map((id) => props.allModels.find((model) => model.id === id))
+    .filter((model): model is ModelOption => Boolean(model));
+}
+
+function subagentModelOptions(agentId: string): DropdownOption[] {
+  const allowed = allowedModels(agentId);
+  const options = optionsWithDefault(t("settings.models.subagentDefault")).map((option) =>
+    allowed.length > 1 && option.value === allowed[0]
+      ? { ...option, hint: t("settings.models.subagentModelDefaultHint") }
+      : option);
+  // Keep removed or unconfigured models visible so they can be deselected.
+  const unavailable = allowed
+    .filter((id) => !options.some((option) => option.value === id))
+    .map((id) => ({ value: id, label: id, group: t("settings.models.subagentModelUnavailable") }));
+  return [...options, ...unavailable];
+}
+
+function subagentModelSummary(agentId: string): string {
+  const [first, ...others] = allowedModels(agentId);
+  if (!first) return "";
+  const label = selectedModelLabel(first);
+  return others.length ? t("settings.models.subagentModelSummary", label, others.length) : label;
+}
+
+/** Effort and speed apply to whichever allowed model the agent picks, so only
+ *  values every known allowed model supports are offered. */
 function effortOptions(agentId: string): DropdownOption[] {
-  const selected = selectedSubagentModel(agentId);
-  const values = selected ? (selected.supportedEfforts ?? []) : effortLevels;
+  const [first, ...others] = knownAllowedModels(agentId);
+  const values = first
+    ? (first.supportedEfforts ?? []).filter((level) =>
+      others.every((model) => (model.supportedEfforts ?? []).includes(level)))
+    : effortLevels;
   return [
     { value: "", label: t("settings.models.subagentEffortDefault") },
     ...values.map((value) => ({
@@ -100,8 +132,7 @@ function fastModeValue(agentId: string): string {
 }
 
 function speedOptions(agentId: string): DropdownOption[] {
-  const selected = selectedSubagentModel(agentId);
-  const fastAvailable = !selected || modelSupportsFastMode(selected);
+  const fastAvailable = knownAllowedModels(agentId).every(modelSupportsFastMode);
   return [
     { value: "", label: t("settings.models.subagentSpeedDefault") },
     { value: "standard", label: t("settings.models.subagentSpeedStandard") },
@@ -119,12 +150,19 @@ function updatePlanModel(value: string) {
   emit("save");
 }
 
-function updateSubagentModel(agentId: string, value: string) {
-  const subagentModels = { ...props.modelDefaults.subagentModels };
-  if (value) subagentModels[agentId] = value;
-  else delete subagentModels[agentId];
+function saveSubagentModels(agentId: string, models: string[]) {
+  const subagentModels = withSubagentModels(props.modelDefaults.subagentModels, agentId, models);
   emit("update:modelDefaults", { ...props.modelDefaults, subagentModels });
   emit("save");
+}
+
+/** The inherit option clears the list; any model toggles its membership. */
+function updateSubagentModel(agentId: string, value: string) {
+  saveSubagentModels(agentId, value ? toggleSubagentModel(allowedModels(agentId), value) : []);
+}
+
+function setDefaultSubagentModel(agentId: string, modelId: string) {
+  saveSubagentModels(agentId, makeDefaultSubagentModel(allowedModels(agentId), modelId));
 }
 
 function updateSubagentEffort(agentId: string, value: string) {
@@ -208,15 +246,36 @@ function updateSubagentSpeed(agentId: string, value: string) {
         <div class="subagent-default-controls">
           <BaseDropdown
             class="model-default-dropdown inline subagent-model-dropdown"
-            :model-value="modelDefaults.subagentModels[agent.id] || ''"
-            :options="optionsWithDefault(t('settings.models.subagentDefault'))"
-            :selected-label="selectedModelLabel(modelDefaults.subagentModels[agent.id] || '')"
+            :model-value="allowedModels(agent.id)[0] ?? ''"
+            :selected-values="allowedModels(agent.id).length ? allowedModels(agent.id) : ['']"
+            :options="subagentModelOptions(agent.id)"
+            :selected-label="subagentModelSummary(agent.id)"
+            :close-on-select="false"
             size="md"
             menu-align="end"
             teleport
             :aria-label="`${agent.name} ${t('settings.models.subagentModel')}`"
             @update:model-value="updateSubagentModel(agent.id, $event)"
-          />
+          >
+            <template v-if="allowedModels(agent.id).length > 1" #aside>
+              <div class="subagent-model-order" role="group" :aria-label="t('settings.models.subagentModelOrder')">
+                <div class="subagent-model-order-title">{{ t("settings.models.subagentModelOrder") }}</div>
+                <div
+                  v-for="(modelId, index) in allowedModels(agent.id)"
+                  :key="modelId"
+                  class="subagent-model-order-row"
+                >
+                  <span class="subagent-model-order-name" :title="modelId">{{ selectedModelLabel(modelId) }}</span>
+                  <span v-if="index === 0" class="subagent-model-order-default">
+                    {{ t("settings.models.subagentModelDefaultHint") }}
+                  </span>
+                  <BaseButton v-else @click="setDefaultSubagentModel(agent.id, modelId)">
+                    {{ t("settings.models.subagentModelMakeDefault") }}
+                  </BaseButton>
+                </div>
+              </div>
+            </template>
+          </BaseDropdown>
           <BaseDropdown
             class="subagent-effort-dropdown"
             :model-value="modelDefaults.subagentEfforts[agent.id] || ''"
@@ -225,7 +284,7 @@ function updateSubagentSpeed(agentId: string, value: string) {
             size="md"
             menu-align="end"
             teleport
-            :disabled="Boolean(modelDefaults.subagentModels[agent.id]) && effortOptions(agent.id).length === 1"
+            :disabled="allowedModels(agent.id).length > 0 && effortOptions(agent.id).length === 1"
             :aria-label="`${agent.name} ${t('settings.models.subagentEffort')}`"
             @update:model-value="updateSubagentEffort(agent.id, $event)"
           />
@@ -267,6 +326,36 @@ function updateSubagentSpeed(agentId: string, value: string) {
 .subagent-effort-dropdown,
 .subagent-speed-dropdown {
   width: 100%;
+}
+
+.subagent-model-order-title {
+  padding: 4px 4px 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.subagent-model-order-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 2px 4px;
+  font-size: 12px;
+}
+
+.subagent-model-order-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-model-order-default {
+  flex-shrink: 0;
+  color: var(--accent-color);
+  font-size: 11px;
 }
 
 @media (max-width: 980px) {

@@ -123,6 +123,9 @@ fn readable(value: &Value) -> String {
 /// display text. The small items envelope still drives the existing todo stream
 /// reducer; the complete snapshot is stored separately by the host.
 pub(crate) fn external(tool: &str, output: &str) -> String {
+    if tool == "Agent" {
+        return agent_result_text(output);
+    }
     if !matches!(
         tool,
         "TodoWrite"
@@ -189,6 +192,23 @@ pub(crate) fn external(tool: &str, output: &str) -> String {
     readable(result)
 }
 
+/// A native Agent result is protocol data (status, usage, ids). The transcript
+/// keeps the subagent's answer; other states keep their readable fields.
+fn agent_result_text(output: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return output.into();
+    };
+    let result = value.get("result").unwrap_or(&value);
+    if result["status"] == "completed" {
+        if let Some(content) = result["content"].as_array() {
+            let text = content.iter().filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n");
+            if !text.trim().is_empty() { return text; }
+        }
+    }
+    readable(result)
+}
+
 /// The host has already saved the complete readable output and returned a
 /// persisted-output reference. Apply that same boundary to the CLI payload,
 /// rather than sending the unbounded pre-storage result through a side channel.
@@ -214,6 +234,8 @@ pub(crate) fn apply_persisted_output(tool: &str, value: &mut Value, output: &str
             }
         }
         "TaskOutput" => value["task"]["output"] = json!(output),
+        // A Locus subagent's report; the saved copy is its persisted output.
+        "Agent" => value["content"] = json!([{"type": "text", "text": output}]),
         _ => {}
     }
 }

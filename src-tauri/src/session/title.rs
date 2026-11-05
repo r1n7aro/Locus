@@ -73,6 +73,34 @@ pub struct SessionTitleUpdatedEvent {
     pub title: String,
 }
 
+/// Announces a title change made outside generation (a manual rename), so
+/// other windows and paired phones show it without reloading.
+pub fn publish_session_title_updated(
+    app_handle: &AppHandle,
+    store: &SessionStore,
+    session_id: &str,
+    title: &str,
+) {
+    let event = SessionTitleUpdatedEvent {
+        session_id: session_id.to_string(),
+        title: title.to_string(),
+    };
+    let scope = crate::session::gateway::live_session_event_scope(app_handle, store, session_id);
+    let published = scope.is_some_and(|scope| {
+        crate::workspace_service::event::emit_for_workspace_scope(
+            app_handle,
+            &scope,
+            SESSION_TITLE_UPDATED_EVENT,
+            event.clone(),
+        ) == crate::workspace_service::event::WorkspaceEventPublishOutcome::PublishedScoped
+    });
+    if !published {
+        if let Err(error) = app_handle.emit(SESSION_TITLE_UPDATED_EVENT, event) {
+            eprintln!("[SessionTitle] failed to emit title update for session {session_id}: {error}");
+        }
+    }
+}
+
 pub fn prepare_session_title_prompt(raw_prompt: &str) -> Option<String> {
     let unwrapped = unwrap_codex_delegations(raw_prompt);
     let limited = take_chars(&unwrapped, TITLE_PROMPT_CHAR_LIMIT);

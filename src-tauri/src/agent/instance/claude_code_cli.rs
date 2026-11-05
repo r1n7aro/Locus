@@ -25,6 +25,10 @@ const CLAUDE_CODE_CLI_PROVIDER: &str = "claude_code";
 #[cfg(test)]
 #[path = "claude_fork_sync_tests.rs"]
 mod fork_sync_tests;
+#[path = "claude_native_agent_host.rs"]
+mod native_agent_host;
+#[path = "claude_native_agent_hub.rs"]
+mod native_agent_hub;
 
 pub(super) fn pending_input_metadata() -> serde_json::Value {
     serde_json::json!({
@@ -78,9 +82,17 @@ fn ensure_claude_history_origin(store: &SessionStore, session_id: &str, pending:
     store.verify_claude_history_origin(session_id, &messages, &metadata, &pending)
 }
 
+#[cfg(test)]
 fn prepare_pending_claude_input(
     store: &SessionStore, session_id: &str, current: Option<&str>, prompt: &str,
     remote: &Option<claude_code_cli::ssh::SshConfig>, system_prompt: &str,
+) -> Result<serde_json::Value, String> {
+    prepare_pending_claude_input_with_model(store, session_id, current, prompt, &remote.clone().map(Into::into), system_prompt, None)
+}
+
+fn prepare_pending_claude_input_with_model(
+    store: &SessionStore, session_id: &str, current: Option<&str>, prompt: &str,
+    remote: &Option<claude_code_cli::connection::NativeConnection>, system_prompt: &str, model: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let mut messages = store.get_messages(session_id)?;
     let mut metadata = store.get_response_request_metadata(session_id)?;
@@ -100,9 +112,10 @@ fn prepare_pending_claude_input(
         let rendered = claude_user_prompt(previous,None,system_prompt);
         let continuation = prompt.strip_prefix(&rendered).unwrap_or("").trim();
         let continuation = if continuation.is_empty() { "Continue from the existing conversation context and finish the current request. Do not repeat completed work or tool operations. Use the recorded results and inspect current state before any new action." } else { continuation };
+        let continuation = claude_code_cli::recovery::continuation_prompt(continuation);
         let receipt = pending_input_metadata();
         let id = store.add_message_with_images_asset_refs_signature_and_response(
-            session_id, MessageRole::User, continuation, None, None, None, None, None,
+            session_id, MessageRole::User, "", None, None, None, None, Some(&continuation),
             Some(&receipt),
         )?;
         metadata.insert(id.clone(), receipt);
@@ -130,6 +143,7 @@ fn prepare_pending_claude_input(
         let mut value = metadata.remove(id).unwrap_or_else(||serde_json::json!({}));
         value["backend"] = serde_json::json!("claude_code_cli");
         value["claude_connection"] = serde_json::json!(remote);
+        if let Some(model) = model { value["model"] = serde_json::json!(model); }
         value["claude_pending_input"] = serde_json::json!({"version":1,"token":tokens[index],
             "carrier":if index<last {Some(&tokens[last])} else {None}});
         store.set_message_response_request_metadata(session_id,id,&value)?;
@@ -325,9 +339,109 @@ fn save_claude_code_tool_result(
     )
 }
 
+/// Retain producer provenance for error/cancellation snapshots, including when
+/// the native host future is dropped. A stream is not a committed native row:
+/// never copy a prior checkpoint, pending-input receipt or usage attribution.
+fn track_claude_stream_origin(
+    stream: &AssistantStreamState,
+    metadata: &serde_json::Value,
+    run_id: &str,
+) {
+    let mut origin = serde_json::json!({"backend":"claude_code_cli", "claude_run_id":run_id});
+    for key in ["model", "upstream_model", "claude_connection", "claude_native_tool_search"] {
+        if let Some(value) = metadata.get(key) { origin[key] = value.clone(); }
+    }
+    stream.set_response_metadata(origin);
+}
+
 impl<'a> ClaudeCodeRoundHost<'a> {
     fn select_tool_round(&mut self, id: &str) {
         PendingAssistantRound::activate(&mut self.pending_round, &mut self.waiting_rounds, id);
+    }
+
+    /// Summarizer instructions, a local transcript copy and the carry-forward
+    /// block, captured while the conversation being compacted is still intact.
+    async fn compaction_preparation(&self) -> Result<serde_json::Value, String> {
+        let session_id = self.agent.session_id.as_str();
+        let (transcript_path, copy_error) = match self.save_compaction_transcript().await {
+            Ok(path) => (path, None),
+            Err(error) => {
+                eprintln!("[Agent {}] Claude transcript copy failed for session {}: {}", self.agent.id, session_id, error);
+                (None, Some(error))
+            }
+        };
+        // A local Claude names a path Locus can read; a remote one cannot.
+        let remote = claude_code_cli::recovery::recorded_remote(self.store, session_id)?.is_some();
+        let transcript_error = (transcript_path.is_none() && remote).then(|| copy_error
+            .unwrap_or_else(|| "The native transcript was not available in the local archive.".to_string()));
+        let display = self.store.get_messages_for_display(session_id)?;
+        let context = self.store.get_messages_for_prompt(session_id)?;
+        let todos = self.store.get_todos(session_id)?.items;
+        let model_window = self.store.get_token_usage(session_id)?.context_limit;
+        let configured = claude_code_cli::ssh::load_settings().ok()
+            .and_then(|settings| settings.runtime.auto_compact_window);
+        let compaction_window = match (configured, model_window) {
+            (Some(configured), 0) => configured,
+            (Some(configured), model) => configured.min(model),
+            (None, model) => model,
+        };
+        let carry_forward = crate::compact::claude_native::build_carry_forward(
+            &crate::compact::claude_native::CarryForwardInput {
+                display_messages: &display,
+                context_messages: &context,
+                todos: &todos,
+                working_dir: &self.agent.working_dir,
+                transcript_path: transcript_path.as_deref(),
+                transcript_unreachable: transcript_error.is_some(),
+                compaction_window,
+            },
+        );
+        Ok(serde_json::json!({
+            "ok": true,
+            "instructions": crate::compact::claude_native::SUMMARY_INSTRUCTIONS,
+            "transcriptPath": transcript_path,
+            "transcriptError": transcript_error,
+            "carryForward": carry_forward,
+        }))
+    }
+
+    /// Copy the native transcript to this machine. In SSH and server mode the
+    /// path Claude names is on the Claude host, unreachable for Locus tools.
+    async fn save_compaction_transcript(&self) -> Result<Option<String>, String> {
+        let id = self.agent.session_id.as_str();
+        let Some(native_id) = claude_code_cli::recovery::native_session_id(self.store, id)? else {
+            return Ok(None);
+        };
+        let Some(target) = crate::compact::claude_native::transcript_copy_path(id, &native_id) else {
+            return Ok(None);
+        };
+        let bytes = if claude_code_cli::recovery::recorded_remote(self.store, id)?.is_some() {
+            // The archive follows every checkpoint; a slightly older copy is
+            // still the right fallback when the refresh is slow or fails.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                claude_code_cli::archive::refresh_for_compaction(self.store, id),
+            ).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("[Agent {}] Claude archive refresh before compaction failed: {}", self.agent.id, error),
+                Err(_) => eprintln!("[Agent {}] Claude archive refresh before compaction timed out", self.agent.id),
+            }
+            self.store.claude_archive_files(id)?.remove("transcript.jsonl")
+        } else {
+            match claude_code_cli::tui::local_native_transcript(id, &native_id) {
+                Some(path) => Some(tokio::fs::read(&path).await.map_err(|e| format!("Failed to read native transcript: {e}"))?),
+                None => None,
+            }
+        };
+        let Some(bytes) = bytes.filter(|bytes| !bytes.is_empty()) else {
+            return Ok(None);
+        };
+        let parent = target.parent().ok_or("Invalid transcript copy path")?;
+        tokio::fs::create_dir_all(parent).await.map_err(|e| format!("Failed to create transcript directory: {e}"))?;
+        let temporary = target.with_extension("jsonl.partial");
+        tokio::fs::write(&temporary, &bytes).await.map_err(|e| format!("Failed to write transcript copy: {e}"))?;
+        tokio::fs::rename(&temporary, &target).await.map_err(|e| format!("Failed to install transcript copy: {e}"))?;
+        Ok(Some(target.to_string_lossy().replace('\\', "/")))
     }
 
     fn save_assistant_message(&mut self, message: ClaudeCodeAssistantMessage, force_persist: bool) -> Result<(), String> {
@@ -613,6 +727,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
                 },
             );
             self.partial_assistant.reset();
+            track_claude_stream_origin(&self.partial_assistant, &self.response_metadata, self.run_id);
         }
     }
 
@@ -716,21 +831,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
     }
 
     fn emit_undo_checkpoint_warning(&self, error: &str) {
-        let lower = error.to_ascii_lowercase();
-        let message = if lower.contains("unable to index file 'nul'")
-            || lower.contains("short read while indexing nul")
-        {
-            "Undo is unavailable for this round because Git could not snapshot the workspace. Remove or rename reserved Windows file names such as NUL in the repository."
-        } else {
-            "Undo may be unavailable for this round because the workspace snapshot failed."
-        };
-        crate::error::AppError::emit_background(
-            self.app_handle,
-            &crate::error::AppError::new("undo.checkpoint_failed", message)
-                .detail(error.to_string())
-                .operation("undo")
-                .severity(crate::error::ErrorSeverity::Warning),
-        );
+        emit_undo_checkpoint_warning(self.app_handle, error);
     }
 
     fn cli_round_workspace_policy(
@@ -1105,7 +1206,7 @@ impl<'a> ClaudeCodeRoundHost<'a> {
             }
         }
 
-        if !crate::unity_bridge::is_unity_project(&self.agent.working_dir)
+        if !crate::unity_bridge::unity_integration_enabled(&self.agent.working_dir)
             || !self.agent.is_unity_asset_write_call(tool_call, args)
         {
             return;
@@ -1192,73 +1293,105 @@ impl<'a> ClaudeCodeRoundHost<'a> {
     }
 
     async fn finish_cli_round_external_side_effects(&self, completion: CliRoundCompletion) {
-        let workspace_guard = completion.workspace_guard;
-        if !completion.queued_unity_asset_paths.is_empty() {
-            crate::unity_bridge::import_assets_fire_and_forget(
-                &self.agent.working_dir,
-                completion.queued_unity_asset_paths,
-            );
-        }
+        record_cli_side_effects(self.agent, self.app_handle, self.run_id, Some(self.run_id), completion).await;
+    }
+}
 
-        let Some(undo_guard) = completion.undo_guard else {
-            drop(workspace_guard);
-            return;
-        };
-        let Some(undo_mgr) = self.agent.undo_manager.as_ref() else {
-            drop(workspace_guard);
-            return;
-        };
-        let recorded = undo_mgr
-            .after_round_for_paths(
-                &self.agent.session_id,
-                &completion.message_id,
-                Some(self.run_id),
-                undo_guard,
-                completion.has_unity_execute,
-                &self.agent.working_dir,
-                workspace_guard
-                    .as_ref()
-                    .and_then(WorkspaceExecutionGuard::path_keys),
-            )
-            .await;
-        match recorded {
-            Ok(true) => {
-                if let Some(entry) = undo_mgr
-                    .find_entry(&self.agent.session_id, &completion.message_id)
-                    .await
-                {
-                    if AgentInstance::changed_files_touch_view_tree(&entry.changed_files) {
-                        if let Some(execution) = self.agent.execution_context.as_ref() {
-                            crate::view::emit_view_tree_changed_for_scope(
-                                self.app_handle,
-                                &crate::workspace_service::event::WorkspaceEventScope::for_runtime(
-                                    execution.workspace.as_ref(),
-                                ),
-                            );
-                        }
+fn emit_undo_checkpoint_warning(app_handle: &AppHandle, error: &str) {
+    let lower = error.to_ascii_lowercase();
+    let message = if lower.contains("unable to index file 'nul'")
+        || lower.contains("short read while indexing nul")
+    {
+        "Undo is unavailable for this round because Git could not snapshot the workspace. Remove or rename reserved Windows file names such as NUL in the repository."
+    } else {
+        "Undo may be unavailable for this round because the workspace snapshot failed."
+    };
+    crate::error::AppError::emit_background(
+        app_handle,
+        &crate::error::AppError::new("undo.checkpoint_failed", message)
+            .detail(error.to_string())
+            .operation("undo")
+            .severity(crate::error::ErrorSeverity::Warning),
+    );
+}
+
+/// Records undo for a finished batch of writes, attributed to its assistant
+/// message, then releases the batch's workspace lock. A background subagent's
+/// batch has no Locus run (`undo_run_id` is None); `emit_run_id` scopes the
+/// live notice.
+async fn record_cli_side_effects(
+    agent: &AgentInstance,
+    app_handle: &AppHandle,
+    emit_run_id: &str,
+    undo_run_id: Option<&str>,
+    completion: CliRoundCompletion,
+) {
+    let workspace_guard = completion.workspace_guard;
+    if !completion.queued_unity_asset_paths.is_empty() {
+        crate::unity_bridge::import_assets_fire_and_forget(
+            &agent.working_dir,
+            completion.queued_unity_asset_paths,
+        );
+    }
+
+    let Some(undo_guard) = completion.undo_guard else {
+        drop(workspace_guard);
+        return;
+    };
+    let Some(undo_mgr) = agent.undo_manager.as_ref() else {
+        drop(workspace_guard);
+        return;
+    };
+    let recorded = undo_mgr
+        .after_round_for_paths(
+            &agent.session_id,
+            &completion.message_id,
+            undo_run_id,
+            undo_guard,
+            completion.has_unity_execute,
+            &agent.working_dir,
+            workspace_guard
+                .as_ref()
+                .and_then(WorkspaceExecutionGuard::path_keys),
+        )
+        .await;
+    match recorded {
+        Ok(true) => {
+            if let Some(entry) = undo_mgr
+                .find_entry(&agent.session_id, &completion.message_id)
+                .await
+            {
+                if AgentInstance::changed_files_touch_view_tree(&entry.changed_files) {
+                    if let Some(execution) = agent.execution_context.as_ref() {
+                        crate::view::emit_view_tree_changed_for_scope(
+                            app_handle,
+                            &crate::workspace_service::event::WorkspaceEventScope::for_runtime(
+                                execution.workspace.as_ref(),
+                            ),
+                        );
                     }
                 }
-                eprintln!(
-                    "[Agent {}] emitting Claude Code CLI UndoAvailable for session {} run {} message {}",
-                    self.agent.id, self.agent.session_id, self.run_id, completion.message_id
-                );
-                emit_stream(
-                    self.app_handle,
-                    self.run_id,
-                    StreamEvent::UndoAvailable {
-                        session_id: self.agent.session_id.clone(),
-                        assistant_message_id: completion.message_id,
-                    },
-                );
             }
-            Ok(false) => {}
-            Err(error) => eprintln!(
-                "[Agent {}] failed to record Claude Code CLI undo state for session {} message {}: {}",
-                self.agent.id, self.agent.session_id, completion.message_id, error
-            ),
+            eprintln!(
+                "[Agent {}] emitting Claude Code CLI UndoAvailable for session {} run {} message {}",
+                agent.id, agent.session_id, emit_run_id, completion.message_id
+            );
+            emit_stream(
+                app_handle,
+                emit_run_id,
+                StreamEvent::UndoAvailable {
+                    session_id: agent.session_id.clone(),
+                    assistant_message_id: completion.message_id,
+                },
+            );
         }
-        drop(workspace_guard);
+        Ok(false) => {}
+        Err(error) => eprintln!(
+            "[Agent {}] failed to record Claude Code CLI undo state for session {} message {}: {}",
+            agent.id, agent.session_id, completion.message_id, error
+        ),
     }
+    drop(workspace_guard);
 }
 
 impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
@@ -1272,7 +1405,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
     fn on_checkpoint(&mut self,event:&serde_json::Value)->Result<(),String>{
         self.native_checkpoints.push(event.clone());
         self.flush_native_checkpoints()?;
-        claude_code_cli::archive::schedule(self.store.clone(),self.agent.session_id.clone());
+        claude_code_cli::archive::schedule(self.store.clone(),self.agent.session_id.clone(),self.app_handle.clone());
         Ok(())
     }
     fn on_compaction(&mut self, event: &serde_json::Value) -> Result<(), String> {
@@ -1283,29 +1416,66 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 trigger:Some(if event["trigger"]=="auto" {crate::commands::CompactTrigger::Auto} else {crate::commands::CompactTrigger::Manual}),
             });
         } else {
-            let tokens=event["tokens"].as_u64().or_else(||event["context"]["tokens"].as_u64()).map(|v|v.min(u32::MAX as u64) as u32);
+            // Claude's own post-compaction count excludes the system prompt and
+            // tools. The Mod's local estimate covers the whole context.
+            let tokens=event["estimate"].as_u64().filter(|value|*value>0)
+                .or_else(||event["tokens"].as_u64()).or_else(||event["context"]["tokens"].as_u64())
+                .map(|v|v.min(u32::MAX as u64) as u32);
             let limit=event["context"]["window"].as_u64().map(|v|v.min(u32::MAX as u64) as u32);
             let usage=self.store.record_token_usage(&self.agent.session_id,0,0,0,0,0.0,0,tokens,limit)?;
-            self.response_metadata["claude_compaction"] = event.clone();
             if let Some(point)=event.get("checkpoint").filter(|value|value.is_object()) {
                 self.response_metadata["claude_checkpoint"]=point.clone();
             }
             let messages=self.store.get_messages_for_prompt(&self.agent.session_id)?;
             if let Some(boundary)=messages.last() {
                 let summary=event["summary"].as_str().filter(|text|!text.is_empty()).ok_or("Claude compaction returned no summary")?;
-                let handoff=crate::compact::build_post_compact_message(summary,"",boundary.created_at,false,None);
-                self.store.compact_messages_with_response_request(&self.agent.session_id,&handoff,&boundary.id,0,Some(&self.response_metadata))?;
+                let kept: Vec<crate::compact::claude_native::KeptMessage> =
+                    serde_json::from_value(event["kept"].clone()).unwrap_or_default();
+                let retained = crate::compact::claude_native::resolve_kept_message_ids(&messages, &kept);
+                let earliest = retained.first()
+                    .and_then(|id| messages.iter().find(|message| &message.id == id))
+                    .map(|message| message.created_at)
+                    .unwrap_or(boundary.created_at);
+                // The receipt belongs to the handoff only; later rows of this
+                // run must not each persist a copy of the summary.
+                let mut receipt = event.clone();
+                if let Some(object) = receipt.as_object_mut() { object.remove("kept"); }
+                receipt["keptMessageIds"] = serde_json::json!(retained);
+                let mut request = self.response_metadata.clone();
+                request["claude_compaction"] = receipt;
+                // Claude reads the summary, its kept messages and then the
+                // Locus carry-forward (SessionStart context); the mirror keeps
+                // both texts on the handoff.
+                let body=match event["carryForward"].as_str().filter(|text|!text.trim().is_empty()) {
+                    Some(carry)=>format!("{}\n\n{}",summary.trim_end(),carry),
+                    None=>summary.to_string(),
+                };
+                let handoff=crate::compact::claude_native::build_handoff_message(&body,earliest,!retained.is_empty());
+                self.store.compact_messages_retaining(&self.agent.session_id,&handoff,&boundary.id,0,&retained,Some(&request))?;
                 if let Some(session_id)=self.cli_session_id.as_deref() {
                     self.store.set_message_cli_session_id(&self.agent.session_id,&handoff.id,CLAUDE_CODE_CLI_PROVIDER,session_id)?;
                 }
             }
+            let page = crate::commands::StreamHistoryPage::load(self.store, &self.agent.session_id)?;
             emit_stream(self.app_handle,self.run_id,StreamEvent::CompactDone {
                 session_id:self.agent.session_id.clone(),messages_before:event["before"].as_u64().unwrap_or(0) as u32,
                 messages_after:event["after"].as_u64().unwrap_or(0) as u32,context_tokens:usage.context_tokens,context_limit:usage.context_limit,
-                messages:self.store.get_messages_for_display(&self.agent.session_id)?,
+                messages:page.messages,oldest_message_row_id:page.oldest_message_row_id,has_more_history:page.has_more_history,
             });
         }
         Ok(())
+    }
+    fn prepare_compaction<'b>(&'b mut self, _event: &'b serde_json::Value) -> std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send + 'b>> {
+        Box::pin(async move {
+            match self.compaction_preparation().await {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("[Agent {}] Claude compaction preparation failed for session {}: {}", self.agent.id, self.agent.session_id, error);
+                    // Claude still compacts; it only loses the Locus additions.
+                    serde_json::json!({"ok":false,"error":error,"instructions":crate::compact::claude_native::SUMMARY_INSTRUCTIONS})
+                }
+            }
+        })
     }
     fn on_phase(&mut self, phase: crate::session::models::ClaudeCodePhase) {
         use crate::session::models::ClaudeCodePhase;
@@ -1366,10 +1536,22 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
         self.started_tool_calls.push_back((tool_call_id, tool_name));
     }
 
+    fn on_tool_call_abandoned(&mut self, tool_call_id: &str) {
+        if let Some((_, name)) = self.started_tool_calls.iter().find(|(id, _)| id == tool_call_id).cloned() {
+            // Duplicate preview receipts still describe one abandoned input.
+            self.started_tool_calls.retain(|(id, _)| id != tool_call_id);
+            // End the preview in the GUI only. There is no committed call,
+            // local execution, journal entry or model-visible tool result.
+            self.emit_tool_call_done(tool_call_id, &name,
+                "Claude abandoned incomplete tool input before execution.",
+                ToolCallOutcome::Interrupted, None);
+        }
+    }
+
     fn on_session_started(&mut self, session_id: &str) -> Result<(), String> {
         self.cli_session_id=Some(session_id.to_string());
         if let Some(remote)=self.response_metadata.get("claude_connection").filter(|v|!v.is_null()) {
-            let remote=serde_json::from_value(remote.clone()).map_err(|e|format!("Invalid Claude connection: {e}"))?;
+            let remote: claude_code_cli::connection::NativeConnection=serde_json::from_value(remote.clone()).map_err(|e|format!("Invalid Claude connection: {e}"))?;
             self.store.bind_claude_native_session(&self.agent.session_id,&remote,session_id)?;
         }
         // The user row already exists before launch. Persist the provider resume
@@ -1386,6 +1568,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
         // request metadata, never a new composer selection or catalog entry.
         self.response_metadata["upstream_model"] = serde_json::json!(model);
         self.response_metadata["claude_timing"] = serde_json::Value::Null;
+        track_claude_stream_origin(&self.partial_assistant, &self.response_metadata, self.run_id);
         self.step_message_ids.clear();
         Ok(())
     }
@@ -1467,6 +1650,22 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
         if message.text.is_empty() && message.thinking_text.is_empty() { return Ok(()); }
         self.save_assistant_message(message, true)
     }
+    fn native_agent_host(&self) -> Option<Arc<dyn claude_code_cli::ClaudeNativeAgentHost>> {
+        self.agent.claude_delegation()?;
+        Some(native_agent_hub::NativeAgentHub::install(self))
+    }
+    fn before_native_agent<'b>(
+        &'b mut self,
+        tool_call_id: &'b str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> {
+        Box::pin(async move {
+            if let Some(hub) = native_agent_hub::NativeAgentHub::existing(&self.agent.session_id) {
+                let message_id = self.message_id_for_tool_call(tool_call_id);
+                hub.note_agent_call(tool_call_id, message_id, self.run_id);
+            }
+            self.finish_parent_writes_before_agent(tool_call_id).await;
+        })
+    }
     fn on_external_tool_result<'b>(
         &'b mut self,
         id: &'b str,
@@ -1495,8 +1694,12 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 projected.output = claude_code_cli::native_output::external(&call.name, &result.output);
                 projected.text_with_context()
             };
-            let result =
-                ExecutedToolResult::from_tool_result(crate::tool::ToolResult { output, is_error });
+            // A native Agent's subagent calls persist with its result.
+            let nested = native_agent_hub::NativeAgentHub::existing(&self.agent.session_id)
+                .map(|hub| hub.take_records(id))
+                .unwrap_or_default();
+            let result = ExecutedToolResult::from_tool_result(crate::tool::ToolResult { output, is_error })
+                .with_nested_tool_calls(nested);
             let output = self.store.rewrite_tool_result_for_storage(
                 &self.agent.session_id,
                 id,
@@ -1595,6 +1798,13 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
             }
             self.agent
                 .inject_working_dir(&tool_call.name, &mut args_for_exec);
+            // The native route delegates only through Agent, including meta calls.
+            let delegation_refusal = (self.agent.claude_delegation().is_some()
+                && super::multi_agent::requires_multi_agent(&tool_call.name))
+            .then(|| ExecutedToolResult::from_tool_result(crate::tool::ToolResult {
+                output: format!("Delegate with the Agent tool in this conversation; '{}' was not run.", tool_call.name),
+                is_error: true,
+            }));
 
             let workspace_policy = self.cli_round_workspace_policy(&tool_call.name, &args_for_exec);
             let is_deterministic_pre_ask_call =
@@ -1617,7 +1827,7 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 .pending_round
                 .as_mut()
                 .and_then(|round| round.precompleted_subagent_results.remove(&tool_call.id));
-            let mut result_override = precompleted_subagent_result.or_else(|| match workspace_policy.as_ref() {
+            let mut result_override = precompleted_subagent_result.or(delegation_refusal).or_else(|| match workspace_policy.as_ref() {
                 Err(error) => {
                     eprintln!(
                         "[Agent {}] Claude Code tool round policy blocked tool='{}' id={} session={} run={} reason={}",
@@ -1747,6 +1957,14 @@ impl<'a> ClaudeCodeHost for ClaudeCodeRoundHost<'a> {
                 .unwrap_or_default();
             let mut result = if let Some(result) = result_override {
                 result
+            } else if tool_call.name == "Agent" {
+                // Only Locus-routed types reach the host; native types run in Claude.
+                self.finish_parent_writes_before_agent(&tool_call.id).await;
+                self.execute_locus_agent(&tool_call, &arguments, &assistant_message_id)
+                    .await
+            } else if tool_call.name == "SendMessage" {
+                // Only messages to Locus subagents reach the host.
+                self.execute_locus_send_message(&tool_call, &arguments)
             } else {
                 self.ensure_cli_round_undo_checkpoint(&tool_call.name, &args_for_exec)
                     .await;
@@ -1905,17 +2123,24 @@ impl AgentInstance {
         dynamic_mode: crate::config::DynamicToolLoadingMode,
         active_skill_tool_names: &HashSet<String>,
     ) -> Vec<serde_json::Value> {
+        // The native route delegates only through Agent/SendMessage. Locus
+        // subagent/send_message stay authorized for that route's forwarding.
+        let unified = self.claude_delegation().is_some();
+        let delegation_hidden = |tool: &serde_json::Value| unified
+            && tool["function"]["name"].as_str().is_some_and(super::multi_agent::requires_multi_agent);
         if self.cached_lazy_tool_renderer() == super::LazyToolRenderer::ClaudeCliNative {
             let plan = self.build_native_request_tool_plan(super::LazyToolRenderer::ClaudeCliNative, active_skill_tool_names).await;
             let mut tools = self.build_api_tools_for_plan(super::LazyToolRenderer::ClaudeCliNative, &plan).await;
             // Only the model-facing catalog is deduplicated. The local names
             // must remain authorized: native Edit/Bash/etc. dispatch to them.
             tools.retain(|tool| tool["function"]["name"].as_str().is_none_or(|name|
-                claude_code_cli::native_tools::native_equivalent_for_locus_tool(name).is_none()));
+                claude_code_cli::native_tools::native_equivalent_for_locus_tool(name).is_none()) && !delegation_hidden(tool));
             return tools;
         }
         let names = self.build_cli_request_tool_names(dynamic_mode, active_skill_tool_names).await;
-        self.build_api_tools(&names).await
+        let mut tools = self.build_api_tools(&names).await;
+        tools.retain(|tool| !delegation_hidden(tool));
+        tools
     }
 
     async fn build_cli_request_tool_names(
@@ -2019,7 +2244,9 @@ impl AgentInstance {
         match result {
             Some(text) => Ok(text),
             None => {
-                claude_code_cli::tui::close_session(&self.session_id);
+                // Claude's own Esc already cancelled the turn. Running
+                // background agents keep the process, as in Claude's TUI.
+                claude_code_cli::tui::close_cancelled_session(&self.session_id);
                 self.record_captured_attempt(store, run_id, "normal", 1,
                     current_attempt.load(Ordering::Relaxed).max(1), "cancelled", fallback(), "",
                     Some("cancelled during Claude execution or recovery")).await;
@@ -2057,9 +2284,24 @@ impl AgentInstance {
             .build_cli_api_tools(dynamic_tool_loading_mode, active_skill_tool_names)
             .await;
 
-        claude_code_cli::tui::prewarm::wait_for(&self.session_id).await?;
+        #[cfg(feature = "server-client")]
+        let server_binding = crate::server_client::binding_for_model(&self.effective_model)?.map(|(binding, _)| binding.id);
+        #[cfg(not(feature = "server-client"))]
+        let server_binding: Option<String> = None;
+        let recorded_connection = claude_code_cli::recovery::recorded_connection(store,&self.session_id)?;
+        if let Some(binding_id)=server_binding.as_deref() {
+            let expected=claude_code_cli::connection::NativeConnection::server(binding_id)?;
+            if recorded_connection.as_ref().is_some_and(|recorded|recorded.as_ref()!=Some(&expected)) {
+                return Err("Use a new conversation for Locus Server; this history belongs to another connection.".into());
+            }
+        } else {
+            if recorded_connection.as_ref().and_then(|value|value.as_ref()).is_some_and(|connection|connection.server_binding_id().is_some()) {
+                return Err("This conversation requires its bound internal Locus Server connection".into());
+            }
+            claude_code_cli::tui::prewarm::wait_for(&self.session_id).await?;
+        }
         let pending = if initial_mode == "compact" { None } else { current_user_message_id.map(str::to_owned) };
-        if claude_code_cli::archive::transfer_check(store,&self.session_id)?.is_some() {
+        if server_binding.is_none() && claude_code_cli::archive::transfer_check(store,&self.session_id)?.is_some() {
             return Err("The SSH server has changed. Confirm restoring this conversation in the input area before sending.".into());
         }
         let compact = initial_mode == "compact";
@@ -2072,9 +2314,12 @@ impl AgentInstance {
         };
         let recovery_required = recovered.warning.is_some() || recovered.resume_context.is_some();
         if recovered.changed || attempt > 1 {
+            let page = crate::commands::StreamHistoryPage::load(store, &self.session_id)?;
             emit_stream(app_handle, run_id, StreamEvent::HistorySynchronized {
                 session_id: self.session_id.clone(),
-                messages: store.get_messages_for_display(&self.session_id)?,
+                messages: page.messages,
+                oldest_message_row_id: page.oldest_message_row_id,
+                has_more_history: page.has_more_history,
             });
         }
         if !compact {
@@ -2124,8 +2369,15 @@ impl AgentInstance {
             return Err("This conversation has no verifiable Claude Code session. Create a new Claude Code conversation; existing history was not sent.".into());
         }
 
-        let recorded_connection = claude_code_cli::recovery::recorded_connection(store,&self.session_id)?;
-        let remote = claude_code_cli::ssh::session_connection(&self.session_id, resume_session_id.is_some(), recorded_connection)?;
+        let remote = if let Some(binding_id) = &server_binding {
+            let selected = claude_code_cli::connection::NativeConnection::server(binding_id.clone())?;
+            if recorded_connection.as_ref().is_some_and(|recorded|recorded.as_ref()!=Some(&selected)) {
+                return Err("The saved Claude conversation belongs to another connection".into());
+            }
+            Some(selected)
+        } else {
+            claude_code_cli::ssh::native_session_connection(&self.session_id, resume_session_id.is_some(), recorded_connection)?
+        };
         if !compact {
             use tauri::Manager;
             // Synchronize old receipts before deciding which notifications
@@ -2134,7 +2386,7 @@ impl AgentInstance {
                 .deliver_notifications(&self.session_id, store)?;
         }
         let mut user_message = if initial_mode=="compact" {build_cli_user_message(prompt_text,images)} else {
-            prepare_pending_claude_input(store,&self.session_id,pending.as_deref(),prompt_text,&remote,system_prompt)?
+            prepare_pending_claude_input_with_model(store,&self.session_id,pending.as_deref(),prompt_text,&remote,system_prompt,server_binding.as_ref().map(|_|self.effective_model.as_str()))?
         };
         if let Some(context)=recovered.resume_context {
             if let Some(text)=user_message["content"].as_str() {
@@ -2174,23 +2426,32 @@ impl AgentInstance {
             render_scope: if attempt == 1 { run_id.to_string() } else { format!("{run_id}:attempt-{attempt}") },
             retrying: attempt > 1,
         };
+        track_claude_stream_origin(&self.partial_assistant, &host.response_metadata, run_id);
 
+        let delegation = self.claude_delegation();
+        let cwd = if self.has_selected_working_dir() {
+            self.working_dir.clone()
+        } else {
+            std::env::current_dir()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        };
+        let agents = delegation
+            .as_ref()
+            .map(|directory| directory.mod_payload(&super::claude_native_agents::claude_subagent_environment(&cwd)))
+            .unwrap_or(serde_json::Value::Null);
         let options = ClaudeCodeCliOptions {
-            remote,
+            remote: remote.as_ref().and_then(|remote| remote.as_ssh()).cloned(),
             locus_session_id: self.session_id.clone(),
-            cwd: if self.has_selected_working_dir() {
-                self.working_dir.clone()
-            } else {
-                std::env::current_dir()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
-            },
+            cwd,
             system_prompt: system_prompt.to_string(),
             model: self.effective_model.clone(),
             effort: self.effort.clone(),
             resume_session_id,
             tools,
             native_tool_search: self.cached_lazy_tool_renderer() == super::LazyToolRenderer::ClaudeCliNative,
+            native_agents: delegation.is_some(),
+            agents,
         };
         *capture = serde_json::json!({
             "backend": "claude_code_cli",
@@ -2350,11 +2611,9 @@ impl AgentInstance {
         }
 
         host.flush_native_checkpoints()?;
-        if let Err(error)=claude_code_cli::archive::backup(store,&self.session_id).await {
-            crate::error::AppError::emit_background(app_handle,&crate::error::AppError::new(
-                "claude.archive_failed","Claude session backup was not updated; the previous backup was retained.")
-                .detail(error).operation("claudeArchive").severity(crate::error::ErrorSeverity::Warning));
-        }
+        // The response is durable locally. Bulk SSH backup has its own status
+        // and must not keep the conversation running after Claude has finished.
+        claude_code_cli::archive::schedule(store.clone(),self.session_id.clone(),app_handle.clone());
         store.close_run_pending_input_queue(run_id)?;
 
         if let Err(error) = store.set_latest_completed_run_id(&self.session_id, Some(run_id)) {
@@ -2490,6 +2749,10 @@ fn sanitize_request_id(request_id: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "claude_stream_tests.rs"]
+mod stream_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn concurrent_native_results_restore_their_own_pending_round_without_losing_siblings() {
@@ -2528,7 +2791,7 @@ mod tests {
         // Before source confirmation, retry preparation retains the exact token
         // and row, rather than duplicating the user request in local history.
         assert_eq!(wire, prepare_pending_claude_input(&store, &id, Some(&user), "Apply the change exactly once", &Some(remote.clone()), "").unwrap());
-        let native: claude_code_cli::recovery::NativeSnapshot = serde_json::from_value(json!({
+        let mut native: claude_code_cli::recovery::NativeSnapshot = serde_json::from_value(json!({
             "version":1,"nativeId":uuid::Uuid::new_v4(),"digest":"a".repeat(64),
             "messages":[{"key":"accepted-user","role":"user","uuids":[uuid::Uuid::new_v4()],"content":wire["content"]}],
             "todos":[],"pendingToolIds":[],"incompleteTail":false,
@@ -2539,8 +2802,37 @@ mod tests {
         assert!(!resumed["content"].as_str().unwrap().contains("Apply the change exactly once"));
         assert!(resumed["content"].as_str().unwrap().contains("Continue from the existing conversation"));
         // A second disconnect before consuming the continuation reuses it.
-        assert_eq!(resumed, prepare_pending_claude_input(&store, &id, Some(&user), "Apply the change exactly once", &Some(remote), "").unwrap());
+        assert_eq!(resumed, prepare_pending_claude_input(&store, &id, Some(&user), "Apply the change exactly once", &Some(remote.clone()), "").unwrap());
         assert_eq!(store.get_messages(&id).unwrap().len(), 2);
+        let mut resumed = resumed;
+        for index in 0..2 {
+            let messages = store.get_messages(&id).unwrap();
+            let continuation = messages.iter().find(|m| Some(m.id.as_str()) == resumed["locusMessageId"].as_str()).unwrap();
+            assert!(continuation.content.is_empty());
+            assert!(claude_code_cli::recovery::is_continuation_prompt(continuation.prompt_suffix.as_deref().unwrap()));
+            let view = store.load_session_view(&id, 100).unwrap();
+            assert_eq!(view.user_message_ids, vec![user.clone()]);
+            assert_eq!(view.session.messages.len(), 1);
+
+            // The continuation itself was accepted, but the transport failed
+            // again. Authoritative recovery must retain its hidden identity.
+            let mut accepted = native.messages[0].clone();
+            accepted.key = format!("accepted-continuation-{index}");
+            accepted.uuids = vec![uuid::Uuid::new_v4().to_string()];
+            accepted.content = resumed["content"].clone();
+            native.messages.push(accepted);
+            native.digest = format!("{:064x}", index + 1);
+            store.rebuild_claude_native_for_retry(&id, &remote, &native, &messages, Some(&user)).unwrap();
+            let recovered = store.get_messages(&id).unwrap();
+            let continuation = recovered.iter().find(|m| Some(m.id.as_str()) == resumed["locusMessageId"].as_str()).unwrap();
+            assert!(continuation.content.is_empty());
+            assert!(claude_code_cli::recovery::is_continuation_prompt(continuation.prompt_suffix.as_deref().unwrap()));
+            assert_eq!(store.load_session_view(&id, 100).unwrap().user_message_ids, vec![user.clone()]);
+            let next = prepare_pending_claude_input(&store, &id, Some(&user), "Apply the change exactly once", &Some(remote.clone()), "").unwrap();
+            assert_ne!(next["locusMessageId"], resumed["locusMessageId"]);
+            assert!(!next["content"].as_str().unwrap().contains("Apply the change exactly once"));
+            resumed = next;
+        }
     }
 
     #[tokio::test]

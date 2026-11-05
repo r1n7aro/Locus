@@ -17,6 +17,8 @@ use crate::session::models::{ImageData, ToolCallInfo};
 use crate::tool::ToolResult;
 
 mod mod_bridge;
+#[cfg(feature = "server-client")]
+mod server_transport;
 mod bridge_health;
 mod turn_tools;
 mod diagnostics;
@@ -32,6 +34,8 @@ mod native_feature_tests;
 mod native_lazy_tests;
 #[cfg(test)]
 mod native_search_tests;
+#[cfg(test)]
+mod native_agents_tests;
 pub(crate) mod native_tools;
 pub(crate) mod native_scope;
 pub(crate) mod native_executor;
@@ -39,6 +43,8 @@ pub(crate) mod native_grep;
 pub(crate) mod native_output;
 pub(crate) mod tui;
 pub(crate) mod ssh;
+pub(crate) mod connection;
+pub(crate) mod connection_publisher;
 pub(crate) mod recovery;
 pub(crate) mod turn_retry;
 pub(crate) mod archive;
@@ -103,10 +109,12 @@ const DISALLOWED_CLAUDE_BUILTINS: &[&str] = &[
     "Workflow",
 ];
 
-// Native mode exposes only builtins whose execution the Mod actually adapts.
+// Every TUI launch exposes only builtins whose execution the Mod actually adapts.
 // Unsupported feature-flagged tools (e.g. Artifact) otherwise change schemas
 // across CLI restarts and invalidate an unrelated conversation's prefix.
-pub(super) const NATIVE_BUILTIN_TOOLS: &str = "Read,Write,Edit,Bash,Glob,Grep,TaskOutput,TaskStop,AskUserQuestion,TodoWrite,TaskCreate,TaskGet,TaskList,TaskUpdate,ToolSearch,WebSearch,WebFetch";
+// Launches use `claude_launch::native_tools`, which adds the delegation tools.
+#[cfg(test)]
+pub(super) use locus_remote_core::claude_launch::NATIVE_BUILTIN_TOOLS;
 
 fn claude_session_map() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
     static STORE: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -167,6 +175,10 @@ pub struct ClaudeCodeCliOptions {
     pub resume_session_id: Option<String>,
     pub tools: Vec<ClaudeCodeToolDefinition>,
     pub native_tool_search: bool,
+    /// Launch with the native Agent/SendMessage tools (pinned route, Multi-Agent on).
+    pub native_agents: bool,
+    /// Pinned delegation directory for the Mod (`/options` "agents"); null when off.
+    pub agents: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -225,6 +237,57 @@ impl From<ToolResult> for ClaudeCodeToolResult {
 }
 
 pub type ClaudeCodeHostFuture<'a> = Pin<Box<dyn Future<Output = ClaudeCodeToolResult> + Send + 'a>>;
+/// A native Claude subagent of the current conversation (`agent.spawn`).
+pub use mod_bridge::NativeAgent as ClaudeCodeNativeAgent;
+
+/// Claude's `<task-notification>` for a background subagent run. The Mod
+/// drops it before Claude's model sees it; Locus delivers the outcome as a
+/// task result (and wakes an idle conversation) instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeCodeAgentNotice {
+    pub agent_id: String,
+    /// The call that started this run: the Agent call or a resuming SendMessage.
+    pub tool_use_id: String,
+    /// `completed`, `failed` or `killed`.
+    pub status: String,
+    pub summary: String,
+    pub result: Option<String>,
+    /// An earlier run's notice, seen after Claude already continued the
+    /// agent: its task belongs to the newer run.
+    pub superseded: bool,
+}
+
+pub(crate) type ClaudeCodeUnitFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Executes and records a conversation's native Claude subagents. A Locus run
+/// installs it; it keeps serving background agents after that run ends, so
+/// none of its calls borrow the run's host. Calls may run concurrently.
+pub trait ClaudeNativeAgentHost: Send + Sync {
+    /// A run started: an `Agent` call, or the `SendMessage` that resumed it.
+    fn registered<'a>(&'a self, agent: &'a ClaudeCodeNativeAgent) -> ClaudeCodeUnitFuture<'a>;
+    /// A subagent announced a tool call (Locus name and arguments).
+    fn tool_started(&self, agent: &ClaudeCodeNativeAgent, tool_call_id: &str, tool_name: &str, arguments: &serde_json::Value);
+    /// Display-only text of a subagent's message; never parent content.
+    fn text(&self, agent: &ClaudeCodeNativeAgent, text: &str);
+    /// Executes a bridged call under the parent's authority. `SendMessage`
+    /// is a message to the main agent; its output is the native result JSON.
+    fn execute<'a>(
+        &'a self,
+        agent: &'a ClaudeCodeNativeAgent,
+        tool_call_id: &'a str,
+        tool_name: &'a str,
+        arguments: serde_json::Value,
+    ) -> ClaudeCodeHostFuture<'a>;
+    /// A call that Claude ran itself or that was refused before Locus ran it.
+    /// Idempotent with `execute`.
+    fn tool_finished<'a>(&'a self, agent: &'a ClaudeCodeNativeAgent, tool_call_id: &'a str, result: ClaudeCodeToolResult) -> ClaudeCodeUnitFuture<'a>;
+    /// A background run ended (completed, failed, or stopped).
+    fn notification<'a>(&'a self, notice: &'a ClaudeCodeAgentNotice) -> ClaudeCodeUnitFuture<'a>;
+    /// Usage of one subagent model step.
+    fn usage(&self, _agent: &ClaudeCodeNativeAgent, _usage: &serde_json::Value) {}
+    /// The Claude process is gone; its running background agents ended.
+    fn process_exited<'a>(&'a self, agents: Vec<ClaudeCodeNativeAgent>) -> ClaudeCodeUnitFuture<'a>;
+}
 
 pub struct ClaudeCodeInput {
     pub id: String,
@@ -246,6 +309,12 @@ pub trait ClaudeCodeHost {
     fn on_interrupted_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String> { self.on_assistant_message(message) }
     fn on_checkpoint(&mut self, _event: &serde_json::Value) -> Result<(), String> { Ok(()) }
     fn on_compaction(&mut self, _event: &serde_json::Value) -> Result<(), String> { Ok(()) }
+    /// Called before Claude summarizes. The reply carries summarizer
+    /// instructions, the local transcript copy and the carry-forward block;
+    /// an empty reply leaves Claude's native compaction unchanged.
+    fn prepare_compaction<'a>(&'a mut self, _event: &'a serde_json::Value) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'a>> {
+        Box::pin(async { serde_json::json!({"ok":true}) })
+    }
     fn on_session_started(&mut self, _session_id: &str) -> Result<(), String> { Ok(()) }
     fn on_model_resolved(&mut self, _model: &str) -> Result<(), String> { Ok(()) }
     fn on_step_started(&mut self, _step_id: u64) -> Result<(), String> { Ok(()) }
@@ -255,6 +324,9 @@ pub trait ClaudeCodeHost {
     fn on_text_delta(&mut self, delta: String);
     fn on_thinking_delta(&mut self, delta: String);
     fn on_tool_call_start(&mut self, tool_call_id: String, tool_name: String);
+    /// Display-only retirement of an incomplete streamed preview. This is not
+    /// a tool result and must never be persisted or sent back to the model.
+    fn on_tool_call_abandoned(&mut self, _tool_call_id: &str) {}
     fn on_assistant_message(&mut self, message: ClaudeCodeAssistantMessage) -> Result<(), String>;
     fn on_external_tool_result<'a>(
         &'a mut self,
@@ -269,6 +341,14 @@ pub trait ClaudeCodeHost {
         tool_name: &'a str,
         arguments: serde_json::Value,
     ) -> ClaudeCodeHostFuture<'a>;
+    /// This conversation's subagent host. The session's agent pump keeps it
+    /// after the run ends, for background agents.
+    fn native_agent_host(&self) -> Option<std::sync::Arc<dyn ClaudeNativeAgentHost>> { None }
+    /// Claude starts the native `Agent` call announced in this run. Its
+    /// subagent takes its own workspace locks, so the run releases its batch.
+    fn before_native_agent<'a>(&'a mut self, _tool_call_id: &'a str) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async {})
+    }
 }
 
 pub fn claude_cli_status() -> (bool, String) {
@@ -437,6 +517,49 @@ pub fn find_claude_cli() -> Option<PathBuf> {
     }
 
     resolved
+}
+
+/// Native multi-agent requires the CLI version its protocol was verified on.
+pub(crate) const NATIVE_AGENTS_MIN_VERSION: (u64, u64, u64) = (2, 1, 312);
+
+/// CLI version a new conversation's native-agent check uses: for SSH the
+/// last connection test or session launch recorded it, otherwise the local
+/// CLI's. Blocking: the local check runs `claude --version`.
+pub(crate) fn native_agents_cli_version(settings: &ssh::ConnectionSettings) -> Option<String> {
+    match &settings.remote {
+        Some(_) => settings.info.as_ref().and_then(|info| info.cli_version.clone()),
+        None => local_cli_version(),
+    }
+}
+
+/// `claude --version` of the local CLI, cached like discovery. Called when a
+/// new conversation chooses its multi-agent route and by Settings.
+pub(crate) fn local_cli_version() -> Option<String> {
+    static CACHE: OnceLock<std::sync::Mutex<Option<(PathBuf, Option<String>, Instant)>>> = OnceLock::new();
+    let path = find_claude_cli()?;
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some((cached, version, at)) = cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if *cached == path && at.elapsed() < CLI_DISCOVERY_TTL { return version.clone(); }
+    }
+    let mut command = std::process::Command::new(&path);
+    command.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let version = command.output().ok().filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.split_whitespace().next().map(str::to_owned));
+    *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((path, version.clone(), Instant::now()));
+    version
+}
+
+/// Compares the numeric `major.minor.patch` prefix ("2.1.312 (Claude Code)").
+pub(crate) fn version_at_least(version: &str, minimum: (u64, u64, u64)) -> bool {
+    let mut parts = version.trim().split(|c: char| !c.is_ascii_digit()).filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor), Some(patch)) => (major, minor, patch) >= minimum,
+        _ => false,
+    }
 }
 
 fn discover_claude_cli() -> Option<PathBuf> {
@@ -864,7 +987,7 @@ fn mcp_tool_result_content(result: &ClaudeCodeToolResult) -> Vec<serde_json::Val
     content
 }
 
-fn normalize_claude_model(model: &str) -> String {
+pub(crate) fn normalize_claude_model(model: &str) -> String {
     let trimmed = model.trim();
     let short = trimmed.strip_prefix("claude_code/").unwrap_or(trimmed);
     let (base, suffix) = short
@@ -964,6 +1087,17 @@ fn cli_binary_names() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_agent_version_gate_reads_cli_version_output() {
+        assert!(version_at_least("2.1.312 (Claude Code)", NATIVE_AGENTS_MIN_VERSION));
+        assert!(version_at_least("2.2.0", NATIVE_AGENTS_MIN_VERSION));
+        assert!(version_at_least("3.0.1", NATIVE_AGENTS_MIN_VERSION));
+        assert!(!version_at_least("2.1.311 (Claude Code)", NATIVE_AGENTS_MIN_VERSION));
+        assert!(!version_at_least("2.0.999", NATIVE_AGENTS_MIN_VERSION));
+        assert!(!version_at_least("", NATIVE_AGENTS_MIN_VERSION));
+        assert!(!version_at_least("Claude Code", NATIVE_AGENTS_MIN_VERSION));
+    }
 
     #[test]
     fn normalize_claude_model_maps_current_aliases_and_ids() {

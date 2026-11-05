@@ -34,7 +34,7 @@ impl SessionStore {
             } else {
                 format!("async-result:{task}:{attempt}")
             };
-            expected.insert(key, reminder);
+            expected.insert(key, vec![reminder]);
         }
         let mut stmt = conn.prepare("SELECT id,sender,body FROM agent_messages WHERE delivered=1 AND ((target_task_id IS NULL AND target_session_id=?1) OR target_task_id IN (SELECT task_id FROM async_task_results WHERE json_extract(snapshot_json,'$.resume.childSessionId')=?1))")
             .map_err(|e| e.to_string())?;
@@ -51,19 +51,22 @@ impl SessionStore {
             let (key, sender, body) = row.map_err(|e| e.to_string())?;
             expected.insert(
                 format!("agent-message:{key}"),
-                Self::agent_message_reminder(&sender, &body),
+                Self::agent_message_reminder_variants(&sender, &body),
             );
         }
         let mut verified = HashSet::new();
         for message in messages {
-            let Some(reminder) = expected.get(&message.id) else {
+            let Some(reminders) = expected.get(&message.id) else {
                 continue;
             };
             // An ID prefix or a saved marker alone is never provenance. Match
             // the original outbox body, destination and complete message shape.
             if message.role != MessageRole::User
                 || !message.content.is_empty()
-                || message.prompt_suffix.as_ref() != Some(reminder)
+                || !message
+                    .prompt_suffix
+                    .as_ref()
+                    .is_some_and(|suffix| reminders.contains(suffix))
                 || message
                     .prompt_prefix
                     .as_deref()

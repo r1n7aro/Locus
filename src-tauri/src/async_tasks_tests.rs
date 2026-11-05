@@ -257,6 +257,35 @@ fn async_agent_mail_is_durable_replyable_and_injected_once() {
 }
 
 #[test]
+fn agent_messages_name_the_sender_and_reachable_ids_exclude_self() {
+    let (_dir, store, manager, session) = fixture();
+    let (_, child) = named_child(&store, &manager, &session, "reviewer");
+    let (_, sibling) = named_child(&store, &manager, &session, "tester");
+    let bash = manager.create_task(&session, "bash", false);
+    manager.prepare_task(&bash.task_id, None).unwrap();
+
+    let mut root_ids = manager.reachable_agent_ids(&session);
+    root_ids.sort();
+    assert_eq!(root_ids, ["reviewer", "tester"]);
+    let mut child_ids = manager.reachable_agent_ids(&child);
+    child_ids.sort();
+    assert_eq!(child_ids, ["parent", "parent/tester"]);
+    assert!(manager
+        .identity_reminder(&child)
+        .unwrap()
+        .contains("send_message with to=\"parent\""));
+
+    manager
+        .queue_task_message(&child, "parent/tester", "check the race")
+        .unwrap();
+    let delivered = manager.deliver_notifications(&sibling, &store).unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert!(delivered[0].contains("\"from\":\"parent/reviewer\""));
+    assert!(delivered[0].contains("\"message\":\"check the race\""));
+    assert!(delivered[0].contains("send a message to the 'from' id: with send_message"));
+}
+
+#[test]
 fn async_completion_keeps_idle_waiter_alive_until_delivery_is_ready() {
     let (_dir, store, manager, session) = fixture();
     let task = manager.create_task(&session, "subagent", true);

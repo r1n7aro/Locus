@@ -74,7 +74,9 @@ pub fn adapt(id: &str, tool: &str, input: &Value) -> Result<NativeCall, String> 
             "bash",
             json!({"command":string("command")?,
                 "workdir":".","readonly":false,
-                "async":if input["run_in_background"].as_bool().unwrap_or(false){"async"}else{"sync"},
+                // Claude promises that a background command re-invokes the
+                // model when it exits, also after the turn ends.
+                "async":if input["run_in_background"].as_bool().unwrap_or(false){"notify"}else{"sync"},
                 "description":input.get("description").cloned().unwrap_or(json!("")),
                 "timeout":input.get("timeout").cloned().unwrap_or(json!(120000))}),
         ),
@@ -98,6 +100,25 @@ pub fn adapt(id: &str, tool: &str, input: &Value) -> Result<NativeCall, String> 
                 "python",
                 json!({"code":format!("await locus.{method}({})",json!(id.trim_start_matches("locus:"))),"readonly":true}),
             )
+        }
+        // The Mod routes messages for Claude's own agents to Claude; the
+        // host receives only those for a Locus agent (`locus:<task id>`).
+        "SendMessage" => {
+            if !string("to")?.starts_with("locus:") {
+                return Err("SendMessage runs in Locus only for a Locus agent (to: \"locus:<task id>\")".into());
+            }
+            let _ = string("message")?;
+            ("SendMessage", input.clone())
+        }
+        // Only Locus-routed types reach the host; the Agent host maps the
+        // native input onto its pinned delegation directory.
+        "Agent" => {
+            let _ = string("subagent_type")?;
+            let _ = string("prompt")?;
+            // Claude's parser may fill unset options; they select nothing.
+            let mut fields = input.as_object().cloned().unwrap_or_default();
+            fields.retain(|key, value| !value.is_null() && !(key == "run_in_background" && value == false));
+            ("Agent", Value::Object(fields))
         }
         "AskUserQuestion" => {
             let questions = input["questions"]
@@ -204,7 +225,7 @@ fn finish_result_inner(
             let id = serde_json::from_str::<String>(id).unwrap_or_else(|_| id.to_string());
             let code = format!("task = await locus.wait_task({}, timeout=30)\nprint(task.status, task.output)", json!(id));
             return json!({"callId":call.id,"result":{"stdout":"","stderr":"","interrupted":false,"backgroundTaskId":id},
-                "context":[result.output, format!("This background task runs in Locus. Read its output with mcp__locus__python, readonly=true, code: {code}. Use locus.get_task_status with the same task ID for a nonblocking check, or native TaskStop to stop it. Task APIs are scoped to the current Locus session.")]});
+                "context":[result.output, format!("This background task runs in Locus. Its result is delivered to you automatically when it finishes, even after this turn ends; do not poll it. Only if this turn cannot continue without the result, wait with mcp__locus__python, readonly=true, code: {code}. Use locus.get_task_status with the same task ID for a nonblocking check, or native TaskStop to stop it (a stopped task sends no result). Task APIs are scoped to the current Locus session.")]});
         }
         // Immediate commands can finish during the background startup handshake.
     }
@@ -354,16 +375,29 @@ mod tests {
     #[test]
     fn background_result_unquotes_locus_ids_and_accepts_local_task_control(){
         let call=adapt("b1","Bash",&json!({"command":"sleep 1","run_in_background":true})).unwrap();
-        let output=super::super::ClaudeCodeToolResult{output:"Async task: id=\"t4\" status=queued notify=false".into(),is_error:false,images:None,context:Vec::new()};
+        // Background commands deliver their result and wake an idle session.
+        assert_eq!(call.locus_input["async"],"notify");
+        assert_eq!(adapt("b0","Bash",&json!({"command":"echo ok"})).unwrap().locus_input["async"],"sync");
+        let output=super::super::ClaudeCodeToolResult{output:"Async task: id=\"t4\" status=queued notify=true\nResult sent automatically.".into(),is_error:false,images:None,context:Vec::new()};
         let result = finish_result(&call,&output,None);
         assert_eq!(result["result"]["backgroundTaskId"],"t4");
         let context = result["context"][1].as_str().unwrap();
+        assert!(context.contains("delivered to you automatically"));
         assert!(context.contains("mcp__locus__python"));
         assert!(context.contains("readonly=true"));
         assert!(context.contains("await locus.wait_task(\"t4\", timeout=30)"));
         assert!(context.contains("print(task.status, task.output)"));
         assert!(adapt("s1","TaskStop",&json!({"task_id":"t4"})).is_ok());
         assert!(adapt("r1","TaskOutput",&json!({"task_id":"t4"})).is_ok());
+    }
+    #[test]
+    fn only_messages_for_locus_agents_reach_the_host() {
+        let input = json!({"to":"locus:t3","message":"Also check the tests","summary":"tests"});
+        let call = adapt("m1", "SendMessage", &input).unwrap();
+        assert_eq!((call.locus_name, &call.locus_input), ("SendMessage", &input));
+        // Claude's own agents (and the main agent) are never Locus's.
+        assert!(adapt("m2", "SendMessage", &json!({"to":"a1b2","message":"hi"})).is_err());
+        assert!(adapt("m3", "SendMessage", &json!({"to":"locus:t3"})).is_err());
     }
     #[test]
     fn edits_use_locus_atomic_batch_schema() {
@@ -557,7 +591,7 @@ mod tests {
             ("Edit", json!({"file_path":"a.md","old_string":"old","new_string":"new"}), None, "Edited a.md\nKnowledge index: immediate update failed; filesystem watcher will retry"),
             ("Read", json!({"file_path":"a.txt"}), None, "<content>\n1\tline\n\n(End of file — 1 lines total)\n</content>\n\nSkill runtime ready"),
             ("Bash", json!({"command":"echo ok"}), None, "Exit code: 0\nok"),
-            ("Bash", json!({"command":"echo ok","run_in_background":true}), None, "Async task: id=\"t1\" status=queued notify=false"),
+            ("Bash", json!({"command":"echo ok","run_in_background":true}), None, "Async task: id=\"t1\" status=queued notify=true"),
         ];
         for (tool, input, structured, output) in cases {
             let call = adapt("notification", tool, &input).unwrap();

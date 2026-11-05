@@ -1,7 +1,9 @@
 import { ref, computed, watch } from "vue";
+import { additionalModels, protocolModelId } from '@locus/server-client';
 import { defineStore } from "pinia";
 import { useAuthStore } from "./auth";
 import { pickPreferredModelId } from "./modelSelection";
+import { clampEffortToLevels } from "./newSessionSelection";
 import * as modelService from "../services/model";
 import { claudeCodeModelCatalogScope } from "../services/claudeConnection";
 import {
@@ -26,6 +28,7 @@ import {
   normalizeCodexContextWindow,
 } from "../config/codexContext";
 import { modelSupportsFastMode } from "../utils/modelDisplay";
+import { normalizeSubagentModelChoices } from "../utils/subagentModels";
 import { getCachedDebugMode, getDebugMode, subscribeDebugMode } from "../services/permissions";
 import { t } from "../i18n";
 
@@ -377,7 +380,7 @@ export const useModelStore = defineStore("model", () => {
     const models = [...builtinModels, ...claudeCodeModels.value.filter(model => !builtinModels.some(item => item.id === model.id)), ...codexModels.value, ...customs, ...mocks].filter(
       (m) => m.provider !== "claude_code" || claudeCodeCliEnabled.value,
     );
-    return filterVisibleModels(models);
+    return filterVisibleModels([...models, ...additionalModels.value]);
   });
 
   const availableModels = computed(() => {
@@ -388,7 +391,8 @@ export const useModelStore = defineStore("model", () => {
     if (authStore.codexAuthenticated) providers.add("openai_codex");
     providers.add("custom");
     if (debugModeEnabled.value) providers.add("mock");
-    return allModels.value.filter((m) => providers.has(m.provider));
+    const additionalIds = new Set(additionalModels.value.map(model => model.id));
+    return allModels.value.filter((m) => providers.has(m.provider) || additionalIds.has(m.id));
   });
 
   /** Resolve a `custom/...` model id to its provider + model config. Accepts
@@ -425,7 +429,7 @@ export const useModelStore = defineStore("model", () => {
   );
 
   const selectedOpenAiReasoningModel = computed<string | null>(() => {
-    const selected = selectedModelId.value;
+    const selected = protocolModelId(selectedModelId.value);
     if (selected.startsWith("openai/")) {
       return selected.slice("openai/".length);
     }
@@ -437,47 +441,62 @@ export const useModelStore = defineStore("model", () => {
   });
 
   function openAiReasoningModelFor(modelId: string): string | null {
+    modelId = protocolModelId(modelId);
     if (modelId.startsWith("openai/")) return modelId.slice("openai/".length);
     const custom = findCustomModel(modelId);
     if (custom && custom.provider.apiFormat === "openai_responses") return custom.model.apiModel;
     return null;
   }
 
-  /** Reasoning levels a model accepts; empty when it has no effort control. */
-  function effortsForModel(modelId: string): EffortLevel[] {
+  /**
+   * Reasoning levels a model accepts. `known` is false when the levels are a
+   * guess (e.g. a Claude CLI model before its catalog has loaded); a guess is
+   * shown in the selector but must never rewrite a remembered effort.
+   */
+  function effortCatalogForModel(modelId: string): { levels: EffortLevel[]; known: boolean } {
     const m = modelId.toLowerCase();
     if (modelId.startsWith("custom/")) {
       const custom = findCustomModel(modelId);
-      if (!custom || custom.model.reasoningParamFormat === "none") return [];
-      return normalizeCustomReasoningEfforts(custom.model.supportedReasoningEfforts);
+      if (!custom) return { levels: [], known: false };
+      if (custom.model.reasoningParamFormat === "none") return { levels: [], known: true };
+      return { levels: normalizeCustomReasoningEfforts(custom.model.supportedReasoningEfforts), known: true };
     }
     const catalogEfforts = allModels.value.find((model) => model.id === modelId)?.supportedEfforts ?? [];
-    if (catalogEfforts.length > 0) return catalogEfforts;
-    if (m.includes("claude")) return ["none", "low", "medium", "high"];
+    if (catalogEfforts.length > 0) return { levels: catalogEfforts, known: true };
+    if (m.includes("claude")) return { levels: [...CLAUDE_XHIGH_EFFORTS], known: false };
     const openAiModel = openAiReasoningModelFor(modelId);
-    if (!openAiModel || !supportsOpenAiReasoningModel(openAiModel)) return [];
-    return openAiReasoningLevels(openAiModel);
+    if (!openAiModel || !supportsOpenAiReasoningModel(openAiModel)) return { levels: [], known: false };
+    return { levels: openAiReasoningLevels(openAiModel), known: true };
   }
 
-  const availableEfforts = computed<EffortLevel[]>(() => effortsForModel(selectedModelId.value));
+  /** Reasoning levels a model accepts; empty when it has no effort control. */
+  function effortsForModel(modelId: string): EffortLevel[] {
+    return effortCatalogForModel(modelId).levels;
+  }
+
+  /** Fits an effort to a model; unknown models keep the requested effort. */
+  function clampEffortForModel(modelId: string, level: EffortLevel): EffortLevel {
+    const catalog = effortCatalogForModel(modelId);
+    return catalog.known ? clampEffortToLevels(catalog.levels, level) : level;
+  }
+
+  const selectedEffortCatalog = computed(() => effortCatalogForModel(selectedModelId.value));
+
+  const availableEfforts = computed<EffortLevel[]>(() => selectedEffortCatalog.value.levels);
 
   const effortSupported = computed(() => availableEfforts.value.length > 0);
 
   // -- Internal watchers (model-domain only) --
 
   function clampEffortForSelectedModel(level: EffortLevel): EffortLevel {
-    const levels = availableEfforts.value;
-    if (levels.length > 0 && !levels.includes(level)) {
-      return levels[0];
-    }
-    return level;
+    return clampEffortForModel(selectedModelId.value, level);
   }
 
-  // Clamp effort when available levels change
-  watch(availableEfforts, (levels) => {
-    if (levels.length > 0 && !levels.includes(effort.value)) {
-      effort.value = levels[0];
-    }
+  // Clamp effort once the selected model's levels are actually known.
+  watch(selectedEffortCatalog, (catalog) => {
+    if (!catalog.known) return;
+    const next = clampEffortToLevels(catalog.levels, effort.value);
+    if (next !== effort.value) effort.value = next;
   }, { immediate: true });
 
   watch(defaultEffort, (level) => {
@@ -491,7 +510,7 @@ export const useModelStore = defineStore("model", () => {
   watch(availableModels, (models) => {
     // A CLI session remains a CLI session when auth/catalog discovery is
     // pending or unavailable. Never silently switch its next turn to an API.
-    if (selectedModelId.value.startsWith("claude_code/")) return;
+    if (selectedModelId.value.startsWith("claude_code/") || selectedModelId.value.startsWith("locus-server/")) return;
     if (models.length === 0) {
       selectedModelId.value = "";
       return;
@@ -628,7 +647,7 @@ export const useModelStore = defineStore("model", () => {
   }
 
   function resolveSelectedModel(force = false) {
-    if (!force && selectedModelId.value.startsWith("claude_code/")) return;
+    if (!force && (selectedModelId.value.startsWith("claude_code/") || selectedModelId.value.startsWith("locus-server/"))) return;
     const models = availableModels.value;
     if (models.length === 0) {
       selectedModelId.value = "";
@@ -688,10 +707,11 @@ export const useModelStore = defineStore("model", () => {
     const requestedEffort = preference && isEffortLevel(preference.effort)
       ? preference.effort
       : fallbackEffort;
-    const normalizedEffort = clampEffortForSelectedModel(requestedEffort);
     if (preference) hasUserDefaultEffort.value = true;
-    defaultEffort.value = normalizedEffort;
-    effort.value = normalizedEffort;
+    // The default is the user's preference; only the live effort is fitted to
+    // the model, so a limited model never overwrites the saved default.
+    defaultEffort.value = requestedEffort;
+    effort.value = clampEffortForSelectedModel(requestedEffort);
   }
 
   function selectModel(id: string) {
@@ -729,7 +749,7 @@ export const useModelStore = defineStore("model", () => {
   function applySessionModel(id: string | null | undefined) {
     const normalized = id?.trim();
     if (!normalized) return;
-    if (!normalized.startsWith("claude_code/") && !availableModels.value.some((model) => model.id === normalized)) return;
+    if (!normalized.startsWith("claude_code/") && !normalized.startsWith("locus-server/") && !availableModels.value.some((model) => model.id === normalized)) return;
     selectedModelId.value = normalized;
   }
 
@@ -772,7 +792,7 @@ export const useModelStore = defineStore("model", () => {
   function applyModelDefaults(defaults: ModelDefaults) {
     modelDefaults.value = {
       ...defaults,
-      subagentModels: defaults.subagentModels ?? {},
+      subagentModels: normalizeSubagentModelChoices(defaults.subagentModels),
       subagentEfforts: defaults.subagentEfforts ?? {},
       subagentFastModes: defaults.subagentFastModes ?? {},
     };
@@ -827,6 +847,7 @@ export const useModelStore = defineStore("model", () => {
     loadCodexAvailableModels,
     resolveSelectedModel,
     effortsForModel,
+    clampEffortForModel,
     noteRememberedSelection,
     applyNewSessionSelection,
     selectModel,

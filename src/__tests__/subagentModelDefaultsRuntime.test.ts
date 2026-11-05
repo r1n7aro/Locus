@@ -37,8 +37,11 @@ async function selectModel(value: string) {
     '[aria-label="explorer settings.models.subagentModel"]',
   );
   expect(trigger).not.toBeNull();
-  trigger!.click();
-  await nextTick();
+  // The multi-select menu stays open between selections.
+  if (trigger!.getAttribute("aria-expanded") !== "true") {
+    trigger!.click();
+    await nextTick();
+  }
   const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')]
     .find((element) => element.id.endsWith(`-option-${value}`));
   expect(option).toBeDefined();
@@ -56,7 +59,7 @@ describe("sub-agent model defaults panel", () => {
     const store = useAgentStore();
     const defaults = ref<ModelDefaults>({
       mainModel: "main-model", planModel: "plan-model",
-      subagentModels: { unity: "unity-model" },
+      subagentModels: { unity: ["unity-model"] },
       subagentEfforts: { explorer: "high" },
       subagentFastModes: { explorer: false },
     });
@@ -85,7 +88,7 @@ describe("sub-agent model defaults panel", () => {
 
     await selectModel(model.id);
     expect(save).toHaveReturnedWith({
-      ...initial, subagentModels: { unity: "unity-model", explorer: model.id },
+      ...initial, subagentModels: { unity: ["unity-model"], explorer: [model.id] },
     });
     await store.loadAppAgents();
     await nextTick();
@@ -97,5 +100,69 @@ describe("sub-agent model defaults panel", () => {
     expect(save).toHaveLastReturnedWith(initial);
     expect(store.selectedAgentId).toBe("project-agent");
     expect(store.workspaceCheckoutId).toBe("workspace");
+  });
+
+  it("selects several allowed models, reorders the default, and limits shared options", async () => {
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+      configurable: true, value: vi.fn(),
+    });
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const store = useAgentStore();
+    const defaults = ref<ModelDefaults>({
+      mainModel: "", planModel: "", subagentModels: {}, subagentEfforts: {}, subagentFastModes: {},
+    });
+    const sol: ModelOption = {
+      id: "openai/gpt-5.6-sol", name: "GPT-5.6-Sol", provider: "openai_codex",
+      supportedEfforts: ["low", "medium", "high"],
+    };
+    const luna: ModelOption = {
+      id: "custom/fixture/luna", name: "Luna", provider: "custom",
+      supportedEfforts: ["medium", "high", "max"],
+    };
+    const save = vi.fn(() => JSON.parse(JSON.stringify(defaults.value.subagentModels)));
+    const host = document.createElement("div");
+    document.body.append(host);
+    app = createApp(() => h(ModelDefaultsPanel, {
+      modelDefaults: defaults.value, allModels: [sol, luna],
+      agents: store.appAgents, subagents: store.appSubagents, modelSaveMsg: "",
+      "onUpdate:modelDefaults": (value: ModelDefaults) => { defaults.value = value; },
+      onSave: save,
+    }));
+    app.use(pinia);
+    app.mount(host);
+    await store.loadAppAgents();
+    await nextTick();
+
+    await selectModel(sol.id);
+    await selectModel(luna.id);
+    expect(save).toHaveLastReturnedWith({ explorer: [sol.id, luna.id] });
+    const selected = [...document.querySelectorAll<HTMLElement>('[role="option"][aria-selected="true"]')]
+      .map((element) => element.textContent?.trim());
+    expect(selected).toHaveLength(2);
+    expect(selected[0]).toContain("settings.models.subagentModelDefaultHint");
+
+    const makeDefault = [...document.querySelectorAll<HTMLButtonElement>(".subagent-model-order-row button")];
+    expect(makeDefault).toHaveLength(1);
+    makeDefault[0].click();
+    await nextTick();
+    expect(save).toHaveLastReturnedWith({ explorer: [luna.id, sol.id] });
+
+    const effortTrigger = host.querySelector<HTMLButtonElement>(
+      '[aria-label="explorer settings.models.subagentEffort"]',
+    );
+    effortTrigger!.click();
+    await nextTick();
+    const effortList = document.getElementById(effortTrigger!.getAttribute("aria-controls") ?? "");
+    const efforts = [...effortList!.querySelectorAll<HTMLElement>('[role="option"]')]
+      .map((element) => element.id.replace(/^.*-option-/, ""));
+    expect(efforts).toEqual(["", "medium", "high"]);
+    effortTrigger!.click();
+    await nextTick();
+
+    await selectModel(luna.id);
+    expect(save).toHaveLastReturnedWith({ explorer: [sol.id] });
+    await selectModel("");
+    expect(save).toHaveLastReturnedWith({});
   });
 });

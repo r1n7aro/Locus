@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 #[path = "permission_mode_tests.rs"]
 mod permission_mode_tests;
+#[path = "native_agent_pump.rs"]
+mod agent_pump;
+pub(crate) use agent_pump::stop_native_agent;
 
 #[path = "connection_status.rs"]
 mod connection_status;
@@ -20,10 +23,34 @@ pub(crate) mod prewarm;
 #[path = "startup_diagnostics.rs"]
 mod startup_diagnostics;
 
+enum SessionTransport {
+    Ssh(super::ssh::Transport),
+    #[cfg(feature = "server-client")]
+    Server(super::server_transport::Transport),
+}
+macro_rules! transport_method {
+    ($self:ident, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            SessionTransport::Ssh(transport) => transport.$method($($arg),*),
+            #[cfg(feature = "server-client")]
+            SessionTransport::Server(transport) => transport.$method($($arg),*),
+        }
+    };
+}
+impl SessionTransport {
+    fn stop(&self) { transport_method!(self, stop) }
+    fn alive(&self) -> bool { transport_method!(self, alive) }
+    fn failure(&self) -> String { transport_method!(self, failure) }
+    fn latency_ms(&self) -> Option<f64> { transport_method!(self, latency_ms) }
+    fn health_failure(&self) -> Option<String> { transport_method!(self, health_failure) }
+    fn input(&self, text: &str) -> Result<(), String> { transport_method!(self, input, text) }
+    fn send(&self, value: serde_json::Value) -> Result<(), String> { transport_method!(self, send, value) }
+}
+
 struct Session {
     #[cfg(windows)]
     job: Option<super::pty_job::PtyJob>,
-    remote: Option<super::ssh::Transport>,
+    remote: Option<SessionTransport>,
     connection: Option<super::ssh::SshConfig>,
     bridge: tokio::sync::Mutex<mod_bridge::ModBridge>,
     options: Arc<std::sync::RwLock<serde_json::Value>>,
@@ -48,9 +75,14 @@ struct Session {
     accepting_inputs: AtomicBool,
     journal: super::native_journal::Journal,
     native_tool_search: bool,
+    native_agents: bool,
     tool_catalog_path: PathBuf,
     tool_catalog: Mutex<super::tool_catalog::ToolCatalog>,
     last_used: Mutex<Instant>,
+    /// Installed by the latest run; serves subagents between runs too.
+    agent_host: agent_pump::AgentHostSlot,
+    /// Subagent calls announced in this process (identity and dedup).
+    agent_tools: Mutex<super::turn_tools::TurnTools>,
 }
 fn sessions() -> &'static Mutex<HashMap<String, Arc<Session>>> {
     static POOL: OnceLock<Mutex<HashMap<String, Arc<Session>>>> = OnceLock::new();
@@ -74,11 +106,14 @@ pub(crate) fn require_recovery(id: &str) {
 pub(crate) fn is_unused_prewarm(id: &str) -> bool {
     sessions().lock().unwrap_or_else(|e| e.into_inner()).get(id).is_some_and(|s| s.fresh_start && s.prewarmed.load(Ordering::SeqCst) && s.ready.load(Ordering::SeqCst) && s.alive())
 }
-pub(crate) async fn archive_request(id:&str,request:serde_json::Value)->Option<Result<serde_json::Value,String>> {
-    let session=sessions().lock().unwrap_or_else(|e|e.into_inner()).get(id).cloned()?;
-    if !session.alive() {return None;}
-    let remote=session.remote.as_ref()?;
-    Some(remote.archive_request(request).await)
+/// Native JSONL of a local (non-SSH) TUI conversation. Claude files it under
+/// the session profile as `projects/<sanitized cwd>/<native id>.jsonl`.
+pub(crate) fn local_native_transcript(id: &str, native_id: &str) -> Option<std::path::PathBuf> {
+    uuid::Uuid::parse_str(native_id).ok()?;
+    let projects = super::ssh::profile_root(id).ok()?.join("profile").join("projects");
+    std::fs::read_dir(projects).ok()?.flatten()
+        .map(|entry| entry.path().join(format!("{native_id}.jsonl")))
+        .find(|path| path.is_file())
 }
 pub(super) fn history_gate(id:&str)->Arc<tokio::sync::RwLock<()>> {
     static GATES:OnceLock<Mutex<HashMap<String,std::sync::Weak<tokio::sync::RwLock<()>>>>>=OnceLock::new();
@@ -98,7 +133,15 @@ pub(crate) fn close_session(id: &str) {
         session.stop();
     }
 }
+/// After a cancelled turn: a process whose background agents still run stays,
+/// as in Claude's own TUI. The turn itself was already interrupted with Esc.
+pub(crate) fn close_cancelled_session(id: &str) {
+    let leased = sessions().lock().unwrap_or_else(|e| e.into_inner()).get(id)
+        .is_some_and(|session| session.leased() && session.alive());
+    if !leased { close_session(id); }
+}
 pub(crate) fn close_all() {
+    locus_remote_core::claude_ssh::archive_pool::shutdown();
     prewarm::shutdown();
     for (_, session) in sessions().lock().unwrap_or_else(|e| e.into_inner()).drain() {
         session.stop();
@@ -134,7 +177,8 @@ fn watch_remote_session(id: String, session: &Arc<Session>) {
             // The same exclusive gate covers startup, turns and history edits,
             // so reaping cannot race a new turn or interrupt a pending tool.
             let Ok(_guard) = history_gate(&id).try_write_owned() else { continue; };
-            let idle = remote_idle_expired(*session.last_used.lock().unwrap_or_else(|e| e.into_inner()), Instant::now());
+            let idle = remote_idle_expired(*session.last_used.lock().unwrap_or_else(|e| e.into_inner()), Instant::now())
+                && !session.leased();
             let alive = session.alive();
             if !alive {
                 if let Some(remote) = &session.remote { let _ = remote.failure(); }
@@ -150,8 +194,9 @@ fn watch_remote_session(id: String, session: &Arc<Session>) {
 /// Configuration changes retire only idle SSH sessions for other targets.
 /// Running turns remain pinned to their recorded server and finish normally.
 pub(crate) fn retire_idle_remote_connections(keep: Option<&super::ssh::SshConfig>) {
+    locus_remote_core::claude_ssh::archive_pool::retire_except(keep);
     let candidates: Vec<_> = sessions().lock().unwrap_or_else(|e| e.into_inner()).iter()
-        .filter(|(_, s)| s.connection.is_some() && s.connection.as_ref() != keep)
+        .filter(|(_, s)| s.connection.is_some() && s.connection.as_ref() != keep && !s.leased())
         .map(|(id, s)| (id.clone(), s.clone())).collect();
     for (id, session) in candidates {
         if let Ok(_guard) = history_gate(&id).try_write_owned() {
@@ -163,7 +208,7 @@ pub(crate) fn retire_idle_remote_connections(keep: Option<&super::ssh::SshConfig
 pub(crate) fn retire_outdated_runtime_settings(settings: super::runtime_settings::RuntimeSettings) {
     prewarm::cancel_all();
     let candidates: Vec<_> = sessions().lock().unwrap_or_else(|e| e.into_inner()).iter()
-        .filter(|(_, session)| session.runtime_settings != settings)
+        .filter(|(_, session)| session.runtime_settings != settings && !session.leased())
         .map(|(id, session)| (id.clone(), session.clone())).collect();
     for (id, session) in candidates {
         if let Ok(_guard) = history_gate(&id).try_write_owned() {
@@ -199,15 +244,33 @@ impl Session {
         let mut catalog = self.tool_catalog.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = catalog.clone();
         let delta = next.merge(incoming)?;
-        if next != *catalog { next.save(&self.tool_catalog_path)?; }
+        if next != *catalog {
+            next.keep_pinned_route(&self.tool_catalog_path);
+            next.save(&self.tool_catalog_path)?;
+        }
         let snapshot = next.active_tools();
         *catalog = next;
         Ok((snapshot, delta))
     }
-    fn configure(&self, options: serde_json::Value) -> Result<(), String> {
+    fn configure(&self, mut options: serde_json::Value) -> Result<(), String> {
+        self.with_agent_control(&mut options);
         *self.options.write().unwrap_or_else(|e| e.into_inner()) = options.clone();
         if let Some(remote) = &self.remote { remote.send(json!({"type":"configure","options":options}))?; }
         Ok(())
+    }
+}
+impl Session {
+    /// Subagent stop commands ride the Mod's input poll. Every configuration
+    /// carries the current list, so a new turn never drops a pending stop.
+    fn with_agent_control(&self, options: &mut serde_json::Value) {
+        if self.native_agents && options.is_object() {
+            options["agentControl"] = self.controls.agent_control();
+        }
+    }
+    /// Running background agents keep this process: between turns, across a
+    /// cancelled turn, and against idle reaping.
+    fn leased(&self) -> bool {
+        self.native_agents && self.controls.has_running_background_agents()
     }
 }
 impl Drop for Session {
@@ -226,9 +289,14 @@ impl Drop for TurnLease {
         *self.0.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         if !self.1 {
             // Interrupt first, then retire this process. A fresh resume never
-            // consumes stale callbacks from an interrupted Locus run.
+            // consumes stale callbacks from an interrupted Locus run. Running
+            // background agents keep it, as in Claude's own TUI: Esc cancels
+            // the main turn and its foreground agents only. Stale callbacks of
+            // the cancelled turn are refused by run identity.
             let _ = self.0.write("\x1b");
-            self.0.stop();
+            let keep = self.0.leased() && self.0.alive()
+                && !self.0.recovery_required.load(Ordering::SeqCst);
+            if !keep { self.0.stop(); }
         } else if super::ssh::load_settings().is_ok_and(|settings| settings.runtime != self.0.runtime_settings) {
             self.0.stop();
         }
@@ -283,8 +351,12 @@ impl ValueExt {
     }
 }
 
-async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::PermissionMode) -> Result<Arc<Session>, String> {
+async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::PermissionMode, _prewarm:bool) -> Result<Arc<Session>, String> {
     let runtime_settings = super::ssh::load_settings()?.runtime;
+    #[cfg(feature = "server-client")]
+    if crate::server_client::binding_for_model(&options.model)?.is_some() {
+        return start_server(options, permission_mode, runtime_settings, _prewarm).await;
+    }
     if let Some(remote) = &options.remote { return start_remote(options, remote, permission_mode, runtime_settings).await; }
     let cli = find_claude_cli().ok_or("Claude Code CLI was not found")?;
     let root = super::ssh::profile_root(&options.locus_session_id)?;
@@ -317,7 +389,7 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
         .map_err(|error| super::turn_retry::with_context("Environment preparation", error))?;
     let bridge = mod_bridge::ModBridge::start().await?;
     *bridge.options.write().unwrap_or_else(|e| e.into_inner()) =
-        json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools()});
+        json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools(),"agents":options.agents});
     let mut command = CommandBuilder::new(cli);
     command.cwd(&cwd);
     command.env_clear();
@@ -335,22 +407,30 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
     command.env_remove("CLAUDECODE");
     command.env_remove("CLAUDE_CODE_ENTRYPOINT");
     command.env_remove("CLAUDE_CODE_TASK_LIST_ID");
+    if options.native_agents {
+        for key in locus_remote_core::claude_launch::NATIVE_AGENT_REMOVED_ENV { command.env_remove(key); }
+        for (key, value) in locus_remote_core::claude_launch::NATIVE_AGENT_ENV { command.env(key, value); }
+    }
     command.env("NO_PROXY", "127.0.0.1,localhost");
     command.env("no_proxy", "127.0.0.1,localhost");
     command.args(["--plugin-dir"]);
     command.arg(&plugin);
+    // Native-agent conversations add only the delegation tools; every other
+    // launch keeps exactly the historical arguments (ssh_host.py mirrors this).
+    let mut allowed_tools = vec!["TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "WebFetch", "ToolSearch"];
+    if options.native_agents { allowed_tools.extend(["Agent", "SendMessage"]); }
+    command.args(["--setting-sources", "", "--strict-mcp-config", "--allowedTools"]);
+    command.args(&allowed_tools);
     command.args([
-        "--setting-sources",
-        "",
-        "--strict-mcp-config",
-        "--allowedTools", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "WebFetch", "ToolSearch",
         "--disallowedTools", "mcp__locus__web_fetch",
         "--permission-mode",
         permission_mode.as_str(),
         "--system-prompt-snapshot",
         "off",
     ]);
-    if options.native_tool_search { command.args(["--tools", NATIVE_BUILTIN_TOOLS]); }
+    // Every loading mode pins the adapted builtins. Without the list Claude
+    // also offers NotebookEdit and other tools the Mod always denies.
+    command.args(["--tools", &locus_remote_core::claude_launch::native_tools(options.native_agents)]);
     // Explicit CLI settings remain active with --setting-sources "".
     command.args(["--settings", &runtime_settings.cli_settings(
         permission_mode == super::ssh::PermissionMode::BypassPermissions,
@@ -413,7 +493,7 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
             }
         }
     });
-    Ok(Arc::new(Session {
+    Ok(agent_pump::with_agent_pump(Arc::new(Session {
         #[cfg(windows)]
         job: Some(job),
         remote: None,
@@ -439,33 +519,36 @@ async fn start(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::Perm
         attachment_root: root.to_string_lossy().into_owned(),
         journal: super::native_journal::Journal::new(root.join("calls")),
         native_tool_search: options.native_tool_search,
+        native_agents: options.native_agents,
         tool_catalog_path, tool_catalog: Mutex::new(tool_catalog),
         last_used: Mutex::new(Instant::now()),
-    }))
+        agent_host: Default::default(), agent_tools: Default::default(),
+    }), &options.locus_session_id))
 }
 
 async fn start_remote(options: &ClaudeCodeCliOptions, config: &super::ssh::SshConfig, permission_mode: super::ssh::PermissionMode, runtime_settings: super::runtime_settings::RuntimeSettings) -> Result<Arc<Session>, String> {
     let (bridge, send) = mod_bridge::ModBridge::channel();
     let tool_catalog_path = super::tool_catalog::path(&options.locus_session_id)?;
     let tool_catalog = super::tool_catalog::ToolCatalog::load(&tool_catalog_path, options.native_tool_search)?;
-    let initial = json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools()});
+    let initial = json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools(),"agents":options.agents});
     *bridge.options.write().unwrap_or_else(|e| e.into_inner()) = initial.clone();
-    let (remote, info) = super::ssh::Transport::start(config, json!({
+    let mut request=json!({
         "mode":"session", "authorizedSetup":true, "sessionKey":super::ssh::session_key(&options.locus_session_id, config),
         "modSource":native_mod_source(), "token":bridge.token, "options":initial,
         "model":normalize_claude_model(&options.model), "resume":options.resume_session_id,
-        "permissionMode":permission_mode, "runtimeSettings":runtime_settings, "nativeToolSearch":options.native_tool_search,
-        "nativeTools":NATIVE_BUILTIN_TOOLS,
-    }), Some((send,bridge.controls.clone(),bridge.options.clone()))).await
+    });
+    locus_remote_core::claude_launch::LaunchOptions{permission_mode,runtime_settings,native_tool_search:options.native_tool_search,native_agents:options.native_agents}.apply(&mut request)?;
+    let (remote,info)=super::ssh::Transport::start(config,request,Some((send,bridge.controls.clone(),bridge.options.clone()))).await
         .map_err(|error| {
             // Bound terminal details without truncating the stage or retry tag.
             let (summary, detail) = error.split_once('\n').unwrap_or((&error, ""));
             startup_diagnostics::message(summary, detail.as_bytes())
         })?;
+    super::ssh::record_launched_cli(config, &info);
     let diagnostic = remote.diagnostic.clone();
-    Ok(Arc::new(Session {
+    Ok(agent_pump::with_agent_pump(Arc::new(Session {
         #[cfg(windows)] job: None,
-        remote: Some(remote), connection: Some(config.clone()), options: bridge.options.clone(),
+        remote: Some(SessionTransport::Ssh(remote)), connection: Some(config.clone()), options: bridge.options.clone(),
         controls: bridge.controls.clone(),
         accepting_inputs: AtomicBool::new(false),
         bridge: tokio::sync::Mutex::new(bridge), writer: None, child: None, _master: None, diagnostic,
@@ -477,9 +560,34 @@ async fn start_remote(options: &ClaudeCodeCliOptions, config: &super::ssh::SshCo
         attachment_root: info.session_root.ok_or("SSH host did not provide its attachment directory")?,
         journal: super::native_journal::Journal::new(super::ssh::profile_root(&options.locus_session_id)?.join("calls")),
         native_tool_search: options.native_tool_search,
+        native_agents: options.native_agents,
         tool_catalog_path, tool_catalog: Mutex::new(tool_catalog),
         last_used: Mutex::new(Instant::now()),
-    }))
+        agent_host: Default::default(), agent_tools: Default::default(),
+    }), &options.locus_session_id))
+}
+
+#[cfg(feature = "server-client")]
+async fn start_server(options: &ClaudeCodeCliOptions, permission_mode: super::ssh::PermissionMode, runtime_settings: super::runtime_settings::RuntimeSettings, prewarm:bool) -> Result<Arc<Session>, String> {
+    let (bridge, send) = mod_bridge::ModBridge::channel();
+    let tool_catalog_path = super::tool_catalog::path(&options.locus_session_id)?;
+    let tool_catalog = super::tool_catalog::ToolCatalog::load(&tool_catalog_path, options.native_tool_search)?;
+    let initial = json!({"transport":"tui","active":false,"systemPrompt":options.system_prompt,"tools":tool_catalog.active_tools(),"agents":options.agents});
+    *bridge.options.write().unwrap_or_else(|e| e.into_inner()) = initial.clone();
+    let (remote, info) = super::server_transport::Transport::start(&options.model, &options.locus_session_id, options.resume_session_id.as_deref(), initial, locus_remote_core::claude_launch::LaunchOptions{permission_mode,runtime_settings,native_tool_search:options.native_tool_search,native_agents:options.native_agents},prewarm,send, bridge.controls.clone(), bridge.options.clone()).await?;
+    let diagnostic = remote.diagnostic.clone();
+    Ok(agent_pump::with_agent_pump(Arc::new(Session {
+        #[cfg(windows)] job: None,
+        remote: Some(SessionTransport::Server(remote)), connection: None, options: bridge.options.clone(),
+        controls: bridge.controls.clone(), accepting_inputs: AtomicBool::new(false),
+        bridge: tokio::sync::Mutex::new(bridge), writer: None, child: None, _master: None, diagnostic,
+        ready: AtomicBool::new(false), prewarmed: AtomicBool::new(false), recovery_required: AtomicBool::new(false), upstream_model: Mutex::new(None), busy: AtomicBool::new(false), healthy: AtomicBool::new(true),
+        fresh_start: options.resume_session_id.is_none(), session_id: Mutex::new(None), cwd: options.cwd.clone(), model: options.model.clone(),
+        permission_mode, runtime_settings, attachment_root: info.session_root.unwrap_or_else(|| "locus-server".into()),
+        journal: super::native_journal::Journal::new(super::ssh::profile_root(&options.locus_session_id)?.join("calls")),
+        native_tool_search: options.native_tool_search, native_agents: options.native_agents, tool_catalog_path, tool_catalog: Mutex::new(tool_catalog), last_used: Mutex::new(Instant::now()),
+        agent_host: Default::default(), agent_tools: Default::default(),
+    }), &options.locus_session_id))
 }
 
 pub(super) async fn run<H: ClaudeCodeHost>(
@@ -496,7 +604,7 @@ pub(super) async fn run_with_inputs<H: ClaudeCodeHost>(
     host.on_phase(crate::session::models::ClaudeCodePhase::Starting);
     let _history_guard = prewarm::turn_gate(&options.locus_session_id).await?;
     let settings = super::ssh::load_settings()?;
-    let permission_mode = settings.permission_mode;
+    let permission_mode = settings.permission_mode.for_launch(options.native_agents);
     let existing = sessions()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -509,6 +617,7 @@ pub(super) async fn run_with_inputs<H: ClaudeCodeHost>(
             && session.permission_mode == permission_mode
             && session.runtime_settings == settings.runtime
             && session.native_tool_search == options.native_tool_search
+            && session.native_agents == options.native_agents
             && session.alive()
             && options.resume_session_id.as_ref().is_none_or(|expected| {
                 session
@@ -700,6 +809,13 @@ async fn run_session<H: ClaudeCodeHost>(
 ) -> Result<ClaudeCodeTurnResult, String> {
     let mut bridge = session.bridge.lock().await;
     await_ready(session, &options, host, &mut bridge).await?;
+    // This run's authority serves the conversation's subagents, also after
+    // the run ends (background agents) and until the next run replaces it.
+    if session.native_agents {
+        if let Some(agent_host) = host.native_agent_host() {
+            *session.agent_host.lock().unwrap_or_else(|e| e.into_inner()) = Some(agent_host);
+        }
+    }
     let prepared = super::attachments::prepare(&user, &options.cwd)?;
     let input_id = format!("LOCUS_INPUT_{}", uuid::Uuid::new_v4().simple());
     let paths = prepared.paths(&session.attachment_root, &input_id);
@@ -707,9 +823,11 @@ async fn run_session<H: ClaudeCodeHost>(
     let (tools, _) = session.merge_tools(&options.tools)?;
     session.controls.begin_turn(&input_id);
     let configuration = json!({"transport":"tui","active":true,"inputId":input_id,"prompt":prompt,
-        "systemPrompt":options.system_prompt,"model":normalize_claude_model(&options.model),"effort":options.effort.as_deref().filter(|e|*e!="none"),"tools":tools,
+        "systemPrompt":options.system_prompt,"model":normalize_claude_model(&options.model),"effort":options.effort.as_deref().filter(|e|*e!="none"),"tools":tools,"agents":options.agents,
         "control":user["locusControl"],"messageId":user["locusMessageId"],"pendingUsers":user["locusPendingUsers"],
         "terminalText":if user["locusControl"]=="compact" {"/compact".to_string()} else {prepared.terminal_text(&input_id,&paths)},"imageCount":prepared.image_count(),"expectedImageCount":prepared.image_count(),"attachmentMappings":prepared.mappings(&paths)});
+    let mut configuration = configuration;
+    session.with_agent_control(&mut configuration);
     if let Some(remote) = &session.remote {
         *session.options.write().unwrap_or_else(|e|e.into_inner()) = configuration.clone();
         remote.send(json!({"type":"configure","options":configuration,"uploads":prepared.files}))?;
@@ -760,6 +878,7 @@ async fn run_session<H: ClaudeCodeHost>(
                 host.on_checkpoint(message)?;
             },
             "compact_start" | "compact_done" => host.on_compaction(message)?,
+            "compact_prepare" => reply = host.prepare_compaction(message).await,
             "diagnostic" => {
                 if let Some(notice) = diagnostics.record(message) { host.on_diagnostic(notice); }
             },
@@ -769,6 +888,9 @@ async fn run_session<H: ClaudeCodeHost>(
                 diagnostics.start_step();
                 activity_step = message["stepId"].as_u64();
                 activity_sequence = 0;
+                for id in tools.start_step(activity_step.unwrap_or(0)) {
+                    host.on_tool_call_abandoned(&id);
+                }
                 host.on_step_started(activity_step.unwrap_or(0))?;
                 host.on_phase(crate::session::models::ClaudeCodePhase::Requesting);
                 if let Some(model) = message["model"].as_str().filter(|value| !value.trim().is_empty()) {
@@ -802,8 +924,14 @@ async fn run_session<H: ClaudeCodeHost>(
                 host.on_tool_call_start(id.into(),
                     native_tools::locus_name(&tool_name(message["name"].as_str().unwrap_or_default())).into());
             }
+            // Subagent callbacks belong to the session's agent pump. Without
+            // one (native agents off) nothing runs on a subagent's behalf.
+            "assistant" | "interrupted_assistant" | "tool_result" if message["agentId"].as_str().is_some_and(|id| !id.is_empty()) => {
+                reply = json!({"deny":"Native subagent execution is not enabled"});
+            }
             "assistant" | "interrupted_assistant" => {
                 let mut projected = message.clone();
+                let mut agent_calls = Vec::new();
                 if let Some(blocks) = projected["message"]["content"].as_array_mut() {
                     let mut had_tools = false;
                     let mut has_new_tool = false;
@@ -812,6 +940,9 @@ async fn run_session<H: ClaudeCodeHost>(
                             had_tools = true;
                             if !tools.announce(&block)? { continue; }
                             has_new_tool = true;
+                            if block["name"] == "Agent" {
+                                agent_calls.push(block["id"].as_str().unwrap_or_default().to_string());
+                            }
                         }
                         blocks.push(block);
                     }
@@ -828,6 +959,12 @@ async fn run_session<H: ClaudeCodeHost>(
                         result.final_text = parsed.text.clone();
                         host.on_assistant_message(parsed)?;
                     }
+                }
+                // The Mod announces a call just before Claude starts it. Its
+                // subagent takes its own workspace locks, so the parent batch's
+                // completed writes end now, before the receipt lets it start.
+                for id in agent_calls {
+                    host.before_native_agent(&id).await;
                 }
             }
             "complete" => {
@@ -944,8 +1081,10 @@ async fn run_session<H: ClaudeCodeHost>(
                     }
                 }
                 if let Some(deny) = reply["deny"].as_str() {
-                    host.on_external_tool_result(id, crate::tool::ToolResult { output: deny.to_string(), is_error: true }.into())
-                        .await?;
+                    if message.get("agentId").is_none_or(serde_json::Value::is_null) {
+                        let error: ClaudeCodeToolResult = crate::tool::ToolResult { output: deny.to_string(), is_error: true }.into();
+                        host.on_external_tool_result(id, error).await?;
+                    }
                 }
             }
             _ => {}
@@ -1067,9 +1206,9 @@ fn native_mod_source() -> String {
     #[cfg(test)]
     if let Ok(source) = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/llm/claude_code_cli/native_mod.js"
+        "/../crates/locus-remote-core/src/resources/native_mod.js"
     )) {
         return source;
     }
-    include_str!("native_mod.js").to_string()
+    locus_remote_core::claude_ssh::NATIVE_MOD_SOURCE.to_string()
 }

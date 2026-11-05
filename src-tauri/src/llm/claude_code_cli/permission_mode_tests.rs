@@ -25,7 +25,7 @@ async fn real_ssh_idle_startup_uses_saved_connection_without_inference() {
         let options = ClaudeCodeCliOptions {
             remote: Some(remote.clone()), locus_session_id: uuid::Uuid::new_v4().to_string(),
             cwd: std::env::temp_dir().to_string_lossy().into_owned(), system_prompt: String::new(),
-            model: model.clone(), effort: None, resume_session_id: None, tools: vec![], native_tool_search: false,
+            model: model.clone(), effort: None, resume_session_id: None, tools: vec![], native_tool_search: false, native_agents: false, agents: serde_json::Value::Null,
         };
         let started = Instant::now();
         let session = connection_status::start_cached(&options, settings.permission_mode).await.unwrap();
@@ -65,9 +65,9 @@ async fn real_tui_auto_and_bypass_initialize_without_chat_commands() {
         let options = ClaudeCodeCliOptions {
             remote: None, locus_session_id: format!("permission-probe-{}", mode.as_str()),
             cwd: root.path().to_string_lossy().into_owned(), system_prompt: "Locus permission probe".into(),
-            model: "claude-sonnet-4-6".into(), effort: None, resume_session_id: None, tools: vec![], native_tool_search: false,
+            model: "claude-sonnet-4-6".into(), effort: None, resume_session_id: None, tools: vec![], native_tool_search: false, native_agents: false, agents: serde_json::Value::Null,
         };
-        let session = start(&options, mode).await.unwrap();
+        let session = start(&options, mode, false).await.unwrap();
         let mut bridge = session.bridge.lock().await;
         let result = tokio::time::timeout(Duration::from_secs(40), await_ready(
             &session, &options, &mut CommandHost, &mut bridge,

@@ -236,6 +236,8 @@ async fn read_probe(persistent: bool, exit_during_tool: bool, recover: bool) {
         resume_session_id: None,
         tools: vec![],
         native_tool_search: false,
+        native_agents: false,
+        agents: serde_json::Value::Null,
     };
     if exit_during_tool {
         let error = tokio::time::timeout(Duration::from_secs(20), run_turn(
@@ -338,6 +340,8 @@ async fn read_probe(persistent: bool, exit_during_tool: bool, recover: bool) {
                 resume_session_id: None,
                 tools,
                 native_tool_search: false,
+                native_agents: false,
+                agents: serde_json::Value::Null,
             },
             json!({"role":"user","content":"Read the probe file"}),
             &mut host,

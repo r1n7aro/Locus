@@ -42,12 +42,15 @@ export interface ChatParams {
   sessionType?: string | null;
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
-  subagentModels?: Record<string, string> | null;
+  /** Allowed models per sub-agent type, default first; a single string is one model. */
+  subagentModels?: Record<string, string | string[]> | null;
   subagentEfforts?: Record<string, string> | null;
   subagentFastModes?: Record<string, boolean> | null;
   knowledgeMode?: KnowledgeAccessMode | null;
   knowledgeDocType?: KnowledgeDocumentType | null;
   knowledgeDocPath?: string | null;
+  /** Blender target picked in the draft; applied when this call creates the session. */
+  blenderTarget?: string | null;
 }
 
 export interface CreateSessionParams {

@@ -1,5 +1,5 @@
 Delegate a bounded research or implementation task to an available agent:
-{agent_list}
+{agent_list}{model_choice}
 
 Set subagent_type and provide the question, scope, and expected result. Use a read-only research agent for multi-file research; use a writable agent for authorized implementation. For simple directed searches or a few known files, use direct tools. Independent read-only research may overlap other safe reads when the active interface supports it.
 
@@ -8,10 +8,10 @@ Nesting and concurrency follow Locus settings (defaults: depth 1, concurrency 3)
 
 Optionally set name to a short, unique task id such as reviewer (1–48 letters,
 digits, underscores or hyphens). Otherwise Locus assigns t1, t2, etc. Task ids
-are local to this session and remain stable across continuation. Use Python
-await locus.send_message("reviewer", message) to send follow-ups, or
+are local to this session and remain stable across continuation. Use the
+send_message tool with to="reviewer" to send follow-ups, or Python
 await locus.wait_task("reviewer", timeout=30) to wait. A finished subagent
 receiving a message continues its original conversation and notifies you when
-it finishes. The child receives its own id and parent_id=parent so it can reply.
-Task-control-only Python scripts use readonly=true. For the full API, read
+it finishes. The child receives its own id and parent_id=parent so it can reply
+with send_message. Task-control-only Python scripts use readonly=true. For the full API, read
 tasks.md in the SDK documentation directory shown by the python tool.

@@ -4,13 +4,19 @@ use serde_json::Value;
 /// of the scheduler's source-file mutation classification.
 pub(super) fn allows_observation(tool_name: &str, args: &Value) -> bool {
     match tool_name {
-        "bash" | "unity_execute" => args.get("readonly").and_then(Value::as_bool) == Some(true),
+        "bash" | "unity_execute" | "blender_execute" => {
+            args.get("readonly").and_then(Value::as_bool) == Some(true)
+        }
         "python" => crate::tool::builtins::python_is_readonly(args),
         "read"
         | "grep"
         | "list"
         | "ask_user_question"
         | "todowrite"
+        // Agent messages change no workspace or Editor state, like the
+        // readonly Python send_message route. A subagent resumed by a message
+        // is spawned through the plan-mode run and stays read-only.
+        | "send_message"
         | "web_fetch"
         | "web.run"
         | "code_find_references"
@@ -56,6 +62,7 @@ mod tests {
             "unity_test_run",
             "unity_run_states",
             "execute_typescript",
+            "config_set",
         ] {
             assert!(
                 !allows_observation(tool, &json!({"readonly": true})),
@@ -66,7 +73,7 @@ mod tests {
 
     #[test]
     fn observation_scripts_require_an_explicit_readonly_contract() {
-        for tool in ["bash", "python", "unity_execute"] {
+        for tool in ["bash", "python", "unity_execute", "blender_execute"] {
             assert!(
                 allows_observation(tool, &json!({"readonly": true})),
                 "{tool}"

@@ -51,6 +51,28 @@ pub(super) fn todowrite() -> ToolDef {
     }
 }
 
+/// Offered only while the session has Multi-Agent enabled; the agent loop
+/// intercepts calls because delivery needs the sender's session identity.
+pub(super) fn send_message() -> ToolDef {
+    let execute: ToolExecuteFn = Arc::new(|_args, _ctx| {
+        Box::pin(async {
+            ToolResult {
+                output: "Error: send_message tool should be intercepted by agent loop".to_string(),
+                is_error: true,
+            }
+        })
+    });
+
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::SEND_MESSAGE);
+    ToolDef {
+        name: "send_message".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute,
+    }
+}
+
 // ─── ask ─────────────────────────────────────────────────────────────────────
 
 pub(super) fn ask() -> ToolDef {

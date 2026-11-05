@@ -158,6 +158,8 @@ async fn real_tui_first_tool_search_and_late_skill_preserve_cache_prefix_on_resu
         resume_session_id:None,
         tools:["read_skill","read","edit","write","bash","grep","list","ask_user_question","todowrite","python"].into_iter().map(tool).collect(),
         native_tool_search:true,
+        native_agents:false,
+        agents:serde_json::Value::Null,
     };
     std::fs::write(root.path().join("native-edit.txt"), "before").unwrap();
     let mut host=Host { root: root.path().to_string_lossy().into_owned(), ..Default::default() };

@@ -10,6 +10,10 @@ use std::sync::{
     Arc, Mutex,
 };
 
+const COMPACT_INSTRUCTIONS_FIXTURE: &str = "LOCUS_COMPACT_INSTRUCTIONS_5521";
+const COMPACT_TRANSCRIPT_FIXTURE: &str = "C:/locus-fixture/compact-transcripts/claude/s/native.jsonl";
+const COMPACT_CARRY_FIXTURE: &str = "LOCUS_CARRY_FORWARD_7741";
+
 #[derive(Default)]
 struct Host {
     checkpoints: Vec<serde_json::Value>,
@@ -34,6 +38,12 @@ impl ClaudeCodeHost for Host {
     fn on_compaction(&mut self, event: &serde_json::Value) -> Result<(), String> {
         self.compactions.push(event.clone());
         Ok(())
+    }
+    fn prepare_compaction<'a>(&'a mut self, _: &'a serde_json::Value) -> Pin<Box<dyn Future<Output = serde_json::Value> + Send + 'a>> {
+        Box::pin(async {
+            json!({"ok":true,"instructions":COMPACT_INSTRUCTIONS_FIXTURE,"transcriptPath":COMPACT_TRANSCRIPT_FIXTURE,
+                "carryForward":format!("## Locus Carry-Forward Context\n{COMPACT_CARRY_FIXTURE}")})
+        })
     }
     fn execute_tool<'a>(
         &'a mut self,
@@ -127,7 +137,7 @@ async fn claude_queued_input_real_ssh_continues_tools_and_the_next_turn() {
         system_prompt:"Test queued inputs. Use only mcp__locus__queued_probe and follow the exact requested stage sequence. Never use other tools.".into(),
         tools:vec![ClaudeCodeToolDefinition{name:"queued_probe".into(),description:"Read-only queued input regression fixture; returns its stage.".into(),
             input_schema:json!({"type":"object","properties":{"stage":{"type":"string","enum":["before","after","next"]}},"required":["stage"]}),defer_loading:false}],
-        remote:Some(remote),native_tool_search:false};
+        remote:Some(remote),native_tool_search:false,native_agents:false,agents:serde_json::Value::Null};
     let result=tokio::time::timeout(Duration::from_secs(180),async {
         let first=run_turn_with_inputs(options.clone(),json!({"role":"user","content":"Call mcp__locus__queued_probe with stage before exactly once. While it is running, the user will send a new direction. Follow it when it arrives."}),&mut host,&input).await?;
         std::fs::write(root.join("first-response.jsonl"),&first.raw_response).unwrap();
@@ -303,6 +313,8 @@ async fn real_tui_native_attachments_fork_compact_and_insert() {
         resume_session_id: None,
         tools: vec![],
         native_tool_search: false,
+        native_agents: false,
+        agents: serde_json::Value::Null,
     };
     let file = root.as_path().join("space name.txt");
     std::fs::write(&file, "FILE_ATTACHMENT_83914").unwrap();
@@ -504,6 +516,28 @@ async fn real_tui_native_attachments_fork_compact_and_insert() {
         "native compact missing: {}",
         compact.final_text
     );
+    // Locus additions: summarizer instructions, and the carry-forward block
+    // as the compaction's SessionStart context, which Claude stores after the
+    // summary (interactive Claude does not pass compaction rows through
+    // session.append, so the summary itself stays native).
+    assert!(requests.lock().unwrap().iter().any(|request| request.to_string().contains(COMPACT_INSTRUCTIONS_FIXTURE)),
+        "summarizer request lacked the Locus compaction instructions");
+    let done = host.compactions.iter().rev().find(|event| event["type"] == "compact_done").unwrap();
+    assert!(done["carryForward"].as_str().is_some_and(|text| text.contains(COMPACT_CARRY_FIXTURE)), "compact receipt lacked carry-forward: {done}");
+    assert!(!done["summary"].as_str().unwrap().contains(COMPACT_CARRY_FIXTURE), "the native summary must stay unmodified");
+    assert_eq!(done["transcriptPath"], COMPACT_TRANSCRIPT_FIXTURE);
+    // Claude flushes transcript rows asynchronously.
+    let stored = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let text = super::tui::local_native_transcript(&session, &native_id)
+                .and_then(|path| std::fs::read_to_string(path).ok()).unwrap_or_default();
+            if let Some(line) = text.lines().find(|line| line.contains("hook_additional_context") && line.contains(COMPACT_CARRY_FIXTURE)) {
+                break line.to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.expect("Claude did not store the Locus carry-forward context");
+    assert!(stored.contains("\"hookEvent\":\"SessionStart\""), "unexpected carry-forward row: {stored}");
     assert!(super::tui::has_synchronized_session(&session));
     super::tui::require_recovery(&session);
     assert!(super::tui::has_live_session(&session), "keep native rows flushing after compaction");
@@ -559,6 +593,8 @@ async fn real_tui_native_attachments_fork_compact_and_insert() {
         "fork restored the pre-compaction context"
     );
     assert!(!requests.lock().unwrap().last().unwrap()["messages"].to_string().contains("ATTACHMENT_TEST"),"fork replayed the original uncompacted prompt");
+    assert!(requests.lock().unwrap().last().unwrap()["messages"].to_string().contains(COMPACT_CARRY_FIXTURE),
+        "resumed context lacked the carry-forward block");
     super::tui::close_session(&compact_branch);
     eprintln!("NATIVE_FEATURE_STAGE insert");
     let inputs = Input {
@@ -583,6 +619,10 @@ async fn real_tui_native_attachments_fork_compact_and_insert() {
         "insert lacked native consumption ACK"
     );
     assert_eq!(inserted.final_text, "INSERT_ACCEPTED_67218");
+    let continued: Vec<String> = requests.lock().unwrap().iter().map(|request| request["messages"].to_string())
+        .filter(|messages| messages.contains("START_SLOW_INSERT")).collect();
+    assert!(!continued.is_empty() && continued.iter().all(|messages| messages.contains(COMPACT_CARRY_FIXTURE)),
+        "the compacted session's next request lacked the carry-forward block");
     assert!(requests.lock().unwrap().last().unwrap()["tools"].as_array().unwrap().iter().any(|tool|tool["name"]=="mcp__locus__inserted_skill_probe"),"inserted Skill tool was absent from the next native model request");
     assert_eq!(host.interrupted,vec!["PARTIAL_BEFORE_INSERT"],"interrupted text must be persisted separately from the successor response");
     super::tui::close_session(&session);

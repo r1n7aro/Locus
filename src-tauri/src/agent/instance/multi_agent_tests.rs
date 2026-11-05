@@ -36,7 +36,7 @@ fn instance() -> AgentInstance {
         Arc::new(None),
         KnowledgeAccessMode::Full,
         None,
-        HashMap::new(),
+        Default::default(),
         cancel_rx,
     )
 }
@@ -120,21 +120,18 @@ async fn multi_agent_policy_does_not_expand_python_tool_descriptions() {
         );
     for enabled in [false, true] {
         agent.set_multi_agent_enabled(enabled);
-        for async_tasks in [false, true] {
-            agent.set_async_tasks_enabled(async_tasks);
-            let direct = agent.build_api_tools(&["python".to_string()]).await;
-            let description = direct[0]["function"]["description"].as_str().unwrap();
-            assert_eq!(description, "Run workspace Python.");
-            let (text, parameters) = agent.tool_description("python").unwrap();
-            let (lazy_description, _) =
-                agent.contextualize_tool_description("python", text, parameters);
-            assert_eq!(lazy_description, description);
-        }
+        let direct = agent.build_api_tools(&["python".to_string()]).await;
+        let description = direct[0]["function"]["description"].as_str().unwrap();
+        assert_eq!(description, "Run workspace Python.");
+        let (text, parameters) = agent.tool_description("python").unwrap();
+        let (lazy_description, _) =
+            agent.contextualize_tool_description("python", text, parameters);
+        assert_eq!(lazy_description, description);
     }
 }
 
 #[tokio::test]
-async fn python_preview_and_api_share_minimal_schema_and_conditional_async_usage() {
+async fn python_preview_and_api_share_minimal_schema_and_async_usage() {
     let mut agent = instance();
     let def = Arc::make_mut(&mut agent.def);
     def.tools.push("python".to_string());
@@ -145,41 +142,33 @@ async fn python_preview_and_api_share_minimal_schema_and_conditional_async_usage
             parameters: None,
         },
     );
-    for enabled in [false, true, false] {
-        agent.set_async_tasks_enabled(enabled);
-        let direct = agent.build_api_tools(&["python".to_string()]).await;
-        let function = &direct[0]["function"];
-        let description = function["description"].as_str().unwrap();
-        assert!(description.starts_with("Run Python "));
-        assert!(description.contains("SDK documentation"));
-        assert!(!description.contains("{python_"));
-        assert!(!description.contains("overview.md"));
-        assert!(!description.contains("locus."));
-        assert!(!description.contains(EXPLICIT_DELEGATION_GUIDANCE));
-        let properties = function["parameters"]["properties"].as_object().unwrap();
-        assert_eq!(properties.len(), if enabled { 4 } else { 3 });
-        assert_eq!(properties.contains_key("async"), enabled);
-        assert_eq!(
-            function["parameters"]["required"],
-            serde_json::json!(["code", "readonly"])
-        );
-        if enabled {
-            let usage = properties["async"]["description"].as_str().unwrap();
-            assert!(usage.contains("await locus.list_tasks()"));
-            assert!(usage.contains("readonly=true"));
-        } else {
-            assert!(!function.to_string().contains("locus.list_tasks"));
-            assert!(!function.to_string().contains("notify"));
-        }
-        let (text, parameters) = agent.tool_description("python").unwrap();
-        let (lazy_description, lazy_parameters) =
-            agent.contextualize_tool_description("python", text, parameters);
-        assert_eq!(lazy_description, description);
-        assert_eq!(lazy_parameters, function["parameters"]);
-        let preview = agent.available_tool_prompt_items().await;
-        let python = preview.iter().find(|item| item.title == "python").unwrap();
-        assert_eq!(python.meta.as_ref().unwrap()["function"], *function);
-    }
+    let direct = agent.build_api_tools(&["python".to_string()]).await;
+    let function = &direct[0]["function"];
+    let description = function["description"].as_str().unwrap();
+    assert!(description.starts_with("Run Python "));
+    assert!(description.contains("SDK documentation"));
+    assert!(!description.contains("{python_"));
+    assert!(!description.contains("overview.md"));
+    assert!(!description.contains("locus."));
+    assert!(!description.contains(EXPLICIT_DELEGATION_GUIDANCE));
+    let properties = function["parameters"]["properties"].as_object().unwrap();
+    assert_eq!(properties.len(), 4);
+    assert!(properties.contains_key("async"));
+    assert_eq!(
+        function["parameters"]["required"],
+        serde_json::json!(["code", "readonly"])
+    );
+    let usage = properties["async"]["description"].as_str().unwrap();
+    assert!(usage.contains("await locus.list_tasks()"));
+    assert!(usage.contains("readonly=true"));
+    let (text, parameters) = agent.tool_description("python").unwrap();
+    let (lazy_description, lazy_parameters) =
+        agent.contextualize_tool_description("python", text, parameters);
+    assert_eq!(lazy_description, description);
+    assert_eq!(lazy_parameters, function["parameters"]);
+    let preview = agent.available_tool_prompt_items().await;
+    let python = preview.iter().find(|item| item.title == "python").unwrap();
+    assert_eq!(python.meta.as_ref().unwrap()["function"], *function);
 }
 
 #[tokio::test]
@@ -219,6 +208,68 @@ async fn multi_agent_inspection_preserves_schema_when_session_disables_calls() {
     assert_eq!(meta["unavailableReason"], "subagent_depth_limit");
     assert!(meta["function"]["parameters"]["properties"]["prompt"].is_object());
     assert!(agent.resolve_api_tool("subagent").is_none());
+}
+
+#[tokio::test]
+async fn send_message_is_injected_only_with_multi_agent_and_survives_depth_limits() {
+    let mut agent = instance();
+    let requested = vec!["read".to_string(), SEND_MESSAGE_TOOL.to_string()];
+    for enabled in [false, true, false] {
+        agent.set_multi_agent_enabled(enabled);
+        assert_eq!(
+            agent
+                .resolve_configured_tool_names()
+                .await
+                .iter()
+                .any(|name| name == SEND_MESSAGE_TOOL),
+            enabled
+        );
+        assert_eq!(
+            agent.allowed_tool_set().await.contains(SEND_MESSAGE_TOOL),
+            enabled
+        );
+        let tools = agent.build_api_tools(&requested).await;
+        assert_eq!(
+            tools
+                .iter()
+                .any(|tool| tool["function"]["name"] == SEND_MESSAGE_TOOL),
+            enabled
+        );
+        assert_eq!(agent.resolve_api_tool(SEND_MESSAGE_TOOL).is_some(), enabled);
+        assert_eq!(
+            agent.tool_runtime_unavailable_reason(SEND_MESSAGE_TOOL),
+            (!enabled).then_some("multi_agent_disabled")
+        );
+    }
+
+    agent.set_multi_agent_enabled(true);
+    agent.subagent_tool_suppressed = true;
+    let allowed = agent.allowed_tool_set().await;
+    assert!(!allowed.contains("subagent"));
+    assert!(allowed.contains(SEND_MESSAGE_TOOL));
+    let schema = agent.resolve_api_tool(SEND_MESSAGE_TOOL).unwrap();
+    assert_eq!(
+        schema["function"]["parameters"]["required"],
+        serde_json::json!(["to", "message"])
+    );
+
+    // Messaging is collaboration data: no confirmation, no workspace lock,
+    // and allowed for plan-mode agents.
+    let args = serde_json::json!({"to": "parent", "message": "done"});
+    assert!(AgentInstance::is_readonly_tool_call(
+        SEND_MESSAGE_TOOL,
+        &args
+    ));
+    assert!(!AgentInstance::default_tool_requires_confirm(
+        SEND_MESSAGE_TOOL,
+        &args
+    ));
+    assert!(agent
+        .workspace_execution_request_for_tool(SEND_MESSAGE_TOOL, &args)
+        .is_none());
+    assert!(agent
+        .plan_mode_tool_violation(&PlanRuntime::Subagent, SEND_MESSAGE_TOOL, &args)
+        .is_none());
 }
 
 #[tokio::test]

@@ -9,7 +9,15 @@ pub(crate) struct ToolCatalog {
     pub native_tool_search: bool,
     initialized: bool,
     tools: Vec<ClaudeCodeToolDefinition>,
+    /// Multi-agent route fixed by the conversation's first turn. Catalogs
+    /// written before native agents existed have none: they stay on Locus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multi_agent_route: Option<String>,
 }
+
+/// Route values stored in the catalog.
+pub(crate) const ROUTE_CLAUDE_UNIFIED: &str = "claudeUnified";
+pub(crate) const ROUTE_LOCUS: &str = "locus";
 
 impl ToolCatalog {
     pub fn load(path: &Path, native_tool_search: bool) -> Result<Self, String> {
@@ -23,7 +31,7 @@ impl ToolCatalog {
                 Ok(catalog)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                version: 1, native_tool_search, initialized: false, tools: Vec::new(),
+                version: 1, native_tool_search, initialized: false, tools: Vec::new(), multi_agent_route: None,
             }),
             Err(error) => Err(format!("Cannot read Claude tool catalog: {error}")),
         }
@@ -69,6 +77,15 @@ impl ToolCatalog {
         self.tools.iter().filter(|tool| tool.name != "web_fetch").cloned().collect()
     }
 
+    /// A process started before the route was pinned (an SSH spare) must not
+    /// drop the pin when it saves its catalog. Called only before a save.
+    pub fn keep_pinned_route(&mut self, path: &Path) {
+        if self.multi_agent_route.is_some() { return; }
+        if let Some(saved) = std::fs::read(path).ok().and_then(|bytes| serde_json::from_slice::<ToolCatalog>(&bytes).ok()) {
+            self.multi_agent_route = saved.multi_agent_route;
+        }
+    }
+
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let bytes = serde_json::to_vec(self).map_err(|error| error.to_string())?;
         crate::config::atomic_write_config(path, &bytes).map_err(|error| error.to_string())
@@ -77,6 +94,17 @@ impl ToolCatalog {
 
 pub(crate) fn path(session_id: &str) -> Result<PathBuf, String> {
     Ok(super::ssh::profile_root(session_id)?.join("tool-catalog.json"))
+}
+
+/// The definition this conversation already published for `name`, if any.
+/// Read-only: it neither validates nor changes the loading mode.
+pub(crate) fn pinned_definition(session_id: &str, name: &str) -> Option<ClaudeCodeToolDefinition> {
+    pinned_definition_at(&path(session_id).ok()?, name)
+}
+
+fn pinned_definition_at(path: &Path, name: &str) -> Option<ClaudeCodeToolDefinition> {
+    let catalog: ToolCatalog = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    catalog.tools.into_iter().find(|tool| tool.name == name)
 }
 
 pub(crate) fn native_mode_for_session(session_id: &str, resuming: bool) -> Result<bool, String> {
@@ -94,6 +122,52 @@ fn native_mode_at(path: &Path, resuming: bool) -> Result<bool, String> {
         // loading starts with a new conversation, not its first later search.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(!resuming),
         Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Whether this conversation uses the Claude-native multi-agent route. The
+/// first turn of a new conversation pins `desired`; a resumed conversation
+/// without a pin (created before native agents) always stays on Locus.
+/// `desired` runs only when this call pins a new conversation.
+pub(crate) fn pin_multi_agent_route(session_id: &str, resuming: bool, native_tool_search: bool, desired: impl FnOnce() -> bool) -> Result<bool, String> {
+    pin_multi_agent_route_with(&path(session_id)?, resuming, native_tool_search, desired)
+}
+
+#[cfg(test)]
+fn pin_multi_agent_route_at(path: &Path, resuming: bool, native_tool_search: bool, desired: bool) -> Result<bool, String> {
+    pin_multi_agent_route_with(path, resuming, native_tool_search, || desired)
+}
+
+fn pin_multi_agent_route_with(path: &Path, resuming: bool, native_tool_search: bool, desired: impl FnOnce() -> bool) -> Result<bool, String> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let route = |catalog: &ToolCatalog| catalog.multi_agent_route.as_deref() == Some(ROUTE_CLAUDE_UNIFIED);
+    let pin = |unified: bool| Some(if unified { ROUTE_CLAUDE_UNIFIED } else { ROUTE_LOCUS }.to_string());
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let catalog: ToolCatalog = serde_json::from_slice(&bytes).map_err(|error| format!("Cannot restore Claude tool catalog: {error}"))?;
+            if catalog.version != 1 { return Err("Unsupported Claude tool catalog version".into()); }
+            // A catalog that never published a tool and has no pin belongs to
+            // a conversation that has not completed its first turn yet.
+            if catalog.multi_agent_route.is_none() && !catalog.initialized && !resuming {
+                let mut pinned = catalog;
+                pinned.multi_agent_route = pin(desired());
+                pinned.save(path)?;
+                return Ok(route(&pinned));
+            }
+            Ok(route(&catalog))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if resuming { return Ok(false); }
+            let unified = desired();
+            let catalog = ToolCatalog {
+                version: 1, native_tool_search, initialized: false, tools: Vec::new(), multi_agent_route: pin(unified),
+            };
+            std::fs::create_dir_all(path.parent().ok_or("Missing Claude profile directory")?).map_err(|error| error.to_string())?;
+            catalog.save(path)?;
+            Ok(unified)
+        }
+        Err(error) => Err(format!("Cannot read Claude tool catalog: {error}")),
     }
 }
 
@@ -124,6 +198,22 @@ mod tests {
     use super::*;
     fn tool(name: &str, deferred: bool) -> ClaudeCodeToolDefinition {
         ClaudeCodeToolDefinition { name: name.into(), description: name.into(), input_schema: serde_json::json!({"type":"object"}), defer_loading: deferred }
+    }
+    #[test]
+    fn published_definitions_are_read_in_either_loading_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("catalog.json");
+        assert!(pinned_definition_at(&path, "subagent").is_none());
+        for native in [false, true] {
+            let mut catalog = ToolCatalog::load(&path, native).unwrap_or_else(|_| {
+                std::fs::remove_file(&path).unwrap();
+                ToolCatalog::load(&path, native).unwrap()
+            });
+            catalog.merge(&[tool("subagent", false), tool("python", false)]).unwrap();
+            catalog.save(&path).unwrap();
+            assert_eq!(pinned_definition_at(&path, "subagent").unwrap().description, "subagent");
+            assert!(pinned_definition_at(&path, "missing").is_none());
+        }
     }
     #[test]
     fn web_fetch_is_unavailable_in_new_and_restored_catalogs_without_rewriting_history() {
@@ -190,6 +280,43 @@ mod tests {
         assert_eq!(delta[0].name, "skill_new");
         assert!(delta[0].defer_loading);
         assert_eq!(serde_json::to_vec(&restored.tools[..2]).unwrap(), prefix);
+    }
+    #[test]
+    fn multi_agent_route_is_pinned_by_the_first_turn_and_legacy_catalogs_stay_on_locus() {
+        let root = tempfile::tempdir().unwrap();
+        // A new conversation pins the setting once; later changes do not apply.
+        let path = root.path().join("new.json");
+        assert!(pin_multi_agent_route_at(&path, false, true, true).unwrap());
+        assert!(pin_multi_agent_route_at(&path, false, true, false).unwrap());
+        assert!(pin_multi_agent_route_at(&path, true, true, false).unwrap());
+        // The TUI's own catalog saves keep the pin.
+        let mut catalog = ToolCatalog::load(&path, true).unwrap();
+        catalog.merge(&[tool("python", false)]).unwrap();
+        catalog.save(&path).unwrap();
+        assert!(pin_multi_agent_route_at(&path, true, true, false).unwrap());
+        let off = root.path().join("off.json");
+        assert!(!pin_multi_agent_route_at(&off, false, false, false).unwrap());
+        assert!(!pin_multi_agent_route_at(&off, false, false, true).unwrap());
+        assert!(ToolCatalog::load(&off, false).is_ok());
+        // Catalogs written before native agents have no pin and stay on Locus.
+        let legacy = root.path().join("legacy.json");
+        let mut old = ToolCatalog::load(&legacy, true).unwrap();
+        old.merge(&[tool("python", false)]).unwrap();
+        old.save(&legacy).unwrap();
+        assert!(!std::fs::read_to_string(&legacy).unwrap().contains("multi_agent_route"));
+        assert!(!pin_multi_agent_route_at(&legacy, true, true, true).unwrap());
+        assert!(!pin_multi_agent_route_at(&legacy, false, true, true).unwrap());
+        let missing = root.path().join("missing.json");
+        assert!(!pin_multi_agent_route_at(&missing, true, true, true).unwrap());
+        assert!(!missing.exists());
+        // A process started before the pin (an SSH spare) does not drop it.
+        let spare_path = root.path().join("spare.json");
+        let mut spare = ToolCatalog::load(&spare_path, true).unwrap();
+        assert!(pin_multi_agent_route_at(&spare_path, false, true, true).unwrap());
+        spare.merge(&[tool("python", false)]).unwrap();
+        spare.keep_pinned_route(&spare_path);
+        spare.save(&spare_path).unwrap();
+        assert!(pin_multi_agent_route_at(&spare_path, true, true, false).unwrap());
     }
     #[test]
     fn existing_conversations_are_not_migrated_on_first_search() {

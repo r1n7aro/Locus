@@ -44,7 +44,7 @@ describe("Agent workspace scope", () => {
       "unity",
       null,
       "openai/gpt-5.6-sol",
-      { explorer: "openai/gpt-5.6-luna" },
+      { explorer: ["openai/gpt-5.6-luna"] },
     );
     await listRules(workspaceRef, "unity");
     await readRule(workspaceRef, "unity", "workflow.md");
@@ -67,7 +67,7 @@ describe("Agent workspace scope", () => {
       agentId: "unity",
       knowledgeMode: null,
       selectedModel: "openai/gpt-5.6-sol",
-      subagentModels: { explorer: "openai/gpt-5.6-luna" },
+      subagentModels: { explorer: ["openai/gpt-5.6-luna"] },
     });
   });
 

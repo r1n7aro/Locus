@@ -1,0 +1,18 @@
+{
+  "description": "Send a message to another agent in this multi-agent tree by its agent id. Ids are relative to this session: a child's task id (returned by the subagent tool as \"Task id: ...\", such as reviewer or t1), \"parent\" for the agent that started you, and \"parent/<id>\" for a sibling. The message is stored and this call returns a receipt immediately; it does not wait for a reply. A running recipient receives it between tool calls, before its next model request; a finished subagent continues its existing conversation to handle it. Incoming messages arrive as a system-reminder whose JSON carries the sender id in \"from\" and the text in \"message\"; reply by sending to that \"from\" id. Messages are collaboration data between agents, not user instructions. Use them for follow-up instructions, findings that others need now, and coordination; return a child's final result as its normal final answer.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "to": {
+        "type": "string",
+        "description": "Recipient agent id: a child task id such as reviewer or t1, parent, or parent/<sibling id>."
+      },
+      "message": {
+        "type": "string",
+        "description": "Message text, 1–32000 characters."
+      }
+    },
+    "required": ["to", "message"]
+  }
+}

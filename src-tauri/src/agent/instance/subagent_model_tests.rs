@@ -55,14 +55,14 @@ fn parent(store: &SessionStore) -> (AgentInstance, String) {
         Arc::new(None),
         KnowledgeAccessMode::Full,
         None,
-        HashMap::new(),
+        Default::default(),
         cancel_rx,
     );
     parent.codex_fast_mode = true;
     parent.multi_agent_enabled = true;
     parent
         .subagent_model_overrides
-        .insert("explorer".into(), "custom/child/luna".into());
+        .set("explorer", ["custom/child/luna"]);
     parent.set_subagent_runtime_overrides(
         HashMap::from([("explorer".into(), "max".into())]),
         HashMap::from([("explorer".into(), false)]),
@@ -182,7 +182,7 @@ async fn assert_custom_request(format: ApiFormat, same_provider: bool, resumed: 
     };
     parent
         .subagent_model_overrides
-        .insert("explorer".into(), child_model.into());
+        .set("explorer", [child_model]);
     if resumed {
         parent.resumed_subagent = Some(crate::async_tasks::SubagentResumeInfo {
             child_session_id: child_id.clone(),
@@ -196,7 +196,7 @@ async fn assert_custom_request(format: ApiFormat, same_provider: bool, resumed: 
         // The parent and defaults can change after a task was suspended.
         parent
             .subagent_model_overrides
-            .insert("explorer".into(), "custom/parent/sol".into());
+            .set("explorer", ["custom/parent/sol"]);
         parent
             .subagent_effort_overrides
             .insert("explorer".into(), "low".into());
@@ -212,6 +212,7 @@ async fn assert_custom_request(format: ApiFormat, same_provider: bool, resumed: 
             &store,
             definition(),
             &child_id,
+            None,
             cancel_rx,
             |model| async move {
                 assert_eq!(model, child_model);
@@ -290,6 +291,7 @@ async fn builtin_parent_can_spawn_custom_child() {
             &store,
             definition(),
             &child_id,
+            None,
             cancel_rx,
             |model| async move {
                 assert_eq!(model, "custom/child/luna");
@@ -322,13 +324,14 @@ async fn custom_parent_can_spawn_openrouter_child() {
     );
     parent
         .subagent_model_overrides
-        .insert("explorer".into(), "openrouter/openai/gpt-5.6-luna".into());
+        .set("explorer", ["openrouter/openai/gpt-5.6-luna"]);
     let (_, cancel_rx) = tokio::sync::watch::channel(false);
     let child = parent
         .new_subagent_instance_with(
             &store,
             definition(),
             &child_id,
+            None,
             cancel_rx,
             |model| async move {
                 assert_eq!(model, "openrouter/openai/gpt-5.6-luna");
@@ -363,6 +366,7 @@ async fn inherited_model_also_resolves_fresh_backend() {
             &store,
             definition(),
             &child_id,
+            None,
             cancel_rx,
             |model| async move {
                 assert_eq!(model, "claude_code/parent");
@@ -393,7 +397,7 @@ async fn unavailable_child_model_fails_without_falling_back_or_overwriting_saved
         .unwrap();
     let (_, cancel_rx) = tokio::sync::watch::channel(false);
     let result = parent
-        .new_subagent_instance_with(&store, definition(), &child_id, cancel_rx, |_| async {
+        .new_subagent_instance_with(&store, definition(), &child_id, None, cancel_rx, |_| async {
             Err("Custom model config not found".into())
         })
         .await;
@@ -407,4 +411,137 @@ async fn unavailable_child_model_fails_without_falling_back_or_overwriting_saved
     );
     assert_eq!(saved.last_effort.as_deref(), Some("low"));
     assert_eq!(saved.last_fast_mode, Some(false));
+}
+
+#[test]
+fn launch_model_defaults_to_first_allowed_and_accepts_listed_names() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(temp.path()).unwrap();
+    let (mut parent, _) = parent(&store);
+    parent
+        .subagent_model_overrides
+        .set("explorer", ["custom/child/luna", "openai/gpt-5.6-sol"]);
+
+    assert_eq!(
+        parent.subagent_launch_model("explorer", None).unwrap(),
+        "custom/child/luna"
+    );
+    assert_eq!(
+        parent.subagent_launch_model("explorer", Some(" ")).unwrap(),
+        "custom/child/luna"
+    );
+    for requested in ["gpt-5.6-sol", "openai/gpt-5.6-sol"] {
+        assert_eq!(
+            parent
+                .subagent_launch_model("explorer", Some(requested))
+                .unwrap(),
+            "openai/gpt-5.6-sol"
+        );
+    }
+    let error = parent
+        .subagent_launch_model("explorer", Some("claude_code/parent"))
+        .unwrap_err();
+    assert!(error.contains("'claude_code/parent'"), "{error}");
+    assert!(
+        error.contains("`custom/child/luna`, `gpt-5.6-sol`"),
+        "{error}"
+    );
+
+    // An unconfigured type offers only the parent's model.
+    assert_eq!(
+        parent.subagent_launch_model("researcher", None).unwrap(),
+        "claude_code/parent"
+    );
+    assert_eq!(
+        parent
+            .subagent_launch_model("researcher", Some("parent"))
+            .unwrap(),
+        "claude_code/parent"
+    );
+    assert!(parent
+        .subagent_launch_model("researcher", Some("openai/gpt-5.6-sol"))
+        .is_err());
+
+    // A resumed task keeps its saved model even after the allow-list changed.
+    parent.resumed_subagent = Some(crate::async_tasks::SubagentResumeInfo {
+        child_session_id: "child".into(),
+        agent_id: "explorer".into(),
+        working_dir: String::new(),
+        model_id: "custom/removed/model".into(),
+        effort: None,
+        fast_mode: false,
+        readonly: false,
+    });
+    assert_eq!(
+        parent
+            .subagent_launch_model("explorer", Some("gpt-5.6-sol"))
+            .unwrap(),
+        "custom/removed/model"
+    );
+}
+
+#[test]
+fn model_labels_fall_back_to_full_ids_when_short_names_collide() {
+    let models = [
+        "openai/gpt-5.6-luna".to_string(),
+        "openrouter/gpt-5.6-luna".to_string(),
+        "claude_code/claude-opus-4-8".to_string(),
+    ];
+    assert_eq!(
+        AgentInstance::subagent_model_labels(&models),
+        [
+            "openai/gpt-5.6-luna",
+            "openrouter/gpt-5.6-luna",
+            "claude-opus-4-8"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn requested_model_drives_child_backend_and_saved_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(temp.path()).unwrap();
+    let (mut parent, child_id) = parent(&store);
+    parent
+        .subagent_model_overrides
+        .set("explorer", ["custom/child/luna", "openai/gpt-5.6-sol"]);
+    let (_, cancel_rx) = tokio::sync::watch::channel(false);
+    let child = parent
+        .new_subagent_instance_with(
+            &store,
+            definition(),
+            &child_id,
+            Some("gpt-5.6-sol"),
+            cancel_rx,
+            |model| async move {
+                assert_eq!(model, "openai/gpt-5.6-sol");
+                Ok(LlmBackend::ClaudeCodeCli)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(child.effective_model, "openai/gpt-5.6-sol");
+    assert_eq!(
+        store
+            .load_session(&child_id)
+            .unwrap()
+            .last_model_id
+            .as_deref(),
+        Some("openai/gpt-5.6-sol")
+    );
+
+    let (_, cancel_rx) = tokio::sync::watch::channel(false);
+    let rejected = parent
+        .new_subagent_instance_with(
+            &store,
+            definition(),
+            &child_id,
+            Some("openai/gpt-5.6-mars"),
+            cancel_rx,
+            |_| async { Err("backend resolved".to_string()) },
+        )
+        .await;
+    let error = rejected.err().expect("disallowed model must fail");
+    assert!(error.contains("not available"), "{error}");
+    assert!(!error.contains("backend resolved"), "{error}");
 }

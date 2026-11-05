@@ -22,11 +22,86 @@ class LocusUnavailableError(LocusSdkError):
 
 
 class LocusRpcError(LocusSdkError):
-    """The local Locus bridge rejected an SDK operation."""
+    """The local Locus bridge rejected an SDK operation.
 
-    def __init__(self, message: str, *, code: int | None = None) -> None:
+    ``reported`` is true for a condition Locus detected and reported on purpose,
+    such as a stale merge snapshot or a busy checkout: ``kind`` names it and
+    ``hint`` (when present) gives the next step. Any other error is an
+    unexpected failure.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: int | None = None,
+        method: str | None = None,
+        data: Any = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.method = method
+        self.data: dict[str, Any] = data if isinstance(data, dict) else {}
+        self.reported = self.data.get("reported") is True
+        kind, hint = self.data.get("kind"), self.data.get("hint")
+        self.kind = kind if isinstance(kind, str) else None
+        self.hint = hint.strip() if isinstance(hint, str) and hint.strip() else None
+        if self.hint and hasattr(self, "add_note"):
+            self.add_note(f"next: {self.hint}")
+
+
+def _normalized_path(path: str) -> str:
+    path = os.path.normcase(os.path.abspath(path))
+    # Windows may load the SDK through a verbatim (\\?\) path.
+    return path[4:] if path.startswith("\\\\?\\") else path
+
+
+_PLUMBING = ("asyncio", "concurrent", "threading.py")
+
+
+def _internal_frame(filename: str) -> bool:
+    """SDK modules, the asyncio/thread plumbing and the tool's own wrapper."""
+    if filename == "<stdin>":
+        return True
+    if not os.path.isabs(filename):
+        # A zipped (embedded) stdlib names its frames relative to its root.
+        return os.path.normcase(filename).replace("/", "\\").split("\\")[0] in _PLUMBING
+    path = _normalized_path(filename)
+    if os.path.dirname(path) == os.path.dirname(_normalized_path(__file__)):
+        return True
+    stdlib = os.path.dirname(os.path.dirname(_normalized_path(asyncio.__file__)))
+    if not path.startswith(stdlib + os.sep):
+        return False
+    return path[len(stdlib) + 1:].split(os.sep)[0] in _PLUMBING
+
+
+def _print_reported_error(error: BaseException) -> bool:
+    """Print a reported condition without SDK/asyncio frames; called by the
+    Python tool. Returns False (print nothing) for every other error, so its
+    complete traceback is shown. ``LOCUS_SDK_FULL_TRACEBACK=1`` disables this."""
+    import sys
+    import traceback
+
+    if not isinstance(error, LocusRpcError) or not error.reported:
+        return False
+    if os.environ.get("LOCUS_SDK_FULL_TRACEBACK", "").strip() == "1":
+        return False
+    frames = [
+        frame for frame in traceback.extract_tb(error.__traceback__)
+        if not _internal_frame(frame.filename)
+    ]
+    lines = []
+    if frames:
+        lines.append("Traceback (most recent call last; Locus SDK frames omitted):\n")
+        lines.extend(traceback.format_list(frames))
+    label = "/".join(part for part in (error.method, error.kind) if part)
+    lines.append(f"locus.LocusRpcError [{label}]: {error}\n")
+    lines.extend(f"{note}\n" for note in getattr(error, "__notes__", None) or ())
+    if error.hint and not hasattr(error, "add_note"):
+        lines.append(f"next: {error.hint}\n")
+    sys.stderr.write("".join(lines))
+    sys.stderr.flush()
+    return True
 
 
 class LocusToolError(LocusSdkError):
@@ -80,6 +155,16 @@ class Client:
     def assets(self) -> "Assets":
         from ._assets import Assets
         return Assets(self)
+
+    @property
+    def blender(self) -> "Blender":
+        """`locus.blender` bound to this client (function caches persist)."""
+        from ._blender import Blender
+        existing = self.__dict__.get("_blender")
+        if existing is None:
+            existing = Blender(self)
+            self.__dict__["_blender"] = existing
+        return existing
 
     @property
     def captures(self) -> "Captures":
@@ -147,6 +232,8 @@ class Client:
             raise LocusRpcError(
                 str(error.get("message") or "Locus SDK request failed"),
                 code=error.get("code"),
+                method=method,
+                data=error.get("data"),
             )
         return payload.get("result")
 
@@ -747,7 +834,7 @@ class Client:
         mode: str = "build",
         session_type: str = "chat",
         knowledge_mode: str = "full",
-        subagent_models: dict[str, str] | None = None,
+        subagent_models: dict[str, str | list[str]] | None = None,
         subagent_efforts: dict[str, str] | None = None,
         subagent_fast_modes: dict[str, bool] | None = None,
     ) -> "Run":

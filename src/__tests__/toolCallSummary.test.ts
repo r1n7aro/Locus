@@ -99,4 +99,22 @@ describe("toolCallSummary", () => {
     }))).toBe("https://example.com/docs");
   });
 
+  it("summarizes send_message by recipient and collapsed message text", () => {
+    expect(buildToolCallArgsSummary("send_message", JSON.stringify({ to: "parent/tester", message: "Check\n  the race" })))
+      .toBe("→ parent/tester: Check the race");
+    expect(buildToolCallArgsSummary("send_message", JSON.stringify({ to: "reviewer", message: "x".repeat(80) })))
+      .toBe(`→ reviewer: ${"x".repeat(45)}...`);
+  });
+
+  it("summarizes Claude's Agent and SendMessage like the Locus delegation tools", () => {
+    expect(buildToolCallArgsSummary("Agent", JSON.stringify({ description: "Find the parser", prompt: "Long brief", subagent_type: "Explore" })))
+      .toBe("Find the parser");
+    expect(buildToolCallArgsSummary("SendMessage", JSON.stringify({ to: "a1b2", message: "Long body\nwith details", summary: "stop and report" })))
+      .toBe("→ a1b2: stop and report");
+    expect(buildToolCallArgsSummary("SendMessage", JSON.stringify({ to: "main", message: "Done\n  here" })))
+      .toBe("→ main: Done here");
+    expect(buildToolCallArgsSummary("TaskStop", JSON.stringify({ task_id: "a92abd40066ed59f2" }))).toBe("a92abd40066ed59f2");
+    expect(buildToolCallArgsSummary("TaskOutput", JSON.stringify({ task_id: "locus:t3", block: true }))).toBe("locus:t3");
+  });
+
 });

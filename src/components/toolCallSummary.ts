@@ -271,10 +271,24 @@ export function buildToolCallArgsSummary(
       return member;
     }
 
-    if (toolName === "subagent" || toolName === "task") {
+    if (toolName === "subagent" || toolName === "task" || toolName === "Agent") {
       const desc = getStringArg(args, ["description"]);
       if (desc.length <= 60) return desc;
       return desc.slice(0, 57) + "...";
+    }
+
+    if (toolName === "send_message" || toolName === "SendMessage") {
+      const to = getStringArg(args, ["to"]);
+      // Claude's SendMessage carries a short summary of its message.
+      const message = getStringArg(args, toolName === "SendMessage" ? ["summary", "message"] : ["message"])
+        .replace(/\s+/g, " ").trim();
+      const summary = to ? (message ? `→ ${to}: ${message}` : `→ ${to}`) : message;
+      return summary.length <= 60 ? summary : summary.slice(0, 57) + "...";
+    }
+
+    // Claude's own agent or a Locus task, by the id its start returned.
+    if (toolName === "TaskStop" || toolName === "TaskOutput") {
+      return getStringArg(args, ["task_id"]);
     }
 
     if (toolName === "web_fetch" || toolName === "WebFetch") {

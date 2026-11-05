@@ -604,7 +604,7 @@ class Agent:
         mode: str = "build",
         session_type: str = "chat",
         knowledge_mode: str = "full",
-        subagent_models: dict[str, str] | None = None,
+        subagent_models: dict[str, str | list[str]] | None = None,
         subagent_efforts: dict[str, str] | None = None,
         subagent_fast_modes: dict[str, bool] | None = None,
     ) -> "Run":

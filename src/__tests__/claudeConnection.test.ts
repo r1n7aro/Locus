@@ -3,12 +3,18 @@ import { createApp, nextTick, type App } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ClaudeConnection from '../components/settings/ClaudeConnection.vue';
 import * as service from '../services/claudeConnection';
-vi.mock('../services/claudeConnection', () => ({
+vi.mock('../services/claudeConnection', async (importOriginal) => ({
+  // Constants (the configurable builtin agents) come from the real module.
+  ...await importOriginal<typeof import('../services/claudeConnection')>(),
   getClaudeConnection: vi.fn(), inspectClaudeSsh: vi.fn(), authorizeClaudeSsh: vi.fn(), useLocalClaude: vi.fn(), setClaudePermissionMode: vi.fn(),
   clearClaudeSshUnlockPassword: vi.fn(),
-  setClaudePrewarm: vi.fn(), setClaudeRuntimeSettings: vi.fn(),
+  setClaudePrewarm: vi.fn(), setClaudeRuntimeSettings: vi.fn(), setClaudeNativeAgents: vi.fn(), getClaudeNativeAgentsSupport: vi.fn(),
 }));
 vi.mock('../i18n', () => ({ t: (key: string) => key }));
+vi.mock('../services/agent', () => ({ listAgents: vi.fn(), listSubagentDefs: vi.fn() }));
+import * as agentService from '../services/agent';
+const agentInfo = (id: string, delegatable = true, projectTypes: string[] = []) =>
+  ({ id, name: id, description: `${id} agent`, projectTypes, isDefault: false, source: 'builtin', delegatable });
 const info = { platform: 'linux', pythonInstalled: true, cliSupported: true, cliVersion: '2.1.299', model: 'test-model', authenticated: true, home: '/home/test' };
 let app: App | undefined;
 const flushPromises = async () => { await Promise.resolve(); await nextTick(); await Promise.resolve(); await nextTick(); };
@@ -35,6 +41,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(service.getClaudeConnection).mockResolvedValue({ version: 1, permissionMode: 'auto', remote: null, authorizedTarget: null, info: null });
   vi.mocked(service.inspectClaudeSsh).mockResolvedValue(info);
+  vi.mocked(service.getClaudeNativeAgentsSupport).mockResolvedValue({ cliVersion: '2.1.312 (Claude Code)', supported: true, remote: false, installable: false });
+  vi.mocked(agentService.listAgents).mockResolvedValue([agentInfo('general', false), agentInfo('unity', true, ['unity'])]);
+  vi.mocked(agentService.listSubagentDefs).mockResolvedValue([agentInfo('explorer', true, ['unity']), agentInfo('researcher')]);
 });
 describe('Claude SSH authorization', () => {
   it('saves optional spare capacity without probing SSH or sending messages', async () => {
@@ -223,6 +232,104 @@ describe('Claude permission mode', () => {
     await flushPromises();
     expect(wrapper.find('[role="alert"]').text()).toContain('save failed');
     expect(wrapper.findAll('button').find(b => b.text() === 'Bypass')!.attr('aria-checked')).toBe('true');
+  });
+});
+
+describe('Claude native multi-agent', () => {
+  const saved = { version: 1, permissionMode: 'auto' as const, remote: null, authorizedTarget: null, info: null };
+  it('defaults on with the three builtins and saves the switch and each builtin', async () => {
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    const native = wrapper.find('[aria-label="settings.claudeCode.nativeMultiAgent"]');
+    expect(native.attr('aria-checked')).toBe('true');
+    const checked = () => wrapper.findAll('.connection-builtin-agents [role="checkbox"]')
+      .filter(box => box.attr('aria-checked') === 'true').map(box => box.attr('aria-label'));
+    expect(checked()).toEqual(['general-purpose', 'Explore', 'Plan']);
+    expect(service.setClaudeNativeAgents).not.toHaveBeenCalled();
+
+    // A builtin is added in the published order, never appended.
+    vi.mocked(service.setClaudeNativeAgents).mockResolvedValueOnce({ ...saved, nativeMultiAgent: true, nativeAgents: { builtins: ['general-purpose', 'Explore', 'Plan', 'claude'] } });
+    await wrapper.find('[aria-label="claude"]').trigger('click'); await flushPromises();
+    expect(service.setClaudeNativeAgents).toHaveBeenLastCalledWith(true, ['general-purpose', 'Explore', 'Plan', 'claude'], []);
+    expect(checked()).toEqual(['general-purpose', 'Explore', 'Plan', 'claude']);
+
+    // Turning the mode off keeps the builtins and hides their picker.
+    vi.mocked(service.setClaudeNativeAgents).mockResolvedValueOnce({ ...saved, nativeMultiAgent: false, nativeAgents: { builtins: ['general-purpose', 'Explore', 'Plan', 'claude'] } });
+    await native.trigger('click'); await flushPromises();
+    expect(service.setClaudeNativeAgents).toHaveBeenLastCalledWith(false, ['general-purpose', 'Explore', 'Plan', 'claude'], []);
+    expect(native.attr('aria-checked')).toBe('false');
+    expect(wrapper.findAll('.connection-builtin-agents')).toEqual([]);
+    expect(wrapper.findAll('.connection-locus-agents')).toEqual([]);
+    expect(service.inspectClaudeSsh).not.toHaveBeenCalled();
+  });
+
+  it('offers every delegatable Locus agent by default and saves exclusions', async () => {
+    vi.mocked(service.getClaudeConnection).mockResolvedValue({ ...saved, nativeAgents: { builtins: ['Explore'], excludedLocusAgents: ['gone'] } });
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    const boxes = () => wrapper.findAll('.connection-locus-agents [role="checkbox"]');
+    // Non-delegatable agents (general) are not listed; a type limited to a
+    // project type shows it.
+    expect(boxes().map(box => box.attr('aria-label'))).toEqual(['unity', 'explorer', 'researcher']);
+    expect(boxes().every(box => box.attr('aria-checked') === 'true')).toBe(true);
+    expect(wrapper.findAll('.connection-agent-scope').map(scope => scope.text())).toEqual(['Unity', 'Unity']);
+
+    // Unchecking adds the id; an unlisted saved id stays excluded.
+    vi.mocked(service.setClaudeNativeAgents).mockResolvedValueOnce({ ...saved, nativeMultiAgent: true, nativeAgents: { builtins: ['Explore'], excludedLocusAgents: ['gone', 'explorer'] } });
+    await wrapper.find('.connection-locus-agents [aria-label="explorer"]').trigger('click'); await flushPromises();
+    expect(service.setClaudeNativeAgents).toHaveBeenLastCalledWith(true, ['Explore'], ['gone', 'explorer']);
+    expect(wrapper.find('.connection-locus-agents [aria-label="explorer"]').attr('aria-checked')).toBe('false');
+
+    // A builtin change keeps the exclusions; rechecking removes the id.
+    vi.mocked(service.setClaudeNativeAgents).mockResolvedValueOnce({ ...saved, nativeMultiAgent: true, nativeAgents: { builtins: ['Explore', 'Plan'], excludedLocusAgents: ['gone', 'explorer'] } });
+    await wrapper.find('[aria-label="Plan"]').trigger('click'); await flushPromises();
+    expect(service.setClaudeNativeAgents).toHaveBeenLastCalledWith(true, ['Explore', 'Plan'], ['gone', 'explorer']);
+    vi.mocked(service.setClaudeNativeAgents).mockResolvedValueOnce({ ...saved, nativeMultiAgent: true, nativeAgents: { builtins: ['Explore', 'Plan'], excludedLocusAgents: ['gone'] } });
+    await wrapper.find('.connection-locus-agents [aria-label="explorer"]').trigger('click'); await flushPromises();
+    expect(service.setClaudeNativeAgents).toHaveBeenLastCalledWith(true, ['Explore', 'Plan'], ['gone']);
+  });
+
+  it('warns when the local CLI is too old and hides the warning while the mode is off', async () => {
+    vi.mocked(service.getClaudeNativeAgentsSupport).mockResolvedValue({ cliVersion: '2.1.302 (Claude Code)', supported: false, remote: false, installable: false });
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    expect(wrapper.find('.connection-warning').text()).toBe('settings.claudeCode.nativeUnsupportedVersion');
+    expect(wrapper.findAll('button').some(b => b.text() === 'settings.claudeSsh.upgradeSave')).toBe(false);
+    vi.mocked(service.setClaudeNativeAgents).mockResolvedValueOnce({ ...saved, nativeMultiAgent: false, nativeAgents: { builtins: ['general-purpose', 'Explore', 'Plan'] } });
+    await wrapper.find('[aria-label="settings.claudeCode.nativeMultiAgent"]').trigger('click'); await flushPromises();
+    expect(wrapper.findAll('.connection-warning')).toEqual([]);
+  });
+
+  it('upgrades a saved SSH connection whose Claude Code is too old after a fresh test', async () => {
+    const remote = { target: 'user@server', port: null, identityFile: null, knownHostsFile: null, cliPath: null };
+    const old = { ...info, cliVersion: '2.1.302 (Claude Code)' };
+    const savedRemote = { ...saved, remote, authorizedTarget: 'bound', info: old };
+    vi.mocked(service.getClaudeConnection).mockResolvedValue(savedRemote);
+    vi.mocked(service.inspectClaudeSsh).mockResolvedValue(old);
+    vi.mocked(service.getClaudeNativeAgentsSupport).mockResolvedValue({ cliVersion: old.cliVersion, supported: false, remote: true, installable: true });
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    expect(wrapper.find('.connection-warning').text()).toBe('settings.claudeCode.nativeUnsupportedVersion');
+    // Cached information is not a connection test: no button until tested.
+    expect(wrapper.findAll('button').some(b => b.text() === 'settings.claudeSsh.upgradeSave')).toBe(false);
+    await wrapper.findAll('button').find(b => b.text().endsWith('.inspect'))!.trigger('click'); await flushPromises();
+    const upgrade = () => wrapper.findAll('button').find(b => b.text() === 'settings.claudeSsh.upgradeSave');
+    expect(upgrade()).toBeDefined();
+
+    vi.mocked(service.authorizeClaudeSsh).mockResolvedValue({ ...savedRemote, info: { ...old, cliVersion: '2.1.312 (Claude Code)' } });
+    vi.mocked(service.getClaudeNativeAgentsSupport).mockResolvedValue({ cliVersion: '2.1.312 (Claude Code)', supported: true, remote: true, installable: true });
+    await upgrade()!.trigger('click'); await flushPromises();
+    expect(service.authorizeClaudeSsh).toHaveBeenCalledExactlyOnceWith(remote, undefined);
+    expect(wrapper.findAll('.connection-warning')).toEqual([]);
+    expect(upgrade()).toBeUndefined();
+  });
+
+  it('does not offer an upgrade for a custom remote Claude path', async () => {
+    const remote = { target: 'user@server', port: null, identityFile: null, knownHostsFile: null, cliPath: '/opt/claude' };
+    const old = { ...info, cliVersion: '2.1.302 (Claude Code)' };
+    vi.mocked(service.getClaudeConnection).mockResolvedValue({ ...saved, remote, authorizedTarget: 'bound', info: old });
+    vi.mocked(service.inspectClaudeSsh).mockResolvedValue(old);
+    vi.mocked(service.getClaudeNativeAgentsSupport).mockResolvedValue({ cliVersion: old.cliVersion, supported: false, remote: true, installable: false });
+    const wrapper = mount(ClaudeConnection); await flushPromises();
+    await wrapper.findAll('button').find(b => b.text().endsWith('.inspect'))!.trigger('click'); await flushPromises();
+    expect(wrapper.find('.connection-warning').text()).toBe('settings.claudeCode.nativeUnsupportedVersion');
+    expect(wrapper.findAll('button').some(b => b.text() === 'settings.claudeSsh.upgradeSave')).toBe(false);
   });
 });
 

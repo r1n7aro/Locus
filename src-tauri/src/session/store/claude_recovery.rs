@@ -1,10 +1,13 @@
 use super::*;
-use crate::llm::claude_code_cli::{recovery::{self, NativeMessage, NativeSnapshot}, ssh::SshConfig};
+use crate::llm::claude_code_cli::{recovery::{self, NativeMessage, NativeSnapshot}, connection::NativeConnection};
 use serde_json::{json, Value};
 
 #[cfg(test)]
 #[path = "claude_recovery_parts_tests.rs"]
 mod parts_tests;
+#[cfg(test)]
+#[path = "claude_history_retention_tests.rs"]
+mod history_retention_tests;
 
 fn pending_input_matches(metadata: Option<&Value>, native: &NativeMessage) -> bool {
     if native.role != MessageRole::User { return false; }
@@ -13,16 +16,22 @@ fn pending_input_matches(metadata: Option<&Value>, native: &NativeMessage) -> bo
         recovery::pending_input_token(&recovery::text_content(&native.content)) == Some(token))
 }
 
+fn native_user_text(native: &NativeMessage) -> String {
+    let raw = recovery::text_content(&native.content);
+    if recovery::pending_input_token(&raw).is_some() {
+        raw.split_once('\n').and_then(|(_, body)| body.rsplit_once("\n</locus-pending-user>"))
+            .map(|(body, trailing)| format!("{body}{trailing}"))
+            .unwrap_or(raw)
+    } else { raw }
+}
+
 fn authoritative_user_text(native:&NativeMessage,existing:Option<&ChatMessage>)->String {
-    let raw=recovery::text_content(&native.content);
-    let text=if recovery::pending_input_token(&raw).is_some() {
-        raw.split_once('\n').and_then(|(_,body)|body.rsplit_once("\n</locus-pending-user>").map(|(body,_)|body)).unwrap_or(&raw)
-    } else {&raw};
+    let text = native_user_text(native);
     if let Some(message)=existing.filter(|message|crate::session::history::render_prompt_content(
         &message.content,message.prompt_prefix.as_deref(),message.prompt_suffix.as_deref())==text) {
         return message.content.clone();
     }
-    text.to_string()
+    text
 }
 
 fn matches_native(message: &ChatMessage, metadata: Option<&Value>, native: &NativeMessage, exact: bool) -> bool {
@@ -50,6 +59,21 @@ fn matches_native(message: &ChatMessage, metadata: Option<&Value>, native: &Nati
     }
     let text = recovery::text_content(&native.content);
     !message.content.is_empty() && (text == message.content || text.contains(&message.content))
+}
+
+/// A committed native UUID proves that a row belongs to this conversation,
+/// even when compaction removes it from the active native branch. Merely
+/// having a provider label or an unsubmitted input receipt is not proof.
+fn confirmed_native_uuid<'a>(metadata: Option<&'a Value>, native_id: &str) -> Option<&'a str> {
+    let metadata = metadata?;
+    if metadata["backend"].as_str().is_some_and(|backend| backend != "claude_code_cli") {
+        return None;
+    }
+    let checkpoint = &metadata["claude_checkpoint"];
+    if checkpoint["version"] != 1 || checkpoint["sessionId"].as_str() != Some(native_id) {
+        return None;
+    }
+    checkpoint["uuid"].as_str().filter(|id| Uuid::parse_str(id).is_ok())
 }
 
 /// Migrate checkpoint-only tool rounds (and previously synchronized rounds)
@@ -145,8 +169,8 @@ mod tests {
         }
     }
 
-    fn fixture() -> (SshConfig, NativeSnapshot) {
-        let remote: SshConfig = serde_json::from_value(json!({"target":"test@127.0.0.1","port":22242})).unwrap();
+    fn fixture() -> (NativeConnection, NativeSnapshot) {
+        let remote: NativeConnection = serde_json::from_value(json!({"target":"test@127.0.0.1","port":22242})).unwrap();
         let row = |role, content, key: &str| json!({"key":key,"role":role,"uuids":[Uuid::new_v4().to_string()],"content":content,"timestamp":"2026-10-15T00:00:00Z"});
         let user = row("user", json!([{"type":"text","text":"question"}]), "user1");
         let mut answer = row("assistant", json!([{"type":"text","text":"complete answer"}]), "assistant1");
@@ -155,6 +179,54 @@ mod tests {
         let snapshot = serde_json::from_value(json!({"version":1,"nativeId":Uuid::new_v4().to_string(),"digest":"a".repeat(64),
             "messages":[user,answer],"todos":[{"content":"native task","status":"completed","priority":"medium"}],"incompleteTail":false,"pendingToolIds":[]})).unwrap();
         (remote,snapshot)
+    }
+
+    #[test]
+    fn claude_continuations_stay_internal_when_imported_or_rebuilt_from_native_history() {
+        for mode in ["passive", "retry", "repair", "restore"] {
+            let root = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(root.path()).unwrap();
+            let id = store.create_session("continuation display", None, None, "chat", None).unwrap();
+            let (remote, mut snapshot) = fixture();
+            // Identical prose submitted by a real user must remain visible.
+            let literal = "Continue from the existing conversation context and finish the current request. Do not repeat completed work or tool operations. Use the recorded results and inspect current state before any new action.";
+            snapshot.messages[0].content = json!(literal);
+            let mut continuation = snapshot.messages[0].clone();
+            continuation.key = "continuation".into();
+            continuation.uuids = vec![Uuid::new_v4().to_string()];
+            let reminder = recovery::continuation_prompt(literal);
+            let notice = "<system-reminder>Background result already recorded.</system-reminder>";
+            let context = "<system-reminder>Inspect interrupted tool state before continuing.</system-reminder>";
+            let body = format!("{reminder}\n\n{notice}");
+            let expected_prompt = format!("{body}\n\n{context}");
+            // Resume context is appended after the pending-input envelope.
+            continuation.content = json!(format!("{}\n\n{context}", recovery::pending_input_text(&Uuid::new_v4().to_string(), &body)));
+            snapshot.messages.push(continuation);
+
+            // No local continuation row/metadata survives: the native marker
+            // alone must restore the hidden projection in every recovery mode.
+            match mode {
+                "passive" => store.reconcile_claude_native(&id, &remote, &snapshot, &[], None),
+                "retry" => store.rebuild_claude_native_for_retry(&id, &remote, &snapshot, &[], None),
+                "repair" => store.rebuild_claude_native(&id, &remote, &snapshot, &[], None),
+                _ => store.restore_claude_native_binding(&id, &remote, &snapshot, &[]),
+            }.unwrap();
+            for _ in 0..2 {
+                let messages = store.get_messages(&id).unwrap();
+                assert_eq!(messages.len(), 3, "{mode}");
+                assert_eq!(messages[0].content, literal, "{mode}");
+                assert!(messages[2].content.is_empty(), "{mode}");
+                assert_eq!(messages[2].prompt_suffix.as_deref(), Some(expected_prompt.as_str()), "{mode}");
+                assert_eq!(crate::session::history::render_prompt_content(&messages[2].content,
+                    messages[2].prompt_prefix.as_deref(), messages[2].prompt_suffix.as_deref()), expected_prompt, "{mode}");
+                let view = store.load_session_view(&id, 100).unwrap();
+                assert_eq!(view.session.messages.len(), 2, "{mode}");
+                assert_eq!(view.user_message_ids, vec![messages[0].id.clone()], "{mode}");
+                let page = crate::commands::StreamHistoryPage::load(&store, &id).unwrap();
+                assert_eq!(page.messages.as_ref().unwrap().len(), 2, "{mode}");
+                store.rebuild_claude_native(&id, &remote, &snapshot, &messages, None).unwrap();
+            }
+        }
     }
 
     #[test]
@@ -254,6 +326,87 @@ mod tests {
     }
 
     #[test]
+    fn claude_compaction_mirrors_kept_rows_through_preview_and_reconcile() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        let id = store.create_session("kept compact", None, None, "chat", None).unwrap();
+        let (remote, mut snapshot) = fixture();
+        let native_row = |template: &NativeMessage, key: &str, text: &str, time: &str| {
+            let mut row = template.clone();
+            row.key = key.into();
+            row.uuids = vec![Uuid::new_v4().to_string()];
+            row.content = json!([{"type":"text","text":text}]);
+            row.timestamp = Some(time.into());
+            row
+        };
+        let follow = native_row(&snapshot.messages[0], "user2", "follow up", "2026-10-15T00:01:00Z");
+        let kept_answer = native_row(&snapshot.messages[1], "assistant2", "kept answer", "2026-10-15T00:02:00Z");
+        snapshot.messages.extend([follow, kept_answer]);
+        let mut local = Vec::new();
+        for native in &snapshot.messages {
+            let text = recovery::text_content(&native.content);
+            let message = store.add_message(&id, native.role.clone(), &text).unwrap();
+            store.set_message_response_request_metadata(&id, &message, &json!({
+                "backend":"claude_code_cli", "claude_connection":remote,
+                "claude_checkpoint":{"version":1,"uuid":native.uuids[0],"sessionId":snapshot.native_id}
+            })).unwrap();
+            local.push(message);
+        }
+
+        // Claude kept the follow-up exchange verbatim after its summary.
+        let summary = "Summary:\nWORK";
+        let carry = "## Locus Carry-Forward Context\nCARRY";
+        let retained = vec![local[2].clone(), local[3].clone()];
+        let earliest = store.get_messages(&id).unwrap()[2].created_at;
+        let handoff = crate::compact::claude_native::build_handoff_message(&format!("{summary}\n\n{carry}"), earliest, true);
+        let receipt = json!({"backend":"claude_code_cli", "claude_connection":remote,
+            "claude_checkpoint":{"version":1,"uuid":snapshot.messages[3].uuids[0],"sessionId":snapshot.native_id},
+            "claude_compaction":{"type":"compact_done","summary":summary,"carryForward":carry,"keptMessageIds":retained}});
+        store.compact_messages_retaining(&id, &handoff, &local[3], 0, &retained, Some(&receipt)).unwrap();
+        let prompt_ids = |store: &SessionStore| store.get_messages_for_prompt(&id).unwrap().into_iter().map(|m| m.id).collect::<Vec<_>>();
+        let mirrored = vec![handoff.id.clone(), local[2].clone(), local[3].clone()];
+        assert_eq!(prompt_ids(&store), mirrored);
+        let preview_ids = |store: &SessionStore| {
+            let preview = store.get_compacted_context_output(&id, &handoff.id).unwrap().unwrap();
+            (preview.snapshot_status.clone(), preview.messages.into_iter().map(|m| m.id).collect::<Vec<_>>())
+        };
+        assert_eq!(preview_ids(&store), ("complete".to_string(), mirrored.clone()));
+        let preview = store.get_compacted_context_output(&id, &handoff.id).unwrap().unwrap();
+        assert_eq!(preview.messages[0].content, format!("{summary}\n\n{carry}"));
+        assert_eq!(preview.messages[2].content, "kept answer");
+
+        // Claude's chain lists kept rows before its summary; synchronization
+        // keeps them in the prompt and keeps the summary first.
+        let mut native_summary = snapshot.messages[0].clone();
+        native_summary.key = "native-summary".into();
+        native_summary.uuids = vec![Uuid::new_v4().to_string()];
+        native_summary.content = json!(summary);
+        native_summary.compact_summary = true;
+        native_summary.timestamp = Some("2026-10-15T00:03:00Z".into());
+        snapshot.messages.push(native_summary);
+        assert!(store.reconcile_claude_native(&id, &remote, &snapshot, &store.get_messages(&id).unwrap(), None).unwrap());
+        let display = store.get_messages(&id).unwrap().into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(display, [local.clone(), vec![handoff.id.clone()]].concat());
+        assert_eq!(prompt_ids(&store), mirrored);
+        assert!(!store.reconcile_claude_native(&id, &remote, &snapshot, &store.get_messages(&id).unwrap(), None).unwrap());
+        assert_eq!(prompt_ids(&store), mirrored);
+
+        // Later native rows join the prompt but not the compaction preview.
+        let later = native_row(&snapshot.messages[0], "user3", "next request", "2026-10-15T00:04:00Z");
+        snapshot.messages.push(later);
+        snapshot.digest = "b".repeat(64);
+        assert!(store.reconcile_claude_native(&id, &remote, &snapshot, &store.get_messages(&id).unwrap(), None).unwrap());
+        let prompt = prompt_ids(&store);
+        assert_eq!(prompt.len(), 4);
+        assert_eq!(&prompt[..3], &mirrored[..]);
+        assert_eq!(preview_ids(&store), ("complete".to_string(), mirrored.clone()));
+
+        // A kept row removed later leaves an explicitly partial preview.
+        store.conn.lock().unwrap().execute("DELETE FROM messages WHERE id=?1", [&local[2]]).unwrap();
+        assert_eq!(preview_ids(&store), ("partial".to_string(), vec![handoff.id.clone(), local[3].clone()]));
+    }
+
+    #[test]
     fn claude_restore_commits_server_binding_with_history_and_session_tasks() {
         let root=tempfile::tempdir().unwrap();let store=SessionStore::new(root.path()).unwrap();
         let id=store.create_session("restore",None,None,"chat",None).unwrap();
@@ -261,7 +414,7 @@ mod tests {
         snapshot.task_snapshot=json!({"version":1,"kind":"tasks","items":snapshot.todos,"tasks":[]});
         store.reconcile_claude_native(&id,&source,&snapshot,&[],None).unwrap();
         let messages=store.get_messages(&id).unwrap();
-        let mut target=source.clone();target.target="test@other".into();
+        let mut target=source.clone();target.as_ssh_mut().unwrap().target="test@other".into();
         assert!(store.restore_claude_native_binding(&id,&target,&snapshot,&[]).is_err());
         assert!(store.claude_active_remote(&id).unwrap().is_none());
         store.restore_claude_native_binding(&id,&target,&snapshot,&messages).unwrap();
@@ -417,25 +570,29 @@ impl SessionStore {
     /// record identities. No new SQL columns; historical missing fields remain
     /// explicit `empty` in exports until a verified native snapshot is applied.
     pub(crate) fn reconcile_claude_native(
-        &self, id: &str, remote: &SshConfig, snapshot: &NativeSnapshot,
+        &self, id: &str, remote: &(impl Clone + Into<NativeConnection>), snapshot: &NativeSnapshot,
         expected: &[ChatMessage], pending: Option<&str>,
     ) -> Result<bool, String> {
+        let remote: &NativeConnection = &remote.clone().into();
         self.reconcile_claude_native_binding(id,remote,snapshot,expected,pending,false,false,false,false)
     }
     /// Passive view synchronization must yield to a newly started run. Check
     /// again inside the write transaction, atomically with history replacement.
     pub(crate) fn reconcile_claude_native_if_idle(
-        &self, id: &str, remote: &SshConfig, snapshot: &NativeSnapshot,
+        &self, id: &str, remote: &(impl Clone + Into<NativeConnection>), snapshot: &NativeSnapshot,
         expected: &[ChatMessage],
     ) -> Result<bool, String> {
+        let remote: &NativeConnection = &remote.clone().into();
         if self.active_run_for_session(id)?.is_some() { return Ok(false); }
         self.reconcile_claude_native_binding(id,remote,snapshot,expected,None,false,false,false,true)
     }
-    /// Remote-authoritative recovery deliberately drops unsubmitted local
-    /// history. Only the current, explicitly submitted user input survives.
+    /// Rebuild active context from native history. Confirmed local transcript
+    /// rows survive for viewing/export; only the current unsubmitted input is
+    /// carried into the new prompt.
     pub(crate) fn rebuild_claude_native(
-        &self,id:&str,remote:&SshConfig,snapshot:&NativeSnapshot,expected:&[ChatMessage],pending:Option<&str>,
+        &self,id:&str,remote:&(impl Clone + Into<NativeConnection>),snapshot:&NativeSnapshot,expected:&[ChatMessage],pending:Option<&str>,
     )->Result<bool,String> {
+        let remote: &NativeConnection = &remote.clone().into();
         if let Some((bound,native))=self.claude_native_binding(id)? {
             if &bound!=remote { return Err("Remote Claude server does not match the conversation binding".into()); }
             snapshot.validate(native.as_deref())?;
@@ -445,9 +602,10 @@ impl SessionStore {
     /// A transport retry is not an explicit history repair: keep all proven
     /// unsent inputs (including mid-turn steering and continuation receipts).
     pub(crate) fn rebuild_claude_native_for_retry(
-        &self, id: &str, remote: &SshConfig, snapshot: &NativeSnapshot,
+        &self, id: &str, remote: &(impl Clone + Into<NativeConnection>), snapshot: &NativeSnapshot,
         expected: &[ChatMessage], pending: Option<&str>,
     ) -> Result<bool, String> {
+        let remote: &NativeConnection = &remote.clone().into();
         if let Some((bound, native)) = self.claude_native_binding(id)? {
             if &bound != remote { return Err("Remote Claude server does not match the conversation binding".into()); }
             snapshot.validate(native.as_deref())?;
@@ -455,12 +613,13 @@ impl SessionStore {
         self.reconcile_claude_native_binding(id, remote, snapshot, expected, pending, true, true, true, false)
     }
     pub(crate) fn restore_claude_native_binding(
-        &self,id:&str,remote:&SshConfig,snapshot:&NativeSnapshot,expected:&[ChatMessage],
+        &self,id:&str,remote:&(impl Clone + Into<NativeConnection>),snapshot:&NativeSnapshot,expected:&[ChatMessage],
     )->Result<bool,String> {
+        let remote: &NativeConnection = &remote.clone().into();
         self.reconcile_claude_native_binding(id,remote,snapshot,expected,None,true,false,false,false)
     }
     fn reconcile_claude_native_binding(
-        &self,id:&str,remote:&SshConfig,snapshot:&NativeSnapshot,expected:&[ChatMessage],pending:Option<&str>,bind:bool,authoritative:bool,preserve_pending:bool,idle_only:bool,
+        &self,id:&str,remote:&NativeConnection,snapshot:&NativeSnapshot,expected:&[ChatMessage],pending:Option<&str>,bind:bool,authoritative:bool,preserve_pending:bool,idle_only:bool,
     )->Result<bool,String> {
         snapshot.validate(None)?;
         self.migrate_claude_queued_inputs(id,remote,snapshot,expected,&self.get_response_request_metadata(id)?)?;
@@ -469,29 +628,42 @@ impl SessionStore {
             expected.iter().filter(|m|m.role==MessageRole::User && Some(m.id.as_str())==pending).map(|m|m.id.clone()).collect()
         } else { self.claude_recovery_pending_messages(id,expected,&metadata,pending)? };
         if !authoritative { self.verify_claude_history_origin(id, expected, &metadata, &pending)?; }
-        let notifications = if authoritative && !preserve_pending { HashSet::new() } else { self.claude_notification_ids(id, expected, &metadata)? };
+        let mut notifications = self.claude_notification_ids(id, expected, &metadata)?;
+        if authoritative && !preserve_pending {
+            notifications.retain(|id| metadata.get(id).is_some_and(|value| {
+                let receipt = &value["locus_claude_notification"];
+                receipt["version"] == 1 && receipt["nativeId"].as_str() == Some(snapshot.native_id.as_str())
+                    && receipt["uuid"].as_str().is_some_and(|uuid| Uuid::parse_str(uuid).is_ok())
+            }));
+        }
         let notification_updates = Self::claude_notification_migration(expected, &metadata, &notifications, snapshot);
         let hidden: HashSet<_> = snapshot.hidden_user_uuids.iter().map(String::as_str).collect();
         // Older builds imported command echoes as user messages. Remove only
         // rows whose original native UUIDs are now proven hidden, even if a
         // later compaction archived them. Never classify local text heuristically.
         let obsolete: HashSet<_> = expected.iter().filter(|m| m.role == MessageRole::User
-            && metadata.get(&m.id).and_then(|v| v["claude_native"]["uuids"].as_array()).is_some_and(|ids|
-                !ids.is_empty() && ids.iter().all(|id| id.as_str().is_some_and(|id| hidden.contains(id)))))
+            && (confirmed_native_uuid(metadata.get(&m.id), &snapshot.native_id).is_some_and(|id| hidden.contains(id))
+                || metadata.get(&m.id).and_then(|v| v["claude_native"]["uuids"].as_array()).is_some_and(|ids|
+                    !ids.is_empty() && ids.iter().all(|id| id.as_str().is_some_and(|id| hidden.contains(id))))))
             .map(|m| m.id.clone()).collect();
-        let mut archived: HashSet<String> = if !authoritative && snapshot.messages.iter().any(|m|m.compact_summary) {
+        let previously_archived: HashSet<String> = {
             let conn=self.conn.lock().map_err(|e|e.to_string())?;
             let mut stmt=conn.prepare("SELECT id FROM messages WHERE session_id=?1 AND include_in_prompt=0").map_err(|e|e.to_string())?;
             let rows=stmt.query_map([id],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;
             rows.collect::<Result<_,_>>().map_err(|e|e.to_string())?
+        };
+        let mut archived = if !authoritative && snapshot.messages.iter().any(|m|m.compact_summary) {
+            previously_archived.clone()
         } else { HashSet::new() };
         archived.retain(|id| !obsolete.contains(id));
         let mut selected = HashSet::new();
         let mut resolved = Vec::new();
         for native in &snapshot.messages {
             if authoritative {
-                let matches:Vec<_>=expected.iter().filter(|m|!selected.contains(&m.id)
-                    && matches_native(m,metadata.get(&m.id),native,true)).collect();
+                let matches:Vec<_>=expected.iter().filter(|m|!obsolete.contains(&m.id) && !selected.contains(&m.id)
+                    && (matches_native(m,metadata.get(&m.id),native,true)
+                        || (native.compact_summary && is_context_handoff_message(m)
+                            && matches_native(m,metadata.get(&m.id),native,false)))).collect();
                 let existing = if matches.len()==1 {Some(matches[0])} else {None};
                 if let Some(message)=existing {selected.insert(message.id.clone());}
                 resolved.push((native.clone(),existing));
@@ -527,7 +699,18 @@ impl SessionStore {
                 resolved.push((native.clone(), existing));
             }
         }
-        if !bind && notification_updates.is_empty() && resolved.iter().all(|(native, existing)| existing.is_some_and(|m| metadata.get(&m.id).is_some_and(|v|
+        // The snapshot describes the active native branch, not everything the
+        // user has seen. Preserve confirmed rows absent from that branch in
+        // every recovery mode, including a missed compact_done and retries.
+        // Rows represented by the snapshot may be regrouped, not duplicated.
+        let native_uuids: HashSet<_> = snapshot.messages.iter().flat_map(|m| m.uuids.iter().map(String::as_str)).collect();
+        for message in expected.iter().filter(|m| !selected.contains(&m.id) && !obsolete.contains(&m.id)) {
+            if confirmed_native_uuid(metadata.get(&message.id), &snapshot.native_id)
+                .is_some_and(|uuid| !native_uuids.contains(uuid)) {
+                archived.insert(message.id.clone());
+            }
+        }
+        if !bind && archived.is_subset(&previously_archived) && notification_updates.is_empty() && resolved.iter().all(|(native, existing)| existing.is_some_and(|m| metadata.get(&m.id).is_some_and(|v|
             v["claude_native"]["key"] == native.key && v["claude_native"]["digest"] == snapshot.digest
                 && v["claude_native"]["cacheAlgorithmVersion"] == 2)))
             && expected.iter().all(|m| notifications.contains(&m.id) || pending.contains(&m.id) || archived.contains(&m.id) || selected.contains(&m.id)) {
@@ -542,6 +725,11 @@ impl SessionStore {
             let mut payload = if authoritative && !preserve_pending {json!({})} else {metadata.get(&message_id).cloned().unwrap_or_else(|| json!({}))};
             if authoritative && pending_input_matches(metadata.get(&message_id),&native) {
                 payload["claude_pending_input"]=metadata[&message_id]["claude_pending_input"].clone();
+            }
+            if native.compact_summary {
+                if let Some(receipt) = metadata.get(&message_id).and_then(|v| v.get("claude_compaction")) {
+                    payload["claude_compaction"] = receipt.clone();
+                }
             }
             if payload.get("claude_native").is_some_and(|v| v["version"] != 1) {
                 return Err("Unsupported saved Claude recovery metadata version".into());
@@ -558,6 +746,24 @@ impl SessionStore {
                 payload["claude_todos"] = snapshot.task_snapshot.clone();
             }
             prepared.push((native, message_id, existing, payload));
+        }
+        // Rows kept without a native record (verified archives, delivered
+        // notifications) stay where they were relative to the synchronized
+        // rows: each one goes after every earlier row that the snapshot
+        // places. Keeping their old rowids instead moved every renumbered row
+        // behind them, so a cancelled trailing round that never reached the
+        // native transcript was shown above the first user message.
+        let prepared_slots: HashMap<&str, usize> = prepared.iter().enumerate()
+            .map(|(position, (_, message_id, ..))| (message_id.as_str(), position)).collect();
+        let mut retained_before: Vec<Vec<&str>> = vec![Vec::new(); prepared.len() + 1];
+        let mut slot = 0;
+        for message in expected {
+            if let Some(position) = prepared_slots.get(message.id.as_str()) {
+                slot = slot.max(position + 1);
+            } else if !selected.contains(&message.id) && (notifications.contains(&message.id)
+                || (!pending.contains(&message.id) && archived.contains(&message.id))) {
+                retained_before[slot].push(message.id.as_str());
+            }
         }
 
         // Keep a local, versioned backup before an authoritative replacement.
@@ -598,11 +804,30 @@ impl SessionStore {
             return Err("Local conversation content changed during native synchronization; retry".into());
         }
         let base: i64 = tx.query_row("SELECT COALESCE(MAX(rowid),0)+1 FROM messages", [], |r|r.get(0)).map_err(|e|e.to_string())?;
+        // New rowids above every existing row: synchronized rows in native
+        // order with retained rows in their slots, then unsent inputs.
+        let mut next_row = base;
+        let mut prepared_rows = Vec::with_capacity(prepared.len());
+        let mut retained_rows = Vec::new();
+        for (slot, retained) in retained_before.iter().enumerate() {
+            for message_id in retained {
+                retained_rows.push((*message_id, next_row));
+                next_row += 1;
+            }
+            if slot < prepared.len() {
+                prepared_rows.push(next_row);
+                next_row += 1;
+            }
+        }
+        for (message_id, row_id) in &retained_rows {
+            tx.execute("UPDATE messages SET rowid=?1 WHERE id=?2 AND session_id=?3",params![row_id,message_id,id]).map_err(|e|e.to_string())?;
+        }
         let mut timestamp = 0i64;
         let mut totals = [0u64; 4];
         let mut timed = 0u64;
         let mut duration = 0u64;
         let mut context = 0u64;
+        let mut missing_archived_usage = 0usize;
         tx.execute(if authoritative {"DELETE FROM model_usage_events WHERE session_id=?1"} else {"DELETE FROM model_usage_events WHERE session_id=?1 AND provider='Claude Code CLI'"}, [id]).map_err(|e|e.to_string())?;
         // Claude may prune pre-compaction rows on resume. Keep verified local
         // archives for viewing/export only; they are never sent back to CLI.
@@ -614,7 +839,13 @@ impl SessionStore {
                 let Some(usage) = native.get("usage").filter(|v| v.is_object()) else { continue; };
                 Some(usage)
             } else { payload.get("claude_usage").filter(|v| v.is_object()) };
-            let Some(usage)=usage else { return Err("Pre-compaction usage is unavailable in this older conversation; cached history was retained without replacement".into()); };
+            let Some(usage)=usage else {
+                // Legacy transcripts can prove a message without recording
+                // usage. Missing billing data must not discard the transcript
+                // or force another authoritative rebuild. Do not invent usage.
+                missing_archived_usage += 1;
+                continue;
+            };
             let counts=["input_tokens","output_tokens","cache_read_input_tokens","cache_creation_input_tokens"].map(|k|usage[k].as_u64().unwrap_or(0).min(u32::MAX as u64));
             for i in 0..4 { totals[i]=totals[i].saturating_add(counts[i]); }
             let model=payload["upstream_model"].as_str().or_else(||payload["model"].as_str()).unwrap_or("unknown");
@@ -634,7 +865,14 @@ impl SessionStore {
                     tool.recorded_output = Some(crate::llm::claude_code_cli::recovery::failed_tool_message().into());
                 }
             }
-            let content = if native.compact_summary {
+            // This marker is written only for Locus-generated continuation
+            // input. Restore its hidden prompt suffix even without a local row,
+            // retaining any notification/recovery context appended on the wire.
+            let continuation = (native.role == MessageRole::User && !native.compact_summary)
+                .then(|| native_user_text(native))
+                .filter(|text| recovery::is_continuation_prompt(text));
+            let content = if continuation.is_some() { String::new() }
+                else if native.compact_summary {
                 crate::compact::build_conversation_checkpoint_content(&recovery::text_content(&native.content), "")
             } else if native.role == MessageRole::Assistant { parsed.text.clone() }
                 else if native.role == MessageRole::User && authoritative { authoritative_user_text(native,*existing) }
@@ -655,7 +893,7 @@ impl SessionStore {
                 display.conversation_checkpoint = crate::compact::parse_conversation_checkpoint(&content);
             }
             let payload_id = Self::persist_response_request_with_conn(&tx, Some(payload))?;
-            let row_id = base + position as i64;
+            let row_id = prepared_rows[position];
             if existing.is_none() {
                 tx.execute("INSERT INTO messages(rowid,id,session_id,role,content,created_at) VALUES(?1,?2,?3,?4,'',?5) ON CONFLICT(id) DO NOTHING",params![row_id,message_id,id,native.role.as_str(),timestamp]).map_err(|e|e.to_string())?;
             }
@@ -664,8 +902,8 @@ impl SessionStore {
                     images.as_ref().map(serde_json::to_string).transpose().map_err(|e|e.to_string())?,
                     (!parsed.thinking_text.is_empty()).then_some(parsed.thinking_text),(!parsed.thinking_signature.is_empty()).then_some(parsed.thinking_signature),
                     serialize_message_metadata(&display)?,payload_id,message_id,id]).map_err(|e|e.to_string())?;
-            if authoritative {
-                tx.execute("UPDATE messages SET include_in_prompt=1,prompt_prefix=NULL,prompt_suffix=NULL,asset_refs=NULL WHERE id=?1 AND session_id=?2",params![message_id,id]).map_err(|e|e.to_string())?;
+            if authoritative || continuation.is_some() {
+                tx.execute("UPDATE messages SET include_in_prompt=1,prompt_prefix=NULL,prompt_suffix=?1,asset_refs=NULL WHERE id=?2 AND session_id=?3",params![continuation,message_id,id]).map_err(|e|e.to_string())?;
             }
             if let Some(usage) = &native.usage {
                 let counts = ["input_tokens","output_tokens","cache_read_input_tokens","cache_creation_input_tokens"].map(|k|usage[k].as_u64().unwrap_or(0).min(u32::MAX as u64));
@@ -728,29 +966,72 @@ impl SessionStore {
                     native.usage.as_ref().unwrap_or(&Value::Null), occurred_at)?;
             }
         }
-        let mut pending_position = prepared.len() as i64;
+        let mut pending_row = next_row;
         for (message, payload) in notification_updates {
             let payload_id = Self::persist_response_request_with_conn(&tx, Some(&payload))?;
             tx.execute("UPDATE messages SET response_request_id=?1 WHERE session_id=?2 AND id=?3",params![payload_id,id,message]).map_err(|e|e.to_string())?;
         }
         for message in expected {
-            if notifications.contains(&message.id) { continue; }
+            if notifications.contains(&message.id) {
+                if authoritative {
+                    // The native carrier owns model context; this separate
+                    // delivery row is retained only as visible local history.
+                    tx.execute("UPDATE messages SET include_in_prompt=0 WHERE id=?1 AND session_id=?2",params![message.id,id]).map_err(|e|e.to_string())?;
+                }
+                continue;
+            }
             if pending.contains(&message.id) && !selected.contains(&message.id) {
                 timestamp = timestamp.max(message.created_at);
-                tx.execute("UPDATE messages SET rowid=?1,created_at=?2 WHERE id=?3 AND session_id=?4",params![base+pending_position,timestamp,message.id,id]).map_err(|e|e.to_string())?;
-                pending_position += 1;
+                tx.execute("UPDATE messages SET rowid=?1,created_at=?2 WHERE id=?3 AND session_id=?4",params![pending_row,timestamp,message.id,id]).map_err(|e|e.to_string())?;
+                pending_row += 1;
             } else if !selected.contains(&message.id) && !archived.contains(&message.id) {
                 tx.execute("DELETE FROM messages WHERE id=?1 AND session_id=?2",params![message.id,id]).map_err(|e|e.to_string())?;
+            } else if !selected.contains(&message.id) && archived.contains(&message.id) {
+                tx.execute("UPDATE messages SET include_in_prompt=0 WHERE id=?1 AND session_id=?2",params![message.id,id]).map_err(|e|e.to_string())?;
             }
         }
         // Preserve pre-compaction transcript for viewing, while matching the
         // native summary boundary in Locus's context viewer and exports.
         if let Some((boundary, _)) = prepared.iter().enumerate().rev().find(|(_, (m, ..))| m.compact_summary) {
-            tx.execute("UPDATE messages SET include_in_prompt=(rowid>=?1) WHERE session_id=?2",params![base+boundary as i64,id]).map_err(|e|e.to_string())?;
-            for (position, (native, message_id, ..)) in prepared.iter().enumerate().filter(|(_, (m, ..))| m.compact_summary) {
+            tx.execute("UPDATE messages SET include_in_prompt=(rowid>=?1) WHERE session_id=?2",params![prepared_rows[boundary],id]).map_err(|e|e.to_string())?;
+            // Retained rows can now follow the boundary; they still stay out of context.
+            for (message_id, _) in &retained_rows {
+                tx.execute("UPDATE messages SET include_in_prompt=0 WHERE id=?1 AND session_id=?2",params![message_id,id]).map_err(|e|e.to_string())?;
+            }
+            // Claude keeps its most recent messages verbatim after a summary.
+            // The live compaction receipt names their local rows; keep them in
+            // the mirror when they survived this synchronization.
+            let surviving_kept = |payload: &Value| -> Result<Vec<String>, String> {
+                let mut kept = Vec::new();
+                for message_id in payload["claude_compaction"]["keptMessageIds"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE session_id=?1 AND id=?2)", params![id, message_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                    if exists { kept.push(message_id.to_string()); }
+                }
+                Ok(kept)
+            };
+            let mut earliest_kept: Option<i64> = None;
+            for message_id in surviving_kept(&prepared[boundary].3)?.into_iter().filter(|id| selected.contains(id)) {
+                // A retained display row is not proof that Claude still keeps
+                // it in the active context. Require the native snapshot too.
+                tx.execute("UPDATE messages SET include_in_prompt=1 WHERE session_id=?1 AND id=?2", params![id, message_id]).map_err(|e| e.to_string())?;
+                let created_at: i64 = tx.query_row("SELECT created_at FROM messages WHERE session_id=?1 AND id=?2", params![id, message_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                earliest_kept = Some(earliest_kept.map_or(created_at, |earliest| earliest.min(created_at)));
+            }
+            // Claude's native chain lists kept rows before the summary, but
+            // Claude reads the summary first. Prompt order follows created_at,
+            // so backdate the summary as live compaction does.
+            if let Some(earliest) = earliest_kept {
+                tx.execute("UPDATE messages SET created_at=MIN(created_at,?1) WHERE session_id=?2 AND id=?3",
+                    params![earliest - 1, id, &prepared[boundary].1]).map_err(|e| e.to_string())?;
+            }
+            for (position, (native, message_id, _, payload)) in prepared.iter().enumerate().filter(|(_, (m, ..))| m.compact_summary) {
                 let _ = native;
-                let entries = prepared.iter().skip(position).take_while(|(m,..)| !m.compact_summary || m.key == prepared[position].0.key)
-                    .map(|(_,id,..)| CompactedContextSnapshotEntry { message_id:id.clone(),prompt_prefix_placeholder:false,prompt_suffix_placeholder:false }).collect();
+                let kept = surviving_kept(payload)?;
+                let entry = |message_id: &String| CompactedContextSnapshotEntry { message_id:message_id.clone(),prompt_prefix_placeholder:false,prompt_suffix_placeholder:false };
+                let mut seen = HashSet::new();
+                let entries = std::iter::once(message_id).chain(kept.iter())
+                    .chain(prepared.iter().skip(position + 1).take_while(|(m,..)| !m.compact_summary).map(|(_,id,..)| id))
+                    .filter(|id| seen.insert(id.as_str())).map(entry).collect();
                 let raw:String=tx.query_row("SELECT metadata_json FROM messages WHERE id=?1",[message_id],|r|r.get(0)).map_err(|e|e.to_string())?;
                 let mut display:MessageMetadata=serde_json::from_str(&raw).map_err(|e|e.to_string())?;
                 display.compacted_context=Some(CompactedContextSnapshot{version:1,entries:Some(entries)});
@@ -769,6 +1050,9 @@ impl SessionStore {
                 params![id,serde_json::to_string(remote).map_err(|e|e.to_string())?,snapshot.native_id]).map_err(|e|e.to_string())?;
         }
         tx.commit().map_err(|e|e.to_string())?;
+        eprintln!("[Claude] history synchronized: session={} native={} authoritative={} retry={} native_messages={} retained_history={} missing_history_usage={} backup={}",
+            id, snapshot.native_id, authoritative, preserve_pending, snapshot.messages.len(),
+            archived.iter().filter(|id| !selected.contains(*id)).count(), missing_archived_usage, backup.display());
         Ok(true)
     }
 }

@@ -78,9 +78,6 @@ impl AgentInstance {
         store: &SessionStore,
         run_id: &str,
     ) {
-        if !self.async_tasks_enabled {
-            return;
-        }
         let manager = app.state::<Arc<crate::async_tasks::AsyncTaskManager>>();
         manager.attach_runtime(app);
         let parent = self.clone_for_background_task(self.cancel_waiter());

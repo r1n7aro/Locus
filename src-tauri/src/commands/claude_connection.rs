@@ -11,6 +11,13 @@ pub fn get_claude_native_archive(session_id:String,store:State<'_,Arc<SessionSto
     store.claude_archive_info(&session_id)
 }
 
+/// The conversation's pinned Agent types: backend and model of each, for
+/// the Agent cards. `None` when the conversation has no native route.
+#[tauri::command]
+pub fn get_claude_agent_routes(session_id:String,store:State<'_,Arc<SessionStore>>)->Result<Option<serde_json::Value>,String> {
+    crate::agent::instance::claude_agent_routes(store.inner(),&session_id)
+}
+
 #[tauri::command]
 pub async fn backup_claude_native_session(session_id:String,store:State<'_,Arc<SessionStore>>)->Result<Option<crate::llm::claude_code_cli::archive::ArchiveInfo>,String> {
     crate::llm::claude_code_cli::archive::backup(store.inner(),&session_id).await
@@ -45,9 +52,8 @@ pub async fn connect_claude_session(
     config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<(), String> {
     use crate::llm::claude_code_cli::tui::prewarm;
-    if !model.starts_with("claude_code/") { return Err("Select a Claude Code model to connect".into()); }
     let settings = ssh::load_settings()?;
-    let remote = settings.remote.ok_or("No Claude SSH server is configured")?;
+    let remote = prewarm::target(&model,&settings)?;
     let scope = super::session::resolve_workspace_scope(workspace_registry.inner(), &workspace_ref, "connectClaude")
         .map_err(|e| e.to_string())?;
     let runtime = scope.runtime();
@@ -67,8 +73,8 @@ pub async fn prewarm_claude_session(
     // provider is off.
     if !config.claude_code_cli_enabled() { return Ok(()); }
     let settings = ssh::load_settings()?;
-    if !settings.prewarm || !model.starts_with("claude_code/") { return Ok(()); }
-    let Some(remote) = settings.remote else { return Ok(()); };
+    if !settings.prewarm { return Ok(()); }
+    let Ok(remote) = prewarm::target(&model,&settings) else { return Ok(()); };
     let scope = if let Some(id) = session_id.as_deref() {
         super::session::resolve_session_workspace_scope(store.inner(), workspace_registry.inner(), id, Some(&workspace_ref), "prewarmClaude")
     } else {
@@ -127,6 +133,61 @@ pub fn set_claude_runtime_settings(idle_compaction: bool, telemetry: bool, auto_
     ssh::save_settings(&settings)?;
     crate::llm::claude_code_cli::tui::retire_outdated_runtime_settings(settings.runtime);
     get_claude_connection()
+}
+
+/// Applies to conversations that have not pinned their route yet. Running
+/// processes are unaffected: existing conversations keep their own pin.
+#[tauri::command]
+pub fn set_claude_native_agents(
+    enabled: bool,
+    builtins: Vec<String>,
+    excluded_locus_agents: Option<Vec<String>>,
+) -> Result<ConnectionSettings, String> {
+    let mut settings = ssh::load_settings()?;
+    settings.native_multi_agent = enabled;
+    settings.native_agents.builtins = builtins;
+    // Omitted by older clients: keep the saved exclusions.
+    if let Some(excluded) = excluded_locus_agents {
+        settings.native_agents.excluded_locus_agents = excluded;
+    }
+    ssh::save_settings(&settings)?;
+    get_claude_connection()
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeNativeAgentsSupport {
+    pub cli_version: Option<String>,
+    pub supported: bool,
+    /// The saved SSH connection, not the local CLI.
+    pub remote: bool,
+    /// "Test and save" installs the required version: an SSH connection
+    /// without a custom Claude path.
+    pub installable: bool,
+}
+
+/// Whether new conversations on the configured connection can use native
+/// agents: the version check a new conversation runs when it pins its route.
+#[tauri::command]
+pub async fn get_claude_native_agents_support() -> Result<ClaudeNativeAgentsSupport, String> {
+    tokio::task::spawn_blocking(|| {
+        let settings = ssh::load_settings()?;
+        let cli_version = crate::llm::claude_code_cli::native_agents_cli_version(&settings);
+        let supported = cli_version.as_deref().is_some_and(|version| {
+            crate::llm::claude_code_cli::version_at_least(
+                version,
+                crate::llm::claude_code_cli::NATIVE_AGENTS_MIN_VERSION,
+            )
+        });
+        let remote = settings.remote.is_some();
+        let installable = settings
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.cli_path.is_none());
+        Ok(ClaudeNativeAgentsSupport { cli_version, supported, remote, installable })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -193,6 +254,8 @@ pub async fn authorize_claude_ssh(
         prewarm: previous_settings.prewarm,
         pool_capacity: previous_settings.pool_capacity,
         idle_minutes: previous_settings.idle_minutes,
+        native_multi_agent: previous_settings.native_multi_agent,
+        native_agents: previous_settings.native_agents,
         has_unlock_password: false,
     };
     // Testing never replaces a working secret. Commit only after CLI auth succeeds;
@@ -252,6 +315,8 @@ pub fn use_local_claude() -> Result<ConnectionSettings, String> {
         prewarm: previous.prewarm,
         pool_capacity: previous.pool_capacity,
         idle_minutes: previous.idle_minutes,
+        native_multi_agent: previous.native_multi_agent,
+        native_agents: previous.native_agents,
         ..ConnectionSettings::default()
     };
     ssh::save_settings(&settings)?;

@@ -53,6 +53,8 @@ pub struct AgentInfo {
     pub default_effort: Option<String>,
     pub model_recommendation: Option<String>,
     pub source: String,
+    /// Whether delegating agents may start it (subject to project type).
+    pub delegatable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -580,6 +582,7 @@ fn list_agent_infos(registry: &AgentDefRegistry, project_type: Option<&str>) -> 
             default_effort: def.default_effort.clone(),
             model_recommendation: def.model_recommendation.clone(),
             source: def.source.clone(),
+            delegatable: def.is_delegation_target_for_project_type(None),
         })
         .collect();
     agents.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.name.cmp(&b.name)));
@@ -605,6 +608,7 @@ fn list_subagent_infos(registry: &AgentDefRegistry) -> Vec<AgentInfo> {
             default_effort: def.default_effort.clone(),
             model_recommendation: def.model_recommendation.clone(),
             source: def.source.clone(),
+            delegatable: def.is_delegation_target_for_project_type(None),
         })
         .collect();
     agents.sort_by(|a, b| a.name.cmp(&b.name));
@@ -925,21 +929,45 @@ pub async fn get_workspace_agent_env_template(
     agent_env_template(&registry, &agent_id)
 }
 
+/// Record services bound mid-run (lazy mode) on the run row, so run history
+/// and context export list every service the run used.
+fn install_run_binding_writeback(
+    execution: &Arc<crate::workspace_service::AgentExecutionContext>,
+    store: Arc<SessionStore>,
+    run_id: String,
+) {
+    execution.set_binding_listener(Arc::new(move |snapshots| {
+        let bindings = snapshots
+            .into_iter()
+            .map(|binding| crate::session::models::SessionRunServiceBinding {
+                service_kind: binding.service_kind.as_str().to_string(),
+                service_instance_id: binding.service_instance_id.to_string(),
+                runtime_generation: binding.runtime_generation,
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = store.update_run_service_bindings(&run_id, &bindings) {
+            eprintln!("[Locus] failed to record late service binding for run {run_id}: {error}");
+        }
+    }));
+}
+
+/// Services bound when a run starts: only auto-mode services the agent uses.
+/// Lazy-mode services bind on their first tool call or SDK use instead.
 fn requested_agent_services(runtime: &WorkspaceRuntime, def: &AgentDef) -> Vec<ServiceKind> {
-    let needs_unity = runtime
-        .services()
-        .detected_kinds()
-        .contains(&ServiceKind::Unity)
-        && (def.env_template.contains("{{#unity}}")
-            || def.tools.iter().any(|tool_name| {
-                crate::workspace_service::service::owner_service_for_tool(tool_name)
-                    == Some(ServiceKind::Unity)
-            }));
-    if needs_unity {
-        vec![ServiceKind::Unity]
-    } else {
-        Vec::new()
-    }
+    ServiceKind::ALL
+        .into_iter()
+        .filter(|kind| {
+            runtime.services().effective_mode(*kind)
+                == crate::workspace_service::EffectiveServiceMode::Auto
+        })
+        .filter(|kind| {
+            (*kind == ServiceKind::Unity && def.env_template.contains("{{#unity}}"))
+                || def.tools.iter().any(|tool_name| {
+                    crate::workspace_service::service::owner_service_for_tool(tool_name)
+                        == Some(*kind)
+                })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -948,7 +976,7 @@ async fn workspace_agent_preview_instance(
     agent_id: &str,
     knowledge_access_mode: KnowledgeAccessMode,
     selected_model: Option<&str>,
-    subagent_models: Option<HashMap<String, String>>,
+    subagent_models: Option<crate::agent::subagent_models::SubagentModelChoices>,
     operation: &'static str,
     definitions: &WorkspaceDefinitionRegistry,
     workspace_tools: &WorkspaceToolRegistry,
@@ -1016,11 +1044,10 @@ async fn workspace_agent_preview_instance(
         tokio::sync::watch::channel(false).1,
     );
     instance.set_execution_context(execution);
-    instance.set_async_tasks_enabled(config.async_tasks_enabled());
     instance.configure_preview_lazy_tool_renderer(
         selected_model,
         config.dynamic_tool_loading_mode(),
-        config.base_url.as_deref(),
+        None,
     );
     Ok(instance)
 }
@@ -1030,7 +1057,6 @@ pub async fn get_agent_rendered_env_prompt(
     agent_id: String,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
-    config: State<'_, Arc<AppConfig>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
@@ -1043,7 +1069,7 @@ pub async fn get_agent_rendered_env_prompt(
     let working_dir = String::new();
     let workspace_id = None;
 
-    let mut instance = AgentInstance::new(
+    let instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
         LlmBackend::ClaudeCodeCli,
@@ -1059,10 +1085,9 @@ pub async fn get_agent_rendered_env_prompt(
         app_agent_dir.0.clone(),
         KnowledgeAccessMode::Full,
         None,
-        HashMap::new(),
+        Default::default(),
         tokio::sync::watch::channel(false).1,
     );
-    instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     Ok(instance.rendered_env_prompt().await)
 }
@@ -1104,7 +1129,6 @@ pub async fn get_agent_system_prompt_stats(
     agent_id: String,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
-    config: State<'_, Arc<AppConfig>>,
     raw_store: State<'_, RawContextStore>,
     app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
     app_agent_dir: State<'_, crate::AppAgentDir>,
@@ -1117,7 +1141,7 @@ pub async fn get_agent_system_prompt_stats(
     let working_dir = String::new();
     let workspace_id = None;
 
-    let mut instance = AgentInstance::new(
+    let instance = AgentInstance::new(
         Arc::new(def),
         "__agent-preview__",
         LlmBackend::ClaudeCodeCli,
@@ -1133,10 +1157,9 @@ pub async fn get_agent_system_prompt_stats(
         app_agent_dir.0.clone(),
         KnowledgeAccessMode::Full,
         None,
-        HashMap::new(),
+        Default::default(),
         tokio::sync::watch::channel(false).1,
     );
-    instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     Ok(instance.system_prompt_stats().await)
 }
@@ -1219,6 +1242,27 @@ async fn resolve_model_backend(
     codex: &CodexAuthStateHandle,
 ) -> Result<LlmBackend, AppError> {
     let selected_model = selected_model.trim();
+    if selected_model.starts_with("locus-server/") {
+        #[cfg(not(feature = "server-client"))]
+        return Err("此会话需要内部版 Locus Server 客户端".into());
+        #[cfg(feature = "server-client")]
+        {
+            let (binding, _) = crate::server_client::binding_for_model(selected_model)
+                .map_err(AppError::from)?.ok_or_else(|| AppError::from("无效的服务器模型"))?;
+            // The model ID binds an immutable server/user/upstream reference. Existing
+            // openai/* sessions retain their direct OAuth behavior.
+            crate::server_client::credential_for_binding(&binding.id).await.map_err(AppError::from)?;
+            if binding.kind == "codex" {
+                let base_url = crate::server_client::codex_base_url(&binding);
+                return Ok(LlmBackend::OpenAiCodex {
+                    auth: Arc::new(tokio::sync::Mutex::new(crate::auth::codex::CodexAuthState::for_server(binding))),
+                    transport: crate::commands::load_codex_model_config().map(|c| c.transport).unwrap_or_default(),
+                    base_url: Some(base_url),
+                });
+            }
+            return Ok(LlmBackend::ClaudeCodeCli);
+        }
+    }
     if selected_model.is_empty() {
         return Err(
             "No model selected. Select a model before sending a message."
@@ -1254,7 +1298,7 @@ async fn resolve_model_backend(
         }
         return Ok(LlmBackend::OpenRouter {
             api_key,
-            base_url: config.base_url.clone(),
+            base_url: None,
         });
     }
 
@@ -1268,7 +1312,7 @@ async fn resolve_model_backend(
                 Ok(LlmBackend::OpenAiCodex {
                     auth: codex.clone(),
                     transport,
-                    base_url: config.base_url.clone(),
+                    base_url: None,
                 })
             }
             Err(error) => {
@@ -1295,7 +1339,7 @@ async fn resolve_model_backend(
                     .map_err(|e| format!("Anthropic OAuth metadata failed: {}", e))?;
                 Ok(LlmBackend::Anthropic {
                     access_token: token,
-                    base_url: config.base_url.clone(),
+                    base_url: None,
                     user_metadata,
                 })
             }
@@ -1330,7 +1374,7 @@ pub async fn list_agent_injected_items(
     agent_id: String,
     knowledge_mode: Option<String>,
     selected_model: Option<String>,
-    subagent_models: Option<HashMap<String, String>>,
+    subagent_models: Option<crate::agent::subagent_models::SubagentModelChoices>,
     registry: State<'_, AgentDefRegistryState>,
     tool_registry: State<'_, Arc<ToolRegistry>>,
     config: State<'_, Arc<AppConfig>>,
@@ -1367,11 +1411,10 @@ pub async fn list_agent_injected_items(
         subagent_models.unwrap_or_default(),
         tokio::sync::watch::channel(false).1,
     );
-    instance.set_async_tasks_enabled(config.async_tasks_enabled());
     instance.configure_preview_lazy_tool_renderer(
         selected_model.as_deref(),
         config.dynamic_tool_loading_mode(),
-        config.base_url.as_deref(),
+        None,
     );
 
     Ok(instance.list_injected_prompt_items().await)
@@ -1383,7 +1426,7 @@ pub async fn list_workspace_agent_injected_items(
     agent_id: String,
     knowledge_mode: Option<String>,
     selected_model: Option<String>,
-    subagent_models: Option<HashMap<String, String>>,
+    subagent_models: Option<crate::agent::subagent_models::SubagentModelChoices>,
     definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
     workspace_tools: State<'_, Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
@@ -1644,12 +1687,73 @@ pub async fn chat(
     session_type: Option<String>,
     mode: Option<String>,
     user_intent: Option<UserIntentPayload>,
-    subagent_models: Option<HashMap<String, String>>,
+    subagent_models: Option<crate::agent::subagent_models::SubagentModelChoices>,
     subagent_efforts: Option<HashMap<String, String>>,
     subagent_fast_modes: Option<HashMap<String, bool>>,
     knowledge_mode: Option<String>,
     knowledge_doc_type: Option<crate::knowledge_store::KnowledgeType>,
     knowledge_doc_path: Option<String>,
+    blender_target: Option<String>,
+    app_handle: AppHandle,
+    store: State<'_, Arc<SessionStore>>,
+    registry: State<'_, AgentDefRegistryState>,
+    definitions: State<'_, Arc<WorkspaceDefinitionRegistry>>,
+    config: State<'_, Arc<AppConfig>>,
+    tool_registry: State<'_, Arc<ToolRegistry>>,
+    workspace_tools: State<'_, Arc<crate::workspace_tool_registry::WorkspaceToolRegistry>>,
+    auth: State<'_, Arc<tokio::sync::Mutex<AuthState>>>,
+    api_key_state: State<'_, ApiKeyState>,
+    provider_keys: State<'_, ProviderKeysState>,
+    codex: State<'_, CodexAuthStateHandle>,
+    workspace_registry: State<'_, Arc<crate::workspace_service::ProjectRegistry>>,
+    raw_store: State<'_, RawContextStore>,
+    active_tasks: State<'_, ActiveTasks>,
+    app_knowledge_dir: State<'_, crate::commands::AppKnowledgeDir>,
+    app_agent_dir: State<'_, crate::AppAgentDir>,
+    undo_manager: State<'_, crate::UndoManagerHandle>,
+) -> Result<ChatLaunch, AppError> {
+    launch_chat(
+        session_id, workspace_ref, text, resume, session_title, agent_id, sdk_agent,
+        model, effort, fast_mode, multi_agent_enabled, images, asset_refs, session_type,
+        mode, user_intent, subagent_models, subagent_efforts, subagent_fast_modes,
+        knowledge_mode, knowledge_doc_type, knowledge_doc_path, blender_target, None,
+        app_handle, store, registry, definitions, config, tool_registry, workspace_tools,
+        auth, api_key_state, provider_keys, codex, workspace_registry, raw_store,
+        active_tasks, app_knowledge_dir, app_agent_dir, undo_manager,
+    )
+    .await
+}
+
+/// `chat` plus a backend-only launch whose input is an internal system
+/// reminder (e.g. waking an idle session for delivered task results). Such a
+/// launch requires an existing session and an empty composer, and persists no
+/// visible user text.
+pub(crate) async fn launch_chat(
+    session_id: Option<String>,
+    workspace_ref: Option<WorkspaceRef>,
+    text: String,
+    resume: Option<bool>,
+    session_title: Option<String>,
+    agent_id: Option<String>,
+    sdk_agent: Option<crate::sdk::SdkAgentSpec>,
+    model: Option<String>,
+    effort: Option<String>,
+    fast_mode: Option<bool>,
+    multi_agent_enabled: Option<bool>,
+    images: Option<Vec<ImageData>>,
+    asset_refs: Option<Vec<AssetRefData>>,
+    session_type: Option<String>,
+    mode: Option<String>,
+    user_intent: Option<UserIntentPayload>,
+    subagent_models: Option<crate::agent::subagent_models::SubagentModelChoices>,
+    subagent_efforts: Option<HashMap<String, String>>,
+    subagent_fast_modes: Option<HashMap<String, bool>>,
+    knowledge_mode: Option<String>,
+    knowledge_doc_type: Option<crate::knowledge_store::KnowledgeType>,
+    knowledge_doc_path: Option<String>,
+    // Blender target chosen in the draft; applied to a new session only.
+    blender_target: Option<String>,
+    internal_system_reminder: Option<String>,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
     registry: State<'_, AgentDefRegistryState>,
@@ -1712,6 +1816,19 @@ pub async fn chat(
         )
         .operation("chat"));
     }
+    if internal_system_reminder.is_some()
+        && (is_new_session
+            || resume_requested
+            || !text.trim().is_empty()
+            || images.as_ref().is_some_and(|items| !items.is_empty())
+            || asset_refs.as_ref().is_some_and(|items| !items.is_empty()))
+    {
+        return Err(AppError::new(
+            "session.internal_launch_invalid",
+            "An internal launch requires an existing session and no user input.",
+        )
+        .operation("chat"));
+    }
     let session_kind = session_type.as_deref().unwrap_or("chat");
     let mock_model_requested = model
         .as_deref()
@@ -1723,10 +1840,19 @@ pub async fn chat(
         .filter(|title| !title.is_empty())
         .map(str::to_string);
     let codex_model_config = crate::commands::load_codex_model_config().unwrap_or_default();
+    let server_model_requested = model.as_deref().is_some_and(|value| value.trim().starts_with("locus-server/"));
     let codex_title_generation_enabled =
         if codex_model_config.generate_session_titles && !mock_model_requested {
-            let status = codex.lock().await.status();
-            status.authenticated && !status.validation_failed
+            if server_model_requested {
+                #[cfg(feature = "server-client")]
+                { crate::server_client::binding_for_model(model.as_deref().unwrap_or("").trim())
+                    .ok().flatten().is_some_and(|(binding, _)| binding.kind == "codex") }
+                #[cfg(not(feature = "server-client"))]
+                { false }
+            } else {
+                let status = codex.lock().await.status();
+                status.authenticated && !status.validation_failed
+            }
         } else {
             false
         };
@@ -1755,7 +1881,7 @@ pub async fn chat(
         None => {
             let title = explicit_session_title.unwrap_or_else(|| text.chars().take(20).collect());
             let title = generated_title_fallback.unwrap_or(title);
-            let pooled = model.as_deref().filter(|m| m.starts_with("claude_code/")).and_then(|model| {
+            let pooled = model.as_deref().and_then(|model| {
                 let runtime = scoped_runtime.as_ref()?;
                 crate::llm::claude_code_cli::tui::prewarm::claim(&cwd, runtime.checkout_id().as_str(), runtime.materialization_epoch(), model)
             });
@@ -1774,6 +1900,25 @@ pub async fn chat(
             )? }
         }
     };
+
+    // Before the run starts, so its first `blender_execute` already resolves
+    // to the instance picked in the draft. A stale pick (instance gone) is
+    // reported by that call like any vanished session target.
+    if is_new_session {
+        if let (Some(spec), Some(runtime)) = (
+            blender_target.as_deref().map(str::trim).filter(|spec| !spec.is_empty()),
+            scoped_runtime.as_ref(),
+        ) {
+            if let Err(error) = crate::blender::target::set_initial_session_target(
+                runtime.checkout_id().as_str(),
+                runtime.root(),
+                &sid,
+                spec,
+            ) {
+                eprintln!("[Locus] ignoring Blender target from the draft: {error}");
+            }
+        }
+    }
 
     if resume_requested && !store.latest_run_is_interrupted(&sid)? {
         return Err(AppError::new(
@@ -1848,6 +1993,10 @@ pub async fn chat(
     )
     .await?;
     if let Some(title_prompt) = prepared_title_prompt {
+        let (title_auth, title_transport, title_base_url) = match &backend {
+            LlmBackend::OpenAiCodex { auth, transport, base_url } => (auth.clone(), *transport, base_url.clone()),
+            _ => (codex.inner().clone(), codex_model_config.transport, None),
+        };
         let expected_title = store
             .get_session_title(&sid)?
             .unwrap_or_else(|| title_prompt.chars().take(20).collect());
@@ -1857,9 +2006,9 @@ pub async fn chat(
             scoped_runtime
                 .as_deref()
                 .map(crate::workspace_service::event::WorkspaceEventScope::for_runtime),
-            codex.inner().clone(),
-            codex_model_config.transport,
-            config.base_url.clone(),
+            title_auth,
+            title_transport,
+            title_base_url,
             sid.clone(),
             expected_title,
             crate::session::title::SessionTitleGenerationRequest::codex_default(title_prompt),
@@ -1921,6 +2070,7 @@ pub async fn chat(
     let persisted_run_scope = execution_context
         .as_ref()
         .map(|execution| execution.persisted_run_scope());
+    let execution_for_binding_writeback = execution_context.clone();
     let mut instance = AgentInstance::new(
         def,
         &sid,
@@ -1957,7 +2107,6 @@ pub async fn chat(
         subagent_efforts.unwrap_or_default(),
         subagent_fast_modes.unwrap_or_default(),
     );
-    instance.set_async_tasks_enabled(config.async_tasks_enabled());
     let knowledge_focus = match (knowledge_doc_type, knowledge_doc_path) {
         (Some(doc_type), Some(path)) if !path.trim().is_empty() => {
             Some(crate::agent::instance::KnowledgeFocusDoc {
@@ -1992,6 +2141,9 @@ pub async fn chat(
                     .operation("chat")
             }
         })?;
+    if let Some(execution) = execution_for_binding_writeback.as_ref() {
+        install_run_binding_writeback(execution, store.inner().clone(), run_id.clone());
+    }
     if let Err(error) = store.set_session_execution_state(
         &sid,
         &selected_model,
@@ -2017,10 +2169,12 @@ pub async fn chat(
     let run_id_for_task = run_id.clone();
     let store_for_task = store.clone();
     let execution_binding_request_for_task = execution_binding_request.clone();
-    let initial_system_reminder = resume_requested.then(|| {
-        "<system-reminder>\nThe previous run was interrupted before the task was complete. Continue from the existing conversation context. Inspect the current state, finish the remaining work, and verify the result. Do not repeat completed work.\n</system-reminder>"
-            .to_string()
-    });
+    let initial_system_reminder = resume_requested
+        .then(|| {
+            "<system-reminder>\nThe previous run was interrupted before the task was complete. Continue from the existing conversation context. Inspect the current state, finish the remaining work, and verify the result. Do not repeat completed work.\n</system-reminder>"
+                .to_string()
+        })
+        .or(internal_system_reminder);
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
 
     let join_handle = tauri::async_runtime::spawn(async move {
@@ -2040,7 +2194,7 @@ pub async fn chat(
         let mut next_user_intent = user_intent_for_task;
         let mut accepted_pending_input_id: Option<String> = None;
         let mut next_internal_system_reminder = initial_system_reminder;
-        let mut idle_cancel_rx = idle_cancel_rx;
+        let idle_cancel_rx = idle_cancel_rx;
 
         loop {
             let task_result = AssertUnwindSafe(instance.run_with_run_id(
@@ -2093,8 +2247,11 @@ pub async fn chat(
 
             let mut async_reminder: Option<String> = None;
             let mut compact_requested = false;
-            let follow_up = loop {
-                if *idle_cancel_rx.borrow() { break None; }
+            // Results that are already ready continue this launch. Tasks still
+            // running do not hold the session: it goes idle, and the task's
+            // completion wakes it through `ensure_root_delivery`.
+            let follow_up = 'follow_up: {
+                if *idle_cancel_rx.borrow() { break 'follow_up None; }
                 let (claimed_compact, claimed) = {
                     let queue_state: tauri::State<'_, crate::PendingInputQueueHandle> =
                         handle.state();
@@ -2118,28 +2275,20 @@ pub async fn chat(
                 };
                 if claimed_compact {
                     compact_requested = true;
-                    break None;
+                    break 'follow_up None;
                 }
                 if claimed.is_some() {
-                    break claimed;
+                    break 'follow_up claimed;
                 }
 
                 let async_tasks: tauri::State<'_, Arc<crate::async_tasks::AsyncTaskManager>> =
                     handle.state();
-                let (notifications, has_pending_notifications) =
-                    async_tasks.take_notifications_and_pending(&sid_clone);
+                let (notifications, _) = async_tasks.take_notifications_and_pending(&sid_clone);
                 if !notifications.is_empty() {
-                    async_reminder = Some("<system-reminder>\nBackground task results are ready. Process the delivered results and continue the unfinished work.\n</system-reminder>".to_string());
-                    break None;
+                    async_reminder =
+                        Some(crate::async_tasks::BACKGROUND_RESULTS_REMINDER.to_string());
                 }
-                if !has_pending_notifications || *idle_cancel_rx.borrow() {
-                    break None;
-                }
-
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-                    _ = idle_cancel_rx.changed() => {}
-                }
+                None
             };
             if !compact_requested && follow_up.is_none() && async_reminder.is_none() {
                 break;
@@ -2149,6 +2298,7 @@ pub async fn chat(
             // Every queued input/reminder/compact is a new Agent run. Rebind
             // the checkout's current service generation before persisting it;
             // the previous run may have crossed an idle stop or service restart.
+            let mut next_execution_for_writeback = None;
             let next_persisted_run_scope = if let Some((checkout_id, requested_services)) =
                 execution_binding_request_for_task.as_ref()
             {
@@ -2162,6 +2312,7 @@ pub async fn chat(
                 {
                     Ok(execution) => {
                         let scope = execution.persisted_run_scope();
+                        next_execution_for_writeback = Some(Arc::clone(&execution));
                         instance.set_execution_context(execution);
                         Some(scope)
                     }
@@ -2218,6 +2369,13 @@ pub async fn chat(
                     sid_clone, current_run_id, error
                 );
                 break;
+            }
+            if let Some(execution) = next_execution_for_writeback.as_ref() {
+                install_run_binding_writeback(
+                    execution,
+                    Arc::clone(&store_for_task),
+                    next_run_id.clone(),
+                );
             }
 
             {
@@ -3276,11 +3434,14 @@ pub async fn get_archived_checkout_storage_bytes(
 pub async fn rename_session(
     session_id: String,
     title: String,
+    app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<(), AppError> {
     store
         .rename_session(&session_id, &title)
-        .map_err(Into::into)
+        .map_err(AppError::from)?;
+    crate::session::title::publish_session_title_updated(&app_handle, &store, &session_id, &title);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3306,9 +3467,34 @@ pub async fn delete_session(
     session_id: String,
     app_handle: AppHandle,
     store: State<'_, Arc<SessionStore>>,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
     undo_manager: State<'_, crate::UndoManagerHandle>,
 ) -> Result<(), AppError> {
+    // Read before deleting: subagent sessions cascade with their parent.
+    let placements = match (
+        store.get_session_workspace_id(&session_id),
+        store.session_tree_ids(&session_id),
+    ) {
+        (Ok(Some(project_id)), Ok(session_ids)) if !project_id.trim().is_empty() => {
+            Some((project_id, session_ids))
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!("[workspace-tree] failed to resolve placements of deleted session {session_id}: {error}");
+            None
+        }
+        _ => None,
+    };
     store.delete_session(&session_id).map_err(AppError::from)?;
+    if let Some((project_id, session_ids)) = placements {
+        if let Err(error) = crate::commands::workspace_explorer::remove_deleted_session_placements(
+            &app_handle,
+            workspace_registry.inner(),
+            project_id,
+            &session_ids,
+        ) {
+            tracing::warn!("[workspace-tree] failed to remove deleted session {session_id}: {error}");
+        }
+    }
     crate::llm::claude_code_cli::clear_session_id(&session_id).await;
     crate::llm::codex::invalidate_cached_session(&session_id);
     undo_manager.on_session_delete(&session_id).await;
@@ -3375,7 +3561,7 @@ pub async fn get_session_context_usage_report(
         .or_else(|| registry_snapshot.default_def().cloned())
         .ok_or_else(|| "No agent definitions found".to_string())?;
     let selected_model = detail.last_model_id.as_deref()
-        .filter(|value| value.starts_with("claude_code/"))
+        .filter(|value| value.starts_with("claude_code/") || value.starts_with("locus-server/"))
         .or(model_id
         .as_deref()
         .map(str::trim)
@@ -3451,13 +3637,12 @@ pub async fn get_session_context_usage_report(
         app_agent_dir.0.clone(),
         knowledge_access_mode,
         None,
-        HashMap::new(),
+        Default::default(),
         tokio::sync::watch::channel(false).1,
     );
     if let Some(execution_context) = execution_context {
         instance.set_execution_context(execution_context);
     }
-    instance.set_async_tasks_enabled(config.async_tasks_enabled());
 
     instance.set_multi_agent_enabled(detail.last_multi_agent_enabled.unwrap_or(false));
     let timing = store.get_session_timing_usage(&session_id, &session_messages, &usage)?;

@@ -101,6 +101,62 @@ fn retry_rebuild_keeps_every_proven_unsent_input_and_does_not_change_identity() 
 }
 
 #[tokio::test]
+async fn claude_history_retention_survives_automatic_reconciliation_failure_fallback() {
+    // App println/eprintln macros emit tracing events rather than stderr.
+    // Capture the actual subscriber output to verify the recovery audit trail.
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+        .with_writer(move || LogCapture(writer.clone())).finish();
+    let _logging = tracing::subscriber::set_default(subscriber);
+    let root = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(root.path()).unwrap();
+    let id = store.create_session("retry fallback", None, None, "chat", None).unwrap();
+    let remote: ssh::SshConfig = serde_json::from_value(json!({"target":"unused.invalid"})).unwrap();
+    let mut original = tests::snapshot();
+    original.pending_tool_ids.clear();
+    store.bind_claude_native_session(&id, &remote, &original.native_id).unwrap();
+    store.reconcile_claude_native(&id, &remote, &original, &[], None).unwrap();
+    let old_ids: Vec<_> = store.get_messages(&id).unwrap().into_iter().map(|m| m.id).collect();
+    // A stale unverified row makes ordinary reconciliation fail. Automatic
+    // fallback must not take confirmed history with it when rebuilding.
+    store.add_message(&id, MessageRole::Assistant, "unverified drift").unwrap();
+    let pending = store.add_message(&id, MessageRole::User, "continue").unwrap();
+    store.set_message_response_request_metadata(&id, &pending, &json!({"backend":"claude_code_cli",
+        "claude_pending_input":{"version":1,"token":uuid::Uuid::new_v4()}})).unwrap();
+    let mut summary = original.messages[0].clone();
+    summary.key = "summary".into();
+    summary.uuids = vec![uuid::Uuid::new_v4().to_string()];
+    summary.content = json!("native summary");
+    summary.compact_summary = true;
+    original.messages = vec![summary];
+    original.digest = "b".repeat(64);
+    let recovered = synchronize_with_fetch(&store, &id, Some(&pending), false, true,
+        |_, _| async move { Ok(original) }).await.unwrap();
+    assert!(recovered.changed);
+    let transcript = store.get_messages(&id).unwrap();
+    assert_eq!(transcript.len(), 4);
+    assert_eq!(transcript[..2].iter().map(|m| &m.id).collect::<Vec<_>>(), old_ids.iter().collect::<Vec<_>>());
+    assert!(!transcript.iter().any(|m| m.content == "unverified drift"));
+    let prompt = store.get_messages_for_prompt(&id).unwrap();
+    assert_eq!(prompt.len(), 2);
+    assert!(!prompt.iter().any(|m| old_ids.contains(&m.id)));
+    assert!(prompt.iter().any(|m| m.id == pending));
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("reason=reconciliation_failed:"));
+    assert!(logs.contains("This conversation contains API or unverified history"));
+    assert!(logs.contains("retained_history=2") && logs.contains("backup="));
+}
+
+#[tokio::test]
 async fn history_handshake_timeout_retries_sync_before_any_input_or_tool_replay() {
     use super::super::{native_journal::Journal, turn_retry};
     use std::sync::atomic::{AtomicU32, Ordering};
