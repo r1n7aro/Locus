@@ -15,8 +15,13 @@ pub struct WorktreeBranchOption {
     pub unavailable: bool,
 }
 
+/// Empty only outside a Git repository: a repository always lists its own
+/// checkout, so the picker reads an empty list as "no worktrees here".
 pub fn branches(source: &Path) -> Result<Vec<WorktreeBranchOption>, String> {
     let source = canonical(source)?;
+    if !inside_git_repository(&source) {
+        return Ok(Vec::new());
+    }
     let records = list(&source)?;
     let refs = git_text(
         &source,
@@ -90,6 +95,12 @@ pub fn branches(source: &Path) -> Result<Vec<WorktreeBranchOption>, String> {
             .then_with(|| a.branch.cmp(&b.branch))
     });
     Ok(options)
+}
+
+/// Mirrors Git's upward discovery with file-system checks only, so a
+/// non-repository workspace costs no git process and no localized error text.
+fn inside_git_repository(path: &Path) -> bool {
+    path.ancestors().any(|dir| dir.join(".git").exists())
 }
 
 pub fn select(
@@ -300,6 +311,19 @@ pub fn select_from_ref(
 mod tests {
     use super::super::tests::fixture;
     use super::*;
+    #[test]
+    fn workspace_outside_a_repository_lists_no_branches() {
+        let temp = tempfile::tempdir().unwrap();
+        let plain = temp.path().join("plain/nested");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(branches(&plain).unwrap().is_empty());
+
+        let (_temp, source) = fixture();
+        let nested = source.join("Assets");
+        assert!(!branches(&source).unwrap().is_empty());
+        assert!(inside_git_repository(&canonical(&nested).unwrap()));
+    }
+
     #[test]
     fn remote_branches_are_distinct_from_local_names_and_exclude_symbolic_head() {
         let (_temp, source) = fixture();

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { protocolModelId } from '@locus/server-client';
 import { computed, ref, shallowRef, watch, type CSSProperties } from "vue";
 import type { AgentInfo, EffortLevel, ModelOption } from "../types";
 import { t } from "../i18n";
@@ -15,6 +16,7 @@ import { useSelectionMemoryStore } from "../stores/selectionMemory";
 import LucideIcon from "./icons/LucideIcon.vue";
 import BaseSwitch from "./ui/BaseSwitch.vue";
 import WorktreeSelectorPanel from "./chat/WorktreeSelectorPanel.vue";
+import { worktreeRepositoryAbsent } from "./chat/worktreeRepositories";
 import type { WorkspaceRef } from "../services/project";
 import type { ManagedWorktree } from "../services/worktrees";
 
@@ -63,7 +65,11 @@ const dropdownRef = ref<HTMLElement | null>(null);
 const dropdownTarget = shallowRef<HTMLElement | null>(null);
 const dropdownStyle = ref<CSSProperties>({ visibility: "hidden" });
 const worktreeBusy = ref(false);
-const hasWorktreePanel = computed(() => !!props.worktreeEnabled && !!props.workspaceRef && !!props.selectWorktree);
+const worktreePanelMounted = computed(() => !!props.worktreeEnabled && !!props.workspaceRef && !!props.selectWorktree);
+// Outside Git the panel stays mounted but hidden: each open still lists
+// branches, so the column returns once the workspace becomes a repository.
+const hasWorktreePanel = computed(() => worktreePanelMounted.value
+  && !worktreeRepositoryAbsent(props.workspaceRef!.checkoutId));
 function setWorktreeBusy(value: boolean) { worktreeBusy.value = value; emit("worktreeBusy", value); }
 function close() { if (!worktreeBusy.value) open.value = false; }
 function positionDropdown() {
@@ -138,7 +144,7 @@ const selectedAgent = computed(() =>
 
 const selectedDisplayName = computed(() => {
   const selected = selectedModel.value;
-  if (!selected) return props.selectedId.startsWith("claude_code/") ? props.selectedId.slice(12) : "Model";
+  if (!selected) { const model = protocolModelId(props.selectedId); return model.startsWith("claude_code/") ? model.slice(12) : "Model"; }
   const displayName = optionDisplayName(selected);
   const duplicated = props.models.some((model) => model.id !== selected.id && optionDisplayName(model) === displayName);
   if (!duplicated) return displayName;
@@ -395,7 +401,8 @@ function onClickOutside(event: MouseEvent) {
             </button>
           </div>
           <WorktreeSelectorPanel
-            v-if="hasWorktreePanel && workspaceRef && selectWorktree"
+            v-if="worktreePanelMounted && workspaceRef && selectWorktree"
+            v-show="hasWorktreePanel"
             :workspace-ref="workspaceRef"
             :locked="worktreeLocked || disabled"
             :select-worktree="selectWorktree"
@@ -561,6 +568,32 @@ function onClickOutside(event: MouseEvent) {
 
 :root[data-theme="dark"] .model-effort-dropdown {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+/* Phone-width viewports: three columns would leave the model names a few
+   characters wide, so the Agent list moves above the model and effort lists. */
+@media (max-width: 520px) {
+  .model-effort-dropdown.has-agent,
+  .model-effort-dropdown.has-agent.has-effort {
+    width: calc(100vw - 24px);
+    max-height: min(460px, calc(100vh - 120px));
+    grid-template-columns: minmax(0, 1fr) 120px;
+  }
+
+  .model-effort-dropdown.has-agent .model-effort-agent-panel {
+    grid-column: 1 / -1;
+    max-height: 120px;
+    margin-bottom: 4px;
+    padding-right: 0;
+    padding-bottom: 4px;
+    border-right: none;
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .model-effort-dropdown.has-agent .model-effort-model-panel,
+  .model-effort-dropdown.has-agent .model-effort-effort-panel {
+    max-height: min(300px, calc(100vh - 300px));
+  }
 }
 
 .model-effort-agent-panel,

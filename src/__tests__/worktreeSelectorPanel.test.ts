@@ -5,6 +5,7 @@ import WorktreeSelectorPanel from "../components/chat/WorktreeSelectorPanel.vue"
 import ModelEffortSelector from "../components/ModelEffortSelector.vue";
 import type { ManagedWorktree, WorktreeBranchOption, WorktreeCreationPlan, WorktreeProgressHandler } from "../services/worktrees";
 import { resetWorktreeCreationJobsForTests } from "../components/chat/worktreeCreationJobs";
+import { resetWorktreeRepositoriesForTests } from "../components/chat/worktreeRepositories";
 
 const mocks = vi.hoisted(() => ({ list: vi.fn(), plan: vi.fn(), select: vi.fn(), selected: vi.fn(), bind: vi.fn(), busy: vi.fn() }));
 vi.mock("../services/worktrees", () => ({ listWorktreeBranches: mocks.list, planWorktreeSelection: mocks.plan, selectWorktreeBranch: mocks.select }));
@@ -30,7 +31,7 @@ function mountPanel() {
 function row(name: string, root: ParentNode = host) { return [...root.querySelectorAll<HTMLButtonElement>(".worktree-option")].find((button) => button.textContent?.includes(name))!; }
 async function fill(selector: string, value: string) { const input = host.querySelector<HTMLInputElement>(selector)!; input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); await settle(); }
 beforeEach(() => {
-  vi.resetAllMocks(); resetWorktreeCreationJobsForTests(); state.locked = false; state.workspaceRef = { checkoutId: "source", expectedGeneration: 3, expectedMaterializationEpoch: 1 };
+  vi.resetAllMocks(); resetWorktreeCreationJobsForTests(); resetWorktreeRepositoriesForTests(); state.locked = false; state.workspaceRef = { checkoutId: "source", expectedGeneration: 3, expectedMaterializationEpoch: 1 };
   mocks.list.mockResolvedValue(items); mocks.select.mockResolvedValue(target); mocks.bind.mockResolvedValue(undefined);
   mocks.plan.mockResolvedValue({ startOid: "frozen-head", requiresNewProject: false, atCapacity: false, budget: null });
   host = document.createElement("div"); document.body.append(host);
@@ -217,5 +218,30 @@ describe("worktree picker", () => {
     row("worktrees.selector.create", document.body).click(); await settle();
     expect(document.body.querySelector(".worktree-create")).not.toBeNull();
     expect(document.body.querySelector(".model-effort-dropdown")).not.toBeNull();
+  });
+  it("hides the column outside a Git repository and restores it once branches appear", async () => {
+    const open = () => {
+      app?.unmount(); document.body.querySelectorAll(".model-effort-dropdown").forEach((element) => element.remove());
+      app = createApp({ render: () => h(ModelEffortSelector, { models: [], selectedId: "", effort: "high", worktreeEnabled: true,
+        workspaceRef: state.workspaceRef, selectWorktree: mocks.bind }) }); app.mount(host);
+      host.querySelector<HTMLButtonElement>(".model-effort-trigger")!.click();
+    };
+    const dropdown = () => document.body.querySelector<HTMLElement>(".model-effort-dropdown");
+    const panel = () => document.body.querySelector<HTMLElement>(".worktree-selector-panel");
+    mocks.list.mockResolvedValue([]);
+    open(); await settle();
+    expect(panel()?.style.display).toBe("none");
+    expect(dropdown()?.classList.contains("has-worktree")).toBe(false);
+    expect(document.body.querySelector('.worktree-selector-panel [role="alert"]')).toBeNull();
+    // A known non-repository hides the column from the first frame of a later open.
+    mocks.list.mockReturnValueOnce(new Promise(() => {}));
+    open(); await nextTick();
+    expect(dropdown()?.classList.contains("has-worktree")).toBe(false);
+    // The hidden panel still lists branches, so `git init` brings the column back.
+    mocks.list.mockResolvedValue(items);
+    open(); await settle();
+    expect(panel()?.style.display).toBe("");
+    expect(dropdown()?.classList.contains("has-worktree")).toBe(true);
+    expect(row("feature/one", document.body)).toBeDefined();
   });
 });

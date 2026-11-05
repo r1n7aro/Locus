@@ -11,6 +11,7 @@ import BaseCheckbox from "../ui/BaseCheckbox.vue";
 import WorktreeCreationBudget from "../workbench/WorktreeCreationBudget.vue";
 import WorktreePlanProgress from "../workbench/WorktreePlanProgress.vue";
 import { dismissWorktreeCreation, startWorktreeCreation, worktreeCreationJob, worktreeSelectionError } from "./worktreeCreationJobs";
+import { rememberWorktreeRepository } from "./worktreeRepositories";
 
 const props = defineProps<{
   workspaceRef: WorkspaceRef;
@@ -65,6 +66,7 @@ async function load() {
   try {
     const items = await listWorktreeBranches({ ...props.workspaceRef });
     if (!disposed && id === requestId) {
+      rememberWorktreeRepository(props.workspaceRef.checkoutId, items.length > 0);
       // Pool acquisition leaves a private staging ref after binding an existing
       // branch. Keep attached checkouts, but hide these unused internal refs.
       options.value = items.filter(item => item.root || !/^locus\/pool\/unity-[a-f0-9]{32}$/.test(item.branch ?? ""));
