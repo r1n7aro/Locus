@@ -12,6 +12,7 @@ import {
   normalizeSelectionFilePath,
   selectionLocationLabel,
   useDocumentSelectionReporter,
+  DOCUMENT_QUOTE_IN_NEW_SESSION_KEY,
 } from "../../composables/documentSelection";
 import { normalizeAppError } from "../../services/errors";
 import type {
@@ -103,6 +104,7 @@ import { useMarkdownDocumentOutline } from "../../composables/useMarkdownDocumen
 import { useDocumentAutosave } from "../../composables/useDocumentAutosave";
 const notificationStore = useNotificationStore();
 const quoteInConversation = inject(KNOWLEDGE_QUOTE_SELECTION_KEY, null);
+const quoteInNewSession = inject(DOCUMENT_QUOTE_IN_NEW_SESSION_KEY, null);
 const quotingSelection = ref(false);
 const workspaceContextStore = useWorkspaceContextStore();
 type InjectModeSelection = KnowledgeInjectMode | "inherit_parent";
@@ -239,10 +241,15 @@ function onEditorReferenceOpen(reference: MarkdownReferenceToken): void {
   emit("referenceOpen", reference);
 }
 
-async function onQuoteSelection(section: KnowledgeDocumentSection, selection: MarkdownEditorSelection): Promise<void> {
+async function onQuoteSelection(
+  section: KnowledgeDocumentSection,
+  selection: MarkdownEditorSelection,
+  target: "conversation" | "newSession" = "conversation",
+): Promise<void> {
   const document = props.document;
   const workspaceRef = props.workspaceRef ? { ...props.workspaceRef } : null;
-  if (!document || !workspaceRef || !quoteInConversation || quotingSelection.value || !selection.ranges.length) return;
+  const quote = target === "newSession" ? quoteInNewSession : quoteInConversation;
+  if (!document || !workspaceRef || !quote || quotingSelection.value || !selection.ranges.length) return;
   const savedText = section === "body" ? document.body : section === "summary" ? document.summary ?? "" : document.maintenanceRules ?? "";
   quotingSelection.value = true;
   try {
@@ -251,7 +258,7 @@ async function onQuoteSelection(section: KnowledgeDocumentSection, selection: Ma
       draft: t("editor.quoteDraft"),
       unavailable: t("editor.quoteSourceUnavailable"),
     });
-    await quoteInConversation(workspaceRef, {
+    await quote(workspaceRef, {
       path: `${document.type}/${document.path}`,
       name: documentTitle.value,
       content: text,
@@ -1867,6 +1874,8 @@ function labelForProvider(provider?: string | null): string {
                 :model-value="summaryDraft"
                 :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
                 @quote-selection="onQuoteSelection('summary', $event)"
+                :can-quote-selection-in-new-session="!!quoteInNewSession && !!workspaceRef && !quotingSelection"
+                @quote-selection-in-new-session="onQuoteSelection('summary', $event, 'newSession')"
                 @selection-change="onEditorSelectionChange('summary', $event)"
                 :active="active"
                 :session-cache="markdownEditorSessions"
@@ -1917,6 +1926,8 @@ function labelForProvider(provider?: string | null): string {
                 :model-value="rulesPropertyValue"
                 :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
                 @quote-selection="onQuoteSelection('maintenanceRules', $event)"
+                :can-quote-selection-in-new-session="!!quoteInNewSession && !!workspaceRef && !quotingSelection"
+                @quote-selection-in-new-session="onQuoteSelection('maintenanceRules', $event, 'newSession')"
                 @selection-change="onEditorSelectionChange('maintenanceRules', $event)"
                 :active="active"
                 :session-cache="markdownEditorSessions"
@@ -1971,6 +1982,8 @@ function labelForProvider(provider?: string | null): string {
                   :model-value="bodyDraft"
                   :can-quote-selection="!!quoteInConversation && !!workspaceRef && !quotingSelection"
                   @quote-selection="onQuoteSelection('body', $event)"
+                  :can-quote-selection-in-new-session="!!quoteInNewSession && !!workspaceRef && !quotingSelection"
+                  @quote-selection-in-new-session="onQuoteSelection('body', $event, 'newSession')"
                   @selection-change="onEditorSelectionChange('body', $event)"
                   :active="active"
                   :session-cache="markdownEditorSessions"

@@ -51,6 +51,8 @@ export function workspaceFileEntries(
 export interface WorkspaceFileTreeState {
   entries: WorkspaceFileEntry[];
   toggle: (path: string) => void;
+  /** Expands and pages a path's ancestors; resolves the listed relative path, or null. */
+  reveal: (path: string) => Promise<string | null>;
   loadMore: (path: string) => void;
   refresh: (path: string, kind: "delete" | "upsert") => Promise<void>;
   order: WorkspaceFileOrder;

@@ -1,6 +1,15 @@
 import { inject, onBeforeUnmount, shallowRef, type InjectionKey, type ShallowRef } from "vue";
 import type { MarkdownEditorSelection } from "../components/ui/markdown-editor/markdownEditorSelection";
+import type { WorkspaceRef } from "../services/project";
 import type { UserMessageDraftKnowledgeQuote } from "./chatMessageDraft";
+
+/**
+ * Opens a new conversation beside the document's pane with the quote attached.
+ * Provided by the Workbench; `workspaceRef` is null for files outside a checkout.
+ */
+export const DOCUMENT_QUOTE_IN_NEW_SESSION_KEY: InjectionKey<
+  (workspaceRef: WorkspaceRef | null, quote: UserMessageDraftKnowledgeQuote) => Promise<void>
+> = Symbol("document-quote-in-new-session");
 
 /** The latest non-empty text selection in a document editor of one window. */
 export interface DocumentSelectionSnapshot {

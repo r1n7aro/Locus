@@ -187,6 +187,8 @@ const props = withDefaults(defineProps<{
   draftStateKey?: string;
   /** Current document selection offered as context; it is not part of the saved draft. */
   liveSelectionQuote?: LiveSelectionQuote | null;
+  /** Commands this host cannot run (e.g. desktop-only actions on a phone). */
+  hiddenCommandTypes?: readonly IntentCommandType[];
 }>(), {
   skills: () => [],
   placeholder: "",
@@ -213,6 +215,7 @@ const props = withDefaults(defineProps<{
   planModeActive: false,
   draftStateKey: "",
   liveSelectionQuote: null,
+  hiddenCommandTypes: () => [],
 });
 
 const emit = defineEmits<{
@@ -298,7 +301,12 @@ const knowledgeQuoteAttachments = ref<KnowledgeQuoteAttachment[]>([]);
 const dismissedLiveSelectionId = ref<string | null>(null);
 const liveSelectionAttachment = computed(() => {
   const quote = props.liveSelectionQuote;
-  return quote && quote.id !== dismissedLiveSelectionId.value && quote.content.trim() ? quote : null;
+  if (!quote || quote.id === dismissedLiveSelectionId.value || !quote.content.trim()) return null;
+  // An explicit quote of the same selection (e.g. "quote in new conversation") already shows it.
+  const path = quote.path.replace(/\\/g, "/").toLowerCase();
+  return knowledgeQuoteAttachments.value.some((attachment) => (
+    attachment.path.toLowerCase() === path && attachment.content === quote.content
+  )) ? null : quote;
 });
 const liveSelectionTitle = computed(() => {
   const content = liveSelectionAttachment.value?.content ?? "";
@@ -504,6 +512,7 @@ const actionCommandFilterOptions = computed(() => ({
 const filteredCommands = computed(() =>
   commandToken.value
     ? getFilteredCommands(commandToken.value, actionCommandFilterOptions.value)
+      .filter((command) => !props.hiddenCommandTypes.includes(command.commandType))
     : [],
 );
 
@@ -2449,7 +2458,9 @@ function tryHandleExactActionCommand(): boolean {
   }
 
   const command = findExactAvailableCommand(typed);
-  return command ? executeActionCommand(command) : false;
+  return command && !props.hiddenCommandTypes.includes(command.commandType)
+    ? executeActionCommand(command)
+    : false;
 }
 
 async function handleSend() {
@@ -3142,8 +3153,16 @@ onUnmounted(() => {
   invalidateMentionRequests();
 });
 
+/** Adds an image chosen outside the composer (e.g. a phone's photo picker). */
+function attachImage(image: ImageAttachment): boolean {
+  if (props.disabled || !props.allowImages || imageAttachments.value.length >= props.maxImages) return false;
+  imageAttachments.value.push({ data: image.data, mimeType: image.mimeType });
+  return true;
+}
+
 defineExpose({
   send: handleSend,
+  attachImage,
   focus() {
     composerRef.value?.focus();
   },

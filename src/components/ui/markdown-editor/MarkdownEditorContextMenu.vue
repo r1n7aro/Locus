@@ -5,7 +5,7 @@ import type { EditorView } from "@codemirror/view";
 import { nextTick, onBeforeUnmount, ref, shallowRef, useId, watch } from "vue";
 import {
   BetweenHorizontalEnd, BetweenHorizontalStart, BetweenVerticalEnd, BetweenVerticalStart,
-  ClipboardPaste, Copy, History, MessageSquarePlus, Redo2, Scissors, SquareDashedMousePointer, Superscript, TextQuote, Trash2, Undo2,
+  ClipboardPaste, Copy, History, MessageSquarePlus, MessageSquareQuote, Redo2, Scissors, SquareDashedMousePointer, Superscript, TextQuote, Trash2, Undo2,
   type IconNode,
 } from "lucide";
 import { t } from "../../../i18n";
@@ -15,9 +15,10 @@ import { normalizeMarkdownEditorLineEndings } from "../markdownEditorFormatting"
 import { captureMarkdownEditorSelection, syncMarkdownDOMSelection, type MarkdownEditorSelection } from "./markdownEditorSelection";
 import { editMarkdownTable, markdownTableTarget, type MarkdownTableAction, type MarkdownTableTarget } from "./markdownTableEditing";
 
-const props = defineProps<{ view: EditorView; canQuote?: boolean; canHistory?: boolean; canComment?: boolean; canFootnote?: boolean }>();
+const props = defineProps<{ view: EditorView; canQuote?: boolean; canQuoteInNewSession?: boolean; canHistory?: boolean; canComment?: boolean; canFootnote?: boolean }>();
 const emit = defineEmits<{
   quoteSelection: [selection: MarkdownEditorSelection];
+  quoteSelectionInNewSession: [selection: MarkdownEditorSelection];
   actionError: [error: unknown];
   history: [];
   comment: [];
@@ -33,10 +34,11 @@ const readOnly = ref(false);
 const tableTarget = shallowRef<MarkdownTableTarget | null>(null);
 const tableActions: MarkdownTableAction[] = ["row-before", "row-after", "row-delete", "column-before", "column-after", "column-delete", "table-delete"];
 const actions = ["undo", "redo", "cut", "copy", "paste", "delete", "selectAll"] as const;
-type EditorAction = typeof actions[number] | "quoteSelection";
+type EditorAction = typeof actions[number] | "quoteSelection" | "quoteSelectionInNewSession";
 const actionIcons: Record<EditorAction, IconNode> = {
   undo: Undo2, redo: Redo2, cut: Scissors, copy: Copy, paste: ClipboardPaste,
   delete: Trash2, selectAll: SquareDashedMousePointer, quoteSelection: TextQuote,
+  quoteSelectionInNewSession: MessageSquareQuote,
 };
 const tableActionIcons: Record<MarkdownTableAction, IconNode> = {
   "row-before": BetweenHorizontalStart,
@@ -53,7 +55,7 @@ const shortcuts: Record<string, string> = {
 let disposed = false;
 
 function isDisabled(action: EditorAction): boolean {
-  if (action === "copy" || action === "quoteSelection") return !hasSelection.value;
+  if (action === "copy" || action === "quoteSelection" || action === "quoteSelectionInNewSession") return !hasSelection.value;
   if (action === "selectAll") return false;
   if (readOnly.value) return true;
   if (action === "undo") return !canUndo.value;
@@ -133,6 +135,10 @@ async function run(action: EditorAction): Promise<void> {
   try {
     if (action === "quoteSelection") {
       if (props.canQuote && selection.ranges.length) emit("quoteSelection", selection);
+      return;
+    }
+    if (action === "quoteSelectionInNewSession") {
+      if (props.canQuoteInNewSession && selection.ranges.length) emit("quoteSelectionInNewSession", selection);
       return;
     }
     if (action === "copy" || action === "cut") {
@@ -220,11 +226,15 @@ defineExpose({ open, onKeydown, close });
       </template>
       <div class="base-context-menu-separator" role="separator" />
     </template>
-    <button v-if="canQuote" type="button" role="menuitem" :disabled="!hasSelection" @click="run('quoteSelection')">
+    <button v-if="canQuote" type="button" role="menuitem" data-editor-action="quoteSelection" :disabled="!hasSelection" @click="run('quoteSelection')">
       <LucideIcon :icon="actionIcons.quoteSelection" :size="13" />
       <span>{{ t('editor.quoteSelection') }}</span>
     </button>
-    <div v-if="canQuote" class="base-context-menu-separator" role="separator" />
+    <button v-if="canQuoteInNewSession" type="button" role="menuitem" data-editor-action="quoteSelectionInNewSession" :disabled="!hasSelection" @click="run('quoteSelectionInNewSession')">
+      <LucideIcon :icon="actionIcons.quoteSelectionInNewSession" :size="13" />
+      <span>{{ t('editor.quoteSelectionInNewSession') }}</span>
+    </button>
+    <div v-if="canQuote || canQuoteInNewSession" class="base-context-menu-separator" role="separator" />
     <template v-if="(canComment || canFootnote) && !readOnly">
       <button v-if="canComment" type="button" role="menuitem" data-editor-action="comment" :disabled="!hasSelection" @click="runAnnotation('comment')">
         <LucideIcon :icon="MessageSquarePlus" :size="13" />

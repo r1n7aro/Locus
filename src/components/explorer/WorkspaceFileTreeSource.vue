@@ -74,7 +74,7 @@ async function siblings(directory: string) {
 }
 const entries = computed(() => workspaceFileEntries(state.explorerTree.value, state.isPathExpanded, t("asset.explorer.loadMore"), isHidden));
 watch([entries, ordering.order], ([value, order]) => emit("change", { entries: value, toggle: state.togglePath,
-  loadMore: state.loadMoreFolder, refresh: state.applyExplorerFileChange, order, siblings, move: ordering.move }), { immediate: true });
+  reveal: state.revealPath, loadMore: state.loadMoreFolder, refresh: state.applyExplorerFileChange, order, siblings, move: ordering.move }), { immediate: true });
 watch(state.error, message => { if (message) emit("error", message); });
 </script>
 

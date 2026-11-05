@@ -33,16 +33,17 @@ async function mount(disabled = false, transactionModel = false, initialContent 
   const save = vi.fn();
   const changes = vi.fn();
   const quote = vi.fn<(selection: MarkdownEditorSelection) => void>();
+  const quoteNew = vi.fn<(selection: MarkdownEditorSelection) => void>();
   app = createApp({ setup: () => () => h(BaseMarkdownEditor, {
     ref: editor, modelValue: model.value, contentKey: contentKey.value,
-    disabled, transactionModel, canQuoteSelection: true, viewMode: viewMode.value,
+    disabled, transactionModel, canQuoteSelection: true, canQuoteSelectionInNewSession: true, viewMode: viewMode.value,
     "onUpdate:modelValue": (value: string) => { model.value = value; },
-    onDocumentChange: changes, onQuoteSelection: quote, onShortcutSave: save,
+    onDocumentChange: changes, onQuoteSelection: quote, onQuoteSelectionInNewSession: quoteNew, onShortcutSave: save,
   }) });
   app.mount(root);
   await nextTick();
   const view = editor.value!.getEditorView();
-  return { view, contentKey, model, quote, changes, viewMode, save };
+  return { view, contentKey, model, quote, quoteNew, changes, viewMode, save };
 }
 async function open(view: EditorView, target: Element = view.contentDOM) {
   target.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 20, clientY: 30 }));
@@ -68,6 +69,19 @@ describe("Markdown editor context menu", () => {
     expect(quote).toHaveBeenCalledTimes(1);
     expect(quote.mock.calls[0]![0].ranges[0]).toMatchObject({ text: "alpha\nbeta\n", startLine: 2, endLine: 3 });
     expect(view.state.selection.main.from).toBe(7);
+  });
+
+  it("offers quoting in a new conversation only for a selection and emits its snapshot", async () => {
+    const { view, quote, quoteNew } = await mount();
+    await open(view);
+    expect(button("quoteSelectionInNewSession").textContent).toContain("editor.quoteSelectionInNewSession");
+    expect(button("quoteSelectionInNewSession").disabled).toBe(true);
+    view.dispatch({ selection: { anchor: 7, head: 17 } });
+    await open(view);
+    button("quoteSelectionInNewSession").click();
+    expect(quote).not.toHaveBeenCalled();
+    expect(quoteNew).toHaveBeenCalledTimes(1);
+    expect(quoteNew.mock.calls[0]![0].ranges[0]).toMatchObject({ text: "alpha\nbeta", startLine: 2, endLine: 3 });
   });
 
   it("cuts through CodeMirror transactions, supports undo/redo, and pastes at the captured selection", async () => {

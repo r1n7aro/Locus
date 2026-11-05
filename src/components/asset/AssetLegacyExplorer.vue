@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { ChevronDown, ChevronRight } from "lucide";
 import { t } from "../../i18n";
 import { explorerFileKey, explorerFilePath, useExplorerPathDisplay } from "../../composables/useExplorerPathDisplay";
@@ -106,6 +106,18 @@ const workspaceRows = computed(() => workspaceFileEntries(props.tree, props.isPa
     classes: { "is-open": !entry.loadMore && props.selectedPath === entry.node.path },
   } })));
 
+const workspaceTreeRef = ref<InstanceType<typeof WorkspaceTree> | null>(null);
+
+/** Scroll a listed path into view; only the workspace-style tree supports it. */
+function scrollToPath(path: string): boolean {
+  const index = workspaceRows.value.findIndex((entry) => !entry.loadMore && entry.node.path === path);
+  if (index < 0 || !workspaceTreeRef.value) return false;
+  workspaceTreeRef.value.scrollToIndex(index, { align: "center" });
+  return true;
+}
+
+defineExpose({ scrollToPath });
+
 function activateWorkspaceEntry(entry: WorkspaceFileEntry) {
   if (entry.loadMore) emit("loadMore", entry.node.path);
   else if (entry.node.kind === "folder") emit("toggle", entry.node.path);
@@ -170,6 +182,7 @@ function beginDrag(node: AssetExplorerNode, event: PointerEvent) {
   <div class="alx-root" :class="{ 'is-workspace-tree': props.workspaceStyle }">
     <WorkspaceTree
       v-if="props.workspaceStyle"
+      ref="workspaceTreeRef"
       :resource-rename="resourceRename"
       navigation
       :searchable="props.searchable"

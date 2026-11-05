@@ -388,6 +388,22 @@ describe("RichChatInput live document selection", () => {
     await flushAsync();
     expect(liveChip(mounted.host)).toBeNull();
   });
+
+  it("hides the live selection while an explicit quote of the same selection is attached", async () => {
+    const selection = fileSelection("sel-q");
+    const mounted = await mountInput({ liveSelectionQuote: selection });
+    await mounted.input.value!.applyDraftPrefill({
+      text: "", images: [], assetRefs: [], localFiles: [], consoleTexts: [], intent: { mode: "build", skills: [] },
+      knowledgeQuotes: [{ path: selection.path, name: selection.name, content: selection.content, source: "file" }],
+    });
+    await flushAsync();
+    expect(liveChip(mounted.host)).toBeNull();
+    expect(mounted.host.querySelectorAll(".knowledge-quote-chip")).toHaveLength(1);
+
+    mounted.state.liveSelectionQuote = { ...fileSelection("sel-r"), content: "C:/projects/a/docs/Hero.md:9\n```markdown\nother\n```" };
+    await flushAsync();
+    expect(liveChip(mounted.host)).not.toBeNull();
+  });
 });
 
 describe("RichChatInput scoped controller", () => {

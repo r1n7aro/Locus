@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref, watch } from "vue";
+import { computed, defineAsyncComponent, nextTick, ref, watch } from "vue";
 import { useAssetState, type AssetExplorerNode } from "../composables/useAssetState";
 import type { AssetSearchResult } from "../types";
 import { useUiStore } from "../stores/ui";
@@ -129,6 +129,7 @@ const {
   updateSearchScope,
   selectFromSearchResult,
   openAssetPath,
+  revealPath,
   visibleDirectoryEntries,
   currentFolderLoading,
   currentFolderLoaded,
@@ -164,6 +165,21 @@ function selectListNode(node: AssetExplorerNode) {
   }
   emit("openFile", { path: node.path, name: node.name });
 }
+
+const listExplorerRef = ref<InstanceType<typeof AssetLegacyExplorer> | null>(null);
+
+/** Select a workspace path in the list-only tree and scroll it into view. */
+async function revealListPath(path: string): Promise<boolean> {
+  if (!props.listOnly) return false;
+  if (searchQuery.value.trim()) runFilenameSearch("");
+  const listedPath = await revealPath(path);
+  if (!listedPath) return false;
+  listSelectedPath.value = listedPath;
+  await nextTick();
+  return listExplorerRef.value?.scrollToPath(listedPath) ?? false;
+}
+
+defineExpose({ revealPath: revealListPath });
 
 function selectListSearchResult(result: AssetSearchResult) {
   listSelectedPath.value = result.path;
@@ -294,6 +310,7 @@ function startAssetWorkspaceDrag(entry: AssetWorkspaceDragEntry, event: PointerE
               @drag-pointer-down="startAssetWorkspaceDrag"
             />
             <AssetLegacyExplorer
+              ref="listExplorerRef"
               :resource-rename="renameSource === 'tree' ? resourceActions?.draft : null"
               :working-dir="workingDir"
               @file-contextmenu="(file, event) => openFileMenu(file, event, 'tree')"

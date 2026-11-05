@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import {
-  BookOpen, CopyX, File, Folder, GitBranch, History, ListX, MessageSquare,
+  BookOpen, CopyX, File, Folder, FolderOpen, GitBranch, History, ListX, LocateFixed, MessageSquare,
   PanelLeftClose, PanelRightClose, X,
 } from "lucide";
 import { t } from "../../i18n";
@@ -13,6 +13,7 @@ import { useChatStore } from "../../stores/chat";
 import { shouldShowWorkbenchTabStrip } from "../../stores/workbench";
 import { isDocumentPreview } from "./workbenchDocumentPreview";
 import { isExternalWorkspaceFileEditor } from "./workbenchExternalFile";
+import { canOpenEditorInFileExplorer, canRevealEditorInWorkspace } from "./workbenchTabReveal";
 import type { WorkbenchEditorGroup, WorkbenchEditorInput } from "../../types/workbench";
 import LucideIcon from "../icons/LucideIcon.vue";
 import { resolveLocusViewIcon } from "../icons/locusViewIcons";
@@ -39,6 +40,8 @@ const props = defineProps<{
   dropIndex?: number;
   viewIcon?: (editor: WorkbenchEditorInput) => string | null | undefined;
   workspaceLabel?: (editor: WorkbenchEditorInput) => string | null | undefined;
+  /** The window shows a workspace tree that tabs can be located in. */
+  workspaceReveal?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -46,6 +49,8 @@ const emit = defineEmits<{
   (event: "close", editorId: string): void;
   (event: "close-many", editorIds: string[]): void;
   (event: "pin", editorId: string): void;
+  (event: "reveal-in-workspace", editorId: string): void;
+  (event: "open-in-file-explorer", editorId: string): void;
   (event: "drag-externalize", tab: BaseTabStripItem): void;
   (event: "title-keydown", keyEvent: KeyboardEvent): void;
 }>();
@@ -165,6 +170,25 @@ function closeFromContextMenu(scope: WorkbenchTabCloseScope): void {
   emit("close-many", editorIds);
 }
 
+const contextEditor = computed(() => {
+  const editorId = tabContextMenu.value?.editorId;
+  return editorId ? props.group.tabs.find((editor) => editor.editorId === editorId) ?? null : null;
+});
+const contextRevealInWorkspace = computed(() => (
+  !!props.workspaceReveal && !!contextEditor.value && canRevealEditorInWorkspace(contextEditor.value)
+));
+const contextOpenInFileExplorer = computed(() => (
+  !!contextEditor.value && canOpenEditorInFileExplorer(contextEditor.value)
+));
+
+function runContextEditorAction(event: "reveal-in-workspace" | "open-in-file-explorer"): void {
+  const editorId = tabContextMenu.value?.editorId;
+  tabContextMenu.value = null;
+  if (!editorId) return;
+  if (event === "reveal-in-workspace") emit("reveal-in-workspace", editorId);
+  else emit("open-in-file-explorer", editorId);
+}
+
 </script>
 
 <template>
@@ -236,6 +260,27 @@ function closeFromContextMenu(scope: WorkbenchTabCloseScope): void {
         <LucideIcon :icon="ListX" :size="13" />
         {{ t("workbench.tabs.closeAll") }}
       </button>
+      <template v-if="contextRevealInWorkspace || contextOpenInFileExplorer">
+        <div class="base-context-menu-separator" role="separator" />
+        <button
+          v-if="contextRevealInWorkspace"
+          type="button"
+          role="menuitem"
+          @click="runContextEditorAction('reveal-in-workspace')"
+        >
+          <LucideIcon :icon="LocateFixed" :size="13" />
+          {{ t("workbench.tabs.revealInWorkspace") }}
+        </button>
+        <button
+          v-if="contextOpenInFileExplorer"
+          type="button"
+          role="menuitem"
+          @click="runContextEditorAction('open-in-file-explorer')"
+        >
+          <LucideIcon :icon="FolderOpen" :size="13" />
+          {{ t("workbench.tabs.openInFileBrowser") }}
+        </button>
+      </template>
     </BaseContextMenu>
   </template>
 </template>
