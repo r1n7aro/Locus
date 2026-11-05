@@ -16,9 +16,9 @@ const RATE_LIMIT_RESET_CREDITS_CONSUME_ENDPOINT_PATH: &str = "/rate-limit-reset-
 const CODEX_ORIGINATOR_HEADER_VALUE: &str = "opencode";
 const CODEX_USER_AGENT_PREFIX: &str = "codex_cli_rs";
 const MAX_ERROR_BODY_CHARS: usize = 512;
-const USAGE_REFRESH_TIMEOUT_SECS: u64 = 8;
+const USAGE_REFRESH_TIMEOUT_SECS: u64 = locus_remote_core::network::USAGE_TIMEOUT_SECS;
 const RESET_CREDIT_DETAILS_TIMEOUT_SECS: u64 = 5;
-const RESET_CREDIT_CONSUME_TIMEOUT_SECS: u64 = 10;
+const RESET_CREDIT_CONSUME_TIMEOUT_SECS: u64 = locus_remote_core::network::CONSUME_TIMEOUT_SECS;
 
 #[derive(Debug)]
 pub enum CodexRateLimitsFetchError {
@@ -218,9 +218,7 @@ pub async fn fetch_codex_rate_limits(
     base_url: Option<&str>,
 ) -> Result<CodexRateLimitsResponse, CodexRateLimitsFetchError> {
     let client = crate::network::rustls_reqwest_client(
-        crate::network::ReqwestClientOptions::new()
-            .connect_timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(USAGE_REFRESH_TIMEOUT_SECS))
+        locus_remote_core::network::codex_http_options(locus_remote_core::network::CodexHttpProfile::Usage)
             .user_agent(codex_user_agent()),
     )
     .map_err(|e| {
@@ -271,9 +269,7 @@ pub async fn consume_codex_rate_limit_reset_credit(
     credit_id: Option<&str>,
 ) -> Result<CodexRateLimitResetConsumeResponse, CodexRateLimitsFetchError> {
     let client = crate::network::rustls_reqwest_client(
-        crate::network::ReqwestClientOptions::new()
-            .connect_timeout(Duration::from_secs(RESET_CREDIT_CONSUME_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(RESET_CREDIT_CONSUME_TIMEOUT_SECS))
+        locus_remote_core::network::codex_http_options(locus_remote_core::network::CodexHttpProfile::ConsumeCredit)
             .user_agent(codex_user_agent()),
     )
     .map_err(|error| {
@@ -323,6 +319,7 @@ async fn execute_codex_json_request<T: DeserializeOwned>(
         CodexRateLimitsFetchError::Other(format!("Codex {operation} request failed: {error}"))
     })?;
     let status = response.status();
+    let upstream_auth=locus_remote_core::network::upstream_auth_failure(status,response.headers());
     if !status.is_success() {
         let content_type = response
             .headers()
@@ -345,7 +342,7 @@ async fn execute_codex_json_request<T: DeserializeOwned>(
                 status.canonical_reason().unwrap_or("")
             )
         };
-        if status == reqwest::StatusCode::UNAUTHORIZED {
+        if status == reqwest::StatusCode::UNAUTHORIZED && !upstream_auth {
             return Err(CodexRateLimitsFetchError::Unauthorized(message));
         }
         return Err(CodexRateLimitsFetchError::Other(message));

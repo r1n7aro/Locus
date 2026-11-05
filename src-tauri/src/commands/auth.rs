@@ -453,7 +453,6 @@ pub async fn codex_retry_auth(
 #[tauri::command]
 pub async fn codex_rate_limits(
     codex: State<'_, CodexAuthStateHandle>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<CodexRateLimitsResponse, AppError> {
     let (access_token, account_id) = {
         let mut guard = codex.lock().await;
@@ -465,7 +464,7 @@ pub async fn codex_rate_limits(
     match crate::llm::codex_usage::fetch_codex_rate_limits(
         &access_token,
         account_id.as_deref(),
-        config.base_url.as_deref(),
+        None,
     )
     .await
     {
@@ -482,7 +481,7 @@ pub async fn codex_rate_limits(
             crate::llm::codex_usage::fetch_codex_rate_limits(
                 &access_token,
                 account_id.as_deref(),
-                config.base_url.as_deref(),
+                None,
             )
             .await
             .map_err(|err| AppError::from(err.to_string()))
@@ -495,7 +494,6 @@ pub async fn codex_rate_limits(
 pub async fn codex_consume_rate_limit_reset_credit(
     credit_id: Option<String>,
     codex: State<'_, CodexAuthStateHandle>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
 ) -> Result<CodexRateLimitResetConsumeResponse, AppError> {
     let credit_id = credit_id
         .map(|value| value.trim().to_string())
@@ -511,7 +509,7 @@ pub async fn codex_consume_rate_limit_reset_credit(
     match crate::llm::codex_usage::consume_codex_rate_limit_reset_credit(
         &access_token,
         account_id.as_deref(),
-        config.base_url.as_deref(),
+        None,
         &redeem_request_id,
         credit_id.as_deref(),
     )
@@ -530,7 +528,7 @@ pub async fn codex_consume_rate_limit_reset_credit(
             crate::llm::codex_usage::consume_codex_rate_limit_reset_credit(
                 &access_token,
                 account_id.as_deref(),
-                config.base_url.as_deref(),
+                None,
                 &redeem_request_id,
                 credit_id.as_deref(),
             )

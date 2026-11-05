@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 // This is the same self-contained module embedded in the Rust CLI launcher.
 // @ts-expect-error Claude loads this JavaScript module directly.
-import { register } from '../../src-tauri/src/llm/claude_code_cli/native_mod.js';
+import { register } from '../../crates/locus-remote-core/src/resources/native_mod.js';
 
 function harness(answer: unknown = { callId: 't1', result: { stdout: 'local', stderr: '', interrupted: false } }) {
   const hooks = new Map<string, { run: Function; fail?: Function; matcher?: object }>();
@@ -237,17 +237,33 @@ describe('Claude native tools Mod', () => {
     expect(h.events().filter(e => e.type === 'input_staging_error')).toHaveLength(1);
   });
 
-  it('blocks idle main and auxiliary model steps before invoking the CLI inference stream', async () => {
+  it('ends idle main and auxiliary model steps instead of throwing into the CLI fallback', async () => {
     const h = harness({ active: false });
+    const abort = vi.fn(async () => ({}));
     const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' },
-      session: { id: async () => 'idle-native', model: async () => 'claude-opus-5-5' } };
+      session: { id: async () => 'idle-native', model: async () => 'claude-opus-5-5' }, turn: { abort } };
     await h.hooks.get('session.start')!.run(api, {}, h.next);
     const inference = vi.fn();
-    for (const event of [{}, { agentId: 'background' }]) {
-      const consume = async () => { for await (const _ of h.hooks.get('turn.step')!.run(api, event, inference)) { /* consume */ } };
-      await expect(consume()).rejects.toThrow('Claude is idle');
+    for (const event of [{ turnId: 'main-turn', index: 0 }, { agentId: 'background', turnId: 'agent-turn', index: 0 }]) {
+      const step = h.hooks.get('turn.step')!.run(api, event, inference);
+      await expect(step.next()).resolves.toEqual({ done: true, value: expect.objectContaining({ turnId: event.turnId, answer: '', toolUses: [] }) });
     }
     expect(inference).not.toHaveBeenCalled();
+    expect(abort.mock.calls).toEqual([[{ turnId: 'main-turn' }], [{ turnId: 'agent-turn' }]]);
+  });
+
+  it('ends the step when the input check cannot reach the bridge or the turn is already ending', async () => {
+    const h = harness({ active: true });
+    const abort = vi.fn(async () => { throw new Error('$.turn.abort: no turn is running'); });
+    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' },
+      session: { id: async () => 'native', model: async () => 'claude-opus-5-5' }, turn: { abort } };
+    await h.hooks.get('session.start')!.run(api, {}, h.next);
+    h.fetch.mockResolvedValue({ ok: false, status: 502, text: '{}' });
+    const inference = vi.fn();
+    const step = h.hooks.get('turn.step')!.run(api, { turnId: 'main-turn', index: 1 }, inference);
+    await expect(step.next()).resolves.toMatchObject({ done: true, value: { turnId: 'main-turn', answer: '' } });
+    expect(inference).not.toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledWith({ turnId: 'main-turn' });
   });
   it('does not refill input while an earlier input-ready receipt is pending', async () => {
     const h = harness({ active: true, inputId: 'input', terminalText: 'hello' });
@@ -660,14 +676,17 @@ describe('Claude native tools Mod', () => {
 
   it('blocks inference when native @image expansion omitted an image', async () => {
     const h = harness({ active: true, inputId: 'input', expectedImageCount: 1, prompt: 'Inspect the image' });
-    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' }, session: { model: async () => 'claude-opus-5-5', id: async () => 'session', messages: async () => [] } };
+    const abort = vi.fn(async () => ({}));
+    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' }, session: { model: async () => 'claude-opus-5-5', id: async () => 'session', messages: async () => [] }, turn: { abort } };
     await h.hooks.get('session.start')!.run(api, {}, h.next);
     await h.hooks.get('prompt.submit')!.run(api, { text: 'input' }, h.next);
     const inference = vi.fn();
-    const stream = h.hooks.get('turn.step')!.run(api, {}, inference);
-    await expect(stream.next()).rejects.toThrow('did not load every image');
+    const stream = h.hooks.get('turn.step')!.run(api, { turnId: 'image-turn', index: 0 }, inference);
+    // Throwing here would make Claude send the request without the image.
+    await expect(stream.next()).resolves.toMatchObject({ done: true, value: { turnId: 'image-turn', answer: '' } });
     expect(inference).not.toHaveBeenCalled();
-    expect(h.fetch.mock.calls.map(call => JSON.parse(call[1].body)).find(event => event.type === 'complete')).toMatchObject({ reason: 'error' });
+    expect(abort).toHaveBeenCalledWith({ turnId: 'image-turn' });
+    expect(h.fetch.mock.calls.map(call => JSON.parse(call[1].body)).find(event => event.type === 'complete')).toMatchObject({ reason: 'error', answer: expect.stringContaining('did not load every image') });
   });
 
   it('preserves native images and rejects a partially staged attachment set', async () => {
@@ -719,6 +738,104 @@ describe('Claude native tools Mod', () => {
     const next = vi.fn(async () => compacted);
     expect(await h.hooks.get('session.compact')!.run(api, { trigger: 'manual', messages: [1, 2, 3] }, next)).toBe(compacted);
     expect(h.fetch.mock.calls.map(call => JSON.parse(call[1].body)).find(event => event.type === 'compact_done')).toMatchObject({ before: 3, after: 1, summary: 'Native summary', tokens: 500 });
+  });
+
+  const compactionHarness = async (prepared: unknown) => {
+    const options = { active: true, inputId: 'input', prompt: 'test' };
+    const h = harness(options);
+    h.fetch.mockImplementation(async (_url, init) => {
+      if (JSON.parse(init.body).type !== 'compact_prepare') return { ok: true, status: 200, text: JSON.stringify(options) };
+      if (prepared instanceof Error) throw prepared;
+      return { ok: true, status: 200, text: JSON.stringify(prepared) };
+    });
+    const usage = vi.fn(async (args?: { breakdown?: string }) => args?.breakdown
+      ? { context: { window: 1_000_000, breakdown: { totalTokens: 48_000 } } } : { context: { tokens: 500, window: 1_000_000 } });
+    const api = { ...h.api, env: { get: async (key: string) => key === 'LOCUS_CLAUDE_TUI' ? '1' : key.endsWith('_URL') ? 'http://127.0.0.1:19200' : 'test-token' },
+      session: { model: async () => 'claude-opus-5-5', id: async () => 'session', usage } };
+    await h.hooks.get('session.start')!.run(api, {}, h.next);
+    await h.hooks.get('prompt.submit')!.run(api, { text: 'input' }, h.next);
+    const events = () => h.fetch.mock.calls.map(call => JSON.parse(call[1].body));
+    // Claude runs SessionStart (source "compact") inside the native compaction.
+    const sessionStart = (event: object) => h.hooks.get('classic.SessionStart')!.run(api, { hook_event_name: 'SessionStart', ...event }, async () => ({}));
+    return { h, api, events, sessionStart };
+  };
+  const nativeSummary = 'Summary:\nWORK\n\nIf you need details, read the full transcript at: /Users/r/.claude/projects/x/abc.jsonl\nContinue the conversation.';
+
+  it('delivers Locus compaction context as the SessionStart context of the compaction', async () => {
+    const prepared = { ok: true, instructions: 'LOCUS_RULES', transcriptPath: 'C:/tmp/compact-transcripts/claude/s/n.jsonl', carryForward: '## Locus Carry-Forward Context\nCARRY' };
+    const { h, api, events, sessionStart } = await compactionHarness(prepared);
+    expect(await sessionStart({ source: 'resume' })).toEqual({});
+    const compacted = { tokensAfter: 900, messages: [
+      { role: 'user', text: nativeSummary, toolUses: [], handle: 'summary' },
+      { role: 'assistant', text: 'Kept answer', toolUses: [{ tool_use_id: 'toolu_1', tool: 'Bash', input: {} }], handle: 'kept-1' },
+      { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_1', text: 'ok', isError: false }], handle: 'kept-2' },
+    ] };
+    const contexts: unknown[] = [];
+    const next = vi.fn(async (_event: { instructions?: string }) => {
+      contexts.push(await sessionStart({ source: 'compact', agent_id: 'subagent' }));
+      contexts.push(await sessionStart({ source: 'compact' }));
+      contexts.push(await sessionStart({ source: 'compact' }));
+      return compacted;
+    });
+    expect(await h.hooks.get('session.compact')!.run(api, { trigger: 'auto', messages: [1, 2, 3, 4], instructions: 'USER_FOCUS' }, next)).toBe(compacted);
+    expect(next.mock.calls[0]![0].instructions).toBe('USER_FOCUS\n\nLOCUS_RULES');
+    expect(contexts).toEqual([{}, { additionalContext: [prepared.carryForward] }, {}]);
+    expect(events().map(event => String(event.type ?? '')).filter(type => type.startsWith('compact_'))).toEqual(['compact_start', 'compact_prepare', 'compact_done']);
+    expect(events().find(event => event.type === 'compact_done')).toMatchObject({
+      before: 4, after: 3, tokens: 900, estimate: 48_000, summary: nativeSummary, carryForward: prepared.carryForward,
+      transcriptPath: prepared.transcriptPath, kept: [
+        { role: 'assistant', text: 'Kept answer', toolUseIds: ['toolu_1'], toolResultIds: [] },
+        { role: 'user', text: '', toolUseIds: [], toolResultIds: ['toolu_1'] },
+      ] });
+    expect(events().some(event => event.type === 'diagnostic')).toBe(false);
+    // Nothing stays staged for a later compaction or summary row.
+    expect(await sessionStart({ source: 'compact' })).toEqual({});
+    const append = vi.fn(async (event) => event);
+    const row = { uuid: 'summary-row', door: 'compaction', message: { type: 'user', role: 'user', content: [{ type: 'text', text: nativeSummary }] } };
+    await h.hooks.get('session.append')!.run(api, row, append);
+    expect(append.mock.calls[0]![0].message.content).toEqual(row.message.content);
+  });
+
+  it('reports a compaction whose SessionStart context was not requested', async () => {
+    const { h, api, events } = await compactionHarness({ ok: true, instructions: 'LOCUS_RULES', transcriptPath: 'C:/tmp/n.jsonl', carryForward: 'CARRY' });
+    await h.hooks.get('session.compact')!.run(api, { trigger: 'manual', messages: [1] },
+      async () => ({ messages: [{ role: 'user', text: nativeSummary, toolUses: [], handle: 'summary' }] }));
+    expect(events().filter(event => event.type === 'diagnostic' && event.kind === 'compaction_context')).toHaveLength(1);
+    expect(events().find(event => event.type === 'compact_done')).toMatchObject({ summary: nativeSummary, carryForward: null });
+  });
+
+  it('warns when the transcript copy failed but still delivers the carry-forward context', async () => {
+    const { h, api, events, sessionStart } = await compactionHarness({ ok: true, instructions: 'LOCUS_RULES', transcriptPath: null, transcriptError: 'archive refresh timed out', carryForward: 'CARRY' });
+    let context: unknown;
+    await h.hooks.get('session.compact')!.run(api, { trigger: 'auto', messages: [1] }, async () => {
+      context = await sessionStart({ source: 'compact' });
+      return { messages: [{ role: 'user', text: nativeSummary, toolUses: [], handle: 'summary' }] };
+    });
+    expect(context).toEqual({ additionalContext: ['CARRY'] });
+    const notice = events().find(event => event.type === 'diagnostic');
+    expect(notice).toMatchObject({ kind: 'compaction_context' });
+    expect(notice.text).toContain('archive refresh timed out');
+    expect(events().find(event => event.type === 'compact_done')).toMatchObject({ summary: nativeSummary, carryForward: 'CARRY', transcriptPath: null });
+  });
+
+  it('compacts natively when Locus cannot prepare compaction context', async () => {
+    const { h, api, events, sessionStart } = await compactionHarness(new Error('bridge unavailable'));
+    const compacted = { messages: [{ role: 'user', text: 'Native summary', toolUses: [], handle: 'summary' }] };
+    let context: unknown;
+    const next = vi.fn(async (_event: object) => { context = await sessionStart({ source: 'compact' }); return compacted; });
+    const input = { trigger: 'auto', messages: [1] };
+    expect(await h.hooks.get('session.compact')!.run(api, input, next)).toBe(compacted);
+    expect(next).toHaveBeenCalledExactlyOnceWith(input);
+    expect(context).toEqual({});
+    expect(events().filter(event => event.type === 'diagnostic').map(event => event.kind)).toEqual(['compaction_context']);
+    expect(events().find(event => event.type === 'compact_done')).toMatchObject({ summary: 'Native summary', carryForward: null, kept: [], transcriptPath: null });
+  });
+
+  it('clears staged compaction context when native compaction fails', async () => {
+    const { h, api, sessionStart } = await compactionHarness({ ok: true, instructions: 'LOCUS_RULES', transcriptPath: null, carryForward: 'CARRY' });
+    await expect(h.hooks.get('session.compact')!.run(api, { trigger: 'auto', messages: [1] }, async () => { throw new Error('summary failed'); }))
+      .rejects.toThrow('summary failed');
+    expect(await sessionStart({ source: 'compact' })).toEqual({});
   });
 
   it('keeps synthetic CLI notices in native storage but out of conversation events', async () => {

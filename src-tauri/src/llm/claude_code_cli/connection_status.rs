@@ -21,6 +21,7 @@ pub(crate) struct ConnectionStatus {
     pub latency_ms: Option<f64>,
     pub last_error: Option<String>,
     pub pool: PoolStatus,
+    pub archive_pool: Option<locus_remote_core::claude_ssh::archive_pool::Snapshot>,
     pub diagnostics: super::super::ssh::diagnostics::Overview,
 }
 
@@ -42,6 +43,14 @@ fn starting() -> &'static Mutex<HashMap<String, SshConfig>> {
 
 // Also clears a pending startup if its future fails or is cancelled.
 struct StartupStatus(String);
+#[cfg(feature="server-client")]
+fn server_starting()->&'static Mutex<HashMap<String,String>> {
+    static STARTING:OnceLock<Mutex<HashMap<String,String>>>=OnceLock::new();STARTING.get_or_init(Default::default)
+}
+#[cfg(feature="server-client")]
+struct ServerStartupStatus(String);
+#[cfg(feature="server-client")]
+impl Drop for ServerStartupStatus {fn drop(&mut self){server_starting().lock().unwrap_or_else(|e|e.into_inner()).remove(&self.0);}}
 impl StartupStatus {
     fn new(id: &str, config: &SshConfig) -> Self {
         starting().lock().unwrap_or_else(|e| e.into_inner()).insert(id.into(), config.clone());
@@ -56,7 +65,7 @@ impl Drop for StartupStatus {
 
 fn snapshot(config: &SshConfig, phase: ConnectionPhase) -> ConnectionStatus {
     ConnectionStatus { phase, target: config.target.clone(), port: config.port, latency_ms: None, last_error: None,
-        pool: PoolStatus { state: "disabled", ..Default::default() }, diagnostics: Default::default() }
+        pool: PoolStatus { state: "disabled", ..Default::default() }, archive_pool: None, diagnostics: Default::default() }
 }
 
 #[cfg(test)]
@@ -94,6 +103,38 @@ fn pool_status(processes: &[ProcessStatus], pool: &prewarm::PoolSnapshot, enable
 /// Read existing processes only. An API-selected composer sees the configured
 /// server, while a Claude conversation continues to report its bound server.
 pub(crate) fn connection_overview(id: Option<&str>, cwd: Option<&str>, model: Option<&str>, settings: &ConnectionSettings) -> Option<ConnectionStatus> {
+    #[cfg(feature="server-client")]
+    let selected_server=if model.is_none(){prewarm::desired_server_model().or_else(|| {
+        if settings.remote.is_some(){return None;}
+        sessions().lock().unwrap_or_else(|e|e.into_inner()).values().filter(|session|session.model.starts_with("locus-server/"))
+            .max_by_key(|session|*session.last_used.lock().unwrap_or_else(|e|e.into_inner())).map(|session|session.model.clone())
+    })}else{None};
+    #[cfg(feature="server-client")]
+    let model=model.or(selected_server.as_deref());
+    if model.is_some_and(|model|model.starts_with("locus-server/")) {
+        #[cfg(feature="server-client")]
+        {
+            let (binding,_) = crate::server_client::binding_for_model(model?).ok()??;
+            if binding.kind!="claude" {return None;}
+            let pool=prewarm::status_connection(&super::super::connection::NativeConnection::server(&binding.id).ok()?,settings);
+            let cached=sessions().lock().unwrap_or_else(|e|e.into_inner()).clone();
+            let mut processes=Vec::new();
+            for (id,session) in &cached {
+                if Some(session.model.as_str())!=model {continue;}
+                processes.push(ProcessStatus{id:id.clone(),phase:if !session.alive(){ConnectionPhase::Disconnected}else if session.ready.load(Ordering::SeqCst){ConnectionPhase::Ready}else{ConnectionPhase::Starting},busy:session.busy.load(Ordering::SeqCst),latency_ms:session.remote.as_ref().and_then(|remote|remote.latency_ms())});
+            }
+            for (id,pending_model) in server_starting().lock().unwrap_or_else(|e|e.into_inner()).iter() {
+                if Some(pending_model.as_str())==model {processes.retain(|process|&process.id!=id);processes.push(ProcessStatus{id:id.clone(),phase:ConnectionPhase::Connecting,busy:false,latency_ms:None});}
+            }
+            for pending in &pool.pending {if !processes.iter().any(|process|&process.id==pending){processes.push(ProcessStatus{id:pending.clone(),phase:ConnectionPhase::Connecting,busy:false,latency_ms:None});}}
+            let spare=if id.is_none(){cwd.zip(model).and_then(|(cwd,model)|prewarm::spare_id(cwd,model,settings))}else{None};
+            let chosen=id.or(spare.as_deref()).and_then(|id|processes.iter().find(|process|process.id==id)).or_else(||processes.iter().find(|process|process.phase==ConnectionPhase::Ready)).or_else(||processes.first());
+            return Some(ConnectionStatus {phase:chosen.map_or(ConnectionPhase::Disconnected,|process|process.phase),target:binding.name,port:None,latency_ms:chosen.and_then(|process|process.latency_ms),
+                last_error:pool.last_error.clone(),pool:pool_status(&processes,&pool,settings.prewarm,settings.pool_capacity.clamp(1,4)),archive_pool:None,diagnostics:Default::default()});
+        }
+        #[cfg(not(feature="server-client"))]
+        return None;
+    }
     let spare = if id.is_none() { cwd.zip(model).and_then(|(cwd, model)| prewarm::spare_id(cwd, model, settings)) } else { None };
     let id = id.or(spare.as_deref());
     let cached = sessions().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -132,13 +173,20 @@ pub(crate) fn connection_overview(id: Option<&str>, cwd: Option<&str>, model: Op
     result.latency_ms = selected.and_then(|p| p.latency_ms);
     result.pool = pool_status(&processes, &pool, settings.prewarm && settings.remote.as_ref() == Some(config), settings.pool_capacity.clamp(1, 4));
     result.last_error = pool.last_error;
+    result.archive_pool = locus_remote_core::claude_ssh::archive_pool::snapshot(config);
     result.diagnostics = super::super::ssh::diagnostics::overview(config);
     Some(result)
 }
 
 pub(super) async fn start_cached(options: &ClaudeCodeCliOptions, permission_mode: super::super::ssh::PermissionMode) -> Result<Arc<Session>, String> {
+    start_cached_with_mode(options,permission_mode,false).await
+}
+pub(super) async fn start_cached_with_mode(options:&ClaudeCodeCliOptions,permission_mode:super::super::ssh::PermissionMode,prewarm:bool)->Result<Arc<Session>,String> {
+    if let Some(remote) = &options.remote { super::super::archive::prewarm(remote); }
     let _startup = options.remote.as_ref().map(|config| StartupStatus::new(&options.locus_session_id, config));
-    let session = start(options, permission_mode).await?;
+    #[cfg(feature="server-client")]
+    let _server_startup=if options.model.starts_with("locus-server/"){server_starting().lock().unwrap_or_else(|e|e.into_inner()).insert(options.locus_session_id.clone(),options.model.clone());Some(ServerStartupStatus(options.locus_session_id.clone()))}else{None};
+    let session = start(options, permission_mode,prewarm).await?;
     sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(options.locus_session_id.clone(), session.clone());
     if session.remote.is_some() {
         watch_remote_session(options.locus_session_id.clone(), &session);

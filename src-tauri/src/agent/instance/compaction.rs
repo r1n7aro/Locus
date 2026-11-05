@@ -21,7 +21,7 @@ impl AgentInstance {
                 base_url,
             } => {
                 let model_name = &self.effective_model;
-                let actual_model = model_name.strip_prefix("openai/").unwrap_or(model_name);
+                let actual_model = codex::protocol_model_name(model_name);
                 let (access_token, account_id) =
                     resolve_codex_request_auth(auth, false).await.map_err(|e| {
                         codex::CodexRemoteCompactError::new(

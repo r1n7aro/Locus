@@ -1,7 +1,9 @@
 use super::CODEX_CLIENT_VERSION;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Duration;
 
 #[path = "codex_model_version.rs"]
 mod client_version;
@@ -13,7 +15,6 @@ const MODELS_ENDPOINT_PATH: &str = "/models";
 const RESPONSES_ENDPOINT_PATH: &str = "/responses";
 const MODEL_CACHE_FILE: &str = "codex_models_cache.json";
 const MODEL_CACHE_TTL_MS: i64 = 300_000;
-const MODELS_REFRESH_TIMEOUT_SECS: u64 = 5;
 const CODEX_ORIGINATOR_HEADER_VALUE: &str = "opencode";
 const CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT: u32 = 95;
 const CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT: u32 = 90;
@@ -334,9 +335,7 @@ async fn fetch_remote_models(
     client_version: &str,
 ) -> Result<CodexModelsFetchOutcome, String> {
     let client = crate::network::rustls_reqwest_client(
-        crate::network::ReqwestClientOptions::new()
-            .connect_timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(MODELS_REFRESH_TIMEOUT_SECS)),
+        locus_remote_core::network::codex_http_options(locus_remote_core::network::CodexHttpProfile::Models),
     )
     .map_err(|e| format!("Failed to create Codex models client: {e}"))?;
 
@@ -452,6 +451,8 @@ pub fn resolve_context_limits(
     model: &str,
     context_window: u32,
 ) -> Option<CodexContextLimits> {
+    #[cfg(feature = "server-client")]
+    let model = crate::server_client::protocol_model_id(model);
     let key = normalize_model_key(model);
     if key.is_empty() {
         return None;

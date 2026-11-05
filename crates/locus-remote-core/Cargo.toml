@@ -1,0 +1,37 @@
+[package]
+name = "locus-remote-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Minimal shared Locus remote authentication and SSH transport"
+
+[workspace]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "form", "rustls", "stream", "http2", "gzip", "deflate", "system-proxy", "socks"] }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186", features = ["proxy"] }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f", features = ["deflate", "proxy"] }
+hyper-util = { version = "0.1.20", features = ["client-proxy", "client-proxy-system", "client-legacy", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-native-certs = "0.8.4"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tower-service = "0.3.3"
+http = "1"
+tracing = "0.1"
+sha2 = "0.10"
+base64 = "0.23.1"
+chrono = "0.4.45"
+tokio = { version = "1.53.1", features = ["full"] }
+uuid = { version = "1.24.1", features = ["v4", "v5", "serde"] }
+regex = "1.13.1"
+zeroize = "1"
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1.53.1", features = ["test-util"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+windows-core = "0.61.2"

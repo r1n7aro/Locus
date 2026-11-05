@@ -1,8 +1,9 @@
-//! Passive counters on the existing transport. No polling, logging, subprocesses
-//! or network probes on the healthy path. Failure probes are bounded and detached
-//! from recovery; neither their result nor the UI can authorize input replay.
+//! Passive counters on the existing transport, plus bounded helper lifecycle
+//! metadata. No polling, subprocesses or network probes on the healthy path.
+//! Failure probes are bounded and detached from recovery; neither their result
+//! nor the UI can authorize input replay.
 use super::{heartbeat::Heartbeat, SshConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::VecDeque, sync::{Arc, Mutex, OnceLock, Weak, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
@@ -11,16 +12,46 @@ mod failure_probe;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct StageSample {
+pub struct StageSample {
     pub stage: &'static str,
     pub elapsed_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelperSnapshot {
+    pub helper_version: String,
+    pub source_hash: Option<String>,
+    pub host_pid: u32,
+    pub claude_pid: Option<u32>,
+    pub started_at: u64,
+    pub updated_at: u64,
+    pub event: String,
+    pub exit_reason: Option<String>,
+    pub exit_code: Option<i32>,
+    pub claude_exit_code: Option<i32>,
+    pub error_type: Option<String>,
+    pub reporting_error: Option<String>,
+    pub cleanup_error: Option<String>,
+}
+impl HelperSnapshot {
+    fn valid(&self) -> bool {
+        let token = |s: &str| !s.is_empty() && s.len() <= 80
+            && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c));
+        self.host_pid > 0 && self.claude_pid != Some(0) && token(&self.helper_version)
+            && matches!(self.event.as_str(), "started" | "ready" | "exit")
+            && self.source_hash.as_ref().is_none_or(|hash| hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_hexdigit()))
+            && [&self.exit_reason, &self.error_type, &self.reporting_error, &self.cleanup_error]
+                .iter().all(|v| v.as_ref().is_none_or(|s| token(s)))
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct TransportSnapshot {
+pub struct TransportSnapshot {
     pub id: u64,
     pub pid: Option<u32>,
+    pub helper: Option<HelperSnapshot>,
     pub operation: String,
     pub stage: &'static str,
     pub elapsed_ms: u64,
@@ -39,7 +70,7 @@ pub(crate) struct TransportSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct FailureSnapshot {
+pub struct FailureSnapshot {
     pub at: u64,
     pub kind: &'static str,
     pub message: String,
@@ -50,7 +81,7 @@ pub(crate) struct FailureSnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ProbeCheck {
+pub struct ProbeCheck {
     pub name: &'static str,
     pub outcome: &'static str,
     pub elapsed_ms: u64,
@@ -59,7 +90,7 @@ pub(crate) struct ProbeCheck {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ProbeReport {
+pub struct ProbeReport {
     pub failure_id: u64,
     pub at: u64,
     pub state: &'static str,
@@ -68,7 +99,7 @@ pub(crate) struct ProbeReport {
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct Overview {
+pub struct Overview {
     pub active: Option<TransportSnapshot>,
     pub last_failure: Option<FailureSnapshot>,
     pub probe: Option<ProbeReport>,
@@ -80,6 +111,12 @@ struct Stage {
     received_at_start: u64,
     expected_bytes: Option<u64>,
     timeline: Vec<StageSample>,
+}
+
+#[derive(Default)]
+struct Stderr {
+    tail: Vec<u8>,
+    pending: Vec<u8>,
 }
 
 pub(super) struct Trace {
@@ -96,7 +133,8 @@ pub(super) struct Trace {
     handshaken: AtomicBool,
     failed: AtomicBool,
     stage: Mutex<Stage>,
-    stderr: Mutex<Vec<u8>>,
+    stderr: Mutex<Stderr>,
+    helper: Mutex<Option<HelperSnapshot>>,
     heartbeat: Arc<Mutex<Heartbeat>>,
 }
 
@@ -111,8 +149,11 @@ impl Trace {
             handshaken: AtomicBool::new(false), failed: AtomicBool::new(false),
             stage: Mutex::new(Stage { name: "ssh", since_ms: 0, received_at_start: 0, expected_bytes: None,
                 timeline: vec![StageSample { stage: "ssh", elapsed_ms: 0 }] }),
-            stderr: Mutex::new(Vec::new()), heartbeat,
+            stderr: Mutex::new(Stderr::default()), helper: Mutex::new(None), heartbeat,
         });
+        // A warm data helper is not a live conversation. Its caller reports
+        // backup errors separately; it must not replace the chat health panel.
+        if trace.operation == "archive_read" { return trace; }
         let mut targets = registry().lock().unwrap_or_else(|e| e.into_inner());
         let target = target(&mut targets, config);
         target.live.retain(|trace| trace.strong_count() > 0);
@@ -129,10 +170,45 @@ impl Trace {
     pub(super) fn frame_complete(&self) { self.partial_frame.store(0, Relaxed); }
     pub(super) fn sent(&self, bytes: usize) { self.sent.fetch_add(bytes as u64, Relaxed); }
     pub(super) fn stderr(&self, bytes: &[u8]) {
-        let mut tail = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
-        tail.extend_from_slice(bytes);
-        let excess = tail.len().saturating_sub(4096);
-        if excess > 0 { tail.drain(..excess); }
+        let records = {
+            let mut stderr = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+            stderr.tail.extend_from_slice(bytes);
+            let excess = stderr.tail.len().saturating_sub(4096);
+            if excess > 0 { stderr.tail.drain(..excess); }
+            let mut records = Vec::new();
+            // SSH reads may split UTF-8, JSON, or the marker across chunks.
+            for &byte in bytes {
+                if byte == b'\n' {
+                    if let Some(json) = stderr.pending.strip_prefix(b"LOCUS_SSH_HELPER ") {
+                        if let Ok(value) = serde_json::from_slice::<Value>(json) { records.push(value); }
+                    }
+                    stderr.pending.clear();
+                } else if stderr.pending.len() <= 4096 {
+                    stderr.pending.push(byte);
+                }
+            }
+            records
+        };
+        for record in records { self.helper(&record); }
+    }
+    pub(super) fn helper(&self, value: &Value) {
+        if !value.is_object() { return; }
+        let Ok(record) = serde_json::from_value::<HelperSnapshot>(value.clone()) else { return; };
+        if !record.valid() { return; }
+        {
+            let mut helper = self.helper.lock().unwrap_or_else(|e| e.into_inner());
+            if helper.as_ref().is_some_and(|previous| previous.host_pid != record.host_pid
+                || previous.updated_at > record.updated_at
+                || (previous.event == "exit" && record.event != "exit")) { return; }
+            *helper = Some(record.clone());
+        }
+        // Exit diagnostics can arrive on stderr after stdout EOF froze the
+        // failure. Preserve its counters/cause while enriching only metadata.
+        let mut targets = registry().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(failure) = targets.iter_mut().find(|t| t.config == self.config)
+            .and_then(|t| t.last_failure.as_mut()).filter(|f| f.transport.id == self.id) {
+            failure.transport.helper = Some(record);
+        }
     }
     fn elapsed_ms(&self) -> u64 { self.started.elapsed().as_millis() as u64 }
     pub(super) fn progress(&self, frame: &Value) {
@@ -180,7 +256,8 @@ impl Trace {
         let last_receive = self.last_receive.load(Relaxed);
         let (heartbeat_age_ms, pending_heartbeats) = self.heartbeat.lock().unwrap_or_else(|e| e.into_inner()).diagnostic(Instant::now());
         TransportSnapshot {
-            id: self.id, pid: Some(self.pid.load(Relaxed)).filter(|pid| *pid != 0), operation: self.operation.clone(),
+            id: self.id, pid: Some(self.pid.load(Relaxed)).filter(|pid| *pid != 0),
+            helper: self.helper.lock().unwrap_or_else(|e| e.into_inner()).clone(), operation: self.operation.clone(),
             stage: stage.name, elapsed_ms, stage_elapsed_ms, received_bytes, sent_bytes: self.sent.load(Relaxed),
             last_receive_age_ms: last_receive.checked_sub(1).map(|at| elapsed_ms.saturating_sub(at)),
             partial_frame_bytes: self.partial_frame.load(Relaxed), expected_frame_bytes: stage.expected_bytes,
@@ -198,6 +275,7 @@ impl Trace {
     }
     pub(super) fn fail(self: &Arc<Self>, kind: &'static str, message: &str, exit_code: Option<i32>) {
         if self.stopped.load(Relaxed) || self.failed.swap(true, Relaxed) { return; }
+        if self.operation == "archive_read" { return; }
         let snapshot = self.snapshot();
         let kind = if kind == "timeout" && snapshot.stage == "historyTransfer" { "historyTransferTimeout" }
             else if kind == "timeout" && snapshot.stage == "historyLock" { "historyLockTimeout" } else { kind };
@@ -213,12 +291,14 @@ impl Trace {
         let trace = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let stderr = super::super::diagnostics::plain_text(&String::from_utf8_lossy(&trace.stderr.lock().unwrap_or_else(|e| e.into_inner())));
+            let stderr = super::errors::plain_text(&String::from_utf8_lossy(&trace.stderr.lock().unwrap_or_else(|e| e.into_inner()).tail));
+            let helper = trace.helper.lock().unwrap_or_else(|e| e.into_inner()).clone();
             {
                 let mut targets = registry().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(failure) = targets.iter_mut().find(|t| t.config == trace.config)
                     .and_then(|t| t.last_failure.as_mut()).filter(|f| f.transport.id == trace.id) {
                     failure.stderr = stderr;
+                    if helper.is_some() { failure.transport.helper = helper; }
                 }
             }
             if probe {
@@ -261,7 +341,7 @@ fn target<'a>(targets: &'a mut VecDeque<Target>, config: &SshConfig) -> &'a mut 
 /// Pure local snapshot, shared by the existing one-second UI poll. The newest
 /// operation is explicit: one pool may have several healthy conversations even
 /// while a different conversation's history recovery fails.
-pub(crate) fn overview(config: &SshConfig) -> Overview {
+pub fn overview(config: &SshConfig) -> Overview {
     let (active, last_failure, probe) = {
         let mut targets = registry().lock().unwrap_or_else(|e| e.into_inner());
         let Some(target) = targets.iter_mut().find(|t| &t.config == config) else { return Overview::default(); };
@@ -299,6 +379,17 @@ mod tests {
         assert!(overview(&self::config()).active.is_none());
     }
     #[test]
+    fn download_pool_does_not_replace_conversation_health_or_trigger_failure_probes() {
+        let config = config();
+        let chat = Trace::new(&config, &json!({"mode":"session"}), Arc::new(Mutex::new(Heartbeat::default())));
+        let data = Trace::new(&config, &json!({"mode":"archive_read"}), Arc::new(Mutex::new(Heartbeat::default())));
+        data.received(262144, 200000);
+        data.fail("timeout", "bulk transfer stalled", None);
+        let status = overview(&config);
+        assert_eq!(status.active.unwrap().id, chat.id);
+        assert!(status.last_failure.is_none() && status.probe.is_none());
+    }
+    #[test]
     fn failure_probes_are_rate_limited_and_tied_to_the_triggering_failure() {
         let mut targets = VecDeque::new();
         let config = config();
@@ -333,6 +424,71 @@ mod tests {
         assert_eq!(failure.exit_code, Some(255));
         assert!(status.probe.is_none());
         assert!(status.active.is_none());
+    }
+    fn helper_record(event: &str, at: u64) -> Value {
+        json!({"helperVersion":"2", "sourceHash":"ab".repeat(32), "hostPid":61196,
+            "claudePid":61210, "startedAt":1000, "updatedAt":at, "event":event})
+    }
+    #[test]
+    fn helper_identity_is_remote_not_the_local_ssh_pid_and_stderr_is_chunk_safe() {
+        let trace = Trace::new(&config(), &json!({"mode":"session"}), Arc::new(Mutex::new(Heartbeat::default())));
+        trace.pid(123);
+        let started = helper_record("started", 1000);
+        trace.helper(&started);
+        assert_eq!(trace.snapshot().pid, Some(123));
+        assert_eq!(trace.snapshot().helper.unwrap().host_pid, 61196);
+        let mut exit = helper_record("exit", 2000);
+        exit["exitCode"] = json!(130);
+        exit["exitReason"] = json!("keyboard_interrupt");
+        let record = format!("LOCUS_SSH_HELPER {exit}\n");
+        for chunk in record.as_bytes().chunks(7) { trace.stderr(chunk); }
+        trace.helper(&started); // stdout/stderr delivery order is independent
+        let helper = trace.snapshot().helper.unwrap();
+        assert_eq!(helper.exit_reason.as_deref(), Some("keyboard_interrupt"));
+        assert_eq!(helper.exit_code, Some(130));
+        assert_eq!(helper.claude_pid, Some(61210));
+        trace.stderr(&vec![b'x'; 20000]);
+        assert_eq!(trace.stderr.lock().unwrap().pending.len(), 4097);
+        trace.stderr(b"\n");
+        trace.stderr(record.as_bytes());
+        assert_eq!(trace.snapshot().helper.unwrap().event, "exit");
+        assert!(trace.stderr.lock().unwrap().tail.len() <= 4096);
+    }
+    #[test]
+    fn helper_metadata_is_optional_bounded_and_rejects_foreign_pids() {
+        let trace = Trace::new(&config(), &json!({}), Arc::new(Mutex::new(Heartbeat::default())));
+        trace.helper(&Value::Null); // legacy peers remain valid
+        assert!(trace.snapshot().helper.is_none());
+        let mut record = helper_record("started", 1000);
+        record["helperVersion"] = json!("x".repeat(10000));
+        trace.helper(&record);
+        assert!(trace.snapshot().helper.is_none());
+        trace.helper(&helper_record("ready", 1100));
+        record = helper_record("exit", 2000);
+        record["hostPid"] = json!(999);
+        trace.helper(&record);
+        assert_eq!(trace.snapshot().helper.unwrap().event, "ready");
+    }
+    #[tokio::test]
+    async fn late_stderr_enriches_only_its_own_frozen_failure() {
+        let config = config();
+        let trace = Trace::new(&config, &json!({"mode":"session"}), Arc::new(Mutex::new(Heartbeat::default())));
+        trace.helper(&helper_record("started", 1000));
+        target(&mut registry().lock().unwrap(), &config).last_probe = Some(Instant::now());
+        trace.fail("closed", "original EOF", None);
+        let mut exit = helper_record("exit", 2000);
+        exit["exitCode"] = json!(1);
+        exit["exitReason"] = json!("stdin_error");
+        trace.stderr(format!("LOCUS_SSH_HELPER {exit}\n").as_bytes());
+        let failure = overview(&config).last_failure.unwrap();
+        assert_eq!(failure.message, "original EOF");
+        assert_eq!(failure.transport.helper.unwrap().exit_reason.as_deref(), Some("stdin_error"));
+        let other = Trace::new(&config, &json!({"mode":"session"}), Arc::new(Mutex::new(Heartbeat::default())));
+        other.fail("closed", "new failure", None);
+        trace.stderr(format!("LOCUS_SSH_HELPER {exit}\n").as_bytes());
+        let failure = overview(&config).last_failure.unwrap();
+        assert_eq!(failure.message, "new failure");
+        assert!(failure.transport.helper.is_none());
     }
     #[test]
     fn intentional_stop_and_one_shot_completion_are_not_connection_failures() {

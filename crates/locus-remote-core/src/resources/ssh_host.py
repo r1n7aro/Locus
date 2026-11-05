@@ -25,7 +25,13 @@ import urllib.request
 import uuid
 
 PROTOCOL = 1
+HELPER_VERSION = "3"
+LIFECYCLE_LIMIT = 128
 MIN_VERSION = (2, 1, 299)
+# Native multi-agent conversations need these Mods hooks (keep in sync with
+# claude_code_cli::NATIVE_AGENTS_MIN_VERSION). Automatic setup installs it.
+NATIVE_AGENTS_VERSION = (2, 1, 312)
+INSTALL_VERSION = "2.1.312"
 MAX_FRAME = 32 * 1024 * 1024
 output_lock = threading.Lock()
 closing = threading.Event()
@@ -35,6 +41,10 @@ options_lock = threading.Lock()
 options = {}
 last_contact = time.monotonic()
 child_pid = None
+child_reaped = False
+shutdown_status = None
+lifecycle = None
+lifecycle_path = None
 keychain_unlock_tested = False
 archive_lock = threading.Lock()
 ARCHIVE_LIMIT = 256 * 1024 * 1024
@@ -42,16 +52,24 @@ ARCHIVE_CHUNK = 192 * 1024
 
 
 def frame(value, announce_history_size=False):
-    encoded = None
+    if lifecycle is not None and value.get("type") in ("progress", "hello", "error", "exit"):
+        value = dict(value, helper=dict(lifecycle))
+    # ASCII JSON: len is the byte count including LF. Serialize payloads once.
+    encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n"
+    progress = None
     if announce_history_size:
-        encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n"
-        # ASCII JSON: len is the exact byte count, including its terminating LF.
-        # Serialize the large hello only once; never add progress to normal PTY
-        # traffic or send history contents as diagnostic metadata.
-        frame({"type": "progress", "protocol": PROTOCOL,
-               "stage": "history_transfer", "bytes": len(encoded)})
+        progress = {"type": "progress", "protocol": PROTOCOL,
+                    "stage": "history_transfer", "bytes": len(encoded)}
+    elif value.get("type") in ("archive_chunk", "archive_result"):
+        progress = {"type": "progress", "protocol": PROTOCOL, "stage": "archive_transfer",
+                    "id": value["id"], "bytes": len(encoded)}
     with output_lock:
-        sys.stdout.write(encoded if encoded is not None else json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n")
+        # Marker + payload are one ordered pair: a heartbeat or another lane
+        # cannot slip between them and falsely renew a bulk transfer deadline.
+        if progress is not None:
+            sys.stdout.write(json.dumps(progress, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+        sys.stdout.write(encoded)
         sys.stdout.flush()
 
 
@@ -73,6 +91,128 @@ def private_write(path, data):
         file.flush()
         os.fsync(file.fileno())
     os.replace(temporary, path)
+
+
+class HostSignal(BaseException):
+    def __init__(self, signum):
+        self.signum = signum
+
+
+def exception_status(error):
+    if isinstance(error, HostSignal):
+        return 128 + error.signum, "signal_" + signal.Signals(error.signum).name.lower()
+    if isinstance(error, KeyboardInterrupt):
+        return 130, "keyboard_interrupt"
+    if isinstance(error, SystemExit):
+        code = error.code if isinstance(error.code, int) else (0 if error.code is None else 1)
+        return code if 0 <= code <= 255 else 1, "system_exit"
+    return 1, "stdout_closed" if isinstance(error, BrokenPipeError) else "unhandled_exception"
+
+
+def request_shutdown(reason, code=0):
+    global shutdown_status
+    # Keep the initiating reason, not a secondary broken pipe during teardown.
+    if shutdown_status is None:
+        shutdown_status = (code, reason)
+    closing.set()
+
+
+def handle_signal(signum, _frame):
+    # Do not take Python locks inside a signal handler.
+    raise HostSignal(signum)
+
+
+def initialize_lifecycle():
+    global lifecycle, lifecycle_path
+    source = globals().get("_locus_source")
+    if source is None and "__file__" in globals():
+        source = Path(__file__).read_bytes()
+    started = time.time_ns() // 1000000
+    lifecycle = {"helperVersion": HELPER_VERSION,
+                 "sourceHash": hashlib.sha256(source).hexdigest() if isinstance(source, bytes) else None,
+                 "hostPid": os.getpid(), "claudePid": None, "startedAt": started}
+    directory = Path.home() / ".local/share/locus/claude-ssh/v1/diagnostics"
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lifecycle_path = directory / ("helper-%d-%d.json" % (started, os.getpid()))
+        # Only lifecycle boundaries touch disk; never log traffic or credentials.
+        old = sorted(directory.glob("helper-*.json"), key=lambda p: p.name)
+        for path in old[:max(0, len(old) - LIFECYCLE_LIMIT + 1)]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    except OSError:
+        lifecycle_path = None
+
+
+def record_lifecycle(event, **fields):
+    if lifecycle is None:
+        return
+    lifecycle.update(fields, event=event, claudePid=child_pid if child_pid and child_pid > 0 else None,
+                     updatedAt=time.time_ns() // 1000000)
+    encoded = json.dumps(lifecycle, ensure_ascii=True, separators=(",", ":"))
+    try:
+        if lifecycle_path is not None:
+            private_write(lifecycle_path, encoded + "\n")
+    except Exception:
+        pass
+    try:
+        # Never acquire Python's buffered stderr lock or wait for a dead SSH peer.
+        os.set_blocking(2, False)
+        os.write(2, ("LOCUS_SSH_HELPER " + encoded + "\n").encode("ascii"))
+    except (OSError, ValueError):
+        pass
+
+
+def cleanup(action):
+    try:
+        action()
+    except BaseException as error:
+        if lifecycle is not None:
+            lifecycle["cleanupError"] = type(error).__name__[:80]
+        request_shutdown("cleanup_error", 1)
+
+
+def reap_child():
+    global child_reaped
+    if not child_pid or child_pid < 0 or child_reaped:
+        return
+    deadline = time.monotonic() + 1
+    while True:
+        try:
+            pid, status = os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError:
+            child_reaped = True
+            return
+        if pid:
+            child_reaped = True
+            if lifecycle is not None:
+                lifecycle["claudeExitCode"] = os.waitstatus_to_exitcode(status)
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Child reap deadline expired")
+        time.sleep(0.01)
+
+
+def exit_process(code, reason):
+    try:
+        # Signals during cleanup must not interrupt the unconditional _exit.
+        if threading.current_thread() is threading.main_thread():
+            for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+                if hasattr(signal, name):
+                    signal.signal(getattr(signal, name), signal.SIG_IGN)
+        closing.set()
+        cleanup(terminate_child)
+        cleanup(reap_child)
+        if lifecycle is not None and lifecycle.get("cleanupError") and code == 0:
+            code = 1
+            if reason == "completed":
+                reason = "cleanup_error"
+        record_lifecycle("exit", exitCode=code, exitReason=reason)
+    finally:
+        # Includes failed cleanup/logging and live daemon threads in buffered I/O.
+        os._exit(code)
 
 
 def mac_keychain(password=None):
@@ -173,7 +313,9 @@ def apply_runtime_env(env, config):
 
 
 def runtime_cli_settings(config, permission_mode):
-    settings = {"idleCompaction": bool(config.get("runtimeSettings", {}).get("idleCompaction", False))}
+    # Keep in sync with RuntimeSettings::cli_settings: refuse other sessions' peers.
+    settings = {"idleCompaction": bool(config.get("runtimeSettings", {}).get("idleCompaction", False)),
+                "crossSessionInbound": "refuse"}
     if permission_mode == "bypassPermissions":
         settings["skipDangerousModePermissionPrompt"] = True
     return settings
@@ -243,30 +385,57 @@ def inspect(config):
     return cli, source, env, info
 
 
+def version_at_least(value, minimum):
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value or "")
+    return bool(match and tuple(map(int, match.groups())) >= minimum)
+
+
+def install_claude(env):
+    frame({"type": "progress", "message": "Installing Claude Code " + INSTALL_VERSION})
+    # This downloads the official installer only, never a model request.
+    if shutil.which("curl", path=env["PATH"]):
+        installer = subprocess.check_output(["curl", "-fsSL", "--max-time", "60", "https://claude.ai/install.sh"], env=env, timeout=65)
+    else:
+        installer = urllib.request.urlopen("https://claude.ai/install.sh", timeout=30).read(2 * 1024 * 1024)
+    if len(installer) >= 2 * 1024 * 1024:
+        raise RuntimeError("Unexpectedly large Claude installer")
+    process = subprocess.run(["bash", "-s", "--", INSTALL_VERSION], input=installer,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600, env=env)
+    if process.returncode:
+        raise RuntimeError("Remote Claude installation failed: " + process.stdout.decode(errors="replace")[-1600:])
+
+
 def prepare(config, mode):
     cli, source, env, info = inspect(config)
     if mode == "inspect":
         return cli, source, env, info
     if not config.get("authorizedSetup"):
         raise PermissionError("Authorize remote environment setup in Locus settings before connecting")
+    # A native-agent launch requires NATIVE_AGENTS_VERSION. Setup while native
+    # agents are enabled installs it when it can; a failure there keeps a
+    # Mods-capable CLI, and new conversations then use Locus subagents.
+    launch_native = config.get("nativeAgents") is True
+    wants_native = launch_native or config.get("nativeMultiAgent") is True
+    native_ready = version_at_least(info["cliVersion"], NATIVE_AGENTS_VERSION)
     if config.get("cliPath") and not info["cliSupported"]:
         raise RuntimeError("The selected Claude executable is too old for Mods. Clear the custom path to install automatically.")
-    if not info["cliSupported"]:
-        frame({"type": "progress", "message": "Installing Claude Code 2.1.299"})
-        # This downloads the official installer only, never a model request.
-        if shutil.which("curl", path=env["PATH"]):
-            installer = subprocess.check_output(["curl", "-fsSL", "--max-time", "60", "https://claude.ai/install.sh"], env=env, timeout=65)
+    if config.get("cliPath") and launch_native and not native_ready:
+        raise RuntimeError("The selected Claude executable is too old for native agents (Claude Code " + INSTALL_VERSION
+                           + " or later). Clear the custom path to install automatically.")
+    if not config.get("cliPath") and (not info["cliSupported"] or (wants_native and not native_ready)):
+        try:
+            install_claude(env)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            if not info["cliSupported"] or launch_native:
+                raise
+            frame({"type": "progress", "message": "Claude Code " + INSTALL_VERSION
+                   + " could not be installed; native agents stay off. " + str(error)[-400:]})
         else:
-            installer = urllib.request.urlopen("https://claude.ai/install.sh", timeout=30).read(2 * 1024 * 1024)
-        if len(installer) >= 2 * 1024 * 1024:
-            raise RuntimeError("Unexpectedly large Claude installer")
-        process = subprocess.run(["bash", "-s", "--", "2.1.299"], input=installer,
-                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600, env=env)
-        if process.returncode:
-            raise RuntimeError("Remote Claude installation failed: " + process.stdout.decode(errors="replace")[-1600:])
-        cli, source, env, info = inspect({**config, "cliPath": None})
-        if not info["cliSupported"]:
-            raise RuntimeError("The installed CLI does not support the required Mods protocol")
+            cli, source, env, info = inspect({**config, "cliPath": None})
+            if not info["cliSupported"]:
+                raise RuntimeError("The installed CLI does not support the required Mods protocol")
+            if launch_native and not version_at_least(info["cliVersion"], NATIVE_AGENTS_VERSION):
+                raise RuntimeError("The installed Claude Code does not support native agents")
     root = Path.home() / ".local/share/locus/claude-ssh/v1"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if os.path.commonpath([str(root.resolve()), str(Path.home().resolve())]) != str(Path.home().resolve()):
@@ -295,6 +464,9 @@ def options_view(value, view):
         result = {key: value.get(key) for key in ("active", "inputId", "terminalText", "imageCount")}
         if value.get("insertion"):
             result["insertion"] = {key: value["insertion"].get(key) for key in ("inputId", "terminalText", "imageCount")}
+        # Same as mod_bridge::options_view: user stops of native subagents.
+        if isinstance(value.get("agentControl"), dict):
+            result["agentControl"] = value["agentControl"]
         return result
     if view == "prompt":
         return {"systemPrompt": value.get("systemPrompt")}
@@ -304,7 +476,11 @@ def options_view(value, view):
 
 
 ASYNC_EVENTS = frozenset(("text", "thinking", "tool_start", "step_start"))
-CONTROL_EVENTS = frozenset(("input_ready", "input_images", "input_staging_error", "input_queued", "input_consumed", "turn_interrupted", "bridge_health", "bridge_fault"))
+# Native subagent registration, routing and stops are answered at the Locus
+# host's ingress (or by its agent pump): never behind a lane's tool call.
+CONTROL_EVENTS = frozenset(("input_ready", "input_images", "input_staging_error", "input_queued", "input_consumed", "turn_interrupted", "bridge_health", "bridge_fault",
+                            "agent_spawn", "agent_finished", "agent_route", "agent_notification", "control_done"))
+PENDING_LIMIT = 256
 
 
 class OrderedBridgeQueue:
@@ -358,7 +534,7 @@ class OrderedBridgeQueue:
                     "ticket": uuid.uuid4().hex, "receipt": {"event": threading.Event(), "value": None}}
             if not asynchronous:
                 with pending_lock:
-                    if len(pending) >= 64:
+                    if len(pending) >= PENDING_LIMIT:
                         raise BufferError("Too many pending critical bridge calls")
                     pending[item["ticket"]] = item["receipt"]
             self.items.append(item)
@@ -412,6 +588,39 @@ class OrderedBridgeQueue:
             closing.set()
         finally:
             self.fail("SSH event delivery stopped; resume from native history")
+
+
+class BridgeLanes:
+    """One ordered lane per agent (the main agent, and each native subagent by
+    agentId). Each lane keeps its FIFO order, but a long tool call in one never
+    holds up another: Locus serves subagents in parallel with the main agent.
+    """
+    MAX_LANES = 32
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.lanes = {}
+
+    def lane(self, payload):
+        agent = payload.get("agentId")
+        key = agent if isinstance(agent, str) and agent else ""
+        with self.lock:
+            queue = self.lanes.get(key)
+            if queue is None:
+                if len(self.lanes) >= self.MAX_LANES:
+                    raise BufferError("Too many concurrent Claude subagents")
+                queue = self.lanes[key] = OrderedBridgeQueue()
+                threading.Thread(target=queue.run, daemon=True).start()
+            return queue
+
+    def submit(self, payload, asynchronous=False):
+        return self.lane(payload).submit(payload, asynchronous)
+
+    def fail(self, message):
+        with self.lock:
+            lanes = list(self.lanes.values())
+        for queue in lanes:
+            queue.fail(message)
 
 
 class Bridge(http.server.BaseHTTPRequestHandler):
@@ -494,7 +703,7 @@ class Bridge(http.server.BaseHTTPRequestHandler):
             ticket = uuid.uuid4().hex
             receipt = {"event": threading.Event(), "value": None}
             with pending_lock:
-                if len(pending) >= 64:
+                if len(pending) >= PENDING_LIMIT:
                     return self.respond(503, {"error": "Too many pending calls"})
                 pending[ticket] = receipt
             frame({"type": "call", "id": ticket, "payload": payload})
@@ -521,7 +730,8 @@ class Bridge(http.server.BaseHTTPRequestHandler):
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 16
-    slots = threading.BoundedSemaphore(32)
+    # Each waiting Mod hook holds one request; native subagents add their own.
+    slots = threading.BoundedSemaphore(96)
 
     def process_request(self, request, client_address):
         if not self.slots.acquire(blocking=False):
@@ -546,7 +756,7 @@ class Server(http.server.ThreadingHTTPServer):
 
 
 def terminate_child():
-    if child_pid is not None:
+    if child_pid is not None and child_pid > 0 and not child_reaped:
         try:
             os.killpg(child_pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -565,6 +775,7 @@ def stdin_loop(master, root):
         while not closing.is_set():
             value = read_frame()
             if value is None:
+                request_shutdown("stdin_eof")
                 break
             last_contact = time.monotonic()
             kind = value.get("type")
@@ -606,25 +817,34 @@ def stdin_loop(master, root):
             elif kind == "archive":
                 threading.Thread(target=archive_download, args=(root, value), daemon=True).start()
             elif kind == "close":
+                request_shutdown("client_close")
                 break
             else:
                 raise ValueError("Unknown SSH frame")
+    except BaseException as error:
+        if lifecycle is not None:
+            lifecycle["errorType"] = type(error).__name__[:80]
+        request_shutdown("stdin_error", 1)
     finally:
         closing.set()
 
 
 def watchdog():
-    # This must be independent of stdout: a blackholed SSH connection can block
-    # a terminal frame write while the remote PTY continues running.
-    while not closing.wait(0.5):
-        if time.monotonic() - last_contact > 25:
-            closing.set()
-            terminate_child()
-            os._exit(1)
-    terminate_child()
-    # Give normal cleanup a chance, but don't leave a host stuck writing stdout.
-    time.sleep(2)
-    os._exit(0)
+    # Independent of stdout: neither reporting nor cleanup may bypass _exit.
+    try:
+        while not closing.wait(0.5):
+            if time.monotonic() - last_contact > 25:
+                request_shutdown("heartbeat_timeout", 1)
+                return
+        # Give the main thread its bounded cleanup window, even if stdout stalls.
+        time.sleep(2)
+    except BaseException as error:
+        if lifecycle is not None:
+            lifecycle["errorType"] = type(error).__name__[:80]
+        request_shutdown("watchdog_error", 1)
+    finally:
+        code, reason = shutdown_status or (1, "watchdog_error")
+        exit_process(code, reason)
 
 
 def native_storage(root, shared_profile=None):
@@ -855,7 +1075,7 @@ def settle_dispatches(root, native_id, transcript):
 def archive_name(name):
     if name == "transcript.jsonl":
         return True
-    return bool(re.fullmatch(r"(?:tasks/[a-zA-Z0-9_-]+\.json|dispatch/[a-f0-9]+\.json|attachments/LOCUS_INPUT_[a-f0-9]{32}/(?:image|file)-[0-9]+\.(?:png|jpg|gif|webp|txt))", name))
+    return bool(re.fullmatch(r"(?:tasks/[a-zA-Z0-9_-]+\.json|dispatch/[a-f0-9]+\.json|subagents/agent-[a-zA-Z0-9_-]{1,128}\.(?:jsonl|meta\.json)|attachments/LOCUS_INPUT_[a-f0-9]{32}/(?:image|file)-[0-9]+\.(?:png|jpg|gif|webp|txt))", name))
 
 
 def archive_sources(root, native_id, allow_missing=False, frozen_fork=False):
@@ -866,8 +1086,11 @@ def archive_sources(root, native_id, allow_missing=False, frozen_fork=False):
     for path in paths:
         safe_archive_path(path, project)
     files = {"transcript.jsonl": paths[0]} if paths else {}
+    # Native subagent transcripts live beside the transcript they belong to.
+    subagents = paths[0].parent / paths[0].stem / "subagents" if paths else project / native_id / "subagents"
     for prefix, directory, pattern in [("tasks", profile / "tasks" / native_id, "*.json"),
                                        ("dispatch", root / "tool-dispatch" / native_id, "*.json"),
+                                       ("subagents", subagents, "agent-*"),
                                        ("attachments", root / "attachments", "*/*")]:
         for path in directory.glob(pattern):
             name = prefix + "/" + path.relative_to(directory).as_posix()
@@ -923,7 +1146,8 @@ def archive_download(root, request):
         settle_dispatches(root, native_id, transcript)
         manifest, changes, total, transferred, incomplete = {}, [], 0, 0, False
         for name, path in sorted(sources.items()):
-            data = transcript if name == "transcript.jsonl" else stable_archive_bytes(path)
+            # A running subagent's transcript also grows record by record.
+            data = transcript if name == "transcript.jsonl" else stable_archive_bytes(path, name.endswith(".jsonl"))
             if name == "transcript.jsonl":
                 incomplete = path.stat().st_size > len(data)
             total += len(data)
@@ -961,6 +1185,8 @@ def restore_path(root, native_id, name):
         target, boundary = profile / "tasks" / native_id / name.split("/", 1)[1], profile
     elif name.startswith("dispatch/"):
         target, boundary = root / "tool-dispatch" / native_id / name.split("/", 1)[1], root
+    elif name.startswith("subagents/"):
+        target, boundary = project / native_id / "subagents" / name.split("/", 1)[1], project
     else:
         target, boundary = root / name, root
     safe_archive_path(target, boundary)
@@ -1061,6 +1287,33 @@ def restore_commit(root, state, request):
     return {"nativeId": native_id, "transferredBytes": state["received"], "sourceRoot": str(root), "manifest": state["manifest"]}
 
 
+def archive_read_listener():
+    """Reusable download-only connection. Every request owns its session scope.
+
+    Never start Claude, unlock its keychain, or accept restore/write operations.
+    Existing dispatch settlement inside archive_download remains part of backup.
+    """
+    frame({"type": "hello", "protocol": PROTOCOL, "info": {"pythonInstalled": True,
+           "platform": sys.platform, "cliSupported": False, "authenticated": False}})
+    while True:
+        request = read_frame()
+        if request is None or request.get("type") == "close":
+            request_shutdown("stdin_eof" if request is None else "client_close")
+            return
+        if request.get("type") == "ping":
+            frame({"type": "pong", "id": request.get("id")})
+            continue
+        try:
+            if request.get("type") != "archive":
+                raise ValueError("Download connections do not accept restore operations")
+            key = str(uuid.UUID(request["sessionKey"]))
+            uuid.UUID(request["nativeId"])
+            root = Path.home() / ".local/share/locus/claude-ssh/v1/sessions" / key
+            archive_download(root, request)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            frame({"type": "archive_error", "id": request.get("id"), "message": "Invalid archive download request"})
+
+
 def archive_listener(config):
     root = Path.home() / ".local/share/locus/claude-ssh/v1/sessions" / str(uuid.UUID(config["sessionKey"]))
     frame({"type": "hello", "protocol": PROTOCOL, "info": {"pythonInstalled": True,
@@ -1070,6 +1323,7 @@ def archive_listener(config):
         while True:
             request = read_frame()
             if request is None or request.get("type") == "close":
+                request_shutdown("stdin_eof" if request is None else "client_close")
                 return
             kind = request.get("type")
             if kind == "ping":
@@ -1229,7 +1483,10 @@ def transcript_snapshot(path, at, after_compact):
                 if found:
                     break
                 raise ValueError("Claude transcript contains an incomplete row before the requested boundary")
-            if found and (value.get("attachment", {}).get("type") == "queued_command" or (value.get("uuid") and value.get("type") != "attachment" and not (value.get("type") == "user" and value.get("isMeta") is True))):
+            # After a compaction summary Claude records the /compact command echo
+            # and then the post-compaction attachments, including the Locus
+            # carry-forward (SessionStart context). They belong to the summary.
+            if found and (value.get("attachment", {}).get("type") == "queued_command" or (value.get("uuid") and value.get("type") != "attachment" and not (value.get("type") == "user" and value.get("isMeta") is True) and not (after_compact and hidden_native_user(value)))):
                 break
             snapshot.append(line.rstrip("\n") + "\n")
             if value.get("uuid") == at:
@@ -1391,10 +1648,12 @@ def run(config):
     if config.get("protocol") != PROTOCOL:
         raise ValueError("Unsupported Locus SSH protocol")
     mode = config.get("mode", "session")
-    if mode not in ("inspect", "prepare", "session", "fork", "rewind", "history", "archive"):
+    if mode not in ("inspect", "prepare", "session", "fork", "rewind", "history", "archive", "archive_read"):
         raise ValueError("Invalid SSH operation")
     frame({"type": "progress", "protocol": PROTOCOL, "source": "helper",
-           "stage": "history" if mode in ("history", "archive") else "environment"})
+           "stage": "history" if mode in ("history", "archive", "archive_read") else "environment"})
+    if mode == "archive_read":
+        return archive_read_listener()
     if mode == "archive":
         return archive_listener(config)
     if mode == "history":
@@ -1488,15 +1747,29 @@ def run_session(config, cli, source, env, info, root):
     permission_mode = config.get("permissionMode", "auto")
     if permission_mode not in ("auto", "bypassPermissions"):
         raise ValueError("Invalid Claude permission mode")
+    # Keep in sync with tui.rs: native-agent conversations add only the
+    # delegation tools; other launches keep the historical arguments.
+    native_agents = config.get("nativeAgents") is True
+    allowed = ["TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "WebFetch", "ToolSearch"]
+    if native_agents:
+        allowed += ["Agent", "SendMessage"]
+        for key in ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "CLAUDE_AUTO_BACKGROUND_TASKS"):
+            env.pop(key, None)
+        # Same as claude_launch::NATIVE_AGENT_ENV: fork subagents would force
+        # every Agent into the background.
+        env["CLAUDE_CODE_FORK_SUBAGENT"] = "0"
     args = [cli, "--plugin-dir", str(plugin), "--setting-sources", "", "--strict-mcp-config",
-            "--allowedTools", "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "WebSearch", "WebFetch", "ToolSearch",
+            "--allowedTools", *allowed,
             "--disallowedTools", "mcp__locus__web_fetch",
             "--permission-mode", permission_mode, "--system-prompt-snapshot", "off"]
-    if config.get("nativeToolSearch"):
-        native_tools = config.get("nativeTools")
-        if not isinstance(native_tools, str) or not native_tools or "ToolSearch" not in native_tools.split(",") or "TaskList" not in native_tools.split(","):
-            raise ValueError("Native tool loading requires the pinned builtin tool list")
-        args += ["--tools", native_tools]
+    # Every loading mode pins the adapted builtins; without the list Claude also
+    # offers NotebookEdit and other tools the Mod always denies.
+    native_tools = config.get("nativeTools")
+    if not isinstance(native_tools, str) or not native_tools or "ToolSearch" not in native_tools.split(",") or "TaskList" not in native_tools.split(","):
+        raise ValueError("Claude launch requires the pinned builtin tool list")
+    if ("Agent" in native_tools.split(",")) != native_agents:
+        raise ValueError("Claude native agent tools do not match the launch request")
+    args += ["--tools", native_tools]
     args += ["--settings", json.dumps(runtime_cli_settings(config, permission_mode))]
     if config.get("model"):
         args += ["--model", config["model"]]
@@ -1513,31 +1786,39 @@ def run_session(config, cli, source, env, info, root):
     host_pid = os.getpid()
     child_pid, master = pty.fork()
     if child_pid == 0:
-        # Linux also stops Claude if this helper itself is killed abruptly.
-        if sys.platform.startswith("linux"):
-            import ctypes
-            if ctypes.CDLL(None).prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != host_pid:
-                os._exit(1)
-        server.server_close()
-        os.chdir(cwd)
-        os.execvpe(cli, args, env)
-    import fcntl
-    import struct
-    import termios
-    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
-    last_contact = time.monotonic()
-    # Start after fork: the child must not inherit locks held by queue threads.
-    server.events = OrderedBridgeQueue()
-    threading.Thread(target=server.events.run, daemon=True).start()
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    threading.Thread(target=stdin_loop, args=(master, root), daemon=True).start()
-    threading.Thread(target=watchdog, daemon=True).start()
-    info["sessionRoot"] = str(root)
-    frame({"type": "hello", "protocol": PROTOCOL, "info": info, "pid": child_pid, "hostPid": host_pid, "root": str(root)})
-    trust = StartupTrustPrompt(cwd, config.get("authorizedSetup") is True)
+        try:
+            for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+                if hasattr(signal, name):
+                    signal.signal(getattr(signal, name), signal.SIG_DFL)
+            # Linux also stops Claude if this helper itself is killed abruptly.
+            if sys.platform.startswith("linux"):
+                import ctypes
+                if ctypes.CDLL(None).prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != host_pid:
+                    os._exit(1)
+            server.server_close()
+            os.chdir(cwd)
+            os.execvpe(cli, args, env)
+        finally:
+            # Failed exec must not run the parent's cleanup or lifecycle journal.
+            os._exit(127)
     try:
+        import fcntl
+        import struct
+        import termios
+        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        last_contact = time.monotonic()
+        # Start after fork: the child must not inherit locks held by queue threads.
+        server.events = BridgeLanes()
+        threading.Thread(target=watchdog, daemon=True).start()
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=stdin_loop, args=(master, root), daemon=True).start()
+        info["sessionRoot"] = str(root)
+        record_lifecycle("ready")
+        frame({"type": "hello", "protocol": PROTOCOL, "info": info, "pid": child_pid, "hostPid": host_pid, "root": str(root)})
+        trust = StartupTrustPrompt(cwd, config.get("authorizedSetup") is True)
         while not closing.is_set():
             if time.monotonic() - last_contact > 25:
+                request_shutdown("heartbeat_timeout", 1)
                 raise TimeoutError("SSH heartbeat expired; remote Claude was stopped")
             readable, _, _ = select.select([master], [], [], 0.2)
             data = b""
@@ -1545,40 +1826,61 @@ def run_session(config, cli, source, env, info, root):
                 try:
                     data = os.read(master, 8192)
                 except OSError:
+                    request_shutdown("pty_closed")
                     break
                 if not data:
+                    request_shutdown("claude_exit")
                     break
                 frame({"type": "terminal", "data": base64.b64encode(data).decode()})
             if not hasattr(server, "native_id"):
                 approval = trust.advance(data)
                 if approval:
                     os.write(master, approval)
+        if lifecycle is not None:
+            code, reason = shutdown_status or (0, "completed")
+            lifecycle.update(exitCode=code, exitReason=reason)
         frame({"type": "exit"})
+    except BaseException as error:
+        code, reason = exception_status(error)
+        request_shutdown(reason, code)
+        raise
     finally:
         closing.set()
-        terminate_child()
-        server.server_close()
-        os.close(master)
+        cleanup(terminate_child)
+        cleanup(server.server_close)
+        cleanup(lambda: os.close(master))
+        cleanup(reap_child)
+
+
+def main():
+    code, reason = 1, "bootstrap_error"
+    try:
+        os.umask(0o077)
+        for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            if hasattr(signal, name):
+                signal.signal(getattr(signal, name), handle_signal)
+        initialize_lifecycle()
+        record_lifecycle("started")
+        config = read_frame()
+        if config is None:
+            request_shutdown("stdin_eof")
+        else:
+            run(config)
+        code, reason = shutdown_status or (0, "completed")
+    except BaseException as error:
+        code, reason = exception_status(error)
+        request_shutdown(reason, code)
+        code, reason = shutdown_status
+        if lifecycle is not None:
+            lifecycle.update(errorType=type(error).__name__[:80], exitCode=code, exitReason=reason)
         try:
-            os.waitpid(child_pid, 0)
-        except ChildProcessError:
-            pass
+            frame({"type": "error", "message": str(error) or reason})
+        except BaseException as reporting_error:
+            if lifecycle is not None:
+                lifecycle["reportingError"] = type(reporting_error).__name__[:80]
+    finally:
+        exit_process(code, reason)
 
 
 if __name__ == "__main__":
-    os.umask(0o077)
-    exit_code = 0
-    try:
-        run(read_frame())
-    except Exception as error:
-        closing.set()
-        terminate_child()
-        try:
-            frame({"type": "error", "message": str(error)})
-        except BrokenPipeError:
-            pass
-        exit_code = 1
-    # Reader/HTTP threads are daemonized and may be blocked in buffered I/O.
-    # All owned children are already reaped; avoid interpreter shutdown racing
-    # those locks (particularly when the SSH stdin remains open after timeout).
-    os._exit(exit_code)
+    main()

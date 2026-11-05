@@ -3,82 +3,18 @@
 //! errors must not become retryable through a broad keyword match.
 use std::{future::Future, time::Duration};
 
-const DISCONNECTED: &str = "Claude transport disconnected: ";
 pub(crate) const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(5),
     Duration::from_secs(10),
 ];
 
-pub(super) fn disconnected(reason: impl AsRef<str>) -> String {
-    format!("{DISCONNECTED}{}", reason.as_ref())
-}
-
-pub(crate) fn is_disconnected(error: &str) -> bool {
-    error.starts_with(DISCONNECTED)
-}
-
-/// Adding a stage must not hide the transport tag from the bounded retry loop.
-pub(super) fn with_context(context: &str, error: String) -> String {
-    match error.strip_prefix(DISCONNECTED) {
-        Some(reason) => disconnected(format!("{context}: {reason}")),
-        None => format!("{context}: {error}"),
-    }
-}
+pub use locus_remote_core::claude_ssh::errors::{disconnected, is_disconnected, with_context, startup_rejected, ssh_startup_error};
 
 fn with_first_disconnect(error: String, first: Option<&str>) -> String {
     match first.filter(|first| !error.contains(*first)) {
         Some(first) => format!("{error}\nFirst disconnect: {first}"),
         None => error,
-    }
-}
-
-// OpenSSH has no structured startup verdict. Classify its bounded diagnostic
-// only at the SSH startup boundary, never arbitrary model/tool error text.
-pub(super) fn startup_rejected(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    [
-        "permission denied",
-        "host key verification failed",
-        "remote host identification has changed",
-        "invalid",
-        "not found",
-        "keychain",
-        "authentication",
-        "not logged in",
-        "plugin validation failed",
-    ]
-    .iter()
-    .any(|s| lower.contains(s))
-}
-
-pub(super) fn ssh_startup_error(error: String) -> String {
-    if startup_rejected(&error) {
-        return error
-            .strip_prefix(DISCONNECTED)
-            .unwrap_or(&error)
-            .to_string();
-    }
-    if is_disconnected(&error) {
-        return error;
-    }
-    let lower = error.to_ascii_lowercase();
-    if [
-        "connection timed out",
-        "connection refused",
-        "connection reset",
-        "connection closed",
-        "broken pipe",
-        "network is unreachable",
-        "no route to host",
-        "operation timed out",
-    ]
-    .iter()
-    .any(|s| lower.contains(s))
-    {
-        disconnected(error)
-    } else {
-        error
     }
 }
 

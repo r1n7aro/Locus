@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 if os.name == "nt":
     sys.modules.setdefault("pty", types.ModuleType("pty"))
 host = types.ModuleType("locus_ssh_host")
-source = Path(__file__).resolve().parents[1] / "src/llm/claude_code_cli/ssh_host.py"
+source = Path(__file__).resolve().parents[2] / "crates/locus-remote-core/src/resources/ssh_host.py"
 exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"), host.__dict__)
 
 

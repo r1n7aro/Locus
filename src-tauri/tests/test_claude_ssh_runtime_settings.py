@@ -16,7 +16,7 @@ from unittest.mock import patch
 if os.name == "nt":
     sys.modules.setdefault("pty", types.ModuleType("pty"))
 host = types.ModuleType("locus_ssh_host")
-source = Path(__file__).resolve().parents[1] / "src/llm/claude_code_cli/ssh_host.py"
+source = Path(__file__).resolve().parents[2] / "crates/locus-remote-core/src/resources/ssh_host.py"
 exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"), host.__dict__)
 
 
@@ -70,9 +70,11 @@ class RuntimeSettingsTests(unittest.TestCase):
                     patch.object(host, "validate_plugin"), \
                     patch.object(host, "acquire_session_lease", side_effect=lambda _: nullcontext()), \
                     patch.object(host, "Server"), patch.object(host.pty, "fork", return_value=(0, 1), create=True), \
-                    patch.object(os, "chdir"), patch.object(os, "execvpe", side_effect=launch):
+                    patch.object(os, "chdir"), patch.object(os, "execvpe", side_effect=launch), \
+                    patch.object(host.signal, "signal"), patch.object(os, "_exit", side_effect=Launched):
                 config = {"protocol": 1, "sessionKey": str(uuid.uuid4()), "cliPath": str(cli), "authorizedSetup": True,
-                          "modSource": "test", "token": "test", "options": {}}
+                          "modSource": "test", "token": "test", "options": {},
+                          "nativeTools": "TaskCreate,TaskGet,TaskList,TaskUpdate,ToolSearch"}
                 for window in (350_000, None):
                     with self.assertRaises(Launched):
                         host.run({**config, "runtimeSettings": {"autoCompactWindow": window}})

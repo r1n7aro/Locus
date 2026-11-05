@@ -2,21 +2,10 @@
 use crate::error::{AppError, ErrorSeverity};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::OnceLock;
 
 const PENDING_TOOLS: &str = "Claude did not return every tool result. Verify local state before continuing; no result was fabricated and no remote fallback was executed.";
 
-pub(super) fn plain_text(text: &str) -> String {
-    static ESCAPES: OnceLock<regex::Regex> = OnceLock::new();
-    let escapes = ESCAPES.get_or_init(|| regex::Regex::new(
-        r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])"
-    ).expect("terminal escape pattern"));
-    let plain = escapes.replace_all(text, "");
-    let plain: String = plain.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')).collect();
-    let plain = plain.replace('\r', "\n");
-    let plain = plain.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n");
-    plain.chars().rev().take(6000).collect::<Vec<_>>().into_iter().rev().collect()
-}
+pub(super) use locus_remote_core::claude_ssh::errors::plain_text;
 
 #[derive(Default)]
 pub(super) struct TurnDiagnostics {

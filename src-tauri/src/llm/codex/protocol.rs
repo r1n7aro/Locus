@@ -9,7 +9,7 @@ pub(super) const LITE_METADATA: &str = "ws_request_header_x_openai_internal_code
 pub(super) const TURN_STATE_METADATA: &str = "x-codex-turn-state";
 
 pub(super) fn uses_lite(model: &str) -> bool {
-    let model = model.strip_prefix("openai/").unwrap_or(model);
+    let model = super::protocol_model_name(model);
     model == "gpt-6-astra" || model.starts_with("gpt-6-astra-")
 }
 

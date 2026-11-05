@@ -1,5 +1,6 @@
 //! Startup stages come from the helper, not guessed from stderr or elapsed time.
-use super::super::{diagnostics, turn_retry};
+use super::errors as turn_retry;
+use super::errors as diagnostics;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -21,31 +22,31 @@ impl Stage {
     }
 }
 
-pub(crate) struct Handshake {
+pub struct Handshake {
     stage: Stage,
     mode: String,
 }
 impl Handshake {
-    pub(crate) fn new(request: &Value) -> Self {
+    pub fn new(request: &Value) -> Self {
         Self { stage: Stage::Ssh, mode: request["mode"].as_str().unwrap_or("session").into() }
     }
 
-    pub(crate) fn progress(&mut self, frame: &Value) {
+    pub fn progress(&mut self, frame: &Value) {
         if frame["protocol"] != 1 || frame["type"] != "progress" { return; }
         // Ignore unknown stages and backwards transitions. A progress frame is
         // evidence that SSH reached the helper, not evidence of a submitted input.
         match (self.stage, frame["stage"].as_str(), self.mode.as_str()) {
-            (Stage::Ssh, Some("history"), "history" | "archive") => self.stage = Stage::History,
+            (Stage::Ssh, Some("history"), "history" | "archive" | "archive_read") => self.stage = Stage::History,
             (Stage::Ssh, Some("environment"), "inspect" | "prepare" | "session" | "fork" | "rewind") => self.stage = Stage::Environment,
             (Stage::Environment, Some("tui"), "session") => self.stage = Stage::Tui,
             _ => {},
         }
     }
 
-    pub(crate) fn context(&self, error: String) -> String {
+    pub fn context(&self, error: String) -> String {
         let operation = match self.mode.as_str() {
             "history" => "reading native history",
-            "archive" => "transferring native history",
+            "archive" | "archive_read" => "transferring native history",
             "inspect" => "inspecting the environment",
             "prepare" => "preparing the environment",
             "fork" => "forking native history",
@@ -55,7 +56,7 @@ impl Handshake {
         turn_retry::with_context(&format!("{} ({operation})", self.stage.label()), error)
     }
 
-    pub(crate) fn failed(
+    pub fn failed(
         &self, timed_out: bool, timeout: Duration, failure: Option<String>, diagnostic: &[u8],
     ) -> String {
         let diagnostic = diagnostics::plain_text(&String::from_utf8_lossy(diagnostic));
@@ -102,6 +103,16 @@ mod tests {
         let error = timeout(&handshake);
         assert!(turn_retry::is_disconnected(&error), "{error}");
         assert!(error.contains("History synchronization") && error.contains("45s"));
+    }
+
+    #[test]
+    fn pooled_archive_startup_never_claims_to_start_claude() {
+        let mut handshake = Handshake::new(&json!({"mode":"archive_read"}));
+        handshake.progress(&progress("history"));
+        let error = timeout(&handshake);
+        assert!(error.contains("transferring native history"));
+        assert!(turn_retry::is_disconnected(&error));
+        assert!(!error.contains("starting Claude"));
     }
 
     #[test]

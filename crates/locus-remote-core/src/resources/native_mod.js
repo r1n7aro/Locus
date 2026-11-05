@@ -29,6 +29,14 @@ async function reportInterruption($, turnId, runId, text, thinking) {
   if (content.length) await callBridge($, '/event', { protocol: 1, type: 'interrupted_assistant', runId, message: { content } });
 }
 
+// A turn.step hook that throws before next() makes Claude run the original
+// step, so the request still reaches the model. Refuse by ending the turn and
+// returning an empty step instead; the abort may fail if the turn is ending.
+async function refuseStep($, e) {
+  try { await $.turn.abort({ turnId: e.turnId }); } catch { /* already ending */ }
+  return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null };
+}
+
 // Mods only allows passing $ to file-level helpers; keep session state explicit.
 async function reportPhase($, phase, activity) {
   if (!activity || activity.phase === phase) return;
@@ -84,6 +92,117 @@ function toolResultDisplay(content) {
       ? { type: block.type, omitted: 'Media retained in native history' } : block) ?? '';
   const limit = 64 * 1024;
   return text.length <= limit ? text : text.slice(0, limit) + '\n[Display truncated; full result retained in native history.]';
+}
+
+// Native delegation (one Agent entry). Configured builtins and Locus-
+// registered Claude types run as native subagents; the other registered
+// types run as Locus subagents through the host. Unknown types are refused,
+// never replaced by another type or by an inherited model. Agents run in the
+// foreground unless the call explicitly asks for the background.
+function agentRoute(delegation, type) {
+  if (!delegation || typeof type !== 'string' || !type) return null;
+  if (delegation.builtins.includes(type)) return 'native';
+  const definition = delegation.definitions.find(item => 'locus:' + item.name === type);
+  return definition ? (definition.backend === 'native' ? 'native' : 'locus') : null;
+}
+
+function agentInputRefusal(delegation, e) {
+  if (!delegation) return 'Agent is not available in this conversation.';
+  if (e.isolation) return 'Agent isolation is not supported; subagent tools run in this conversation\'s workspace.';
+  if (e.cwd) return 'Agent cwd is not supported; subagent tools run in this conversation\'s workspace.';
+  const type = e.subagent_type || 'general-purpose';
+  if (!agentRoute(delegation, type)) {
+    const choices = [...delegation.definitions.map(item => '`locus:' + item.name + '`'), ...delegation.builtins.map(name => '`' + name + '`')];
+    return 'Unknown subagent_type ' + JSON.stringify(type) + '. Available subagent_type values: ' + (choices.join(', ') || 'none') + '.';
+  }
+  if (type.startsWith('locus:') && e.model) return 'Agent type ' + type + ' always uses its configured model. Omit model, or choose another subagent_type.';
+  return null;
+}
+
+// Subagents run with the delegating agent's authority but never delegate,
+// keep the parent's task list or start background work of their own. They
+// may message the main agent only.
+function subagentToolRefusal(e) {
+  if (e.tool === 'Agent') return 'Claude Code subagents cannot start other agents in Locus.';
+  if (e.tool === 'SendMessage' && e.to !== 'main') return 'Claude Code subagents can send messages only to the main agent (to: "main").';
+  if (['TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'TaskOutput', 'TaskStop'].includes(e.tool)) {
+    return e.tool + ' is not available to Claude Code subagents. Report progress in your final answer.';
+  }
+  if (e.tool === 'Bash' && e.run_in_background === true) return 'Background commands are not available to Claude Code subagents. Run the command in the foreground.';
+  return null;
+}
+
+// Claude owns its agents (addressed by agentId); Locus agents are addressed
+// as locus:<task id>. The host answers from its registry, also for agents of
+// an earlier Claude process of this conversation.
+async function nativeAgentTarget($, id) {
+  if (typeof id !== 'string' || !id || id === 'main' || id.startsWith('locus:')) return null;
+  const route = await callBridge($, '/event', { protocol: 1, type: 'agent_route', id });
+  return route?.native ? route : null;
+}
+
+// A subagent's calls share one cancellation scope per model step.
+function agentScope(agentSteps, agentId) {
+  return 'agent:' + agentId + ':' + (agentSteps.get(agentId) || 0);
+}
+
+// A stopped agent's pending Locus call ends now; it is never repeated.
+async function releaseAgentCalls($, agentSteps, agentId, runId) {
+  if (!agentSteps.has(agentId)) return;
+  try { await callBridge($, '/event', { protocol: 1, type: 'turn_interrupted', runId, agentId, id: agentScope(agentSteps, agentId) }); }
+  catch { /* The host's stop flag also ends a user-stopped agent's calls. */ }
+}
+
+// The user's stop from Locus: the host persisted it first; this runs
+// Claude's TaskStop and acknowledges. A repeated command only acknowledges.
+async function runAgentStop($, command, control, agentSteps, runId) {
+  let ok = true;
+  if (!control.done.has(command.id)) {
+    control.stopping.add(command.agentId);
+    let result;
+    try { result = await $.tool.call({ tool: 'TaskStop', task_id: command.agentId }); }
+    catch (error) { result = { deny: String(error) }; }
+    finally { control.stopping.delete(command.agentId); }
+    control.done.add(command.id);
+    ok = !result.deny && !result.isError;
+    await releaseAgentCalls($, agentSteps, command.agentId, runId);
+  }
+  await callBridge($, '/event', { protocol: 1, type: 'control_done', id: command.id, agentId: command.agentId, ok });
+}
+
+function toolResultEvent(e, runId, output, isError) {
+  return { protocol: 1, type: 'tool_result', runId, ...(e.agentId ? { agentId: e.agentId } : {}), id: e.tool_use_id, output, isError };
+}
+
+// The transcript keeps a subagent's answer, not the result's protocol data.
+function agentResultDisplay(result) {
+  const value = result?.result ?? result;
+  if (value?.status === 'async_launched' && typeof value.agentId === 'string') {
+    return 'Running in the background as agent ' + value.agentId + '. Its result is delivered when it finishes.';
+  }
+  if (value?.status === 'completed' && Array.isArray(value.content)) {
+    const text = value.content.filter(block => block.type === 'text' && typeof block.text === 'string'
+      && !/^\s*<tools-used-before-summary>[\s\S]*<\/tools-used-before-summary>\s*$/.test(block.text))
+      .map(block => block.text).join('\n');
+    if (text.trim()) return toolResultDisplay(text);
+  }
+  return toolResultDisplay(value);
+}
+
+// Definitions are re-registered in every process; the published directory is
+// pinned by the host, so a resumed conversation registers the same types.
+async function registerAgents($, agents, registeredAgents) {
+  if (!agents || !Array.isArray(agents.definitions) || !Array.isArray(agents.builtins)) return null;
+  for (const definition of agents.definitions) {
+    const id = 'locus:' + definition.name;
+    if (registeredAgents.has(id)) continue;
+    const registered = await $.agent.register({ name: definition.name, description: definition.description,
+      prompt: definition.prompt, tools: definition.tools, model: definition.model });
+    if (registered?.agent !== id) throw new Error('Claude registered agent ' + definition.name + ' as ' + String(registered?.agent));
+    registeredAgents.add(id);
+  }
+  return { builtins: agents.builtins, definitions: agents.definitions,
+    environment: typeof agents.environment === 'string' ? agents.environment : null };
 }
 
 // Correct only NEW attachment rows (see session.append below). Re-rendering
@@ -171,6 +290,22 @@ export function register(on) {
   let appendingPending = null;
   let activity = null;
   let activityStep = 0;
+  // Locus context staged for the compaction in progress. Interactive Claude
+  // stores compaction rows without session.append, so it is delivered as the
+  // compaction's SessionStart additional context instead.
+  let compaction = null;
+  // Published delegation directory; null keeps Claude's agent hooks inert.
+  let delegation = null;
+  const registeredAgents = new Set();
+  // Agent calls that asked for the background; their spawn may run there.
+  const backgroundCalls = new Set();
+  // SendMessage/TaskStop/TaskOutput calls routed to Claude's own agents;
+  // tool.check allows exactly these.
+  const nativeCalls = new Set();
+  // Model steps per subagent: the cancellation scope of its calls.
+  const agentSteps = new Map();
+  // User stops in flight (by command id and by agent) and completed ones.
+  const agentControl = { running: new Set(), stopping: new Set(), done: new Set() };
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
     if (tui && e.surface === 'terminal' && e.requestId === 'main'
         && ['requesting', 'thinking', 'tool-input', 'tool-use', 'responding'].includes(e.props?.mode)) {
@@ -187,6 +322,7 @@ export function register(on) {
       // not only when the next user prompt is submitted.
       const options = await callBridge($, '/options', { protocol: 1 });
       await registerTools($, options.tools, registeredTools, toolPlacements);
+      delegation = await registerAgents($, options.agents, registeredAgents);
     }
     // A worker replacement must be authorized before it can refill/submit the
     // current input. The host rejects reloads during an active turn.
@@ -202,6 +338,16 @@ export function register(on) {
       let input;
       try {
       options = await callBridge($, '/options', { protocol: 1, view: 'input' });
+      // User stops also arrive while the conversation is idle. TaskStop runs
+      // on its own, so input staging never waits for it.
+      for (const command of (delegation && options.agentControl?.commands) || []) {
+        if (command?.type !== 'stop' || typeof command.id !== 'string' || typeof command.agentId !== 'string'
+            || agentControl.running.has(command.id)) continue;
+        agentControl.running.add(command.id);
+        runAgentStop($, command, agentControl, agentSteps, runId)
+          .catch(() => { /* Still pending: the next poll acknowledges it. */ })
+          .finally(() => agentControl.running.delete(command.id));
+      }
       input = options.insertion || options;
       if (!options.active || !input.inputId) return;
       const key = input.inputId;
@@ -270,7 +416,8 @@ export function register(on) {
   // Advertising the PTY host here gives the model two conflicting machines.
   on('prompt.attachment', { type: 'environment' }, async ($, e, next) => {
     if (await $.env.get('LOCUS_CLAUDE_TUI') === '1' && e.type === 'environment') {
-      return { text: null };
+      // A subagent has no Locus system prompt: tell it where its tools run.
+      return { text: e.agentId && delegation?.environment ? delegation.environment : null };
     }
     return next(e);
   }).catch(async ($, e, next) => {
@@ -281,6 +428,16 @@ export function register(on) {
   on('prompt.submit', async ($, e, next) => {
     if (!tui) return next(e);
     if (bridgeFailed) return { drop: 'Locus bridge recovery is required.' };
+    // A background agent's result: Locus records it on the agent's task and
+    // delivers it as a task notification (waking an idle conversation), so
+    // Claude's own copy never starts a turn without a Locus input.
+    if (delegation && e.origin?.kind === 'task-notification') {
+      try { await callBridge($, '/event', { protocol: 1, type: 'agent_notification', text: e.text }); }
+      catch { /* A Claude exit still closes the agent's task. */ }
+      return { drop: 'Locus delivers agent results.' };
+    }
+    // Subagents message the main agent through Locus (SendMessage to main).
+    if (delegation && e.origin?.kind === 'peer') return { drop: 'Locus delivers messages from other agents.' };
     settings = await callBridge($, '/options', { protocol: 1 });
     if (!settings.active) return { drop: 'The Locus turn is no longer active.' };
     const inputToken = e.text.replace(/\[Image #\d+\]/g, '').trim();
@@ -347,6 +504,47 @@ export function register(on) {
   on('tool.describe', { tool: /^mcp__locus__/ }, async ($, e, next) => ({
     ...(await next(e)), isDeferred: toolPlacements.get(e.tool) === true,
   }));
+  // The Agent catalog: configured builtins and the published Locus types.
+  // Unknown and internal builtins (fork, worker, ...) stay hidden.
+  on('agent.offer', async ($, e, next) => {
+    if (!delegation) return next(e);
+    if (e.source === 'built-in') return { isOffered: delegation.builtins.includes(e.agent) };
+    return { isOffered: e.source === 'plugin' && registeredAgents.has(e.agent) };
+  }).catch(async () => ({ isOffered: false }));
+  // Backstop behind tool.call routing: only an ordinary subagent of a native
+  // type may start, in the background only when its Agent call asked for it.
+  // Claude continues a finished agent (SendMessage, or a message queued for
+  // it) only if it belongs to this conversation and the user did not stop
+  // it. The host learns each run's identity before any of its calls execute.
+  on('agent.spawn', async ($, e, next) => {
+    if (!delegation) return next(e);
+    if (e.fork || e.isTeammate || e.workflow) return { deny: 'Locus runs ordinary Claude subagents only (no fork, teammate or workflow agents).' };
+    if (e.parentAgentId) return { deny: 'Claude Code subagents cannot start other agents in Locus.' };
+    if (agentRoute(delegation, e.subagentType) !== 'native') {
+      return { deny: 'Agent type ' + JSON.stringify(e.subagentType) + ' does not run as a Claude subagent; no agent was started.' };
+    }
+    if (e.resume) {
+      const target = await nativeAgentTarget($, e.resume.agentId);
+      if (!target) return { deny: 'Claude tried to continue an agent this conversation did not start; it was not resumed.' };
+      if (target.stopped) return { deny: 'The user stopped this agent; it stays stopped in this conversation. Start a new Agent if the work is still needed.' };
+    } else if (e.background && !backgroundCalls.has(e.tool_use_id)) {
+      return { deny: 'This agent runs in the foreground. Pass run_in_background: true to start it in the background.' };
+    }
+    const spawnRunId = runId;
+    const result = await next(e);
+    if (result.agentId) {
+      // Registration is handled at the host's ingress, never behind a call.
+      // A refused registration (stale turn) leaves the subagent without any
+      // executable tool; its next model step is refused.
+      await callBridge($, '/event', { protocol: 1, type: 'agent_spawn', runId: spawnRunId,
+        agentId: result.agentId, parentToolUseId: e.tool_use_id, name: e.subagentType,
+        description: typeof e.description === 'string' ? e.description : '',
+        background: e.background === true, resume: !!e.resume });
+    }
+    return result;
+  }).catch(async ($, e, next) => (next.called
+    ? { deny: 'Locus could not register the Claude subagent; its tools will not run.' }
+    : { deny: 'Locus could not start the Claude subagent.' }));
   on('session.append', async ($, e, next) => {
     if (!tui) return next(e);
     // Since 2.1.299, queue records also pass through this hook. They are
@@ -380,6 +578,19 @@ export function register(on) {
         await callBridge($, '/event', { protocol: 1, type: 'diagnostic', runId, ...diagnostic });
       }
       return result;
+    }
+    // A subagent's text is display only, on its Agent card (or its task, in
+    // the background, also while the conversation is idle). tool.call
+    // announces its calls; only the text travels here.
+    if (e.agentId && delegation && !bridgeFailed
+        && e.message.type === 'assistant' && e.origin?.kind === 'model') {
+      const text = content.filter(block => block.type === 'text').map(block => block.text).join('\n');
+      if (text.trim()) {
+        try {
+          await callBridge($, '/event', { protocol: 1, type: 'assistant', runId, agentId: e.agentId,
+            message: { content: [{ type: 'text', text }] } });
+        } catch { /* display only */ }
+      }
     }
     // Native history is authoritative. This second observation closes the
     // display even if tool.call's post-processing/catch lost its receipt. The
@@ -427,14 +638,34 @@ export function register(on) {
   });
   on('turn.step', async function* ($, e, next) {
     if (!tui) return yield* next(e);
-    if (bridgeFailed) throw new Error('Locus bridge recovery is required.');
-    const inputState = await callBridge($, '/options', { protocol: 1, view: 'input' });
-    if (!inputState.active) throw new Error('Claude is idle; model requests require an active Locus input.');
+    // Recovery is required, or Claude is idle: model requests need an active Locus input.
+    if (bridgeFailed) return await refuseStep($, e);
+    // A subagent's request needs its live host registration instead: a
+    // background agent keeps working while the conversation is idle, and a
+    // stopped one sends nothing more.
+    if (e.agentId && delegation) {
+      agentSteps.set(e.agentId, (agentSteps.get(e.agentId) || 0) + 1);
+      let gate;
+      try { gate = await callBridge($, '/event', { protocol: 1, type: 'agent_step', agentId: e.agentId }); }
+      catch { return await refuseStep($, e); }
+      if (!gate?.ok) return await refuseStep($, e);
+      const result = yield* next(e);
+      try {
+        await callBridge($, '/event', { protocol: 1, type: 'usage', agentId: e.agentId,
+          usage: { ...(result?.usage || {}), model: result?.usage?.model || e.model || null, stepKey: e.turnId + ':' + e.index } });
+      } catch { /* Billing record only. */ }
+      return result;
+    }
+    let inputState;
+    try { inputState = await callBridge($, '/options', { protocol: 1, view: 'input' }); }
+    catch { return await refuseStep($, e); }
+    if (!inputState.active) return await refuseStep($, e);
     if (e.agentId) return yield* next(e);
     // Claude may absorb input without starting another native turn. Tools
     // produced after that input need a fresh cancellation scope nonetheless.
     if (insertion && insertionAppended) executionId = `${runId}:${++executionSequence}`;
     const stepTurnId = executionId;
+    let inferenceStarted = false;
     try {
     if (insertion && insertionAppended) {
       if (pendingText || pendingThinking) {
@@ -460,6 +691,7 @@ export function register(on) {
     await callBridge($, '/event', { protocol: 1, type: 'step_start', runId, stepId, model: request.model });
     activity = { runId, stepId, phase: 'requesting', sequence: 0 };
     const timing = { version: 1, source: 'claude-turn-step', requestStartedAtMs: await $.clock.now(), firstOutputAtMs: null, responseStoppedAtMs: null, resultReadyAtMs: null, bridgeDurationMs: 0, consumerPauseMs: 0, outputChunks: 0 };
+    inferenceStarted = true;
     const stream = next(request);
     const tools = [];
     let thinking = '';
@@ -512,16 +744,22 @@ export function register(on) {
     return result;
     } catch (error) {
       activity = null;
-      if (insertion) {
-        if (!interruptionReported) {
-          interruptionReported = true;
-          await reportInterruption($, stepTurnId, runId, pendingText, pendingThinking);
-          pendingText = ''; pendingThinking = '';
+      try {
+        if (insertion) {
+          if (!interruptionReported) {
+            interruptionReported = true;
+            await reportInterruption($, stepTurnId, runId, pendingText, pendingThinking);
+            pendingText = ''; pendingThinking = '';
+          }
+        } else {
+          bridgeState = 'complete';
+          await callBridge($, '/event', { protocol: 1, type: 'complete', runId, reason: 'error', answer: String(error) });
         }
-        throw error;
+      } catch (reportError) {
+        if (inferenceStarted) throw reportError;
       }
-      bridgeState = 'complete';
-      await callBridge($, '/event', { protocol: 1, type: 'complete', runId, reason: 'error', answer: String(error) });
+      // Before inference a rethrow would let Claude send the request anyway.
+      if (!inferenceStarted) return await refuseStep($, e);
       throw error;
     } finally {
       if (insertion) activity = null;
@@ -534,6 +772,13 @@ export function register(on) {
     }
   });
   on('turn.complete', async ($, e, next) => {
+    // A subagent's run ended. Its result reaches Locus as its Agent result
+    // (foreground) or its task notification (background).
+    if (tui && e.agentId && delegation) {
+      try { await callBridge($, '/event', { protocol: 1, type: 'agent_finished', agentId: e.agentId }); }
+      catch { /* Its notification and Claude's exit still settle the run. */ }
+      return next(e);
+    }
     if (tui && !e.agentId && insertion) {
       if (e.isAborted && !interruptionReported) {
         interruptionReported = true;
@@ -558,20 +803,81 @@ export function register(on) {
     }
     return next(e);
   });
+  on('classic.SessionStart', async ($, e, next) => {
+    const base = await next(e);
+    if (!tui || e.source !== 'compact' || e.agent_id || !compaction || compaction.delivered) return base;
+    compaction.delivered = true;
+    return { ...base, additionalContext: [...(base?.additionalContext || []), compaction.carryForward] };
+  });
   on('session.compact', async ($, e, next) => {
     if (!tui || e.agentId || e.trigger === 'precompute') return next(e);
     await callBridge($, '/event', { protocol: 1, type: 'compact_start', runId, trigger: e.trigger });
-    const result = await next(e);
+    // Locus copies the transcript to the client and captures what repeated
+    // summaries lose (user messages, tasks, files read through Locus) while
+    // the conversation is still intact. Without it Claude compacts natively.
+    let prepared = null;
+    try {
+      prepared = await callBridge($, '/event', { protocol: 1, type: 'compact_prepare', runId, trigger: e.trigger });
+    } catch (error) {
+      try {
+        await callBridge($, '/event', { protocol: 1, type: 'diagnostic', runId, kind: 'compaction_context',
+          text: 'Locus could not prepare compaction context; Claude compacted without it. ' + String(error) });
+      } catch { /* The compaction itself must not depend on this notice. */ }
+    }
+    const prepareNotice = prepared?.ok === false
+      ? 'Locus could not prepare compaction context; Claude compacted with its own summary only. ' + String(prepared.error ?? '')
+      : prepared?.transcriptError
+        ? 'Locus could not save a local copy of the Claude transcript; the summary keeps the path on the Claude host. ' + String(prepared.transcriptError)
+        : null;
+    if (prepareNotice) {
+      try {
+        await callBridge($, '/event', { protocol: 1, type: 'diagnostic', runId, kind: 'compaction_context', text: prepareNotice.trim() });
+      } catch { /* The compaction itself must not depend on this notice. */ }
+    }
+    const instructions = [e.instructions, prepared?.instructions]
+      .filter(text => typeof text === 'string' && text.trim()).join('\n\n');
+    // Claude runs SessionStart (source "compact") inside the compaction and
+    // stores its additional context after the summary and kept messages.
+    compaction = prepared?.carryForward
+      ? { transcriptPath: prepared.transcriptPath || null, carryForward: prepared.carryForward, delivered: false } : null;
+    const staged = compaction;
+    let result;
+    try {
+      result = await next(instructions ? { ...e, instructions } : e);
+    } finally {
+      compaction = null;
+    }
     if (result.skip) {
       await callBridge($, '/event', { protocol: 1, type: 'input_error', runId, error: result.skip });
       return result;
     }
+    const carryForward = staged?.delivered ? staged.carryForward : null;
+    if (staged && !staged.delivered) {
+      try {
+        await callBridge($, '/event', { protocol: 1, type: 'diagnostic', runId, kind: 'compaction_context',
+          text: 'Claude did not run the post-compaction SessionStart hook; the Locus carry-forward context was not added.' });
+      } catch { /* The compaction itself must not depend on this notice. */ }
+    }
     const context = (await $.session.usage()).context;
-    const summary = result.messages.map(message => message.text).filter(Boolean).join('\n');
+    // Claude's tokensAfter excludes the system prompt and tools.
+    let estimate = null;
+    try { estimate = (await $.session.usage({ breakdown: 'summary' })).context?.breakdown?.totalTokens ?? null; }
+    catch { /* Display estimate only. */ }
+    const [summaryMessage, ...keptMessages] = result.messages;
+    // The summary stays exactly as Claude stored it; Locus's additions travel
+    // separately as the SessionStart context.
+    const summary = summaryMessage?.text || '';
+    // Kept rows are the most recent messages, verbatim after the summary.
+    // Tool ids anchor them to Locus rows; text is a bounded fallback.
+    const kept = keptMessages.map(message => ({ role: message.role, text: (message.text || '').slice(0, 4000),
+      toolUseIds: (message.toolUses || []).map(use => use.tool_use_id),
+      toolResultIds: (message.toolResults || []).map(item => item.tool_use_id) }));
     await callBridge($, '/event', { protocol: 1, type: 'compact_done', runId,
-      before: e.messages.length, after: result.messages.length, tokens: result.tokensAfter, context, summary, checkpoint: lastCheckpoint });
+      before: e.messages.length, after: result.messages.length, tokens: result.tokensAfter, estimate, context,
+      summary, carryForward, kept, transcriptPath: staged?.transcriptPath ?? null, checkpoint: lastCheckpoint });
     return result;
   }).catch(async ($, e, next) => {
+    compaction = null;
     const detail = next.error?.message;
     await callBridge($, '/event', { protocol: 1, type: 'input_error', runId, error: 'Locus could not record Claude compaction.' + (detail ? ' ' + detail : '') });
     return next.called ? next(e) : { skip: 'Locus could not record Claude compaction.' };
@@ -600,13 +906,16 @@ export function register(on) {
     return { text: 'Locus 命令桥接失败，未回退执行命令。' };
   });
   on('tool.call', async ($, e, next) => {
-    if (tui && settings.control === 'compact') {
+    // A background agent's calls are not part of the parent's compaction
+    // (settings keeps the last control while the conversation is idle).
+    const subagent = !!(delegation && e.agentId);
+    if (tui && settings.control === 'compact' && !subagent) {
       return { deny: 'Tool execution is disabled during Locus compaction.' };
     }
     const callTurnId = currentTurnId;
-    const callExecutionId = executionId;
+    const callExecutionId = subagent ? agentScope(agentSteps, e.agentId) : executionId;
     const callRunId = runId;
-    toolScopes.set(e.tool_use_id, { runId: callRunId, executionId: callExecutionId, dispatched: false });
+    toolScopes.set(e.tool_use_id, { runId: callRunId, executionId: callExecutionId, agentId: subagent ? e.agentId : null, dispatched: false });
     if (bridgeFailed) return { deny: 'Locus bridge recovery is required.' };
     if (next.signal?.aborted) throw new Error('Claude tool dispatch was interrupted before execution');
     // Native tools retain Claude's concurrency. Bridged tools are serialized by
@@ -615,14 +924,86 @@ export function register(on) {
       if (!e.agentId) await reportPhase($, 'tool-use', activity);
       const { tool, tool_use_id, agentId, ...input } = e;
       const content = [];
-      if (pendingText) content.push({ type: 'text', text: pendingText });
-      if (pendingThinking) content.push({ type: 'thinking', thinking: pendingThinking });
-      pendingText = ''; pendingThinking = '';
+      // A subagent's call belongs to its Agent card, never to the parent's
+      // streamed text or assistant round.
+      if (!agentId) {
+        if (pendingText) content.push({ type: 'text', text: pendingText });
+        if (pendingThinking) content.push({ type: 'thinking', thinking: pendingThinking });
+        pendingText = ''; pendingThinking = '';
+      }
       content.push({ type: 'tool_use', id: tool_use_id, name: tool, input });
-      await callBridge($, '/event', { protocol: 1, type: 'assistant', runId: callRunId, message: { content } });
+      await callBridge($, '/event', { protocol: 1, type: 'assistant', runId: callRunId, ...(agentId ? { agentId } : {}), message: { content } });
       announcedTools.add(tool_use_id);
     }
     if (next.signal?.aborted) throw new Error('Claude tool dispatch was interrupted before execution');
+    const subagentRefusal = e.agentId ? subagentToolRefusal(e) : null;
+    if (subagentRefusal) {
+      if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, subagentRefusal, true));
+      return { deny: subagentRefusal };
+    }
+    if (!e.agentId && e.tool === 'SendMessage' && !delegation) {
+      const deny = 'SendMessage is not available in this conversation.';
+      if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, deny, true));
+      return { deny };
+    }
+    // The main agent's messages, output reads and stops for Claude's own
+    // agents run in Claude. Locus agents (locus:<task id>) and Locus tasks
+    // stay with the host below.
+    if (!e.agentId && delegation && ['SendMessage', 'TaskStop', 'TaskOutput'].includes(e.tool)) {
+      const target = e.tool === 'SendMessage' ? e.to : e.task_id;
+      const toLocus = typeof target === 'string' && target.startsWith('locus:');
+      const native = toLocus ? null : await nativeAgentTarget($, target);
+      let refusal = null;
+      if (e.tool === 'SendMessage' && !toLocus) {
+        if (target === 'main') refusal = 'You are the main agent. Address a subagent by the agentId its Agent call returned.';
+        else if (!native) refusal = 'No agent ' + JSON.stringify(target) + ' belongs to this conversation. Use the agentId an Agent call returned, or locus:<task id> for a Locus agent.';
+        else if (native.stopped) refusal = 'The user stopped agent ' + target + '; it stays stopped in this conversation. Start a new Agent if the work is still needed.';
+      }
+      if (refusal) {
+        if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, refusal, true));
+        return { deny: refusal };
+      }
+      if (native) {
+        // Never retried: a second next() could deliver a message twice.
+        nativeCalls.add(e.tool_use_id);
+        let result;
+        try {
+          result = await next(e);
+        } catch (error) {
+          const deny = next.signal?.aborted ? 'The call was interrupted.' : e.tool + ' failed: ' + String(error);
+          if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, deny, true));
+          return { deny };
+        } finally { nativeCalls.delete(e.tool_use_id); }
+        if (e.tool === 'TaskStop' && !result.deny && !result.isError) await releaseAgentCalls($, agentSteps, target, callRunId);
+        if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, toolResultDisplay(result.deny ?? result.result ?? result), !!(result.deny || result.isError)));
+        return result;
+      }
+    }
+    let agentToLocus = false;
+    if (!e.agentId && e.tool === 'Agent') {
+      const refusal = agentInputRefusal(delegation, e);
+      if (refusal) {
+        if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, refusal, true));
+        return { deny: refusal };
+      }
+      if (agentRoute(delegation, e.subagent_type || 'general-purpose') === 'native') {
+        // Claude runs it, in the foreground unless the call asks for the
+        // background. Never retried: a second next() could start another agent.
+        const background = e.run_in_background === true;
+        if (background) backgroundCalls.add(e.tool_use_id);
+        let result;
+        try {
+          result = await next({ ...e, run_in_background: background });
+        } catch (error) {
+          const deny = next.signal?.aborted ? 'The agent was interrupted.' : 'The agent failed: ' + String(error);
+          if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, deny, true));
+          return { deny };
+        } finally { backgroundCalls.delete(e.tool_use_id); }
+        if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, agentResultDisplay(result), !!(result.deny || result.isError)));
+        return result;
+      }
+      agentToLocus = true;
+    }
     const locusTool = e.tool.startsWith('mcp__locus__');
     // Session bookkeeping and web tools retain Claude's implementation.
     // Search/fetch requests belong to the CLI, never to Locus.
@@ -632,7 +1013,7 @@ export function register(on) {
       try {
         result = await next(e);
       } catch (error) {
-        if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: String(error), isError: true });
+        if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, String(error), true));
         throw error;
       }
       let observed = result;
@@ -662,17 +1043,20 @@ export function register(on) {
           return result;
         }
       }
-      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: JSON.stringify(observed), isError: !!(result.deny || result.isError) });
+      if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, JSON.stringify(observed), !!(result.deny || result.isError)));
       return result;
     }
     if (e.tool === 'mcp__locus__web_fetch') {
       const deny = 'Use Claude Code WebFetch. Locus web_fetch is unavailable in Claude Code sessions.';
-      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: deny, isError: true });
+      if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, deny, true));
       return { deny };
     }
-    if (!locusTool && !['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TaskOutput', 'TaskStop', 'AskUserQuestion'].includes(e.tool)) {
+    // A Locus-routed Agent runs in the host as a Locus subagent. SendMessage
+    // reaching here addresses a Locus agent, or (from a subagent) the main one.
+    if (!locusTool && !agentToLocus && !['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TaskOutput', 'TaskStop', 'AskUserQuestion',
+      ...(delegation ? ['SendMessage'] : [])].includes(e.tool)) {
       const deny = 'Locus has not adapted ' + e.tool + ' for local execution yet.';
-      if (tui) await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: callRunId, id: e.tool_use_id, output: deny, isError: true });
+      if (tui) await callBridge($, '/event', toolResultEvent(e, callRunId, deny, true));
       return { deny };
     }
     // Do not call next for a bridged tool, including on failure. Retrying a
@@ -693,11 +1077,15 @@ export function register(on) {
     await registerTools($, answer.toolCatalogDelta, registeredTools, toolPlacements);
     return { result: locusTool ? nativeToolContent(answer.result) : answer.result, ...(answer.context ? { context: answer.context } : {}) };
   }).catch(async ($, e, next) => {
-    if (next.error?.kind === 're-entry' && ['TaskList','TaskGet'].includes(e.tool)) return next(e);
+    // This Mod's own calls: task synchronization and the user's agent stops.
+    if (next.error?.kind === 're-entry' && ['TaskList', 'TaskGet', 'TaskStop'].includes(e.tool)) return next(e);
     // Replay a completed native result, never execute a bridged write again.
     const scope = toolScopes.get(e.tool_use_id) || { runId, executionId };
     let result;
-    if (next.called) {
+    if (next.called && ['Agent', 'SendMessage'].includes(e.tool)) {
+      // Never start a second subagent, or deliver a message twice.
+      result = { deny: e.tool === 'Agent' ? 'The agent ended without a result; it was not run again.' : 'The message outcome is unknown; it was not sent again.' };
+    } else if (next.called) {
       try { result = await next(e); }
       catch (error) { result = { deny: String(error) }; }
     } else {
@@ -707,12 +1095,14 @@ export function register(on) {
           : 'Claude tool dispatch was interrupted before execution.')
         : 'Locus tool bridge failed; no fallback tool was run. Verify local state before retrying a write.' };
     }
-    if (tui && !bridgeFailed && scope?.runId) {
+    if (tui && !bridgeFailed && (scope?.runId || scope?.agentId)) {
       try {
         // These receipts bypass the ordered tool lane. Send them FIRST: a
         // tool_result behind a pending /call cannot unblock that same call.
+        // A subagent's interruption ends only its own scope.
         if (!next.called && next.signal?.aborted && scope.executionId) {
-          await callBridge($, '/event', { protocol: 1, type: 'turn_interrupted', runId: scope.runId, id: scope.executionId });
+          await callBridge($, '/event', { protocol: 1, type: 'turn_interrupted', runId: scope.runId,
+            ...(scope.agentId ? { agentId: scope.agentId } : {}), id: scope.executionId });
         }
         if (!next.called && (!next.signal?.aborted || next.error?.kind === 'timeout')) {
           await callBridge($, '/event', { protocol: 1, type: 'bridge_fault', runId: scope.runId,
@@ -721,12 +1111,11 @@ export function register(on) {
         }
         if (!announcedTools.has(e.tool_use_id)) {
           const { tool, tool_use_id, agentId, ...input } = e;
-          await callBridge($, '/event', { protocol: 1, type: 'assistant', runId: scope.runId,
+          await callBridge($, '/event', { protocol: 1, type: 'assistant', runId: scope.runId, ...(agentId ? { agentId } : {}),
             message: { content: [{ type: 'tool_use', id: tool_use_id, name: tool, input }] } });
           announcedTools.add(tool_use_id);
         }
-        await callBridge($, '/event', { protocol: 1, type: 'tool_result', runId: scope.runId,
-          id: e.tool_use_id, output: JSON.stringify(result), isError: !!(result.deny || result.isError) });
+        await callBridge($, '/event', toolResultEvent(e, scope.runId, JSON.stringify(result), !!(result.deny || result.isError)));
       } catch { bridgeFailed = true; /* Host heartbeat lease will fail closed. */ }
     }
     return result;
@@ -736,8 +1125,27 @@ export function register(on) {
   // filesystem/process tools must not execute on the Claude host.
   on('tool.check', async ($, e, next) => {
     if (bridgeFailed) return { decision: 'deny', reason: 'Locus bridge recovery is required.' };
-    if (tui && settings.control === 'compact') {
+    // tool.check names no agent; tool.call recorded the call's scope.
+    const subagent = !!(e.tool_use_id && toolScopes.get(e.tool_use_id)?.agentId);
+    if (tui && settings.control === 'compact' && !subagent) {
       return { decision: 'deny', reason: 'Tool execution is disabled during Locus compaction.' };
+    }
+    // Only tool.call's native route reaches the engine with an Agent call.
+    // Unlike tool.call, tool.check nests the call's arguments in { input }.
+    // Locus decides here: auto mode ignores the CLI's Agent allow rule and
+    // would classify or prompt in a TUI nobody answers. Starting the agent
+    // has no effect of its own; each of its calls runs through Locus.
+    if (e.tool === 'Agent' && !e.agentId) {
+      const input = e.input || {};
+      return agentInputRefusal(delegation, input) || agentRoute(delegation, input.subagent_type || 'general-purpose') !== 'native'
+        ? { decision: 'deny', reason: 'This agent must start through the Locus delegation route.' } : { decision: 'allow' };
+    }
+    // Exactly the calls tool.call routed to Claude's own agents, and the
+    // user's stops this Mod runs (they carry no tool_use_id of the model).
+    if (['SendMessage', 'TaskStop', 'TaskOutput'].includes(e.tool)) {
+      const routed = (e.tool_use_id && nativeCalls.has(e.tool_use_id))
+        || (e.tool === 'TaskStop' && agentControl.stopping.has(e.input?.task_id));
+      return routed ? { decision: 'allow' } : { decision: 'deny', reason: 'This tool must execute through the Locus bridge.' };
     }
     if (['TodoWrite',
         'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch', 'WebSearch', 'WebFetch'].includes(e.tool)) {

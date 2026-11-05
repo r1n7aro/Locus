@@ -18,7 +18,7 @@ if os.name == "nt":
     sys.modules.setdefault("pty", types.ModuleType("pty"))
 host = types.ModuleType("locus_ssh_host")
 root = Path(__file__).resolve().parents[1]
-source = root / "src/llm/claude_code_cli/ssh_host.py"
+source = root.parent / "crates/locus-remote-core/src/resources/ssh_host.py"
 exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"), host.__dict__)
 CASES = json.loads((root / "tests/fixtures/claude_native_user_visibility.json").read_text(encoding="utf-8"))
 
@@ -36,6 +36,26 @@ class NativeHistoryDisplayTests(unittest.TestCase):
         self.assertEqual(host.canonical_history([user, answer])[-1]["stopReason"], "end_turn")
         del answer["message"]["stop_reason"]
         self.assertNotIn("stopReason", host.canonical_history([user, answer])[-1])
+
+    def test_compaction_fork_snapshot_keeps_command_echo_and_carry_forward(self):
+        rows = [
+            {"uuid": "command"},
+            {"uuid": "boundary", "type": "system"},
+            {"uuid": "summary", "type": "user", "isCompactSummary": True, "message": {"content": "Summary"}},
+            {"uuid": "caveat", "type": "user", "isMeta": True, "message": {"content": "<local-command-caveat>x</local-command-caveat>"}},
+            {"uuid": "echo", "type": "user", "message": {"content": "<command-name>/compact</command-name>"}},
+            {"uuid": "stdout", "type": "user", "message": {"content": "<local-command-stdout>Compacted</local-command-stdout>"}},
+            {"uuid": "carry", "type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["CARRY"]}},
+            {"uuid": "future", "type": "user", "message": {"content": "next request"}},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            copied = host.transcript_snapshot(path, "command", True)
+            self.assertIn('"carry"', copied)
+            self.assertIn('"stdout"', copied)
+            self.assertNotIn('"future"', copied)
+            self.assertNotIn('"carry"', host.transcript_snapshot(path, "caveat", False))
 
     def test_session_lease_waits_for_orphan_and_times_out_without_killing_it(self):
         fake = types.SimpleNamespace(LOCK_EX=2, LOCK_NB=4)

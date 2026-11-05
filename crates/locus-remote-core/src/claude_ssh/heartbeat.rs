@@ -16,6 +16,13 @@ pub(super) struct Heartbeat {
     last_reply: Option<Instant>,
 }
 impl Heartbeat {
+    /// Dedicated bulk connections use transfer progress while busy. Old pings
+    /// queued behind that transfer must not poison the next idle lease.
+    pub fn suspend(&mut self) {
+        self.pending.clear();
+        self.last_progress = None;
+        self.sample = None;
+    }
     pub fn sent(&mut self, id: u64, now: Instant) {
         if self.pending.is_empty() { self.last_progress = Some(now); }
         self.pending.push_back((id, now));
@@ -46,6 +53,22 @@ impl Heartbeat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_bulk_progress_lease_does_not_leave_expired_pings_in_the_next_idle_lease() {
+        let now = Instant::now();
+        let mut heartbeat = Heartbeat::default();
+        heartbeat.sent(1, now);
+        heartbeat.suspend();
+        let idle = now + Duration::from_secs(300);
+        assert!(!heartbeat.unresponsive(idle));
+        heartbeat.received(1, idle); // delayed pre-transfer pong is not a new sample
+        assert_eq!(heartbeat.latency_ms(idle), None);
+        heartbeat.sent(2, idle);
+        assert!(!heartbeat.unresponsive(idle + Duration::from_secs(29)));
+        assert!(heartbeat.unresponsive(idle + Duration::from_secs(30)));
+        heartbeat.received(2, idle + Duration::from_secs(30));
+        assert!(!heartbeat.unresponsive(idle + Duration::from_secs(31)));
+    }
     #[test]
     fn silence_requires_sent_pings_and_survives_pending_queue_eviction() {
         let now = Instant::now();

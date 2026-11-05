@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::OnceLock;
+#[cfg(test)]
 use std::time::Duration;
 
 #[path = "web_commands.rs"]
@@ -85,7 +86,7 @@ pub(crate) fn request_body(
             "web.run requires at least one operation, such as open or search_query.".into(),
         );
     }
-    let mut request = json!({"id":session_id,"model":model.strip_prefix("openai/").unwrap_or(model),
+    let mut request = json!({"id":session_id,"model":super::protocol_model_name(model),
         "commands":commands,"settings":{"external_web_access":true,"allowed_callers":["direct"]},
         "max_output_tokens":MAX_OUTPUT_TOKENS});
     let input = recent_input(history);
@@ -167,9 +168,7 @@ where
     Fut: Future<Output = Result<(String, Option<String>), String>>,
 {
     let client = crate::network::rustls_reqwest_client(
-        crate::network::ReqwestClientOptions::new()
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(300)),
+        locus_remote_core::network::codex_http_options(locus_remote_core::network::CodexHttpProfile::Web),
     )?;
     let url = endpoint(base_url);
     for refresh in [false, true] {
@@ -188,7 +187,7 @@ where
             .await
             .map_err(|error| format!("Codex web.run request failed: {error}"))?;
         let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED && !refresh {
+        if status == reqwest::StatusCode::UNAUTHORIZED && !refresh && !locus_remote_core::network::upstream_auth_failure(status,response.headers()) {
             continue;
         }
         if !status.is_success() {

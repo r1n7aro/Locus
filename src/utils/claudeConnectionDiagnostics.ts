@@ -22,6 +22,20 @@ function timeline(trace: ClaudeTransportSnapshot): string {
   return trace.timeline.map(item => `${seconds(item.elapsedMs)}  ${stage(item.stage)}`).join('\n');
 }
 
+function helperDetails(trace: ClaudeTransportSnapshot): string | null {
+  const helper = trace.helper;
+  if (!helper) return null;
+  return [
+    `v${helper.helperVersion} · SHA-256 ${helper.sourceHash ?? '—'}`,
+    `Python PID ${helper.hostPid} · Claude PID ${helper.claudePid ?? '—'} · ${helper.event}`,
+    helper.exitReason == null ? null : `${helper.exitReason} · exit ${helper.exitCode ?? '—'} · Claude exit ${helper.claudeExitCode ?? '—'}`,
+    ...['errorType', 'reportingError', 'cleanupError'].flatMap(field => {
+      const value = helper[field as 'errorType' | 'reportingError' | 'cleanupError'];
+      return value == null ? [] : [`${field}: ${value}`];
+    }),
+  ].filter(value => value != null).join('\n');
+}
+
 // Formatting only: no IPC, timers, network checks or side effects on opening the
 // panel. The existing shared poll supplies both passive and failure-only data.
 export function claudeDiagnosticRows(diagnostics: ClaudeConnectionDiagnostics | undefined): DiagnosticRow[] {
@@ -35,6 +49,8 @@ export function claudeDiagnosticRows(diagnostics: ClaudeConnectionDiagnostics | 
     row('heartbeat', active.heartbeatAgeMs == null ? t(`${key}waitingHeartbeat`)
       : t(`${key}${active.heartbeatAgeMs <= 15_000 ? 'responsive' : 'stale'}`, age(active.heartbeatAgeMs)), true);
     row('operation', `#${active.id} · ${active.operation} · PID ${active.pid ?? '—'}`);
+    const helper = helperDetails(active);
+    if (helper) row('helper', helper);
     row('stage', `${stage(active.stage)} · ${seconds(active.stageElapsedMs)}`);
     row('traffic', `↓ ${bytes(active.receivedBytes)} · ↑ ${bytes(active.sentBytes)}`);
     row('lastReceive', age(active.lastReceiveAgeMs));
@@ -49,6 +65,8 @@ export function claudeDiagnosticRows(diagnostics: ClaudeConnectionDiagnostics | 
     row('failure', `${failure.kind} · ${trace.operation} · ${seconds(trace.elapsedMs)} · exit ${failure.exitCode ?? '—'}\n${failure.message}`);
     row('failureProgress', `${progress(trace)}\n${t(`${key}lastReceive`)}: ${age(trace.lastReceiveAgeMs)}`);
     row('failureTimeline', timeline(trace));
+    const helper = helperDetails(trace);
+    if (helper) row('failureHelper', helper);
     if (failure.stderr) row('stderr', failure.stderr);
   }
   const probe = diagnostics.probe;

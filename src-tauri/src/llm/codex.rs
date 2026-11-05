@@ -6,28 +6,15 @@ use super::CODEX_CLIENT_VERSION;
 use crate::commands::CodexTransportMode;
 use crate::session::models::{ChatMessage, ImageData, MessageRole, ServerToolKind, ToolCallInfo};
 use futures::{SinkExt, StreamExt};
-use http::Uri;
-use hyper_util::client::legacy::connect::proxy::SocksV4;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::proxy::matcher::Intercept;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::io;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::client_async_with_config;
-use tokio_tungstenite::proxy::connect_via_proxy;
-use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
-use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::proxy::{
-    ProxyAuth as TungsteniteProxyAuth, ProxyConfig as TungsteniteProxyConfig,
-    ProxyScheme as TungsteniteProxyScheme,
-};
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
-use tower_service::Service;
 use url::Url;
 
 #[cfg(test)]
@@ -65,10 +52,10 @@ const WEBSOCKET_CONNECTION_LIMIT_REACHED_MESSAGE: &str = "Responses websocket co
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE: &str = "previous_response_not_found";
 const PREVIOUS_RESPONSE_NOT_FOUND_MESSAGE: &str =
     "Previous response was not found. Retrying the full request.";
-const CODEX_ORIGINATOR_HEADER_VALUE: &str = "opencode";
+const CODEX_ORIGINATOR_HEADER_VALUE: &str = locus_remote_core::codex_transport::ORIGINATOR;
 const MAX_SAFE_STREAM_RECOVERY_RETRIES: u32 = 2;
 const SAFE_STREAM_RECOVERY_DELAY_MS: u64 = 1200;
-const WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+use locus_remote_core::codex_transport::WEBSOCKET_CONNECT_TIMEOUT;
 const WEBSOCKET_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const ASTRA_COMPACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -88,18 +75,20 @@ pub fn supports_reasoning_updates(model: &str) -> bool {
 }
 
 fn is_astra_model(model: &str) -> bool {
-    let model = model.strip_prefix("openai/").unwrap_or(model);
+    let model = protocol_model_name(model);
     model == "gpt-6-astra"
         || model.strip_prefix("gpt-6-astra-")
             .and_then(|suffix| suffix.chars().next())
             .is_some_and(|first| first.is_ascii_digit())
 }
 
-trait CodexAsyncIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+pub fn protocol_model_name(model: &str) -> &str {
+    #[cfg(feature = "server-client")]
+    let model = crate::server_client::protocol_model_id(model);
+    model.strip_prefix("openai/").unwrap_or(model)
+}
 
-impl<T> CodexAsyncIo for T where T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-
-type BoxedCodexIo = Box<dyn CodexAsyncIo>;
+use locus_remote_core::codex_transport::BoxedCodexIo;
 type CodexWebSocket = tokio_tungstenite::WebSocketStream<BoxedCodexIo>;
 
 struct CodexWebsocketStream {
@@ -813,7 +802,7 @@ fn build_standard_request_body(
     }
 
     let mut body = serde_json::json!({
-        "model": model.strip_prefix("openai/").unwrap_or(model),
+        "model": protocol_model_name(model),
         "input": input,
         "stream": true,
         "store": false,
@@ -1264,7 +1253,7 @@ fn codex_compact_endpoint(base_url: Option<&str>) -> String {
 
 // `/responses/compact` is unary, so this covers the full response rather than
 // one idle period between stream events (codex-rs uses idle timeout x4).
-const COMPACT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const COMPACT_REQUEST_TIMEOUT: Duration = locus_remote_core::network::COMPACT_TIMEOUT;
 
 #[derive(Debug)]
 pub struct CodexRemoteCompactOutcome {
@@ -1477,9 +1466,7 @@ pub async fn compact_conversation_history(
     }
 
     let client = crate::network::rustls_reqwest_client(
-        crate::network::ReqwestClientOptions::new()
-            .tcp_keepalive(Duration::from_secs(20))
-            .connect_timeout(Duration::from_secs(30)),
+        locus_remote_core::network::codex_http_options(locus_remote_core::network::CodexHttpProfile::Responses),
     )
     .map_err(|error| CodexRemoteCompactError::new(error, raw_request.clone(), ""))?;
     let mut req = client
@@ -1513,11 +1500,12 @@ pub async fn compact_conversation_history(
         )
     })?;
     let status = resp.status();
+    let origin=if locus_remote_core::network::upstream_auth_failure(status,resp.headers()){locus_remote_core::network::UPSTREAM_ERROR_MARKER}else{""};
     let response_text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         return Err(CodexRemoteCompactError::new(
             format!(
-                "OpenAI Codex API error ({} {}): {}",
+                "{origin}OpenAI Codex API error ({} {}): {}",
                 status.as_u16(),
                 status.canonical_reason().unwrap_or(""),
                 response_text
@@ -1849,270 +1837,11 @@ async fn enable_cached_websocket_http_fallback(
     .await;
 }
 
-fn websocket_proxy_match_uri(uri: &Uri) -> Result<Uri, String> {
-    let scheme = match uri.scheme_str() {
-        Some("ws") => "http",
-        Some("wss") => "https",
-        Some(other) => {
-            return Err(format!(
-                "Unsupported websocket endpoint scheme for proxy matching: {}",
-                other
-            ));
-        }
-        None => return Err("Websocket endpoint is missing a scheme".to_string()),
-    };
-
-    let authority = uri
-        .authority()
-        .cloned()
-        .ok_or_else(|| "Websocket endpoint is missing an authority".to_string())?;
-    let path_and_query = uri
-        .path_and_query()
-        .cloned()
-        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-
-    http::Uri::builder()
-        .scheme(scheme)
-        .authority(authority)
-        .path_and_query(path_and_query)
-        .build()
-        .map_err(|e| format!("Failed to build proxy match URI: {}", e))
-}
-
-fn uri_host_port(uri: &Uri) -> Result<(String, u16), String> {
-    let host = uri
-        .host()
-        .ok_or_else(|| "URI is missing host".to_string())?
-        .to_string();
-    let port = match uri.port_u16() {
-        Some(port) => port,
-        None => match uri.scheme_str() {
-            Some("http") | Some("ws") => 80,
-            Some("https") | Some("wss") => 443,
-            Some("socks4") | Some("socks4a") | Some("socks5") | Some("socks5h") => 1080,
-            Some(other) => {
-                return Err(format!(
-                    "Unsupported URI scheme for port resolution: {}",
-                    other
-                ));
-            }
-            None => return Err("URI is missing a scheme".to_string()),
-        },
-    };
-    Ok((host, port))
-}
-
-fn uri_with_resolved_port(uri: &Uri) -> Result<Uri, String> {
-    let scheme = uri
-        .scheme_str()
-        .ok_or_else(|| "URI is missing a scheme".to_string())?;
-    let (host, port) = uri_host_port(uri)?;
-    let authority = match uri.authority() {
-        Some(authority) if authority.as_str().contains('@') => {
-            let userinfo = authority
-                .as_str()
-                .split('@')
-                .next()
-                .ok_or_else(|| "URI authority is invalid".to_string())?;
-            format!("{userinfo}@{}:{}", authority_host(&host), port)
-        }
-        _ => format!("{}:{}", authority_host(&host), port),
-    };
-    let path_and_query = uri
-        .path_and_query()
-        .cloned()
-        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
-
-    http::Uri::builder()
-        .scheme(scheme)
-        .authority(authority)
-        .path_and_query(path_and_query)
-        .build()
-        .map_err(|e| format!("Failed to normalize URI port: {}", e))
-}
-
-fn build_tcp_connector() -> HttpConnector {
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(false);
-    connector.set_connect_timeout(Some(Duration::from_secs(30)));
-    connector.set_keepalive(Some(Duration::from_secs(20)));
-    connector.set_keepalive_interval(Some(Duration::from_secs(15)));
-    connector.set_keepalive_retries(Some(3));
-    connector.set_nodelay(true);
-    connector
-}
-
-fn ws_io_error(message: impl Into<String>) -> WsError {
-    WsError::Io(io::Error::other(message.into()))
-}
-
-fn proxy_display_uri(uri: &Uri) -> String {
-    let scheme = uri.scheme_str().unwrap_or("http");
-    let host = uri.host().unwrap_or("<missing-host>");
-    match uri.port_u16() {
-        Some(port) => format!("{}://{}:{}", scheme, authority_host(host), port),
-        None => format!("{}://{}", scheme, authority_host(host)),
-    }
-}
-
-async fn connect_tcp_stream(uri: &Uri) -> Result<tokio::net::TcpStream, String> {
-    let normalized_uri = uri_with_resolved_port(uri)?;
-    let mut connector = build_tcp_connector();
-    let connection = connector
-        .call(normalized_uri.clone())
-        .await
-        .map_err(|e| format!("Failed to connect to {}: {}", normalized_uri, e))?;
-    Ok(connection.into_inner())
-}
-
-fn tungstenite_proxy_config(
-    proxy: &Intercept,
-    scheme: TungsteniteProxyScheme,
-) -> Result<TungsteniteProxyConfig, String> {
-    let (host, port) = uri_host_port(proxy.uri())?;
-    let auth = proxy
-        .raw_auth()
-        .map(|(username, password)| TungsteniteProxyAuth {
-            username: username.to_string(),
-            password: password.to_string(),
-        });
-    Ok(TungsteniteProxyConfig {
-        scheme,
-        host,
-        port,
-        auth,
-    })
-}
-
-async fn connect_via_http_proxy(
-    target_uri: &Uri,
-    proxy: &Intercept,
-) -> Result<BoxedCodexIo, String> {
-    let proxy_uri = uri_with_resolved_port(proxy.uri())?;
-    eprintln!(
-        "[OpenAI Codex][websocket] SYSTEM_PROXY {}",
-        proxy_display_uri(&proxy_uri)
-    );
-
-    let (target_host, target_port) = uri_host_port(target_uri)?;
-    let proxy_config = tungstenite_proxy_config(proxy, TungsteniteProxyScheme::Http)?;
-    let tcp = connect_tcp_stream(&proxy_uri).await?;
-    let tunneled = connect_via_proxy(tcp, &proxy_config, &target_host, target_port)
-        .await
-        .map_err(|e| format!("Failed to establish HTTP proxy tunnel: {}", e))?;
-    Ok(Box::new(tunneled))
-}
-
-async fn connect_via_https_proxy(
-    target_uri: &Uri,
-    proxy: &Intercept,
-) -> Result<BoxedCodexIo, String> {
-    let proxy_uri = uri_with_resolved_port(proxy.uri())?;
-    eprintln!(
-        "[OpenAI Codex][websocket] SYSTEM_PROXY {}",
-        proxy_display_uri(&proxy_uri)
-    );
-
-    let (proxy_host, _) = uri_host_port(&proxy_uri)?;
-    let (target_host, target_port) = uri_host_port(target_uri)?;
-    let proxy_config = tungstenite_proxy_config(proxy, TungsteniteProxyScheme::Http)?;
-
-    let tcp = connect_tcp_stream(&proxy_uri).await?;
-    let proxy_tls = tls::connector()?
-        .connect(tls::server_name(&proxy_host)?, tcp)
-        .await
-        .map_err(|e| format!("Failed to establish TLS to HTTPS proxy: {}", e))?;
-    let tunneled = connect_via_proxy(proxy_tls, &proxy_config, &target_host, target_port)
-        .await
-        .map_err(|e| format!("Failed to establish HTTPS proxy tunnel: {}", e))?;
-
-    Ok(Box::new(tunneled))
-}
-
-async fn connect_via_socks4_proxy(
-    target_uri: &Uri,
-    proxy: &Intercept,
-) -> Result<BoxedCodexIo, String> {
-    let proxy_uri = uri_with_resolved_port(proxy.uri())?;
-    eprintln!(
-        "[OpenAI Codex][websocket] SYSTEM_PROXY {}",
-        proxy_display_uri(&proxy_uri)
-    );
-
-    let mut socks = SocksV4::new(proxy_uri, build_tcp_connector());
-    if proxy.uri().scheme_str() == Some("socks4") {
-        socks = socks.local_dns(true);
-    }
-    let connection = socks
-        .call(target_uri.clone())
-        .await
-        .map_err(|e| format!("Failed to establish SOCKS4 proxy tunnel: {}", e))?;
-    Ok(Box::new(connection.into_inner()))
-}
-
-async fn connect_via_socks5_proxy(
-    target_uri: &Uri,
-    proxy: &Intercept,
-) -> Result<BoxedCodexIo, String> {
-    let proxy_uri = uri_with_resolved_port(proxy.uri())?;
-    eprintln!(
-        "[OpenAI Codex][websocket] SYSTEM_PROXY {}",
-        proxy_display_uri(&proxy_uri)
-    );
-
-    let scheme = match proxy.uri().scheme_str() {
-        Some("socks5h") => TungsteniteProxyScheme::Socks5h,
-        _ => TungsteniteProxyScheme::Socks5,
-    };
-    let (target_host, target_port) = uri_host_port(target_uri)?;
-    let proxy_config = tungstenite_proxy_config(proxy, scheme)?;
-    let tcp = connect_tcp_stream(&proxy_uri).await?;
-    let tunneled = connect_via_proxy(tcp, &proxy_config, &target_host, target_port)
-        .await
-        .map_err(|e| format!("Failed to establish SOCKS5 proxy tunnel: {}", e))?;
-    Ok(Box::new(tunneled))
-}
-
+use locus_remote_core::codex_transport::{ws_io_error, wrap_websocket_transport_tls};
+#[cfg(test)]
+use locus_remote_core::codex_transport::{websocket_proxy_match_uri, uri_host_port};
 async fn connect_websocket_transport(request: &http::Request<()>) -> Result<BoxedCodexIo, String> {
-    let target_uri = websocket_proxy_match_uri(request.uri())?;
-    let matcher = crate::network::proxy_matcher();
-
-    if let Some(proxy) = matcher.intercept(&target_uri) {
-        match proxy.uri().scheme_str().unwrap_or("http") {
-            "http" => connect_via_http_proxy(&target_uri, &proxy).await,
-            "https" => connect_via_https_proxy(&target_uri, &proxy).await,
-            "socks4" | "socks4a" => connect_via_socks4_proxy(&target_uri, &proxy).await,
-            "socks5" | "socks5h" => connect_via_socks5_proxy(&target_uri, &proxy).await,
-            other => Err(format!(
-                "Unsupported system proxy scheme for Codex websocket: {}",
-                other
-            )),
-        }
-    } else {
-        Ok(Box::new(connect_tcp_stream(&target_uri).await?))
-    }
-}
-
-async fn wrap_websocket_transport_tls(
-    request: &http::Request<()>,
-    stream: BoxedCodexIo,
-) -> Result<BoxedCodexIo, String> {
-    match request.uri().scheme_str() {
-        Some("wss") => {
-            let host = request
-                .uri()
-                .host()
-                .ok_or_else(|| "Websocket endpoint is missing host".to_string())?;
-            let tls_stream = tls::connector()?
-                .connect(tls::server_name(host)?, stream)
-                .await
-                .map_err(|e| format!("Failed to establish TLS to websocket endpoint: {}", e))?;
-            Ok(Box::new(tls_stream))
-        }
-        Some("ws") => Ok(stream),
-        Some(other) => Err(format!("Unsupported websocket scheme: {}", other)),
-        None => Err("Websocket endpoint is missing scheme".to_string()),
-    }
+    locus_remote_core::codex_transport::connect_websocket_transport(request, &crate::network::proxy_matcher()).await
 }
 
 enum WebsocketConnectOutcome<S> {
@@ -2161,19 +1890,14 @@ async fn connect_codex_websocket(
         {
             Ok(WebsocketConnectOutcome::FallbackToHttp)
         }
+        Ok(Err(WsError::Http(response))) if locus_remote_core::network::upstream_auth_failure(response.status(),response.headers()) =>
+            Err(format!("{}Codex websocket connect failed: {}",locus_remote_core::network::UPSTREAM_ERROR_MARKER,WsError::Http(response))),
         Ok(Err(err)) => Err(format!("Codex websocket connect failed: {}", err)),
         Err(_) => Err("Codex websocket connect timed out".to_string()),
     }
 }
 
-fn websocket_config() -> WebSocketConfig {
-    let mut extensions = ExtensionsConfig::default();
-    extensions.permessage_deflate = Some(DeflateConfig::default());
-
-    let mut config = WebSocketConfig::default();
-    config.extensions = extensions;
-    config
-}
+fn websocket_config() -> WebSocketConfig { locus_remote_core::codex_transport::websocket_config() }
 
 fn websocket_event_error_message(payload: &str) -> Option<String> {
     let event: serde_json::Value = serde_json::from_str(payload).ok()?;
@@ -3524,9 +3248,7 @@ where
     H: Fn(String, String) + Send,
 {
     let client = crate::network::rustls_reqwest_client(
-        crate::network::ReqwestClientOptions::new()
-            .tcp_keepalive(Duration::from_secs(20))
-            .connect_timeout(Duration::from_secs(30)),
+        locus_remote_core::network::codex_http_options(locus_remote_core::network::CodexHttpProfile::Responses),
     )?;
 
     let continuation_request = reasoning::continuation_metadata(&body);
@@ -3621,6 +3343,7 @@ where
     );
     let status = resp.status();
     if !status.is_success() {
+        let origin=if locus_remote_core::network::upstream_auth_failure(status,resp.headers()){locus_remote_core::network::UPSTREAM_ERROR_MARKER}else{""};
         trace.stage("error_body");
         let err_body = tokio::time::timeout(request_timeout, resp.text())
             .await
@@ -3628,7 +3351,7 @@ where
             .map_err(protocol::http_error)?;
         trace.push_response(&err_body);
         return Err(format!(
-            "OpenAI Codex API error ({} {}): {}",
+            "{origin}OpenAI Codex API error ({} {}): {}",
             status.as_u16(),
             status.canonical_reason().unwrap_or(""),
             err_body

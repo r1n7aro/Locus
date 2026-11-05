@@ -1,106 +1,14 @@
-//! One SSH stdio connection carries PTY bytes, Mod events and local tool replies.
-//! This module never sends inference requests or forwards a network port.
-use super::mod_bridge::PendingCall;
-use base64::Engine;
+//! Desktop settings and callbacks for the shared SSH transport.
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
-use zeroize::Zeroizing;
+use tokio::sync::mpsc;
+use super::mod_bridge::PendingCall;
+pub use locus_remote_core::claude_ssh::{SshConfig, RemoteInfo, diagnostics, startup};
 pub(crate) mod unlock;
-mod archive_rpc;
-mod heartbeat;
-pub(crate) mod diagnostics;
-pub(super) mod startup;
 
-const MAX_FRAME: usize = 32 * 1024 * 1024;
-const PYTHON: &str = "exec python3 -u -c 'import base64,sys;exec(compile(base64.b64decode(sys.stdin.buffer.readline()),\"<locus-ssh>\",\"exec\"))'";
-const INSTALL_PYTHON: &str = "if ! command -v python3 >/dev/null 2>&1; then if [ \"$(id -u)\" = 0 ]; then SUDO=''; elif sudo -n true 2>/dev/null; then SUDO='sudo -n'; else echo 'Python 3 is missing; installation requires passwordless sudo or an administrator' >&2; exit 1; fi; if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update >&2 && $SUDO apt-get install -y python3 bash ca-certificates curl >&2 || exit 1; elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y python3 bash ca-certificates curl >&2 || exit 1; elif command -v apk >/dev/null 2>&1; then $SUDO apk add python3 bash ca-certificates curl >&2 || exit 1; else echo 'Install Python 3 on this server first' >&2; exit 1; fi; fi; ";
-const CHECK_PYTHON: &str = "if ! command -v python3 >/dev/null 2>&1; then printf '%s\\n' '{\"type\":\"hello\",\"protocol\":1,\"info\":{\"pythonInstalled\":false,\"cliSupported\":false,\"authenticated\":false}}'; exit 0; fi; ";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct SshConfig {
-    /// An OpenSSH config alias or user@hostname. Never a shell command.
-    pub target: String,
-    pub port: Option<u16>,
-    pub identity_file: Option<String>,
-    pub known_hosts_file: Option<String>,
-    pub cli_path: Option<String>,
-}
-impl SshConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.target.is_empty()
-            || self.target.starts_with('-')
-            || self.target.len() > 512
-            || !self
-                .target
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"_.-@[]:%".contains(&c))
-            || self.target.matches('@').count() > 1
-            || self.port == Some(0)
-        {
-            return Err(
-                "Enter an SSH alias or user@hostname, with the port in its own field".into(),
-            );
-        }
-        for value in [&self.identity_file, &self.known_hosts_file, &self.cli_path]
-            .into_iter()
-            .flatten()
-        {
-            if value.is_empty() || value.chars().any(char::is_control) {
-                return Err("SSH paths must not be empty or contain control characters".into());
-            }
-        }
-        Ok(())
-    }
-    pub fn fingerprint(&self) -> String {
-        uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_URL,
-            &serde_json::to_vec(self).expect("SSH config serialization"),
-        )
-        .to_string()
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoteInfo {
-    #[serde(default, skip_serializing)]
-    pub history: Option<Value>,
-    #[serde(default)]
-    pub platform: Option<String>,
-    #[serde(default)]
-    pub keychain_unlocked: Option<bool>,
-    #[serde(default)]
-    pub keychain_unlock_tested: bool,
-    pub python_installed: bool,
-    pub cli_version: Option<String>,
-    pub cli_supported: bool,
-    pub model: Option<String>,
-    pub authenticated: bool,
-    pub home: Option<String>,
-    pub session_root: Option<String>,
-}
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum PermissionMode {
-    #[default]
-    Auto,
-    BypassPermissions,
-}
-impl PermissionMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::BypassPermissions => "bypassPermissions",
-        }
-    }
-}
+pub use locus_remote_core::claude_launch::PermissionMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +24,11 @@ pub struct ConnectionSettings {
     pub pool_capacity: u32,
     #[serde(default = "default_idle_minutes")]
     pub idle_minutes: u32,
+    /// Route for new Multi-Agent conversations; existing ones keep their pin.
+    #[serde(default = "default_native_multi_agent")]
+    pub native_multi_agent: bool,
+    #[serde(default)]
+    pub native_agents: NativeAgentSettings,
     pub remote: Option<SshConfig>,
     pub authorized_target: Option<String>,
     pub info: Option<RemoteInfo>,
@@ -132,6 +45,8 @@ impl Default for ConnectionSettings {
             prewarm: false,
             pool_capacity: default_pool_capacity(),
             idle_minutes: default_idle_minutes(),
+            native_multi_agent: default_native_multi_agent(),
+            native_agents: NativeAgentSettings::default(),
             remote: None,
             authorized_target: None,
             info: None,
@@ -141,36 +56,122 @@ impl Default for ConnectionSettings {
 }
 fn default_idle_minutes() -> u32 { 15 }
 fn default_pool_capacity() -> u32 { 1 }
+fn default_native_multi_agent() -> bool { true }
+
+/// `providers.claudeCode.nativeAgents.*`: the Claude Code builtin Agent types
+/// the native Agent tool offers, and the delegatable Locus agent types it
+/// leaves out. Read when a conversation pins its route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeAgentSettings {
+    #[serde(default = "default_builtin_agents")]
+    pub builtins: Vec<String>,
+    #[serde(default)]
+    pub excluded_locus_agents: Vec<String>,
+}
+impl Default for NativeAgentSettings {
+    fn default() -> Self { Self { builtins: default_builtin_agents(), excluded_locus_agents: Vec::new() } }
+}
+fn default_builtin_agents() -> Vec<String> {
+    ["general-purpose", "Explore", "Plan"].into_iter().map(str::to_owned).collect()
+}
+/// State kept in `claude_connection.json`: which SSH target the user
+/// authorized and what the last probe found. The options themselves are
+/// settings under `providers.claudeCode`.
 fn settings_path() -> Result<PathBuf, String> {
     Ok(crate::commands::persistent_config_dir()?.join("claude_connection.json"))
 }
-pub fn load_settings() -> Result<ConnectionSettings, String> {
-    let path = settings_path()?;
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            let value: ConnectionSettings =
-                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            if value.version != 1 {
-                return Err("Unsupported Claude connection configuration version".into());
-            }
-            value.runtime.validate()?;
-            if let Some(remote) = &value.remote {
-                remote.validate()?;
-                if value.authorized_target.as_deref() != Some(remote.fingerprint().as_str()) {
-                    return Err(
-                        "Authorize environment setup for this SSH target in Settings".into(),
-                    );
-                }
-            }
-            Ok(value)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConnectionSettings::default()),
-        Err(e) => Err(e.to_string()),
+const SETTINGS_GROUP: &str = "providers.claudeCode";
+const STATE_FIELDS: [&str; 2] = ["authorizedTarget", "info"];
+const OPTIONAL_REMOTE_FIELDS: [&str; 3] = ["identityFile", "knownHostsFile", "cliPath"];
+
+/// `remote.*` settings as `Option<SshConfig>` JSON: an empty target means
+/// local, empty paths mean unset.
+fn remote_from_settings(remote: &Value) -> Value {
+    let Some(fields) = remote.as_object() else { return Value::Null };
+    if fields.get("target").and_then(Value::as_str).unwrap_or_default().is_empty() {
+        return Value::Null;
     }
+    let mut remote = fields.clone();
+    for field in OPTIONAL_REMOTE_FIELDS {
+        if remote.get(field).and_then(Value::as_str).is_some_and(str::is_empty) {
+            remote.insert(field.to_string(), Value::Null);
+        }
+    }
+    Value::Object(remote)
+}
+
+fn remote_to_settings(remote: Option<&SshConfig>) -> Value {
+    json!({
+        "target": remote.map(|remote| remote.target.as_str()).unwrap_or_default(),
+        "port": remote.and_then(|remote| remote.port),
+        "identityFile": remote.and_then(|remote| remote.identity_file.as_deref()).unwrap_or_default(),
+        "knownHostsFile": remote.and_then(|remote| remote.known_hosts_file.as_deref()).unwrap_or_default(),
+        "cliPath": remote.and_then(|remote| remote.cli_path.as_deref()).unwrap_or_default(),
+    })
+}
+
+pub fn load_settings() -> Result<ConnectionSettings, String> {
+    let state = crate::config::read_state_file(&settings_path()?);
+    let mut object = match crate::settings::group::read(
+        crate::settings::global::global(),
+        SETTINGS_GROUP,
+    ) {
+        Value::Object(object) => object,
+        _ => Default::default(),
+    };
+    let remote = object.remove("remote").unwrap_or(Value::Null);
+    object.insert("remote".into(), remote_from_settings(&remote));
+    object.insert("version".into(), json!(1));
+    for field in STATE_FIELDS {
+        object.insert(field.into(), state.get(field).cloned().unwrap_or(Value::Null));
+    }
+    let value: ConnectionSettings =
+        serde_json::from_value(Value::Object(object)).map_err(|e| e.to_string())?;
+    value.runtime.validate()?;
+    if let Some(remote) = &value.remote {
+        remote.validate()?;
+        if value.authorized_target.as_deref() != Some(remote.fingerprint().as_str()) {
+            return Err("Authorize environment setup for this SSH target in Settings".into());
+        }
+    }
+    Ok(value)
 }
 pub fn save_settings(value: &ConnectionSettings) -> Result<(), String> {
     value.runtime.validate()?;
-    write_json(&settings_path()?, value)
+    let mut options = serde_json::to_value(value).map_err(|e| e.to_string())?;
+    options["remote"] = remote_to_settings(value.remote.as_ref());
+    crate::settings::global::global()
+        .set_values(&crate::settings::group::changes(SETTINGS_GROUP, &options))
+        .map_err(|error| error.message)?;
+    crate::config::update_state_file(&settings_path()?, |state| {
+        state.insert("version".into(), json!(1));
+        state.insert("authorizedTarget".into(), json!(value.authorized_target));
+        state.insert("info".into(), json!(value.info));
+    })
+}
+
+/// Applies `providers.claudeCode.*` changes written through settings
+/// (agent `config_set`) the way the connection commands do.
+pub(crate) fn apply_settings_change(changed_keys: &[&str]) {
+    let settings = load_settings();
+    let touched = |prefix: &str| changed_keys.iter().any(|key| key.starts_with(prefix));
+    if touched("providers.claudeCode.idleCompaction")
+        || touched("providers.claudeCode.telemetry")
+        || touched("providers.claudeCode.autoCompactWindow")
+    {
+        if let Ok(settings) = &settings {
+            super::tui::retire_outdated_runtime_settings(settings.runtime);
+        }
+    }
+    let prewarm_off = settings.as_ref().map(|settings| !settings.prewarm).unwrap_or(true);
+    if touched("providers.claudeCode.remote.") || (touched("providers.claudeCode.prewarm") && prewarm_off) {
+        super::tui::prewarm::cancel_all();
+    }
+    if touched("providers.claudeCode.remote.") {
+        let keep = settings.ok().and_then(|settings| settings.remote);
+        super::tui::retire_idle_remote_connections(keep.as_ref());
+    }
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     std::fs::create_dir_all(path.parent().ok_or("Missing parent directory")?)
@@ -275,116 +276,14 @@ pub fn session_key(id: &str, remote: &SshConfig) -> String {
     .to_string()
 }
 
-pub(super) fn configured_command(config: &SshConfig) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("ssh");
-    command.args(["-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-        "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
-        "-o", "ClearAllForwardings=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none"]);
-    if let Some(port) = config.port { command.args(["-p", &port.to_string()]); }
-    if let Some(path) = &config.identity_file { command.args(["-i", path]); }
-    if let Some(path) = &config.known_hosts_file { command.args(["-o", &format!("UserKnownHostsFile={path}")]); }
-    command
-}
 
-pub struct Transport {
-    trace: Arc<diagnostics::Trace>,
-    #[cfg(windows)]
-    job: super::pty_job::PtyJob,
-    child: Mutex<tokio::process::Child>,
-    send: mpsc::Sender<Value>,
-    healthy: Arc<AtomicBool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    pub diagnostic: Arc<Mutex<Vec<u8>>>,
-    failure: Arc<Mutex<Option<String>>>,
-    archive_rpc: Arc<archive_rpc::ArchiveRpc>,
-    heartbeat: Arc<Mutex<heartbeat::Heartbeat>>,
+/// Existing callers keep their API; transport behavior is shared with Locus Server.
+pub struct Transport(locus_remote_core::claude_ssh::Transport);
+impl std::ops::Deref for Transport {
+    type Target = locus_remote_core::claude_ssh::Transport;
+    fn deref(&self) -> &Self::Target { &self.0 }
 }
 impl Transport {
-    pub fn failure(&self) -> String {
-        let status = self.child.lock().unwrap_or_else(|e| e.into_inner()).try_wait().ok().flatten();
-        let error = self.failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
-            .unwrap_or_else(|| super::turn_retry::disconnected("SSH connection closed"));
-        // The child watcher can observe exit before the reader gets scheduled.
-        // Capture that failure too; intentional stop sets trace.stopped first.
-        if status.is_some() || !self.healthy.load(Ordering::SeqCst) {
-            self.trace.fail("closed", &error, status.and_then(|s| s.code()));
-        }
-        self.trace.observe_exit(status.and_then(|s| s.code()));
-        error
-    }
-    pub fn latency_ms(&self) -> Option<f64> {
-        if !self.alive() { return None; }
-        self.heartbeat.lock().unwrap_or_else(|e| e.into_inner()).latency_ms(std::time::Instant::now())
-    }
-    /// Called when the hooks lease expires, not during environment bootstrap.
-    /// A live SSH child or missing RTT is insufficient evidence either way.
-    pub(super) fn health_failure(&self) -> Option<String> {
-        if !self.alive() { return Some(self.failure()); }
-        let unresponsive = self.heartbeat.lock().unwrap_or_else(|e| e.into_inner())
-            .unresponsive(std::time::Instant::now());
-        unresponsive.then(|| {
-            let error = super::turn_retry::disconnected("SSH transport heartbeat received no response for 30s");
-            self.trace.fail("heartbeat", &error, None);
-            error
-        })
-    }
-    pub fn alive(&self) -> bool {
-        self.healthy.load(Ordering::SeqCst)
-            && matches!(
-                self.child
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .try_wait(),
-                Ok(None)
-            )
-    }
-    pub fn stop(&self) {
-        if self.trace.stopped.swap(true, Ordering::Relaxed) { return; }
-        self.archive_rpc.close(&self.failure());
-        self.healthy.store(false, Ordering::SeqCst);
-        let _ = self.send.try_send(json!({"type":"close"}));
-        #[cfg(windows)]
-        self.job.terminate();
-        let _ = self
-            .child
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .start_kill();
-        // A stopped Session can remain in the cache until its next turn. Do not
-        // retain its writer/reader tasks (or pending tool futures) until Drop.
-        for (index, task) in self.tasks.iter().enumerate() {
-            // On real failure only, drain already-written SSH stderr briefly.
-            // Recovery and process termination do not wait for this, and all
-            // tool/read/write/heartbeat tasks are still retired immediately.
-            if index == 2 && self.trace.has_failed() {
-                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                    let abort = task.abort_handle();
-                    runtime.spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        abort.abort();
-                    });
-                    continue;
-                }
-            }
-            task.abort();
-        }
-    }
-    pub fn send(&self, value: Value) -> Result<(), String> {
-        if !self.alive() {
-            return Err(self.failure());
-        }
-        self.send
-            .try_send(value)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Closed(_) => self.failure(),
-                mpsc::error::TrySendError::Full(_) => "SSH input queue is full".into(),
-            })
-    }
-    pub fn input(&self, text: &str) -> Result<(), String> {
-        self.send(
-            json!({"type":"input","data":base64::engine::general_purpose::STANDARD.encode(text)}),
-        )
-    }
     pub async fn start(
         config: &SshConfig,
         request: Value,
@@ -392,394 +291,76 @@ impl Transport {
     ) -> Result<(Self, RemoteInfo), String> {
         Self::start_with_unlock(config, request, calls, unlock::UnlockPassword::Saved).await
     }
-
     pub async fn start_with_unlock(
         config: &SshConfig,
         mut request: Value,
         calls: Option<(mpsc::Sender<PendingCall>, Arc<super::mod_bridge::ControlSignals>, Arc<std::sync::RwLock<Value>>)>,
-        unlock_password: unlock::UnlockPassword,
+        password: unlock::UnlockPassword,
     ) -> Result<(Self, RemoteInfo), String> {
         config.validate()?;
-        let unlock_key = unlock::key(config)?;
+        let key = unlock::key(config)?;
         if request.get("runtimeSettings").is_none() {
             request["runtimeSettings"] = json!(load_settings()?.runtime);
         }
-        request["protocol"] = json!(1);
-        request["cliPath"] = json!(config.cli_path);
-        request["keychainUnlock"] = json!(true);
-        let authorized = request["authorizedSetup"] == true;
-        let handshake = Arc::new(Mutex::new(startup::Handshake::new(&request)));
-        let heartbeat = Arc::new(Mutex::new(heartbeat::Heartbeat::default()));
-        let trace = diagnostics::Trace::new(config, &request, heartbeat.clone());
-        let mut command = configured_command(config);
-        // The remote shell reaching this marker proves SSH connected, including
-        // when Python installation/bootstrap has not reached the helper yet.
-        let bootstrap_stage = if matches!(request["mode"].as_str(), Some("history" | "archive")) {
-            "history"
-        } else { "environment" };
-        command.arg("--").arg(&config.target).arg(format!(
-            "printf '%s\\n' '{{\"type\":\"progress\",\"protocol\":1,\"stage\":\"{bootstrap_stage}\",\"source\":\"shell\"}}'; {}{}",
-            if authorized {
-                INSTALL_PYTHON
-            } else {
-                CHECK_PYTHON
-            },
-            PYTHON
-        ));
-        command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        command.creation_flags(super::CREATE_NO_WINDOW);
-        let mut child = command.spawn().map_err(|e| {
-            let error = handshake.lock().unwrap_or_else(|e| e.into_inner())
-                .context(format!("Could not start OpenSSH: {e}"));
-            trace.fail("spawn", &error, None);
-            error
-        })?;
-        if let Some(pid) = child.id() { trace.pid(pid); }
-        #[cfg(windows)]
-        let job = super::pty_job::PtyJob::attach(child.id().ok_or("SSH process ID unavailable")?)?;
-        let mut stdin = child.stdin.take().ok_or("SSH stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("SSH stdout unavailable")?;
-        let mut stderr = child.stderr.take().ok_or("SSH stderr unavailable")?;
-        let (send, mut receive) = mpsc::channel::<Value>(64);
-        // Separate from ordinary frames so passwords cannot enter generic logs
-        // or be retained as session input. The writer wipes its serialized bytes.
-        let (unlock_send, mut unlock_receive) = mpsc::channel::<Option<Zeroizing<String>>>(1);
-        let healthy = Arc::new(AtomicBool::new(true));
-        let failure = Arc::new(Mutex::new(None));
-        let diagnostic = Arc::new(Mutex::new(Vec::new()));
-        let error_buffer = diagnostic.clone();
-        let stderr_trace = trace.clone();
-        let stderr_task = tokio::spawn(async move {
-            let mut bytes = [0; 8192];
-            while let Ok(count) = stderr.read(&mut bytes).await {
-                if count == 0 {
-                    break;
-                }
-                stderr_trace.stderr(&bytes[..count]);
-                append_diagnostic(&error_buffer, &bytes[..count]);
-            }
+        let calls = calls.map(|(sender, controls, options)| locus_remote_core::claude_ssh::BridgeCalls {
+            sender, route: Arc::new(move |payload| controls.route(payload, &options)),
         });
-        let writer_health = healthy.clone();
-        let writer_failure = failure.clone();
-        let writer_trace = trace.clone();
-        let writer_heartbeat = heartbeat.clone();
-        let source = base64::engine::general_purpose::STANDARD.encode(include_str!("ssh_host.py"));
-        let write_task = tokio::spawn(async move {
-            let run = async {
-                let bootstrap = format!("{source}\n{request}\n");
-                stdin.write_all(bootstrap.as_bytes()).await?;
-                writer_trace.sent(bootstrap.len());
-                drop(bootstrap);
-                stdin.flush().await?;
-                loop {
-                    let bytes = tokio::select! {
-                        Some(password) = unlock_receive.recv() => {
-                            #[derive(Serialize)]
-                            struct Reply<'a> { r#type: &'static str, password: Option<&'a str> }
-                            Zeroizing::new(serde_json::to_vec(&Reply {
-                                r#type: "keychain_unlock", password: password.as_deref().map(String::as_str),
-                            })?)
-                        }
-                        value = receive.recv() => {
-                            let Some(value) = value else { break; };
-                            if value["type"] == "ping" {
-                                if let Some(id) = value["id"].as_u64() {
-                                    writer_heartbeat.lock().unwrap_or_else(|e| e.into_inner()).sent(id, std::time::Instant::now());
-                                }
-                            }
-                            Zeroizing::new(serde_json::to_vec(&value)?)
-                        }
-                    };
-                    if bytes.len() > MAX_FRAME {
-                        return Err(std::io::Error::other("SSH frame too large"));
-                    }
-                    stdin.write_all(&bytes).await?;
-                    stdin.write_all(b"\n").await?;
-                    writer_trace.sent(bytes.len() + 1);
-                    stdin.flush().await?;
-                }
-                Ok::<_, std::io::Error>(())
-            };
-            if let Err(error) = run.await {
-                let error = super::turn_retry::disconnected(format!("SSH write failed: {error}"));
-                writer_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(error.clone());
-                if writer_trace.unexpected_end() { writer_trace.fail("write", &error, None); }
-            }
-            writer_health.store(false, Ordering::SeqCst);
-        });
-        let (hello_send, hello_receive) = oneshot::channel();
-        let read_health = healthy.clone();
-        let read_failure = failure.clone();
-        let reply_send = send.clone();
-        let read_buffer = diagnostic.clone();
-        let archive_rpc=Arc::new(archive_rpc::ArchiveRpc::default());
-        let read_archive_rpc=archive_rpc.clone();
-        let read_heartbeat = heartbeat.clone();
-        let read_handshake = handshake.clone();
-        let read_trace = trace.clone();
-        let read_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut hello = Some(hello_send);
-            let mut unlock_requested = false;
-            let mut pending = tokio::task::JoinSet::new();
-            loop {
-                while pending.try_join_next().is_some() {}
-                // Reading a frame is deliberately not raced against completed
-                // replies: cancelling a partial read would discard its prefix.
-                let value = match read_frame_traced(&mut reader, Some(&read_trace)).await {
-                    Ok(Some(value)) => value,
-                    result => {
-                        let error = result.err().unwrap_or_else(|| super::turn_retry::disconnected("SSH output closed"));
-                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(error);
-                        break;
-                    }
-                };
-                if read_archive_rpc.route(&value) { continue; }
-                match value["type"].as_str() {
-                    Some("keychain_unlock_required") if hello.is_some()
-                        && !unlock_requested && value["protocol"] == 1 && value["platform"] == "darwin" => {
-                        unlock_requested = true;
-                        // A Linux peer never asks for this and never loads the local secret.
-                        match unlock_password.resolve(&unlock_key) {
-                            Ok(password) => { if unlock_send.send(password).await.is_err() { break; } }
-                            Err(_) => {
-                                if let Some(hello) = hello.take() {
-                                    let _ = hello.send(Err("Could not read the saved macOS keychain password from this computer's credential store".into()));
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    Some("hello") if value["protocol"] == 1 => {
-                        if let Some(hello) = hello.take() {
-                            let info = serde_json::from_value::<RemoteInfo>(value["info"].clone()).map_err(|e| e.to_string());
-                            if info.is_ok() { read_trace.ready(); }
-                            let _ = hello.send(info);
-                        }
-                    }
-                    Some("terminal") => {
-                        if let Some(data) = value["data"]
-                            .as_str()
-                            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-                        {
-                            append_diagnostic(&read_buffer, &data);
-                            if data.windows(4).any(|p| p == b"\x1b[6n") {
-                                let _ = reply_send.try_send(json!({"type":"input","data":base64::engine::general_purpose::STANDARD.encode(b"\x1b[1;1R")}));
-                            }
-                        }
-                    }
-                    Some("bridge_health") => {
-                        // One-way samples bypass tool queues and pending reply
-                        // tasks. No remote receipt is needed for liveness: the
-                        // lease advances only when this process receives it.
-                        if value["payload"]["type"] == "bridge_health" {
-                            if let Some((_, controls, options)) = &calls {
-                                controls.route(&value["payload"], options);
-                            }
-                        }
-                    }
-                    Some("call") => {
-                        let Some(calls) = calls.clone().filter(|_| pending.len() < 64) else {
-                            read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert("Unexpected or excessive SSH bridge calls".into());
-                            break;
-                        };
-                        let Some(id) = value["id"].as_str().map(str::to_string) else {
-                            read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert("SSH bridge call has no identity".into());
-                            break;
-                        };
-                        let send = reply_send.clone();
-                        pending.spawn(async move {
-                            let (calls,controls,options)=calls;
-                            if let Some(result)=controls.route(&value["payload"],&options) {
-                                let _=send.send(json!({"type":"reply","id":id,"value":result})).await;
-                                return;
-                            }
-                            let (reply, receive) = oneshot::channel();
-                            if calls
-                                .send(PendingCall {
-                                    payload: value["payload"].clone(),
-                                    reply,
-                                    received_at: tokio::time::Instant::now(),
-                                })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            let result = receive.await.unwrap_or_else(
-                                |_| json!({"bridgeError":"Locus tool handler closed"}),
-                            );
-                            let _ = send
-                                .send(json!({"type":"reply","id":id,"value":result}))
-                                .await;
-                        });
-                    }
-                    Some("error") => {
-                        let message = value["message"]
-                            .as_str()
-                            .unwrap_or("Remote Claude failed")
-                            .to_string();
-                        append_diagnostic(&read_buffer, message.as_bytes());
-                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(message.clone());
-                        if let Some(hello) = hello.take() {
-                            let _ = hello.send(Err(message));
-                        }
-                        break;
-                    }
-                    Some("exit") => {
-                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(||
-                            super::turn_retry::disconnected(format!("Remote Claude exited: {value}")));
-                        break;
-                    },
-                    Some("pong") => {
-                        if let Some(id) = value["id"].as_u64() {
-                            read_heartbeat.lock().unwrap_or_else(|e| e.into_inner()).received(id, std::time::Instant::now());
-                        }
-                    }
-                    Some("progress") => {
-                        read_trace.progress(&value);
-                        read_handshake.lock().unwrap_or_else(|e| e.into_inner()).progress(&value);
-                    }
-                    _ => {
-                        read_failure.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert("Unexpected SSH protocol frame".into());
-                        break;
-                    },
-                }
-            }
-            read_health.store(false, Ordering::SeqCst);
-            let error = read_failure.lock().unwrap_or_else(|e| e.into_inner()).clone()
-                .unwrap_or_else(|| super::turn_retry::disconnected("SSH reader stopped"));
-            if calls.is_some() { eprintln!("[Claude] transport ended: {error}"); }
-            if read_trace.unexpected_end() { read_trace.fail("closed", &error, None); }
-            read_archive_rpc.close(&error);
-        });
-        let heartbeat_health = healthy.clone();
-        let heartbeat_send = send.clone();
-        let heartbeat_task = tokio::spawn(async move {
-            let mut id = 0_u64;
-            while heartbeat_health.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                id += 1;
-                if heartbeat_send.send(json!({"type":"ping","id":id})).await.is_err() {
-                    break;
-                }
-            }
-        });
-        let mut transport = Self {
-            trace,
-            archive_rpc,
-            heartbeat,
-            #[cfg(windows)]
-            job,
-            child: Mutex::new(child),
-            send,
-            healthy,
-            tasks: vec![read_task, write_task, stderr_task, heartbeat_task],
-            diagnostic,
-            failure,
-        };
-        let timeout = Duration::from_secs(if authorized { 660 } else { 45 });
-        let info = match tokio::time::timeout(timeout, hello_receive).await {
-            Ok(Ok(result)) => match result {
-                Ok(info) => info,
-                Err(error) => {
-                    let error = handshake.lock().unwrap_or_else(|e| e.into_inner()).context(error);
-                    transport.trace.fail("remote", &error, None);
-                    return Err(error);
-                }
-            },
-            result => {
-                // stdout EOF can precede delivery of OpenSSH's stderr verdict.
-                // Drain it briefly so permission/host-key failures are not
-                // mislabeled as an unexplained bridge closure.
-                let _ = tokio::time::timeout(Duration::from_millis(200), &mut transport.tasks[2]).await;
-                let diagnostic = transport.diagnostic.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let failure = transport.failure.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let error = handshake.lock().unwrap_or_else(|e| e.into_inner())
-                    .failed(result.is_err(), timeout, failure, &diagnostic);
-                let exit_code = transport.child.lock().unwrap_or_else(|e| e.into_inner()).try_wait().ok().flatten().and_then(|s| s.code());
-                transport.trace.fail(if result.is_err() { "timeout" } else { "closed" }, &error, exit_code);
-                return Err(error);
-            }
-        };
-        Ok((transport, info))
-    }
-}
-impl Drop for Transport {
-    fn drop(&mut self) {
-        self.stop();
+        let unlock = Arc::new(move || password.resolve(&key));
+        let (transport, info) = locus_remote_core::claude_ssh::Transport::start(config, request, calls, unlock).await?;
+        Ok((Self(transport), info))
     }
 }
 pub async fn probe(config: &SshConfig, authorized: bool) -> Result<RemoteInfo, String> {
     probe_with_unlock(config, authorized, unlock::UnlockPassword::Saved).await
 }
 pub async fn probe_with_unlock(config: &SshConfig, authorized: bool, password: unlock::UnlockPassword) -> Result<RemoteInfo, String> {
+    // Setup with native agents enabled also installs the Claude Code they need.
+    let native_multi_agent = authorized && load_settings().is_ok_and(|settings| settings.native_multi_agent);
     let (_transport, info) = Transport::start_with_unlock(
         config,
-        json!({"mode":if authorized {"prepare"} else {"inspect"},"authorizedSetup":authorized}),
+        json!({"mode":if authorized {"prepare"} else {"inspect"},"authorizedSetup":authorized,"nativeMultiAgent":native_multi_agent}),
         None,
         password,
     )
     .await?;
     Ok(info)
 }
-fn append_diagnostic(buffer: &Mutex<Vec<u8>>, bytes: &[u8]) {
-    let mut buffer = buffer.lock().unwrap_or_else(|e| e.into_inner());
-    buffer.extend_from_slice(bytes);
-    if buffer.len() > 65536 {
-        let excess = buffer.len() - 65536;
-        buffer.drain(..excess);
-    }
-}
-#[cfg(test)]
-async fn read_frame(
-    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
-) -> Result<Option<Value>, String> {
-    read_frame_traced(reader, None).await
-}
-async fn read_frame_traced(
-    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
-    trace: Option<&diagnostics::Trace>,
-) -> Result<Option<Value>, String> {
-    let mut bytes = Vec::new();
-    loop {
-        let available = reader.fill_buf().await.map_err(|e| super::turn_retry::disconnected(format!("SSH read failed: {e}")))?;
-        if available.is_empty() {
-            return if bytes.is_empty() {
-                Ok(None)
-            } else {
-                Err(super::turn_retry::disconnected("Truncated SSH frame"))
-            };
-        }
-        let count = available
-            .iter()
-            .position(|b| *b == b'\n')
-            .map(|i| i + 1)
-            .unwrap_or(available.len());
-        if bytes.len() + count > MAX_FRAME {
-            return Err("SSH frame exceeds size limit".into());
-        }
-        let complete = available[count - 1] == b'\n';
-        bytes.extend_from_slice(&available[..count]);
-        reader.consume(count);
-        if let Some(trace) = trace { trace.received(count, bytes.len()); }
-        if complete {
-            if let Some(trace) = trace { trace.frame_complete(); }
-            return serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| e.to_string());
-        }
+
+/// Saves the CLI version a session launch found, which can differ from the
+/// last connection test (the launch installs Claude Code when it must, and
+/// Claude updates itself). New conversations choose their route from it.
+pub fn record_launched_cli(config: &SshConfig, launched: &RemoteInfo) {
+    let Some(settings) = load_settings().ok().and_then(|settings| with_launched_cli(settings, config, launched)) else { return };
+    if let Err(error) = save_settings(&settings) {
+        eprintln!("[Claude SSH] could not save the remote CLI version: {error}");
     }
 }
 
+/// The saved connection updated with a launch's CLI, or `None` when it is
+/// another connection or nothing changed.
+fn with_launched_cli(mut settings: ConnectionSettings, config: &SshConfig, launched: &RemoteInfo) -> Option<ConnectionSettings> {
+    if settings.remote.as_ref() != Some(config) { return None; }
+    let saved = settings.info.as_mut()?;
+    if launched.cli_version.is_none() || saved.cli_version == launched.cli_version { return None; }
+    saved.cli_version = launched.cli_version.clone();
+    saved.cli_supported = launched.cli_supported;
+    Some(settings)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_launch_records_the_remote_cli_version_it_found() {
+        let config = SshConfig { target: "user@host".into(), port: None, identity_file: None, known_hosts_file: None, cli_path: None };
+        let info = |version: Option<&str>| RemoteInfo { cli_version: version.map(str::to_owned), cli_supported: true, ..Default::default() };
+        let saved = ConnectionSettings { remote: Some(config.clone()), info: Some(info(Some("2.1.300 (Claude Code)"))), ..Default::default() };
+        let updated = with_launched_cli(saved.clone(), &config, &info(Some("2.1.312 (Claude Code)"))).unwrap();
+        assert_eq!(updated.info.unwrap().cli_version.as_deref(), Some("2.1.312 (Claude Code)"));
+        assert!(with_launched_cli(saved.clone(), &config, &info(Some("2.1.300 (Claude Code)"))).is_none());
+        assert!(with_launched_cli(saved.clone(), &config, &info(None)).is_none());
+        let other = SshConfig { target: "user@other".into(), ..config };
+        assert!(with_launched_cli(saved, &other, &info(Some("2.1.312 (Claude Code)"))).is_none());
+    }
     #[test]
     fn permission_mode_defaults_to_auto_and_roundtrips_explicit_bypass() {
         let old = json!({"version":1,"remote":null,"authorizedTarget":null,"info":null});
@@ -863,32 +444,16 @@ mod tests {
         std::fs::write(&new, r#"{"version":2,"remote":null}"#).unwrap();
         assert!(resolve_binding(&new, false, || Ok(None)).is_err());
     }
-    #[tokio::test]
-    async fn partial_history_bytes_remain_observable_before_a_frame_completes() {
-        let trace = diagnostics::Trace::new(&config(), &json!({"mode":"history"}), Arc::new(Mutex::new(heartbeat::Heartbeat::default())));
-        trace.progress(&json!({"type":"progress","protocol":1,"stage":"history_transfer","bytes":1000}));
-        let (mut writer, reader) = tokio::io::duplex(128);
-        writer.write_all(b"{\"info\":").await.unwrap();
-        let mut reader = BufReader::new(reader);
-        assert!(tokio::time::timeout(Duration::from_millis(10), read_frame_traced(&mut reader, Some(&trace))).await.is_err());
-        let status = trace.snapshot();
-        assert_eq!(status.partial_frame_bytes, 8);
-        assert_eq!(status.received_bytes, 8);
-        assert_eq!(status.expected_frame_bytes, Some(1000));
-        assert!(status.last_receive_age_ms.is_some());
-    }
-    #[tokio::test]
-    async fn frames_reject_truncation_and_invalid_json() {
-        assert_eq!(
-            read_frame(&mut &b"{\"type\":\"pong\"}\n"[..])
-                .await
-                .unwrap()
-                .unwrap()["type"],
-            "pong"
-        );
-        let truncated = read_frame(&mut &b"{}"[..]).await.unwrap_err();
-        assert!(super::super::turn_retry::is_disconnected(&truncated));
-        let malformed = read_frame(&mut &b"oops\n"[..]).await.unwrap_err();
-        assert!(!super::super::turn_retry::is_disconnected(&malformed));
+}
+
+/// Versioned server identities never pass through the direct SSH sidecar.
+pub fn native_session_connection(id:&str,legacy_local:bool,recorded:Option<Option<super::connection::NativeConnection>>)->Result<Option<super::connection::NativeConnection>,String>{
+    use super::connection::NativeConnection;
+    match recorded {
+        Some(Some(connection @ NativeConnection::Server{..})) => {connection.validate()?;Ok(Some(connection))}
+        other => {
+            let recorded=other.map(|value|value.and_then(|value|value.as_ssh().cloned()));
+            session_connection(id,legacy_local,recorded).map(|value|value.map(NativeConnection::Ssh))
+        }
     }
 }

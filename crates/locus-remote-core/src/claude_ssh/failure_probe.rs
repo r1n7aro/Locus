@@ -151,10 +151,10 @@ fn tailscale() -> Command {
 async fn capture(mut command: Command, timeout: Duration) -> Result<(Vec<u8>, Vec<u8>), &'static str> {
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     #[cfg(windows)]
-    command.creation_flags(super::super::super::CREATE_NO_WINDOW);
+    command.creation_flags(super::super::CREATE_NO_WINDOW);
     let mut child = command.spawn().map_err(|_| "unavailable")?;
     #[cfg(windows)]
-    let _job = super::super::super::pty_job::PtyJob::attach(child.id().ok_or("unavailable")?).map_err(|_| "unavailable")?;
+    let _job = super::super::pty_job::PtyJob::attach(child.id().ok_or("unavailable")?).map_err(|_| "unavailable")?;
     let mut stdout = child.stdout.take().ok_or("unavailable")?.take(256 * 1024 + 1);
     let mut stderr = child.stderr.take().ok_or("unavailable")?.take(8193);
     let result = tokio::time::timeout(timeout, async {

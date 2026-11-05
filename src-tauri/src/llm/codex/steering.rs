@@ -38,7 +38,7 @@ pub(super) fn refusal_error(error_message: &str, text_len: usize, tool_calls: us
 }
 
 pub fn supports_steering(model: &str) -> bool {
-    let model = model.strip_prefix("openai/").unwrap_or(model);
+    let model = super::protocol_model_name(model);
     model == "gpt-6-astra" || model.starts_with("gpt-6-astra-")
 }
 
