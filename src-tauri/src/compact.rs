@@ -2,6 +2,8 @@ use crate::session::models::{ChatMessage, MessageRole, ToolCallInfo};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+pub mod claude_native;
+
 const AUTO_COMPACT_THRESHOLD: f64 = 0.9;
 const AUTO_COMPACT_BUFFER_MIN_TOKENS: u32 = 4_000;
 const AUTO_COMPACT_BUFFER_MAX_TOKENS: u32 = 24_000;
@@ -2347,11 +2349,30 @@ pub fn build_post_compact_restored_files_section(
     working_dir: &str,
     context_limit: u32,
 ) -> String {
-    if pruned_messages.is_empty() || working_dir.trim().is_empty() {
-        return String::new();
-    }
     let (total_file_token_budget, max_tokens_per_file) =
         post_compact_restore_budgets(context_limit);
+    build_post_compact_restored_files_section_with_budgets(
+        pruned_messages,
+        working_dir,
+        total_file_token_budget,
+        max_tokens_per_file,
+        POST_COMPACT_MAX_FILES_TO_RESTORE,
+    )
+}
+
+/// Same restoration as `build_post_compact_restored_files_section`, with
+/// explicit budgets for callers whose compaction window is not the request
+/// context window (Claude Code's native compaction).
+pub(crate) fn build_post_compact_restored_files_section_with_budgets(
+    pruned_messages: &[ChatMessage],
+    working_dir: &str,
+    total_file_token_budget: u32,
+    max_tokens_per_file: u32,
+    max_files: usize,
+) -> String {
+    if pruned_messages.is_empty() || working_dir.trim().is_empty() || max_files == 0 {
+        return String::new();
+    }
 
     let tool_results: HashMap<&str, &str> = pruned_messages
         .iter()
@@ -2503,7 +2524,7 @@ pub fn build_post_compact_restored_files_section(
                 source_note,
             });
 
-            if restored.len() >= POST_COMPACT_MAX_FILES_TO_RESTORE {
+            if restored.len() >= max_files {
                 break 'outer;
             }
         }
