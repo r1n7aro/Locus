@@ -37,6 +37,52 @@ namespace Locus
         private static double _lastAsyncExecutePumpRequestSeconds;
         private static readonly bool ExecuteCodeDebugLoggingEnabled = IsExecuteCodeDebugLoggingEnabled();
         private const string ExecuteCodeExecutionIdMarker = "//__LOCUS_EXECUTION_ID__:";
+        private const string ExecuteCodeTimeoutMarker = "//__LOCUS_TIMEOUT_MS__:";
+
+        // Total run budget of one execution (the unity_execute `timeout`
+        // argument). The 30s inactivity limit (ExecuteTimeoutMs) applies
+        // independently of it.
+        private const int DefaultExecuteRunTimeoutMs = 600000;
+        private const int MinExecuteRunTimeoutMs = 1000;
+        private const int MaxExecuteRunTimeoutMs = 3600000;
+        private const int ExecuteProgressOutputTailChars = 240;
+
+        /// <summary>
+        /// Stopwatch timestamp of the latest editor-loop pump. While a snippet
+        /// holds the main thread this stops advancing, which is how progress
+        /// snapshots report how long the Editor has been frozen.
+        /// </summary>
+        private static long _lastEditorPumpTimestamp;
+
+        private static void MarkEditorPump()
+        {
+            Volatile.Write(ref _lastEditorPumpTimestamp, System.Diagnostics.Stopwatch.GetTimestamp());
+        }
+
+        /// <summary>Milliseconds since the editor loop last pumped; 0 when unknown.</summary>
+        private static long MainThreadBlockedMs()
+        {
+            long last = Volatile.Read(ref _lastEditorPumpTimestamp);
+            return last <= 0 ? 0 : StopwatchElapsedMs(last);
+        }
+
+        private static long StopwatchElapsedMs(long since)
+        {
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - since;
+            return elapsed <= 0 ? 0 : elapsed * 1000L / System.Diagnostics.Stopwatch.Frequency;
+        }
+
+        private static int NormalizeExecuteRunTimeoutMs(long timeoutMs)
+        {
+            if (timeoutMs <= 0)
+                return DefaultExecuteRunTimeoutMs;
+            return (int)Math.Max(MinExecuteRunTimeoutMs, Math.Min(MaxExecuteRunTimeoutMs, timeoutMs));
+        }
+
+        private static string FormatSeconds(long milliseconds)
+        {
+            return (milliseconds / 1000.0).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture);
+        }
 
         private sealed class CompiledAsyncSnippet
         {
@@ -71,15 +117,51 @@ namespace Locus
         internal sealed class AsyncSnippetExecution : IDisposable
         {
             private long _lastActivityTimestamp;
+            private long _maxMainThreadBlockedMs;
 
             public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
             public readonly TaskCompletionSource<string> Completion = LocusAsync.CreateTcs<string>();
+            public readonly long StartedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+            public readonly int TimeoutMs;
             public volatile ScriptGlobals Globals;
             public volatile string TimeoutError;
+            /// <summary>Set once the snippet body starts on the main thread.</summary>
+            public volatile bool Started;
+            /// <summary>Why Locus asked the snippet to stop (idle_timeout, timeout, cancelled).</summary>
+            public volatile string StopReason;
 
-            public AsyncSnippetExecution()
+            public AsyncSnippetExecution(int timeoutMs)
             {
+                TimeoutMs = NormalizeExecuteRunTimeoutMs(timeoutMs);
                 TouchActivity();
+            }
+
+            public long ElapsedMs
+            {
+                get { return StopwatchElapsedMs(StartedTimestamp); }
+            }
+
+            public long IdleMs
+            {
+                get { return (long)(IdleSeconds * 1000.0); }
+            }
+
+            public long MaxMainThreadBlockedMs
+            {
+                get { return Interlocked.Read(ref _maxMainThreadBlockedMs); }
+            }
+
+            /// <summary>Fold one sample of the current main-thread block into the maximum.</summary>
+            public void RecordMainThreadBlock(long blockedMs)
+            {
+                long current = Interlocked.Read(ref _maxMainThreadBlockedMs);
+                while (blockedMs > current)
+                {
+                    long observed = Interlocked.CompareExchange(ref _maxMainThreadBlockedMs, blockedMs, current);
+                    if (observed == current)
+                        return;
+                    current = observed;
+                }
             }
 
             public void TouchActivity()
@@ -142,17 +224,157 @@ namespace Locus
             private ExecuteCodeProgressSnapshot _pendingProgressSnapshot;
             private readonly string[] _sourceLines;
             private long _waitStartedTimestamp;
+            private int _waiterCount;
+            private readonly object _publishLock = new object();
+            private bool _publishClosed;
+            private volatile bool _nativeProgressPublished;
 
             public readonly string ExecutionId;
+            public readonly byte[] ExecutionIdBytes;
+            public readonly int TimeoutMs;
+            public readonly long StartedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
             public readonly CancellationTokenSource Cancellation = new CancellationTokenSource();
 
-            public ExecuteCodeRequestState(string executionId, string sourceCode)
+            public ExecuteCodeRequestState(string executionId, string sourceCode, int timeoutMs)
             {
                 ExecutionId = executionId;
+                ExecutionIdBytes = Utf8NoBom.GetBytes(executionId ?? "");
+                TimeoutMs = NormalizeExecuteRunTimeoutMs(timeoutMs);
                 string leadingUsings;
                 string bodyCode;
                 SplitLeadingUsings(sourceCode ?? "", out leadingUsings, out bodyCode);
                 _sourceLines = bodyCode.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            }
+
+            /// <summary>The broker answers this execution's progress polls itself.</summary>
+            public bool NativeProgressPublished
+            {
+                get { return _nativeProgressPublished; }
+            }
+
+            /// <summary>`execute_code_wait` requests currently waiting on this execution.</summary>
+            public int WaiterCount
+            {
+                get { return Interlocked.CompareExchange(ref _waiterCount, 0, 0); }
+            }
+
+            public void AddWaiter()
+            {
+                Interlocked.Increment(ref _waiterCount);
+            }
+
+            public void RemoveWaiter()
+            {
+                Interlocked.Decrement(ref _waiterCount);
+            }
+
+            public AsyncSnippetExecution CurrentExecution
+            {
+                get
+                {
+                    lock (_lock)
+                        return _execution;
+                }
+            }
+
+            /// <summary>
+            /// Publish the current snapshot (progress, last output, liveness) to
+            /// the native broker. Runs on the thread-pool monitor, so it keeps
+            /// working while the snippet holds the main thread.
+            /// </summary>
+            public void PublishNativeProgress()
+            {
+                lock (_publishLock)
+                {
+                    if (_publishClosed || _disposed)
+                        return;
+                    string json = BuildPublishedProgressJson();
+                    if (NativePublishExecutionProgress(ExecutionIdBytes, json))
+                        _nativeProgressPublished = true;
+                }
+            }
+
+            /// <summary>Stop publishing and let the broker forget this execution.</summary>
+            public void EndNativeProgress()
+            {
+                lock (_publishLock)
+                {
+                    if (_publishClosed)
+                        return;
+                    _publishClosed = true;
+                    if (_nativeProgressPublished)
+                        NativeEndExecutionProgress(ExecutionIdBytes);
+                }
+            }
+
+            /// <summary>
+            /// Where an awaiting snippet is waiting ("next EditorApplication.update
+            /// at line 12"), or null while it runs code.
+            /// </summary>
+            public string DescribeCurrentWait()
+            {
+                lock (_lock)
+                {
+                    if (_progress == null || _progress.source != "await")
+                        return null;
+                    string target = string.IsNullOrEmpty(_progress.waitTarget) ? "an editor update" : _progress.waitTarget;
+                    return _progress.sourceLine > 0 ? target + " (snippet line " + _progress.sourceLine + ")" : target;
+                }
+            }
+
+            private string BuildPublishedProgressJson()
+            {
+                var sb = new StringBuilder(512);
+                lock (_lock)
+                {
+                    ExecuteCodeProgressSnapshot snapshot = TakeProgressSnapshotLocked();
+                    sb.Append("{\"active\":").Append(snapshot.active ? "true" : "false");
+                    AppendJsonStringField(sb, "title", snapshot.title);
+                    AppendJsonStringField(sb, "info", snapshot.info);
+                    sb.Append(",\"progress\":").Append(snapshot.progress.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
+                    sb.Append(",\"revision\":").Append(snapshot.revision);
+                    AppendJsonStringField(sb, "source", snapshot.source);
+                    AppendJsonStringField(sb, "waitKind", snapshot.waitKind);
+                    AppendJsonStringField(sb, "waitTarget", snapshot.waitTarget);
+                    AppendJsonStringField(sb, "waitCondition", snapshot.waitCondition);
+                    sb.Append(",\"sourceLine\":").Append(snapshot.sourceLine);
+                    AppendJsonStringField(sb, "sourceText", snapshot.sourceText);
+                    sb.Append(",\"waitedMs\":").Append(snapshot.waitedMs);
+                }
+
+                AsyncSnippetExecution execution = CurrentExecution;
+                bool executing = execution != null && execution.Started;
+                long blockedMs = executing ? MainThreadBlockedMs() : 0;
+                if (executing)
+                    execution.RecordMainThreadBlock(blockedMs);
+                int outputChars = 0;
+                string lastOutput = "";
+                ScriptGlobals globals = execution != null ? execution.Globals : null;
+                if (globals != null)
+                    globals.GetOutputSummary(ExecuteProgressOutputTailChars, out outputChars, out lastOutput);
+                string stopReason = execution != null ? execution.StopReason : null;
+                if (string.IsNullOrEmpty(stopReason) && IsCancellationRequested)
+                    stopReason = "cancelled";
+
+                AppendJsonStringField(sb, "executionId", ExecutionId);
+                sb.Append(",\"elapsedMs\":").Append(StopwatchElapsedMs(StartedTimestamp));
+                sb.Append(",\"timeoutMs\":").Append(TimeoutMs);
+                sb.Append(",\"executing\":").Append(executing ? "true" : "false");
+                sb.Append(",\"idleMs\":").Append(executing ? execution.IdleMs : 0);
+                sb.Append(",\"idleLimitMs\":").Append(ExecuteTimeoutMs);
+                sb.Append(",\"mainThreadBlockedMs\":").Append(blockedMs);
+                sb.Append(",\"maxMainThreadBlockedMs\":").Append(execution != null ? execution.MaxMainThreadBlockedMs : 0);
+                sb.Append(",\"outputChars\":").Append(outputChars);
+                AppendJsonStringField(sb, "lastOutput", lastOutput);
+                sb.Append(",\"stopRequested\":").Append(string.IsNullOrEmpty(stopReason) ? "false" : "true");
+                AppendJsonStringField(sb, "stopReason", stopReason);
+                sb.Append('}');
+                return sb.ToString();
+            }
+
+            private static void AppendJsonStringField(StringBuilder sb, string name, string value)
+            {
+                sb.Append(",\"").Append(name).Append("\":\"").Append(JsonEscape(value ?? "")).Append('"');
             }
 
             public bool IsCancellationRequested
@@ -270,6 +492,12 @@ namespace Locus
                 SetProgress(title, info, progress, "api");
             }
 
+            /// <summary>Text-only progress: no fraction, so no progress bar.</summary>
+            public void SetApiInfo(string title, string info)
+            {
+                SetProgress(title, info, 0, "api_info");
+            }
+
             public void SetAwaiting(
                 string kind,
                 string target,
@@ -278,7 +506,7 @@ namespace Locus
             {
                 lock (_lock)
                 {
-                    if (_progress != null && _progress.source == "api")
+                    if (_progress != null && IsApiProgressSource(_progress.source))
                         _pendingProgressSnapshot = _progress;
                     _waitStartedTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
                     _progressRevision++;
@@ -345,23 +573,9 @@ namespace Locus
             {
                 lock (_lock)
                 {
-                    if (_pendingProgressSnapshot != null)
-                    {
-                        ExecuteCodeProgressSnapshot pending = _pendingProgressSnapshot;
-                        _pendingProgressSnapshot = null;
-                        return JsonUtility.ToJson(pending);
-                    }
-                    if (_progress != null && _progress.source == "await" && _waitStartedTimestamp > 0)
-                    {
-                        long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - _waitStartedTimestamp;
-                        _progress.waitedMs = elapsed <= 0
-                            ? 0
-                            : (int)Math.Min(int.MaxValue,
-                                elapsed * 1000L / System.Diagnostics.Stopwatch.Frequency);
-                        _progressRevision++;
-                        _progress.revision = _progressRevision;
-                        _progressJsonCache = null;
-                    }
+                    ExecuteCodeProgressSnapshot snapshot = TakeProgressSnapshotLocked();
+                    if (!ReferenceEquals(snapshot, _progress))
+                        return JsonUtility.ToJson(snapshot);
                     if (_progressJsonCache == null || _progressJsonCacheRevision != _progressRevision)
                     {
                         _progressJsonCache = JsonUtility.ToJson(_progress);
@@ -369,6 +583,38 @@ namespace Locus
                     }
                     return _progressJsonCache;
                 }
+            }
+
+            /// <summary>
+            /// The snapshot the next reader should see: an API progress report
+            /// that an await replaced before anyone read it (once), otherwise the
+            /// current snapshot with a refreshed wait time. Caller holds _lock.
+            /// </summary>
+            private ExecuteCodeProgressSnapshot TakeProgressSnapshotLocked()
+            {
+                if (_pendingProgressSnapshot != null)
+                {
+                    ExecuteCodeProgressSnapshot pending = _pendingProgressSnapshot;
+                    _pendingProgressSnapshot = null;
+                    return pending;
+                }
+                if (_progress != null && _progress.source == "await" && _waitStartedTimestamp > 0)
+                {
+                    long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - _waitStartedTimestamp;
+                    _progress.waitedMs = elapsed <= 0
+                        ? 0
+                        : (int)Math.Min(int.MaxValue,
+                            elapsed * 1000L / System.Diagnostics.Stopwatch.Frequency);
+                    _progressRevision++;
+                    _progress.revision = _progressRevision;
+                    _progressJsonCache = null;
+                }
+                return _progress;
+            }
+
+            private static bool IsApiProgressSource(string source)
+            {
+                return source == "api" || source == "api_info";
             }
 
             private string SourceLineText(int sourceLine)
@@ -383,7 +629,7 @@ namespace Locus
             {
                 lock (_lock)
                 {
-                    if (source == "api")
+                    if (IsApiProgressSource(source))
                         _pendingProgressSnapshot = null;
                     _progressRevision++;
                     _progress = new ExecuteCodeProgressSnapshot
@@ -580,8 +826,21 @@ namespace Locus
             if (entry == null)
                 return ErrorResponse(requestId, "unknown execution_id: " + normalized);
 
-            PipeEnvelope response = await entry.Completion.Task.ConfigureAwait(false);
-            return RebindExecuteCodeResponse(response, requestId);
+            // A waiting client is present even though it sends no progress
+            // polls; the client-loss monitor must not cancel the execution.
+            ExecuteCodeRequestState requestState = FindExecuteCodeRequestState(normalized);
+            if (requestState != null)
+                requestState.AddWaiter();
+            try
+            {
+                PipeEnvelope response = await entry.Completion.Task.ConfigureAwait(false);
+                return RebindExecuteCodeResponse(response, requestId);
+            }
+            finally
+            {
+                if (requestState != null)
+                    requestState.RemoveWaiter();
+            }
         }
 
         private static ExecuteCodeRequestState FindExecuteCodeRequestState(string executionId)
@@ -732,6 +991,11 @@ namespace Locus
                     if (requestState.IsCancellationRequested)
                         return;
 
+                    // Progress, printed output and liveness reach the client
+                    // through the broker even while the snippet holds the
+                    // main thread.
+                    requestState.PublishNativeProgress();
+
                     // A snippet holding the main thread can never dequeue its
                     // own cancel request; the broker records it for us instead.
                     // The first poll also catches a cancel that raced the start.
@@ -746,6 +1010,31 @@ namespace Locus
                             Debug.LogWarning("[Locus] execute_code canceled by the Locus client");
                             return;
                         }
+                    }
+
+                    if (requestState.WaiterCount > 0)
+                    {
+                        requestState.TouchClientHeartbeat();
+                        continue;
+                    }
+
+                    // Once the broker answers this execution's polls, it also
+                    // knows when the client last asked; that reading does not
+                    // depend on the main thread.
+                    long nativePollAgeMs = requestState.NativeProgressPublished
+                        ? NativeExecutionClientPollAgeMs(requestState.ExecutionIdBytes)
+                        : -1;
+                    if (nativePollAgeMs >= 0)
+                    {
+                        if (nativePollAgeMs < ExecuteClientHeartbeatTimeoutMs)
+                            continue;
+                        requestState.Cancel();
+                        requestState.ResetProgress();
+                        Debug.LogWarning(
+                            "[Locus] execute_code canceled: the Locus client stopped polling for " +
+                            (ExecuteClientHeartbeatTimeoutMs / 1000) +
+                            " seconds");
+                        return;
                     }
 
                     if (requestState.ClientHeartbeatCount <= 0)
@@ -802,6 +1091,7 @@ namespace Locus
                 executionId,
                 code,
                 BuildExecuteCodeRequestSignature("execute_code", code),
+                ExtractExecuteCodeTimeoutMs(code),
                 prepareCompiler: true,
                 compileStage: "Compiling snippet",
                 compile: delegate { return CompileAsyncSnippet(code); });
@@ -817,6 +1107,7 @@ namespace Locus
             public string entry_type;
             public string execution_id;
             public string source_code;
+            public int timeout_ms;
         }
 
         /// <summary>
@@ -883,6 +1174,7 @@ namespace Locus
                 NormalizeExecuteCodeExecutionId(request.execution_id, requestId),
                 request.source_code ?? "",
                 BuildExecuteLoadedRequestSignature(entryTypeName, request.source_code, assemblyBytes),
+                request.timeout_ms,
                 prepareCompiler: false,
                 compileStage: "Loading compiled snippet",
                 compile: delegate { return LoadCompiledSnippet(requestId, assemblyBytes, entryTypeName); });
@@ -990,6 +1282,7 @@ namespace Locus
             string executionId,
             string sourceCode,
             string requestSignature,
+            int timeoutMs,
             bool prepareCompiler,
             string compileStage,
             Func<CompiledAsyncSnippet> compile)
@@ -1019,6 +1312,7 @@ namespace Locus
                     requestId,
                     executionId,
                     sourceCode,
+                    timeoutMs,
                     prepareCompiler,
                     compileStage,
                     compile).ConfigureAwait(false);
@@ -1036,6 +1330,7 @@ namespace Locus
             string requestId,
             string executionId,
             string sourceCode,
+            int timeoutMs,
             bool prepareCompiler,
             string compileStage,
             Func<CompiledAsyncSnippet> compile)
@@ -1089,12 +1384,13 @@ namespace Locus
             ExecuteCodeRequestState requestState = null;
             try
             {
-                requestState = new ExecuteCodeRequestState(executionId, sourceCode);
+                requestState = new ExecuteCodeRequestState(executionId, sourceCode, timeoutMs);
                 RegisterExecuteCodeRequestState(requestState);
                 _ = MonitorExecuteCodeClientHeartbeatAsync(requestState);
                 LogExecuteCodeDebug(requestId, "request state registered");
 
                 requestState.ResetProgress();
+                requestState.PublishNativeProgress();
 
                 if (prepareCompiler)
                 {
@@ -1205,6 +1501,8 @@ namespace Locus
             }
             finally
             {
+                if (requestState != null)
+                    requestState.EndNativeProgress();
                 UnregisterExecuteCodeRequestState(requestState);
                 if (requestState != null)
                     requestState.Dispose();
@@ -1238,6 +1536,11 @@ namespace Locus
                     out primaryError))
                 return snippet;
 
+            // Only a bare expression body can compile in expression mode;
+            // statement bodies report their own errors alone.
+            if (!LocusSnippetExpressionMode.Applies(bodyCode, SnippetParseOptions))
+                throw new Exception(string.IsNullOrEmpty(primaryError) ? "unknown async compilation failure" : primaryError);
+
             string fallbackError;
             if (TryCompileAsyncSnippet(
                     bodyCode,
@@ -1264,6 +1567,15 @@ namespace Locus
 
             throw new Exception(sb.Length > 0 ? sb.ToString() : "unknown async compilation failure");
         }
+
+        /// <summary>
+        /// Embedded portable PDB, same as the compile-server snippet path: Mono
+        /// then reports runtime exceptions as "in LocusRuntimeAsyncSnippet.cs:N"
+        /// (snippet lines, via the wrapper's #line 1) instead of "&lt;mvid&gt;:0".
+        /// The IL is unchanged; Assembly.Load(byte[]) reads the embedded PDB.
+        /// </summary>
+        private static readonly EmitOptions SnippetEmitOptions =
+            new EmitOptions(debugInformationFormat: DebugInformationFormat.Embedded);
 
         private static bool TryCompileAsyncSnippet(
             string bodyCode,
@@ -1321,7 +1633,10 @@ namespace Locus
                 {
                     try
                     {
-                        emitResult = compilation.Emit(peStream, cancellationToken: InProcessCompileReloadToken);
+                        emitResult = compilation.Emit(
+                            peStream,
+                            options: SnippetEmitOptions,
+                            cancellationToken: InProcessCompileReloadToken);
                     }
                     catch (Exception ex)
                     {
@@ -1396,6 +1711,22 @@ namespace Locus
             return NormalizeExecuteCodeExecutionId(value, requestId);
         }
 
+        /// <summary>Run budget from the `//__LOCUS_TIMEOUT_MS__:` marker; 0 when absent.</summary>
+        private static int ExtractExecuteCodeTimeoutMs(string code)
+        {
+            int marker = (code ?? "").LastIndexOf(ExecuteCodeTimeoutMarker, StringComparison.Ordinal);
+            if (marker < 0)
+                return 0;
+            int start = marker + ExecuteCodeTimeoutMarker.Length;
+            int end = code.IndexOfAny(new[] { '\r', '\n' }, start);
+            string value = (end >= 0 ? code.Substring(start, end - start) : code.Substring(start)).Trim();
+            long parsed;
+            return long.TryParse(value, System.Globalization.NumberStyles.Integer,
+                    System.Globalization.CultureInfo.InvariantCulture, out parsed)
+                ? (int)Math.Max(0, Math.Min(int.MaxValue, parsed))
+                : 0;
+        }
+
         private static bool ContainsTopLevelAwait(SyntaxNode node)
         {
             if (node is AnonymousFunctionExpressionSyntax || node is LocalFunctionStatementSyntax)
@@ -1444,8 +1775,18 @@ namespace Locus
             sb.AppendLine("using Object = UnityEngine.Object;");
 
             if (!string.IsNullOrWhiteSpace(leadingUsings))
+            {
+                // Hoisted snippet usings keep their snippet line numbers.
+                sb.AppendLine("#line 1");
                 sb.AppendLine(leadingUsings);
+                sb.AppendLine("#line default");
+            }
 
+            // The wrapper has no snippet line: hidden sequence points keep its
+            // stack frames (e.g. the ExecuteAsync forwarder) from reporting
+            // generated line numbers. Diagnostics here keep the generated
+            // numbering, because hidden continues the #line default mapping.
+            sb.AppendLine("#line hidden");
             sb.AppendLine("namespace Locus.RuntimeSnippets");
             sb.AppendLine("{");
             sb.Append("    public static class ").Append(hostTypeName).AppendLine();
@@ -1506,7 +1847,8 @@ namespace Locus
             CompiledAsyncSnippet snippet,
             ExecuteCodeRequestState requestState)
         {
-            var execution = new AsyncSnippetExecution();
+            var execution = new AsyncSnippetExecution(
+                requestState != null ? requestState.TimeoutMs : DefaultExecuteRunTimeoutMs);
             if (requestState != null)
                 requestState.SetExecution(execution);
 
@@ -1530,12 +1872,20 @@ namespace Locus
                 synchronizationContext.Run(() => RunAsyncSnippetOnMainThread(snippet, execution, requestState));
             });
 
-            _ = MonitorAsyncSnippetInactivityAsync(execution);
+            _ = MonitorAsyncSnippetInactivityAsync(execution, requestState);
 
             return execution.Completion.Task;
         }
 
-        private static async Task MonitorAsyncSnippetInactivityAsync(AsyncSnippetExecution execution)
+        /// <summary>
+        /// Thread-pool watchdog for one execution: the total run budget
+        /// (`timeout`) and the 30s limit without print/printJson/ctx.Progress.
+        /// It answers the request itself, so the client gets a result even
+        /// when the snippet still holds the main thread.
+        /// </summary>
+        private static async Task MonitorAsyncSnippetInactivityAsync(
+            AsyncSnippetExecution execution,
+            ExecuteCodeRequestState requestState)
         {
             try
             {
@@ -1546,13 +1896,33 @@ namespace Locus
                     if (execution.Completion.Task.IsCompleted)
                         return;
 
-                    if (execution.IdleSeconds < ExecuteTimeoutMs / 1000.0)
-                        continue;
+                    long blockedMs = execution.Started ? MainThreadBlockedMs() : 0;
+                    if (execution.Started)
+                        execution.RecordMainThreadBlock(blockedMs);
 
-                    execution.TimeoutError = "execution timed out after " + (ExecuteTimeoutMs / 1000)
-                        + " seconds without print/progress output";
+                    string reason;
+                    string error;
+                    if (execution.ElapsedMs >= execution.TimeoutMs)
+                    {
+                        reason = "timeout";
+                        error = BuildRunTimeoutError(execution);
+                    }
+                    else if (execution.IdleSeconds >= ExecuteTimeoutMs / 1000.0)
+                    {
+                        reason = "idle_timeout";
+                        error = BuildIdleTimeoutError(execution, requestState, blockedMs);
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    execution.StopReason = reason;
+                    execution.TimeoutError = error;
                     execution.Cancel();
-                    execution.Completion.TrySetResult(ExecuteCodeErrorWithOutput(execution.TimeoutError, execution.Globals));
+                    execution.Completion.TrySetResult(ExecuteCodeErrorWithOutput(error, execution.Globals));
+                    if (requestState != null)
+                        requestState.PublishNativeProgress();
                     return;
                 }
             }
@@ -1560,6 +1930,54 @@ namespace Locus
             {
                 Debug.LogError("[Locus] Async execute timeout monitor failed: " + ex);
             }
+        }
+
+        // Keep the leading "execution timed out after N seconds" wording:
+        // drivers and agents match on it.
+        private static string BuildIdleTimeoutError(
+            AsyncSnippetExecution execution,
+            ExecuteCodeRequestState requestState,
+            long blockedMs)
+        {
+            var sb = new StringBuilder(512);
+            sb.Append("execution timed out after ")
+              .Append(ExecuteTimeoutMs / 1000)
+              .Append(" seconds without print/progress output");
+
+            string wait = requestState != null ? requestState.DescribeCurrentWait() : null;
+            if (!execution.Started)
+            {
+                sb.Append(". The snippet never started: Unity's main thread stayed busy with other work for ")
+                  .Append(FormatSeconds(blockedMs > 0 ? blockedMs : MainThreadBlockedMs()))
+                  .Append("s.");
+                return sb.ToString();
+            }
+
+            if (!string.IsNullOrEmpty(wait))
+            {
+                sb.Append(" while awaiting ").Append(wait)
+                  .Append(". A single wait longer than ").Append(ExecuteTimeoutMs / 1000)
+                  .Append("s needs a loop of shorter waits that reports ctx.Progress(...) each turn.");
+            }
+            else
+            {
+                sb.Append(". The snippet held Unity's main thread (Editor frozen) for ")
+                  .Append(FormatSeconds(blockedMs))
+                  .Append("s. Print or call ctx.Progress(...) at least every ")
+                  .Append(ExecuteTimeoutMs / 1000)
+                  .Append("s; for long batches also `await ctx.WaitFrame()` between chunks so the Editor stays responsive.");
+            }
+            sb.Append(" The `timeout` argument (now ")
+              .Append(execution.TimeoutMs)
+              .Append(" ms) only limits total run time.");
+            return sb.ToString();
+        }
+
+        private static string BuildRunTimeoutError(AsyncSnippetExecution execution)
+        {
+            return "execution timed out after " + (execution.TimeoutMs / 1000)
+                + " seconds: it exceeded the `timeout` budget of " + execution.TimeoutMs
+                + " ms (maximum " + MaxExecuteRunTimeoutMs + "). Pass a larger `timeout` or split the work.";
         }
 
         private static async void RunAsyncSnippetOnMainThread(
@@ -1585,12 +2003,13 @@ namespace Locus
                 ctx.InitializeProfilerOutput(globals.print);
                 loopGuardRegistration = BindSnippetLoopGuard(snippet, execution.Cancellation.Token);
 
+                execution.Started = true;
                 object returnValue = await snippet.Executor(globals, ctx, execution.Cancellation.Token);
 
                 if (returnValue != null)
                     globals.print(returnValue);
 
-                execution.Completion.TrySetResult(globals.GetOutput());
+                CompleteOnMainThread(execution, globals.GetOutput());
             }
             catch (ExecuteCodeBreakpointReachedException breakpoint)
             {
@@ -1600,15 +2019,15 @@ namespace Locus
                     : "status: breakpoint\neditor_status: playing_paused";
                 if (!string.IsNullOrEmpty(output))
                     result = output.TrimEnd() + "\n" + result;
-                execution.Completion.TrySetResult(result);
+                CompleteOnMainThread(execution, result);
             }
             catch (OperationCanceledException)
             {
-                execution.Completion.TrySetResult(ExecuteCodeErrorWithOutput(execution.TimeoutError ?? "execution canceled", globals));
+                CompleteOnMainThread(execution, ExecuteCodeErrorWithOutput(execution.TimeoutError ?? "execution canceled", globals));
             }
             catch (Exception ex)
             {
-                execution.Completion.TrySetResult(ExecuteCodeErrorWithOutput("runtime error: " + ex, globals));
+                CompleteOnMainThread(execution, ExecuteCodeErrorWithOutput("runtime error: " + ex, globals));
             }
             finally
             {
@@ -1633,6 +2052,17 @@ namespace Locus
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// The snippet left the main thread (it returned or threw there). Pulse
+        /// the broker heartbeat before publishing the result, so the client's
+        /// next request is not rejected for the stall this snippet caused.
+        /// </summary>
+        private static void CompleteOnMainThread(AsyncSnippetExecution execution, string result)
+        {
+            NativePulseMainThread();
+            execution.Completion.TrySetResult(result);
         }
 
         /// <summary>
@@ -1949,6 +2379,19 @@ namespace Locus
             public bool Progress(float progress)
             {
                 return Progress("Locus", "", progress);
+            }
+
+            /// <summary>Report a status line without a completion fraction.</summary>
+            public bool Progress(string info)
+            {
+                TouchActivity();
+                ThrowIfCancellationRequested();
+
+                if (_requestState != null)
+                    _requestState.SetApiInfo("Locus", info ?? "");
+
+                TouchActivity();
+                return _cancellation.IsCancellationRequested;
             }
 
             public void ClearProgress()

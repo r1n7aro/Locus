@@ -202,6 +202,53 @@ public class CompileServiceTests
         Assert.Contains("\n\nexpression fallback:\ncompilation failed:\n", error);
     }
 
+    /// <summary>
+    /// A statement body can never compile as one expression, so its errors
+    /// are reported without a second, unrelated expression-mode section.
+    /// </summary>
+    [Theory]
+    [InlineData("bool flag = true;\nprint(flag);")]
+    [InlineData("var x = 1;\nreturn x;")]
+    [InlineData("foo(\"a\");")]
+    public void Statement_snippet_failure_reports_only_statement_errors(string code)
+    {
+        var service = new CompileService();
+        var request = new JsonObject
+        {
+            ["code"] = code,
+            ["params"] = new JsonObject
+            {
+                ["fingerprint"] = "test",
+                ["domainGeneration"] = "gen",
+                ["langVersion"] = "9",
+                ["referencePaths"] = new JsonArray(typeof(object).Assembly.Location),
+                ["defines"] = new JsonArray(),
+            },
+        };
+
+        JsonNode result = service.HandleCompileSnippet(request);
+
+        Assert.False(result["success"]!.GetValue<bool>());
+        string error = result["error"]!.GetValue<string>();
+        Assert.StartsWith("compilation failed:\n", error);
+        Assert.DoesNotContain("expression fallback", error);
+    }
+
+    [Theory]
+    [InlineData("1 + 1", true)]
+    [InlineData("Selection.activeObject.name", true)]
+    [InlineData("  // comment\nSelection.activeObject  ", true)]
+    [InlineData("print(\"x\")", true)]
+    [InlineData("print(\"x\");", false)]
+    [InlineData("var x = 1;\nreturn x;", false)]
+    [InlineData("bool burstWas = true;", false)]
+    [InlineData("", false)]
+    public void Expression_mode_applies_only_to_a_single_expression(string body, bool expected)
+    {
+        var options = new CSharpParseOptions(languageVersion: LanguageVersion.CSharp9);
+        Assert.Equal(expected, Locus.LocusSnippetExpressionMode.Applies(body, options));
+    }
+
     [Fact]
     public void Sync_snippet_wrapper_allows_ref_locals_under_csharp9()
     {

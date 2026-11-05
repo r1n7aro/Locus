@@ -108,20 +108,16 @@ namespace Locus
 
                 if (stillInUsingBlock)
                 {
-                    if (string.IsNullOrEmpty(trimmed))
-                    {
-                        if (usingSb.Length > 0)
-                            usingSb.AppendLine(line);
-                        else
-                            bodySb.AppendLine(line);
-
-                        continue;
-                    }
-
-                    if (trimmed.StartsWith("using ", StringComparison.Ordinal) &&
-                        trimmed.EndsWith(";", StringComparison.Ordinal))
+                    // Every line read here keeps its slot on both sides (blank
+                    // in the body), so the `#line 1` on the hoisted usings and
+                    // on the body maps line N back to line N of the snippet.
+                    if (string.IsNullOrEmpty(trimmed) ||
+                        (trimmed.StartsWith("using ", StringComparison.Ordinal) &&
+                         trimmed.EndsWith(";", StringComparison.Ordinal) &&
+                         IsUsingDirectiveLine(trimmed)))
                     {
                         usingSb.AppendLine(line);
+                        bodySb.AppendLine();
                         continue;
                     }
 
@@ -133,6 +129,18 @@ namespace Locus
 
             leadingUsings = usingSb.ToString().TrimEnd();
             bodyCode = bodySb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// "using var x = ...;", "using Type x = ...;" and "using (...) ...;" are
+        /// statements, not directives. Hoisted above the snippet host they become
+        /// top-level statements (CS8805) whose locals the body cannot see (CS8801),
+        /// so let the parser decide how the line reads at the top of a file.
+        /// </summary>
+        private static bool IsUsingDirectiveLine(string trimmedLine)
+        {
+            var unit = SyntaxFactory.ParseCompilationUnit(trimmedLine, options: SnippetParseOptions);
+            return unit.Usings.Count > 0 && unit.Members.Count == 0;
         }
 
         /// <summary>

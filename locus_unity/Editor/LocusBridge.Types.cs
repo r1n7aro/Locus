@@ -175,6 +175,33 @@ namespace Locus
             {
                 lock (_output) return _output.ToString();
             }
+
+            /// <summary>
+            /// Output length and the last non-empty line (at most
+            /// <paramref name="maxChars"/> characters, keeping its end). Safe
+            /// from the thread-pool progress publisher while the snippet prints.
+            /// </summary>
+            internal void GetOutputSummary(int maxChars, out int chars, out string lastLine)
+            {
+                // Bounded scans: this runs under the lock print() takes, so a
+                // huge single-line printJson must not cost a full walk.
+                const int MaxTrailingWhitespace = 4096;
+                lock (_output)
+                {
+                    chars = _output.Length;
+                    int end = _output.Length;
+                    int whitespaceLimit = Math.Max(0, end - MaxTrailingWhitespace);
+                    while (end > whitespaceLimit && char.IsWhiteSpace(_output[end - 1]))
+                        end--;
+                    int start = end;
+                    int lineLimit = Math.Max(0, end - Math.Max(1, maxChars));
+                    while (start > lineLimit && _output[start - 1] != '\n' && _output[start - 1] != '\r')
+                        start--;
+                    if (start < end && char.IsLowSurrogate(_output[start]))
+                        start++;
+                    lastLine = end > start ? _output.ToString(start, end - start) : "";
+                }
+            }
         }
     }
 

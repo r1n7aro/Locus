@@ -579,8 +579,9 @@ public sealed class CompileService
             ResolveParseOptions(request.Params));
 
         // Same two-attempt semantics as the Unity-side CompileAsyncSnippet:
-        // statement mode first, expression mode as the fallback, errors of
-        // both attempts combined in the legacy format.
+        // statement mode first, expression mode as the fallback for a bare
+        // expression body, errors of both attempts combined in the legacy
+        // format.
         var (bytes, assemblyName, primaryError) = CompileSnippetAttempt(
             request,
             leadingUsings,
@@ -589,6 +590,14 @@ public sealed class CompileService
             useAsyncWrapper: useAsyncWrapper);
         if (bytes != null)
             return SnippetSuccessResult(bytes, assemblyName!, "statements", request, startedAt);
+
+        if (!LocusSnippetExpressionMode.Applies(bodyCode, ResolveParseOptions(request.Params)))
+        {
+            return FailureResult(
+                string.IsNullOrEmpty(primaryError) ? "unknown async compilation failure" : primaryError,
+                "compile",
+                startedAt);
+        }
 
         var (fallbackBytes, fallbackAssemblyName, fallbackError) = CompileSnippetAttempt(
             request,
@@ -3010,7 +3019,12 @@ namespace System.Runtime.CompilerServices
             request.Params,
             request.ReferenceSessionImages,
             request.NonPublicAccessProbeMode,
-            loopGuardHostType: UnitySnippetSource.HostTypeName);
+            loopGuardHostType: UnitySnippetSource.HostTypeName,
+            // Embedded portable PDB: Unity's Mono then reports runtime
+            // exceptions as "in LocusRuntimeAsyncSnippet.cs:<snippet line>"
+            // instead of "<mvid>:0". The IL is unchanged; the cost is a few
+            // KB per assembly and ~2 ms of emit time.
+            emitDebugSymbols: true);
 
         return (bytes, bytes != null ? assemblyName : null, error);
     }
@@ -3047,7 +3061,8 @@ namespace System.Runtime.CompilerServices
         CompileParamsDto? compileParams,
         bool referenceSessionImages,
         string? nonPublicAccessProbeMode = null,
-        string? loopGuardHostType = null)
+        string? loopGuardHostType = null,
+        bool emitDebugSymbols = false)
     {
         CSharpParseOptions parseOptions = ResolveParseOptions(compileParams);
 
@@ -3075,6 +3090,7 @@ namespace System.Runtime.CompilerServices
             compileParams,
             useHostBcl: false,
             referenceSessionImages,
+            emitDebugSymbols: emitDebugSymbols,
             nonPublicAccessProbeMode: nonPublicAccessProbeMode);
     }
 

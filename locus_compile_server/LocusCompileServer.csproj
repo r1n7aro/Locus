@@ -22,6 +22,7 @@
        same loop cancellation checks. -->
   <ItemGroup>
     <Compile Include="..\locus_unity\Editor\ExecuteCodeAsync\LocusSnippetLoopGuard.cs" Link="Shared\LocusSnippetLoopGuard.cs" />
+    <Compile Include="..\locus_unity\Editor\ExecuteCodeAsync\LocusSnippetExpressionMode.cs" Link="Shared\LocusSnippetExpressionMode.cs" />
   </ItemGroup>
 
   <!-- The xunit test project lives in Tests/ next to the sources; keep it

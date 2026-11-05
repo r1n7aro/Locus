@@ -459,7 +459,7 @@ fn unity_cooperative_lock_context(
             ),
             is_error: true,
         })?;
-    if !crate::unity_bridge::is_unity_project(&project_path) {
+    if !crate::unity_bridge::unity_integration_enabled(&project_path) {
         return Err(ToolResult {
             output: format!("Tool '{tool_name}' requires a Unity project workspace."),
             is_error: true,
@@ -727,52 +727,16 @@ pub(super) fn unity_execute() -> ToolDef {
         mutates_workspace: true,
         execute: make_exec(|args, ctx| {
             Box::pin(async move {
-                let code = match args.get("code").and_then(|v| v.as_str()) {
-                    Some(c) => c.to_string(),
-                    None => {
+                let parsed = match crate::unity_bridge::parse_unity_execute_args(&args) {
+                    Ok(parsed) => parsed,
+                    Err(output) => {
                         return ToolResult {
-                            output: "Missing required parameter: code".to_string(),
+                            output,
                             is_error: true,
                         };
                     }
                 };
-                let enable_non_public_access =
-                    match crate::csharp_compile::resolve_tool_non_public_access(&args) {
-                        Ok(value) => value,
-                        Err(output) => {
-                            return ToolResult {
-                                output,
-                                is_error: true,
-                            };
-                        }
-                    };
-
-                let requested_status = match args
-                    .get("request_editor_status")
-                    .and_then(|v| v.as_str())
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    Some(status) => status,
-                    None => {
-                        return ToolResult {
-                            output: "Missing required parameter: request_editor_status".to_string(),
-                            is_error: true,
-                        };
-                    }
-                };
-
-                if requested_status == crate::unity_bridge::UNITY_EDITOR_STATUS_DISCONNECTED
-                    || !crate::unity_bridge::is_known_editor_status(requested_status)
-                {
-                    return ToolResult {
-                        output: format!(
-                            "Invalid request_editor_status: '{}'. Allowed values: editing, playing, playing_paused.",
-                            requested_status
-                        ),
-                        is_error: true,
-                    };
-                }
+                let requested_status = parsed.requested_status.as_str();
 
                 let project_path = match ctx.working_dir {
                     Some(path) if !path.trim().is_empty() => path.trim().to_string(),
@@ -803,21 +767,32 @@ pub(super) fn unity_execute() -> ToolDef {
                     };
                 }
 
-                match crate::unity_bridge::unity_execute_code_with_non_public_access(
+                // Never cancelled; the sender must outlive the call.
+                let (_never_cancelled, cancel_rx) = tokio::sync::watch::channel(false);
+                match crate::unity_bridge::unity_execute_code_with_options(
                     &project_path,
-                    &code,
-                    enable_non_public_access,
+                    &parsed.code,
+                    parsed.options,
+                    cancel_rx,
+                    |_| {},
                 )
                 .await
                 {
-                    Ok(output) => {
-                        let trimmed = output.trim();
+                    Ok(outcome) => {
+                        let trimmed = outcome.output.trim();
+                        let mut output = if trimmed.is_empty() {
+                            "Code executed successfully (no output).".to_string()
+                        } else {
+                            trimmed.to_string()
+                        };
+                        if let Some(note) = crate::unity_bridge::unity_execute_long_block_note(
+                            outcome.max_main_thread_blocked_ms,
+                        ) {
+                            output.push_str("\n\n");
+                            output.push_str(&note);
+                        }
                         ToolResult {
-                            output: if trimmed.is_empty() {
-                                "Code executed successfully (no output).".to_string()
-                            } else {
-                                trimmed.to_string()
-                            },
+                            output,
                             is_error: false,
                         }
                     }

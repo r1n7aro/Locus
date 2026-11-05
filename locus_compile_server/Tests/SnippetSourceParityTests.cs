@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using Microsoft.CodeAnalysis.CSharp;
 using Xunit;
 
@@ -27,6 +28,31 @@ public class SnippetSourceParityTests
         "// leading comment\nusing After.Comment;\nreturn 1;",
         "var values = new[] { 41 };\nref int value = ref values[0];\nvalue++;\nprint(value);",
         "await ctx.WaitFrame();\nprint(\"done\");",
+        "using var replay = Open(@\"F:/a.dereplay\");\nif (!replay.Success) return null;\nprintJson(replay.Summary);",
+        "using static UnityEngine.Mathf;\nusing L = System.Collections.Generic.List<int>;\n\nusing FileStream fs = File.OpenRead(p);\nprint(fs.Length);",
+        "using (var s = Open()) Use(s);\nreturn 0;",
+        "using A; using B;\nreturn 0;",
+    };
+
+    public static TheoryData<string> UsingStatementLines => new()
+    {
+        "using var replay = DustEcho.Replay.ReplayAgentApi.Open(@\"F:/a.dereplay\");",
+        "using var x = a == b;",
+        "using FileStream fs = File.OpenRead(p);",
+        "using System.Collections.Generic.List<int> xs = new();",
+        "using (var s = Open()) Use(s);",
+    };
+
+    public static TheoryData<string> UsingDirectiveLines => new()
+    {
+        "using A.B;",
+        "using global::A.B;",
+        "using static UnityEngine.Mathf;",
+        "using L = System.Collections.Generic.List<int>;",
+        "using @var = Foo;",
+        "using A; using B;",
+        // Malformed directives keep being hoisted so their errors stay as before.
+        "using Foo.;",
     };
 
     public static TheoryData<string, bool> AwaitInputs => new()
@@ -52,6 +78,97 @@ public class SnippetSourceParityTests
         Assert.Equal(expectedUsings, actualUsings);
         Assert.Equal(expectedBody, actualBody);
     }
+
+    [Theory]
+    [MemberData(nameof(UsingStatementLines))]
+    public void Leading_using_statements_stay_in_the_snippet_body(string line)
+    {
+        string code = line + "\nreturn null;";
+        UnitySnippetSource.SplitLeadingUsings(code, out string leadingUsings, out string bodyCode);
+
+        Assert.Equal("", leadingUsings);
+        Assert.Equal(code, NormalizeNewlines(bodyCode));
+    }
+
+    [Theory]
+    [MemberData(nameof(UsingDirectiveLines))]
+    public void Leading_using_directives_are_hoisted(string line)
+    {
+        UnitySnippetSource.SplitLeadingUsings(line + "\nreturn null;", out string leadingUsings, out string bodyCode);
+
+        Assert.Equal(line, leadingUsings);
+        Assert.Equal("\nreturn null;", NormalizeNewlines(bodyCode));
+    }
+
+    [Fact]
+    public void Directives_before_a_using_declaration_are_hoisted_alone()
+    {
+        UnitySnippetSource.SplitLeadingUsings(
+            "using static UnityEngine.Mathf;\nusing var d = Open();\nprint(d);",
+            out string leadingUsings,
+            out string bodyCode);
+
+        Assert.Equal("using static UnityEngine.Mathf;", leadingUsings);
+        Assert.Equal("\nusing var d = Open();\nprint(d);", NormalizeNewlines(bodyCode));
+    }
+
+    /// <summary>
+    /// Both halves start at `#line 1` in the generated source, so each must
+    /// keep every snippet line at its original index.
+    /// </summary>
+    [Fact]
+    public void Split_keeps_original_line_numbers_on_both_sides()
+    {
+        string[] snippet =
+        {
+            "",
+            "using A.B;",
+            "",
+            "using C;",
+            "var x = 1;",
+            "print(x);",
+        };
+        UnitySnippetSource.SplitLeadingUsings(string.Join("\n", snippet), out string leadingUsings, out string bodyCode);
+
+        string[] usingLines = NormalizeNewlines(leadingUsings).Split('\n');
+        string[] bodyLines = NormalizeNewlines(bodyCode).Split('\n');
+        Assert.Equal(new[] { "", "using A.B;", "", "using C;" }, usingLines);
+        Assert.Equal(snippet.Length, bodyLines.Length);
+        Assert.All(bodyLines.Take(4), line => Assert.Equal("", line));
+        Assert.Equal(snippet.Skip(4), bodyLines.Skip(4));
+    }
+
+    /// <summary>
+    /// Hoisted above the snippet host, a leading using declaration became a
+    /// top-level statement (CS8805) whose local the body could not see
+    /// (CS8801). It must compile inside the snippet method instead.
+    /// </summary>
+    [Fact]
+    public void Leading_using_declaration_compiles_inside_the_snippet_method()
+    {
+        var service = new CompileService();
+        var request = new JsonObject
+        {
+            ["code"] = "using var stream = new MemoryStream();\nif (stream.Length != 0) return null;\nprint(stream.Length);",
+            ["params"] = new JsonObject
+            {
+                ["fingerprint"] = "test",
+                ["domainGeneration"] = "gen",
+                ["langVersion"] = "9",
+                // BCL-only references: the wrapper's Unity types still fail,
+                // but no diagnostic may come from the hoisting itself.
+                ["referencePaths"] = new JsonArray(typeof(object).Assembly.Location),
+                ["defines"] = new JsonArray(),
+            },
+        };
+
+        string error = service.HandleCompileSnippet(request)["error"]!.GetValue<string>();
+
+        Assert.DoesNotContain("CS8805", error);
+        Assert.DoesNotContain("CS8801", error);
+    }
+
+    private static string NormalizeNewlines(string text) => text.Replace("\r\n", "\n");
 
     [Theory]
     [MemberData(nameof(SnippetInputs))]

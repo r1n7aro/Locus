@@ -44,20 +44,16 @@ internal static class UnityReferenceImpl
 
             if (stillInUsingBlock)
             {
-                if (string.IsNullOrEmpty(trimmed))
-                {
-                    if (usingSb.Length > 0)
-                        usingSb.AppendLine(line);
-                    else
-                        bodySb.AppendLine(line);
-
-                    continue;
-                }
-
-                if (trimmed.StartsWith("using ", StringComparison.Ordinal) &&
-                    trimmed.EndsWith(";", StringComparison.Ordinal))
+                // Every line read here keeps its slot on both sides (blank
+                // in the body), so the `#line 1` on the hoisted usings and
+                // on the body maps line N back to line N of the snippet.
+                if (string.IsNullOrEmpty(trimmed) ||
+                    (trimmed.StartsWith("using ", StringComparison.Ordinal) &&
+                     trimmed.EndsWith(";", StringComparison.Ordinal) &&
+                     IsUsingDirectiveLine(trimmed)))
                 {
                     usingSb.AppendLine(line);
+                    bodySb.AppendLine();
                     continue;
                 }
 
@@ -70,6 +66,20 @@ internal static class UnityReferenceImpl
         leadingUsings = usingSb.ToString().TrimEnd();
         bodyCode = bodySb.ToString().TrimEnd();
     }
+
+    private static bool IsUsingDirectiveLine(string trimmedLine)
+    {
+        var unit = SyntaxFactory.ParseCompilationUnit(trimmedLine, options: SnippetParseOptions);
+        return unit.Usings.Count > 0 && unit.Members.Count == 0;
+    }
+
+    // ── LocusBridge.cs ──────────────────────────────────────────────
+    // SnippetParseOptions without the Unity preprocessor symbols.
+
+    private static readonly CSharpParseOptions SnippetParseOptions = new(
+        kind: SourceCodeKind.Regular,
+        documentationMode: DocumentationMode.None,
+        languageVersion: LanguageVersion.CSharp9);
 
     // ── ExecuteCodeAsync/LocusBridge.ExecuteCodeAsync.cs ────────────
 
@@ -135,8 +145,18 @@ internal static class UnityReferenceImpl
         sb.AppendLine("using Object = UnityEngine.Object;");
 
         if (!string.IsNullOrWhiteSpace(leadingUsings))
+        {
+            // Hoisted snippet usings keep their snippet line numbers.
+            sb.AppendLine("#line 1");
             sb.AppendLine(leadingUsings);
+            sb.AppendLine("#line default");
+        }
 
+        // The wrapper has no snippet line: hidden sequence points keep its
+        // stack frames (e.g. the ExecuteAsync forwarder) from reporting
+        // generated line numbers. Diagnostics here keep the generated
+        // numbering, because hidden continues the #line default mapping.
+        sb.AppendLine("#line hidden");
         sb.AppendLine("namespace Locus.RuntimeSnippets");
         sb.AppendLine("{");
         sb.Append("    public static class ").Append(hostTypeName).AppendLine();

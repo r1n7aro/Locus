@@ -25,6 +25,8 @@ When the editor's main thread has not returned to the editor loop for 30 seconds
 
 The Agent gets the same diagnosis: Unity tool errors returned during the hang include it, and if Agent calls are still waiting on Unity when you click `Restart Unity`, they end immediately and tell the Agent that you restarted Unity and where it was stuck, instead of hanging or attaching to the restarted editor.
 
+Long work the Agent runs on purpose is not treated as a hang. While an Agent `unity_execute` snippet holds the main thread and keeps printing or reporting progress, the status panel names that execution and shows `Wait for execution` instead of offering `Restart Unity`, and the Agent's call keeps streaming output and finishes normally. A snippet that reports nothing for 30 seconds is stopped by Locus.
+
 With an older plugin, the diagnosis falls back to scanning the stack from outside the process and shows native frames only; update the Locus Unity plugin to see C# frames.
 
 ## Native bridge

@@ -122,20 +122,16 @@ public static class UnitySnippetSource
 
             if (stillInUsingBlock)
             {
-                if (string.IsNullOrEmpty(trimmed))
-                {
-                    if (usingSb.Length > 0)
-                        usingSb.AppendLine(line);
-                    else
-                        bodySb.AppendLine(line);
-
-                    continue;
-                }
-
-                if (trimmed.StartsWith("using ", StringComparison.Ordinal) &&
-                    trimmed.EndsWith(";", StringComparison.Ordinal))
+                // Every line read here keeps its slot on both sides (blank
+                // in the body), so the `#line 1` on the hoisted usings and
+                // on the body maps line N back to line N of the snippet.
+                if (string.IsNullOrEmpty(trimmed) ||
+                    (trimmed.StartsWith("using ", StringComparison.Ordinal) &&
+                     trimmed.EndsWith(";", StringComparison.Ordinal) &&
+                     IsUsingDirectiveLine(trimmed)))
                 {
                     usingSb.AppendLine(line);
+                    bodySb.AppendLine();
                     continue;
                 }
 
@@ -147,6 +143,20 @@ public static class UnitySnippetSource
 
         leadingUsings = usingSb.ToString().TrimEnd();
         bodyCode = bodySb.ToString().TrimEnd();
+    }
+
+    // Unity's SnippetParseOptions minus the preprocessor symbols, which a
+    // single line starting with "using" cannot observe.
+    private static readonly CSharpParseOptions UsingDirectiveParseOptions = new(
+        languageVersion: LanguageVersion.CSharp9,
+        documentationMode: DocumentationMode.None,
+        kind: SourceCodeKind.Regular);
+
+    /// <summary>Port of LocusBridge.ExecuteCode.cs IsUsingDirectiveLine.</summary>
+    private static bool IsUsingDirectiveLine(string trimmedLine)
+    {
+        var unit = SyntaxFactory.ParseCompilationUnit(trimmedLine, options: UsingDirectiveParseOptions);
+        return unit.Usings.Count > 0 && unit.Members.Count == 0;
     }
 
     /// <summary>Port of LocusBridge.ExecuteCodeAsync.cs BuildAsyncSnippetSource.</summary>
@@ -178,8 +188,18 @@ public static class UnitySnippetSource
         sb.AppendLine("using Object = UnityEngine.Object;");
 
         if (!string.IsNullOrWhiteSpace(leadingUsings))
+        {
+            // Hoisted snippet usings keep their snippet line numbers.
+            sb.AppendLine("#line 1");
             sb.AppendLine(leadingUsings);
+            sb.AppendLine("#line default");
+        }
 
+        // The wrapper has no snippet line: hidden sequence points keep its
+        // stack frames (e.g. the ExecuteAsync forwarder) from reporting
+        // generated line numbers. Diagnostics here keep the generated
+        // numbering, because hidden continues the #line default mapping.
+        sb.AppendLine("#line hidden");
         sb.AppendLine("namespace Locus.RuntimeSnippets");
         sb.AppendLine("{");
         sb.Append("    public static class ").Append(hostTypeName).AppendLine();
