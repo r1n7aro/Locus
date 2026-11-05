@@ -52,9 +52,12 @@
         var params=new URLSearchParams(location.search);
         var isUnityEmbed=location.pathname!=='/unity-embed-test'&&
           (location.pathname==='/unity-embed'||params.get('host')==='unity');
+        // Boot cache of the settings store; the legacy key predates it.
+        var setting=isUnityEmbed?'appearance.theme.unityEmbed':'appearance.theme.main';
         var key=isUnityEmbed?'locus-unity-embed-theme-preference':'locus-theme-preference';
         var fallback='dark';
-        var p;try{p=localStorage.getItem(key)}catch(e){}
+        var p;try{var c=JSON.parse(localStorage.getItem('locus-settings-boot-cache')||'null');
+          p=c&&c.values?c.values[setting]:undefined;if(p===undefined)p=localStorage.getItem(key)}catch(e){}
         p=p==='light'||p==='dark'||p==='system'?p:fallback;
         var t=p==='light'?'light':p==='dark'?'dark':
           (window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');

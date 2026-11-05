@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { installFakeSettingsBackend } from "./fixtures/settingsBackend";
 
 const key = "locus-new-session-settings";
 
@@ -47,16 +48,21 @@ describe("new session settings", () => {
   });
 
   it("syncs detached windows and clears the saved preference on reset", async () => {
+    localStorage.setItem(key, JSON.stringify({ defaultAgentId: "legacy" }));
+    const backend = await installFakeSettingsBackend();
     const settings = (await import("../composables/useNewSessionSettings")).useNewSessionSettings();
-    localStorage.setItem(key, JSON.stringify({ defaultAgentId: "simple" }));
-    window.dispatchEvent(new StorageEvent("storage", { key }));
-    expect(settings.state.defaultAgentId).toBe("simple");
+    await backend.settle();
+    backend.change("agent.newSession.defaultAgentId", "simple");
+    backend.change("agent.newSession.agentMode", "fixed");
+    expect(settings.state).toMatchObject({ agentMode: "fixed", defaultAgentId: "simple" });
     settings.reset();
-    expect(settings.state.defaultAgentId).toBe("");
+    expect(settings.state).toMatchObject({ agentMode: "remember", defaultAgentId: "", legacyAgentId: "" });
     expect(localStorage.getItem(key)).toBeNull();
-    settings.setDefaultAgentId("unity");
-    localStorage.clear();
-    window.dispatchEvent(new StorageEvent("storage", { key: null }));
-    expect(settings.state.defaultAgentId).toBe("");
+    await backend.settle();
+    expect(backend.values).toMatchObject({
+      "agent.newSession.agentMode": "remember",
+      "agent.newSession.defaultAgentId": "",
+    });
+    backend.uninstall();
   });
 });

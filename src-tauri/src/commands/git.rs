@@ -1698,26 +1698,41 @@ pub struct GitRuntimeState {
     pub missing_selected: bool,
 }
 
-const GIT_OVERRIDE_FILE: &str = "git_path_override.txt";
 type GitRuntimeDiscoveryCache = Option<Vec<GitRuntimeCandidate>>;
 
-fn git_override_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, AppError> {
-    let data_dir = crate::commands::resolve_runtime_storage_dir(app_handle)
-        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("Failed to create app data dir: {}", e))?;
-    Ok(data_dir.join(GIT_OVERRIDE_FILE))
+/// The Git override is the `runtimes.git.path` setting; empty means automatic.
+fn read_saved_git_override(_app_handle: &AppHandle) -> Option<String> {
+    Some(crate::settings::global::global().get(crate::settings::RUNTIMES_GIT_PATH))
+        .filter(|path| !path.is_empty())
 }
 
-fn read_saved_git_override(app_handle: &AppHandle) -> Option<String> {
-    let Ok(path) = git_override_path(app_handle) else {
-        return None;
-    };
+fn save_git_override(path: &str) -> Result<(), AppError> {
+    crate::settings::global::global()
+        .set(crate::settings::RUNTIMES_GIT_PATH, path.to_string())
+        .map(|_| ())
+        .map_err(|error| AppError::new(error.code, format!("Failed to save Git override: {error}")))
+}
 
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
+/// Applies `runtimes.git.path` written through settings (agent `config_set`).
+pub(crate) fn apply_git_path_setting(path: &str) {
+    if path.is_empty() {
+        std::env::remove_var("LOCUS_GIT_PATH");
+    } else {
+        std::env::set_var("LOCUS_GIT_PATH", path);
+    }
+    let _ = refresh_git_resolution();
+    clear_git_runtime_discovery_cache();
+}
+
+/// Settings validator: a Git executable or installation directory.
+pub(crate) fn validate_git_path_setting(path: &str) -> Result<String, String> {
+    let trimmed = path.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    normalize_git_path(Path::new(trimmed))
+        .map(|path| path.display().to_string())
+        .ok_or_else(|| "no usable Git executable at this location".to_string())
 }
 
 pub fn restore_saved_git_override(app_handle: &AppHandle) {
@@ -1901,9 +1916,7 @@ pub async fn git_save_runtime_selection(
             ));
         };
 
-        let override_path = git_override_path(&app_handle)?;
-        std::fs::write(&override_path, &selected.path)
-            .map_err(|e| format!("Failed to save Git runtime selection: {}", e))?;
+        save_git_override(&selected.path)?;
         std::env::set_var("LOCUS_GIT_PATH", &selected.path);
         let _ = refresh_git_resolution();
 
@@ -2111,7 +2124,7 @@ pub async fn git_install_via(manager: String) -> Result<RunCommandResult, AppErr
 }
 
 #[tauri::command]
-pub async fn git_set_override(path: String, app_handle: AppHandle) -> Result<String, AppError> {
+pub async fn git_set_override(path: String, _app_handle: AppHandle) -> Result<String, AppError> {
     let trimmed = path.trim().trim_matches('"');
     if trimmed.is_empty() {
         return Err(AppError::new(
@@ -2128,9 +2141,7 @@ pub async fn git_set_override(path: String, app_handle: AppHandle) -> Result<Str
     })?;
 
     let normalized = normalized.display().to_string();
-    let override_path = git_override_path(&app_handle)?;
-    std::fs::write(&override_path, &normalized)
-        .map_err(|e| format!("Failed to save Git override: {}", e))?;
+    save_git_override(&normalized)?;
     std::env::set_var("LOCUS_GIT_PATH", &normalized);
     let _ = refresh_git_resolution();
     clear_git_runtime_discovery_cache();
@@ -2138,12 +2149,8 @@ pub async fn git_set_override(path: String, app_handle: AppHandle) -> Result<Str
 }
 
 #[tauri::command]
-pub async fn git_clear_override(app_handle: AppHandle) -> Result<(), AppError> {
-    let override_path = git_override_path(&app_handle)?;
-    if override_path.exists() {
-        std::fs::remove_file(&override_path)
-            .map_err(|e| format!("Failed to clear Git override: {}", e))?;
-    }
+pub async fn git_clear_override(_app_handle: AppHandle) -> Result<(), AppError> {
+    save_git_override("")?;
     std::env::remove_var("LOCUS_GIT_PATH");
     let _ = refresh_git_resolution();
     clear_git_runtime_discovery_cache();
@@ -5295,11 +5302,22 @@ async fn generate_commit_message_with_claude_code(
     selected_model: &str,
     user_prompt: &str,
 ) -> Result<String, AppError> {
+    let selected_model = selected_model.trim();
     let mut host = GitClaudeCodeHost::default();
+    #[cfg(feature = "server-client")]
+    let server_bound = crate::server_client::binding_for_model(selected_model)?.is_some();
+    #[cfg(not(feature = "server-client"))]
+    let server_bound = false;
+    let (remote, locus_session_id) = if server_bound {
+        // The relay owns remote configuration and requires a UUID for its user-scoped session.
+        (None, uuid::Uuid::new_v4().to_string())
+    } else {
+        (claude_code_cli::ssh::load_settings()?.remote, format!("git_commit_{}", uuid::Uuid::new_v4()))
+    };
     let turn = claude_code_cli::run_ephemeral_turn(
         ClaudeCodeCliOptions {
-            remote: claude_code_cli::ssh::load_settings()?.remote,
-            locus_session_id: format!("git_commit_{}", uuid::Uuid::new_v4()),
+            remote,
+            locus_session_id,
             cwd: cwd.to_string(),
             system_prompt: "You are a git commit message generator.".to_string(),
             model: selected_model.to_string(),
@@ -5307,6 +5325,8 @@ async fn generate_commit_message_with_claude_code(
             resume_session_id: None,
             tools: Vec::new(),
             native_tool_search: false,
+            native_agents: false,
+            agents: serde_json::Value::Null,
         },
         serde_json::json!({
             "role": "user",
@@ -5349,6 +5369,8 @@ fn classify_commit_message_model_provider(
     selected_model: &str,
 ) -> Option<CommitMessageModelProvider> {
     let selected_model = selected_model.trim();
+    #[cfg(feature = "server-client")]
+    let selected_model = crate::server_client::provider_model_id(selected_model);
     if selected_model.is_empty() {
         return None;
     }
@@ -5393,6 +5415,7 @@ async fn resolve_codex_commit_request_auth(
 
 #[tauri::command]
 pub async fn git_generate_commit_message(
+    app: tauri::AppHandle,
     model: Option<String>,
     registry: State<'_, Arc<ProjectRegistry>>,
     workspace_ref: WorkspaceRef,
@@ -5463,7 +5486,24 @@ pub async fn git_generate_commit_message(
 
     let history = vec![user_msg];
 
-    let selected_model = model.as_deref().unwrap_or(&config.model);
+    let requested_model = model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let selected_model = match requested_model {
+        Some(model) => model,
+        None => {
+            let project_id = registry
+                .resolve_workspace_ref(&workspace_ref)
+                .ok()
+                .map(|scope| scope.runtime().project_id().to_string());
+            crate::commands::default_model_for_project(&app, project_id.as_deref())
+                .await
+                .ok_or_else(|| AppError::from("No model is configured in Locus".to_string()))?
+        }
+    };
+    let selected_model = selected_model.as_str();
     let provider = classify_commit_message_model_provider(selected_model);
 
     let response_text = if matches!(provider, Some(CommitMessageModelProvider::OpenRouter)) {
@@ -5478,7 +5518,7 @@ pub async fn git_generate_commit_message(
             "You are a git commit message generator.",
             &history,
             &[],
-            config.base_url.as_deref(),
+            None,
             None,
             Some("OpenRouter"),
             &[],
@@ -5495,20 +5535,26 @@ pub async fn git_generate_commit_message(
         let transport = crate::commands::load_codex_model_config()
             .map(|config| config.transport)
             .unwrap_or_default();
-        let actual_model = selected_model
-            .trim()
-            .strip_prefix("openai/")
-            .unwrap_or(selected_model);
+        let actual_model = crate::llm::codex::protocol_model_name(selected_model.trim());
+        let (request_auth, request_base_url): (_, Option<String>) = (codex.inner().clone(), None);
+        #[cfg(feature = "server-client")]
+        let (request_auth, request_base_url) = match crate::server_client::binding_for_model(selected_model.trim())? {
+            Some((binding, _)) => {
+                let base_url = crate::server_client::codex_base_url(&binding);
+                (Arc::new(tokio::sync::Mutex::new(crate::auth::codex::CodexAuthState::for_server(binding))), Some(base_url))
+            }
+            None => (request_auth, request_base_url),
+        };
         let session_id = format!("git_commit_{}", uuid::Uuid::new_v4());
         let mut turn_state = crate::llm::codex::TurnState::default();
-        let (access_token, account_id) = resolve_codex_commit_request_auth(&codex, false)
+        let (access_token, account_id) = resolve_codex_commit_request_auth(&request_auth, false)
             .await
             .map_err(|e| format!("OpenAI Codex token failed (please re-login): {}", e))?;
         let resp = match crate::llm::codex::stream_chat(
             &access_token,
             account_id.as_deref(),
             transport,
-            config.base_url.as_deref(),
+            request_base_url.as_deref(),
             actual_model,
             "You are a git commit message generator.",
             &history,
@@ -5528,14 +5574,14 @@ pub async fn git_generate_commit_message(
         {
             Ok(resp) => resp,
             Err(error) if is_codex_unauthorized_error(&error) => {
-                let (access_token, account_id) = resolve_codex_commit_request_auth(&codex, true)
+                let (access_token, account_id) = resolve_codex_commit_request_auth(&request_auth, true)
                     .await
                     .map_err(|e| format!("OpenAI Codex token refresh failed: {}", e))?;
                 crate::llm::codex::stream_chat(
                     &access_token,
                     account_id.as_deref(),
                     transport,
-                    config.base_url.as_deref(),
+                    request_base_url.as_deref(),
                     actual_model,
                     "You are a git commit message generator.",
                     &history,
@@ -5584,7 +5630,7 @@ pub async fn git_generate_commit_message(
             &["You are a git commit message generator."],
             &history,
             &[],
-            config.base_url.as_deref(),
+            None,
             None,
             None,
             None,
@@ -5673,6 +5719,22 @@ mod commit_message_prompt_tests {
             classify_commit_message_model_provider("openai/gpt-5.4"),
             Some(CommitMessageModelProvider::OpenAiCodex)
         );
+    }
+
+    #[test]
+    fn server_commit_models_follow_their_provider_only_in_internal_builds() {
+        let codex = classify_commit_message_model_provider("locus-server/00000000-0000-0000-0000-000000000001/openai/gpt-5.4");
+        let claude = classify_commit_message_model_provider("locus-server/00000000-0000-0000-0000-000000000001/claude_code/claude-opus-5-5");
+        #[cfg(feature = "server-client")]
+        {
+            assert_eq!(codex, Some(CommitMessageModelProvider::OpenAiCodex));
+            assert_eq!(claude, Some(CommitMessageModelProvider::ClaudeCode));
+        }
+        #[cfg(not(feature = "server-client"))]
+        {
+            assert_eq!(codex, None);
+            assert_eq!(claude, None);
+        }
     }
 }
 

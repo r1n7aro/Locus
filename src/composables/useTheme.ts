@@ -1,13 +1,14 @@
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { hasTauriWindowRuntime } from "../services/tauriRuntime";
+import { saveSetting, settingValue } from "./useSettingsStore";
 
 export type ThemePreference = "system" | "light" | "dark";
 export type ThemeScope = "main" | "unityEmbed";
 
-const STORAGE_KEYS: Record<ThemeScope, string> = {
-  main: "locus-theme-preference",
-  unityEmbed: "locus-unity-embed-theme-preference",
+const SETTING_KEYS: Record<ThemeScope, string> = {
+  main: "appearance.theme.main",
+  unityEmbed: "appearance.theme.unityEmbed",
 };
 
 const DEFAULT_PREFERENCES: Record<ThemeScope, ThemePreference> = {
@@ -24,25 +25,19 @@ const mainPreference = ref<ThemePreference>(readPreference("main"));
 const unityEmbedPreference = ref<ThemePreference>(readPreference("unityEmbed"));
 let lastNativeBackgroundColor: string | null = null;
 let activeScope: ThemeScope = "main";
-let storageListenerBound = false;
+let themeInitialized = false;
 
 function preferenceRef(scope: ThemeScope) {
   return scope === "main" ? mainPreference : unityEmbedPreference;
 }
 
-function normalizePreference(value: string | null, fallback: ThemePreference): ThemePreference {
+function normalizePreference(value: unknown, fallback: ThemePreference): ThemePreference {
   if (value === "light" || value === "dark" || value === "system") return value;
   return fallback;
 }
 
 function readPreference(scope: ThemeScope): ThemePreference {
-  try {
-    return normalizePreference(
-      localStorage.getItem(STORAGE_KEYS[scope]),
-      DEFAULT_PREFERENCES[scope],
-    );
-  } catch { /* ignore */ }
-  return DEFAULT_PREFERENCES[scope];
+  return normalizePreference(settingValue(SETTING_KEYS[scope]), DEFAULT_PREFERENCES[scope]);
 }
 
 function resolveTheme(pref: ThemePreference): "light" | "dark" {
@@ -90,23 +85,19 @@ function unbindSystemListener() {
   mediaHandler = null;
 }
 
-function bindStorageListener() {
-  if (storageListenerBound || typeof window === "undefined") return;
-  window.addEventListener("storage", handleStorageChange);
-  storageListenerBound = true;
+/** Follows the settings snapshot, so changes from other windows and the
+ *  agent apply here too. */
+function applyPreferenceChange(scope: ThemeScope, next: ThemePreference) {
+  const preference = preferenceRef(scope);
+  if (preference.value === next) return;
+  preference.value = next;
+  if (scope !== activeScope || !themeInitialized) return;
+  applyTheme(resolveTheme(next));
+  bindSystemListener();
 }
 
-function handleStorageChange(event: StorageEvent) {
-  const scope = (Object.keys(STORAGE_KEYS) as ThemeScope[])
-    .find((candidate) => STORAGE_KEYS[candidate] === event.key);
-  if (!scope) return;
-
-  const nextPreference = normalizePreference(event.newValue, DEFAULT_PREFERENCES[scope]);
-  preferenceRef(scope).value = nextPreference;
-  if (scope !== activeScope) return;
-
-  applyTheme(resolveTheme(nextPreference));
-  bindSystemListener();
+for (const scope of Object.keys(SETTING_KEYS) as ThemeScope[]) {
+  watch(() => readPreference(scope), (next) => applyPreferenceChange(scope, next), { flush: "sync" });
 }
 
 export function setThemePreference(pref: ThemePreference): void;
@@ -117,12 +108,8 @@ export function setThemePreference(
 ) {
   const scope = maybePreference ? scopeOrPreference as ThemeScope : "main";
   const pref = maybePreference ?? scopeOrPreference as ThemePreference;
-  preferenceRef(scope).value = pref;
-  try { localStorage.setItem(STORAGE_KEYS[scope], pref); } catch { /* ignore */ }
-  if (scope !== activeScope) return;
-
-  applyTheme(resolveTheme(pref));
-  bindSystemListener();
+  // The snapshot updates synchronously, which applies the theme here.
+  saveSetting(SETTING_KEYS[scope], pref);
 }
 
 /** Resolved background color for the current theme; used as the native
@@ -138,9 +125,9 @@ export function resolvedTheme(scope: ThemeScope): "light" | "dark" {
 /** Call once from App.vue for each window surface that uses shared app tokens. */
 export function initTheme(scope: ThemeScope = "main") {
   activeScope = scope;
+  themeInitialized = true;
   applyTheme(resolveTheme(preferenceRef(scope).value));
   bindSystemListener();
-  bindStorageListener();
 }
 
 /** Composable for reactive access in components. */

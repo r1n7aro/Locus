@@ -1,4 +1,5 @@
-import { reactive } from "vue";
+import { reactive, watch } from "vue";
+import { saveSetting, settingValue } from "./useSettingsStore";
 import { detectShortcutPlatform, type ShortcutPlatform } from "./useKeyboardShortcuts";
 
 export type ChatSubmitMode = "enter-send" | "mod-enter-send";
@@ -13,8 +14,6 @@ type EnterEventLike = Pick<KeyboardEvent, "key" | "shiftKey" | "ctrlKey" | "meta
   isComposing?: boolean;
 };
 
-const STORAGE_KEY = "locus-chat-input-settings";
-
 const defaults: ChatInputSettings = {
   submitMode: "enter-send",
   runningSendMode: "insert",
@@ -28,31 +27,21 @@ function normalizeRunningSendMode(value: unknown): RunningSendMode {
   return value === "after-run" ? "after-run" : defaults.runningSendMode;
 }
 
-function load(): ChatInputSettings {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<ChatInputSettings>;
-      return {
-        submitMode: normalizeSubmitMode(parsed.submitMode),
-        runningSendMode: normalizeRunningSendMode(parsed.runningSendMode),
-      };
-    }
-  } catch {
-    // ignore persistence failures
-  }
-  return { ...defaults };
+const SUBMIT_MODE_KEY = "chat.input.submitMode";
+const RUNNING_SEND_MODE_KEY = "chat.input.runningSendMode";
+
+function project(): ChatInputSettings {
+  return {
+    submitMode: normalizeSubmitMode(settingValue(SUBMIT_MODE_KEY)),
+    runningSendMode: normalizeRunningSendMode(settingValue(RUNNING_SEND_MODE_KEY)),
+  };
 }
 
-function save(settings: ChatInputSettings) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-  } catch {
-    // ignore persistence failures
-  }
-}
-
-const state = reactive<ChatInputSettings>(load());
+const state = reactive<ChatInputSettings>(project());
+watch(project, (next) => {
+  if (state.submitMode !== next.submitMode) state.submitMode = next.submitMode;
+  if (state.runningSendMode !== next.runningSendMode) state.runningSendMode = next.runningSendMode;
+}, { flush: "sync" });
 
 function isEnterKey(event: EnterEventLike): boolean {
   return event.key === "Enter" && !event.isComposing;
@@ -84,13 +73,11 @@ export function shouldSelectPopupOnEnter(
 
 export function useChatInputSettings() {
   function setSubmitMode(mode: ChatSubmitMode) {
-    state.submitMode = normalizeSubmitMode(mode);
-    save({ ...state });
+    saveSetting(SUBMIT_MODE_KEY, normalizeSubmitMode(mode));
   }
 
   function setRunningSendMode(mode: RunningSendMode) {
-    state.runningSendMode = normalizeRunningSendMode(mode);
-    save({ ...state });
+    saveSetting(RUNNING_SEND_MODE_KEY, normalizeRunningSendMode(mode));
   }
 
   return {

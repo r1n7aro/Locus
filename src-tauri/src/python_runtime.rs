@@ -725,29 +725,33 @@ pub fn python_process_env(runtime: &ResolvedPythonRuntime) -> Vec<(String, OsStr
     env
 }
 
-fn config_path() -> Result<PathBuf, String> {
-    Ok(crate::commands::persistent_config_dir()?.join(CONFIG_FILE))
-}
-
+/// The selection lives in settings (`runtimes.python.*`); empty means unset.
 fn load_config() -> Result<PythonRuntimeConfig, String> {
-    let path = config_path()?;
-    let Some(raw) = std::fs::read_to_string(&path).ok() else {
-        return Ok(PythonRuntimeConfig::default());
+    let store = crate::settings::global::global();
+    let text = |key: crate::settings::Key<String>| {
+        Some(store.get(key)).filter(|value| !value.trim().is_empty())
     };
-    serde_json::from_str(&raw).map_err(|e| format!("Invalid Python runtime config: {}", e))
+    Ok(PythonRuntimeConfig {
+        selected_id: text(crate::settings::RUNTIMES_PYTHON_SELECTED_ID),
+        selected_path: text(crate::settings::RUNTIMES_PYTHON_SELECTED_PATH),
+    })
 }
 
 fn save_config(config: &PythonRuntimeConfig) -> Result<(), String> {
-    let path = config_path()?;
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("Failed to serialize Python runtime config: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| {
-        format!(
-            "Failed to save Python runtime config '{}': {}",
-            path.display(),
-            e
-        )
-    })
+    let value = |text: &Option<String>| serde_json::Value::from(text.clone().unwrap_or_default());
+    crate::settings::global::global()
+        .set_values(&[
+            (
+                crate::settings::RUNTIMES_PYTHON_SELECTED_ID.index(),
+                value(&config.selected_id),
+            ),
+            (
+                crate::settings::RUNTIMES_PYTHON_SELECTED_PATH.index(),
+                value(&config.selected_path),
+            ),
+        ])
+        .map(|_| ())
+        .map_err(|error| format!("Failed to save Python runtime selection: {error}"))
 }
 
 fn discover_python_runtimes(app_handle: Option<&AppHandle>) -> Vec<PythonRuntimeInfo> {
@@ -874,7 +878,7 @@ fn locus_python_sdk_roots(app_handle: Option<&AppHandle>) -> Vec<PathBuf> {
     candidates
 }
 
-fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
+pub(crate) fn locus_python_sdk_dir(app_handle: Option<&AppHandle>) -> Option<PathBuf> {
     let mut candidates = locus_python_sdk_roots(app_handle);
     #[cfg(debug_assertions)]
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../python"));

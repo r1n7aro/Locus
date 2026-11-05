@@ -43,7 +43,7 @@ fn live_unity_runtime_scopes(workspace_registry: &ProjectRegistry) -> Vec<(Works
         .into_iter()
         .filter_map(|runtime| {
             let root = runtime.root().to_string_lossy().to_string();
-            crate::unity_bridge::is_unity_project(&root)
+            crate::unity_bridge::unity_integration_enabled(&root)
                 .then(|| (WorkspaceRef::for_runtime(&runtime), root))
         })
         .collect::<Vec<_>>();
@@ -391,27 +391,6 @@ pub fn set_anthropic_native_lazy_enabled(
 }
 
 #[tauri::command]
-pub fn get_async_tasks_enabled(
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-) -> Result<bool, crate::error::AppError> {
-    Ok(config.async_tasks_enabled())
-}
-
-#[tauri::command]
-pub fn set_async_tasks_enabled(
-    value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-    app: AppHandle,
-) -> Result<(), crate::error::AppError> {
-    use tauri::Emitter;
-    config
-        .set_async_tasks_enabled(value)
-        .map_err(crate::error::AppError::from)?;
-    app.emit("async-tasks-enabled-changed", value)
-        .map_err(|error| crate::error::AppError::from(error.to_string()))
-}
-
-#[tauri::command]
 pub fn get_unity_multi_agent_editor_enabled(
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
 ) -> Result<bool, crate::error::AppError> {
@@ -438,17 +417,49 @@ pub fn get_claude_code_cli_enabled(
 }
 
 #[tauri::command]
-pub fn set_claude_code_cli_enabled(
+pub async fn set_claude_code_cli_enabled(
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
     app: AppHandle,
 ) -> Result<(), crate::error::AppError> {
+    let context = crate::settings::apply::WriteContext::new(app, None);
+    crate::settings::apply::write_one(
+        &context,
+        crate::settings::PROVIDERS_CLAUDE_CODE_ENABLED,
+        value,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Effect of `providers.claudeCode.enabled`.
+pub(crate) fn publish_claude_code_cli_enabled(app: &AppHandle, value: bool) -> Result<(), String> {
     use tauri::Emitter;
-    config
-        .set_claude_code_cli_enabled(value)
-        .map_err(crate::error::AppError::from)?;
+    if !value { locus_remote_core::claude_ssh::archive_pool::shutdown(); }
     app.emit(CLAUDE_CODE_CLI_ENABLED_CHANGED_EVENT, value)
-        .map_err(|error| crate::error::AppError::from(error.to_string()))
+        .map_err(|error| error.to_string())
+}
+
+/// Publishes `status_for` to every live Unity checkout except `skip_root`.
+async fn publish_unity_status_to_live_scopes<T, F, P>(
+    app: &AppHandle,
+    workspace_registry: &ProjectRegistry,
+    skip_root: Option<&str>,
+    status_for: F,
+    publish: P,
+) where
+    F: Fn(&WorkspaceEventScope) -> T,
+    P: Fn(&AppHandle, &ProjectRegistry, &WorkspaceEventScope, T),
+{
+    for (workspace_ref, root) in live_unity_runtime_scopes(workspace_registry) {
+        if skip_root == Some(root.as_str()) {
+            continue;
+        }
+        let Ok(scope) = workspace_registry.resolve_workspace_ref(&workspace_ref) else {
+            continue;
+        };
+        let event_scope = unity_observable_event_scope(&scope).await;
+        publish(app, workspace_registry, &event_scope, status_for(&event_scope));
+    }
 }
 
 #[tauri::command]
@@ -458,11 +469,93 @@ pub fn get_unity_background_hook_enabled(
     Ok(config.unity_background_hook_enabled())
 }
 
+/// Effect of `unity.connection.backgroundHook`: per-checkout markers and the
+/// in-process switch form one transaction (any failure rolls both back and
+/// the setting reverts). Enabling then applies the hook to every live Unity
+/// checkout except `reporting_root`, whose caller applies and reports it.
+pub(crate) async fn apply_unity_background_hook(
+    app: &AppHandle,
+    value: bool,
+    previous: bool,
+    reporting_root: Option<&str>,
+) -> Result<(), String> {
+    let workspace_registry = app.state::<Arc<ProjectRegistry>>().inner().clone();
+    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
+    let runtime_scopes = live_unity_runtime_scopes(&workspace_registry);
+    let roots = runtime_scopes
+        .iter()
+        .map(|(_, root)| root.clone())
+        .collect::<Vec<_>>();
+
+    sync_unity_markers_transactionally(
+        &roots,
+        value,
+        previous,
+        crate::unity_bridge::sync_background_hook_marker,
+    )?;
+    if let Err(error) = crate::unity_bridge::set_background_hook_enabled(value) {
+        let _ = sync_unity_markers_transactionally(
+            &roots,
+            previous,
+            value,
+            crate::unity_bridge::sync_background_hook_marker,
+        );
+        let _ = crate::unity_bridge::set_background_hook_enabled(previous);
+        return Err(error);
+    }
+
+    if value {
+        for (_, root) in &runtime_scopes {
+            if reporting_root == Some(root.as_str()) {
+                continue;
+            }
+            match crate::unity_bridge::ensure_background_hook_for_project(root).await {
+                Ok(other_status)
+                    if other_status.enabled
+                        && other_status.state
+                            == crate::unity_bridge::UnityBackgroundHookState::Failed =>
+                {
+                    eprintln!(
+                        "[Locus] warning: Unity background hook failed for checkout root '{}': {}",
+                        root,
+                        other_status.error.as_deref().unwrap_or("unknown failure")
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let process_info =
+                        crate::unity_bridge::query_current_project_editor_process(root).await;
+                    if !matches!(
+                        process_info.state,
+                        crate::unity_bridge::UnityEditorProcessState::NotRunning
+                    ) {
+                        eprintln!(
+                            "[Locus] warning: failed to apply Unity background hook for checkout root '{}': {}",
+                            root, error
+                        );
+                    }
+                }
+            }
+        }
+    }
+    drop(_settings_mutation);
+    publish_unity_status_to_live_scopes(
+        app,
+        &workspace_registry,
+        reporting_root,
+        crate::unity_bridge::background_hook_status_for_scope,
+        |app, registry, scope, status| {
+            publish_background_hook_status(app, registry, scope, status.status);
+        },
+    )
+    .await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_unity_background_hook_enabled(
     value: bool,
     app: AppHandle,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<
@@ -474,54 +567,22 @@ pub async fn set_unity_background_hook_enabled(
         &workspace_ref,
         "set_unity_background_hook_enabled",
     )?;
-    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
     let cwd = scope_root(&scope);
     let event_scope = unity_observable_event_scope(&scope).await;
-    let runtime_scopes = live_unity_runtime_scopes(workspace_registry.inner());
-    let cwd_is_unity = crate::unity_bridge::is_unity_project(&cwd);
-    let roots = runtime_scopes
-        .iter()
-        .map(|(_, root)| root.clone())
-        .collect::<Vec<_>>();
-    let previous = config.unity_background_hook_enabled();
+    let cwd_is_unity = crate::unity_bridge::unity_integration_enabled(&cwd);
 
-    if let Err(error) = config.set_unity_background_hook_enabled(value) {
-        let _ = config.set_unity_background_hook_enabled(previous);
-        return Err(crate::error::AppError::from(error));
-    }
-
-    if let Err(error) = sync_unity_markers_transactionally(
-        &roots,
+    let context = crate::settings::apply::WriteContext::new(app.clone(), Some(&scope))
+        .reporting_root(cwd.clone());
+    crate::settings::apply::write_one(
+        &context,
+        crate::settings::UNITY_CONNECTION_BACKGROUND_HOOK,
         value,
-        previous,
-        crate::unity_bridge::sync_background_hook_marker,
-    ) {
-        let _ = config.set_unity_background_hook_enabled(previous);
-        return Err(
-            crate::error::AppError::new("unity.background_hook.marker_failed", error)
-                .operation("setUnityBackgroundHookEnabled"),
-        );
-    }
+    )
+    .await
+    .map_err(|error| error.operation("setUnityBackgroundHookEnabled"))?;
 
-    let status = match crate::unity_bridge::set_background_hook_enabled(value) {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = config.set_unity_background_hook_enabled(previous);
-            let _ = sync_unity_markers_transactionally(
-                &roots,
-                previous,
-                value,
-                crate::unity_bridge::sync_background_hook_marker,
-            );
-            let _ = crate::unity_bridge::set_background_hook_enabled(previous);
-            return Err(
-                crate::error::AppError::new("unity.background_hook.restore_failed", error)
-                    .operation("setUnityBackgroundHookEnabled"),
-            );
-        }
-    };
-
-    if !value {
+    let status = crate::unity_bridge::background_hook_status_for_scope(&event_scope).status;
+    if !value || !cwd_is_unity {
         return Ok(publish_background_hook_status(
             &app,
             workspace_registry.inner(),
@@ -530,48 +591,7 @@ pub async fn set_unity_background_hook_enabled(
         ));
     }
 
-    for (_, root) in &runtime_scopes {
-        if root == &cwd {
-            continue;
-        }
-        match crate::unity_bridge::ensure_background_hook_for_project(root).await {
-            Ok(other_status)
-                if other_status.enabled
-                    && other_status.state
-                        == crate::unity_bridge::UnityBackgroundHookState::Failed =>
-            {
-                eprintln!(
-                    "[Locus] warning: Unity background hook failed for checkout root '{}': {}",
-                    root,
-                    other_status.error.as_deref().unwrap_or("unknown failure")
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let process_info =
-                    crate::unity_bridge::query_current_project_editor_process(root).await;
-                if !matches!(
-                    process_info.state,
-                    crate::unity_bridge::UnityEditorProcessState::NotRunning
-                ) {
-                    eprintln!(
-                        "[Locus] warning: failed to apply Unity background hook for checkout root '{}': {}",
-                        root, error
-                    );
-                }
-            }
-        }
-    }
-
-    if !cwd_is_unity {
-        return Ok(publish_background_hook_status(
-            &app,
-            workspace_registry.inner(),
-            &event_scope,
-            status,
-        ));
-    }
-
+    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
     match crate::unity_bridge::ensure_background_hook_for_project(&cwd).await {
         Ok(status) => {
             if status.enabled
@@ -641,22 +661,18 @@ pub fn get_unity_external_editor_default_enabled(
     Ok(config.unity_external_editor_default_enabled())
 }
 
-#[tauri::command]
-pub async fn set_unity_external_editor_default_enabled(
+/// Effect of `unity.externalEditor.autoSelect`. Fails (and the setting
+/// reverts) when `requesting_checkout` is connected but not Ready; other
+/// checkouts that are not Ready pick the setting up later.
+pub(crate) async fn apply_unity_external_editor_default(
+    app: &AppHandle,
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-    workspace_ref: WorkspaceRef,
-    workspace_registry: State<'_, Arc<ProjectRegistry>>,
-) -> Result<bool, crate::error::AppError> {
-    let scope = resolve_workspace_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "set_unity_external_editor_default_enabled",
-    )?;
+    requesting_checkout: Option<crate::workspace_service::CheckoutId>,
+) -> Result<(), String> {
+    let workspace_registry = app.state::<Arc<ProjectRegistry>>().inner().clone();
     let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
-    let request_checkout = scope.runtime().checkout_id().clone();
-    let runtime_scopes = live_unity_runtime_scopes(workspace_registry.inner());
-    let registry = workspace_registry.inner();
+    let runtime_scopes = live_unity_runtime_scopes(&workspace_registry);
+    let registry = &workspace_registry;
     let mut ready_roots = Vec::new();
     let connection_states = join_all(runtime_scopes.iter().map(|(runtime_ref, root)| async move {
         (
@@ -684,7 +700,9 @@ pub async fn set_unity_external_editor_default_enabled(
     for (runtime_ref, result) in ready_states {
         match result {
             Ok(ready) => ready_roots.push(ready.root_text()),
-            Err(error) if runtime_ref.checkout_id == request_checkout => return Err(error),
+            Err(error) if requesting_checkout.as_ref() == Some(&runtime_ref.checkout_id) => {
+                return Err(error.to_string())
+            }
             Err(error) => eprintln!(
                 "[Locus] warning: Unity external editor setting is waiting for checkout {} Ready: {}",
                 runtime_ref.checkout_id, error
@@ -692,11 +710,7 @@ pub async fn set_unity_external_editor_default_enabled(
         }
     }
 
-    config
-        .set_unity_external_editor_default_enabled(value)
-        .map_err(crate::error::AppError::from)?;
     crate::unity_bridge::set_external_editor_default(value);
-
     let apply_results = join_all(ready_roots.into_iter().map(|root| async move {
         let result = crate::unity_bridge::configure_locus_external_editor(&root, value).await;
         (root, result)
@@ -710,6 +724,28 @@ pub async fn set_unity_external_editor_default_enabled(
             );
         }
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_unity_external_editor_default_enabled(
+    value: bool,
+    app: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<bool, crate::error::AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "set_unity_external_editor_default_enabled",
+    )?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(
+        &context,
+        crate::settings::UNITY_EXTERNAL_EDITOR_AUTO_SELECT,
+        value,
+    )
+    .await?;
     Ok(value)
 }
 
@@ -727,11 +763,30 @@ pub fn get_unity_state_probe_enabled(
     Ok(config.unity_state_probe_enabled())
 }
 
+/// Effect of `unity.connection.stateProbe`.
+pub(crate) async fn apply_unity_state_probe(app: &AppHandle, value: bool) -> Result<(), String> {
+    let workspace_registry = app.state::<Arc<ProjectRegistry>>().inner().clone();
+    {
+        let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
+        crate::unity_bridge::set_state_probe_enabled(value);
+    }
+    publish_unity_status_to_live_scopes(
+        app,
+        &workspace_registry,
+        None,
+        crate::unity_bridge::state_probe_status_for_scope,
+        |app, registry, scope, status| {
+            publish_state_probe_status(app, registry, scope, status.status);
+        },
+    )
+    .await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn set_unity_state_probe_enabled(
     value: bool,
     app: AppHandle,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<
@@ -743,12 +798,15 @@ pub async fn set_unity_state_probe_enabled(
         &workspace_ref,
         "set_unity_state_probe_enabled",
     )?;
-    let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
     let event_scope = unity_observable_event_scope(&scope).await;
-    config
-        .set_unity_state_probe_enabled(value)
-        .map_err(crate::error::AppError::from)?;
-    let status = crate::unity_bridge::set_state_probe_enabled(value);
+    let context = crate::settings::apply::WriteContext::new(app.clone(), Some(&scope));
+    crate::settings::apply::write_one(
+        &context,
+        crate::settings::UNITY_CONNECTION_STATE_PROBE,
+        value,
+    )
+    .await?;
+    let status = crate::unity_bridge::state_probe_status_for_scope(&event_scope).status;
     Ok(publish_state_probe_status(
         &app,
         workspace_registry.inner(),
@@ -783,49 +841,52 @@ pub fn get_unity_native_bridge_enabled(
     Ok(config.unity_native_bridge_enabled())
 }
 
-/// Toggle the native broker transport. Persists the config flag, flips the
-/// in-process transport switch, and writes/removes the per-project marker the
-/// Unity plugin checks before loading the native DLL. The change takes full
-/// effect after the editor's next domain reload (when the plugin re-reads the
-/// marker); disabling it leaves the native-only Unity command transport
-/// unavailable until the marker is restored.
-#[tauri::command]
-pub async fn set_unity_native_bridge_enabled(
+/// Effect of `unity.connection.nativeBridge`: writes/removes the per-project
+/// marker the Unity plugin checks before loading the native DLL and flips the
+/// in-process transport switch. The change takes full effect after the
+/// editor's next domain reload; disabling it leaves the native-only Unity
+/// command transport unavailable until the marker is restored.
+pub(crate) async fn apply_unity_native_bridge(
+    app: &AppHandle,
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
-    workspace_ref: WorkspaceRef,
-    workspace_registry: State<'_, Arc<ProjectRegistry>>,
-) -> Result<bool, crate::error::AppError> {
-    let _scope = resolve_workspace_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "set_unity_native_bridge_enabled",
-    )?;
+    previous: bool,
+) -> Result<(), String> {
+    let workspace_registry = app.state::<Arc<ProjectRegistry>>().inner().clone();
     let _settings_mutation = unity_process_settings_mutation_gate().lock().await;
-    let roots = live_unity_runtime_scopes(workspace_registry.inner())
+    let roots = live_unity_runtime_scopes(&workspace_registry)
         .into_iter()
         .map(|(_, root)| root)
         .collect::<Vec<_>>();
-    let previous = config.unity_native_bridge_enabled();
-
-    if let Err(error) = config.set_unity_native_bridge_enabled(value) {
-        let _ = config.set_unity_native_bridge_enabled(previous);
-        return Err(crate::error::AppError::from(error));
-    }
-
-    if let Err(error) = sync_unity_markers_transactionally(
+    sync_unity_markers_transactionally(
         &roots,
         value,
         previous,
         crate::unity_bridge::sync_native_bridge_marker,
-    ) {
-        let _ = config.set_unity_native_bridge_enabled(previous);
-        return Err(
-            crate::error::AppError::new("unity.native_bridge.marker_failed", error)
-                .operation("setUnityNativeBridgeEnabled"),
-        );
-    }
+    )?;
     crate::unity_bridge::set_native_bridge_enabled(value);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_unity_native_bridge_enabled(
+    value: bool,
+    app: AppHandle,
+    workspace_ref: WorkspaceRef,
+    workspace_registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<bool, crate::error::AppError> {
+    let scope = resolve_workspace_scope(
+        workspace_registry.inner(),
+        &workspace_ref,
+        "set_unity_native_bridge_enabled",
+    )?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(
+        &context,
+        crate::settings::UNITY_CONNECTION_NATIVE_BRIDGE,
+        value,
+    )
+    .await
+    .map_err(|error| error.operation("setUnityNativeBridgeEnabled"))?;
     Ok(value)
 }
 
@@ -842,7 +903,7 @@ pub async fn get_unity_native_broker_status(
         "get_unity_native_broker_status",
     )?;
     let cwd = scope_root(&scope);
-    if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
+    if cwd.trim().is_empty() || !crate::unity_bridge::unity_integration_enabled(&cwd) {
         return Ok(None);
     }
     Ok(crate::unity_bridge::query_native_broker_status(&cwd).await)
@@ -861,7 +922,7 @@ pub async fn get_unity_semantic_state(
         "get_unity_semantic_state",
     )?;
     let cwd = scope_root(&scope);
-    if cwd.trim().is_empty() || !crate::unity_bridge::is_unity_project(&cwd) {
+    if cwd.trim().is_empty() || !crate::unity_bridge::unity_integration_enabled(&cwd) {
         return Ok(crate::unity_bridge::unity_semantic_state("").await);
     }
     Ok(crate::unity_bridge::unity_semantic_state(&cwd).await)

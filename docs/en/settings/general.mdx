@@ -11,7 +11,7 @@ The `General` group in Settings collects interface and environment configuration
 - **`Debug Mode`**: when enabled, every LLM HTTP request is saved to the debug capture directory (`debug/llm/` in dev builds, `data/debug/llm/` in packaged builds). Sensitive headers like `Authorization` are automatically redacted. Turn it on to inspect requests, keep it off otherwise.
 - **`LLM Auto Retry`**: how many times a failed model request (connection errors, timeouts, HTTP 5xx and 429 rate limits) is retried automatically. Default 3, range 0 to 10; retries only happen before any output has streamed, 429 responses honor the server's Retry-After header, and 0 disables retries.
 - **`Unity Background Boost`**: keeps the Unity editor loop responsive while the Unity window is in the background, so compiles and Agent commands do not wait for you to click back into Unity.
-- **`Close Behavior`**: closing the main window either runs `Exit App` or `Minimize to Tray`.
+- **`Close Behavior`**: closing the last window either runs `Exit App` or `Minimize to Tray`. Closing any other window never exits the app.
 - **`Local Data Storage`**: where sessions and memory files live (Knowledge content stays in the project directory). `Open Directory` or `Change Location`; a move finishes after restart.
 - **`Temporary Files`**: large tool outputs and runtime temp files. `Clear` frees space; historical sessions still open afterwards, and cleared large tool outputs show as `Full output deleted`.
 - **`Session File Undo`**: records each round of Agent file changes for review and undo. Turning it off stops automatic Git snapshots; writes with known file paths still coordinate access to the same file, and Unity execution keeps its required serialization.

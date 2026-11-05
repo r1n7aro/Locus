@@ -7,6 +7,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { hasTauriWindowRuntime, getCurrentTauriWindowLabel } from "../services/tauriRuntime";
 import type { UserMessageDraft } from "../composables/chatMessageDraft";
+import type { SettingsPageId } from "../components/settings/nav";
 
 export type AppPage = "development" | "plugins" | "agent" | "settings";
 export type LegacyAppTab =
@@ -61,7 +62,8 @@ export const useUiStore = defineStore("ui", () => {
     get: () => activePage.value === "development" ? "chat" : activePage.value,
     set: (value) => { activePage.value = migrateAppPage(value); },
   });
-  const settingsCategoryHint = ref<"api" | "models" | "modelUsage" | "permissions" | "mcp" | "mcpServer" | "codeAnalysis" | "hotReload" | "unityConnection" | "testing" | "proxy" | "general" | "display" | "notifications" | "shortcuts" | "globalSearch" | "console" | "about" | "experimental" | null>(null);
+  /** Settings page (and optional section) to show next; see `components/settings/nav.ts`. */
+  const settingsCategoryHint = ref<{ page: SettingsPageId; section?: string } | null>(null);
   const alwaysOnTop = ref(false);
   const isMaximized = ref(false);
   const isWindowResizing = ref(false);
@@ -270,8 +272,8 @@ export const useUiStore = defineStore("ui", () => {
     setPage(migrateAppPage(tab));
   }
 
-  function openSettingsCategory(category: NonNullable<typeof settingsCategoryHint.value>) {
-    settingsCategoryHint.value = category;
+  function openSettingsCategory(page: SettingsPageId, section?: string) {
+    settingsCategoryHint.value = { page, section };
     setTab("settings");
   }
 

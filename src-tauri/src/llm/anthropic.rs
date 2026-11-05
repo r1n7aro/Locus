@@ -2471,6 +2471,7 @@ fn oauth_public_tool_name(internal_name: &str) -> String {
     match internal_name {
         "ask_user_question" => "AskUserQuestion".to_string(),
         "config_query" => "ConfigQuery".to_string(),
+        "config_set" => "ConfigSet".to_string(),
         "knowledge_list" => "KnowledgeList".to_string(),
         "knowledge_query" => "KnowledgeQuery".to_string(),
         "knowledge_read" => "KnowledgeRead".to_string(),

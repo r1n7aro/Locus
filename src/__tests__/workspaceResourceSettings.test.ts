@@ -5,7 +5,7 @@ import WorkspaceResourceSettings from "../components/settings/WorkspaceResourceS
 import { getWorkspaceResourceLimits, setWorkspaceResourceLimits, type WorkspaceResourceLimits } from "../services/worktrees";
 
 vi.mock("../i18n", () => ({ t: (key: string) => key }));
-vi.mock("../services/worktrees", () => ({ getWorkspaceResourceLimits: vi.fn(), setWorkspaceResourceLimits: vi.fn(), getUnityEditorResources: vi.fn().mockResolvedValue([]) }));
+vi.mock("../services/worktrees", () => ({ getWorkspaceResourceLimits: vi.fn(), setWorkspaceResourceLimits: vi.fn(), getUnityEditorResources: vi.fn().mockResolvedValue([]), subscribeUnityEditorProcessesChanged: vi.fn(async () => () => {}) }));
 
 const limits: WorkspaceResourceLimits = {
   workspaceIdleTimeoutSecs: 421,

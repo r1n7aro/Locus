@@ -361,8 +361,9 @@ pub struct ModelDefaults {
     pub main_model: String,
     #[serde(default)]
     pub plan_model: String,
+    /// Models each sub-agent type may use; the first is its default.
     #[serde(default)]
-    pub subagent_models: std::collections::HashMap<String, String>,
+    pub subagent_models: crate::agent::subagent_models::SubagentModelChoices,
     #[serde(default)]
     pub subagent_efforts: std::collections::HashMap<String, String>,
     /// Missing keys inherit the current session; explicit false selects the
@@ -376,7 +377,7 @@ impl Default for ModelDefaults {
         ModelDefaults {
             main_model: String::new(),
             plan_model: String::new(),
-            subagent_models: std::collections::HashMap::new(),
+            subagent_models: Default::default(),
             subagent_efforts: std::collections::HashMap::new(),
             subagent_fast_modes: std::collections::HashMap::new(),
         }
@@ -396,6 +397,7 @@ pub const DEFAULT_CODEX_CONTEXT_WINDOW: u32 = 272_000;
 pub const LEGACY_CODEX_EXTENDED_CONTEXT_WINDOW: u32 = 372_000;
 pub const MIN_CODEX_CONTEXT_WINDOW: u32 = 16_000;
 pub const MAX_CODEX_CONTEXT_WINDOW: u32 = 1_000_000;
+pub const MAX_CODEX_PREFIX_CACHE_TTL_SECONDS: u32 = 30 * 24 * 60 * 60;
 
 fn default_provider_prefix_cache_ttl_seconds() -> u32 {
     DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS
@@ -481,25 +483,28 @@ impl CodexModelConfig {
     }
 }
 
-fn codex_model_config_path() -> Result<std::path::PathBuf, String> {
-    Ok(persistent_config_dir()?.join("codex_model_config.json"))
-}
+/// Settings group behind `CodexModelConfig` (`providers.codex.*`).
+const CODEX_SETTINGS: &str = "providers.codex";
+/// Settings group behind `ModelDefaults` (`models.defaults.*`).
+const MODEL_DEFAULTS_SETTINGS: &str = "models.defaults";
 
 pub(crate) fn load_codex_model_config() -> Result<CodexModelConfig, String> {
-    let path = codex_model_config_path()?;
-    Ok(std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<CodexModelConfig>(&s).ok())
-        .unwrap_or_default())
+    let group = crate::settings::group::read(crate::settings::global::global(), CODEX_SETTINGS);
+    serde_json::from_value(group).map_err(|error| format!("Invalid Codex settings: {error}"))
+}
+
+pub(crate) fn read_model_defaults() -> ModelDefaults {
+    let group =
+        crate::settings::group::read(crate::settings::global::global(), MODEL_DEFAULTS_SETTINGS);
+    serde_json::from_value(group).unwrap_or_else(|error| {
+        tracing::warn!("[model] invalid model defaults in settings: {error}");
+        ModelDefaults::default()
+    })
 }
 
 #[tauri::command]
 pub async fn get_model_defaults(_app_handle: AppHandle) -> Result<ModelDefaults, AppError> {
-    let primary_path = persistent_config_dir()?.join("model_defaults.json");
-    let mut defaults = std::fs::read_to_string(&primary_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<ModelDefaults>(&s).ok())
-        .unwrap_or_default();
+    let mut defaults = read_model_defaults();
     // A pinned main model used to override every manual switch. It now seeds
     // the remembered selection once; users can pin it again in Settings.
     if let Err(error) = super::selection_memory::migrate_legacy_main_model(&mut defaults) {
@@ -517,13 +522,15 @@ pub async fn save_model_defaults(
 }
 
 pub(crate) fn write_model_defaults(defaults: &ModelDefaults) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(defaults)
-        .map_err(|e| format!("Failed to serialize: {}", e))?;
-    // Save to persistent location
-    let dir = persistent_config_dir().map_err(|e| format!("Failed to get config dir: {}", e))?;
-    std::fs::write(dir.join("model_defaults.json"), &json)
-        .map_err(|e| format!("Failed to save model defaults: {}", e))?;
-    Ok(())
+    let value = serde_json::to_value(defaults)
+        .map_err(|e| format!("Failed to serialize model defaults: {}", e))?;
+    crate::settings::global::global()
+        .set_values(&crate::settings::group::changes(
+            MODEL_DEFAULTS_SETTINGS,
+            &value,
+        ))
+        .map(|_| ())
+        .map_err(|error| format!("Failed to save model defaults: {error}"))
 }
 
 #[tauri::command]
@@ -545,7 +552,6 @@ pub fn get_claude_code_models() -> Result<Vec<serde_json::Value>, String> {
 #[tauri::command]
 pub async fn get_codex_available_models(
     codex: State<'_, crate::commands::auth::CodexAuthStateHandle>,
-    config: State<'_, Arc<crate::config::AppConfig>>,
     force_refresh: Option<bool>,
 ) -> Result<Vec<crate::llm::codex_models::CodexAvailableModel>, AppError> {
     let cache_dir = persistent_config_dir().map_err(AppError::from)?;
@@ -559,7 +565,7 @@ pub async fn get_codex_available_models(
     crate::llm::codex_models::list_codex_available_models(
         &access_token,
         account_id.as_deref(),
-        config.base_url.as_deref(),
+        None,
         &cache_dir,
         force_refresh.unwrap_or(false),
         load_codex_model_config().map_err(AppError::from)?.auto_update_client_version,
@@ -570,11 +576,14 @@ pub async fn get_codex_available_models(
 
 #[tauri::command]
 pub async fn save_codex_model_config(config: CodexModelConfig) -> Result<(), AppError> {
-    let path = codex_model_config_path().map_err(AppError::from)?;
-    let config = config.normalized_for_save();
-    let json = serde_json::to_string_pretty(&config)
+    let mut config = config.normalized_for_save();
+    config.prefix_cache_ttl_seconds = config
+        .prefix_cache_ttl_seconds
+        .min(MAX_CODEX_PREFIX_CACHE_TTL_SECONDS);
+    let value = serde_json::to_value(&config)
         .map_err(|e| format!("Failed to serialize codex model config: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| format!("Failed to save codex model config: {}", e))?;
+    crate::settings::global::global()
+        .set_values(&crate::settings::group::changes(CODEX_SETTINGS, &value))?;
     Ok(())
 }
 
@@ -695,14 +704,7 @@ fn prune_stale_custom_model_refs(valid_endpoint_ids: &HashSet<String>) -> Result
         }
     }
 
-    let defaults_path = dir.join("model_defaults.json");
-    let Some(mut defaults) = std::fs::read_to_string(&defaults_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<ModelDefaults>(&s).ok())
-    else {
-        return Ok(());
-    };
-
+    let mut defaults = read_model_defaults();
     let mut changed = false;
     if is_stale_custom_model_ref(&defaults.main_model, valid_endpoint_ids) {
         defaults.main_model.clear();
@@ -712,19 +714,12 @@ fn prune_stale_custom_model_refs(valid_endpoint_ids: &HashSet<String>) -> Result
         defaults.plan_model.clear();
         changed = true;
     }
-    defaults.subagent_models.retain(|_, model_id| {
-        let keep = !is_stale_custom_model_ref(model_id, valid_endpoint_ids);
-        if !keep {
-            changed = true;
-        }
-        keep
-    });
+    changed |= defaults
+        .subagent_models
+        .retain_models(|model_id| !is_stale_custom_model_ref(model_id, valid_endpoint_ids));
 
     if changed {
-        let json = serde_json::to_string_pretty(&defaults)
-            .map_err(|e| format!("Failed to serialize model defaults: {}", e))?;
-        std::fs::write(&defaults_path, json)
-            .map_err(|e| format!("Failed to save model defaults: {}", e))?;
+        write_model_defaults(&defaults)?;
     }
     Ok(())
 }
@@ -1169,13 +1164,7 @@ fn rewrite_legacy_custom_model_refs(providers: &[CustomProvider]) {
         }
     }
 
-    let defaults_path = dir.join("model_defaults.json");
-    let Some(mut defaults) = std::fs::read_to_string(&defaults_path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<ModelDefaults>(&s).ok())
-    else {
-        return;
-    };
+    let mut defaults = read_model_defaults();
     let mut changed = false;
     if let Some(rewritten) = rewrite_legacy_custom_model_ref(&defaults.main_model, providers) {
         defaults.main_model = rewritten;
@@ -1185,15 +1174,12 @@ fn rewrite_legacy_custom_model_refs(providers: &[CustomProvider]) {
         defaults.plan_model = rewritten;
         changed = true;
     }
-    for model_id in defaults.subagent_models.values_mut() {
-        if let Some(rewritten) = rewrite_legacy_custom_model_ref(model_id, providers) {
-            *model_id = rewritten;
-            changed = true;
-        }
-    }
+    changed |= defaults
+        .subagent_models
+        .rewrite_models(|model_id| rewrite_legacy_custom_model_ref(model_id, providers));
     if changed {
-        if let Ok(json) = serde_json::to_string_pretty(&defaults) {
-            let _ = std::fs::write(&defaults_path, json);
+        if let Err(error) = write_model_defaults(&defaults) {
+            tracing::warn!("[model] failed to rewrite legacy custom model refs: {error}");
         }
     }
 }
@@ -1314,6 +1300,19 @@ pub async fn get_custom_providers() -> Result<Vec<CustomProvider>, AppError> {
     Ok(providers)
 }
 
+/// Custom providers as model catalog entries, without credentials: no API
+/// key, and no endpoint (some carry a key in the URL). Remote devices list
+/// these models; `get_custom_providers` returns the keys and stays desktop only.
+#[tauri::command]
+pub async fn get_custom_provider_catalog() -> Result<Vec<CustomProvider>, AppError> {
+    let mut providers = load_custom_providers()?;
+    for provider in &mut providers {
+        provider.api_key.clear();
+        provider.endpoint.clear();
+    }
+    Ok(providers)
+}
+
 #[tauri::command]
 pub async fn save_custom_providers(providers: Vec<CustomProvider>) -> Result<(), AppError> {
     let previous_ids: HashSet<String> = load_custom_providers()
@@ -1407,25 +1406,20 @@ pub fn debug_webview_bridge_heartbeat(
 }
 
 #[tauri::command]
-pub async fn set_debug_mode(
-    value: bool,
-    app_handle: AppHandle,
-    config: State<'_, Arc<crate::config::AppConfig>>,
-) -> Result<(), AppError> {
-    config.set_debug_enabled(value).map_err(AppError::from)?;
-    if let Err(error) = crate::cdp_debug::reconcile(app_handle, value).await {
-        if value {
-            let rollback_error = config.set_debug_enabled(false).err();
-            let message = match rollback_error {
-                Some(rollback_error) => {
-                    format!("{error}; failed to roll back debug mode: {rollback_error}")
-                }
-                None => error,
-            };
-            return Err(AppError::from(message));
-        }
+pub async fn set_debug_mode(value: bool, app_handle: AppHandle) -> Result<(), AppError> {
+    let context = crate::settings::apply::WriteContext::new(app_handle, None);
+    crate::settings::apply::write_one(&context, crate::settings::SYSTEM_DEBUG, value)
+        .await
+        .map(|_| ())
+}
+
+/// Effect of `system.debug`: starts or stops the runtime CDP server. A
+/// failure to start reverts the setting; stopping never fails the change.
+pub(crate) async fn apply_debug_mode(app_handle: &AppHandle, value: bool) -> Result<(), String> {
+    match crate::cdp_debug::reconcile(app_handle.clone(), value).await {
+        Err(error) if value => Err(error),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1454,21 +1448,21 @@ pub async fn get_session_undo_enabled(
 }
 
 #[tauri::command]
-pub async fn set_session_undo_enabled(
-    value: bool,
-    app_handle: AppHandle,
-    config: State<'_, Arc<crate::config::AppConfig>>,
-) -> Result<(), AppError> {
-    config
-        .set_session_undo_enabled(value)
-        .map_err(AppError::from)?;
+pub async fn set_session_undo_enabled(value: bool, app_handle: AppHandle) -> Result<(), AppError> {
+    let context = crate::settings::apply::WriteContext::new(app_handle, None);
+    crate::settings::apply::write_one(&context, crate::settings::AGENT_SESSION_UNDO, value)
+        .await
+        .map(|_| ())
+}
+
+/// Effect of `agent.sessionUndo`.
+pub(crate) fn publish_session_undo_enabled(app_handle: &AppHandle, value: bool) {
     if let Err(error) = app_handle.emit(
         SESSION_UNDO_ENABLED_CHANGED_EVENT,
         SessionUndoEnabledChangedEvent { enabled: value },
     ) {
         eprintln!("[Locus] failed to publish session undo setting: {error}");
     }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1488,7 +1482,6 @@ pub async fn set_llm_retry_max_attempts(
     config
         .set_llm_retry_max_attempts(value)
         .map_err(AppError::from)?;
-    crate::llm::retry::set_max_retries(value);
     Ok(config.llm_retry_max_attempts())
 }
 
@@ -1600,22 +1593,51 @@ fn normalize_tool_permission_mode_request(value: Option<&str>, mode: Option<&str
     }
 }
 
+/// Global approval mode from `permissions.mode` ("auto" or "ask").
+pub(crate) fn tool_permission_mode_setting(store: &crate::settings::SettingsStore) -> String {
+    store.get(crate::settings::PERMISSIONS_MODE)
+}
+
+/// Per-tool and behavior approvals from `permissions.tools`.
+pub(crate) fn tool_permissions_setting(
+    store: &crate::settings::SettingsStore,
+) -> std::collections::HashMap<String, String> {
+    store
+        .get(crate::settings::PERMISSIONS_TOOLS)
+        .as_object()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|(tool, mode)| Some((tool.clone(), mode.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Refreshes the in-memory approval state after `permissions.*` changed
+/// through settings (agent `config_set`, reset).
+pub(crate) async fn publish_tool_permissions(app_handle: &AppHandle) {
+    let store = crate::settings::global::global();
+    if let Some(mode) = app_handle.try_state::<crate::ToolPermissionMode>() {
+        *mode.0.write().await = tool_permission_mode_setting(store);
+    }
+    if let Some(perms) = app_handle.try_state::<crate::ToolPermissions>() {
+        *perms.0.write().await = tool_permissions_setting(store);
+    }
+}
+
 #[tauri::command]
 pub async fn save_tool_permission_mode(
     value: Option<String>,
     mode: Option<String>,
     mode_state: State<'_, crate::ToolPermissionMode>,
-    app_handle: AppHandle,
 ) -> Result<(), AppError> {
     // Accept both `value` and the legacy `mode` argument to keep older frontends working.
     let normalized =
         normalize_tool_permission_mode_request(value.as_deref(), mode.as_deref()).to_string();
-    *mode_state.0.write().await = normalized.clone();
-    let data_dir = super::resolve_runtime_storage_dir(&app_handle)
-        .map_err(|e| format!("Failed to get data dir: {}", e))?;
-    let path = data_dir.join("tool_permission_mode.txt");
-    std::fs::write(&path, &normalized)
-        .map_err(|e| format!("Failed to save tool permission mode: {}", e))?;
+    crate::settings::global::global()
+        .set(crate::settings::PERMISSIONS_MODE, normalized.clone())?;
+    *mode_state.0.write().await = normalized;
     Ok(())
 }
 
@@ -1630,7 +1652,6 @@ pub async fn get_tool_permissions(
 pub async fn save_tool_permissions(
     value: std::collections::HashMap<String, String>,
     perms: State<'_, crate::ToolPermissions>,
-    app_handle: AppHandle,
 ) -> Result<(), AppError> {
     let mut normalized: std::collections::HashMap<String, String> = value
         .into_iter()
@@ -1645,13 +1666,10 @@ pub async fn save_tool_permissions(
         }
     }
     normalized.remove("task");
-    *perms.0.write().await = normalized.clone();
-    let data_dir = super::resolve_runtime_storage_dir(&app_handle)
-        .map_err(|e| format!("Failed to get data dir: {}", e))?;
-    let path = data_dir.join("tool_permissions.json");
-    let json = serde_json::to_string_pretty(&normalized)
+    let value = serde_json::to_value(&normalized)
         .map_err(|e| format!("Failed to serialize tool permissions: {}", e))?;
-    std::fs::write(&path, json).map_err(|e| format!("Failed to save tool permissions: {}", e))?;
+    crate::settings::global::global().set(crate::settings::PERMISSIONS_TOOLS, value)?;
+    *perms.0.write().await = normalized;
     Ok(())
 }
 
@@ -2021,12 +2039,13 @@ fn missing_workspace_entry_stat(path: &str) -> WorkspaceEntryStat {
     }
 }
 
-fn workspace_entry_stat_from_target(path: String, target: &std::path::Path) -> WorkspaceEntryStat {
-    let is_dir = target.is_dir();
-    let is_file = target.is_file();
-    let entry_kind = if is_dir {
+fn workspace_entry_stat_from_metadata(
+    path: String,
+    metadata: &std::fs::Metadata,
+) -> WorkspaceEntryStat {
+    let entry_kind = if metadata.is_dir() {
         "folder"
-    } else if is_file {
+    } else if metadata.is_file() {
         "file"
     } else {
         "other"
@@ -2034,7 +2053,7 @@ fn workspace_entry_stat_from_target(path: String, target: &std::path::Path) -> W
 
     WorkspaceEntryStat {
         path,
-        exists: target.exists(),
+        exists: true,
         entry_kind: entry_kind.to_string(),
     }
 }
@@ -2051,17 +2070,44 @@ pub(crate) fn workspace_entry_target_allowed(
     rel_path: &str,
     target: &std::path::Path,
 ) -> bool {
-    let canonical_base =
-        dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_base = canonical_workspace_root(workspace_root);
+    workspace_entry_target_allowed_in(&canonical_base, workspace_root, rel_path, target)
+}
+
+fn canonical_workspace_root(workspace_root: &std::path::Path) -> std::path::PathBuf {
+    dunce::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf())
+}
+
+/// `workspace_entry_target_allowed` with the root already canonicalized, so a
+/// batch canonicalizes it once instead of once per path.
+fn workspace_entry_target_allowed_in(
+    canonical_base: &std::path::Path,
+    workspace_root: &std::path::Path,
+    rel_path: &str,
+    target: &std::path::Path,
+) -> bool {
     let canonical_target = match dunce::canonicalize(target) {
         Ok(path) => path,
         Err(_) => return false,
     };
-    canonical_target.starts_with(&canonical_base)
+    canonical_target.starts_with(canonical_base)
         || path_reaches_allowed_linked_asset_dir(workspace_root, rel_path)
 }
 
+#[cfg(test)]
 fn workspace_entry_stat_for_path(cwd: &str, raw_path: &str) -> WorkspaceEntryStat {
+    let canonical_root = canonical_workspace_root(std::path::Path::new(cwd));
+    workspace_entry_stat_for_path_in(cwd, &canonical_root, raw_path)
+}
+
+/// Stats one markdown path candidate. A missing path, the common case for
+/// rejected candidates, costs one metadata call; an existing workspace path
+/// adds only its own canonicalization (`canonical_root` is per batch).
+fn workspace_entry_stat_for_path_in(
+    cwd: &str,
+    canonical_root: &std::path::Path,
+    raw_path: &str,
+) -> WorkspaceEntryStat {
     let display_path = normalize_workspace_entry_stat_path(raw_path);
     if display_path.is_empty() {
         return missing_workspace_entry_stat(raw_path);
@@ -2070,10 +2116,10 @@ fn workspace_entry_stat_for_path(cwd: &str, raw_path: &str) -> WorkspaceEntrySta
     if is_workspace_entry_stat_absolute_path(&display_path) {
         let target =
             std::path::PathBuf::from(display_path.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if !target.exists() {
-            return missing_workspace_entry_stat(&display_path);
-        }
-        return workspace_entry_stat_from_target(display_path, &target);
+        return match std::fs::metadata(&target) {
+            Ok(metadata) => workspace_entry_stat_from_metadata(display_path, &metadata),
+            Err(_) => missing_workspace_entry_stat(&display_path),
+        };
     }
 
     if cwd.trim().is_empty() {
@@ -2086,14 +2132,14 @@ fn workspace_entry_stat_for_path(cwd: &str, raw_path: &str) -> WorkspaceEntrySta
     };
     let workspace_root = std::path::Path::new(cwd);
     let target = workspace_root.join(&rel_path);
-    if !target.exists() {
+    let Ok(metadata) = std::fs::metadata(&target) else {
         return missing_workspace_entry_stat(&rel_path);
-    }
-    if !workspace_entry_target_allowed(workspace_root, &rel_path, &target) {
+    };
+    if !workspace_entry_target_allowed_in(canonical_root, workspace_root, &rel_path, &target) {
         return missing_workspace_entry_stat(&rel_path);
     }
 
-    workspace_entry_stat_from_target(rel_path, &target)
+    workspace_entry_stat_from_metadata(rel_path, &metadata)
 }
 
 fn workspace_search_tokens(value: &str) -> Vec<String> {
@@ -2501,6 +2547,7 @@ pub async fn stat_workspace_entries(
         "stat_workspace_entries",
     )?;
     let cwd = scope.runtime().root().to_string_lossy().to_string();
+    let canonical_root = canonical_workspace_root(std::path::Path::new(&cwd));
     let mut stats = Vec::new();
     let mut seen = HashSet::new();
 
@@ -2509,7 +2556,11 @@ pub async fn stat_workspace_entries(
         if normalized.is_empty() || !seen.insert(normalized.clone()) {
             continue;
         }
-        stats.push(workspace_entry_stat_for_path(&cwd, &normalized));
+        stats.push(workspace_entry_stat_for_path_in(
+            &cwd,
+            &canonical_root,
+            &normalized,
+        ));
     }
 
     Ok(stats)
@@ -2754,7 +2805,7 @@ pub async fn check_unity_plugin(
         "check_unity_plugin",
     )?;
     let cwd = scope.runtime().root().to_string_lossy().to_string();
-    if !crate::unity_bridge::is_unity_project(&cwd) {
+    if !crate::unity_bridge::unity_integration_enabled(&cwd) {
         return Ok(crate::unity_bridge::PluginStatus::UpToDate);
     }
     crate::unity_bridge::check_plugin_status(&cwd).map_err(Into::into)
@@ -2771,7 +2822,7 @@ pub async fn check_unity_plugin_install_plan(
         "check_unity_plugin_install_plan",
     )?;
     let cwd = scope.runtime().root().to_string_lossy().to_string();
-    if !crate::unity_bridge::is_unity_project(&cwd) {
+    if !crate::unity_bridge::unity_integration_enabled(&cwd) {
         return Ok(crate::unity_bridge::PluginInstallPlan {
             status: crate::unity_bridge::PluginStatus::UpToDate,
             dll_update_required: false,
@@ -2798,7 +2849,7 @@ pub async fn install_unity_plugin(
     )?;
     let runtime = scope.runtime();
     let cwd = runtime.root().to_string_lossy().to_string();
-    if !crate::unity_bridge::is_unity_project(&cwd) {
+    if !crate::unity_bridge::unity_integration_enabled(&cwd) {
         return Err("Current working directory is not a Unity project"
             .to_string()
             .into());
@@ -3173,6 +3224,10 @@ pub async fn reset_all_config(
     workspace_registry.shutdown_all().await;
     super::reset_unity_embed_control_window(&app_handle);
     super::refresh_unity_embed_control_server(app_handle.clone());
+    match crate::settings::global::global().reset_to_defaults() {
+        Ok(changes) => crate::settings::apply::apply_group_effects(&app_handle, &changes).await,
+        Err(error) => eprintln!("[Locus] failed to reset settings: {error}"),
+    }
     *mode.0.write().await = "auto".to_string();
     *perms.0.write().await = std::collections::HashMap::new();
     *api_key_state.write().await = String::new();
@@ -3191,11 +3246,10 @@ pub async fn reset_all_config(
 #[tauri::command]
 pub async fn get_config_registry(
     category: Option<String>,
-    app_handle: AppHandle,
 ) -> Result<Vec<crate::config_registry::ConfigEntry>, AppError> {
     match category.as_deref() {
-        Some(cat) => crate::config_registry::collect_by_category(&app_handle, cat, None),
-        None => crate::config_registry::collect_all(&app_handle, None),
+        Some(cat) => crate::config_registry::collect_by_category(cat, None),
+        None => crate::config_registry::collect_all(None),
     }
 }
 
@@ -3204,7 +3258,6 @@ pub async fn get_workspace_config_registry(
     category: Option<String>,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
-    app_handle: AppHandle,
 ) -> Result<Vec<crate::config_registry::ConfigEntry>, AppError> {
     let workspace_scope = super::session::resolve_workspace_scope(
         workspace_registry.inner(),
@@ -3213,9 +3266,9 @@ pub async fn get_workspace_config_registry(
     )?;
     match category.as_deref() {
         Some(cat) => {
-            crate::config_registry::collect_by_category(&app_handle, cat, Some(&workspace_scope))
+            crate::config_registry::collect_by_category(cat, Some(&workspace_scope))
         }
-        None => crate::config_registry::collect_all(&app_handle, Some(&workspace_scope)),
+        None => crate::config_registry::collect_all(Some(&workspace_scope)),
     }
 }
 
@@ -3383,11 +3436,32 @@ mod tests {
         .expect("legacy model defaults");
 
         assert_eq!(
-            defaults.subagent_models.get("explorer").map(String::as_str),
-            Some("openai/gpt-5.6-luna")
+            defaults.subagent_models.allowed("explorer"),
+            ["openai/gpt-5.6-luna"]
         );
         assert!(defaults.subagent_efforts.is_empty());
         assert!(defaults.subagent_fast_modes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_model_config_round_trips_through_settings() {
+        let config = CodexModelConfig {
+            transport: super::CodexTransportMode::Http,
+            context_window: Some(500_000),
+            auto_review: true,
+            prefix_cache_ttl_seconds: 600,
+            ..CodexModelConfig::default()
+        };
+        super::save_codex_model_config(config).await.expect("save");
+        let loaded = super::load_codex_model_config().expect("load");
+        assert_eq!(loaded.transport, super::CodexTransportMode::Http);
+        assert_eq!(loaded.resolved_context_window(), 500_000);
+        assert!(loaded.auto_review);
+        assert_eq!(loaded.prefix_cache_ttl_seconds, 600);
+        assert_eq!(
+            crate::settings::global::global().get(crate::settings::PROVIDERS_CODEX_TRANSPORT),
+            "http"
+        );
     }
 
     #[test]

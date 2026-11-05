@@ -1,4 +1,10 @@
-import { reactive } from "vue";
+import { reactive, watch } from "vue";
+import {
+  DISPLAY_FIELD_KEYS,
+  DISPLAY_GROUP_FIELDS,
+  DISPLAY_GROUP_PREFIXES,
+} from "./settingsLegacy";
+import { saveSetting, saveSettings, settingValue } from "./useSettingsStore";
 import type {
   NotificationSoundMode,
   NotificationSoundSource,
@@ -42,6 +48,9 @@ export function normalizeAssetRefClickAction(
 
 export const DEFAULT_SESSION_MESSAGE_PAGE_SIZE = 120;
 export const SESSION_MESSAGE_PAGE_SIZE_OPTIONS = [80, 120, 160, 240, 400] as const;
+/** Session tabs each workbench editor group keeps mounted; 0 keeps every tab mounted. */
+export const DEFAULT_MOUNTED_SESSION_EDITORS_PER_GROUP = 6;
+export const MOUNTED_SESSION_EDITORS_PER_GROUP_OPTIONS = [1, 2, 3, 6, 10, 0] as const;
 export const DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES = [
   ".git",
   ".vs",
@@ -90,6 +99,18 @@ export function normalizeSessionMessagePageSize(value: unknown): number {
   )
     ? parsed
     : DEFAULT_SESSION_MESSAGE_PAGE_SIZE;
+}
+
+export function normalizeMountedSessionEditorsPerGroup(value: unknown): number {
+  // Number(null) and Number("") are 0, which would silently mean "unlimited".
+  const parsed = typeof value === "number" || (typeof value === "string" && value.trim() !== "")
+    ? Number(value)
+    : Number.NaN;
+  return MOUNTED_SESSION_EDITORS_PER_GROUP_OPTIONS.includes(
+    parsed as (typeof MOUNTED_SESSION_EDITORS_PER_GROUP_OPTIONS)[number],
+  )
+    ? parsed
+    : DEFAULT_MOUNTED_SESSION_EDITORS_PER_GROUP;
 }
 
 export interface DisplaySettings {
@@ -145,6 +166,11 @@ export interface DisplaySettings {
   showTurnNavigationRail: boolean;
   /** Number of messages requested for initial session history and each older page */
   sessionMessagePageSize: number;
+  /**
+   * Session tabs each workbench editor group keeps mounted (active, recent and
+   * running ones); hidden tabs beyond it unload and reload when shown. 0 = all.
+   */
+  mountedSessionEditorsPerGroup: number;
   /** Collapse completed tool call batches in chat transcript */
   compactToolCalls: boolean;
   /** Hide completed thinking blocks in chat transcript */
@@ -196,8 +222,6 @@ export interface DisplaySettings {
   fonts: Record<FontSlot, string>;
 }
 
-const STORAGE_KEY = "locus-display-settings";
-
 const defaultFonts: Record<FontSlot, string> = {
   ui: "",
   prose: "",
@@ -236,7 +260,7 @@ const defaults: DisplaySettings = {
   showAgentSelector: true,
   worktreeEnabled: false,
   todoAutoOpen: true,
-  changesAutoOpen: true,
+  changesAutoOpen: false,
   changesAutoClose: true,
   fileChangePopoverEnabled: true,
   chatDiffReviewTarget: "window",
@@ -250,6 +274,7 @@ const defaults: DisplaySettings = {
   rightAlignUserMessages: true,
   showTurnNavigationRail: true,
   sessionMessagePageSize: DEFAULT_SESSION_MESSAGE_PAGE_SIZE,
+  mountedSessionEditorsPerGroup: DEFAULT_MOUNTED_SESSION_EDITORS_PER_GROUP,
   compactToolCalls: true,
   hideThinkingBlocks: true,
   showViewsInSessionPanel: false,
@@ -277,103 +302,134 @@ const defaults: DisplaySettings = {
   fonts: { ...defaultFonts },
 };
 
-function load(): DisplaySettings {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      return {
-        ...defaults,
-        ...parsed,
-        workspaceDisplayMode: parsed.workspaceDisplayMode === "multi" ? "multi" : "single",
-        viewOpenTarget: parsed.viewOpenTarget === "window" ? "window" : "tab",
-        viewOpenOverrides: Object.fromEntries(Object.entries(parsed.viewOpenOverrides ?? {})
-          .filter(([, value]) => value === "tab" || value === "window")) as Record<string, ViewOpenTarget>,
-        workspaceSectionVisibility: {
-          ...defaultWorkspaceSectionVisibility,
-          ...parsed.workspaceSectionVisibility,
-        },
-        knowledgeFolderVisibility: {
-          ...defaultKnowledgeFolderVisibility,
-          ...parsed.knowledgeFolderVisibility,
-        },
-        fileExplorerHiddenDirectories: normalizeHiddenDirectoryNames(
-          parsed.fileExplorerHiddenDirectories,
-          DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES,
-        ),
-        unityFileExplorerHiddenDirectories: normalizeHiddenDirectoryNames(
-          parsed.unityFileExplorerHiddenDirectories,
-          DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES,
-        ),
-        sessionMessagePageSize: normalizeSessionMessagePageSize(parsed.sessionMessagePageSize),
-        assetRefClickAction: normalizeAssetRefClickAction(
-          parsed.assetRefClickAction,
-          defaults.assetRefClickAction,
-        ),
-        unityEmbedAssetRefClickAction: normalizeAssetRefClickAction(
-          parsed.unityEmbedAssetRefClickAction,
-          defaults.unityEmbedAssetRefClickAction,
-        ),
-        fonts: { ...defaultFonts, ...parsed.fonts },
-      };
+type ScalarDisplayField = Exclude<
+  keyof DisplaySettings,
+  "fonts" | "workspaceSectionVisibility" | "knowledgeFolderVisibility"
+>;
+
+/** Setting key behind each scalar field (see `settingsLegacy.ts`). */
+const FIELD_KEYS: Record<ScalarDisplayField, string> = DISPLAY_FIELD_KEYS;
+const FONT_SLOTS = DISPLAY_GROUP_FIELDS.fonts;
+const SECTION_KINDS = DISPLAY_GROUP_FIELDS.workspaceSectionVisibility;
+const KNOWLEDGE_FOLDER_KINDS = DISPLAY_GROUP_FIELDS.knowledgeFolderVisibility;
+
+const ENUM_FIELDS: Partial<Record<ScalarDisplayField, readonly string[]>> = {
+  workspaceDisplayMode: ["single", "multi"],
+  viewOpenTarget: ["tab", "window"],
+  chatDiffReviewTarget: ["inline", "window"],
+  gitDiffReviewTarget: ["inline", "window"],
+  planApprovalTarget: ["card", "window"],
+  memoryFileOpenTarget: ["window", "knowledge"],
+  soundAlertMode: ["soft", "bright", "urgent"],
+  soundAlertSource: ["builtin", "custom"],
+};
+
+function normalizeViewOpenOverrides(value: unknown): Record<string, ViewOpenTarget> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter(([, target]) => target === "tab" || target === "window")) as Record<string, ViewOpenTarget>;
+}
+
+function readField<K extends ScalarDisplayField>(field: K, raw: unknown): DisplaySettings[K] {
+  const fallback = defaults[field];
+  let value: unknown;
+  switch (field) {
+    case "sessionMessagePageSize":
+      value = normalizeSessionMessagePageSize(raw);
+      break;
+    case "mountedSessionEditorsPerGroup":
+      value = normalizeMountedSessionEditorsPerGroup(raw);
+      break;
+    case "assetRefClickAction":
+    case "unityEmbedAssetRefClickAction":
+      value = normalizeAssetRefClickAction(raw, fallback as AssetRefClickAction);
+      break;
+    case "fileExplorerHiddenDirectories":
+      value = normalizeHiddenDirectoryNames(raw, DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES);
+      break;
+    case "unityFileExplorerHiddenDirectories":
+      value = normalizeHiddenDirectoryNames(raw, DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES);
+      break;
+    case "viewOpenOverrides":
+      value = normalizeViewOpenOverrides(raw);
+      break;
+    case "soundAlertVolume":
+      value = typeof raw === "number" && Number.isFinite(raw)
+        ? Math.min(100, Math.max(0, Math.round(raw)))
+        : fallback;
+      break;
+    default: {
+      const allowed = ENUM_FIELDS[field];
+      if (allowed) value = allowed.includes(raw as string) ? raw : fallback;
+      else value = typeof raw === typeof fallback ? raw : fallback;
     }
-  } catch { /* ignore */ }
-  return {
-    ...defaults,
-    knowledgeFolderVisibility: { ...defaultKnowledgeFolderVisibility },
-    workspaceSectionVisibility: { ...defaultWorkspaceSectionVisibility },
-    fileExplorerHiddenDirectories: [...DEFAULT_FILE_EXPLORER_HIDDEN_DIRECTORIES],
-    unityFileExplorerHiddenDirectories: [...DEFAULT_UNITY_FILE_EXPLORER_HIDDEN_DIRECTORIES],
-    fonts: { ...defaultFonts },
-  };
+  }
+  return value as DisplaySettings[K];
 }
 
-function save(s: DisplaySettings) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch { /* ignore */ }
+function project(): DisplaySettings {
+  const next = {} as DisplaySettings;
+  for (const field of Object.keys(FIELD_KEYS) as ScalarDisplayField[]) {
+    (next as unknown as Record<string, unknown>)[field] = readField(field, settingValue(FIELD_KEYS[field]));
+  }
+  next.fonts = Object.fromEntries(FONT_SLOTS.map((slot) => {
+    const raw = settingValue(DISPLAY_GROUP_PREFIXES.fonts + slot);
+    return [slot, typeof raw === "string" ? raw : ""];
+  })) as Record<FontSlot, string>;
+  next.workspaceSectionVisibility = Object.fromEntries(SECTION_KINDS.map((kind) => {
+    const raw = settingValue(DISPLAY_GROUP_PREFIXES.workspaceSectionVisibility + kind);
+    return [kind, typeof raw === "boolean" ? raw : defaultWorkspaceSectionVisibility[kind]];
+  })) as Record<WorkspaceSectionVisibilityKind, boolean>;
+  next.knowledgeFolderVisibility = Object.fromEntries(KNOWLEDGE_FOLDER_KINDS.map((kind) => {
+    const raw = settingValue(DISPLAY_GROUP_PREFIXES.knowledgeFolderVisibility + kind);
+    return [kind, typeof raw === "boolean" ? raw : defaultKnowledgeFolderVisibility[kind]];
+  })) as Record<KnowledgeFolderKind, boolean>;
+  return next;
 }
 
-const state = reactive<DisplaySettings>(load());
+const state = reactive<DisplaySettings>(project());
 
-/** Keep every window's copy in sync: View host/content windows are separate
- *  webviews sharing the same origin, so a settings change in the main window
- *  arrives here as a storage event (same mechanism as useTheme). */
-function handleStorageChange(event: StorageEvent) {
-  if (event.key !== null && event.key !== STORAGE_KEY) return;
-  const next = load();
-  Object.assign(state, next, {
-    knowledgeFolderVisibility: { ...next.knowledgeFolderVisibility },
-    workspaceSectionVisibility: { ...next.workspaceSectionVisibility },
-    fileExplorerHiddenDirectories: [...next.fileExplorerHiddenDirectories],
-    unityFileExplorerHiddenDirectories: [...next.unityFileExplorerHiddenDirectories],
-    fonts: { ...next.fonts },
-  });
-  applyFonts(state.fonts);
-}
+/** Every window follows `settings.json`: changes from this window, other
+ *  windows and the agent all arrive through the settings snapshot. Only
+ *  fields whose value moved are replaced, so unrelated watchers stay quiet. */
+watch(project, (next) => {
+  const target = state as unknown as Record<string, unknown>;
+  let fontsChanged = false;
+  for (const [field, value] of Object.entries(next)) {
+    if (JSON.stringify(target[field]) === JSON.stringify(value)) continue;
+    target[field] = value;
+    if (field === "fonts") fontsChanged = true;
+  }
+  if (fontsChanged && typeof document !== "undefined") applyFonts(state.fonts);
+}, { flush: "sync" });
 
-if (typeof window !== "undefined") {
-  window.addEventListener("storage", handleStorageChange);
+function groupWrites<G extends keyof typeof DISPLAY_GROUP_PREFIXES>(
+  group: G,
+  value: Record<string, unknown>,
+): { key: string; value: unknown }[] {
+  return DISPLAY_GROUP_FIELDS[group]
+    .filter((field) => value[field] !== undefined)
+    .map((field) => ({ key: DISPLAY_GROUP_PREFIXES[group] + field, value: value[field] }));
 }
 
 export function useDisplaySettings() {
   function set<K extends keyof DisplaySettings>(key: K, value: DisplaySettings[K]) {
-    state[key] = (
-      key === "sessionMessagePageSize"
-        ? normalizeSessionMessagePageSize(value)
-        : key === "assetRefClickAction"
-          ? normalizeAssetRefClickAction(value, defaults.assetRefClickAction)
-        : key === "unityEmbedAssetRefClickAction"
-          ? normalizeAssetRefClickAction(value, defaults.unityEmbedAssetRefClickAction)
-        : key === "fileExplorerHiddenDirectories" || key === "unityFileExplorerHiddenDirectories"
-          ? normalizeHiddenDirectoryNames(value)
-        : value
-    ) as DisplaySettings[K];
-    save({ ...state });
+    if (key === "fonts" || key === "workspaceSectionVisibility" || key === "knowledgeFolderVisibility") {
+      saveSettings(groupWrites(
+        key as keyof typeof DISPLAY_GROUP_PREFIXES,
+        value as unknown as Record<string, unknown>,
+      ));
+      return;
+    }
+    const field = key as ScalarDisplayField;
+    const normalized = field === "fileExplorerHiddenDirectories" || field === "unityFileExplorerHiddenDirectories"
+      ? normalizeHiddenDirectoryNames(value)
+      : readField(field, value);
+    saveSetting(FIELD_KEYS[field], normalized);
   }
 
   function setFont(slot: FontSlot, value: string) {
-    state.fonts[slot] = value;
-    save({ ...state, fonts: { ...state.fonts } });
-    applyFonts(state.fonts);
+    saveSetting(DISPLAY_GROUP_PREFIXES.fonts + slot, value);
   }
 
   return { state, set, setFont };

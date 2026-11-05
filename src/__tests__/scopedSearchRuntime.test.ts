@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { EditorView } from "@codemirror/view";
 import { registerSearchScope, useGlobalSearchShortcut } from "../composables/useSearchScope";
 import { createDefaultShortcutSettings, formatShortcut, useKeyboardShortcuts } from "../composables/useKeyboardShortcuts";
+import { setSettingValue, settingValue } from "../composables/useSettingsStore";
 import { documentSearchRanges } from "../composables/documentSearch";
 import BaseMarkdownEditor from "../components/ui/BaseMarkdownEditor.vue";
 import WorkspaceTree from "../components/explorer/WorkspaceTree.vue";
@@ -29,8 +30,12 @@ async function input(root: Element, value: string) {
   field.value = value; field.dispatchEvent(new Event("input", { bubbles: true })); await settle();
   return field;
 }
+function resetShortcuts() {
+  const shortcuts = useKeyboardShortcuts();
+  for (const action of ["newChat", "cancelRun", "findInContext", "globalSearch"] as const) shortcuts.resetShortcut(action);
+}
 beforeEach(() => {
-  Object.assign(useKeyboardShortcuts().state, createDefaultShortcutSettings("default"));
+  resetShortcuts();
   Object.defineProperty(Range.prototype, "getClientRects", { configurable: true, value: () => [] });
   Object.defineProperty(Range.prototype, "getBoundingClientRect", { configurable: true, value: () => ({ left: 0, right: 0, top: 0, bottom: 0, width: 0, height: 0 }) });
   HTMLElement.prototype.scrollIntoView = vi.fn();
@@ -38,8 +43,7 @@ beforeEach(() => {
 afterEach(() => {
   for (const dispose of cleanup.splice(0).reverse()) dispose();
   document.body.replaceChildren();
-  Object.assign(useKeyboardShortcuts().state, createDefaultShortcutSettings("default"));
-  localStorage.removeItem("locus-keyboard-shortcuts");
+  resetShortcuts();
 });
 
 describe("search shortcut routing", () => {
@@ -89,10 +93,10 @@ describe("search shortcut routing", () => {
     expect(key(window).defaultPrevented).toBe(false);
     key(window, "h", { ctrlKey: true }); expect(f.left).toHaveBeenCalledOnce();
     key(window, "g", { ctrlKey: true, altKey: true }); expect(f.global).toHaveBeenCalledOnce();
-    expect(JSON.parse(localStorage.getItem("locus-keyboard-shortcuts")!).globalSearch.key).toBe("g");
+    expect(settingValue("shortcuts.globalSearch")).toBe("ctrl+alt+g");
   });
-  it("adds search defaults when loading a previous settings snapshot from another window", () => {
-    window.dispatchEvent(new StorageEvent("storage", { key: "locus-keyboard-shortcuts", newValue: JSON.stringify({ newChat: { ctrl: true, alt: true, key: "n" } }) }));
+  it("uses defaults for actions without a stored shortcut when another window changes one", () => {
+    void setSettingValue("shortcuts.newChat", "ctrl+alt+n");
     const state = useKeyboardShortcuts().state;
     expect(formatShortcut(state.newChat)).toBe("Ctrl+Alt+N");
     expect(formatShortcut(state.findInContext)).toBe("Ctrl+F");

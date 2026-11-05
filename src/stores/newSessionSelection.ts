@@ -15,6 +15,20 @@ export function isEffortLevel(value: unknown): value is EffortLevel {
   return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
 }
 
+/**
+ * Maps a requested effort onto the levels a model accepts: the highest level
+ * not above the request, else the lowest level above it. Never jumps to the
+ * first listed level, which for Claude would silently turn thinking off.
+ */
+export function clampEffortToLevels(levels: readonly EffortLevel[], level: EffortLevel): EffortLevel {
+  if (levels.length === 0 || levels.includes(level)) return level;
+  const rank = EFFORT_LEVELS.indexOf(level);
+  const supported = EFFORT_LEVELS.filter((candidate) => levels.includes(candidate));
+  const below = supported.filter((candidate) => EFFORT_LEVELS.indexOf(candidate) < rank);
+  if (below.length > 0) return below[below.length - 1]!;
+  return supported[0] ?? levels[0]!;
+}
+
 export interface NewSessionAgentInput {
   agents: readonly Pick<AgentInfo, "id" | "isDefault">[];
   mode: NewSessionAgentMode;

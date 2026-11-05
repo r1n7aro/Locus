@@ -3,7 +3,6 @@ import { onMounted, ref } from "vue";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
 import { getWorkspaceResourceLimits, setWorkspaceResourceLimits, type WorkspaceResourceLimits } from "../../services/worktrees";
-import UnityEditorResources from "./UnityEditorResources.vue";
 
 const limits = ref<WorkspaceResourceLimits | null>(null);
 const busy = ref(false);
@@ -41,7 +40,6 @@ async function update(field: typeof fields[number], event: Event) {
       </label>
     </div>
     <p v-if="error" class="resource-error" role="alert">{{ error }}</p>
-    <UnityEditorResources />
   </section>
 </template>
 

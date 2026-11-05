@@ -1,12 +1,17 @@
 {
-  "description": "Query Locus application configuration. Returns each setting's name, description, current value, and storage path. Use this to help users understand or troubleshoot their Locus configuration.",
+  "description": "Read Locus settings. Returns every setting key with its current value, type, allowed values or range, default, and description; sensitive, experimental, restart-required, and project-scoped settings are marked. Without `keys`, the output also lists configuration not yet in the settings table (credential status, model defaults, tool permissions, MCP servers, UI preferences) as read-only context. Use the returned keys with config_set to change settings.",
   "parameters": {
     "type": "object",
+    "additionalProperties": false,
     "properties": {
-      "category": {
+      "prefix": {
         "type": "string",
-        "enum": ["general", "display", "api", "models", "permissions", "knowledge"],
-        "description": "Filter by category. Omit to return all settings."
+        "description": "Optional key prefix on dot boundaries, e.g. `unity`, `agent.subagent`, `appearance`, or `notifications`. Also accepts the older categories (general, api, models, permissions, knowledge, mcp) for the configuration listed after the settings table."
+      },
+      "keys": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional exact setting keys to read. Overrides `prefix`."
       }
     }
   }

@@ -1,8 +1,11 @@
-import { reactive, readonly } from "vue";
+import { reactive, readonly, watch } from "vue";
 import type { AgentInfo } from "../types";
 import type { NewSessionAgentMode } from "../stores/newSessionSelection";
+import { LEGACY_STORAGE_KEYS, readLegacyNewSessionAgentId } from "./settingsLegacy";
+import { saveSettings, settingValue } from "./useSettingsStore";
 
-const STORAGE_KEY = "locus-new-session-settings";
+const AGENT_MODE_KEY = "agent.newSession.agentMode";
+const DEFAULT_AGENT_ID_KEY = "agent.newSession.defaultAgentId";
 
 interface NewSessionSettings {
   agentMode: NewSessionAgentMode;
@@ -16,38 +19,29 @@ function trimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
 
-function normalizeSettings(value: unknown): NewSessionSettings {
-  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  const defaultAgentId = trimmedString(record.defaultAgentId);
-  const mode = record.agentMode;
-  if (mode === "remember" || mode === "workspace" || mode === "fixed") {
-    return {
-      agentMode: mode === "fixed" && !defaultAgentId ? "remember" : mode,
-      defaultAgentId,
-      legacyAgentId: trimmedString(record.legacyAgentId),
-    };
-  }
-  // Older builds stored only an Agent id that overrode every manual switch.
-  // It now seeds the remembered choice instead of pinning it.
-  return { agentMode: "remember", defaultAgentId, legacyAgentId: defaultAgentId };
+// Migration state of older builds, not a setting: read once.
+let legacyAgentId = readLegacyNewSessionAgentId();
+
+function project(): NewSessionSettings {
+  const defaultAgentId = trimmedString(settingValue(DEFAULT_AGENT_ID_KEY));
+  const mode = settingValue(AGENT_MODE_KEY);
+  const agentMode: NewSessionAgentMode = mode === "workspace" || mode === "fixed" ? mode : "remember";
+  return {
+    agentMode: agentMode === "fixed" && !defaultAgentId ? "remember" : agentMode,
+    defaultAgentId,
+    legacyAgentId,
+  };
 }
 
-function load() {
-  try {
-    return normalizeSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"));
-  } catch {
-    return normalizeSettings(null);
-  }
-}
+const state = reactive(project());
 
-const state = reactive(load());
+watch(project, (next) => Object.assign(state, next), { flush: "sync" });
 
-if (typeof window !== "undefined") window.addEventListener("storage", (event) => {
-  if (event.key === STORAGE_KEY || event.key === null) Object.assign(state, load());
-});
-
-function persist() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { /* optional persistence */ }
+function persist(agentMode: NewSessionAgentMode, defaultAgentId: string) {
+  saveSettings([
+    { key: AGENT_MODE_KEY, value: agentMode },
+    { key: DEFAULT_AGENT_ID_KEY, value: defaultAgentId },
+  ]);
 }
 
 /** Plain catalog default: the preferred Agent when available, else the workspace default. */
@@ -65,19 +59,18 @@ export function useNewSessionSettings() {
   return {
     state: readonly(state),
     setAgentMode(mode: NewSessionAgentMode) {
-      state.agentMode = mode === "fixed" && !state.defaultAgentId ? "remember" : mode;
-      persist();
+      persist(mode === "fixed" && !state.defaultAgentId ? "remember" : mode, state.defaultAgentId);
     },
     /** Pins an Agent; an empty id follows the workspace default. */
     setDefaultAgentId(id: string) {
       const agentId = id.trim();
-      state.defaultAgentId = agentId;
-      state.agentMode = agentId ? "fixed" : "workspace";
-      persist();
+      persist(agentId ? "fixed" : "workspace", agentId);
     },
     reset() {
-      Object.assign(state, normalizeSettings(null));
-      try { localStorage.removeItem(STORAGE_KEY); } catch { /* optional persistence */ }
+      legacyAgentId = "";
+      state.legacyAgentId = "";
+      try { localStorage.removeItem(LEGACY_STORAGE_KEYS.newSession); } catch { /* optional */ }
+      persist("remember", "");
     },
   };
 }

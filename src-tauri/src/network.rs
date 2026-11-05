@@ -1,13 +1,13 @@
 use std::ffi::{OsStr, OsString};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
 
 use http::Uri;
 use hyper_util::client::proxy::matcher::Matcher;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const PROXY_CONFIG_FILE: &str = "proxy_config.json";
+/// Settings group behind `ProxyConfig` (`network.proxy.*`).
+const PROXY_SETTINGS: &str = "network.proxy";
 const LOCAL_PROXY_BYPASS: &str = "localhost,127.0.0.1,::1,*.localhost,locus-binary.localhost";
 const PROXY_ENV_KEYS: [&str; 8] = [
     "HTTP_PROXY",
@@ -122,115 +122,7 @@ pub struct ProxyStatus {
     pub routes: Vec<ProxyRoute>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ReqwestClientOptions {
-    connect_timeout: Option<Duration>,
-    timeout: Option<Duration>,
-    tcp_keepalive: Option<Duration>,
-    tcp_nodelay: Option<bool>,
-    pool_idle_timeout: Option<Duration>,
-    pool_max_idle_per_host: Option<usize>,
-    http2_adaptive_window: Option<bool>,
-    http2_keep_alive_interval: Option<Duration>,
-    http2_keep_alive_timeout: Option<Duration>,
-    user_agent: Option<String>,
-    gzip: Option<bool>,
-    deflate: Option<bool>,
-    follow_redirects: Option<bool>,
-}
-
-impl Default for ReqwestClientOptions {
-    fn default() -> Self {
-        Self {
-            connect_timeout: None,
-            timeout: None,
-            tcp_keepalive: None,
-            tcp_nodelay: None,
-            pool_idle_timeout: None,
-            pool_max_idle_per_host: None,
-            http2_adaptive_window: None,
-            http2_keep_alive_interval: None,
-            http2_keep_alive_timeout: None,
-            user_agent: None,
-            gzip: None,
-            deflate: None,
-            follow_redirects: None,
-        }
-    }
-}
-
-impl ReqwestClientOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn connect_timeout(mut self, value: Duration) -> Self {
-        self.connect_timeout = Some(value);
-        self
-    }
-
-    pub fn timeout(mut self, value: Duration) -> Self {
-        self.timeout = Some(value);
-        self
-    }
-
-    pub fn tcp_keepalive(mut self, value: Duration) -> Self {
-        self.tcp_keepalive = Some(value);
-        self
-    }
-
-    pub fn tcp_nodelay(mut self, value: bool) -> Self {
-        self.tcp_nodelay = Some(value);
-        self
-    }
-
-    pub fn pool_idle_timeout(mut self, value: Duration) -> Self {
-        self.pool_idle_timeout = Some(value);
-        self
-    }
-
-    pub fn pool_max_idle_per_host(mut self, value: usize) -> Self {
-        self.pool_max_idle_per_host = Some(value);
-        self
-    }
-
-    pub fn http2_adaptive_window(mut self, value: bool) -> Self {
-        self.http2_adaptive_window = Some(value);
-        self
-    }
-
-    pub fn http2_keep_alive_interval(mut self, value: Duration) -> Self {
-        self.http2_keep_alive_interval = Some(value);
-        self
-    }
-
-    pub fn http2_keep_alive_timeout(mut self, value: Duration) -> Self {
-        self.http2_keep_alive_timeout = Some(value);
-        self
-    }
-
-    pub fn user_agent(mut self, value: impl Into<String>) -> Self {
-        self.user_agent = Some(value.into());
-        self
-    }
-
-    pub fn gzip(mut self, value: bool) -> Self {
-        self.gzip = Some(value);
-        self
-    }
-
-    pub fn deflate(mut self, value: bool) -> Self {
-        self.deflate = Some(value);
-        self
-    }
-
-    /// `false` returns 3xx responses to the caller instead of following them,
-    /// so it can inspect every hop (e.g. a destination check per redirect).
-    pub fn follow_redirects(mut self, value: bool) -> Self {
-        self.follow_redirects = Some(value);
-        self
-    }
-}
+pub use locus_remote_core::network::ReqwestClientOptions;
 
 #[derive(Debug, Clone)]
 pub struct ResolvedProxyRoute {
@@ -287,10 +179,6 @@ fn system_proxy_config_override_value() -> Option<SystemProxyConfig> {
         .cloned()
 }
 
-fn proxy_config_path() -> Result<std::path::PathBuf, String> {
-    Ok(crate::commands::persistent_config_dir()?.join(PROXY_CONFIG_FILE))
-}
-
 fn sanitize_manual_proxy_config(config: ManualProxyConfig) -> ManualProxyConfig {
     ManualProxyConfig {
         http_proxy: config.http_proxy.trim().to_string(),
@@ -318,28 +206,30 @@ fn load_proxy_config() -> ProxyConfig {
         return config;
     }
 
-    let Ok(path) = proxy_config_path() else {
-        return ProxyConfig::default();
-    };
-
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<ProxyConfig>(&raw).ok())
+    let group = crate::settings::group::read(crate::settings::global::global(), PROXY_SETTINGS);
+    serde_json::from_value::<ProxyConfig>(group)
         .map(sanitize_proxy_config)
         .unwrap_or_default()
 }
 
 pub fn save_proxy_config(config: ProxyConfig) -> Result<ProxyStatus, String> {
     let config = sanitize_proxy_config(config);
-    let path = proxy_config_path()?;
-    let json = serde_json::to_string_pretty(&config)
+    let value = serde_json::to_value(&config)
         .map_err(|e| format!("Failed to serialize proxy config: {}", e))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to save proxy config '{}': {}", path.display(), e))?;
+    crate::settings::global::global()
+        .set_values(&crate::settings::group::changes(PROXY_SETTINGS, &value))
+        .map_err(|error| format!("Failed to save proxy config: {error}"))?;
 
     let _guard = proxy_env_access_guard();
     clear_locus_injected_proxy_env_unlocked();
     Ok(get_proxy_status_unlocked())
+}
+
+/// Applies proxy settings written elsewhere (agent `config_set`): drops the
+/// proxy environment Locus injected so the next request resolves again.
+pub fn apply_proxy_settings() {
+    let _guard = proxy_env_access_guard();
+    clear_locus_injected_proxy_env_unlocked();
 }
 
 fn proxy_env_access_lock() -> &'static Mutex<()> {
@@ -662,45 +552,7 @@ fn build_reqwest_client(
     options: ReqwestClientOptions,
     mut builder: reqwest::ClientBuilder,
 ) -> Result<reqwest::Client, String> {
-    if let Some(value) = options.connect_timeout {
-        builder = builder.connect_timeout(value);
-    }
-    if let Some(value) = options.timeout {
-        builder = builder.timeout(value);
-    }
-    if let Some(value) = options.tcp_keepalive {
-        builder = builder.tcp_keepalive(value);
-    }
-    if let Some(value) = options.tcp_nodelay {
-        builder = builder.tcp_nodelay(value);
-    }
-    if let Some(value) = options.pool_idle_timeout {
-        builder = builder.pool_idle_timeout(value);
-    }
-    if let Some(value) = options.pool_max_idle_per_host {
-        builder = builder.pool_max_idle_per_host(value);
-    }
-    if let Some(value) = options.http2_adaptive_window {
-        builder = builder.http2_adaptive_window(value);
-    }
-    if let Some(value) = options.http2_keep_alive_interval {
-        builder = builder.http2_keep_alive_interval(value);
-    }
-    if let Some(value) = options.http2_keep_alive_timeout {
-        builder = builder.http2_keep_alive_timeout(value);
-    }
-    if let Some(value) = options.user_agent {
-        builder = builder.user_agent(value);
-    }
-    if let Some(value) = options.gzip {
-        builder = builder.gzip(value);
-    }
-    if let Some(value) = options.deflate {
-        builder = builder.deflate(value);
-    }
-    if options.follow_redirects == Some(false) {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
-    }
+    builder = options.apply(builder);
 
     let builder = {
         let _guard = proxy_env_access_guard();

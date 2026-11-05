@@ -22,8 +22,7 @@ import {
   getProviders,
   codexStatus as fetchCodexStatus,
 } from "../services/auth";
-import { getModelDefaults, getCustomProviders } from "../services/model";
-import { getToolPermissions } from "../services/permissions";
+import { getCustomProviders } from "../services/model";
 import {
   gitProbe,
   gitHistorySnapshot,
@@ -48,6 +47,7 @@ import type {
   SessionTitleUpdatedEvent,
   WorkspaceExecutionLockDiagnostic,
   AsyncTaskUpdatedEvent,
+  NestedToolCallUpdatedEvent,
 } from "../types";
 import { filterVisibleProviders } from "../config/providerVisibility";
 import { t } from "../i18n";
@@ -74,6 +74,7 @@ import {
 } from "../services/project";
 import {
   publishSessionAsyncTaskUpdate,
+  publishSessionNestedToolCallUpdate,
   publishSessionExecutionState,
   publishSessionContentChange,
   publishSessionStreamEvent,
@@ -144,10 +145,11 @@ export interface AppBootstrapOptions {
   /** Started by the window owner before auth/model bootstrap. */
   workspaceReady?: Promise<void>;
   /** Keep this window pinned to its own session instead of following the
-   *  main window's globally persisted active-session selection. */
+   *  globally persisted active-session selection. */
   syncActiveSessionSelection?: boolean;
-  /** Route Unity external-editor open requests into this window's asset tab. */
-  handleExternalScriptOpen?: boolean;
+  /** Route Unity external-editor open requests into this window's asset tab.
+   *  A function is re-evaluated per request, for duties that move between windows. */
+  handleExternalScriptOpen?: boolean | (() => boolean);
 }
 
 export function useAppBootstrap(options: AppBootstrapOptions = {}) {
@@ -176,6 +178,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   let unlistenSessionContentChanged: RuntimeUnsubscribe | null = null;
   let unlistenSessionTitleUpdated: RuntimeUnsubscribe | null = null;
   let unlistenAsyncTaskUpdated: RuntimeUnsubscribe | null = null;
+  let unlistenNestedToolCallUpdated: RuntimeUnsubscribe | null = null;
   let unlistenPluginsChanged: RuntimeUnsubscribe | null = null;
   let unlistenAgentsChanged: RuntimeUnsubscribe | null = null;
   let unlistenExternalScriptOpen: RuntimeUnsubscribe | null = null;
@@ -312,6 +315,11 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     void chatStore.refreshSessionAfterExternalChange(change.sessionId);
   }
 
+  function handlesExternalScriptOpen(): boolean {
+    const option = options.handleExternalScriptOpen;
+    return typeof option === "function" ? option() : option === true;
+  }
+
   function handleExternalScriptOpen(request: ExternalScriptOpenRequest) {
     if (!request.projectPath?.trim()) return;
     if (request.assetPath?.trim()) {
@@ -358,12 +366,16 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     await measureStartupAsync("bootstrap_ui_init", async () => {
       await uiStore.init();
     });
+    // Auth unlocks the shell and mounts restored session tabs, so the saved
+    // default effort must be known before then; otherwise a new session tab
+    // resolves the "none" fallback.
     await measureStartupAsync("bootstrap_model_config", async () => {
       await Promise.all([
         chatStore.loadToolPermissionMode(),
         modelStore.loadDebugMode(),
         modelStore.loadModelDefaults(),
         modelStore.loadLastModel(),
+        modelStore.loadLastEffort(),
         modelStore.loadAgentModelPreferences(),
         modelStore.loadCodexFastMode(),
         modelStore.loadCustomProviders(),
@@ -410,9 +422,6 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         projectStore.checkUnityPlugin(),
         projectStore.loadAssetDbStatus(),
       ]);
-    });
-    await measureStartupAsync("bootstrap_last_effort", async () => {
-      await modelStore.loadLastEffort();
     });
     // Restoring a session writes its Agent/model/effort selection, so defaults
     // and the scoped Agent list must have settled first.
@@ -534,11 +543,9 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
   function warmupSettings(generation: number): Promise<void> {
     if (_wpSettings) return _wpSettings;
     _wpSettings = (async () => {
-      const [providers, codex, defaults, perms, customProviders] = await Promise.all([
+      const [providers, codex, customProviders] = await Promise.all([
         getProviders(),
         fetchCodexStatus(),
-        getModelDefaults(),
-        getToolPermissions(),
         getCustomProviders(),
       ]);
       setWarmup(
@@ -547,8 +554,6 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         generation,
       );
       setWarmup("settings:codexStatus", codex, generation);
-      setWarmup("settings:modelDefaults", defaults, generation);
-      setWarmup("settings:toolPermissions", perms, generation);
       setWarmup("settings:customProviders", customProviders, generation);
     })();
     return _wpSettings;
@@ -738,6 +743,13 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
         publishSessionAsyncTaskUpdate(payload);
       },
     );
+    unlistenNestedToolCallUpdated = await runtime.subscribe<NestedToolCallUpdatedEvent>(
+      "nested-tool-call-updated",
+      (payload) => {
+        chatStore.applyNestedToolCallUpdate(payload);
+        publishSessionNestedToolCallUpdate(payload);
+      },
+    );
     unlistenKnowledgeChanged = await runtime.subscribe<RoutedWorkspaceEvent>(
       WORKSPACE_EVENT_NAME,
       (event) => {
@@ -807,7 +819,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
           void agentStore.loadWorkspaceAgents(workspaceRef);
         } else if (
           event.eventName === "locus-open-script"
-          && options.handleExternalScriptOpen === true
+          && handlesExternalScriptOpen()
         ) {
           handleExternalScriptOpen(event.payload as ExternalScriptOpenRequest);
         }
@@ -827,7 +839,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     unlistenAgentsChanged = await runtime.subscribe<void>("agents-changed", () => {
       void loadCurrentAgents();
     });
-    if (options.handleExternalScriptOpen === true) {
+    if (handlesExternalScriptOpen()) {
       unlistenExternalScriptOpen = null;
       const startupRequest = await takeExternalScriptOpenRequest();
       if (startupRequest) handleExternalScriptOpen(startupRequest);
@@ -849,6 +861,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
     unlistenSessionContentChanged?.();
     unlistenSessionTitleUpdated?.();
     unlistenAsyncTaskUpdated?.();
+    unlistenNestedToolCallUpdated?.();
     unlistenPluginsChanged?.();
     unlistenAgentsChanged?.();
     unlistenExternalScriptOpen?.();
@@ -946,6 +959,7 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       modelStore.loadModelDefaults(),
       modelStore.loadDebugMode(),
       modelStore.loadLastModel(),
+      modelStore.loadLastEffort(),
       modelStore.loadAgentModelPreferences(),
       modelStore.loadCodexFastMode(),
       modelStore.loadCustomProviders(),
@@ -961,7 +975,6 @@ export function useAppBootstrap(options: AppBootstrapOptions = {}) {
       projectStore.loadAssetDbStatus(),
       loadSkills(),
     ]);
-    await modelStore.loadLastEffort();
     await chatStore.refreshSessions();
     syncEffortForChatContext();
     syncFastModeForChatContext();

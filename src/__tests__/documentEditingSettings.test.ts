@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { installFakeSettingsBackend } from "./fixtures/settingsBackend";
 
 const key = "locus-document-editing-settings";
 beforeEach(() => { localStorage.clear(); vi.resetModules(); });
@@ -40,13 +41,27 @@ describe("document editing settings", () => {
     expect(second.state.punctuationPairing).toBe(false);
   });
 
-  it("updates other windows and returns to disabled when storage is reset", async () => {
+  it("follows changes from other windows and a settings reset", async () => {
+    const backend = await installFakeSettingsBackend({ "documents.punctuationPairing": false });
     const settings = (await import("../composables/useDocumentEditingSettings")).useDocumentEditingSettings();
-    localStorage.setItem(key, JSON.stringify({ punctuationPairing: true }));
-    window.dispatchEvent(new StorageEvent("storage", { key }));
+    await backend.settle();
+    backend.change("documents.punctuationPairing", true);
     expect(settings.state.punctuationPairing).toBe(true);
-    localStorage.clear();
-    window.dispatchEvent(new StorageEvent("storage", { key: null }));
+    backend.change("documents.punctuationPairing", false);
     expect(settings.state.punctuationPairing).toBe(false);
+    backend.uninstall();
+  });
+
+  it("writes through the settings backend and imports the old preference once", async () => {
+    localStorage.setItem(key, JSON.stringify({ punctuationPairing: true, commentAuthor: "Enno" }));
+    const backend = await installFakeSettingsBackend();
+    const settings = (await import("../composables/useDocumentEditingSettings")).useDocumentEditingSettings();
+    await backend.settle();
+    expect(backend.imports).toEqual([{ "documents.punctuationPairing": true, "documents.commentAuthor": "Enno" }]);
+    expect(settings.state).toEqual({ punctuationPairing: true, commentAuthor: "Enno" });
+    settings.setCommentAuthor("  Other  Name ");
+    await backend.settle();
+    expect(backend.values["documents.commentAuthor"]).toBe("Other Name");
+    backend.uninstall();
   });
 });

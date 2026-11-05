@@ -1,12 +1,19 @@
+//! `AppConfig` is the typed facade over the settings store
+//! (`crate::settings`). Values live in `settings.json`; the definitions,
+//! defaults and validation live in `settings/definitions.rs`. Getters and
+//! setters keep their historical names so call sites stay unchanged.
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-const CONFIG_FILE_NAME: &str = "config.json";
+use crate::settings::{self, Key, SettingValue, SettingsStore};
+
+const LEGACY_CONFIG_FILE_NAME: &str = settings::legacy::LEGACY_CONFIG_FILE_NAME;
 
 /// Resource lifetime settings. Legacy count/concurrency fields are deliberately
 /// ignored on load and disappear on the next save.
@@ -20,6 +27,10 @@ pub struct WorkspaceServiceResourceLimits {
     /// Interactive Editors remain under user control.
     pub service_idle_timeout_secs: u64,
     pub lsp_idle_timeout_secs: u64,
+    /// Locus-launched background Blender instances across all checkouts.
+    pub blender_max_background_instances: u32,
+    /// Idle TTL for a Locus-launched background Blender instance.
+    pub blender_background_idle_timeout_secs: u64,
 }
 
 impl Default for WorkspaceServiceResourceLimits {
@@ -28,6 +39,8 @@ impl Default for WorkspaceServiceResourceLimits {
             workspace_idle_timeout_secs: 600,
             service_idle_timeout_secs: 3600,
             lsp_idle_timeout_secs: 600,
+            blender_max_background_instances: 2,
+            blender_background_idle_timeout_secs: 600,
         }
     }
 }
@@ -80,7 +93,9 @@ impl WorkspaceServiceResourceLimits {
             }
 
             let duration = std::time::Duration::from_secs(value);
-            if std::time::Instant::now().checked_add(duration).is_none() {
+            if value > crate::settings::MAX_IDLE_TIMEOUT_SECS as u64
+                || std::time::Instant::now().checked_add(duration).is_none()
+            {
                 fields.push(WorkspaceServiceResourceLimitFieldError {
                     field: field.to_string(),
                     message: "exceeds the platform-supported timeout range".to_string(),
@@ -103,6 +118,17 @@ impl WorkspaceServiceResourceLimits {
             "lspIdleTimeoutSecs",
             self.lsp_idle_timeout_secs,
         );
+        require_checked_timeout(
+            &mut fields,
+            "blenderBackgroundIdleTimeoutSecs",
+            self.blender_background_idle_timeout_secs,
+        );
+        if !(1..=8).contains(&self.blender_max_background_instances) {
+            fields.push(WorkspaceServiceResourceLimitFieldError {
+                field: "blenderMaxBackgroundInstances".to_string(),
+                message: "must be between 1 and 8".to_string(),
+            });
+        }
 
         if fields.is_empty() {
             Ok(())
@@ -158,42 +184,6 @@ impl From<WorkspaceServiceResourceLimitsValidationErrors>
     }
 }
 
-mod serde_atomic_bool {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Arc<AtomicBool>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bool(v.load(Ordering::Relaxed))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<AtomicBool>, D::Error> {
-        let b = bool::deserialize(d)?;
-        Ok(Arc::new(AtomicBool::new(b)))
-    }
-}
-
-mod serde_atomic_u32 {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Arc<AtomicU32>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u32(v.load(Ordering::Relaxed))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<AtomicU32>, D::Error> {
-        let v = u32::deserialize(d)?;
-        Ok(Arc::new(AtomicU32::new(v)))
-    }
-}
-
-fn default_llm_retry_max_attempts() -> Arc<AtomicU32> {
-    Arc::new(AtomicU32::new(crate::llm::retry::DEFAULT_MAX_RETRIES))
-}
-
-fn default_llm_strip_inline_think_tags() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
 /// Default `subagent` nesting depth: the top-level agent may spawn
 /// subagents, but those subagents may not spawn further subagents.
 pub const DEFAULT_SUBAGENT_MAX_DEPTH: u32 = 1;
@@ -211,138 +201,15 @@ fn clamp_subagent_max_concurrent(value: u32) -> u32 {
     value.clamp(1, SUBAGENT_MAX_CONCURRENT_LIMIT)
 }
 
-fn default_subagent_max_depth() -> Arc<AtomicU32> {
-    Arc::new(AtomicU32::new(DEFAULT_SUBAGENT_MAX_DEPTH))
-}
-
-fn default_subagent_max_concurrent() -> Arc<AtomicU32> {
-    Arc::new(AtomicU32::new(DEFAULT_SUBAGENT_MAX_CONCURRENT))
-}
-
-fn default_debug_flag() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-fn default_async_tasks_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_multi_agent_editor_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-fn default_claude_code_cli_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-const CLAUDE_CODE_CLI_ENABLED_KEY: &str = "claude_code_cli_enabled";
-const LEGACY_MODEL_DEFAULTS_FILE_NAME: &str = "model_defaults.json";
-
-/// Before the experimental setting existed, the Claude Code CLI opt-in lived
-/// in `model_defaults.json` as `claudeCodeEnabled`.
-fn legacy_claude_code_cli_enabled(config_dir: &Path) -> bool {
-    fs::read_to_string(config_dir.join(LEGACY_MODEL_DEFAULTS_FILE_NAME))
-        .ok()
-        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
-        .and_then(|value| value.get("claudeCodeEnabled").and_then(Value::as_bool))
-        .unwrap_or(false)
-}
-
-fn default_unity_background_hook_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_embed_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_state_probe_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_sidecar_compiler() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_non_public_access() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_in_process_compile_fallback() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_hot_reload() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-fn default_tool_failure_log_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-fn default_session_undo_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_external_editor_default_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(false))
-}
-
-fn default_unity_inline_force_evaluate_enabled() -> Arc<AtomicBool> {
-    // Phase D rollout: default ON. The force-JIT stub only runs for methods whose
-    // Mono inline bits are still clear (a minority — in a running game most changed
-    // methods' callers have already JITed, so the bit is set and the stub is never
-    // built), is correctness-safe (every inline verdict converges via recompile),
-    // and only takes effect when hot reload is enabled (itself opt-in). A guard
-    // skips any type with a static initializer, so no cctor side effect is
-    // triggered. Set to false to disable.
-    Arc::new(AtomicBool::new(true))
-}
-
-fn default_unity_native_bridge_enabled() -> Arc<AtomicBool> {
-    // Default-on: the native command channel survives domain reloads and is the
-    // required Unity command transport.
-    Arc::new(AtomicBool::new(true))
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum AppCloseBehavior {
+    #[default]
     Exit,
     MinimizeToTray,
 }
 
-impl Default for AppCloseBehavior {
-    fn default() -> Self {
-        Self::Exit
-    }
-}
-
-mod serde_close_behavior {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        v: &Arc<Mutex<AppCloseBehavior>>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        let value = *v.lock().map_err(serde::ser::Error::custom)?;
-        value.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Arc<Mutex<AppCloseBehavior>>, D::Error> {
-        let value = AppCloseBehavior::deserialize(d)?;
-        Ok(Arc::new(Mutex::new(value)))
-    }
-}
-
-fn default_close_behavior() -> Arc<Mutex<AppCloseBehavior>> {
-    Arc::new(Mutex::new(AppCloseBehavior::Exit))
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum DynamicToolLoadingMode {
     #[serde(alias = "meta-tool", alias = "meta_tool")]
@@ -351,41 +218,8 @@ pub enum DynamicToolLoadingMode {
     /// Protocol-native lazy loading: Anthropic `defer_loading` +
     /// `tool_reference`, Codex `tool_search`. Backends without a native
     /// renderer fall back to the MetaTool mechanism per request.
+    #[default]
     Native,
-}
-
-impl Default for DynamicToolLoadingMode {
-    fn default() -> Self {
-        Self::Native
-    }
-}
-
-mod serde_dynamic_tool_loading_mode {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        v: &Arc<Mutex<DynamicToolLoadingMode>>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        let value = *v.lock().map_err(serde::ser::Error::custom)?;
-        value.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Arc<Mutex<DynamicToolLoadingMode>>, D::Error> {
-        let value = DynamicToolLoadingMode::deserialize(d)?;
-        Ok(Arc::new(Mutex::new(value)))
-    }
-}
-
-fn default_dynamic_tool_loading_mode() -> Arc<Mutex<DynamicToolLoadingMode>> {
-    Arc::new(Mutex::new(DynamicToolLoadingMode::Native))
-}
-
-fn default_anthropic_native_lazy_enabled() -> Arc<AtomicBool> {
-    Arc::new(AtomicBool::new(true))
 }
 
 /// Per-tool switches for the code-analysis tool family. Each flag controls
@@ -407,6 +241,21 @@ pub struct CodeAnalysisToolsConfig {
     pub unity_analyzers: bool,
 }
 
+impl CodeAnalysisToolsConfig {
+    pub fn from_settings(store: &SettingsStore) -> Self {
+        Self {
+            code_symbol_search: store.get(settings::UNITY_CODE_ANALYSIS_SYMBOL_SEARCH),
+            code_goto_definition: store.get(settings::UNITY_CODE_ANALYSIS_GOTO_DEFINITION),
+            code_find_references: store.get(settings::UNITY_CODE_ANALYSIS_FIND_REFERENCES),
+            code_diagnostics: store.get(settings::UNITY_CODE_ANALYSIS_DIAGNOSTICS),
+            edit_write_diagnostics: store.get(settings::UNITY_CODE_ANALYSIS_EDIT_WRITE_DIAGNOSTICS),
+            code_hover: store.get(settings::UNITY_CODE_ANALYSIS_HOVER),
+            unity_code_usages: store.get(settings::UNITY_CODE_ANALYSIS_UNITY_CODE_USAGES),
+            unity_analyzers: store.get(settings::UNITY_CODE_ANALYSIS_UNITY_ANALYZERS),
+        }
+    }
+}
+
 impl Default for CodeAnalysisToolsConfig {
     fn default() -> Self {
         Self {
@@ -422,979 +271,447 @@ impl Default for CodeAnalysisToolsConfig {
     }
 }
 
-mod serde_code_analysis_tools {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        v: &Arc<Mutex<CodeAnalysisToolsConfig>>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        let value = *v.lock().map_err(serde::ser::Error::custom)?;
-        value.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Arc<Mutex<CodeAnalysisToolsConfig>>, D::Error> {
-        let value = CodeAnalysisToolsConfig::deserialize(d)?;
-        Ok(Arc::new(Mutex::new(value)))
-    }
+/// Serde form of an enum setting value (`"minimizeToTray"`).
+fn enum_setting<T: Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .expect("setting enums serialize to strings")
 }
 
-fn default_code_analysis_tools() -> Arc<Mutex<CodeAnalysisToolsConfig>> {
-    Arc::new(Mutex::new(CodeAnalysisToolsConfig::default()))
+/// Reads a JSON object file that holds state or secrets next to (former)
+/// settings; missing or unreadable files read as empty.
+pub(crate) fn read_state_file(path: &Path) -> serde_json::Map<String, Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(content.trim_start_matches('\u{feff}')).ok())
+        .and_then(|value| match value {
+            Value::Object(object) => Some(object),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
-mod serde_string_mutex {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Arc<Mutex<String>>, s: S) -> Result<S::Ok, S::Error> {
-        let value = v.lock().map_err(serde::ser::Error::custom)?;
-        value.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<Mutex<String>>, D::Error> {
-        let value = String::deserialize(d)?;
-        Ok(Arc::new(Mutex::new(value)))
-    }
+/// Updates fields of a JSON object file, keeping the other fields (an older
+/// Locus still reads its settings from them).
+pub(crate) fn update_state_file(
+    path: &Path,
+    update: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<(), String> {
+    let mut object = read_state_file(path);
+    update(&mut object);
+    let json = serde_json::to_vec_pretty(&Value::Object(object))
+        .map_err(|error| format!("failed to serialize '{}': {error}", path.display()))?;
+    atomic_write_config(path, &json)
 }
 
-fn default_skill_package_namespace() -> Arc<Mutex<String>> {
-    Arc::new(Mutex::new(String::new()))
+fn parse_enum_setting<T: for<'de> Deserialize<'de> + Default>(value: String) -> T {
+    serde_json::from_value(Value::String(value)).unwrap_or_default()
 }
 
-fn default_worktree_root() -> Arc<Mutex<String>> {
-    Arc::new(Mutex::new(String::new()))
-}
-
-mod serde_workspace_service_resource_limits {
-    use super::*;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        value: &Arc<Mutex<WorkspaceServiceResourceLimits>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let value = value.lock().map_err(serde::ser::Error::custom)?;
-        value.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Arc<Mutex<WorkspaceServiceResourceLimits>>, D::Error> {
-        let value = WorkspaceServiceResourceLimits::deserialize(deserializer)?;
-        Ok(Arc::new(Mutex::new(value)))
-    }
-}
-
-fn default_workspace_service_resource_limits() -> Arc<Mutex<WorkspaceServiceResourceLimits>> {
-    Arc::new(Mutex::new(WorkspaceServiceResourceLimits::default()))
-}
-
-fn default_config_persist_lock() -> Arc<Mutex<()>> {
-    Arc::new(Mutex::new(()))
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct AppConfig {
-    pub model: String,
-    #[serde(default)]
-    pub base_url: Option<String>,
-    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
-    pub debug: Arc<AtomicBool>,
-    /// Persist a bounded corpus of failed agent tool calls for later tool
-    /// quality analysis. Default off because entries include call arguments,
-    /// error output and session-position identifiers.
-    #[serde(
-        default = "default_tool_failure_log_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub tool_failure_log_enabled: Arc<AtomicBool>,
-    /// Capture per-round workspace snapshots so Agent changes can be reviewed
-    /// and restored from the session. Default on for backward compatibility.
-    #[serde(default = "default_session_undo_enabled", with = "serde_atomic_bool")]
-    pub session_undo_enabled: Arc<AtomicBool>,
-    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
-    pub file_tool_workspace_boundary: Arc<AtomicBool>,
-    /// Experimental background execution for selected long-running tools.
-    #[serde(default = "default_async_tasks_enabled", with = "serde_atomic_bool")]
-    pub async_tasks_enabled: Arc<AtomicBool>,
-    /// Enable background tools once for older installations, then preserve
-    /// subsequent user choices, including an explicit opt-out.
-    #[serde(default)]
-    pub async_tasks_default_enabled_migrated: bool,
-    /// Experimental cooperative lock protocol for multiple Agent sessions
-    /// sharing one Unity Editor. The lock is advisory and never gates Unity
-    /// tool execution in the harness.
-    #[serde(
-        default = "default_unity_multi_agent_editor_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_multi_agent_editor_enabled: Arc<AtomicBool>,
-    /// Experimental Claude Code CLI provider. Default off; the frontend lists
-    /// its models and connection settings only after the user opts in.
-    #[serde(
-        default = "default_claude_code_cli_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub claude_code_cli_enabled: Arc<AtomicBool>,
-    #[serde(default = "default_close_behavior", with = "serde_close_behavior")]
-    pub close_behavior: Arc<Mutex<AppCloseBehavior>>,
-    #[serde(
-        default = "default_dynamic_tool_loading_mode",
-        with = "serde_dynamic_tool_loading_mode"
-    )]
-    pub dynamic_tool_loading_mode: Arc<Mutex<DynamicToolLoadingMode>>,
-    /// One-time migration marker: configs written before the Native default
-    /// get `dynamic_tool_loading_mode` rewritten to `native` exactly once
-    /// (regardless of the previously persisted value); afterwards the user's
-    /// choice sticks.
-    #[serde(default)]
-    pub dynamic_tool_loading_native_migrated: bool,
-    /// One-time migration marker for the one-hour Unity service idle TTL.
-    /// Workspace service settings currently apply only to the Unity service.
-    #[serde(default)]
-    pub workspace_service_ttl_hour_migrated: bool,
-    /// Whether the configured Anthropic endpoint supports native lazy tool
-    /// loading (`defer_loading` + `tool_reference`). Default on — the
-    /// official API supports it. Turn off for gateway/proxy `base_url`s that
-    /// reject those fields; otherwise every request pays a 400 + eager
-    /// retry round-trip (the strip-retry in `llm::anthropic` is per-request
-    /// and cannot remember the endpoint's answer).
-    #[serde(
-        default = "default_anthropic_native_lazy_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub anthropic_native_lazy_enabled: Arc<AtomicBool>,
-    #[serde(
-        default = "default_skill_package_namespace",
-        with = "serde_string_mutex"
-    )]
-    pub default_skill_package_namespace: Arc<Mutex<String>>,
-    #[serde(
-        default = "default_unity_background_hook_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_background_hook_enabled: Arc<AtomicBool>,
-    /// Show Locus WebView windows inside Unity editor windows. Default on.
-    /// Turning this off destroys existing embed windows and makes incoming
-    /// overlay control messages inert while leaving the Unity command bridge on.
-    #[serde(default = "default_unity_embed_enabled", with = "serde_atomic_bool")]
-    pub unity_embed_enabled: Arc<AtomicBool>,
-    /// Out-of-process native editor-state probe (stack/CPU classification) that
-    /// keeps reporting through domain reloads and editor hangs, when the named
-    /// pipe is silent. Default on; degrades to pipe+process inference when the
-    /// native tier is unavailable (no PDB / unsupported platform).
-    #[serde(
-        default = "default_unity_state_probe_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_state_probe_enabled: Arc<AtomicBool>,
-    #[serde(default = "default_debug_flag", with = "serde_atomic_bool")]
-    pub csharp_lsp_enabled: Arc<AtomicBool>,
-    /// Compile unity_execute / unity_run_states / View Script snippets in
-    /// the CoreCLR compile-server sidecar instead of inside the Unity Editor
-    /// process. Default on (phase 6 rollout); any sidecar failure falls back
-    /// to the in-Unity path at runtime, and the fallback path stays for at
-    /// least one release cycle.
-    #[serde(default = "default_unity_sidecar_compiler", with = "serde_atomic_bool")]
-    pub unity_sidecar_compiler: Arc<AtomicBool>,
-    /// Let unity_execute / unity_run_states generated assemblies bind and
-    /// directly execute private/internal APIs and fields. Default on. The
-    /// per-tool `enable_non_public_access` argument can further disable this
-    /// for an individual call; this persisted setting remains the master gate.
-    #[serde(
-        default = "default_unity_non_public_access",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_non_public_access: Arc<AtomicBool>,
-    /// When the sidecar compiler is on and a compile is *unavailable* (sidecar
-    /// down / transport error), fall back to the in-Unity Roslyn compile.
-    /// Default on (keeps the graceful behavior). Turn off for pure-sidecar /
-    /// A-B: an unavailable sidecar then returns an error instead of compiling
-    /// in Unity, so no in-process Roslyn runs. No effect when the sidecar
-    /// itself is off (the in-Unity path is then the only path).
-    #[serde(
-        default = "default_unity_in_process_compile_fallback",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_in_process_compile_fallback: Arc<AtomicBool>,
-    /// Hot-patch Unity C# method-body edits via the compile-server sidecar
-    /// (no Unity recompile / domain reload). Default off (phase H0 gate);
-    /// signature/field changes always go through `unity_recompile`.
-    #[serde(default = "default_unity_hot_reload", with = "serde_atomic_bool")]
-    pub unity_hot_reload: Arc<AtomicBool>,
-    /// Automatically select Locus as Unity's current external C# editor.
-    /// Registration remains available for manual selection when this is off.
-    #[serde(
-        default = "default_unity_external_editor_default_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_external_editor_default_enabled: Arc<AtomicBool>,
-    /// Route the Tauri↔Unity command channel through the native broker DLL
-    /// (`locus_native`) loaded inside the Unity process, so the connection
-    /// survives domain reloads. Default on; disabling this disables the Unity
-    /// command transport for native-only builds.
-    #[serde(
-        default = "default_unity_native_bridge_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_native_bridge_enabled: Arc<AtomicBool>,
-    /// Let the Unity plugin force-JIT a synthetic caller stub to evaluate a
-    /// not-yet-evaluated method's inline risk (Phase B), instead of relying only
-    /// on the static heuristic. Default on (Phase D); correctness is unaffected
-    /// either way — every inline-risk state converges via recompile — so this only
-    /// trades a rare per-apply stub JIT for tighter "is it live yet" reporting.
-    #[serde(
-        default = "default_unity_inline_force_evaluate_enabled",
-        with = "serde_atomic_bool"
-    )]
-    pub unity_inline_force_evaluate_enabled: Arc<AtomicBool>,
-    #[serde(
-        default = "default_code_analysis_tools",
-        with = "serde_code_analysis_tools"
-    )]
-    pub code_analysis_tools: Arc<Mutex<CodeAnalysisToolsConfig>>,
-    /// Automatic retries per LLM HTTP request after a retryable failure
-    /// (connect error, timeout, HTTP 5xx / 429) before any output has
-    /// streamed. `0` disables automatic retries; values are clamped to
-    /// `llm::retry::MAX_RETRIES_LIMIT`. Mirrored into `llm::retry` at
-    /// startup and on change.
-    #[serde(default = "default_llm_retry_max_attempts", with = "serde_atomic_u32")]
-    pub llm_retry_max_attempts: Arc<AtomicU32>,
-    /// Reroute literal `<think>`/`<thinking>` prefixes of streamed content
-    /// into the thinking channel on the OpenAI-compatible transports
-    /// (`llm::chat_completions`, `llm::openrouter`). Third-party endpoints
-    /// without a reasoning parser inline reasoning as text tags; without
-    /// rerouting it floods the transcript and the streaming markdown
-    /// renderer. Mirrored into `llm::think_tag_filter` at startup and on
-    /// change. Default on.
-    #[serde(
-        default = "default_llm_strip_inline_think_tags",
-        with = "serde_atomic_bool"
-    )]
-    pub llm_strip_inline_think_tags: Arc<AtomicBool>,
-    /// Maximum `subagent` nesting depth. 1 (default) lets the top-level agent
-    /// spawn subagents while subagents themselves cannot; a `subagent` call
-    /// past the cap fails with an error tool result. Clamped to
-    /// 1..=SUBAGENT_MAX_DEPTH_LIMIT on read and write.
-    #[serde(default = "default_subagent_max_depth", with = "serde_atomic_u32")]
-    pub subagent_max_depth: Arc<AtomicU32>,
-    /// Maximum `subagent` calls running at once within one top-level agent
-    /// tree (default 3). Excess calls fail with an error tool result instead
-    /// of queueing. Clamped to 1..=SUBAGENT_MAX_CONCURRENT_LIMIT on read and
-    /// write.
-    #[serde(default = "default_subagent_max_concurrent", with = "serde_atomic_u32")]
-    pub subagent_max_concurrent: Arc<AtomicU32>,
-    /// Persisted resource limits shared by workspace runtimes, optional
-    /// workspace services, C# LSP processes, and the compile scheduler.
-    /// Defaults live exclusively in `WorkspaceServiceResourceLimits::default`.
-    #[serde(
-        default = "default_workspace_service_resource_limits",
-        with = "serde_workspace_service_resource_limits"
-    )]
-    pub workspace_service_resource_limits: Arc<Mutex<WorkspaceServiceResourceLimits>>,
-    /// Base directory for new worktrees. Empty places them beside the main
-    /// repository. `--locus-worktree-root` / `LOCUS_WORKTREE_ROOT` override it
-    /// for one process without changing this persisted value.
-    #[serde(default = "default_worktree_root", with = "serde_string_mutex")]
-    pub worktree_root: Arc<Mutex<String>>,
-    #[serde(skip)]
-    config_path: Arc<Mutex<Option<PathBuf>>>,
-    /// Serializes whole-file config replacements so a resource-policy update
-    /// cannot be overwritten by a concurrent setting persistence.
-    #[serde(skip, default = "default_config_persist_lock")]
-    persist_lock: Arc<Mutex<()>>,
+    store: Arc<SettingsStore>,
+    /// Shared with the tracing layer so `system.debug` reaches log filtering
+    /// without a settings lookup per event.
+    debug_mirror: Arc<AtomicBool>,
 }
 
 impl AppConfig {
+    /// Opens the process-wide settings in the persistent config directory,
+    /// importing legacy files from it and from `data_dir` on first use.
     pub fn load(data_dir: &Path) -> Self {
-        let primary_path = stable_config_path(data_dir);
-        Self::load_from_path(&primary_path)
-    }
-
-    pub(crate) fn load_from_path(primary_path: &Path) -> Self {
-        if let Some(mut config) = Self::try_load_file(primary_path) {
-            println!(
-                "[Locus] config loaded from persistent path: {:?}",
-                dunce::canonicalize(primary_path).unwrap_or(primary_path.to_path_buf())
-            );
-            config.set_config_path(primary_path.to_path_buf());
-            return config;
-        }
-
-        println!("[Locus] config not found in any path, creating defaults");
-
-        let model = std::env::var("LOCUS_MODEL")
-            .unwrap_or_else(|_| "openrouter/claude-opus-4.8".to_string());
-
-        let base_url = std::env::var("LOCUS_BASE_URL").ok();
-
-        let debug = std::env::var("LOCUS_DEBUG")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false);
-
-        let config = AppConfig {
-            model,
-            base_url,
-            debug: Arc::new(AtomicBool::new(debug)),
-            tool_failure_log_enabled: default_tool_failure_log_enabled(),
-            session_undo_enabled: default_session_undo_enabled(),
-            file_tool_workspace_boundary: default_debug_flag(),
-            async_tasks_enabled: default_async_tasks_enabled(),
-            async_tasks_default_enabled_migrated: true,
-            unity_multi_agent_editor_enabled: default_unity_multi_agent_editor_enabled(),
-            claude_code_cli_enabled: Arc::new(AtomicBool::new(
-                primary_path
-                    .parent()
-                    .is_some_and(legacy_claude_code_cli_enabled),
-            )),
-            close_behavior: default_close_behavior(),
-            dynamic_tool_loading_mode: default_dynamic_tool_loading_mode(),
-            dynamic_tool_loading_native_migrated: true,
-            workspace_service_ttl_hour_migrated: true,
-            anthropic_native_lazy_enabled: default_anthropic_native_lazy_enabled(),
-            default_skill_package_namespace: default_skill_package_namespace(),
-            unity_background_hook_enabled: default_unity_background_hook_enabled(),
-            unity_embed_enabled: default_unity_embed_enabled(),
-            unity_state_probe_enabled: default_unity_state_probe_enabled(),
-            csharp_lsp_enabled: default_debug_flag(),
-            unity_sidecar_compiler: default_unity_sidecar_compiler(),
-            unity_non_public_access: default_unity_non_public_access(),
-            unity_in_process_compile_fallback: default_unity_in_process_compile_fallback(),
-            unity_hot_reload: default_unity_hot_reload(),
-            unity_external_editor_default_enabled: default_unity_external_editor_default_enabled(),
-            unity_native_bridge_enabled: default_unity_native_bridge_enabled(),
-            unity_inline_force_evaluate_enabled: default_unity_inline_force_evaluate_enabled(),
-            code_analysis_tools: default_code_analysis_tools(),
-            llm_retry_max_attempts: default_llm_retry_max_attempts(),
-            llm_strip_inline_think_tags: default_llm_strip_inline_think_tags(),
-            subagent_max_depth: default_subagent_max_depth(),
-            subagent_max_concurrent: default_subagent_max_concurrent(),
-            workspace_service_resource_limits: default_workspace_service_resource_limits(),
-            worktree_root: default_worktree_root(),
-            config_path: Arc::new(Mutex::new(Some(primary_path.to_path_buf()))),
-            persist_lock: default_config_persist_lock(),
-        };
-
-        if let Err(err) = Self::persist_to_path(&config, primary_path) {
-            eprintln!(
-                "[Locus] failed to write default config to '{}': {}",
-                primary_path.display(),
-                err
-            );
-        } else {
-            println!(
-                "[Locus] default config written to {:?}",
-                dunce::canonicalize(primary_path).unwrap_or(primary_path.to_path_buf())
-            );
-        }
-
-        config
-    }
-
-    fn try_load_file(path: &Path) -> Option<Self> {
-        let content = fs::read_to_string(path).ok()?;
-        let (config, rewritten) = Self::parse_content(&content, path.parent()).ok()?;
-        if rewritten {
-            if let Err(err) = Self::persist_to_path(&config, path) {
+        match crate::commands::persistent_config_dir() {
+            Ok(config_dir) => Self::from_store(settings::global::open(&config_dir, data_dir)),
+            Err(error) => {
                 eprintln!(
-                    "[Locus] failed to rewrite migrated config '{}': {}",
-                    path.display(),
-                    err
+                    "[Locus] failed to resolve persistent config dir, falling back to runtime storage: {error}"
                 );
-            } else {
-                println!(
-                    "[Locus] config migrations applied and persisted: {:?}",
-                    dunce::canonicalize(path).unwrap_or(path.to_path_buf())
-                );
+                Self::load_from_path(&data_dir.join(LEGACY_CONFIG_FILE_NAME))
             }
         }
-        Some(config)
     }
 
-    /// `config_dir` locates sibling legacy settings files for one-time
-    /// migrations; `None` skips reading them.
-    fn parse_content(content: &str, config_dir: Option<&Path>) -> Result<(Self, bool), String> {
-        let mut value: Value =
-            serde_json::from_str(content).map_err(|e| format!("failed to parse config: {}", e))?;
-        let scrubbed_legacy_secret = Self::remove_legacy_api_key(&mut value);
-        let migrated_native_tool_loading = Self::apply_native_tool_loading_migration(&mut value);
-        let migrated_workspace_service_ttl =
-            Self::apply_workspace_service_ttl_hour_migration(&mut value);
-        let migrated_async_tasks = Self::apply_async_tasks_default_migration(&mut value);
-        let migrated_claude_code_cli =
-            Self::apply_claude_code_cli_enabled_migration(&mut value, config_dir);
-        let config = serde_json::from_value::<AppConfig>(value)
-            .map_err(|e| format!("failed to deserialize config: {}", e))?;
-        Ok((
-            config,
-            scrubbed_legacy_secret
-                || migrated_native_tool_loading
-                || migrated_workspace_service_ttl
-                || migrated_async_tasks
-                || migrated_claude_code_cli,
-        ))
+    /// A separate store in the directory of `legacy_config_path` (the old
+    /// `config.json`), with legacy files imported from that directory.
+    pub(crate) fn load_from_path(legacy_config_path: &Path) -> Self {
+        let dir = legacy_config_path.parent().unwrap_or_else(|| Path::new("."));
+        Self::from_store(Arc::new(settings::global::open_store(dir, dir)))
     }
 
-    /// Carries an existing Claude Code CLI opt-in from model configuration into
-    /// the experimental setting once. The persisted key then keeps later user
-    /// choices authoritative.
-    fn apply_claude_code_cli_enabled_migration(
-        value: &mut Value,
-        config_dir: Option<&Path>,
-    ) -> bool {
-        let Some(obj) = value.as_object_mut() else {
-            return false;
-        };
-        if obj.contains_key(CLAUDE_CODE_CLI_ENABLED_KEY) {
-            return false;
+    pub fn from_store(store: Arc<SettingsStore>) -> Self {
+        let debug_mirror = Arc::new(AtomicBool::new(store.get(settings::SYSTEM_DEBUG)));
+        Self {
+            store,
+            debug_mirror,
         }
-        let enabled = config_dir.is_some_and(legacy_claude_code_cli_enabled);
-        obj.insert(CLAUDE_CODE_CLI_ENABLED_KEY.to_string(), Value::Bool(enabled));
-        true
     }
 
-    /// Rewrites `dynamic_tool_loading_mode` to `native` exactly once per
-    /// config file — the Native default should reach existing installs too,
-    /// whether the old value was the previous default or a manual choice.
-    /// The marker keeps later user changes authoritative.
-    fn apply_native_tool_loading_migration(value: &mut Value) -> bool {
-        let Some(obj) = value.as_object_mut() else {
-            return false;
-        };
-        if obj
-            .get("dynamic_tool_loading_native_migrated")
-            .and_then(|v| v.as_bool())
-            == Some(true)
-        {
-            return false;
-        }
-        obj.insert(
-            "dynamic_tool_loading_native_migrated".to_string(),
-            Value::Bool(true),
-        );
-        let previous = obj.insert(
-            "dynamic_tool_loading_mode".to_string(),
-            Value::String("native".to_string()),
-        );
-        println!(
-            "[Locus] dynamic tool loading migrated to native (previous: {})",
-            previous
-                .as_ref()
-                .and_then(|v| v.as_str())
-                .unwrap_or("<default>")
-        );
-        true
+    pub fn settings(&self) -> &Arc<SettingsStore> {
+        &self.store
     }
 
-    fn apply_async_tasks_default_migration(value: &mut Value) -> bool {
-        let Some(obj) = value.as_object_mut() else {
-            return false;
-        };
-        if obj
-            .get("async_tasks_default_enabled_migrated")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            return false;
-        }
-        obj.insert("async_tasks_enabled".to_string(), Value::Bool(true));
-        obj.insert(
-            "async_tasks_default_enabled_migrated".to_string(),
-            Value::Bool(true),
-        );
-        true
+    /// Replaces the debug mirror with a flag owned by another component
+    /// (the tracing layer) and seeds it with the persisted value.
+    pub fn share_debug_flag(&mut self, flag: Arc<AtomicBool>) {
+        flag.store(self.store.get(settings::SYSTEM_DEBUG), Ordering::Relaxed);
+        self.debug_mirror = flag;
     }
 
-    fn apply_workspace_service_ttl_hour_migration(value: &mut Value) -> bool {
-        const UNITY_SERVICE_IDLE_TTL_SECS: u64 = 3600;
-
-        let Some(obj) = value.as_object_mut() else {
-            return false;
-        };
-        if obj
-            .get("workspace_service_ttl_hour_migrated")
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            return false;
-        }
-        obj.insert(
-            "workspace_service_ttl_hour_migrated".to_string(),
-            Value::Bool(true),
-        );
-        let limits = obj
-            .entry("workspace_service_resource_limits".to_string())
-            .or_insert_with(|| Value::Object(serde_json::Map::new()));
-        if !limits.is_object() {
-            *limits = Value::Object(serde_json::Map::new());
-        }
-        let previous = limits
-            .as_object_mut()
-            .expect("workspace service resource limits object")
-            .insert(
-                "serviceIdleTimeoutSecs".to_string(),
-                Value::from(UNITY_SERVICE_IDLE_TTL_SECS),
-            );
-        println!(
-            "[Locus] workspace service idle TTL migrated to one hour (previous: {})",
-            previous
-                .as_ref()
-                .and_then(Value::as_u64)
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "<default>".to_string())
-        );
-        true
+    fn get<T: SettingValue>(&self, key: Key<T>) -> T {
+        self.store.get(key)
     }
 
-    fn remove_legacy_api_key(value: &mut Value) -> bool {
-        let Some(obj) = value.as_object_mut() else {
-            return false;
-        };
-        let removed_snake = obj.remove("api_key").is_some();
-        let removed_camel = obj.remove("apiKey").is_some();
-        removed_snake || removed_camel
-    }
-
-    fn set_config_path(&mut self, path: PathBuf) {
-        if let Ok(mut guard) = self.config_path.lock() {
-            *guard = Some(path);
-        }
+    fn set<T: SettingValue>(&self, key: Key<T>, value: T) -> Result<(), String> {
+        self.store.set(key, value).map(|_| ()).map_err(String::from)
     }
 
     pub fn debug_enabled(&self) -> bool {
-        self.debug.load(Ordering::Relaxed)
+        self.debug_mirror.load(Ordering::Relaxed)
     }
 
     pub fn set_debug_enabled(&self, value: bool) -> Result<(), String> {
-        self.debug.store(value, Ordering::Relaxed);
-        self.persist()
+        self.set(settings::SYSTEM_DEBUG, value)?;
+        // The app's mirror listener does this too; stores without one
+        // (tests, tools) still need the flag to follow.
+        self.debug_mirror.store(value, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn debug_flag(&self) -> Arc<AtomicBool> {
+        self.debug_mirror.clone()
     }
 
     pub fn tool_failure_log_enabled(&self) -> bool {
-        self.tool_failure_log_enabled.load(Ordering::Relaxed)
+        self.get(settings::SYSTEM_TOOL_FAILURE_LOG)
     }
 
     pub fn set_tool_failure_log_enabled(&self, value: bool) -> Result<(), String> {
-        self.tool_failure_log_enabled
-            .store(value, Ordering::Relaxed);
-        self.persist()
+        self.set(settings::SYSTEM_TOOL_FAILURE_LOG, value)
     }
 
     pub fn session_undo_enabled(&self) -> bool {
-        self.session_undo_enabled.load(Ordering::Relaxed)
+        self.get(settings::AGENT_SESSION_UNDO)
     }
 
     pub fn set_session_undo_enabled(&self, value: bool) -> Result<(), String> {
-        self.session_undo_enabled.store(value, Ordering::Relaxed);
-        self.persist()
+        self.set(settings::AGENT_SESSION_UNDO, value)
     }
 
     pub fn file_tool_workspace_boundary_enabled(&self) -> bool {
-        self.file_tool_workspace_boundary.load(Ordering::Relaxed)
+        self.get(settings::PERMISSIONS_FILE_WORKSPACE_BOUNDARY)
     }
 
     pub fn set_file_tool_workspace_boundary_enabled(&self, value: bool) -> Result<(), String> {
-        self.file_tool_workspace_boundary
-            .store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn async_tasks_enabled(&self) -> bool {
-        self.async_tasks_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn set_async_tasks_enabled(&self, value: bool) -> Result<(), String> {
-        self.async_tasks_enabled.store(value, Ordering::Relaxed);
-        self.persist()
+        self.set(settings::PERMISSIONS_FILE_WORKSPACE_BOUNDARY, value)
     }
 
     pub fn unity_multi_agent_editor_enabled(&self) -> bool {
-        self.unity_multi_agent_editor_enabled
-            .load(Ordering::Relaxed)
+        self.get(settings::UNITY_MULTI_AGENT_EDITOR)
     }
 
     pub fn set_unity_multi_agent_editor_enabled(&self, value: bool) -> Result<(), String> {
-        let previous = self.unity_multi_agent_editor_enabled();
-        self.unity_multi_agent_editor_enabled
-            .store(value, Ordering::Relaxed);
-        if let Err(error) = self.persist() {
-            self.unity_multi_agent_editor_enabled
-                .store(previous, Ordering::Relaxed);
-            return Err(error);
-        }
-        crate::unity_editor_lock::set_enabled(value);
-        Ok(())
+        self.set(settings::UNITY_MULTI_AGENT_EDITOR, value)
+    }
+
+    pub fn unity_enabled(&self) -> bool {
+        self.get(settings::UNITY_ENABLED)
+    }
+
+    pub fn set_unity_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_ENABLED, value)
+    }
+
+    pub fn blender_enabled(&self) -> bool {
+        self.get(settings::BLENDER_ENABLED)
+    }
+
+    pub fn set_blender_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::BLENDER_ENABLED, value)
     }
 
     pub fn claude_code_cli_enabled(&self) -> bool {
-        self.claude_code_cli_enabled.load(Ordering::Relaxed)
+        self.get(settings::PROVIDERS_CLAUDE_CODE_ENABLED)
     }
 
     pub fn set_claude_code_cli_enabled(&self, value: bool) -> Result<(), String> {
-        let previous = self.claude_code_cli_enabled();
-        self.claude_code_cli_enabled.store(value, Ordering::Relaxed);
-        if let Err(error) = self.persist() {
-            self.claude_code_cli_enabled
-                .store(previous, Ordering::Relaxed);
-            return Err(error);
-        }
-        Ok(())
+        self.set(settings::PROVIDERS_CLAUDE_CODE_ENABLED, value)
     }
 
     pub fn close_behavior(&self) -> AppCloseBehavior {
-        self.close_behavior
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or_default()
+        parse_enum_setting(self.get(settings::SYSTEM_CLOSE_BEHAVIOR))
     }
 
     pub fn set_close_behavior(&self, value: AppCloseBehavior) -> Result<(), String> {
-        *self
-            .close_behavior
-            .lock()
-            .map_err(|e| format!("close behavior lock poisoned: {}", e))? = value;
-        self.persist()
+        self.set(settings::SYSTEM_CLOSE_BEHAVIOR, enum_setting(value))
     }
 
     pub fn dynamic_tool_loading_mode(&self) -> DynamicToolLoadingMode {
-        self.dynamic_tool_loading_mode
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or_default()
+        parse_enum_setting(self.get(settings::AGENT_TOOL_LOADING_MODE))
     }
 
     pub fn set_dynamic_tool_loading_mode(
         &self,
         value: DynamicToolLoadingMode,
     ) -> Result<(), String> {
-        *self
-            .dynamic_tool_loading_mode
-            .lock()
-            .map_err(|e| format!("dynamic tool loading mode lock poisoned: {}", e))? = value;
-        self.persist()
+        self.set(settings::AGENT_TOOL_LOADING_MODE, enum_setting(value))
     }
 
     pub fn anthropic_native_lazy_enabled(&self) -> bool {
-        self.anthropic_native_lazy_enabled.load(Ordering::Relaxed)
+        self.get(settings::PROVIDERS_ANTHROPIC_NATIVE_LAZY_LOADING)
     }
 
     pub fn set_anthropic_native_lazy_enabled(&self, value: bool) -> Result<(), String> {
-        self.anthropic_native_lazy_enabled
-            .store(value, Ordering::Relaxed);
-        self.persist()
+        self.set(settings::PROVIDERS_ANTHROPIC_NATIVE_LAZY_LOADING, value)
     }
 
     pub fn default_skill_package_namespace(&self) -> String {
-        self.default_skill_package_namespace
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+        self.get(settings::KNOWLEDGE_DEFAULT_SKILL_PACKAGE_NAMESPACE)
     }
 
     pub fn set_default_skill_package_namespace(&self, value: String) -> Result<(), String> {
-        *self
-            .default_skill_package_namespace
-            .lock()
-            .map_err(|e| format!("default skill package namespace lock poisoned: {}", e))? = value;
-        self.persist()
+        self.set(settings::KNOWLEDGE_DEFAULT_SKILL_PACKAGE_NAMESPACE, value)
     }
 
     /// Persisted worktree base directory; `None` when unset.
     pub fn worktree_root(&self) -> Option<PathBuf> {
-        self.worktree_root
-            .lock()
-            .ok()
-            .map(|guard| guard.trim().to_string())
-            .filter(|value| !value.is_empty())
+        Some(self.get(settings::WORKSPACE_WORKTREE_ROOT))
+            .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
     }
 
     pub fn set_worktree_root(&self, value: Option<&Path>) -> Result<(), String> {
-        *self
-            .worktree_root
-            .lock()
-            .map_err(|e| format!("worktree root lock poisoned: {}", e))? = value
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.persist()
+        self.set(
+            settings::WORKSPACE_WORKTREE_ROOT,
+            value
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
     }
 
     pub fn unity_background_hook_enabled(&self) -> bool {
-        self.unity_background_hook_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn unity_embed_enabled(&self) -> bool {
-        self.unity_embed_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_embed_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_embed_enabled.store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_state_probe_enabled(&self) -> bool {
-        self.unity_state_probe_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_state_probe_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_state_probe_enabled
-            .store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn csharp_lsp_enabled(&self) -> bool {
-        self.csharp_lsp_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn set_csharp_lsp_enabled(&self, value: bool) -> Result<(), String> {
-        self.csharp_lsp_enabled.store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_sidecar_compiler_enabled(&self) -> bool {
-        self.unity_sidecar_compiler.load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_sidecar_compiler_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_sidecar_compiler.store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_non_public_access_enabled(&self) -> bool {
-        self.unity_non_public_access.load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_non_public_access_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_non_public_access.store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_in_process_compile_fallback_enabled(&self) -> bool {
-        self.unity_in_process_compile_fallback
-            .load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_in_process_compile_fallback_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_in_process_compile_fallback
-            .store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_hot_reload_enabled(&self) -> bool {
-        self.unity_hot_reload.load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_hot_reload_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_hot_reload.store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_external_editor_default_enabled(&self) -> bool {
-        self.unity_external_editor_default_enabled
-            .load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_external_editor_default_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_external_editor_default_enabled
-            .store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_native_bridge_enabled(&self) -> bool {
-        self.unity_native_bridge_enabled.load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_native_bridge_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_native_bridge_enabled
-            .store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn unity_inline_force_evaluate_enabled(&self) -> bool {
-        self.unity_inline_force_evaluate_enabled
-            .load(Ordering::Relaxed)
-    }
-
-    pub fn set_unity_inline_force_evaluate_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_inline_force_evaluate_enabled
-            .store(value, Ordering::Relaxed);
-        self.persist()
-    }
-
-    pub fn code_analysis_tools(&self) -> CodeAnalysisToolsConfig {
-        self.code_analysis_tools
-            .lock()
-            .map(|guard| *guard)
-            .unwrap_or_default()
-    }
-
-    pub fn set_code_analysis_tools(&self, value: CodeAnalysisToolsConfig) -> Result<(), String> {
-        *self
-            .code_analysis_tools
-            .lock()
-            .map_err(|e| format!("code analysis tools lock poisoned: {}", e))? = value;
-        self.persist()
+        self.get(settings::UNITY_CONNECTION_BACKGROUND_HOOK)
     }
 
     pub fn set_unity_background_hook_enabled(&self, value: bool) -> Result<(), String> {
-        self.unity_background_hook_enabled
-            .store(value, Ordering::Relaxed);
-        self.persist()
+        self.set(settings::UNITY_CONNECTION_BACKGROUND_HOOK, value)
+    }
+
+    pub fn unity_embed_enabled(&self) -> bool {
+        self.get(settings::UNITY_EMBED_ENABLED)
+    }
+
+    pub fn set_unity_embed_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_EMBED_ENABLED, value)
+    }
+
+    /// Forces Unity embed windows off for this process only (CLI drivers).
+    pub fn disable_unity_embed_for_process(&self) {
+        self.store
+            .set_runtime_override(settings::UNITY_EMBED_ENABLED, false);
+    }
+
+    pub fn unity_state_probe_enabled(&self) -> bool {
+        self.get(settings::UNITY_CONNECTION_STATE_PROBE)
+    }
+
+    pub fn set_unity_state_probe_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_CONNECTION_STATE_PROBE, value)
+    }
+
+    pub fn csharp_lsp_enabled(&self) -> bool {
+        self.get(settings::UNITY_CODE_ANALYSIS_CSHARP_LSP)
+    }
+
+    pub fn set_csharp_lsp_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_CODE_ANALYSIS_CSHARP_LSP, value)
+    }
+
+    pub fn unity_sidecar_compiler_enabled(&self) -> bool {
+        self.get(settings::UNITY_COMPILE_SIDECAR)
+    }
+
+    pub fn set_unity_sidecar_compiler_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_COMPILE_SIDECAR, value)
+    }
+
+    pub fn unity_non_public_access_enabled(&self) -> bool {
+        self.get(settings::UNITY_COMPILE_NON_PUBLIC_ACCESS)
+    }
+
+    pub fn set_unity_non_public_access_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_COMPILE_NON_PUBLIC_ACCESS, value)
+    }
+
+    pub fn unity_in_process_compile_fallback_enabled(&self) -> bool {
+        self.get(settings::UNITY_COMPILE_IN_PROCESS_FALLBACK)
+    }
+
+    pub fn set_unity_in_process_compile_fallback_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_COMPILE_IN_PROCESS_FALLBACK, value)
+    }
+
+    pub fn unity_hot_reload_enabled(&self) -> bool {
+        self.get(settings::UNITY_HOT_RELOAD_ENABLED)
+    }
+
+    pub fn set_unity_hot_reload_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_HOT_RELOAD_ENABLED, value)
+    }
+
+    pub fn unity_external_editor_default_enabled(&self) -> bool {
+        self.get(settings::UNITY_EXTERNAL_EDITOR_AUTO_SELECT)
+    }
+
+    pub fn set_unity_external_editor_default_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_EXTERNAL_EDITOR_AUTO_SELECT, value)
+    }
+
+    pub fn unity_native_bridge_enabled(&self) -> bool {
+        self.get(settings::UNITY_CONNECTION_NATIVE_BRIDGE)
+    }
+
+    pub fn set_unity_native_bridge_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_CONNECTION_NATIVE_BRIDGE, value)
+    }
+
+    pub fn unity_inline_force_evaluate_enabled(&self) -> bool {
+        self.get(settings::UNITY_HOT_RELOAD_INLINE_FORCE_EVALUATE)
+    }
+
+    pub fn set_unity_inline_force_evaluate_enabled(&self, value: bool) -> Result<(), String> {
+        self.set(settings::UNITY_HOT_RELOAD_INLINE_FORCE_EVALUATE, value)
+    }
+
+    pub fn code_analysis_tools(&self) -> CodeAnalysisToolsConfig {
+        CodeAnalysisToolsConfig::from_settings(&self.store)
+    }
+
+    pub fn set_code_analysis_tools(&self, value: CodeAnalysisToolsConfig) -> Result<(), String> {
+        let changes = [
+            (settings::UNITY_CODE_ANALYSIS_SYMBOL_SEARCH, value.code_symbol_search),
+            (settings::UNITY_CODE_ANALYSIS_GOTO_DEFINITION, value.code_goto_definition),
+            (settings::UNITY_CODE_ANALYSIS_FIND_REFERENCES, value.code_find_references),
+            (settings::UNITY_CODE_ANALYSIS_DIAGNOSTICS, value.code_diagnostics),
+            (settings::UNITY_CODE_ANALYSIS_EDIT_WRITE_DIAGNOSTICS, value.edit_write_diagnostics),
+            (settings::UNITY_CODE_ANALYSIS_HOVER, value.code_hover),
+            (settings::UNITY_CODE_ANALYSIS_UNITY_CODE_USAGES, value.unity_code_usages),
+            (settings::UNITY_CODE_ANALYSIS_UNITY_ANALYZERS, value.unity_analyzers),
+        ]
+        .map(|(key, enabled)| (key.index(), Value::Bool(enabled)));
+        self.store
+            .set_values(&changes)
+            .map(|_| ())
+            .map_err(String::from)
     }
 
     pub fn llm_retry_max_attempts(&self) -> u32 {
-        crate::llm::retry::clamp_max_retries(self.llm_retry_max_attempts.load(Ordering::Relaxed))
+        self.get(settings::AGENT_LLM_RETRY_MAX_ATTEMPTS)
     }
 
     pub fn set_llm_retry_max_attempts(&self, value: u32) -> Result<(), String> {
-        self.llm_retry_max_attempts.store(
+        self.set(
+            settings::AGENT_LLM_RETRY_MAX_ATTEMPTS,
             crate::llm::retry::clamp_max_retries(value),
-            Ordering::Relaxed,
-        );
-        self.persist()
+        )
     }
 
     pub fn llm_strip_inline_think_tags(&self) -> bool {
-        self.llm_strip_inline_think_tags.load(Ordering::Relaxed)
+        self.get(settings::AGENT_LLM_STRIP_INLINE_THINK_TAGS)
     }
 
     pub fn subagent_max_depth(&self) -> u32 {
-        clamp_subagent_max_depth(self.subagent_max_depth.load(Ordering::Relaxed))
+        self.get(settings::AGENT_SUBAGENT_MAX_DEPTH)
     }
 
     pub fn set_subagent_max_depth(&self, value: u32) -> Result<(), String> {
-        self.subagent_max_depth
-            .store(clamp_subagent_max_depth(value), Ordering::Relaxed);
-        self.persist()
+        self.set(
+            settings::AGENT_SUBAGENT_MAX_DEPTH,
+            clamp_subagent_max_depth(value),
+        )
     }
 
     pub fn subagent_max_concurrent(&self) -> u32 {
-        clamp_subagent_max_concurrent(self.subagent_max_concurrent.load(Ordering::Relaxed))
+        self.get(settings::AGENT_SUBAGENT_MAX_CONCURRENT)
     }
 
     pub fn set_subagent_max_concurrent(&self, value: u32) -> Result<(), String> {
-        self.subagent_max_concurrent
-            .store(clamp_subagent_max_concurrent(value), Ordering::Relaxed);
-        self.persist()
+        self.set(
+            settings::AGENT_SUBAGENT_MAX_CONCURRENT,
+            clamp_subagent_max_concurrent(value),
+        )
     }
 
     pub fn workspace_service_resource_limits(&self) -> WorkspaceServiceResourceLimits {
-        self.try_workspace_service_resource_limits()
-            .unwrap_or_default()
+        WorkspaceServiceResourceLimits {
+            workspace_idle_timeout_secs: self
+                .get(settings::WORKSPACE_RESOURCES_WORKSPACE_IDLE_TIMEOUT_SECS),
+            service_idle_timeout_secs: self
+                .get(settings::WORKSPACE_RESOURCES_SERVICE_IDLE_TIMEOUT_SECS),
+            lsp_idle_timeout_secs: self.get(settings::WORKSPACE_RESOURCES_LSP_IDLE_TIMEOUT_SECS),
+            blender_max_background_instances: self
+                .get(settings::BLENDER_RESOURCES_MAX_BACKGROUND_INSTANCES),
+            blender_background_idle_timeout_secs: self
+                .get(settings::BLENDER_RESOURCES_BACKGROUND_IDLE_TIMEOUT_SECS),
+        }
     }
 
     pub fn try_workspace_service_resource_limits(
         &self,
     ) -> Result<WorkspaceServiceResourceLimits, String> {
-        self.workspace_service_resource_limits
-            .lock()
-            .map(|limits| limits.clone())
-            .map_err(|error| format!("workspace service resource limits lock poisoned: {error}"))
+        Ok(self.workspace_service_resource_limits())
     }
 
-    /// Persist a complete, validated resource-policy replacement and expose
-    /// it in memory only after the on-disk config has been atomically replaced.
-    /// A failed write leaves the prior in-memory snapshot untouched.
+    /// Persists a complete, validated resource-policy replacement. A failed
+    /// write leaves the prior values untouched.
     pub fn set_workspace_service_resource_limits(
         &self,
         value: WorkspaceServiceResourceLimits,
     ) -> Result<(), WorkspaceServiceResourceLimitsUpdateError> {
         value.validate()?;
-
-        let _persist_guard = self.persist_lock.lock().map_err(|error| {
-            WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                message: format!("config persistence lock poisoned: {error}"),
-            }
-        })?;
-        let path = self
-            .config_path
-            .lock()
-            .map_err(
-                |error| WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                    message: format!("config path lock poisoned: {error}"),
-                },
-            )?
-            .clone()
-            .ok_or_else(|| WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                message: "config path is unknown; cannot persist".to_string(),
-            })?;
-
-        // Serialize a candidate whole-file snapshot without mutating the live
-        // limits. Holding `persist_lock` makes this candidate authoritative
-        // with respect to every other config file replacement.
-        let mut candidate = serde_json::to_value(self).map_err(|error| {
-            WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                message: format!("failed to serialize config: {error}"),
-            }
-        })?;
-        let object = candidate.as_object_mut().ok_or_else(|| {
-            WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                message: "serialized config is not an object".to_string(),
-            }
-        })?;
-        object.insert(
-            "workspace_service_resource_limits".to_string(),
-            serde_json::to_value(&value).map_err(|error| {
-                WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                    message: format!(
-                        "failed to serialize workspace service resource limits: {error}"
-                    ),
+        let changes = [
+            (
+                settings::WORKSPACE_RESOURCES_WORKSPACE_IDLE_TIMEOUT_SECS.index(),
+                Value::from(value.workspace_idle_timeout_secs),
+            ),
+            (
+                settings::WORKSPACE_RESOURCES_SERVICE_IDLE_TIMEOUT_SECS.index(),
+                Value::from(value.service_idle_timeout_secs),
+            ),
+            (
+                settings::WORKSPACE_RESOURCES_LSP_IDLE_TIMEOUT_SECS.index(),
+                Value::from(value.lsp_idle_timeout_secs),
+            ),
+            (
+                settings::BLENDER_RESOURCES_MAX_BACKGROUND_INSTANCES.index(),
+                Value::from(value.blender_max_background_instances),
+            ),
+            (
+                settings::BLENDER_RESOURCES_BACKGROUND_IDLE_TIMEOUT_SECS.index(),
+                Value::from(value.blender_background_idle_timeout_secs),
+            ),
+        ];
+        self.store
+            .set_values(&changes)
+            .map(|_| ())
+            .map_err(|error| match error.code {
+                "settings.persist_failed" => {
+                    WorkspaceServiceResourceLimitsUpdateError::Persistence {
+                        message: error.message,
+                    }
                 }
-            })?,
-        );
-        let json = serde_json::to_string_pretty(&candidate).map_err(|error| {
-            WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                message: format!("failed to serialize config: {error}"),
-            }
-        })?;
-
-        // Acquire the state lock before writing. This detects poison before
-        // the disk commit and keeps readers on the old snapshot until the
-        // atomic replacement has succeeded.
-        let mut current = self
-            .workspace_service_resource_limits
-            .lock()
-            .map_err(
-                |error| WorkspaceServiceResourceLimitsUpdateError::Persistence {
-                    message: format!("workspace service resource limits lock poisoned: {error}"),
+                _ => WorkspaceServiceResourceLimitsUpdateError::Validation {
+                    fields: vec![WorkspaceServiceResourceLimitFieldError {
+                        field: error
+                            .key
+                            .as_deref()
+                            .and_then(|key| key.rsplit('.').next())
+                            .unwrap_or_default()
+                            .to_string(),
+                        message: error.message,
+                    }],
                 },
-            )?;
-        atomic_write_config(&path, json.as_bytes()).map_err(|message| {
-            WorkspaceServiceResourceLimitsUpdateError::Persistence { message }
-        })?;
-        *current = value;
-        Ok(())
-    }
-
-    fn persist(&self) -> Result<(), String> {
-        let _persist_guard = self
-            .persist_lock
-            .lock()
-            .map_err(|e| format!("config persistence lock poisoned: {}", e))?;
-        let path = self
-            .config_path
-            .lock()
-            .map_err(|e| format!("config path lock poisoned: {}", e))?
-            .clone();
-        let Some(path) = path else {
-            return Err("config path is unknown; cannot persist".to_string());
-        };
-        Self::persist_to_path(self, &path)
-    }
-
-    fn persist_to_path(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!("failed to create config dir '{}': {}", parent.display(), e)
-            })?;
-        }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("failed to serialize config: {}", e))?;
-        atomic_write_config(path, json.as_bytes())
+            })
     }
 }
 
@@ -1474,903 +791,215 @@ pub(crate) fn atomic_write_config(path: &Path, contents: &[u8]) -> Result<(), St
     })
 }
 
-fn stable_config_path(data_dir: &Path) -> PathBuf {
-    crate::commands::persistent_config_dir()
-        .map(|dir| dir.join(CONFIG_FILE_NAME))
-        .unwrap_or_else(|err| {
-            eprintln!(
-                "[Locus] failed to resolve persistent config dir, falling back to runtime storage: {}",
-                err
-            );
-            data_dir.join(CONFIG_FILE_NAME)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
 
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
+    fn settings_file(dir: &Path) -> Value {
+        serde_json::from_str(
+            &fs::read_to_string(dir.join(settings::store::SETTINGS_FILE_NAME)).expect("settings file"),
+        )
+        .expect("settings json")
     }
 
-    impl EnvGuard {
-        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
-            let saved = vars
-                .iter()
-                .map(|(key, value)| {
-                    let previous = std::env::var(key).ok();
-                    match value {
-                        Some(next) => std::env::set_var(key, next),
-                        None => std::env::remove_var(key),
-                    }
-                    (*key, previous)
-                })
-                .collect();
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.saved.drain(..).rev() {
-                match value {
-                    Some(previous) => std::env::set_var(key, previous),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
+    fn load_legacy(dir: &Path, legacy: &str) -> AppConfig {
+        let config_path = dir.join(LEGACY_CONFIG_FILE_NAME);
+        fs::write(&config_path, legacy).expect("legacy config");
+        AppConfig::load_from_path(&config_path)
     }
 
     #[test]
-    fn load_from_path_does_not_persist_openrouter_key_from_env() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
-        let _env_guard = EnvGuard::set(&[
-            ("OPENROUTER_API_KEY", Some("or-secret-value")),
-            ("LOCUS_MODEL", Some("test-model")),
-            ("LOCUS_BASE_URL", None),
-            ("LOCUS_DEBUG", Some("0")),
-        ]);
+    fn legacy_config_is_imported_once_and_never_rewritten() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-
-        let config = AppConfig::load_from_path(&config_path);
-        let written = fs::read_to_string(&config_path).expect("written config");
-
-        assert_eq!(config.model, "test-model");
-        assert!(!written.contains("api_key"));
-        assert!(!written.contains("or-secret-value"));
-    }
-
-    #[test]
-    fn load_from_path_scrubs_legacy_api_key_from_file() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
+        let legacy = r#"{
   "api_key": "or-legacy-secret",
   "model": "legacy-model",
   "base_url": "https://example.com",
-  "debug": true
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-        let written = fs::read_to_string(&config_path).expect("scrubbed config");
-
-        assert_eq!(config.model, "legacy-model");
-        assert_eq!(config.base_url.as_deref(), Some("https://example.com"));
+  "debug": true,
+  "dynamic_tool_loading_native_migrated": true,
+  "async_tasks_default_enabled_migrated": true,
+  "workspace_service_ttl_hour_migrated": true
+}"#;
+        let config = load_legacy(temp.path(), legacy);
         assert!(config.debug_enabled());
-        assert!(!config.file_tool_workspace_boundary_enabled());
-        assert!(!written.contains("api_key"));
+
+        config.set_debug_enabled(false).expect("persist debug");
+        assert_eq!(
+            fs::read_to_string(temp.path().join(LEGACY_CONFIG_FILE_NAME)).unwrap(),
+            legacy
+        );
+        let written = settings_file(temp.path()).to_string();
         assert!(!written.contains("or-legacy-secret"));
+        assert!(!written.contains("legacy-model"));
+        assert!(!written.contains("example.com"));
+
+        // settings.json now wins over the legacy file.
+        let reloaded = AppConfig::load_from_path(&temp.path().join(LEGACY_CONFIG_FILE_NAME));
+        assert!(!reloaded.debug_enabled());
     }
 
     #[test]
-    fn file_tool_workspace_boundary_defaults_to_disabled() {
+    fn fresh_install_uses_defaults() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
+        let config = AppConfig::load_from_path(&temp.path().join(LEGACY_CONFIG_FILE_NAME));
 
         assert!(!config.file_tool_workspace_boundary_enabled());
-    }
-
-    #[test]
-    fn close_behavior_defaults_to_exit() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
         assert_eq!(config.close_behavior(), AppCloseBehavior::Exit);
-    }
-
-    #[test]
-    fn dynamic_tool_loading_mode_defaults_to_native() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert_eq!(
-            config.dynamic_tool_loading_mode(),
-            DynamicToolLoadingMode::Native
-        );
-    }
-
-    #[test]
-    fn dynamic_tool_loading_mode_migrates_persisted_value_to_native_once() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false,
-  "dynamic_tool_loading_mode": "metaTool"
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        // Pre-migration values — even manual ones — flip to native once.
-        assert_eq!(
-            config.dynamic_tool_loading_mode(),
-            DynamicToolLoadingMode::Native
-        );
-        let written = fs::read_to_string(&config_path).expect("rewritten config");
-        assert!(written.contains("\"dynamic_tool_loading_native_migrated\": true"));
-        assert!(written.contains("\"dynamic_tool_loading_mode\": \"native\""));
-    }
-
-    #[test]
-    fn dynamic_tool_loading_mode_user_choice_sticks_after_migration() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false,
-  "dynamic_tool_loading_mode": "metaTool",
-  "dynamic_tool_loading_native_migrated": true
-}"#,
-        )
-        .expect("migrated config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert_eq!(
-            config.dynamic_tool_loading_mode(),
-            DynamicToolLoadingMode::MetaTool
-        );
-    }
-
-    #[test]
-    fn anthropic_native_lazy_enabled_defaults_to_true_and_persists_opt_out() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
+        assert_eq!(config.dynamic_tool_loading_mode(), DynamicToolLoadingMode::Native);
         assert!(config.anthropic_native_lazy_enabled());
-
-        config
-            .set_anthropic_native_lazy_enabled(false)
-            .expect("persist opt-out");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(!reloaded.anthropic_native_lazy_enabled());
-    }
-
-    #[test]
-    fn async_tasks_legacy_missing_setting_enables_once_and_persists_opt_out() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-        assert!(config.async_tasks_enabled());
-
-        config
-            .set_async_tasks_enabled(false)
-            .expect("persist async task opt-out");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(!reloaded.async_tasks_enabled());
-    }
-
-    #[test]
-    fn async_tasks_fresh_install_enables_and_preserves_later_opt_out() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-        assert!(config.async_tasks_enabled());
-        let saved: Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(saved["async_tasks_enabled"], true);
-        assert_eq!(saved["async_tasks_default_enabled_migrated"], true);
-        config.set_async_tasks_enabled(false).unwrap();
-        assert!(!AppConfig::load_from_path(&config_path).async_tasks_enabled());
-    }
-
-    #[test]
-    fn async_tasks_existing_disabled_setting_is_upgraded_once() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{
-            "model": "legacy-model", "debug": false, "async_tasks_enabled": false
-        }"#).unwrap();
-        let config = AppConfig::load_from_path(&config_path);
-        assert!(config.async_tasks_enabled());
-        let saved = fs::read_to_string(&config_path).unwrap();
-        let (_, rewritten) = AppConfig::parse_content(&saved, None).unwrap();
-        assert!(!rewritten, "loading a migrated configuration must be idempotent");
-        config.set_async_tasks_enabled(false).unwrap();
-        assert!(!AppConfig::load_from_path(&config_path).async_tasks_enabled());
-    }
-
-    #[test]
-    fn unity_multi_agent_editor_defaults_to_disabled_and_persists_opt_in() {
-        let _gate = crate::unity_editor_lock::test_gate();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
         assert!(!config.unity_multi_agent_editor_enabled());
-
-        config
-            .set_unity_multi_agent_editor_enabled(true)
-            .expect("persist Unity multi-Agent Editor opt-in");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(reloaded.unity_multi_agent_editor_enabled());
-        crate::unity_editor_lock::set_enabled(false);
-    }
-
-    #[test]
-    fn claude_code_cli_defaults_to_disabled_and_persists_opt_in() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{ "model": "legacy-model", "debug": false }"#)
-            .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-        assert!(!config.claude_code_cli_enabled());
-
-        config
-            .set_claude_code_cli_enabled(true)
-            .expect("persist Claude Code CLI opt-in");
-        assert!(AppConfig::load_from_path(&config_path).claude_code_cli_enabled());
-    }
-
-    #[test]
-    fn claude_code_cli_migrates_model_defaults_opt_in_once() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let defaults_path = temp.path().join(LEGACY_MODEL_DEFAULTS_FILE_NAME);
-        fs::write(&config_path, r#"{ "model": "legacy-model", "debug": false }"#)
-            .expect("legacy config");
-        fs::write(&defaults_path, r#"{ "mainModel": "", "claudeCodeEnabled": true }"#)
-            .expect("legacy model defaults");
-
-        let config = AppConfig::load_from_path(&config_path);
-        assert!(config.claude_code_cli_enabled());
-        let saved: Value =
-            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(saved[CLAUDE_CODE_CLI_ENABLED_KEY], true);
-
-        // Later choices win over the legacy model configuration value.
-        config.set_claude_code_cli_enabled(false).unwrap();
-        let saved = fs::read_to_string(&config_path).unwrap();
-        let (_, rewritten) = AppConfig::parse_content(&saved, Some(temp.path())).unwrap();
-        assert!(!rewritten, "loading a migrated configuration must be idempotent");
-        assert!(!AppConfig::load_from_path(&config_path).claude_code_cli_enabled());
-    }
-
-    #[test]
-    fn claude_code_cli_fresh_config_inherits_model_defaults_opt_in() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            temp.path().join(LEGACY_MODEL_DEFAULTS_FILE_NAME),
-            r#"{ "claudeCodeEnabled": true }"#,
-        )
-        .expect("legacy model defaults");
-
-        assert!(AppConfig::load_from_path(&config_path).claude_code_cli_enabled());
-    }
-
-    #[test]
-    fn default_skill_package_namespace_defaults_to_empty() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert_eq!(config.default_skill_package_namespace(), "");
-    }
-
-    #[test]
-    fn unity_sidecar_compiler_defaults_to_enabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
+        assert!(config.default_skill_package_namespace().is_empty());
         assert!(config.unity_sidecar_compiler_enabled());
-    }
-
-    #[test]
-    fn unity_non_public_access_defaults_to_enabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
         assert!(config.unity_non_public_access_enabled());
-    }
-
-    #[test]
-    fn unity_hot_reload_defaults_to_disabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
         assert!(!config.unity_hot_reload_enabled());
-    }
-
-    #[test]
-    fn tool_failure_log_defaults_to_disabled_and_persists() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{"model":"legacy-model"}"#).expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
         assert!(!config.tool_failure_log_enabled());
-
-        config
-            .set_tool_failure_log_enabled(true)
-            .expect("persist tool failure log setting");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(reloaded.tool_failure_log_enabled());
-    }
-
-    #[test]
-    fn session_undo_defaults_to_enabled_and_persists() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{"model":"legacy-model"}"#).expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
         assert!(config.session_undo_enabled());
-
-        config
-            .set_session_undo_enabled(false)
-            .expect("persist session undo setting");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(!reloaded.session_undo_enabled());
-    }
-
-    #[test]
-    fn unity_external_editor_default_is_opt_in_and_persists() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(&config_path, r#"{"model":"legacy-model"}"#).expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
         assert!(!config.unity_external_editor_default_enabled());
-
-        config
-            .set_unity_external_editor_default_enabled(true)
-            .expect("persist external editor default");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(reloaded.unity_external_editor_default_enabled());
-    }
-
-    #[test]
-    fn unity_native_bridge_defaults_to_enabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        // The native command channel is the default transport; a legacy config
-        // that predates the flag opts in to the required broker path.
         assert!(config.unity_native_bridge_enabled());
-    }
-
-    #[test]
-    fn unity_native_bridge_respects_explicit_opt_out() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "unity_native_bridge_enabled": false
-}"#,
-        )
-        .expect("opt-out config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert!(!config.unity_native_bridge_enabled());
-    }
-
-    #[test]
-    fn unity_inline_force_evaluate_defaults_to_enabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        // Phase D rollout: a config that predates the flag gets force-evaluation on.
         assert!(config.unity_inline_force_evaluate_enabled());
-    }
-
-    #[test]
-    fn unity_embed_defaults_to_enabled_and_respects_opt_out() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let default_path = temp.path().join("default-config.json");
-        fs::write(&default_path, r#"{"model":"legacy-model"}"#).expect("legacy config");
-        let default_config = AppConfig::load_from_path(&default_path);
-        assert!(default_config.unity_embed_enabled());
-
-        let disabled_path = temp.path().join("disabled-config.json");
-        fs::write(
-            &disabled_path,
-            r#"{"model":"legacy-model","unity_embed_enabled":false}"#,
-        )
-        .expect("disabled config");
-        let disabled_config = AppConfig::load_from_path(&disabled_path);
-        assert!(!disabled_config.unity_embed_enabled());
-    }
-
-    #[test]
-    fn unity_inline_force_evaluate_respects_explicit_opt_out() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "unity_inline_force_evaluate_enabled": false
-}"#,
-        )
-        .expect("opt-out config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert!(!config.unity_inline_force_evaluate_enabled());
-    }
-
-    #[test]
-    fn code_analysis_diagnostics_defaults_are_split() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert!(!config.code_analysis_tools().code_diagnostics);
-        assert!(config.code_analysis_tools().edit_write_diagnostics);
-    }
-
-    #[test]
-    fn unity_background_hook_defaults_to_enabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
+        assert!(config.unity_embed_enabled());
         assert!(config.unity_background_hook_enabled());
-    }
-
-    #[test]
-    fn close_behavior_persists_minimize_to_tray() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_close_behavior(AppCloseBehavior::MinimizeToTray)
-            .expect("persist close behavior");
-
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(reloaded.close_behavior(), AppCloseBehavior::MinimizeToTray);
-    }
-
-    #[test]
-    fn dynamic_tool_loading_mode_persists_direct() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_dynamic_tool_loading_mode(DynamicToolLoadingMode::Direct)
-            .expect("persist dynamic tool loading mode");
-
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(
-            reloaded.dynamic_tool_loading_mode(),
-            DynamicToolLoadingMode::Direct
-        );
-    }
-
-    #[test]
-    fn default_skill_package_namespace_persists() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_default_skill_package_namespace("studio.tools".to_string())
-            .expect("persist skill package namespace");
-
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(reloaded.default_skill_package_namespace(), "studio.tools");
-    }
-
-    #[test]
-    fn worktree_root_defaults_to_unset_and_persists() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
+        assert_eq!(config.code_analysis_tools(), CodeAnalysisToolsConfig::default());
         assert_eq!(config.worktree_root(), None);
-
-        let root = temp.path().join("worktrees");
-        config
-            .set_worktree_root(Some(&root))
-            .expect("persist worktree root");
         assert_eq!(
-            AppConfig::load_from_path(&config_path).worktree_root(),
-            Some(root)
+            config.llm_retry_max_attempts(),
+            crate::llm::retry::DEFAULT_MAX_RETRIES
         );
-
-        config.set_worktree_root(None).expect("clear worktree root");
-        assert_eq!(AppConfig::load_from_path(&config_path).worktree_root(), None);
-    }
-
-    #[test]
-    fn unity_background_hook_persists_disabled() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_unity_background_hook_enabled(false)
-            .expect("persist unity background hook setting");
-
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert!(!reloaded.unity_background_hook_enabled());
-    }
-
-    #[test]
-    fn llm_retry_max_attempts_defaults_to_three() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
-        // A config that predates the field keeps the historical retry count.
-        assert_eq!(config.llm_retry_max_attempts(), 3);
-    }
-
-    #[test]
-    fn llm_retry_max_attempts_persists_zero_and_clamps_large_values() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_llm_retry_max_attempts(0)
-            .expect("persist retry opt-out");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(reloaded.llm_retry_max_attempts(), 0);
-
-        config
-            .set_llm_retry_max_attempts(99)
-            .expect("persist clamped retry count");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(
-            reloaded.llm_retry_max_attempts(),
-            crate::llm::retry::MAX_RETRIES_LIMIT
-        );
-    }
-
-    #[test]
-    fn subagent_limits_default_for_legacy_config() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "debug": false
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
-
         assert_eq!(config.subagent_max_depth(), DEFAULT_SUBAGENT_MAX_DEPTH);
-        assert_eq!(
-            config.subagent_max_concurrent(),
-            DEFAULT_SUBAGENT_MAX_CONCURRENT
-        );
-    }
-
-    #[test]
-    fn subagent_limits_persist_and_clamp() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-
-        config
-            .set_subagent_max_depth(3)
-            .expect("persist subagent depth");
-        config
-            .set_subagent_max_concurrent(5)
-            .expect("persist subagent concurrency");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(reloaded.subagent_max_depth(), 3);
-        assert_eq!(reloaded.subagent_max_concurrent(), 5);
-
-        // 0 and oversized values clamp into range instead of persisting raw.
-        config
-            .set_subagent_max_depth(0)
-            .expect("persist clamped depth");
-        config
-            .set_subagent_max_concurrent(999)
-            .expect("persist clamped concurrency");
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(reloaded.subagent_max_depth(), 1);
-        assert_eq!(
-            reloaded.subagent_max_concurrent(),
-            SUBAGENT_MAX_CONCURRENT_LIMIT
-        );
-    }
-
-    #[test]
-    fn workspace_service_resource_limits_default_for_legacy_config_and_persist_on_next_save() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "dynamic_tool_loading_native_migrated": true
-}"#,
-        )
-        .expect("legacy config");
-
-        let config = AppConfig::load_from_path(&config_path);
+        assert_eq!(config.subagent_max_concurrent(), DEFAULT_SUBAGENT_MAX_CONCURRENT);
         assert_eq!(
             config.workspace_service_resource_limits(),
             WorkspaceServiceResourceLimits::default()
         );
+        assert_eq!(settings_file(temp.path()), serde_json::json!({ "version": settings::store::SETTINGS_VERSION }));
+    }
 
+    #[test]
+    fn enum_settings_round_trip() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(LEGACY_CONFIG_FILE_NAME);
+        let config = AppConfig::load_from_path(&path);
         config
-            .set_debug_enabled(true)
-            .expect("persist config with resource defaults");
-        let persisted: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&config_path).expect("read persisted config"))
-                .expect("parse persisted config");
-        let limits = &persisted["workspace_service_resource_limits"];
-        assert!(limits.get("maxReadyWorkspaceRuntimes").is_none());
-        assert_eq!(limits["workspaceIdleTimeoutSecs"], 600);
-        assert_eq!(limits["serviceIdleTimeoutSecs"], 3600);
-        assert_eq!(limits["lspIdleTimeoutSecs"], 600);
+            .set_close_behavior(AppCloseBehavior::MinimizeToTray)
+            .unwrap();
+        config
+            .set_dynamic_tool_loading_mode(DynamicToolLoadingMode::MetaTool)
+            .unwrap();
+
+        let reloaded = AppConfig::load_from_path(&path);
+        assert_eq!(reloaded.close_behavior(), AppCloseBehavior::MinimizeToTray);
+        assert_eq!(
+            reloaded.dynamic_tool_loading_mode(),
+            DynamicToolLoadingMode::MetaTool
+        );
+        assert_eq!(
+            settings_file(temp.path())["system"]["closeBehavior"],
+            "minimizeToTray"
+        );
     }
 
     #[test]
-    fn legacy_resource_caps_are_ignored_and_removed_without_resetting_idle_preferences() {
+    fn opt_outs_and_opt_ins_persist() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let legacy = serde_json::json!({
-            "model": "legacy-model",
-            "dynamic_tool_loading_native_migrated": true,
-            "workspace_service_ttl_hour_migrated": true,
-            "workspace_service_resource_limits": {
-                "maxRunningSessions": 1, "maxUnityEditors": 1,
-                "maxRunningWorkspaceServices": 1, "maxWatchedWorkspaces": 1,
-                "maxLspProcesses": 1, "maxConcurrentServiceStarts": 1,
-                "maxConcurrentCompileJobs": 1, "maxCompileQueueDepth": 1,
-                "workspaceIdleTimeoutSecs": 321,
-                "serviceIdleTimeoutSecs": 900,
-                "lspIdleTimeoutSecs": 123
-            }
-        });
-        fs::write(&config_path, legacy.to_string()).unwrap();
-        let config = AppConfig::load_from_path(&config_path);
-        let expected = WorkspaceServiceResourceLimits {
-            workspace_idle_timeout_secs: 321,
-            service_idle_timeout_secs: 900,
-            lsp_idle_timeout_secs: 123,
+        let path = temp.path().join(LEGACY_CONFIG_FILE_NAME);
+        let config = AppConfig::load_from_path(&path);
+        config.set_anthropic_native_lazy_enabled(false).unwrap();
+        config.set_unity_embed_enabled(false).unwrap();
+        config.set_unity_native_bridge_enabled(false).unwrap();
+        config.set_unity_background_hook_enabled(false).unwrap();
+        config.set_tool_failure_log_enabled(true).unwrap();
+        config.set_unity_external_editor_default_enabled(true).unwrap();
+        config
+            .set_default_skill_package_namespace("acme".to_string())
+            .unwrap();
+        let worktrees = tempfile::tempdir().expect("worktree root");
+        config.set_worktree_root(Some(worktrees.path())).unwrap();
+        let worktree_root = dunce::canonicalize(worktrees.path()).unwrap();
+
+        let reloaded = AppConfig::load_from_path(&path);
+        assert!(!reloaded.anthropic_native_lazy_enabled());
+        assert!(!reloaded.unity_embed_enabled());
+        assert!(!reloaded.unity_native_bridge_enabled());
+        assert!(!reloaded.unity_background_hook_enabled());
+        assert!(reloaded.tool_failure_log_enabled());
+        assert!(reloaded.unity_external_editor_default_enabled());
+        assert_eq!(reloaded.default_skill_package_namespace(), "acme");
+        assert_eq!(reloaded.worktree_root(), Some(worktree_root));
+        assert!(reloaded
+            .set_worktree_root(Some(Path::new("Z:/does/not/exist")))
+            .is_err());
+
+        reloaded.set_worktree_root(None).unwrap();
+        assert_eq!(AppConfig::load_from_path(&path).worktree_root(), None);
+    }
+
+    #[test]
+    fn code_analysis_tools_round_trip_as_individual_settings() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(LEGACY_CONFIG_FILE_NAME);
+        let config = AppConfig::load_from_path(&path);
+        let value = CodeAnalysisToolsConfig {
+            code_diagnostics: true,
+            unity_analyzers: false,
+            ..Default::default()
         };
-        assert_eq!(config.workspace_service_resource_limits(), expected);
-        config.set_debug_enabled(true).unwrap();
-        let persisted: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(persisted["workspace_service_resource_limits"], serde_json::to_value(&expected).unwrap());
-        assert_eq!(AppConfig::load_from_path(&config_path).workspace_service_resource_limits(), expected);
+        config.set_code_analysis_tools(value).unwrap();
+
+        assert_eq!(AppConfig::load_from_path(&path).code_analysis_tools(), value);
+        assert_eq!(
+            settings_file(temp.path())["unity"]["codeAnalysis"]["tools"],
+            serde_json::json!({ "codeDiagnostics": true, "unityAnalyzers": false })
+        );
     }
 
     #[test]
-    fn workspace_service_idle_ttl_migrates_existing_configs_to_one_hour_once() {
+    fn counts_persist_and_clamp() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "legacy-model",
-  "dynamic_tool_loading_native_migrated": true,
-  "workspace_service_resource_limits": {
-    "serviceIdleTimeoutSecs": 600
-  }
-}"#,
-        )
-        .expect("legacy config");
+        let path = temp.path().join(LEGACY_CONFIG_FILE_NAME);
+        let config = AppConfig::load_from_path(&path);
 
-        let config = AppConfig::load_from_path(&config_path);
+        config.set_llm_retry_max_attempts(0).unwrap();
+        config.set_subagent_max_depth(3).unwrap();
+        config.set_subagent_max_concurrent(5).unwrap();
+        let reloaded = AppConfig::load_from_path(&path);
+        assert_eq!(reloaded.llm_retry_max_attempts(), 0);
+        assert_eq!(reloaded.subagent_max_depth(), 3);
+        assert_eq!(reloaded.subagent_max_concurrent(), 5);
 
+        config.set_llm_retry_max_attempts(999).unwrap();
+        config.set_subagent_max_depth(0).unwrap();
+        config.set_subagent_max_concurrent(999).unwrap();
+        let reloaded = AppConfig::load_from_path(&path);
         assert_eq!(
-            config
-                .workspace_service_resource_limits()
-                .service_idle_timeout_secs,
-            3600
+            reloaded.llm_retry_max_attempts(),
+            crate::llm::retry::MAX_RETRIES_LIMIT
         );
-        let written = fs::read_to_string(&config_path).expect("rewritten config");
-        assert!(written.contains("\"workspace_service_ttl_hour_migrated\": true"));
-        assert!(written.contains("\"serviceIdleTimeoutSecs\": 3600"));
+        assert_eq!(reloaded.subagent_max_depth(), 1);
+        assert_eq!(reloaded.subagent_max_concurrent(), SUBAGENT_MAX_CONCURRENT_LIMIT);
     }
 
     #[test]
-    fn workspace_service_idle_ttl_keeps_post_migration_user_value() {
+    fn process_override_disables_unity_embed_without_persisting() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"{
-  "model": "configured-model",
-  "dynamic_tool_loading_native_migrated": true,
-  "workspace_service_ttl_hour_migrated": true,
-  "workspace_service_resource_limits": {
-    "serviceIdleTimeoutSecs": 7200
-  }
-}"#,
-        )
-        .expect("configured config");
+        let path = temp.path().join(LEGACY_CONFIG_FILE_NAME);
+        let config = AppConfig::load_from_path(&path);
+        config.disable_unity_embed_for_process();
+        assert!(!config.unity_embed_enabled());
+        assert!(AppConfig::load_from_path(&path).unity_embed_enabled());
+    }
 
-        let config = AppConfig::load_from_path(&config_path);
-
-        assert_eq!(
-            config
-                .workspace_service_resource_limits()
-                .service_idle_timeout_secs,
-            7200
+    #[test]
+    fn shared_debug_flag_follows_the_setting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = load_legacy(
+            temp.path(),
+            r#"{ "debug": true, "dynamic_tool_loading_native_migrated": true }"#,
         );
+        let flag = Arc::new(AtomicBool::new(false));
+        config.share_debug_flag(flag.clone());
+        assert!(flag.load(Ordering::Relaxed));
+        config.set_debug_enabled(false).unwrap();
+        assert!(!flag.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -2379,6 +1008,7 @@ mod tests {
             workspace_idle_timeout_secs: 0,
             service_idle_timeout_secs: 0,
             lsp_idle_timeout_secs: 0,
+            ..Default::default()
         };
 
         let errors = invalid.validate().expect_err("all zero values are invalid");
@@ -2412,9 +1042,11 @@ mod tests {
     #[test]
     fn workspace_service_resource_limits_set_is_transactional_on_persistence_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config-target-is-a-directory");
-        fs::create_dir(&config_path).expect("create invalid config target");
-        let config = AppConfig::load_from_path(&config_path);
+        let path = temp.path().join(LEGACY_CONFIG_FILE_NAME);
+        let config = AppConfig::load_from_path(&path);
+        let settings_path = temp.path().join(settings::store::SETTINGS_FILE_NAME);
+        fs::remove_file(&settings_path).unwrap();
+        fs::create_dir(&settings_path).expect("make the settings target unwritable");
         let before = config.workspace_service_resource_limits();
         let mut candidate = before.clone();
         candidate.lsp_idle_timeout_secs = 180;
@@ -2433,18 +1065,23 @@ mod tests {
     #[test]
     fn workspace_service_resource_limits_set_persists_complete_replacement() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = temp.path().join("config.json");
-        let config = AppConfig::load_from_path(&config_path);
-        let mut candidate = WorkspaceServiceResourceLimits::default();
-        candidate.lsp_idle_timeout_secs = 180;
-        candidate.service_idle_timeout_secs = 900;
+        let path = temp.path().join(LEGACY_CONFIG_FILE_NAME);
+        let config = AppConfig::load_from_path(&path);
+        let candidate = WorkspaceServiceResourceLimits {
+            lsp_idle_timeout_secs: 180,
+            service_idle_timeout_secs: 900,
+            blender_max_background_instances: 4,
+            ..Default::default()
+        };
 
         config
             .set_workspace_service_resource_limits(candidate.clone())
             .expect("persist resource limits");
 
         assert_eq!(config.workspace_service_resource_limits(), candidate);
-        let reloaded = AppConfig::load_from_path(&config_path);
-        assert_eq!(reloaded.workspace_service_resource_limits(), candidate);
+        assert_eq!(
+            AppConfig::load_from_path(&path).workspace_service_resource_limits(),
+            candidate
+        );
     }
 }

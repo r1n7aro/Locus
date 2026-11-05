@@ -516,9 +516,10 @@ describe("useAppBootstrap onboarding completion", () => {
 
     expect(chatStoreMock.loadToolPermissionMode).toHaveBeenCalledTimes(1);
     expect(modelStoreMock.loadLastEffort).toHaveBeenCalledTimes(1);
+    // Session tabs mount once auth unlocks the shell; they need the saved default.
     expect(
-      agentStoreMock.loadWorkspaceAgents.mock.invocationCallOrder[0],
-    ).toBeLessThan(modelStoreMock.loadLastEffort.mock.invocationCallOrder[0]);
+      modelStoreMock.loadLastEffort.mock.invocationCallOrder[0],
+    ).toBeLessThan(authStoreMock.checkAuth.mock.invocationCallOrder[0]);
     expect(
       chatStoreMock.loadToolPermissionMode.mock.invocationCallOrder[0],
     ).toBeLessThan(authStoreMock.checkAuth.mock.invocationCallOrder[0]);
@@ -819,6 +820,48 @@ describe("useAppBootstrap onboarding completion", () => {
     expect(subscribedEvents).toContain("locus://workspace-event");
     expect(subscribedEvents).not.toContain("session-content-changed");
     expect(subscribedEvents).toContain("session-execution-state-changed");
+  });
+
+  it("hands external script opens to whichever window is currently primary", async () => {
+    const eventModule = await import("@tauri-apps/api/event");
+    const listenMock = eventModule.listen as unknown as ReturnType<typeof vi.fn>;
+    const handlers = new Map<string, (event: { payload: any }) => void>();
+    listenMock.mockImplementation(
+      async (name: string, handler: (event: { payload: any }) => void) => {
+        handlers.set(name, handler);
+        return vi.fn();
+      },
+    );
+    uiStoreMock.stageExternalScriptOpen = vi.fn();
+    uiStoreMock.setPage = vi.fn();
+
+    let primary = false;
+    const useAppBootstrap = await loadUseAppBootstrap();
+    const { registerListeners } = useAppBootstrap({ handleExternalScriptOpen: () => primary });
+    await registerListeners();
+
+    const openScript = () => handlers.get("locus://workspace-event")?.({
+      payload: {
+        eventName: "locus-open-script",
+        checkoutId: "checkout-test",
+        workspaceGeneration: 7,
+        payload: { projectPath: "C:/Project", assetPath: "Assets/A.cs", line: 3, column: 2 },
+      },
+    });
+
+    openScript();
+    expect(uiStoreMock.stageExternalScriptOpen).not.toHaveBeenCalled();
+
+    // The window that held the duty closed and this one was promoted.
+    primary = true;
+    openScript();
+    expect(uiStoreMock.stageExternalScriptOpen).toHaveBeenCalledExactlyOnceWith({
+      projectPath: "C:/Project",
+      assetPath: "Assets/A.cs",
+      line: 3,
+      column: 2,
+    });
+    expect(uiStoreMock.setPage).toHaveBeenCalledWith("development");
   });
 
   it("publishes routed session events before focused-workspace projection", async () => {

@@ -41,10 +41,6 @@ export function getClaudeCodeModels(): Promise<ModelOption[]> {
   return ipcInvoke<ModelOption[]>("get_claude_code_models");
 }
 
-export function saveCodexModelConfig(config: CodexModelConfig): Promise<void> {
-  return ipcInvoke("save_codex_model_config", { config });
-}
-
 export function getLastModel(): Promise<string> {
   return ipcInvoke<string>("get_last_model");
 }
@@ -71,6 +67,12 @@ export function saveCodexFastMode(enabled: boolean): Promise<void> {
 
 export function getCustomProviders(): Promise<CustomProvider[]> {
   return ipcInvoke<CustomProvider[]>("get_custom_providers");
+}
+
+/** Custom providers without API keys and endpoints: enough to list their
+ * models (remote devices cannot read the keys). */
+export function getCustomProviderCatalog(): Promise<CustomProvider[]> {
+  return ipcInvoke<CustomProvider[]>("get_custom_provider_catalog");
 }
 
 export function saveCustomProviders(providers: CustomProvider[]): Promise<void> {

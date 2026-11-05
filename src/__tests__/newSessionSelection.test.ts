@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveNewSessionAgentId, resolveNewSessionModel } from "../stores/newSessionSelection";
+import { clampEffortToLevels, resolveNewSessionAgentId, resolveNewSessionModel } from "../stores/newSessionSelection";
 import type { WorkspaceSelectionSnapshot } from "../services/selectionMemory";
 
 const agents = [
@@ -69,5 +69,22 @@ describe("resolveNewSessionModel", () => {
   it("skips unavailable models and returns nothing without a catalog", () => {
     expect(resolveNewSessionModel({ models, agentId: "unity", pinnedModelId: "gone", snapshot: snapshot({ modelId: "gone2" }), lastModelId: "m-c" }).modelId).toBe("m-c");
     expect(resolveNewSessionModel({ models: [], agentId: "unity", lastModelId: "m-c" })).toEqual({ modelId: "", effort: null });
+  });
+});
+
+describe("clampEffortToLevels", () => {
+  it("keeps supported levels and passes through when a model has no effort control", () => {
+    expect(clampEffortToLevels(["none", "low", "high", "xhigh"], "xhigh")).toBe("xhigh");
+    expect(clampEffortToLevels([], "xhigh")).toBe("xhigh");
+  });
+
+  it("falls back to the nearest lower level, never to the first listed level", () => {
+    expect(clampEffortToLevels(["none", "low", "medium", "high", "max"], "xhigh")).toBe("high");
+    expect(clampEffortToLevels(["none", "low", "medium", "high"], "max")).toBe("high");
+  });
+
+  it("uses the lowest supported level when nothing lower exists", () => {
+    expect(clampEffortToLevels(["low", "medium", "high"], "none")).toBe("low");
+    expect(clampEffortToLevels(["medium", "high"], "low")).toBe("medium");
   });
 });

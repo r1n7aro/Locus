@@ -60,7 +60,7 @@ async function selectUpdateChannel(value: string) {
 </script>
 
 <template>
-  <div class="settings-section">
+  <div class="settings-section" data-settings-section="updates">
     <div class="section-label">{{ t("settings.about.title") }}</div>
     <p class="section-desc">{{ t("settings.about.desc") }}</p>
 

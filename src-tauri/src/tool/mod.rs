@@ -3,6 +3,7 @@ pub(crate) mod apply_patch;
 pub(crate) mod failure_log;
 pub(crate) mod output;
 pub(crate) mod path;
+pub(crate) mod python_call;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
@@ -164,6 +165,7 @@ pub fn default_load_mode_for_builtin_tool(name: &str) -> ToolLoadMode {
         "unity_capture_viewport"
             | "unity_run_states"
             | "web_fetch"
+            | "config_set"
     ) {
         ToolLoadMode::Lazy
     } else {
@@ -191,6 +193,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     // Planning, delegation & user interaction.
     "todowrite",
     "subagent",
+    "send_message",
     "ask_user_question",
     "exit_plan_mode",
     // Unity editor actions.
@@ -203,6 +206,8 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "unity_test_list",
     "unity_test_run",
     "unity_release",
+    // Blender.
+    "blender_execute",
     // Unity project search & inspection.
     "unity_asset_search",
     "unity_ref_search",
@@ -222,6 +227,7 @@ const TOOL_PRIORITY_ORDER: &[&str] = &[
     "unity_run_states",
     "unity_capture_viewport",
     "config_query",
+    "config_set",
     // Skill & plugin management.
     "create_skill_package",
     "skill_list",
@@ -515,7 +521,11 @@ impl ToolRegistry {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let description = crate::prompt::tools::SUBAGENT.replace("{agent_list}", &agent_list);
+        // Agent instances re-render the list with each type's allowed models
+        // and the model-choice guidance; the registry copy has neither.
+        let description = crate::prompt::tools::SUBAGENT
+            .replace("{agent_list}", &agent_list)
+            .replace("{model_choice}", "");
 
         let execute: ToolExecuteFn = Arc::new(|_args, _ctx| {
             Box::pin(async {
@@ -551,6 +561,10 @@ impl ToolRegistry {
                     "subagent_type": {
                         "type": "string",
                         "description": "The type of specialized agent to use for this task"
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model for this task: one of the names listed for the chosen subagent_type. Omit to use its default."
                     }
                 },
                 "required": ["description", "prompt", "subagent_type"]

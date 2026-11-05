@@ -1,6 +1,8 @@
-import { reactive, readonly } from "vue";
+import { reactive, readonly, watch } from "vue";
+import { saveSetting, settingValue } from "./useSettingsStore";
 
-const STORAGE_KEY = "locus-document-editing-settings";
+const PUNCTUATION_PAIRING_KEY = "documents.punctuationPairing";
+const COMMENT_AUTHOR_KEY = "documents.commentAuthor";
 const MAX_COMMENT_AUTHOR_LENGTH = 64;
 
 export function normalizeCommentAuthor(value: unknown): string {
@@ -16,35 +18,26 @@ export function normalizeDocumentEditingSettings(value: unknown) {
   };
 }
 
-function load() {
-  try {
-    return normalizeDocumentEditingSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"));
-  } catch {
-    return normalizeDocumentEditingSettings(null);
-  }
+function project() {
+  return normalizeDocumentEditingSettings({
+    punctuationPairing: settingValue(PUNCTUATION_PAIRING_KEY),
+    commentAuthor: settingValue(COMMENT_AUTHOR_KEY),
+  });
 }
 
-const state = reactive(load());
+const state = reactive(project());
 
-// Document and settings windows share the same origin and storage.
-if (typeof window !== "undefined") window.addEventListener("storage", (event) => {
-  if (event.key === STORAGE_KEY || event.key === null) Object.assign(state, load());
-});
-
-function persist(): void {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { /* optional persistence */ }
-}
+// Document and settings windows (and the agent) change it through settings.
+watch(project, (next) => Object.assign(state, next), { flush: "sync" });
 
 export function useDocumentEditingSettings() {
   return {
     state: readonly(state),
     setPunctuationPairing(enabled: boolean) {
-      state.punctuationPairing = enabled;
-      persist();
+      saveSetting(PUNCTUATION_PAIRING_KEY, enabled);
     },
     setCommentAuthor(name: string) {
-      state.commentAuthor = normalizeCommentAuthor(name);
-      persist();
+      saveSetting(COMMENT_AUTHOR_KEY, normalizeCommentAuthor(name));
     },
   };
 }

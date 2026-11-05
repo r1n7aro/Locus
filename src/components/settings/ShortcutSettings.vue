@@ -143,7 +143,7 @@ function handleReset(action: ShortcutAction) {
 </script>
 
 <template>
-  <div class="settings-section">
+  <div class="settings-section" data-settings-section="shortcuts">
     <div class="section-label">{{ t("settings.shortcuts.title") }}</div>
     <p class="section-desc">{{ t("settings.shortcuts.desc") }}</p>
 

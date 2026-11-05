@@ -847,7 +847,7 @@ fn normalize_package_id(value: &str) -> Result<String, String> {
     Ok(id.to_string())
 }
 
-fn normalize_default_skill_package_namespace(value: &str) -> Result<String, String> {
+pub(crate) fn normalize_default_skill_package_namespace(value: &str) -> Result<String, String> {
     let namespace = value.trim();
     if namespace.is_empty() {
         return Ok(String::new());

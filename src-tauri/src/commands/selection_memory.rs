@@ -268,7 +268,36 @@ pub(crate) fn remembered_model_for_project(project_id: &str) -> Option<String> {
     (!model.is_empty()).then_some(model)
 }
 
-fn migrate_legacy_main_model_in(dir: &Path, defaults: &mut ModelDefaults) -> Result<bool, String> {
+/// Model for a request that names none, in the order a new chat uses: a
+/// pinned main model, the project's remembered choice, then the most recent
+/// choice anywhere.
+pub(crate) async fn default_model_for_project(
+    app: &tauri::AppHandle,
+    project_id: Option<&str>,
+) -> Option<String> {
+    let nonempty = |model: String| {
+        let model = model.trim().to_string();
+        (!model.is_empty()).then_some(model)
+    };
+    if let Ok(defaults) = super::workspace::get_model_defaults(app.clone()).await {
+        if let Some(model) = nonempty(defaults.main_model) {
+            return Some(model);
+        }
+    }
+    if let Some(model) = project_id.and_then(remembered_model_for_project) {
+        return Some(model);
+    }
+    super::workspace::get_last_model(app.clone())
+        .await
+        .ok()
+        .and_then(nonempty)
+}
+
+fn migrate_legacy_main_model_in(
+    dir: &Path,
+    defaults: &mut ModelDefaults,
+    save: impl FnOnce(&ModelDefaults) -> Result<(), String>,
+) -> Result<bool, String> {
     let marker = dir.join(MAIN_MODEL_MIGRATION_MARKER);
     if marker.exists() {
         return Ok(false);
@@ -279,10 +308,7 @@ fn migrate_legacy_main_model_in(dir: &Path, defaults: &mut ModelDefaults) -> Res
         std::fs::write(dir.join("last_model.txt"), &main_model)
             .map_err(|error| format!("Failed to seed last model: {error}"))?;
         defaults.main_model.clear();
-        let json = serde_json::to_string_pretty(defaults)
-            .map_err(|error| format!("Failed to serialize model defaults: {error}"))?;
-        std::fs::write(dir.join("model_defaults.json"), json)
-            .map_err(|error| format!("Failed to save model defaults: {error}"))?;
+        save(defaults)?;
     }
     std::fs::write(&marker, b"1")
         .map_err(|error| format!("Failed to record main model migration: {error}"))?;
@@ -293,7 +319,7 @@ fn migrate_legacy_main_model_in(dir: &Path, defaults: &mut ModelDefaults) -> Res
 pub(crate) fn migrate_legacy_main_model(defaults: &mut ModelDefaults) -> Result<bool, String> {
     let dir = persistent_config_dir()?;
     let _guard = memory_lock();
-    migrate_legacy_main_model_in(&dir, defaults)
+    migrate_legacy_main_model_in(&dir, defaults, super::workspace::write_model_defaults)
 }
 
 #[tauri::command]
@@ -446,24 +472,28 @@ mod tests {
             main_model: "openai/gpt-5.5".into(),
             ..ModelDefaults::default()
         };
-        assert!(migrate_legacy_main_model_in(dir.path(), &mut defaults).unwrap());
+        let mut saved = None;
+        assert!(migrate_legacy_main_model_in(dir.path(), &mut defaults, |value| {
+            saved = Some(value.clone());
+            Ok(())
+        })
+        .unwrap());
         assert_eq!(defaults.main_model, "");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("last_model.txt")).unwrap(),
             "openai/gpt-5.5"
         );
-        let saved: ModelDefaults = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("model_defaults.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(saved.main_model, "");
+        assert_eq!(saved.unwrap().main_model, "");
 
         // A model pinned after the migration stays pinned.
         let mut pinned = ModelDefaults {
             main_model: "custom/a/b".into(),
             ..ModelDefaults::default()
         };
-        assert!(!migrate_legacy_main_model_in(dir.path(), &mut pinned).unwrap());
+        assert!(!migrate_legacy_main_model_in(dir.path(), &mut pinned, |_| {
+            panic!("a completed migration saves nothing")
+        })
+        .unwrap());
         assert_eq!(pinned.main_model, "custom/a/b");
     }
 
@@ -471,7 +501,10 @@ mod tests {
     fn fresh_install_only_records_the_migration() {
         let dir = tempfile::tempdir().unwrap();
         let mut defaults = ModelDefaults::default();
-        assert!(!migrate_legacy_main_model_in(dir.path(), &mut defaults).unwrap());
+        assert!(!migrate_legacy_main_model_in(dir.path(), &mut defaults, |_| {
+            panic!("an empty main model saves nothing")
+        })
+        .unwrap());
         assert!(dir.path().join(MAIN_MODEL_MIGRATION_MARKER).exists());
         assert!(!dir.path().join("last_model.txt").exists());
     }

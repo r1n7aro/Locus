@@ -57,7 +57,7 @@ const {
   cleanup,
 } = useWorkspacePageBootstrap();
 if (payload?.scope === "app" && payload.settingsCategory === "globalSearch") {
-  uiStore.openSettingsCategory("globalSearch");
+  uiStore.openSettingsCategory("workspace", "search");
 }
 const diffOverlay = provideDiffOverlay();
 
@@ -106,9 +106,6 @@ const pageProps = computed<Record<string, unknown>>(() => {
         agents: agentStore.agents,
         subagents: agentStore.subagents,
         onAuthChanged: handleSettingsAuthChanged,
-        onModelDefaultsChanged: modelStore.applyModelDefaults,
-        onCodexTransportChanged: modelStore.applyCodexModelConfig,
-        onCustomProvidersChanged: modelStore.applyCustomProviders,
         onResetOnboarding: requestResetOnboarding,
       };
     case "asset":

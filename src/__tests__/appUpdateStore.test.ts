@@ -18,6 +18,7 @@ vi.mock("../services/appVersion", () => ({
 import * as appUpdateService from "../services/appUpdate";
 import * as appVersionService from "../services/appVersion";
 import { useAppUpdateStore } from "../stores/appUpdate";
+import { settingValue } from "../composables/useSettingsStore";
 
 function createLocalStorageMock() {
   let storage = new Map<string, string>();
@@ -171,10 +172,7 @@ describe("app update store", () => {
     store.setUpdateChannel("experimental");
     const info = await store.checkForUpdates({ silent: true });
 
-    expect(localStorageMock.setItem).toHaveBeenCalledWith(
-      "locus-app-update-channel",
-      "experimental",
-    );
+    expect(settingValue("updates.channel")).toBe("experimental");
     expect(fetchAppUpdateManifestMock).toHaveBeenCalledWith({
       throwOnError: false,
       channel: "experimental",

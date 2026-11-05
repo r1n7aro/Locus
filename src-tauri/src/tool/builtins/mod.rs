@@ -1,6 +1,15 @@
 mod agent;
+mod blender;
 mod code;
 mod code_unity;
+mod code_unity_managed;
+#[cfg(test)]
+mod code_unity_managed_tests;
+#[cfg(test)]
+mod code_unity_override_tests;
+mod code_unity_plain;
+#[cfg(test)]
+mod code_unity_plain_tests;
 mod filesystem;
 mod filesystem_patch;
 mod knowledge;
@@ -37,6 +46,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(unity::unity_asset_search());
     registry.register_builtin(web_fetch::web_fetch());
     registry.register_builtin(misc::todowrite());
+    registry.register_builtin(misc::send_message());
 
     registry.register_builtin(filesystem::list());
     registry.register_builtin(unity::unity_lock());
@@ -45,6 +55,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin(unity::unity_execute());
     registry.register_builtin(unity::unity_run_states());
     registry.register_builtin(unity::unity_capture_viewport());
+    registry.register_builtin(blender::blender_execute());
     registry.register_builtin(unity::unity_get_console_log());
     registry.register_builtin(unity::unity_test_list());
     registry.register_builtin(unity::unity_test_run());
@@ -74,6 +85,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
     registry.register_builtin_with_load_mode(plugin::plugin_uninstall(), ToolLoadMode::Skill);
     registry.register_builtin_with_load_mode(plugin::plugin_export(), ToolLoadMode::Skill);
     registry.register_builtin(config_query_tool());
+    registry.register_builtin(config_set_tool());
     registry.register_builtin(tool_load_tool());
     registry.register_builtin(tool_call_tool());
     registry.register_builtin(exit_plan_mode_tool());
@@ -120,6 +132,26 @@ fn config_query_tool() -> ToolDef {
     let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::CONFIG_QUERY);
     ToolDef {
         name: "config_query".to_string(),
+        description: prompt.description,
+        parameters: prompt.parameters,
+        mutates_workspace: false,
+        execute,
+    }
+}
+
+fn config_set_tool() -> ToolDef {
+    let execute: ToolExecuteFn = std::sync::Arc::new(|_args, _ctx| {
+        Box::pin(async {
+            ToolResult {
+                output: "Error: config_set tool should be intercepted by agent loop".to_string(),
+                is_error: true,
+            }
+        })
+    });
+
+    let prompt = crate::prompt::parse_tool_prompt(crate::prompt::tools::CONFIG_SET);
+    ToolDef {
+        name: "config_set".to_string(),
         description: prompt.description,
         parameters: prompt.parameters,
         mutates_workspace: false,

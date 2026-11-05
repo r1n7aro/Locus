@@ -25,7 +25,7 @@ Unity 项目的 C# 代码里，同名方法、字段随处可见，纯文本搜�
 - **`code_goto_definition`**：解析符号的声明位置，包括其他程序集与 package。
 - **`code_find_references`**：语义级精确查找符号的全部代码引用。
 - **`edit/write 诊断`**：Agent 修改 Unity C# 文件后，自动返回有上限的文件级错误、警告与项目字符串引用检查，构成"改完即验证"的回路。
-- **`code_diagnostics`**：不切到 Unity 即可获取编译器与分析器的错误和警告；file 模式同时校验 tag、layer、场景、Resources、Input 字符串是否存在于项目配置。
+- **`code_diagnostics`**：不切到 Unity 即可获取编译器与分析器的错误和警告；file 模式同时校验 tag、layer、场景、Resources、Input 字符串是否存在于项目配置。两种模式都会核对资产中 `[SerializeReference]` 实例记录的类型是否仍能在代码中找到，及时发现未加 `[MovedFrom]` 的改名或跨 asmdef 移动导致的数据丢失。
 - **`code_hover`**：查询符号的精确签名、类型与文档（IDE 悬停信息），避免 Agent 凭记忆猜 API。
 - **`Unity 分析器（UNT*）`**：注入 Microsoft.Unity.Analyzers，为 `code_diagnostics` 提供 Unity 特化诊断，并压制对 Unity 代码具有误导性的通用 C# 提示。切换后会自动重启分析服务。
 
@@ -33,6 +33,6 @@ Unity 项目的 C# 代码里，同名方法、字段随处可见，纯文本搜�
 
 把 C# 符号桥接到 Unity 资产数据与项目配置，不依赖 Roslyn 服务：
 
-- **`unity_code_usages`**：查询脚本或成员在场景、预制体、资产中的序列化使用，包括挂载点、UnityEvent 绑定、序列化字段与 AnimationEvent。代码侧的"查找引用"看不到这些资产里的使用点，删改脚本前让 Agent 先查一遍，可以避免破坏场景中的绑定。该工具依赖资产数据库，见[资产页面](/assets/index)。
+- **`unity_code_usages`**：查询脚本或成员在场景、预制体、资产中的序列化使用，包括挂载点、UnityEvent 绑定、序列化字段、AnimationEvent，文件中声明的类型（含子类和接口实现）的 `[SerializeReference]` 实例（包括预制体实例、变体与嵌套预制体上的类型覆盖），以及经由序列化字段（含数组、List、泛型与嵌套类型）保存的普通 `[Serializable]` 类/结构体的值和预制体覆盖。代码侧的"查找引用"看不到这些资产里的使用点，删改脚本前让 Agent 先查一遍，可以避免破坏场景中的绑定。该工具依赖资产数据库，见[资产页面](/assets/index)。
 
 同属`代码与 Unity` 分组的`热更新与编译`、`Unity 连接`、`测试`标签，见 [Unity 执行与编译](/unity/execute-and-compile)与[热更新](/unity/hot-reload)。

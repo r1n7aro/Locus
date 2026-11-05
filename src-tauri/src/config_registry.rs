@@ -3,10 +3,8 @@
 //! can explain Locus configuration to the user.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::Manager;
 
 use crate::error::AppError;
 use crate::keychain;
@@ -33,19 +31,16 @@ pub struct ConfigEntry {
 // ── collect ──────────────────────────────────────────────────────────────────
 
 pub fn collect_all(
-    app_handle: &tauri::AppHandle,
     workspace_scope: Option<&crate::workspace_service::ResolvedWorkspaceScope>,
 ) -> Result<Vec<ConfigEntry>, AppError> {
     let mut entries = Vec::with_capacity(40);
 
     collect_general(&mut entries);
-    collect_display(app_handle, &mut entries);
-    collect_notifications(&mut entries);
     collect_api(&mut entries);
     collect_models(&mut entries);
-    collect_permissions(app_handle, &mut entries);
+    collect_permissions(&mut entries);
     if let Some(scope) = workspace_scope {
-        collect_knowledge(app_handle, scope, &mut entries);
+        collect_knowledge(scope, &mut entries);
     }
     collect_mcp(&mut entries);
 
@@ -53,18 +48,15 @@ pub fn collect_all(
 }
 
 pub fn collect_by_category(
-    app_handle: &tauri::AppHandle,
     category: &str,
     workspace_scope: Option<&crate::workspace_service::ResolvedWorkspaceScope>,
 ) -> Result<Vec<ConfigEntry>, AppError> {
     let mut entries = Vec::new();
     match category {
         "general" => collect_general(&mut entries),
-        "display" => collect_display(app_handle, &mut entries),
-        "notifications" => collect_notifications(&mut entries),
         "api" => collect_api(&mut entries),
         "models" => collect_models(&mut entries),
-        "permissions" => collect_permissions(app_handle, &mut entries),
+        "permissions" => collect_permissions(&mut entries),
         "knowledge" => {
             let scope = workspace_scope.ok_or_else(|| {
                 AppError::new(
@@ -72,14 +64,14 @@ pub fn collect_by_category(
                     "Knowledge configuration inspection requires a checkout scope.",
                 )
             })?;
-            collect_knowledge(app_handle, scope, &mut entries)
+            collect_knowledge(scope, &mut entries)
         }
         "mcp" => collect_mcp(&mut entries),
         _ => {
             return Err(AppError::new(
                 "invalid_category",
                 format!(
-                    "Unknown category '{}'. Valid: general, display, notifications, api, models, permissions, knowledge, mcp",
+                    "Unknown category '{}'. Valid: general, api, models, permissions, knowledge, mcp",
                     category
                 ),
             ));
@@ -92,16 +84,6 @@ pub fn collect_by_category(
 
 fn collect_general(out: &mut Vec<ConfigEntry>) {
     out.push(ConfigEntry {
-        key: "general.language".into(),
-        category: "general".into(),
-        label: "Interface Language".into(),
-        description:
-            "UI language (zh / en). Stored in the WebView; not accessible from Rust or agent code."
-                .into(),
-        storage: "localStorage: locus-locale".into(),
-        current_value: "(frontend-only)".into(),
-    });
-    out.push(ConfigEntry {
         key: "general.onboarding_completed".into(),
         category: "general".into(),
         label: "Onboarding Completed".into(),
@@ -109,183 +91,6 @@ fn collect_general(out: &mut Vec<ConfigEntry>) {
         storage: "localStorage: locus-onboarding-completed".into(),
         current_value: "(frontend-only)".into(),
     });
-}
-
-// ── display ──────────────────────────────────────────────────────────────────
-
-fn collect_display(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) {
-    out.push(ConfigEntry {
-        key: "display.theme.main_window".into(),
-        category: "display".into(),
-        label: "Main Window Theme".into(),
-        description: "Color theme for the main window: system, light, or dark.".into(),
-        storage: "localStorage: locus-theme-preference".into(),
-        current_value: "(frontend-only)".into(),
-    });
-    let unity_embed_enabled = app_handle
-        .try_state::<Arc<crate::config::AppConfig>>()
-        .map(|config| config.unity_embed_enabled())
-        .unwrap_or(true);
-    out.push(ConfigEntry {
-        key: "display.unity_embed_enabled".into(),
-        category: "display".into(),
-        label: "Unity Embedded Window".into(),
-        description: "Show Locus desktop content inside Unity editor windows.".into(),
-        storage: "persistent_config_dir/config.json → unity_embed_enabled".into(),
-        current_value: unity_embed_enabled.to_string(),
-    });
-    out.push(ConfigEntry {
-        key: "display.theme.unity_embed_window".into(),
-        category: "display".into(),
-        label: "Unity Embedded Window Theme".into(),
-        description:
-            "Color theme for the Unity embedded window: system, light, or dark. Default is dark."
-                .into(),
-        storage: "localStorage: locus-unity-embed-theme-preference".into(),
-        current_value: "(frontend-only)".into(),
-    });
-    for (key_suffix, label, desc) in [
-        (
-            "todo_auto_open",
-            "Auto-open TODO Panel",
-            "Automatically open the TODO panel when new items appear.",
-        ),
-        (
-            "changes_auto_open",
-            "Auto-open Changes Panel",
-            "Automatically open the file-changes panel when files change.",
-        ),
-        (
-            "changes_auto_close",
-            "Auto-close Changes Panel",
-            "Automatically close the file-changes panel when a new tool-call round starts.",
-        ),
-    ] {
-        out.push(ConfigEntry {
-            key: format!("display.{}", key_suffix),
-            category: "display".into(),
-            label: label.into(),
-            description: desc.into(),
-            storage: "localStorage: locus-display-settings".into(),
-            current_value: "(frontend-only)".into(),
-        });
-    }
-
-    for (slot, label) in [
-        ("ui", "UI Font"),
-        ("prose", "Prose Font"),
-        ("mono_inline", "Mono Inline Font"),
-        ("mono_block", "Mono Block Font"),
-        ("mono_editor", "Mono Editor Font"),
-    ] {
-        out.push(ConfigEntry {
-            key: format!("display.font.{}", slot),
-            category: "display".into(),
-            label: label.into(),
-            description: format!(
-                "Custom font family for the {} slot. Empty string means system default.",
-                slot
-            ),
-            storage: "localStorage: locus-display-settings → fonts".into(),
-            current_value: "(frontend-only)".into(),
-        });
-    }
-}
-
-// ── notifications ────────────────────────────────────────────────────────────
-
-fn collect_notifications(out: &mut Vec<ConfigEntry>) {
-    for (key_suffix, label, desc) in [
-        (
-            "system_notifications_enabled",
-            "Background System Notifications",
-            "Enable desktop notifications for key chat events while the app is unfocused.",
-        ),
-        (
-            "notify_on_chat_done",
-            "Notify on Chat Complete",
-            "Send a desktop notification when a chat run completes.",
-        ),
-        (
-            "notify_on_subagent_done",
-            "Notify on Sub-agent Complete",
-            "Send a desktop notification when a sub-agent run completes.",
-        ),
-        (
-            "notify_on_ask_user",
-            "Notify on User Input Request",
-            "Send a desktop notification when the agent asks the user for input.",
-        ),
-        (
-            "notify_on_chat_error",
-            "Notify on Chat Error",
-            "Send a desktop notification when a chat run fails.",
-        ),
-        (
-            "notify_on_tool_confirm",
-            "Notify on Tool Approval",
-            "Send a desktop notification when a tool action waits for approval.",
-        ),
-        (
-            "sound_alerts_enabled",
-            "Sound Alerts",
-            "Enable sound alerts for key chat events.",
-        ),
-        (
-            "sound_alert_mode",
-            "Sound Alert Mode",
-            "Sound profile used for sound alerts: soft, bright, or urgent.",
-        ),
-        (
-            "sound_alert_source",
-            "Sound Alert Source",
-            "Sound source used for sound alerts: built-in or custom.",
-        ),
-        (
-            "sound_alert_custom_file_path",
-            "Custom Sound File",
-            "Audio file path used when custom sound alerts are selected.",
-        ),
-        (
-            "sound_alert_volume",
-            "Sound Alert Volume",
-            "Volume used for built-in and custom sound alerts.",
-        ),
-        (
-            "sound_on_chat_done",
-            "Sound on Chat Complete",
-            "Play a sound when a chat run completes.",
-        ),
-        (
-            "sound_on_subagent_done",
-            "Sound on Sub-agent Complete",
-            "Play a sound when a sub-agent run completes.",
-        ),
-        (
-            "sound_on_ask_user",
-            "Sound on User Input Request",
-            "Play a sound when the agent asks the user for input.",
-        ),
-        (
-            "sound_on_chat_error",
-            "Sound on Chat Error",
-            "Play a sound when a chat run fails.",
-        ),
-        (
-            "sound_on_tool_confirm",
-            "Sound on Tool Approval",
-            "Play a sound when a tool action waits for approval.",
-        ),
-    ] {
-        out.push(ConfigEntry {
-            key: format!("notifications.{}", key_suffix),
-            category: "notifications".into(),
-            label: label.into(),
-            description: desc.into(),
-            storage: "localStorage: locus-display-settings".into(),
-            current_value: "(frontend-only)".into(),
-        });
-    }
 }
 
 // ── api ──────────────────────────────────────────────────────────────────────
@@ -342,53 +147,6 @@ fn collect_api(out: &mut Vec<ConfigEntry>) {
         current_value: codex_status.into(),
     });
 
-    let codex_model_config = crate::commands::load_codex_model_config().ok();
-    let codex_transport = codex_model_config
-        .as_ref()
-        .map(|config| match config.transport {
-            crate::commands::CodexTransportMode::Http => "http",
-            crate::commands::CodexTransportMode::Websocket => "websocket",
-        })
-        .unwrap_or("http");
-
-    out.push(ConfigEntry {
-        key: "api.codex_transport".into(),
-        category: "api".into(),
-        label: "Codex Transport".into(),
-        description:
-            "Transport used for ChatGPT Codex models: current HTTP SSE route or OpenAI Responses websocket route."
-                .into(),
-        storage: "persistent_config_dir/codex_model_config.json → transport".into(),
-        current_value: codex_transport.into(),
-    });
-
-    out.push(ConfigEntry {
-        key: "api.codex_context_window".into(),
-        category: "api".into(),
-        label: "Codex Context Window".into(),
-        description: "Raw context window for all Codex subscription models; defaults to 272K and supports values up to 1M."
-            .into(),
-        storage: "persistent_config_dir/codex_model_config.json → contextWindow".into(),
-        current_value: codex_model_config
-            .as_ref()
-            .map(|config| config.resolved_context_window())
-            .unwrap_or(crate::commands::DEFAULT_CODEX_CONTEXT_WINDOW)
-            .to_string(),
-    });
-
-    out.push(ConfigEntry {
-        key: "api.codex_session_titles".into(),
-        category: "api".into(),
-        label: "Codex Session Titles".into(),
-        description: "Generate titles for new chat sessions through the current Codex OAuth login using GPT-5.6 Luna with low reasoning effort."
-            .into(),
-        storage: "persistent_config_dir/codex_model_config.json → generateSessionTitles".into(),
-        current_value: codex_model_config
-            .as_ref()
-            .is_some_and(|config| config.generate_session_titles)
-            .to_string(),
-    });
-
     // Custom endpoints – count only, no secrets
     let ep_count = crate::commands::persistent_config_dir()
         .ok()
@@ -411,97 +169,6 @@ fn collect_api(out: &mut Vec<ConfigEntry>) {
 
 fn collect_models(out: &mut Vec<ConfigEntry>) {
     let dir = crate::commands::persistent_config_dir().ok();
-
-    let defaults: Option<serde_json::Value> = dir.as_ref().and_then(|d| {
-        std::fs::read_to_string(d.join("model_defaults.json"))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-    });
-
-    let main_model = defaults
-        .as_ref()
-        .and_then(|v| v.get("mainModel"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let plan_model = defaults
-        .as_ref()
-        .and_then(|v| v.get("planModel"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let subagent_models = defaults
-        .as_ref()
-        .and_then(|v| v.get("subagentModels"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-    let subagent_efforts = defaults
-        .as_ref()
-        .and_then(|v| v.get("subagentEfforts"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-    let subagent_fast_modes = defaults
-        .as_ref()
-        .and_then(|v| v.get("subagentFastModes"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Object(Default::default()));
-
-    out.push(ConfigEntry {
-        key: "models.main_model".into(),
-        category: "models".into(),
-        label: "Main Model".into(),
-        description:
-            "Pinned model for new chat sessions. Empty means remember each workspace's last explicit choice (persistent_config_dir/workspace_selections.json), then the last selected model, then the first available model."
-                .into(),
-        storage: "persistent_config_dir/model_defaults.json → mainModel".into(),
-        current_value: if main_model.is_empty() {
-            "(default)".into()
-        } else {
-            main_model
-        },
-    });
-
-    out.push(ConfigEntry {
-        key: "models.plan_model".into(),
-        category: "models".into(),
-        label: "Plan Model".into(),
-        description: "Default model used during plan mode. Empty means use the main model.".into(),
-        storage: "persistent_config_dir/model_defaults.json → planModel".into(),
-        current_value: if plan_model.is_empty() {
-            "(default)".into()
-        } else {
-            plan_model
-        },
-    });
-
-    out.push(ConfigEntry {
-        key: "models.subagent_models".into(),
-        category: "models".into(),
-        label: "Sub-agent Model Overrides".into(),
-        description: "Per-agent model overrides. Keys are agent IDs, values are model IDs. Empty object means sub-agents inherit the current session model.".into(),
-        storage: "persistent_config_dir/model_defaults.json → subagentModels".into(),
-        current_value: serde_json::to_string(&subagent_models).unwrap_or_default(),
-    });
-
-    out.push(ConfigEntry {
-        key: "models.subagent_efforts".into(),
-        category: "models".into(),
-        label: "Sub-agent Reasoning Effort Overrides".into(),
-        description: "Per-agent reasoning effort overrides. Empty object means sub-agents inherit the current session effort.".into(),
-        storage: "persistent_config_dir/model_defaults.json → subagentEfforts".into(),
-        current_value: serde_json::to_string(&subagent_efforts).unwrap_or_default(),
-    });
-
-    out.push(ConfigEntry {
-        key: "models.subagent_fast_modes".into(),
-        category: "models".into(),
-        label: "Sub-agent Fast Mode Overrides".into(),
-        description: "Per-agent Codex Fast mode overrides. Missing keys inherit the current session; true selects Fast and false selects standard speed.".into(),
-        storage: "persistent_config_dir/model_defaults.json → subagentFastModes".into(),
-        current_value: serde_json::to_string(&subagent_fast_modes).unwrap_or_default(),
-    });
 
     let last_model = dir
         .as_ref()
@@ -546,19 +213,11 @@ fn collect_models(out: &mut Vec<ConfigEntry>) {
 
 // ── permissions ──────────────────────────────────────────────────────────────
 
-fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>) {
-    // Read tool_permissions.json from the active app storage directory.
-    let mut perms: HashMap<String, String> =
-        crate::commands::resolve_runtime_storage_dir(app_handle)
-            .ok()
-            .and_then(|dir| std::fs::read_to_string(dir.join("tool_permissions.json")).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-    if !perms.contains_key("subagent") {
-        if let Some(mode) = perms.get("task").cloned() {
-            perms.insert("subagent".to_string(), mode);
-        }
-    }
+/// Effective approval per tool and behavior, including defaults that
+/// `permissions.tools` (overrides only) does not list.
+fn collect_permissions(out: &mut Vec<ConfigEntry>) {
+    let perms: HashMap<String, String> =
+        crate::commands::tool_permissions_setting(crate::settings::global::global());
 
     let tool_list = [
         ("read", "File reading"),
@@ -614,7 +273,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
                 "Permission mode for the '{}' tool ({}). 'auto' = execute without confirmation, 'ask' = require user approval.",
                 name, desc
             ),
-            storage: "app_storage_dir/tool_permissions.json".into(),
+            storage: "settings.json → permissions.tools (setting key permissions.tools)".into(),
             current_value: current.into(),
         });
     }
@@ -630,10 +289,25 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
             "Edit protected knowledge",
             "Approval mode for protected knowledge changes, including Design, Skill, Reference, and approval-gated folders.",
         ),
+        (
+            crate::settings::agent::BEHAVIOR_SETTINGS_CHANGE,
+            "Change settings",
+            "Approval mode for config_set changes to normal Locus settings.",
+        ),
+        (
+            crate::settings::agent::BEHAVIOR_SENSITIVE_SETTINGS_CHANGE,
+            "Change sensitive settings",
+            "Approval mode for config_set changes to sensitive Locus settings (debug, workspace boundary, compiler access, worktree root). Global auto mode does not skip this confirmation.",
+        ),
     ];
 
     for (name, label, desc) in behavior_list {
-        let current = perms.get(name).map(|s| s.as_str()).unwrap_or("auto");
+        let default_mode = if name == crate::settings::agent::BEHAVIOR_SENSITIVE_SETTINGS_CHANGE {
+            "ask"
+        } else {
+            "auto"
+        };
+        let current = perms.get(name).map(|s| s.as_str()).unwrap_or(default_mode);
 
         out.push(ConfigEntry {
             key: format!("permissions.{}", name),
@@ -643,7 +317,7 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
                 "{} 'auto' = execute without confirmation, 'ask' = require user approval.",
                 desc
             ),
-            storage: "app_storage_dir/tool_permissions.json".into(),
+            storage: "settings.json → permissions.tools (setting key permissions.tools)".into(),
             current_value: current.into(),
         });
     }
@@ -652,7 +326,6 @@ fn collect_permissions(app_handle: &tauri::AppHandle, out: &mut Vec<ConfigEntry>
 // ── knowledge ────────────────────────────────────────────────────────────────
 
 fn collect_knowledge(
-    app_handle: &tauri::AppHandle,
     workspace_scope: &crate::workspace_service::ResolvedWorkspaceScope,
     out: &mut Vec<ConfigEntry>,
 ) {
@@ -667,10 +340,6 @@ fn collect_knowledge(
         .ok()
         .map(|docs| docs.len())
         .unwrap_or(0);
-    let default_skill_package_namespace = app_handle
-        .try_state::<Arc<crate::config::AppConfig>>()
-        .map(|config| config.default_skill_package_namespace())
-        .unwrap_or_default();
 
     out.push(ConfigEntry {
         key: "knowledge.documents.root".into(),
@@ -690,21 +359,6 @@ fn collect_knowledge(
         description: "Number of knowledge documents currently indexed in this workspace.".into(),
         storage: "<project>/Locus/knowledge/**/*.md".into(),
         current_value: knowledge_doc_count.to_string(),
-    });
-
-    out.push(ConfigEntry {
-        key: "knowledge.skill.default_package_namespace".into(),
-        category: "knowledge".into(),
-        label: "Default Skill Package Namespace".into(),
-        description:
-            "Optional author namespace for manually assigned published or shared Skill package IDs."
-                .into(),
-        storage: "persistent_config_dir/config.json → default_skill_package_namespace".into(),
-        current_value: if default_skill_package_namespace.is_empty() {
-            "(empty)".into()
-        } else {
-            default_skill_package_namespace
-        },
     });
 }
 

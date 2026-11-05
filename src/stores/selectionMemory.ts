@@ -201,8 +201,7 @@ export const useSelectionMemoryStore = defineStore("selectionMemory", () => {
   }
 
   function clampEffort(modelId: string, level: EffortLevel): EffortLevel {
-    const levels = modelStore.effortsForModel(modelId);
-    return levels.length > 0 && !levels.includes(level) ? levels[0]! : level;
+    return modelStore.clampEffortForModel(modelId, level);
   }
 
   /** Model, effort and fast mode a new session with this Agent starts with. */

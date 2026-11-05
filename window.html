@@ -49,9 +49,11 @@
     <script>
       // Apply theme before Vue mounts to prevent flash of wrong theme.
       (function(){
-        var key='locus-theme-preference';
+        // Boot cache of the settings store; the legacy key predates it.
         var fallback='dark';
-        var p;try{p=localStorage.getItem(key)}catch(e){}
+        var p;try{var c=JSON.parse(localStorage.getItem('locus-settings-boot-cache')||'null');
+          p=c&&c.values?c.values['appearance.theme.main']:undefined;
+          if(p===undefined)p=localStorage.getItem('locus-theme-preference')}catch(e){}
         p=p==='light'||p==='dark'||p==='system'?p:fallback;
         var t=p==='light'?'light':p==='dark'?'dark':
           (window.matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');

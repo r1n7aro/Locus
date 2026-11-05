@@ -507,4 +507,52 @@ describe("useModelStore OpenAI effort mapping", () => {
     expect(modelStore.effort).toBe("medium");
     expect(modelServiceMocks.saveLastEffort).not.toHaveBeenCalled();
   });
+
+  it("keeps a remembered effort for a Claude CLI model whose catalog has not loaded yet", async () => {
+    useAuthStore().claudeCodeAvailable = true;
+    const modelStore = useModelStore();
+    // The experimental gate is still off/unknown, so the CLI model is not in the catalog.
+    modelStore.applySessionModel("claude_code/claude-opus-5-5");
+    modelStore.applyNewSessionSelection({ modelId: "claude_code/claude-opus-5-5", effort: "xhigh", fastMode: false });
+    await nextTick();
+    expect(modelStore.effort).toBe("xhigh");
+    expect(modelStore.clampEffortForModel("claude_code/claude-opus-5-5", "max")).toBe("max");
+
+    await setClaudeCodeCliEnabled(true);
+    await nextTick();
+    expect(modelStore.availableEfforts).toContain("xhigh");
+    expect(modelStore.effort).toBe("xhigh");
+  });
+
+  it("fits an unsupported effort to the nearest lower level instead of turning thinking off", async () => {
+    useAuthStore().isAuthenticated = true;
+    const modelStore = useModelStore();
+    modelStore.selectModel("claude-opus-5-5");
+    modelStore.applyContextEffort("xhigh");
+    expect(modelStore.effort).toBe("xhigh");
+
+    modelStore.selectModel("claude-haiku-5-5");
+    await nextTick();
+    expect(modelStore.effort).toBe("high");
+    expect(modelStore.clampEffortForModel("claude-haiku-5-5", "xhigh")).toBe("high");
+  });
+
+  it("does not let a model with fewer levels overwrite the saved default effort", async () => {
+    useAuthStore().isAuthenticated = true;
+    modelServiceMocks.getAgentModelPreferences.mockResolvedValue({
+      unity: { modelId: "claude-haiku-5-5", effort: "xhigh" },
+    });
+    const modelStore = useModelStore();
+    await modelStore.loadAgentModelPreferences();
+    await modelStore.loadLastEffort();
+
+    modelStore.activateAgentPreference("unity", "medium", true);
+    await nextTick();
+
+    expect(modelStore.selectedModelId).toBe("claude-haiku-5-5");
+    expect(modelStore.effort).toBe("high");
+    expect(modelStore.defaultEffort).toBe("xhigh");
+    expect(modelServiceMocks.saveLastEffort).not.toHaveBeenCalledWith("none");
+    expect(modelServiceMocks.saveLastEffort).not.toHaveBeenCalledWith("high");
+  });
 });

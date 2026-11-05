@@ -23,6 +23,23 @@ pub(crate) fn isolated_test_root() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("LocusTemp"))
 }
 
+static ACTIVE_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Records the data directory this process locked at startup. It stays fixed
+/// for the process lifetime (storage moves apply on restart).
+pub(crate) fn set_active_data_dir(dir: &Path) {
+    let _ = ACTIVE_DATA_DIR.set(dir.to_path_buf());
+}
+
+/// The locked data directory. Per-user state kept out of project checkouts
+/// (workspace layouts) lives here, so it follows `LOCUS_RUNTIME_DATA_DIR`.
+pub(crate) fn active_data_dir() -> Result<&'static Path, String> {
+    ACTIVE_DATA_DIR
+        .get()
+        .map(PathBuf::as_path)
+        .ok_or_else(|| "The Locus data directory is not initialized".to_string())
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeLaunchOptions {
     pub(crate) runtime_root: Option<PathBuf>,

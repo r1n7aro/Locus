@@ -49,21 +49,13 @@ pub async fn csharp_lsp_get_status(
 #[tauri::command]
 pub async fn csharp_lsp_set_enabled(
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: tauri::AppHandle,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_lsp::CsharpLspStatusPayload, AppError> {
-    let scope = resolve_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "csharp_lsp_set_enabled",
-    )?;
-    config
-        .set_csharp_lsp_enabled(value)
-        .map_err(|error| AppError::new("csharp_lsp.persist_failed", error))?;
-
-    let warm_target = value.then(|| scope_root(&scope));
-    crate::csharp_lsp::set_enabled(value, warm_target).await;
+    let scope = resolve_scope(workspace_registry.inner(), &workspace_ref, "csharp_lsp_set_enabled")?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(&context, crate::settings::UNITY_CODE_ANALYSIS_CSHARP_LSP, value).await?;
     Ok(scope_lsp_status(&scope).await)
 }
 
@@ -83,43 +75,26 @@ pub async fn unity_sidecar_compiler_get_status(
 #[tauri::command]
 pub async fn unity_sidecar_compiler_set_enabled(
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: tauri::AppHandle,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
-    let scope = resolve_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "unity_sidecar_compiler_set_enabled",
-    )?;
-    config
-        .set_unity_sidecar_compiler_enabled(value)
-        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
-
-    crate::csharp_compile::set_enabled(value).await;
-    if value {
-        crate::csharp_compile::warm_up_in_background();
-    }
+    let scope = resolve_scope(workspace_registry.inner(), &workspace_ref, "unity_sidecar_compiler_set_enabled")?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(&context, crate::settings::UNITY_COMPILE_SIDECAR, value).await?;
     Ok(scope_compile_status(&scope).await)
 }
 
 #[tauri::command]
 pub async fn unity_non_public_access_set_enabled(
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: tauri::AppHandle,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
-    let scope = resolve_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "unity_non_public_access_set_enabled",
-    )?;
-    config
-        .set_unity_non_public_access_enabled(value)
-        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
-
-    crate::csharp_compile::set_non_public_access_enabled(value);
+    let scope = resolve_scope(workspace_registry.inner(), &workspace_ref, "unity_non_public_access_set_enabled")?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(&context, crate::settings::UNITY_COMPILE_NON_PUBLIC_ACCESS, value).await?;
     Ok(scope_compile_status(&scope).await)
 }
 
@@ -136,63 +111,42 @@ pub async fn unity_in_process_compile_fallback_get_enabled(
 #[tauri::command]
 pub async fn unity_in_process_compile_fallback_set_enabled(
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: tauri::AppHandle,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
-    let scope = resolve_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "unity_in_process_compile_fallback_set_enabled",
-    )?;
-    config
-        .set_unity_in_process_compile_fallback_enabled(value)
-        .map_err(|error| AppError::new("csharp_compile.persist_failed", error))?;
-
-    crate::csharp_compile::set_in_process_fallback(value);
+    let scope = resolve_scope(workspace_registry.inner(), &workspace_ref, "unity_in_process_compile_fallback_set_enabled")?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(&context, crate::settings::UNITY_COMPILE_IN_PROCESS_FALLBACK, value).await?;
     Ok(scope_compile_status(&scope).await)
 }
 
 #[tauri::command]
 pub async fn unity_hot_reload_set_enabled(
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: tauri::AppHandle,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
-    let scope = resolve_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "unity_hot_reload_set_enabled",
-    )?;
-    config
-        .set_unity_hot_reload_enabled(value)
-        .map_err(|error| AppError::new("unity_hotreload.persist_failed", error))?;
-
-    crate::unity_hotreload::set_enabled(value);
+    let scope = resolve_scope(workspace_registry.inner(), &workspace_ref, "unity_hot_reload_set_enabled")?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(&context, crate::settings::UNITY_HOT_RELOAD_ENABLED, value).await?;
     Ok(scope_compile_status(&scope).await)
 }
 
-/// Experimental (Phase B, default off): toggle whether the Unity plugin may
-/// force-JIT a synthetic caller stub to evaluate a method's inline risk. Persists
-/// to config and updates the live module flag delivered in each hot-patch payload.
+/// Toggle whether the Unity plugin may force-JIT a synthetic caller stub to
+/// evaluate a method's inline risk; the live flag is delivered in each
+/// hot-patch payload.
 #[tauri::command]
 pub async fn unity_inline_force_evaluate_set_enabled(
     value: bool,
-    config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
+    app: tauri::AppHandle,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<crate::csharp_compile::CsharpCompileStatusPayload, AppError> {
-    let scope = resolve_scope(
-        workspace_registry.inner(),
-        &workspace_ref,
-        "unity_inline_force_evaluate_set_enabled",
-    )?;
-    config
-        .set_unity_inline_force_evaluate_enabled(value)
-        .map_err(|error| AppError::new("unity_hotreload.persist_failed", error))?;
-
-    crate::unity_hotreload::set_inline_force_evaluate_enabled(value);
+    let scope = resolve_scope(workspace_registry.inner(), &workspace_ref, "unity_inline_force_evaluate_set_enabled")?;
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    crate::settings::apply::write_one(&context, crate::settings::UNITY_HOT_RELOAD_INLINE_FORCE_EVALUATE, value).await?;
     Ok(scope_compile_status(&scope).await)
 }
 
@@ -371,6 +325,7 @@ pub async fn code_analysis_tools_get_config(
 #[tauri::command]
 pub async fn code_analysis_tools_set_config(
     value: crate::config::CodeAnalysisToolsConfig,
+    app: tauri::AppHandle,
     config: State<'_, std::sync::Arc<crate::config::AppConfig>>,
     workspace_ref: WorkspaceRef,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
@@ -380,21 +335,22 @@ pub async fn code_analysis_tools_set_config(
         &workspace_ref,
         "code_analysis_tools_set_config",
     )?;
-    let previous = config.code_analysis_tools();
-    config
-        .set_code_analysis_tools(value)
-        .map_err(|error| AppError::new("code_analysis.persist_failed", error))?;
-    crate::code_tools::set(value);
-
-    // The analyzer set is wired into the language server workspace at startup
-    // (Directory.Build.props), so flipping it only takes effect after a
-    // server restart. Do that in the background when one is running.
-    if previous.unity_analyzers != value.unity_analyzers && crate::csharp_lsp::is_enabled() {
-        let cwd = scope_root(&scope);
-        tokio::spawn(async move {
-            let _ = crate::csharp_lsp::restart(&cwd).await;
-        });
-    }
+    let context = crate::settings::apply::WriteContext::new(app, Some(&scope));
+    let changes = [
+        (crate::settings::UNITY_CODE_ANALYSIS_SYMBOL_SEARCH, value.code_symbol_search),
+        (crate::settings::UNITY_CODE_ANALYSIS_GOTO_DEFINITION, value.code_goto_definition),
+        (crate::settings::UNITY_CODE_ANALYSIS_FIND_REFERENCES, value.code_find_references),
+        (crate::settings::UNITY_CODE_ANALYSIS_DIAGNOSTICS, value.code_diagnostics),
+        (
+            crate::settings::UNITY_CODE_ANALYSIS_EDIT_WRITE_DIAGNOSTICS,
+            value.edit_write_diagnostics,
+        ),
+        (crate::settings::UNITY_CODE_ANALYSIS_HOVER, value.code_hover),
+        (crate::settings::UNITY_CODE_ANALYSIS_UNITY_CODE_USAGES, value.unity_code_usages),
+        (crate::settings::UNITY_CODE_ANALYSIS_UNITY_ANALYZERS, value.unity_analyzers),
+    ]
+    .map(|(key, enabled)| (key.index(), serde_json::Value::Bool(enabled)));
+    crate::settings::apply::write(&context, &changes).await?;
     Ok(config.code_analysis_tools())
 }
 

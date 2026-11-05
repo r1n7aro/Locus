@@ -134,7 +134,7 @@ async function previewSoundAlert() {
 </script>
 
 <template>
-  <div class="settings-section">
+  <div class="settings-section" data-settings-section="system">
     <div class="section-label">{{ t("settings.notifications.systemTitle") }}</div>
     <p class="section-desc">{{ t("settings.notifications.systemDesc") }}</p>
 
@@ -213,7 +213,7 @@ async function previewSoundAlert() {
     </div>
   </div>
 
-  <div class="settings-section">
+  <div class="settings-section" data-settings-section="hints">
     <div class="section-label">{{ t("settings.notifications.cacheTitle") }}</div>
     <p class="section-desc">{{ t("settings.notifications.cacheDesc") }}</p>
 
@@ -227,7 +227,7 @@ async function previewSoundAlert() {
     </div>
   </div>
 
-  <div class="settings-section">
+  <div class="settings-section" data-settings-section="sound">
     <div class="section-label">{{ t("settings.notifications.soundTitle") }}</div>
     <p class="section-desc">{{ t("settings.notifications.soundDesc") }}</p>
 

@@ -1,37 +1,53 @@
 
 <script setup lang="ts">
-import { watch } from "vue";
-import type {
-  ModelOption,
-  ModelDefaults,
-  AgentInfo,
-  CustomProvider,
-  CodexModelConfig,
-} from "../types";
-import { t, locale, setLocale } from "../i18n";
-import { useSettingsState } from "../composables/useSettingsState";
-import GeneralSettings from "./settings/GeneralSettings.vue";
-import DisplaySettings from "./settings/DisplaySettings.vue";
+import { computed, defineAsyncComponent, nextTick, ref, watch } from "vue";
+import { storeToRefs } from "pinia";
+import { Search, X } from "lucide";
+import type { ModelOption, AgentInfo } from "../types";
+import { t, locale } from "../i18n";
+import { useSettingsSchema } from "../composables/useSettingsStore";
+import { useSearchScope } from "../composables/useSearchScope";
+import {
+  DEFAULT_SETTINGS_PAGE,
+  SETTINGS_GROUPS,
+  buildSettingsSearchIndex,
+  searchSettings,
+  settingsPage,
+  settingsPagesInGroup,
+  type SettingsPageId,
+  type SettingsSearchResult,
+} from "./settings/nav";
+import "./settings/settingsView.css";
 import NotificationsSettings from "./settings/NotificationsSettings.vue";
 import ShortcutSettings from "./settings/ShortcutSettings.vue";
-import GlobalSearchSettings from "./settings/GlobalSearchSettings.vue";
 import ConsoleSettings from "./settings/ConsoleSettings.vue";
 import AboutSettings from "./settings/AboutSettings.vue";
 import ProxySettings from "./settings/ProxySettings.vue";
-import ApiProviders from "./settings/ApiProviders.vue";
 import CustomProviderModal from "./settings/CustomProviderModal.vue";
-import ModelDefaultsPanel from "./settings/ModelDefaults.vue";
 import ModelUsageStats from "./settings/ModelUsageStats.vue";
-import ToolPermissions from "./settings/ToolPermissions.vue";
-import CodeAnalysisSettings from "./settings/CodeAnalysisSettings.vue";
 import McpSettings from "./settings/McpSettings.vue";
 import McpServerSettings from "./settings/McpServerSettings.vue";
-import HotReloadSettings from "./settings/HotReloadSettings.vue";
-import UnityConnectionSettings from "./settings/UnityConnectionSettings.vue";
-import TestingSettings from "./settings/TestingSettings.vue";
-import ExperimentalSettings from "./settings/ExperimentalSettings.vue";
+import RemoteAccessSettings from "./settings/RemoteAccessSettings.vue";
+import UnitySettings from "./settings/UnitySettings.vue";
+import BlenderSettings from "./settings/BlenderSettings.vue";
+import AgentBehaviorPage from "./settings/pages/AgentBehaviorPage.vue";
+import AppearancePage from "./settings/pages/AppearancePage.vue";
+import ChatSettingsPage from "./settings/pages/ChatSettingsPage.vue";
+import DebugSettingsPage from "./settings/pages/DebugSettingsPage.vue";
+import ModelDefaultsPage from "./settings/pages/ModelDefaultsPage.vue";
+import PermissionsPage from "./settings/pages/PermissionsPage.vue";
+import ProvidersPage from "./settings/pages/ProvidersPage.vue";
+import SystemSettingsPage from "./settings/pages/SystemSettingsPage.vue";
+import WorkbenchSettingsPage from "./settings/pages/WorkbenchSettingsPage.vue";
+import WorkspacePage from "./settings/pages/WorkspacePage.vue";
+import LucideIcon from "./icons/LucideIcon.vue";
+import { resetToOnboarding } from "./settings/resetToOnboarding";
 import { useUiStore } from "../stores/ui";
-import { useChatStore } from "../stores/chat";
+import { useCustomProviderSettingsStore } from "../stores/customProviderSettings";
+import { useSettingsFeedbackStore } from "../stores/settingsFeedback";
+
+// Loaded when the LaTeX page is opened.
+const LatexSettings = defineAsyncComponent(() => import("./settings/LatexSettings.vue"));
 
 const props = withDefaults(defineProps<{
   active?: boolean;
@@ -44,427 +60,301 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   authChanged: [];
-  modelDefaultsChanged: [defaults: ModelDefaults];
-  codexTransportChanged: [config: CodexModelConfig];
-  customProvidersChanged: [providers: CustomProvider[]];
   resetOnboarding: [];
 }>();
 
-const {
-  resetConfirm, handleResetOnboarding, activeCategory,
-  providers, editingProvider, editKey, errorMsg, successMsg, isLoading,
-  claudeCodeTestStatus, claudeCodeTestResult, testClaudeCode, loadProviders,
-  startEdit, cancelEdit, saveKey, deleteKey, handleKeydown,
-  dynamicToolLoadingMode, dynamicToolLoadingBusy, setDynamicToolLoadingMode,
-  anthropicNativeLazyEnabled, anthropicNativeLazyBusy, setAnthropicNativeLazyEnabled,
-  oauthStep, oauthCode, startOAuthLogin, submitOAuthCode, cancelOAuth, oauthLogout, importClaudeCodeOAuth, handleOAuthKeydown, anthropicQuota, loadAnthropicRateLimits,
-  codexStep, codexStatus, codexQuota, codexRefreshing, codexResetCreditBusyId, codexRetrying, codexModelConfig, codexUserCode, codexUrl, codexCodeCopied, cancelCodexLogin, codexLogout, importCodexCli, retryCodexValidation, copyCode, setCodexTransportMode, setCodexContextWindow, setCodexSessionTitleGeneration, setCodexAutoReview, setCodexUseApplyPatch, setCodexPrefixCacheTtlSeconds, refreshCodexSubscription, consumeCodexResetCredit,
-  requestCodexLogin,
-  codexClientVersionBusy, setCodexAutoUpdateClientVersion,
-  modelDefaults, modelSaveMsg, saveModelDefaults,
-  permSaveMsg, toolList, approvalBehaviorList, toolPermissions,
-  fileToolWorkspaceBoundary, fileToolWorkspaceBoundaryReady, fileToolWorkspaceBoundaryBusy,
-  setToolPermission, setFileToolWorkspaceBoundaryEnabled,
-  customProviders, editingCustomProvider, isAddingCustomProvider, customProviderSaving, testStatus, testResult,
-  modelCatalog, modelCatalogLoading, modelCatalogRefreshing, loadModelCatalog, refreshCatalog,
-  startAddCustomProvider, startEditCustomProvider, cancelEditCustomProvider, saveCustomProvider, deleteCustomProvider, testCustomProvider,
-} = useSettingsState(emit);
-
 const uiStore = useUiStore();
-const chatStore = useChatStore();
+const feedback = useSettingsFeedbackStore();
+const customProviderSettings = useCustomProviderSettingsStore();
+const {
+  editingCustomProvider,
+  isAddingCustomProvider,
+  customProviderSaving,
+  testStatus,
+  testResult,
+  modelCatalog,
+  modelCatalogLoading,
+  modelCatalogRefreshing,
+} = storeToRefs(customProviderSettings);
+const activeCategory = ref<SettingsPageId>(DEFAULT_SETTINGS_PAGE);
+const panelRef = ref<HTMLElement | null>(null);
+const contentRef = ref<HTMLElement | null>(null);
+
+// Provider sign-in changes reach the host, which reloads auth and models.
+watch(() => feedback.authRevision, () => emit("authChanged"));
+
+// ── reset ───────────────────────────────────────────────────────────────
+
+const resetConfirm = ref(false);
+
+async function handleResetOnboarding() {
+  await resetToOnboarding();
+  resetConfirm.value = false;
+  activeCategory.value = DEFAULT_SETTINGS_PAGE;
+  emit("authChanged");
+  emit("resetOnboarding");
+}
+
+// ── navigation ──────────────────────────────────────────────────────────
+
+const TARGET_HIGHLIGHT_MS = 1600;
+
+/** Scrolls to a section once the page has rendered it (pages may load async). */
+async function revealSection(sectionId: string) {
+  await nextTick();
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const target = contentRef.value?.querySelector<HTMLElement>(`[data-settings-section="${sectionId}"]`);
+    if (target) {
+      target.scrollIntoView({ block: "start", behavior: "smooth" });
+      target.classList.add("settings-section-target");
+      window.setTimeout(() => target.classList.remove("settings-section-target"), TARGET_HIGHLIGHT_MS);
+      return;
+    }
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+  // Pages that are a single block have no section anchors.
+  contentRef.value?.scrollTo({ top: 0 });
+}
+
+function openPage(page: SettingsPageId, section?: string | null) {
+  closeSearch(false);
+  activeCategory.value = page;
+  if (section) void revealSection(section);
+  else contentRef.value?.scrollTo({ top: 0 });
+}
 
 watch(
   () => uiStore.settingsCategoryHint,
-  (category) => {
-    if (!category) return;
-    activeCategory.value = category;
+  (hint) => {
+    if (!hint) return;
+    openPage(hint.page, hint.section);
     uiStore.clearSettingsCategoryHint();
   },
   { immediate: true },
 );
 
+// ── search ──────────────────────────────────────────────────────────────
+// Hidden until the find shortcut (Ctrl+F) is pressed inside the settings
+// panel; it then opens above the content and lists matches in its place.
+
+const searchOpen = ref(false);
+const searchInputRef = ref<HTMLInputElement | null>(null);
+const selectedResult = ref(0);
+const searchQuery = ref("");
+const schema = useSettingsSchema();
+const searchIndex = computed(() => {
+  void locale.value;
+  const entries = schema.value;
+  const keys = entries ? [...entries.keys()] : [];
+  const experimental = new Set(keys.filter((key) => entries?.get(key)?.experimental));
+  return buildSettingsSearchIndex(t, keys, experimental);
+});
+const searchActive = computed(() => searchQuery.value.trim().length > 0);
+const searchResults = computed(() => searchSettings(searchIndex.value, searchQuery.value, t));
+
+function resultTitle(result: SettingsSearchResult): string {
+  if (result.settingLabel) return result.settingLabel;
+  const page = settingsPage(result.pageId);
+  const section = page.sections.find((item) => item.id === result.sectionId);
+  return t(section?.titleKey ?? page.labelKey);
+}
+
+function resultPath(result: SettingsSearchResult): string {
+  const page = settingsPage(result.pageId);
+  const section = page.sections.find((item) => item.id === result.sectionId);
+  const pageLabel = t(page.labelKey);
+  if (!section || !result.settingLabel) return pageLabel;
+  const sectionLabel = t(section.titleKey);
+  return sectionLabel === pageLabel ? pageLabel : `${pageLabel} › ${sectionLabel}`;
+}
+
+function openResult(result: SettingsSearchResult) {
+  openPage(result.pageId, result.sectionId);
+}
+
+async function openSearch() {
+  searchOpen.value = true;
+  await nextTick();
+  searchInputRef.value?.focus();
+  searchInputRef.value?.select();
+}
+
+/** Hides the search bar; `refocus` keeps the find shortcut in this panel. */
+function closeSearch(refocus = true) {
+  if (!searchOpen.value) return;
+  searchOpen.value = false;
+  searchQuery.value = "";
+  if (refocus) panelRef.value?.focus({ preventScroll: true });
+}
+
+watch(searchQuery, () => {
+  selectedResult.value = 0;
+});
+
+function moveSelection(step: number) {
+  const count = searchResults.value.length;
+  if (count === 0) return;
+  selectedResult.value = (selectedResult.value + step + count) % count;
+  void nextTick(() => {
+    contentRef.value
+      ?.querySelector(".settings-search-result.selected")
+      ?.scrollIntoView({ block: "nearest" });
+  });
+}
+
+function openSelectedResult() {
+  const result = searchResults.value[selectedResult.value];
+  if (result) openResult(result);
+}
+
+useSearchScope(panelRef, () => void openSearch(), { enabled: () => props.active });
+
+// Entering the page from the top navigation leaves focus outside the panel;
+// move it in so the find shortcut opens this search instead of the global one.
+watch(
+  () => props.active,
+  (active) => {
+    if (!active) return;
+    void nextTick(() => {
+      const panel = panelRef.value;
+      if (panel && !panel.contains(panel.ownerDocument.activeElement)) panel.focus({ preventScroll: true });
+    });
+  },
+  { immediate: true },
+);
 </script>
 
 <template>
-  <div class="settings-panel">
+  <div ref="panelRef" class="settings-panel" tabindex="-1">
     <div class="settings-sidebar">
-      <div class="sidebar-nav" :class="{ 'is-cjk': locale === 'zh' }">
-        <div class="sidebar-group-label">{{ t("settings.group.models") }}</div>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'api' }"
-          @click="activeCategory = 'api'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 0a4 4 0 0 0-4 4v1H3a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V6a1 1 0 0 0-1-1h-1V4a4 4 0 0 0-4-4zm2.5 5V4a2.5 2.5 0 1 0-5 0v1h5z"/>
-          </svg>
-          <span>{{ t("settings.tab.api") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'models' }"
-          @click="activeCategory = 'models'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M1 2.5A1.5 1.5 0 0 1 2.5 1h3A1.5 1.5 0 0 1 7 2.5v3A1.5 1.5 0 0 1 5.5 7h-3A1.5 1.5 0 0 1 1 5.5v-3zm8 0A1.5 1.5 0 0 1 10.5 1h3A1.5 1.5 0 0 1 15 2.5v3A1.5 1.5 0 0 1 13.5 7h-3A1.5 1.5 0 0 1 9 5.5v-3zm-8 8A1.5 1.5 0 0 1 2.5 9h3A1.5 1.5 0 0 1 7 10.5v3A1.5 1.5 0 0 1 5.5 15h-3A1.5 1.5 0 0 1 1 13.5v-3zm8 0A1.5 1.5 0 0 1 10.5 9h3a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5h-3A1.5 1.5 0 0 1 9 13.5v-3z"/>
-          </svg>
-          <span>{{ t("settings.tab.models") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'modelUsage' }"
-          @click="activeCategory = 'modelUsage'"
-        >
-          <svg viewBox="0 0 16 16" fill="none" width="14" height="14" aria-hidden="true">
-            <path d="M2.5 13.5V8.75h2.25v4.75H2.5zm4.375 0V5.25h2.25v8.25h-2.25zm4.375 0V2.5h2.25v11h-2.25z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
-          </svg>
-          <span>{{ t("settings.tab.modelUsage") }}</span>
-        </button>
-        <div class="sidebar-group-label">{{ t("settings.group.codeUnity") }}</div>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'codeAnalysis' }"
-          @click="activeCategory = 'codeAnalysis'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M5.72 4.22a.75.75 0 0 1 0 1.06L2.999 8l2.72 2.72a.75.75 0 1 1-1.06 1.06l-3.25-3.25a.75.75 0 0 1 0-1.06l3.25-3.25a.75.75 0 0 1 1.06 0zm4.56 0a.75.75 0 0 1 1.06 0l3.25 3.25a.75.75 0 0 1 0 1.06l-3.25 3.25a.75.75 0 1 1-1.06-1.06L13.001 8l-2.72-2.72a.75.75 0 0 1 0-1.06zM9.262 2.07a.75.75 0 0 1 .545.91l-2.5 10a.75.75 0 0 1-1.455-.364l2.5-10a.75.75 0 0 1 .91-.546z"/>
-          </svg>
-          <span>{{ t("settings.tab.codeAnalysis") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'hotReload' }"
-          @click="activeCategory = 'hotReload'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M11.251.068a.5.5 0 0 1 .227.58L9.677 6.5H13a.5.5 0 0 1 .364.843l-8 8.5a.5.5 0 0 1-.842-.49L6.323 9.5H3a.5.5 0 0 1-.364-.843l8-8.5a.5.5 0 0 1 .615-.09z"/>
-          </svg>
-          <span>{{ t("settings.tab.hotReload") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'unityConnection' }"
-          @click="activeCategory = 'unityConnection'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M6 0a.5.5 0 0 1 .5.5V3h3V.5a.5.5 0 0 1 1 0V3h1a.5.5 0 0 1 .5.5v3A3.5 3.5 0 0 1 8.5 10c-.002.434-.01.845-.04 1.22-.041.514-.126 1.003-.317 1.424a2.083 2.083 0 0 1-.97 1.028C6.725 13.9 6.169 14 5.5 14c-.998 0-1.61.33-1.974.718A1.922 1.922 0 0 0 3 16H2c0-.616.232-1.34.797-1.94C3.323 13.484 4.169 13 5.5 13c.998 0 1.61-.33 1.974-.718.16-.21.26-.485.3-.79H4.5A3.5 3.5 0 0 1 1 7V3.5a.5.5 0 0 1 .5-.5h1V.5a.5.5 0 0 1 1 0V3h3V.5A.5.5 0 0 1 6 0z"/>
-          </svg>
-          <span>{{ t("settings.tab.unityConnection") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'testing' }"
-          @click="activeCategory = 'testing'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M12.78 2.72a.75.75 0 0 1 0 1.06l-5.5 5.5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 0 1 1.06-1.06l1.47 1.47 4.97-4.97a.75.75 0 0 1 1.06 0zM3 11.25A1.75 1.75 0 0 0 4.75 13h6.5A1.75 1.75 0 0 0 13 11.25V8.5a.75.75 0 0 1 1.5 0v2.75a3.25 3.25 0 0 1-3.25 3.25h-6.5A3.25 3.25 0 0 1 1.5 11.25v-6.5A3.25 3.25 0 0 1 4.75 1.5H8.5a.75.75 0 0 1 0 1.5H4.75A1.75 1.75 0 0 0 3 4.75v6.5z"/>
-          </svg>
-          <span>{{ t("settings.tab.testing") }}</span>
-        </button>
-        <div class="sidebar-group-label">{{ t("settings.group.tools") }}</div>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'permissions' }"
-          @click="activeCategory = 'permissions'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 1a3.5 3.5 0 0 0-3.5 3.5v1H3.25A1.25 1.25 0 0 0 2 6.75v7A1.25 1.25 0 0 0 3.25 15h9.5A1.25 1.25 0 0 0 14 13.75v-7A1.25 1.25 0 0 0 12.75 5.5H11.5v-1A3.5 3.5 0 0 0 8 1zm-2 4.5v-1a2 2 0 1 1 4 0v1H6z"/>
-          </svg>
-          <span>{{ t("settings.tab.permissions") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'mcp' }"
-          @click="activeCategory = 'mcp'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M6 3.5A1.5 1.5 0 0 1 7.5 2h1A1.5 1.5 0 0 1 10 3.5v1A1.5 1.5 0 0 1 8.5 6v1H14a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0V8h-5v.5a.5.5 0 0 1-1 0v-1A.5.5 0 0 1 2 7h5.5V6A1.5 1.5 0 0 1 6 4.5v-1zM8.5 5a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1zM0 11.5A1.5 1.5 0 0 1 1.5 10h1A1.5 1.5 0 0 1 4 11.5v1A1.5 1.5 0 0 1 2.5 14h-1A1.5 1.5 0 0 1 0 12.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1zm4.5.5A1.5 1.5 0 0 1 7.5 10h1a1.5 1.5 0 0 1 1.5 1.5v1A1.5 1.5 0 0 1 8.5 14h-1A1.5 1.5 0 0 1 6 12.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1zm4.5.5a1.5 1.5 0 0 1 1.5-1.5h1a1.5 1.5 0 0 1 1.5 1.5v1a1.5 1.5 0 0 1-1.5 1.5h-1a1.5 1.5 0 0 1-1.5-1.5v-1zm1.5-.5a.5.5 0 0 0-.5.5v1a.5.5 0 0 0 .5.5h1a.5.5 0 0 0 .5-.5v-1a.5.5 0 0 0-.5-.5h-1z"/>
-          </svg>
-          <span>{{ t("settings.tab.mcp") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'mcpServer' }"
-          @click="activeCategory = 'mcpServer'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M1.5 2A1.5 1.5 0 0 0 0 3.5v2A1.5 1.5 0 0 0 1.5 7h13A1.5 1.5 0 0 0 16 5.5v-2A1.5 1.5 0 0 0 14.5 2h-13zM1 3.5a.5.5 0 0 1 .5-.5h13a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-.5.5h-13a.5.5 0 0 1-.5-.5v-2zM3.75 4a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5zM1.5 9A1.5 1.5 0 0 0 0 10.5v2A1.5 1.5 0 0 0 1.5 14h13a1.5 1.5 0 0 0 1.5-1.5v-2A1.5 1.5 0 0 0 14.5 9h-13zM1 10.5a.5.5 0 0 1 .5-.5h13a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-.5.5h-13a.5.5 0 0 1-.5-.5v-2zm2.75.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5z"/>
-          </svg>
-          <span>{{ t("settings.tab.mcpServer") }}</span>
-        </button>
-        <div class="sidebar-group-label">{{ t("settings.group.general") }}</div>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'general' }"
-          @click="activeCategory = 'general'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm0 1.5a6.5 6.5 0 0 1 4.936 10.752l-.221-.164c-.976-.725-2.622-1.338-4.715-1.338s-3.739.613-4.715 1.338l-.221.164A6.5 6.5 0 0 1 8 1.5zM4 6a4 4 0 1 1 8 0 4 4 0 0 1-8 0z"/>
-          </svg>
-          <span>{{ t("settings.tab.general") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'display' }"
-          @click="activeCategory = 'display'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 9.5v-6zM3.5 3a.5.5 0 0 0-.5.5v6a.5.5 0 0 0 .5.5h9a.5.5 0 0 0 .5-.5v-6a.5.5 0 0 0-.5-.5h-9zM5 13a.75.75 0 0 0 0 1.5h6a.75.75 0 0 0 0-1.5H5z"/>
-          </svg>
-          <span>{{ t("settings.tab.display") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'notifications' }"
-          @click="activeCategory = 'notifications'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 1.5a3.75 3.75 0 0 0-3.75 3.75v1.9c0 .7-.2 1.38-.57 1.96L3.04 10.1A1.25 1.25 0 0 0 4.1 12h7.8a1.25 1.25 0 0 0 1.06-1.9l-.64-.99a3.7 3.7 0 0 1-.57-1.96v-1.9A3.75 3.75 0 0 0 8 1.5zM6.25 13a1.75 1.75 0 0 0 3.5 0h-3.5z"/>
-          </svg>
-          <span>{{ t("settings.tab.notifications") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'globalSearch' }"
-          @click="activeCategory = 'globalSearch'"
-        >
-          <svg viewBox="0 0 16 16" fill="none" width="14" height="14" aria-hidden="true"><circle cx="6.75" cy="6.75" r="4.5" stroke="currentColor" stroke-width="1.4"/><path d="m10 10 3.75 3.75" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
-          <span>{{ t("settings.tab.globalSearch") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'shortcuts' }"
-          @click="activeCategory = 'shortcuts'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M2 4.25A2.25 2.25 0 0 1 4.25 2h7.5A2.25 2.25 0 0 1 14 4.25v7.5A2.25 2.25 0 0 1 11.75 14h-7.5A2.25 2.25 0 0 1 2 11.75v-7.5zm2.25-1.25A1.25 1.25 0 0 0 3 4.25V6h10V4.25A1.25 1.25 0 0 0 11.75 3h-7.5zM13 7H3v4.75A1.25 1.25 0 0 0 4.25 13h7.5A1.25 1.25 0 0 0 13 11.75V7zM4.25 8.25h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1 0-1.5zm0 2.5h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1 0-1.5zm4-2.5h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1 0-1.5zm0 2.5h3.5a.75.75 0 0 1 0 1.5h-3.5a.75.75 0 0 1 0-1.5z"/>
-          </svg>
-          <span>{{ t("settings.tab.shortcuts") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'proxy' }"
-          @click="activeCategory = 'proxy'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 1.25a6.75 6.75 0 1 0 0 13.5A6.75 6.75 0 0 0 8 1.25zM2.8 7.25a5.25 5.25 0 0 1 2.044-3.376A8.66 8.66 0 0 0 4.13 7.25H2.8zm0 1.5h1.33c.111 1.294.36 2.454.714 3.376A5.25 5.25 0 0 1 2.8 8.75zm2.84 0h4.72C10.09 11.684 9.09 13.25 8 13.25S5.91 11.684 5.64 8.75zm0-1.5C5.91 4.316 6.91 2.75 8 2.75s2.09 1.566 2.36 4.5H5.64zm5.516 4.876c.354-.922.603-2.082.714-3.376h1.33a5.25 5.25 0 0 1-2.044 3.376zM11.87 7.25a8.66 8.66 0 0 0-.714-3.376A5.25 5.25 0 0 1 13.2 7.25h-1.33z"/>
-          </svg>
-          <span>{{ t("settings.tab.proxy") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'console' }"
-          @click="activeCategory = 'console'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M2.75 2A1.75 1.75 0 0 0 1 3.75v8.5C1 13.216 1.784 14 2.75 14h10.5A1.75 1.75 0 0 0 15 12.25v-8.5A1.75 1.75 0 0 0 13.25 2H2.75zm0 1h10.5c.414 0 .75.336.75.75v1.643H2V3.75c0-.414.336-.75.75-.75zM2 6.393h12v5.857a.75.75 0 0 1-.75.75H2.75a.75.75 0 0 1-.75-.75V6.393zm2.22 1.327a.75.75 0 0 0-1.06 1.06L4.379 10 3.16 11.22a.75.75 0 0 0 1.06 1.06L6.5 10 4.22 7.72zM7.75 11a.75.75 0 0 0 0 1.5h4a.75.75 0 0 0 0-1.5h-4z"/>
-          </svg>
-          <span>{{ t("settings.tab.console") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'about' }"
-          @click="activeCategory = 'about'"
-        >
-          <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
-            <path d="M8 1.25a6.75 6.75 0 1 0 0 13.5 6.75 6.75 0 0 0 0-13.5zM8 2.5a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11zm0 2a.875.875 0 1 0 0 1.75A.875.875 0 0 0 8 4.5zm-.75 3.25a.75.75 0 0 0 0 1.5h.25v2a.75.75 0 0 0 1.5 0v-2a.75.75 0 0 0-.75-.75h-1z"/>
-          </svg>
-          <span>{{ t("settings.tab.about") }}</span>
-        </button>
-        <button
-          class="sidebar-item"
-          :class="{ active: activeCategory === 'experimental' }"
-          @click="activeCategory = 'experimental'"
-        >
-          <svg viewBox="0 0 16 16" fill="none" width="14" height="14" aria-hidden="true">
-            <path d="M5.5 1.5h5M7 1.5v3.25L3.4 11a2.25 2.25 0 0 0 1.95 3.5h5.3A2.25 2.25 0 0 0 12.6 11L9 4.75V1.5M5.1 10h5.8" stroke="currentColor" stroke-width="1.15" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-          <span>{{ t("settings.tab.experimental") }}</span>
-        </button>
-      </div>
+      <nav class="sidebar-nav" :class="{ 'is-cjk': locale === 'zh' }">
+        <template v-for="group in SETTINGS_GROUPS" :key="group.id">
+          <div class="sidebar-group-label">{{ t(group.labelKey) }}</div>
+          <button
+            v-for="page in settingsPagesInGroup(group.id)"
+            :key="page.id"
+            type="button"
+            class="sidebar-item"
+            :class="{ active: activeCategory === page.id }"
+            :data-settings-page="page.id"
+            @click="openPage(page.id as SettingsPageId)"
+          >
+            <LucideIcon :icon="page.icon" :size="14" />
+            <span>{{ t(page.labelKey) }}</span>
+          </button>
+        </template>
+      </nav>
     </div>
 
-    <div class="settings-content">
+    <div ref="contentRef" class="settings-content">
+      <div v-if="searchOpen" class="settings-search-bar">
+        <div class="settings-search">
+          <LucideIcon :icon="Search" :size="14" />
+          <input
+            ref="searchInputRef"
+            v-model="searchQuery"
+            type="search"
+            spellcheck="false"
+            autocomplete="off"
+            :placeholder="t('settings.search.placeholder')"
+            :aria-label="t('settings.search.placeholder')"
+            @keydown.escape.stop.prevent="closeSearch()"
+            @keydown.enter.prevent="openSelectedResult"
+            @keydown.down.prevent="moveSelection(1)"
+            @keydown.up.prevent="moveSelection(-1)"
+          />
+          <button
+            type="button"
+            class="settings-search-clear"
+            :title="t('settings.search.close')"
+            :aria-label="t('settings.search.close')"
+            @click="closeSearch()"
+          >
+            <LucideIcon :icon="X" :size="13" />
+          </button>
+        </div>
+      </div>
+
+      <div v-if="searchActive" class="settings-search-results" :class="{ 'is-cjk': locale === 'zh' }">
+        <button
+          v-for="(result, index) in searchResults"
+          :key="`${result.pageId}/${result.sectionId ?? ''}/${result.settingLabel ?? ''}`"
+          type="button"
+          class="settings-search-result"
+          :class="{ selected: index === selectedResult }"
+          @click="openResult(result)"
+          @mouseenter="selectedResult = index"
+        >
+          <span class="settings-search-result-title">{{ resultTitle(result) }}</span>
+          <span class="settings-search-result-path">{{ resultPath(result) }}</span>
+        </button>
+        <div v-if="searchResults.length === 0" class="settings-search-empty">
+          {{ t("settings.search.noResults") }}
+        </div>
+      </div>
+
+      <div v-show="!searchActive" class="settings-page-host">
       <Transition name="fade">
-        <div v-if="successMsg || modelSaveMsg" class="success-msg">{{ successMsg || modelSaveMsg }}</div>
+        <div v-if="feedback.success" class="success-msg">{{ feedback.success }}</div>
       </Transition>
 
-      <template v-if="activeCategory === 'api'">
-        <ApiProviders
-          :providers="providers"
-          :editing-provider="editingProvider"
-          :edit-key="editKey"
-          :error-msg="errorMsg"
-          :success-msg="successMsg"
-          :is-loading="isLoading"
-          :oauth-step="oauthStep"
-          :oauth-code="oauthCode"
-          :anthropic-quota="anthropicQuota"
-          :codex-step="codexStep"
-          :codex-status="codexStatus"
-          :codex-quota="codexQuota"
-          :codex-refreshing="codexRefreshing || codexClientVersionBusy"
-          :codex-reset-credit-busy-id="codexResetCreditBusyId"
-          :codex-retrying="codexRetrying"
-          :codex-transport="codexModelConfig.transport"
-          :codex-auto-update-client-version="codexModelConfig.autoUpdateClientVersion"
-          :codex-client-version-busy="codexClientVersionBusy"
-          :codex-context-window="codexModelConfig.contextWindow"
-          :codex-session-title-generation="codexModelConfig.generateSessionTitles"
-          :codex-auto-review="codexModelConfig.autoReview"
-          :codex-use-apply-patch="codexModelConfig.useApplyPatch"
-          :codex-prefix-cache-ttl-seconds="codexModelConfig.prefixCacheTtlSeconds"
-          :dynamic-tool-loading-mode="dynamicToolLoadingMode"
-          :dynamic-tool-loading-busy="dynamicToolLoadingBusy"
-          :anthropic-native-lazy-enabled="anthropicNativeLazyEnabled"
-          :anthropic-native-lazy-busy="anthropicNativeLazyBusy"
-          :codex-user-code="codexUserCode"
-          :codex-url="codexUrl"
-          :codex-code-copied="codexCodeCopied"
-          :all-models="allModels"
-          :custom-providers="customProviders"
-          :custom-provider-saving="customProviderSaving"
-          :claude-code-test-status="claudeCodeTestStatus"
-          :claude-code-test-result="claudeCodeTestResult"
-          @test-claude-code="testClaudeCode"
-          @claude-connection-changed="loadProviders(); emit('authChanged')"
-          @start-edit="startEdit"
-          @cancel-edit="cancelEdit"
-          @save-key="saveKey"
-          @delete-key="deleteKey"
-          @handle-keydown="handleKeydown"
-          @start-o-auth-login="startOAuthLogin"
-          @submit-o-auth-code="submitOAuthCode"
-          @cancel-o-auth="cancelOAuth"
-          @oauth-logout="oauthLogout"
-          @import-claude-code-o-auth="importClaudeCodeOAuth"
-          @handle-o-auth-keydown="handleOAuthKeydown"
-          @refresh-anthropic-quota="loadAnthropicRateLimits"
-          @start-codex-login="requestCodexLogin"
-          @import-codex-cli="importCodexCli"
-          @cancel-codex-login="cancelCodexLogin"
-          @codex-logout="codexLogout"
-          @retry-codex-validation="retryCodexValidation"
-          @refresh-codex-quota="refreshCodexSubscription"
-          @consume-codex-reset-credit="consumeCodexResetCredit"
-          @copy-code="copyCode"
-          @update:codex-transport="setCodexTransportMode"
-          @update:codex-auto-update-client-version="setCodexAutoUpdateClientVersion"
-          @update:codex-context-window="setCodexContextWindow"
-          @update:codex-session-title-generation="setCodexSessionTitleGeneration"
-          @update:codex-auto-review="setCodexAutoReview"
-          @update:codex-use-apply-patch="setCodexUseApplyPatch"
-          @update:codex-prefix-cache-ttl-seconds="setCodexPrefixCacheTtlSeconds"
-          @update:dynamic-tool-loading-mode="setDynamicToolLoadingMode"
-          @update:anthropic-native-lazy-enabled="setAnthropicNativeLazyEnabled"
-          @start-add-provider="startAddCustomProvider"
-          @start-edit-provider="startEditCustomProvider"
-          @delete-provider="deleteCustomProvider"
-          @update:edit-key="editKey = $event"
-          @update:oauth-code="oauthCode = $event"
-        />
-      </template>
+      <ProvidersPage v-if="activeCategory === 'providers'" :all-models="allModels" />
 
-      <template v-if="activeCategory === 'models'">
-        <ModelDefaultsPanel
-          :model-defaults="modelDefaults"
-          :all-models="allModels"
-          :agents="agents"
-          :subagents="subagents"
-          :model-save-msg="modelSaveMsg"
-          @update:model-defaults="modelDefaults = $event"
-          @save="saveModelDefaults"
-        />
-      </template>
+      <ModelDefaultsPage
+        v-else-if="activeCategory === 'modelDefaults'"
+        :all-models="allModels"
+        :agents="agents"
+        :subagents="subagents"
+      />
 
-      <template v-if="activeCategory === 'modelUsage'">
-        <ModelUsageStats />
-      </template>
+      <ModelUsageStats v-else-if="activeCategory === 'modelUsage'" />
 
-      <template v-if="activeCategory === 'mcpServer'">
-        <McpServerSettings />
-      </template>
+      <AgentBehaviorPage v-else-if="activeCategory === 'agentBehavior'" :agents="agents" />
 
-      <template v-if="activeCategory === 'mcp'">
-        <McpSettings />
-      </template>
+      <PermissionsPage v-else-if="activeCategory === 'permissions'" />
 
-      <template v-if="activeCategory === 'permissions'">
-        <ToolPermissions
-          :tool-permission-mode="chatStore.toolPermissionMode"
-          :tool-list="toolList"
-          :behavior-list="approvalBehaviorList"
-          :tool-permissions="toolPermissions"
-          :file-workspace-boundary-enabled="fileToolWorkspaceBoundary"
-          :file-workspace-boundary-ready="fileToolWorkspaceBoundaryReady"
-          :file-workspace-boundary-busy="fileToolWorkspaceBoundaryBusy"
-          :perm-save-msg="permSaveMsg"
-          @set-global-permission-mode="chatStore.setToolPermissionMode"
-          @set-permission="setToolPermission"
-          @set-file-workspace-boundary="setFileToolWorkspaceBoundaryEnabled"
-        />
-      </template>
+      <McpSettings v-else-if="activeCategory === 'mcp'" />
 
-      <template v-if="activeCategory === 'codeAnalysis'">
-        <CodeAnalysisSettings />
-      </template>
+      <WorkspacePage v-else-if="activeCategory === 'workspace'" />
 
-      <template v-if="activeCategory === 'hotReload'">
-        <HotReloadSettings />
-      </template>
+      <UnitySettings v-else-if="activeCategory === 'unity'" />
 
-      <template v-if="activeCategory === 'unityConnection'">
-        <UnityConnectionSettings />
-      </template>
+      <BlenderSettings v-else-if="activeCategory === 'blender'" />
 
-      <template v-if="activeCategory === 'testing'">
-        <TestingSettings />
-      </template>
+      <LatexSettings v-else-if="activeCategory === 'latex'" />
 
-      <template v-if="activeCategory === 'proxy'">
-        <ProxySettings />
-      </template>
+      <AppearancePage v-else-if="activeCategory === 'appearance'" />
 
-      <template v-if="activeCategory === 'display'">
-        <DisplaySettings />
-      </template>
+      <ChatSettingsPage v-else-if="activeCategory === 'chat'" />
 
-      <template v-if="activeCategory === 'notifications'">
-        <NotificationsSettings />
-      </template>
+      <WorkbenchSettingsPage v-else-if="activeCategory === 'workbench'" />
 
-      <template v-if="activeCategory === 'shortcuts'">
-        <ShortcutSettings />
-      </template>
+      <NotificationsSettings v-else-if="activeCategory === 'notifications'" />
 
-      <template v-if="props.active && activeCategory === 'console'">
-        <ConsoleSettings />
-      </template>
-      <template v-if="activeCategory === 'globalSearch'">
-        <GlobalSearchSettings />
-      </template>
+      <ShortcutSettings v-else-if="activeCategory === 'shortcuts'" />
 
-      <template v-if="activeCategory === 'about'">
-        <AboutSettings />
-      </template>
+      <ProxySettings v-else-if="activeCategory === 'proxy'" />
 
-      <template v-if="activeCategory === 'experimental'">
-        <ExperimentalSettings />
-      </template>
+      <McpServerSettings v-else-if="activeCategory === 'mcpServer'" />
 
-      <template v-if="activeCategory === 'general'">
-        <GeneralSettings
-          :locale="locale"
-          :agents="agents"
-          :reset-confirm="resetConfirm"
-          @set-locale="setLocale"
-          @start-reset="resetConfirm = true"
-          @confirm-reset="handleResetOnboarding"
-          @cancel-reset="resetConfirm = false"
-        />
-      </template>
+      <RemoteAccessSettings v-else-if="activeCategory === 'remoteAccess'" />
 
-      <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
+      <SystemSettingsPage
+        v-else-if="activeCategory === 'system'"
+        :reset-confirm="resetConfirm"
+        @start-reset="resetConfirm = true"
+        @confirm-reset="handleResetOnboarding"
+        @cancel-reset="resetConfirm = false"
+      />
+
+      <DebugSettingsPage v-else-if="activeCategory === 'debug'" />
+
+      <ConsoleSettings v-else-if="props.active && activeCategory === 'logs'" />
+
+      <AboutSettings v-else-if="activeCategory === 'about'" />
+
+      <div v-if="feedback.error" class="error-msg">{{ feedback.error }}</div>
+      </div>
     </div><!-- end settings-content -->
 
     <CustomProviderModal
@@ -476,17 +366,18 @@ watch(
       :catalog="modelCatalog"
       :catalog-loading="modelCatalogLoading"
       :catalog-refreshing="modelCatalogRefreshing"
-      @close="cancelEditCustomProvider"
-      @save="saveCustomProvider"
-      @test="testCustomProvider"
-      @open-catalog="loadModelCatalog()"
-      @refresh-catalog="refreshCatalog"
+      @close="customProviderSettings.cancelEditCustomProvider"
+      @save="customProviderSettings.saveCustomProvider"
+      @test="customProviderSettings.testCustomProvider"
+      @open-catalog="customProviderSettings.loadModelCatalog()"
+      @refresh-catalog="customProviderSettings.refreshCatalog"
     />
 
   </div>
 </template>
 
 <style scoped>
+/* Shared settings styles: ./settings/settingsView.css */
 .settings-panel {
   flex: 1;
   display: flex;
@@ -494,949 +385,6 @@ watch(
   background: var(--bg-color);
   height: 100%;
   overflow: hidden;
-}
-
-:deep(.settings-sidebar) {
-  width: 160px;
-  min-width: 140px;
-  display: flex;
-  flex-direction: column;
-  border-right: 1px solid var(--border-color);
-  background: var(--sidebar-bg);
-  flex-shrink: 0;
-  overflow: hidden;
-}
-
-:deep(.sidebar-nav) {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 12px 8px 8px;
-}
-
-:deep(.sidebar-group-label) {
-  padding: 12px 10px 5px;
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  /* 微染强调色：比子项更亮且带色相，分组标题一眼可辨；用 token 混合以适配 light/dark */
-  color: color-mix(in srgb, var(--accent-color) 55%, var(--text-secondary) 45%);
-  user-select: none;
-}
-
-:deep(.sidebar-group-label:first-child) {
-  padding-top: 4px;
-}
-
-/* 中文等 CJK 文案：大写英文需要的字距会把汉字拉散，这里收紧字距并略放大以保持清晰 */
-:deep(.sidebar-nav.is-cjk .sidebar-group-label) {
-  font-size: 11.5px;
-  letter-spacing: 0;
-}
-
-:deep(.sidebar-item) {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  min-height: 34px;
-  border: none;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 13px;
-  line-height: 1.3;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-  text-align: left;
-  white-space: nowrap;
-}
-
-:deep(.sidebar-item:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-}
-
-:deep(.sidebar-item.active) {
-  background: color-mix(in srgb, var(--panel-bg) 40%, var(--active-bg) 60%);
-  color: var(--text-color);
-}
-
-:deep(.sidebar-item svg) {
-  flex-shrink: 0;
-  opacity: 0.6;
-}
-
-:deep(.sidebar-item.active svg) {
-  opacity: 1;
-}
-
-:deep(.settings-content) {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow-y: auto;
-  min-width: 0;
-  background: var(--panel-bg);
-}
-
-:deep(.settings-section) {
-  padding: 18px 28px;
-}
-
-:deep(.section-label) {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-secondary);
-  margin-bottom: 12px;
-}
-
-:deep(.provider-card) {
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  padding: 14px 16px;
-  margin-bottom: 10px;
-  transition: border-color 0.15s ease, background 0.15s ease;
-  background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
-}
-
-:deep(.provider-card:hover) {
-  border-color: var(--border-strong);
-  background: color-mix(in srgb, var(--panel-bg) 88%, var(--hover-bg) 12%);
-}
-
-:deep(.provider-header) {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-:deep(.provider-info) {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-:deep(.provider-name) {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-:deep(.provider-desc) {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-:deep(.provider-status) {
-  font-size: 11px;
-  font-weight: 500;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: var(--hover-bg);
-  color: var(--text-secondary);
-  border: 1px solid transparent;
-  flex-shrink: 0;
-  white-space: nowrap;
-}
-
-:deep(.provider-status.active) {
-  background: var(--status-good-bg);
-  color: var(--status-good-fg);
-  border-color: var(--status-good-border);
-}
-
-:deep(.provider-status.error) {
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-  border-color: var(--status-danger-border);
-}
-
-:deep(.provider-detail) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-color);
-}
-
-:deep(.key-hint) {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-:deep(.key-hint.mono) {
-  font-family: var(--font-mono-identifier);
-}
-
-:deep(.provider-actions) {
-  display: flex;
-  gap: 6px;
-}
-
-:deep(.codex-detail) {
-  align-items: flex-start;
-}
-
-:deep(.codex-status-copy) {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-}
-
-:deep(.codex-transport-detail) {
-  align-items: center;
-}
-
-:deep(.codex-transport-copy) {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-}
-
-:deep(.codex-transport-label) {
-  color: var(--text-color);
-}
-
-:deep(.codex-validation-label) {
-  font-size: 11px;
-  color: var(--status-danger-fg);
-  line-height: 1.4;
-}
-
-:deep(.codex-validation-error) {
-  line-height: 1.5;
-  color: var(--text-secondary);
-}
-
-:deep(.action-btn) {
-  padding: 4px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-}
-
-:deep(.action-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--border-strong);
-}
-
-:deep(.action-btn.danger:hover) {
-  color: var(--status-danger-fg);
-  border-color: var(--status-danger-border);
-  background: var(--status-danger-bg);
-}
-
-:deep(.add-key-btn) {
-  padding: 6px 12px;
-  border-radius: 6px;
-  border: 1px dashed var(--border-color);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-}
-
-:deep(.add-key-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--border-strong);
-}
-
-:deep(.get-key-link) {
-  font-size: 11px;
-  color: var(--text-secondary);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  transition: color 0.15s;
-}
-
-:deep(.get-key-link:hover) {
-  color: var(--text-color);
-}
-
-:deep(.edit-form) {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-color);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-:deep(.edit-row) {
-  display: flex;
-  gap: 6px;
-}
-
-:deep(.key-input) {
-  flex: 1;
-  padding: 7px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: var(--input-bg);
-  color: var(--text-color);
-  font-size: 13px;
-  font-family: var(--font-mono-editor);
   outline: none;
-  transition: border-color 0.15s ease, background 0.15s ease;
 }
-
-:deep(.key-input:focus) {
-  border-color: var(--accent-border);
-  background: color-mix(in srgb, var(--input-bg) 88%, var(--accent-soft) 12%);
-}
-
-:deep(.save-btn) {
-  padding: 6px 14px;
-  border-radius: 6px;
-  border: 1px solid var(--accent-color);
-  background: var(--accent-color);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: filter 0.15s ease, opacity 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-:deep(.save-btn:hover:not(:disabled)) {
-  filter: brightness(1.06);
-}
-
-:deep(.save-btn:disabled) {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-:deep(.cancel-btn) {
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 12px;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-:deep(.cancel-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--border-strong);
-}
-
-:deep(.oauth-login-btn) {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 14px;
-  border-radius: 6px;
-  border: 1px solid var(--accent-color);
-  background: var(--accent-color);
-  color: #fff;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: filter 0.15s ease, opacity 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-:deep(.oauth-login-btn:hover:not(:disabled)) {
-  filter: brightness(1.06);
-}
-
-:deep(.oauth-login-btn:disabled) {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-:deep(.oauth-hint) {
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-:deep(.oauth-instruction) {
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.5;
-}
-
-:deep(.error-msg) {
-  margin: 0 28px 16px;
-  padding: 10px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--status-danger-border);
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-  font-size: 13px;
-  line-height: 1.5;
-}
-
-:deep(.success-msg) {
-  margin: 8px 28px 0;
-  padding: 8px 14px;
-  border-radius: 8px;
-  border: 1px solid var(--status-good-border);
-  background: var(--status-good-bg);
-  color: var(--status-good-fg);
-  font-size: 13px;
-  font-weight: 500;
-}
-
-:deep(.fade-enter-active),
-:deep(.fade-leave-active) {
-  transition: opacity 0.2s;
-}
-
-:deep(.fade-enter-from),
-:deep(.fade-leave-to) {
-  opacity: 0;
-}
-
-:deep(.codex-code-row) {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-:deep(.codex-url) {
-  font-size: 11px;
-  color: var(--accent-color);
-  text-decoration: underline;
-  word-break: break-all;
-}
-
-:deep(.codex-code-wrap) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  width: 100%;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: var(--input-bg);
-  border: 1px solid var(--border-color);
-  color: inherit;
-  cursor: pointer;
-  text-align: left;
-  box-shadow: none;
-  transition: border-color 0.15s, background 0.15s;
-}
-
-:deep(.codex-code-wrap:hover) {
-  background: var(--hover-bg);
-  border-color: var(--border-strong, var(--accent-color));
-}
-
-:deep(.codex-code-wrap:focus-visible) {
-  outline: none;
-  border-color: var(--accent-color);
-}
-
-:deep(.codex-code-wrap.copied) {
-  border-color: var(--status-good-border);
-  background: var(--status-good-bg);
-}
-
-:deep(.codex-code) {
-  flex: 1;
-  font-family: var(--font-mono-display);
-  font-size: 18px;
-  font-weight: 700;
-  letter-spacing: 3px;
-  color: var(--accent-color);
-}
-
-:deep(.codex-copy-indicator) {
-  flex-shrink: 0;
-  font-size: 11px;
-  color: var(--text-secondary);
-  transition: color 0.15s;
-}
-
-:deep(.codex-code-wrap.copied .codex-copy-indicator) {
-  color: var(--status-good-fg);
-}
-
-:deep(.codex-poll-row) {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-:deep(.codex-spinner) {
-  width: 12px;
-  height: 12px;
-  border: 2px solid var(--border-color);
-  border-top-color: var(--accent-color);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-  flex-shrink: 0;
-}
-
-@keyframes spin { to { transform: rotate(360deg); } }
-
-:deep(.section-desc) {
-  font-size: 12px;
-  color: var(--text-secondary);
-  margin: -4px 0 14px;
-  line-height: 1.5;
-}
-
-:deep(.model-default-card) {
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  padding: 14px 16px;
-  margin-bottom: 10px;
-  transition: border-color 0.15s ease, background 0.15s ease;
-  background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
-}
-
-:deep(.model-default-card:hover) {
-  border-color: var(--border-strong);
-  background: color-mix(in srgb, var(--panel-bg) 88%, var(--hover-bg) 12%);
-}
-
-:deep(.model-default-header) {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-bottom: 10px;
-}
-
-:deep(.model-default-label) {
-  font-size: 14px;
-  font-weight: 600;
-}
-
-:deep(.model-default-hint) {
-  font-size: 12px;
-  color: var(--text-secondary);
-}
-
-:deep(.model-default-dropdown) {
-  width: 100%;
-}
-
-:deep(.model-default-dropdown.inline) {
-  width: 220px;
-  flex-shrink: 0;
-}
-
-:deep(.model-default-card.compact) {
-  padding: 10px 14px;
-  margin-bottom: 6px;
-}
-
-:deep(.model-default-row) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-:deep(.model-default-agent) {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
-:deep(.model-default-agent .model-default-label) {
-  font-size: 13px;
-}
-
-:deep(.model-default-agent .model-default-hint) {
-  font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-:deep(.tool-perm-list) {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-top: 8px;
-}
-
-:deep(.tool-perm-row) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
-  border-radius: 6px;
-  transition: background 0.12s;
-}
-
-:deep(.tool-perm-row:hover) {
-  background: var(--hover-bg, rgba(128, 128, 128, 0.08));
-}
-
-:deep(.tool-perm-info) {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
-:deep(.tool-perm-name) {
-  font-size: 12.5px;
-  font-weight: 600;
-  font-family: var(--font-mono-identifier);
-  color: var(--text-color);
-}
-
-:deep(.tool-perm-desc) {
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-:deep(.tool-perm-toggle) {
-  flex-shrink: 0;
-  padding: 3px 12px;
-  border-radius: 4px;
-  font-size: 11px;
-  font-weight: 600;
-  border: 1px solid var(--border-color);
-  cursor: pointer;
-  transition: all 0.15s;
-  min-width: 50px;
-  text-align: center;
-}
-
-:deep(.tool-perm-toggle.auto) {
-  background: var(--status-good-bg);
-  color: var(--status-good-fg);
-  border-color: var(--status-good-border);
-}
-
-:deep(.tool-perm-toggle.ask) {
-  background: var(--status-warn-bg);
-  color: var(--status-warn-fg);
-  border-color: var(--status-warn-border);
-}
-
-:deep(.tool-perm-toggle:hover) {
-  filter: brightness(1.03);
-}
-
-:deep(.lang-switcher) {
-  display: flex;
-  gap: 6px;
-}
-
-:deep(.lang-btn) {
-  padding: 8px 18px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-secondary);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-}
-
-:deep(.lang-btn:hover) {
-  background: var(--hover-bg);
-  color: var(--text-color);
-  border-color: var(--border-strong);
-}
-
-:deep(.lang-btn.active) {
-  background: var(--accent-soft);
-  color: var(--accent-color);
-  border-color: var(--accent-border);
-}
-
-:deep(.reset-onboarding-btn) {
-  padding: 7px 16px;
-  border-radius: 6px;
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  border: 1px solid var(--status-danger-border);
-  background: transparent;
-  color: var(--status-danger-fg);
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-}
-:deep(.reset-onboarding-btn:hover) {
-  background: var(--status-danger-bg);
-  border-color: var(--status-danger-fg);
-}
-:deep(.reset-confirm-row) {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-:deep(.reset-confirm-text) {
-  font-size: 13px;
-  color: var(--status-danger-fg);
-}
-
-:deep(.available-models-grid) {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-:deep(.available-models-group) {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-:deep(.available-models-provider) {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--text-secondary);
-}
-
-:deep(.available-models-list) {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-:deep(.available-model-tag) {
-  display: inline-block;
-  padding: 3px 10px;
-  font-size: 12px;
-  font-weight: 500;
-  border-radius: var(--radius-badge);
-  background: color-mix(in srgb, var(--panel-bg) 60%, var(--hover-bg) 40%);
-  color: var(--text-secondary);
-  border: 1px solid var(--border-color);
-  white-space: nowrap;
-}
-
-:deep(.custom-endpoints-list) {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-:deep(.custom-form-row) {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-:deep(.custom-form-label) {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-color);
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-:deep(.custom-form-hint) {
-  font-size: 11px;
-  font-weight: 400;
-  color: var(--text-secondary);
-}
-
-:deep(.beta-flags-list) {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-:deep(.beta-flag-item) {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-:deep(.beta-flag-item input[type="checkbox"]) {
-  margin: 0;
-  cursor: pointer;
-}
-
-:deep(.beta-flag-name) {
-  font-family: var(--font-mono-identifier);
-  font-size: 11px;
-  color: var(--text-color);
-}
-
-:deep(.beta-flag-desc) {
-  font-size: 11px;
-  color: var(--text-secondary);
-  margin-left: 2px;
-}
-
-:deep(.modal-overlay) {
-  position: absolute;
-  inset: 0;
-  background: rgba(8, 10, 14, 0.28);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-}
-
-:deep(.modal-dialog) {
-  background: var(--surface-elevated);
-  border: 1px solid var(--border-color);
-  border-radius: 12px;
-  width: 500px;
-  max-width: calc(100% - 48px);
-  max-height: 84%;
-  display: flex;
-  flex-direction: column;
-  box-shadow: 0 18px 40px rgba(15, 17, 21, 0.16);
-  overflow: hidden;
-}
-
-:deep(.modal-header) {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 20px 12px;
-  border-bottom: 1px solid var(--border-color);
-  flex-shrink: 0;
-}
-
-:deep(.modal-title) {
-  font-size: 14px;
-  font-weight: 700;
-}
-
-:deep(.modal-body) {
-  padding: 16px 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  overflow-y: auto;
-}
-
-:deep(.modal-footer) {
-  display: flex;
-  gap: 8px;
-  padding: 12px 20px 16px;
-  border-top: 1px solid var(--border-color);
-  flex-shrink: 0;
-}
-
-:deep(.modal-enter-active),
-:deep(.modal-leave-active) {
-  transition: opacity 0.15s ease;
-}
-
-:deep(.modal-enter-active .modal-dialog),
-:deep(.modal-leave-active .modal-dialog) {
-  transition: transform 0.15s ease;
-}
-
-:deep(.modal-enter-from),
-:deep(.modal-leave-to) {
-  opacity: 0;
-}
-
-:deep(.modal-enter-from .modal-dialog) {
-  transform: scale(0.95) translateY(8px);
-}
-
-:deep(.modal-leave-to .modal-dialog) {
-  transform: scale(0.95) translateY(8px);
-}
-
-:deep(.test-btn) {
-  padding: 6px 14px;
-  border-radius: 6px;
-  border: 1px solid var(--border-color);
-  background: transparent;
-  color: var(--text-color);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-  box-shadow: none;
-  white-space: nowrap;
-}
-
-:deep(.test-btn:hover:not(:disabled)) {
-  background: var(--hover-bg);
-  border-color: var(--accent-border);
-  color: var(--accent-color);
-}
-
-:deep(.test-btn:disabled) {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-:deep(.test-result) {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  font-size: 12px;
-  line-height: 1.5;
-  flex-wrap: wrap;
-}
-
-:deep(.test-result.testing) {
-  background: var(--hover-bg);
-  color: var(--text-secondary);
-}
-
-:deep(.test-result.success) {
-  background: var(--status-good-bg);
-  color: var(--status-good-fg);
-}
-
-:deep(.test-result.error) {
-  background: var(--status-danger-bg);
-  color: var(--status-danger-fg);
-}
-
-:deep(.test-ok) {
-  color: #22c55e;
-  font-weight: 600;
-}
-
-:deep(.test-err) {
-  color: #dc3232;
-  font-weight: 600;
-}
-
-:deep(.test-detail) {
-  color: var(--text-secondary);
-  word-break: break-all;
-  width: 100%;
-}
-
 </style>

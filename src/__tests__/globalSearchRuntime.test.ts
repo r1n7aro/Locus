@@ -3,6 +3,7 @@ import { createApp, h, nextTick, reactive, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import GlobalSearch from "../components/workbench/GlobalSearch.vue";
 import { useGlobalSearchSettings } from "../composables/useGlobalSearchSettings";
+import { settingValue } from "../composables/useSettingsStore";
 import { searchGlobalPage, type GlobalSearchRequest } from "../services/globalSearch";
 
 vi.mock("../services/globalSearch", async (original) => ({ ...await original<typeof import("../services/globalSearch")>(), searchGlobalPage: vi.fn() }));
@@ -55,7 +56,7 @@ describe("global search keyboard interaction", () => {
     checkbox.focus(); checkbox.click(); await vi.advanceTimersByTimeAsync(120); await nextTick();
     expect(document.querySelector(".search-filter-panel")).not.toBeNull();
     expect([...document.querySelectorAll(".search-result-category")].map(row => row.textContent)).toEqual(["globalSearch.view"]);
-    expect(JSON.parse(localStorage.getItem("locus-global-search-settings")!).fileName).toBe(false);
+    expect(settingValue("workspace.search.sources.fileName")).toBe(false);
     expect(trigger.classList.contains("filtered")).toBe(true);
     key("Escape"); await nextTick();
     expect(document.querySelector(".search-filter-panel")).toBeNull();

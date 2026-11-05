@@ -426,10 +426,6 @@ function statusLabel(state: SuiteState): string {
   }
 }
 
-function badgeLabel(state: SuiteState): string {
-  return state.status === "idle" ? "—" : statusLabel(state);
-}
-
 function lineClass(line: string): string {
   if (line.startsWith("FAIL") || line.startsWith("ERROR")) return "output-line--fail";
   if (line.startsWith("PASS")) return "output-line--pass";
@@ -460,29 +456,59 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="settings-section">
-    <div class="run-bar">
-      <div class="run-status" :class="`run-status--${runState}`">
-        <span v-if="running" class="run-spinner" aria-hidden="true" />
-        <span class="run-status-text">{{ runSummary || t("settings.testing.ready") }}</span>
+  <div class="self-test">
+    <div class="test-card run-panel">
+      <div class="run-bar">
+        <div class="run-status" :class="`run-status--${runState}`">
+          <span v-if="running" class="run-spinner" aria-hidden="true" />
+          <span class="run-status-text">{{ runSummary || t("settings.testing.ready") }}</span>
+        </div>
+        <div class="run-actions">
+          <BaseButton
+            v-if="running"
+            variant="danger"
+            :disabled="cancelling"
+            @click="interruptRun"
+          >
+            {{ cancelling ? t("settings.testing.interrupting") : t("settings.testing.interrupt") }}
+          </BaseButton>
+          <template v-else>
+            <BaseButton :disabled="!canRun" @click="runSelectedSuites">
+              {{ t("settings.testing.runSelected") }}
+            </BaseButton>
+            <BaseButton variant="primary" :disabled="probeRunning" @click="runAllSuites">
+              {{ t("settings.testing.runAll") }}
+            </BaseButton>
+          </template>
+        </div>
       </div>
-      <div class="run-actions">
-        <BaseButton
-          v-if="running"
-          variant="danger"
-          :disabled="cancelling"
-          @click="interruptRun"
-        >
-          {{ cancelling ? t("settings.testing.interrupting") : t("settings.testing.interrupt") }}
-        </BaseButton>
-        <template v-else>
-          <BaseButton :disabled="!canRun" @click="runSelectedSuites">
-            {{ t("settings.testing.runSelected") }}
-          </BaseButton>
-          <BaseButton variant="primary" :disabled="probeRunning" @click="runAllSuites">
-            {{ t("settings.testing.runAll") }}
-          </BaseButton>
-        </template>
+      <div class="run-options" role="group" :aria-label="t('settings.testing.options')">
+        <label class="run-option">
+          <BaseCheckbox v-model="installPlugin" :disabled="running" :aria-label="t('settings.testing.installPlugin')" />
+          <span>{{ t("settings.testing.installPlugin") }}</span>
+        </label>
+        <label class="run-option">
+          <BaseCheckbox v-model="openUnity" :disabled="running" :aria-label="t('settings.testing.openUnity')" />
+          <span>{{ t("settings.testing.openUnity") }}</span>
+        </label>
+        <label class="run-option">
+          <BaseCheckbox v-model="forceEditMode" :disabled="running" :aria-label="t('settings.testing.forceEditMode')" />
+          <span>{{ t("settings.testing.forceEditMode") }}</span>
+        </label>
+        <div class="run-option">
+          <span>{{ t("settings.testing.typeIndexSample") }}</span>
+          <BaseDropdown
+            class="sample-select"
+            :model-value="typeIndexSampleMode"
+            :options="typeIndexSampleOptions"
+            :disabled="running"
+            size="sm"
+            menu-align="end"
+            teleport
+            :aria-label="t('settings.testing.typeIndexSample')"
+            @update:model-value="typeIndexSampleMode = $event as TypeIndexSampleMode"
+          />
+        </div>
       </div>
     </div>
 
@@ -518,8 +544,8 @@ onUnmounted(() => {
               @click.stop
             />
             <span class="suite-name">{{ t(suite.labelKey) }}</span>
-            <span class="suite-badge" :class="suiteStates[suite.id].status">
-              {{ badgeLabel(suiteStates[suite.id]) }}
+            <span v-if="suiteStates[suite.id].status !== 'idle'" class="suite-badge" :class="suiteStates[suite.id].status">
+              {{ statusLabel(suiteStates[suite.id]) }}
             </span>
           </div>
         </div>
@@ -539,8 +565,7 @@ onUnmounted(() => {
         </div>
         <p class="detail-desc">{{ t(selectedItem.descKey) }}</p>
         <p v-if="selectedState.detail" class="detail-meta">{{ selectedState.detail }}</p>
-        <div class="detail-output-label">{{ t("settings.testing.output") }}</div>
-        <div ref="consoleRef" class="detail-output" role="log">
+        <div ref="consoleRef" class="detail-output" role="log" :aria-label="t('settings.testing.output')">
           <template v-if="selectedLogs.length > 0">
             <div
               v-for="(line, index) in selectedLogs"
@@ -555,13 +580,13 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
-  </div>
 
-  <div class="settings-section">
-    <div class="section-label">{{ t("settings.testing.probe.title") }}</div>
     <div class="test-card probe-card">
-      <p class="probe-desc">{{ t("settings.testing.probe.desc") }}</p>
-      <div class="probe-actions">
+      <div class="probe-head">
+        <div class="probe-text">
+          <span class="probe-title">{{ t("settings.testing.probe.title") }}</span>
+          <p class="probe-desc">{{ t("settings.testing.probe.desc") }}</p>
+        </div>
         <BaseButton :disabled="running || probeRunning" @click="runProbe">
           {{ probeRunning ? t("settings.testing.probe.running") : t("settings.testing.probe.run") }}
         </BaseButton>
@@ -578,86 +603,32 @@ onUnmounted(() => {
       </div>
     </div>
   </div>
-
-  <div class="settings-section">
-    <div class="section-label">{{ t("settings.testing.options") }}</div>
-    <div class="test-card">
-      <label class="option-row">
-        <BaseCheckbox v-model="installPlugin" :disabled="running" :aria-label="t('settings.testing.installPlugin')" />
-        <span class="option-text">{{ t("settings.testing.installPlugin") }}</span>
-      </label>
-      <label class="option-row">
-        <BaseCheckbox v-model="openUnity" :disabled="running" :aria-label="t('settings.testing.openUnity')" />
-        <span class="option-text">{{ t("settings.testing.openUnity") }}</span>
-      </label>
-      <label class="option-row">
-        <BaseCheckbox v-model="forceEditMode" :disabled="running" :aria-label="t('settings.testing.forceEditMode')" />
-        <span class="option-text">{{ t("settings.testing.forceEditMode") }}</span>
-      </label>
-      <div class="option-row option-select-row">
-        <span class="option-text">{{ t("settings.testing.typeIndexSample") }}</span>
-        <BaseDropdown
-          class="sample-select"
-          :model-value="typeIndexSampleMode"
-          :options="typeIndexSampleOptions"
-          :disabled="running"
-          size="sm"
-          menu-align="end"
-          teleport
-          :aria-label="t('settings.testing.typeIndexSample')"
-          @update:model-value="typeIndexSampleMode = $event as TypeIndexSampleMode"
-        />
-      </div>
-    </div>
-  </div>
 </template>
 
 <style scoped>
+.self-test {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 760px;
+}
+
 .test-card {
   display: flex;
   flex-direction: column;
-  max-width: 980px;
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
   overflow: hidden;
 }
 
-.probe-card {
-  gap: 12px;
-  padding: 14px 16px;
-}
-
-.probe-desc {
-  margin: 0;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-.probe-actions {
-  display: flex;
-  gap: 8px;
-}
-
-.probe-output {
-  min-height: auto;
-  max-height: 320px;
-  margin-top: 2px;
-}
-
-/* Run bar ------------------------------------------------------------------ */
+/* Run panel: status, actions, options --------------------------------------- */
 .run-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  max-width: 980px;
-  margin-bottom: 12px;
-  padding: 10px 14px;
-  border: 1px solid var(--border-color);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
+  padding: 8px 10px 8px 14px;
 }
 
 .run-status {
@@ -700,12 +671,74 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 
+.run-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 16px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-color);
+}
+
+.run-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 26px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.sample-select {
+  width: 130px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+/* Probe ------------------------------------------------------------------- */
+.probe-card {
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.probe-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.probe-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.probe-title {
+  color: var(--text-color);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.probe-desc {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.probe-output {
+  min-height: auto;
+  max-height: 320px;
+}
+
 /* Workbench: list + detail ------------------------------------------------- */
 .test-workbench {
   display: grid;
-  grid-template-columns: minmax(220px, 290px) 1fr;
-  max-width: 980px;
-  min-height: 380px;
+  grid-template-columns: minmax(190px, 230px) 1fr;
+  min-height: 320px;
   border: 1px solid var(--border-color);
   border-radius: 10px;
   background: color-mix(in srgb, var(--panel-bg) 84%, var(--sidebar-bg) 16%);
@@ -902,15 +935,6 @@ onUnmounted(() => {
   font-family: var(--font-mono-identifier);
 }
 
-.detail-output-label {
-  margin-top: 2px;
-  color: var(--text-secondary);
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.4px;
-  text-transform: uppercase;
-}
-
 .detail-output {
   flex: 1;
   min-height: 180px;
@@ -943,39 +967,6 @@ onUnmounted(() => {
   color: var(--text-tertiary, var(--text-secondary));
   opacity: 0.7;
   font-style: italic;
-}
-
-/* Options ------------------------------------------------------------------ */
-.option-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 11px 14px;
-  cursor: default;
-  transition: background 0.12s;
-}
-
-.option-row + .option-row {
-  border-top: 1px solid var(--border-color);
-}
-
-.option-row:hover {
-  background: var(--hover-bg, rgba(128, 128, 128, 0.08));
-}
-
-.option-text {
-  color: var(--text-color);
-  font-size: 12.5px;
-  font-weight: 600;
-}
-
-.option-select-row {
-  justify-content: space-between;
-}
-
-.sample-select {
-  width: 150px;
-  flex-shrink: 0;
 }
 
 @media (max-width: 720px) {

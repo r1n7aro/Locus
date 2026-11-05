@@ -5,10 +5,13 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import type { CodexModelConfig, CustomProvider, GitProbeResult, ModelDefaults, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
+import type { GitProbeResult, PluginStatus, AssetDbScanEvent, ScanStats } from "../types";
 import { t, setLocale, locale, type Locale } from "../i18n";
 import { useTheme, type ThemePreference } from "../composables/useTheme";
-import { useSettingsState } from "../composables/useSettingsState";
+import { storeToRefs } from "pinia";
+import { useCodexAccountStore } from "../stores/codexAccount";
+import { useCustomProviderSettingsStore } from "../stores/customProviderSettings";
+import { useSettingsFeedbackStore } from "../stores/settingsFeedback";
 import { normalizeAppError } from "../services/errors";
 import { useAuthStore } from "../stores/auth";
 import { useModelStore } from "../stores/model";
@@ -21,6 +24,7 @@ import { assetDbScanStart } from "../services/asset";
 import BaseSegmented from "./ui/BaseSegmented.vue";
 import GitMissingHelp from "./git/GitMissingHelp.vue";
 import CustomProviderModal from "./settings/CustomProviderModal.vue";
+import { ServerConnection } from '@locus/server-client';
 import {
   canInitOnboardingGit,
   resolveOnboardingGitInitTargetPath,
@@ -83,36 +87,18 @@ function handleThemeChange(value: string) {
   setThemePreference(value as ThemePreference);
 }
 
-function emitSettingsState(event: "authChanged"): void;
-function emitSettingsState(event: "modelDefaultsChanged", defaults: ModelDefaults): void;
-function emitSettingsState(event: "codexTransportChanged", config: CodexModelConfig): void;
-function emitSettingsState(event: "customProvidersChanged", providers: CustomProvider[]): void;
-function emitSettingsState(event: "resetOnboarding"): void;
-function emitSettingsState(
-  event: "authChanged" | "modelDefaultsChanged" | "codexTransportChanged" | "customProvidersChanged" | "resetOnboarding",
-  payload?: ModelDefaults | CodexModelConfig | CustomProvider[],
-) {
-  if (event === "authChanged") {
-    void handleSettingsAuthChanged();
-  } else if (event === "modelDefaultsChanged") {
-    modelStore.applyModelDefaults(payload as ModelDefaults);
-  } else if (event === "codexTransportChanged") {
-    modelStore.applyCodexModelConfig(payload as CodexModelConfig);
-  } else if (event === "customProvidersChanged") {
-    modelStore.applyCustomProviders(payload as CustomProvider[]);
-  }
-}
-
+// Codex sign-in and custom providers share their state with Settings.
+const codexAccount = useCodexAccountStore();
+const customProviderSettings = useCustomProviderSettingsStore();
+const settingsFeedback = useSettingsFeedbackStore();
 const {
-  codexStep: settingsCodexStep,
-  codexStatus: settingsCodexStatus,
-  codexUserCode: settingsCodexUserCode,
-  codexUrl: settingsCodexUrl,
-  codexCodeCopied: settingsCodexCodeCopied,
-  cancelCodexLogin: settingsCancelCodexLogin,
-  codexLogout: settingsCodexLogout,
-  copyCode: settingsCopyCode,
-  requestCodexLogin: settingsRequestCodexLogin,
+  step: settingsCodexStep,
+  status: settingsCodexStatus,
+  userCode: settingsCodexUserCode,
+  url: settingsCodexUrl,
+  codeCopied: settingsCodexCodeCopied,
+} = storeToRefs(codexAccount);
+const {
   customProviders: settingsCustomProviders,
   editingCustomProvider: settingsEditingProvider,
   isAddingCustomProvider: settingsIsAddingProvider,
@@ -122,14 +108,24 @@ const {
   modelCatalog: settingsModelCatalog,
   modelCatalogLoading: settingsModelCatalogLoading,
   modelCatalogRefreshing: settingsModelCatalogRefreshing,
-  loadModelCatalog: settingsLoadModelCatalog,
-  refreshCatalog: settingsRefreshCatalog,
-  startAddCustomProvider: settingsStartAddProvider,
-  startEditCustomProvider: settingsStartEditProvider,
-  cancelEditCustomProvider: settingsCancelEditProvider,
-  saveCustomProvider: settingsSaveProvider,
-  testCustomProvider: settingsTestProvider,
-} = useSettingsState(emitSettingsState);
+} = storeToRefs(customProviderSettings);
+const settingsCancelCodexLogin = codexAccount.cancelLogin;
+const settingsCodexLogout = codexAccount.logout;
+const settingsCopyCode = codexAccount.copyCode;
+const settingsRequestCodexLogin = () => void codexAccount.startLogin();
+const settingsLoadModelCatalog = customProviderSettings.loadModelCatalog;
+const settingsRefreshCatalog = customProviderSettings.refreshCatalog;
+const settingsStartAddProvider = customProviderSettings.startAddCustomProvider;
+const settingsStartEditProvider = customProviderSettings.startEditCustomProvider;
+const settingsCancelEditProvider = customProviderSettings.cancelEditCustomProvider;
+const settingsSaveProvider = customProviderSettings.saveCustomProvider;
+const settingsTestProvider = customProviderSettings.testCustomProvider;
+
+watch(() => settingsFeedback.authRevision, () => void handleSettingsAuthChanged());
+onMounted(() => {
+  void codexAccount.ensureLoaded();
+  void customProviderSettings.ensureLoaded();
+});
 
 const authExpanded = ref<"codex" | null>(null);
 const customEndpointConfigured = computed(() => settingsCustomProviders.value.length > 0);
@@ -567,6 +563,7 @@ onUnmounted(() => {
 
     <div v-else-if="step === 1" class="step-card">
       <h2 class="step-title">{{ t("onboarding.auth.title") }}</h2>
+      <component :is="ServerConnection" v-if="ServerConnection" />
       <div class="step-desc auth-desc-lines">
         <p>{{ t("onboarding.auth.desc1") }}</p>
         <p>{{ t("onboarding.auth.desc2") }}</p>

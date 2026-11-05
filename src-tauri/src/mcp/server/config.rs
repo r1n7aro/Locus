@@ -1,8 +1,8 @@
 //! MCP server (expose-to-other-agents) configuration.
 //!
-//! Stored in `{persistent_config_dir}/mcp_server.json`, deliberately OUTSIDE
-//! config.json/AppConfig: the auth token must never surface through
-//! config_registry / the agent-facing config_query tool.
+//! The options are settings (`mcpServer.*`, sensitive). The auth token is a
+//! secret and stays in `{persistent_config_dir}/mcp_server.json`; it never
+//! surfaces through config_query.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -10,6 +10,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 const MCP_SERVER_FILE: &str = "mcp_server.json";
+/// Settings group behind the non-secret fields.
+const SETTINGS_GROUP: &str = "mcpServer";
+const TOKEN_FIELD: &str = "token";
 
 pub const DEFAULT_PORT: u16 = 27121;
 pub const DEFAULT_CALL_TIMEOUT_MS: u64 = 600_000;
@@ -112,20 +115,35 @@ fn save_lock() -> &'static Mutex<()> {
     &LOCK
 }
 
+fn load_token() -> String {
+    config_path()
+        .map(|path| crate::config::read_state_file(&path))
+        .ok()
+        .and_then(|file| file.get(TOKEN_FIELD).and_then(|token| token.as_str()).map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn save_token(token: &str) -> Result<(), String> {
+    let path = config_path()?;
+    let _guard = save_lock().lock().unwrap_or_else(|p| p.into_inner());
+    crate::config::update_state_file(&path, |file| {
+        file.insert(TOKEN_FIELD.to_string(), serde_json::Value::from(token));
+    })
+}
+
 /// Loads settings; generates and persists a token on first use so the
 /// settings page always has one to show.
 pub fn load_settings() -> McpServerSettings {
-    let mut settings = config_path()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|data| serde_json::from_str::<McpServerSettings>(&data).ok())
-        .unwrap_or_default();
+    let group =
+        crate::settings::group::read(crate::settings::global::global(), SETTINGS_GROUP);
+    let mut settings = serde_json::from_value::<McpServerSettings>(group).unwrap_or_default();
     settings.call_timeout_ms = settings
         .call_timeout_ms
         .clamp(MIN_CALL_TIMEOUT_MS, MAX_CALL_TIMEOUT_MS);
+    settings.token = load_token();
     if settings.token.trim().is_empty() {
         settings.token = generate_token();
-        if let Err(e) = save_settings(&settings) {
+        if let Err(e) = save_token(&settings.token) {
             eprintln!("[McpServer] failed to persist generated token: {e}");
         }
     }
@@ -133,14 +151,15 @@ pub fn load_settings() -> McpServerSettings {
 }
 
 pub fn save_settings(settings: &McpServerSettings) -> Result<(), String> {
-    let path = config_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
+    let value = serde_json::to_value(settings)
+        .map_err(|e| format!("Failed to serialize MCP server settings: {e}"))?;
+    crate::settings::global::global()
+        .set_values(&crate::settings::group::changes(SETTINGS_GROUP, &value))
+        .map_err(|error| format!("Failed to save MCP server settings: {error}"))?;
+    if !settings.token.trim().is_empty() && settings.token != load_token() {
+        save_token(&settings.token)?;
     }
-    let data = serde_json::to_string_pretty(settings)
-        .map_err(|e| format!("Failed to serialize mcp_server.json: {e}"))?;
-    let _guard = save_lock().lock().unwrap_or_else(|p| p.into_inner());
-    std::fs::write(path, data).map_err(|e| format!("Failed to write mcp_server.json: {e}"))
+    Ok(())
 }
 
 #[cfg(test)]

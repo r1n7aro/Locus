@@ -20,19 +20,11 @@ const modelServiceMocks = vi.hoisted(() => ({
   codexPollLogin: vi.fn(),
   codexLogout: vi.fn(),
   codexRetryAuth: vi.fn(),
-  getModelDefaults: vi.fn(),
-  saveModelDefaults: vi.fn(),
-  getCodexModelConfig: vi.fn(),
-  saveCodexModelConfig: vi.fn(),
-  getToolPermissions: vi.fn(),
-  saveToolPermissions: vi.fn(),
-  getFileToolWorkspaceBoundary: vi.fn(),
-  setFileToolWorkspaceBoundary: vi.fn(),
-  resetAllConfig: vi.fn(),
   setWarmup: vi.fn(),
   getWarmup: vi.fn(),
   clearWarmup: vi.fn(),
   confirm: vi.fn(),
+  applyCustomProviders: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -66,21 +58,6 @@ vi.mock("../services/model", () => ({
   testCustomEndpoint: modelServiceMocks.testCustomEndpoint,
   getModelCatalog: modelServiceMocks.getModelCatalog,
   refreshModelCatalog: modelServiceMocks.refreshModelCatalog,
-  getModelDefaults: modelServiceMocks.getModelDefaults,
-  saveModelDefaults: modelServiceMocks.saveModelDefaults,
-  getCodexModelConfig: modelServiceMocks.getCodexModelConfig,
-  saveCodexModelConfig: modelServiceMocks.saveCodexModelConfig,
-}));
-
-vi.mock("../services/permissions", () => ({
-  getToolPermissions: modelServiceMocks.getToolPermissions,
-  saveToolPermissions: modelServiceMocks.saveToolPermissions,
-  getFileToolWorkspaceBoundary: modelServiceMocks.getFileToolWorkspaceBoundary,
-  setFileToolWorkspaceBoundary: modelServiceMocks.setFileToolWorkspaceBoundary,
-}));
-
-vi.mock("../services/project", () => ({
-  resetAllConfig: modelServiceMocks.resetAllConfig,
 }));
 
 vi.mock("../composables/warmupCache", () => ({
@@ -97,13 +74,19 @@ vi.mock("../composables/useCopyFeedback", () => ({
   }),
 }));
 
+vi.mock("../stores/model", () => ({
+  useModelStore: () => ({ applyCustomProviders: modelServiceMocks.applyCustomProviders }),
+}));
+
 vi.mock("../stores/notification", () => ({
   useNotificationStore: () => ({
     addNotice: vi.fn(),
   }),
 }));
 
-import { useSettingsState } from "../composables/useSettingsState";
+import { createPinia, setActivePinia } from "pinia";
+import { useCustomProviderSettingsStore } from "../stores/customProviderSettings";
+import { useProviderAccountsStore } from "../stores/providerAccounts";
 import {
   DEFAULT_PROVIDER_PREFIX_CACHE_TTL_SECONDS,
   isOpenRouterEndpoint,
@@ -144,45 +127,16 @@ function provider(
 
 describe("custom provider persistence", () => {
   beforeEach(() => {
+    setActivePinia(createPinia());
     vi.clearAllMocks();
     modelServiceMocks.getWarmup.mockReturnValue(undefined);
     modelServiceMocks.getCustomProviders.mockResolvedValue([]);
     modelServiceMocks.saveCustomProviders.mockResolvedValue(undefined);
-    modelServiceMocks.getFileToolWorkspaceBoundary.mockResolvedValue(false);
-    modelServiceMocks.setFileToolWorkspaceBoundary.mockResolvedValue(undefined);
     modelServiceMocks.confirm.mockResolvedValue(true);
   });
 
-  it("persists the Codex patch choice and preserves other subscription settings", async () => {
-    const emit = vi.fn();
-    const state = useSettingsState(emit as never);
-    modelServiceMocks.getCodexModelConfig.mockResolvedValueOnce({ transport: "http", contextWindow: 400000, autoReview: true });
-    await state.loadCodexModelConfig();
-    expect(state.codexModelConfig.value.useApplyPatch).toBe(false);
-    modelServiceMocks.saveCodexModelConfig.mockResolvedValueOnce(undefined);
-    await state.setCodexUseApplyPatch(true);
-    expect(modelServiceMocks.saveCodexModelConfig).toHaveBeenLastCalledWith(expect.objectContaining({
-      transport: "http", contextWindow: 400000, autoReview: true, useApplyPatch: true,
-    }));
-    expect(emit).toHaveBeenCalledWith("codexTransportChanged", expect.objectContaining({ useApplyPatch: true }));
-    await state.setCodexContextWindow(500000);
-    expect(modelServiceMocks.saveCodexModelConfig).toHaveBeenLastCalledWith(expect.objectContaining({ useApplyPatch: true, contextWindow: 500000 }));
-  });
-
-  it("restores the Codex patch choice when saving fails", async () => {
-    const emit = vi.fn();
-    const state = useSettingsState(emit as never);
-    modelServiceMocks.saveCodexModelConfig.mockRejectedValueOnce(new Error("save failed"));
-    await state.setCodexUseApplyPatch(true);
-    expect(state.codexModelConfig.value.useApplyPatch).toBe(false);
-    expect(emit).not.toHaveBeenCalled();
-  });
-
   it("reloads saved providers and refreshes the warmup cache", async () => {
-    const emitted: unknown[][] = [];
-    const state = useSettingsState(((...args: unknown[]) => {
-      emitted.push(args);
-    }) as never);
+    const state = useCustomProviderSettingsStore();
     const saved = provider({ id: "saved", name: "Saved", apiKey: "sk-live" });
     const normalizedSaved = {
       ...saved,
@@ -191,7 +145,7 @@ describe("custom provider persistence", () => {
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([saved]);
 
     state.startAddCustomProvider();
-    state.editingCustomProvider.value = provider({
+    state.editingCustomProvider = provider({
       id: "draft",
       name: "Draft",
       apiKey: "sk-draft",
@@ -203,22 +157,22 @@ describe("custom provider persistence", () => {
     expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
       expect.objectContaining({ id: "draft", name: "Draft", apiKey: "sk-draft" }),
     ]);
-    expect(state.customProviders.value).toEqual([normalizedSaved]);
+    expect(state.customProviders).toEqual([normalizedSaved]);
     expect(modelServiceMocks.setWarmup).toHaveBeenCalledWith(
       "settings:customProviders",
       [normalizedSaved],
     );
-    expect(emitted).toContainEqual(["customProvidersChanged", [normalizedSaved]]);
-    expect(state.customProviderSaving.value).toBe(false);
-    expect(state.editingCustomProvider.value).toBeNull();
+    expect(modelServiceMocks.applyCustomProviders).toHaveBeenCalledWith([normalizedSaved]);
+    expect(state.customProviderSaving).toBe(false);
+    expect(state.editingCustomProvider).toBeNull();
   });
 
   it("starts new providers with one blank model row at the 256k default", () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
 
     state.startAddCustomProvider();
 
-    const draft = state.editingCustomProvider.value;
+    const draft = state.editingCustomProvider;
     expect(draft?.models).toHaveLength(1);
     expect(draft?.models[0].contextLength).toBe(256000);
     expect(draft?.models[0].remoteCompactionMode).toBe("disabled");
@@ -234,10 +188,8 @@ describe("custom provider persistence", () => {
   });
 
   it("imports a Claude Code custom endpoint as a single-model provider", async () => {
-    const emitted: unknown[][] = [];
-    const state = useSettingsState(((...args: unknown[]) => {
-      emitted.push(args);
-    }) as never);
+    const accounts = useProviderAccountsStore();
+    const state = useCustomProviderSettingsStore();
     const imported: CustomEndpoint = {
       id: "claude-code-import",
       name: "Claude Code",
@@ -279,7 +231,7 @@ describe("custom provider persistence", () => {
     });
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([savedProvider]);
 
-    await state.importClaudeCodeOAuth();
+    await accounts.importClaudeCodeOAuth();
 
     expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledWith([
       expect.objectContaining({
@@ -299,15 +251,15 @@ describe("custom provider persistence", () => {
       }),
     ]);
     expect(modelServiceMocks.getProviders).not.toHaveBeenCalled();
-    expect(state.customProviders.value).toEqual([normalizedSavedProvider]);
-    expect(emitted).toContainEqual(["customProvidersChanged", [normalizedSavedProvider]]);
+    expect(state.customProviders).toEqual([normalizedSavedProvider]);
+    expect(modelServiceMocks.applyCustomProviders).toHaveBeenCalledWith([normalizedSavedProvider]);
   });
 
   it("saves new OpenAI Chat models with reasoning content replay enabled", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
 
     state.startAddCustomProvider();
-    const draft = state.editingCustomProvider.value!;
+    const draft = state.editingCustomProvider!;
     draft.name = "Chat";
     draft.endpoint = "https://example.com/v1";
     draft.models[0].apiModel = "chat-model";
@@ -322,10 +274,10 @@ describe("custom provider persistence", () => {
   });
 
   it("persists Codex V2 remote compaction on a Responses model", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
 
     state.startAddCustomProvider();
-    const draft = state.editingCustomProvider.value!;
+    const draft = state.editingCustomProvider!;
     draft.name = "CPA";
     draft.endpoint = "http://192.168.0.2:8317/v1";
     draft.apiFormat = "openai_responses";
@@ -343,9 +295,9 @@ describe("custom provider persistence", () => {
   });
 
   it("persists a Codex gateway transport, enables compaction, and tests the selected route", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     state.startAddCustomProvider();
-    const draft = state.editingCustomProvider.value!;
+    const draft = state.editingCustomProvider!;
     draft.name = "CPA";
     draft.endpoint = "http://192.168.0.2:8317/v1";
     draft.apiFormat = "openai_responses";
@@ -365,17 +317,17 @@ describe("custom provider persistence", () => {
   });
 
   it("keeps legacy endpoints on generic HTTP and clears Codex transport on other formats", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({ id: "legacy", name: "Legacy", apiFormat: "openai_responses", models: [providerModel({ codexTransport: undefined })] }),
       provider({ id: "chat", name: "Chat", apiFormat: "openai_chat", models: [providerModel({ codexTransport: "websocket" })] }),
     ]);
     await state.loadCustomProviders();
-    expect(state.customProviders.value.map((p) => p.models[0].codexTransport)).toEqual([null, null]);
+    expect(state.customProviders.map((p) => p.models[0].codexTransport)).toEqual([null, null]);
   });
 
   it("normalizes legacy OpenAI Chat models to replay reasoning content", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "openai-chat",
@@ -386,11 +338,11 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].replayReasoningContent).toBe(true);
+    expect(state.customProviders[0].models[0].replayReasoningContent).toBe(true);
   });
 
   it("normalizes legacy Anthropic Messages models to disabled reasoning replay", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "anthropic-messages",
@@ -405,11 +357,11 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].replayReasoningContent).toBe(false);
+    expect(state.customProviders[0].models[0].replayReasoningContent).toBe(false);
   });
 
   it("forces reasoning replay for an existing DeepSeek V4 Anthropic model", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "deepseek",
@@ -428,12 +380,12 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].replayReasoningContent).toBe(true);
-    expect(state.customProviders.value[0].models[0].reasoningReplayField).toBe("reasoning_content");
+    expect(state.customProviders[0].models[0].replayReasoningContent).toBe(true);
+    expect(state.customProviders[0].models[0].reasoningReplayField).toBe("reasoning_content");
   });
 
   it("normalizes legacy models to disabled server tools", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "legacy-server-tools",
@@ -444,11 +396,11 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].serverTools).toEqual({ webSearch: false });
+    expect(state.customProviders[0].models[0].serverTools).toEqual({ webSearch: false });
   });
 
   it("keeps a known OpenRouter search engine and drops unknown ones", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "openrouter-search",
@@ -466,7 +418,7 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    const [exa, bogus] = state.customProviders.value[0].models;
+    const [exa, bogus] = state.customProviders[0].models;
     expect(exa.serverTools).toEqual({ webSearch: true, webSearchEngine: "exa" });
     expect(bogus.serverTools).toEqual({ webSearch: true });
   });
@@ -479,7 +431,7 @@ describe("custom provider persistence", () => {
   });
 
   it("normalizes legacy remote compaction and preserves an enabled Codex compact mode", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "legacy-compaction",
@@ -497,12 +449,12 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].remoteCompactionMode).toBe("disabled");
-    expect(state.customProviders.value[1].models[0].remoteCompactionMode).toBe("codex_v2");
+    expect(state.customProviders[0].models[0].remoteCompactionMode).toBe("disabled");
+    expect(state.customProviders[1].models[0].remoteCompactionMode).toBe("codex_v2");
   });
 
   it("normalizes legacy models to enabled image understanding", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "legacy-vision",
@@ -513,11 +465,11 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].supportsVision).toBe(true);
+    expect(state.customProviders[0].models[0].supportsVision).toBe(true);
   });
 
   it("normalizes legacy default reasoning efforts to include xhigh", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "legacy-efforts",
@@ -530,7 +482,7 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].supportedReasoningEfforts).toEqual([
+    expect(state.customProviders[0].models[0].supportedReasoningEfforts).toEqual([
       "low",
       "medium",
       "high",
@@ -540,7 +492,7 @@ describe("custom provider persistence", () => {
   });
 
   it("fills empty model row ids from the api model", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     modelServiceMocks.getCustomProviders.mockResolvedValueOnce([
       provider({
         id: "row-ids",
@@ -551,14 +503,14 @@ describe("custom provider persistence", () => {
 
     await state.loadCustomProviders();
 
-    expect(state.customProviders.value[0].models[0].id).toBe("zai-org-GLM-5.2");
+    expect(state.customProviders[0].models[0].id).toBe("zai-org-GLM-5.2");
   });
 
   it("serializes delete mutations against the latest reloaded list", async () => {
-    const state = useSettingsState((() => undefined) as never);
+    const state = useCustomProviderSettingsStore();
     const first = provider({ id: "first", name: "First" });
     const second = provider({ id: "second", name: "Second" });
-    state.customProviders.value = [first, second];
+    state.customProviders = [first, second];
 
     let releaseFirstSave!: () => void;
     modelServiceMocks.saveCustomProviders
@@ -575,7 +527,7 @@ describe("custom provider persistence", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(state.customProviderSaving.value).toBe(true);
+    expect(state.customProviderSaving).toBe(true);
     expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledTimes(1);
     expect(modelServiceMocks.saveCustomProviders).toHaveBeenNthCalledWith(1, [second]);
 
@@ -584,97 +536,7 @@ describe("custom provider persistence", () => {
 
     expect(modelServiceMocks.saveCustomProviders).toHaveBeenCalledTimes(2);
     expect(modelServiceMocks.saveCustomProviders).toHaveBeenNthCalledWith(2, []);
-    expect(state.customProviders.value).toEqual([]);
-    expect(state.customProviderSaving.value).toBe(false);
-  });
-
-  it("loads and sorts detailed Codex usage reset credits", async () => {
-    const state = useSettingsState((() => undefined) as never);
-    state.codexStatus.value = {
-      authenticated: true,
-      accountId: "account-1",
-      validationFailed: false,
-      validationError: null,
-    };
-    modelServiceMocks.codexRateLimits.mockResolvedValueOnce({
-      fetchedAtMs: 1_735_689_600_000,
-      rateLimits: {
-        limitId: "codex",
-        primary: {
-          usedPercent: 25,
-          remainingPercent: 75,
-          windowMinutes: 300,
-          resetsAt: 1_735_707_600,
-        },
-      },
-      rateLimitsByLimitId: {},
-      rateLimitResetCredits: {
-        availableCount: 4,
-        credits: [
-          {
-            id: "credit-later",
-            resetType: "codex_rate_limits",
-            status: "available",
-            grantedAt: 1_752_796_800,
-            expiresAt: 1_784_851_200,
-            title: "Full reset (Weekly + 5 hr)",
-          },
-          {
-            id: "credit-used",
-            resetType: "codex_rate_limits",
-            status: "redeemed",
-            grantedAt: 1_752_796_800,
-            expiresAt: 1_784_246_400,
-          },
-          {
-            id: "credit-sooner",
-            resetType: "codex_rate_limits",
-            status: "available",
-            grantedAt: 1_752_796_800,
-            expiresAt: 1_784_246_400,
-            title: "Full reset (Weekly + 5 hr)",
-          },
-        ],
-      },
-    });
-
-    await state.loadCodexRateLimits();
-
-    expect(state.codexQuota.value.resetCreditsAvailable).toBe(4);
-    expect(state.codexQuota.value.resetCredits.map((credit) => credit.id)).toEqual([
-      "credit-sooner",
-      "credit-later",
-    ]);
-  });
-
-  it("consumes a selected Codex reset credit and refreshes quota", async () => {
-    const state = useSettingsState((() => undefined) as never);
-    state.codexStatus.value = {
-      authenticated: true,
-      accountId: "account-1",
-      validationFailed: false,
-      validationError: null,
-    };
-    modelServiceMocks.codexConsumeRateLimitResetCredit.mockResolvedValueOnce({
-      outcome: "reset",
-      windowsReset: 2,
-    });
-    modelServiceMocks.codexRateLimits.mockResolvedValueOnce({
-      fetchedAtMs: 1_735_689_600_000,
-      rateLimits: { limitId: "codex" },
-      rateLimitsByLimitId: {},
-      rateLimitResetCredits: {
-        availableCount: 3,
-        credits: [],
-      },
-    });
-
-    await state.consumeCodexResetCredit("credit-sooner");
-
-    expect(modelServiceMocks.confirm).toHaveBeenCalledOnce();
-    expect(modelServiceMocks.codexConsumeRateLimitResetCredit).toHaveBeenCalledWith("credit-sooner");
-    expect(modelServiceMocks.codexRateLimits).toHaveBeenCalledOnce();
-    expect(state.codexQuota.value.resetCreditsAvailable).toBe(3);
-    expect(state.codexResetCreditBusyId.value).toBeNull();
+    expect(state.customProviders).toEqual([]);
+    expect(state.customProviderSaving).toBe(false);
   });
 });

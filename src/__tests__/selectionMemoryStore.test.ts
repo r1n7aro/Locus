@@ -5,6 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useNewSessionSettings } from "../composables/useNewSessionSettings";
 import { useSelectionMemoryStore } from "../stores/selectionMemory";
 import type { WorkspaceSelectionSnapshot } from "../services/selectionMemory";
+import { clampEffortToLevels } from "../stores/newSessionSelection";
+import type { EffortLevel } from "../types";
 
 const service = vi.hoisted(() => ({
   getWorkspaceSelection: vi.fn(),
@@ -22,6 +24,7 @@ const modelStore = reactive({
   defaultEffort: "high",
   defaultCodexFastMode: false,
   effortsForModel: (id: string) => (id === "m-b" ? ["low", "high"] : []),
+  clampEffortForModel: (id: string, level: EffortLevel) => clampEffortToLevels(id === "m-b" ? ["low", "high"] : [], level),
   noteRememberedSelection: vi.fn(),
 });
 vi.mock("../stores/model", () => ({ useModelStore: () => modelStore }));

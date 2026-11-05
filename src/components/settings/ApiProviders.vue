@@ -3,6 +3,8 @@ import BaseButton from "../ui/BaseButton.vue";
 import BaseSegmented from "../ui/BaseSegmented.vue";
 import BaseSwitch from "../ui/BaseSwitch.vue";
 import ClaudeConnection from './ClaudeConnection.vue';
+import SettingRow from './SettingRow.vue';
+import { ServerConnection } from '@locus/server-client';
 import { computed, ref } from "vue";
 import { isRemoteClaudeCode } from "../../services/claudeConnection";
 import { claudeCodeCliEnabled } from "../../services/claudeCodeCli";
@@ -20,16 +22,16 @@ import type {
   CodexQuotaState,
   CodexQuotaResetCreditState,
   CodexQuotaWindowState,
-  CodexStatusState,
-  ProviderStatus,
-} from "../../composables/useSettingsState";
+} from "../../utils/providerQuota";
+import type { CodexStatusState } from "../../stores/codexAccount";
+import type { ProviderStatus } from "../../stores/providerAccounts";
+import { readBool, saveSetting, useSetting } from "../../composables/useSettingsStore";
 import { visibleProviderOrder } from "../../config/providerVisibility";
 import {
   CODEX_MAX_CONTEXT_WINDOW,
   CODEX_MIN_CONTEXT_WINDOW,
   normalizeCodexContextWindow,
 } from "../../config/codexContext";
-import type { DynamicToolLoadingMode } from "../../services/system";
 
 interface ModelGroup {
   provider: string;
@@ -41,8 +43,6 @@ const props = withDefaults(defineProps<{
   providers: ProviderStatus[];
   editingProvider: string | null;
   editKey: string;
-  errorMsg: string;
-  successMsg: string;
   isLoading: boolean;
   oauthStep: "idle" | "waiting_code" | "exchanging";
   oauthCode: string;
@@ -61,10 +61,6 @@ const props = withDefaults(defineProps<{
   codexAutoReview: boolean;
   codexUseApplyPatch?: boolean;
   codexPrefixCacheTtlSeconds: number;
-  dynamicToolLoadingMode: DynamicToolLoadingMode;
-  dynamicToolLoadingBusy?: boolean;
-  anthropicNativeLazyEnabled?: boolean;
-  anthropicNativeLazyBusy?: boolean;
   codexUserCode: string;
   codexUrl: string;
   codexCodeCopied: boolean;
@@ -108,8 +104,6 @@ const emit = defineEmits<{
   "update:codexAutoReview": [value: boolean];
   "update:codexUseApplyPatch": [value: boolean];
   "update:codexPrefixCacheTtlSeconds": [value: number];
-  "update:dynamicToolLoadingMode": [value: DynamicToolLoadingMode];
-  "update:anthropicNativeLazyEnabled": [value: boolean];
   startAddProvider: [];
   startEditProvider: [provider: CustomProvider];
   deleteProvider: [id: string];
@@ -119,6 +113,11 @@ const emit = defineEmits<{
 }>();
 
 const anthropicProvider = computed(() => props.providers.find((p) => p.id === "anthropic"));
+const ANTHROPIC_NATIVE_LAZY_KEY = "providers.anthropic.nativeLazyLoading";
+const {
+  value: anthropicNativeLazyEnabled,
+  busy: anthropicNativeLazyBusy,
+} = useSetting(ANTHROPIC_NATIVE_LAZY_KEY, readBool(true));
 const claudeCodeProvider = computed(() => props.providers.find((p) => p.id === "claude_code"));
 const claudeConnectionMode = ref<'local' | 'ssh'>(isRemoteClaudeCode.value ? 'ssh' : 'local');
 const claudeCodeLoggedOut = computed(
@@ -229,33 +228,8 @@ const codexTransportOptions = [
   },
 ] satisfies Array<{ value: CodexTransportMode; label: string; hint: string }>;
 
-const dynamicToolLoadingOptions = [
-  {
-    value: "native",
-    label: t("settings.dynamicToolLoading.native"),
-    hint: t("settings.dynamicToolLoading.nativeDesc"),
-  },
-  {
-    value: "metaTool",
-    label: t("settings.dynamicToolLoading.metaTool"),
-    hint: t("settings.dynamicToolLoading.metaToolDesc"),
-  },
-  {
-    value: "direct",
-    label: t("settings.dynamicToolLoading.direct"),
-    hint: t("settings.dynamicToolLoading.directDesc"),
-  },
-] satisfies Array<{ value: DynamicToolLoadingMode; label: string; hint: string }>;
-
 function updateCodexTransport(value: string) {
   emit("update:codexTransport", value === "websocket" ? "websocket" : "http");
-}
-
-function updateDynamicToolLoadingMode(value: string) {
-  emit(
-    "update:dynamicToolLoadingMode",
-    value === "direct" || value === "native" ? value : "metaTool",
-  );
 }
 
 function focusSectionClass(section: "custom" | "codex") {
@@ -373,7 +347,8 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
 
 <template>
   <div class="settings-api-providers" :class="{ 'is-onboarding': isOnboardingMode }">
-  <div class="settings-section" v-if="!isOnboardingMode && allModels.length > 0">
+  <div v-if="ServerConnection && !isOnboardingMode" class="settings-section"><component :is="ServerConnection" /></div>
+  <div class="settings-section" data-settings-section="available" v-if="!isOnboardingMode && allModels.length > 0">
     <div class="section-label">{{ t("settings.models.available") }}</div>
     <div class="available-models-grid">
       <div
@@ -392,39 +367,12 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
       </div>
     </div>
   </div>
-  <div class="settings-section" v-else-if="!isOnboardingMode">
+  <div class="settings-section" data-settings-section="available" v-else-if="!isOnboardingMode">
     <div class="section-label">{{ t("settings.models.available") }}</div>
     <p class="section-desc" style="opacity:0.6;">{{ t("settings.models.noModels") }}</p>
   </div>
 
-  <div class="settings-section" v-if="!isOnboardingMode">
-    <div class="section-label">{{ t("settings.dynamicToolLoading.title") }}</div>
-    <div class="provider-card dynamic-tool-card">
-      <div class="provider-header dynamic-tool-header">
-        <div class="provider-info">
-          <span class="provider-name">{{ t("settings.dynamicToolLoading.mode") }}</span>
-          <span class="provider-desc">
-            {{
-              dynamicToolLoadingMode === "native"
-                ? t("settings.dynamicToolLoading.nativeDesc")
-                : dynamicToolLoadingMode === "direct"
-                  ? t("settings.dynamicToolLoading.directDesc")
-                  : t("settings.dynamicToolLoading.metaToolDesc")
-            }}
-          </span>
-        </div>
-        <BaseSegmented
-          size="sm"
-          :model-value="dynamicToolLoadingMode"
-          :options="dynamicToolLoadingOptions"
-          :class="{ 'is-saving': dynamicToolLoadingBusy }"
-          @update:model-value="updateDynamicToolLoadingMode"
-        />
-      </div>
-    </div>
-  </div>
-
-  <div class="settings-section" v-if="!isOnboardingMode && anthropicProvider">
+  <div class="settings-section" data-settings-section="anthropic" v-if="!isOnboardingMode && anthropicProvider">
     <div class="section-label">{{ t("settings.anthropic.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">
@@ -486,10 +434,10 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
           <span class="provider-desc">{{ t("settings.anthropic.nativeLazyDesc") }}</span>
         </div>
         <BaseSwitch
-          :model-value="anthropicNativeLazyEnabled ?? true"
+          :model-value="anthropicNativeLazyEnabled"
           :disabled="anthropicNativeLazyBusy"
           :aria-label="t('settings.anthropic.nativeLazyTitle')"
-          @update:model-value="emit('update:anthropicNativeLazyEnabled', $event)"
+          @update:model-value="saveSetting(ANTHROPIC_NATIVE_LAZY_KEY, $event)"
         />
       </div>
 
@@ -569,9 +517,10 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     </div>
   </div>
 
-  <div class="settings-section" v-if="!isOnboardingMode && claudeCodeCliEnabled && claudeCodeProvider">
+  <div class="settings-section" data-settings-section="claudeCode" v-if="!isOnboardingMode">
     <div class="section-label">{{ t("settings.claudeCode.title") }}</div>
-    <div class="provider-card">
+    <SettingRow setting-key="providers.claudeCode.enabled" />
+    <div v-if="claudeCodeCliEnabled && claudeCodeProvider" class="provider-card">
       <ClaudeConnection @changed="emit('claudeConnectionChanged')" @mode-change="claudeConnectionMode = $event" />
       <div v-if="claudeConnectionMode === 'local'" class="provider-detail">
         <span
@@ -615,7 +564,7 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     </div>
   </div>
 
-  <div class="settings-section" :class="focusSectionClass('codex')">
+  <div class="settings-section" data-settings-section="codex" :class="focusSectionClass('codex')">
     <div class="section-label">{{ t("settings.codex.title") }}</div>
     <div class="provider-card">
       <div class="provider-header">
@@ -905,7 +854,7 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     </div>
   </div>
 
-  <div v-if="!isOnboardingMode && thirdPartyProviders.length > 0" class="settings-section">
+  <div v-if="!isOnboardingMode && thirdPartyProviders.length > 0" class="settings-section" data-settings-section="openrouter">
     <div class="section-label">{{ t("settings.provider.title") }}</div>
 
     <div
@@ -979,7 +928,7 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
     </div>
   </div>
 
-  <div class="settings-section" :class="focusSectionClass('custom')">
+  <div class="settings-section" data-settings-section="custom" :class="focusSectionClass('custom')">
     <div class="section-label">{{ t("settings.custom.title") }}</div>
     <p class="section-desc">{{ t("settings.custom.desc") }}</p>
 
@@ -1096,15 +1045,6 @@ function resetCreditBusyKey(credit: CodexQuotaResetCreditState): string {
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-}
-
-.dynamic-tool-header {
-  align-items: center;
-}
-
-.dynamic-tool-header :deep(.base-segmented.is-saving) {
-  opacity: 0.65;
-  pointer-events: none;
 }
 
 .provider-info {

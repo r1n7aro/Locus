@@ -1,139 +1,57 @@
-import { reactive } from "vue";
+import { reactive, watch } from "vue";
+import {
+  SHORTCUT_ACTIONS,
+  SHORTCUT_SETTING_KEYS,
+  cloneShortcut,
+  createDefaultShortcutSettings,
+  detectShortcutPlatform,
+  hasModifier,
+  normalizeKeyValue,
+  normalizeShortcut,
+  sameShortcut,
+  shortcutFromSetting,
+  shortcutRequiresModifier,
+  shortcutToSetting,
+  type ShortcutAction,
+  type ShortcutDefinition,
+  type ShortcutPlatform,
+  type ShortcutSettings,
+} from "./keyboardShortcutCore";
+import { saveSetting, settingValue } from "./useSettingsStore";
 
-export type ShortcutAction = "newChat" | "cancelRun" | "findInContext" | "globalSearch";
-export type ShortcutPlatform = "default" | "mac";
+export {
+  createDefaultShortcutSettings,
+  detectShortcutPlatform,
+  type ShortcutAction,
+  type ShortcutDefinition,
+  type ShortcutPlatform,
+  type ShortcutSettings,
+} from "./keyboardShortcutCore";
 
-export interface ShortcutDefinition {
-  ctrl: boolean;
-  meta: boolean;
-  alt: boolean;
-  shift: boolean;
-  key: string;
-}
-
-export type ShortcutSettings = Record<ShortcutAction, ShortcutDefinition>;
-
-const STORAGE_KEY = "locus-keyboard-shortcuts";
-
-function normalizeKeyValue(value: string | null | undefined): string {
-  const raw = String(value ?? "").trim();
-  if (!raw) return "";
-  if (raw === " ") return "space";
-  const lower = raw.toLowerCase();
-  if (lower === "spacebar") return "space";
-  return lower;
-}
-
-function hasModifier(shortcut: ShortcutDefinition): boolean {
-  return shortcut.ctrl || shortcut.meta || shortcut.alt || shortcut.shift;
-}
-
-function cloneShortcut(shortcut: ShortcutDefinition): ShortcutDefinition {
-  return { ...shortcut };
-}
-
-function snapshotSettings(settings: ShortcutSettings): ShortcutSettings {
-  return {
-    newChat: cloneShortcut(settings.newChat),
-    cancelRun: cloneShortcut(settings.cancelRun),
-    findInContext: cloneShortcut(settings.findInContext),
-    globalSearch: cloneShortcut(settings.globalSearch),
-  };
-}
-
-export function detectShortcutPlatform(): ShortcutPlatform {
-  if (typeof navigator !== "undefined" && /Mac|iPhone|iPod|iPad/i.test(navigator.platform)) {
-    return "mac";
-  }
-  return "default";
-}
-
-export function createDefaultShortcutSettings(
-  platform: ShortcutPlatform = detectShortcutPlatform(),
-): ShortcutSettings {
-  const useMeta = platform === "mac";
-  return {
-    findInContext: { ctrl: !useMeta, meta: useMeta, alt: false, shift: false, key: "f" },
-    globalSearch: { ctrl: !useMeta, meta: useMeta, alt: false, shift: true, key: "f" },
-    newChat: {
-      ctrl: !useMeta,
-      meta: useMeta,
-      alt: false,
-      shift: false,
-      key: "n",
-    },
-    cancelRun: {
-      ctrl: false,
-      meta: false,
-      alt: false,
-      shift: false,
-      key: "escape",
-    },
-  };
-}
-
-function normalizeShortcut(
-  shortcut: Partial<ShortcutDefinition> | null | undefined,
-  fallback: ShortcutDefinition,
-  requireModifier = true,
-): ShortcutDefinition {
-  const normalized: ShortcutDefinition = {
-    ctrl: Boolean(shortcut?.ctrl),
-    meta: Boolean(shortcut?.meta),
-    alt: Boolean(shortcut?.alt),
-    shift: Boolean(shortcut?.shift),
-    key: normalizeKeyValue(shortcut?.key),
-  };
-
-  if (!normalized.key || (requireModifier && !hasModifier(normalized))) {
-    return cloneShortcut(fallback);
-  }
-
-  return normalized;
-}
-
-function normalizeShortcutSettings(raw: unknown): ShortcutSettings {
+/** Each shortcut setting holds `ctrl+shift+f`; empty follows the platform default. */
+function project(): ShortcutSettings {
   const defaults = createDefaultShortcutSettings();
-  if (!raw || typeof raw !== "object") {
-    return defaults;
-  }
-
-  const record = raw as Partial<Record<ShortcutAction, ShortcutDefinition>>;
-  return {
-    newChat: normalizeShortcut(record.newChat, defaults.newChat),
-    cancelRun: normalizeShortcut(record.cancelRun, defaults.cancelRun, false),
-    findInContext: normalizeShortcut(record.findInContext, defaults.findInContext),
-    globalSearch: normalizeShortcut(record.globalSearch, defaults.globalSearch),
-  };
+  return Object.fromEntries(SHORTCUT_ACTIONS.map((action) => [
+    action,
+    normalizeShortcut(
+      shortcutFromSetting(settingValue(SHORTCUT_SETTING_KEYS[action])),
+      defaults[action],
+      shortcutRequiresModifier(action),
+    ),
+  ])) as ShortcutSettings;
 }
 
-function loadShortcutSettings(): ShortcutSettings {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      return normalizeShortcutSettings(JSON.parse(raw));
-    }
-  } catch {
-    // ignore persistence failures
+const state = reactive<ShortcutSettings>(project());
+watch(project, (next) => {
+  for (const action of SHORTCUT_ACTIONS) {
+    if (!sameShortcut(state[action], next[action])) state[action] = next[action];
   }
-  return createDefaultShortcutSettings();
-}
+}, { flush: "sync" });
 
-function saveShortcutSettings(settings: ShortcutSettings) {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshotSettings(settings)));
-  } catch {
-    // ignore persistence failures
-  }
-}
-
-const state = reactive<ShortcutSettings>(loadShortcutSettings());
-if (typeof window !== "undefined") {
-  window.addEventListener("storage", (event) => {
-    if (event.key !== STORAGE_KEY) return;
-    try { Object.assign(state, normalizeShortcutSettings(JSON.parse(event.newValue ?? "null"))); }
-    catch { /* Ignore invalid settings from another window. */ }
-  });
+/** Stores a shortcut; the platform default is stored as empty. */
+function saveShortcut(action: ShortcutAction, shortcut: ShortcutDefinition) {
+  const isDefault = sameShortcut(shortcut, createDefaultShortcutSettings()[action]);
+  saveSetting(SHORTCUT_SETTING_KEYS[action], isDefault ? "" : shortcutToSetting(shortcut));
 }
 
 function keyLabel(key: string): string {
@@ -244,18 +162,15 @@ export function createDoublePressShortcutTracker(
 
 export function useKeyboardShortcuts() {
   function setShortcut(action: ShortcutAction, shortcut: ShortcutDefinition) {
-    state[action] = normalizeShortcut(
+    saveShortcut(action, normalizeShortcut(
       shortcut,
       createDefaultShortcutSettings()[action],
-      action !== "cancelRun",
-    );
-    saveShortcutSettings(state);
+      shortcutRequiresModifier(action),
+    ));
   }
 
   function resetShortcut(action: ShortcutAction) {
-    const defaults = createDefaultShortcutSettings();
-    state[action] = cloneShortcut(defaults[action]);
-    saveShortcutSettings(state);
+    saveShortcut(action, cloneShortcut(createDefaultShortcutSettings()[action]));
   }
 
   return {

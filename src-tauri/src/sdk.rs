@@ -40,6 +40,8 @@ mod worktrees;
 mod sessions;
 mod agent_rules;
 mod csv;
+mod blender;
+mod reported;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WAIT_MS: u64 = 30_000;
 const DEFAULT_TOOL_TIMEOUT_MS: u64 = 120_000;
@@ -380,7 +382,7 @@ struct PromptAgentParams {
     #[serde(default)]
     knowledge_mode: Option<String>,
     #[serde(default)]
-    subagent_models: Option<HashMap<String, String>>,
+    subagent_models: Option<crate::agent::subagent_models::SubagentModelChoices>,
     #[serde(default)]
     subagent_efforts: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -797,11 +799,10 @@ async fn codex_model_values(
         };
         if let Some((access_token, account_id)) = credentials {
             if let Ok(cache_dir) = crate::commands::persistent_config_dir() {
-                let config = app.state::<Arc<crate::config::AppConfig>>();
                 if let Ok(models) = crate::llm::codex_models::list_codex_available_models(
                     &access_token,
                     account_id.as_deref(),
-                    config.base_url.as_deref(),
+                    None,
                     &cache_dir,
                     false,
                     crate::commands::load_codex_model_config()
@@ -890,6 +891,17 @@ async fn list_models(app: &AppHandle, params: ListModelsParams) -> Result<Value,
             .await
             .into_iter(),
     );
+    #[cfg(feature = "server-client")]
+    if let Ok(server_models) = crate::server_client::server_client_models().await {
+        for model in server_models {
+            let is_default = default_model.as_deref() == Some(model.id.as_str());
+            let mut value = serde_json::to_value(model).map_err(|error| error.to_string())?;
+            value["available"] = json!(true);
+            value["unavailableReason"] = Value::Null;
+            value["isDefault"] = json!(is_default);
+            models.push(value);
+        }
+    }
 
     for provider in crate::commands::load_custom_providers()? {
         let multiple_models = provider.models.len() > 1;
@@ -1347,13 +1359,10 @@ async fn resolve_prompt_model(
             return Ok(model);
         }
     }
-    if let Ok(model) = crate::commands::get_last_model(app.clone()).await {
-        if let Some(model) = nonempty(Some(model)) {
-            return Ok(model);
-        }
-    }
-    let config = app.state::<Arc<crate::config::AppConfig>>();
-    nonempty(Some(config.model.clone()))
+    crate::commands::get_last_model(app.clone())
+        .await
+        .ok()
+        .and_then(|model| nonempty(Some(model)))
         .ok_or_else(|| "No model is configured in Locus".to_string())
 }
 
@@ -1460,6 +1469,7 @@ async fn prompt_agent(app: &AppHandle, mut params: PromptAgentParams) -> Result<
         Some(subagent_efforts),
         Some(subagent_fast_modes),
         Some(params.knowledge_mode.unwrap_or_else(|| "full".to_string())),
+        None,
         None,
         None,
         app.clone(),
@@ -1663,9 +1673,25 @@ fn resolve_sdk_unity_runtime(
     };
     let runtime = scope.runtime();
     let resolved_project = runtime.root().to_string_lossy().to_string();
-    if !crate::unity_bridge::is_unity_project(&resolved_project) {
+    if !crate::unity_bridge::unity_integration_globally_enabled() {
+        return Err(format!(
+            "service_disabled: {operation} requires Unity, which is turned off in Settings > Services"
+        ));
+    }
+    if !crate::unity_bridge::unity_integration_enabled(&resolved_project) {
         return Err(format!(
             "{operation} requires an active Unity project: {resolved_project}"
+        ));
+    }
+    // Lazy mode needs nothing here: the lifecycle call binds (and starts)
+    // the service itself. Only a workspace that turned Unity off refuses.
+    if runtime
+        .services()
+        .effective_mode(crate::workspace_service::ServiceKind::Unity)
+        == crate::workspace_service::EffectiveServiceMode::Off
+    {
+        return Err(format!(
+            "service_disabled: {operation} requires the Unity service, which is turned off for this workspace"
         ));
     }
     Ok(scope)
@@ -2594,24 +2620,52 @@ fn call_config_query(
     arguments: &Value,
     workspace_scope: Option<&crate::workspace_service::ResolvedWorkspaceScope>,
 ) -> ToolResult {
-    let category = arguments
-        .get("category")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let entries = match category {
-        Some(category) => {
-            crate::config_registry::collect_by_category(app, category, workspace_scope)
-        }
-        None => crate::config_registry::collect_all(app, workspace_scope),
-    };
-    match entries {
-        Ok(entries) => ToolResult {
-            output: serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string()),
+    let config = app.state::<Arc<crate::config::AppConfig>>();
+    match crate::settings::agent::query_json(&config, workspace_scope, arguments) {
+        Ok(result) => ToolResult {
+            output: serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()),
             is_error: false,
         },
         Err(error) => ToolResult {
-            output: error.to_string(),
+            output: error,
+            is_error: true,
+        },
+    }
+}
+
+/// SDK calls have no confirmation UI, so changes that would ask the user
+/// (sensitive settings, or every change when `behavior.settings_change` is
+/// `ask`) are rejected and left to the agent's `config_set`.
+async fn call_config_set(
+    app: &AppHandle,
+    arguments: &Value,
+    workspace_scope: Option<&crate::workspace_service::ResolvedWorkspaceScope>,
+) -> ToolResult {
+    let request = match crate::settings::agent::parse_config_set(arguments) {
+        Ok(request) => request,
+        Err(error) => {
+            return ToolResult {
+                output: error,
+                is_error: true,
+            }
+        }
+    };
+    let permissions = app.state::<crate::ToolPermissions>().0.read().await.clone();
+    if crate::settings::agent::requires_confirmation(&request, &permissions) {
+        return ToolResult {
+            output: "This settings change needs user confirmation, which SDK calls cannot show. Call the config_set tool directly so the user can confirm it.".to_string(),
+            is_error: true,
+        };
+    }
+    let context = crate::settings::apply::WriteContext::new(app.clone(), workspace_scope);
+    match crate::settings::apply::write(&context, &request.changes).await {
+        Ok(changes) => ToolResult {
+            output: serde_json::to_string_pretty(&json!({ "changes": changes }))
+                .unwrap_or_else(|_| "{}".to_string()),
+            is_error: false,
+        },
+        Err(error) => ToolResult {
+            output: format!("Settings unchanged: {}", error.message),
             is_error: true,
         },
     }
@@ -2759,6 +2813,16 @@ async fn call_tool(app: &AppHandle, params: CallToolParams) -> Result<Value, Str
             working_dir,
         ));
     }
+    if canonical == "config_set" {
+        let result = call_config_set(app, &params.arguments, workspace_scope.as_ref()).await;
+        return Ok(direct_tool_result(
+            &canonical,
+            result.output,
+            result.is_error,
+            Value::Array(Vec::new()),
+            working_dir,
+        ));
+    }
     if workspace_scope.is_none() {
         return Err(format!(
             "Tool '{canonical}' requires workspaceRef with a live checkout generation"
@@ -2851,12 +2915,14 @@ pub(crate) fn direct_tool_lock_request(
 }
 
 /// Start an idle root receiver with its persisted settings. The actual message
-/// stays in the durable mailbox and is injected as an agent reminder.
+/// or task result stays in the durable mailbox and is injected before the first
+/// model request; the launch itself carries only an internal reminder, so no
+/// empty user message is shown.
 pub(crate) async fn wake_session_for_agent_message(app: &AppHandle, session_id: &str) -> Result<(), String> {
     let store = app.state::<Arc<SessionStore>>();
     if store.pending_agent_messages(session_id)?.is_empty() && store.pending_async_notifications(session_id)?.is_empty() { return Ok(()); }
     let detail = store.load_session(session_id)?;
-    crate::commands::chat(
+    crate::commands::launch_chat(
         Some(session_id.to_string()),
         None,
         String::new(),
@@ -2870,7 +2936,8 @@ pub(crate) async fn wake_session_for_agent_message(app: &AppHandle, session_id: 
         None, None,
         Some(detail.session_type),
         Some(if store.get_plan_mode_state(session_id)?.active { "plan" } else { "build" }.into()),
-        None, None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None,
+        Some(crate::async_tasks::BACKGROUND_RESULTS_REMINDER.to_string()),
         app.clone(),
         app.state::<Arc<SessionStore>>(),
         app.state::<AgentDefRegistryState>(),
@@ -2906,6 +2973,12 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
         let reference = serde_json::from_value(params.get("workspaceRef").cloned().ok_or("workspaceRef is required")?).map_err(|e|e.to_string())?;
         return serde_json::to_value(crate::native_view::open(app, reference, params["viewId"].as_str().ok_or("viewId is required")?).await?).map_err(|e|e.to_string());
     }
+    if let Some(action) = method.strip_prefix("blender.") {
+        return blender::dispatch(app, action, params).await;
+    }
+    if method == "attachments.add" {
+        return blender::attach(params).await;
+    }
     if let Some(action) = method.strip_prefix("csv.") {
         return csv::dispatch(app, action, params).await;
     }
@@ -2940,6 +3013,11 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
             return Ok(json!({"workspace_ref":crate::workspace_service::WorkspaceRef::for_runtime(&runtime),"job":crate::merge_jobs::summary(&job)}));
         }
         let job_id=params.get("job_id").and_then(Value::as_str).ok_or("Merge job_id is required")?.to_string();
+        if action=="replan" {
+            let (job,report)=crate::merge_jobs::coordination::run_blocking(_merge_guard,move||{let _scope=scope;crate::merge_jobs::replan(&root,&job_id)}).await??;
+            let runtime=app.state::<Arc<crate::workspace_service::ProjectRegistry>>().register(&job.project_root)?;
+            return Ok(json!({"workspace_ref":crate::workspace_service::WorkspaceRef::for_runtime(&runtime),"job":crate::merge_jobs::summary(&job),"report":report}));
+        }
         if action=="apply"{crate::merge_jobs::preflight_apply(&root,&job_id).await?;}
         if action=="validate"&&params.get("level").and_then(Value::as_str)==Some("unity") {
             if params.get("paths").and_then(Value::as_array).is_some(){return crate::merge_jobs::validate_commit_unity(app,&root,&job_id,params).await;}
@@ -2965,14 +3043,7 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
                 .filter(|id| !id.is_empty()).ok_or("taskId is required")?;
             if method == "tasks.send_message" {
                 let message = params.get("message").and_then(Value::as_str).ok_or("message is required")?;
-                let (receipt, task) = manager.queue_task_message(session_id, task_id, message)?;
-                if let Some(task) = task {
-                    manager.inner().ensure_message_delivery(app.clone(), task, receipt["messageId"].as_str().unwrap().to_string());
-                } else {
-                    let (target, _, _) = manager.resolve_message_target(session_id, task_id)?;
-                    manager.inner().ensure_parent_message_delivery(app.clone(), target, receipt["messageId"].as_str().unwrap().to_string());
-                }
-                return Ok(receipt);
+                return manager.inner().send_agent_message(app, session_id, task_id, message);
             }
             if method == "tasks.wait" {
                 let timeout = params.get("timeoutMs").and_then(Value::as_u64).unwrap_or(30_000);
@@ -2982,9 +3053,6 @@ async fn dispatch(app: &AppHandle, method: &str, params: Value) -> Result<Value,
             let snapshot = if method == "tasks.cancel" {
                 manager.cancel(&current.task_id)?
             } else if method == "tasks.resume" {
-                if !app.state::<Arc<crate::config::AppConfig>>().async_tasks_enabled() {
-                    return Err("Async tasks are disabled in Settings > Experimental.".into());
-                }
                 let message = params.get("message").and_then(Value::as_str).unwrap_or_default().to_string();
                 manager.inner().resume_task(session_id, task_id, message, app.clone())?
             } else {
@@ -3103,7 +3171,12 @@ async fn handle_request_inner(
             } else {
                 -32602
             };
-            rpc_error(id, code, error)
+            let data = reported::classify(&rpc.method, &error);
+            let mut response = rpc_error(id, code, error);
+            if let Some(data) = data {
+                response["error"]["data"] = data;
+            }
+            response
         }
     };
     json_response(&response)

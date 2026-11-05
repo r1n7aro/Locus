@@ -27,6 +27,7 @@ vi.mock("../stores/workbench", () => ({
   createWorkbenchEditorInput: (resource: object, title: string, options: object) => ({ editorId: "new-view", resource, title, ...options }),
 }));
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { setSettingValue, settingValue } from "../composables/useSettingsStore";
 import { useOpenView, VIEW_OPEN_WINDOW_KEY } from "../composables/useOpenView";
 import { openViewPackage, setViewOpenOverride, viewOpenPreferenceKey } from "../services/viewOpening";
 
@@ -105,15 +106,15 @@ describe("View opening preferences and window ownership", () => {
     setViewOpenOverride(scope, "hero", "tab");
     await openViewPackage(scope, "hero", "workspace-app-project");
     expect(mocks.run).toHaveBeenCalledOnce();
-    expect(JSON.parse(localStorage.getItem("locus-display-settings")!).viewOpenOverrides[viewOpenPreferenceKey(scope, "hero")]).toBe("tab");
+    expect((settingValue("workbench.open.viewOverrides") as Record<string, string>)[viewOpenPreferenceKey(scope, "hero")]).toBe("tab");
     expect(viewOpenPreferenceKey({ ...scope, checkoutId: "checkout-b" }, "hero")).not.toBe(viewOpenPreferenceKey(scope, "hero"));
     setViewOpenOverride(scope, "hero", "default");
     await openViewPackage(scope, "hero");
     expect(mocks.create).toHaveBeenCalledOnce();
   });
   it("applies changes from another window and normalizes invalid stored defaults", () => {
-    localStorage.setItem("locus-display-settings", JSON.stringify({ viewOpenTarget: "invalid", viewOpenOverrides: { a: "window", b: "invalid" } }));
-    window.dispatchEvent(new StorageEvent("storage", { key: "locus-display-settings" }));
+    void setSettingValue("workbench.open.view", "invalid");
+    void setSettingValue("workbench.open.viewOverrides", { a: "window", b: "invalid" });
     expect(useDisplaySettings().state.viewOpenTarget).toBe("tab");
     expect(useDisplaySettings().state.viewOpenOverrides).toEqual({ a: "window" });
   });

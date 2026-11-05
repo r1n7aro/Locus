@@ -1,8 +1,9 @@
-import { reactive, readonly } from "vue";
+import { reactive, readonly, watch } from "vue";
 import type { GlobalSearchSource } from "../services/globalSearch";
+import { GLOBAL_SEARCH_FIELD_KEYS } from "./settingsLegacy";
+import { saveSetting, settingValue } from "./useSettingsStore";
 
 export type GlobalSearchSettings = Record<GlobalSearchSource | "enabled" | "includeArchived", boolean>;
-const STORAGE_KEY = "locus-global-search-settings";
 const defaults: GlobalSearchSettings = {
   enabled: true, knowledgeTitle: true, knowledgeContent: true, sessionTitle: true, sessionContent: true,
   fileName: true, viewName: true, includeArchived: true,
@@ -13,21 +14,20 @@ export function normalizeGlobalSearchSettings(value: unknown): GlobalSearchSetti
     key, typeof record[key as keyof GlobalSearchSettings] === "boolean" ? record[key as keyof GlobalSearchSettings] : fallback,
   ])) as GlobalSearchSettings;
 }
-function load(): GlobalSearchSettings {
-  try { return normalizeGlobalSearchSettings(JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")); }
-  catch { return { ...defaults }; }
+const FIELD_KEYS: Record<keyof GlobalSearchSettings, string> = GLOBAL_SEARCH_FIELD_KEYS;
+function project(): GlobalSearchSettings {
+  return normalizeGlobalSearchSettings(Object.fromEntries(
+    Object.entries(FIELD_KEYS).map(([field, key]) => [field, settingValue(key)]),
+  ));
 }
-const state = reactive(load());
+const state = reactive(project());
 // Settings can also be opened in an independent native window.
-if (typeof window !== "undefined") window.addEventListener("storage", (event) => {
-  if (event.key === STORAGE_KEY || event.key === null) Object.assign(state, load());
-});
+watch(project, (next) => Object.assign(state, next), { flush: "sync" });
 export function useGlobalSearchSettings() {
   return {
     state: readonly(state),
     set(key: keyof GlobalSearchSettings, value: boolean) {
-      state[key] = value;
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch { /* optional persistence */ }
+      saveSetting(FIELD_KEYS[key], value);
     },
   };
 }
