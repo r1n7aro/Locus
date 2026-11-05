@@ -86,15 +86,19 @@ async function ensureIlRepack() {
   await mkdir(ilRepackDir, { recursive: true });
 
   if (process.platform === "win32") {
+    // Windows PowerShell's Expand-Archive only accepts the .zip extension.
+    const zipCopy = `${packagePath}.zip`;
+    await copyFile(packagePath, zipCopy);
     run("powershell", [
       "-NoProfile",
       "-ExecutionPolicy",
       "Bypass",
       "-Command",
       "& { param($archive, $destination) Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force }",
-      packagePath,
+      zipCopy,
       ilRepackDir,
     ]);
+    await rm(zipCopy, { force: true });
   } else {
     run("unzip", ["-q", packagePath, "-d", ilRepackDir]);
   }
