@@ -13,12 +13,12 @@ Click the `File changes` button above the composer to open the panel:
 
 - **Scope switch**: `Current Round` shows this round's edits; `All Changes` lists everything since the conversation started.
 - **Status labels**: each file is marked `Modified`, `Added`, `Deleted`, or `Renamed`.
-- **Auto open**: by default the panel opens when file changes arrive. Under `Panel Behavior` in Settings > Display you can turn that off, or have the panel close automatically when you send a new message.
+- **Auto open**: by default the panel opens when file changes arrive. Under `Panel Behavior` in Settings > Workbench you can turn that off, or have the panel close automatically when you send a new message.
 
 ## Reviewing diffs
 
 - **Inline**: click a file, or choose `View diff` from its `File actions` menu, to compare before and after in the current window.
-- **Separate window**: choose `Separate window` to open the review in its own window, which suits dual monitors and long diffs. The default location is set under `File Change Review` in Settings > Display.
+- **Separate window**: choose `Separate window` to open the review in its own window, which suits dual monitors and long diffs. The default location is set by `Review session changes in` under `Open Targets` in Settings > Workbench.
 
 ## Undo
 
@@ -45,4 +45,4 @@ If files changed again after the undo point, Locus warns you before proceeding:
 
 ## How it works: Git snapshots
 
-Locus builds undo and change analysis on version control: it records a file snapshot before each round, and undoing restores files to that snapshot. This means undo requires the [Git setup](/en/overview/install-and-setup) to be complete, and the Git binary Locus uses is chosen under `Git Runtime` in Settings > General. Undo only covers changes recorded by Agent sessions; for cross-session or cross-commit version operations, use the Collab tab. See [Changes and commit](/en/collaboration/changes-and-commit).
+Locus builds undo and change analysis on version control: it records a file snapshot before each round, and undoing restores files to that snapshot. This means undo requires the [Git setup](/en/overview/install-and-setup) to be complete, and the Git binary Locus uses is chosen under `Git Runtime` in Settings > System. Undo only covers changes recorded by Agent sessions; for cross-session or cross-commit version operations, use the Collab tab. See [Changes and commit](/en/collaboration/changes-and-commit).

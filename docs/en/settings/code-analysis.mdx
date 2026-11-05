@@ -3,9 +3,9 @@ title: Code analysis
 description: The C# language service and per-tool switches
 ---
 
-Settings > Code Analysis controls the Agent's semantic C# capabilities. With it on, find-references and go-to-definition return compiler-grade results instead of text-search approximations.
+The `C# Code Analysis` section of Settings > Unity controls the Agent's semantic C# capabilities. With it on, find-references and go-to-definition return compiler-grade results instead of text-search approximations.
 
-{/* TODO: 截图：设置页代码分析标签，展示 C# 代码分析总开关与 Roslyn 工具逐项开关列表 */}
+{/* TODO: 截图：设置页 Unity 页面的 C# 代码分析分区，展示 C# 代码分析总开关与 Roslyn 工具逐项开关列表 */}
 
 ## C# code analysis switch
 
@@ -35,4 +35,4 @@ These bridge C# symbols to Unity asset data and project settings, and work witho
 
 - **`unity_code_usages`**: where a script or member is used inside scenes, prefabs, and assets: attach points, UnityEvent bindings, serialized fields, AnimationEvents, `[SerializeReference]` instances of the types the file declares (including subclasses, interface implementations, and instance types set on prefab instances, variants, and nested prefabs), and plain `[Serializable]` class/struct values held by serialized fields (arrays, lists, generics, and nested types included) together with their prefab overrides. Code-side find-references cannot see these usage sites, so have the Agent check here before deleting or renaming a script to avoid breaking scene bindings. This tool relies on the asset database. See [Assets](/en/assets/index).
 
-The other tabs in the `Code & Unity` group (`Hot Reload & Compile`, `Unity Connection`, `Testing`) are covered in [Execute and compile](/en/unity/execute-and-compile) and [Hot reload](/en/unity/hot-reload).
+The other sections of the same page (`Connection and Embedding`, `Hot Reload & Compile`, `Testing`, and more) are covered in [Execute and compile](/en/unity/execute-and-compile) and [Hot reload](/en/unity/hot-reload).

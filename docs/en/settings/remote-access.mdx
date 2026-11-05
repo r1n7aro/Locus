@@ -9,7 +9,7 @@ Remote access is experimental and off by default. While it is off, Locus listens
 
 ## Turning it on
 
-Open Settings → `Tools` → `Remote Access`, turn on `Enable remote access`. A security warning first explains what paired devices can do on this computer, and remote access turns on only after you confirm; turning it off needs no confirmation. Then choose under `Network` where your phone connects from:
+Open Settings → `Connections` → `Remote Access`, turn on `Enable remote access`. A security warning first explains what paired devices can do on this computer, and remote access turns on only after you confirm; turning it off needs no confirmation. Then choose under `Network` where your phone connects from:
 
 - **`Direct LAN and Tailscale connections`**: turn on the adapters your phone can reach. Locus serves HTTPS there with a self-signed certificate generated on this computer and accepts only devices on the same LAN (or tailnet). Windows may ask about the firewall the first time; allow Locus on **private networks**. `Open firewall settings` jumps straight there.
 - **`Local address (for tunnels)`**: serves HTTP on `127.0.0.1` for tools that terminate encryption on this computer, such as `tailscale serve`, UU Remote port mapping or frp. The page shows an example `tailscale serve` command.

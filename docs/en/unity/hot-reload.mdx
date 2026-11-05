@@ -5,7 +5,7 @@ description: Method-body C# edits reach the running editor in 1-2 seconds; struc
 
 Hot reload (experimental, off by default) compiles method-body C# edits into patches and applies them to the running editor within 1 to 2 seconds, skipping the Unity recompile and domain reload. While you tune feel, change values, or fix logic in Play Mode, the game is never interrupted and memory state stays exactly as it was.
 
-To turn it on: Settings > `Hot Reload & Compile` > `Unity hot reload (experimental)`. It requires the [compile server](/en/unity/execute-and-compile#compile-server) on the same page to be enabled first.
+To turn it on: Settings > `Unity` > `Hot Reload & Compile` > `Unity hot reload (experimental)`. It requires the [compile server](/en/unity/execute-and-compile#compile-server) in the same section to be enabled first.
 
 ## Which changes hot reload
 
@@ -40,7 +40,7 @@ The `Reload on Play` control on the panel decides whether entering Play Mode run
 
 ## Self-test
 
-If hot reload seems to misbehave, run a self-test first: Settings > `Hot Reload & Compile` > `Hot reload self-test`, then click `Run self-test` with the editor connected and in Edit Mode. The self-test writes a set of test scripts, enters Play Mode, verifies the hot reload behavior of each change kind one by one, cleans up automatically when finished, and reports the passed and failed counts with a full log.
+If hot reload seems to misbehave, run a self-test first: under Settings > `Unity` > `Diagnostics (Current Workspace)` > `Self-test`, check `Hot Reload` and click `Run Selected` with the editor connected and in Edit Mode. The self-test writes a set of test scripts, enters Play Mode, verifies the hot reload behavior of each change kind one by one, cleans up automatically when finished, and reports the passed and failed counts with a full log.
 
 ## Boundaries and safety
 

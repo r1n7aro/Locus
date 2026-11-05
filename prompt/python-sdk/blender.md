@@ -92,7 +92,7 @@ await bl.close(bg)                           # background instances only
 await bl.reset_namespace()                   # clear namespace="session" variables
 ```
 
-`target` accepts an `Instance`, its key, a PID, an open .blend path, `"background"` or `"background:<version>"`. Session targets live in memory and clear when Locus restarts. Background instances belong to the checkout; at most 2 run at once (Settings > Workspace resources) and idle ones close after 10 minutes. A running call keeps its instance alive.
+`target` accepts an `Instance`, its key, a PID, an open .blend path, `"background"` or `"background:<version>"`. Session targets live in memory and clear when Locus restarts. Background instances belong to the checkout; at most 2 run at once (Settings > Blender) and idle ones close after 10 minutes. A running call keeps its instance alive.
 
 ## Versions and add-on
 

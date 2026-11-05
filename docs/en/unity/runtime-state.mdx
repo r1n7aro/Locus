@@ -5,7 +5,7 @@ description: The state probe keeps reading editor state, while the native bridge
 
 Locus tracks the Unity editor's actual state continuously: `Editing`, `Playing`, `Paused`, `Reloading`, `Compiling`, `Importing`, and even `Unresponsive`. The same state feeds both sides. On the status panel you can see what Unity is doing, whether it is hung or just reloading normally; the Agent reads the same information to decide when to call Unity and when to wait, and the `Operation safety` row on the panel is exactly that verdict. This pays off in troubleshooting: the Agent can confirm the game is actually playing, or that the editor is mid-reload, instead of poking blind at a black box.
 
-The three subsystems below are all on by default; their switches sit together under Settings > `Unity Connection`.
+The three subsystems below are all on by default; their switches sit together under Settings > `Unity` > `Connection and Embedding`.
 
 ## State probe
 
@@ -43,6 +43,6 @@ The background boost (`Background Hook`) patches the editor so it keeps processi
 
 The switch is `Keep editor responsive in background`. It is built on native symbols and falls back automatically when unavailable; after a fallback, bringing Unity to the foreground makes everything run normally again. The `Background Hook` row on the status panel shows `Active`, `Waiting for process`, `Failed`, `Unavailable`, or `Disabled`.
 
-`Background recompile probe` under Settings > `Testing` verifies the effect: it writes a harmless temporary script, triggers one real recompile, and cleans up automatically when done; with the background hook active, the whole run needs no switch of Unity to the foreground.
+`Background recompile probe` under Settings > `Unity` > `Diagnostics (Current Workspace)` > `Self-test` verifies the effect: it writes a harmless temporary script, triggers one real recompile, and cleans up automatically when done; with the background hook active, the whole run needs no switch of Unity to the foreground.
 
-{/* TODO: 截图：「设置」→「Unity 连接」页面，可见 Native Plugin Bridge、进程外状态探针、后台保持编辑器响应三个开关 */}
+{/* TODO: 截图：「设置」→「Unity」→「连接与嵌入」分区，可见 Native Plugin Bridge、进程外状态探针、后台保持编辑器响应三个开关 */}

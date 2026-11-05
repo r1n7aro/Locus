@@ -1,30 +1,22 @@
 ---
-title: General settings
-description: Interface, notifications, shortcuts, proxy, logs, and runtimes
+title: Interface and system settings
+description: Appearance, workbench, notifications, shortcuts, proxy, runtimes, logs, and updates
 ---
 
-The `General` group in Settings collects interface and environment configuration. This page walks through its tabs.
+Settings groups its pages into `Models`, `Agent`, `Workspace`, `Integrations`, `Interface`, `Connections`, and `System`, with a search box at the top. This page covers the `Interface`, `Connections`, and `System` groups, plus some general options on the `Agent Behavior` page. Models are covered in [Model settings](/en/settings/models); Unity switches are covered in [Unity runtime state](/en/unity/runtime-state) and [Code analysis](/en/settings/code-analysis).
 
-## General
+## Appearance
 
 - **`Interface Language`**: switch the display language.
-- **`Debug Mode`**: when enabled, every LLM HTTP request is saved to the debug capture directory (`debug/llm/` in dev builds, `data/debug/llm/` in packaged builds). Sensitive headers like `Authorization` are automatically redacted. Turn it on to inspect requests, keep it off otherwise.
-- **`LLM Auto Retry`**: how many times a failed model request (connection errors, timeouts, HTTP 5xx and 429 rate limits) is retried automatically. Default 3, range 0 to 10; retries only happen before any output has streamed, 429 responses honor the server's Retry-After header, and 0 disables retries.
-- **`Unity Background Boost`**: keeps the Unity editor loop responsive while the Unity window is in the background, so compiles and Agent commands do not wait for you to click back into Unity.
-- **`Close Behavior`**: closing the last window either runs `Exit App` or `Minimize to Tray`. Closing any other window never exits the app.
-- **`Local Data Storage`**: where sessions and memory files live (Knowledge content stays in the project directory). `Open Directory` or `Change Location`; a move finishes after restart.
-- **`Temporary Files`**: large tool outputs and runtime temp files. `Clear` frees space; historical sessions still open afterwards, and cleared large tool outputs show as `Full output deleted`.
-- **`Session File Undo`**: records each round of Agent file changes for review and undo. Turning it off stops automatic Git snapshots; writes with known file paths still coordinate access to the same file, and Unity execution keeps its required serialization.
-- **`Git Runtime`**: the Git that Locus uses for version control, undo, and change analysis. Choose the managed Git or one installed on your system.
-- **`Python Runtime`**: the interpreter the bash tool uses for `python` and `pip`. Managed Python installs packages into the data directory instead of your system environment.
-- **`Reset All Settings`**: clears the configuration and re-enters the onboarding flow.
-
-## Display
-
 - **`Theme`**: pick `System`, `Light`, or `Dark` separately for the main window and the Unity embedded window.
-- **`Main Interface`**: toggles for top navigation entries: `Show Knowledge`, `Show Collab`, `Show Assets`, `Show Views`, `Show Plugins`, `Show Agent`.
-- **`Panel Behavior`**: auto open and close rules for the task list and file changes panels. See [File changes and undo](/en/sessions/changes-and-undo).
 - **`Fonts`**: custom fonts for UI, prose, inline code, code blocks, and the editor area.
+- **`Main Interface`**: toggles for top navigation entries: `Show Knowledge`, `Show Collab`, `Show Assets`, `Show Views`, `Show Plugins`, `Show Agent`. `Show the title bar in workspace windows` decides whether workspace windows other than the primary one show the title bar.
+
+## Workbench
+
+- **`Session Tabs`**: how many hidden session tabs each editor group keeps loaded, 6 by default. Tabs beyond the limit unload to save memory and load again when shown; 0 keeps all of them loaded.
+- **`Panel Behavior`**: auto open and close rules for the task list and file changes panels. See [File changes and undo](/en/sessions/changes-and-undo).
+- **`Open Targets`**: where session changes, Git changes, plan approvals, Views, and similar content open by default.
 
 ## Notifications
 
@@ -37,25 +29,44 @@ The `General` group in Settings collects interface and environment configuration
 - **`While running`**: the default handling for messages sent during an active run, `Queue next` or `Insert now`. See [Sessions page](/en/sessions/index).
 - **`New session`**: record a custom key combination. Click `Record` and press the keys; at least one modifier is required.
 
+## Agent Behavior
+
+- **`LLM Auto Retry`**: under `Requests and Output`. How many times a failed model request (connection errors, timeouts, HTTP 5xx and 429 rate limits) is retried automatically. Default 3, range 0 to 10; retries only happen before any output has streamed, 429 responses honor the server's Retry-After header, and 0 disables retries.
+- **`Session File Undo`**: records each round of Agent file changes for review and undo. Turning it off stops automatic Git snapshots; writes with known file paths still coordinate access to the same file, and Unity execution keeps its required serialization.
+
 ## Proxy
 
-`Proxy mode` decides the network route for Locus backend requests:
+In the `Connections` group. `Proxy mode` decides the network route for Locus backend requests:
 
 - **`Auto discovery`** (default): reads proxy settings from environment variables and system configuration.
 - **`System Proxy`**: backend requests read the system proxy configuration.
 - **`Manual Proxy`**: uses the `Proxy URL` you enter, such as `http://127.0.0.1:7890`.
 - **`Disable Proxy`**: backend requests connect directly.
 
-The `Request routes` section below shows the route each request class actually takes, which confirms whether the proxy is in effect.
+The `Request routes` section below shows the route each request class actually takes, which confirms whether the proxy is in effect. `Remote Access` in the `Connections` group is covered in [Remote access](/en/settings/remote-access).
 
-## Console
+## System
 
-Unified frontend and backend debug output. Filter by level (`Trace` through `Error`) and source (`Frontend`/`Backend`), or search by module name and log text. Backend debug and trace logs follow `General > Debug Mode`. Logs are also written to a local file, so they survive a crash; `Export Logs` bundles the current output and `Locate Log File` opens the log's directory. Attaching an export is the most useful thing to include in a bug report.
+- **`Close Behavior`**: closing the last window either runs `Exit App` or `Minimize to Tray`. Closing any other window never exits the app.
+- **`Local Data Storage`**: where sessions and memory files live (Knowledge content stays in the project directory). `Open Directory` or `Change Location`; a move finishes after restart.
+- **`Temporary Files`**: large tool outputs and runtime temp files. `Clear` frees space; historical sessions still open afterwards, and cleared large tool outputs show as `Full output deleted`.
+- **`Git Runtime`**: the Git that Locus uses for version control, undo, and change analysis. Choose the managed Git or one installed on your system.
+- **`Python Runtime`**: the interpreter the bash tool uses for `python` and `pip`. Managed Python installs packages into the data directory instead of your system environment.
+- **`Reset All Settings`**: clears the configuration and re-enters the onboarding flow.
 
-## Archived sessions
+## Debugging
 
-Review archived conversations. Archived sessions are hidden from the Sessions list but remain readable here, and `Unarchive` restores them.
+- **`Debug Mode`**: when enabled, every LLM HTTP request is saved to the debug capture directory (`debug/llm/` in dev builds, `data/debug/llm/` in packaged builds). Sensitive headers like `Authorization` are automatically redacted. Turn it on to inspect requests, keep it off otherwise.
+- **`Tool Failure Log`**: keeps the latest 100 failed tool calls locally, including arguments, error output, and session location. Off by default.
+
+## Logs
+
+Unified frontend and backend debug output. Filter by level (`Trace` through `Error`) and source (`Frontend`/`Backend`), or search by module name and log text. Backend debug and trace logs follow `Debug Mode` on the `Debugging` page. Logs are also written to a local file, so they survive a crash; `Export Logs` bundles the current output and `Locate Log File` opens the log's directory. Attaching an export is the most useful thing to include in a bug report.
 
 ## About
 
 Shows the current version and contact information. `Update channel` offers `Stable` or `Experimental`: the experimental channel gets features earlier with weaker stability. `Check for updates` fetches the latest release information on demand.
+
+## Archived sessions
+
+Archived sessions no longer appear in the session list. Open them from `Archived` in the workspace tree, or `Unarchive` them to restore.

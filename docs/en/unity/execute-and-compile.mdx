@@ -31,6 +31,6 @@ The code snippets the Agent executes (along with View scripts) have to compile f
 
 The compile server only handles the Agent's snippets; recompiling project scripts remains Unity's own job.
 
-The switch lives under Settings > `Hot Reload & Compile` as `Compile in CoreCLR sidecar`, on by default. Any compile-server failure falls back to in-Unity compilation automatically without interrupting the task; if you suspect it is causing problems, you can also turn the switch off manually to fall back to in-editor compilation. [Hot reload](/en/unity/hot-reload) depends on this switch.
+The switch lives under Settings > `Unity` > `Hot Reload & Compile` as `Compile in CoreCLR sidecar`, on by default. Any compile-server failure falls back to in-Unity compilation automatically without interrupting the task; if you suspect it is causing problems, you can also turn the switch off manually to fall back to in-editor compilation. [Hot reload](/en/unity/hot-reload) depends on this switch.
 
 The `Compiler` row in the panel shows its state: `Running`, `Idle`, `Falling back to Unity`, or `Off`.
