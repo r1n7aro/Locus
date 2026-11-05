@@ -2,7 +2,11 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import { t } from "../../i18n";
 import { normalizeAppError } from "../../services/errors";
-import { getUnityEditorResources, type UnityEditorResource } from "../../services/worktrees";
+import {
+  getUnityEditorResources,
+  subscribeUnityEditorProcessesChanged,
+  type UnityEditorResource,
+} from "../../services/worktrees";
 import { formatWorktreeBytes } from "../../utils/worktreeDiskUsage";
 import BaseButton from "../ui/BaseButton.vue";
 
@@ -11,24 +15,43 @@ const loading = ref(false);
 const loaded = ref(false);
 const error = ref("");
 let disposed = false;
-let timer: ReturnType<typeof setInterval> | undefined;
+let rerun = false;
+let unsubscribe: (() => void) | null = null;
 async function refresh() {
-  if (loading.value || disposed) return;
+  if (disposed) return;
+  // A change pushed mid-request must not be lost: read again afterwards.
+  if (loading.value) { rerun = true; return; }
   loading.value = true;
   try {
     const result = await getUnityEditorResources();
     if (!disposed) { editors.value = result; error.value = ""; loaded.value = true; }
   } catch (cause) { if (!disposed) error.value = normalizeAppError(cause).message; }
-  finally { if (!disposed) loading.value = false; }
+  finally {
+    if (!disposed) loading.value = false;
+    if (rerun && !disposed) { rerun = false; void refresh(); }
+  }
 }
 function modeLabel(editor: UnityEditorResource) {
   return t(`settings.resources.editors.${editor.managed ? "managed" : editor.mode}`);
 }
+function onVisibilityChange() {
+  if (document.visibilityState !== "hidden") void refresh();
+}
+// Memory figures are a snapshot: they reload when an editor starts or exits
+// (pushed by the backend), when the window is shown again, or on Refresh.
 onMounted(() => {
   void refresh();
-  timer = setInterval(() => { if (document.visibilityState !== "hidden") void refresh(); }, 5000);
+  document.addEventListener("visibilitychange", onVisibilityChange);
+  void subscribeUnityEditorProcessesChanged(() => void refresh())
+    .then((release) => { if (disposed) release(); else unsubscribe = release; })
+    .catch(() => {});
 });
-onUnmounted(() => { disposed = true; if (timer) clearInterval(timer); });
+onUnmounted(() => {
+  disposed = true;
+  document.removeEventListener("visibilitychange", onVisibilityChange);
+  unsubscribe?.();
+  unsubscribe = null;
+});
 </script>
 
 <template>

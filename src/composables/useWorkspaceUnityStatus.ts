@@ -35,7 +35,6 @@ interface WorkspaceUnityStatusOptions {
   onError?: (error: AppErrorPayload, operation: string) => void;
 }
 
-const CONNECTION_POLL_MS = 1500;
 const CONNECTION_TIMEOUT_MS = 120_000;
 
 function workspaceRefKey(workspaceRef: WorkspaceRef | null): string {
@@ -83,6 +82,27 @@ function launchedConnectionStatus(
   };
 }
 
+function unityConnectionStatusSignature(status: UnityConnectionStatus): string {
+  const {
+    checkedAtMs: _checkedAtMs,
+    processCheckedAtMs: _processCheckedAtMs,
+    latencyMs: _latencyMs,
+    backgroundHook,
+    ...stable
+  } = status;
+  const { updatedAtMs: _updatedAtMs, ...hook } = backgroundHook;
+  return JSON.stringify([stable, hook]);
+}
+
+/** Equal apart from per-check timing: check timestamps and ping latency. */
+export function sameUnityConnectionStatusIgnoringTiming(
+  left: UnityConnectionStatus,
+  right: UnityConnectionStatus,
+): boolean {
+  return !!left.backgroundHook && !!right.backgroundHook
+    && unityConnectionStatusSignature(left) === unityConnectionStatusSignature(right);
+}
+
 export function useWorkspaceUnityStatus(options: WorkspaceUnityStatusOptions) {
   const connected = ref(false);
   const connectionStatus = ref<UnityConnectionStatus | null>(null);
@@ -100,8 +120,7 @@ export function useWorkspaceUnityStatus(options: WorkspaceUnityStatusOptions) {
   let connectionRevision = 0;
   let pluginRevision = 0;
   let unsubscribe: RuntimeUnsubscribe | null = null;
-  let launchPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
-  let launchWaitStartedAt = 0;
+  let launchTimeoutTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
 
   function isCurrentBinding(workspaceRef: WorkspaceRef, version: number): boolean {
     return version === bindingVersion
@@ -109,14 +128,13 @@ export function useWorkspaceUnityStatus(options: WorkspaceUnityStatusOptions) {
       && workspaceRefKey(currentWorkspaceRef.value) === workspaceRefKey(workspaceRef);
   }
 
-  function clearLaunchPoll() {
-    if (launchPollTimer) globalThis.clearTimeout(launchPollTimer);
-    launchPollTimer = null;
-    launchWaitStartedAt = 0;
+  function clearLaunchTimeout() {
+    if (launchTimeoutTimer) globalThis.clearTimeout(launchTimeoutTimer);
+    launchTimeoutTimer = null;
   }
 
   function resetLaunchState() {
-    clearLaunchPoll();
+    clearLaunchTimeout();
     launchState.value = "idle";
   }
 
@@ -127,7 +145,17 @@ export function useWorkspaceUnityStatus(options: WorkspaceUnityStatusOptions) {
   }
 
   function setConnectionStatus(status: UnityConnectionStatus) {
-    connectionStatus.value = status;
+    const current = connectionStatus.value;
+    if (current && sameUnityConnectionStatusIgnoringTiming(current, status)) {
+      // The Unity monitor re-sends the status every few seconds. Patch only the
+      // timing fields so that just their readers (the open popover) update.
+      current.checkedAtMs = status.checkedAtMs;
+      current.processCheckedAtMs = status.processCheckedAtMs;
+      current.latencyMs = status.latencyMs;
+      current.backgroundHook.updatedAtMs = status.backgroundHook.updatedAtMs;
+    } else {
+      connectionStatus.value = status;
+    }
     setConnected(status.connected);
   }
 
@@ -205,26 +233,15 @@ export function useWorkspaceUnityStatus(options: WorkspaceUnityStatusOptions) {
     }
   }
 
-  function scheduleConnectionPoll(workspaceRef: WorkspaceRef, version: number) {
-    clearLaunchPoll();
-    launchWaitStartedAt = Date.now();
-    const poll = async () => {
-      if (!isCurrentBinding(workspaceRef, version) || launchState.value !== "waitingConnection") return;
-      try {
-        const status = await checkUnityConnectionStatus(workspaceRef);
-        if (!isCurrentBinding(workspaceRef, version)) return;
-        setConnected(status.connected);
-      } catch {
-        // The routed connection event remains authoritative while polling recovers.
-      }
-      if (connected.value || launchState.value !== "waitingConnection") return;
-      if (Date.now() - launchWaitStartedAt >= CONNECTION_TIMEOUT_MS) {
-        resetLaunchState();
-        return;
-      }
-      launchPollTimer = globalThis.setTimeout(poll, CONNECTION_POLL_MS);
-    };
-    launchPollTimer = globalThis.setTimeout(poll, CONNECTION_POLL_MS);
+  /** The routed `unity-connection-status` event ends the wait when the editor
+   * connects (`setConnected`); only the give-up deadline is timed here. */
+  function scheduleLaunchTimeout(workspaceRef: WorkspaceRef, version: number) {
+    clearLaunchTimeout();
+    launchTimeoutTimer = globalThis.setTimeout(() => {
+      launchTimeoutTimer = null;
+      if (!isCurrentBinding(workspaceRef, version)) return;
+      if (!connected.value && launchState.value === "waitingConnection") resetLaunchState();
+    }, CONNECTION_TIMEOUT_MS);
   }
 
   async function launch(): Promise<boolean> {
@@ -242,7 +259,7 @@ export function useWorkspaceUnityStatus(options: WorkspaceUnityStatusOptions) {
       }
       connectionStatus.value = launchedConnectionStatus(result, connectionStatus.value);
       launchState.value = "waitingConnection";
-      scheduleConnectionPoll(scopedRef, version);
+      scheduleLaunchTimeout(scopedRef, version);
       return true;
     } catch (error) {
       if (!isCurrentBinding(scopedRef, version)) return false;
@@ -301,7 +318,7 @@ export function useWorkspaceUnityStatus(options: WorkspaceUnityStatusOptions) {
     bindingVersion += 1;
     unsubscribe?.();
     unsubscribe = null;
-    clearLaunchPoll();
+    clearLaunchTimeout();
   });
 
   return {

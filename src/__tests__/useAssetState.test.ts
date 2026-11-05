@@ -637,6 +637,30 @@ describe("useAssetState preview flow", () => {
     expect(assetsRoot?.kind === "folder" && assetsRoot.hasMore).toBe(false);
   });
 
+  it("reveals a nested path after initialization by paging its ancestors without a preview", async () => {
+    projectServiceMocks.listDirEntriesPage.mockImplementation(async (path: string, _ref, offset: number) => {
+      if (path === ".") {
+        return offset === 0
+          ? dirEntriesPage([{ name: "README.md", relPath: "README.md", isDir: false }], 2, 1, true)
+          : dirEntriesPage([{ name: "docs", relPath: "docs", isDir: true }], 2, 2, false);
+      }
+      if (path === "docs") return dirEntriesPage([{ name: "guide", relPath: "docs/guide", isDir: true }]);
+      if (path === "docs/guide") return dirEntriesPage([{ name: "a.md", relPath: "docs/guide/a.md", isDir: false }]);
+      return dirEntriesPage([]);
+    });
+    const state = useAssetState(reactive({ workingDir: "F:/repo", workspaceRef, includeFilesInTree: true }));
+
+    // Requested before the explorer is ready: the reveal must survive initRoots.
+    const revealed = state.revealPath("docs\\guide\\a.md");
+    await state.initializeExplorer({ detectUnity: false });
+
+    await expect(revealed).resolves.toBe("docs/guide/a.md");
+    expect(state.isPathExpanded("docs")).toBe(true);
+    expect(state.isPathExpanded("docs/guide")).toBe(true);
+    expect(assetServiceMocks.previewWorkspaceAsset).not.toHaveBeenCalled();
+    await expect(state.revealPath("docs/missing.md")).resolves.toBeNull();
+  });
+
   it("prefetches one level of child folders when expanding a directory", async () => {
     projectServiceMocks.listDirEntriesPage.mockImplementation(
       async (subPath: string, _workspaceRef: unknown, offset = 0, limit = 200) => {

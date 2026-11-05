@@ -3,12 +3,19 @@ import { createApp, nextTick, type App } from "vue";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import UnityEditorResources from "../components/settings/UnityEditorResources.vue";
 import { getUnityEditorResources } from "../services/worktrees";
+const pushes = vi.hoisted(() => ({ handlers: new Set<() => void>(), release: vi.fn() }));
 vi.mock("../i18n", () => ({ t: (key: string) => key }));
-vi.mock("../services/worktrees", () => ({ getUnityEditorResources: vi.fn() }));
+vi.mock("../services/worktrees", () => ({
+  getUnityEditorResources: vi.fn(),
+  subscribeUnityEditorProcessesChanged: vi.fn(async (handler: () => void) => {
+    pushes.handlers.add(handler);
+    return () => { pushes.handlers.delete(handler); pushes.release(); };
+  }),
+}));
 let app: App | undefined;
 let root: HTMLDivElement;
 async function settle() { await nextTick(); await Promise.resolve(); await nextTick(); }
-beforeEach(() => { vi.useFakeTimers(); root = document.createElement("div"); document.body.append(root); vi.mocked(getUnityEditorResources).mockReset(); });
+beforeEach(() => { vi.useFakeTimers(); root = document.createElement("div"); document.body.append(root); vi.mocked(getUnityEditorResources).mockReset(); pushes.handlers.clear(); pushes.release.mockReset(); });
 afterEach(() => { app?.unmount(); root.remove(); vi.useRealTimers(); });
 it("shows measured and unavailable memory without adding foreground lifecycle controls", async () => {
   vi.mocked(getUnityEditorResources).mockResolvedValue([
@@ -23,12 +30,16 @@ it("shows measured and unavailable memory without adding foreground lifecycle co
   expect(root.querySelectorAll("button")).toHaveLength(1);
   expect(root.querySelector("button")?.textContent).toBe("common.refresh");
 });
-it("refreshes while mounted and stops polling after the settings pane closes", async () => {
+it("reloads when an editor starts or exits instead of polling, and unsubscribes on close", async () => {
   vi.mocked(getUnityEditorResources).mockResolvedValue([]);
   app = createApp(UnityEditorResources); app.mount(root); await settle();
-  await vi.advanceTimersByTimeAsync(5000); await settle();
+  await vi.advanceTimersByTimeAsync(30000); await settle();
+  expect(getUnityEditorResources).toHaveBeenCalledTimes(1);
+  for (const handler of pushes.handlers) handler();
+  await settle();
   expect(getUnityEditorResources).toHaveBeenCalledTimes(2);
   app.unmount(); app = undefined;
+  expect(pushes.release).toHaveBeenCalledOnce();
   await vi.advanceTimersByTimeAsync(10000);
   expect(getUnityEditorResources).toHaveBeenCalledTimes(2);
 });

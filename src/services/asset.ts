@@ -1,6 +1,9 @@
 import { ipcInvoke } from "./ipc";
 import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 import { WORKSPACE_EVENT_NAME, type RoutedWorkspaceEvent, type WorkspaceRef } from "./project";
+
+/** The asset watcher pushes its queue depth and current file on change. */
+export const ASSET_DB_WATCHER_STATUS_EVENT = "asset-db-watcher-status";
 import type {
   AssetDbScanEvent,
   AssetDbLightStatus,

@@ -285,6 +285,29 @@ export function unitySemanticStateGet(workspaceRef: WorkspaceRef): Promise<Unity
   });
 }
 
+/** The backend observer pushes the full state whenever it changes. */
+export const UNITY_SEMANTIC_STATE_EVENT = "unity-semantic-state";
+
+export function subscribeUnitySemanticState(
+  workspaceRef: WorkspaceRef,
+  handler: (state: UnitySemanticState) => void,
+): Promise<RuntimeUnsubscribe> {
+  const scopedRef = { ...workspaceRef };
+  return getLocusRuntime().subscribe<RoutedWorkspaceEvent<UnitySemanticState>>(
+    WORKSPACE_EVENT_NAME,
+    (event) => {
+      if (event.eventName !== UNITY_SEMANTIC_STATE_EVENT) return;
+      if (event.checkoutId !== scopedRef.checkoutId) return;
+      if (
+        scopedRef.expectedGeneration != null
+        && event.workspaceGeneration !== scopedRef.expectedGeneration
+      ) return;
+      handler(event.payload);
+    },
+    { owner: "csharpLsp.subscribeUnitySemanticState" },
+  );
+}
+
 export function subscribeUnityStateProbeSelfTest(
   workspaceRef: WorkspaceRef,
   handler: (payload: HotReloadSelfTestEvent) => void,

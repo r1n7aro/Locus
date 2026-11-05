@@ -4,7 +4,7 @@ import { createApp, h, nextTick, reactive, ref, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UnitySemanticState } from "../types";
 
-const mocks = vi.hoisted(() => ({ invoke: vi.fn(), confirm: vi.fn() }));
+const mocks = vi.hoisted(() => ({ invoke: vi.fn(), confirm: vi.fn(), handlers: new Set<(event: unknown) => void>() }));
 vi.mock("../services/ipc", () => ({ ipcInvoke: mocks.invoke }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: mocks.confirm }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
@@ -13,7 +13,11 @@ vi.mock("../composables/useClaudeConnectionStatus", () => ({
 }));
 vi.mock("../composables/useClaudePrewarm", () => ({ useClaudePrewarm: () => {} }));
 vi.mock("../services/locusRuntime", () => ({ getLocusRuntime: () => ({
-  invoke: mocks.invoke, subscribe: async () => () => {},
+  invoke: mocks.invoke,
+  subscribe: async (_name: string, handler: (event: unknown) => void) => {
+    mocks.handlers.add(handler);
+    return () => mocks.handlers.delete(handler);
+  },
 }) }));
 
 import ChatStatusIndicators from "../components/chat/ChatStatusIndicators.vue";
@@ -24,6 +28,14 @@ let host: HTMLDivElement;
 let semantic: UnitySemanticState;
 const scope = { checkoutId: "recovery-a", expectedGeneration: 1, expectedMaterializationEpoch: 0 };
 async function flush() { for (let i = 0; i < 25; i++) await nextTick(); }
+/** The backend observer pushes every semantic state change. */
+async function push(next: UnitySemanticState) {
+  semantic = { ...next, checkedAtMs: semantic.checkedAtMs + 1 };
+  for (const handler of [...mocks.handlers]) {
+    handler({ eventName: "unity-semantic-state", checkoutId: scope.checkoutId, workspaceGeneration: 1, payload: semantic });
+  }
+  await flush();
+}
 function restartCalls() { return mocks.invoke.mock.calls.filter(([command]) => command === "restart_unresponsive_unity_project"); }
 function recoveryButton() { return [...host.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent?.trim() === t("chat.status.unity.restart")); }
 async function mount(extra: Record<string, unknown> = {}) {
@@ -37,6 +49,7 @@ async function mount(extra: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  mocks.handlers.clear();
   semantic = {
     phase: "unresponsive", source: "native_broker", confidence: "high", transient: false, checkedAtMs: 1,
     process: { state: "running", pid: 42, pidCreatedAtMs: 1000 },
@@ -88,11 +101,10 @@ describe("Unity recovery panel", () => {
     const implementation = mocks.invoke.getMockImplementation()!;
     mocks.invoke.mockImplementation((command, args, options) => command === "restart_unresponsive_unity_project"
       ? Promise.reject(new Error("Restart failed")) : implementation(command, args, options));
-    const props = await mount();
+    await mount();
     recoveryButton()!.click(); await flush();
     expect(host.querySelector('[role="alert"]')?.textContent).toContain("Restart failed");
-    semantic = { ...semantic, phase: "editing", safety: { canCallUnityApi: true, canModifyAssetsSafely: true, recommendedAction: "proceed" } };
-    props.unityConnected = false; await flush();
+    await push({ ...semantic, phase: "editing", safety: { canCallUnityApi: true, canModifyAssetsSafely: true, recommendedAction: "proceed" } });
     expect(recoveryButton()).toBeUndefined();
   });
 
@@ -101,14 +113,14 @@ describe("Unity recovery panel", () => {
       status: "running", processId: 42, startedAtMs: 1, verdict: "unknown", sampleCount: 0,
       summary: "Analyzing", frames: [],
     };
-    const props = await mount();
+    await mount();
     expect(host.textContent).toContain(t("chat.status.unity.hang.running"));
 
     const location = {
       index: 2, kind: "managed", origin: "agent", ip: "0x1",
       display: "__LocusSnippet:Run () (at Snippet.cs:3)",
     };
-    semantic = { ...semantic, hangDiagnosis: {
+    await push({ ...semantic, hangDiagnosis: {
       status: "complete", processId: 42, startedAtMs: 1, source: "native_broker", verdict: "busy",
       cpuPercent: 97.6, stackStable: true, sampleCount: 3, location, locationReason: "agent_code",
       summary: "busy", notes: ["Mono note"],
@@ -117,9 +129,7 @@ describe("Unity recovery panel", () => {
         { index: 1, kind: "unknown", origin: "unknown", ip: "0x3", display: "0x3 (JIT or dynamic code)" },
         location,
       ],
-    } };
-    props.unityConnected = false; await flush();
-    props.unityConnected = true; await flush();
+    } });
     const main = host.querySelector(".chat-status-detail-list")!.textContent!;
     expect(main).toContain(t("chat.status.unity.hang.location"));
     expect(main).toContain(location.display);

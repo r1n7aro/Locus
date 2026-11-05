@@ -2,6 +2,7 @@ import { ipcInvoke } from "./ipc";
 import { beginWorkspaceGitHeadObservation, rememberWorkspaceGitHead } from "./workspaceGitHead";
 import { Channel } from "@tauri-apps/api/core";
 import type { WorkspaceRef } from "./project";
+import { getLocusRuntime, type RuntimeUnsubscribe } from "./locusRuntime";
 
 export interface WorktreeBranchOption {
   branch: string | null;
@@ -120,6 +121,7 @@ export const removeManagedWorktree = (sourceRoot: string, item: ManagedWorktree)
 
 export interface WorkspaceResourceLimits {
   workspaceIdleTimeoutSecs: number; serviceIdleTimeoutSecs: number; lspIdleTimeoutSecs: number;
+  blenderMaxBackgroundInstances?: number; blenderBackgroundIdleTimeoutSecs?: number;
 }
 export interface ResourcePolicySnapshot { revision: number; limits: WorkspaceResourceLimits }
 export const getWorkspaceResourceLimits = () => ipcInvoke<ResourcePolicySnapshot>("get_workspace_service_resource_limits");
@@ -135,6 +137,13 @@ export interface UnityEditorResource {
   lastError: string | null;
 }
 export const getUnityEditorResources = () => ipcInvoke<UnityEditorResource[]>("get_unity_editor_resources");
+
+/** App-wide: an observed project's Unity editor process started or exited. */
+export const UNITY_EDITOR_PROCESSES_CHANGED_EVENT = "unity-editor-processes-changed";
+
+export function subscribeUnityEditorProcessesChanged(handler: () => void): Promise<RuntimeUnsubscribe> {
+  return getLocusRuntime().subscribe<null>(UNITY_EDITOR_PROCESSES_CHANGED_EVENT, () => handler());
+}
 
 export interface AcquirePoolRequest {
   sourceRoot: string; poolRoot: string; commit: string; branch?: string | null;

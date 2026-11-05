@@ -56,6 +56,32 @@ const KNOWLEDGE_QUERY_TEXT_SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const KNOWLEDGE_QUERY_TEXT_SCAN_MAX_DOCUMENTS: usize = 500;
 const TEXT_SCAN_PROGRESS_EMIT_DOC_INTERVAL: usize = 32;
 pub const KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT: &str = "knowledge-lexical-rebuild-status";
+/// Workspace event carrying the full [`EmbeddingStatus`] after it changes.
+pub const KNOWLEDGE_EMBEDDING_STATUS_EVENT: &str = "knowledge-embedding-status";
+/// Download and indexing report per chunk/file; between phase changes the
+/// status is pushed at most this often (the latest value always follows).
+const EMBEDDING_STATUS_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct EmbeddingStatusPublish {
+    phase: Option<String>,
+    at: Option<Instant>,
+    trailing: bool,
+}
+
+/// The fields that make up a phase change rather than progress.
+fn embedding_status_phase(status: &EmbeddingStatus) -> String {
+    serde_json::json!([
+        status.enabled,
+        status.ready,
+        status.activating,
+        status.model_downloaded,
+        status.stage,
+        status.error,
+        status.last_test_passed,
+    ])
+    .to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,6 +201,7 @@ pub struct KnowledgeIndexState {
     event_scope: Option<crate::workspace_service::event::WorkspaceEventScope>,
     embedding_download_cancel_requested: Arc<AtomicBool>,
     catalog_bootstrapped_workspaces: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    embedding_status_publish: Arc<StdMutex<EmbeddingStatusPublish>>,
 }
 
 type PreviousKnowledgeRuntime = (
@@ -245,6 +272,7 @@ impl KnowledgeIndexState {
             event_scope,
             embedding_download_cancel_requested: Arc::new(AtomicBool::new(false)),
             catalog_bootstrapped_workspaces: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            embedding_status_publish: Arc::new(StdMutex::new(EmbeddingStatusPublish::default())),
         }
     }
 
@@ -276,7 +304,63 @@ impl KnowledgeIndexState {
     }
 
     pub fn set_embedding_status(&self, status: EmbeddingStatus) {
-        *self.embedding_status.read().unwrap().lock().unwrap() = status;
+        *self.embedding_status.read().unwrap().lock().unwrap() = status.clone();
+        self.publish_embedding_status(status);
+    }
+
+    /// Push [`KNOWLEDGE_EMBEDDING_STATUS_EVENT`] so retrieval panels and the
+    /// startup notice need no polling. Phase changes go out at once; progress
+    /// is throttled, with a trailing push carrying the latest value.
+    fn publish_embedding_status(&self, status: EmbeddingStatus) {
+        let (Some(app_handle), Some(event_scope)) = (&self.app_handle, self.event_scope.as_ref())
+        else {
+            return;
+        };
+        let phase = embedding_status_phase(&status);
+        let mut publish = self
+            .embedding_status_publish
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let elapsed = publish.at.map(|at| at.elapsed());
+        let throttled = publish.phase.as_deref() == Some(phase.as_str())
+            && elapsed.is_some_and(|elapsed| elapsed < EMBEDDING_STATUS_PROGRESS_INTERVAL);
+        if throttled {
+            if publish.trailing {
+                return;
+            }
+            publish.trailing = true;
+            let delay = EMBEDDING_STATUS_PROGRESS_INTERVAL.saturating_sub(elapsed.unwrap_or_default());
+            let state = self.embedding_status_publish.clone();
+            let current = self.embedding_status.read().unwrap().clone();
+            let app_handle = app_handle.clone();
+            let event_scope = event_scope.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let latest = current.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                {
+                    let mut publish = state.lock().unwrap_or_else(|e| e.into_inner());
+                    publish.trailing = false;
+                    publish.phase = Some(embedding_status_phase(&latest));
+                    publish.at = Some(Instant::now());
+                }
+                crate::workspace_service::event::emit_for_workspace_scope(
+                    &app_handle,
+                    &event_scope,
+                    KNOWLEDGE_EMBEDDING_STATUS_EVENT,
+                    latest,
+                );
+            });
+            return;
+        }
+        publish.phase = Some(phase);
+        publish.at = Some(Instant::now());
+        drop(publish);
+        crate::workspace_service::event::emit_for_workspace_scope(
+            app_handle,
+            event_scope,
+            KNOWLEDGE_EMBEDDING_STATUS_EVENT,
+            status,
+        );
     }
 
     pub fn lexical_rebuild_status_snapshot(&self) -> LexicalRebuildStatus {
@@ -388,6 +472,7 @@ impl KnowledgeIndexState {
 
         self.reset_embedding_download_cancel();
         self.catalog_bootstrapped_workspaces.lock().await.clear();
+        self.publish_embedding_status(self.embedding_status_snapshot());
 
         (
             db,

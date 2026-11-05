@@ -2,6 +2,7 @@ import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  ASSET_DB_WATCHER_STATUS_EVENT,
   assetDbOverview,
   assetDbScanStart,
   previewWorkspaceAsset,
@@ -34,6 +35,7 @@ import type {
   AssetSearchResult,
   AssetPreviewPayload,
   AssetDbScanEvent,
+  AssetDbWatcherStatusEvent,
   SemanticTargetInspector,
   WatcherTuning,
 } from "../types";
@@ -181,6 +183,8 @@ export function useAssetState(props: AssetProps) {
   const watcherTuningSaving = ref(false);
   let explorerInitialization = 0;
   let explorerInitializing = false;
+  // The root is listed and later tree expansions survive (no pending initRoots).
+  const explorerReady = ref(false);
   const pendingExplorerFileChanges = new Map<string, WorkspaceFileChangedPayload["kind"]>();
   // Rescanned paths: their loaded descendants change without separate events.
   const pendingExplorerSubtrees = new Set<string>();
@@ -320,6 +324,7 @@ export function useAssetState(props: AssetProps) {
     stopFileWatch();
     explorerInitialization += 1;
     explorerInitializing = false;
+    explorerReady.value = false;
     if (explorerFileChangeTimer) clearTimeout(explorerFileChangeTimer);
     explorerFileChangeTimer = null;
     pendingExplorerFileChanges.clear();
@@ -983,6 +988,50 @@ export function useAssetState(props: AssetProps) {
     return true;
   }
 
+  function whenSettled(done: () => boolean, timeoutMs = 10_000): Promise<boolean> {
+    if (done()) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { stop(); resolve(false); }, timeoutMs);
+      const stop = watch(done, (settled) => {
+        if (!settled) return;
+        clearTimeout(timer);
+        stop();
+        resolve(true);
+      });
+    });
+  }
+
+  /**
+   * Expand and page a path's ancestors so its tree row exists, without opening
+   * a preview. Resolves the listed root-relative path, or null when it is not listed.
+   */
+  async function revealPath(path: string): Promise<string | null> {
+    const target = normalizeOpenAssetPath(path);
+    if (!target || !await whenSettled(() => explorerReady.value)) return null;
+    const segments = target.split("/");
+    let node = findNodeByPath(WORKSPACE_ROOT_PATH);
+    for (let index = 1; index <= segments.length; index += 1) {
+      if (node?.kind !== "folder") return null;
+      const parent = node;
+      const current = segments.slice(0, index).join("/");
+      // A page already in flight (scroll paging, a toggle) makes loads return early.
+      await whenSettled(() => !parent.loading);
+      if (!parent.loaded) await loadFolderChildren(parent);
+      // Page a large folder only until the next segment is listed; a page that
+      // adds nothing (a failed load) ends the search.
+      while (parent.hasMore && !parent.children.some((child) => child.path === current)) {
+        const offset = parent.nextOffset;
+        await loadFolderChildren(parent, { append: true });
+        await whenSettled(() => !parent.loading);
+        if (parent.nextOffset === offset) break;
+      }
+      expandedPaths.value = new Set(expandedPaths.value).add(parent.path);
+      node = findNodeByPath(current);
+    }
+    explorerTree.value = [...explorerTree.value];
+    return node ? target : null;
+  }
+
   // ── Preview ──────────────────────────────────────────────
   async function loadPreview(file: string | AssetPreviewFileNode, focusLine?: number) {
     const nextNode = toPreviewFileNode(file);
@@ -1171,6 +1220,7 @@ export function useAssetState(props: AssetProps) {
     if (!hasWorkspace.value) return false;
     const initialization = ++explorerInitialization;
     explorerInitializing = true;
+    explorerReady.value = false;
     try {
       if (options.detectUnity !== false) {
         const detected = await detectUnityWorkspace();
@@ -1191,6 +1241,7 @@ export function useAssetState(props: AssetProps) {
       if (root?.kind === "folder") {
         void prefetchChildFolderBranchState(root);
       }
+      explorerReady.value = true;
       return true;
     } finally {
       if (initialization === explorerInitialization) {
@@ -1233,27 +1284,22 @@ export function useAssetState(props: AssetProps) {
   let fileChangeListenerStarting: Promise<void> | null = null;
   let releaseExplorerFileActions: RuntimeUnsubscribe | null = null;
   let assetStateUnmounted = false;
-  let watcherPollTimer: ReturnType<typeof setInterval> | null = null;
 
-  // Lightweight polling so the watcher card can show queue depth + current
-  // file in near real-time without requiring a dedicated event channel.
-  // Skips while a full scan is running (the scan-event subscription drives
-  // updates in that case) and while the page is hidden.
-  function startWatcherPoll() {
-    if (!hasWorkspace.value || !isUnityWorkspace.value) return;
-    if (watcherPollTimer) return;
-    watcherPollTimer = setInterval(() => {
-      if (!hasWorkspace.value) return;
-      if (typeof document !== "undefined" && document.hidden) return;
-      if (dbOverview.value?.status === "scanning") return;
-      refreshDbOverview();
-    }, 1500);
-  }
-  function stopWatcherPoll() {
-    if (watcherPollTimer) {
-      clearInterval(watcherPollTimer);
-      watcherPollTimer = null;
-    }
+  // The watcher pushes its queue depth and current file whenever they change
+  // (`asset-db-watcher-status`). Counts and sizes only change as the queue
+  // drains, so the full overview is reloaded once when it becomes idle.
+  function applyWatcherStatus(status: AssetDbWatcherStatusEvent) {
+    const overview = dbOverview.value;
+    if (!overview) return;
+    const wasBusy = overview.watcherQueueLen > 0 || !!overview.watcherCurrentFile;
+    const idle = status.watcherQueueLen === 0 && !status.watcherCurrentFile;
+    dbOverview.value = {
+      ...overview,
+      watcherRunning: status.watcherRunning,
+      watcherQueueLen: status.watcherQueueLen,
+      watcherCurrentFile: status.watcherCurrentFile,
+    };
+    if (wasBusy && idle && overview.status !== "scanning") void refreshDbOverview();
   }
 
   function ensureFileChangeListener(): Promise<void> {
@@ -1340,19 +1386,23 @@ export function useAssetState(props: AssetProps) {
           };
         }
       };
-      unlistenScoped = await listenWorkspaceEvent<RoutedWorkspaceEvent<AssetDbScanEvent>>(
+      unlistenScoped = await listenWorkspaceEvent<RoutedWorkspaceEvent<unknown>>(
         "useAssetState.useAssetState",
         async (event) => {
           const workspaceRef = props.workspaceRef;
           if (!workspaceRef) return;
           const routed = event.payload;
-          if (routed.eventName !== "ref-graph-scan") return;
+          if (routed.eventName !== "ref-graph-scan" && routed.eventName !== ASSET_DB_WATCHER_STATUS_EVENT) return;
           if (routed.checkoutId !== workspaceRef.checkoutId) return;
           if (
             workspaceRef.expectedGeneration != null
             && routed.workspaceGeneration !== workspaceRef.expectedGeneration
           ) return;
-          await applyScanPhase(routed.payload);
+          if (routed.eventName === ASSET_DB_WATCHER_STATUS_EVENT) {
+            applyWatcherStatus(routed.payload as AssetDbWatcherStatusEvent);
+            return;
+          }
+          await applyScanPhase(routed.payload as AssetDbScanEvent);
         },
         { signal: workspaceEventSignal },
       );
@@ -1360,7 +1410,6 @@ export function useAssetState(props: AssetProps) {
       // listen failure shouldn't break the page
       console.warn("[useAssetState] failed to listen ref-graph-scan", e);
     }
-    if (hasWorkspace.value && isUnityWorkspace.value) startWatcherPoll();
   });
 
   onUnmounted(() => {
@@ -1377,7 +1426,6 @@ export function useAssetState(props: AssetProps) {
     explorerFileChangeTimer = null;
     pendingExplorerFileChanges.clear();
     pendingExplorerSubtrees.clear();
-    stopWatcherPoll();
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
     releaseSelectionLock?.();
     releaseSelectionLock = null;
@@ -1392,13 +1440,11 @@ export function useAssetState(props: AssetProps) {
       () => props.workspaceRef?.expectedMaterializationEpoch ?? null,
     ] as const,
     async ([workingDir]) => {
-      stopWatcherPoll();
       resetWorkspaceState();
       if (!workingDir.trim()) return;
       const initialized = await initializeExplorer();
       if (!initialized) return;
       await initializeUnityAssetState();
-      startWatcherPoll();
     },
   );
 
@@ -1561,6 +1607,7 @@ export function useAssetState(props: AssetProps) {
     updateSearchScope,
     selectFromSearchResult,
     openAssetPath,
+    revealPath,
     loadPreview,
     loadTarget,
     refreshDbOverview,

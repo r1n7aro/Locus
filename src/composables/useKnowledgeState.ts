@@ -7,6 +7,7 @@ import {
   deleteSkillPackage,
   exportSkillPackage,
   importSkillPackage,
+  KNOWLEDGE_EMBEDDING_STATUS_EVENT,
   knowledgeCreate,
   knowledgeDeactivateEmbedding,
   knowledgeDelete,
@@ -851,7 +852,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
   let externalRefreshInFlight = false;
   const appliedExternalChangeWatermarks = new Map<string, number>();
   const applyingExternalChangeWatermarks = new Map<string, number>();
-  let retrievalStatusPollTimer: ReturnType<typeof setTimeout> | null = null;
   let feishuReferenceStatusPollTimer: ReturnType<typeof setTimeout> | null =
     null;
   let unityReferenceStatusPollTimer: ReturnType<typeof setTimeout> | null =
@@ -1149,20 +1149,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     );
   }
 
-  function scheduleRetrievalStatusPoll(delay = 450) {
-    if (retrievalStatusPollTimer) clearTimeout(retrievalStatusPollTimer);
-    retrievalStatusPollTimer = setTimeout(() => {
-      retrievalStatusPollTimer = null;
-      void refreshRetrievalRuntimeStatus();
-    }, delay);
-  }
-
-  function stopRetrievalStatusPoll() {
-    if (!retrievalStatusPollTimer) return;
-    clearTimeout(retrievalStatusPollTimer);
-    retrievalStatusPollTimer = null;
-  }
-
   function scheduleFeishuReferenceStatusPoll(delay = 900) {
     if (feishuReferenceStatusPollTimer)
       clearTimeout(feishuReferenceStatusPollTimer);
@@ -1193,6 +1179,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
     unityReferenceStatusPollTimer = null;
   }
 
+  // One snapshot; afterwards the backend pushes `knowledge-embedding-status`
+  // and `knowledge-lexical-rebuild-status` whenever either changes.
   async function refreshRetrievalRuntimeStatus() {
     if (!hasWorkspace.value) return;
     const request = captureWorkspaceRequest();
@@ -1205,12 +1193,8 @@ export function useKnowledgeState(props: KnowledgeProps) {
       if (!isCurrentWorkspaceRequest(request)) return;
       embeddingStatus.value = nextEmbeddingStatus;
       lexicalRebuildStatus.value = nextLexicalStatus;
-      if (retrievalActionPending.value || nextEmbeddingStatus.activating) {
-        scheduleRetrievalStatusPoll();
-      }
     } catch {
-      if (!isCurrentWorkspaceRequest(request)) return;
-      stopRetrievalStatusPoll();
+      // Keep the last known status; pushes keep it current.
     }
   }
 
@@ -2057,7 +2041,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     applyingExternalChangeWatermarks.clear();
     clearExternalRefreshQueue();
     clearAdjacentDocumentPrefetch();
-    stopRetrievalStatusPoll();
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();
     documents.value = [];
@@ -2536,11 +2519,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
       unityReferenceImportStatus.value = nextUnityReferenceImportStatus;
       unityReferenceImportPending.value =
         nextUnityReferenceImportStatus.running;
-      if (nextEmbeddingStatus.activating) {
-        scheduleRetrievalStatusPoll();
-      } else {
-        stopRetrievalStatusPoll();
-      }
       if (
         nextFeishuReferenceImportStatus.running ||
         nextFeishuReferenceImportStatus.stage === "authorizing"
@@ -2560,7 +2538,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
       }
       notifyError("knowledge_get_overview", cause);
       retrievalOverview.value = null;
-      stopRetrievalStatusPoll();
       stopUnityReferenceStatusPoll();
     } finally {
       if (isCurrentWorkspaceRequest(request)) {
@@ -3288,7 +3265,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     if (!embeddingConfig.value) return;
     retrievalActionPending.value = true;
     error.value = "";
-    scheduleRetrievalStatusPoll(120);
     try {
       embeddingConfig.value = await knowledgeSaveEmbeddingConfig({
         ...embeddingConfig.value,
@@ -3303,9 +3279,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
       )(cause);
     } finally {
       retrievalActionPending.value = false;
-      if (!embeddingStatus.value?.activating) {
-        stopRetrievalStatusPoll();
-      }
     }
   }
 
@@ -3396,7 +3369,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     };
     retrievalActionPending.value = true;
     error.value = "";
-    scheduleRetrievalStatusPoll(120);
     try {
       const savedConfigs = await enqueueMutation(async () => {
         const general = await knowledgeSaveGeneralConfig({
@@ -3418,16 +3390,12 @@ export function useKnowledgeState(props: KnowledgeProps) {
       notifyError("knowledge_save_embedding_config", cause);
     } finally {
       retrievalActionPending.value = false;
-      if (!embeddingStatus.value?.activating) {
-        stopRetrievalStatusPoll();
-      }
     }
   }
 
   async function activateSemanticRuntime() {
     retrievalActionPending.value = true;
     error.value = "";
-    scheduleRetrievalStatusPoll(120);
     try {
       await knowledgeActivateEmbedding(requireWorkspaceRef());
       await loadOverview();
@@ -3435,9 +3403,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
       notifyEmbeddingRuntimeError(cause);
     } finally {
       retrievalActionPending.value = false;
-      if (!embeddingStatus.value?.activating) {
-        stopRetrievalStatusPoll();
-      }
     }
   }
 
@@ -3464,9 +3429,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
       notifyError("knowledge_rebuild_lexical_index", cause);
     } finally {
       retrievalActionPending.value = false;
-      if (!embeddingStatus.value?.activating) {
-        stopRetrievalStatusPoll();
-      }
     }
   }
 
@@ -3542,7 +3504,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
 
     retrievalActionPending.value = true;
     error.value = "";
-    scheduleRetrievalStatusPoll(120);
     try {
       try {
         await openKnowledgeDownloadProgressWindow(requireWorkspaceRef(), targetModelId);
@@ -3590,9 +3551,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
       );
     } finally {
       retrievalActionPending.value = false;
-      if (!embeddingStatus.value?.activating) {
-        stopRetrievalStatusPoll();
-      }
     }
   }
 
@@ -4807,7 +4765,11 @@ export function useKnowledgeState(props: KnowledgeProps) {
           || event.workspaceGeneration !== workspaceRef.expectedGeneration
         ) return;
         if (event.eventName === KNOWLEDGE_LEXICAL_REBUILD_STATUS_EVENT) {
-          void refreshRetrievalRuntimeStatus();
+          lexicalRebuildStatus.value = event.payload as LexicalRebuildStatus;
+          return;
+        }
+        if (event.eventName === KNOWLEDGE_EMBEDDING_STATUS_EVENT) {
+          embeddingStatus.value = event.payload as EmbeddingStatus;
           return;
         }
         if (event.eventName !== "knowledge-changed") return;
@@ -4858,7 +4820,6 @@ export function useKnowledgeState(props: KnowledgeProps) {
     clearSearchTimer();
     clearExternalRefreshQueue();
     clearAdjacentDocumentPrefetch();
-    stopRetrievalStatusPoll();
     stopFeishuReferenceStatusPoll();
     stopUnityReferenceStatusPoll();
     workspaceEventsUnsubscribe?.();

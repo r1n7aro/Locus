@@ -646,6 +646,9 @@ export function knowledgeDeactivateEmbedding(workspaceRef: WorkspaceRef): Promis
   return ipcInvoke<void>("knowledge_deactivate_embedding", { workspaceRef });
 }
 
+/** Workspace event carrying the full embedding status after it changes. */
+export const KNOWLEDGE_EMBEDDING_STATUS_EVENT = "knowledge-embedding-status";
+
 export function knowledgeGetEmbeddingStatus(workspaceRef: WorkspaceRef): Promise<EmbeddingStatus> {
   return ipcInvoke<EmbeddingStatus>("knowledge_get_embedding_status", { workspaceRef });
 }

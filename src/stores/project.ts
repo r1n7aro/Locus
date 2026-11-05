@@ -25,7 +25,6 @@ export type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 const PLUGIN_STATUS_NOTICE_OPERATION = "unity-plugin-status";
 const UNITY_BACKGROUND_HOOK_NOTICE_OPERATION = "unity-background-hook";
 const EXTRA_WORKDIRS_MISSING_NOTICE_OPERATION = "extra-workdirs-missing";
-const UNITY_LAUNCH_CONNECTION_POLL_MS = 1500;
 const UNITY_LAUNCH_WAIT_TIMEOUT_MS = 120_000;
 
 export const useProjectStore = defineStore("project", () => {
@@ -44,8 +43,7 @@ export const useProjectStore = defineStore("project", () => {
   let scanInFlight = false;
   let assetStatusRequestSeq = 0;
   let pluginStatusRevision = 0;
-  let unityLaunchPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
-  let unityLaunchWaitStartedAt = 0;
+  let unityLaunchTimeoutTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
   const unityConnectionChecksInFlight = new Map<string, Promise<void>>();
   const pluginStatusChecksInFlight = new Map<string, Promise<void>>();
 
@@ -75,6 +73,10 @@ export const useProjectStore = defineStore("project", () => {
     workspaceContextStore.focusedRuntime?.detectedServices ?? []
   ));
   const isUnityProject = computed(() => detectedServices.value.includes("unity"));
+  /** Auto: started on workspace focus. Lazy: dormant until a tool, the SDK or the user starts it. */
+  const unityServiceMode = computed(() => (
+    workspaceContextStore.focusedRuntime?.serviceModes?.unity ?? (isUnityProject.value ? "auto" : null)
+  ));
 
   function pluginStatusLabel(status: PluginNoticeStatus): string {
     return status === "missing" ? t("app.plugin.notInstalled") : t("app.plugin.needUpdate");
@@ -119,16 +121,15 @@ export const useProjectStore = defineStore("project", () => {
       && phase.phase !== "error";
   }
 
-  function clearUnityLaunchPoll() {
-    if (unityLaunchPollTimer) {
-      globalThis.clearTimeout(unityLaunchPollTimer);
-      unityLaunchPollTimer = null;
+  function clearUnityLaunchTimeout() {
+    if (unityLaunchTimeoutTimer) {
+      globalThis.clearTimeout(unityLaunchTimeoutTimer);
+      unityLaunchTimeoutTimer = null;
     }
-    unityLaunchWaitStartedAt = 0;
   }
 
   function resetUnityLaunchState() {
-    clearUnityLaunchPoll();
+    clearUnityLaunchTimeout();
     unityLaunchState.value = "idle";
   }
 
@@ -188,29 +189,19 @@ export const useProjectStore = defineStore("project", () => {
     };
   }
 
-  function scheduleUnityLaunchConnectionCheck(delayMs = UNITY_LAUNCH_CONNECTION_POLL_MS) {
-    if (unityLaunchPollTimer) {
-      globalThis.clearTimeout(unityLaunchPollTimer);
+  /** The Unity monitor pushes `unity-connection-status` once the launched
+   * editor connects (`setUnityConnected` ends the wait); only the give-up
+   * deadline is timed here. */
+  function scheduleUnityLaunchTimeout() {
+    if (unityLaunchTimeoutTimer) {
+      globalThis.clearTimeout(unityLaunchTimeoutTimer);
     }
-    unityLaunchPollTimer = globalThis.setTimeout(() => {
-      unityLaunchPollTimer = null;
-      void checkUnityConnectionAfterLaunch();
-    }, delayMs);
-  }
-
-  async function checkUnityConnectionAfterLaunch() {
-    await checkUnityConnection();
-    if (unityConnected.value || unityLaunchState.value !== "waitingConnection") return;
-
-    if (
-      unityLaunchWaitStartedAt > 0
-      && Date.now() - unityLaunchWaitStartedAt >= UNITY_LAUNCH_WAIT_TIMEOUT_MS
-    ) {
-      resetUnityLaunchState();
-      return;
-    }
-
-    scheduleUnityLaunchConnectionCheck();
+    unityLaunchTimeoutTimer = globalThis.setTimeout(() => {
+      unityLaunchTimeoutTimer = null;
+      if (!unityConnected.value && unityLaunchState.value === "waitingConnection") {
+        resetUnityLaunchState();
+      }
+    }, UNITY_LAUNCH_WAIT_TIMEOUT_MS);
   }
 
   function minimalStatsFromLightStatus(status: AssetDbLightStatus): ScanStats {
@@ -365,7 +356,10 @@ export const useProjectStore = defineStore("project", () => {
     if (existing) return existing;
     const request = (async () => {
       try {
-        await projectService.startWorkspaceUnityService(workspaceRef);
+        // Lazy mode keeps the service dormant until it is actually used.
+        if (unityServiceMode.value === "auto") {
+          await projectService.startWorkspaceUnityService(workspaceRef);
+        }
         const status = await unityService.checkUnityConnectionStatus(workspaceRef);
         if (isFocusedWorkspaceRef(workspaceRef)) {
           setUnityConnected(status.connected);
@@ -383,6 +377,15 @@ export const useProjectStore = defineStore("project", () => {
       }
     });
     return request;
+  }
+
+  /** Start a lazy-mode Unity service on request (status popover). */
+  async function startUnityService() {
+    if (!isUnityProject.value) return;
+    const workspaceRef = requireWorkspaceRef();
+    await projectService.startWorkspaceUnityService(workspaceRef);
+    const status = await unityService.checkUnityConnectionStatus(workspaceRef);
+    if (isFocusedWorkspaceRef(workspaceRef)) setUnityConnected(status.connected);
   }
 
   async function checkUnityPlugin() {
@@ -453,7 +456,7 @@ export const useProjectStore = defineStore("project", () => {
   async function launchUnityProject() {
     if (!isUnityProject.value) return;
     if (unityLaunchState.value !== "idle" || unityConnected.value) return;
-    clearUnityLaunchPoll();
+    clearUnityLaunchTimeout();
     unityLaunchState.value = "starting";
     try {
       const launch = await unityService.launchUnityProject(requireWorkspaceRef());
@@ -463,8 +466,7 @@ export const useProjectStore = defineStore("project", () => {
         return;
       }
       unityLaunchState.value = "waitingConnection";
-      unityLaunchWaitStartedAt = Date.now();
-      scheduleUnityLaunchConnectionCheck();
+      scheduleUnityLaunchTimeout();
     } catch (e) {
       resetUnityLaunchState();
       const err = normalizeAppError(e);
@@ -617,6 +619,8 @@ export const useProjectStore = defineStore("project", () => {
     unityLaunching,
     detectedServices,
     isUnityProject,
+    unityServiceMode,
+    startUnityService,
     requireWorkspaceRef,
     loadRecentDirs,
     loadExtraWorkdirs,

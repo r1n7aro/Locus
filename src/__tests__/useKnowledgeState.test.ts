@@ -95,6 +95,7 @@ const knowledgeMocks = vi.hoisted(() => ({
 
 vi.mock("../services/knowledge", () => ({
   ...knowledgeMocks,
+  KNOWLEDGE_EMBEDDING_STATUS_EVENT: "knowledge-embedding-status",
   knowledgeActivateEmbedding: () => knowledgeMocks.knowledgeActivateEmbedding(),
   knowledgeCreate: (input: unknown) => knowledgeMocks.knowledgeCreate(input),
   knowledgeDeactivateEmbedding: () => knowledgeMocks.knowledgeDeactivateEmbedding(),
@@ -1587,7 +1588,7 @@ describe("useKnowledgeState", () => {
     });
   });
 
-  it("refreshes checkout-local lexical rebuild status after the backend event", async () => {
+  it("applies checkout-local lexical rebuild status pushed by the backend", async () => {
     const mounted = mountKnowledgeState(
       reactive({
         workingDir: "F:/repo",
@@ -1597,18 +1598,6 @@ describe("useKnowledgeState", () => {
     );
     await flushPromises(8);
     knowledgeMocks.knowledgeGetLexicalRebuildStatus.mockClear();
-    knowledgeMocks.knowledgeGetLexicalRebuildStatus.mockResolvedValueOnce({
-      running: true,
-      stage: "indexing",
-      detail: "Indexing docs",
-      currentFile: "design/a.md",
-      progress: 0.42,
-      processedDocs: 42,
-      totalDocs: 100,
-      error: null,
-      startedAt: "2026-04-16T00:00:00Z",
-      completedAt: null,
-    });
 
     emitWorkspaceKnowledgeEvent("knowledge-lexical-rebuild-status", {
       running: true,
@@ -1630,9 +1619,21 @@ describe("useKnowledgeState", () => {
       stage: "indexing",
       progress: 0.42,
     });
+    // The payload is the status; no follow-up request.
     expect(
       knowledgeMocks.knowledgeGetLexicalRebuildStatus,
-    ).toHaveBeenCalledTimes(1);
+    ).not.toHaveBeenCalled();
+
+    knowledgeMocks.knowledgeGetEmbeddingStatus.mockClear();
+    emitWorkspaceKnowledgeEvent("knowledge-embedding-status", {
+      enabled: true,
+      ready: false,
+      activating: true,
+      stage: "downloading",
+    });
+    await nextTick();
+    expect(mounted.state.embeddingStatus.value).toMatchObject({ activating: true, stage: "downloading" });
+    expect(knowledgeMocks.knowledgeGetEmbeddingStatus).not.toHaveBeenCalled();
 
     mounted.unmount();
   });
