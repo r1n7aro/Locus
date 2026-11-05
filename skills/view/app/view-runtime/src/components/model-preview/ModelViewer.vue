@@ -4,6 +4,7 @@ import { Pause, Play, RotateCcw } from "lucide";
 import { t } from "../../i18n";
 import { createAnimationFrameResizeObserver, type ResizeObserverHandle } from "../../composables/resizeObserver";
 import LucideIcon from "../icons/LucideIcon.vue";
+import BaseDropdown, { type DropdownOption } from "../ui/BaseDropdown.vue";
 import { dataUrlToArrayBuffer, detectModelFormat, type ModelFormat } from "./modelFormat";
 import {
   createModelPreviewEngine,
@@ -91,6 +92,10 @@ const summaryLabel = computed(() => {
 function clipLabel(clip: ModelClipInfo, index: number): string {
   return clip.name || t("model.preview.clipUnnamed", index + 1);
 }
+
+const clipOptions = computed<DropdownOption[]>(() =>
+  clips.value.map((clip, index) => ({ value: String(index), label: clipLabel(clip, index) })),
+);
 
 async function fetchBuffer(url: string): Promise<ArrayBuffer> {
   if (url.startsWith("data:")) return dataUrlToArrayBuffer(url);
@@ -182,8 +187,8 @@ function togglePlaying(): void {
   engine?.setPlaying(playing.value);
 }
 
-function onClipChange(event: Event): void {
-  clipIndex.value = Number((event.target as HTMLSelectElement).value) || 0;
+function onClipChange(value: string): void {
+  clipIndex.value = Number(value) || 0;
   engine?.selectClip(clipIndex.value);
   engine?.setPlaying(playing.value);
 }
@@ -224,15 +229,17 @@ onBeforeUnmount(() => {
         >
           <LucideIcon :icon="playing ? Pause : Play" :size="13" :stroke-width="1.8" />
         </button>
-        <select
+        <BaseDropdown
           v-if="clips.length > 1"
           class="model-viewer-clip"
-          :value="clipIndex"
+          size="sm"
+          menu-align="start"
+          teleport
+          :model-value="String(clipIndex)"
+          :options="clipOptions"
           :aria-label="t('model.preview.clip')"
-          @change="onClipChange"
-        >
-          <option v-for="(clip, index) in clips" :key="index" :value="index">{{ clipLabel(clip, index) }}</option>
-        </select>
+          @update:model-value="onClipChange"
+        />
       </template>
       <button
         type="button"
@@ -283,8 +290,7 @@ onBeforeUnmount(() => {
   font-size: 11px;
 }
 
-.model-viewer-tool,
-.model-viewer-clip {
+.model-viewer-tool {
   height: 24px;
   padding: 0 9px;
   border: 1px solid var(--border-color);
@@ -308,8 +314,7 @@ onBeforeUnmount(() => {
   margin-left: auto;
 }
 
-.model-viewer-tool:hover,
-.model-viewer-clip:hover {
+.model-viewer-tool:hover {
   background: var(--hover-bg);
   color: var(--text-color);
 }

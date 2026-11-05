@@ -221,7 +221,7 @@
     },
     {
       "path": "src/components/model-preview/ModelViewer.vue",
-      "bytes": 10917
+      "bytes": 11065
     },
     {
       "path": "src/components/model-preview/modelFormat.ts",
@@ -509,11 +509,11 @@
     },
     {
       "path": "src/language/en.json",
-      "bytes": 381876
+      "bytes": 381877
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 372012
+      "bytes": 372016
     },
     {
       "path": "src/services/asset.ts",
