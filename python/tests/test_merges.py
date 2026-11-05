@@ -16,10 +16,32 @@ class MergeClient(locus.Client):
         if method == "merges.prepare":
             return {"workspace_ref": {"checkoutId": "destination", "expectedGeneration": 7},
                     "job": {"id": "job-1", "snapshot": {"head": "head"}, "project_root": "C:/project", "state": "prepared"}}
+        if method == "merges.replan":
+            return {"workspace_ref": {"checkoutId": "destination", "expectedGeneration": 8},
+                    "job": {"id": "job-2", "snapshot": {"head": "head"}, "project_root": "C:/project", "state": "prepared"},
+                    "report": {"replaced_job_id": params["job_id"], "carried": {"decisions": 2},
+                               "dropped": [{"path": "state.json", "reason": "destination_changed"}],
+                               "dropped_total": 1, "changed_paths": ["state.json"]}}
         return {"ready_to_apply": True, "plan_hash": "hash", "state": "prepared"}
 
 
 class MergeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_replan_returns_a_new_job_bound_to_the_returned_destination(self):
+        client = MergeClient()
+        job = await client.merges.prepare(sources=[{"commits": ["one"]}], workspace_ref=locus.WorkspaceRef("A"))
+        self.assertIsNone(job.replan_report)
+        replanned = await job.replan()
+        method, params = client.calls[-1]
+        self.assertEqual(method, "merges.replan")
+        self.assertEqual(params["job_id"], "job-1")
+        self.assertEqual(params["workspaceRef"], job.workspace_ref)
+        self.assertEqual(replanned.id, "job-2")
+        self.assertEqual(replanned.workspace_ref["expectedGeneration"], 8)
+        self.assertEqual(replanned.replan_report.dropped[0]["path"], "state.json")
+        self.assertEqual(replanned.replan_report.carried["decisions"], 2)
+        await replanned.plan().preview()
+        self.assertEqual(client.calls[-1][1]["job_id"], "job-2")
+
     async def test_file_scope_and_snapshot_pagination(self):
         client = MergeClient()
         job = await client.merges.prepare(sources=[{"commits": ["one"]}],
@@ -163,6 +185,40 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p["offset"] for m, p in client.calls if m == "merges.changes"], [0, 2, 4])
         with self.assertRaises(ValueError):
             await job.all_changes(page_size=0)
+
+    async def test_restore_sends_the_object_and_its_commit(self):
+        client = MergeClient()
+        job = await client.merges.prepare(sources=[{"commits": ["one"]}], workspace_ref=locus.WorkspaceRef("A"))
+        await job.plan().objects.restore("Assets/Level.unity", object_id="302", commit="one")
+        method, params = client.calls[-1]
+        self.assertEqual(method, "merges.objects.restore")
+        self.assertEqual((params["path"], params["object_id"], params["commit"]), ("Assets/Level.unity", "302", "one"))
+
+    async def test_filters_go_to_the_server_and_the_summary_follows_pages(self):
+        class SummaryClient(MergeClient):
+            async def rpc(self, method, params=None, **kwargs):
+                if method == "merges.change_summary":
+                    self.calls.append((method, params))
+                    files = [{"path": "a.unity", "statuses": {"conflict": 1}}] if params["offset"] == 0                         else [{"path": "b.unity", "statuses": {"clean": 3}}]
+                    return {"files": files, "file_total": 2, "changes": 4, "statuses": {"clean": 3, "conflict": 1},
+                            "next_offset": 1 if params["offset"] == 0 else None}
+                return await super().rpc(method, params, **kwargs)
+
+        client = SummaryClient()
+        job = await client.merges.prepare(sources=[{"commits": ["one"]}], workspace_ref=locus.WorkspaceRef("A"))
+        await job.all_changes(status="conflict", paths=["a.unity"])
+        method, params = client.calls[-1]
+        self.assertEqual(method, "merges.changes")
+        self.assertEqual((params["status"], params["paths"]), ("conflict", ["a.unity"]))
+        await job.changes()
+        self.assertNotIn("status", client.calls[-1][1])
+        with self.assertRaises(ValueError):
+            await job.changes(paths="a.unity")
+        summary = await job.change_summary()
+        self.assertEqual([f.path for f in summary.files], ["a.unity", "b.unity"])
+        self.assertEqual(summary.statuses["conflict"], 1)
+        self.assertNotIn("next_offset", summary)
+        self.assertEqual([p["offset"] for m, p in client.calls if m == "merges.change_summary"], [0, 1])
 
 
 if __name__ == "__main__":

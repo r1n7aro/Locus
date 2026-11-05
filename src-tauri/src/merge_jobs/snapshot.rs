@@ -218,13 +218,13 @@ fn policy(root: &Path, attributes: &[u8]) -> Result<String, String> {
 }
 
 pub fn all_files(job: &MergeJob) -> BTreeMap<String, Option<FileState>> {
-    let mut files = job.dependency_files.clone();
-    files.extend(job.snapshot.files.clone());
+    let mut files = job.dependency_files.to_inner();
+    files.extend(job.snapshot.files.to_inner());
     files
 }
 
 pub fn check_dependencies(root: &Path, dir: &Path, job: &MergeJob) -> Result<(), String> {
-    if job.paths.is_none() {
+    if job.dependency_policy.is_none() {
         return Ok(());
     }
     if let Some(expected) = &job.dependency_policy {
@@ -242,7 +242,13 @@ pub fn check_dependencies(root: &Path, dir: &Path, job: &MergeJob) -> Result<(),
         .collect();
     check_files(root, dir, &raw)?;
     let dirty = names(root, &["diff", "--name-only", "-z", "HEAD", "--"])?;
-    let untracked = names(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    // A full snapshot never covered files that appear after it, so only a
+    // scoped job treats a new untracked input as stale.
+    let untracked = if job.paths.is_some() {
+        names(root, &["ls-files", "--others", "--exclude-standard", "-z"])?
+    } else {
+        BTreeSet::new()
+    };
     for path in dirty.iter().chain(&untracked) {
         if !evidence(path)
             || !path_in_project(root, Path::new(&job.project_root), path)
@@ -261,4 +267,24 @@ pub fn check_dependencies(root: &Path, dir: &Path, job: &MergeJob) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// The raw bytes of `path` for a job that did not freeze it as a writable
+/// target, provided they are still what the snapshot recorded as a read-only
+/// input (or the path is still absent). A full snapshot keeps clean files as
+/// Git-backed inputs and promotes one only when a plan writes it.
+pub fn capture_target(root: &Path, dir: &Path, job: &MergeJob, path: &str) -> Result<Option<FileState>, String> {
+    let state = capture(root, dir, path)?;
+    let unchanged = match job.dependency_files.get(path) {
+        None => true,
+        Some(None) => state.is_none(),
+        Some(Some(input)) => match git_blob_oid(input) {
+            Some(oid) => state.is_some() && git_text(root, &["hash-object", "--", path])? == oid,
+            None => state.as_ref().is_some_and(|s| s.blob == input.blob),
+        },
+    };
+    if !unchanged {
+        return Err(format!("stale: {path} changed after the snapshot; replan before writing"));
+    }
+    Ok(state)
 }

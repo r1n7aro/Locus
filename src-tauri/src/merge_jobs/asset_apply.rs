@@ -2,9 +2,8 @@
 //! The caller persists the merge journal before entering this function and runs
 //! on spawn_blocking; the Editor never calls back into the merge filesystem lock.
 use super::{io, FileState, MergeJob};
-use base64::Engine;
-use serde_json::{json, Value};
-use sha2::Digest;
+use crate::unity_assets::disk_payload;
+use serde_json::json;
 use std::path::Path;
 
 fn project_asset_path(root: &Path, project: &Path, path: &str) -> Option<String> {
@@ -36,11 +35,13 @@ fn project_asset_path(root: &Path, project: &Path, path: &str) -> Option<String>
     .then_some(relative)
 }
 
-fn request(root: &Path, dir: &Path, job: &MergeJob) -> Result<Option<Value>, String> {
+/// (asset path, SHA-256 of its current bytes, replacement bytes) of a plan the
+/// Editor adapter covers: up to 256 existing Unity text assets, modes unchanged.
+fn replacements(root: &Path, dir: &Path, job: &MergeJob) -> Result<Option<Vec<(String, String, Vec<u8>)>>, String> {
     if job.applied_files.is_empty() || job.applied_files.len() > 256 {
         return Ok(None);
     }
-    let mut entries = Vec::new();
+    let mut replacements = Vec::new();
     for (path, after) in &job.applied_files {
         let (Some(before), Some(after)) = (
             job.applied_before.get(path).and_then(Option::as_ref),
@@ -64,13 +65,9 @@ fn request(root: &Path, dir: &Path, job: &MergeJob) -> Result<Option<Value>, Str
         {
             return Ok(None);
         }
-        entries.push(json!({"path":asset_path,
-            "expected_sha256":sha2::Sha256::digest(&before_bytes).iter().map(|byte|format!("{byte:02x}")).collect::<String>(),
-            "bytes_base64":base64::engine::general_purpose::STANDARD.encode(&after_bytes)}));
+        replacements.push((asset_path, disk_payload::sha256_hex(&before_bytes), after_bytes));
     }
-    Ok(Some(
-        json!({"action":"disk_apply","transaction_id":job.id,"entries":entries}),
-    ))
+    Ok(Some(replacements))
 }
 
 /// Returns false only when this plan is outside the adapter or the Editor is
@@ -79,7 +76,7 @@ pub(super) fn try_apply(root: &Path, dir: &Path, job: &MergeJob) -> Result<bool,
     if !crate::unity_bridge::is_unity_project(&job.project_root) {
         return Ok(false);
     }
-    let Some(request) = request(root, dir, job)? else {
+    let Some(replacements) = replacements(root, dir, job)? else {
         return Ok(false);
     };
     let runtime = match tokio::runtime::Handle::try_current() {
@@ -107,9 +104,25 @@ pub(super) fn try_apply(root: &Path, dir: &Path, job: &MergeJob) -> Result<bool,
         })?;
         return Ok(false);
     }
+    let project = Path::new(&job.project_root);
+    let replacements: Vec<_> = replacements
+        .iter()
+        .map(|(path, expected, bytes)| disk_payload::Replacement {
+            path: path.clone(),
+            expected_sha256: expected.clone(),
+            after: bytes,
+        })
+        .collect();
+    let entries = disk_payload::entries(project, &job.id, &replacements).map_err(|error| {
+        disk_payload::clear(project, &job.id);
+        format!("Could not hand the merge result to the Editor: {error}")
+    })?;
+    let request = json!({"action":"disk_apply","transaction_id":job.id,"entries":entries});
     let response = tokio::task::block_in_place(|| {
         runtime.block_on(crate::unity_bridge::asset_api(&job.project_root, &request))
-    })?;
+    });
+    disk_payload::clear(project, &job.id);
+    let response = response?;
     if response["applied"].as_bool() != Some(true) || response["persisted"].as_bool() != Some(true)
     {
         return Err(

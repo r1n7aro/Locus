@@ -23,6 +23,8 @@ enum Plan {
     RestoreReference(&'static str),
     /// A list without identity: keep the destination list, take one source element field.
     RefineList(&'static str, &'static str),
+    /// One deleted-object conflict: run the `objects.restore` its reason names.
+    RestoreAsReasonSays,
 }
 
 struct Case {
@@ -31,6 +33,9 @@ struct Case {
     expect: &'static [(&'static str, &'static str)],
     /// The Editor has the asset open (scene or Prefab Mode) during the merge.
     editor_open: Option<Write>,
+    /// The destination never changed the asset: the merged file must be the
+    /// source file byte for byte.
+    untouched: bool,
 }
 
 /// How an apply reaches disk while the Editor has the asset open.
@@ -44,7 +49,11 @@ enum Write {
 }
 
 const fn case(name: &'static str, plan: Plan, expect: &'static [(&'static str, &'static str)]) -> Case {
-    Case { name, plan, expect, editor_open: None }
+    Case { name, plan, expect, editor_open: None, untouched: false }
+}
+
+const fn open(name: &'static str, write: Write) -> Case {
+    Case { name, plan: Plan::Clean, expect: OPEN, editor_open: Some(write), untouched: false }
 }
 
 /// The open copy shows both sides' position edits and holds no unsaved state.
@@ -80,9 +89,38 @@ const CASES: &[Case] = &[
     case("scene_roots", Plan::Clean,
         &[("roots", "A|Inner|SourceRoot|TargetRoot"), ("a.y", "2"), ("x", "3"), ("y", "4")]),
     case("scene_same_id", Plan::ResolveAll("target"), &[("roots", "A|TargetRoot")]),
-    Case { name: "scene_open_reload", plan: Plan::Clean, expect: OPEN, editor_open: Some(Write::Direct) },
-    Case { name: "scene_open_transaction", plan: Plan::Clean, expect: OPEN, editor_open: Some(Write::Transaction) },
-    Case { name: "prefab_stage_reload", plan: Plan::Clean, expect: OPEN, editor_open: Some(Write::Direct) },
+    open("scene_open_reload", Write::Direct),
+    open("scene_open_transaction", Write::Transaction),
+    // About 18 MB, over the bridge's 16 MiB request: written by the Editor from a staged file.
+    open("scene_large_transaction", Write::Transaction),
+    open("prefab_stage_reload", Write::Direct),
+    // Both sides add interleaving roots; Unity must re-save the merge unchanged.
+    case("scene_both_add", Plan::Clean,
+        &[("roots", "A|B|S0|S1|S2|S3|T0|T1|T2|T3"), ("a.x", "1"), ("b.y", "2"), ("leaves", "10"), ("resave_stable", "true")]),
+    Case { name: "scene_untouched_destination", plan: Plan::Clean, editor_open: None, untouched: true,
+        expect: &[("roots", "A|S0|S1|S2|S3"), ("a.y", "2"), ("resave_stable", "true")] },
+    // Reparenting, an added component and a rename on the other side.
+    case("scene_hierarchy_edits", Plan::Clean,
+        &[("a.children", "A2T"), ("b.children", "A1|B1"), ("a.components", "BoxCollider|Transform"),
+          ("b1.x", "1"), ("b1.y", "3"), ("resave_stable", "true")]),
+    // The source removed a component the destination edited: keep the destination's.
+    case("scene_component_delete_modify", Plan::ResolveAll("target"),
+        &[("a.components", "BoxCollider|Transform"), ("box.x", "2"), ("resave_stable", "true")]),
+    // The destination removed a component the source edited: restore it as the reason says.
+    case("scene_component_restore", Plan::RestoreAsReasonSays,
+        &[("a.components", "BoxCollider|Transform"), ("box.x", "3"), ("resave_stable", "true")]),
+    // The destination deleted a root subtree; one restore brings it back.
+    case("scene_subtree_restore", Plan::RestoreAsReasonSays,
+        &[("roots", "A|R"), ("d", "present"), ("d.box.x", "3"), ("resave_stable", "true")]),
+    // The destination deleted a child of a kept root (now `m_Children: []`).
+    case("scene_child_restore", Plan::RestoreAsReasonSays,
+        &[("r.children", "C"), ("d.box.x", "3"), ("resave_stable", "true")]),
+    // The destination deleted a Prefab child the source moved; keep the move.
+    case("prefab_delete_modify_restore", Plan::RestoreAsReasonSays,
+        &[("children", "A|B"), ("b.z", "5")]),
+    // Two consecutive source commits merged in order.
+    case("scene_commit_sequence", Plan::Clean,
+        &[("roots", "A|B|S"), ("a.x", "1"), ("b.y", "5"), ("s.y", "2"), ("resave_stable", "true")]),
 ];
 
 /// The agent's view of one job: every call is counted with its latency and
@@ -103,15 +141,21 @@ impl Agent<'_> {
         result.map_err(|error| format!("{action}: {error}"))
     }
 
-    fn changes(&mut self) -> Result<Vec<Value>, String> {
-        let page = self.call("changes", json!({"limit":1000}))?;
-        Ok(page["changes"]
+    /// Reads the catalog the way an agent should: the per-file summary, then
+    /// only the conflicts of the case asset.
+    fn catalog(&mut self) -> Result<(Value, Vec<Value>), String> {
+        let summary = self.call("change_summary", json!({}))?;
+        let file = summary["files"]
             .as_array()
-            .ok_or("changes omitted the catalog page")?
-            .iter()
-            .filter(|c| c["path"].as_str() == Some(self.path.as_str()))
+            .and_then(|files| files.iter().find(|f| f["path"].as_str() == Some(self.path.as_str())))
             .cloned()
-            .collect())
+            .ok_or("change_summary omitted the case asset")?;
+        let page = self.call("changes", json!({"status":"conflict","paths":[self.path],"limit":1000}))?;
+        let conflicts = page["changes"].as_array().ok_or("changes omitted the catalog page")?.clone();
+        if conflicts.len() as u64 != file["statuses"]["conflict"].as_u64().unwrap_or(0) {
+            return Err(format!("the conflict filter returned {} change(s) but the summary counts {}", conflicts.len(), file["statuses"]));
+        }
+        Ok((file, conflicts))
     }
 
     fn preview(&mut self) -> Result<Value, String> {
@@ -227,6 +271,20 @@ fn resolve(agent: &mut Agent<'_>, plan: Plan, changes: &[Value]) -> Result<Strin
             agent.call("fields.take", json!({"path":agent.path,"object_id":object,"property_path":element,"side":"source"}))?;
             Ok("resolve target + fields.take element".into())
         }
+        Plan::RestoreAsReasonSays => {
+            let [only] = open.as_slice() else {
+                return Err(format!("expected one deleted-object conflict, got {}: {}", open.len(), open.iter().map(describe).collect::<Vec<_>>().join("; ")));
+            };
+            let reason = only["reason"].as_str().unwrap_or_default();
+            let object = only["object_id"].as_str().unwrap_or_default();
+            if !reason.contains(&format!("objects.restore(path, object_id='{object}')")) {
+                return Err(format!("the reason does not name the restore: {reason}"));
+            }
+            let restored = agent.call("objects.restore", json!({"path":agent.path,"object_id":object}))?;
+            Ok(format!("objects.restore: {} object(s), {} attachment(s)",
+                restored["restored"]["objects"].as_array().map_or(0, Vec::len),
+                restored["restored"]["attached"].as_array().map_or(0, Vec::len)))
+        }
     }
 }
 
@@ -243,15 +301,15 @@ async fn run_case(
         std::fs::read(snapshots.join(format!("{}-{side}.yaml", case.name))).map_err(|e| e.to_string())
     };
     let (base, target, source) = (read("base")?, read("target")?, read("source")?);
-    if base == target || base == source {
-        return Err("Unity did not produce independent target/source edits".into());
+    if base == source || (base == target) != case.untouched {
+        return Err("Unity did not produce the case's target/source edits".into());
     }
     let meta = std::fs::read(root.join(format!("{file}.meta"))).map_err(|e| e.to_string())?;
     // A companion text change keeps a Direct plan off the Editor's asset-only
     // transaction, so it exercises the post-apply reload instead.
     let notes = format!("{file}.merge-notes.txt");
     let mut base_files = vec![(file.to_string(), base), (format!("{file}.meta"), meta)];
-    let mut source_files = vec![(file.to_string(), source)];
+    let mut source_files = vec![(file.to_string(), source.clone())];
     let direct = case.editor_open == Some(Write::Direct);
     if direct {
         base_files.push((notes.clone(), b"base\n".to_vec()));
@@ -259,6 +317,14 @@ async fn run_case(
     }
     let base_commit = patch_commit(root, head, &base_files, &format!("merge matrix base: {}", case.name))?;
     let source_commit = patch_commit(root, &base_commit, &source_files, &format!("merge matrix source: {}", case.name))?;
+    // An optional second source commit on top of the first, merged after it.
+    let mut commits = vec![source_commit.clone()];
+    let mut source = source;
+    if let Ok(second) = read("source2") {
+        let next = patch_commit(root, &source_commit, &[(file.to_string(), second.clone())], &format!("merge matrix source 2: {}", case.name))?;
+        commits.push(next);
+        source = second;
+    }
     std::fs::write(root.join(file), &target).map_err(|e| e.to_string())?;
     let mut paths = vec![file.to_string()];
     if direct {
@@ -277,17 +343,21 @@ async fn run_case(
     let job = merge_jobs::prepare(
         root,
         &PrepareRequest {
-            sources: vec![SourceSelection { commits: vec![source_commit], ..Default::default() }],
+            sources: vec![SourceSelection { commits, ..Default::default() }],
             paths: Some(paths.clone()),
             ..Default::default()
         },
     )?;
     let prepare_ms = started.elapsed().as_millis();
     let mut agent = Agent { root, job: job.id.clone(), path: file.to_string(), calls: Vec::new() };
-    let changes = agent.changes()?;
-    if changes.is_empty() {
+    let (summary, changes) = agent.catalog()?;
+    if summary["changes"].as_u64().unwrap_or(0) == 0 {
         return Err("catalog has no changes for the case asset".into());
     }
+    if summary["destination_changed"] != json!(!case.untouched) {
+        return Err(format!("summary reports destination_changed={} for this case", summary["destination_changed"]));
+    }
+    let full_catalog_bytes = merge_jobs::execute(root, &job.id, "changes", json!({"limit":1000}))?.to_string().len();
     for path in &paths {
         agent.call("include", json!({"path":path}))?;
     }
@@ -310,6 +380,9 @@ async fn run_case(
         Some(Write::Direct) => applied["editor_sync"]["status"] == "synced" && applied["warnings"].is_null(),
         Some(Write::Transaction) => applied["editor_applied"] == true,
     };
+    if case.untouched && std::fs::read(root.join(file)).map_err(|e| e.to_string())? != source {
+        return Err("the destination never changed this asset, yet the merged file differs from the source".into());
+    }
     if !reloaded {
         return Err(format!(
             "the open asset was not written/reloaded as expected: editor_applied={}, editor_sync={}, warnings={}",
@@ -349,18 +422,16 @@ async fn run_case(
     if !mismatches.is_empty() {
         return Err(format!("Unity facts differ after `{decisions}`: {}", mismatches.join("; ")));
     }
-    let statuses = changes.iter().fold(BTreeMap::<String, usize>::new(), |mut counts, c| {
-        *counts.entry(c["status"].as_str().unwrap_or("?").to_string()).or_default() += 1;
-        counts
-    });
     let mutating = agent
         .calls
         .iter()
-        .filter(|c| !matches!(c["action"].as_str(), Some("changes" | "preview" | "inspect_asset")))
+        .filter(|c| !matches!(c["action"].as_str(), Some("changes" | "change_summary" | "preview" | "inspect_asset")))
         .count();
     Ok(json!({
-        "changes": changes.len(),
-        "statuses": statuses,
+        "changes": summary["changes"],
+        "statuses": summary["statuses"],
+        "kinds": summary["kinds"],
+        "full_catalog_bytes": full_catalog_bytes,
         "first_preview_issues": first["issues"].as_array().map(|i| i.len()).unwrap_or(0),
         "decisions": decisions,
         "agent_calls": agent.calls.len() + 2,

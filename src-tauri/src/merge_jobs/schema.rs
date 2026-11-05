@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use std::collections::BTreeSet;
 
 fn persisted_script(dir: &Path, path: &str, bytes: &[u8]) -> Result<Option<ScriptSchema>, String> {
-    let folder = dir.parent().ok_or("Missing schema cache parent")?.join("script-cache-v2");
+    let folder = dir.parent().ok_or("Missing schema cache parent")?.join(super::retention::SCRIPT_CACHE);
     std::fs::create_dir_all(&folder).map_err(|e|e.to_string())?;
     let key = blake3::hash(&serde_json::to_vec(&(path, blake3::hash(bytes).to_hex().as_str())).map_err(|e|e.to_string())?);
     let cache = folder.join(format!("{key}.json"));
@@ -44,7 +44,7 @@ pub fn working_for_guids(dir: &Path, files: &BTreeMap<String, Option<FileState>>
 
 pub fn tree_for_guids(root: &Path, dir: &Path, revision: &str, scope: &Path, guids: &BTreeSet<String>) -> Result<SchemaMap,String> {
     let key = blake3::hash(&serde_json::to_vec(&(revision,scope_relative_path(root,scope)?,guids)).map_err(|e|e.to_string())?);
-    let folder = dir.parent().ok_or("Missing schema cache parent")?.join("schema-cache-selected-v2");
+    let folder = dir.parent().ok_or("Missing schema cache parent")?.join(super::retention::SELECTED_SCHEMAS);
     std::fs::create_dir_all(&folder).map_err(|e|e.to_string())?;
     let cache = folder.join(format!("{key}.json"));
     if let Ok(bytes) = std::fs::read(&cache) {
@@ -159,7 +159,7 @@ pub fn tree(root: &Path, dir: &Path, tree: &str, scope: &Path) -> Result<SchemaM
     let cache_dir = dir
         .parent()
         .ok_or("Missing schema cache directory")?
-        .join("schema-cache-v1");
+        .join(super::retention::TREE_SCHEMAS);
     std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let relative_scope = scope_relative_path(root, scope)?;
     let scope_hash = blake3::hash(relative_scope.as_bytes()).to_hex().to_string();

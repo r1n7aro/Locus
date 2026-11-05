@@ -1,3 +1,4 @@
+use super::shared::Shared;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -10,9 +11,18 @@ pub struct SourceSelection {
     pub commits: Vec<String>,
     #[serde(default)]
     pub range: Option<String>,
+    /// Integrate the net result of `range` (or `HEAD..branch_ref`) as one delta
+    /// from the merge base to the tip, like a squash.
+    #[serde(default)]
+    pub squash: bool,
     /// One-based mainline parent for a merge commit, keyed by the requested ref or resolved OID.
     #[serde(default)]
     pub mainline: BTreeMap<String, usize>,
+    /// Exact (commit, delta base) of a previous job's delta. Only `replan`
+    /// sets it, so a replanned job reproduces the same deltas and change IDs
+    /// even after the source branch moved. Never accepted from SDK input.
+    #[serde(skip)]
+    pub pinned: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -27,6 +37,10 @@ pub struct PrepareRequest {
     pub mode: PrepareMode,
     #[serde(default)]
     pub eager_catalog: bool,
+    /// A job the journal prune at the start of this prepare must keep: the
+    /// job `replan` is reading. Never accepted from SDK input.
+    #[serde(skip)]
+    pub keep_job: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,9 +63,16 @@ pub struct TargetSnapshot {
     pub materialization_epoch: u64,
     pub head: String,
     pub branch: Option<String>,
-    pub index_records: String,
-    pub index_flags: String,
-    pub files: BTreeMap<String, Option<FileState>>,
+    /// The three large parts are stored in their own files (see `journal`).
+    #[serde(skip)]
+    pub index_records: Shared<String>,
+    #[serde(skip)]
+    pub index_flags: Shared<String>,
+    /// Writable targets: every path a selected commit changes plus the
+    /// destination's dirty and untracked paths, as raw working-tree bytes.
+    /// Other files are read-only inputs in `MergeJob::dependency_files`.
+    #[serde(skip)]
+    pub files: Shared<BTreeMap<String, Option<FileState>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -82,7 +103,9 @@ pub struct FileChoice {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Selection {
-    #[serde(default)]
+    /// Stored compactly by the journal: a file whose changes all carry one
+    /// decision is recorded once.
+    #[serde(skip)]
     pub decisions: BTreeMap<String, Value>,
     #[serde(default)]
     pub files: BTreeMap<String, FileChoice>,
@@ -126,17 +149,18 @@ pub struct MergeJob {
     pub mode: PrepareMode,
     /// Dependency-only inputs are never writable selections. Clean files refer
     /// to pinned Git blobs; dirty inputs retain their actual worktree bytes.
-    #[serde(default)]
-    pub dependency_files: BTreeMap<String, Option<FileState>>,
+    #[serde(skip)]
+    pub dependency_files: Shared<BTreeMap<String, Option<FileState>>>,
     #[serde(default)]
     pub dependency_policy: Option<String>,
     #[serde(default = "legacy_catalog_ready")]
     pub catalog_ready: bool,
     #[serde(default)]
     pub prepare_metrics: Value,
-    pub deltas: Vec<CommitDelta>,
-    #[serde(default)]
-    pub schemas: BTreeMap<String, super::schema::SchemaMap>,
+    #[serde(skip)]
+    pub deltas: Shared<Vec<CommitDelta>>,
+    #[serde(skip)]
+    pub schemas: Shared<BTreeMap<String, super::schema::SchemaMap>>,
     pub selection: Selection,
     pub revision: u64,
     pub state: String,

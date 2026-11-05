@@ -151,7 +151,7 @@ pub(crate) async fn acquire(
 }
 
 pub(crate) fn needs_guard(action: &str, params: &serde_json::Value) -> bool {
-    matches!(action, "prepare" | "apply" | "abort" | "stage" | "commit")
+    matches!(action, "prepare" | "replan" | "apply" | "abort" | "stage" | "commit")
         || (action == "validate"
             && params.get("level").and_then(serde_json::Value::as_str) == Some("unity"))
 }

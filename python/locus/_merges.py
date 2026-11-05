@@ -83,7 +83,27 @@ class MergeJob:
         self.mode = payload.get("mode", "structural")
         self.paths = payload.get("paths")
         self.prepare_metrics = MergeResult(payload.get("prepare_metrics") or {})
+        self.replan_report: MergeResult | None = None
         self.assets = MergeAssets(self)
+
+    async def replan(self) -> MergeJob:
+        """Re-prepare this job on the current destination, keeping its decisions.
+
+        Use it after ``stale`` (the checkout changed after the snapshot). The new
+        job uses this job's exact source commits and bases, so change IDs stay
+        the same. A decision is carried over only when every file it touches has
+        identical destination bytes; ``replan_report["dropped"]`` lists the rest
+        and ``changed_paths`` the source files whose destination changed. The
+        previous job is removed once the new one is saved. Preview the new plan
+        before applying it.
+        """
+        payload = await self._client.rpc("merges.replan", {
+            "workspaceRef": self.workspace_ref, "job_id": self.id,
+            "execution_delegation": os.environ.get("LOCUS_SDK_EXECUTION_DELEGATION"),
+        }, timeout=300)
+        job = MergeJob(self._client, payload["workspace_ref"], payload["job"])
+        job.replan_report = MergeResult(payload.get("report") or {})
+        return job
 
     async def _call(self, action: str, params: dict[str, Any] | None = None, *, timeout: float = 300) -> MergeResult:
         payload = await self._client.rpc("merges." + action, {
@@ -92,27 +112,60 @@ class MergeJob:
         }, timeout=timeout)
         return MergeResult(payload)
 
-    async def changes(self, *, include_clean: bool = True, offset: int = 0, limit: int = 100) -> MergeResult:
-        if not include_clean:
-            raise ValueError("The catalog includes all source changes; filter status locally to retain selection control")
-        return await self._call("changes", {"offset": offset, "limit": limit})
+    @staticmethod
+    def _filters(status: str | list[str] | None, paths: list[str] | None) -> dict[str, Any]:
+        if isinstance(paths, str):
+            raise ValueError("paths must be a list of exact repository-relative file paths")
+        return {key: value for key, value in (("status", status), ("paths", paths)) if value is not None}
 
-    async def all_changes(self, *, page_size: int = 1000) -> list[MergeResult]:
-        """Every catalog change, following ``next_offset`` across pages.
+    async def changes(self, *, status: str | list[str] | None = None, paths: list[str] | None = None,
+        offset: int = 0, limit: int = 100) -> MergeResult:
+        """One catalog page, optionally filtered on the server by ``status`` and exact ``paths``.
+
+        ``total`` counts the matching changes, ``catalog_total`` the whole catalog.
+        """
+        return await self._call("changes", {"offset": offset, "limit": limit, **self._filters(status, paths)})
+
+    async def all_changes(self, *, status: str | list[str] | None = None, paths: list[str] | None = None,
+        page_size: int = 1000) -> list[MergeResult]:
+        """Every matching catalog change, following ``next_offset`` across pages.
 
         Statuses: ``clean`` (include applies; for text ``merge`` names a line
         merge), ``already_applied``, ``conflict`` (with ``reason``; text adds
-        ``hunks``) and ``explicit_choice`` (file mode).
+        ``hunks``) and ``explicit_choice`` (file mode). ``status="conflict"``
+        reads only the changes that need a decision.
         """
         if not 1 <= page_size <= 1000:
             raise ValueError("page_size must be between 1 and 1000")
         items: list[MergeResult] = []
         offset: int | None = 0
         while offset is not None:
-            page = await self.changes(offset=offset, limit=page_size)
+            page = await self.changes(status=status, paths=paths, offset=offset, limit=page_size)
             items.extend(MergeResult(change) for change in page.get("changes", []))
             offset = page.get("next_offset")
         return items
+
+    async def change_summary(self) -> MergeResult:
+        """Per-file rollup of the whole catalog, following pages.
+
+        Returns ``files`` (each with ``path``, ``file_kind``, ``commits``,
+        ``changes``, ``statuses``, ``kinds``, ``destination_changed`` and
+        ``outside_destination_scope``), ``file_total``, ``changes`` and total
+        ``statuses``.
+        """
+        summary: MergeResult | None = None
+        offset: int | None = 0
+        while offset is not None:
+            page = await self._call("change_summary", {"offset": offset, "limit": 1000})
+            if summary is None:
+                summary = page
+            else:
+                summary["files"].extend(page.get("files", []))
+            offset = page.get("next_offset")
+        assert summary is not None
+        summary.pop("next_offset", None)
+        summary["files"] = [MergeResult(item) for item in summary.get("files", [])]
+        return summary
 
     async def snapshot_page(self, *, kind: str = "target", offset: int = 0, limit: int = 100) -> MergeResult:
         """Page immutable file identities; ``snapshot`` contains only summary metadata."""
@@ -204,6 +257,17 @@ class _Objects(_Scope):
 
     async def delete(self, path: str, *, object_id: str, commit: str | None = None) -> MergeResult:
         return await self._plan._call("objects.delete", {"path": path, "object_id": object_id, "commit": commit})
+
+    async def restore(self, path: str, *, object_id: str, commit: str | None = None) -> MergeResult:
+        """Bring back an object the destination deleted, with what it needs to load.
+
+        Restores the deleted part of the hierarchy it belongs to (its GameObject,
+        components and children, up to the nearest object the destination kept)
+        and adds it to that object's ``m_Component``/``m_Children`` or the scene's
+        ``m_Roots``. ``result.restored`` lists the ``objects``, the
+        ``resolved_change_ids`` and the ``attached`` list elements.
+        """
+        return await self._plan._call("objects.restore", {"path": path, "object_id": object_id, "commit": commit})
 
 
 class _Fields(_Scope):

@@ -4,11 +4,18 @@
 mod commit_validation;
 mod asset_preflight;
 mod asset_apply;
+mod catalog_query;
+mod chain;
 pub(crate) mod coordination;
 mod dependencies;
 mod eol_proof;
 mod inspection;
+mod journal;
 mod parallel;
+mod replan;
+pub use replan::replan;
+mod retention;
+mod shared;
 mod snapshot;
 pub(crate) mod io;
 mod schema;
@@ -84,23 +91,17 @@ fn scope_allows(job: &MergeJob, path: &str) -> bool {
         && job.paths.as_ref().map_or(true, |paths| paths.iter().any(|p| p == path))
 }
 fn save(dir: &Path, job: &MergeJob) -> Result<(), String> {
-    atomic_json(&dir.join("job.json"), job)
+    journal::save(dir, job)
 }
 pub fn load(root: &Path, id: &str) -> Result<MergeJob, String> {
     let requested_project = dunce::canonicalize(root).map_err(|e| e.to_string())?;
     let root = repository(root)?;
-    let job: MergeJob = serde_json::from_slice(
-        &std::fs::read(job_dir(&root, id)?.join("job.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let job = journal::load(&job_dir(&root, id)?)?;
     if Path::new(&job.root) != root {
         return Err("Merge job belongs to a different destination checkout; prepare a new job to change direction".into());
     }
     if Path::new(&job.project_root) != requested_project {
         return Err("Merge job belongs to another Unity project root within this repository; use its exact destination WorkspaceRef".into());
-    }
-    if !matches!(job.version, 1 | 2) {
-        return Err("Unsupported merge journal version".into());
     }
     Ok(job)
 }
@@ -177,29 +178,54 @@ fn ensure_catalog(dir: &Path, job: &mut MergeJob) -> Result<(), String> {
         }
     }
     let folder = dir.parent().ok_or("Missing catalog cache parent")?
-        .join(format!("catalog-cache-{}-v3", crate::unity_asset_core::PARSER_VERSION));
+        .join(retention::catalog_cache());
     std::fs::create_dir_all(&folder).map_err(|e|e.to_string())?;
     let structural = job.mode == PrepareMode::Structural;
-    let changes: Result<Vec<_>, String> = parallel::pool().install(|| job.deltas.par_iter().map(|delta| {
-        let target = job.snapshot.files.get(&delta.path).unwrap_or(&None);
-        let key = blake3::hash(&serde_json::to_vec(&(&delta.commit, &delta.parent, &delta.path,
-            &delta.base, &delta.source, target, structural, &job.schemas)).map_err(|e|e.to_string())?).to_hex();
-        let cache = folder.join(format!("{key}.json"));
-        let cached = std::fs::read(&cache).ok().and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok());
-        let mut changes = match cached {
-            Some(value) => value,
-            None => {
-                let value = catalog(dir, delta, target, &job.schemas, structural)?;
-                cache_json(&cache, &value)?;
-                value
+    // The commits of one file are cataloged in preview order, each against the
+    // file as the earlier selected commits leave it (see `chain`).
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, delta) in job.deltas.iter().enumerate() {
+        groups.entry(delta.path.as_str()).or_default().push(index);
+    }
+    let mut groups: Vec<Vec<usize>> = groups.into_values().collect();
+    for indices in &mut groups {
+        indices.sort_by_key(|&i| job.deltas[i].kind != "text");
+    }
+    let shared = &*job;
+    let computed: Result<Vec<Vec<(usize, Vec<Value>)>>, String> = parallel::pool().install(|| groups.par_iter().map(|indices| {
+        let mut target = shared.snapshot.files.get(&shared.deltas[indices[0]].path).cloned().unwrap_or(None);
+        let mut out = Vec::with_capacity(indices.len());
+        for (position, &index) in indices.iter().enumerate() {
+            let delta = &shared.deltas[index];
+            let key = blake3::hash(&serde_json::to_vec(&(&delta.commit, &delta.parent, &delta.path,
+                &delta.base, &delta.source, &target, structural, &shared.schemas)).map_err(|e|e.to_string())?).to_hex();
+            let cache = folder.join(format!("{key}.json"));
+            let cached = std::fs::read(&cache).ok().and_then(|bytes| serde_json::from_slice::<Vec<Value>>(&bytes).ok());
+            let mut changes = match cached {
+                Some(value) => value,
+                None => {
+                    let value = catalog(dir, delta, &target, &shared.schemas, structural)?;
+                    cache_json(&cache, &value)?;
+                    value
+                }
+            };
+            for change in &mut changes {
+                change["outside_destination_scope"] = json!(!scope_allows(shared, &delta.path));
             }
-        };
-        for change in &mut changes {
-            change["outside_destination_scope"] = json!(!scope_allows(job, &delta.path));
+            if position + 1 < indices.len() {
+                target = chain::included_result(dir, delta, &target, &changes, &shared.schemas)?;
+            }
+            out.push((index, changes));
         }
-        Ok(changes)
+        Ok(out)
     }).collect());
-    for (delta, changes) in job.deltas.iter_mut().zip(changes?) { delta.changes = changes; }
+    let mut cataloged: Vec<Option<Vec<Value>>> = vec![None; job.deltas.len()];
+    for (index, changes) in computed?.into_iter().flatten() {
+        cataloged[index] = Some(changes);
+    }
+    for (delta, changes) in job.deltas.iter_mut().zip(cataloged) {
+        delta.changes = changes.ok_or("A source delta was not cataloged")?;
+    }
     job.catalog_ready = true;
     Ok(())
 }
@@ -344,6 +370,40 @@ fn catalog(
 
 /// The root can be any participating checkout. The caller resolves its explicit
 /// WorkspaceRef before entry; no active pane or global working directory is consulted.
+/// Tip and merge base of a squash source: `range` "A..B", or `HEAD..branch_ref`.
+fn squash_endpoints(root: &Path, selection: &SourceSelection) -> Result<(String, String), String> {
+    if !selection.commits.is_empty() {
+        return Err("squash takes a range or branch_ref, not a commit list".into());
+    }
+    let range = match (&selection.range, &selection.branch_ref) {
+        (Some(range), _) => range.clone(),
+        (None, Some(branch)) => format!("HEAD..{branch}"),
+        (None, None) => return Err("squash requires a range or branch_ref".into()),
+    };
+    let Some((from, to)) = range.split_once("..").filter(|_| !range.contains("...")) else {
+        return Err("squash requires a two-dot A..B range".into());
+    };
+    let from = if from.is_empty() { "HEAD" } else { from };
+    if to.is_empty() || from.starts_with('-') || to.starts_with('-') {
+        return Err("Invalid squash range".into());
+    }
+    let tip = git_text(root, &["rev-parse", "--verify", &format!("{to}^{{commit}}")])?;
+    let from = git_text(root, &["rev-parse", "--verify", &format!("{from}^{{commit}}")])?;
+    let bases = git_text(root, &["merge-base", "--all", &from, &tip])
+        .map_err(|e| format!("squash found no merge base between {from} and {tip}: {e}"))?;
+    let bases: Vec<_> = bases.lines().collect();
+    let [base] = bases.as_slice() else {
+        return Err(format!(
+            "squash needs exactly one merge base between {from} and {tip}, found {}; select commits explicitly",
+            bases.len()
+        ));
+    };
+    if *base == tip {
+        return Err("Source selection contains no commits".into());
+    }
+    Ok((tip, base.to_string()))
+}
+
 pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob, String> {
     let started = Instant::now();
     let mut timings = serde_json::Map::new();
@@ -386,9 +446,14 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
             ));
         }
     }
+    // Finished jobs and whatever only they used leave before a new one starts.
+    let prune_started = Instant::now();
+    retention::prune(&root, request.keep_job.as_deref())?;
+    timings.insert("prune_ms".into(), json!(prune_started.elapsed().as_millis()));
     let id = uuid::Uuid::new_v4().to_string();
     let dir = job_dir(&root, &id)?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let guard = retention::PrepareGuard::new(&root, &id);
     init_storage(&root, &dir)?;
     // Private refs keep dependency/schema objects reachable even after source
     // branches move and Git garbage collection runs.
@@ -400,7 +465,13 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
         if !selection.commits.is_empty() && selection.range.is_some() {
             return Err("Specify commits or range, not both".into());
         }
-        let commits = if let Some(range) = &selection.range {
+        // (requested revision, delta base overriding its parent)
+        let commits: Vec<(String, Option<String>)> = if let Some((commit, base)) = &selection.pinned {
+            vec![(commit.clone(), Some(base.clone()))]
+        } else if selection.squash {
+            let (tip, base) = squash_endpoints(&root, selection)?;
+            vec![(tip, Some(base))]
+        } else if let Some(range) = &selection.range {
             if !range.contains("..") || range.starts_with('-') {
                 return Err("Source range must be an explicit A..B or A...B revision range".into());
             }
@@ -409,15 +480,15 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
                 &["rev-list", "--reverse", "--topo-order", range, "--"],
             )?
             .lines()
-            .map(str::to_string)
+            .map(|commit| (commit.to_string(), None))
             .collect()
         } else {
-            selection.commits.clone()
+            selection.commits.iter().map(|commit| (commit.clone(), None)).collect()
         };
         if commits.is_empty() {
             return Err("Source selection contains no commits".into());
         }
-        for requested in commits {
+        for (requested, squash_base) in commits {
             if requested.starts_with('-') {
                 return Err("Invalid source revision".into());
             }
@@ -430,7 +501,9 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
             }
             let parents = git_text(&root, &["rev-list", "--parents", "-n", "1", &commit])?;
             let parents: Vec<_> = parents.split_whitespace().skip(1).collect();
-            let parent = if parents.is_empty() {
+            let parent = if let Some(base) = squash_base {
+                base
+            } else if parents.is_empty() {
                 git_input(
                     &root,
                     &["hash-object", "-t", "tree", "-w", "--stdin"],
@@ -525,8 +598,11 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
     }
     timings.insert("git_sources_ms".into(), json!(started.elapsed().as_millis()));
     let snapshot_started = Instant::now();
-    // Freeze every dirty/untracked path plus meta/script dependency inputs. Ignored
-    // caches never enter the job and unrelated paths are never written on apply.
+    // Writable targets (changed paths, plus the destination's dirty and
+    // untracked paths for a full snapshot) keep their raw bytes. Every other
+    // Unity input is a read-only dependency pinned to its HEAD blob, so a
+    // large project is not copied. Ignored caches never enter the job and
+    // unrelated paths are never written on apply.
     let (dirty, untracked) = parallel::pool().install(|| rayon::join(
         || snapshot::names(&root, &["diff", "--name-only", "-z", "HEAD", "--"]),
         || snapshot::names(&root, &["ls-files", "--others", "--exclude-standard", "-z"])));
@@ -536,32 +612,6 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
     } else {
         paths.extend(dirty.iter().chain(&untracked)
             .filter(|p| path_in_project(&root, &scope_root, p)).cloned());
-        for path in snapshot::names(&root, &[
-            "ls-files",
-            "-z",
-            "--",
-            "*.meta",
-            "*.cs",
-            "*.asmdef",
-            "*.unity",
-            "*.prefab",
-            "*.asset",
-            "*.mat",
-            "*.anim",
-            "*.controller",
-            "*.overrideController",
-            "*.playable",
-            "*.mask",
-            "*.renderTexture",
-            "*.terrainlayer",
-            "Packages/manifest.json",
-            "Packages/packages-lock.json",
-            "ProjectSettings/ProjectVersion.txt",
-        ])? {
-            if path_in_project(&root, &scope_root, &path) {
-                paths.insert(path);
-            }
-        }
     }
     let index_modes: BTreeMap<_, _> = index_records
         .split('\0')
@@ -575,9 +625,7 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
         .collect();
     let (files, dependency_files) = parallel::pool().install(|| rayon::join(
         || snapshot::capture_paths(&root, &dir, &paths, &index_modes),
-        || if selected_paths.is_some() {
-            snapshot::dependencies(&root, &scope_root, &dir, &head, &paths, &dirty, &untracked, &index_modes, &index_flags)
-        } else { Ok((BTreeMap::new(), None)) }));
+        || snapshot::dependencies(&root, &scope_root, &dir, &head, &paths, &dirty, &untracked, &index_modes, &index_flags)));
     let (files, (dependency_files, dependency_policy)) = (files?, dependency_files?);
     if let Some(requested) = &request.paths {
         if !requested.iter().any(|path| files.get(path).and_then(Option::as_ref).is_some()
@@ -591,7 +639,7 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
         .unwrap_or(0);
     let mut job = MergeJob {
         id,
-        version: 2,
+        version: journal::VERSION,
         root: root.to_string_lossy().into_owned(),
         project_root: dunce::canonicalize(project_root)
             .map_err(|e| e.to_string())?
@@ -602,18 +650,18 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
             materialization_epoch,
             head,
             branch,
-            index_records,
-            index_flags,
-            files,
+            index_records: index_records.into(),
+            index_flags: index_flags.into(),
+            files: files.into(),
         },
-        deltas,
+        deltas: deltas.into(),
         paths: selected_paths,
         mode: request.mode,
-        dependency_files,
+        dependency_files: dependency_files.into(),
         dependency_policy,
         catalog_ready: false,
         prepare_metrics: Value::Null,
-        schemas: BTreeMap::new(),
+        schemas: Default::default(),
         selection: Selection::default(),
         revision: 0,
         state: "prepared".into(),
@@ -640,6 +688,7 @@ pub fn prepare(project_root: &Path, request: &PrepareRequest) -> Result<MergeJob
         "dependency_files":job.dependency_files.len(), "git_backed_dependencies":job.dependency_files.values().flatten().filter(|s|git_blob_oid(s).is_some()).count(),
         "workers":parallel::pool().current_num_threads(), "total_ms":started.elapsed().as_millis()});
     save(&dir, &job)?;
+    guard.disarm();
     tracing::info!(target: "locus::merge_jobs", job_id = %job.id, metrics = %job.prepare_metrics, "Merge prepare completed");
     Ok(job)
 }
@@ -750,7 +799,7 @@ fn check_target(root: &Path, dir: &Path, job: &MergeJob) -> Result<(), String> {
         return Err("stale: destination branch changed".into());
     }
     let (records, flags) = index_entries(root)?;
-    if records != job.snapshot.index_records || flags != job.snapshot.index_flags {
+    if records != *job.snapshot.index_records || flags != *job.snapshot.index_flags {
         return Err("stale: destination index changed".into());
     }
     check_files(root, dir, &job.snapshot.files)?;
@@ -795,9 +844,7 @@ pub fn preview(root: &Path, id: &str) -> Result<Preview, String> {
 /// Editor preflight each preview again: the latest result is kept per job so an
 /// unchanged plan renders once. Any change to the record misses the cache.
 fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
-    let key = blake3::hash(&serde_json::to_vec(job).map_err(|e| e.to_string())?)
-        .to_hex()
-        .to_string();
+    let key = journal::fingerprint(dir, job)?;
     let cache = dir.join("preview-latest.json");
     if let Some(preview) = std::fs::read(&cache)
         .ok()
@@ -807,6 +854,9 @@ fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
         return Ok(preview);
     }
     let preview = compute_preview(dir, job)?;
+    if depends_on_lfs_cache(&preview) {
+        return Ok(preview);
+    }
     // Best effort: a failed cache write only costs the next render.
     if let Ok(mut temp) = tempfile::NamedTempFile::new_in(dir) {
         use std::io::Write;
@@ -820,12 +870,54 @@ fn preview_job(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
     Ok(preview)
 }
 
+/// Remote for `git lfs fetch <remote> <commit>`, which must be named when a
+/// commit is given: `origin`, else the only remote, else a placeholder.
+fn lfs_fetch_remote(root: &Path) -> String {
+    let remotes = git_text(root, &["remote"]).unwrap_or_default();
+    let remotes: Vec<_> = remotes.lines().map(str::trim).filter(|r| !r.is_empty()).collect();
+    if remotes.contains(&"origin") {
+        "origin".into()
+    } else if let [only] = remotes.as_slice() {
+        (*only).into()
+    } else {
+        "<remote>".into()
+    }
+}
+
+/// One command downloads every missing object of `commit` (None: the current
+/// checkout) into the LFS cache. Paths that cannot be passed literally as a
+/// comma-separated, single-quoted `--include` list fetch the whole commit.
+fn lfs_fetch_command(remote: &str, commit: Option<&str>, paths: &BTreeSet<String>) -> String {
+    let mut command = match commit {
+        Some(commit) => format!("git lfs fetch {remote} {commit}"),
+        None => "git lfs fetch".into(),
+    };
+    if paths
+        .iter()
+        .all(|path| !path.contains([',', '\'', '*', '?', '[', '\\']))
+    {
+        let include = paths.iter().map(String::as_str).collect::<Vec<_>>().join(",");
+        command.push_str(&format!(" --include '{include}'"));
+    }
+    command
+}
+
+/// Whether a preview depends on the local LFS cache rather than only the job,
+/// so it must be recomputed after fetching instead of served from cache.
+fn depends_on_lfs_cache(preview: &Preview) -> bool {
+    preview
+        .issues
+        .iter()
+        .any(|issue| issue["code"] == "lfs_object_missing")
+}
+
 fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
-    let mut result = job.snapshot.files.clone();
+    let mut result = job.snapshot.files.to_inner();
     let mut issues = vec![];
     let mut excluded = vec![];
     let mut deferred = vec![];
     let mut result_schema_cache: Option<schema::SchemaMap> = None;
+    let mut rendered_fields: BTreeSet<(String, String)> = BTreeSet::new();
     for delta in job
         .deltas
         .iter()
@@ -974,9 +1066,26 @@ fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
         let base = state_bytes(dir, &delta.base)?;
         let source = state_bytes(dir, &delta.source)?;
         let current = state_bytes(dir, &target)?;
+        // The destination never changed this file and every source change is
+        // included: the three-way result is the source file, byte for byte.
+        // Rendering it from the destination could only reorder or respell it.
+        if object_choices.is_empty()
+            && current == base
+            && selected.len() == delta.changes.len()
+            && selected.iter().all(|(_, decision)| resolution_name(decision) == "include")
+        {
+            let output = delta.source.clone().map(|mut state| {
+                if let Some(target) = &target {
+                    state.mode = target.mode.clone();
+                }
+                state
+            });
+            result.insert(delta.path.clone(), output);
+            continue;
+        }
         let empty = schema::SchemaMap::new();
         if result_schema_cache.is_none() {
-            let mut schema_files = job.dependency_files.clone();
+            let mut schema_files = job.dependency_files.to_inner();
             schema_files.extend(result.clone());
             for choice in job
                 .selection
@@ -1043,7 +1152,45 @@ fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
         );
         match merge_session(&base, &current, &source, &aliases) {
             Ok(session) => {
+                // A later commit of this file was cataloged against the file as
+                // its earlier selected commits leave it when included in full.
+                // Other decisions for those commits can change what it meets.
+                let known: BTreeSet<&str> = session.catalog().changes.iter().map(|c| c.id.as_str()).collect();
+                let moved: Vec<Value> = selected
+                    .iter()
+                    .filter(|(change, _)| change["core_id"].as_str().is_some_and(|id| !known.contains(id)))
+                    .map(|(change, _)| change["id"].clone())
+                    .collect();
+                if !moved.is_empty() {
+                    let earlier: Vec<&str> = job.deltas.iter()
+                        .take_while(|d| !std::ptr::eq(*d, delta))
+                        .filter(|d| d.path == delta.path)
+                        .map(|d| d.commit.as_str())
+                        .collect();
+                    issues.push(json!({"code":"earlier_commit_decisions","path":delta.path,"commit":delta.commit,
+                        "change_ids":moved,"earlier_commits":earlier,
+                        "detail":"This commit's changes were listed against the file as the earlier selected commits leave it when included in full; the current decisions for those commits change the file, so these changes no longer apply as listed. Include the earlier commits' changes for this file, or choose the complete file with files.take"}));
+                    continue;
+                }
+                // Field operations bound to this commit that refine no selected
+                // change render with it, so their combined result is validated
+                // once (e.g. a restored component and its owner's listing).
+                let fields: Vec<&FieldChoice> = job.selection.fields.values()
+                    .filter(|f| f.path == delta.path && f.commit.as_deref() == Some(delta.commit.as_str()))
+                    .collect();
+                let independent = !fields.is_empty() && fields.iter().all(|f| {
+                    !job.selection.objects.values().any(|o| o.path == delta.path && o.object_id == f.object_id)
+                        && !selected.iter().any(|(c, _)| c["object_id"].as_str() == Some(f.object_id.as_str())
+                            && transforms::overlaps(c["property_path"].as_str().unwrap_or(""), &f.property_path))
+                });
                 let mut decisions = vec![];
+                if independent {
+                    for field in &fields {
+                        let resolution = serde_json::from_value(field.resolution.clone()).map_err(|e| e.to_string())?;
+                        decisions.push(crate::unity_asset_core::MergeSession::field_decision(&field.object_id, &field.property_path, resolution));
+                    }
+                    rendered_fields.insert((delta.path.clone(), delta.commit.clone()));
+                }
                 for (change, decision) in selected {
                     decisions.push(core_decision(
                         change["core_id"].as_str().ok_or("Missing core ID")?,
@@ -1102,15 +1249,31 @@ fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
                                             &delta.path,
                                             &conflict.change_id
                                         ));
+                                    } else if conflict.change_id.is_empty() && !conflict.object_id.is_empty() {
+                                        // A validation finding names an object, not a change:
+                                        // list the catalog changes of that object or of
+                                        // references to it, which are the ones to decide.
+                                        let reference = format!("={}", conflict.object_id);
+                                        let related: Vec<&Value> = delta.changes.iter()
+                                            .filter(|c| c["object_id"].as_str() == Some(conflict.object_id.as_str())
+                                                || c["property_path"].as_str().is_some_and(|p| p.ends_with(&reference)))
+                                            .map(|c| &c["id"])
+                                            .collect();
+                                        value["related_change_ids"] = json!(related);
                                     }
                                     value
                                 })
                                 .collect();
-                            let change_ids: Vec<_> = conflicts
-                                .iter()
-                                .filter_map(|c| c["change_id"].as_str().filter(|id| id.contains(':')))
-                                .map(str::to_string)
-                                .collect();
+                            let mut change_ids: Vec<String> = vec![];
+                            for conflict in &conflicts {
+                                let direct = conflict["change_id"].as_str().filter(|id| id.contains(':'));
+                                let related = conflict["related_change_ids"].as_array().into_iter().flatten().filter_map(Value::as_str);
+                                for id in direct.into_iter().chain(related) {
+                                    if !change_ids.iter().any(|known| known == id) {
+                                        change_ids.push(id.to_string());
+                                    }
+                                }
+                            }
                             issues.push(json!({"code":"asset_conflict","path":delta.path,"commit":delta.commit,
                                 "change_ids":change_ids,"conflicts":conflicts,"diagnostics":output.diagnostics,
                                 "detail":"resolve each listed change with plan.resolve(change_id, side=...) or a typed field operation"}));
@@ -1122,7 +1285,11 @@ fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
             Err(e) => issues.push(error_value("asset_parse", &delta.path, e.to_string())),
         }
     }
+    // (issue index, commit, path) of whole-file versions whose LFS object is not cached.
+    let mut missing_lfs: Vec<(usize, Option<String>, String)> = vec![];
     for choice in job.selection.files.values() {
+        // Commit whose tree holds a source/base version, for fetching its LFS objects.
+        let mut version_commit = None;
         if !scope_allows(job, &choice.path)
             || choice
                 .destination
@@ -1179,17 +1346,37 @@ fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
                     continue;
                 }
                 if choice.version == "source" {
+                    version_commit = Some(candidates[0].commit.clone());
                     candidates[0].source.clone()
                 } else {
+                    version_commit = Some(candidates[0].parent.clone());
                     candidates[0].base.clone()
                 }
             }
             _ => return Err("Unsupported whole-file version".into()),
         };
-        let output = output
+        let output = match output
             .as_ref()
             .map(|state| materialize_lfs(Path::new(&job.root), dir, state))
-            .transpose()?;
+            .transpose()?
+        {
+            None => None,
+            Some(Materialized::Complete(state)) => Some(state),
+            Some(Materialized::Missing { oid, size }) => {
+                // Report and keep going so one preview lists every missing object;
+                // the pointer bytes are never planned.
+                let detail = if choice.version == "content" {
+                    "Supplied content is a Git LFS pointer whose object is not in the local LFS cache; supply the complete file content instead"
+                } else {
+                    missing_lfs.push((issues.len(), version_commit.clone(), choice.path.clone()));
+                    "The complete Git LFS object for this file version is not in the local LFS cache; run each distinct fetch_command once (it only fills the LFS cache and leaves the working tree untouched), then preview again"
+                };
+                issues.push(json!({"code":"lfs_object_missing","path":choice.path,
+                    "version":choice.version,"commit":version_commit,"oid":oid,"size":size,
+                    "fetch_command":null,"detail":detail}));
+                continue;
+            }
+        };
         if choice.version == "move" {
             let destination = choice
                 .destination
@@ -1222,7 +1409,18 @@ fn compute_preview(dir: &Path, job: &MergeJob) -> Result<Preview, String> {
             result.insert(choice.path.clone(), output);
         }
     }
-    transforms::apply(dir, job, &mut result, &mut issues)?;
+    if !missing_lfs.is_empty() {
+        let mut by_commit: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+        for (_, commit, path) in &missing_lfs {
+            by_commit.entry(commit.clone()).or_default().insert(path.clone());
+        }
+        let remote = lfs_fetch_remote(Path::new(&job.root));
+        for (index, commit, _) in &missing_lfs {
+            issues[*index]["fetch_command"] =
+                json!(lfs_fetch_command(&remote, commit.as_deref(), &by_commit[commit]));
+        }
+    }
+    transforms::apply(dir, job, &mut result, &mut issues, &rendered_fields)?;
     let changed: BTreeMap<_, _> = result
         .iter()
         .filter(|(p, s)| job.snapshot.files.get(*p) != Some(*s))
@@ -1265,10 +1463,11 @@ fn dependency_issues(
     let mut full_result = job.dependency_files.clone();
     full_result.extend(result.clone());
     let result = &full_result;
+    let root = Path::new(&job.root);
     let target_guids = dependencies::owners(dir, &target)?;
     let guids = dependencies::owners(dir, result)?;
     issues.extend(dependencies::removed_object_issues(
-        dir, &target, result, changed, &target_guids, &guids,
+        root, dir, &target, result, changed, &target_guids, &guids,
     )?);
     for (guid, owners) in &guids {
         if owners.len() > 1 && target_guids.get(guid) != Some(owners) {
@@ -1284,49 +1483,77 @@ fn dependency_issues(
         .filter(|guid| !guids.contains_key(*guid))
         .cloned()
         .collect();
-    // A changed/deleted meta can break an UNCHANGED asset. The full frozen
-    // graph is inspected only when ownership disappears; compact blob summaries
-    // are reused across jobs and previews without reparsing whole scenes.
-    if !removed_guids.is_empty() {
+    // A changed/deleted meta can break an UNCHANGED asset, but only one that
+    // spells a removed GUID: those few are found by a budgeted byte search and
+    // only they are parsed. Changed assets are always checked for new
+    // references. Compact blob summaries are reused across jobs and previews.
+    let matcher = dependencies::GuidMatcher::new(&removed_guids);
+    let mut checked: Vec<(&String, dependencies::Mention)> = Vec::new();
+    for (path, state) in changed {
+        let Some(state) = state.as_ref().filter(|_| dependencies::reference_candidate(path)) else {
+            continue;
+        };
+        match dependencies::dependency_bytes(root, dir, state)? {
+            Ok((state, bytes)) if unity_yaml(path, &bytes) => {
+                checked.push((path, dependencies::Mention::Spells(state)))
+            }
+            Ok(_) => {}
+            Err(reason) => checked.push((path, dependencies::Mention::Unreadable(reason))),
+        }
+    }
+    if !matcher.is_empty() {
         prefetch_git(dir, result.iter().filter(|(p,_)| snapshot::evidence(p)
             && !p.ends_with(".cs") && !p.ends_with(".meta") && !p.ends_with(".asmdef"))
             .filter_map(|(_,s)|s.as_ref()))?;
+        checked.extend(dependencies::spelling_assets(
+            root, dir, result, &|path| !changed.contains_key(path), &matcher,
+        )?);
+        checked.sort_by(|a, b| a.0.cmp(b.0));
     }
-    for (path, state) in if removed_guids.is_empty() {
-        changed
-    } else {
-        result
-    } {
-        if !dependencies::reference_candidate(path) { continue; }
-        let Some(state) = state else {
-            continue;
-        };
-        let bytes = read_blob(dir, state)?;
-        if !unity_yaml(path, &bytes) {
-            if !removed_guids.is_empty() && is_lfs_pointer(&bytes) {
-                issues.push(error_value("dependency_coverage",path,"A dependency is an unmaterialized LFS pointer while GUID ownership is removed"));
+    let check = |path: &String, found: dependencies::Mention| -> Result<Vec<Value>, String> {
+        let state = match found {
+            dependencies::Mention::Spells(state) => state,
+            dependencies::Mention::Unreadable(reason) if !matcher.is_empty() => {
+                return Ok(vec![error_value("dependency_coverage", path,
+                    format!("Cannot check this asset's references while a GUID is removed: {reason}"))]);
             }
-            continue;
-        }
-        let references = dependencies::references(dir, state)?;
-        if !references.parsed && !removed_guids.is_empty() {
-            issues.push(error_value("dependency_coverage",path,"An asset cannot be parsed while a GUID is being removed; its references require explicit handling"));
-            continue;
+            dependencies::Mention::Unreadable(_) => return Ok(vec![]),
+        };
+        let references = dependencies::references(dir, &state)?;
+        let mut found = Vec::new();
+        // GUIDs named only in `guid` keys the lexical scan could not resolve.
+        let unresolved = references.unresolved(&removed_guids, || {
+            parallel::with_bytes(blob_len(dir, &state).unwrap_or(0), || read_blob(dir, &state))
+                .map(|bytes| matcher.mentioned(&bytes))
+        })?;
+        if !unresolved.is_empty() {
+            found.push(json!({"code":"dependency_coverage","path":path,"guids":unresolved,
+                "detail":"This asset names a GUID whose asset/meta is being removed in a `guid` key outside a recognizable `{fileID, guid}` reference, so its references cannot be checked; keep the removed asset/meta, or take a version of this asset in Unity's text format"}));
         }
         let old_guids = match target.get(path).and_then(|s| s.as_ref()) {
             Some(state) => dependencies::references(dir, state)?.guids,
             None => BTreeSet::new(),
         };
-        for guid in &references.guids {
-            if guid.starts_with("0000000000000000")
-                || guids.contains_key(guid)
-                || (old_guids.contains(guid) && !removed_guids.contains(guid))
-            {
-                continue;
-            }
-            issues.push(error_value("missing_guid_dependency",path,format!("Reference {guid} has no meta in the frozen result; include its asset/meta or explicitly revise the reference")));
-        }
-    }
+        found.extend(
+            references
+                .guids
+                .iter()
+                .filter(|guid| {
+                    !(guid.starts_with("0000000000000000")
+                        || guids.contains_key(*guid)
+                        || (old_guids.contains(*guid) && !removed_guids.contains(*guid)))
+                })
+                .map(|guid| error_value("missing_guid_dependency",path,format!("Reference {guid} has no meta in the frozen result; include its asset/meta or explicitly revise the reference"))),
+        );
+        Ok(found)
+    };
+    let found = parallel::pool().install(|| {
+        checked
+            .into_par_iter()
+            .map(|(path, found)| check(path, found))
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    issues.extend(found.into_iter().flatten());
     for (path, state) in changed.iter().filter(|(p, _)| !p.ends_with(".meta")) {
         if state.is_none()
             && result
@@ -1593,7 +1820,7 @@ fn chosen_paths(job: &MergeJob, params: &Value) -> Result<Vec<String>, String> {
 }
 
 fn scoped_files(job: &MergeJob) -> BTreeMap<String, Option<FileState>> {
-    let mut files = job.snapshot.files.clone();
+    let mut files = job.snapshot.files.to_inner();
     files.extend(job.applied_files.clone());
     files
 }
@@ -1623,7 +1850,7 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
         "files.set_text" => Some(&["path", "content", "eol"]),
         "files.move" => Some(&["path", "destination"]),
         "objects.take" | "objects.add" => Some(&["path", "object_id", "commit", "side"]),
-        "objects.delete" => Some(&["path", "object_id", "commit"]),
+        "objects.delete" | "objects.restore" => Some(&["path", "object_id", "commit"]),
         "objects.clear" => Some(&["path", "object_id"]),
         "objects.move" => Some(&["path", "object_id", "parent_id", "position"]),
         "fields.set" => Some(&["path", "object_id", "property_path", "commit", "value"]),
@@ -1672,16 +1899,33 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
     let root = repository(root)?;
     let _lock = lock(&root)?;
     let dir = job_dir(&root, id)?;
+    if action == "abort" && !dir.join("job.json").is_file() {
+        return Ok(json!({"job_id":id,"state":"removed","idempotent":true}));
+    }
     let mut job = load(&project_root, id)?;
     if job.mode == PrepareMode::Files && (action.starts_with("objects.") || action.starts_with("fields.") || action.starts_with("assets.")) {
         return Err("File replacement plans support file operations; prepare mode='structural' for object/field edits".into());
     }
-    if matches!(action, "changes" | "include" | "exclude" | "defer" | "resolve"
+    if matches!(action, "changes" | "change_summary" | "include" | "exclude" | "defer" | "resolve"
         | "files.include" | "files.exclude" | "objects.include" | "objects.exclude"
-        | "objects.take" | "objects.add" | "objects.delete" | "fields.include" | "fields.exclude"
+        | "objects.take" | "objects.add" | "objects.delete" | "objects.restore" | "fields.include" | "fields.exclude"
         | "fields.take" | "fields.set" | "fields.delete") && !job.catalog_ready {
         ensure_catalog(&dir, &mut job)?;
         save(&dir, &job)?;
+    }
+    // A full snapshot freezes clean Unity files as read-only inputs; an edit
+    // of one makes it a writable target with its unchanged raw bytes.
+    if job.paths.is_none() && matches!(action, "assets.preview" | "assets.apply" | "files.set_text"
+        | "objects.take" | "objects.add" | "objects.delete" | "objects.move" | "objects.restore"
+        | "fields.take" | "fields.set" | "fields.delete")
+    {
+        if let Some(path) = params.get("path").and_then(Value::as_str) {
+            if !job.snapshot.files.contains_key(path) && scope_allows(&job, path) {
+                safe_path(&root, path)?;
+                let state = snapshot::capture_target(&root, &dir, &job, path)?;
+                job.snapshot.files.insert(path.to_string(), state);
+            }
+        }
     }
     if action == "assets.read" { return transforms::read_asset(&dir,&job,&params); }
     if matches!(action,"assets.preview"|"assets.apply") {
@@ -1708,16 +1952,10 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
         return inspection::inspect(&dir, &job, &params);
     }
     if action == "changes" {
-        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(100)
-            .clamp(1, 1000) as usize;
-        let changes: Vec<_> = job.deltas.iter().flat_map(|d| &d.changes).collect();
-        return Ok(
-            json!({"changes":changes.iter().skip(offset).take(limit).collect::<Vec<_>>(),"total":changes.len(),"next_offset":offset.checked_add(limit).filter(|next|*next<changes.len())}),
-        );
+        return catalog_query::changes(&job, &params);
+    }
+    if action == "change_summary" {
+        return catalog_query::summary(&dir, &job, &params);
     }
     if matches!(action, "preview" | "validate" | "check_dependencies") {
         let preview = preview_job(&dir, &job)?;
@@ -1732,6 +1970,7 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
         }
         return serde_json::to_value(preview).map_err(|e| e.to_string());
     }
+    let mut restored = Value::Null;
     match action {
         "new_plan" => {
             editable(&job)?;
@@ -1797,6 +2036,10 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
                 .objects
                 .insert(format!("{}:{}:{}", choice.commit, path, object_id), choice);
         }
+        "objects.restore" => {
+            editable(&job)?;
+            restored = objects_restore(&dir, &mut job, &params)?;
+        }
         "objects.clear" => {
             editable(&job)?;
             let path = param_str(&params, "path")?;
@@ -1821,9 +2064,8 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
             }
             safe_path(&root, &path)?;
             if !job.snapshot.files.contains_key(&path) {
-                job.snapshot
-                    .files
-                    .insert(path.clone(), capture(&root, &dir, &path)?);
+                let state = snapshot::capture_target(&root, &dir, &job, &path)?;
+                job.snapshot.files.insert(path.clone(), state);
             }
             let version = if action == "files.delete" {
                 "delete"
@@ -1866,9 +2108,8 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
                 }
                 safe_path(&root, dest)?;
                 if !job.snapshot.files.contains_key(dest) {
-                    job.snapshot
-                        .files
-                        .insert(dest.clone(), capture(&root, &dir, dest)?);
+                    let state = snapshot::capture_target(&root, &dir, &job, dest)?;
+                    job.snapshot.files.insert(dest.clone(), state);
                 }
             }
             job.selection.files.insert(
@@ -1972,8 +2213,8 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
             if git_text(&root, &["rev-parse", "HEAD"])? != job.snapshot.head
                 || index_entries(&root)?
                     != (
-                        job.snapshot.index_records.clone(),
-                        job.snapshot.index_flags.clone(),
+                        job.snapshot.index_records.to_inner(),
+                        job.snapshot.index_flags.to_inner(),
                     )
             {
                 job.state = "recovery_required".into();
@@ -1988,14 +2229,16 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
         }
         "abort" => {
             if job.state == "aborted" {
-                return Ok(json!({"state":"aborted","idempotent":true}));
+                retention::retire(&root, id)?;
+                return Ok(json!({"job_id":id,"state":"aborted","idempotent":true,"removed":true}));
             }
             if job.commit_oid.is_some() || matches!(job.state.as_str(), "staged" | "staging") {
                 return Err("A staged/committed job requires a new explicit reverse plan; abort never resets index or rewrites commits".into());
             }
             restore(&root, &dir, &mut job)?;
             save(&dir, &job)?;
-            return Ok(json!({"job_id":id,"state":job.state}));
+            retention::retire(&root, id)?;
+            return Ok(json!({"job_id":id,"state":job.state,"removed":true}));
         }
         "stage" => {
             check_destination(&root, &job)?;
@@ -2055,18 +2298,100 @@ pub fn execute(root: &Path, id: &str, action: &str, params: Value) -> Result<Val
             return Ok(json!({"job_id":id,"state":job.state,"paths":paths}));
         }
         "commit" => {
-            return commit_job(&root, &dir, &mut job, &params);
+            let mut result = commit_job(&root, &dir, &mut job, &params)?;
+            if job.state == "committed" {
+                // The commit is the job's record from here on.
+                retention::retire(&root, id)?;
+                result["removed"] = json!(true);
+            }
+            return Ok(result);
         }
         _ => return Err(format!("Unknown merge job operation: {action}")),
     }
     job.revision += 1;
     job.unity_validated_hash = None;
     save(&dir, &job)?;
-    Ok(json!({"job_id":id,"revision":job.revision,"state":job.state}))
+    let mut result = json!({"job_id":id,"revision":job.revision,"state":job.state});
+    if !restored.is_null() {
+        result["restored"] = restored;
+    }
+    Ok(result)
+}
+
+/// Brings back an object the destination deleted, with the deleted part of
+/// the hierarchy it belongs to and the owner list elements that attach it.
+/// Objects with a catalog change are resolved to the source; the others are
+/// added from the source; attachments are field takes. All of them render
+/// with this commit's changes and are validated as one result.
+fn objects_restore(dir: &Path, job: &mut MergeJob, params: &Value) -> Result<Value, String> {
+    let path = param_str(params, "path")?.to_string();
+    let object_id = param_str(params, "object_id")?.to_string();
+    let commit = params.get("commit").and_then(Value::as_str);
+    let candidates: Vec<&CommitDelta> = job
+        .deltas
+        .iter()
+        .filter(|d| d.path == path && commit.map_or(true, |c| c == d.commit))
+        .collect();
+    let [delta] = candidates.as_slice() else {
+        return Err("objects.restore requires one explicit selected source commit when the file has multiple versions".into());
+    };
+    if delta.kind != "unity_yaml" {
+        return Err("objects.restore requires a Unity YAML asset".into());
+    }
+    let delta = (*delta).clone();
+    let target = state_bytes(dir, job.snapshot.files.get(&path).unwrap_or(&None))?;
+    let source = state_bytes(dir, &delta.source)?;
+    let parse = |bytes: &[u8], side: &str| {
+        crate::unity_asset_core::parse(bytes).map_err(|e| format!("Cannot read the {side} version of {path}: {e}"))
+    };
+    let restore = crate::unity_asset_core::restore_closure(&parse(&target, "destination")?, &parse(&source, "source")?, &object_id)?;
+    let mut resolved = vec![];
+    let mut added = vec![];
+    for object in &restore.objects {
+        let key = format!("{}:{}:{}", delta.commit, path, object);
+        let ids: Vec<String> = delta
+            .changes
+            .iter()
+            .filter(|c| c["object_id"].as_str() == Some(object.as_str()) && c["property_path"].as_str() == Some(""))
+            .filter_map(|c| c["id"].as_str().map(str::to_string))
+            .collect();
+        if ids.is_empty() {
+            job.selection.objects.insert(key, ObjectChoice {
+                path: path.clone(),
+                object_id: object.clone(),
+                commit: delta.commit.clone(),
+                operation: "add".into(),
+                resolution: json!({"kind":"source"}),
+            });
+            added.push(object.clone());
+        } else {
+            job.selection.objects.remove(&key);
+            for id in ids {
+                job.selection.decisions.insert(id.clone(), json!({"kind":"source"}));
+                resolved.push(id);
+            }
+        }
+    }
+    let mut attached = vec![];
+    for (owner, property) in &restore.attach {
+        transforms::set(job, "fields.take", &json!({"path":path,"object_id":owner,"property_path":property,"side":"source","commit":delta.commit}))?;
+        attached.push(json!({"object_id":owner,"property_path":property}));
+    }
+    Ok(json!({"objects":restore.objects,"resolved_change_ids":resolved,"added":added,"attached":attached}))
+}
+
+/// A file the Editor serializes (an asset, scene, Prefab or `.meta`) and can
+/// therefore hold with unsaved changes; code and plain text it never writes.
+fn editor_serialized(path: &str) -> bool {
+    snapshot::evidence(path)
+        && !path.ends_with(".cs")
+        && !path.ends_with(".asmdef")
+        && !path.ends_with(".json")
+        && !path.ends_with("ProjectVersion.txt")
 }
 
 fn restore(root: &Path, dir: &Path, job: &mut MergeJob) -> Result<(), String> {
-    if !job.applied_files.is_empty() && crate::unity_bridge::is_unity_project(&job.project_root) {
+    if job.applied_files.keys().any(|path| editor_serialized(path)) && crate::unity_bridge::is_unity_project(&job.project_root) {
         let editor = crate::unity_bridge::query_current_project_editor_process_uncached(job.project_root.clone());
         match editor.state {
             crate::unity_bridge::UnityEditorProcessState::NotRunning => {}
@@ -2219,7 +2544,7 @@ fn commit_job(
     job.state = "committed".into();
     save(dir, job)?;
     Ok(
-        json!({"job_id":job.id,"state":job.state,"commit":oid,"parents":[job.snapshot.head],"paths":paths,"manifest":dir.join("job.json").to_string_lossy()}),
+        json!({"job_id":job.id,"state":job.state,"commit":oid,"parents":[job.snapshot.head],"paths":paths}),
     )
 }
 
@@ -2314,7 +2639,7 @@ fn validate_commit_dependencies(
     job: &MergeJob,
     outputs: &BTreeMap<String, Option<FileState>>,
 ) -> Result<BTreeMap<String, Option<FileState>>, String> {
-    let mut all_files = job.dependency_files.clone();
+    let mut all_files = job.dependency_files.to_inner();
     all_files.extend(scoped_files(job));
     let paths: Vec<_> = all_files.keys().cloned().collect();
     let head_files = tree_files(root, dir, &job.snapshot.head, &paths)?;
@@ -2322,7 +2647,7 @@ fn validate_commit_dependencies(
     candidate.extend(outputs.clone());
     let mut baseline = job.clone();
     baseline.dependency_files.clear();
-    baseline.snapshot.files = head_files;
+    baseline.snapshot.files = head_files.into();
     let mut issues = vec![];
     dependency_issues(dir, &baseline, &candidate, outputs, &mut issues)?;
     issues.extend(schema::commit_field_issues(

@@ -79,6 +79,8 @@ namespace Locus.MergeTesting
             public Action<Ctx> createBase;
             public Action<Ctx> target;
             public Action<Ctx> source;
+            // A second source commit made on top of the first; both are merged in order.
+            public Action<Ctx> source2;
             public Action<string, Facts> inspect;
             // Reads the copy the Editor already has open (scene or Prefab Stage), then closes it.
             public Action<string, Facts> inspectOpen;
@@ -388,6 +390,251 @@ namespace Locus.MergeTesting
                 // own disk transaction.
                 ["scene_open_reload"] = OpenSceneCase("Reload.unity"),
                 ["scene_open_transaction"] = OpenSceneCase("ReloadTransaction.unity"),
+                // Larger than the bridge's 16 MiB request: the Editor's transaction
+                // must read the merged bytes from the staged file.
+                ["scene_large_transaction"] = OpenSceneCase("LargeTransaction.unity", LargeSceneRoots),
+                // Both sides add roots whose random fileIDs interleave across the
+                // file and the source deletes one. The merged scene must be the file
+                // Unity itself writes, so re-saving it changes no byte.
+                ["scene_both_add"] = new Case
+                {
+                    file = "BothAdd.unity",
+                    createBase = c => CreateScene(c.path, scene =>
+                    {
+                        foreach (var name in new[] { "A", "B", "C" }) Child(NewObject(name, scene), name + "Leaf");
+                    }),
+                    target = c => EditScene(c.path, scene =>
+                    {
+                        Root(scene, "A").transform.localPosition = new Vector3(1, 0, 0);
+                        AddRoots(scene, "T");
+                    }),
+                    source = c => EditScene(c.path, scene =>
+                    {
+                        AddRoots(scene, "S");
+                        BurnTargetIds(scene);
+                        Root(scene, "B").transform.localPosition = new Vector3(0, 2, 0);
+                        UnityEngine.Object.DestroyImmediate(Root(scene, "C"));
+                    }),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            f.Add("roots", Sorted(scene.GetRootGameObjects().Select(root => root.name)));
+                            f.Add("a.x", Root(scene, "A").transform.localPosition.x);
+                            f.Add("b.y", Root(scene, "B").transform.localPosition.y);
+                            f.Add("leaves", scene.GetRootGameObjects().Sum(root => root.transform.childCount));
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
+                // The destination never changed the scene: the result is the source
+                // file itself (checked byte for byte by the driver) and stays stable.
+                ["scene_untouched_destination"] = new Case
+                {
+                    file = "Untouched.unity",
+                    createBase = c => CreateScene(c.path, scene =>
+                    {
+                        foreach (var name in new[] { "A", "B" }) Child(NewObject(name, scene), name + "Leaf");
+                    }),
+                    target = c => { },
+                    source = c => EditScene(c.path, scene =>
+                    {
+                        AddRoots(scene, "S");
+                        Root(scene, "A").transform.localPosition = new Vector3(0, 2, 0);
+                        UnityEngine.Object.DestroyImmediate(Root(scene, "B"));
+                    }),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            f.Add("roots", Sorted(scene.GetRootGameObjects().Select(root => root.name)));
+                            f.Add("a.y", Root(scene, "A").transform.localPosition.y);
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
+                // Hierarchy edits on both sides: the source reparents a child and
+                // adds a component, the destination renames another child; both
+                // edit different axes of one position.
+                ["scene_hierarchy_edits"] = new Case
+                {
+                    file = "Hierarchy.unity",
+                    createBase = c => CreateScene(c.path, scene =>
+                    {
+                        var a = NewObject("A", scene);
+                        Child(a, "A1");
+                        Child(a, "A2");
+                        Child(NewObject("B", scene), "B1");
+                    }),
+                    target = c => EditScene(c.path, scene =>
+                    {
+                        Root(scene, "A").transform.Find("A2").name = "A2T";
+                        Root(scene, "B").transform.Find("B1").localPosition = new Vector3(1, 0, 0);
+                    }),
+                    source = c => EditScene(c.path, scene =>
+                    {
+                        var a = Root(scene, "A");
+                        a.transform.Find("A1").SetParent(Root(scene, "B").transform, false);
+                        a.AddComponent<BoxCollider>();
+                        Root(scene, "B").transform.Find("B1").localPosition = new Vector3(0, 3, 0);
+                    }),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            var a = Root(scene, "A");
+                            var b = Root(scene, "B");
+                            f.Add("a.children", Sorted(ChildNames(a.transform)));
+                            f.Add("b.children", Sorted(ChildNames(b.transform)));
+                            f.Add("a.components", Sorted(ComponentNames(a)));
+                            var b1 = b.transform.Find("B1");
+                            f.Add("b1.x", b1.localPosition.x);
+                            f.Add("b1.y", b1.localPosition.y);
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
+                // The source removes a component the destination edited; keeping
+                // the destination's component must leave it attached.
+                ["scene_component_delete_modify"] = new Case
+                {
+                    file = "ComponentDeleteModify.unity",
+                    createBase = c => CreateScene(c.path, scene => NewObject("A", scene).AddComponent<BoxCollider>()),
+                    target = c => EditScene(c.path, scene => SetFloat(Root(scene, "A").GetComponent<BoxCollider>(), "m_Size.x", 2)),
+                    source = c => EditScene(c.path, scene => UnityEngine.Object.DestroyImmediate(Root(scene, "A").GetComponent<BoxCollider>())),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            var a = Root(scene, "A");
+                            f.Add("a.components", Sorted(ComponentNames(a)));
+                            var box = a.GetComponent<BoxCollider>();
+                            f.Add("box.x", box == null ? (object)"none" : box.size.x);
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
+                // The destination removed a component the source edited; restoring
+                // the source's component must attach it to its GameObject again.
+                ["scene_component_restore"] = new Case
+                {
+                    file = "ComponentRestore.unity",
+                    createBase = c => CreateScene(c.path, scene => NewObject("A", scene).AddComponent<BoxCollider>()),
+                    target = c => EditScene(c.path, scene => UnityEngine.Object.DestroyImmediate(Root(scene, "A").GetComponent<BoxCollider>())),
+                    source = c => EditScene(c.path, scene => SetFloat(Root(scene, "A").GetComponent<BoxCollider>(), "m_Size.x", 3)),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            var a = Root(scene, "A");
+                            f.Add("a.components", Sorted(ComponentNames(a)));
+                            var box = a.GetComponent<BoxCollider>();
+                            f.Add("box.x", box == null ? (object)"none" : box.size.x);
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
+                // The destination deleted a root with its children while the
+                // source edited a collider two levels down: one restore brings
+                // the whole root back under the scene roots.
+                ["scene_subtree_restore"] = new Case
+                {
+                    file = "SubtreeRestore.unity",
+                    createBase = c => CreateScene(c.path, scene =>
+                    {
+                        NewObject("A", scene);
+                        var r = NewObject("R", scene);
+                        var child = Child(r, "C");
+                        Child(child.gameObject, "D").gameObject.AddComponent<BoxCollider>();
+                    }),
+                    target = c => EditScene(c.path, scene => UnityEngine.Object.DestroyImmediate(Root(scene, "R"))),
+                    source = c => EditScene(c.path, scene =>
+                        SetFloat(Root(scene, "R").transform.Find("C/D").GetComponent<BoxCollider>(), "m_Size.x", 3)),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            f.Add("roots", Sorted(scene.GetRootGameObjects().Select(root => root.name)));
+                            var d = Root(scene, "R").transform.Find("C/D");
+                            f.Add("d", d == null ? "missing" : "present");
+                            f.Add("d.box.x", d == null ? (object)"none" : d.GetComponent<BoxCollider>().size.x);
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
+                // The destination deleted a child of a kept root, leaving its
+                // `m_Children: []`; the restore adds it back there.
+                ["scene_child_restore"] = new Case
+                {
+                    file = "ChildRestore.unity",
+                    createBase = c => CreateScene(c.path, scene =>
+                    {
+                        var r = NewObject("R", scene);
+                        Child(Child(r, "C").gameObject, "D").gameObject.AddComponent<BoxCollider>();
+                    }),
+                    target = c => EditScene(c.path, scene => UnityEngine.Object.DestroyImmediate(Root(scene, "R").transform.Find("C").gameObject)),
+                    source = c => EditScene(c.path, scene =>
+                        SetFloat(Root(scene, "R").transform.Find("C/D").GetComponent<BoxCollider>(), "m_Size.x", 3)),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            var r = Root(scene, "R").transform;
+                            f.Add("r.children", Sorted(ChildNames(r)));
+                            var d = r.Find("C/D");
+                            f.Add("d.box.x", d == null ? (object)"none" : d.GetComponent<BoxCollider>().size.x);
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
+                // The destination deleted a Prefab child the source moved; restoring
+                // keeps the move.
+                ["prefab_delete_modify_restore"] = new Case
+                {
+                    file = "DeleteModifyRestore.prefab",
+                    createBase = c => SavePrefab(c.path, "Root", root => { Child(root, "A"); Child(root, "B"); }),
+                    target = c => EditPrefab(c.path, root => UnityEngine.Object.DestroyImmediate(root.transform.Find("B").gameObject)),
+                    source = c => EditPrefab(c.path, root => root.transform.Find("B").localPosition = new Vector3(0, 0, 5)),
+                    inspect = (path, f) => WithPrefab(path, root =>
+                    {
+                        f.Add("children", Sorted(ChildNames(root.transform)));
+                        var b = root.transform.Find("B");
+                        f.Add("b.z", b == null ? (object)"none" : b.localPosition.z);
+                    }),
+                },
+                // Two consecutive source commits: the second edits the root the
+                // first added and a value the first changed.
+                ["scene_commit_sequence"] = new Case
+                {
+                    file = "Sequence.unity",
+                    createBase = c => CreateScene(c.path, scene =>
+                    {
+                        NewObject("A", scene);
+                        Child(NewObject("B", scene), "BLeaf");
+                    }),
+                    target = c => EditScene(c.path, scene => Root(scene, "A").transform.localPosition = new Vector3(1, 0, 0)),
+                    source = c => EditScene(c.path, scene =>
+                    {
+                        Child(NewObject("S", scene), "SLeaf");
+                        Root(scene, "B").transform.localPosition = new Vector3(0, 1, 0);
+                    }),
+                    source2 = c => EditScene(c.path, scene =>
+                    {
+                        Root(scene, "S").transform.localPosition = new Vector3(0, 2, 0);
+                        Root(scene, "B").transform.localPosition = new Vector3(0, 5, 0);
+                    }),
+                    inspect = (path, f) =>
+                    {
+                        WithScene(path, scene =>
+                        {
+                            f.Add("roots", Sorted(scene.GetRootGameObjects().Select(root => root.name)));
+                            f.Add("a.x", Root(scene, "A").transform.localPosition.x);
+                            f.Add("b.y", Root(scene, "B").transform.localPosition.y);
+                            f.Add("s.y", Root(scene, "S").transform.localPosition.y);
+                        });
+                        ResaveFacts(path, f);
+                    },
+                },
                 // The same for a prefab open in Prefab Mode.
                 ["prefab_stage_reload"] = new Case
                 {
@@ -411,12 +658,68 @@ namespace Locus.MergeTesting
             };
         }
 
-        private static Case OpenSceneCase(string file)
+        private const int AddedRoots = 4;
+        // About 2.9 KB of YAML per root: roughly 18 MB in total.
+        private const int LargeSceneRoots = 6500;
+
+        private static void AddRoots(Scene scene, string prefix)
+        {
+            for (var i = 0; i < AddedRoots; i++) Child(NewObject(prefix + i, scene), prefix + "Leaf" + i);
+        }
+
+        // One Editor session gives the same fileIDs to the same sequence of new
+        // objects, newest first. Throwaways shaped like the target's additions,
+        // created after the source's own and saved once, take those ids so the
+        // source's objects keep ids a second machine could produce.
+        private static void BurnTargetIds(Scene scene)
+        {
+            var burners = new List<GameObject>();
+            for (var i = 0; i < AddedRoots; i++)
+            {
+                var burner = NewObject("Burner" + i, scene);
+                Child(burner, "BurnerLeaf" + i);
+                burners.Add(burner);
+            }
+            EditorSceneManager.MarkSceneDirty(scene);
+            if (!EditorSceneManager.SaveScene(scene)) throw new InvalidOperationException("Unable to save the id burners");
+            foreach (var burner in burners) UnityEngine.Object.DestroyImmediate(burner);
+        }
+
+        // Unity writes a scene in its own document order; a merge that produced
+        // that order saves back to identical bytes.
+        private static void ResaveFacts(string path, Facts f)
+        {
+            var before = File.ReadAllBytes(path);
+            var scene = EditorSceneManager.OpenScene(path, OpenSceneMode.Additive);
+            try
+            {
+                EditorSceneManager.MarkSceneDirty(scene);
+                if (!EditorSceneManager.SaveScene(scene)) throw new InvalidOperationException("Unable to re-save the merged scene: " + path);
+            }
+            finally { EditorSceneManager.CloseScene(scene, true); }
+            var after = File.ReadAllBytes(path);
+            var stable = before.SequenceEqual(after);
+            f.Add("resave_stable", stable);
+            if (!stable)
+            {
+                var a = System.Text.Encoding.UTF8.GetString(before).Split('\n');
+                var b = System.Text.Encoding.UTF8.GetString(after).Split('\n');
+                var line = Enumerable.Range(0, Math.Min(a.Length, b.Length)).FirstOrDefault(i => a[i] != b[i]);
+                f.Add("resave_first_difference", "line " + (line + 1) + ": merged '" + (line < a.Length ? a[line] : "") + "' saved '" + (line < b.Length ? b[line] : "") + "'");
+            }
+        }
+
+        private static Case OpenSceneCase(string file, int bulk = 0)
         {
             return new Case
             {
                 file = file,
-                createBase = c => CreateScene(c.path, scene => NewObject("A", scene)),
+                createBase = c => CreateScene(c.path, scene =>
+                {
+                    NewObject("A", scene);
+                    var padding = new string('x', 2400);
+                    for (var i = 0; i < bulk; i++) NewObject("Bulk" + i.ToString("D5", CultureInfo.InvariantCulture) + padding, scene);
+                }),
                 target = c => EditScene(c.path, scene => Root(scene, "A").transform.localPosition = new Vector3(1, 0, 0)),
                 source = c => EditScene(c.path, scene => Root(scene, "A").transform.localPosition = new Vector3(0, 2, 0)),
                 inspect = (path, f) => WithScene(path, scene => PositionFacts(Root(scene, "A").transform, f)),
@@ -492,6 +795,11 @@ namespace Locus.MergeTesting
                     ctx.Restore("base");
                     pair.Value.source(ctx);
                     ctx.Snap("source");
+                    if (pair.Value.source2 != null)
+                    {
+                        pair.Value.source2(ctx);
+                        ctx.Snap("source2");
+                    }
                     ctx.Restore("base");
                 }
                 catch (Exception error)

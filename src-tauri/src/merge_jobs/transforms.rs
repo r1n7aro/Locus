@@ -82,7 +82,7 @@ fn asset_bytes(dir: &Path, job: &MergeJob, path: &str) -> Result<Vec<u8>, String
     if !scope_allows(job, path) {
         return Err("Asset escapes the destination project root".into());
     }
-    if !job.snapshot.files.contains_key(path) {
+    if !job.snapshot.files.contains_key(path) && !job.dependency_files.contains_key(path) {
         return Err(
             "Asset is not in the frozen target snapshot; prepare a new job containing it".into(),
         );
@@ -97,6 +97,7 @@ fn asset_bytes(dir: &Path, job: &MergeJob, path: &str) -> Result<Vec<u8>, String
         .files
         .get(path)
         .or_else(|| job.snapshot.files.get(path))
+        .or_else(|| job.dependency_files.get(path))
         .cloned()
         .flatten()
         .ok_or("Asset is absent from the current plan result")?;
@@ -288,7 +289,7 @@ pub fn edit_asset(
     )
 }
 
-fn overlaps(a: &str, b: &str) -> bool {
+pub(super) fn overlaps(a: &str, b: &str) -> bool {
     a == b
         || a.strip_prefix(b).is_some_and(|v| v.starts_with('/'))
         || b.strip_prefix(a).is_some_and(|v| v.starts_with('/'))
@@ -298,9 +299,13 @@ pub fn apply(
     job: &MergeJob,
     result: &mut BTreeMap<String, Option<FileState>>,
     issues: &mut Vec<Value>,
+    rendered: &BTreeSet<(String, String)>,
 ) -> Result<(), String> {
     let mut groups: BTreeMap<(String, Option<String>), Vec<&FieldChoice>> = BTreeMap::new();
-    for choice in job.selection.fields.values() {
+    // `rendered` groups already ran inside their commit's structural render.
+    for choice in job.selection.fields.values().filter(|c| {
+        !c.commit.as_ref().is_some_and(|commit| rendered.contains(&(c.path.clone(), commit.clone())))
+    }) {
         groups
             .entry((choice.path.clone(), choice.commit.clone()))
             .or_default()

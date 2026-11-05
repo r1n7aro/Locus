@@ -194,7 +194,7 @@ fn shared_blobs_are_reused_and_stale_verification_does_not_write() {
     let repo = Repo::new();
     let commit = repo.commit("asset.asset", yaml(111, 5, "source"));
     let first = scoped(&repo, commit.clone(), "asset.asset", PrepareMode::Files);
-    let folder = journal_root(&repo.root).unwrap().join("blobs-v2");
+    let folder = journal_root(&repo.root).unwrap().join(BLOB_STORE);
     let count = std::fs::read_dir(&folder).unwrap().count();
     let second = scoped(&repo, commit, "asset.asset", PrepareMode::Files);
     assert_eq!(std::fs::read_dir(&folder).unwrap().count(), count);
@@ -355,51 +355,34 @@ fn custom_filter_clean_dependency_keeps_real_worktree_bytes() {
         .contains("configuration"));
 }
 
+/// A job written by an earlier journal version is not read; the next
+/// prepare removes it with the stores only earlier versions used.
 #[test]
-fn legacy_journal_still_reads_its_local_blobs() {
+fn earlier_journal_versions_are_rejected_and_removed() {
     let repo = Repo::new();
     let commit = repo.commit("asset.asset", yaml(111, 5, "source"));
-    let job = repo.job(vec![commit]);
-    let dir = job_dir(&repo.root, &job.id).unwrap();
-    let mut legacy = job.clone();
-    legacy.id = uuid::Uuid::new_v4().to_string();
-    legacy.version = 1;
-    let old = job_dir(&repo.root, &legacy.id).unwrap();
-    std::fs::create_dir_all(&old).unwrap();
-    for state in job.snapshot.files.values().flatten().chain(
-        job.deltas
-            .iter()
-            .flat_map(|d| d.base.iter().chain(&d.source)),
-    ) {
-        assert_eq!(
-            store_blob(&old, &read_blob(&dir, state).unwrap(), &state.mode).unwrap(),
-            *state
-        );
+    let journal = journal_root(&repo.root).unwrap();
+    let old = uuid::Uuid::new_v4().to_string();
+    let recovering = uuid::Uuid::new_v4().to_string();
+    for (id, state) in [(&old, "prepared"), (&recovering, "recovery_required")] {
+        std::fs::create_dir_all(journal.join(id)).unwrap();
+        std::fs::write(journal.join(id).join("job.json"), format!(r#"{{"version":2,"state":"{state}","deltas":[]}}"#)).unwrap();
     }
-    let mut value = serde_json::to_value(&legacy).unwrap();
-    for field in [
-        "paths",
-        "mode",
-        "dependency_files",
-        "catalog_ready",
-        "prepare_metrics",
-    ] {
-        value.as_object_mut().unwrap().remove(field);
+    for store in ["blobs-v2", "git-blobs-v2", "reference-cache-1-objects-v2"] {
+        std::fs::create_dir_all(journal.join(store)).unwrap();
+        std::fs::write(journal.join(store).join("entry"), b"x").unwrap();
     }
-    atomic_json(&old.join("job.json"), &value).unwrap();
-    let loaded = load(&repo.root, &legacy.id).unwrap();
-    assert!(loaded.catalog_ready);
-    assert_eq!(loaded.version, 1);
-    let view = execute(
-        &repo.root,
-        &legacy.id,
-        "inspect_asset",
-        json!({"path":"asset.asset"}),
-    )
-    .unwrap();
-    assert_eq!(view["kind"], "unity_yaml");
-    execute(&repo.root, &legacy.id, "include", json!({"all":true})).unwrap();
-    assert!(preview(&repo.root, &legacy.id).unwrap().ready_to_apply);
+    let error = load(&repo.root, &old).unwrap_err();
+    assert!(error.contains("earlier Locus version"), "{error}");
+    repo.job(vec![commit]);
+    assert!(!journal.join(&old).exists());
+    assert!(!journal.join("reference-cache-1-objects-v2").exists());
+    // A job an earlier version left mid-recovery keeps its data.
+    assert!(journal.join(&recovering).join("job.json").is_file());
+    assert!(journal.join("blobs-v2").exists());
+    std::fs::remove_dir_all(journal.join(&recovering)).unwrap();
+    repo.job(vec![repo.commit("notes.txt", "next\n")]);
+    assert!(!journal.join("blobs-v2").exists() && !journal.join("git-blobs-v2").exists());
 }
 
 #[test]
@@ -533,7 +516,7 @@ fn prepare_performance_baseline() {
         )
         .unwrap();
         let prepare_ms = start.elapsed().as_millis();
-        let folder = journal_root(&repo.root).unwrap().join("blobs-v2");
+        let folder = journal_root(&repo.root).unwrap().join(BLOB_STORE);
         let size: u64 = std::fs::read_dir(&folder)
             .unwrap()
             .map(|e| e.unwrap().metadata().unwrap().len())
@@ -652,4 +635,71 @@ fn real_asset_merge_benchmark() {
                 "preview_ms":preview_ms,"repeat_preview_ms":repeat_preview_ms,"apply_ms":apply_ms,"response_bytes":bytes})
         );
     }
+}
+
+/// Journal cost of one large merge: a full snapshot of a project with many
+/// clean Unity files and a scene whose every object changed. Prints the cost
+/// of each agent call and the bytes a plan change writes.
+#[test]
+#[ignore = "manual journal benchmark; prints JOURNAL_BENCH"]
+fn journal_cost_of_a_large_catalog() {
+    let objects: i64 = std::env::var("LOCUS_JOURNAL_BENCH_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(12_000);
+    let clean_files = 4_000;
+    let scene = |suffix: &str| {
+        let mut text = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+        for id in 1..=objects {
+            text.push_str(&format!("--- !u!1 &{id}\nGameObject:\n  m_Name: Object{id}{suffix}\n  m_IsActive: 1\n"));
+        }
+        text
+    };
+    let mut files: Vec<(String, String)> = (0..clean_files)
+        .map(|i| (format!("Assets/Clean/Asset{i}.asset.meta"), format!("fileFormatVersion: 2\nguid: {:032x}\n", i + 1)))
+        .collect();
+    files.push(("Assets/Level.unity".into(), scene("")));
+    let borrowed: Vec<(&str, &str)> = files.iter().map(|(p, c)| (p.as_str(), c.as_str())).collect();
+    let repo = repo_with(&borrowed);
+    let commit = repo.commit_files(&[("Assets/Level.unity", Some(&scene("Renamed")))]);
+    let start = Instant::now();
+    let job = repo.job(vec![commit]);
+    let prepare_ms = start.elapsed().as_millis();
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    let sizes = |dir: &Path| -> BTreeMap<String, u64> {
+        std::fs::read_dir(dir).unwrap().flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len())).collect()
+    };
+    let blobs = std::fs::read_dir(journal_root(&repo.root).unwrap().join(BLOB_STORE)).unwrap().count();
+    let mut calls = serde_json::Map::new();
+    let mut time = |label: &str, action: &str, params: Value| {
+        let start = Instant::now();
+        let value = execute(&repo.root, &job.id, action, params).unwrap();
+        calls.insert(label.into(), json!({"ms": start.elapsed().as_millis(), "response_bytes": value.to_string().len()}));
+    };
+    time("change_summary", "change_summary", json!({}));
+    time("conflicts", "changes", json!({"status":"conflict"}));
+    time("include_all", "include", json!({"all":true}));
+    time("exclude_one_file", "exclude", json!({"path":"Assets/Level.unity"}));
+    time("include_again", "include", json!({"path":"Assets/Level.unity"}));
+    time("preview", "preview", json!({}));
+    time("repeat_preview", "preview", json!({}));
+    let load_start = Instant::now();
+    let loaded = load(&repo.root, &job.id).unwrap();
+    let cached_load_ms = load_start.elapsed().as_micros() as f64 / 1000.0;
+    // The single-file journal every call used to parse, and every plan change to rewrite.
+    let whole = serde_json::to_vec(&(&loaded, &*loaded.deltas, &*loaded.snapshot.files, &*loaded.snapshot.index_records,
+        &*loaded.snapshot.index_flags, &*loaded.dependency_files, &loaded.selection.decisions)).unwrap();
+    let old_start = Instant::now();
+    let parsed: Value = serde_json::from_slice(&whole).unwrap();
+    let old_parse_ms = old_start.elapsed().as_millis();
+    let old_start = Instant::now();
+    atomic_bytes(&dir.join("old-format.tmp"), &serde_json::to_vec(&parsed).unwrap()).unwrap();
+    let old_write_ms = old_start.elapsed().as_millis();
+    std::fs::remove_file(dir.join("old-format.tmp")).unwrap();
+    std::println!(
+        "JOURNAL_BENCH {}",
+        json!({"objects":objects,"clean_files":clean_files,"changes":job.deltas.iter().map(|d| d.changes.len()).sum::<usize>(),
+            "prepare_ms":prepare_ms,"prepare_phases":job.prepare_metrics["phases"],"snapshot_targets":job.snapshot.files.len(),
+            "dependency_inputs":job.dependency_files.len(),"blob_files":blobs,"journal_files":sizes(&dir),
+            "calls":calls,"cached_load_ms":cached_load_ms,
+            "single_file_journal":{"bytes":whole.len(),"parse_ms":old_parse_ms,"write_ms":old_write_ms}})
+    );
 }

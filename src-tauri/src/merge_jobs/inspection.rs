@@ -110,10 +110,10 @@ pub(super) fn inspect(dir: &Path, job: &MergeJob, params: &Value) -> Result<Valu
     let mut preview_info = Value::Null;
     let mut selected_commit = None;
     let state = match version {
-        "target" => job.snapshot.files.get(path).cloned().ok_or("Asset was not part of the frozen target snapshot; prepare a job that includes this asset")?,
+        "target" => job.snapshot.files.get(path).or_else(|| job.dependency_files.get(path)).cloned().ok_or("Asset was not part of the frozen target snapshot; prepare a job that includes this asset")?,
         "result" => {
             let preview = preview_job(dir, job)?;
-            let state = preview.files.get(path).or_else(||job.snapshot.files.get(path)).cloned().ok_or("Asset is absent from the frozen target and selected result")?;
+            let state = preview.files.get(path).or_else(||job.snapshot.files.get(path)).or_else(|| job.dependency_files.get(path)).cloned().ok_or("Asset is absent from the frozen target and selected result")?;
             preview_info = json!({"plan_hash":preview.plan_hash,"ready_to_apply":preview.ready_to_apply,"issues":preview.issues});
             state
         }

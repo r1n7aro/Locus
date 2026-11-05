@@ -6,60 +6,30 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
+
 use std::sync::{LazyLock, Mutex};
 
-#[derive(Clone, Serialize, Deserialize)]
-struct Storage {
-    version: u32,
-    git_dir: PathBuf,
-}
-static STORAGE_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, Option<Storage>>>> =
-    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+/// Content-addressed bytes shared by every job of a repository: frozen
+/// working-tree files and merge outputs under their BLAKE3 digest, Git blobs
+/// under `git-<oid>`. Retention removes what no remaining job refers to.
+pub const BLOB_STORE: &str = "blobs-v3";
 
-pub fn init_storage(root: &Path, dir: &Path) -> Result<(), String> {
-    let git_dir = dunce::canonicalize(checkout_dirs(root)?.1).map_err(|e| e.to_string())?;
-    let storage = Storage { version: 2, git_dir };
-    fs::create_dir_all(shared_blobs(dir)?).map_err(|e| e.to_string())?;
-    fs::create_dir_all(dir.parent().ok_or("Missing journal parent")?.join("git-blobs-v2"))
-        .map_err(|e| e.to_string())?;
-    atomic_json(&dir.join("storage.json"), &storage)?;
-    cache_storage(dir, Some(storage));
-    Ok(())
+pub fn init_storage(_root: &Path, dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(blob_folder(dir)?).map_err(|e| e.to_string())
 }
-fn cache_storage(dir: &Path, storage: Option<Storage>) {
-    let mut cache = STORAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.len() >= 512 { cache.clear(); }
-    cache.insert(dir.to_path_buf(), storage);
+pub fn blob_folder(dir: &Path) -> Result<PathBuf, String> {
+    Ok(dir.parent().ok_or("Missing journal parent")?.join(BLOB_STORE))
 }
-fn storage(dir: &Path) -> Result<Option<Storage>, String> {
-    if let Some(value) = STORAGE_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(dir).cloned() {
-        return Ok(value);
-    }
-    let value = match fs::read(dir.join("storage.json")) {
-        Ok(bytes) => {
-            let value: Storage = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            if value.version != 2 { return Err("Unsupported merge blob storage version".into()); }
-            Some(value)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.to_string()),
-    };
-    cache_storage(dir, value.clone());
-    Ok(value)
-}
-fn shared_blobs(dir: &Path) -> Result<PathBuf, String> {
-    Ok(dir.parent().ok_or("Missing journal parent")?.join("blobs-v2"))
-}
-fn blob_folder(dir: &Path) -> Result<PathBuf, String> {
-    if storage(dir)?.is_some() { shared_blobs(dir) } else { Ok(dir.join("blobs")) }
+/// The common Git directory: `<git-dir>/locus/merge-jobs/<job>`.
+fn git_dir(dir: &Path) -> Result<PathBuf, String> {
+    dir.ancestors().nth(3).map(Path::to_path_buf).ok_or_else(|| "Merge job is outside a Git directory".into())
 }
 pub fn git_blob_oid(state: &FileState) -> Option<&str> {
     state.blob.strip_prefix("git-").filter(|oid|
         matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()))
 }
-fn git_mapping(dir: &Path, oid: &str) -> Result<PathBuf, String> {
-    Ok(dir.parent().ok_or("Missing journal parent")?.join("git-blobs-v2").join(format!("{oid}.json")))
+fn git_blob_path(dir: &Path, oid: &str) -> Result<PathBuf, String> {
+    Ok(blob_folder(dir)?.join(format!("git-{oid}")))
 }
 
 /// Hydrate immutable Git inputs in batches, avoiding one process per meta/script.
@@ -67,14 +37,13 @@ pub fn prefetch_git<'a>(dir: &Path, states: impl IntoIterator<Item = &'a FileSta
     let oids: std::collections::BTreeSet<_> = states.into_iter().filter_map(git_blob_oid)
         .map(str::to_owned).collect();
     if oids.is_empty() { return Ok(()); }
-    let storage = storage(dir)?.ok_or("Git-backed snapshot requires v2 storage")?;
-    let missing: Vec<_> = oids.into_iter().filter(|oid| {
-        fs::read(git_mapping(dir, oid).unwrap()).ok()
-            .and_then(|bytes| serde_json::from_slice::<FileState>(&bytes).ok())
-            .is_none()
-    }).collect();
+    let missing: Vec<_> = oids.into_iter()
+        .filter(|oid| git_blob_path(dir, oid).map_or(true, |path| !path.is_file()))
+        .collect();
     if missing.is_empty() { return Ok(()); }
-    let sizes = git_batch(&storage.git_dir, &["cat-file", "--batch-check=%(objectname) %(objectsize)"], &missing)?;
+    let git_dir = git_dir(dir)?;
+    fs::create_dir_all(blob_folder(dir)?).map_err(|e| e.to_string())?;
+    let sizes = git_batch(&git_dir, &["cat-file", "--batch-check=%(objectname) %(objectsize)"], &missing)?;
     let mut batches = Vec::new();
     let mut batch = Vec::new();
     let mut size = 0u64;
@@ -90,10 +59,9 @@ pub fn prefetch_git<'a>(dir: &Path, states: impl IntoIterator<Item = &'a FileSta
     // Bound total bytes, not just file count: thousands of metas fit in one
     // process while a large scene is read in its own batch.
     for batch in batches {
-        let blobs = git_blobs(&storage.git_dir, &batch)?;
+        let blobs = git_blobs(&git_dir, &batch)?;
         super::parallel::pool().install(|| blobs.par_iter().try_for_each(|(oid, bytes)| {
-            let state = store_blob(dir, bytes, "100644")?;
-            cache_json(&git_mapping(dir, oid)?, &state)
+            publish(&git_blob_path(dir, oid)?, bytes)
         }))?;
     }
     Ok(())
@@ -315,22 +283,26 @@ pub fn safe_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     }
     Ok(current)
 }
+/// Atomic publication of immutable content: a reader never observes a partial file.
+fn publish(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    let folder = path.parent().ok_or("Missing blob store")?;
+    let mut temp = tempfile::NamedTempFile::new_in(folder).map_err(|e| e.to_string())?;
+    temp.write_all(bytes).map_err(|e| e.to_string())?;
+    match temp.persist_noclobber(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists
+            || (path.is_file() && fs::read(path).is_ok_and(|existing| existing == bytes)) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
 pub fn store_blob(dir: &Path, bytes: &[u8], mode: &str) -> Result<FileState, String> {
     let blob = blake3::hash(bytes).to_hex().to_string();
     let folder = blob_folder(dir)?;
-    if storage(dir)?.is_none() { fs::create_dir_all(&folder).map_err(|e| e.to_string())?; }
-    let path = folder.join(&blob);
-    if !path.exists() {
-        // Atomic publication: parallel jobs must never observe a partial blob.
-        let mut temp = tempfile::NamedTempFile::new_in(&folder).map_err(|e| e.to_string())?;
-        temp.write_all(bytes).map_err(|e| e.to_string())?;
-        match temp.persist_noclobber(&path) {
-            Ok(_) => {},
-            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists
-                || (path.is_file() && fs::read(&path).is_ok_and(|existing| existing == bytes)) => {},
-            Err(e) => return Err(e.to_string()),
-        }
-    }
+    fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    publish(&folder.join(&blob), bytes)?;
     Ok(FileState {
         blob,
         mode: mode.into(),
@@ -339,10 +311,7 @@ pub fn store_blob(dir: &Path, bytes: &[u8], mode: &str) -> Result<FileState, Str
 pub fn read_blob(dir: &Path, state: &FileState) -> Result<Vec<u8>, String> {
     if let Some(oid) = git_blob_oid(state) {
         prefetch_git(dir, [state])?;
-        let resolved: FileState = serde_json::from_slice(&fs::read(git_mapping(dir, oid)?)
-            .map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        if resolved.blob.starts_with("git-") { return Err("Invalid recursive Git blob mapping".into()); }
-        return read_blob(dir, &resolved);
+        return fs::read(git_blob_path(dir, oid)?).map_err(|e| e.to_string());
     }
     if state.blob.len() != 64 || !state.blob.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("Invalid snapshot blob".into());
@@ -353,8 +322,21 @@ pub fn read_blob(dir: &Path, state: &FileState) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+/// Stored size of a snapshot blob without reading it, for memory budgeting.
+pub fn blob_len(dir: &Path, state: &FileState) -> Result<u64, String> {
+    if let Some(oid) = git_blob_oid(state) {
+        prefetch_git(dir, [state])?;
+        return fs::metadata(git_blob_path(dir, oid)?).map(|m| m.len()).map_err(|e| e.to_string());
+    }
+    fs::metadata(blob_folder(dir)?.join(&state.blob)).map(|m| m.len()).map_err(|e| e.to_string())
+}
 pub fn capture(root: &Path, dir: &Path, path: &str) -> Result<Option<FileState>, String> {
     let full = safe_path(root, path)?;
+    if full.is_dir() {
+        // Git tracks files only: the folder a paired folder `.meta` names is an
+        // absent file, exactly as it reads from every Git tree.
+        return Ok(None);
+    }
     let size = fs::metadata(&full).map(|s| s.len()).unwrap_or(0);
     super::parallel::with_bytes(size, || match fs::read(&full) {
         Ok(bytes) => {
@@ -491,10 +473,18 @@ pub fn is_lfs_pointer(bytes: &[u8]) -> bool {
     bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
         || bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\r\n")
 }
-pub fn materialize_lfs(root: &Path, dir: &Path, state: &FileState) -> Result<FileState, String> {
+/// A whole-file version ready to apply, or a Git LFS pointer whose complete
+/// object is absent from the local LFS cache. Absence is recoverable by
+/// fetching, so callers report it instead of failing; malformed pointers and
+/// objects failing verification remain errors.
+pub enum Materialized {
+    Complete(FileState),
+    Missing { oid: String, size: u64 },
+}
+pub fn materialize_lfs(root: &Path, dir: &Path, state: &FileState) -> Result<Materialized, String> {
     let pointer = read_blob(dir, state)?;
     if !is_lfs_pointer(&pointer) {
-        return Ok(state.clone());
+        return Ok(Materialized::Complete(state.clone()));
     }
     let text = std::str::from_utf8(&pointer).map_err(|_| "Invalid Git LFS pointer encoding")?;
     let oid = text
@@ -530,7 +520,13 @@ pub fn materialize_lfs(root: &Path, dir: &Path, state: &FileState) -> Result<Fil
         .join(&oid[..2])
         .join(&oid[2..4])
         .join(oid);
-    let bytes=std::fs::read(&path).map_err(|_|format!("LFS object {oid} is not available locally; fetch the selected commit's LFS objects, then retry preview (pointer bytes will never be applied)"))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Materialized::Missing { oid: oid.to_ascii_lowercase(), size });
+        }
+        Err(error) => return Err(format!("Could not read LFS object {oid}: {error}")),
+    };
     use sha2::Digest;
     if bytes.len() as u64 != size
         || sha2::Sha256::digest(&bytes)
@@ -541,7 +537,7 @@ pub fn materialize_lfs(root: &Path, dir: &Path, state: &FileState) -> Result<Fil
     {
         return Err(format!("LFS object {oid} failed size/SHA-256 verification"));
     }
-    store_blob(dir, &bytes, &state.mode)
+    store_blob(dir, &bytes, &state.mode).map(Materialized::Complete)
 }
 fn atomic_replace(
     path: &Path,
@@ -573,6 +569,10 @@ fn atomic_replace(
         .map_err(|e| format!("Could not atomically replace {}: {e}", path.display()))?;
     Ok(())
 }
+pub fn atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_replace(path, |temp| temp.write_all(bytes).map_err(|e| e.to_string()))
+}
+
 pub fn atomic_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
     atomic_replace(path, |temp| {
         let mut writer = std::io::BufWriter::with_capacity(256 * 1024, temp);
@@ -632,6 +632,10 @@ pub fn check_files(
 /// hashing also keeps revalidation memory independent of the largest scene.
 pub fn fingerprint(root: &Path, path: &str, known: Option<&FileState>) -> Result<Option<FileState>, String> {
     let full = safe_path(root, path)?;
+    if full.is_dir() {
+        // Same file-only view as `capture`; opening a directory fails on Windows.
+        return Ok(None);
+    }
     let mut file = match fs::File::open(&full) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

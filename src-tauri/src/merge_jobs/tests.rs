@@ -410,15 +410,31 @@ fn explicit_text_commit_does_not_include_unrelated_staged_files() {
     assert!(git_text(&repo.root, &["diff", "--cached", "--name-only"])
         .unwrap()
         .contains("notes.txt"));
+    let head = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+    assert_eq!(commit["removed"], true);
     let retried = execute(
         &repo.root,
         &job.id,
         "commit",
         json!({"paths":["new.txt"],"message":"Ignored retry"}),
     )
-    .unwrap();
-    assert_eq!(retried["commit"], commit["commit"]);
-    assert_eq!(retried["idempotent"], true);
+    .unwrap_err();
+    assert!(retried.contains("no longer exists"), "{retried}");
+    assert_eq!(git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(), head);
+}
+
+/// Rebuilds the journal an interrupted commit leaves behind: the job as it
+/// was before `commit`, now committing `oid` from `before` to `after` index bytes.
+fn interrupted_commit(repo: &Repo, prior: &MergeJob, oid: &str, before: &[u8], after: &[u8]) {
+    let dir = job_dir(&repo.root, &prior.id).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    init_storage(&repo.root, &dir).unwrap();
+    let mut pending = prior.clone();
+    pending.state = "committing".into();
+    pending.commit_oid = Some(oid.into());
+    pending.pending_index_before = Some(blake3::hash(before).to_hex().to_string());
+    pending.pending_index_after = Some(store_blob(&dir, after, "index").unwrap());
+    save(&dir, &pending).unwrap();
 }
 
 #[test]
@@ -477,6 +493,45 @@ fn removed_guid_is_detected_in_an_unchanged_referencing_asset() {
         "{:?}",
         plan.issues
     );
+}
+
+#[test]
+fn removed_guid_checks_unparsable_referrers_by_their_guid_keys() {
+    let repo = Repo::new();
+    let guid = "1234567890abcdef1234567890abcdef";
+    let referrers = ["block.asset", "lexical.asset", "text.asset"];
+    for (path, body) in referrers.iter().zip([
+        format!("  linked:\n    fileID: 11400000\n    guid: {guid}\n"),
+        format!("  linked: {{fileID: 11400000, guid: {guid}, type: 2}}\n"),
+        format!(
+            "  note: 'a wrapped string that\n    mentions guid: {guid} mid-line'\n  wwise:\n    guid: 00FFFCE6-9E61-4205-8AE9-DEDCAD2C0E03\n"
+        ),
+    ]) {
+        std::fs::write(repo.root.join(path), unparsable_unity_yaml(&body)).unwrap();
+    }
+    std::fs::write(repo.root.join("asset.asset.meta"), format!("fileFormatVersion: 2\nguid: {guid}\n")).unwrap();
+    git(&repo.root, &["add", "."]).unwrap();
+    git(&repo.root, &["commit", "-m", "references"]).unwrap();
+    git(&repo.source, &["merge", "--ff-only", "main"]).unwrap();
+    let commit = repo.commit("asset.asset.meta", "fileFormatVersion: 2\nguid: fedcba0987654321fedcba0987654321\n");
+    let job = repo.job(vec![commit.clone()]);
+    execute(&repo.root, &job.id, "files.take", json!({"path":"asset.asset.meta","version":"source","commit":commit})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    let found: Vec<_> = plan
+        .issues
+        .iter()
+        .filter(|i| referrers.contains(&i["path"].as_str().unwrap_or_default()))
+        .collect();
+    let codes: Vec<_> = found.iter().map(|i| (i["code"].as_str().unwrap(), i["path"].as_str().unwrap())).collect();
+    // The exact reference is found lexically; a block-form `guid` key naming
+    // the removed GUID stays unprovable; mid-line text and dashed GUIDs cannot.
+    assert_eq!(
+        codes,
+        [("dependency_coverage", "block.asset"), ("missing_guid_dependency", "lexical.asset")],
+        "{:?}",
+        plan.issues
+    );
+    assert_eq!(found[0]["guids"], json!([guid]));
 }
 
 #[test]
@@ -627,6 +682,7 @@ fn interrupted_commit_before_ref_update_recovers_exact_pending_commit() {
     .unwrap();
     let index_path = repo.root.join(".git/index");
     let before = std::fs::read(&index_path).unwrap();
+    let prior = load(&repo.root, &job.id).unwrap();
     let committed = execute(
         &repo.root,
         &job.id,
@@ -635,12 +691,10 @@ fn interrupted_commit_before_ref_update_recovers_exact_pending_commit() {
     )
     .unwrap();
     let oid = committed["commit"].as_str().unwrap();
+    let after = std::fs::read(&index_path).unwrap();
     git(&repo.root, &["update-ref", "HEAD", &job.snapshot.head, oid]).unwrap();
-    std::fs::write(&index_path, before).unwrap();
-    let dir = job_dir(&repo.root, &job.id).unwrap();
-    let mut pending = load(&repo.root, &job.id).unwrap();
-    pending.state = "committing".into();
-    save(&dir, &pending).unwrap();
+    std::fs::write(&index_path, &before).unwrap();
+    interrupted_commit(&repo, &prior, oid, &before, &after);
     let recovered = execute(
         &repo.root,
         &job.id,
@@ -650,7 +704,9 @@ fn interrupted_commit_before_ref_update_recovers_exact_pending_commit() {
     .unwrap();
     assert_eq!(recovered["commit"], oid);
     assert_eq!(recovered["recovered"], true);
+    assert_eq!(recovered["removed"], true);
     assert_eq!(git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap(), oid);
+    assert_eq!(std::fs::read(&index_path).unwrap(), after);
 }
 
 #[test]
@@ -693,6 +749,91 @@ fn binary_lfs_take_materializes_verified_local_object_never_pointer() {
     )
     .unwrap();
     assert_eq!(std::fs::read(repo.root.join("model.fbx")).unwrap(), bytes);
+}
+
+#[test]
+fn missing_lfs_objects_are_reported_together_and_preview_recovers_after_fetch() {
+    use sha2::Digest;
+    let repo = Repo::new();
+    git(&repo.root, &["remote", "add", "origin", "https://example.invalid/lfs.git"]).unwrap();
+    let objects: [(&str, &[u8]); 2] = [
+        ("model.fbx", b"complete fbx bytes\0binary"),
+        ("Plugins/native.dll", b"MZ complete dll\0bytes"),
+    ];
+    let oid = |bytes: &[u8]| {
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let pointers: Vec<String> = objects
+        .iter()
+        .map(|(_, bytes)| {
+            format!(
+                "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+                oid(bytes),
+                bytes.len()
+            )
+        })
+        .collect();
+    let commit = repo.commit_files(&[
+        (objects[0].0, Some(pointers[0].as_str())),
+        (objects[1].0, Some(pointers[1].as_str())),
+    ]);
+    let job = repo.job(vec![commit.clone()]);
+    for (path, _) in objects {
+        execute(
+            &repo.root,
+            &job.id,
+            "files.take",
+            json!({"path":path,"version":"source","commit":commit}),
+        )
+        .unwrap();
+    }
+
+    let blocked = preview(&repo.root, &job.id).unwrap();
+    assert!(!blocked.ready_to_apply);
+    let missing: Vec<_> = blocked
+        .issues
+        .iter()
+        .filter(|issue| issue["code"] == "lfs_object_missing")
+        .collect();
+    assert_eq!(missing.len(), 2, "{:?}", blocked.issues);
+    let command =
+        format!("git lfs fetch origin {commit} --include 'Plugins/native.dll,model.fbx'");
+    for (path, bytes) in objects {
+        let issue = missing.iter().find(|issue| issue["path"] == path).unwrap();
+        assert_eq!(issue["oid"], oid(bytes));
+        assert_eq!(issue["size"], bytes.len());
+        assert_eq!(issue["commit"], commit.as_str());
+        assert_eq!(issue["fetch_command"], command.as_str());
+        assert!(!blocked.files.contains_key(path), "pointer bytes must never be planned");
+    }
+
+    for (_, bytes) in objects {
+        let oid = oid(bytes);
+        let local = repo
+            .root
+            .join(".git/lfs/objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(&oid);
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(local, bytes).unwrap();
+    }
+    // The job is unchanged, so a cached blocked preview would hide the fetch.
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    execute(
+        &repo.root,
+        &job.id,
+        "apply",
+        json!({"expected_plan_hash":plan.plan_hash}),
+    )
+    .unwrap();
+    for (path, bytes) in objects {
+        assert_eq!(std::fs::read(repo.root.join(path)).unwrap(), bytes);
+    }
 }
 
 #[test]
@@ -1147,6 +1288,8 @@ fn whole_file_mode_survives_apply_stage_commit_and_journal_recovery() {
     save(&dir, &pending).unwrap();
     execute(&repo.root, &job.id, "stage", json!({"paths":["notes.txt"]})).unwrap();
     let params = json!({"paths":["notes.txt"],"message":"Explicit executable mode only"});
+    let prior = load(&repo.root, &job.id).unwrap();
+    let prior_index = std::fs::read(repo.root.join(".git/index")).unwrap();
     let committed = execute(&repo.root, &job.id, "commit", params.clone()).unwrap();
     assert!(
         git_text(&repo.root, &["ls-tree", "HEAD", "--", "notes.txt"])
@@ -1167,9 +1310,8 @@ fn whole_file_mode_survives_apply_stage_commit_and_journal_recovery() {
         yaml(102, 5, "unstaged local")
     );
     // Likewise recover a post-ref/post-index commit without absorbing local I/W.
-    let mut pending = load(&repo.root, &job.id).unwrap();
-    pending.state = "committing".into();
-    save(&dir, &pending).unwrap();
+    let index = std::fs::read(repo.root.join(".git/index")).unwrap();
+    interrupted_commit(&repo, &prior, committed["commit"].as_str().unwrap(), &prior_index, &index);
     let retry = execute(&repo.root, &job.id, "commit", params).unwrap();
     assert_eq!(retry["commit"], committed["commit"]);
     assert_eq!(retry["idempotent"], true);
@@ -1429,6 +1571,200 @@ fn removed_document_does_not_match_same_file_id_under_another_guid() {
         std::fs::read_to_string(repo.root.join("Assets/Referrer.unity")).unwrap(),
         external_scene_reference(EXTERNAL_OTHER_GUID, 3)
     );
+}
+
+/// A Unity document the structural parser rejects (a YAML alias is outside
+/// its dialect), so dependency checks must rely on the lexical scan.
+fn unparsable_unity_yaml(body: &str) -> String {
+    let text = format!("--- !u!114 &11400000\nMonoBehaviour:\n  m_Shared: *anchor\n{body}");
+    assert!(crate::unity_asset_core::parse(text.as_bytes()).is_err(), "fixture must be unparsable");
+    text
+}
+
+const PLUGIN_META: &str = "fileFormatVersion: 2\nguid: 44444444444444444444444444444444\nPluginImporter:\n  platformData:\n  - first:\n      : Any\n    second:\n      enabled: 0\n";
+
+#[test]
+fn object_removal_checks_unparsable_assets_lexically_and_exactly() {
+    // Unity's empty-key importer metadata now parses like any other asset.
+    assert!(crate::unity_asset_core::parse(PLUGIN_META.as_bytes()).unwrap().is_writable());
+    let repo = repo_with_external_prefab_reference(EXTERNAL_OTHER_GUID);
+    let flow = |file_id: i64| format!("  m_Target: {{fileID: {file_id}, guid: {EXTERNAL_PARENT_GUID}, type: 3}}\n");
+    for (path, content) in [
+        ("Assets/Plugin.dll.meta", PLUGIN_META.to_owned()),
+        // Recognized references: exact verdicts despite the parse failure.
+        ("Assets/Lexical.asset", unparsable_unity_yaml(&flow(3))),
+        // Spells the prefab GUID, but only in a kept reference, a wrapped
+        // string's continuation text, and `guid` keys that cannot name it.
+        (
+            "Assets/Kept.asset",
+            unparsable_unity_yaml(&format!(
+                "{}  wwise:\n    guid: 00FFFCE6-9E61-4205-8AE9-DEDCAD2C0E03\n  bank:\n    guid: 33333333333333333333333333333333\n\
+                 \x20 m_Text: 'notes that wrap\n    over the guid: {EXTERNAL_PARENT_GUID} line'\n",
+                flow(1)
+            )),
+        ),
+        // A block-form `guid` key is not provably a complete reference list.
+        (
+            "Assets/Legacy.asset",
+            unparsable_unity_yaml(&format!("  m_Target:\n    fileID: 1\n    guid: {EXTERNAL_PARENT_GUID}\n")),
+        ),
+    ] {
+        std::fs::write(repo.root.join(path), content).unwrap();
+    }
+    git(&repo.root, &["add", "Assets"]).unwrap();
+    git(&repo.root, &["commit", "-m", "unparsable assets"]).unwrap();
+    let baseline = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+    git(&repo.source, &["merge", "--ff-only", &baseline]).unwrap();
+    let source = repo.commit("Assets/Parent.prefab", externally_referenced_prefab(false));
+    let job = repo.job(vec![source]);
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    let codes: Vec<_> = plan.issues.iter().map(|i| (i["code"].as_str().unwrap(), i["path"].as_str().unwrap())).collect();
+    assert_eq!(
+        codes,
+        [
+            ("external_object_dependency_coverage", "Assets/Legacy.asset"),
+            ("removed_object_dependency", "Assets/Lexical.asset"),
+        ],
+        "{:?}",
+        plan.issues
+    );
+    let coverage = &plan.issues[0];
+    assert_eq!(coverage["guids"], json!([EXTERNAL_PARENT_GUID]));
+    assert_eq!(coverage["deleted_from"], json!(["Assets/Parent.prefab"]));
+    let lexical = &plan.issues[1];
+    assert_eq!((lexical["file_id"].as_str(), lexical["object_id"].as_str()), (Some("3"), Some("11400000")));
+    assert_eq!(lexical["line"], 4);
+    assert_eq!(lexical["property_path"], "/MonoBehaviour/m_Target");
+    assert_eq!(lexical["property_path_approximate"], true);
+}
+
+#[test]
+fn lfs_stored_yaml_dependencies_are_materialized_before_checking() {
+    use sha2::Digest;
+    let repo = repo_with_external_prefab_reference(EXTERNAL_OTHER_GUID);
+    let content = external_scene_reference(EXTERNAL_PARENT_GUID, 3);
+    let oid = sha2::Sha256::digest(content.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let pointer = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {}\n", content.len());
+    std::fs::write(repo.root.join("Assets/Stored.unity"), &pointer).unwrap();
+    git(&repo.root, &["add", "Assets"]).unwrap();
+    git(&repo.root, &["commit", "-m", "LFS scene"]).unwrap();
+    let baseline = git_text(&repo.root, &["rev-parse", "HEAD"]).unwrap();
+    git(&repo.source, &["merge", "--ff-only", &baseline]).unwrap();
+    let source = repo.commit("Assets/Parent.prefab", externally_referenced_prefab(false));
+    let issues = |repo: &Repo| {
+        let job = repo.job(vec![source.clone()]);
+        execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+        preview(&repo.root, &job.id).unwrap().issues
+    };
+    let missing = issues(&repo);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing[0]["code"], "external_object_dependency_coverage");
+    assert!(missing[0]["detail"].as_str().unwrap().contains("git lfs fetch"));
+    let local = repo.root.join(".git/lfs/objects").join(&oid[..2]).join(&oid[2..4]).join(&oid);
+    std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+    std::fs::write(local, &content).unwrap();
+    let found = issues(&repo);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["code"], "removed_object_dependency");
+    assert_eq!(found[0]["path"], "Assets/Stored.unity");
+    assert_eq!(found[0]["property_path"], "/MonoBehaviour/m_Target");
+}
+
+#[test]
+fn scene_object_removal_needs_no_cross_asset_proof() {
+    let scene = |with_extra: bool| {
+        let mut text = external_scene_reference(EXTERNAL_PARENT_GUID, 3);
+        if with_extra {
+            text.push_str("--- !u!114 &11400001\nMonoBehaviour:\n  m_Enabled: 1\n");
+        }
+        text
+    };
+    let repo = repo_with(&[
+        ("Assets/Level.unity", scene(true).as_str()),
+        ("Assets/Level.unity.meta", "fileFormatVersion: 2\nguid: 55555555555555555555555555555555\n"),
+        (
+            "Assets/Legacy.asset",
+            unparsable_unity_yaml("  m_Scene:\n    fileID: 11400001\n    guid: 55555555555555555555555555555555\n")
+                .as_str(),
+        ),
+    ]);
+    let source = repo.commit("Assets/Level.unity", scene(false));
+    let job = repo.job(vec![source]);
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    assert!(plan.files["Assets/Level.unity"].is_some());
+}
+
+#[test]
+fn folder_meta_in_scope_reads_its_folder_as_an_absent_file() {
+    let repo = Repo::new();
+    let source = repo.commit_files(&[
+        ("Assets/Materials.meta", Some("fileFormatVersion: 2\nguid: 66666666666666666666666666666666\nfolderAsset: yes\n")),
+        ("Assets/Materials/Deck.txt", Some("deck\n")),
+    ]);
+    let request = |commit: &str| PrepareRequest {
+        sources: vec![SourceSelection { commits: vec![commit.to_string()], ..Default::default() }],
+        paths: Some(vec!["Assets/Materials.meta".into(), "Assets/Materials/Deck.txt".into()]),
+        ..Default::default()
+    };
+    let job = prepare(&repo.root, &request(&source)).unwrap();
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    execute(&repo.root, &job.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap();
+    assert!(repo.root.join("Assets/Materials").is_dir());
+    // Post-apply checks (stage/commit/Unity validation) fingerprint the whole scope.
+    let applied = load(&repo.root, &job.id).unwrap();
+    check_files(&repo.root, &job_dir(&repo.root, &job.id).unwrap(), &scoped_files(&applied)).unwrap();
+    // Snapshotting the same scope once the folder exists also succeeds.
+    prepare(&repo.root, &request(&source)).unwrap();
+}
+
+#[test]
+fn squash_source_integrates_the_branch_net_result_as_one_delta() {
+    let repo = Repo::new();
+    // The destination moves on after the fork, so the merge base is not HEAD.
+    std::fs::write(repo.root.join("target-only.txt"), "destination\n").unwrap();
+    git(&repo.root, &["add", "target-only.txt"]).unwrap();
+    git(&repo.root, &["commit", "-m", "destination change"]).unwrap();
+    let fork = git_text(&repo.source, &["rev-parse", "HEAD"]).unwrap();
+    repo.commit_files(&[("notes.txt", Some("draft\n")), ("scratch.txt", Some("temporary\n"))]);
+    let tip = repo.commit_files(&[("notes.txt", Some("final notes\n")), ("scratch.txt", None)]);
+    let request = |source: SourceSelection| PrepareRequest { sources: vec![source], ..Default::default() };
+    let squash = |source: SourceSelection| SourceSelection { squash: true, ..source };
+    for source in [
+        squash(SourceSelection { branch_ref: Some("source".into()), ..Default::default() }),
+        squash(SourceSelection { range: Some(format!("HEAD..{tip}")), ..Default::default() }),
+    ] {
+        let job = prepare(&repo.root, &request(source)).unwrap();
+        assert!(job.deltas.iter().all(|d| d.commit == tip && d.parent == fork));
+        // The file the branch added and later deleted is no change at all.
+        let paths: BTreeSet<_> = job.deltas.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, BTreeSet::from(["notes.txt"]));
+    }
+    let job = prepare(
+        &repo.root,
+        &request(squash(SourceSelection { branch_ref: Some("source".into()), ..Default::default() })),
+    )
+    .unwrap();
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    execute(&repo.root, &job.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap();
+    assert_eq!(std::fs::read_to_string(repo.root.join("notes.txt")).unwrap(), "final notes\n");
+    assert_eq!(std::fs::read_to_string(repo.root.join("target-only.txt")).unwrap(), "destination\n");
+    assert!(!repo.root.join("scratch.txt").exists());
+    for invalid in [
+        squash(SourceSelection { commits: vec![tip.clone()], ..Default::default() }),
+        squash(SourceSelection { range: Some(format!("HEAD...{tip}")), ..Default::default() }),
+        // Nothing beyond the merge base.
+        squash(SourceSelection { range: Some(format!("{tip}..{fork}")), ..Default::default() }),
+        squash(SourceSelection::default()),
+    ] {
+        assert!(prepare(&repo.root, &request(invalid)).is_err());
+    }
 }
 
 /// A repository whose base commit also contains `files`, with a source worktree.
@@ -1775,4 +2111,505 @@ fn scoped_prepare_reads_paths_with_pattern_characters_literally() {
     let dir = job_dir(&repo.root, &job.id).unwrap();
     assert_eq!(state_bytes(&dir, &job.deltas[0].base).unwrap(), b"base\n");
     assert_eq!(state_bytes(&dir, &job.deltas[0].source).unwrap(), b"source\n");
+}
+
+/// An app-managed file rewritten after the snapshot makes apply stale. Replan
+/// keeps the source commits pinned (a moved branch adds nothing), carries the
+/// decisions of unchanged files and reports the changed file's decision.
+#[test]
+fn replan_carries_decisions_of_unchanged_files_and_reports_the_rest() {
+    let repo = repo_with(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("state.json", "{\"revision\":1}\n")]);
+    let source = repo.commit_files(&[
+        ("a.txt", Some("A\n")),
+        ("b.txt", Some("B\n")),
+        ("state.json", Some("{\"revision\":2}\n")),
+    ]);
+    let job = repo.job(vec![source.clone()]);
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    execute(&repo.root, &job.id, "files.set_text", json!({"path":"b.txt","content":"merged b\n"})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+
+    std::fs::write(repo.root.join("state.json"), "{\"revision\":7}\n").unwrap();
+    let stale = execute(&repo.root, &job.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap_err();
+    assert!(stale.starts_with("stale: state.json changed after the snapshot"), "{stale}");
+    repo.commit_files(&[("later.txt", Some("not selected\n"))]);
+
+    let (replanned, report) = replan(&repo.root, &job.id).unwrap();
+    assert_eq!(report["replaced_job_id"], job.id.as_str());
+    assert_eq!(report["carried"]["files"], 1);
+    assert_eq!(report["dropped_total"], 1, "{report:#}");
+    assert_eq!(report["dropped"][0]["path"], "state.json");
+    assert_eq!(report["dropped"][0]["reason"], "destination_changed");
+    assert_eq!(report["changed_paths"], json!(["state.json"]));
+    assert!(replanned.deltas.iter().all(|delta| delta.commit == source));
+    assert!(load(&repo.root, &job.id).unwrap_err().contains("no longer exists"));
+
+    let plan = preview(&repo.root, &replanned.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    execute(&repo.root, &replanned.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap();
+    assert_eq!(std::fs::read_to_string(repo.root.join("a.txt")).unwrap(), "A\n");
+    assert_eq!(std::fs::read_to_string(repo.root.join("b.txt")).unwrap(), "merged b\n");
+    assert_eq!(std::fs::read_to_string(repo.root.join("state.json")).unwrap(), "{\"revision\":7}\n");
+    assert!(!repo.root.join("later.txt").exists());
+    assert!(replan(&repo.root, &replanned.id).unwrap_err().starts_with("Cannot replan: job is applied"));
+}
+
+fn scene_text(docs: &[(u64, &str)]) -> String {
+    let mut text = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+    for (id, name) in docs {
+        text.push_str(&format!("--- !u!1 &{id}\nGameObject:\n  m_Name: {name}\n"));
+    }
+    text
+}
+
+/// A scene the destination never changed takes the source file byte for byte,
+/// even where re-rendering would keep the destination's document order.
+#[test]
+fn untouched_destination_takes_the_source_scene_byte_for_byte() {
+    let base = scene_text(&[(100, "a"), (300, "c"), (500, "e")]);
+    let repo = repo_with(&[("Assets/Level.unity", &base)]);
+    // Additions between existing objects, and one existing object listed earlier.
+    let source = scene_text(&[(100, "a"), (200, "b"), (500, "e"), (300, "C"), (400, "d")]);
+    let commit = repo.commit_files(&[("Assets/Level.unity", Some(&source))]);
+    let job = repo.job(vec![commit]);
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(state_bytes(&dir, &plan.files["Assets/Level.unity"]).unwrap(), source.as_bytes());
+}
+
+/// With destination changes the file is rendered; source additions still sit
+/// next to their source neighbours rather than at the end of the scene.
+#[test]
+fn changed_destination_places_source_additions_beside_their_neighbours() {
+    let base = scene_text(&[(100, "a"), (300, "c"), (500, "e")]);
+    let repo = repo_with(&[("Assets/Level.unity", &base)]);
+    let source = scene_text(&[(100, "a"), (200, "b"), (300, "C"), (400, "d"), (500, "e")]);
+    let commit = repo.commit_files(&[("Assets/Level.unity", Some(&source))]);
+    std::fs::write(repo.root.join("Assets/Level.unity"), scene_text(&[(100, "A"), (300, "c"), (500, "e")])).unwrap();
+    let job = repo.job(vec![commit]);
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    let merged = String::from_utf8(state_bytes(&dir, &plan.files["Assets/Level.unity"]).unwrap()).unwrap();
+    assert_eq!(merged, scene_text(&[(100, "A"), (200, "b"), (300, "C"), (400, "d"), (500, "e")]));
+}
+
+/// The summary rolls the catalog up per file and the change filters return
+/// only what needs a decision, while totals still describe the whole catalog.
+#[test]
+fn catalog_summary_and_filters_point_at_the_changes_that_need_a_decision() {
+    let base = scene_text(&[(100, "a"), (300, "c")]);
+    let repo = repo_with(&[("Assets/Quiet.unity", &base), ("Assets/Busy.unity", &base)]);
+    let source = scene_text(&[(100, "A"), (200, "b"), (300, "C")]);
+    let commit = repo.commit_files(&[("Assets/Quiet.unity", Some(&source)), ("Assets/Busy.unity", Some(&source))]);
+    std::fs::write(repo.root.join("Assets/Busy.unity"), scene_text(&[(100, "X"), (300, "c")])).unwrap();
+    let job = repo.job(vec![commit]);
+
+    let summary = execute(&repo.root, &job.id, "change_summary", json!({})).unwrap();
+    let files = summary["files"].as_array().unwrap();
+    assert_eq!(files.iter().map(|f| f["path"].as_str().unwrap()).collect::<Vec<_>>(), ["Assets/Busy.unity", "Assets/Quiet.unity"]);
+    let (busy, quiet) = (&files[0], &files[1]);
+    assert_eq!(busy["destination_changed"], true);
+    assert_eq!(quiet["destination_changed"], false);
+    assert_eq!(busy["statuses"]["conflict"], 1, "{busy}");
+    assert!(quiet["statuses"].get("conflict").is_none(), "{quiet}");
+    assert_eq!(quiet["kinds"]["add_object"], 1, "{quiet}");
+    assert_eq!(summary["file_total"], 2);
+    assert_eq!(summary["changes"], busy["changes"].as_u64().unwrap() + quiet["changes"].as_u64().unwrap());
+    assert!(summary["next_offset"].is_null());
+    let second = execute(&repo.root, &job.id, "change_summary", json!({"offset":1,"limit":1})).unwrap();
+    assert_eq!(second["files"][0]["path"], "Assets/Quiet.unity");
+
+    let conflicts = execute(&repo.root, &job.id, "changes", json!({"status":"conflict"})).unwrap();
+    assert_eq!(conflicts["total"], 1);
+    assert_eq!(conflicts["catalog_total"], summary["changes"]);
+    assert_eq!(conflicts["changes"][0]["path"], "Assets/Busy.unity");
+    assert!(conflicts["changes"][0]["reason"].as_str().is_some_and(|r| !r.is_empty()));
+    let quiet_changes = execute(&repo.root, &job.id, "changes", json!({"paths":["Assets/Quiet.unity"],"status":["clean","already_applied"]})).unwrap();
+    assert_eq!(quiet_changes["total"], quiet["changes"]);
+    let error = execute(&repo.root, &job.id, "changes", json!({"status":"conflicts"})).unwrap_err();
+    assert!(error.contains("Unknown change status `conflicts`"), "{error}");
+    assert!(execute(&repo.root, &job.id, "changes", json!({"paths":"Assets"})).unwrap()["total"] == 0);
+}
+
+/// Selecting consecutive commits of one scene: the later commit edits an
+/// object the earlier one added, while the destination edited another object.
+#[test]
+fn consecutive_commits_edit_what_the_earlier_commit_added() {
+    let base = scene_text(&[(100, "a"), (300, "c")]);
+    let repo = repo_with(&[("Assets/Level.unity", &base)]);
+    let first = repo.commit_files(&[("Assets/Level.unity", Some(&scene_text(&[(100, "a"), (200, "b"), (300, "c")])))]);
+    let second = repo.commit_files(&[("Assets/Level.unity", Some(&scene_text(&[(100, "a"), (200, "B"), (300, "C")])))]);
+    std::fs::write(repo.root.join("Assets/Level.unity"), scene_text(&[(100, "A"), (300, "c")])).unwrap();
+    let job = repo.job(vec![first.clone(), second.clone()]);
+    let conflicts = execute(&repo.root, &job.id, "changes", json!({"status":"conflict"})).unwrap();
+    assert_eq!(conflicts["total"], 0, "{conflicts}");
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    let merged = String::from_utf8(state_bytes(&dir, &plan.files["Assets/Level.unity"]).unwrap()).unwrap();
+    assert_eq!(merged, scene_text(&[(100, "A"), (200, "B"), (300, "C")]));
+
+    // Leaving out the commit that added the object: the later edit cannot
+    // apply as listed, and preview says why instead of failing to render.
+    execute(&repo.root, &job.id, "new_plan", json!({})).unwrap();
+    execute(&repo.root, &job.id, "include", json!({"commit":second})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    let issue = plan.issues.iter().find(|i| i["code"] == "earlier_commit_decisions").unwrap_or_else(|| panic!("{:?}", plan.issues));
+    assert_eq!(issue["earlier_commits"], json!([first]));
+    assert!(!issue["change_ids"].as_array().unwrap().is_empty());
+    assert!(plan.issues.iter().all(|i| i["code"] != "asset_render"), "{:?}", plan.issues);
+}
+
+/// Consecutive commits of one text file: the later commit edits lines the
+/// earlier one wrote, which merges cleanly once the earlier one is included.
+#[test]
+fn consecutive_text_commits_are_cataloged_against_the_earlier_commit() {
+    let repo = repo_with(&[("Assets/notes.md", "one
+two
+three
+four
+five
+")]);
+    let first = repo.commit_files(&[("Assets/notes.md", Some("one
+TWO
+three
+four
+five
+"))]);
+    let second = repo.commit_files(&[("Assets/notes.md", Some("one
+TWO!
+three
+four
+five
+"))]);
+    std::fs::write(repo.root.join("Assets/notes.md"), "one
+two
+three
+four
+FIVE
+").unwrap();
+    let job = repo.job(vec![first, second]);
+    let conflicts = execute(&repo.root, &job.id, "changes", json!({"status":"conflict"})).unwrap();
+    assert_eq!(conflicts["total"], 0, "{conflicts}");
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(state_bytes(&dir, &plan.files["Assets/notes.md"]).unwrap(), b"one
+TWO!
+three
+four
+FIVE
+");
+}
+
+/// GameObject 100 with Transform 400 and, if `size` is set, BoxCollider 500.
+fn collider_scene(size: Option<u32>) -> String {
+    let listed = if size.is_some() { "  - component: {fileID: 500}\n" } else { "" };
+    let mut text = format!(
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &100\nGameObject:\n  m_Component:\n  - component: {{fileID: 400}}\n{listed}  m_Name: A\n\
+         --- !u!4 &400\nTransform:\n  m_GameObject: {{fileID: 100}}\n  m_Children: []\n  m_Father: {{fileID: 0}}\n"
+    );
+    if let Some(size) = size {
+        text.push_str(&format!("--- !u!65 &500\nBoxCollider:\n  m_GameObject: {{fileID: 100}}\n  m_Size: {{x: {size}, y: 1, z: 1}}\n"));
+    }
+    text
+}
+
+/// A validation finding names an object rather than a change; the issue
+/// lists the catalog changes of that object so the agent has an ID to act on.
+#[test]
+fn validation_conflicts_name_the_changes_of_the_reported_object() {
+    let repo = repo_with(&[("Assets/Level.unity", &collider_scene(Some(1)))]);
+    let commit = repo.commit_files(&[("Assets/Level.unity", Some(&collider_scene(Some(3))))]);
+    std::fs::write(repo.root.join("Assets/Level.unity"), collider_scene(None)).unwrap();
+    let job = repo.job(vec![commit]);
+    let conflicts = execute(&repo.root, &job.id, "changes", json!({"status":"conflict"})).unwrap();
+    let restored = conflicts["changes"].as_array().unwrap().iter()
+        .find(|c| c["object_id"] == "500").unwrap_or_else(|| panic!("{conflicts}"))["id"].clone();
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    execute(&repo.root, &job.id, "resolve", json!({"change_ids":[restored],"side":"source"})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    let issue = plan.issues.iter().find(|i| i["code"] == "asset_conflict").unwrap_or_else(|| panic!("{:?}", plan.issues));
+    assert!(issue["change_ids"].as_array().unwrap().contains(&restored), "{issue}");
+    assert!(issue["conflicts"].as_array().unwrap().iter().any(|c| c["related_change_ids"].as_array().is_some_and(|ids| ids.contains(&restored))), "{issue}");
+
+    // The conflict's reason names the restore that brings its listing along.
+    let reason = conflicts["changes"].as_array().unwrap().iter().find(|c| c["id"] == restored).unwrap()["reason"].as_str().unwrap().to_string();
+    assert!(reason.contains("objects.restore(path, object_id='500')"), "{reason}");
+    let outcome = execute(&repo.root, &job.id, "objects.restore", json!({"path":"Assets/Level.unity","object_id":"500"})).unwrap();
+    assert_eq!(outcome["restored"]["attached"], json!([{"object_id":"100","property_path":"/GameObject/m_Component/@component=500"}]));
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(String::from_utf8(state_bytes(&dir, &plan.files["Assets/Level.unity"]).unwrap()).unwrap(), collider_scene(Some(3)));
+}
+
+fn journal_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn job_dirs(repo: &Repo) -> Vec<String> {
+    journal_entries(&journal_root(&repo.root).unwrap()).into_iter().filter(|n| uuid::Uuid::parse_str(n).is_ok()).collect()
+}
+
+fn job_refs(repo: &Repo) -> String {
+    git_text(&repo.root, &["for-each-ref", "--format=%(refname)", "refs/locus/merge-jobs/"]).unwrap()
+}
+
+fn backdate(path: &Path, days: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 3600))
+        .unwrap();
+}
+
+/// The large parts of a job are written once; a plan change rewrites only the
+/// small record, which stores a file whose changes share one decision once.
+#[test]
+fn plan_changes_rewrite_only_the_job_record() {
+    let repo = Repo::new();
+    let commit = repo.commit("asset.asset", yaml(111, 6, "source"));
+    let job = repo.job(vec![commit]);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    let names = journal_entries(&dir);
+    let prefixes: Vec<&str> = names.iter().map(|n| n.rsplit_once('-').map_or(n.as_str(), |(p, _)| p)).collect();
+    assert_eq!(prefixes, ["deltas", "dependencies", "files", "index-flags", "index-records", "job.json", "schemas"], "{names:?}");
+    let stamps = |names: &[String]| -> Vec<std::time::SystemTime> {
+        names.iter().filter(|n| *n != "job.json").map(|n| std::fs::metadata(dir.join(n)).unwrap().modified().unwrap()).collect()
+    };
+    let before = stamps(&names);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let after_names: Vec<String> = journal_entries(&dir).into_iter().filter(|n| n != "preview-latest.json").collect();
+    assert_eq!(after_names, names);
+    assert_eq!(stamps(&after_names), before);
+    let record: Value = serde_json::from_slice(&std::fs::read(dir.join("job.json")).unwrap()).unwrap();
+    let decisions = &record["selection"]["decisions"];
+    assert_eq!(decisions["files"].as_array().unwrap().len(), 1, "{decisions}");
+    assert!(decisions["changes"].as_object().unwrap().is_empty(), "{decisions}");
+    let loaded = load(&repo.root, &job.id).unwrap();
+    let changes = loaded.deltas.iter().map(|d| d.changes.len()).sum::<usize>();
+    assert!(changes > 1);
+    assert_eq!(loaded.selection.decisions.len(), changes);
+    assert!(preview(&repo.root, &job.id).unwrap().ready_to_apply);
+}
+
+/// A failed prepare, an abort and a commit each leave no job directory, ref
+/// or blob behind.
+#[test]
+fn ended_jobs_leave_no_journal_files() {
+    let repo = Repo::new();
+    let commit = repo.commit("notes.txt", "source notes\n");
+    let failed = prepare(&repo.root, &PrepareRequest {
+        sources: vec![SourceSelection { commits: vec![commit.clone()], ..Default::default() }],
+        paths: Some(vec!["absent.txt".into()]),
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(failed.contains("absent"), "{failed}");
+    assert!(job_dirs(&repo).is_empty());
+    assert!(job_refs(&repo).is_empty());
+
+    let aborted = repo.job(vec![commit.clone()]);
+    assert_eq!(execute(&repo.root, &aborted.id, "abort", json!({})).unwrap()["removed"], true);
+    assert!(job_dirs(&repo).is_empty());
+    assert!(job_refs(&repo).is_empty());
+    assert_eq!(execute(&repo.root, &aborted.id, "abort", json!({})).unwrap()["state"], "removed");
+    let gone = load(&repo.root, &aborted.id).unwrap_err();
+    assert!(gone.contains("no longer exists"), "{gone}");
+
+    let job = repo.job(vec![commit]);
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    execute(&repo.root, &job.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap();
+    let committed = execute(&repo.root, &job.id, "commit", json!({"paths":["notes.txt"],"message":"Take source notes"})).unwrap();
+    assert_eq!(committed["removed"], true);
+    assert_eq!(git_text(&repo.root, &["show", "HEAD:notes.txt"]).unwrap(), "source notes");
+    assert!(job_dirs(&repo).is_empty());
+    assert!(job_refs(&repo).is_empty());
+    let journal = journal_root(&repo.root).unwrap();
+    assert!(journal_entries(&journal.join(BLOB_STORE)).is_empty(), "{:?}", journal_entries(&journal.join(BLOB_STORE)));
+    assert!(journal_entries(&journal).iter().all(|n| !n.starts_with("trash-")));
+}
+
+/// An applied job stays usable until its destination moves on; a prepared
+/// job expires when unused; a job needing recovery is never removed.
+#[test]
+fn unfinished_jobs_expire_by_their_own_rules() {
+    let repo = Repo::new();
+    let commit = repo.commit("notes.txt", "source notes\n");
+    let applied = repo.job(vec![commit.clone()]);
+    execute(&repo.root, &applied.id, "include", json!({"all":true})).unwrap();
+    let plan = preview(&repo.root, &applied.id).unwrap();
+    execute(&repo.root, &applied.id, "apply", json!({"expected_plan_hash":plan.plan_hash})).unwrap();
+    let prepared = repo.job(vec![commit.clone()]);
+    assert!(job_dirs(&repo).contains(&applied.id), "a new prepare keeps an applied job whose destination is unchanged");
+
+    git(&repo.root, &["commit", "-qam", "user commits the merge"]).unwrap();
+    let next = repo.job(vec![repo.commit("asset.asset", yaml(103, 5, "later"))]);
+    let live = job_dirs(&repo);
+    assert!(!live.contains(&applied.id), "HEAD moved: the applied job is finished");
+    assert!(live.contains(&prepared.id) && live.contains(&next.id));
+    assert!(next.prepare_metrics["phases"]["prune_ms"].is_number());
+
+    backdate(&job_dir(&repo.root, &prepared.id).unwrap().join("job.json"), 4);
+    let dir = job_dir(&repo.root, &next.id).unwrap();
+    let mut recovering = load(&repo.root, &next.id).unwrap();
+    recovering.state = "recovery_required".into();
+    save(&dir, &recovering).unwrap();
+    backdate(&dir.join("job.json"), 30);
+    repo.job(vec![commit]);
+    let live = job_dirs(&repo);
+    assert!(!live.contains(&prepared.id), "unused for three days");
+    assert!(live.contains(&next.id), "recovery data is kept");
+    assert!(job_refs(&repo).contains(&next.id));
+}
+
+/// A full snapshot freezes raw bytes only for writable targets. Clean Unity
+/// files stay Git-backed inputs: readable, promoted when a plan writes one,
+/// and still stale when they change.
+#[test]
+fn full_snapshots_keep_clean_inputs_in_git() {
+    let meta = "fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\n";
+    let repo = repo_with(&[("Assets/Other.prefab", &scene_text(&[(1, "o")])), ("Assets/Other.prefab.meta", meta)]);
+    let commit = repo.commit("asset.asset", yaml(111, 5, "source"));
+    std::fs::write(repo.root.join("notes.txt"), "dirty notes\n").unwrap();
+    let job = repo.job(vec![commit]);
+    assert!(job.snapshot.files.contains_key("asset.asset"));
+    assert!(job.snapshot.files.contains_key("notes.txt"));
+    assert!(!job.snapshot.files.contains_key("Assets/Other.prefab"));
+    assert!(git_blob_oid(job.dependency_files["Assets/Other.prefab"].as_ref().unwrap()).is_some());
+    let view = execute(&repo.root, &job.id, "inspect_asset", json!({"path":"Assets/Other.prefab"})).unwrap();
+    assert_eq!(view["kind"], "unity_yaml");
+
+    execute(&repo.root, &job.id, "files.delete", json!({"path":"Assets/Other.prefab"})).unwrap();
+    let promoted = load(&repo.root, &job.id).unwrap();
+    let state = promoted.snapshot.files["Assets/Other.prefab"].as_ref().unwrap();
+    assert!(git_blob_oid(state).is_none());
+
+    std::fs::write(repo.root.join("Assets/Other.prefab.meta"), meta.replace("0123", "fedc")).unwrap();
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    let error = check_target(&repo.root, &dir, &promoted).unwrap_err();
+    assert!(error.contains("stale"), "{error}");
+    let error = execute(&repo.root, &job.id, "files.delete", json!({"path":"Assets/Other.prefab.meta"})).unwrap_err();
+    assert!(error.contains("stale"), "{error}");
+}
+
+
+/// Kept root K and root R > child C > grandchild D with a collider.
+fn restore_level(r: bool, c: bool, collider: Option<u32>) -> String {
+    let object = |id: i64, name: &str, father: i64, children: &[i64], collider: Option<u32>| {
+        let mut text = format!("--- !u!1 &{id}\nGameObject:\n  m_Component:\n  - component: {{fileID: {}}}\n", id + 1);
+        if collider.is_some() {
+            text.push_str(&format!("  - component: {{fileID: {}}}\n", id + 2));
+        }
+        text.push_str(&format!("  m_Name: {name}\n--- !u!4 &{}\nTransform:\n  m_GameObject: {{fileID: {id}}}\n", id + 1));
+        if children.is_empty() {
+            text.push_str("  m_Children: []\n");
+        } else {
+            text.push_str("  m_Children:\n");
+            for child in children {
+                text.push_str(&format!("  - {{fileID: {child}}}\n"));
+            }
+        }
+        text.push_str(&format!("  m_Father: {{fileID: {father}}}\n"));
+        if let Some(size) = collider {
+            text.push_str(&format!("--- !u!65 &{}\nBoxCollider:\n  m_GameObject: {{fileID: {id}}}\n  m_Size: {{x: {size}, y: 1, z: 1}}\n", id + 2));
+        }
+        text
+    };
+    let mut text = String::from("%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n");
+    if r {
+        text.push_str(&object(100, "R", 0, if c { &[201] } else { &[] }, None));
+    }
+    if c {
+        text.push_str(&object(200, "C", 101, &[301], None));
+        text.push_str(&object(300, "D", 201, &[], collider));
+    }
+    text.push_str(&object(1000, "K", 0, &[], None));
+    text.push_str("--- !u!1660057539 &9223372036854775807\nSceneRoots:\n  m_Roots:\n");
+    for root in if r { vec![101, 1001] } else { vec![1001] } {
+        text.push_str(&format!("  - {{fileID: {root}}}\n"));
+    }
+    text
+}
+
+/// The destination deleted a root subtree while the source edited a
+/// component deep inside it. One restore brings the subtree back with its
+/// scene root entry, and the result is exactly the source scene.
+#[test]
+fn restoring_a_deleted_subtree_is_one_operation() {
+    let repo = repo_with(&[("Assets/Level.unity", &restore_level(true, true, Some(1)))]);
+    let source = restore_level(true, true, Some(3));
+    let commit = repo.commit_files(&[("Assets/Level.unity", Some(&source))]);
+    std::fs::write(repo.root.join("Assets/Level.unity"), restore_level(false, false, None)).unwrap();
+    let job = repo.job(vec![commit]);
+    let conflicts = execute(&repo.root, &job.id, "changes", json!({"status":"conflict"})).unwrap();
+    assert_eq!(conflicts["total"], 1, "{conflicts}");
+    let conflict = &conflicts["changes"][0];
+    assert_eq!(conflict["object_id"], "302");
+    assert!(conflict["reason"].as_str().unwrap().contains("objects.restore(path, object_id='302')"));
+
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    let outcome = execute(&repo.root, &job.id, "objects.restore", json!({"path":"Assets/Level.unity","object_id":"302"})).unwrap();
+    let restored = &outcome["restored"];
+    assert_eq!(restored["objects"], json!(["100", "101", "200", "201", "300", "301", "302"]));
+    assert_eq!(restored["resolved_change_ids"], json!([conflict["id"]]));
+    assert_eq!(restored["attached"], json!([{"object_id":"9223372036854775807","property_path":"/SceneRoots/m_Roots/@root=101"}]));
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(String::from_utf8(state_bytes(&dir, &plan.files["Assets/Level.unity"]).unwrap()).unwrap(), source);
+
+    // Keeping it deleted instead stays one decision.
+    execute(&repo.root, &job.id, "new_plan", json!({})).unwrap();
+    execute(&repo.root, &job.id, "include", json!({"all":true})).unwrap();
+    execute(&repo.root, &job.id, "resolve", json!({"change_ids":[conflict["id"]],"side":"target"})).unwrap();
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    assert!(!plan.files.contains_key("Assets/Level.unity"), "the destination keeps its file");
+}
+
+/// The destination deleted a child subtree under a kept parent; the restore
+/// stops at that parent and adds the child to its m_Children.
+#[test]
+fn restoring_a_deleted_child_subtree_attaches_it_to_the_kept_parent() {
+    let repo = repo_with(&[("Assets/Level.unity", &restore_level(true, true, Some(1)))]);
+    let source = restore_level(true, true, Some(3));
+    let commit = repo.commit_files(&[("Assets/Level.unity", Some(&source))]);
+    std::fs::write(repo.root.join("Assets/Level.unity"), restore_level(true, false, None)).unwrap();
+    let job = repo.job(vec![commit]);
+    let outcome = execute(&repo.root, &job.id, "objects.restore", json!({"path":"Assets/Level.unity","object_id":"302"})).unwrap();
+    assert_eq!(outcome["restored"]["attached"], json!([{"object_id":"101","property_path":"/Transform/m_Children/@child=201"}]));
+    let plan = preview(&repo.root, &job.id).unwrap();
+    assert!(plan.ready_to_apply, "{:?}", plan.issues);
+    let dir = job_dir(&repo.root, &job.id).unwrap();
+    assert_eq!(String::from_utf8(state_bytes(&dir, &plan.files["Assets/Level.unity"]).unwrap()).unwrap(), source);
+    let error = execute(&repo.root, &job.id, "objects.restore", json!({"path":"Assets/Level.unity","object_id":"1000"})).unwrap_err();
+    assert!(error.contains("still has object 1000"), "{error}");
+}
+
+/// Only files the Editor serializes can hold unsaved Editor changes, so only
+/// they make an abort wait for the Editor to close.
+#[test]
+fn abort_waits_for_the_editor_only_for_files_it_serializes() {
+    for path in ["Assets/Level.unity", "Assets/A.prefab", "Assets/Data.asset", "Assets/Tex.png.meta", "Assets/M.mat"] {
+        assert!(editor_serialized(path), "{path}");
+    }
+    for path in [".locus-sdk-merge.txt", "Assets/Code.cs", "Assets/Game.asmdef", "Packages/manifest.json", "README.md"] {
+        assert!(!editor_serialized(path), "{path}");
+    }
 }
