@@ -3,6 +3,7 @@ import { createApp, h, nextTick, ref } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import ModelViewer from "../components/model-preview/ModelViewer.vue";
 import type { ModelPreviewEngine } from "../components/model-preview/modelPreviewEngine";
+import { t } from "../i18n";
 
 const engineMock = vi.hoisted(() => ({ create: vi.fn() }));
 vi.mock("../components/model-preview/modelPreviewEngine", () => {
@@ -55,10 +56,13 @@ function mountViewer(props: Record<string, unknown> = {}, handlers: Record<strin
 
 beforeEach(() => {
   engineMock.create.mockReset();
+  // jsdom has no layout; BaseDropdown scrolls the active option into view.
+  Object.defineProperty(Element.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
 });
 
 afterEach(() => {
   cleanups.splice(0).forEach((cleanup) => cleanup());
+  Reflect.deleteProperty(Element.prototype, "scrollIntoView");
 });
 
 describe("ModelViewer", () => {
@@ -153,9 +157,11 @@ describe("ModelViewer", () => {
 
     await click(".model-viewer-tool.icon:not(.trailing)"); // pause
     expect(engine.setPlaying).toHaveBeenLastCalledWith(false);
-    const select = host.querySelector<HTMLSelectElement>(".model-viewer-clip")!;
-    select.value = "1";
-    select.dispatchEvent(new Event("change"));
+    await click(".model-viewer-clip .base-dropdown-trigger");
+    const clipOptions = Array.from(document.querySelectorAll<HTMLElement>('[role="option"]'));
+    expect(clipOptions.map((option) => option.textContent?.trim())).toEqual(["Idle", t("model.preview.clipUnnamed", 2)]);
+    clipOptions[1].click();
+    await nextTick();
     expect(engine.selectClip).toHaveBeenCalledWith(1);
     await click(".model-viewer-tool.trailing");
     expect(engine.resetView).toHaveBeenCalled();
