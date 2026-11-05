@@ -3,6 +3,7 @@
 //! A used process never returns to the spare pool: it stays sticky until reaped.
 use super::*;
 use super::super::ssh::{ConnectionSettings, PermissionMode, SshConfig};
+use super::super::connection::NativeConnection;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Context {
@@ -10,7 +11,7 @@ pub(crate) struct Context {
     pub checkout: String,
     pub epoch: u64,
     pub model: String,
-    pub remote: SshConfig,
+    pub remote: NativeConnection,
     pub permission: PermissionMode,
     pub runtime: super::super::runtime_settings::RuntimeSettings,
     pub native_tool_search: bool,
@@ -18,12 +19,23 @@ pub(crate) struct Context {
 impl Context {
     pub fn options(&self, id: String, resume: Option<String>) -> ClaudeCodeCliOptions {
         let native_tool_search = self.native_tool_search && super::super::tool_catalog::native_mode_for_session(&id, resume.is_some()).unwrap_or(self.native_tool_search);
-        ClaudeCodeCliOptions { locus_session_id: id, cwd: self.cwd.clone(), model: self.model.clone(), remote: Some(self.remote.clone()),
-            system_prompt: String::new(), effort: None, tools: vec![], resume_session_id: resume, native_tool_search }
+        ClaudeCodeCliOptions { locus_session_id: id, cwd: self.cwd.clone(), model: self.model.clone(), remote: self.remote.as_ssh().cloned(),
+            system_prompt: String::new(), effort: None, tools: vec![], resume_session_id: resume, native_tool_search,
+            // Spares never register a delegation directory. A native-agent
+            // conversation does not reuse them (the run restarts the process).
+            native_agents: false, agents: serde_json::Value::Null }
     }
     fn configured(&self, settings: &ConnectionSettings) -> bool {
-        settings.remote.as_ref() == Some(&self.remote) && settings.permission_mode == self.permission
-            && settings.runtime == self.runtime
+        let selected=match &self.remote {
+            NativeConnection::Ssh(config)=>settings.remote.as_ref()==Some(config),
+            NativeConnection::Server{binding_id}=>{
+                #[cfg(feature="server-client")]
+                {crate::server_client::binding_is_active(binding_id)}
+                #[cfg(not(feature="server-client"))]
+                {let _=binding_id;false}
+            }
+        };
+        selected && settings.permission_mode==self.permission && settings.runtime==self.runtime
     }
 }
 struct Spare { id: String, context: Context }
@@ -54,7 +66,6 @@ impl ClaudeCodeHost for IdleHost {
     }
 }
 
-const MAX_SPARE_STARTUPS: usize = 2;
 const HISTORY_GATE_TIMEOUT: Duration = Duration::from_secs(90);
 
 async fn startup_gate(id: &str, timeout: Duration) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, String> {
@@ -99,7 +110,7 @@ fn launch(state: &mut Pool, options: ClaudeCodeCliOptions, permission: Permissio
                 }
                 close_session(&job_id);
             }
-            let session = connection_status::start_cached(&options, permission).await?;
+            let session = connection_status::start_cached_with_mode(&options, permission,true).await?;
             session.prewarmed.store(true, Ordering::SeqCst);
             session.busy.store(true, Ordering::SeqCst);
             let mut lease = TurnLease(session.clone(), false);
@@ -148,6 +159,7 @@ pub(crate) fn maintain(context: Context, existing: Option<(String, Option<String
         state.last_error = None;
     }
     state.desired = Some((context.clone(), Instant::now()));
+    if let Some(remote) = context.remote.as_ssh() { super::super::archive::prewarm(remote); }
     if warm_existing {
         if let Some((id, resume)) = existing {
             launch(&mut state, context.options(id, resume), context.permission);
@@ -195,9 +207,7 @@ pub(crate) async fn connect(context: Context) -> Result<(), String> {
 // against replenishment concurrency; a long-running turn must never starve the
 // spare pool. Bound-session warmups also consume startup slots while pending.
 fn replenishment_count(state: &Pool, capacity: usize, now: Instant) -> usize {
-    if state.retry_after.is_some_and(|at| now < at) { return 0; }
-    capacity.saturating_sub(state.spares.len())
-        .min(MAX_SPARE_STARTUPS.saturating_sub(state.jobs.len()))
+    locus_remote_core::claude_launch::spare_start_count(capacity,state.spares.len(),state.jobs.len(),state.retry_after.is_some_and(|at|now<at))
 }
 
 fn reconcile() {
@@ -283,9 +293,25 @@ pub(super) struct PoolSnapshot {
 }
 pub(super) fn status(config: &SshConfig, settings: &ConnectionSettings) -> PoolSnapshot {
     let state = pool().lock().unwrap_or_else(|e| e.into_inner());
-    pool_snapshot(&state, config, settings)
+    pool_snapshot(&state, &NativeConnection::from(config), settings)
 }
-fn pool_snapshot(state: &Pool, config: &SshConfig, settings: &ConnectionSettings) -> PoolSnapshot {
+pub(super) fn status_connection(config:&NativeConnection,settings:&ConnectionSettings)->PoolSnapshot {
+    pool_snapshot(&pool().lock().unwrap_or_else(|e|e.into_inner()),config,settings)
+}
+pub(super) fn desired_server_model()->Option<String> {
+    pool().lock().unwrap_or_else(|e|e.into_inner()).desired.as_ref()
+        .filter(|(context,_)|matches!(context.remote,NativeConnection::Server{..})).map(|(context,_)|context.model.clone())
+}
+pub(crate) fn target(model:&str,settings:&ConnectionSettings)->Result<NativeConnection,String> {
+    #[cfg(feature="server-client")]
+    if let Some((binding,_))=crate::server_client::binding_for_model(model)? {
+        if binding.kind!="claude" {return Err("Select a Claude Code model to connect".into());}
+        return NativeConnection::server(binding.id);
+    }
+    if !model.starts_with("claude_code/"){return Err("Select a Claude Code model to connect".into());}
+    settings.remote.clone().map(NativeConnection::Ssh).ok_or_else(||"No Claude SSH server is configured".into())
+}
+fn pool_snapshot(state: &Pool, config: &NativeConnection, settings: &ConnectionSettings) -> PoolSnapshot {
     let spares: std::collections::HashSet<_> = state.spares.iter().filter(|s| &s.context.remote == config).map(|s| s.id.clone()).collect();
     let demanded = state.desired.as_ref().is_some_and(|(context, touched)| &context.remote == config
         && (settings.prewarm || state.manual) && context.configured(settings) && touched.elapsed() < Duration::from_secs(u64::from(settings.idle_minutes.clamp(1, 60)) * 60));
@@ -324,12 +350,12 @@ mod tests {
     use super::*;
     fn context() -> Context {
         Context { cwd: "C:/workspace".into(), checkout: "checkout".into(), epoch: 3, model: "claude_code/claude-opus-5-5".into(),
-            remote: SshConfig { target: "unused.invalid".into(), port: None, identity_file: None, known_hosts_file: None, cli_path: None }, permission: PermissionMode::Auto, runtime: Default::default(), native_tool_search: true }
+            remote: SshConfig { target: "unused.invalid".into(), port: None, identity_file: None, known_hosts_file: None, cli_path: None }.into(), permission: PermissionMode::Auto, runtime: Default::default(), native_tool_search: true }
     }
     #[test]
     fn connection_failures_remain_visible_until_recovery_and_do_not_cross_contexts() {
         let context = context();
-        let settings = ConnectionSettings { prewarm: true, remote: Some(context.remote.clone()), ..Default::default() };
+        let settings = ConnectionSettings { prewarm: true, remote: context.remote.as_ssh().cloned(), ..Default::default() };
         let mut state = Pool { desired: Some((context.clone(), Instant::now())), ..Default::default() };
         let error = "Claude plugin validation failed.\nregister.js:116: invalid helper";
         record_result(&mut state, Some(&context), Err(error.into()));
@@ -343,8 +369,8 @@ mod tests {
         assert_eq!(state.last_error.as_deref(), Some(error));
         record_result(&mut state, Some(&other), Err("stale failure".into()));
         assert_eq!(state.last_error.as_deref(), Some(error));
-        let another_server = SshConfig { target: "other.invalid".into(), ..context.remote.clone() };
-        assert!(pool_snapshot(&state, &another_server, &settings).last_error.is_none());
+        let another_server = SshConfig { target: "other.invalid".into(), ..context.remote.as_ssh().unwrap().clone() };
+        assert!(pool_snapshot(&state, &NativeConnection::from(&another_server), &settings).last_error.is_none());
         let changed = ConnectionSettings { permission_mode: PermissionMode::BypassPermissions, ..settings.clone() };
         assert!(pool_snapshot(&state, &context.remote, &changed).last_error.is_none());
         record_result(&mut state, Some(&context), Ok(()));
@@ -422,7 +448,7 @@ mod tests {
     #[test]
     fn allocation_is_exclusive_and_never_crosses_server_model_or_checkout() {
         let context = context();
-        let settings = ConnectionSettings { prewarm: true, remote: Some(context.remote.clone()), ..Default::default() };
+        let settings = ConnectionSettings { prewarm: true, remote: context.remote.as_ssh().cloned(), ..Default::default() };
         let mut state = Pool::default();
         for id in ["one", "two"] { state.spares.push(Spare { id: id.into(), context: context.clone() }); }
         let snapshot = HashMap::new();
@@ -452,12 +478,19 @@ mod tests {
         struct Restore(std::path::PathBuf, Vec<u8>);
         impl Drop for Restore { fn drop(&mut self) { cancel_all(); close_all(); let _ = std::fs::write(&self.0, &self.1); } }
         let _restore = Restore(path.clone(), std::fs::read(&path).unwrap());
+        // Connection options are settings now; copy the isolated ones into the
+        // process store that ssh::load_settings reads.
+        let isolated = crate::settings::global::open_store(Path::new(&config_dir), Path::new(&config_dir));
+        let options = crate::settings::group::read(&isolated, "providers.claudeCode");
+        crate::settings::global::global()
+            .set_values(&crate::settings::group::changes("providers.claudeCode", &options))
+            .unwrap();
         let mut settings = super::super::super::ssh::load_settings().unwrap();
         settings.prewarm = true; settings.pool_capacity = 2; settings.idle_minutes = 5;
         super::super::super::ssh::save_settings(&settings).unwrap();
         let root = tempfile::tempdir().unwrap();
         let context = Context { cwd: root.path().display().to_string(), checkout: "pool-test".into(), epoch: 0,
-            model, remote: settings.remote.clone().unwrap(), permission: settings.permission_mode, runtime: settings.runtime, native_tool_search: true };
+            model, remote: settings.remote.clone().unwrap().into(), permission: settings.permission_mode, runtime: settings.runtime, native_tool_search: true };
         maintain(context.clone(), None, true);
         let deadline = Instant::now() + Duration::from_secs(90);
         let ids = loop {

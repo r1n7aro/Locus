@@ -216,16 +216,25 @@ fn crash_recovery_reconciles_committed_history_preserves_input_and_exports_after
             "claude_checkpoint":{"version":1,"uuid":row.uuids[0],"sessionId":native.native_id}
         })).unwrap();
     }
-    let lost = store.add_message(&id, MessageRole::Assistant, "Unflushed streamed text").unwrap();
-    store.set_message_response_request_metadata(&id, &lost, &json!({
+    let retained = store.add_message(&id, MessageRole::Assistant, "Confirmed text absent from active snapshot").unwrap();
+    store.set_message_response_request_metadata(&id, &retained, &json!({
         "backend":"claude_code_cli", "claude_connection":remote,
         "claude_checkpoint":{"version":1,"uuid":uuid::Uuid::new_v4(),"sessionId":native.native_id}
+    })).unwrap();
+    let unconfirmed = store.add_message(&id, MessageRole::Assistant, "Unflushed streamed text").unwrap();
+    store.set_message_response_request_metadata(&id, &unconfirmed, &json!({
+        "backend":"claude_code_cli", "claude_connection":remote
     })).unwrap();
     let pending = store.add_message(&id, MessageRole::User, "continue with my new requirement").unwrap();
     let before = store.get_messages(&id).unwrap();
     assert!(store.reconcile_claude_native(&id, &remote, &native, &before, Some(&pending)).unwrap());
     let after = store.get_messages(&id).unwrap();
-    assert_eq!(after.len(), 3);
+    assert_eq!(after.len(), 4);
+    assert!(after.iter().any(|m| m.id == retained));
+    assert!(!after.iter().any(|m| m.id == unconfirmed));
+    let prompt = store.get_messages_for_prompt(&id).unwrap();
+    assert_eq!(prompt.len(), 3);
+    assert!(!prompt.iter().any(|m| m.id == retained));
     assert_eq!(after.last().unwrap().id, pending);
     assert_eq!(store.latest_cli_session_id(&id, "claude_code").unwrap().as_deref(), Some(native.native_id.as_str()));
     assert!(!store.reconcile_claude_native(&id, &remote, &native, &after, Some(&pending)).unwrap());
@@ -239,6 +248,7 @@ fn crash_recovery_reconciles_committed_history_preserves_input_and_exports_after
     let text = std::fs::read_to_string(output).unwrap();
     assert!(text.contains("Checking the asset."));
     assert!(text.contains("continue with my new requirement"));
+    assert!(text.contains("Confirmed text absent from active snapshot"));
 }
 
 #[tokio::test]

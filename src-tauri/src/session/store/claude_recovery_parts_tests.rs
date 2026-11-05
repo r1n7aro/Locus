@@ -41,7 +41,7 @@ fn authoritative_recovery_of_captured_session_rebuilds_and_exports() {
     eprintln!("Authoritative recovery: {} local rows -> {} remote rows + current input; export verified",before.len(),native.messages.len());
 }
 
-fn fixture() -> (SshConfig, NativeSnapshot) {
+fn fixture() -> (NativeConnection, NativeSnapshot) {
     let remote = serde_json::from_value(json!({"target":"test@host","port":22})).unwrap();
     let uuid = |n| Uuid::from_u128(n).to_string();
     let row = |n, parent: Option<u128>, role: &str, content: Value| json!({"uuid":uuid(n),"parentUuid":parent.map(uuid),
@@ -66,7 +66,7 @@ fn fixture() -> (SshConfig, NativeSnapshot) {
     (remote, snapshot)
 }
 
-fn seed(store: &SessionStore, id: &str, remote: &SshConfig, snapshot: &NativeSnapshot) -> Vec<String> {
+fn seed(store: &SessionStore, id: &str, remote: &NativeConnection, snapshot: &NativeSnapshot) -> Vec<String> {
     let user = store.add_message(id, MessageRole::User, "question").unwrap();
     let assistant = &snapshot.messages[1];
     let mut ids = vec![user.clone()];

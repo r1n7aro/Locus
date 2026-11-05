@@ -1,6 +1,7 @@
 //! Freeze an acknowledged native transcript, then let Claude --fork-session
 //! create the new native identity. Never replay Locus history as model requests.
 use super::*;
+use super::connection::NativeConnection;
 use crate::session::store::SessionStore;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -37,19 +38,33 @@ pub async fn prepare(store: &SessionStore, source: &str, target: &str) -> Result
         uuid::Uuid::parse_str(id).map_err(|_| "Invalid Claude fork boundary")?;
     }
     let remote = recovery::recorded_remote(store,source)?;
-    let remote = ssh::session_connection(source, true, Some(remote))?;
-    ssh::session_connection(target, false, Some(remote.clone()))?;
+    let remote = ssh::native_session_connection(source, true, Some(remote))?;
+    ssh::native_session_connection(target, false, Some(remote.clone()))?;
     if let Some(remote)=&remote {store.set_claude_active_remote(target,remote)?;}
-    let state = ForkState {
+    let mut state = ForkState {
         version: 1,
         source_id: native_id.into(),
         new_id: uuid::Uuid::new_v4().to_string(),
     };
     let todos=messages.iter().rev().find_map(|message|metadata.get(&message.id).and_then(|value|value.get("claude_todos")));
-    if let Some(config) = &remote {
-        let (_transport,_)=ssh::Transport::start(config,json!({"mode":"fork","authorizedSetup":true,
-            "sourceKey":ssh::session_key(source,config),"sessionKey":ssh::session_key(target,config),
-            "sourceId":state.source_id,"newId":state.new_id,"at":at,"afterCompact":after_compact,"todos":todos}),None).await?;
+    if let Some(connection) = &remote {
+        match connection {
+            NativeConnection::Ssh(config) => {
+                let (_transport,_)=ssh::Transport::start(config,json!({"mode":"fork","authorizedSetup":true,
+                    "sourceKey":ssh::session_key(source,config),"sessionKey":ssh::session_key(target,config),
+                    "sourceId":state.source_id,"newId":state.new_id,"at":at,"afterCompact":after_compact,"todos":todos}),None).await?;
+            }
+            NativeConnection::Server{binding_id} => {
+                #[cfg(feature="server-client")]
+                {
+                    let reply=super::server_transport::operation(binding_id,target,"fork",json!({"sourceSessionId":source,"sourceId":state.source_id,"at":at,"afterCompact":after_compact,"todos":todos})).await?;
+                    state.new_id=reply["nativeId"].as_str().ok_or("Server did not return the forked conversation identity")?.into();
+                    uuid::Uuid::parse_str(&state.new_id).map_err(|_|"Invalid forked conversation identity")?;
+                }
+                #[cfg(not(feature="server-client"))]
+                {let _=binding_id;return Err("This conversation requires the internal Locus Server client".into());}
+            }
+        }
     } else {
         let source = ssh::profile_root(source)?;
         let target = ssh::profile_root(target)?;
@@ -148,11 +163,15 @@ pub(super) fn snapshot(input: &str, at: &str, after_compact: bool) -> Result<Str
         // Native @file/image attachments are appended immediately AFTER their
         // user row. Preserve them when forking from that user message, but
         // never include the following assistant response or another prompt.
+        // After a compaction summary Claude records the /compact command echo
+        // and then the post-compaction attachments, including the Locus
+        // carry-forward (SessionStart context). They belong to the summary.
         if found
             && (value["attachment"]["type"] == "queued_command"
                 || (value["uuid"].is_string()
                     && value["type"] != "attachment"
-                    && !(value["type"] == "user" && value["isMeta"] == true)))
+                    && !(value["type"] == "user" && value["isMeta"] == true)
+                    && !(after_compact && super::recovery::hidden_native_user(&value))))
         {
             break;
         }
@@ -220,6 +239,20 @@ mod tests {
         let compacted="{\"uuid\":\"command\"}\n{\"uuid\":\"boundary\",\"type\":\"system\"}\n{\"uuid\":\"summary\",\"type\":\"user\",\"isCompactSummary\":true}\n{\"uuid\":\"future\",\"type\":\"user\"}";
         let copied = snapshot(compacted, "command", true).unwrap();
         assert!(copied.contains("summary") && !copied.contains("future"));
+        let echoed = [
+            r#"{"uuid":"command"}"#,
+            r#"{"uuid":"boundary","type":"system"}"#,
+            r#"{"uuid":"summary","type":"user","isCompactSummary":true,"message":{"content":"Summary"}}"#,
+            r#"{"uuid":"caveat","type":"user","isMeta":true,"message":{"content":"<local-command-caveat>x</local-command-caveat>"}}"#,
+            r#"{"uuid":"echo","type":"user","message":{"content":"<command-name>/compact</command-name>"}}"#,
+            r#"{"uuid":"stdout","type":"user","message":{"content":"<local-command-stdout>Compacted</local-command-stdout>"}}"#,
+            r#"{"uuid":"carry","type":"attachment","attachment":{"type":"hook_additional_context","content":["CARRY"]}}"#,
+            r#"{"uuid":"future","type":"user","message":{"content":"next request"}}"#,
+        ].join("\n");
+        let copied = snapshot(&echoed, "command", true).unwrap();
+        assert!(copied.contains("\"carry\"") && copied.contains("\"stdout\"") && !copied.contains("future"));
+        // Without a compaction, a command echo still ends the copied turn.
+        assert!(!snapshot(&echoed, "caveat", false).unwrap().contains("\"carry\""));
         assert!(snapshot("{\"uuid\":\"command\"}", "command", true).is_err());
     }
 }

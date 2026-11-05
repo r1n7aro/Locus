@@ -1,4 +1,18 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=LOCUS_BUILD_EDITION");
+    println!("cargo:rerun-if-env-changed=LOCUS_VERIFY_FRONTEND");
+    let internal = std::env::var_os("CARGO_FEATURE_SERVER_CLIENT").is_some();
+    let edition = std::env::var("LOCUS_BUILD_EDITION").unwrap_or_else(|_| "public".into());
+    assert!(matches!(edition.as_str(), "public" | "internal"), "Unknown client edition");
+    assert_eq!(internal, edition == "internal", "Frontend/backend edition mismatch; use bun run internal:dev or internal:build");
+    if std::env::var("LOCUS_VERIFY_FRONTEND").as_deref() == Ok("1") {
+        let directory = if internal { "../dist-internal" } else { "../dist" };
+        let marker = std::path::Path::new(directory).join(".locus-edition.json");
+        println!("cargo:rerun-if-changed={}", marker.display());
+        let contents = std::fs::read_to_string(marker).expect("Build the matching frontend first");
+        let expected = format!("\"edition\":\"{edition}\"");
+        assert!(contents.contains(&expected), "Frontend artifact edition mismatch");
+    }
     tauri_build::build();
 
     #[cfg(target_os = "windows")]

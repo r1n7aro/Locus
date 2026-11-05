@@ -3,7 +3,7 @@
 use super::*;
 use crate::llm::claude_code_cli::{
     recovery::{self, NativeSnapshot},
-    ssh::SshConfig,
+    connection::NativeConnection,
 };
 use serde_json::{json, Value};
 
@@ -11,11 +11,12 @@ impl SessionStore {
     pub(crate) fn migrate_claude_queued_inputs(
         &self,
         id: &str,
-        remote: &SshConfig,
+        remote: &(impl Clone + Into<NativeConnection>),
         snapshot: &NativeSnapshot,
         messages: &[ChatMessage],
         metadata: &HashMap<String, Value>,
     ) -> Result<usize, String> {
+        let remote: &NativeConnection = &remote.clone().into();
         snapshot.validate(None)?;
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         let tx = conn
@@ -87,7 +88,7 @@ impl SessionStore {
             let native = candidates[0];
             let binding:Option<(String,Option<String>)>=tx.query_row("SELECT connection_json,native_id FROM claude_native_bindings WHERE session_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
             let verified = binding.as_ref().is_some_and(|(connection, native)| {
-                serde_json::from_str::<SshConfig>(connection).ok().as_ref() == Some(remote)
+                serde_json::from_str::<NativeConnection>(connection).ok().as_ref() == Some(remote)
                     && native.as_deref() == Some(snapshot.native_id.as_str())
             });
             if !verified {
@@ -132,11 +133,11 @@ mod tests {
     use super::*;
     use crate::session::models::ImageData;
 
-    fn fixture(store: &SessionStore) -> (String, SshConfig, NativeSnapshot, String) {
+    fn fixture(store: &SessionStore) -> (String, NativeConnection, NativeSnapshot, String) {
         let id = store
             .create_session("queued input", None, None, "chat", None)
             .unwrap();
-        let remote: SshConfig = serde_json::from_value(json!({"target":"test@host"})).unwrap();
+        let remote: NativeConnection = serde_json::from_value(json!({"target":"test@host"})).unwrap();
         let native_id = Uuid::new_v4().to_string();
         store
             .bind_claude_native_session(&id, &remote, &native_id)
@@ -267,7 +268,7 @@ mod tests {
                     snapshot.messages.push(extra);
                 }
                 "missing" => snapshot.messages.clear(),
-                "server" => remote.target = "another@host".into(),
+                "server" => remote.as_ssh_mut().unwrap().target = "another@host".into(),
                 "api" => store
                     .set_message_response_request_metadata(
                         &id,

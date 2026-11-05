@@ -1,5 +1,6 @@
 
 <script setup lang="ts">
+import { protocolModelId } from '@locus/server-client';
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import type { ModelOption } from "../types";
 import { t } from "../i18n";
@@ -25,7 +26,7 @@ const selectedModel = () => props.models.find((m) => m.id === props.selectedId);
 
 const selectedDisplayName = computed(() => {
   const sel = selectedModel();
-  if (!sel) return props.selectedId.startsWith("claude_code/") ? props.selectedId.slice(12) : "Model";
+  if (!sel) { const model = protocolModelId(props.selectedId); return model.startsWith("claude_code/") ? model.slice(12) : "Model"; }
   const displayName = optionDisplayName(sel);
   const duplicated = props.models.some((m) => m.id !== sel.id && optionDisplayName(m) === displayName);
   if (!duplicated) return displayName;

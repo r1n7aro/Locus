@@ -2,6 +2,9 @@ import { effectScope, reactive, ref } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useClaudePrewarm } from '../composables/useClaudePrewarm';
 import * as service from '../services/claudeConnection';
+vi.mock('@locus/server-client', () => ({
+  protocolModelId: (model: string) => model.startsWith('locus-server/') ? model.split('/').slice(2).join('/') : model,
+}));
 vi.mock('../services/claudeConnection', () => ({
   claudePrewarmSettings: ref({ enabled: true, capacity: 1, idleMinutes: 15, scope: 'server-a' }),
   prewarmClaudeSession: vi.fn(),
@@ -17,6 +20,14 @@ function harness() {
 beforeEach(() => { vi.useFakeTimers(); vi.mocked(service.prewarmClaudeSession).mockReset().mockResolvedValue(); });
 afterEach(() => { scopes.splice(0).forEach(s => s.stop()); vi.useRealTimers(); });
 describe('remote Claude prewarm interest', () => {
+  it('warms server models with the full binding and leaves Codex models alone', async () => {
+    const h=harness();h.context.modelId='locus-server/binding/claude_code/sonnet';
+    await vi.advanceTimersByTimeAsync(350);
+    expect(service.prewarmClaudeSession).toHaveBeenCalledExactlyOnceWith(null,h.context.modelId,h.context.workspaceRef,true);
+    h.context.modelId='locus-server/binding/openai/gpt-test';
+    await vi.advanceTimersByTimeAsync(31000);
+    expect(service.prewarmClaudeSession).toHaveBeenCalledTimes(1);
+  });
   it('defers selection changes during a turn and warms the selected model after completion', async () => {
     const h = harness(); h.context.busy = true;
     h.context.modelId = 'claude_code/claude-sonnet-5-5';

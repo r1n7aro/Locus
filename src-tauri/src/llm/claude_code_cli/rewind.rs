@@ -1,5 +1,6 @@
 //! Prepare a new native transcript first; switch the DB only after it exists.
 use super::*;
+use super::connection::NativeConnection;
 use crate::session::{models::MessageRole, store::SessionStore};
 
 pub enum Target<'a> {
@@ -100,7 +101,7 @@ pub async fn prepare(
                 .and_then(|value| value.get("claude_todos"))
         })
         .cloned();
-    let new_id = uuid::Uuid::new_v4().to_string();
+    let mut new_id = uuid::Uuid::new_v4().to_string();
     if keep > 0 {
         let record = metadata
             .get(&messages[keep - 1].id)
@@ -118,14 +119,40 @@ pub async fn prepare(
         }
         let after_compact = record["claude_compaction"]["checkpoint"]["uuid"] == point["uuid"];
         let remote = recovery::recorded_remote(store,id)?;
-        let remote = ssh::session_connection(id, true, Some(remote))?;
-        if let Some(config) = remote {
-            let (_transport,_)=ssh::Transport::start(&config,json!({"mode":"rewind","authorizedSetup":true,
-                "sessionKey":ssh::session_key(id,&config),"sourceId":source_id,"newId":new_id,"at":at,"afterCompact":after_compact,"todos":todos}),None).await?;
+        let remote = ssh::native_session_connection(id, true, Some(remote))?;
+        if let Some(connection) = remote {
+            match connection {
+                NativeConnection::Ssh(config) => {
+                    let (_transport,_)=ssh::Transport::start(&config,json!({"mode":"rewind","authorizedSetup":true,
+                        "sessionKey":ssh::session_key(id,&config),"sourceId":source_id,"newId":new_id,"at":at,"afterCompact":after_compact,"todos":todos}),None).await?;
+                }
+                NativeConnection::Server{binding_id} => {
+                    #[cfg(feature="server-client")]
+                    {
+                        tui::close_session(id);
+                        let reply=super::server_transport::operation(&binding_id,id,"rewind",json!({"sourceId":source_id,"at":at,"afterCompact":after_compact,"todos":todos})).await?;
+                        new_id=reply["nativeId"].as_str().ok_or("Server did not return the rewound conversation identity")?.into();
+                        uuid::Uuid::parse_str(&new_id).map_err(|_|"Invalid rewind identity")?;
+                    }
+                    #[cfg(not(feature="server-client"))]
+                    {let _=binding_id;return Err("This conversation requires the internal Locus Server client".into());}
+                }
+            }
         } else {
             let root = ssh::profile_root(id)?;
             prepare_local(&root, source_id, &new_id, at, after_compact)?;
             restore_tasks(&root, &new_id, todos.as_ref())?;
+        }
+    }
+    if keep==0 {
+        if let Some(NativeConnection::Server{binding_id})=recovery::recorded_remote(store,id)? {
+            #[cfg(feature="server-client")]
+            {
+                tui::close_session(id);
+                super::server_transport::operation(&binding_id,id,"reset",json!({"sourceId":source_id})).await?;
+            }
+            #[cfg(not(feature="server-client"))]
+            {let _=binding_id;return Err("This conversation requires the internal Locus Server client".into());}
         }
     }
     Ok(Some(PreparedRewind {

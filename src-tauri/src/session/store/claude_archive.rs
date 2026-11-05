@@ -1,9 +1,26 @@
 use super::*;
-use crate::llm::claude_code_cli::{archive::{ArchiveInfo,Delta,Manifest,LIMIT},ssh::SshConfig};
+use crate::llm::claude_code_cli::{archive::{ArchiveInfo,Delta,Manifest,LIMIT},connection::NativeConnection};
 use std::collections::BTreeMap;
 use serde_json::Value;
 
 impl SessionStore {
+    /// Schema 54 explicitly admits versioned server references. Existing SSH
+    /// JSON and fingerprints are retained byte-for-byte; reruns only validate.
+    pub(super) fn migrate_claude_connection_references(conn: &Connection) -> rusqlite::Result<()> {
+        for (table, column) in [("claude_native_bindings", "connection_json"),
+            ("claude_native_endpoints", "connection_json"),
+            ("claude_native_archives", "source_connection_json")] {
+            let mut statement = conn.prepare(&format!("SELECT {column} FROM {table}"))?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                let connection: NativeConnection = serde_json::from_str(&row?).map_err(|error|
+                    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error)))?;
+                connection.validate().map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                    0, rusqlite::types::Type::Text, Box::new(std::io::Error::other(error))))?;
+            }
+        }
+        Ok(())
+    }
     pub(super) fn migrate_claude_native_identity(conn:&Connection)->rusqlite::Result<()> {
         if !Self::table_has_column(conn,"claude_native_bindings","native_id")? {
             conn.execute_batch("ALTER TABLE claude_native_bindings ADD COLUMN native_id TEXT;")?;
@@ -18,7 +35,7 @@ impl SessionStore {
             let Some(native)=metadata.cli_session_ids.as_ref().and_then(|v|v.get("claude_code")) else {continue;};
             if Uuid::parse_str(native).is_err(){continue;}
             let payload=payload.and_then(|s|serde_json::from_str::<Value>(&s).ok()).or(metadata.response_request);
-            let Some(remote)=payload.and_then(|v|serde_json::from_value::<SshConfig>(v["claude_connection"].clone()).ok()) else {continue;};
+            let Some(remote)=payload.and_then(|v|serde_json::from_value::<NativeConnection>(v["claude_connection"].clone()).ok()) else {continue;};
             let remote=serde_json::to_string(&remote).unwrap();
             conn.execute("INSERT INTO claude_native_bindings(session_id,connection_json,native_id) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET native_id=excluded.native_id WHERE claude_native_bindings.native_id IS NULL AND claude_native_bindings.connection_json=excluded.connection_json",params![id,remote,native])?;
         }
@@ -28,7 +45,7 @@ impl SessionStore {
             WHERE claude_native_bindings.native_id IS NULL AND claude_native_bindings.connection_json=excluded.connection_json;")?;
         Ok(())
     }
-    pub(crate) fn claude_native_binding(&self,id:&str)->Result<Option<(SshConfig,Option<String>)>,String> {
+    pub(crate) fn claude_native_binding(&self,id:&str)->Result<Option<(NativeConnection,Option<String>)>,String> {
         let conn=self.conn.lock().map_err(|e|e.to_string())?;
         let row:Option<(String,Option<String>)>=conn.query_row("SELECT connection_json,native_id FROM claude_native_bindings WHERE session_id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         row.map(|(remote,native)|{
@@ -36,7 +53,8 @@ impl SessionStore {
             Ok((serde_json::from_str(&remote).map_err(|e|e.to_string())?,native))
         }).transpose()
     }
-    pub(crate) fn bind_claude_native_session(&self,id:&str,remote:&SshConfig,native:&str)->Result<(),String> {
+    pub(crate) fn bind_claude_native_session(&self,id:&str,remote:&(impl Clone + Into<NativeConnection>),native:&str)->Result<(),String> {
+        let remote: &NativeConnection = &remote.clone().into();
         Uuid::parse_str(native).map_err(|_|"Invalid Claude native identity")?;
         let conn=self.conn.lock().map_err(|e|e.to_string())?;
         conn.execute("INSERT INTO claude_native_bindings(session_id,connection_json,native_id) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET connection_json=excluded.connection_json,native_id=excluded.native_id",params![id,serde_json::to_string(remote).map_err(|e|e.to_string())?,native]).map_err(|e|e.to_string())?;
@@ -95,7 +113,8 @@ impl SessionStore {
         }
         Ok(result)
     }
-    pub(crate) fn save_claude_archive(&self,id:&str,remote:&SshConfig,delta:&Delta,expected:&Manifest)->Result<ArchiveInfo,String> {
+    pub(crate) fn save_claude_archive(&self,id:&str,remote:&(impl Clone + Into<NativeConnection>),delta:&Delta,expected:&Manifest)->Result<ArchiveInfo,String> {
+        let remote: &NativeConnection = &remote.clone().into();
         let mut conn=self.conn.lock().map_err(|e|e.to_string())?;
         let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let current:Option<String>=tx.query_row("SELECT info_json FROM claude_native_archives WHERE session_id=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
@@ -123,17 +142,19 @@ impl SessionStore {
         tx.commit().map_err(|e|e.to_string())?;
         Ok(info)
     }
-    pub(crate) fn claude_active_remote(&self,id:&str)->Result<Option<SshConfig>,String> {
+    pub(crate) fn claude_active_remote(&self,id:&str)->Result<Option<NativeConnection>,String> {
         let conn=self.conn.lock().map_err(|e|e.to_string())?;
         let raw:Option<String>=conn.query_row("SELECT connection_json FROM claude_native_bindings WHERE session_id=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         raw.map(|s|serde_json::from_str(&s).map_err(|e|e.to_string())).transpose()
     }
-    pub(crate) fn claude_endpoint_manifest(&self,id:&str,remote:&SshConfig,native:&str)->Result<Manifest,String> {
+    pub(crate) fn claude_endpoint_manifest(&self,id:&str,remote:&(impl Clone + Into<NativeConnection>),native:&str)->Result<Manifest,String> {
+        let remote: &NativeConnection = &remote.clone().into();
         let conn=self.conn.lock().map_err(|e|e.to_string())?;
         let raw:Option<String>=conn.query_row("SELECT manifest_json FROM claude_native_endpoints WHERE session_id=?1 AND fingerprint=?2 AND native_id=?3",params![id,remote.fingerprint(),native],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
         raw.map(|s|serde_json::from_str(&s).map_err(|e|e.to_string())).transpose().map(Option::unwrap_or_default)
     }
-    pub(crate) fn set_claude_active_remote(&self,id:&str,remote:&SshConfig)->Result<(),String> {
+    pub(crate) fn set_claude_active_remote(&self,id:&str,remote:&(impl Clone + Into<NativeConnection>))->Result<(),String> {
+        let remote: &NativeConnection = &remote.clone().into();
         let conn=self.conn.lock().map_err(|e|e.to_string())?;
         conn.execute("INSERT INTO claude_native_bindings(session_id,connection_json) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET native_id=CASE WHEN connection_json=excluded.connection_json THEN native_id ELSE NULL END,connection_json=excluded.connection_json",params![id,serde_json::to_string(remote).map_err(|e|e.to_string())?]).map_err(|e|e.to_string())?;
         Ok(())
@@ -153,7 +174,44 @@ mod tests {
             transferred_bytes:(bytes.len()-offset) as u64,incomplete_tail:false,
             chunks:BTreeMap::from([(name,vec![base64::engine::general_purpose::STANDARD.encode(&bytes[offset..])])])}
     }
-    fn remote()->SshConfig {serde_json::from_value(serde_json::json!({"target":"test@host","port":22})).unwrap()}
+    fn remote()->NativeConnection {serde_json::from_value(serde_json::json!({"target":"test@host","port":22})).unwrap()}
+    #[test]
+    fn v53_connection_migration_preserves_ssh_and_exports_old_and_server_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path()).unwrap();
+        assert!(SessionStore::schema_version() >= 54);
+        let ssh_session = store.create_session("SSH", None, None, "chat", None).unwrap();
+        let legacy = store.create_session("Legacy", None, None, "chat", None).unwrap();
+        store.add_message(&legacy, MessageRole::User, "legacy history").unwrap();
+        let native_id = Uuid::new_v4().to_string();
+        store.bind_claude_native_session(&ssh_session, &remote(), &native_id).unwrap();
+        let ssh_json: String = store.conn.lock().unwrap().query_row(
+            "SELECT connection_json FROM claude_native_bindings WHERE session_id=?1", [&ssh_session], |r| r.get(0)).unwrap();
+        store.conn.lock().unwrap().pragma_update(None, "user_version", 53).unwrap();
+        drop(store);
+        let store = SessionStore::new(root.path()).unwrap();
+        let (connection, saved_native) = store.claude_native_binding(&ssh_session).unwrap().unwrap();
+        assert_eq!(connection, remote());
+        assert_eq!(connection.fingerprint(), remote().fingerprint());
+        assert_eq!(saved_native, Some(native_id));
+        assert_eq!(serde_json::to_string(&connection).unwrap(), ssh_json);
+        SessionStore::migrate_claude_connection_references(&store.conn.lock().unwrap()).unwrap();
+        SessionStore::migrate_claude_connection_references(&store.conn.lock().unwrap()).unwrap();
+
+        let server_session = store.create_session("Server", None, None, "chat", None).unwrap();
+        let binding = NativeConnection::server(Uuid::new_v4().to_string()).unwrap();
+        store.bind_claude_native_session(&server_session, &binding, &Uuid::new_v4().to_string()).unwrap();
+        assert_eq!(store.claude_active_remote(&server_session).unwrap(), Some(binding.clone()));
+        let output = root.path().join("context.yaml");
+        for id in [&ssh_session, &legacy, &server_session] {
+            crate::session::context_export::export_session_context_yaml(&store, id, "F:/test", None, None, &output).unwrap();
+            let yaml: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+            if id == &legacy { assert_eq!(yaml["sessions"][0]["metadata"]["claudeNativeBinding"].as_str(), Some("empty")); }
+            if id == &server_session {
+                assert_eq!(yaml["sessions"][0]["metadata"]["claudeNativeBinding"]["connection"]["transport"].as_str(), Some("server"));
+            }
+        }
+    }
     #[test]
     fn claude_identity_migrates_v50_survives_lost_messages_and_exports() {
         let root=tempfile::tempdir().unwrap();let store=SessionStore::new(root.path()).unwrap();

@@ -48,6 +48,8 @@ const OPENAI_CODEX_CONTEXT_LIMIT: u32 = 258_400;
 const OPENAI_CODEX_5_6_CONTEXT_LIMIT: u32 = 353_400;
 
 pub(super) fn model_context_limit(model: &str) -> u32 {
+    #[cfg(feature = "server-client")]
+    let model = crate::server_client::provider_model_id(model);
     let raw = model.trim().to_ascii_lowercase();
     let is_claude_code = raw.starts_with("claude_code/");
     let m = raw.strip_prefix("openrouter/").unwrap_or(&raw);

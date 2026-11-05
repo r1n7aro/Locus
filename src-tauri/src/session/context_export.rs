@@ -1049,8 +1049,19 @@ fn non_empty_value(value: Option<&str>) -> Value {
 }
 
 fn export_claude_connection(metadata: Option<&Value>) -> Value {
+    if let Some(model) = metadata.and_then(|value| value["model"].as_str()).and_then(|model| model.strip_prefix("locus-server/")) {
+        if let Some((binding, provider_model)) = model.split_once('/') {
+            if provider_model.starts_with("claude_code/") && uuid::Uuid::parse_str(binding).is_ok() {
+                return json!({"version":1,"transport":"server","bindingId":binding});
+            }
+        }
+    }
     match metadata.and_then(|value| value.get("claude_connection")) {
         Some(Value::Null) => json!({"version":1,"transport":"local"}),
+        Some(config) if config.get("transport").is_some() => {
+            serde_json::from_value::<crate::llm::claude_code_cli::connection::NativeConnection>(config.clone())
+                .ok().and_then(|value| serde_json::to_value(value).ok()).unwrap_or_else(empty_value)
+        }
         Some(config) => json!({"version":1,"transport":"ssh","config":config}),
         None => empty_value(),
     }
@@ -1204,6 +1215,11 @@ mod tests {
         let exported = export_claude_connection(Some(&remote));
         assert_eq!(exported["version"], 1);
         assert_eq!(exported["config"]["target"], "test@host");
+        let binding = uuid::Uuid::new_v4().to_string();
+        let server = json!({"claude_connection":{"version":1,"transport":"server","bindingId":binding}});
+        assert_eq!(export_claude_connection(Some(&server)), server["claude_connection"]);
+        let codex = json!({"model":format!("locus-server/{binding}/openai/gpt-5")});
+        assert_eq!(export_claude_connection(Some(&codex)), empty_value());
     }
 
     #[test]

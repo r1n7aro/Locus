@@ -16,7 +16,7 @@ fn fork_fixture() -> (
     let source = store
         .create_session("source", None, None, "chat", None)
         .unwrap();
-    let remote = serde_json::from_value(json!({"target":"unused.invalid"})).unwrap();
+    let remote: claude_code_cli::ssh::SshConfig = serde_json::from_value(json!({"target":"unused.invalid"})).unwrap();
     let mut native: NativeSnapshot = serde_json::from_value(json!({
         "version":1, "nativeId":uuid::Uuid::new_v4(), "digest":"a".repeat(64),
         "messages":[

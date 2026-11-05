@@ -1,6 +1,7 @@
 //! Read the bound remote transcript over SSH. Never replay Locus history into
 //! Claude, create a replacement session, or issue an inference request here.
 use super::*;
+use super::connection::NativeConnection;
 use crate::session::{models::{ChatMessage, MessageRole, TodoItem}, store::SessionStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -213,18 +214,18 @@ pub fn images(content: &Value) -> Vec<ImageData> {
     }).collect()
 }
 
-pub fn recorded_remote(store: &SessionStore, id: &str) -> Result<Option<ssh::SshConfig>, String> {
+pub fn recorded_remote(store: &SessionStore, id: &str) -> Result<Option<NativeConnection>, String> {
     recorded_connection(store,id).map(Option::flatten)
 }
-pub fn recorded_connection(store: &SessionStore, id: &str) -> Result<Option<Option<ssh::SshConfig>>, String> {
+pub fn recorded_connection(store: &SessionStore, id: &str) -> Result<Option<Option<NativeConnection>>, String> {
     if let Some(remote)=store.claude_active_remote(id)? {
-        ssh::bind_restored_connection(id,&remote)?;
+        if let Some(ssh) = remote.as_ssh() { ssh::bind_restored_connection(id,ssh)?; }
         return Ok(Some(Some(remote)));
     }
     let metadata = store.get_response_request_metadata(id)?;
-    let mut result: Option<Option<ssh::SshConfig>> = None;
+    let mut result: Option<Option<NativeConnection>> = None;
     for value in metadata.values().filter_map(|v| v.get("claude_connection")) {
-        let remote: Option<ssh::SshConfig> = serde_json::from_value(value.clone()).map_err(|_| "Invalid recorded Claude connection")?;
+        let remote: Option<NativeConnection> = serde_json::from_value(value.clone()).map_err(|_| "Invalid recorded Claude connection")?;
         if result.as_ref().is_some_and(|prior| prior != &remote) {
             return Err("Conflicting native Claude server bindings; automatic synchronization stopped".into());
         }
@@ -257,15 +258,40 @@ pub fn pending_input_text(token: &str, text: &str) -> String {
     format!("<locus-pending-user id=\"{token}\">\n{text}\n</locus-pending-user>")
 }
 
-pub async fn fetch(id: &str, remote: &ssh::SshConfig, native: Option<&str>) -> Result<NativeSnapshot, String> {
-    fetch_snapshot(id, remote, native, false).await
+const CONTINUATION_OPEN: &str = "<system-reminder>\n<locus-continuation>\n";
+const CONTINUATION_CLOSE: &str = "\n</locus-continuation>\n</system-reminder>";
+
+/// Keep the internal-input identity in native history as well as the local
+/// prompt suffix, so an authoritative rebuild cannot turn it into user text.
+pub(crate) fn continuation_prompt(text: &str) -> String {
+    format!("{CONTINUATION_OPEN}{text}{CONTINUATION_CLOSE}")
 }
 
-async fn fetch_snapshot(id: &str, remote: &ssh::SshConfig, native: Option<&str>, require_idle: bool) -> Result<NativeSnapshot, String> {
-    let (_transport, info) = ssh::Transport::start(remote, serde_json::json!({
-        "mode":"history", "sessionKey":ssh::session_key(id, remote), "nativeId":native, "requireIdle":require_idle,
-    }), None).await?;
-    let snapshot: NativeSnapshot = serde_json::from_value(info.history.ok_or("Remote host did not return a native history snapshot")?)
+pub(crate) fn is_continuation_prompt(text: &str) -> bool {
+    text.strip_prefix(CONTINUATION_OPEN)
+        .is_some_and(|body| body.contains(CONTINUATION_CLOSE))
+}
+
+pub async fn fetch(id: &str, remote: &(impl Clone + Into<NativeConnection>), native: Option<&str>) -> Result<NativeSnapshot, String> {
+    fetch_snapshot(id, &remote.clone().into(), native, false).await
+}
+
+async fn fetch_snapshot(id: &str, remote: &NativeConnection, native: Option<&str>, require_idle: bool) -> Result<NativeSnapshot, String> {
+    let value = match remote {
+        NativeConnection::Ssh(remote) => {
+            let (_transport, info) = ssh::Transport::start(remote, serde_json::json!({
+                "mode":"history", "sessionKey":ssh::session_key(id, remote), "nativeId":native, "requireIdle":require_idle,
+            }), None).await?;
+            info.history.ok_or("Remote host did not return a native history snapshot")?
+        }
+        NativeConnection::Server { binding_id } => {
+            #[cfg(feature = "server-client")]
+            { super::server_transport::operation(binding_id,id,"history",json!({"nativeId":native,"requireIdle":require_idle})).await? }
+            #[cfg(not(feature = "server-client"))]
+            { let _ = binding_id; return Err("This conversation requires the internal Locus Server client".into()); }
+        }
+    };
+    let snapshot: NativeSnapshot = serde_json::from_value(value)
         .map_err(|e| format!("Invalid remote history snapshot: {e}"))?;
     snapshot.validate(native)?;
     Ok(snapshot)
@@ -317,7 +343,13 @@ async fn synchronize_inner(store: &SessionStore, id: &str, pending: Option<&str>
             super::archive::project(&info,&store.claude_archive_files(id)?)
         }.await;
         // A corrupt local archive/cache must not prevent reading the source server.
-        match archived { Ok(snapshot)=>Ok(snapshot), Err(_)=>fetch(id,&remote,native.as_deref()).await }
+        match archived {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) => {
+                eprintln!("[Claude] history archive fallback: session={} reason={}", id, error);
+                fetch(id,&remote,native.as_deref()).await
+            }
+        }
     }).await.map_err(|error| super::turn_retry::with_context("History synchronization", error))
 }
 
@@ -326,7 +358,7 @@ pub(crate) async fn synchronize_with_fetch<F, Fut>(
     fetch: F,
 ) -> Result<SyncReport, String>
 where
-    F: FnOnce(ssh::SshConfig, Option<String>) -> Fut,
+    F: FnOnce(NativeConnection, Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<NativeSnapshot, String>>,
 {
     let passive = pending.is_none() && !compact && !automatic;
@@ -376,25 +408,41 @@ where
     let pending_local=store.claude_recovery_pending_messages(id,&messages,&metadata,pending);
     // Merely opening a conversation must not discard its durably recorded
     // failed input. A later explicit submission still decides what to resume.
-    let discard_local = resume_context.is_some() || pending_local.as_ref()
-        .map_or(true,|ids|pending.is_some() && ids.iter().any(|old|Some(old.as_str())!=pending));
-    let rebuild = || if automatic {
-        store.rebuild_claude_native_for_retry(id, &remote, &snapshot, &messages, pending)
+    let rebuild_reason = if resume_context.is_some() {
+        Some("interrupted_tool_recovery".to_string())
     } else {
-        store.rebuild_claude_native(id, &remote, &snapshot, &messages, pending)
+        match &pending_local {
+            Err(error) => Some(format!("pending_input_validation_failed: {error}")),
+            Ok(ids) if pending.is_some() && ids.iter().any(|old| Some(old.as_str()) != pending) =>
+                Some("pending_input_replacement".to_string()),
+            _ => None,
+        }
+    };
+    let rebuild = |reason: &str| {
+        eprintln!("[Claude] history rebuild started: session={} native={} automatic={} local_messages={} native_messages={} reason={}",
+            id, snapshot.native_id, automatic, messages.len(), snapshot.messages.len(), reason);
+        let result = if automatic {
+            store.rebuild_claude_native_for_retry(id, &remote, &snapshot, &messages, pending)
+        } else {
+            store.rebuild_claude_native(id, &remote, &snapshot, &messages, pending)
+        };
+        if let Err(error) = &result {
+            eprintln!("[Claude] history rebuild failed: session={} reason={} error={}", id, reason, error);
+        }
+        result
     };
     let changed = if passive {
         // Opening a view is not authorization to discard unsubmitted input.
         // In particular, a run may start while the remote snapshot is fetched.
         store.reconcile_claude_native_if_idle(id, &remote, &snapshot, &messages)?
-    } else if discard_local {
-        rebuild()?
+    } else if let Some(reason) = rebuild_reason {
+        rebuild(&reason)?
     } else {
         // Keep stable display identities and verified pre-compaction history in
         // the normal case. Inconsistent local projections are replaceable.
         match store.reconcile_claude_native(id,&remote,&snapshot,&messages,pending) {
             Ok(changed)=>changed,
-            Err(_)=>rebuild()?,
+            Err(error) => rebuild(&format!("reconciliation_failed: {error}"))?,
         }
     };
     store.bind_claude_native_session(id,&remote,&snapshot.native_id)?;

@@ -1,16 +1,44 @@
 import path from "node:path";
+import { readdirSync, writeFileSync } from "node:fs";
 import { defineConfig, normalizePath } from "vite";
 import vue from "@vitejs/plugin-vue";
+// @ts-expect-error build helper is a native Node module
+import { clientEdition } from "./scripts/client-edition.mjs";
+
+const edition: "public" | "internal" = clientEdition();
+const internalClient = edition === "internal";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
-  plugins: [vue()],
+  plugins: [vue(), {
+    name: "locus-client-edition",
+    generateBundle() {
+      if (!internalClient) {
+        for (const id of this.getModuleIds()) {
+          const normalized = normalizePath(id);
+          if (normalized.includes("/src/server-client/") && !normalized.endsWith("/public.ts")) {
+            this.error(`Internal client module in public build: ${normalized}`);
+          }
+        }
+      }
+    },
+    writeBundle() {
+      const output = path.resolve(import.meta.dirname, internalClient ? "dist-internal" : "dist");
+      const files = readdirSync(output, { recursive: true, withFileTypes: true })
+        .filter(entry => entry.isFile() && entry.name !== ".locus-edition.json")
+        .map(entry => normalizePath(path.relative(output, path.join(entry.parentPath, entry.name))));
+      writeFileSync(path.join(output, ".locus-edition.json"), JSON.stringify({ edition, files }));
+    },
+  }],
+  define: { __LOCUS_SERVER_CLIENT__: internalClient },
 
   resolve: {
     alias: [
+      { find: "@locus/server-client", replacement: path.resolve(import.meta.dirname,
+        `src/server-client/${internalClient ? "internal" : "public"}.ts`) },
       {
         find: /^vue$/,
         replacement: "vue/dist/vue.esm-bundler.js",
@@ -25,6 +53,8 @@ export default defineConfig(async () => ({
   },
 
   build: {
+    outDir: internalClient ? "dist-internal" : "dist",
+    emptyOutDir: true,
     // Locus ships exclusively on WebView2 (Chromium); top-level await in
     // src/i18n.ts (async locale catalogs) needs a post-es2020 target.
     target: "chrome105",
@@ -37,6 +67,8 @@ export default defineConfig(async () => ({
         main: path.resolve(import.meta.dirname, "index.html"),
         window: path.resolve(import.meta.dirname, "window.html"),
         unityView: path.resolve(import.meta.dirname, "unity-view.html"),
+        // Page the desktop serves to the Locus Remote mobile app.
+        mobile: path.resolve(import.meta.dirname, "mobile.html"),
       },
       output: {
         manualChunks(id) {
@@ -72,7 +104,7 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
-    port: 14901,
+    port: internalClient ? 14902 : 14901,
     strictPort: true,
     host: host || false,
     hmr: host
@@ -116,6 +148,8 @@ export default defineConfig(async () => ({
         "**/.venv-docs/**",
         // build output
         "**/dist/**",
+        "**/dist-internal/**",
+        "**/crates/locus-server/**",
         "**/dist-ssr/**",
         "**/site/**",
         // editor / logs

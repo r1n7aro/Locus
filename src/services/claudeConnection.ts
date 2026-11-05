@@ -1,9 +1,11 @@
 import { ipcInvoke } from './ipc';
-import { readonly, ref } from 'vue';
+import { getLocusRuntime, type RuntimeUnsubscribe } from './locusRuntime';
+import { computed, readonly, ref } from 'vue';
+import { additionalModels, protocolModelId } from '@locus/server-client';
 import type { WorkspaceRef } from './project';
 
 const remoteClaudeCode = ref(false);
-export const isRemoteClaudeCode = readonly(remoteClaudeCode);
+export const isRemoteClaudeCode = computed(() => remoteClaudeCode.value || additionalModels.value.some(model => protocolModelId(model.id).startsWith('claude_code/')));
 const modelCatalogScope = ref('');
 export const claudeCodeModelCatalogScope = readonly(modelCatalogScope);
 const prewarmSettings = ref({ enabled: false, capacity: 1, idleMinutes: 15, scope: '' });
@@ -49,6 +51,8 @@ export interface ClaudeConnection {
   prewarm?: boolean;
   poolCapacity?: number;
   idleMinutes?: number;
+  nativeMultiAgent?: boolean;
+  nativeAgents?: { builtins: string[]; excludedLocusAgents?: string[] };
   remote: ClaudeSshConfig | null;
   authorizedTarget: string | null;
   info: ClaudeRemoteInfo | null;
@@ -56,9 +60,25 @@ export interface ClaudeConnection {
 }
 export const getClaudeConnection = () => ipcInvoke<ClaudeConnection>('get_claude_connection').then(rememberConnection);
 export type ClaudeConnectionPhase = 'disconnected' | 'connecting' | 'starting' | 'ready';
+export interface ClaudeHelperSnapshot {
+  helperVersion: string;
+  sourceHash: string | null;
+  hostPid: number;
+  claudePid: number | null;
+  startedAt: number;
+  updatedAt: number;
+  event: string;
+  exitReason: string | null;
+  exitCode: number | null;
+  claudeExitCode: number | null;
+  errorType: string | null;
+  reportingError: string | null;
+  cleanupError: string | null;
+}
 export interface ClaudeTransportSnapshot {
   id: number;
   pid: number | null;
+  helper?: ClaudeHelperSnapshot | null;
   operation: string;
   stage: string;
   elapsedMs: number;
@@ -92,6 +112,13 @@ export interface ClaudeConnectionDiagnostics {
   } | null;
 }
 export interface ClaudeSessionConnection {
+  archivePool?: {
+    ready: number;
+    starting: number;
+    busy: number;
+    queued: number;
+    lastError: string | null;
+  } | null;
   diagnostics?: ClaudeConnectionDiagnostics;
   phase: ClaudeConnectionPhase;
   target: string;
@@ -109,12 +136,38 @@ export interface ClaudeSessionConnection {
 }
 // Local lifecycle snapshot only; this does not probe or open an SSH connection.
 export const getClaudeSessionConnection = (sessionId: string | null, workingDir?: string, model?: string) => ipcInvoke<ClaudeSessionConnection | null>('get_claude_session_connection', { sessionId, workingDir, model });
+
+/** App-wide push of the configured server's connection overview, sent when it
+ * changes (transport counters at most every few seconds). */
+export const CLAUDE_CONNECTION_STATUS_EVENT = 'claude-connection-status';
+export interface ClaudeConnectionStatusEvent {
+  status: ClaudeSessionConnection | null;
+  error: string | null;
+}
+export const subscribeClaudeConnectionStatus = (handler: (event: ClaudeConnectionStatusEvent) => void): Promise<RuntimeUnsubscribe> =>
+  getLocusRuntime().subscribe<ClaudeConnectionStatusEvent>(CLAUDE_CONNECTION_STATUS_EVENT, handler);
 export const setClaudePrewarm = (enabled: boolean, capacity: number, idleMinutes: number) => ipcInvoke<ClaudeConnection>('set_claude_prewarm', { enabled, capacity, idleMinutes }).then(rememberConnection);
 export const prewarmClaudeSession = (sessionId: string | null, model: string, workspaceRef: WorkspaceRef, warmExisting: boolean) =>
   ipcInvoke<void>('prewarm_claude_session', { sessionId, model, workspaceRef, warmExisting });
 export const connectClaudeSession = (model: string, workspaceRef: WorkspaceRef) =>
   ipcInvoke<void>('connect_claude_session', { model, workspaceRef });
 export const setClaudePermissionMode = (mode: ClaudePermissionMode) => ipcInvoke<ClaudeConnection>('set_claude_permission_mode', { mode }).then(rememberConnection);
+/** Claude Code builtin Agent types the user may offer; the backend rejects others. */
+export const CLAUDE_CONFIGURABLE_BUILTIN_AGENTS = ['general-purpose', 'Explore', 'Plan', 'claude-code-guide', 'statusline-setup', 'claude'] as const;
+/** `excludedLocusAgents`: delegatable Locus agent types left out of new native conversations. */
+export const setClaudeNativeAgents = (enabled: boolean, builtins: readonly string[], excludedLocusAgents: readonly string[]) =>
+  ipcInvoke<ClaudeConnection>('set_claude_native_agents', { enabled, builtins: [...builtins], excludedLocusAgents: [...excludedLocusAgents] }).then(rememberConnection);
+/** Version check of the configured connection that new native conversations run. */
+export interface ClaudeNativeAgentsSupport {
+  cliVersion: string | null;
+  supported: boolean;
+  /** The saved SSH connection rather than the local CLI. */
+  remote: boolean;
+  /** SSH without a custom Claude path: "Connect and save" installs the required version. */
+  installable: boolean;
+}
+export const CLAUDE_NATIVE_AGENTS_MIN_VERSION = '2.1.312';
+export const getClaudeNativeAgentsSupport = () => ipcInvoke<ClaudeNativeAgentsSupport>('get_claude_native_agents_support');
 export const setClaudeRuntimeSettings = (idleCompaction: boolean, telemetry: boolean, autoCompactWindow: number | null) =>
   ipcInvoke<ClaudeConnection>('set_claude_runtime_settings', { idleCompaction, telemetry, autoCompactWindow }).then(rememberConnection);
 export const inspectClaudeSsh = (config: ClaudeSshConfig) => ipcInvoke<ClaudeRemoteInfo>('inspect_claude_ssh', { config });

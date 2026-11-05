@@ -11,6 +11,8 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { clientEdition, assertPublicArguments, assertClientBundle } from "./client-edition.mjs";
+import { assertPublicSourceBoundary } from "./public-source-boundary.mjs";
 
 const WEBVIEW2_ARGS_KEY = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 const REMOTE_DEBUG_FLAG = "--remote-debugging-port=";
@@ -28,7 +30,7 @@ const LOCAL_DEV_CONFIG_FILE = ".locus-dev.local.json";
 const DEV_WITH_MCP_COMMAND = "dev-mcp";
 const DEV_ISOLATED_COMMAND = "dev-isolated";
 const DEV_WITH_MCP_ISOLATED_COMMAND = "dev-mcp-isolated";
-const DEV_SERVER_PORT = 14901;
+const DEV_SERVER_PORT = process.env.LOCUS_BUILD_EDITION === "internal" ? 14902 : 14901;
 const DEV_SERVER_START_TIMEOUT_MS = 30_000;
 const DEV_PREREQUISITE_SCRIPTS = [
   "compile-server:ensure",
@@ -88,6 +90,14 @@ let tauriArgs = isCustomDevCommand
   ? ["dev", ...isolatedRuntime.remainingArgs]
   : args;
 const env = { ...process.env };
+const edition = clientEdition(env);
+env.LOCUS_BUILD_EDITION = edition;
+if (edition === "public") assertPublicArguments(tauriArgs, env);
+if (edition === "internal" && (!tauriArgs.includes("server-client") || !tauriArgs.includes("src-tauri/tauri.internal.conf.json"))) {
+  throw new Error("Use the internal:dev/internal:build entry point for internal clients");
+}
+if (requestedCommand === "build") env.LOCUS_VERIFY_FRONTEND = "1";
+if (requestedCommand === "build" && edition === "public") assertPublicSourceBoundary(repoRoot);
 const reuseDevServer = process.env[REUSE_DEV_SERVER_ENV_KEY]?.trim() === "1";
 
 const isHelpOrVersionCommand =
@@ -822,5 +832,6 @@ if (tauriResult.signal) {
 } else if (tauriResult.error || tauriResult.code !== 0) {
   process.exit(tauriResult.code ?? 1);
 } else {
+  if (requestedCommand === "build") assertClientBundle(repoRoot, edition);
   process.exit(0);
 }

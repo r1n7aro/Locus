@@ -37,6 +37,9 @@ pub struct AppUpdateInstallerDownload {
     pub includes_managed_git: bool,
     pub requires_system_python: bool,
     pub requires_system_git: bool,
+    /// Bundles the Locus Remote Android app (`with_remote_app` flavor).
+    #[serde(default)]
+    pub includes_remote_app: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +230,7 @@ async fn fetch_manifest_from_source(
 }
 
 #[tauri::command]
+#[cfg(not(feature = "server-client"))]
 pub async fn fetch_app_update_manifest(
     channel: Option<AppUpdateChannel>,
 ) -> Result<AppUpdateManifestFetchResult, AppError> {
@@ -249,4 +253,13 @@ pub async fn fetch_app_update_manifest(
     }
 
     Err(last_error.unwrap_or_else(|| "Failed to fetch update manifest".into()))
+}
+
+#[tauri::command]
+#[cfg(feature = "server-client")]
+pub async fn fetch_app_update_manifest(
+    channel: Option<AppUpdateChannel>,
+) -> Result<AppUpdateManifestFetchResult, AppError> {
+    let _ = channel;
+    Err("内部版请从管理员提供的渠道更新".into())
 }

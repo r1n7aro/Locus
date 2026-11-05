@@ -133,10 +133,10 @@ fn cache_model_identity_is_canonical_and_model_and_provider_changes_are_distinct
 
 #[test]
 fn claude_cache_recovery_replays_responses_once_and_handles_boundaries_and_missing_usage() {
-    use crate::llm::claude_code_cli::{recovery::NativeSnapshot, ssh::SshConfig};
+    use crate::llm::claude_code_cli::{recovery::NativeSnapshot, connection::NativeConnection};
     use serde_json::json;
     let (_dir, store, session, _user) = fixture();
-    let remote: SshConfig = serde_json::from_value(json!({"target":"test@127.0.0.1","port":22242})).unwrap();
+    let remote: NativeConnection = serde_json::from_value(json!({"target":"test@127.0.0.1","port":22242})).unwrap();
     let native_id = Uuid::new_v4().to_string();
     let assistant = |key: &str, read: u64, write: u64| json!({
         "key":key,"role":"assistant","uuids":[Uuid::new_v4().to_string()],
