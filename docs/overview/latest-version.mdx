@@ -27,6 +27,7 @@ changelogUrl: "/overview/latest-version"
 - 设置页重新整理为模型、Agent、工作区、集成、界面、连接、系统七个分组，可以搜索设置项。所有设置统一保存，旧版设置（包括界面偏好）会自动迁移。项目级设置保存在项目的 `Locus/config.json` 中，可以随仓库共享。
 - Agent 可以通过 `config_query` 和 `config_set` 读取和修改 Locus 设置。“修改设置”和“修改敏感设置”分别在“工具权限”中控制。
 - 主模型为 Claude Code 并开启 Multi-Agent 时，可以改用 Claude Code 自带的 `Agent` 和 `SendMessage` 委派（需要 Claude Code 2.1.312 或更高版本）。后台 Agent 结束时，对话中会显示一行提示；子 Agent 的工具确认显示在当前对话里，并标注来源。
+- Claude 原生子 Agent 的工作过程（每次运行的 prompt、思考、回复、工具调用和完整结果）会记录为主对话下的只读子会话，可以在会话列表中展开主对话，或点击 Agent 卡片上的“查看过程”打开；需要补充指示时，让主 Agent 用 `SendMessage` 继续它。Claude Code 内置类型的 Agent 卡片会在子 Agent 发出第一次请求后显示它实际使用的模型。
 - 开启 Multi-Agent 后，Agent 多了 `send_message` 工具，可以直接给父 Agent、子 Agent 或同级 Agent 发消息。后台任务面板可以一次停止全部 Agent。
 - 子代理模型可以多选。委派时 Agent 按任务从中选择，第一个为默认。
 - 新增 LaTeX 预览。`.tex` 文件可以在编辑器旁预览，修改后只在预览可见时重新编译；编译失败时保留上一次成功的结果。工具链从 PATH 以及 MiKTeX、TeX Live 的默认安装目录检测；缺少 dvisvgm 或文档需要时改用 PDF 显示。
