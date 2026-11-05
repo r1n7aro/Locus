@@ -132,6 +132,27 @@ impl ResourcePolicyStore {
         Ok(next)
     }
 
+    /// Publishes the persisted limits after a generic settings write changed
+    /// them without going through `update`. No-op when nothing moved.
+    pub fn republish_from_config(&self) -> ResourcePolicySnapshot {
+        let _update_guard = self
+            .inner
+            .update_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let current = self.snapshot();
+        let limits = self.inner.config.workspace_service_resource_limits();
+        if limits == current.limits {
+            return current;
+        }
+        let next = ResourcePolicySnapshot {
+            revision: current.revision.saturating_add(1),
+            limits,
+        };
+        self.inner.snapshot_tx.send_replace(next.clone());
+        next
+    }
+
     pub fn configured_limits(&self) -> WorkspaceServiceResourceLimits {
         self.snapshot().limits
     }
@@ -158,32 +179,25 @@ mod tests {
             workspace_idle_timeout_secs: 111,
             service_idle_timeout_secs: 222,
             lsp_idle_timeout_secs: 333,
+            ..Default::default()
         }
     }
 
     #[test]
-    fn from_config_rejects_an_invalid_persisted_snapshot() {
+    fn invalid_persisted_limits_fall_back_to_defaults() {
         let temp = tempfile::tempdir().expect("temp config dir");
-        let path = temp.path().join("config.json");
         std::fs::write(
-            &path,
-            r#"{
-                "model": "test-model",
-                "dynamic_tool_loading_native_migrated": true,
-                "workspace_service_ttl_hour_migrated": true,
-                "workspace_service_resource_limits": {
-                    "serviceIdleTimeoutSecs": 0
-                }
-            }"#,
+            temp.path().join(crate::settings::store::SETTINGS_FILE_NAME),
+            r#"{ "version": 1, "workspace": { "resources": { "serviceIdleTimeoutSecs": 0 } } }"#,
         )
-        .expect("write config");
-        let config = Arc::new(AppConfig::load_from_path(&path));
+        .expect("write settings");
+        let config = Arc::new(AppConfig::load_from_path(&temp.path().join("config.json")));
 
-        let errors = ResourcePolicyStore::from_config(config)
-            .err()
-            .expect("invalid persisted policy must be rejected");
-        assert_eq!(errors.fields.len(), 1);
-        assert_eq!(errors.fields[0].field, "serviceIdleTimeoutSecs");
+        let store = ResourcePolicyStore::from_config(config).expect("defaults replace invalid values");
+        assert_eq!(
+            store.configured_limits(),
+            WorkspaceServiceResourceLimits::default()
+        );
     }
 
     #[tokio::test]
@@ -200,22 +214,22 @@ mod tests {
         assert_eq!(next.revision, 1);
         assert_eq!(*updates.borrow(), next);
         assert_eq!(config.workspace_service_resource_limits(), next.limits);
-        let persisted: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read persisted config"))
-                .expect("parse persisted config");
-        assert_eq!(
-            persisted["workspace_service_resource_limits"]["lspIdleTimeoutSecs"],
-            333
-        );
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(temp.path().join(crate::settings::store::SETTINGS_FILE_NAME))
+                .expect("read persisted settings"),
+        )
+        .expect("parse persisted settings");
+        assert_eq!(persisted["workspace"]["resources"]["lspIdleTimeoutSecs"], 333);
         assert_eq!(store.configured_metrics().revision, 1);
     }
 
     #[test]
     fn persistence_failure_keeps_snapshot_and_watch_unchanged() {
         let temp = tempfile::tempdir().expect("temp config dir");
-        let path = temp.path().join("config-target-is-a-directory");
-        std::fs::create_dir(&path).expect("create invalid config target");
-        let config = Arc::new(AppConfig::load_from_path(&path));
+        let config = Arc::new(AppConfig::load_from_path(&temp.path().join("config.json")));
+        let settings_path = temp.path().join(crate::settings::store::SETTINGS_FILE_NAME);
+        std::fs::remove_file(&settings_path).expect("remove settings file");
+        std::fs::create_dir(&settings_path).expect("make the settings target unwritable");
         let store = ResourcePolicyStore::from_config(config.clone()).expect("valid defaults");
         let updates = store.subscribe();
         let before = store.snapshot();
@@ -258,6 +272,23 @@ mod tests {
         );
         assert_eq!(store.snapshot(), before);
         assert!(!updates.has_changed().expect("watch state"));
+    }
+
+    #[test]
+    fn republish_follows_settings_written_elsewhere() {
+        let temp = tempfile::tempdir().expect("temp config dir");
+        let config = Arc::new(AppConfig::load_from_path(&temp.path().join("config.json")));
+        let store = ResourcePolicyStore::from_config(config.clone()).expect("valid defaults");
+
+        assert_eq!(store.republish_from_config().revision, 0);
+        config
+            .settings()
+            .set(crate::settings::WORKSPACE_RESOURCES_LSP_IDLE_TIMEOUT_SECS, 333)
+            .expect("generic write");
+        let next = store.republish_from_config();
+        assert_eq!(next.revision, 1);
+        assert_eq!(next.limits.lsp_idle_timeout_secs, 333);
+        assert_eq!(store.snapshot(), next);
     }
 
     #[test]

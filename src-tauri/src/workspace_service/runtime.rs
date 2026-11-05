@@ -368,7 +368,9 @@ impl WorkspaceCoreServices {
                 .asset_watcher
                 .lock()
                 .map_err(|error| format!("workspace asset watcher lock poisoned: {error}"))?;
-            if watcher.is_none() && self.root.join("Assets").is_dir() {
+            if watcher.is_none()
+                && crate::unity_bridge::unity_integration_enabled(&self.root.to_string_lossy())
+            {
                 *watcher = Some(crate::asset_db::watcher::AssetDbWatcher::start(
                     self.root.clone(),
                     Arc::clone(&self.asset_db),
@@ -431,6 +433,19 @@ impl WorkspaceCoreServices {
         }
         if let Ok(mut index) = self.knowledge_index.lock() {
             index.take();
+        }
+    }
+
+    /// Unity integration turned off at runtime: stop asset scanning only.
+    pub fn stop_asset_watcher(&self) {
+        let _lifecycle = self
+            .background_watchers_lifecycle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Ok(mut watcher) = self.asset_watcher.lock() {
+            if let Some(watcher) = watcher.take() {
+                watcher.stop_and_join();
+            }
         }
     }
 
@@ -756,6 +771,65 @@ impl ProjectSessionCatalog {
     }
 }
 
+/// Binds a service for a run under the same per-service operation lock and
+/// start accounting as run-start binding, so a late bind cannot race idle
+/// reaping or app-switch retirement.
+#[derive(Clone)]
+pub(crate) struct ServiceLateBinder {
+    start_tracker: Arc<ServiceStartTracker>,
+    operations: Arc<ServiceOperationCoordinator>,
+    state: Arc<ServiceStateNotifier>,
+}
+
+/// Publishes `<kind>-service-state` workspace events when a service starts or
+/// stops, so status items (lazy services in particular) need no polling.
+#[derive(Default)]
+pub(crate) struct ServiceStateNotifier {
+    router: std::sync::OnceLock<Arc<WorkspaceEventRouter>>,
+    app_handle: std::sync::OnceLock<tauri::AppHandle>,
+}
+
+impl ServiceStateNotifier {
+    pub(crate) async fn publish(&self, runtime: &Arc<WorkspaceRuntime>, kind: ServiceKind) {
+        let (Some(router), Some(app_handle)) = (self.router.get(), self.app_handle.get()) else {
+            return;
+        };
+        let Some(snapshot) = runtime.services().state_snapshot(kind).await else {
+            return;
+        };
+        router.publish_for_scope(
+            app_handle,
+            &super::event::WorkspaceEventScope::for_runtime(runtime),
+            format!("{}-service-state", kind.as_str()),
+            snapshot,
+        );
+    }
+}
+
+impl ServiceLateBinder {
+    pub(crate) async fn bind(
+        &self,
+        workspace: &Arc<WorkspaceRuntime>,
+        kind: ServiceKind,
+    ) -> Result<ServiceBinding, String> {
+        let key = ServiceOperationKey {
+            checkout_id: workspace.checkout_id().clone(),
+            kind,
+        };
+        let _operation = self.operations.lock_operation(&key).await;
+        let started = !workspace.services().is_running(kind).await;
+        let _start_permit = started.then(|| self.start_tracker.begin());
+        let binding = workspace
+            .services()
+            .bind(Arc::clone(workspace), kind, true)
+            .await?;
+        if started {
+            self.state.publish(workspace, kind).await;
+        }
+        Ok(binding)
+    }
+}
+
 #[derive(Default)]
 struct ServiceStartTracker { active: AtomicUsize }
 
@@ -835,6 +909,7 @@ pub struct ProjectRegistry {
     service_start_tracker: Arc<ServiceStartTracker>,
     service_operations: Arc<ServiceOperationCoordinator>,
     event_router: Arc<WorkspaceEventRouter>,
+    service_state: Arc<ServiceStateNotifier>,
     runtime_registration_hooks: Mutex<Vec<RuntimeRegistrationHook>>,
     runtime_retirement_hooks: Mutex<Vec<RuntimeRetirementHook>>,
 }
@@ -858,10 +933,12 @@ impl ProjectRegistry {
             service_start_tracker: Arc::new(ServiceStartTracker::default()),
             service_operations: Arc::new(ServiceOperationCoordinator::default()),
             event_router: WorkspaceEventRouter::new(),
+            service_state: Arc::new(ServiceStateNotifier::default()),
             runtime_registration_hooks: Mutex::new(Vec::new()),
             runtime_retirement_hooks: Mutex::new(Vec::new()),
         });
         registry.event_router.attach_registry(&registry);
+        let _ = registry.service_state.router.set(Arc::clone(&registry.event_router));
         registry
     }
 
@@ -1203,7 +1280,13 @@ impl ProjectRegistry {
             }
         }
         runtime.services().stop(kind).await?;
+        self.service_state.publish(runtime, kind).await;
         Ok(())
+    }
+
+    /// Lets service lifecycle changes reach the frontend as workspace events.
+    pub fn attach_app_handle(&self, app_handle: tauri::AppHandle) {
+        let _ = self.service_state.app_handle.set(app_handle);
     }
 
     pub async fn execution_context(
@@ -1212,29 +1295,112 @@ impl ProjectRegistry {
         requested_services: &[ServiceKind],
     ) -> Result<Arc<AgentExecutionContext>, String> {
         let (workspace, acquisition_lease) = self.runtime_with_lease(checkout_id)?;
+        let binder = self.late_binder();
         let mut service_bindings = HashMap::<ServiceKind, ServiceBinding>::new();
         for kind in requested_services {
-            let key = Self::service_key(&workspace, *kind);
-            let _operation = self.service_operations.lock_operation(&key).await;
-            if workspace.services().is_running(*kind).await {
-                let binding = workspace
-                    .services()
-                    .bind(Arc::clone(&workspace), *kind, true)
-                    .await?;
-                service_bindings.insert(*kind, binding);
-                continue;
-            }
-
-            let _start_permit = self.service_start_tracker.begin();
-            let binding = workspace
-                .services()
-                .bind(Arc::clone(&workspace), *kind, true)
-                .await?;
+            let binding = binder.bind(&workspace, *kind).await?;
             service_bindings.insert(*kind, binding);
         }
-        let execution = Arc::new(AgentExecutionContext::new(workspace, service_bindings));
+        let execution = Arc::new(AgentExecutionContext::with_late_binder(
+            workspace,
+            service_bindings,
+            Some(binder),
+        ));
         drop(acquisition_lease);
         Ok(execution)
+    }
+
+    pub(crate) fn late_binder(&self) -> ServiceLateBinder {
+        ServiceLateBinder {
+            start_tracker: Arc::clone(&self.service_start_tracker),
+            operations: Arc::clone(&self.service_operations),
+            state: Arc::clone(&self.service_state),
+        }
+    }
+
+    /// App-level switch turned off: retire `kind` in every open checkout.
+    /// Bindings held by running tools finish first; the slot is removed once
+    /// its leases drain (polled, bounded by `timeout`). Returns the checkouts
+    /// that were still busy when the timeout elapsed.
+    pub async fn retire_service_kind(
+        &self,
+        kind: ServiceKind,
+        timeout: std::time::Duration,
+    ) -> Vec<CheckoutId> {
+        let deadline = Instant::now() + timeout;
+        let mut pending = self.runtimes();
+        loop {
+            let mut busy = Vec::new();
+            for runtime in pending {
+                let key = Self::service_key(&runtime, kind);
+                let removed = {
+                    let _operation = self.service_operations.lock_operation(&key).await;
+                    runtime.services().remove(kind).await
+                };
+                match removed {
+                    Ok(true) => {}
+                    Ok(false) => busy.push(runtime),
+                    Err(error) => eprintln!(
+                        "[Locus] failed to retire {} service for checkout {}: {}",
+                        kind.as_str(),
+                        runtime.checkout_id(),
+                        error
+                    ),
+                }
+            }
+            if busy.is_empty() || Instant::now() >= deadline {
+                return busy
+                    .iter()
+                    .map(|runtime| runtime.checkout_id().clone())
+                    .collect();
+            }
+            pending = busy;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Workspace settings changed a service's mode. Turning it off refuses new
+    /// binds at once and stops the running instance; when a tool still holds a
+    /// lease, idle reaping stops it after the lease drains.
+    pub async fn apply_service_policy(
+        &self,
+        runtime: &Arc<WorkspaceRuntime>,
+        kind: ServiceKind,
+        policy: super::service::ServiceActivationPolicy,
+    ) -> Result<(), String> {
+        if !runtime.services().detected_kinds().contains(&kind) {
+            return Ok(());
+        }
+        runtime.services().set_activation_policy(kind, policy)?;
+        if policy == super::service::ServiceActivationPolicy::Disabled {
+            let key = Self::service_key(runtime, kind);
+            let _operation = self.service_operations.lock_operation(&key).await;
+            if let Err(error) = runtime.services().stop(kind).await {
+                eprintln!(
+                    "[Locus] {} service for checkout {} stops after its leases drain: {}",
+                    kind.as_str(),
+                    runtime.checkout_id(),
+                    error
+                );
+            }
+        }
+        self.service_state.publish(runtime, kind).await;
+        Ok(())
+    }
+
+    /// App-level switch turned on: re-run detection for every open checkout
+    /// and restore (or seed) its persisted service policy.
+    pub fn redetect_services(&self, store: &crate::session::store::SessionStore) {
+        for runtime in self.runtimes() {
+            runtime.services().detect(&runtime);
+            if let Err(error) = super::restore_or_persist_service_settings(store, &runtime) {
+                eprintln!(
+                    "[Locus] failed to restore service settings for checkout {}: {}",
+                    runtime.checkout_id(),
+                    error
+                );
+            }
+        }
     }
 
     pub async fn shutdown_all(&self) {
@@ -2303,7 +2469,7 @@ mod tests {
             .await
             .expect("core execution context");
         assert_eq!(execution.root(), root.as_path());
-        assert!(execution.service_bindings.is_empty());
+        assert!(execution.service_binding_snapshots().is_empty());
     }
 
     #[tokio::test]
@@ -2716,5 +2882,110 @@ mod tests {
 
         assert!(registry.runtime(visible_runtime.checkout_id()).is_some());
         assert!(registry.runtime(background_runtime.checkout_id()).is_some());
+    }
+
+    #[tokio::test]
+    async fn lazy_service_binds_on_first_use_and_rebinds_after_reaping() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let factory = FakeServiceFactory::immediate();
+        let registry = registry(temp.path(), Arc::clone(&factory));
+        let runtime = registry
+            .register(workspace_dir(temp.path(), "lazy-checkout"))
+            .expect("register workspace");
+        assert_eq!(
+            runtime.services().effective_mode(ServiceKind::Unity),
+            crate::workspace_service::EffectiveServiceMode::Lazy
+        );
+        let execution = registry
+            .execution_context(runtime.checkout_id(), &[])
+            .await
+            .expect("run without auto services");
+        assert!(execution.binding(ServiceKind::Unity).is_none());
+        assert!(!runtime.services().is_running(ServiceKind::Unity).await);
+
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        {
+            let recorded = Arc::clone(&recorded);
+            execution.set_binding_listener(Arc::new(move |snapshots| {
+                recorded.lock().expect("recorded bindings").push(snapshots);
+            }));
+        }
+        let first = execution
+            .ensure_service(ServiceKind::Unity)
+            .await
+            .expect("first use starts the service");
+        assert!(runtime.services().is_running(ServiceKind::Unity).await);
+        assert!(execution.resolve_service(ServiceKind::Unity).is_ok());
+        execution
+            .ensure_service(ServiceKind::Unity)
+            .await
+            .expect("second use reuses the binding");
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
+        {
+            let recorded = recorded.lock().expect("recorded bindings");
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].len(), 1);
+            assert_eq!(recorded[0][0].service_kind, ServiceKind::Unity);
+        }
+
+        registry
+            .stop_service(&runtime, ServiceKind::Unity)
+            .await
+            .expect("idle stop");
+        let rebound = execution
+            .ensure_service(ServiceKind::Unity)
+            .await
+            .expect("a reaped service restarts on the next call");
+        assert_ne!(rebound.runtime_generation, first.runtime_generation);
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(recorded.lock().expect("recorded bindings").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_service_refuses_late_binding_and_switch_off_removes_the_slot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let factory = FakeServiceFactory::immediate();
+        let registry = registry(temp.path(), Arc::clone(&factory));
+        let runtime = registry
+            .register(workspace_dir(temp.path(), "off-checkout"))
+            .expect("register workspace");
+        runtime
+            .services()
+            .set_activation_policy(ServiceKind::Unity, ServiceActivationPolicy::Disabled)
+            .expect("turn off");
+        let execution = registry
+            .execution_context(runtime.checkout_id(), &[])
+            .await
+            .expect("run");
+        assert!(execution.ensure_service(ServiceKind::Unity).await.is_err());
+        assert_eq!(factory.starts.load(Ordering::SeqCst), 0);
+
+        runtime
+            .services()
+            .set_activation_policy(ServiceKind::Unity, ServiceActivationPolicy::Auto)
+            .expect("turn on");
+        let running = registry
+            .execution_context(runtime.checkout_id(), &[ServiceKind::Unity])
+            .await
+            .expect("auto run binds at start");
+        assert!(runtime.services().is_running(ServiceKind::Unity).await);
+        let lease = running
+            .resolve_service(ServiceKind::Unity)
+            .expect("tool holds a lease");
+        let busy = registry
+            .retire_service_kind(ServiceKind::Unity, Duration::from_millis(300))
+            .await;
+        assert_eq!(busy, vec![runtime.checkout_id().clone()]);
+        assert_eq!(
+            runtime.services().effective_mode(ServiceKind::Unity),
+            crate::workspace_service::EffectiveServiceMode::Off
+        );
+        drop(lease);
+        let busy = registry
+            .retire_service_kind(ServiceKind::Unity, Duration::from_secs(1))
+            .await;
+        assert!(busy.is_empty());
+        assert!(runtime.services().detected_kinds().is_empty());
+        assert_eq!(factory.stops.load(Ordering::SeqCst), 1);
     }
 }

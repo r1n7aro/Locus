@@ -17,12 +17,72 @@ pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[serde(rename_all = "snake_case")]
 pub enum ServiceKind {
     Unity,
+    Blender,
 }
 
 impl ServiceKind {
+    pub const ALL: [ServiceKind; 2] = [ServiceKind::Unity, ServiceKind::Blender];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Unity => "unity",
+            Self::Blender => "blender",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "unity" => Some(Self::Unity),
+            "blender" => Some(Self::Blender),
+            _ => None,
+        }
+    }
+
+    /// Tool unavailable reason when the checkout has no slot for this service
+    /// (app switch off, or the workspace does not qualify).
+    pub fn missing_reason(self) -> &'static str {
+        match self {
+            Self::Unity if !crate::unity_bridge::unity_integration_globally_enabled() => {
+                "unity_disabled"
+            }
+            Self::Unity => "requires_unity_workspace",
+            Self::Blender => "blender_disabled",
+        }
+    }
+
+    /// Tool unavailable reason when the workspace turned this service off.
+    pub const fn workspace_disabled_reason(self) -> &'static str {
+        match self {
+            Self::Unity => "unity_service_disabled",
+            Self::Blender => "blender_service_disabled",
+        }
+    }
+}
+
+/// How a workspace uses a service, derived from the app switch (detection)
+/// and the checkout's persisted activation policy. Every consumer (tool
+/// exposure, run-start binding, frontend start, SDK) reads this one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveServiceMode {
+    /// Not detected, or turned off for this workspace.
+    Off,
+    /// Started with the workspace; tools keep their configured load mode and
+    /// runs bind the service when they start.
+    Auto,
+    /// Dormant until a tool of the service actually executes or the SDK uses
+    /// it; tools are always declared lazily.
+    Lazy,
+}
+
+impl EffectiveServiceMode {
+    pub fn from_policy(policy: Option<ServiceActivationPolicy>) -> Self {
+        match policy {
+            None | Some(ServiceActivationPolicy::Disabled) => Self::Off,
+            Some(ServiceActivationPolicy::Auto) => Self::Auto,
+            Some(ServiceActivationPolicy::Lazy) | Some(ServiceActivationPolicy::Manual) => {
+                Self::Lazy
+            }
         }
     }
 }
@@ -336,6 +396,12 @@ pub trait ServiceContextProvider: Send + Sync {
 pub trait WorkspaceServiceFactory: Send + Sync {
     fn kind(&self) -> ServiceKind;
     fn detect(&self, workspace: &WorkspaceRuntime) -> DetectionResult;
+    /// Policy written once for a checkout that has no persisted record yet.
+    /// Later detection changes never overwrite the user's choice. Factories
+    /// whose initial value needs an expensive scan compute it only here.
+    fn initial_activation_policy(&self, workspace: &WorkspaceRuntime) -> ServiceActivationPolicy {
+        self.detect(workspace).activation_policy
+    }
     fn create<'a>(
         &'a self,
         workspace: Arc<WorkspaceRuntime>,
@@ -535,6 +601,20 @@ impl ServiceBinding {
             runtime_generation: identity.runtime_generation,
             service: Arc::downgrade(service),
         }
+    }
+
+    /// The bound instance still exists and has not stopped. A dead binding
+    /// (idle reaping, app switch) is replaced by the next late bind.
+    pub fn is_live(&self) -> bool {
+        self.service.upgrade().is_some_and(|service| {
+            let identity = service.identity();
+            identity.service_instance_id == self.service_instance_id
+                && identity.runtime_generation == self.runtime_generation
+                && !matches!(
+                    service.status(),
+                    ServiceStatus::Stopping | ServiceStatus::Stopped | ServiceStatus::Failed
+                )
+        })
     }
 
     pub fn snapshot(&self) -> ServiceBindingSnapshot {
@@ -783,6 +863,23 @@ impl WorkspaceServiceHost {
             .and_then(|slot| slot.activation_policy.read().ok().map(|policy| *policy))
     }
 
+    pub fn initial_activation_policy(
+        &self,
+        kind: ServiceKind,
+        workspace: &WorkspaceRuntime,
+    ) -> Option<ServiceActivationPolicy> {
+        let factory = self
+            .slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(&kind).map(|slot| Arc::clone(&slot.factory)))?;
+        Some(factory.initial_activation_policy(workspace))
+    }
+
+    pub fn effective_mode(&self, kind: ServiceKind) -> EffectiveServiceMode {
+        EffectiveServiceMode::from_policy(self.activation_policy(kind))
+    }
+
     pub fn set_activation_policy(
         &self,
         kind: ServiceKind,
@@ -941,6 +1038,42 @@ impl WorkspaceServiceHost {
         Ok(())
     }
 
+    /// Retire a service slot after its app-level switch was turned off. New
+    /// binds are refused immediately (policy `Disabled`); the running instance
+    /// is stopped once its leases drain, then the slot disappears so the
+    /// service is no longer detected. Returns `Ok(false)` while leases are
+    /// still held; callers retry.
+    pub async fn remove(&self, kind: ServiceKind) -> Result<bool, String> {
+        let slot = self
+            .slots
+            .lock()
+            .map_err(|error| format!("workspace service slots lock poisoned: {error}"))?
+            .get(&kind)
+            .cloned();
+        let Some(slot) = slot else {
+            return Ok(true);
+        };
+        if let Ok(mut policy) = slot.activation_policy.write() {
+            *policy = ServiceActivationPolicy::Disabled;
+        }
+        match self.stop(kind).await {
+            Ok(()) => {}
+            Err(_) if slot.state.lock().await.service.as_ref().is_some_and(|service| {
+                service.lease_tracker().count() > 0
+            }) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        if let Ok(mut slots) = self.slots.lock() {
+            if slots
+                .get(&kind)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                slots.remove(&kind);
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn is_running(&self, kind: ServiceKind) -> bool {
         let slot = self
             .slots
@@ -1052,11 +1185,22 @@ pub fn unity_service_tool_names() -> &'static [&'static str] {
     ]
 }
 
+pub fn blender_service_tool_names() -> &'static [&'static str] {
+    &["blender_execute"]
+}
+
 pub fn owner_service_for_tool(name: &str) -> Option<ServiceKind> {
-    unity_service_tool_names()
+    let name = name.trim();
+    if unity_service_tool_names()
         .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(name.trim()))
-        .then_some(ServiceKind::Unity)
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+    {
+        return Some(ServiceKind::Unity);
+    }
+    blender_service_tool_names()
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        .then_some(ServiceKind::Blender)
 }
 
 /// Unity tools that cross the editor command channel. Checkout-local index and
@@ -1073,6 +1217,7 @@ pub fn service_ready_required_for_tool(name: &str) -> bool {
             | "unity_test_run"
             | "unity_recompile"
             | "unity_hot_reload"
+            | "blender_execute"
     )
 }
 

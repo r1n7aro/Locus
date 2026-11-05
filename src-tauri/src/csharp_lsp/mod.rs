@@ -894,7 +894,7 @@ async fn discover_project_target(server: &Arc<WorkspaceServer>) -> Result<Projec
     }
 
     let workspace = root.to_string_lossy().to_string();
-    if !crate::unity_bridge::is_unity_project(&workspace) {
+    if !crate::unity_bridge::unity_integration_enabled(&workspace) {
         return Err("No .sln/.csproj found in the workspace".to_string());
     }
 

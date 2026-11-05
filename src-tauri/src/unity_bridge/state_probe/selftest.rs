@@ -1390,7 +1390,7 @@ async fn run_owned(
     if project.trim().is_empty() {
         return Err("No workspace selected".to_string());
     }
-    if !crate::unity_bridge::is_unity_project(&project) {
+    if !crate::unity_bridge::unity_integration_enabled(&project) {
         return Err("Current workspace is not a Unity project".to_string());
     }
     let _guard = RunningGuard::acquire(ownership_key)?;

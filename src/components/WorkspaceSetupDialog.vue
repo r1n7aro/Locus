@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, nextTick } from "vue";
+import { computed, ref, watch, nextTick } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Folder, Plus, X } from "lucide";
 import { t } from "../i18n";
@@ -7,6 +7,8 @@ import { useWorkspaceSetup } from "../composables/useWorkspaceSetup";
 import { normalizeAppError } from "../services/errors";
 import BaseButton from "./ui/BaseButton.vue";
 import BaseCheckbox from "./ui/BaseCheckbox.vue";
+import BaseSegmented from "./ui/BaseSegmented.vue";
+import type { WorkspaceServiceSetup, WorkspaceServiceSetupMode } from "../services/project";
 import LucideIcon from "./icons/LucideIcon.vue";
 
 const { request, saving, cancel, save } = useWorkspaceSetup();
@@ -19,6 +21,20 @@ watch(request, async current => {
   await nextTick();
   dialog.value?.showModal();
 });
+const serviceModeOptions = computed(() => (["auto", "lazy", "off"] as const).map(mode => ({
+  value: mode,
+  label: t(`workspace.setup.serviceMode.${mode}`),
+  hint: t(`workspace.setup.serviceMode.${mode}Hint`),
+})));
+const unityServiceOff = computed(() => (request.value?.setup.services ?? [])
+  .some(entry => entry.service === "unity" && entry.mode === "off"));
+function serviceLabel(entry: WorkspaceServiceSetup): string {
+  return t(entry.service === "unity" ? "settings.tab.unity" : "settings.tab.blender");
+}
+function setServiceMode(entry: WorkspaceServiceSetup, mode: string) {
+  if (saving.value) return;
+  entry.mode = mode as WorkspaceServiceSetupMode;
+}
 function shortName(path: string): string {
   return path.replace(/\\/g, "/").split("/").filter(Boolean).pop() || path;
 }
@@ -77,10 +93,18 @@ async function submit() {
             <BaseCheckbox v-model="request.setup.knowledgeEnabled" :disabled="saving" :aria-label="t('workspace.setup.knowledge')" />
             <span>{{ t('workspace.setup.knowledge') }}</span>
           </label>
-          <label v-if="request.setup.isUnityProject" class="workspace-setup-option">
+          <label v-if="request.setup.isUnityProject && !unityServiceOff" class="workspace-setup-option">
             <BaseCheckbox v-model="request.setup.unityTestToolsEnabled" :disabled="saving" :aria-label="t('workspace.setup.unityTests')" />
             <span>{{ t('workspace.setup.unityTests') }}</span>
           </label>
+          <section v-if="request.setup.services?.length" class="workspace-setup-services" aria-labelledby="workspace-setup-services-title">
+            <h2 id="workspace-setup-services-title">{{ t('workspace.setup.services') }}</h2>
+            <div v-for="entry in request.setup.services" :key="entry.service" class="workspace-setup-service">
+              <span class="workspace-setup-service-name">{{ serviceLabel(entry) }}</span>
+              <BaseSegmented size="sm" :model-value="entry.mode" :options="serviceModeOptions"
+                :aria-label="serviceLabel(entry)" @update:model-value="setServiceMode(entry, $event)" />
+            </div>
+          </section>
           <section class="workspace-setup-directories" aria-labelledby="workspace-setup-directories-title">
             <div class="workspace-setup-section-header">
               <h2 id="workspace-setup-directories-title">{{ t('extraWorkdirs.windowTitle') }}</h2>
@@ -137,6 +161,8 @@ header { flex-shrink: 0; padding: 14px 20px; border-bottom: 1px solid var(--bord
 .workspace-setup-option { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 13px; cursor: pointer; }
 .workspace-setup-error { margin: 12px 0 0; color: var(--status-danger-fg); font-size: 12px; }
 footer { display: flex; flex-shrink: 0; justify-content: flex-end; gap: 8px; padding: 12px 20px; border-top: 1px solid var(--border-color); }
+.workspace-setup-services { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border-color); }
+.workspace-setup-service { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; font-size: 13px; }
 .workspace-setup-directories { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border-color); }
 .workspace-setup-section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 h2 { margin: 0; font-size: 13px; font-weight: 600; }

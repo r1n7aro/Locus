@@ -6,6 +6,7 @@ pub mod project_resources;
 pub mod runtime;
 pub mod scope;
 pub mod service;
+pub mod blender;
 pub mod unity;
 pub mod worktrees;
 pub mod pool;
@@ -26,7 +27,8 @@ pub use runtime::{
 };
 pub use scope::{ResolvedWorkspaceScope, WorkspaceRef, WorkspaceResolveError};
 pub use service::{
-    owner_service_for_tool, service_ready_required_for_tool, ServiceBinding, ServiceKind,
+    owner_service_for_tool, service_ready_required_for_tool, EffectiveServiceMode, ResolvedServiceBinding,
+    ServiceBinding, ServiceKind,
     ServiceReadinessError, ServiceReadinessPhase, ServiceReadinessSnapshot, ServiceReadyPermit,
     ServiceStatus, WorkspaceService, WorkspaceServiceStateSnapshot,
 };
@@ -62,10 +64,14 @@ pub fn restore_or_persist_service_settings(
             continue;
         }
 
+        // No record yet: detection decides the initial value, once. The add-
+        // workspace dialog writes its record before registration, so a user
+        // choice made there is restored by the branch above instead.
         let activation_policy = runtime
             .services()
-            .activation_policy(kind)
+            .initial_activation_policy(kind, runtime)
             .unwrap_or(service::ServiceActivationPolicy::Disabled);
+        runtime.services().set_activation_policy(kind, activation_policy)?;
         store.upsert_workspace_service(&crate::session::models::WorkspaceServiceRecord {
             checkout_id: runtime.checkout_id().to_string(),
             service_kind: kind.as_str().to_string(),

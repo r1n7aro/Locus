@@ -113,8 +113,8 @@ impl WorkspaceServiceFactory for UnityServiceFactory {
     }
 
     fn detect(&self, workspace: &WorkspaceRuntime) -> DetectionResult {
-        if crate::unity_bridge::is_unity_project(&workspace.root().to_string_lossy()) {
-            DetectionResult::detected(ServiceActivationPolicy::Lazy)
+        if crate::unity_bridge::unity_integration_enabled(&workspace.root().to_string_lossy()) {
+            DetectionResult::detected(ServiceActivationPolicy::Auto)
         } else {
             DetectionResult::absent()
         }

@@ -1,27 +1,46 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::identity::{CheckoutId, ProjectId};
-use super::runtime::{WorkspaceLease, WorkspaceLeaseKind, WorkspaceRuntime};
+use super::runtime::{ServiceLateBinder, WorkspaceLease, WorkspaceLeaseKind, WorkspaceRuntime};
 use super::service::{
-    ResolvedServiceBinding, ServiceBinding, ServiceBindingError, ServiceBindingSnapshot,
-    ServiceKind,
+    EffectiveServiceMode, ResolvedServiceBinding, ServiceBinding, ServiceBindingError,
+    ServiceBindingSnapshot, ServiceKind,
 };
 
-/// Immutable checkout and service routing snapshot for one Agent run.
+/// Called with the full binding set after a late bind, so the run record
+/// (`session_runs.service_bindings_json`) and context export see it.
+pub type ServiceBindingListener = Arc<dyn Fn(Vec<ServiceBindingSnapshot>) + Send + Sync>;
+
+/// Checkout and service routing for one Agent run. The checkout is fixed for
+/// the run; service bindings start with the auto-mode services and grow when
+/// a lazy-mode service is first used (`ensure_service`).
 pub struct AgentExecutionContext {
     pub project_id: ProjectId,
     pub checkout_id: CheckoutId,
     pub workspace: Arc<WorkspaceRuntime>,
     pub workspace_generation: u64,
-    pub service_bindings: HashMap<ServiceKind, ServiceBinding>,
+    service_bindings: RwLock<HashMap<ServiceKind, ServiceBinding>>,
+    late_binder: Option<ServiceLateBinder>,
+    late_bind_gate: tokio::sync::Mutex<()>,
+    binding_listener: Mutex<Option<ServiceBindingListener>>,
     _workspace_lease: WorkspaceLease,
 }
 
 impl AgentExecutionContext {
+    /// Context without late binding (tests and fixed-binding callers).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         workspace: Arc<WorkspaceRuntime>,
         service_bindings: HashMap<ServiceKind, ServiceBinding>,
+    ) -> Self {
+        Self::with_late_binder(workspace, service_bindings, None)
+    }
+
+    pub(crate) fn with_late_binder(
+        workspace: Arc<WorkspaceRuntime>,
+        service_bindings: HashMap<ServiceKind, ServiceBinding>,
+        late_binder: Option<ServiceLateBinder>,
     ) -> Self {
         let workspace_lease = workspace.acquire_lease(WorkspaceLeaseKind::RunningTask);
         Self {
@@ -29,7 +48,10 @@ impl AgentExecutionContext {
             checkout_id: workspace.checkout_id().clone(),
             workspace_generation: workspace.generation(),
             workspace,
-            service_bindings,
+            service_bindings: RwLock::new(service_bindings),
+            late_binder,
+            late_bind_gate: tokio::sync::Mutex::new(()),
+            binding_listener: Mutex::new(None),
             _workspace_lease: workspace_lease,
         }
     }
@@ -38,17 +60,78 @@ impl AgentExecutionContext {
         self.workspace.root()
     }
 
-    pub fn binding(&self, kind: ServiceKind) -> Option<&ServiceBinding> {
-        self.service_bindings.get(&kind)
+    pub fn binding(&self, kind: ServiceKind) -> Option<ServiceBinding> {
+        self.service_bindings
+            .read()
+            .ok()
+            .and_then(|bindings| bindings.get(&kind).cloned())
+    }
+
+    pub fn bindings(&self) -> Vec<ServiceBinding> {
+        let mut bindings = self
+            .service_bindings
+            .read()
+            .map(|bindings| bindings.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        bindings.sort_by_key(|binding| binding.service_kind);
+        bindings
+    }
+
+    pub fn effective_mode(&self, kind: ServiceKind) -> EffectiveServiceMode {
+        self.workspace.services().effective_mode(kind)
+    }
+
+    /// Install the run-record write-back for late binds.
+    pub fn set_binding_listener(&self, listener: ServiceBindingListener) {
+        if let Ok(mut current) = self.binding_listener.lock() {
+            *current = Some(listener);
+        }
+    }
+
+    /// Bind `kind` for the rest of this run, starting the service when it is
+    /// dormant. Used the first time a lazy-mode service's tool executes, and
+    /// to replace a binding whose instance was reaped while the run waited.
+    pub async fn ensure_service(&self, kind: ServiceKind) -> Result<ServiceBinding, String> {
+        if let Some(binding) = self.binding(kind).filter(ServiceBinding::is_live) {
+            return Ok(binding);
+        }
+        let _gate = self.late_bind_gate.lock().await;
+        if let Some(binding) = self.binding(kind).filter(ServiceBinding::is_live) {
+            return Ok(binding);
+        }
+        if self.effective_mode(kind) == EffectiveServiceMode::Off {
+            return Err(format!(
+                "the {} service is turned off for this workspace",
+                kind.as_str()
+            ));
+        }
+        let binder = self.late_binder.as_ref().ok_or_else(|| {
+            format!(
+                "this run cannot start the {} service on demand",
+                kind.as_str()
+            )
+        })?;
+        let binding = binder.bind(&self.workspace, kind).await?;
+        if let Ok(mut bindings) = self.service_bindings.write() {
+            bindings.insert(kind, binding.clone());
+        }
+        let listener = self
+            .binding_listener
+            .lock()
+            .ok()
+            .and_then(|listener| listener.clone());
+        if let Some(listener) = listener {
+            listener(self.service_binding_snapshots());
+        }
+        Ok(binding)
     }
 
     pub fn resolve_service(
         &self,
         kind: ServiceKind,
     ) -> Result<ResolvedServiceBinding, ServiceBindingError> {
-        self.service_bindings
-            .get(&kind)
-            .ok_or_else(|| ServiceBindingError::Missing { kind })?
+        self.binding(kind)
+            .ok_or(ServiceBindingError::Missing { kind })?
             .resolve()
     }
 
@@ -57,21 +140,17 @@ impl AgentExecutionContext {
         kind: ServiceKind,
         timeout: std::time::Duration,
     ) -> Result<ResolvedServiceBinding, ServiceBindingError> {
-        self.service_bindings
-            .get(&kind)
-            .ok_or_else(|| ServiceBindingError::Missing { kind })?
+        self.binding(kind)
+            .ok_or(ServiceBindingError::Missing { kind })?
             .resolve_ready(timeout)
             .await
     }
 
     pub fn service_binding_snapshots(&self) -> Vec<ServiceBindingSnapshot> {
-        let mut snapshots = self
-            .service_bindings
-            .values()
+        self.bindings()
+            .iter()
             .map(ServiceBinding::snapshot)
-            .collect::<Vec<_>>();
-        snapshots.sort_by_key(|snapshot| snapshot.service_kind);
-        snapshots
+            .collect()
     }
 
     pub fn persisted_run_scope(&self) -> crate::session::models::SessionRunScopeSnapshot {

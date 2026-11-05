@@ -317,7 +317,7 @@ function toolMetaString(meta: InjectedPromptItem["meta"], key: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function currentSubagentModels(): Record<string, string> {
+function currentSubagentModels(): Record<string, string[]> {
   return modelStore.modelDefaults?.subagentModels ?? {};
 }
 
@@ -449,6 +449,14 @@ function toolUnavailableReasonText(reason: string): string {
       return t("agent.tool.unavailableReason.requiresUnityWorkspace");
     case "unity_service_unavailable":
       return t("agent.tool.unavailableReason.unityServiceUnavailable");
+    case "unity_disabled":
+      return t("agent.tool.unavailableReason.unityDisabled");
+    case "unity_service_disabled":
+      return t("agent.tool.unavailableReason.unityServiceDisabled");
+    case "blender_disabled":
+      return t("agent.tool.unavailableReason.blenderDisabled");
+    case "blender_service_disabled":
+      return t("agent.tool.unavailableReason.blenderServiceDisabled");
     case "requires_workspace":
       return t("agent.tool.unavailableReason.requiresWorkspace");
     case "knowledge_access_disabled":

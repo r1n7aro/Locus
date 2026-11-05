@@ -1884,7 +1884,7 @@ pub async fn search_workspace_scene_objects(
     // loaded scenes so unsaved edits and prefab children are included.
     let Some(scene_path) = scene_path else {
         let project_path = scope.root_string();
-        if !crate::unity_bridge::is_unity_project(&project_path) {
+        if !crate::unity_bridge::unity_integration_enabled(&project_path) {
             return Ok(Vec::new());
         }
         let payload = serde_json::json!({ "query": query, "limit": result_limit });

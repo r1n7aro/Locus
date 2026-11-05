@@ -76,6 +76,79 @@ pub struct WorkspaceSetup {
     pub unity_test_tools_enabled: bool,
     #[serde(default)]
     pub extra_workdirs: Option<Vec<crate::extra_workdirs::ExtraWorkdirStatus>>,
+    /// Workspace services offered by the setup dialog (app switch on and,
+    /// for Unity, a Unity project). Saved as the checkout's service records.
+    #[serde(default)]
+    pub services: Vec<WorkspaceServiceSetup>,
+}
+
+/// One service row of the workspace setup dialog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceServiceSetup {
+    /// `unity` or `blender`.
+    pub service: String,
+    /// Detection result that chose the initial mode. Unity: a Unity project.
+    /// Blender: the workspace contains `.blend` files.
+    pub detected: bool,
+    pub mode: WorkspaceServiceMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceServiceMode {
+    Auto,
+    Lazy,
+    Off,
+}
+
+impl WorkspaceServiceMode {
+    pub fn from_record(enabled: bool, policy: &str) -> Self {
+        match crate::workspace_service::service::ServiceActivationPolicy::parse(policy) {
+            _ if !enabled => Self::Off,
+            Ok(crate::workspace_service::service::ServiceActivationPolicy::Auto) => Self::Auto,
+            Ok(crate::workspace_service::service::ServiceActivationPolicy::Lazy)
+            | Ok(crate::workspace_service::service::ServiceActivationPolicy::Manual) => Self::Lazy,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn activation_policy(self) -> crate::workspace_service::service::ServiceActivationPolicy {
+        use crate::workspace_service::service::ServiceActivationPolicy;
+        match self {
+            Self::Auto => ServiceActivationPolicy::Auto,
+            Self::Lazy => ServiceActivationPolicy::Lazy,
+            Self::Off => ServiceActivationPolicy::Disabled,
+        }
+    }
+}
+
+/// Services the dialog offers for `root`, with detection-based initial modes:
+/// Unity in a Unity project starts automatically; Blender is on demand when
+/// the workspace has `.blend` files and off otherwise (the user may still
+/// enable it). Persisted records override these values in the command layer.
+pub fn detected_service_setup(root: &str) -> Vec<WorkspaceServiceSetup> {
+    let mut services = Vec::new();
+    if crate::unity_bridge::unity_integration_enabled(root) {
+        services.push(WorkspaceServiceSetup {
+            service: "unity".to_string(),
+            detected: true,
+            mode: WorkspaceServiceMode::Auto,
+        });
+    }
+    if crate::blender::blender_integration_enabled() {
+        let detected = crate::blender::detect::workspace_has_blend_files(Path::new(root));
+        services.push(WorkspaceServiceSetup {
+            service: "blender".to_string(),
+            detected,
+            mode: if detected {
+                WorkspaceServiceMode::Lazy
+            } else {
+                WorkspaceServiceMode::Off
+            },
+        });
+    }
+    services
 }
 
 /// Unconfigured, existing workspaces retain their knowledge behavior. New
@@ -122,15 +195,16 @@ pub fn initialize_workspace_setup(dir: &str) -> Result<(), String> {
 pub fn inspect_workspace_setup(dir: &str) -> Result<WorkspaceSetup, String> {
     let identity = ProjectIdResolver::resolve(dir).map_err(|error| error.to_string())?;
     let dir = identity.root.to_string_lossy();
-    let is_unity_project = crate::unity_bridge::is_unity_project(&dir);
+    let is_unity_project = crate::unity_bridge::unity_integration_enabled(&dir);
     let config = read_json_object(&workspace_config_path(&dir)).unwrap_or_default();
     Ok(WorkspaceSetup {
         is_unity_project,
+        // The knowledge default follows the folder type, not the Unity switch.
         knowledge_enabled: config
             .get("knowledge_enabled")
             .or_else(|| config.get("knowledgeEnabled"))
             .and_then(|value| value.as_bool())
-            .unwrap_or(is_unity_project),
+            .unwrap_or_else(|| crate::unity_bridge::is_unity_project(&dir)),
         unity_test_tools_enabled: config
             .get("unity_test_tools_enabled")
             .or_else(|| config.get("unityTestToolsEnabled"))
@@ -138,6 +212,7 @@ pub fn inspect_workspace_setup(dir: &str) -> Result<WorkspaceSetup, String> {
             .unwrap_or(false)
             && is_unity_project,
         extra_workdirs: Some(crate::extra_workdirs::load_statuses(&dir)),
+        services: detected_service_setup(&dir),
     })
 }
 
@@ -170,7 +245,7 @@ pub fn save_workspace_setup(dir: &str, setup: &WorkspaceSetup) -> Result<(), Str
         "unity_test_tools_enabled".into(),
         serde_json::json!(
             setup.unity_test_tools_enabled
-                && crate::unity_bridge::is_unity_project(&identity.root.to_string_lossy())
+                && crate::unity_bridge::unity_integration_enabled(&identity.root.to_string_lossy())
         ),
     );
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|error| error.to_string())?;

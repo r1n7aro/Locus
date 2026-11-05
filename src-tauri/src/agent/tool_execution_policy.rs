@@ -78,6 +78,7 @@ pub(crate) fn workspace_request(
         ),
         "python" => !crate::tool::builtins::python_is_readonly(args),
         "unity_execute" => !super::instance::AgentInstance::unity_execute_is_readonly(args),
+        "blender_execute" => !crate::blender::tool::is_readonly(args),
         _ => mutates_workspace || is_unity_execution_barrier_tool(name),
     };
     needs_snapshot_isolation.then_some(Exclusive)

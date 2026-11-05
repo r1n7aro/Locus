@@ -1095,10 +1095,16 @@ mod tests {
                 !tool.starts_with("unity_") && !tool.starts_with("code_"),
                 "General should not expose {tool}"
             );
-            assert!(
-                crate::workspace_service::owner_service_for_tool(tool).is_none(),
-                "General should not depend on a workspace service for {tool}"
-            );
+            // Only optional service tools that hide themselves while their
+            // service is undetected or turned off for the workspace.
+            if let Some(owner) = crate::workspace_service::owner_service_for_tool(tool) {
+                assert_eq!(
+                    owner,
+                    crate::workspace_service::ServiceKind::Blender,
+                    "General should not depend on the {} service for {tool}",
+                    owner.as_str()
+                );
+            }
             if tool != "subagent" {
                 assert!(tools.get(tool).is_some(), "General tool {tool} should be built in");
             }

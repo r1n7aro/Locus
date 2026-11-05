@@ -220,7 +220,12 @@ pub struct WorkspaceRuntimeDescriptor {
     pub workspace_generation: u64,
     pub materialization_epoch: u64,
     pub lease_count: usize,
+    /// Services this workspace uses (mode auto or lazy).
     pub detected_services: Vec<String>,
+    /// `auto`: started on focus and bound when runs start. `lazy`: dormant
+    /// until a tool or SDK call needs it.
+    pub service_modes:
+        std::collections::BTreeMap<String, crate::workspace_service::EffectiveServiceMode>,
     pub knowledge_enabled: bool,
     /// Locus-managed worktree of the project's source checkout.
     pub managed_worktree: bool,
@@ -292,7 +297,7 @@ fn policy_update_error(error: WorkspaceServiceResourceLimitsUpdateError) -> AppE
     }
 }
 
-fn workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
+pub(super) fn workspace_resolve_error(error: WorkspaceResolveError) -> AppError {
     match error {
         error @ WorkspaceResolveError::StaleMaterialization { .. } => AppError::new(
             "workspace.materialization_stale",
@@ -339,14 +344,18 @@ fn window_context_error(error: WindowContextError) -> AppError {
 }
 
 fn runtime_descriptor(runtime: &WorkspaceRuntime) -> WorkspaceRuntimeDescriptor {
-    let mut detected_services = runtime
-        .services()
-        .detected_kinds()
-        .into_iter()
-        .map(|kind| kind.as_str().to_string())
-        .collect::<Vec<_>>();
-    detected_services.sort();
+    // A service the workspace turned off is invisible to the frontend: no
+    // status item, plugin notice or start on focus.
+    let mut service_modes = std::collections::BTreeMap::new();
+    for kind in runtime.services().detected_kinds() {
+        let mode = runtime.services().effective_mode(kind);
+        if mode != crate::workspace_service::EffectiveServiceMode::Off {
+            service_modes.insert(kind.as_str().to_string(), mode);
+        }
+    }
+    let detected_services = service_modes.keys().cloned().collect::<Vec<_>>();
     WorkspaceRuntimeDescriptor {
+        service_modes,
         project_id: runtime.project_id().to_string(),
         checkout_id: runtime.checkout_id().to_string(),
         root: runtime.root().display().to_string(),
@@ -365,7 +374,7 @@ fn project_detected_services(checkouts: &[WorkspaceCheckoutDescriptor]) -> Vec<S
         if let Some(runtime) = &checkout.runtime {
             detected_services.extend(runtime.detected_services.iter().cloned());
         }
-        if crate::unity_bridge::is_unity_project(&checkout.root) {
+        if crate::unity_bridge::unity_integration_enabled(&checkout.root) {
             detected_services.insert(ServiceKind::Unity.as_str().to_string());
         }
     }
@@ -507,8 +516,110 @@ pub fn list_project_contexts(
 }
 
 #[tauri::command]
-pub fn inspect_workspace_setup(path: String) -> Result<crate::workspace::WorkspaceSetup, AppError> {
-    crate::workspace::inspect_workspace_setup(&path).map_err(Into::into)
+pub fn inspect_workspace_setup(
+    path: String,
+    store: State<'_, Arc<SessionStore>>,
+) -> Result<crate::workspace::WorkspaceSetup, AppError> {
+    let mut setup = crate::workspace::inspect_workspace_setup(&path)?;
+    overlay_persisted_service_modes(&path, store.inner().as_ref(), &mut setup);
+    Ok(setup)
+}
+
+/// Detection supplies the initial mode only; a saved choice wins.
+fn overlay_persisted_service_modes(
+    path: &str,
+    store: &SessionStore,
+    setup: &mut crate::workspace::WorkspaceSetup,
+) {
+    let Ok(identity) = crate::workspace_service::identity::ProjectIdResolver::resolve(path) else {
+        return;
+    };
+    let Ok(records) = store.list_workspace_services(identity.checkout_id.as_str()) else {
+        return;
+    };
+    for service in &mut setup.services {
+        if let Some(record) = records
+            .iter()
+            .find(|record| record.service_kind == service.service)
+        {
+            service.mode = crate::workspace::WorkspaceServiceMode::from_record(
+                record.enabled,
+                &record.activation_policy,
+            );
+        }
+    }
+}
+
+/// Persist the dialog's service choices for `identity`'s checkout and apply
+/// them to a live runtime. Runs before registration for new workspaces, so
+/// the registration restore finds these records instead of detecting again.
+async fn persist_workspace_service_modes(
+    identity: &crate::workspace_service::identity::ResolvedWorkspaceIdentity,
+    services: &[crate::workspace::WorkspaceServiceSetup],
+    store: &SessionStore,
+    registry: &Arc<ProjectRegistry>,
+) -> Result<bool, AppError> {
+    let offered = crate::workspace::detected_service_setup(&identity.root.to_string_lossy());
+    let mut changed = false;
+    for choice in services {
+        let Some(kind) = ServiceKind::parse(&choice.service) else {
+            continue;
+        };
+        // Only services the dialog could offer are writable from here.
+        if !offered.iter().any(|offer| offer.service == choice.service) {
+            continue;
+        }
+        let policy = choice.mode.activation_policy();
+        let existing = store
+            .list_workspace_services(identity.checkout_id.as_str())
+            .map_err(AppError::from)?
+            .into_iter()
+            .find(|record| record.service_kind == kind.as_str());
+        if existing.as_ref().is_some_and(|record| {
+            crate::workspace::WorkspaceServiceMode::from_record(
+                record.enabled,
+                &record.activation_policy,
+            ) == choice.mode
+        }) {
+            continue;
+        }
+        store
+            .upsert_workspace_checkout(&crate::session::models::WorkspaceCheckoutRecord {
+                checkout_id: identity.checkout_id.to_string(),
+                project_id: identity.project_id.to_string(),
+                root_path: identity.root.display().to_string(),
+                normalized_root: identity.normalized_root.to_string(),
+                last_opened_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            })
+            .map_err(AppError::from)?;
+        store
+            .upsert_workspace_service(&crate::session::models::WorkspaceServiceRecord {
+                checkout_id: identity.checkout_id.to_string(),
+                service_kind: kind.as_str().to_string(),
+                service_instance_id: crate::workspace_service::ServiceInstanceId::for_service(
+                    &identity.checkout_id,
+                    kind.as_str(),
+                )
+                .to_string(),
+                enabled: choice.mode != crate::workspace::WorkspaceServiceMode::Off,
+                activation_policy: policy.as_str().to_string(),
+                local_config: existing
+                    .map(|record| record.local_config)
+                    .unwrap_or_else(|| serde_json::json!({})),
+            })
+            .map_err(AppError::from)?;
+        if let Some(runtime) = registry.runtime(&identity.checkout_id) {
+            registry
+                .apply_service_policy(&runtime, kind, policy)
+                .await
+                .map_err(AppError::from)?;
+        }
+        changed = true;
+    }
+    Ok(changed)
 }
 
 #[tauri::command]
@@ -516,11 +627,28 @@ pub async fn save_workspace_setup(
     path: String,
     setup: crate::workspace::WorkspaceSetup,
     registry: State<'_, Arc<ProjectRegistry>>,
+    store: State<'_, Arc<SessionStore>>,
     app_handle: tauri::AppHandle,
 ) -> Result<crate::workspace::WorkspaceSetup, AppError> {
+    use tauri::{Emitter, Manager};
     let identity = crate::workspace_service::identity::ProjectIdResolver::resolve(&path)
         .map_err(|error| AppError::from(error.to_string()))?;
     crate::workspace::save_workspace_setup(&path, &setup)?;
+    if persist_workspace_service_modes(
+        &identity,
+        &setup.services,
+        store.inner().as_ref(),
+        registry.inner(),
+    )
+    .await?
+    {
+        let switches = ServiceSwitches::from_config(
+            app_handle.state::<Arc<crate::config::AppConfig>>().inner(),
+        );
+        if let Err(error) = app_handle.emit("workspace-services-changed", switches) {
+            eprintln!("[Locus] failed to emit workspace-services-changed: {error}");
+        }
+    }
     if !setup.knowledge_enabled {
         if let Some(runtime) = registry.runtime(&identity.checkout_id) {
             runtime.core().stop_knowledge_watchers();
@@ -534,7 +662,9 @@ pub async fn save_workspace_setup(
             serde_json::json!({ "knowledgeEnabled": setup.knowledge_enabled }),
         );
     }
-    crate::workspace::inspect_workspace_setup(&path).map_err(Into::into)
+    let mut saved = crate::workspace::inspect_workspace_setup(&path)?;
+    overlay_persisted_service_modes(&path, store.inner().as_ref(), &mut saved);
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -791,6 +921,157 @@ pub fn list_window_workspace_intent_epochs(
     window_contexts
         .intent_epoch_snapshots()
         .map_err(window_context_error)
+}
+
+/// App-level service switches (Settings > Services pages).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceSwitches {
+    pub unity: bool,
+    pub blender: bool,
+}
+
+impl ServiceSwitches {
+    fn from_config(config: &crate::config::AppConfig) -> Self {
+        Self {
+            unity: config.unity_enabled(),
+            blender: config.blender_enabled(),
+        }
+    }
+}
+
+/// Leases of running tools drain before a switched-off service is removed;
+/// a run still holding one after this bound finishes its removal later.
+const SERVICE_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[tauri::command]
+pub fn get_service_switches(
+    config: State<'_, Arc<crate::config::AppConfig>>,
+) -> Result<ServiceSwitches, AppError> {
+    Ok(ServiceSwitches::from_config(config.inner()))
+}
+
+#[tauri::command]
+pub async fn set_service_enabled(
+    service: String,
+    enabled: bool,
+    config: State<'_, Arc<crate::config::AppConfig>>,
+    app_handle: tauri::AppHandle,
+) -> Result<ServiceSwitches, AppError> {
+    let key = match service.trim() {
+        "unity" => crate::settings::UNITY_ENABLED,
+        "blender" => crate::settings::BLENDER_ENABLED,
+        other => {
+            return Err(AppError::new(
+                "workspace.unknown_service",
+                "Unknown workspace service.",
+            )
+            .detail(other.to_string()))
+        }
+    };
+    let context = crate::settings::apply::WriteContext::new(app_handle, None);
+    crate::settings::apply::write_one(&context, key, enabled).await?;
+    Ok(ServiceSwitches::from_config(config.inner()))
+}
+
+/// Effect of `unity.enabled` / `blender.enabled`: enabling redetects the
+/// service in every checkout; disabling stops watchers and retires the
+/// service once running tools release it.
+pub(crate) async fn apply_service_switch(
+    app_handle: &tauri::AppHandle,
+    kind: ServiceKind,
+    enabled: bool,
+) -> Result<(), String> {
+    use tauri::{Emitter, Manager};
+    let registry = app_handle.state::<Arc<ProjectRegistry>>().inner().clone();
+    if enabled {
+        let store = app_handle.state::<Arc<SessionStore>>();
+        registry.redetect_services(store.inner().as_ref());
+        if kind == ServiceKind::Unity {
+            let watcher_tuning =
+                app_handle.state::<crate::asset_db::watcher::WatcherTuningState>();
+            for runtime in registry.runtimes() {
+                if let Err(error) = runtime.core().start_background_watchers(
+                    &runtime,
+                    app_handle,
+                    Arc::clone(&watcher_tuning.0),
+                ) {
+                    eprintln!(
+                        "[Locus] failed to restart watchers for checkout {}: {}",
+                        runtime.checkout_id(),
+                        error
+                    );
+                }
+            }
+        }
+    } else {
+        if kind == ServiceKind::Unity {
+            for runtime in registry.runtimes() {
+                runtime.core().stop_asset_watcher();
+            }
+        }
+        let busy = registry
+            .retire_service_kind(kind, SERVICE_RETIRE_TIMEOUT)
+            .await;
+        if !busy.is_empty() {
+            // The policy is already Disabled, so no new work binds; finish
+            // removing the slots once the remaining runs release them.
+            let registry = Arc::clone(&registry);
+            tauri::async_runtime::spawn(async move {
+                let still_busy = registry
+                    .retire_service_kind(kind, std::time::Duration::from_secs(3600))
+                    .await;
+                if !still_busy.is_empty() {
+                    eprintln!(
+                        "[Locus] {} service still leased in {} checkout(s) after retirement",
+                        kind.as_str(),
+                        still_busy.len()
+                    );
+                }
+            });
+        }
+    }
+    let config = app_handle.state::<Arc<crate::config::AppConfig>>();
+    let switches = ServiceSwitches::from_config(config.inner());
+    if let Err(error) = app_handle.emit("workspace-services-changed", switches) {
+        eprintln!("[Locus] failed to emit workspace-services-changed: {error}");
+    }
+    Ok(())
+}
+
+/// Start a dormant (lazy-mode) service from its status item.
+#[tauri::command]
+pub async fn start_workspace_service(
+    workspace_ref: WorkspaceRef,
+    service: String,
+    registry: State<'_, Arc<ProjectRegistry>>,
+) -> Result<crate::workspace_service::service::ServiceBindingSnapshot, AppError> {
+    let kind = ServiceKind::parse(&service).ok_or_else(|| {
+        AppError::new("workspace.unknown_service", "Unknown workspace service.").detail(service.clone())
+    })?;
+    let registry = registry.inner().clone();
+    let resolved = registry
+        .resolve_workspace_ref(&workspace_ref)
+        .map_err(workspace_resolve_error)?;
+    let execution = registry
+        .execution_context(resolved.runtime().checkout_id(), &[kind])
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "workspace.service_start_failed",
+                "Failed to start the workspace service.",
+            )
+            .detail(error)
+        })?;
+    execution
+        .binding(kind)
+        .map(|binding| binding.snapshot())
+        .ok_or_else(|| {
+            AppError::new(
+                "workspace.service_binding_missing",
+                "The workspace service started without a binding.",
+            )
+        })
 }
 
 #[tauri::command]

@@ -66,6 +66,39 @@ describe("unified workspace settings panel", () => {
     expect(document.querySelector("dialog")).toBeNull();
   });
 
+  it("saves the per-service modes chosen from the detected defaults", async () => {
+    mocks.inspect.mockResolvedValue({
+      isUnityProject: true, knowledgeEnabled: true, unityTestToolsEnabled: false, extraWorkdirs: [],
+      services: [
+        { service: "unity", detected: true, mode: "auto" },
+        { service: "blender", detected: false, mode: "off" },
+      ],
+    });
+    const { result } = await show("add");
+    const rows = Array.from(document.querySelectorAll<HTMLElement>(".workspace-setup-service"));
+    expect(rows.map(row => row.querySelector(".workspace-setup-service-name")?.textContent))
+      .toEqual(["settings.tab.unity", "settings.tab.blender"]);
+    const option = (row: HTMLElement, mode: string) => Array.from(row.querySelectorAll<HTMLButtonElement>("button"))
+      .find(element => element.textContent?.trim() === `workspace.setup.serviceMode.${mode}`)!;
+    expect(option(rows[0], "auto").getAttribute("aria-checked")).toBe("true");
+    expect(document.body.textContent).toContain("workspace.setup.unityTests");
+
+    option(rows[0], "off").click();
+    await flush();
+    // Unity test tools only matter while the Unity service is on.
+    expect(document.body.textContent).not.toContain("workspace.setup.unityTests");
+    option(rows[0], "lazy").click();
+    option(rows[1], "auto").click();
+    await flush();
+    submit();
+    await flush();
+    expect(await result).toBe(true);
+    expect(mocks.save.mock.calls[0][1].services).toEqual([
+      { service: "unity", detected: true, mode: "lazy" },
+      { service: "blender", detected: false, mode: "auto" },
+    ]);
+  });
+
   it("keeps saved attachments untouched when cancelling a removal", async () => {
     const stored = [{ path: "F:/references", comment: "Reference", readOnly: true, exists: false }];
     mocks.inspect.mockResolvedValue({ isUnityProject: false, knowledgeEnabled: true, unityTestToolsEnabled: false, extraWorkdirs: structuredClone(stored) });
