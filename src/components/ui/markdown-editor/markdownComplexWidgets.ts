@@ -1,5 +1,7 @@
 import { EditorSelection } from "@codemirror/state";
 import { EditorView, WidgetType } from "@codemirror/view";
+import { createElement, Pencil } from "lucide";
+import { t } from "../../../i18n";
 import { renderMarkdownMathHtml } from "../../../composables/markdownMath";
 import type { WorkspaceRef } from "../../../services/project";
 import {
@@ -34,6 +36,12 @@ export type MarkdownImageResolver = (
 export interface MarkdownLivePreviewOptions {
   onLinkOpen?: (url: string) => void;
   onEditTarget?: (target: MarkdownEditTarget) => void;
+  /** Shows a loaded image enlarged; without it, clicking an image edits it. */
+  onImageOpen?: (image: {
+    src: string;
+    alt: string;
+    originRect: { left: number; top: number; width: number; height: number };
+  }) => void;
   imageResolver?: MarkdownImageResolver;
   imageContext?: MarkdownImageResolverContext;
   onReferenceOpen?: (reference: MarkdownReferenceToken) => void | Promise<void>;
@@ -186,10 +194,17 @@ export class MarkdownImageWidget extends WidgetType {
     fallback.className = "cm-live-image-fallback";
     const sourceSegments = this.source.split(/[\\/]/);
     fallback.textContent = this.alt.trim() || sourceSegments[sourceSegments.length - 1] || "Image";
-    frame.append(image, fallback);
-    frame.tabIndex = view.state.readOnly ? -1 : 0;
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "cm-live-image-edit";
+    edit.tabIndex = -1;
+    edit.title = t("imageLightbox.edit");
+    edit.setAttribute("aria-label", t("imageLightbox.edit"));
+    edit.append(createElement(Pencil, { width: "14", height: "14", "aria-hidden": "true", focusable: "false" }));
+    frame.append(image, fallback, edit);
+    frame.tabIndex = this.options.onImageOpen || !view.state.readOnly ? 0 : -1;
     frame.setAttribute("role", "button");
-    frame.setAttribute("aria-label", this.alt || "编辑图片");
+    frame.setAttribute("aria-label", this.alt || t(this.options.onImageOpen ? "imageLightbox.view" : "imageLightbox.edit"));
     const editImage = () => {
       if (view.state.readOnly) return;
       const title = markdownNodeAt(view.state, this.sourceFrom, ["Image"])?.getChild("LinkTitle");
@@ -200,9 +215,23 @@ export class MarkdownImageWidget extends WidgetType {
         title: title ? view.state.sliceDoc(title.from + 1, title.to - 1) : "",
       });
     };
-    frame.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); editImage(); });
+    // Like links, a click opens the image and the context menu edits it. Broken
+    // images have nothing to show, so a click goes straight to their editor.
+    const openImage = () => {
+      const src = image.currentSrc || image.src;
+      if (frame.dataset.state !== "ready" || !src || !this.options.onImageOpen) { editImage(); return; }
+      this.options.onImageOpen({ src, alt: this.alt, originRect: image.getBoundingClientRect() });
+    };
+    edit.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); editImage(); });
+    frame.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); openImage(); });
+    frame.addEventListener("contextmenu", (event) => {
+      if (view.state.readOnly || !this.options.onEditTarget) return;
+      event.preventDefault();
+      event.stopPropagation();
+      editImage();
+    });
     frame.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); editImage(); }
+      if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openImage(); }
     });
 
     const applyReady = (resolved: MarkdownImageResolution) => {

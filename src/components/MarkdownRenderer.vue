@@ -1,6 +1,6 @@
 
 <script setup lang="ts">
-import { computed, getCurrentInstance, h, nextTick, onBeforeUnmount, ref, render, watch } from "vue";
+import { computed, getCurrentInstance, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   markdownImageDirectSrc,
@@ -12,6 +12,7 @@ import { normalizeExternalMarkdownHref } from "../composables/markdownExternalLi
 import { openSessionReference } from "../services/sessionReference";
 import "../styles/markdown-links.css";
 import {
+  collectFileRefPathCandidates,
   collectInlineCodePathCandidates,
   injectAssetRefs,
   injectFileRefs,
@@ -30,7 +31,13 @@ import {
   loadCachedMarkdownPathStatuses,
   peekCachedMarkdownPathStatuses,
 } from "../composables/markdownPathStatusCache";
+import { markdownPathStatusWorkingDir } from "../composables/markdownPathStatusPrefetch";
 import { useSurfaceContentReadiness } from "../composables/surfaceContentReadiness";
+import { useSurfaceHidden } from "../composables/surfaceVisibility";
+import {
+  handleMarkdownReferenceSelectStart,
+  installMarkdownReferenceCopy,
+} from "../composables/markdownReferenceSelection";
 import { useInternalDragController } from "../composables/useInternalDrag";
 import { useTextViewerZoom } from "../composables/useTextViewerZoom";
 import { workspaceFileChangeInScope } from "../composables/useFileChangeRevalidation";
@@ -48,8 +55,10 @@ import { t } from "../i18n";
 import { resolveLocusViewIcon } from "./icons/locusViewIcons";
 import UnityObjectPreview from "./unity-preview/UnityObjectPreview.vue";
 import UnityPropertyFenceBlock from "./unity/UnityPropertyFenceBlock.vue";
+import { openImageLightbox } from "./ui/imageLightboxService";
 import type { Citation } from "../types";
 import type { WorkspaceRef } from "../services/project";
+import { isRemoteClient } from "../services/remoteClient";
 import type { UnityObjectPreviewInput, UnityObjectPreviewLevel } from "./unity-preview";
 import { startWorkbenchReferenceInternalDrag } from "./workbench/workbenchReferenceDrag";
 
@@ -61,6 +70,9 @@ const props = withDefaults(defineProps<{
   highlightTerms?: string[];
   unityPreviewStateScope?: string | null;
   workspaceRef?: WorkspaceRef | null;
+  /** Workspace path of the document being shown: relative images resolve
+   * against its folder instead of the workspace root. */
+  contentPath?: string | null;
   textZoom?: boolean;
 }>(), {
   textZoom: false,
@@ -76,17 +88,20 @@ const openViewPackage = useOpenView();
 const projectStore = useProjectStore();
 const workspaceContextStore = useWorkspaceContextStore();
 const markdownWorkspaceRef = computed(() => props.workspaceRef ?? workspaceContextStore.focusedWorkspaceRef);
-const markdownWorkingDir = computed(() => {
-  const scope = markdownWorkspaceRef.value;
-  return (scope && workspaceContextStore.checkoutsById?.[scope.checkoutId]?.root) || projectStore.workingDir;
-});
+const markdownWorkingDir = computed(() => markdownPathStatusWorkingDir(
+  markdownWorkspaceRef.value,
+  workspaceContextStore.checkoutsById,
+  projectStore.workingDir,
+));
 const internalDrag = useInternalDragController();
 const { textViewerZoomStyle, handleTextViewerZoomWheel } = useTextViewerZoom();
 const viewRefSummaries = ref<ViewPackageSummary[]>([]);
 const inlinePathStatuses = ref<Map<string, MarkdownPathStatus>>(new Map());
 const surfaceContentReadiness = useSurfaceContentReadiness();
+const surfaceHidden = useSurfaceHidden();
 const markdownPreviewRevisionEpoch = ref(0);
-const appContext = getCurrentInstance()?.appContext ?? null;
+const instance = getCurrentInstance();
+const appContext = instance?.appContext ?? null;
 const markdownUnityObjectPreviewHosts = new Set<HTMLElement>();
 const markdownUnityPropertyFenceHosts = new Set<HTMLElement>();
 const markdownUnityPropertyFenceSources = new WeakMap<HTMLElement, string>();
@@ -192,7 +207,20 @@ const parsedMarkdownHtml = computed(() => {
   return markdownEngine.parse(normalizeMarkdownForRender(content)) as string;
 });
 
-const inlineFilePathCandidates = computed(() => collectInlineCodePathCandidates(parsedMarkdownHtml.value));
+// Paths whose status decides how this markdown renders: inline code paths, and
+// bare-text paths when file references are enabled.
+const inlineFilePathCandidates = computed(() => {
+  const html = parsedMarkdownHtml.value;
+  const candidates = collectInlineCodePathCandidates(html);
+  if (!props.enableFileRefs) return candidates;
+  const seen = new Set(candidates);
+  for (const candidate of collectFileRefPathCandidates(html)) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    candidates.push(candidate);
+  }
+  return candidates;
+});
 
 function resolveInlinePathStatus(path: string): MarkdownPathStatus | null | undefined {
   return inlinePathStatuses.value.get(normalizeMarkdownPathStatusKey(path));
@@ -224,8 +252,8 @@ function applyInlinePathStatuses(statuses: Map<string, MarkdownPathStatus>) {
   if (!sameInlinePathStatuses(inlinePathStatuses.value, next)) inlinePathStatuses.value = next;
 }
 
-async function loadInlinePathStatuses(html: string) {
-  const candidates = collectInlineCodePathCandidates(html);
+async function loadInlinePathStatuses() {
+  const candidates = inlineFilePathCandidates.value;
   const focusedWorkspaceRef = markdownWorkspaceRef.value;
   const nextKey = `${focusedWorkspaceRef?.checkoutId ?? ""}@${focusedWorkspaceRef?.expectedGeneration ?? ""}@${focusedWorkspaceRef?.expectedMaterializationEpoch ?? ""}\n${markdownWorkingDir.value}\n${candidates.join("\n")}`;
   if (nextKey === markdownInlinePathStatusKey) return;
@@ -291,7 +319,11 @@ const renderedHtml = computed(() => {
       },
     });
     if (props.enableFileRefs) {
-      html = injectFileRefs(html);
+      // Bare text is only a file reference when the file exists.
+      html = injectFileRefs(html, {
+        inlinePathStatus: resolveInlinePathStatus,
+        requireInlinePathStatus: true,
+      });
     }
     if (props.cursor) {
       html = html.replace(
@@ -451,15 +483,29 @@ function mountMarkdownUnityPropertyFences() {
     if (!source.trim()) continue;
     markdownUnityPropertyFenceSources.set(host, source);
 
-    const vnode = h(UnityPropertyFenceBlock, { source });
-    if (appContext) {
-      vnode.appContext = appContext;
-    }
     host.replaceChildren();
-    render(vnode, host);
+    renderMarkdownUnityPropertyFence(host, source);
     markdownUnityPropertyFenceHosts.add(host);
   }
 }
+
+// Fence blocks are mounted with `render()`, outside this component's tree, so
+// they cannot inject the surface visibility; it is passed as a prop instead.
+// Hidden workbench tabs then defer their Unity reads until they are shown.
+function renderMarkdownUnityPropertyFence(host: HTMLElement, source: string) {
+  const vnode = h(UnityPropertyFenceBlock, { source, surfaceHidden: surfaceHidden.value });
+  if (appContext) {
+    vnode.appContext = appContext;
+  }
+  render(vnode, host);
+}
+
+watch(surfaceHidden, () => {
+  for (const host of markdownUnityPropertyFenceHosts) {
+    const source = markdownUnityPropertyFenceSources.get(host);
+    if (source !== undefined) renderMarkdownUnityPropertyFence(host, source);
+  }
+});
 
 function refreshMarkdownEnhancements() {
   if (markdownRendererUnmounted) return;
@@ -520,7 +566,8 @@ async function resolveMarkdownImages() {
       continue;
     }
 
-    const cacheKey = `${workspaceRef?.checkoutId ?? ""}@${workspaceRef?.expectedGeneration ?? ""}@${workspaceRef?.expectedMaterializationEpoch ?? ""}:${source}`;
+    const contentPath = props.contentPath || undefined;
+    const cacheKey = `${workspaceRef?.checkoutId ?? ""}@${workspaceRef?.expectedGeneration ?? ""}@${workspaceRef?.expectedMaterializationEpoch ?? ""}:${contentPath ?? ""}:${source}`;
     const cached = markdownImageCache.get(cacheKey);
     if (cached) {
       applyResolvedMarkdownImage(image, source, cached);
@@ -530,7 +577,7 @@ async function resolveMarkdownImages() {
     setMarkdownImageState(image, "loading");
     try {
       if (!workspaceRef) throw new Error("Workspace scope is required for relative Markdown images");
-      const preview = await resolveMarkdownImage(workspaceRef, source);
+      const preview = await resolveMarkdownImage(workspaceRef, source, contentPath);
       const resolved = {
         url: preview.url,
         displayPath: preview.displayPath || source,
@@ -560,9 +607,9 @@ async function resolveMarkdownImages() {
 }
 
 watch(
-  parsedMarkdownHtml,
-  (html) => {
-    void loadInlinePathStatuses(html);
+  inlineFilePathCandidates,
+  () => {
+    void loadInlinePathStatuses();
   },
   { immediate: true },
 );
@@ -573,6 +620,7 @@ watch(
     markdownWorkspaceRef.value?.checkoutId ?? "",
     markdownWorkspaceRef.value?.expectedGeneration ?? null,
     markdownWorkspaceRef.value?.expectedMaterializationEpoch ?? null,
+    props.contentPath ?? null,
   ],
   () => {
     markdownImageResolveRun++;
@@ -584,7 +632,7 @@ watch(
     for (const image of rootRef.value?.querySelectorAll<HTMLImageElement>("img[data-md-image-source]") ?? []) {
       delete image.dataset.mdImageResolvedFor;
     }
-    void loadInlinePathStatuses(parsedMarkdownHtml.value);
+    void loadInlinePathStatuses();
     void nextTick(refreshMarkdownEnhancements);
   },
 );
@@ -622,6 +670,11 @@ void subscribeWorkspaceFileChanges((event) => {
 }, () => markdownWorkspaceRef.value).then((release) => {
   if (markdownRendererUnmounted) release();
   else releaseWorkspaceFileChanges = release;
+});
+
+// References join text selections; copying one writes its full path.
+onMounted(() => {
+  if (rootRef.value) installMarkdownReferenceCopy(rootRef.value.ownerDocument);
 });
 
 onBeforeUnmount(() => {
@@ -721,7 +774,8 @@ async function resolveMarkdownViewId(rawViewId: string): Promise<string> {
 }
 
 async function openMarkdownViewRef(button: HTMLButtonElement) {
-  if (button.disabled) return;
+  // Views run on the desktop; the phone client cannot host them.
+  if (button.disabled || isRemoteClient()) return;
   const rawViewId = button.dataset.viewId?.trim();
   if (!rawViewId) return;
 
@@ -767,7 +821,7 @@ function handleMarkdownContentActivation(event: MouseEvent) {
     const rawHref = anchor.getAttribute("href");
     const sessionId = /^#locus-session\/([A-Za-z0-9_-]+)$/.exec(rawHref ?? "")?.[1];
     if (sessionId) {
-      void openSessionReference(sessionId, anchor.textContent || sessionId);
+      if (!isRemoteClient()) void openSessionReference(sessionId, anchor.textContent || sessionId);
       return;
     }
     const href = normalizeExternalMarkdownHref(rawHref);
@@ -783,7 +837,10 @@ function handleMarkdownContentActivation(event: MouseEvent) {
 
   event.preventDefault();
   event.stopPropagation();
-  emit("openImage", image.currentSrc || image.src);
+  const src = image.currentSrc || image.src;
+  // Hosts with their own viewer (Chat, mobile) take the image; documents float it in place.
+  if (instance?.vnode.props?.onOpenImage) emit("openImage", src);
+  else openImageLightbox({ src, alt: image.alt, originRect: image.getBoundingClientRect() });
 }
 
 function normalizeUnityRefDatasetPath(value?: string): string {
@@ -791,7 +848,7 @@ function normalizeUnityRefDatasetPath(value?: string): string {
 }
 
 function handleMarkdownPointerDown(event: PointerEvent) {
-  if (event.button !== 0 || event.isPrimary === false) return;
+  if (event.button !== 0 || event.isPrimary === false || isRemoteClient()) return;
   const workspaceRef = props.workspaceRef;
   if (!workspaceRef) return;
   const checkout = workspaceContextStore.checkoutsById[workspaceRef.checkoutId];
@@ -807,6 +864,10 @@ function handleMarkdownWheel(event: WheelEvent) {
   if (!props.textZoom) return;
   handleTextViewerZoomWheel(event);
 }
+
+// Bind wheel only for text zoom: a wheel listener is non-passive, so scrolling
+// over every transcript message would wait for the main thread.
+const markdownWheelListeners = computed(() => (props.textZoom ? { wheel: handleMarkdownWheel } : {}));
 </script>
 
 <template>
@@ -817,7 +878,8 @@ function handleMarkdownWheel(event: WheelEvent) {
     @click="handleMarkdownContentActivation"
     @auxclick="handleMarkdownContentActivation"
     @pointerdown="handleMarkdownPointerDown"
-    @wheel="handleMarkdownWheel"
+    @selectstart="handleMarkdownReferenceSelectStart"
+    v-on="markdownWheelListeners"
     v-html="renderedHtml"
   />
 </template>
@@ -844,11 +906,16 @@ function handleMarkdownWheel(event: WheelEvent) {
   letter-spacing: -0.01em;
 }
 
-.markdown-body > :first-child {
+/* Trim the document's outer edges. Consecutive `.markdown-segment` bodies
+ * render one document together (streaming blocks), so only the first
+ * segment's top and the last segment's bottom are trimmed; at inner
+ * boundaries the margins collapse across the wrappers exactly as inside one
+ * body. `:where` keeps the specificity of a plain `.markdown-body > :x`. */
+.markdown-body:where(:not(.markdown-segment), .markdown-segment:first-child) > :first-child {
   margin-top: 0;
 }
 
-.markdown-body > :last-child {
+.markdown-body:where(:not(.markdown-segment), .markdown-segment:last-child) > :last-child {
   margin-bottom: 0;
 }
 
@@ -1176,6 +1243,10 @@ function handleMarkdownWheel(event: WheelEvent) {
   background: transparent;
 }
 
+.markdown-body .md-image-preview[data-md-image-state="ready"] {
+  cursor: zoom-in;
+}
+
 .markdown-body .md-image-preview[data-md-image-state="pending"],
 .markdown-body .md-image-preview[data-md-image-state="loading"],
 .markdown-body .md-image-preview[data-md-image-state="error"] {
@@ -1345,8 +1416,6 @@ function handleMarkdownWheel(event: WheelEvent) {
   vertical-align: baseline;
   font-weight: 500;
   color: var(--text-secondary);
-  user-select: none;
-  -webkit-user-select: none;
 }
 
 .md-asset-chip:hover {
@@ -1377,8 +1446,6 @@ function handleMarkdownWheel(event: WheelEvent) {
   vertical-align: -2px;
   font-weight: 400;
   color: color-mix(in srgb, var(--text-color) 90%, var(--text-secondary) 10%);
-  user-select: none;
-  -webkit-user-select: none;
 }
 
 .md-unity-asset-ref,
@@ -1445,11 +1512,17 @@ function handleMarkdownWheel(event: WheelEvent) {
   vertical-align: -2px;
   font-weight: 400;
   color: color-mix(in srgb, var(--text-color) 86%, var(--text-secondary) 14%);
-  user-select: none;
-  -webkit-user-select: none;
 }
 
+/* Inline references join text selections that pass over them; a press on one
+ * starts a reference drag instead (handleMarkdownReferenceSelectStart), and
+ * copying writes its full path (markdownReferenceSelection). */
 .markdown-body :is(.md-asset-chip, .md-file-ref, .md-workspace-ref, .md-unity-object-ref) {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.markdown-body .md-unity-object-ref:not([data-md-unity-level="inline"]) {
   user-select: none;
   -webkit-user-select: none;
 }

@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import {
   deferredSessionMessageImageId,
   resolveToolResultImages,
+  toolResultImageColumns,
 } from "../composables/toolResultImages";
 import { loadSessionMessageImages } from "../services/session";
 import type { ImageAttachment } from "../types";
@@ -37,13 +38,21 @@ const validImages = computed(() =>
   resolvedImages.value.filter((image) => image.data && image.mimeType),
 );
 
+const columns = computed(() => toolResultImageColumns(validImages.value.length));
+const isGrid = computed(() => columns.value > 1);
+
 function imageDataUrl(image: ImageAttachment) {
   return `data:${image.mimeType};base64,${image.data}`;
 }
 </script>
 
 <template>
-  <div v-if="validImages.length > 0" class="tool-result-images">
+  <div
+    v-if="validImages.length > 0"
+    class="tool-result-images"
+    :class="{ 'tool-result-images-grid': isGrid }"
+    :style="isGrid ? { '--tool-result-image-columns': columns } : undefined"
+  >
     <div
       v-for="(image, index) in validImages"
       :key="`${image.mimeType}:${index}`"
@@ -67,6 +76,13 @@ function imageDataUrl(image: ImageAttachment) {
   max-width: 100%;
 }
 
+.tool-result-images-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--tool-result-image-columns, 2), minmax(0, 1fr));
+  align-items: start;
+  max-width: min(720px, 100%);
+}
+
 .tool-result-image-frame {
   width: fit-content;
   max-width: 100%;
@@ -83,5 +99,10 @@ function imageDataUrl(image: ImageAttachment) {
   max-height: 420px;
   object-fit: contain;
   border-radius: 4px;
+}
+
+.tool-result-images-grid .tool-result-image {
+  max-width: 100%;
+  max-height: 260px;
 }
 </style>

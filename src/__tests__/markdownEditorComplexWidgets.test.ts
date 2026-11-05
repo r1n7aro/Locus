@@ -215,6 +215,61 @@ describe("Markdown complex Live Preview widgets", () => {
     expect(onEditTarget).toHaveBeenCalledWith(expect.objectContaining({ kind: "image", label: "safe", url: "https://example.com/image.webp" }));
   });
 
+  it("opens loaded images enlarged and keeps editing on the context menu and edit button", () => {
+    const onEditTarget = vi.fn();
+    const onImageOpen = vi.fn();
+    const editor = mountComplexEditor("intro\n\n![map](https://example.com/map.png)", { onEditTarget, onImageOpen });
+    const frame = editor.dom.querySelector<HTMLElement>(".cm-live-image-frame")!;
+    const image = frame.querySelector<HTMLImageElement>(".cm-live-image")!;
+
+    // Nothing to enlarge before the image loads: a click fixes its source instead.
+    frame.click();
+    expect(onImageOpen).not.toHaveBeenCalled();
+    expect(onEditTarget).toHaveBeenCalledTimes(1);
+
+    image.dispatchEvent(new Event("load"));
+    expect(frame.dataset.state).toBe("ready");
+    frame.click();
+    expect(onImageOpen).toHaveBeenCalledWith(expect.objectContaining({ src: "https://example.com/map.png", alt: "map" }));
+    expect(onEditTarget).toHaveBeenCalledTimes(1);
+
+    frame.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(onImageOpen).toHaveBeenCalledTimes(2);
+
+    frame.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    frame.querySelector<HTMLButtonElement>(".cm-live-image-edit")!.click();
+    expect(onImageOpen).toHaveBeenCalledTimes(2);
+    expect(onEditTarget).toHaveBeenCalledTimes(3);
+    expect(onEditTarget).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "image", label: "map" }));
+  });
+
+  it("previews images in read-only editors without offering edits", () => {
+    const onEditTarget = vi.fn();
+    const onImageOpen = vi.fn();
+    const parent = document.createElement("div");
+    document.body.appendChild(parent);
+    view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: "intro\n\n![map](https://example.com/map.png)",
+        extensions: [
+          markdown({ extensions: GFM }),
+          markdownLivePreview({ onEditTarget, onImageOpen }),
+          EditorState.readOnly.of(true),
+        ],
+      }),
+    });
+    const frame = view.dom.querySelector<HTMLElement>(".cm-live-image-frame")!;
+    frame.querySelector(".cm-live-image")!.dispatchEvent(new Event("load"));
+    expect(frame.tabIndex).toBe(0);
+
+    frame.click();
+    frame.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+    frame.querySelector<HTMLButtonElement>(".cm-live-image-edit")!.click();
+    expect(onImageOpen).toHaveBeenCalledTimes(1);
+    expect(onEditTarget).not.toHaveBeenCalled();
+  });
+
   it("keeps oversized tables and fences as bounded editable source", () => {
     const tableRows = Array.from({ length: 201 }, (_, index) => `| row-${index} | ${index} |`);
     const fenceRows = Array.from({ length: 241 }, (_, index) => `Assets/Prefabs/Hero-${index}.prefab`);

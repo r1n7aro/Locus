@@ -3,7 +3,14 @@ import {
   DEFERRED_SESSION_MESSAGE_IMAGE_PREFIX,
   deferredSessionMessageImageId,
   resolveToolResultImages,
+  toolResultImageColumns,
 } from "../composables/toolResultImages";
+
+describe("tool result image grid", () => {
+  it("lays out multiple images as a block grid", () => {
+    expect([0, 1, 2, 3, 4, 5, 6, 9].map(toolResultImageColumns)).toEqual([1, 1, 2, 2, 2, 3, 3, 3]);
+  });
+});
 
 describe("tool result image hydration", () => {
   it("recognizes deferred session message image markers", () => {

@@ -82,6 +82,25 @@ describe("Markdown visual property controls", () => {
     expect(model.value).toBe('![new](https://example.com/image.png "caption")');
   });
 
+  it("floats loaded images in a lightbox and edits them from the context menu", async () => {
+    await mount("![map](https://example.com/map.png)");
+    const frame = view.dom.querySelector<HTMLElement>(".cm-live-image-frame")!;
+    frame.querySelector(".cm-live-image")!.dispatchEvent(new Event("load"));
+    await click(".cm-live-image-frame"); await nextTick();
+    const lightbox = document.querySelector<HTMLElement>(".image-lightbox")!;
+    expect(lightbox).not.toBeNull();
+    expect(lightbox.querySelector<HTMLImageElement>(".image-lightbox-image")?.getAttribute("src")).toBe("https://example.com/map.png");
+    expect(lightbox.querySelector(".image-lightbox-caption")?.textContent).toBe("map");
+    expect(document.querySelector(".md-edit-form")).toBeNull();
+
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await vi.waitFor(() => expect(document.querySelector(".image-lightbox")).toBeNull());
+
+    frame.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true })); await nextTick();
+    await input('input[aria-label="图片说明"]', "north"); submit(); await nextTick();
+    expect(model.value).toBe("![north](https://example.com/map.png)");
+  });
+
   it.each([false, true])("opens relative document links from the physical knowledge path (readOnly=%s)", async readOnly => {
     await mount(String.raw`[005\_文档](../design/005_%E6%96%87%E6%A1%A3.md)`, "Locus/knowledge/spec/current.md", readOnly);
     await click(".cm-live-link-icon");

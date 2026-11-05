@@ -1,9 +1,11 @@
 
 <script setup lang="ts">
+import { protocolModelId } from '@locus/server-client';
 import { useWindowSurface } from "../composables/useWindowSurface";
 const { ownerWindow, ownerDocument, unityEmbedded } = useWindowSurface();
-import { ref, nextTick, watch, computed, onMounted, onUnmounted } from "vue";
-import { BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FileSearch, FolderOpen, GitFork, PanelTopOpen, PencilLine, Undo2 } from "lucide";
+import { ref, nextTick, watch, computed, inject, onMounted, onUnmounted } from "vue";
+import { provideSurfaceHidden } from "../composables/surfaceVisibility";
+import { BookOpen, Copy, Crosshair, ExternalLink, FileDiff, FileSearch, FolderOpen, GitFork, Image as ImageIcon, PanelTopOpen, PencilLine, Undo2 } from "lucide";
 import {
   selectUnityAsset,
   openUnityAssetInspector,
@@ -47,6 +49,11 @@ import {
   openLocusAssetInspectorWorkbenchTab,
   type LocusAssetInspectorTarget,
 } from "../services/locusAssetInspector";
+import {
+  WORKBENCH_FILE_OPEN_KEY,
+  openWorkbenchFileTab,
+  opensInWorkbenchOnClick,
+} from "../services/workbenchFile";
 import { normalizeAppError } from "../services/errors";
 import { useClaudeSessionTransfer } from "../composables/useClaudeSessionTransfer";
 import { knowledgeRevealTarget } from "../services/knowledge";
@@ -109,6 +116,11 @@ import {
   writeChatMessageClipboard,
   type UserMessageDraft,
 } from "../composables/chatMessageDraft";
+import {
+  ChatMessageImageTooLargeError,
+  copyChatMessageImage,
+  findChatMessageImageTarget,
+} from "../composables/chatMessageImage";
 import type { LiveSelectionQuote } from "../composables/documentSelection";
 import { emptyComposerIntent } from "../composables/chatInputIntents";
 import { isMessageFromActiveStream } from "../composables/chatMessageFork";
@@ -312,6 +324,13 @@ const props = defineProps<{
    * prepared behind the previous one or sits in a hidden tab; omitted means shown.
    */
   presented?: boolean;
+  /**
+   * The host keeps this surface mounted but not shown (a hidden workbench tab,
+   * `display: none`). Explicit opt-in: absent means shown, unlike `presented`.
+   * Periodic status polls pause, content defers live reads, and the work-state
+   * scroll export returns the remembered position instead of measuring.
+   */
+  surfaceHidden?: boolean;
   pendingSessionId?: string | null;
   unityConnected?: boolean;
   unityPluginStatus?: "missing" | "outdated" | null;
@@ -422,7 +441,7 @@ const statusWorkspaceKey = computed(() => JSON.stringify([
 ]));
 
 const emit = defineEmits<{
-  send: [text: string, images: ImageAttachment[], assetRefs: AssetRefAttachment[], overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null }];
+  send: [text: string, images: ImageAttachment[], assetRefs: AssetRefAttachment[], overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null; blenderTarget?: string | null }];
   compact: [];
   fork: [];
   cancel: [];
@@ -528,6 +547,25 @@ async function openLocusAssetInspector(
   const workspaceRef = resourceWorkspaceRef();
   if (!workspaceRef) return false;
   return openLocusAssetInspectorWorkbenchTab(workspaceRef, target);
+}
+
+const openFileInWorkbench = inject(WORKBENCH_FILE_OPEN_KEY, openWorkbenchFileTab);
+
+/** Click on a file reference: Markdown opens in Workbench, other files in the OS default app. */
+function openClickedFile(filePath: string, workspaceRef: WorkspaceRef) {
+  if (opensInWorkbenchOnClick(filePath)) {
+    openFileInWorkbench({ workspaceRef, filePath }).catch((error: unknown) => {
+      console.warn("openWorkbenchFileTab failed:", error);
+      const err = normalizeAppError(error);
+      notificationStore.addNotice("warning", t("chat.fileRef.openFailed", err.message || filePath), {
+        code: err.code,
+        operation: "fileRefOpen",
+        replaceOperation: true,
+      });
+    });
+    return;
+  }
+  openFileExternal(filePath, workspaceRef).catch((e: unknown) => console.warn("openFileExternal failed:", e));
 }
 
 type AssetRefContextMenuTarget =
@@ -1036,7 +1074,7 @@ function handleFileRefClick(filePath: string) {
   }
   const workspaceRef = resourceWorkspaceRef();
   if (!workspaceRef) return;
-  openFileExternal(filePath, workspaceRef).catch((e: unknown) => console.warn("openFileExternal failed:", e));
+  openClickedFile(filePath, workspaceRef);
 }
 
 function handleFolderRefClick(folderPath: string) {
@@ -1076,7 +1114,7 @@ function legacyAssetRefClick(target: AssetRefClickTarget) {
     return;
   }
   if (canOpenInEditor(target.assetPath)) {
-    openFileExternal(target.assetPath, workspaceRef).catch((e: unknown) => console.warn("openFileExternal failed:", e));
+    openClickedFile(target.assetPath, workspaceRef);
     return;
   }
   if (shouldSelectUnityAsset(target.assetPath)) {
@@ -1426,6 +1464,36 @@ async function doMessageCopy() {
   }
 }
 
+function doMessageCopyImage() {
+  const messageId = messageCtxMenu.value?.messageId ?? null;
+  const transcript = transcriptScrollElement.value;
+  if (!messageId || !transcript || !messageContextCanCopy.value) return;
+  const target = findChatMessageImageTarget(transcript, messageId);
+  closeMessageContextMenu();
+  const reportFailure = (error: unknown) => {
+    console.warn("copy chat message image failed:", error);
+    const tooLarge = error instanceof ChatMessageImageTooLargeError;
+    notificationStore.addNotice(
+      "warning",
+      t(tooLarge ? "chat.messageMenu.copyImageTooLarge" : "chat.messageMenu.copyImageFailed"),
+      { operation: "messageCopy", replaceOperation: true },
+    );
+  };
+  if (!target) {
+    reportFailure(new Error(`Rendered message not found: ${messageId}`));
+    return;
+  }
+  // Starts the clipboard request inside the click so it keeps the window's focus.
+  copyChatMessageImage(target).then(
+    () => notificationStore.addNotice("success", t("common.copied"), {
+      operation: "messageCopy",
+      replaceOperation: true,
+      skipConsoleLog: true,
+    }),
+    reportFailure,
+  );
+}
+
 async function doMessageCopySelection() {
   const selectionText = messageCtxMenu.value?.selectionText ?? "";
   if (!selectionText) return;
@@ -1530,6 +1598,21 @@ function draftSessionKey(sessionId: string | null) {
 const sessionSurfaceKey = computed(() => (
   props.sessionSurfaceKey?.trim() || draftSessionKey(props.activeSessionId)
 ));
+
+// Blender "Set as target" before the session exists: the backend keys
+// targets by session id, so the pick rides on the first message and is set
+// before that run starts. Kept per checkout so a workspace switch drops it.
+const draftBlenderTarget = ref<{ checkoutId: string; key: string } | null>(null);
+const statusDraftBlenderTarget = computed(() => {
+  const draft = draftBlenderTarget.value;
+  return draft && draft.checkoutId === props.workspaceRef?.checkoutId ? draft.key : null;
+});
+function setDraftBlenderTarget(key: string | null) {
+  const checkoutId = props.workspaceRef?.checkoutId;
+  draftBlenderTarget.value = key && checkoutId ? { checkoutId, key } : null;
+}
+// Session assigned (first send) or another conversation shown.
+watch(() => props.activeSessionId, () => { draftBlenderTarget.value = null; });
 const composerAssetRefSyncKey = computed(() => `chat:${sessionSurfaceKey.value}`);
 type UndoChoice = "conversation" | "files";
 const undoChooserVisible = ref(false);
@@ -1892,7 +1975,11 @@ defineExpose({
   focusComposerInput,
   isComposerDraftEmpty,
   exportWorkStateScroll: () => {
-    if (props.activeSessionId && (pendingRestoreSessionId.value || props.sessionHistoryLoading)) {
+    // A hidden transcript has no layout (all metrics 0), which reads as "at the
+    // bottom"; it cannot scroll either, so its remembered position is current.
+    if (props.activeSessionId && (
+      props.surfaceHidden || pendingRestoreSessionId.value || props.sessionHistoryLoading
+    )) {
       return getSessionScrollState(props.activeSessionId);
     }
     const element = getMessagesElement();
@@ -2010,6 +2097,7 @@ const showWelcomeState = computed(
 const pendingRestoreSessionId = ref<string | null>(null);
 const pendingRestoreMessagesRef = ref<ChatMessage[] | null>(null);
 const surfacePresented = computed(() => props.presented !== false);
+provideSurfaceHidden(computed(() => props.surfaceHidden === true));
 const toolHandoffViewportQuiet = ref(false);
 let sessionRestoreFrame = 0;
 let suppressScrollCapture = false;
@@ -2913,6 +3001,32 @@ function handleTranscriptResize() {
   scheduleTranscriptResizeReconcile("observer");
 }
 
+// The transcript disables native scroll anchoring (overflow-anchor: none) and
+// the resize reconcile above lands one to three frames after layout. While the
+// view follows the bottom, content above the viewport that changes height
+// would be painted at the stale scrollTop for those frames: the transcript
+// jumps by the height change and snaps back. ResizeObserver callbacks run after
+// layout and before paint, so the bottom pin is applied there, in the frame
+// being drawn. Scrolled-up viewports keep the deferred reconcile, which
+// coordinates anchors with user scrolling.
+function pinTranscriptBottomBeforePaint() {
+  if (!surfacePresented.value || toolHandoffViewportQuiet.value || olderHistoryRestoreRunning) return;
+  if (isSessionRestoreViewportGuardActive() || sessionRestoreLayoutStabilizing.value) return;
+  if (activeToolViewportAnchor || isLiveResizeInProgress() || userScrollIntent.isRecent()) return;
+  // Viewport width changes keep their deferred, diagnosed reconcile.
+  if (readTranscriptViewportWidth() !== transcriptObservedViewportWidth) return;
+
+  const sessionId = props.activeSessionId;
+  const remembered = sessionId ? getSessionScrollState(sessionId) : null;
+  if (remembered && remembered.mode !== "bottom") return;
+
+  const el = getMessagesElement();
+  if (!el) return;
+  const bottomScrollTop = resolveSessionScrollTop(readMessageMetrics(el), { mode: "bottom" });
+  if (Math.abs(el.scrollTop - bottomScrollTop) < 1) return;
+  setMessagesScrollTop(bottomScrollTop, sessionId);
+}
+
 function flushPendingTranscriptResizeReconcile(reason: string) {
   if (!transcriptResizeReconcilePending) return;
   scheduleTranscriptResizeReconcile(reason);
@@ -2934,7 +3048,9 @@ function connectTranscriptResizeObserver() {
   if (!scrollEl && !contentEl) return;
   transcriptObservedViewportWidth = readTranscriptViewportWidth();
 
-  transcriptResizeObserver = createAnimationFrameResizeObserver(handleTranscriptResize);
+  transcriptResizeObserver = createAnimationFrameResizeObserver(handleTranscriptResize, {
+    beforePaint: pinTranscriptBottomBeforePaint,
+  });
   if (!transcriptResizeObserver) return;
 
   if (scrollEl) {
@@ -3201,6 +3317,7 @@ function handleComposerSend(payload: ChatComposerSendPayload) {
     displayText: payload.displayText,
     mode: payload.mode ?? undefined,
     userIntent: payload.userIntent ?? null,
+    blenderTarget: props.activeSessionId ? null : statusDraftBlenderTarget.value,
   });
 }
 
@@ -3580,6 +3697,7 @@ onUnmounted(() => {
           variant="session"
           :class="{ 'is-session-restore-stabilizing': sessionRestoreLayoutStabilizing }"
           :session-key="sessionSurfaceKey"
+          :session-id="activeSessionId"
           :workspace-ref="workspaceRef"
           :messages="messages"
           :streaming-text="displayedStreamingText"
@@ -3589,9 +3707,9 @@ onUnmounted(() => {
           :is-streaming="isStreaming"
           :is-compacting="isCompacting"
           :is-thinking="isThinking"
-          :claude-code-mode="selectedModelId.startsWith('claude_code/')"
+          :claude-code-mode="protocolModelId(selectedModelId).startsWith('claude_code/')"
           :claude-code-phase="claudeCodePhase"
-          :show-thinking-blocks="!selectedModelId.startsWith('claude_code/')"
+          :show-thinking-blocks="!protocolModelId(selectedModelId).startsWith('claude_code/')"
           :has-thinking="hasThinking"
           :thinking-order="thinkingOrder"
           :thinking-duration="thinkingDuration"
@@ -3793,8 +3911,10 @@ onUnmounted(() => {
               v-if="!inputControlsCollapsed"
               :key="statusWorkspaceKey"
               :session-id="activeSessionId"
+              :blender-draft-target="statusDraftBlenderTarget"
               :selected-model-id="selectedModelId"
               :active="active"
+              :polling-paused="surfaceHidden"
               :is-streaming="isStreaming"
               :unity-connected="unityConnected"
               :unity-plugin-status="unityPluginStatus"
@@ -3811,6 +3931,7 @@ onUnmounted(() => {
               :knowledge-access-mode="knowledgeAccessMode"
               :knowledge-enabled="workspaceKnowledgeEnabled"
               :selected-agent-id="selectedAgentId"
+              @update:blender-draft-target="setDraftBlenderTarget"
               @start-scan="emit('startScan')"
               @install-plugin="emit('installPlugin')"
               @launch-unity-project="emit('launchUnityProject')"
@@ -4042,6 +4163,17 @@ onUnmounted(() => {
           >
             <LucideIcon :icon="Copy" :size="13" />
             {{ t("chat.messageMenu.copyMessage") }}
+          </button>
+          <button
+            v-if="messageCtxMenu.messageId"
+            type="button"
+            class="asset-ref-ctx-item ui-select-none"
+            role="menuitem"
+            :disabled="!messageContextCanCopy"
+            @click="doMessageCopyImage"
+          >
+            <LucideIcon :icon="ImageIcon" :size="13" />
+            {{ t("chat.messageMenu.copyAsImage") }}
           </button>
           <button
             v-if="messageContextShouldShowReEdit"
