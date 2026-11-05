@@ -21,8 +21,9 @@ export function isWorkbenchMarkdownPath(path: string): boolean {
   return /\.(?:md|markdown)$/i.test(path.trim());
 }
 
+/** Files that open in the workspace file editor, not the asset inspector: Markdown, CSV and PDF. */
 export function isWorkbenchDocumentPath(path: string): boolean {
-  return isWorkbenchMarkdownPath(path) || /\.csv$/i.test(path.trim());
+  return isWorkbenchMarkdownPath(path) || /\.(?:csv|pdf)$/i.test(path.trim());
 }
 
 export function normalizeWorkbenchResource(

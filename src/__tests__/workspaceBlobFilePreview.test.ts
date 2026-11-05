@@ -8,6 +8,7 @@ const files = vi.hoisted(() => ({
   read: vi.fn(),
   revision: vi.fn(),
   release: vi.fn(),
+  fetch: vi.fn(),
   viewers: [] as Array<{ emit: (event: "loaded" | "fetchError") => void }>,
 }));
 vi.mock("../services/workspaceExplorer", () => ({
@@ -63,10 +64,18 @@ async function flush() {
   }
 }
 
+type PreviewInstance = InstanceType<typeof WorkspaceFilePreview>;
+let instance: PreviewInstance | null = null;
+
 async function mountPreview(path: string, active = true) {
   const host = document.createElement("div");
   document.body.appendChild(host);
-  app = createApp({ render: () => h(WorkspaceFilePreview, { projectId: "project", path, active }) });
+  app = createApp({
+    render: () => h(WorkspaceFilePreview, {
+      projectId: "project", path, active,
+      ref: (value: unknown) => { instance = value as PreviewInstance | null; },
+    }),
+  });
   app.mount(host);
   await flush();
   return host;
@@ -79,12 +88,16 @@ beforeEach(() => {
   files.release.mockReset().mockResolvedValue(true);
   files.viewers.length = 0;
   files.revision.mockReset().mockResolvedValue(modelPreview().revision);
+  files.fetch.mockReset().mockResolvedValue({ status: 206 });
+  vi.stubGlobal("fetch", files.fetch);
 });
 
 afterEach(() => {
   app?.unmount();
   app = null;
+  instance = null;
   document.body.replaceChildren();
+  vi.unstubAllGlobals();
 });
 
 describe("workspace model file preview", () => {
@@ -247,5 +260,70 @@ describe("workspace media file preview", () => {
       await flush();
       expect(files.read, name).toHaveBeenCalledTimes(2);
     }
+  });
+});
+
+describe("workspace PDF preview", () => {
+  const pdfPreview = (blob = "a") => modelPreview({
+    kind: "pdf", name: "lecture01.pdf", path: "F:/Project/lecture01.pdf", extension: "pdf",
+    mimeType: "application/pdf", blobUrl: `${BLOB}${blob}`,
+  });
+  const frame = (host: HTMLElement) => host.querySelector("iframe")!;
+
+  it("checks one byte of the blob when the frame loads and keeps a PDF whose bytes are there", async () => {
+    files.read.mockResolvedValue(pdfPreview());
+    const host = await mountPreview("lecture01.pdf");
+    files.fetch.mockClear();
+
+    frame(host).dispatchEvent(new Event("load"));
+    await flush();
+
+    expect(files.fetch).toHaveBeenCalledTimes(1);
+    expect(files.fetch).toHaveBeenCalledWith(`${BLOB}a`, { headers: { Range: "bytes=0-0" } });
+    expect(files.read).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the PDF again once when a reloaded frame finds its blob gone", async () => {
+    files.read
+      .mockResolvedValueOnce(pdfPreview("a"))
+      .mockResolvedValueOnce(pdfPreview("b"));
+    const host = await mountPreview("lecture01.pdf");
+    files.fetch.mockResolvedValue({ status: 404 });
+
+    frame(host).dispatchEvent(new Event("load"));
+    await flush();
+
+    expect(files.read).toHaveBeenCalledTimes(2);
+    expect(frame(host).getAttribute("src")).toBe(`${BLOB}b`);
+    expect(files.release).toHaveBeenCalledWith(`${BLOB}a`);
+
+    // The same streak is not retried again, so a broken source cannot loop.
+    frame(host).dispatchEvent(new Event("load"));
+    await flush();
+    expect(files.read).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves the PDF alone when the probe itself cannot run", async () => {
+    files.read.mockResolvedValue(pdfPreview());
+    const host = await mountPreview("lecture01.pdf");
+    files.fetch.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    frame(host).dispatchEvent(new Event("load"));
+    await flush();
+
+    expect(files.read).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries no text snapshot and restores an older one without waiting for an editor", async () => {
+    files.read.mockResolvedValue(pdfPreview());
+    await mountPreview("lecture01.pdf");
+
+    expect(instance!.exportTransferSnapshot({ workState: true })).toEqual({ kind: "resource" });
+    const started = Date.now();
+    await expect(instance!.restoreWorkState({
+      kind: "workspaceFile", dirty: false, conflicted: false, contentHash: "",
+      originalLineEnding: "\n", selection: null, scrollTop: 0,
+    })).resolves.toBe(true);
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 });

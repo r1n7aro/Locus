@@ -156,6 +156,17 @@ describe("workbench store", () => {
     });
   });
 
+  it("opens PDFs in the workspace file editor and keeps other binaries in the asset inspector", () => {
+    const resource = (path: string) => createWorkbenchEditorInput({
+      kind: "asset", projectId: "project-a", path,
+    }, path).resource;
+    expect(resource("Lectures/01/lecture01.PDF")).toEqual({
+      kind: "workspaceFile", projectId: "project-a", path: "Lectures/01/lecture01.PDF",
+    });
+    expect(resource("Assets/Textures/Hero.png").kind).toBe("asset");
+    expect(resource("Assets/Docs/paper.pdf.meta").kind).toBe("asset");
+  });
+
   it("replaces one unpinned preview and hides the tab strip only for a single session", () => {
     const store = useWorkbenchStore();
     const state = store.ensureWindow("main");

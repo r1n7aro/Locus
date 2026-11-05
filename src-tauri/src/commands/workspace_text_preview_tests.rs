@@ -124,6 +124,22 @@ fn unity_assets_still_use_the_existing_inspector_route() {
     assert!(!preview.editable);
 }
 
+#[test]
+fn pdfs_inside_unity_folders_open_in_the_reader() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("Assets")).unwrap();
+    let registry = registry(root.path());
+    let runtime = registry.open_workspace(root.path()).unwrap();
+    let path = runtime.root().join("Assets/Manual.pdf");
+    std::fs::write(&path, b"%PDF-1.7\n").unwrap();
+    let cache = BinaryCache::new();
+    let preview = build_file_preview(&registry, runtime.project_id(), &path, Some(&cache)).unwrap();
+    assert_eq!(preview.kind, "pdf");
+    assert_eq!(preview.mime_type, "application/pdf");
+    assert!(preview.blob_url.is_some());
+    assert!(preview.checkout_id.is_none());
+}
+
 
 #[test]
 fn media_and_models_hand_their_bytes_to_the_binary_cache_not_the_reply() {

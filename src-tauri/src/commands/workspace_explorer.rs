@@ -826,7 +826,9 @@ fn build_file_preview(
         .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if !is_text_extension(&extension) {
+    // PDFs open in the reader inside Unity folders too: Unity imports them as
+    // a plain DefaultAsset with nothing to inspect.
+    if !is_text_extension(&extension) && extension != "pdf" {
         if let Some((checkout_id, workspace_generation, materialization_epoch, relative_path)) =
             unity_workspace_binding(registry, project_id, canonical)
         {

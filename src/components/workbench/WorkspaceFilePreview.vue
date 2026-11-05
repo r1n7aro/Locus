@@ -422,6 +422,25 @@ async function onBlobFetchError(): Promise<void> {
   await loadPreview({ keepCurrent: true });
 }
 
+/**
+ * An iframe reports no fetch errors and reloads whenever its element moves
+ * (tab reordering), possibly after its lease expired. Each load checks one
+ * byte of the blob so a vanished PDF is read again like the other media.
+ */
+async function onPdfFrameLoad(): Promise<void> {
+  const url = previewBlobUrl.value;
+  if (!url) return;
+  let missing: boolean;
+  try {
+    missing = (await fetch(url, { headers: { Range: "bytes=0-0" } })).status === 404;
+  } catch {
+    return;
+  }
+  if (disposed || url !== previewBlobUrl.value) return;
+  if (missing) await onBlobFetchError();
+  else onBlobLoaded();
+}
+
 async function probeFileRevision(): Promise<ProjectExplorerFileRevision> {
   return props.workspaceRef
     ? await workspaceFileRevision(filePath.value, props.workspaceRef)
@@ -531,7 +550,8 @@ async function saveFile(): Promise<boolean> {
 
 function exportTransferSnapshot(options: EditorSnapshotOptions = {}): WorkbenchEditorTransferSnapshot {
   if (isCsv.value && csvEditor.value) return csvEditor.value.exportTransferSnapshot(options);
-  if (!preview.value || loading.value) return { kind: "resource" };
+  // PDFs and other media have no buffer, selection or scroll position to carry.
+  if (!preview.value || loading.value || preview.value.kind !== "text") return { kind: "resource" };
   const view = sourceEditor.value?.getEditorView();
   return {
     kind: "workspaceFile",
@@ -556,10 +576,13 @@ async function applyTransferSnapshot(snapshot: WorkbenchEditorTransferSnapshot, 
     return await csvEditor.value?.applyTransferSnapshot(snapshot, recovering) ?? false;
   }
   if (snapshot.kind !== "workspaceFile") return false;
+  const nonText = () => !!preview.value && preview.value.kind !== "text";
   const deadline = Date.now() + 4_000;
-  while (!sourceEditor.value?.getEditorView() && Date.now() < deadline) {
+  while (!sourceEditor.value?.getEditorView() && !nonText() && Date.now() < deadline) {
     await new Promise<void>((resolve) => window.setTimeout(resolve, 16));
   }
+  // An older snapshot of a file that now opens as a PDF or media has nothing to restore.
+  if (nonText()) return true;
   const view = sourceEditor.value?.getEditorView();
   if (!view || preview.value?.kind !== "text" || !preview.value.editable) return false;
   const changedOnDisk = !!snapshot.contentHash && preview.value.contentHash !== snapshot.contentHash;
@@ -832,6 +855,7 @@ defineExpose({
           class="workspace-pdf-preview"
           :src="preview.blobUrl"
           :title="preview.name"
+          @load="onPdfFrameLoad"
         />
         <div v-else-if="preview.kind === 'audio' && preview.blobUrl" class="workspace-media-preview">
           <audio :src="preview.blobUrl" controls @loadeddata="onBlobLoaded" @error="onBlobFetchError" />
