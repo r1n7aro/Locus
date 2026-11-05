@@ -16,6 +16,13 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 // so the default budget is much larger than the regular one.
 const INTERACTIVE_DEFAULT_TIMEOUT_MS: u64 = 600_000;
 const INTERACTIVE_POLL_INTERVAL_MS: u64 = 300;
+/// Git for Windows' `sh.exe` silently cuts its `-c` argument at 8186 bytes (read
+/// back through `$BASH_EXECUTION_STRING`), so a long heredoc loses its closing
+/// delimiter and everything after it.
+const WINDOWS_SH_C_ARGUMENT_LIMIT_BYTES: usize = 8_186;
+/// Scripts longer than this (Locus's function prefix counts too) run from a
+/// temporary script file instead, leaving a margin below the cut-off.
+const WINDOWS_SH_MAX_INLINE_SCRIPT_BYTES: usize = 6_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -312,21 +319,34 @@ pub(super) fn bash() -> ToolDef {
                     };
                 }
 
-                let mut cmd = if cfg!(target_os = "windows") {
-                    if detect_shell() == ShellKind::Sh {
-                        let mut c = async_command("sh");
-                        c.arg("-c").arg(sh_command());
-                        c
-                    } else {
-                        let wrapped = format!("chcp 65001 >nul && {}", command);
-                        let mut c = async_command("cmd");
-                        c.arg("/S").arg("/C").arg(&wrapped);
-                        c
-                    }
-                } else {
-                    let mut c = async_command("sh");
-                    c.arg("-c").arg(sh_command());
+                // Held until the command finishes; dropping it deletes the script file.
+                let script_file;
+                let mut cmd = if cfg!(target_os = "windows") && detect_shell() == ShellKind::Cmd {
+                    let wrapped = format!("chcp 65001 >nul && {}", command);
+                    let mut c = async_command("cmd");
+                    c.arg("/S").arg("/C").arg(&wrapped);
+                    script_file = None;
                     c
+                } else {
+                    let script = sh_command();
+                    // The helper functions sit before the command, so `sh` line
+                    // numbers are offset by their line count.
+                    let prefix_lines = script
+                        .matches('\n')
+                        .count()
+                        .saturating_sub(command.matches('\n').count());
+                    match sh_script_command(script, prefix_lines) {
+                        Ok((c, file)) => {
+                            script_file = file;
+                            c
+                        }
+                        Err(message) => {
+                            return ToolResult {
+                                output: message,
+                                is_error: true,
+                            };
+                        }
+                    }
                 };
                 cmd.stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::piped())
@@ -398,6 +418,9 @@ pub(super) fn bash() -> ToolDef {
                 match result {
                     Ok(output) => {
                         let mut out = decode_console_bytes(&output.bytes);
+                        if let Some(file) = &script_file {
+                            out = file.mask_path(&out);
+                        }
 
                         if out.len() > 50_000 {
                             let total_bytes = out.len();
@@ -413,6 +436,11 @@ pub(super) fn bash() -> ToolDef {
                         }
 
                         let exit_code = output.status.code().unwrap_or(-1);
+                        if exit_code != 0 {
+                            if let Some(file) = &script_file {
+                                out.push_str(&file.failure_note());
+                            }
+                        }
                         ToolResult {
                             output: format!("Exit code: {}\n{}", exit_code, out),
                             is_error: exit_code != 0,
@@ -425,6 +453,101 @@ pub(super) fn bash() -> ToolDef {
                 }
             })
         }),
+    }
+}
+
+/// A script file for a command too long to pass through `sh -c`. Deleted on drop.
+struct TempShellScript {
+    path: PathBuf,
+    bytes: usize,
+    /// Lines of Locus helper functions that precede the model's command.
+    prefix_lines: usize,
+}
+
+impl TempShellScript {
+    fn write(script: &str, prefix_lines: usize) -> Result<Self, String> {
+        Self::write_in(
+            &std::env::temp_dir().join("locus-shell"),
+            script,
+            prefix_lines,
+        )
+    }
+
+    /// The error is what the model reads: the command did not run, and why.
+    fn write_in(dir: &Path, script: &str, prefix_lines: usize) -> Result<Self, String> {
+        let path = dir.join(format!("locus-bash-{}.sh", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir)
+            .and_then(|_| std::fs::write(&path, script))
+            .map_err(|error| {
+                format!(
+                    "The command was not run. Its script is {} bytes (the command plus Locus's own \
+                     shell helper functions), and Git for Windows' `sh -c` silently cuts scripts \
+                     longer than {} bytes, so Locus tried to run it from a temporary script file. \
+                     Writing {} failed: {}. Run a shorter command, or save the script with the \
+                     write tool and run that file.",
+                    script.len(),
+                    WINDOWS_SH_C_ARGUMENT_LIMIT_BYTES,
+                    path.display(),
+                    error
+                )
+            })?;
+        Ok(Self {
+            path,
+            bytes: script.len(),
+            prefix_lines,
+        })
+    }
+
+    /// Forward slashes: `sh` takes them on Windows.
+    fn shell_path(&self) -> String {
+        self.path.display().to_string().replace('\\', "/")
+    }
+
+    /// `sh` names the script file in its own messages (`<file>: line 7: ...`).
+    /// Show it as `sh`, as for an inline command, so no temporary path leaks.
+    fn mask_path(&self, output: &str) -> String {
+        output
+            .replace(&self.shell_path(), "sh")
+            .replace(&self.path.display().to_string(), "sh")
+    }
+
+    /// Appended to a failed command's output, so the model can read `sh` line
+    /// numbers and knows why the command looked different to the shell.
+    fn failure_note(&self) -> String {
+        format!(
+            "\n\n(Locus note: this command's script is {} bytes, more than Git for Windows' \
+             `sh -c` passes through, so it ran from a temporary script file that is now \
+             deleted. Line numbers in `sh` messages count from the start of that script, \
+             which begins with {} lines of Locus shell helper functions before your command.)",
+            self.bytes, self.prefix_lines
+        )
+    }
+}
+
+impl Drop for TempShellScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Builds `sh` for `script`: `sh -c <script>`, or on Windows, when the script
+/// would exceed what Git for Windows passes through (see
+/// `WINDOWS_SH_MAX_INLINE_SCRIPT_BYTES`), `sh <temporary script file>`. The
+/// file keeps stdin free for the command, unlike feeding the script through it.
+/// `prefix_lines` is the number of helper-function lines before the command.
+/// The error is a message for the model.
+fn sh_script_command(
+    script: String,
+    prefix_lines: usize,
+) -> Result<(tokio::process::Command, Option<TempShellScript>), String> {
+    let mut c = async_command("sh");
+    if cfg!(target_os = "windows") && script.len() > WINDOWS_SH_MAX_INLINE_SCRIPT_BYTES {
+        let file = TempShellScript::write(&script, prefix_lines)?;
+        c.arg(file.shell_path());
+        Ok((c, Some(file)))
+    } else {
+        c.arg("-c").arg(script);
+        Ok((c, None))
     }
 }
 
@@ -1053,6 +1176,109 @@ mod tests {
             assert!(!result.is_error, "{}", result.output);
             assert!(result.output.contains(marker), "{}", result.output);
         }
+    }
+
+    #[tokio::test]
+    async fn long_bash_command_is_not_truncated() {
+        if detect_shell() != ShellKind::Sh {
+            return;
+        }
+        // About 28 KB: far beyond the 8186 bytes Git for Windows' sh passes via `-c`.
+        let mut command = String::from("cat <<'EOF' | tail -n 1\n");
+        for line in 0..400 {
+            command.push_str(&format!("LINE_{line:04} {}\n", "x".repeat(60)));
+        }
+        command.push_str("EOF\necho TAIL_OK\nexit 3\n");
+        let root = tempfile::tempdir().unwrap();
+        let result = (bash().execute)(serde_json::json!({
+            "workdir": ".", "command": command, "readonly": true, "timeout": 20000
+        }), crate::tool::ToolExecutionContext {
+            working_dir: Some(root.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        }).await;
+        assert!(result.output.contains("LINE_0399"), "{}", result.output);
+        assert!(result.output.contains("TAIL_OK"), "{}", result.output);
+        assert!(result.output.starts_with("Exit code: 3"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn failed_long_bash_command_explains_the_script_file() {
+        if detect_shell() != ShellKind::Sh {
+            return;
+        }
+        let command = format!(
+            "# {}\nlocus_no_such_command_xyz\n",
+            "x".repeat(WINDOWS_SH_MAX_INLINE_SCRIPT_BYTES)
+        );
+        let root = tempfile::tempdir().unwrap();
+        let result = (bash().execute)(serde_json::json!({
+            "workdir": ".", "command": command, "readonly": true, "timeout": 20000
+        }), crate::tool::ToolExecutionContext {
+            working_dir: Some(root.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        }).await;
+        assert!(result.is_error, "{}", result.output);
+        assert!(result.output.contains("locus_no_such_command_xyz"), "{}", result.output);
+        assert!(!result.output.contains("locus-bash-"), "{}", result.output);
+        // Only Windows runs a long script from a file, and only then is there a note.
+        assert_eq!(
+            result.output.contains("Locus note"),
+            cfg!(target_os = "windows"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn sh_script_command_uses_a_file_only_for_long_windows_scripts() {
+        let (_, short) = sh_script_command("echo hi".to_string(), 5).unwrap();
+        assert!(short.is_none());
+        let long = format!(
+            "echo hi\n# {}\n",
+            "x".repeat(WINDOWS_SH_MAX_INLINE_SCRIPT_BYTES)
+        );
+        let (_, file) = sh_script_command(long.clone(), 5).unwrap();
+        if cfg!(target_os = "windows") {
+            let file = file.expect("a long script runs from a file");
+            let path = file.path.clone();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), long);
+            drop(file);
+            assert!(!path.exists(), "the script file is deleted on drop");
+        } else {
+            assert!(file.is_none());
+        }
+    }
+
+    #[test]
+    fn script_file_output_hides_the_temp_path_and_is_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = TempShellScript::write_in(dir.path(), "echo hi\n", 5).unwrap();
+        let raw = format!(
+            "{}: line 7: oops: command not found\nalso {}",
+            file.shell_path(),
+            file.path.display()
+        );
+        let masked = file.mask_path(&raw);
+        assert!(masked.starts_with("sh: line 7: oops"), "{masked}");
+        assert!(!masked.contains("locus-bash-"), "{masked}");
+        let note = file.failure_note();
+        assert!(note.contains("8 bytes"), "{note}");
+        assert!(note.contains("5 lines"), "{note}");
+    }
+
+    #[test]
+    fn script_file_write_failure_tells_the_model_what_happened() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the directory should be: create_dir_all fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        let error = match TempShellScript::write_in(&blocker.join("sub"), "echo hi\n", 5) {
+            Ok(_) => panic!("writing under a regular file must fail"),
+            Err(message) => message,
+        };
+        assert!(error.starts_with("The command was not run."), "{error}");
+        assert!(error.contains("8186"), "{error}");
+        assert!(error.contains("write tool"), "{error}");
     }
 
     #[test]
