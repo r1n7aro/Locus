@@ -965,7 +965,7 @@ defineExpose({ pushOutput });
       </div>
 
       <div v-else-if="streaming && thinking && !displayedStreamingText && !hasRunningTool" class="term-thinking-row">
-        <span class="thinking-dots">Thinking<span class="dots-anim"></span></span>
+        <span class="thinking-dots">Thinking<span class="dots-anim" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span></span>
         <button class="term-cancel-inline ui-select-none" :title="t('git.cancelTitle')" @click.stop="cancel">
           Ctrl+C <span class="cancel-label">{{ t('git.cancelLabel') }}</span>
         </button>
@@ -1482,21 +1482,38 @@ defineExpose({ pushOutput });
   display: inline-flex;
 }
 
-.dots-anim::after {
-  content: '...';
+/* Dots appear one by one through opacity, which runs on the compositor; an
+   animated clip-path repaints the window on the main thread at every step. */
+.dots-anim {
   display: inline-block;
   width: 1.05em;
   vertical-align: bottom;
-  clip-path: inset(0 100% 0 0);
-  animation: dots-clip 1.4s steps(4, end) infinite;
+  white-space: nowrap;
 }
 
-@keyframes dots-clip {
-  0%   { clip-path: inset(0 100% 0 0); }
-  25%  { clip-path: inset(0 66% 0 0); }
-  50%  { clip-path: inset(0 33% 0 0); }
-  75%  { clip-path: inset(0 0 0 0); }
-  100% { clip-path: inset(0 100% 0 0); }
+.dots-anim > span {
+  display: inline-block;
+  opacity: 0;
+  animation: 1.4s linear infinite;
+}
+
+.dots-anim > span:nth-child(1) { animation-name: dots-reveal-1; }
+.dots-anim > span:nth-child(2) { animation-name: dots-reveal-2; }
+.dots-anim > span:nth-child(3) { animation-name: dots-reveal-3; }
+
+@keyframes dots-reveal-1 {
+  0%, 24.9% { opacity: 0; }
+  25%, 100% { opacity: 1; }
+}
+
+@keyframes dots-reveal-2 {
+  0%, 49.9% { opacity: 0; }
+  50%, 100% { opacity: 1; }
+}
+
+@keyframes dots-reveal-3 {
+  0%, 74.9% { opacity: 0; }
+  75%, 100% { opacity: 1; }
 }
 
 .term-cancel-inline {

@@ -207,8 +207,7 @@ defineExpose({ scrollToIndex });
             <span v-else class="workspace-tree-name">
               <span class="workspace-tree-name-text">
                 <span v-if="item.treeRow.session" class="development-session-title"
-                  :class="{ 'is-running': rowActivity(item.treeRow)?.animated }"
-                  :data-title="rowActivity(item.treeRow)?.animated ? item.treeRow.name : undefined">{{ item.treeRow.name }}</span>
+                  :class="{ 'is-running locus-running-text': rowActivity(item.treeRow)?.animated }">{{ item.treeRow.name }}</span>
                 <slot v-else name="name" :item="item" :row="item.treeRow" :index="index">
                   {{ item.treeRow.name }}
                 </slot>
@@ -513,6 +512,8 @@ defineExpose({ scrollToIndex });
   white-space: nowrap;
 }
 
+/* Breathes through the global .locus-running-text (opacity only). The breathing
+   layer loses ClearType, so full --text-color reads as bold. */
 .development-session-title.is-running {
   color: color-mix(in srgb, var(--text-color) 62%, var(--text-secondary) 38%);
   user-select: none;
@@ -525,24 +526,6 @@ defineExpose({ scrollToIndex });
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--accent-color);
-}
-
-.development-session-title.is-running::after {
-  content: attr(data-title);
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  color: var(--text-color);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  pointer-events: none;
-  -webkit-mask-image: linear-gradient(90deg, transparent 40%, currentColor 50%, transparent 60%);
-  mask-image: linear-gradient(90deg, transparent 40%, currentColor 50%, transparent 60%);
-  -webkit-mask-size: 220% 100%;
-  mask-size: 220% 100%;
-  -webkit-mask-repeat: no-repeat;
-  mask-repeat: no-repeat;
-  animation: development-session-title-scan 2s ease-in-out infinite;
 }
 
 .development-session-dot {
@@ -650,17 +633,6 @@ defineExpose({ scrollToIndex });
 }
 
 .development-session-meta .development-branch-label { max-width: 88px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@keyframes development-session-title-scan {
-  0% {
-    -webkit-mask-position: 100% 0;
-    mask-position: 100% 0;
-  }
-  100% {
-    -webkit-mask-position: 0 0;
-    mask-position: 0 0;
-  }
-}
-
 @keyframes development-session-spin {
   to { transform: rotate(360deg); }
 }

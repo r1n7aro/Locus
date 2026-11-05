@@ -163,8 +163,8 @@ const locusEditorTheme = EditorView.theme({
   },
   ".cm-panels": { backgroundColor: "var(--panel-bg)", color: "var(--text-color)" },
   ".cm-panels-top": { borderBottom: "none" },
-  ".cm-searchMatch": { backgroundColor: "var(--accent-soft)", outline: "1px solid var(--border-strong)" },
-  ".cm-searchMatch-selected": { backgroundColor: "color-mix(in srgb, var(--accent-color) 28%, transparent)" },
+  ".cm-searchMatch": { backgroundColor: "var(--find-match-bg)", outline: "none", borderRadius: "2px" },
+  ".cm-searchMatch-selected": { backgroundColor: "var(--find-match-current-bg)" },
 });
 
 export function markdownEditorBaseExtensions(onSave: () => void): Extension[] {

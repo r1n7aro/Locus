@@ -1726,8 +1726,7 @@ function ctxArchive() {
             <div class="sp-session-main">
               <span
                 class="sp-session-title"
-                :class="{ 'is-running': isSessionTitleRunning(row.node) }"
-                :data-title="isSessionTitleRunning(row.node) ? rowLabel(row.node) : undefined"
+                :class="{ 'is-running locus-running-text': isSessionTitleRunning(row.node) }"
               >{{ rowLabel(row.node) }}</span>
               <div class="sp-session-meta">
                 <span
@@ -3040,28 +3039,11 @@ function ctxArchive() {
   white-space: nowrap;
 }
 
+/* Breathes through the global .locus-running-text (opacity only). The breathing
+   layer loses ClearType, so full --text-color reads as bold. */
 .sp-session-title.is-running {
-  position: relative;
   color: color-mix(in srgb, var(--text-color) 62%, var(--text-secondary) 38%);
   user-select: none;
-}
-
-.sp-session-title.is-running::after {
-  content: attr(data-title);
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  color: var(--text-color);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  pointer-events: none;
-  -webkit-mask-image: linear-gradient(90deg, transparent 40%, currentColor 50%, transparent 60%);
-  mask-image: linear-gradient(90deg, transparent 40%, currentColor 50%, transparent 60%);
-  -webkit-mask-size: 220% 100%;
-  mask-size: 220% 100%;
-  -webkit-mask-repeat: no-repeat;
-  mask-repeat: no-repeat;
-  animation: sp-session-title-scan 2s ease-in-out infinite;
 }
 
 .sp-session-meta {
@@ -3184,17 +3166,6 @@ function ctxArchive() {
 @keyframes sp-session-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
-}
-
-@keyframes sp-session-title-scan {
-  0% {
-    -webkit-mask-position: 100% 0;
-    mask-position: 100% 0;
-  }
-  100% {
-    -webkit-mask-position: 0 0;
-    mask-position: 0 0;
-  }
 }
 
 .sp-session-dot {

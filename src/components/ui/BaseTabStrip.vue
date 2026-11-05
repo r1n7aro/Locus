@@ -395,15 +395,15 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
   animation: base-tab-icon-breathe 1.8s ease-in-out infinite;
 }
 
+/* Opacity only: it runs on the compositor. An animated filter (the former
+   drop-shadow glow) repaints the whole window on the main thread every frame. */
 @keyframes base-tab-icon-breathe {
   0%,
   100% {
     opacity: 0.58;
-    filter: drop-shadow(0 0 0 transparent);
   }
   50% {
     opacity: 1;
-    filter: drop-shadow(0 0 2px color-mix(in srgb, var(--accent-color) 72%, transparent));
   }
 }
 
@@ -411,7 +411,6 @@ function onTabKeydown(event: KeyboardEvent, index: number): void {
   .base-tab-shell.running .base-tab-icon {
     animation: none;
     opacity: 1;
-    filter: none;
   }
 }
 

@@ -38,7 +38,7 @@ function highlight() {
   const match = matches.value[position.value];
   if (match) registry.set(currentName, new api.Highlight(match));
   const style = owner.document.createElement("style");
-  style.textContent = `::highlight(${highlightId}) { background: var(--accent-soft); color: var(--text-color); } ::highlight(${currentName}) { background: color-mix(in srgb, var(--accent-color) 35%, var(--panel-bg)); color: var(--text-color); }`;
+  style.textContent = `::highlight(${highlightId}) { background-color: var(--find-match-bg); color: var(--text-color); } ::highlight(${currentName}) { background-color: var(--find-match-current-bg); color: var(--text-color); }`;
   owner.document.head.append(style);
   releaseHighlights = () => { registry.delete(highlightId); registry.delete(currentName); style.remove(); };
 }

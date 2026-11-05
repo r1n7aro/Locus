@@ -20,6 +20,10 @@
   --accent-soft: rgba(76, 91, 212, 0.10);
   --accent-border: rgba(76, 91, 212, 0.22);
 
+  /* In-document find (Ctrl+F): accent-tinted, stronger than the 18% text selection. */
+  --find-match-bg: color-mix(in srgb, var(--accent-color) 30%, transparent);
+  --find-match-current-bg: color-mix(in srgb, var(--accent-color) 58%, transparent);
+
   --git-surface-nav: #f5f7fb;
   --git-surface-history: #fbfcfe;
   --git-surface-detail: #ffffff;
@@ -87,6 +91,9 @@
   --accent-color: #6f77f6;
   --accent-soft: rgba(111, 119, 246, 0.12);
   --accent-border: rgba(111, 119, 246, 0.24);
+
+  --find-match-bg: color-mix(in srgb, var(--accent-color) 38%, transparent);
+  --find-match-current-bg: color-mix(in srgb, var(--accent-color) 68%, transparent);
 
   --git-surface-nav: #17181c;
   --git-surface-history: #141519;
@@ -362,6 +369,29 @@ body.is-internal-dragging * {
   background: var(--accent-color);
   border-radius: 999px;
   opacity: 0.72;
+}
+
+/* Workspace system nodes moved into the top bar, and where a dragged node lands. */
+.tab-bar.is-node-drop-target {
+  background: color-mix(in srgb, var(--accent-color) 6%, var(--sidebar-bg));
+}
+
+.tab-item.is-drop-before::before,
+.tab-item.is-drop-after::before {
+  content: "";
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: -1px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent-color);
+  pointer-events: none;
+}
+
+.tab-item.is-drop-after::before {
+  left: auto;
+  right: -1px;
 }
 
 .tab-brand {
@@ -645,5 +675,30 @@ body.is-internal-dragging * {
 @keyframes tab-plugin-spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* Running / waiting text indicator. Opacity only, so it runs on the compositor.
+   Animating mask-position, background-position, clip-path or filter repaints the
+   window on the main thread every frame, and nesting transform animations keeps
+   the main thread ticking (2026-10: ~85% of the workspace main thread). */
+.locus-running-text {
+  animation: locus-running-text-breathe 3.2s ease-in-out infinite;
+}
+
+@keyframes locus-running-text-breathe {
+  0%,
+  100% {
+    opacity: 0.78;
+  }
+
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .locus-running-text {
+    animation: none;
   }
 }

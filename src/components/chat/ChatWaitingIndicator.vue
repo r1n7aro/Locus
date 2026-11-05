@@ -19,7 +19,7 @@ withDefaults(defineProps<{
       :class="{ compact }"
       aria-hidden="true"
     ></span>
-    <span class="chat-waiting-indicator-label">{{ label }}</span>
+    <span class="chat-waiting-indicator-label" :class="{ 'locus-running-text': active }">{{ label }}</span>
   </span>
 </template>
 
@@ -56,31 +56,19 @@ withDefaults(defineProps<{
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-weight: 500;
 }
 
+/* Breathes through the global .locus-running-text (opacity only); the former
+   background-position shimmer repainted the window on the main thread. The
+   breathing layer loses ClearType, so full --text-color reads as bold; this mix
+   keeps the brightness at the old shimmer's average. */
 .chat-waiting-indicator.active .chat-waiting-indicator-label {
-  background: linear-gradient(90deg, var(--text-secondary) 0%, var(--text-color) 50%, var(--text-secondary) 100%);
-  background-size: 200% 100%;
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  animation: chat-waiting-indicator-shimmer 2s ease-in-out infinite;
+  color: color-mix(in srgb, var(--text-color) 30%, var(--text-secondary));
 }
 
 @keyframes chat-waiting-indicator-spin {
   to {
     transform: rotate(360deg);
-  }
-}
-
-@keyframes chat-waiting-indicator-shimmer {
-  0% {
-    background-position: 100% 0;
-  }
-
-  100% {
-    background-position: -100% 0;
   }
 }
 </style>

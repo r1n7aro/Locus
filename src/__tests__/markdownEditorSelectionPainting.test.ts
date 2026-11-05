@@ -65,4 +65,47 @@ describe("Markdown native selection painting", () => {
     document.body.append(outside);
     expect(outside.firstElementChild!.matches(selectors)).toBe(false);
   });
+
+  // drawSelection paints behind the opaque table rows, so table cells rely on
+  // a visible native selection that must outrank the near-transparent rule.
+  it("paints native selection inside rendered table cells", () => {
+    const parent = document.createElement("div");
+    document.body.append(parent);
+    view = new EditorView({
+      parent,
+      state: EditorState.create({
+        doc: "intro\n\n| 位置 | 例子 |\n| --- | --- |\n| 事后 | **知道**结局 |\n\nend",
+        extensions: [
+          ...markdownEditorBaseExtensions(() => undefined),
+          markdownEditorLanguageExtension("markdown"),
+          markdownEditorModeExtension("rendered", "markdown"),
+        ],
+      }),
+    });
+
+    const rules = Array.from(document.styleSheets).flatMap(sheet => Array.from(sheet.cssRules))
+      .filter((rule): rule is CSSStyleRule => rule instanceof CSSStyleRule);
+    const tableRule = rules.find(rule => rule.selectorText.includes(".cm-live-table-cell::selection"));
+    const lineRule = rules.find(rule => rule.selectorText.includes(".cm-content .cm-line::selection"));
+    expect(tableRule).toBeDefined();
+    expect(lineRule).toBeDefined();
+    expect(tableRule!.selectorText).toContain(".cm-live-table-cell ::selection");
+    // jsdom drops color-mix() declarations, so check the injected source text.
+    const css = Array.from(document.querySelectorAll("style")).map(style => style.textContent ?? "").join("\n");
+    expect(css).toMatch(/\.cm-live-table-cell ::selection\s*\{\s*background-color:\s*color-mix\(in srgb, var\(--accent-color\) 18%, transparent\) !important;?\s*\}/);
+
+    const classCount = (rule: CSSStyleRule) => Math.min(...rule.selectorText.split(",").map(part => part.match(/\.[\w-]+/g)!.length));
+    expect(classCount(tableRule!)).toBeGreaterThan(classCount(lineRule!));
+
+    const selectors = tableRule!.selectorText
+      .replaceAll(" ::selection", " *")
+      .replaceAll("::selection", "");
+    const cells = Array.from(view.contentDOM.querySelectorAll(".cm-live-table-cell"));
+    expect(cells.length).toBe(4);
+    for (const cell of cells) expect(cell.matches(selectors)).toBe(true);
+    const nested = cells.find(cell => cell.textContent?.includes("知道"))!.querySelector("*");
+    expect(nested?.matches(selectors)).toBe(true);
+    const paragraph = Array.from(view.contentDOM.querySelectorAll(".cm-line")).find(line => line.textContent === "intro")!;
+    expect(paragraph.matches(selectors)).toBe(false);
+  });
 });
