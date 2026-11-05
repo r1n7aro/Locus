@@ -100,7 +100,10 @@ __pycache__/
 locus_unity/Editor/Detour/Locus.Detour.dll
 locus_unity/Editor/HotReload/Locus.HotReload.Runtime.dll
 locus_unity/Editor/Json/Locus.Json.dll
+locus_unity/Editor/Native/x86_64/locus_unity_native.dll
 locus_unity/Editor/Native/x86_64/locus_native.dll
+locus_blender/locus_host/bin/*.dll
+locus_blender/locus_host/bin/native.json
 locus_unity/Editor/Roslyn/Locus.Roslyn.dll
 
 # Editor directories and files
@@ -166,3 +169,6 @@ CLAUDE.md
 !/scripts/tests/unity-property/PropertyServiceReview.cs
 !/scripts/tests/unity-property/ServiceData.cs
 !/scripts/tests/unity-property/ServiceUnverified.cs
+# Private server is an independent repository; never include it in public sources.
+/crates/locus-server/
+/dist-internal/

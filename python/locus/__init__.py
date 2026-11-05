@@ -15,6 +15,7 @@ from ._client import (
     LocusSdkError,
     LocusToolError,
     LocusUnavailableError,
+    _print_reported_error,  # Called by the Python tool for reported conditions.
 )
 from ._models import (
     TaskStatus,
@@ -51,8 +52,19 @@ from ._merges import MergeAssets, MergeJob, MergePlan, MergeResult, Merges
 from ._worktrees import Worktree, Worktrees, PoolAcquisition, WorktreeDefaults
 from ._sessions import SessionMessagePage, SessionSearchMatch, SessionSearchPage
 from ._captures import Capture, Captures
+from ._image import Image, attach_image
+from ._blender import (
+    Blender,
+    BlenderError,
+    BlenderFunction,
+    NotExecuted,
+    TargetUnavailable,
+    TimedOut,
+)
 
 __all__ = [
+    "blender", "Blender", "BlenderError", "BlenderFunction", "NotExecuted", "TargetUnavailable", "TimedOut",
+    "Image", "attach_image",
     "captures", "Capture", "Captures",
     "csv", "Csv", "CsvColumnView", "CsvViewSnapshot",
     "assets", "AssetBackend", "AssetResult", "Assets", "asset_integer", "asset_unsigned_integer",
@@ -155,6 +167,19 @@ class _DefaultCaptures:
 
 
 captures = _DefaultCaptures()
+
+
+class _DefaultBlender:
+    """`locus.blender`: the default client's Blender API."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_client().blender, name)
+
+    def __repr__(self) -> str:
+        return "<locus.blender>"
+
+
+blender = _DefaultBlender()
 
 
 class _DefaultCsv:

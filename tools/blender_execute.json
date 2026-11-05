@@ -1,0 +1,33 @@
+{
+  "description": "Run Python inside a running Blender (bpy) on its main thread and return printed output, the return value and images. Default choice for reading or changing a Blender scene or its data. Use `python` with `locus.blender` (docs: Python SDK `blender.md`) instead when the work also drives Unity, files, sessions or several Blender instances, needs external libraries, or is a batch the program should judge itself.\n\nCode runs as the body of a function: `return` ends it and its value is returned; top-level `await` works but freezes Blender's UI while waiting. Pre-imported: bpy, mathutils, bmesh, locus, `project` (workspace root) and the helper object `blender`. Nothing is saved unless the user asked for it; never call bpy.ops.wm.save_mainfile on your own.\n\nHelpers (`blender.<name>`):\n- look(mode='viewport'|'camera'|'angles'|'frames', views=None, shading=None, frames=None, max_long_edge=None): image of the scene. To see the scene, `return blender.look()`; returned images (or `locus.attach_image(img)`, up to 4) are attached to the result. Viewport mode needs an interactive instance; background instances render instead.\n- scene_summary(fields=None, query=None, root=None, limit=20), object_detail(name), file_report(): compact text facts.\n- api(identifier): reflect the running version's API (e.g. 'bpy.types.Object.modifiers', 'bpy.ops.mesh.primitive_cube_add'). Check it before using API that changed between 4.2 and 5.x.\n- view3d(): `with blender.view3d():` gives operators a 3D view context (interactive only).\n- focus(name), render_thumbnail(path, max_long_edge=256).\n\nTarget: without `target`, the session target (set via locus.blender.set_target or the status popover) or else the only interactive Blender of this workspace that no other session targets is used; with none or several, the error lists instances (marking those another session works in; share one only with an explicit `target`). `target` accepts an instance id, a PID, an open .blend path, `background` or `background:<version>` (a Locus-managed `-b --factory-startup` instance for this workspace; launched on demand). A background instance is never chosen implicitly.\n\nResults: values are returned as data (tuples, dicts, numbers); data blocks come back as references (type, name); vectors and matrices as tuples. Large collections should use foreach_get. Unsupported values fall back to repr with a warning. The first output line names the Blender version, PID, file and mode; warnings note version mismatches with the workspace, files open in several instances, instances another session targets and queue waits.\n\nUndo: non-readonly calls in an interactive instance push one undo step (\"Locus: ...\"). bpy references go stale after undo or file reload; keep names, not objects, in `namespace=\"session\"` variables.\n\nTimeouts: when Blender had not started the code, the result says it was not executed and can be retried; once started, Locus requests cancellation and reports that the scene state is uncertain. C-level operations such as renders cannot be interrupted.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "code": {
+        "type": "string",
+        "description": "Python code run as a function body inside Blender. Use print() for text and `return` for the result value."
+      },
+      "readonly": {
+        "type": "boolean",
+        "description": "True only when the code does not change the scene, data, files or Blender settings. Read-only calls skip the undo step."
+      },
+      "target": {
+        "type": "string",
+        "description": "Optional for this call only: instance id, PID, .blend path, `background` or `background:<version>`."
+      },
+      "namespace": {
+        "type": "string",
+        "enum": ["fresh", "session"],
+        "default": "fresh",
+        "description": "`session` keeps top-level variables between calls of this session on the same instance (cleared when a file is opened)."
+      },
+      "timeout": {
+        "type": "integer",
+        "default": 120000,
+        "description": "Milliseconds, clamped to 1000..1800000."
+      }
+    },
+    "required": ["code", "readonly"],
+    "additionalProperties": false
+  }
+}

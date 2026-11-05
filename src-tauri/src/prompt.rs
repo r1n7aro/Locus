@@ -8,6 +8,15 @@ pub mod commit {
     pub const COMMIT_MESSAGE: &str = include_str!("../../prompt/commit-message.md");
 }
 
+/// Blender usage note injected into the agent env prompt, one text per
+/// workspace service mode (see `workspace_service::blender::prompt_fragment`).
+pub mod blender {
+    /// Service starts with the workspace.
+    pub const SERVICE_AUTO: &str = include_str!("../../prompt/blender-service-auto.md");
+    /// Service starts on the first `blender_execute` call; the tool is deferred.
+    pub const SERVICE_LAZY: &str = include_str!("../../prompt/blender-service-lazy.md");
+}
+
 pub mod plan {
     /// Sticky plan-mode reminder for the main agent. `{plan_file_info}` is
     /// replaced at injection time with the exists/create block for the
@@ -26,6 +35,7 @@ pub mod plan {
 pub mod tools {
     pub const EXECUTE_TYPESCRIPT: &str = include_str!("../../tools/execute_typescript.json");
     pub const SUBAGENT: &str = include_str!("../../tools/subagent.md");
+    pub const SEND_MESSAGE: &str = include_str!("../../tools/send_message.json");
 
     pub const READ: &str = include_str!("../../tools/read.json");
     pub const WRITE: &str = include_str!("../../tools/write.json");
@@ -39,6 +49,7 @@ pub mod tools {
     pub const UNITY_RELEASE: &str = include_str!("../../tools/unity_release.json");
     pub const UNITY_SET_PLAY_MODE: &str = include_str!("../../tools/unity_set_play_mode.json");
     pub const UNITY_EXECUTE: &str = include_str!("../../tools/unity_execute.json");
+    pub const BLENDER_EXECUTE: &str = include_str!("../../tools/blender_execute.json");
     pub const UNITY_RUN_STATES: &str = include_str!("../../tools/unity_run_states.json");
     pub const UNITY_CAPTURE_VIEWPORT: &str =
         include_str!("../../tools/unity_capture_viewport.json");
@@ -71,6 +82,7 @@ pub mod tools {
     pub const PLUGIN_SET_ENABLED: &str = include_str!("../../tools/plugin_set_enabled.json");
     pub const PLUGIN_EXPORT: &str = include_str!("../../tools/plugin_export.json");
     pub const CONFIG_QUERY: &str = include_str!("../../tools/config_query.json");
+    pub const CONFIG_SET: &str = include_str!("../../tools/config_set.json");
     pub const TOOL_LOAD: &str = include_str!("../../tools/tool_load.json");
     pub const TOOL_CALL: &str = include_str!("../../tools/tool_call.json");
     pub const EXIT_PLAN_MODE: &str = include_str!("../../tools/exit_plan_mode.json");
@@ -87,10 +99,12 @@ pub mod tools {
         ("grep", GREP),
         ("web_fetch", WEB_FETCH),
         ("todowrite", TODOWRITE),
+        ("send_message", SEND_MESSAGE),
         ("unity_lock", UNITY_LOCK),
         ("unity_release", UNITY_RELEASE),
         ("unity_set_play_mode", UNITY_SET_PLAY_MODE),
         ("unity_execute", UNITY_EXECUTE),
+        ("blender_execute", BLENDER_EXECUTE),
         ("unity_run_states", UNITY_RUN_STATES),
         ("unity_capture_viewport", UNITY_CAPTURE_VIEWPORT),
         ("unity_get_console_log", UNITY_GET_CONSOLE_LOG),
@@ -123,6 +137,7 @@ pub mod tools {
         ("plugin_set_enabled", PLUGIN_SET_ENABLED),
         ("plugin_export", PLUGIN_EXPORT),
         ("config_query", CONFIG_QUERY),
+        ("config_set", CONFIG_SET),
         ("tool_load", TOOL_LOAD),
         ("tool_call", TOOL_CALL),
         ("exit_plan_mode", EXIT_PLAN_MODE),

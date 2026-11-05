@@ -526,7 +526,7 @@ async function sendWorkspaceMessage(
   text: string,
   images: ImageAttachment[],
   assetRefs: AssetRefAttachment[],
-  overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null },
+  overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null; blenderTarget?: string | null },
 ) {
   const sessionId = chatStore.activeSessionId;
   if (sessionId) {

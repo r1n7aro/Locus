@@ -1,0 +1,26 @@
+[package]
+name = "locus_blender_native"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "In-process Blender broker for Locus (loaded by the Blender host add-on via ctypes)"
+authors = ["FarLocus"]
+publish = false
+
+# Loaded into blender.exe by `locus_blender/locus_host` through ctypes. The
+# DLL only exposes a C ABI and links no Python, so one build serves every
+# Blender version (Python 3.11 and 3.13). It is copied under a content-hash
+# file name so a running Blender keeps the old file while a new one installs.
+[lib]
+name = "locus_blender_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+locus-native-broker = { path = "../crates/locus-native-broker" }
+serde_json = "1.0.151"
+
+[profile.release]
+opt-level = 2
+
+# Standalone workspace root, built via `--manifest-path`.
+[workspace]

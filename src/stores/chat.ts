@@ -30,6 +30,7 @@ import {
 import { hydrateChatMessagesIntent, withClientMessageId } from "../composables/chatInputIntents";
 import {
   applyAsyncTaskUpdateToMessages,
+  applyNestedToolCallUpdateToMessages,
   asyncTaskDisplayStatus,
 } from "../composables/asyncTaskUpdates";
 import {
@@ -48,6 +49,7 @@ import type { SessionScrollState } from "../composables/chatScrollState";
 import { t } from "../i18n";
 import { useChatChangesStore } from "./chatChanges";
 import { useDisplaySettings } from "../composables/useDisplaySettings";
+import { prefetchMessagePathStatuses } from "../composables/markdownPathStatusPrefetch";
 import { useKnowledgeAccessMode } from "../composables/useKnowledgeAccessMode";
 import { useChatInputSettings } from "../composables/useChatInputSettings";
 import { applyNewSessionSelection } from "../composables/newSessionSelection";
@@ -68,7 +70,9 @@ import type {
   PendingSessionInput,
   EffortLevel,
   AsyncTaskUpdatedEvent,
+  NestedToolCallUpdatedEvent,
 } from "../types";
+import { subagentToolConfirms } from "../types";
 
 type ToolPermissionMode = "auto" | "ask";
 
@@ -1135,7 +1139,7 @@ export const useChatStore = defineStore("chat", () => {
       if (previousRunId && previousRunId !== run.runId && activeSessionId.value === sessionId) {
         activeToolCalls.value = [];
         pendingQuestion.value = null;
-        pendingToolConfirms.value = [];
+        pendingToolConfirms.value = subagentToolConfirms(pendingToolConfirms.value);
       }
     } catch (e) {
       console.warn("hydrate active session run failed:", e);
@@ -1227,6 +1231,12 @@ export const useChatStore = defineStore("chat", () => {
           return false;
         }),
       ]);
+      // Resolve path statuses before the transcript renders, so its file
+      // references are final in the first frame (null when all are known).
+      const pathStatuses = loadSeq === sessionLoadSeq
+        ? prefetchMessagePathStatuses(snapshot.session.messages)
+        : null;
+      if (pathStatuses) await pathStatuses;
       if (
         loadSeq !== sessionLoadSeq
         || !isWorkspaceScopeCurrent(expectedWorkspaceScopeKey)
@@ -1822,6 +1832,12 @@ export const useChatStore = defineStore("chat", () => {
         break;
       case "replaceMessages":
         messages.value = hydrateMessages(m.messages);
+        if (m.history) {
+          // A newest-page replacement restarts paging from its cursor; an
+          // older-page load still in flight is discarded by its cursor check.
+          sessionHistoryOldestRowId.value = m.history.oldestMessageRowId;
+          sessionHistoryHasMore.value = m.history.hasMoreHistory;
+        }
         break;
       case "pushToolResults":
         traceChatStore("pushToolResults", () => ({
@@ -1891,7 +1907,8 @@ export const useChatStore = defineStore("chat", () => {
         break;
       case "clearPendingInputs":
         pendingQuestion.value = null;
-        pendingToolConfirms.value = [];
+        // A background subagent's confirmation outlives the parent's run.
+        pendingToolConfirms.value = subagentToolConfirms(pendingToolConfirms.value);
         break;
       case "clearPendingInput":
         if (pendingQuestion.value?.questionId === m.questionId) {
@@ -2152,6 +2169,17 @@ export const useChatStore = defineStore("chat", () => {
         if (key.includes(`\u{0}${event.runId}\u{0}`)) {
           localFallbackPendingInputGroups.delete(key);
         }
+      }
+      return true;
+    }
+
+    // A background subagent asks outside the run that started it; its
+    // confirmation carries its own question and agent, so it bypasses run gating.
+    if (event.type === "toolConfirm" && event.agent) {
+      if (event.sessionId === activeSessionId.value) {
+        applyMutation({ type: "enqueueToolConfirm", confirm: {
+          questionId: event.questionId, toolCallId: event.toolCallId, display: event.display, agent: event.agent,
+        } });
       }
       return true;
     }
@@ -2538,6 +2566,11 @@ export const useChatStore = defineStore("chat", () => {
     }
 
     messages.value = applyAsyncTaskUpdateToMessages(messages.value, update);
+  }
+
+  function applyNestedToolCallUpdate(update: NestedToolCallUpdatedEvent) {
+    if (update.sessionId !== activeSessionId.value) return;
+    messages.value = applyNestedToolCallUpdateToMessages(messages.value, update);
   }
 
   async function syncActiveSessionSelection(sessionId: string | null | undefined) {
@@ -2944,7 +2977,7 @@ export const useChatStore = defineStore("chat", () => {
     text: string,
     images: ImageAttachment[] = [],
     assetRefs: AssetRefAttachment[] = [],
-    overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null },
+    overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null; blenderTarget?: string | null },
   ) {
     const modelStore = useModelStore();
     const agentStore = useAgentStore();
@@ -3054,6 +3087,7 @@ export const useChatStore = defineStore("chat", () => {
         subagentEfforts: Object.keys(modelStore.modelDefaults.subagentEfforts).length > 0 ? modelStore.modelDefaults.subagentEfforts : null,
         subagentFastModes: Object.keys(modelStore.modelDefaults.subagentFastModes).length > 0 ? modelStore.modelDefaults.subagentFastModes : null,
         knowledgeMode: knowledgeAccessState.mode,
+        blenderTarget: requestSessionId ? null : overrides?.blenderTarget ?? null,
       });
       if (closedRunIds.get(sid) === runId) {
         return;
@@ -3524,7 +3558,8 @@ export const useChatStore = defineStore("chat", () => {
       await sessionService.cancelChat(sessionId);
       if (activeSessionId.value === sessionId) {
         pendingQuestion.value = null;
-        pendingToolConfirms.value = [];
+        // Background subagents keep running when the turn is cancelled.
+        pendingToolConfirms.value = subagentToolConfirms(pendingToolConfirms.value);
       }
     } catch (e) {
       console.error("cancel_chat failed:", e);
@@ -3867,6 +3902,7 @@ export const useChatStore = defineStore("chat", () => {
     setActiveSessionSelectionPersistence,
     applyActiveSessionExecutionState,
     applyAsyncTaskUpdate,
+    applyNestedToolCallUpdate,
     newChat,
     resetWorkspaceScope,
     openThinkingPanel,

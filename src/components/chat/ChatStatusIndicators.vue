@@ -1,9 +1,16 @@
 <script setup lang="ts">
+import { protocolModelId } from '@locus/server-client';
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { BookOpen, CodeXml, Database, Plug, Server, Zap, type IconNode } from "lucide";
 import { useClaudeConnectionStatus } from "../../composables/useClaudeConnectionStatus";
 import { useClaudePrewarm } from "../../composables/useClaudePrewarm";
+import { useUnitySemanticState } from "../../composables/useUnitySemanticState";
+import { useWorkspaceServiceState } from "../../composables/useWorkspaceServiceState";
+import { useBlenderStatus } from "../../composables/useBlenderStatus";
+import { launchBlender } from "../../services/blender";
+import { blenderErrorText } from "../../services/blenderErrors";
+import BlenderStatusPanel from "./BlenderStatusPanel.vue";
 import { claudePrewarmSettings, connectClaudeSession } from "../../services/claudeConnection";
 import { useModelStore } from "../../stores/model";
 import { formatClaudeSshAddress } from "../../utils/claudeSshAddress";
@@ -19,7 +26,6 @@ import {
   unityHotReloadSetEnabled,
   unityNativeBrokerGetStatus,
   unityRecompileRun,
-  unitySemanticStateGet,
   unitySidecarCompilerGetStatus,
   unityStateProbeGetStatus,
   type UnityStateProbeStatus,
@@ -62,15 +68,16 @@ import BaseSwitch from "../ui/BaseSwitch.vue";
 import { useHotReloadDebugGuard } from "../../composables/useHotReloadDebugGuard";
 import { estimateKnowledgeContextCostTokens } from "./knowledgeContextCost";
 import {
+  BLENDER_PROJECT_ICON,
   UNITY_PROJECT_ICON,
   projectHasCapability,
   projectHasService,
   type ProjectCapabilityId,
 } from "../icons/projectIcons";
 
-type StatusId = "assetDb" | "unity" | "knowledge" | "code" | "hotReload" | "mcp" | "claude";
+type StatusId = "assetDb" | "unity" | "blender" | "knowledge" | "code" | "hotReload" | "mcp" | "claude";
 type StatusTone = "success" | "danger" | "warning" | "accent" | "muted";
-type StatusIcon = "database" | "unity" | "knowledge" | "code" | "hotReload" | "mcp" | "claude";
+type StatusIcon = "database" | "unity" | "blender" | "knowledge" | "code" | "hotReload" | "mcp" | "claude";
 type UnityPluginNotice = "missing" | "outdated";
 type UnityLaunchState = "idle" | "starting" | "waitingConnection";
 type UnitySemanticPhaseTone = Record<string, StatusTone>;
@@ -104,6 +111,7 @@ interface StatusItem {
 const STATUS_ICONS: Record<StatusIcon, IconNode> = {
   database: Database,
   unity: UNITY_PROJECT_ICON,
+  blender: BLENDER_PROJECT_ICON,
   knowledge: BookOpen,
   code: CodeXml,
   hotReload: Zap,
@@ -113,8 +121,14 @@ const STATUS_ICONS: Record<StatusIcon, IconNode> = {
 
 const props = defineProps<{
   sessionId?: string | null;
+  /** Blender target picked while there is no session yet; `undefined` when
+   * the surface cannot carry one into the first message. */
+  blenderDraftTarget?: string | null;
   selectedModelId?: string;
   active?: boolean;
+  /** The hosting surface is mounted but hidden (inactive workbench tab); status
+   * updates pause and resume from the shared snapshot when it is shown again. */
+  pollingPaused?: boolean;
   isStreaming?: boolean;
   unityConnected?: boolean;
   unityPluginStatus?: UnityPluginNotice | null;
@@ -138,6 +152,7 @@ const emit = defineEmits<{
   installPlugin: [];
   launchUnityProject: [];
   updateKnowledgeAccessMode: [mode: KnowledgeAccessMode];
+  "update:blenderDraftTarget": [key: string | null];
 }>();
 
 const activePopover = ref<StatusId | null>(null);
@@ -157,15 +172,12 @@ const nativeBrokerStatus = ref<UnityNativeBrokerStatus | null>(null);
 let nativeBrokerStatusSeq = 0;
 const stateProbeStatus = ref<UnityStateProbeStatus | null>(null);
 let stateProbeStatusSeq = 0;
-const unitySemanticState = ref<UnitySemanticState | null>(null);
-const unitySemanticError = ref("");
 const unityHeadlessClosing = ref(false);
 const unityHeadlessCloseError = ref("");
+const unityServiceStartError = ref("");
 const unityRestarting = ref(false);
 const unityRestartError = ref("");
 let unityRestartVersion = 0;
-let unitySemanticPollTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
-let unitySemanticSeq = 0;
 let unitySemanticDisposed = false;
 const knowledgeOverview = ref<KnowledgeRetrievalOverview | null>(null);
 const lexicalRebuildStatus = ref<LexicalRebuildStatus | null>(null);
@@ -180,7 +192,8 @@ const knowledgeStatusLoading = ref(false);
 const knowledgeRetrievalError = ref("");
 const knowledgeContextError = ref("");
 let knowledgeStatusSeq = 0;
-const UNITY_SEMANTIC_STATUS_POLL_MS = 1200;
+// Absent boolean props are cast to false, so only an explicit pause stops updates.
+const pollingActive = computed(() => !props.pollingPaused);
 const UNITY_SEMANTIC_PHASE_TONES: UnitySemanticPhaseTone = {
   editing: "success",
   // Play mode is a healthy, steady run state.
@@ -203,9 +216,66 @@ const projectServicesKey = computed(() => [...projectServices.value]
   .sort()
   .join(","));
 const isUnityProject = computed(() => projectHasService(projectServices.value, "unity"));
+const unityServiceState = useWorkspaceServiceState(() => props.workspaceRef ?? null, "unity");
+/** Lazy mode before first use: Locus does not watch the Editor yet. */
+const unityServiceDormant = computed(() => (
+  isUnityProject.value && !props.unityConnected && unityServiceState.dormant.value
+));
 
 function hasProjectCapability(capability: ProjectCapabilityId): boolean {
   return projectHasCapability(projectServices.value, capability);
+}
+
+// Blender: event driven (no polling); details load only while the popover is open.
+const blender = useBlenderStatus({
+  workspaceRef: () => props.workspaceRef ?? null,
+  sessionId: () => props.sessionId ?? null,
+  enabled: () => pollingActive.value && hasProjectCapability("blenderConnection"),
+  detail: () => activePopover.value === "blender",
+});
+// Lazy mode: the hub (and with it the view of running Blenders) starts on
+// first use; until then the item says so instead of "no instances".
+const blenderServiceState = useWorkspaceServiceState(() => props.workspaceRef ?? null, "blender");
+const blenderConnectError = ref("");
+const blenderLaunching = ref(false);
+const blenderLaunchError = ref("");
+const blenderSummary = computed(() => {
+  const instances = blender.workspaceInstances.value;
+  if (blenderServiceState.dormant.value) return t("blender.status.notConnected");
+  if (blender.hostError.value) return t("blender.status.summaryHostError");
+  if (blender.stuck.value) return t("blender.status.summaryStuck");
+  if (blender.busy.value) return t("blender.status.summaryBusy");
+  if (instances.length === 0) return t("blender.status.summaryNone");
+  if (instances.length === 1) {
+    const instance = instances[0];
+    return t("blender.status.summaryOne", instance.version || instance.versionString);
+  }
+  return t("blender.status.summaryMany", instances.length);
+});
+
+async function connectBlenderService() {
+  blenderConnectError.value = "";
+  try {
+    await blenderServiceState.start();
+    await blender.refresh();
+  } catch (cause) {
+    blenderConnectError.value = blenderErrorText(cause);
+  }
+}
+
+async function launchBlenderFromStatus() {
+  const workspaceRef = props.workspaceRef;
+  if (!workspaceRef || blenderLaunching.value) return;
+  blenderLaunching.value = true;
+  blenderLaunchError.value = "";
+  try {
+    await launchBlender(workspaceRef, props.sessionId ?? null);
+    await blender.refresh();
+  } catch (cause) {
+    blenderLaunchError.value = blenderErrorText(cause);
+  } finally {
+    blenderLaunching.value = false;
+  }
 }
 
 function isAssetDbRunningPhase(phase: AssetDbScanEvent | null | undefined): boolean {
@@ -246,6 +316,14 @@ const scanSummary = computed(() => {
 });
 
 const unityWorkingDir = computed(() => props.workingDir?.trim() ?? "");
+// Pushed by the backend observer on every change; no polling.
+const unitySemantic = useUnitySemanticState({
+  workspaceRef: () => props.workspaceRef,
+  enabled: () => isUnityProject.value && !!unityWorkingDir.value && hasProjectCapability("editorConnection"),
+  active: () => pollingActive.value,
+});
+const unitySemanticState = unitySemantic.state;
+const unitySemanticError = unitySemantic.error;
 
 const unityPipeName = computed(() =>
   props.unityConnectionStatus?.pipeName || "",
@@ -562,6 +640,7 @@ const unitySummary = computed(() => {
   if (unityRestarting.value) return t("chat.status.unity.restarting");
   if (unitySemanticPhase.value === "unresponsive") return unitySemanticSummaryLabel(unitySemanticState.value!);
   if (unityPluginLabel.value) return unityPluginLabel.value;
+  if (unityServiceDormant.value) return t("chat.status.service.dormant");
   if (unityLaunchInFlight.value) return unityConnectionFallbackSummary.value;
   if (unitySemanticState.value) return unitySemanticSummaryLabel(unitySemanticState.value);
   return unityConnectionFallbackSummary.value;
@@ -582,6 +661,7 @@ const unityTone = computed<StatusTone>(() => {
   if (unityRestarting.value) return "accent";
   if (unitySemanticPhase.value === "unresponsive") return "danger";
   if (props.unityPluginStatus) return "danger";
+  if (unityServiceDormant.value) return "muted";
   if (unityLaunchInFlight.value) return "accent";
   if (unitySemanticState.value) {
     return UNITY_SEMANTIC_PHASE_TONES[unitySemanticPhase.value] ?? "warning";
@@ -630,6 +710,9 @@ const unityActionLabel = computed(() => {
     return unityHeadlessClosing.value
       ? t("chat.status.unity.closingHeadless")
       : t("chat.status.unity.closeHeadless");
+  }
+  if (unityServiceDormant.value) {
+    return unityServiceState.starting.value ? t("chat.status.service.starting") : t("chat.status.service.start");
   }
   if (!unityCanLaunch.value) return "";
   if (effectiveUnityLaunchState.value === "starting") return t("chat.status.unity.launching");
@@ -976,6 +1059,13 @@ const unityRows = computed<StatusDetailRow[]>(() => {
     diagnostics.push({
       label: t("chat.status.unity.processLastError"),
       value: status.processLastError,
+      mono: true,
+    });
+  }
+  if (unityServiceStartError.value) {
+    diagnostics.push({
+      label: t("chat.status.service.startError"),
+      value: unityServiceStartError.value,
       mono: true,
     });
   }
@@ -1451,45 +1541,6 @@ function createUnavailableHotReloadStatus(error: string): CsharpCompileStatus {
   };
 }
 
-function clearUnitySemanticPoll() {
-  if (unitySemanticPollTimer) {
-    globalThis.clearTimeout(unitySemanticPollTimer);
-    unitySemanticPollTimer = null;
-  }
-}
-
-async function refreshUnitySemanticState() {
-  const seq = ++unitySemanticSeq;
-  const workspaceRef = props.workspaceRef;
-  if (!isUnityProject.value || !unityWorkingDir.value || !workspaceRef) {
-    unitySemanticState.value = null;
-    unitySemanticError.value = "";
-    return;
-  }
-
-  try {
-    const state = await unitySemanticStateGet(workspaceRef);
-    if (unitySemanticDisposed || seq !== unitySemanticSeq) return;
-    unitySemanticState.value = state;
-    unitySemanticError.value = "";
-  } catch (error) {
-    if (unitySemanticDisposed || seq !== unitySemanticSeq) return;
-    unitySemanticError.value = normalizeAppError(error).message;
-    if (!unitySemanticState.value) {
-      unitySemanticState.value = null;
-    }
-  }
-}
-
-function scheduleUnitySemanticPoll(delayMs = UNITY_SEMANTIC_STATUS_POLL_MS) {
-  clearUnitySemanticPoll();
-  if (unitySemanticDisposed || !hasProjectCapability("editorConnection")) return;
-  unitySemanticPollTimer = globalThis.setTimeout(() => {
-    unitySemanticPollTimer = null;
-    void refreshUnitySemanticState().finally(() => scheduleUnitySemanticPoll());
-  }, delayMs);
-}
-
 async function refreshCsharpLspStatus() {
   const scope = props.workspaceRef;
   if (!scope || !hasProjectCapability("codeAnalysis")) {
@@ -1881,11 +1932,12 @@ watch(() => [claudeConnection.phase.value, claudePrewarmSettings.value.scope], (
 const claudeError = computed(() => claudeConnectError.value || claudeConnection.error.value);
 const claudeConnecting = computed(() => claudeConnectBusy.value
   || claudeConnection.phase.value === "connecting" || claudeConnection.phase.value === "starting");
-const claudeConnectModel = computed(() => props.selectedModelId?.startsWith("claude_code/") ? props.selectedModelId
+const claudeConnectModel = computed(() => protocolModelId(props.selectedModelId ?? '').startsWith("claude_code/") ? props.selectedModelId
   : (claudeModelStore.allModels.find(model => model.provider === "claude_code" && model.isDefault)
     ?? claudeModelStore.allModels.find(model => model.provider === "claude_code"))?.id ?? "claude_code/");
+const serverClaudeModel = computed(() => !!claudeConnectModel.value && protocolModelId(claudeConnectModel.value) !== claudeConnectModel.value);
 async function connectClaude() {
-  if (claudeConnectBusy.value || !props.workspaceRef || !claudeConnectModel.value) return;
+  if (serverClaudeModel.value || claudeConnectBusy.value || !props.workspaceRef || !claudeConnectModel.value) return;
   claudeConnectBusy.value = true;
   claudeConnectError.value = "";
   const scope = claudePrewarmSettings.value.scope;
@@ -1925,6 +1977,13 @@ const claudeRows = computed<StatusDetailRow[]>(() => {
     if (pool.starting) rows.push({ label: t("chat.status.claude.pool.warming"), value: String(pool.starting), mono: true });
     rows.push({ label: t("chat.status.claude.sessions"), value: t("chat.status.claude.sessionCounts", pool.active, pool.retained) });
   }
+  if (status.archivePool) {
+    const archive = status.archivePool;
+    rows.push({ label: t("chat.status.claude.archivePool"),
+      value: t("chat.status.claude.archiveCounts", archive.ready, archive.busy, archive.queued, archive.starting) });
+    if (archive.lastError) rows.push({ label: t("chat.status.claude.archiveError"),
+      value: archive.lastError, tier: "diagnostic", multiline: true });
+  }
   // Verbose diagnostic formatting is only needed while this panel is open.
   if (activePopover.value === "claude") rows.push(...claudeDiagnosticRows(status.diagnostics));
   return rows;
@@ -1954,10 +2013,12 @@ const statusItems = computed<StatusItem[]>(() => {
     summary: unitySummary.value,
     inlineLabel: unitySummary.value,
     tone: unityTone.value,
-    rows: unityRows.value,
+    // Rows show only in the open popover; reading them otherwise makes the bar
+    // re-render on every connection check timestamp.
+    rows: activePopover.value === "unity" ? unityRows.value : [],
     actionLabel: unityActionLabel.value,
     actionTitle: unityActionTitle.value,
-    actionDisabled: unityRestarting.value || (unityCanRestart.value ? false : props.unityPluginStatus
+    actionDisabled: unityRestarting.value || (unityCanRestart.value ? false : unityServiceDormant.value ? unityServiceState.starting.value : props.unityPluginStatus
       ? props.unityPluginInstalling
       : unityHeadlessClosing.value
         || unityRecompileWaitingConnection.value
@@ -1966,6 +2027,20 @@ const statusItems = computed<StatusItem[]>(() => {
     actionVariant: unityCanRestart.value || unityCanCloseHeadless.value
       ? "danger"
       : props.unityPluginStatus ? "neutral" : "primary",
+  },
+  {
+    id: "blender",
+    icon: "blender",
+    requiredCapability: "blenderConnection",
+    title: t("blender.status.title"),
+    summary: blenderSummary.value,
+    inlineLabel: blenderSummary.value,
+    tone: blender.tone.value,
+    rows: [],
+    actionLabel: blenderLaunching.value ? t("blender.status.launching") : t("blender.status.launch"),
+    actionTitle: t("blender.status.launchTitle"),
+    actionDisabled: blenderLaunching.value || !props.workspaceRef,
+    actionVariant: blender.workspaceInstances.value.length === 0 ? "primary" : "neutral",
   },
   {
     id: "knowledge",
@@ -2033,8 +2108,10 @@ const statusItems = computed<StatusItem[]>(() => {
     summary: claudeSummary.value,
     inlineLabel: claudeSummary.value,
     tone: claudeTone.value,
-    rows: claudeRows.value,
-    actionLabel: claudeConnection.phase.value === "ready" ? ""
+    // Same as Unity: each pushed snapshot replaces the status object (latency,
+    // transport ages), so reading the rows while closed re-renders every mounted bar.
+    rows: activePopover.value === "claude" ? claudeRows.value : [],
+    actionLabel: claudeConnection.phase.value === "ready" || serverClaudeModel.value ? ""
       : t(claudeConnecting.value ? "chat.status.claude.connecting" : "chat.status.claude.connect"),
     actionDisabled: claudeConnecting.value || !props.workspaceRef || !claudeConnectModel.value,
     actionVariant: "neutral" as const,
@@ -2083,7 +2160,7 @@ function togglePopover(id: StatusId) {
     void refreshHotReloadOptimization();
   }
   if (activePopover.value === "unity") {
-    void refreshUnitySemanticState();
+    void unitySemantic.refresh();
   }
 }
 
@@ -2195,9 +2272,15 @@ function runStatusAction(item: StatusItem) {
     } else if (unityCanCloseHeadless.value) {
       void closeRunningHeadlessUnity();
       return;
+    } else if (unityServiceDormant.value) {
+      void startDormantUnityService();
+      return;
     } else {
       emit("launchUnityProject");
     }
+  } else if (item.id === "blender") {
+    void launchBlenderFromStatus();
+    return;
   } else if (item.id === "code") {
     void restartCode();
     return;
@@ -2208,6 +2291,16 @@ function runStatusAction(item: StatusItem) {
   closePopover();
 }
 
+async function startDormantUnityService() {
+  unityServiceStartError.value = "";
+  try {
+    await unityServiceState.start();
+    closePopover();
+  } catch (cause) {
+    unityServiceStartError.value = normalizeAppError(cause).message;
+  }
+}
+
 async function closeRunningHeadlessUnity() {
   const workspaceRef = props.workspaceRef;
   if (!workspaceRef || unityHeadlessClosing.value) return;
@@ -2216,7 +2309,7 @@ async function closeRunningHeadlessUnity() {
   try {
     await closeHeadlessUnityProject(workspaceRef);
     closePopover();
-    await refreshUnitySemanticState();
+    await unitySemantic.refresh();
   } catch (error) {
     unityHeadlessCloseError.value = normalizeAppError(error).message;
   } finally {
@@ -2242,7 +2335,7 @@ async function restartUnresponsiveUnity() {
     });
     if (!approved || !isCurrentScope()) return;
     await restartUnresponsiveUnityProject(scope, process.pid, process.pidCreatedAtMs);
-    if (isCurrentScope()) await refreshUnitySemanticState();
+    if (isCurrentScope()) await unitySemantic.refresh();
   } catch (error) {
     if (isCurrentScope()) unityRestartError.value = normalizeAppError(error).message;
   } finally {
@@ -2264,8 +2357,6 @@ onMounted(() => {
   hotReloadDisposed = false;
   unitySemanticDisposed = false;
   mcpDisposed = false;
-  void refreshUnitySemanticState();
-  scheduleUnitySemanticPoll();
   void bindCsharpLspStatus();
   void bindHotReloadStatus();
   void refreshNativeBrokerStatus();
@@ -2290,8 +2381,6 @@ watch(
     unityRestartVersion++;
     unityRestarting.value = false;
     unityRestartError.value = "";
-    unitySemanticState.value = null;
-    void refreshUnitySemanticState();
     void bindCsharpLspStatus();
     void bindHotReloadStatus();
     void refreshHotReloadOptimization();
@@ -2309,22 +2398,6 @@ watch(
   },
 );
 
-watch(
-  () => [
-    props.workingDir ?? "",
-    projectServicesKey.value,
-    String(props.knowledgeEnabled ?? true),
-    String(props.unityConnected ?? false),
-    String(props.unityConnectionStatus?.checkedAtMs ?? 0),
-    String(props.unityRecompiling ?? false),
-  ].join("::"),
-  () => {
-    clearUnitySemanticPoll();
-    void refreshUnitySemanticState();
-    scheduleUnitySemanticPoll();
-  },
-);
-
 onUnmounted(() => {
   document.removeEventListener("click", closePopover);
   document.removeEventListener("keydown", onDocumentKeydown);
@@ -2334,7 +2407,6 @@ onUnmounted(() => {
   hotReloadSubscriptionVersion += 1;
   unitySemanticDisposed = true;
   mcpDisposed = true;
-  clearUnitySemanticPoll();
   csharpLspUnsubscribe?.();
   csharpLspUnsubscribe = null;
   hotReloadUnsubscribe?.();
@@ -2358,6 +2430,7 @@ onUnmounted(() => {
               active: activePopover === item.id,
               'is-scanning': (item.id === 'assetDb' && isScanning)
                 || (item.id === 'unity' && unitySemanticBusy)
+                || (item.id === 'blender' && blender.busy.value)
                 || (item.id === 'code' && codeTransitional)
                 || (item.id === 'hotReload' && hotReloadBusy),
             },
@@ -2492,6 +2565,21 @@ onUnmounted(() => {
             <dd :class="{ 'is-mono': row.mono, 'is-primary': row.tier === 'primary', 'is-multiline': row.multiline }">{{ row.value }}</dd>
           </template>
         </dl>
+        <BlenderStatusPanel
+          v-if="activeItem.id === 'blender'"
+          :status="blender.status.value"
+          :workspace-ref="props.workspaceRef ?? null"
+          :session-id="props.sessionId ?? null"
+          :draft-target="props.blenderDraftTarget"
+          :dormant="blenderServiceState.dormant.value"
+          :connecting="blenderServiceState.starting.value"
+          @update:draft-target="emit('update:blenderDraftTarget', $event)"
+          @changed="blender.refresh()"
+          @connect="connectBlenderService"
+        />
+        <span v-if="activeItem.id === 'blender' && (blenderLaunchError || blenderConnectError || blender.error.value)" class="chat-status-codeopt-error is-multiline" role="alert">
+          {{ blenderLaunchError || blenderConnectError || blender.error.value }}
+        </span>
         <span v-if="activeItem.id === 'unity' && unityRestartError" class="chat-status-codeopt-error" role="alert">
           {{ unityRestartError }}
         </span>

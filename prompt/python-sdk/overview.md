@@ -11,12 +11,15 @@ Read any topic file directly from this directory as needed:
 - [tools.md](tools.md): discover and call built-in, MCP and Skill tools
 - [tasks.md](tasks.md): background execution, task status, waiting, cancellation and subagent messages
 - [unity.md](unity.md): Editor lifecycle, readiness, crashes, dialogs and detached execution
+- [blender.md](blender.md): run code in Blender (`@locus.blender.function`, `execute`), instances, targets, value rules and `locus.attach_image`; for single scene steps prefer the `blender_execute` tool
 - [worktrees.md](worktrees.md): sibling checkouts, private Unity project pool slots and parallel Editors
 - [assets.md](assets.md): snapshot-bound asset inspection and bulk editing across YAML and the live Editor
 - [captures.md](captures.md): query objects and positions in screenshot snapshots on demand
 - [csv.md](csv.md): edit CSV tables with the same worksheet and style objects as openpyxl, the standard Python Excel-editing library; use `await locus.csv.load_workbook(path)`, normal openpyxl edits, then `await wb.save()`
 - [merges.md](merges.md): selective integration, preview/apply, validation and commits
 - [callbacks.md](callbacks.md): expose local Python functions as typed Agent tools
+
+A condition Locus detects on purpose (a stale merge snapshot, a busy checkout, an unready plan, a blocking Unity dialog) raises `locus.LocusRpcError` with `reported=True`, a stable `kind` and usually a `hint` with the next step. The tool prints it as your script's own lines, the message and `next: ...`. Any other exception is unexpected and keeps its full traceback; set `os.environ["LOCUS_SDK_FULL_TRACEBACK"] = "1"` to also see SDK frames for reported conditions.
 
 Prefer the injected `workspace_ref` for Agent runs so a workflow cannot silently move to another checkout generation.
 

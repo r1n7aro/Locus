@@ -10,6 +10,7 @@
     "edit",
     "bash",
     "python",
+    "blender_execute",
     "grep",
     "list",
     "subagent",
@@ -18,6 +19,8 @@
     "web_fetch",
     "knowledge_query",
     "skill_list",
+    "config_query",
+    "config_set",
     "execute_typescript"
   ],
   "sub_agents": ["researcher"],

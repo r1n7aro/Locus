@@ -11,11 +11,13 @@
       "./gen/ort-runtime": "ort-runtime/",
       "./gen/gh-runtime": "gh-runtime/",
       "../python/locus": "locus-python-sdk/locus/",
+      "../python/bpy": "locus-python-sdk/bpy/",
       "../prompt/python-sdk": "locus-python-sdk/docs/",
       "../agent": "agent/",
       "../knowledge": "knowledge/",
       "../skills": "skills/",
-      "../locus_unity": "locus_unity/"
+      "../locus_unity": "locus_unity/",
+      "../locus_blender": "locus_blender/"
     }
   }
 }

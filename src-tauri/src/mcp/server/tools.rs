@@ -37,6 +37,7 @@ pub const EXPOSED_TOOLS: &[&str] = &[
     "unity_code_usages",
     "unity_yaml_search",
     "unity_yaml_read",
+    "blender_execute",
     "code_symbol_search",
     "code_goto_definition",
     "code_find_references",
@@ -129,6 +130,16 @@ fn tool_available(name: &str, working_dir: Option<&str>) -> (bool, Option<String
                 );
             }
             (true, None)
+        }
+        "blender_execute" => {
+            if crate::blender::blender_integration_enabled() {
+                (true, None)
+            } else {
+                (
+                    false,
+                    Some("Blender integration is turned off in Locus settings".to_string()),
+                )
+            }
         }
         _ => (true, None),
     }
@@ -314,30 +325,27 @@ fn validated_requested_status(args: &Value) -> Result<String, ToolResult> {
 /// unity_execute over MCP: same validation as the registry closure, but a
 /// status mismatch switches the editor instead of erroring.
 async fn run_unity_execute(working_dir: &str, args: &Value) -> ToolResult {
-    let Some(code) = args.get("code").and_then(Value::as_str) else {
-        return err("Missing required parameter: code");
-    };
-    let requested = match validated_requested_status(args) {
-        Ok(status) => status,
-        Err(result) => return result,
-    };
-    let enable_non_public_access = match crate::csharp_compile::resolve_tool_non_public_access(args)
-    {
-        Ok(value) => value,
+    let parsed = match crate::unity_bridge::parse_unity_execute_args(args) {
+        Ok(parsed) => parsed,
         Err(error) => return err(&error),
     };
-    if let Err(e) = ensure_editor_status(working_dir, &requested).await {
+    if let Err(e) = ensure_editor_status(working_dir, &parsed.requested_status).await {
         return err(&e);
     }
-    match crate::unity_bridge::unity_execute_code_with_non_public_access(
+    // Never cancelled; the sender must outlive the call. SDK callers parse
+    // this output, so it stays exactly what the snippet printed.
+    let (_never_cancelled, cancel_rx) = tokio::sync::watch::channel(false);
+    match crate::unity_bridge::unity_execute_code_with_options(
         working_dir,
-        code,
-        enable_non_public_access,
+        &parsed.code,
+        parsed.options,
+        cancel_rx,
+        |_| {},
     )
     .await
     {
-        Ok(output) => {
-            let trimmed = output.trim();
+        Ok(outcome) => {
+            let trimmed = outcome.output.trim();
             ok(if trimmed.is_empty() {
                 "Code executed successfully (no output)."
             } else {
@@ -728,6 +736,24 @@ async fn execute_workspace_tool_inner(
                 is_error,
                 images: images
                     .unwrap_or_default()
+                    .into_iter()
+                    .map(|image| (image.data, image.mime_type))
+                    .collect(),
+                workspace_path: None,
+            }
+        }
+        "blender_execute" => {
+            let scope = crate::blender::target::Scope::new(
+                execution.checkout_id.as_str(),
+                execution.root(),
+                None,
+            );
+            let run = crate::blender::tool::run(&scope, arguments, |_| {}, None).await;
+            ToolCallOutcome {
+                output: run.output,
+                is_error: run.is_error,
+                images: run
+                    .images
                     .into_iter()
                     .map(|image| (image.data, image.mime_type))
                     .collect(),

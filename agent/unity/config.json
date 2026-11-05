@@ -20,6 +20,7 @@
     "unity_execute",
     "unity_run_states",
     "unity_capture_viewport",
+    "blender_execute",
     "unity_get_console_log",
     "unity_test_list",
     "unity_test_run",
@@ -37,6 +38,8 @@
     "unity_yaml_read",
     "knowledge_query",
     "skill_list",
+    "config_query",
+    "config_set",
     "execute_typescript"
   ],
   "sub_agents": [
