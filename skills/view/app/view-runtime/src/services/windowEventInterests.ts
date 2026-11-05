@@ -3,6 +3,7 @@ import { watch, type WatchStopHandle } from "vue";
 import type { WorkspaceRef } from "./project";
 import { hasTauriWindowRuntime } from "./tauriRuntime";
 import { ensureWorkspaceEventTransport } from "./workspaceEventHub";
+import { remoteClientTransport } from "./remoteClient";
 
 export interface WindowEventInterests {
   checkouts: WorkspaceRef[];
@@ -165,6 +166,12 @@ type Registry = ReturnType<typeof createWindowEventInterests>;
 let registry: Registry | undefined = import.meta.hot?.data?.windowEventInterests;
 function currentRegistry(): Registry {
   registry ??= createWindowEventInterests(async interests => {
+    // The mobile app also has a Tauri runtime (its own shell), so check it first.
+    const remote = remoteClientTransport();
+    if (remote) {
+      await remote.setInterests(interests);
+      return;
+    }
     // Native Unity Views use the unfiltered internal router stream, not Tauri.
     if (!hasTauriWindowRuntime()) return;
     await ensureWorkspaceEventTransport();

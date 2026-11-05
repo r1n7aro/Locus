@@ -1,6 +1,7 @@
 import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 import * as projectService from "../services/project";
+import { subscribeWorkspaceServicesChanged } from "../services/workspaceServices";
 import type {
   ProjectContextDescriptor,
   WindowPaneWorkspaceContext,
@@ -342,6 +343,30 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
   }
 
   let initialization: { key: string; promise: Promise<void> } | null = null;
+  let serviceSwitchSubscription: Promise<unknown> | null = null;
+
+  /** An app-level service switch changed detection for every checkout. */
+  async function refreshServiceDescriptors(): Promise<void> {
+    const [projectContexts, runtimes] = await Promise.all([
+      projectService.listProjectContexts(),
+      projectService.listWorkspaceRuntimes(),
+    ]);
+    replaceProjects(projectContexts);
+    for (const runtime of runtimes) upsertRuntime(runtime);
+  }
+
+  function ensureServiceSwitchSubscription() {
+    if (serviceSwitchSubscription) return;
+    try {
+      serviceSwitchSubscription = Promise.resolve(subscribeWorkspaceServicesChanged(() => {
+        void refreshServiceDescriptors().catch((error) => {
+          console.warn("[Locus] failed to refresh workspace services", error);
+        });
+      })).catch(() => { serviceSwitchSubscription = null; });
+    } catch {
+      serviceSwitchSubscription = null;
+    }
+  }
 
   function initialize(
     nextWindowId = DEFAULT_WINDOW_ID,
@@ -373,6 +398,7 @@ export const useWorkspaceContextStore = defineStore("workspaceContext", () => {
   ) {
     windowId.value = nextWindowId;
     paneId.value = nextPaneId;
+    ensureServiceSwitchSubscription();
     const key = paneContextKey(nextWindowId, nextPaneId);
     const initialIntentEpoch = currentIntentEpoch(key);
     const [projectContexts, restoredPaneContexts, restoredIntentEpochs] = await Promise.all([

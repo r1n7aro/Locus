@@ -432,6 +432,8 @@ export interface ChatComposerSendPayload {
   assetRefs: AssetRefAttachment[];
   mode?: string | null;
   userIntent?: UserIntentMeta | null;
+  /** Blender target picked before the session exists (draft only). */
+  blenderTarget?: string | null;
 }
 
 export type KnowledgeProposalVerify = "none" | "required";
@@ -664,6 +666,8 @@ export interface AgentInfo {
   defaultEffort?: EffortLevel | null;
   modelRecommendation?: ModelRecommendation | null;
   source: string;
+  /** Delegating agents may start it (within its project types). */
+  delegatable?: boolean;
 }
 
 export interface AgentModelPreference {
@@ -817,10 +821,14 @@ export interface ModelCatalogResponse {
   providers: Record<string, ModelCatalogProvider>;
 }
 
+/** Models each sub-agent type may use, keyed by agent id; the first is its
+ *  default. A missing entry inherits the current session model. */
+export type SubagentModelChoices = Record<string, string[]>;
+
 export interface ModelDefaults {
   mainModel: string;
   planModel: string;
-  subagentModels: Record<string, string>;
+  subagentModels: SubagentModelChoices;
   subagentEfforts: Record<string, EffortLevel>;
   /** Missing keys inherit the current session; explicit false selects standard speed. */
   subagentFastModes: Record<string, boolean>;
@@ -977,6 +985,8 @@ export interface AppUpdateInstallerDownload {
   includesManagedGit: boolean;
   requiresSystemPython: boolean;
   requiresSystemGit: boolean;
+  /** Bundles the Locus Remote Android app (`with_remote_app` flavor). */
+  includesRemoteApp?: boolean;
 }
 
 export interface AppUpdateLocaleEntry {
@@ -1239,6 +1249,15 @@ export interface AsyncTaskUpdatedEvent {
   output: string;
 }
 
+/** A background Claude subagent's call, persisted on its Agent card. */
+export interface NestedToolCallUpdatedEvent {
+  sessionId: string;
+  assistantMessageId: string;
+  /** The Agent card. */
+  toolCallId: string;
+  nestedToolCall: ToolCallInfo;
+}
+
 /** Every StreamEvent is wrapped in an envelope that carries a runId for filtering stale events. */
 export type StreamEvent = {
   runId: string;
@@ -1358,6 +1377,8 @@ export type StreamEvent = {
       questionId: string;
       toolCallId: string;
       display: ToolConfirmDisplay;
+      /** The Claude subagent asking; its confirmation can outlive the run. */
+      agent?: string;
     }
   | { type: "inputAnswered"; sessionId: string; questionId: string }
   | { type: "undoAvailable"; sessionId: string; assistantMessageId: string }
@@ -1372,7 +1393,10 @@ export type StreamEvent = {
   | {
       type: "historySynchronized";
       sessionId: string;
-      messages: ChatMessage[];
+      /** Newest display page; omitted from persisted event replays. */
+      messages?: ChatMessage[];
+      oldestMessageRowId?: number | null;
+      hasMoreHistory?: boolean;
     }
   | {
       type: "compactDone";
@@ -1381,7 +1405,10 @@ export type StreamEvent = {
       messagesAfter: number;
       contextTokens?: number;
       contextLimit?: number;
-      messages: ChatMessage[];
+      /** Newest display page; omitted from persisted event replays. */
+      messages?: ChatMessage[];
+      oldestMessageRowId?: number | null;
+      hasMoreHistory?: boolean;
     }
   | {
       /** Sticky plan-mode transition (entered via /plan, exited via approved exit_plan_mode or the badge toggle). */
@@ -1460,6 +1487,13 @@ export interface PendingToolConfirm {
   questionId: string;
   toolCallId: string;
   display: ToolConfirmDisplay;
+  /** The Claude subagent asking; its confirmation can outlive the run. */
+  agent?: string;
+}
+
+/** Keeps the confirmations of subagents, which do not end with a run. */
+export function subagentToolConfirms(confirms: PendingToolConfirm[]): PendingToolConfirm[] {
+  return confirms.filter((confirm) => !!confirm.agent);
 }
 
 export type PendingToolConfirmList = PendingToolConfirm[];
@@ -3337,6 +3371,13 @@ export type AssetDbStatus = "indexed" | "scanning" | "none" | "error";
 export interface AssetKindCount {
   kind: string;
   count: number;
+}
+
+/** Payload of `asset-db-watcher-status`, pushed when the watcher queue changes. */
+export interface AssetDbWatcherStatusEvent {
+  watcherRunning: boolean;
+  watcherQueueLen: number;
+  watcherCurrentFile?: string;
 }
 
 export interface AssetDbOverview {

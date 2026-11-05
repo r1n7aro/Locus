@@ -41,7 +41,7 @@
     },
     {
       "path": "src/services/knowledge.ts",
-      "bytes": 37726
+      "bytes": 37884
     },
     {
       "path": "src/services/frontendWorkbench.ts",
@@ -93,19 +93,19 @@
     },
     {
       "path": "src/services/project.ts",
-      "bytes": 10119
+      "bytes": 10893
     },
     {
       "path": "src/stores/workspaceContext.ts",
-      "bytes": 25477
+      "bytes": 26532
     },
     {
       "path": "src/services/workspaceEventHub.ts",
-      "bytes": 10359
+      "bytes": 10793
     },
     {
       "path": "src/services/windowEventInterests.ts",
-      "bytes": 8222
+      "bytes": 8487
     },
     {
       "path": "src/services/windowEventTransport.ts",
@@ -213,11 +213,23 @@
     },
     {
       "path": "src/components/diff/BinaryPreviewHost.vue",
-      "bytes": 1247
+      "bytes": 1253
     },
     {
-      "path": "src/components/diff/FbxBinaryPreview.vue",
-      "bytes": 11818
+      "path": "src/components/diff/ModelBinaryPreview.vue",
+      "bytes": 2787
+    },
+    {
+      "path": "src/components/model-preview/ModelViewer.vue",
+      "bytes": 10917
+    },
+    {
+      "path": "src/components/model-preview/modelFormat.ts",
+      "bytes": 1607
+    },
+    {
+      "path": "src/components/model-preview/modelPreviewEngine.ts",
+      "bytes": 17613
     },
     {
       "path": "src/components/diff/RasterBinaryPreview.vue",
@@ -441,7 +453,7 @@
     },
     {
       "path": "src/components/ui/BaseDropdown.vue",
-      "bytes": 16739
+      "bytes": 17344
     },
     {
       "path": "src/components/ui/BaseSegmented.vue",
@@ -465,7 +477,7 @@
     },
     {
       "path": "src/composables/resizeObserver.ts",
-      "bytes": 1743
+      "bytes": 2253
     },
     {
       "path": "src/composables/useSelectionLock.ts",
@@ -477,19 +489,35 @@
     },
     {
       "path": "src/i18n.ts",
-      "bytes": 4454
+      "bytes": 5119
+    },
+    {
+      "path": "src/composables/useSettingsStore.ts",
+      "bytes": 14442
+    },
+    {
+      "path": "src/composables/settingsLegacy.ts",
+      "bytes": 10766
+    },
+    {
+      "path": "src/composables/keyboardShortcutCore.ts",
+      "bytes": 4370
+    },
+    {
+      "path": "src/services/settings.ts",
+      "bytes": 2814
     },
     {
       "path": "src/language/en.json",
-      "bytes": 312988
+      "bytes": 381876
     },
     {
       "path": "src/language/zh.json",
-      "bytes": 304769
+      "bytes": 372012
     },
     {
       "path": "src/services/asset.ts",
-      "bytes": 6567
+      "bytes": 6858
     },
     {
       "path": "src/services/diff.ts",
@@ -501,7 +529,7 @@
     },
     {
       "path": "src/services/view.ts",
-      "bytes": 21707
+      "bytes": 21907
     },
     {
       "path": "src/services/unity.ts",
@@ -565,11 +593,11 @@
     },
     {
       "path": "src/services/locusRuntime.ts",
-      "bytes": 5716
+      "bytes": 5811
     },
     {
       "path": "src/types.ts",
-      "bytes": 90663
+      "bytes": 92393
     }
   ]
 }

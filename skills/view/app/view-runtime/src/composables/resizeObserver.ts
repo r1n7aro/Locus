@@ -15,8 +15,19 @@ function cancelObserverFrame(handle: number) {
   clearTimeout(handle);
 }
 
+export interface AnimationFrameResizeObserverOptions {
+  /**
+   * Runs synchronously in the native observer callback, after layout and
+   * before paint, for corrections that must land in the frame being drawn
+   * (for example keeping a scroll position pinned). Keep it to cheap reads and
+   * writes; `callback` is still delivered on the next animation frame.
+   */
+  beforePaint?: ResizeObserverCallback;
+}
+
 export function createAnimationFrameResizeObserver(
   callback: ResizeObserverCallback,
+  options: AnimationFrameResizeObserverOptions = {},
 ): ResizeObserverHandle | null {
   if (typeof ResizeObserver === "undefined") return null;
 
@@ -39,6 +50,7 @@ export function createAnimationFrameResizeObserver(
   }
 
   observer = new ResizeObserver((entries) => {
+    options.beforePaint?.(entries, observer);
     for (const entry of entries) {
       pendingEntries.set(entry.target, entry);
     }

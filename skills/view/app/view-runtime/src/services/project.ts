@@ -37,13 +37,28 @@ export interface WorkspaceRuntimeDescriptor {
   workspaceGeneration: number;
   materializationEpoch?: number;
   leaseCount: number;
+  /** Services this workspace uses (mode auto or lazy). */
   detectedServices: string[];
+  /** `auto`: started on focus and bound when runs start. `lazy`: dormant until a tool or SDK call needs it. */
+  serviceModes?: Record<string, WorkspaceServiceMode>;
   /** Locus-managed worktree; entered through its project's source checkout. */
   managedWorktree?: boolean;
 }
 
+export type WorkspaceServiceMode = "auto" | "lazy";
+
+/** Mode of one service in the workspace setup dialog. */
+export type WorkspaceServiceSetupMode = "auto" | "lazy" | "off";
+
+export interface WorkspaceServiceSetup {
+  service: "unity" | "blender";
+  /** Unity: a Unity project. Blender: the workspace contains `.blend` files. */
+  detected: boolean;
+  mode: WorkspaceServiceSetupMode;
+}
+
 export interface ServiceBindingSnapshot {
-  serviceKind: "unity";
+  serviceKind: "unity" | "blender";
   serviceInstanceId: string;
   runtimeGeneration: number;
 }
@@ -67,7 +82,7 @@ export type WorkspaceServiceReadinessPhase =
   | "stopped";
 
 export interface WorkspaceServiceStateSnapshot {
-  serviceKind: "unity";
+  serviceKind: "unity" | "blender";
   activationPolicy: "disabled" | "manual" | "lazy" | "auto";
   identity?: {
     projectId: string;
@@ -207,6 +222,8 @@ export interface WorkspaceSetup {
   knowledgeEnabled: boolean;
   unityTestToolsEnabled: boolean;
   extraWorkdirs?: import("./extraWorkdirs").ExtraWorkdirStatus[];
+  /** Services the setup dialog offers, with detection-based initial modes. */
+  services?: WorkspaceServiceSetup[];
 }
 
 export function inspectWorkspaceSetup(path: string): Promise<WorkspaceSetup> {

@@ -26,6 +26,9 @@ const props = withDefaults(defineProps<{
   /** Render the menu on <body> with fixed positioning so it escapes
    *  overflow-clipping ancestors (scroll containers, embedded panels). */
   teleport?: boolean;
+  /** Multi-select mode: these options render as selected, and every click
+   *  emits the clicked value so the parent can toggle it. */
+  selectedValues?: string[];
 }>(), {
   selectedLabel: "",
   size: "sm",
@@ -35,6 +38,7 @@ const props = withDefaults(defineProps<{
   disabled: false,
   closeOnSelect: true,
   teleport: false,
+  selectedValues: undefined,
 });
 
 const emit = defineEmits<{
@@ -51,9 +55,14 @@ const activeIndex = ref(-1);
 const menuFixedStyle = ref<CSSProperties>({});
 const listboxId = `dropdown-${Math.random().toString(36).slice(2, 10)}`;
 
+const multiple = computed(() => props.selectedValues !== undefined);
 const selectedOption = computed(() =>
   props.options.find((option) => option.value === props.modelValue) ?? null,
 );
+
+function isSelected(value: string): boolean {
+  return props.selectedValues ? props.selectedValues.includes(value) : value === props.modelValue;
+}
 const enabledOptions = computed(() => props.options.filter((option) => !option.disabled));
 const activeDescendant = computed(() => {
   const option = props.options[activeIndex.value];
@@ -82,7 +91,7 @@ function close() {
 
 function select(value: string, disabled?: boolean) {
   if (disabled) return;
-  if (value !== props.modelValue) emit("update:modelValue", value);
+  if (multiple.value || value !== props.modelValue) emit("update:modelValue", value);
   if (props.closeOnSelect) {
     close();
     triggerRef.value?.focus();
@@ -109,7 +118,7 @@ function firstEnabledIndex(): number {
 }
 
 function selectedEnabledIndex(): number {
-  const index = props.options.findIndex((option) => option.value === props.modelValue && !option.disabled);
+  const index = props.options.findIndex((option) => isSelected(option.value) && !option.disabled);
   return index >= 0 ? index : firstEnabledIndex();
 }
 
@@ -323,16 +332,23 @@ watch(() => props.disabled, (disabled) => {
           :style="teleport ? menuFixedStyle : undefined"
           @keydown.capture="teleport && onKeydown($event)"
         >
-          <div :id="listboxId" class="base-dropdown-options" role="listbox" tabindex="-1" :aria-label="ariaLabel || undefined">
+          <div
+            :id="listboxId"
+            class="base-dropdown-options"
+            role="listbox"
+            tabindex="-1"
+            :aria-label="ariaLabel || undefined"
+            :aria-multiselectable="multiple || undefined"
+          >
             <template v-for="(option, index) in options" :key="option.value">
               <div v-if="isGroupStart(index)" class="base-dropdown-group-label">{{ option.group }}</div>
               <button
                 :id="`${listboxId}-option-${option.value}`"
                 type="button"
                 class="base-dropdown-item"
-                :class="{ active: modelValue === option.value, focused: activeIndex === index }"
+                :class="{ active: isSelected(option.value), focused: activeIndex === index }"
                 role="option"
-                :aria-selected="modelValue === option.value"
+                :aria-selected="isSelected(option.value)"
                 :disabled="option.disabled"
                 @click="select(option.value, option.disabled)"
                 @focus="focusOptionAt(index)"

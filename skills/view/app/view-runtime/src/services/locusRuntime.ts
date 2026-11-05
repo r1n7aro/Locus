@@ -10,7 +10,8 @@ import {
 } from "./workspaceEventHub";
 import type { RoutedWorkspaceEvent } from "./project";
 
-export type LocusRuntimeKind = "tauri" | "browser" | "unity";
+/** `remote`: the Locus Remote mobile app talking to a desktop over the network. */
+export type LocusRuntimeKind = "tauri" | "browser" | "unity" | "remote";
 export type RuntimeUnsubscribe = () => void;
 
 export interface LocusRuntimeInvokeActivity {

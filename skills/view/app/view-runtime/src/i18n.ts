@@ -2,11 +2,13 @@
  * i18n - lightweight internationalization system
  * Supports zh / en languages, loaded from JSON at startup, switchable at runtime
  */
-import { ref, readonly } from "vue";
+import { ref, readonly, watch } from "vue";
+import { saveSetting, settingValue } from "./composables/useSettingsStore";
 
 export type Locale = "zh" | "en";
 
-const STORAGE_KEY = "locus-locale";
+/** `system` follows the operating system language. */
+const LANGUAGE_SETTING_KEY = "appearance.language";
 const DEFAULT_LOCALE: Locale = "en";
 
 type Messages = Record<string, string>;
@@ -43,12 +45,12 @@ export function normalizeLocale(value: string | null | undefined): Locale | null
 }
 
 function readSavedLocale(): Locale | null {
-  try {
-    return normalizeLocale(localStorage.getItem(STORAGE_KEY));
-  } catch {
-    return null;
-  }
+  const saved = settingValue(LANGUAGE_SETTING_KEY);
+  return typeof saved === "string" ? normalizeLocale(saved) : null;
 }
+
+/** OS language reported by the backend at startup (`bootstrapLocale`). */
+let systemLocaleHint: string | null = null;
 
 function readNavigatorLocales(): string[] {
   try {
@@ -106,22 +108,31 @@ function activateLocale(locale: Locale) {
     });
 }
 
-export function bootstrapLocale(systemLocale?: string | null): Locale {
-  const resolved = resolveLocale({
+function currentPreferredLocale(): Locale {
+  return resolveLocale({
     savedLocale: readSavedLocale(),
-    systemLocale,
+    systemLocale: systemLocaleHint,
     navigatorLocales: readNavigatorLocales(),
   });
+}
+
+export function bootstrapLocale(systemLocale?: string | null): Locale {
+  systemLocaleHint = systemLocale ?? null;
+  const resolved = currentPreferredLocale();
   activateLocale(resolved);
   return resolved;
 }
 
 export function setLocale(locale: Locale) {
-  try {
-    localStorage.setItem(STORAGE_KEY, locale);
-  } catch { /* ignore */ }
+  // The snapshot updates synchronously and the watcher below switches.
+  saveSetting(LANGUAGE_SETTING_KEY, locale);
   activateLocale(locale);
 }
+
+// Language changes from other windows and the agent arrive as settings.
+watch(currentPreferredLocale, (next) => {
+  if (next !== currentLocale.value) activateLocale(next);
+}, { flush: "sync" });
 
 export const locale = readonly(currentLocale);
 
