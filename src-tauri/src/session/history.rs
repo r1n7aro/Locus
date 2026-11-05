@@ -58,10 +58,89 @@ pub fn normalize_tool_round_history_for_request(messages: &[ChatMessage]) -> Vec
     normalize_tool_round_history_impl(messages, true)
 }
 
+fn opens_tool_round(message: &ChatMessage) -> bool {
+    message.role == MessageRole::Assistant
+        && message.tool_calls.as_ref().is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| !call.is_server_tool() && !call.id.is_empty())
+        })
+}
+
+/// Claude Code reports each content block of one response as its own
+/// assistant message, so parallel calls persist as consecutive assistant rows
+/// whose results all follow the last of them. Within such a region (assistant
+/// rows with tool calls and tool rows only), each result moves right after the
+/// assistant row that owns its call; everything else keeps its order. A user
+/// or text-only row ends the region, so a result never crosses it.
+fn regroup_split_tool_rounds(messages: &[ChatMessage]) -> std::borrow::Cow<'_, [ChatMessage]> {
+    let in_region = |message: &ChatMessage| message.role == MessageRole::Tool || opens_tool_round(message);
+    let mut regrouped: Option<Vec<ChatMessage>> = None;
+    let mut i = 0usize;
+    while i < messages.len() {
+        if !opens_tool_round(&messages[i]) {
+            if let Some(out) = regrouped.as_mut() {
+                out.push(messages[i].clone());
+            }
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut end = i + 1;
+        while end < messages.len() && in_region(&messages[end]) {
+            end += 1;
+        }
+        let region = &messages[start..end];
+        // Region rows grouped under their assistant: (assistant, its call ids, results).
+        let mut groups: Vec<(usize, HashSet<&str>, Vec<usize>)> = Vec::new();
+        for (offset, message) in region.iter().enumerate() {
+            if message.role != MessageRole::Tool {
+                let ids = message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .filter(|call| !call.is_server_tool() && !call.id.is_empty())
+                    .map(|call| call.id.as_str())
+                    .collect();
+                groups.push((offset, ids, Vec::new()));
+                continue;
+            }
+            let id = message.tool_call_id.as_deref().unwrap_or_default();
+            let owner = groups
+                .iter()
+                .position(|(_, ids, results)| {
+                    ids.contains(id)
+                        && !results.iter().any(|result| region[*result].tool_call_id.as_deref() == Some(id))
+                })
+                // Unknown or repeated results stay where they were.
+                .unwrap_or(groups.len() - 1);
+            groups[owner].2.push(offset);
+        }
+        let order: Vec<usize> = groups
+            .iter()
+            .flat_map(|(assistant, _, results)| std::iter::once(*assistant).chain(results.iter().copied()))
+            .collect();
+        let moved = order.iter().enumerate().any(|(position, offset)| position != *offset);
+        if moved && regrouped.is_none() {
+            regrouped = Some(messages[..start].to_vec());
+        }
+        if let Some(out) = regrouped.as_mut() {
+            out.extend(order.into_iter().map(|offset| region[offset].clone()));
+        }
+        i = end;
+    }
+    match regrouped {
+        Some(messages) => std::borrow::Cow::Owned(messages),
+        None => std::borrow::Cow::Borrowed(messages),
+    }
+}
+
 fn normalize_tool_round_history_impl(
     messages: &[ChatMessage],
     close_trailing_tool_round: bool,
 ) -> Vec<ChatMessage> {
+    let messages = regroup_split_tool_rounds(messages);
+    let messages = messages.as_ref();
     let mut normalized = Vec::with_capacity(messages.len());
     let mut i = 0usize;
 
@@ -359,6 +438,63 @@ mod tests {
             knowledge_proposal: None,
             render_parts: None,
         }
+    }
+
+    fn call(id: &str) -> ToolCallInfo {
+        ToolCallInfo {
+            id: id.to_string(),
+            name: "Agent".to_string(),
+            arguments: "{}".to_string(),
+            order: None,
+            server_tool: None,
+            server_tool_output: None,
+            server_tool_result: None,
+            outcome: None,
+            recorded_output: None,
+            nested_tool_calls: None,
+        }
+    }
+
+    #[test]
+    fn parallel_calls_split_across_assistant_rows_keep_their_later_results() {
+        // Claude Code persists one row per tool_use block; all results follow the last.
+        let messages = vec![
+            user_message("user-1", "go"),
+            assistant_with_tools("a-1", vec![call("tc-1")]),
+            assistant_with_tools("a-2", vec![call("tc-2")]),
+            assistant_with_tools("a-3", vec![call("tc-3")]),
+            tool_message("t-3", "tc-3", "third"),
+            tool_message("t-1", "tc-1", "first"),
+            tool_message("t-2", "tc-2", "second"),
+            user_message("user-2", "next"),
+        ];
+        for normalized in [normalize_tool_round_history(&messages), normalize_tool_round_history_for_request(&messages)] {
+            let ids: Vec<&str> = normalized.iter().map(|message| message.id.as_str()).collect();
+            assert_eq!(ids, ["user-1", "a-1", "t-1", "a-2", "t-2", "a-3", "t-3", "user-2"]);
+            for (assistant, output) in [(1, "first"), (3, "second"), (5, "third")] {
+                let calls = normalized[assistant].tool_calls.as_ref().unwrap();
+                assert_eq!(calls[0].recorded_output.as_deref(), Some(output));
+                assert_eq!(calls[0].outcome, Some(ToolCallOutcome::Done));
+            }
+            assert!(normalized.iter().all(|message| message.content != INTERRUPTED_TOOL_RESULT));
+        }
+    }
+
+    #[test]
+    fn split_round_results_never_cross_a_user_message() {
+        let messages = vec![
+            assistant_with_tools("a-1", vec![call("tc-1")]),
+            user_message("user-1", "stop"),
+            assistant_with_tools("a-2", vec![call("tc-2")]),
+            tool_message("t-2", "tc-2", "second"),
+            tool_message("t-1", "tc-1", "late"),
+        ];
+        let normalized = normalize_tool_round_history(&messages);
+        let ids: Vec<&str> = normalized.iter().map(|message| message.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["a-1", "synthetic_tool_result:a-1:tc-1", "user-1", "a-2", "t-2"]
+        );
     }
 
     #[test]

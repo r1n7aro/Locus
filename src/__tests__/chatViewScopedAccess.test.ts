@@ -76,6 +76,7 @@ const mocks = vi.hoisted(() => {
     legacyOpenKnowledgeDocumentInKnowledge: vi.fn(),
     knowledgeRevealTarget: vi.fn(async () => undefined),
     openLocusAssetInspectorWorkbenchTab: vi.fn(async () => true),
+    openWorkbenchFileTab: vi.fn(async () => undefined),
     displaySettings: {
       showTurnNavigationRail: false,
       showWelcomeSubtitle: false,
@@ -117,6 +118,10 @@ vi.mock("../services/knowledge", () => ({
 vi.mock("../services/locusAssetInspector", () => ({
   openLocusAssetInspectorWorkbenchTab: mocks.openLocusAssetInspectorWorkbenchTab,
 }));
+vi.mock("../services/workbenchFile", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/workbenchFile")>(),
+  openWorkbenchFileTab: mocks.openWorkbenchFileTab,
+}));
 vi.mock("../composables/useKnowledgeDocumentOpen", () => ({
   useKnowledgeDocumentOpen: () => ({
     openDocument: mocks.legacyOpenKnowledgeDocument,
@@ -151,6 +156,13 @@ vi.mock("../composables/useInternalDrag", () => ({
   useInternalDragController: () => ({ start: vi.fn(() => false) }),
 }));
 vi.mock("../i18n", () => ({ t: (key: string) => key }));
+const imageMocks = vi.hoisted(() => ({
+  copyChatMessageImage: vi.fn<(element: HTMLElement) => Promise<void>>(async () => undefined),
+}));
+vi.mock("../composables/chatMessageImage", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../composables/chatMessageImage")>(),
+  copyChatMessageImage: imageMocks.copyChatMessageImage,
+}));
 
 vi.mock("../components/chat/ChatTranscript.vue", () => ({
   default: defineComponent({
@@ -188,6 +200,10 @@ vi.mock("../components/chat/ChatTranscript.vue", () => ({
           "data-file-path": "Assets/Scripts/Scoped.cs",
           "data-asset-path": "Assets/Scripts/Scoped.cs",
         }, "Scoped.cs"),
+        h("span", {
+          class: "md-file-ref test-markdown-ref",
+          "data-file-path": "docs/guide.md",
+        }, "guide.md"),
         h("span", {
           class: "md-knowledge-ref test-knowledge-ref",
           "data-knowledge-type": "design",
@@ -372,6 +388,118 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
+describe("ChatView work-state scroll export", () => {
+  it("returns the remembered position while hidden instead of measuring the empty layout", async () => {
+    type ScrollApi = { exportWorkStateScroll(): unknown; restoreWorkStateScroll(state: unknown): void };
+    const view = ref<ScrollApi | null>(null);
+    const props = reactive({ surfaceHidden: false, sessionSurfaceKey: "hidden-export-surface" });
+    mountedHost = document.createElement("div");
+    document.body.appendChild(mountedHost);
+    mountedApp = createApp({ render: () => h(ChatView, { ...baseProps, ...props, ref: view } as never) });
+    mountedApp.use(createPinia());
+    mountedApp.mount(mountedHost);
+    await flushUi();
+    // jsdom has no layout, like a display:none transcript: every metric is 0,
+    // which measuring reports as "at the bottom".
+    expect(view.value!.exportWorkStateScroll()).toEqual({ mode: "bottom" });
+
+    props.surfaceHidden = true;
+    await flushUi();
+    const anchor = { mode: "anchor", anchorId: "message-7", offsetTop: 12, fallbackScrollTop: 240 };
+    view.value!.restoreWorkStateScroll(anchor);
+    expect(view.value!.exportWorkStateScroll()).toEqual(anchor);
+  });
+});
+
+describe("ChatView transcript resize before paint", () => {
+  class FakeResizeObserver {
+    static instances: FakeResizeObserver[] = [];
+    targets: Element[] = [];
+    constructor(public readonly callback: ResizeObserverCallback) {
+      FakeResizeObserver.instances.push(this);
+    }
+    observe(target: Element) { this.targets.push(target); }
+    unobserve(target: Element) { this.targets = this.targets.filter((item) => item !== target); }
+    disconnect() { this.targets = []; }
+  }
+
+  type ScrollApi = { restoreWorkStateScroll(state: unknown): void };
+
+  async function mountMeasuredTranscript(sessionId: string) {
+    FakeResizeObserver.instances = [];
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    const view = ref<ScrollApi | null>(null);
+    mountedHost = document.createElement("div");
+    document.body.appendChild(mountedHost);
+    mountedApp = createApp({
+      render: () => h(ChatView, {
+        ...baseProps,
+        // Workbench hosts always pass it; an absent boolean prop is false.
+        presented: true,
+        activeSessionId: sessionId,
+        messages: [
+          { id: `${sessionId}-user`, role: "user", content: "Question", createdAt: 1 },
+          { id: `${sessionId}-answer`, role: "assistant", content: "Answer", createdAt: 2 },
+        ],
+        ref: view,
+      } as never),
+    });
+    mountedApp.use(createPinia());
+    mountedApp.mount(mountedHost);
+    await flushUi();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await flushUi();
+
+    const scrollEl = mountedHost.querySelector<HTMLElement>(".test-chat-transcript")!;
+    const metrics = { scrollHeight: 1000, clientHeight: 400, scrollTop: 600 };
+    Object.defineProperty(scrollEl, "scrollHeight", { configurable: true, get: () => metrics.scrollHeight });
+    Object.defineProperty(scrollEl, "clientHeight", { configurable: true, get: () => metrics.clientHeight });
+    Object.defineProperty(scrollEl, "scrollTop", {
+      configurable: true,
+      get: () => metrics.scrollTop,
+      set: (value: number) => { metrics.scrollTop = value; },
+    });
+    const observers = FakeResizeObserver.instances.filter((instance) => instance.targets.includes(scrollEl));
+    expect(observers.length).toBeGreaterThan(0);
+    // Delivers the browser's post-layout notification; no animation frame runs.
+    const resize = () => {
+      for (const observer of observers) {
+        observer.callback(
+          [{ target: scrollEl } as unknown as ResizeObserverEntry],
+          observer as unknown as ResizeObserver,
+        );
+      }
+    };
+    return { metrics, resize, view };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps a bottom-following transcript pinned in the same resize callback", async () => {
+    const { metrics, resize } = await mountMeasuredTranscript("pin-bottom-session");
+
+    // Content above the viewport grows back after a transient collapse.
+    metrics.scrollHeight = 4900;
+    resize();
+
+    expect(metrics.scrollTop).toBe(4500);
+  });
+
+  it("leaves a scrolled-up transcript to the deferred anchor reconcile", async () => {
+    const { metrics, resize, view } = await mountMeasuredTranscript("pin-anchor-session");
+    view.value!.restoreWorkStateScroll({ mode: "anchor", anchorId: "missing", offsetTop: 0, fallbackScrollTop: 200 });
+    await flushUi();
+    metrics.scrollTop = 200;
+
+    metrics.scrollHeight = 4900;
+    resize();
+
+    expect(metrics.scrollTop).toBe(200);
+  });
+});
+
 describe("ChatView scoped access boundary", () => {
   it.each([false, true])("reviews the clicked message in its pane session while streaming=%s", async (isStreaming) => {
     const reviewSessionContext = vi.fn();
@@ -393,6 +521,42 @@ describe("ChatView scoped access boundary", () => {
       sessionId: "pane-session", messageId: "selected-message",
     });
     expect(contextMenuButton("chat.messageMenu.reviewMessage")).toBeNull();
+  });
+
+  it("copies the rendered message under the menu as an image", async () => {
+    const host = mountChat({
+      messages: [{ id: "image-message", role: "assistant", content: "Rendered answer", createdAt: 1 }],
+    });
+    await flushUi();
+    const messageElement = host.querySelector<HTMLElement>(".test-message")!;
+    messageElement.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true, clientX: 10, clientY: 10,
+    }));
+    await flushUi();
+    const copyImage = contextMenuButton("chat.messageMenu.copyAsImage");
+    expect(copyImage?.disabled).toBe(false);
+    copyImage?.click();
+    // The clipboard request starts inside the click, before any await.
+    expect(imageMocks.copyChatMessageImage).toHaveBeenCalledExactlyOnceWith(messageElement);
+    await flushUi();
+    expect(contextMenuButton("chat.messageMenu.copyAsImage")).toBeNull();
+    expect(mocks.notificationStore.addNotice).toHaveBeenCalledWith(
+      "success", "common.copied", expect.objectContaining({ operation: "messageCopy" }),
+    );
+
+    const { ChatMessageImageTooLargeError } = await import("../composables/chatMessageImage");
+    imageMocks.copyChatMessageImage.mockRejectedValueOnce(new ChatMessageImageTooLargeError());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    messageElement.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true, clientX: 10, clientY: 10,
+    }));
+    await flushUi();
+    contextMenuButton("chat.messageMenu.copyAsImage")?.click();
+    await flushUi();
+    expect(mocks.notificationStore.addNotice).toHaveBeenLastCalledWith(
+      "warning", "chat.messageMenu.copyImageTooLarge", expect.objectContaining({ operation: "messageCopy" }),
+    );
+    warn.mockRestore();
   });
 
   it.each([
@@ -742,6 +906,20 @@ describe("ChatView scoped access boundary", () => {
     });
     expect(mocks.legacyOpenKnowledgeDocument).not.toHaveBeenCalled();
     expect(mocks.projectStore.requireWorkspaceRef).not.toHaveBeenCalled();
+  });
+
+  it("opens clicked Markdown file references in Workbench instead of the OS default app", async () => {
+    const host = mountChat();
+    await flushUi();
+
+    host.querySelector<HTMLSpanElement>(".test-markdown-ref")?.click();
+    await flushUi();
+
+    expect(mocks.openWorkbenchFileTab).toHaveBeenCalledWith({
+      workspaceRef: paneWorkspaceRef,
+      filePath: "docs/guide.md",
+    });
+    expect(mocks.openFileExternal).not.toHaveBeenCalled();
   });
 
   it("preserves legacy store routing outside scoped surfaces", async () => {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
+import { useSurfaceHidden } from "../../composables/surfaceVisibility";
 import { Crosshair } from "lucide";
 import BaseButton from "../ui/BaseButton.vue";
 import BaseContextMenu from "../ui/BaseContextMenu.vue";
@@ -41,6 +42,11 @@ import type {
 
 const props = defineProps<{
   source: string;
+  /**
+   * Set by hosts that mount the block outside the component tree (Markdown
+   * renders it with `render()`), where the surface visibility cannot be injected.
+   */
+  surfaceHidden?: boolean;
 }>();
 
 interface PropertyRow {
@@ -89,6 +95,30 @@ const rowWriteSeq = new Map<string, number>();
 const rowPreviewTimers = new Map<string, number>();
 const rowPreviewValues = new Map<string, { propertyPath: string; value: unknown }>();
 
+// A hidden workbench tab keeps its transcript mounted. Its rows keep their
+// loading layout, and bridge reads wait until the tab is shown, so restoring or
+// re-rendering many tabs does not send every fence's reads to Unity at once.
+const injectedSurfaceHidden = useSurfaceHidden();
+const surfaceHidden = computed(() => props.surfaceHidden || injectedSurfaceHidden.value);
+const deferredReadIds = new Set<string>();
+
+function readOrDefer(entry: UnityPropertyFenceEntry, run = loadRun): Promise<void> {
+  if (surfaceHidden.value) {
+    deferredReadIds.add(entry.id);
+    return Promise.resolve();
+  }
+  return loadProperty(entry, run);
+}
+
+watch(surfaceHidden, (hidden) => {
+  if (hidden || deferredReadIds.size === 0) return;
+  const entries = rows.value
+    .filter((row) => deferredReadIds.has(row.entry.id))
+    .map((row) => row.entry);
+  deferredReadIds.clear();
+  void mapWithConcurrency(entries, LOAD_CONCURRENCY, (entry) => loadProperty(entry, loadRun));
+});
+
 watch(
   () => props.source,
   () => {
@@ -109,7 +139,7 @@ void listenUnityValueEditorCommitted((event) => {
   const objectKey = unityPropertyTargetKey(unityPropertyObjectTarget(event.target));
   rows.value.forEach((row) => {
     if (unityPropertyTargetKey(unityPropertyObjectTarget(row.entry.target)) === objectKey) {
-      void loadProperty(row.entry);
+      void readOrDefer(row.entry);
     }
   });
 }).then((dispose) => {
@@ -152,7 +182,8 @@ async function reloadProperties() {
     property: null,
   }));
 
-  await mapWithConcurrency(parsed.entries, LOAD_CONCURRENCY, (entry) => loadProperty(entry, run));
+  deferredReadIds.clear();
+  await mapWithConcurrency(parsed.entries, LOAD_CONCURRENCY, (entry) => readOrDefer(entry, run));
 }
 
 async function loadProperty(entry: UnityPropertyFenceEntry, run = loadRun) {

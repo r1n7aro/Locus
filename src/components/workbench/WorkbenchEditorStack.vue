@@ -5,9 +5,25 @@ import type { WorkbenchEditorGroup, WorkbenchEditorInput } from "../../types/wor
 import { isDocumentPreview } from "./workbenchDocumentPreview";
 import { isWorkbenchDocumentPath } from "../../stores/workbench";
 import { WORKSPACE_FILE_PREVIEW_CACHE, WorkspaceFilePreviewCache } from "./workspaceFilePreviewCache";
+import { selectMountedEditorIds } from "./workbenchEditorMounting";
 
-const props = defineProps<{ group: WorkbenchEditorGroup }>();
-const emit = defineEmits<{ (event: "pin", editorId: string): void }>();
+const props = withDefaults(defineProps<{
+  group: WorkbenchEditorGroup;
+  /** Evictable editors mount when first shown; at most this many stay mounted (zero: never unloaded). */
+  mountLimit?: number;
+  isEvictable?: (editor: WorkbenchEditorInput) => boolean;
+  /** Evictable editors that must stay mounted regardless of the limit. */
+  retainedEditorIds?: Set<string>;
+}>(), {
+  mountLimit: 0,
+  isEvictable: undefined,
+  retainedEditorIds: () => new Set<string>(),
+});
+const emit = defineEmits<{
+  (event: "pin", editorId: string): void;
+  /** Sent while the editor is still mounted, before the limit unmounts an open tab. */
+  (event: "evict", editor: WorkbenchEditorInput): void;
+}>();
 provide(WORKSPACE_FILE_PREVIEW_CACHE, new WorkspaceFilePreviewCache());
 const readyEditors = reactive(new Set<string>());
 const presentedEditor = shallowRef<WorkbenchEditorInput | null>(null);
@@ -33,23 +49,63 @@ watch(
   { immediate: true },
 );
 
+// Activation order of this group, most recent first. Synchronous so the mount
+// selection below already sees the editor that was active before a switch.
+const recentEditorIds = shallowRef<string[]>([]);
+watch(() => props.group.activeEditorId, (editorId) => {
+  if (!editorId) return;
+  const open = new Set(props.group.tabs.map((editor) => editor.editorId));
+  recentEditorIds.value = [
+    editorId,
+    ...recentEditorIds.value.filter((id) => id !== editorId && open.has(id)),
+  ];
+}, { immediate: true, flush: "sync" });
+
+// Each group mounts at most `mountLimit` evictable editors (session tabs), so
+// many open tabs do not keep their transcripts, subscriptions and polls alive.
+// The previous selection is what is rendered, so a freed slot never remounts an
+// unloaded tab in the background.
+const mountedEditorIds = computed<Set<string> | null>((previous) => props.isEvictable
+  ? selectMountedEditorIds({
+    tabs: props.group.tabs,
+    activeEditorId: props.group.activeEditorId,
+    presentedEditorId: presentedEditor.value?.editorId ?? null,
+    recentEditorIds: recentEditorIds.value,
+    mountedEditorIds: previous,
+    limit: props.mountLimit,
+    isEvictable: props.isEvictable,
+    retainedEditorIds: props.retainedEditorIds,
+  })
+  : null);
+
 // Retain only the last visible surface while its replacement mounts and loads.
 // This is separate from the persisted tabs: a removed preview must survive long
 // enough to cover the load, without becoming an unbounded KeepAlive cache.
 const renderedEditors = computed(() => {
+  const mounted = mountedEditorIds.value;
+  const tabs = mounted
+    ? props.group.tabs.filter((editor) => mounted.has(editor.editorId))
+    : props.group.tabs;
   const previous = presentedEditor.value;
   return previous && !props.group.tabs.some((editor) => editor.editorId === previous.editorId)
-    ? [...props.group.tabs, previous]
-    : props.group.tabs;
+    ? [...tabs, previous]
+    : tabs;
 });
 const pending = computed(() => requestedEditor.value !== null
   && requestedEditor.value.editorId !== presentedEditor.value?.editorId);
 
+// A pre-flush watcher runs before this stack re-renders, so an evicted editor is
+// still mounted when the host captures its work state.
 watch(
   () => renderedEditors.value.map((editor) => editor.editorId),
-  (ids) => {
+  (ids, previousIds) => {
     const retained = new Set(ids);
     for (const id of readyEditors) if (!retained.has(id)) readyEditors.delete(id);
+    for (const id of previousIds ?? []) {
+      if (retained.has(id)) continue;
+      const editor = props.group.tabs.find((candidate) => candidate.editorId === id);
+      if (editor) emit("evict", editor);
+    }
   },
 );
 

@@ -60,6 +60,7 @@ function createDisplayState(): DisplaySettings {
     rightAlignUserMessages: false,
     showTurnNavigationRail: true,
     sessionMessagePageSize: 120,
+    mountedSessionEditorsPerGroup: 6,
     compactToolCalls: true,
     hideThinkingBlocks: true,
     showViewsInSessionPanel: false,

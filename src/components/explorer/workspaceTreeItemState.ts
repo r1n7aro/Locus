@@ -1,4 +1,5 @@
 import type { ProjectExplorerItemRef, ProjectExplorerItemState, ProjectExplorerSnapshot } from "../../types/workbench";
+import { indexedExplorerItemState } from "./explorerSnapshotIndex";
 
 export function sameWorkspaceTreeItem(left: ProjectExplorerItemRef, right: ProjectExplorerItemRef): boolean {
   return left.nodeId === right.nodeId && (left.relativePath || null) === (right.relativePath || null);
@@ -22,8 +23,9 @@ export function workspaceTreeItemState(
   nodeId: string,
   relativePath?: string | null,
 ): ProjectExplorerItemState | undefined {
-  return snapshot?.itemStates?.find((state) => state.nodeId === nodeId
-    && (state.relativePath ?? null) === (relativePath || null));
+  // Tree building asks this for every node; a linear find made it quadratic.
+  const itemStates = snapshot?.itemStates;
+  return itemStates ? indexedExplorerItemState(itemStates, nodeId, relativePath) : undefined;
 }
 
 /** Partition a mounted directory without losing a pinned descendant when its

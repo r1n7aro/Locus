@@ -38,6 +38,44 @@ function makeToolInfo(id: string, name = "read"): ToolCallInfo {
 }
 
 describe("toolCallBatches", () => {
+  it("reuses the display object for an unchanged tool call", () => {
+    const nested: ToolCallInfo = { id: "child", name: "read", arguments: "{}", outcome: "done" };
+    const info: ToolCallInfo = { id: "edit-1", name: "edit", arguments: "{\"filePath\":\"a.ts\"}", outcome: "done", nestedToolCalls: [nested] };
+    const message: Pick<ChatMessage, "toolCalls"> = { toolCalls: [info] };
+
+    const [first] = buildMessageToolCalls(message, { "edit-1": "Edited a.ts" });
+    // A later render builds a new output map with the same contents.
+    const [second] = buildMessageToolCalls(message, { "edit-1": "Edited a.ts", "other": "x" });
+
+    expect(second).toBe(first);
+    expect(second?.nestedToolCalls?.[0]).toBe(first?.nestedToolCalls?.[0]);
+  });
+
+  it("builds a new display object when a displayed field changes", () => {
+    const info: ToolCallInfo = { id: "bash-1", name: "bash", arguments: "{}" };
+    const message: Pick<ChatMessage, "toolCalls"> = { toolCalls: [info] };
+
+    const [running] = buildMessageToolCalls(message, {});
+    const [withOutput] = buildMessageToolCalls(message, { "bash-1": "done" });
+    info.outcome = "error";
+    const [failed] = buildMessageToolCalls(message, { "bash-1": "done" });
+    const [unchanged] = buildMessageToolCalls(message, { "bash-1": "done" });
+
+    expect(withOutput).not.toBe(running);
+    expect(withOutput).toMatchObject({ output: "done" });
+    expect(failed).not.toBe(withOutput);
+    expect(failed).toMatchObject({ status: "error" });
+    expect(unchanged).toBe(failed);
+  });
+
+  it("does not share display objects between distinct tool call infos", () => {
+    const [a] = buildMessageToolCalls({ toolCalls: [makeToolInfo("same")] }, {});
+    const [b] = buildMessageToolCalls({ toolCalls: [makeToolInfo("same")] }, {});
+
+    expect(b).toEqual(a);
+    expect(b).not.toBe(a);
+  });
+
   it("builds historical message tool calls with persisted output fallback", () => {
     const message: Pick<ChatMessage, "toolCalls"> = {
       toolCalls: [

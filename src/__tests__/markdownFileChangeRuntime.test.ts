@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
 import { createPinia } from "pinia";
-import { createApp, h, nextTick, reactive, type App } from "vue";
+import { createApp, defineComponent, h, nextTick, reactive, ref, type App } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import MarkdownRenderer from "../components/MarkdownRenderer.vue";
+import { provideSurfaceHidden } from "../composables/surfaceVisibility";
 import type { RoutedWorkspaceEvent } from "../services/project";
 import type { WorkspaceFileChangedPayload } from "../services/workspaceExplorer";
 
@@ -16,8 +17,10 @@ vi.mock("../services/workspaceExplorer", async importOriginal => ({
 }));
 vi.mock("../services/markdownImage", () => ({ resolveMarkdownImage: mocks.resolve }));
 vi.mock("../components/unity/UnityPropertyFenceBlock.vue", () => ({ default: {
-  props: ["source"], mounted() { mocks.propertyMounts(); },
-  render(this: { source: string }) { return h("div", { class: "test-property-fence" }, this.source); },
+  props: ["source", "surfaceHidden"], mounted() { mocks.propertyMounts(); },
+  render(this: { source: string; surfaceHidden?: boolean }) {
+    return h("div", { class: "test-property-fence", "data-hidden": String(!!this.surfaceHidden) }, this.source);
+  },
 } }));
 let app: App | null;
 let host: HTMLDivElement;
@@ -42,6 +45,29 @@ beforeEach(() => {
 });
 afterEach(() => {
   app?.unmount(); app = null; host.remove(); mocks.listeners.clear(); vi.useRealTimers();
+});
+
+describe("Markdown property fences in a hidden surface", () => {
+  it("passes the host surface visibility to fences mounted outside the component tree", async () => {
+    const hidden = ref(true);
+    app = createApp(defineComponent({
+      setup() {
+        provideSurfaceHidden(hidden);
+        const content = ["```unity-property", "Assets/Data/A.asset#m_Name", "```"].join(String.fromCharCode(10));
+        return () => h(MarkdownRenderer, { content, workspaceRef: { ...scope } });
+      },
+    }));
+    app.use(createPinia());
+    app.mount(host);
+    await flush();
+    const fence = () => host.querySelector<HTMLElement>(".test-property-fence");
+    expect(fence()?.dataset.hidden).toBe("true");
+    hidden.value = false;
+    await flush();
+    expect(fence()?.dataset.hidden).toBe("false");
+    // Re-rendered in place, not remounted (a remount would re-read every row).
+    expect(mocks.propertyMounts).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("Markdown file event hot path", () => {

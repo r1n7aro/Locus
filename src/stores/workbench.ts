@@ -161,6 +161,21 @@ function workbenchNodeContainsPane(node: WorkbenchSplitNode, paneId: string): bo
     || workbenchNodeContainsPane(node.second, paneId);
 }
 
+/**
+ * The pane adjacent to the right edge of `paneId`: the top-left leaf beyond the
+ * closest horizontal split that has the pane on its left. Null at the right edge.
+ */
+export function workbenchPaneRightOf(node: WorkbenchSplitNode, paneId: string): string | null {
+  if (node.kind === "group") return null;
+  const inFirst = workbenchNodeContainsPane(node.first, paneId);
+  if (!inFirst && !workbenchNodeContainsPane(node.second, paneId)) return null;
+  const nested = workbenchPaneRightOf(inFirst ? node.first : node.second, paneId);
+  if (nested || !inFirst || node.orientation !== "horizontal") return nested;
+  let leaf = node.second;
+  while (leaf.kind === "split") leaf = leaf.first;
+  return leaf.paneId;
+}
+
 function rebalanceWorkbenchSplitPath(
   node: WorkbenchSplitNode,
   paneId: string,

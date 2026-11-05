@@ -235,6 +235,77 @@ describe("chat transcript runtime", () => {
     }
   });
 
+  it("keeps one assistant group across internal user rows with nothing to show", async () => {
+    const toolMessage = (seq: number): ChatMessage => {
+      const toolCall: ToolCallInfo = {
+        id: `tool-${seq}`,
+        name: "read",
+        arguments: JSON.stringify({ filePath: `Assets/File${seq}.cs` }),
+        order: seq,
+        outcome: "done",
+        recordedOutput: "file content",
+      };
+      return {
+        id: `message-${seq}`,
+        role: "assistant",
+        content: "",
+        createdAt: seq,
+        toolCalls: [toolCall],
+        renderParts: [{ kind: "toolCall", id: toolCall.id, order: { runId: "notice-run", seq }, toolCall }],
+      };
+    };
+    const toolResult = (seq: number): ChatMessage => ({
+      id: `result-${seq}`, role: "tool", content: "file content", createdAt: seq, toolCallId: `tool-${seq}`,
+    });
+    const messages: ChatMessage[] = [
+      { id: "user", role: "user", content: "Inspect the project", createdAt: 0 },
+      toolMessage(1),
+      toolResult(1),
+      {
+        id: "async-result:task_1",
+        role: "user",
+        content: "",
+        createdAt: 1,
+        promptSuffix: "<system-reminder>\nAsync task t1 (bash) attempt 1 finished with status completed. Use the result below.\nElapsed: 1 ms\n\nResult:\nok\n</system-reminder>",
+      },
+      toolMessage(2),
+      toolResult(2),
+      { id: "continuation", role: "user", content: "", createdAt: 2, promptSuffix: "Continue from the existing conversation context." },
+      {
+        id: "final",
+        role: "assistant",
+        content: "Final result",
+        createdAt: 3,
+        contentOrder: 3,
+        renderParts: [{ kind: "text", id: "final-part", order: { runId: "notice-run", seq: 3 }, content: "Final result" }],
+      },
+    ];
+    const runtimeErrors: unknown[] = [];
+    const host = document.createElement("div");
+    const app = createApp(ChatTranscript, {
+      messages,
+      streamingText: "",
+      isStreaming: false,
+      isThinking: false,
+      activeToolCalls: [],
+      variant: "session",
+      sessionKey: "internal-user-row-grouping",
+    });
+    app.config.errorHandler = (error) => runtimeErrors.push(error);
+    app.use(createPinia());
+    app.mount(host);
+    await nextTick();
+
+    expect(runtimeErrors).toEqual([]);
+    expect(host.querySelectorAll(".chat-transcript-message.user")).toHaveLength(1);
+    expect(host.querySelectorAll(".chat-transcript-message.assistant")).toHaveLength(1);
+    const parts = Array.from(host.querySelectorAll<HTMLElement>('[data-render-part-scope="history"]'));
+    expect(parts.map((part) => part.dataset.renderPartKind)).toEqual(["toolCall", "text"]);
+    expect(parts[0]?.dataset.toolLayoutToolCallIds?.split(",")).toEqual(["tool-1", "tool-2"]);
+
+    app.unmount();
+  });
+
   it("preserves a completed tool-only response when there is no final text", async () => {
     vi.useFakeTimers();
     const transcript = mountToolHandoffTranscript();

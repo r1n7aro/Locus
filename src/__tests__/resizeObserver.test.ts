@@ -108,4 +108,48 @@ describe("createAnimationFrameResizeObserver", () => {
     expect(frames).toHaveLength(0);
     expect(callback).not.toHaveBeenCalled();
   });
+
+  it("runs the before-paint hook in the observer callback and still defers the main callback", () => {
+    const frames = new Map<number, FrameRequestCallback>();
+    const observers: FakeResizeObserver[] = [];
+
+    class FakeResizeObserver {
+      constructor(public readonly callback: ResizeObserverCallback) {
+        observers.push(this);
+      }
+
+      observe(_target: Element) {}
+      unobserve(_target: Element) {}
+      disconnect() {}
+      emit(entries: ResizeObserverEntry[]) {
+        this.callback(entries, this as unknown as ResizeObserver);
+      }
+    }
+
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    vi.stubGlobal("window", {
+      requestAnimationFrame: vi.fn((callback: FrameRequestCallback) => {
+        frames.set(1, callback);
+        return 1;
+      }),
+      cancelAnimationFrame: vi.fn((id: number) => {
+        frames.delete(id);
+      }),
+    });
+
+    const order: string[] = [];
+    const callback = vi.fn((_entries: ResizeObserverEntry[]) => { order.push("frame"); });
+    const beforePaint = vi.fn((_entries: ResizeObserverEntry[]) => { order.push("beforePaint"); });
+    createAnimationFrameResizeObserver(callback, { beforePaint });
+    const entry = { target: {} as Element } as ResizeObserverEntry;
+
+    observers[0].emit([entry]);
+
+    expect(beforePaint).toHaveBeenCalledTimes(1);
+    expect(beforePaint.mock.calls[0]?.[0]).toEqual([entry]);
+    expect(callback).not.toHaveBeenCalled();
+
+    Array.from(frames.values())[0]?.(16);
+    expect(order).toEqual(["beforePaint", "frame"]);
+  });
 });

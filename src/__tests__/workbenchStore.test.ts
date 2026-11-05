@@ -5,8 +5,10 @@ import {
   createWorkbenchEditorInput,
   shouldShowWorkbenchTabStrip,
   useWorkbenchStore,
+  workbenchPaneRightOf,
   workbenchResourceKey,
 } from "../stores/workbench";
+import type { WorkbenchSplitNode } from "../types/workbench";
 
 function sessionEditor(
   sessionId: string,
@@ -728,5 +730,29 @@ describe("workbench store", () => {
       section: "knowledge",
     });
     expect(restored.groups.main!.tabs[0]!.checkoutBinding).toEqual({ checkoutId: "checkout-a" });
+  });
+});
+
+describe("workbenchPaneRightOf", () => {
+  const leaf = (paneId: string): WorkbenchSplitNode => ({ kind: "group", paneId });
+  const split = (
+    orientation: "horizontal" | "vertical",
+    first: WorkbenchSplitNode,
+    second: WorkbenchSplitNode,
+  ): WorkbenchSplitNode => ({ kind: "split", splitId: `${orientation}-split`, orientation, ratio: 0.5, first, second });
+
+  it("finds the adjacent pane across the closest horizontal split", () => {
+    // | a | b over c | d |, with a and the b/c column on the left of d.
+    const layout = split("horizontal", split("horizontal", leaf("a"), split("vertical", leaf("b"), leaf("c"))), leaf("d"));
+    expect(workbenchPaneRightOf(layout, "a")).toBe("b");
+    expect(workbenchPaneRightOf(layout, "b")).toBe("d");
+    expect(workbenchPaneRightOf(layout, "c")).toBe("d");
+    expect(workbenchPaneRightOf(layout, "d")).toBeNull();
+  });
+
+  it("returns null for a single pane, a vertical stack, or an unknown pane", () => {
+    expect(workbenchPaneRightOf(leaf("main"), "main")).toBeNull();
+    expect(workbenchPaneRightOf(split("vertical", leaf("top"), leaf("bottom")), "top")).toBeNull();
+    expect(workbenchPaneRightOf(split("horizontal", leaf("a"), leaf("b")), "missing")).toBeNull();
   });
 });

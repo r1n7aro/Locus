@@ -88,12 +88,15 @@ describe("Claude Code status-only transcript", () => {
     expect(view.openThinking).not.toHaveBeenCalled();
   });
 
-  it.each(["tool-input", "tool-use"] as const)("leaves %s feedback to tool blocks and restores the next thinking status", async (phase) => {
+  it.each(["tool-input", "tool-use"] as const)("keeps the previous status through %s until the tool block renders, then restores the next thinking status", async (phase) => {
     const view = mount();
+    await nextTick();
+    expect(view.status()?.textContent).toBe(t("chat.transcript.claudeCode.requesting"));
     view.props.claudeCodePhase = phase;
     await nextTick();
-    expect(view.status()).toBeNull();
-    expect(view.host.querySelector('[data-render-part-kind="waiting"]')).toBeNull();
+    // The phase has no label of its own; the previous status stays until output renders.
+    expect(view.status()?.textContent).toBe(t("chat.transcript.claudeCode.requesting"));
+    expect(view.host.querySelectorAll('[data-render-part-kind="waiting"]')).toHaveLength(1);
     view.props.activeToolCalls = [{ id: "read", name: "read", arguments: "{}", status: "running", order: 1 }];
     await nextTick();
     expect(view.host.querySelector('[data-render-part-kind="toolCall"]')).not.toBeNull();
@@ -105,15 +108,16 @@ describe("Claude Code status-only transcript", () => {
     expect(view.host.querySelectorAll('[data-render-part-kind="waiting"]')).toHaveLength(1);
   });
 
-  it("hides response status without hiding text or falling back to waiting", async () => {
+  it("keeps the thinking status until response text renders, without falling back to waiting", async () => {
     const view = mount();
     view.props.claudeCodePhase = "thinking";
     await nextTick();
     expect(view.status()?.textContent).toBe(t("chat.transcript.claudeCode.thinking"));
     view.props.claudeCodePhase = "responding";
     await nextTick();
-    expect(view.status()).toBeNull();
-    expect(view.host.querySelector('[data-render-part-kind="waiting"]')).toBeNull();
+    // Thinking stays until the response text is visible.
+    expect(view.status()?.textContent).toBe(t("chat.transcript.claudeCode.thinking"));
+    expect(view.host.querySelectorAll('[data-render-part-kind="waiting"]')).toHaveLength(1);
     view.props.streamingText = "Answer";
     view.props.liveRenderParts = [{ kind: "text", id: "answer", order: { runId: "run", seq: 1 }, content: "Answer" }];
     await nextTick();

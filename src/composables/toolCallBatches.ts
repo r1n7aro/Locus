@@ -637,6 +637,31 @@ export function buildMessageToolCalls(
   );
 }
 
+// Transcript renders rebuild every history segment, so an unchanged tool call
+// would otherwise reach its ToolCallBlock as a new object on each re-render and
+// re-run everything derived from it (edit diffs, summaries). Display objects
+// are never mutated after construction, so the previous one is reused while it
+// is built from the same info object and every displayed field is unchanged.
+const messageToolCallDisplays = new WeakMap<ToolCallInfo, ToolCallDisplay>();
+
+function sameToolCallDisplayList(
+  previous: readonly ToolCallDisplay[] | undefined,
+  next: readonly ToolCallDisplay[] | undefined,
+) {
+  if (previous === next) return true;
+  if (!previous || !next || previous.length !== next.length) return false;
+  return previous.every((toolCall, index) => toolCall === next[index]);
+}
+
+function sameImageList(
+  previous: readonly ImageAttachment[] | undefined,
+  next: readonly ImageAttachment[] | undefined,
+) {
+  if (previous === next) return true;
+  if (!previous || !next || previous.length !== next.length) return false;
+  return previous.every((image, index) => image === next[index]);
+}
+
 export function buildMessageToolCall(
   toolCall: ToolCallInfo,
   toolOutputMap: Record<string, string>,
@@ -646,23 +671,42 @@ export function buildMessageToolCall(
     toolCall.recordedOutput
     ?? toolCall.serverToolOutput
     ?? toolOutputMap[toolCall.id];
-  const images = toolOutputImageMap[toolCall.id];
+  const attachedImages = toolOutputImageMap[toolCall.id];
+  const images = attachedImages && attachedImages.length > 0 ? attachedImages : undefined;
   const displayShape = resolveToolCallDisplayShape(toolCall);
+  const status = inferToolCallStatus(toolCall, output);
+  const nestedToolCalls = toolCall.nestedToolCalls?.map((nestedToolCall) =>
+    buildMessageToolCall(nestedToolCall, toolOutputMap, toolOutputImageMap),
+  );
+
+  const previous = messageToolCallDisplays.get(toolCall);
+  if (
+    previous
+    && previous.id === toolCall.id
+    && previous.name === displayShape.name
+    && previous.arguments === displayShape.arguments
+    && previous.order === toolCall.order
+    && previous.status === status
+    && previous.output === output
+    && sameImageList(previous.images, images)
+    && sameToolCallDisplayList(previous.nestedToolCalls, nestedToolCalls)
+  ) {
+    return previous;
+  }
 
   const display: ToolCallDisplay = {
     id: toolCall.id,
     name: displayShape.name,
     arguments: displayShape.arguments,
     order: toolCall.order,
-    status: inferToolCallStatus(toolCall, output),
+    status,
     output,
-    nestedToolCalls: toolCall.nestedToolCalls?.map((nestedToolCall) =>
-      buildMessageToolCall(nestedToolCall, toolOutputMap, toolOutputImageMap),
-    ),
+    nestedToolCalls,
   };
-  if (images && images.length > 0) {
+  if (images) {
     display.images = images;
   }
+  messageToolCallDisplays.set(toolCall, display);
   return display;
 }
 

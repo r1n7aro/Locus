@@ -1210,7 +1210,9 @@ describe("chat session panel state", () => {
     chatStore.handleStreamEvent({ type: "textDelta", sessionId: "s1", runId: "retry-run", text: "partial", partId: "old-text", renderSeq: 1 });
     chatStore.handleStreamEvent({ type: "toolCallStart", sessionId: "s1", runId: "retry-run", toolCallId: "write", toolName: "edit", arguments: "{}", partId: "write", renderSeq: 2 });
     chatStore.handleStreamEvent({ type: "claudeCodePhase", sessionId: "s1", runId: "retry-run", phase: "recovering" });
-    chatStore.handleStreamEvent({ type: "historySynchronized", sessionId: "s1", runId: "retry-run", messages: [{ id: "native", role: "assistant", content: "saved partial", createdAt: 1 }] });
+    chatStore.handleStreamEvent({ type: "historySynchronized", sessionId: "s1", runId: "retry-run", messages: [{ id: "native", role: "assistant", content: "saved partial", createdAt: 1 }], oldestMessageRowId: 7, hasMoreHistory: true });
+    expect(chatStore.messages.map((message) => message.id)).toEqual(["native"]);
+    expect(chatStore.sessionHistoryHasMore).toBe(true);
     expect(chatStore.isStreaming).toBe(true);
     expect(chatStore.currentRunId).toBe("retry-run");
     expect(chatStore.claudeCodePhase).toBe("recovering");

@@ -9,6 +9,9 @@ import type { WorkbenchEditorInput } from "../types/workbench";
 import { useWorkspaceNavigationMode } from "../composables/useWorkspaceNavigationMode";
 import { useNewSessionSettings } from "../composables/useNewSessionSettings";
 import { useSurfaceContentReadiness } from "../composables/surfaceContentReadiness";
+import { clampEffortToLevels } from "../stores/newSessionSelection";
+import { createDocumentSelectionHub, DOCUMENT_SELECTION_HUB_KEY } from "../composables/documentSelection";
+import type { EffortLevel } from "../types";
 
 const compact = vi.fn();
 const resumeInterrupted = vi.fn();
@@ -166,14 +169,23 @@ const modelStoreState = reactive({
   modelDefaults: { mainModel: "" },
   agentModelPreferences: {} as Record<string, { modelId: string; effort: string }>,
   lastModelId: "",
+  hasUserDefaultEffort: true,
+  defaultEffort: "high" as EffortLevel,
 });
+// Claude models accept "none" (thinking off) as a regular level.
+const effortLevelsFor = (modelId: string): EffortLevel[] => (
+  modelId.startsWith("claude_code/")
+    ? ["none", "low", "high"]
+    : modelId.startsWith("model-") ? ["low", "high"] : []
+);
 vi.mock("../stores/model", () => ({
   useModelStore: () => ({
     get modelDefaults() { return modelStoreState.modelDefaults; },
     get agentModelPreferences() { return modelStoreState.agentModelPreferences; },
     get lastModelId() { return modelStoreState.lastModelId; },
     defaultCodexFastMode: true,
-    effortsForModel: (modelId: string) => (modelId.startsWith("model-") ? ["low", "high"] : []),
+    effortsForModel: (modelId: string) => effortLevelsFor(modelId),
+    clampEffortForModel: (modelId: string, level: EffortLevel) => clampEffortToLevels(effortLevelsFor(modelId), level),
     noteRememberedSelection: (_agentId: string, modelId: string) => { modelStoreState.lastModelId = modelId; },
     selectedModelId: "model-a",
     effort: "high",
@@ -188,11 +200,16 @@ vi.mock("../stores/model", () => ({
       name: "Child Model",
       provider: "openai_codex",
       supportedEfforts: ["low", "high"],
+    }, {
+      id: "claude_code/claude-cli",
+      name: "Claude CLI",
+      provider: "claude_code",
+      supportedEfforts: ["none", "low", "high"],
     }],
     availableEfforts: ["low", "high"],
     codexTransport: "websocket",
-    hasUserDefaultEffort: true,
-    defaultEffort: "high",
+    get hasUserDefaultEffort() { return modelStoreState.hasUserDefaultEffort; },
+    get defaultEffort() { return modelStoreState.defaultEffort; },
   }),
 }));
 vi.mock("../stores/notification", () => ({
@@ -233,6 +250,7 @@ vi.mock("../components/ChatView.vue", () => ({
       loadSessionTurnPreview: Function,
       loadSessionHistoryThroughMessage: Function,
       forkFromMessage: Function,
+      liveSelectionQuote: Object,
       presented: { type: Boolean, default: undefined },
     },
     emits: [
@@ -362,6 +380,8 @@ beforeEach(() => {
   modelStoreState.modelDefaults = { mainModel: "" };
   modelStoreState.agentModelPreferences = {};
   modelStoreState.lastModelId = "";
+  modelStoreState.hasUserDefaultEffort = true;
+  modelStoreState.defaultEffort = "high";
   selectionMemoryService.getWorkspaceSelection.mockResolvedValue({
     projectId: "project-a",
     memory: { agentId: "", modelId: "", effort: "", agents: {}, updatedAtMs: 0 },
@@ -606,6 +626,135 @@ describe("WorkbenchSessionEditor scoped host", () => {
       app.unmount();
       host.remove();
       Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+    }
+  });
+
+  it("does not pin a new session's selection resolved before startup state loads", async () => {
+    // The main window mounts restored tabs once auth is checked, before the
+    // workspace Agent catalog, workspace memory and saved default effort load.
+    modelStoreState.hasUserDefaultEffort = false;
+    modelStoreState.lastModelId = "claude_code/claude-cli";
+    agentStore.workspaceCheckoutId = "previous-workspace";
+    agentStore.agents = [{ id: "agent-a", name: "Agent A", isDefault: true }] as never;
+    let resolveSnapshot!: (value: unknown) => void;
+    selectionMemoryService.getWorkspaceSelection.mockReturnValue(new Promise((resolve) => { resolveSnapshot = resolve; }));
+    controller.sessionId.value = null;
+    controller.sessionAgentId.value = null;
+    controller.sessionModelId.value = null;
+    controller.sessionEffort.value = null as never;
+    controller.sessionFastMode.value = null as never;
+    // Match the real embedded controller's reactive execution-selection echo.
+    controller.setExecutionSelection.mockImplementation((selection: Record<string, unknown>) => {
+      controller.sessionAgentId.value = (selection.agentId as string) || null;
+      controller.sessionModelId.value = (selection.modelId as string) || null;
+      controller.sessionEffort.value = (selection.effort as never) ?? null;
+      controller.sessionFastMode.value = (selection.fastMode as never) ?? null;
+    });
+    const { app, host } = mountEditor({
+      editor: { ...editor, resource: { kind: "newSession", projectId: "project-a" } },
+    });
+    try {
+      await flushUi();
+      expect(chatViewProps?.effort).toBe("none");
+      agentStore.workspaceCheckoutId = workspaceRef.checkoutId;
+      modelStoreState.hasUserDefaultEffort = true;
+      resolveSnapshot({
+        projectId: "project-a",
+        memory: {
+          agentId: "agent-a",
+          modelId: "claude_code/claude-cli",
+          effort: "low",
+          agents: { "agent-a": { modelId: "claude_code/claude-cli", effort: "low" } },
+          updatedAtMs: 1,
+        },
+        lastAgentId: "agent-a",
+        workspaceDefaultAgentId: null,
+      });
+      await flushUi();
+      await flushUi();
+      expect(chatViewProps).toMatchObject({
+        selectedAgentId: "agent-a",
+        selectedModelId: "claude_code/claude-cli",
+        effort: "low",
+      });
+      expect(controller.setExecutionSelection).toHaveBeenLastCalledWith(
+        expect.objectContaining({ agentId: "agent-a", modelId: "claude_code/claude-cli", effort: "low" }),
+      );
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("keeps a launched session's effort when the workspace default changes", async () => {
+    modelStoreState.lastModelId = "claude_code/claude-cli";
+    controller.sessionId.value = null;
+    controller.sessionAgentId.value = null;
+    controller.sessionModelId.value = null;
+    controller.sessionEffort.value = null as never;
+    controller.setExecutionSelection.mockImplementation((selection: Record<string, unknown>) => {
+      controller.sessionAgentId.value = (selection.agentId as string) || null;
+      controller.sessionModelId.value = (selection.modelId as string) || null;
+      controller.sessionEffort.value = (selection.effort as never) ?? null;
+    });
+    const { app, host } = mountEditor({
+      editor: { ...editor, resource: { kind: "newSession", projectId: "project-a" } },
+    });
+    try {
+      await flushUi();
+      expect(chatViewProps?.effort).toBe("high");
+      // Launching binds the session id; its execution state is the tab's selection.
+      controller.sessionId.value = "session-launched";
+      await flushUi();
+      modelStoreState.defaultEffort = "low";
+      await flushUi();
+      expect(chatViewProps?.effort).toBe("high");
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
+
+  it("offers the live document selection to existing and new conversations", async () => {
+    const resources = [
+      editor.resource,
+      { kind: "newSession" as const, projectId: "project-a" },
+    ];
+    for (const resource of resources) {
+      const hub = createDocumentSelectionHub();
+      const host = document.createElement("div");
+      document.body.appendChild(host);
+      const app = createApp({
+        render: () => h(WorkbenchSessionEditor, { editor: { ...editor, resource }, workspaceRef } as never),
+      });
+      app.provide(DOCUMENT_SELECTION_HUB_KEY, hub);
+      app.mount(host);
+      try {
+        await flushUi();
+        expect(chatViewProps?.liveSelectionQuote).toBeNull();
+        hub.report({
+          id: "file:1:1",
+          ownerId: "file:1",
+          checkoutId: workspaceRef.checkoutId,
+          filePath: "F:/project/notes.md",
+          name: "notes.md",
+          location: "notes.md:3-4",
+          content: "F:/project/notes.md:3-4\n```markdown\nselected\n```",
+        });
+        await flushUi();
+        expect(chatViewProps?.liveSelectionQuote).toMatchObject({
+          id: "file:1:1",
+          path: "F:/project/notes.md",
+          source: "file",
+          location: "notes.md:3-4",
+        });
+        hub.clear("file:1");
+        await flushUi();
+        expect(chatViewProps?.liveSelectionQuote).toBeNull();
+      } finally {
+        app.unmount();
+        host.remove();
+      }
     }
   });
 

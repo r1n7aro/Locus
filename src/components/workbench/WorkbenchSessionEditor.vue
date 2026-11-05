@@ -37,6 +37,8 @@ import ChatSidebarPanel from "../ChatSidebarPanel.vue";
 import ThinkingPanel from "../ThinkingPanel.vue";
 import SessionComposerPicker from "../chat/SessionComposerPicker.vue";
 
+// A literal `[]` would be a new array per render and update ChatView every time.
+const NO_SESSIONS: SessionSummary[] = [];
 const props = defineProps<{
   editor: WorkbenchEditorInput;
   workspaceRef: WorkspaceRef | null;
@@ -46,6 +48,8 @@ const props = defineProps<{
   active?: boolean;
   /** Whether the editor stack shows this surface (false while it is prepared behind another). */
   presented?: boolean;
+  /** Mounted but not shown (`display: none`); explicit, so absent means shown. */
+  surfaceHidden?: boolean;
   referenceDropAvailable?: boolean;
   referenceDropActive?: boolean;
   shortcutActive?: boolean;
@@ -63,6 +67,8 @@ const emit = defineEmits<{
   }): void;
   (event: "composer-draft-change", payload: { editorId: string; hasDraft: boolean }): void;
   (event: "composer-focus", payload: { editorId: string }): void;
+  /** Whether the session is busy and must stay mounted while its tab is hidden. */
+  (event: "keep-mounted-change", keepMounted: boolean): void;
   (event: "session-forked", payload: {
     editorId: string;
     sourceSessionId: string;
@@ -98,10 +104,10 @@ const { state: knowledgeAccessState } = useKnowledgeAccessMode();
 const selectionMemory = useSelectionMemoryStore();
 const chatViewRef = ref<InstanceType<typeof ChatView> | null>(null);
 const documentSelectionHub = inject(DOCUMENT_SELECTION_HUB_KEY, null);
-// Only a conversation that has not started follows the window's document selection.
+// New and existing conversations both follow the window's document selection.
 const liveSelectionQuote = computed(() => {
   const selection = documentSelectionHub?.current.value;
-  if (!selection || props.editor.resource.kind !== "newSession") return null;
+  if (!selection) return null;
   return liveSelectionQuoteForCheckout(selection, props.workspaceRef?.checkoutId);
 });
 
@@ -345,6 +351,16 @@ watch(
   { immediate: true },
 );
 
+// The workbench unmounts hidden session tabs beyond its per-group limit. A
+// running or waiting session stays mounted so its in-flight UI is not rebuilt.
+watch(
+  () => isStreaming.value || isCancelling.value || isCompacting.value || compactQueued.value
+    || !!pendingQuestion.value || (pendingToolConfirms.value?.length ?? 0) > 0
+    || !!queuedFollowUp.value,
+  (keepMounted) => emit("keep-mounted-change", keepMounted),
+  { immediate: true },
+);
+
 const streamingSessionIds = computed(() => (
   sessionId.value && isStreaming.value ? new Set([sessionId.value]) : new Set<string>()
 ));
@@ -400,15 +416,29 @@ watch([errorMessage, errorNotificationHandled], ([message, notified]) => {
   if (message && !notified) notificationStore.addNotice("error", message);
 });
 
+// What this tab last wrote into the embedded session state. Until a session
+// exists those values only echo back here; adopting them as explicit would pin
+// a selection resolved while the Agent catalog, workspace memory or saved
+// default effort were still loading (Claude even accepts the "none" fallback).
+let pushedSelection: {
+  agentId: string;
+  modelId: string;
+  effort: EffortLevel;
+  fastMode: boolean;
+} | null = null;
+
 watch(
-  [sessionAgentId, sessionModelId, sessionEffort, sessionFastMode, sessionMultiAgentEnabled] as const,
-  ([agentId, modelId, effort, fastMode, multiAgentEnabled]) => {
-    if (agentId && agentStore.agents.some((agent) => agent.id === agentId)) editorAgentId.value = agentId;
-    if (modelId) {
-      if (modelId.startsWith("claude_code/") || modelStore.availableModels.some((model) => model.id === modelId)) editorModelId.value = modelId;
+  [sessionId, sessionAgentId, sessionModelId, sessionEffort, sessionFastMode, sessionMultiAgentEnabled] as const,
+  ([targetSessionId, agentId, modelId, effort, fastMode, multiAgentEnabled]) => {
+    const echo = targetSessionId ? null : pushedSelection;
+    if (agentId && agentId !== echo?.agentId && agentStore.agents.some((agent) => agent.id === agentId)) {
+      editorAgentId.value = agentId;
     }
-    if (effort && editorEfforts.value.includes(effort)) editorEffort.value = effort;
-    if (fastMode != null) editorFastMode.value = editorFastModeAvailable.value && fastMode;
+    if (modelId && modelId !== echo?.modelId) {
+      if (modelId.startsWith("claude_code/") || modelId.startsWith("locus-server/") || modelStore.availableModels.some((model) => model.id === modelId)) editorModelId.value = modelId;
+    }
+    if (effort && effort !== echo?.effort && editorEfforts.value.includes(effort)) editorEffort.value = effort;
+    if (fastMode != null && fastMode !== echo?.fastMode) editorFastMode.value = editorFastModeAvailable.value && fastMode;
     editorMultiAgentEnabled.value = multiAgentEnabled;
   },
   { immediate: true },
@@ -459,6 +489,7 @@ function persistExecutionSelection(): void {
 watch(
   [selectedAgentId, editorModelId, editorEffort, editorFastMode, editorMultiAgentEnabled] as const,
   ([agentId, modelId, effort, fastMode, multiAgentEnabled]) => {
+    pushedSelection = { agentId, modelId, effort, fastMode };
     setExecutionSelection({ agentId, modelId, effort, fastMode, multiAgentEnabled });
   },
   { immediate: true },
@@ -468,7 +499,7 @@ function handleSend(
   text: string,
   images: ImageAttachment[],
   assetRefs: AssetRefAttachment[],
-  overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null },
+  overrides?: { displayText?: string; mode?: string; userIntent?: UserIntentMeta | null; blenderTarget?: string | null },
 ): void {
   const payload: ChatComposerSendPayload = {
     text,
@@ -477,6 +508,7 @@ function handleSend(
     assetRefs,
     mode: overrides?.mode ?? null,
     userIntent: overrides?.userIntent ?? null,
+    blenderTarget: overrides?.blenderTarget ?? null,
   };
   sendComposerPayload(payload);
 }
@@ -565,9 +597,8 @@ function handleSelectAgent(agentId: string): void {
 function handleSelectModel(modelId: string): void {
   if (!modelStore.availableModels.some((model) => model.id === modelId)) return;
   editorModelId.value = modelId;
-  if (editorEfforts.value.length > 0 && !editorEfforts.value.includes(editorEffort.value)) {
-    editorEffort.value = editorEfforts.value[0]!;
-  }
+  const fittedEffort = selectionMemory.clampEffort(modelId, editorEffort.value);
+  if (fittedEffort !== editorEffort.value) editorEffort.value = fittedEffort;
   if (!editorFastModeAvailable.value) editorFastMode.value = false;
   persistExecutionSelection();
   rememberEditorSelection();
@@ -719,10 +750,11 @@ defineExpose({
     :pending-tool-confirms="pendingToolConfirms"
     :queued-follow-up="queuedFollowUp"
     :composer-value="inputText"
-    :sessions="[]"
+    :sessions="NO_SESSIONS"
     :active-session-id="sessionId"
     :active="active"
     :presented="presented"
+    :surface-hidden="surfaceHidden"
     :current-run-id="currentRunId"
     :is-viewing-subagent="!!parentSessionId"
     :pending-session-id="null"

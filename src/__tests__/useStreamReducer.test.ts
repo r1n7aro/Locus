@@ -65,6 +65,25 @@ describe("reduceStreamEvent", () => {
       { type: "replaceMessages", messages },
     ]);
   });
+  it("replaces history with the newest page and its paging cursor", () => {
+    const messages = [{ id: "tail", role: "assistant" as const, content: "latest", createdAt: 1 }];
+    const synced = reduceStreamEvent(makeState(), {
+      type: "historySynchronized", sessionId: "s1", runId: "current", messages, oldestMessageRowId: 41, hasMoreHistory: true,
+    });
+    expect(synced).toContainEqual({ type: "replaceMessages", messages, history: { oldestMessageRowId: 41, hasMoreHistory: true } });
+    const compacted = reduceStreamEvent(makeState(), {
+      type: "compactDone", sessionId: "s1", runId: "current", messagesBefore: 2, messagesAfter: 1, messages: [], hasMoreHistory: false,
+    });
+    expect(compacted).toContainEqual({ type: "replaceMessages", messages: [], history: { oldestMessageRowId: null, hasMoreHistory: false } });
+  });
+  it("keeps visible messages for persisted history events without a page", () => {
+    const synced = reduceStreamEvent(makeState(), { type: "historySynchronized", sessionId: "s1", runId: "current" });
+    expect(synced.some((mutation) => mutation.type === "replaceMessages")).toBe(false);
+    const compacted = reduceStreamEvent(makeState(), {
+      type: "compactDone", sessionId: "s1", runId: "current", messagesBefore: 2, messagesAfter: 1,
+    });
+    expect(compacted).toEqual([{ type: "setCompacting", value: false }]);
+  });
   describe("buildToolResultMessages", () => {
     it("materializes completed tool outputs as hidden tool result messages", () => {
       expect(buildToolResultMessages([
@@ -522,6 +541,25 @@ describe("reduceStreamEvent", () => {
   });
 
   describe("toolCallDone", () => {
+    it("retires an abandoned Claude input preview without failing the continuing turn", () => {
+      const state = makeState({ isStreaming: true, activeToolCalls: [
+        { id: "preview", name: "grep", arguments: "", status: "running" },
+        { id: "committed", name: "bash", arguments: "{}", status: "running" },
+      ] });
+      const output = "Claude abandoned incomplete tool input before execution.";
+      const mutations = reduceStreamEvent(state, {
+        runId: "test-run", type: "toolCallDone", sessionId: "s1",
+        toolCallId: "preview", toolName: "grep", output, outcome: "interrupted",
+      });
+      expect(mutations).toEqual([
+        { type: "updateLiveToolPart", toolCallId: "preview", updates: { outcome: "interrupted", recordedOutput: output } },
+        { type: "updateToolCall", id: "preview", updates: { status: "interrupted", output, progress: null } },
+      ]);
+      expect(reduceStreamEvent(state, {
+        runId: "test-run", type: "claudeCodePhase", sessionId: "s1", phase: "requesting",
+      })).toEqual([{ type: "setClaudeCodePhase", phase: "requesting" }]);
+    });
+
     it("marks tool call as done", () => {
       const state = makeState({ isStreaming: true, activeToolCalls: [{ id: "tc1", name: "read", arguments: "{}", status: "running" }] });
       const event: StreamEvent = { runId: "test-run",

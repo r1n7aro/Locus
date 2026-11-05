@@ -10,6 +10,7 @@ import { workspaceFileChangeMatches } from "../../composables/useFileChangeReval
 import { subscribeWorkspaceFileChanges } from "../../services/workspaceExplorer";
 import type { RuntimeUnsubscribe } from "../../services/locusRuntime";
 import { highlightDiffHunk } from "./fileDiffText";
+import { canRenderDiffTextImmediately, markDiffTextRendered } from "./fileDiffTextReady";
 import type {
   FileDiffPayload,
   DiffHunk,
@@ -193,12 +194,25 @@ function onTextScroll(e: Event) {
   updateActiveChangeFromScroll();
 }
 
+let textReadyGeneration = 0;
+
 function scheduleTextReady() {
-  textReady.value = false;
+  const generation = ++textReadyGeneration;
   renderLimit.value = CHUNK_SIZE;
+  const text = effectiveText.value;
+  // Small or already-rendered diffs render now: gating them only collapses
+  // the viewer to the loading placeholder for a frame.
+  if (canRenderDiffTextImmediately(text, totalLineCount.value)) {
+    textReady.value = true;
+    markDiffTextRendered(text);
+    return;
+  }
+  textReady.value = false;
   nextTick(() => {
     requestAnimationFrame(() => {
+      if (generation !== textReadyGeneration) return;
       textReady.value = true;
+      markDiffTextRendered(effectiveText.value);
     });
   });
 }
@@ -276,11 +290,13 @@ const hierarchyColumnStyle = computed(() =>
   props.compact ? undefined : { width: `${hierarchyWidth.value}px` },
 );
 
+// Sources are compared individually: a parent re-render that passes an equal
+// workspace reference must not reset the viewer and re-gate its text.
 watch(
-  () => [
-    props.payload,
-    props.workspaceRef?.checkoutId ?? null,
-    props.workspaceRef?.expectedGeneration ?? null,
+  [
+    () => props.payload,
+    () => props.workspaceRef?.checkoutId ?? null,
+    () => props.workspaceRef?.expectedGeneration ?? null,
   ] as const,
   ([payload]) => {
     sourceChanged.value = false;

@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, useSlots, watch } from "vue";
+import { computed, nextTick, onUnmounted, provide, ref, shallowRef, useSlots, watch } from "vue";
+import { AGENT_ROUTES_SESSION_KEY } from "../../services/claudeAgentRoutes";
 import { FileText } from "lucide";
 import type { ClaudeCodePhase, AssetRefAttachment, AssistantRenderPart, ChatMessage, ImageAttachment, ToolCallDisplay, ToolCallInfo, UserIntentMeta } from "../../types";
-import { t } from "../../i18n";
+import { locale, t } from "../../i18n";
 import {
   collectPendingContinuationToolSegmentItemIds,
   shouldShowAssistantContinuation,
@@ -43,6 +44,7 @@ import { useDisplaySettings } from "../../composables/useDisplaySettings";
 import { parseChatAssetRefs, type ChatAssetRefSegment } from "../../composables/chatAssetRefs";
 import { parseSessionReferences, type SessionReferenceSegment } from "../../composables/sessionReferences";
 import SessionReference from "./SessionReference.vue";
+import { deliveredNotice, deliveredNoticeLabel } from "./deliveredNotice";
 import {
   displayUserMessageContent,
   userMessageConsoleEntries,
@@ -65,6 +67,11 @@ import ToolCallCollection from "../ToolCallCollection.vue";
 import ToolCallBlock from "../ToolCallBlock.vue";
 import KnowledgeProposalCard from "./KnowledgeProposalCard.vue";
 import ChatWaitingIndicator from "./ChatWaitingIndicator.vue";
+import {
+  resolveTransientStatus,
+  transientShrinkHoldHeight,
+  type TransientStatusMemory,
+} from "./transientStatusHold";
 import AssetChip from "../AssetChip.vue";
 import LucideIcon from "../icons/LucideIcon.vue";
 import type { WorkspaceRef } from "../../services/project";
@@ -155,6 +162,8 @@ const props = withDefaults(defineProps<{
   showUserImages?: boolean;
   userContentMode?: UserContentMode;
   sessionKey?: string | null;
+  /** The conversation shown, for tool cards that read its state. */
+  sessionId?: string | null;
   selectedMessageId?: string | null;
   workspaceRef?: WorkspaceRef | null;
 }>(), {
@@ -189,6 +198,8 @@ const props = withDefaults(defineProps<{
   sessionKey: null,
   selectedMessageId: null,
 });
+// Agent cards show where their subagent type runs in this conversation.
+provide(AGENT_ROUTES_SESSION_KEY, computed(() => props.sessionId ?? null));
 
 const emit = defineEmits<{
   (e: "applyKnowledgeProposal", proposalId: string): void;
@@ -625,6 +636,9 @@ watch(
     clearToolCallHandoff("session-key-changed");
     clearRetainedCollapsedToolCalls("session-key-changed");
     clearRememberedToolExpansion();
+    transientStatusMemory = null;
+    transientStatusEpoch.value += 1;
+    releaseTransientShrinkHold();
   },
   { flush: "sync" },
 );
@@ -1173,11 +1187,17 @@ function buildGroupedMessages(hiddenToolCallMatchState: ToolCallMatchState): Mes
       attachedKnowledgeProposals: [],
       hidden: false,
     };
+    // Internal user rows with nothing to show (delivered async results,
+    // recovery continuations) must not split the surrounding assistant group:
+    // dropping their emptied group later would leave adjacent assistant groups,
+    // each rendering its own role header.
+    if (msg.role === "user" && !shouldRenderItem(renderItem)) continue;
     order += 1;
     flatItems.push(renderItem);
     const last = groups[groups.length - 1];
-    const isHandoff = isCompactHandoffMessage(msg);
-    const lastIsHandoff = !!last?.items.some((item) => isCompactHandoffMessage(item.message));
+    // Handoff markers and delivered-result notices stand alone.
+    const isHandoff = isCompactHandoffMessage(msg) || !!deliveredNotice(msg);
+    const lastIsHandoff = !!last?.items.some((item) => isCompactHandoffMessage(item.message) || !!deliveredNotice(item.message));
     if (last && last.role === msg.role && !isHandoff && !lastIsHandoff) {
       last.items.push(renderItem);
       last.sourceMessageIds.push(msg.id);
@@ -1389,6 +1409,9 @@ function stabilizeGroupedMessages(
   return result;
 }
 
+// Declared before the computeds that read it; see historyRenderSegmentsForGroup.
+const historyRenderSegmentCache = new WeakMap<MessageGroup, { hideThinking: boolean; segments: HistoryRenderSegment[] }>();
+
 const baseGroupedMessagesStabilization: { current: GroupStabilizationCache | null } = { current: null };
 const historyGroupedMessagesStabilization: { current: GroupStabilizationCache | null } = { current: null };
 
@@ -1426,9 +1449,10 @@ const promotableHistoryToolCalls = computed<PromotedHistoryToolCallsState>(() =>
   const collectedItemIds = new Set<string>();
   const collectedBatches: ToolCallDisplay[][] = [];
   // Promotion starts from the base grouping and participates in computing the
-  // final grouping. Reading the final-group cache here closes a computed cycle:
-  // promotion -> cached segments -> groupedMessages -> promotion.
-  const segments = buildHistoryRenderSegmentsForGroup(lastGroup);
+  // final grouping, so it must not read a computed over the final grouping
+  // (promotion -> segments -> groupedMessages -> promotion). The per-group
+  // segment cache is not reactive and closes no cycle.
+  const segments = historyRenderSegmentsForGroup(lastGroup);
 
   for (let index = segments.length - 1; index >= 0; index -= 1) {
     const segment = segments[index];
@@ -1535,13 +1559,12 @@ const groupedMessages = computed<MessageGroup[]>(() => {
   // Outside an active promoted-tool window the hidden state IS the active
   // match state, so the base grouping already answers this — skip the second
   // full O(messages) rebuild.
-  if (hiddenMatchState === activeToolCallMatchState.value) {
-    return baseGroupedMessages.value;
-  }
-  return stabilizeGroupedMessages(
-    buildGroupedMessages(hiddenMatchState),
-    historyGroupedMessagesStabilization,
-  );
+  const groups = hiddenMatchState === activeToolCallMatchState.value
+    ? baseGroupedMessages.value
+    : buildGroupedMessages(hiddenMatchState);
+  // One identity cache for both paths: live tool calls switch between them,
+  // and each switch must not hand every unchanged group over as a new object.
+  return stabilizeGroupedMessages(groups, historyGroupedMessagesStabilization);
 });
 
 const shouldRenderPromotedHistoryToolCallsInTransient = computed(() =>
@@ -1589,6 +1612,13 @@ const historyStaticRenderMemoKey = computed(() => [
   displaySettings.rightAlignUserMessages ? "align-user" : "left-user",
   displaySettings.compactToolCalls ? "compact-tools" : "open-tools",
   shouldHideThinkingBlocks() ? "hide-thinking" : "show-thinking",
+  // Unity preview state scopes, workspace-bound chips/tool blocks, and the
+  // template's direct t() calls.
+  props.sessionKey ?? "",
+  props.workspaceRef?.checkoutId ?? "",
+  String(props.workspaceRef?.expectedGeneration ?? ""),
+  String(props.workspaceRef?.expectedMaterializationEpoch ?? ""),
+  locale.value,
 ].join("\u241e"));
 
 function historySelectionMemoKey(group: MessageGroup) {
@@ -1597,14 +1627,45 @@ function historySelectionMemoKey(group: MessageGroup) {
   return group.sourceMessageIds.includes(selectedMessageId) ? selectedMessageId : "";
 }
 
+// Per-item state the assistant group template reads outside the group object.
+function historyGroupItemStateMemoKey(group: MessageGroup) {
+  if (group.role !== "assistant") return "";
+  let stableMarkdown = "";
+  let keepExpanded = "";
+  for (const item of group.items) {
+    stableMarkdown += shouldUseStableHistoryMarkdown(item.id) ? "1" : "0";
+    if (shouldKeepToolItemExpanded(item.id)) keepExpanded += `${item.id},`;
+  }
+  return [
+    stableMarkdown,
+    keepExpanded,
+    keepExpanded ? retainedCollapsedToolCallMemoKey.value : "",
+  ].join("\u241f");
+}
+
+/**
+ * v-memo key of one history group, beside the group object itself. Groups keep
+ * identity while their messages and tool outputs are unchanged, so the key
+ * lists every other value the group template reads; a missing entry renders
+ * stale history. Index-dependent output is keyed through what it decides.
+ * Vue matches a v-for memo by list position, so prepending older history
+ * still re-renders the shifted groups once.
+ */
 function historyGroupMemoKey(group: MessageGroup, index: number) {
-  const lastGroupIndex = groupedMessages.value.length - 1;
+  const isLastGroup = index === groupedMessages.value.length - 1;
   return [
     historyStaticRenderMemoKey.value,
     historySelectionMemoKey(group),
-    index === lastGroupIndex ? historyLiveLayoutMemoKey.value : "",
+    shouldShowSessionRoundDivider(group, index) ? "divider" : "",
+    isLastGroup
+      ? `${historyLiveLayoutMemoKey.value}\u241f${isRenderedStreamingContinuation.value ? "rendered-continuation" : ""}`
+      : "",
+    historyGroupItemStateMemoKey(group),
   ].join("\u241e");
 }
+// vue-tsc renders a <template v-for> as a plain fragment and skips its v-memo,
+// so the template's only use of the key is invisible to the unused check.
+void historyGroupMemoKey;
 
 const transientToolCalls = computed(() => {
   if (!shouldRenderPromotedHistoryToolCallsInTransient.value) {
@@ -1772,6 +1833,10 @@ const isToolWaitingStatusVisible = computed(() => isToolWaitingForResponse.value
 const isStandaloneWaitingPlaceholder = computed(() => isWaitingForResponse.value && !hasTransientToolCalls.value);
 const effectiveWaitingLabel = computed(() => props.isCompacting ? props.compactingLabel : props.waitingLabel);
 const hasStandaloneCompactingPlaceholder = computed(() => props.isCompacting && !isWaitingForResponse.value && !claudeCodeActivityLabel.value);
+// The transient render state is defined below; the holder is assigned once it
+// exists so earlier readers track it without a temporal-dead-zone access.
+const transientStatusHeldSource = shallowRef<{ readonly value: { statusHeld: boolean } } | null>(null);
+const isTransientStatusHeld = computed(() => transientStatusHeldSource.value?.value.statusHeld ?? false);
 const hasTransientAssistantMessage = computed(
   () =>
     hasStreamingContent.value
@@ -1779,7 +1844,9 @@ const hasTransientAssistantMessage = computed(
     || hasVisibleTransientThinkingBlock.value
     || isWaitingForResponse.value
     || hasStandaloneCompactingPlaceholder.value
-    || !!claudeCodeActivityLabel.value,
+    || !!claudeCodeActivityLabel.value
+    // A retained status row keeps the live message until output replaces it.
+    || isTransientStatusHeld.value,
 );
 
 if (transcriptTraceWatchEnabled("waitingLayoutStateChanged")) {
@@ -1829,7 +1896,7 @@ const pendingContinuationToolItemIds = computed(() => {
 
   const segments =
     lastGroup?.role === "assistant"
-      ? buildHistoryRenderSegmentsForGroup(lastGroup).map((segment): PendingContinuationRenderSegment => ({
+      ? historyRenderSegmentsForGroup(lastGroup).map((segment): PendingContinuationRenderSegment => ({
           type: segment.type === "toolCalls" || segment.type === "content" ? segment.type : "other",
           itemIds: segment.type === "toolCalls" ? segment.itemIds : undefined,
         }))
@@ -1848,7 +1915,7 @@ function pendingContinuationSegmentSnapshot() {
   const lastGroup = groups[groups.length - 1];
   const segments =
     lastGroup?.role === "assistant"
-      ? buildHistoryRenderSegmentsForGroup(lastGroup).map((segment, index) => ({
+      ? historyRenderSegmentsForGroup(lastGroup).map((segment, index) => ({
           index,
           type: segment.type === "toolCalls" || segment.type === "content" ? segment.type : "other",
           itemIds: segment.type === "toolCalls" ? segment.itemIds : [],
@@ -1889,8 +1956,16 @@ if (transcriptTraceWatchEnabled("pendingContinuationToolItemIdsChanged")) {
   );
 }
 
-const nonCollapsibleToolItemIds = computed(() => {
-  return new Set(pendingContinuationToolItemIds.value);
+// Read inside every tool collection's scoped slot, which runs in that
+// collection's own render effect. Keeping the previous set while the ids are
+// unchanged stops every live tool update from re-rendering all history
+// collections even though their groups are memoized.
+const nonCollapsibleToolItemIds = computed<Set<string>>((previous) => {
+  const next = pendingContinuationToolItemIds.value;
+  if (previous && previous.size === next.size && Array.from(next).every((id) => previous.has(id))) {
+    return previous;
+  }
+  return new Set(next);
 });
 
 function shouldKeepToolItemExpanded(itemId: string) {
@@ -1920,6 +1995,8 @@ type TransientRenderSegment =
       part: Extract<AssistantRenderPart, { kind: "toolCall" }>;
       toolCalls: ToolCallDisplay[];
       showWaiting: boolean;
+      /** Renders the waiting row under this batch (current or retained). */
+      showWaitingRow: boolean;
       allowCollapse: boolean;
       collapseEnabled: boolean;
       animateCollapseOnMount: boolean;
@@ -2125,25 +2202,22 @@ function buildHistoryRenderSegmentsForGroup(group: MessageGroup): HistoryRenderS
 }
 
 /**
- * Segment construction is O(group items) and the template calls it once per
- * group per render, so an uncached implementation makes every transcript
- * re-render O(history). The cache keys off group identity: groupedMessages
- * is stabilized (groups keep identity while their content is unchanged), so
- * during streaming this map rebuilds only when history actually changes,
- * and reactive dependencies (display settings, message data) still register
- * through the computed.
+ * Segments are cached per group object. Groups keep identity only while their
+ * messages and the tool outputs/images they resolve are unchanged (see
+ * stabilizeGroupedMessages), and messages are replaced, never mutated, so the
+ * only other input is thinking-block visibility. The cache is not reactive:
+ * callers track that visibility through shouldHideThinkingBlocks() and the
+ * group list through the computed that produced the group, so live tool
+ * promotion can read it without closing a computed cycle.
  */
-const historyRenderSegmentsByGroup = computed(() => {
-  const map = new Map<MessageGroup, HistoryRenderSegment[]>();
-  for (const group of groupedMessages.value) {
-    if (group.role !== "assistant") continue;
-    map.set(group, buildHistoryRenderSegmentsForGroup(group));
-  }
-  return map;
-});
-
 function historyRenderSegmentsForGroup(group: MessageGroup): HistoryRenderSegment[] {
-  return historyRenderSegmentsByGroup.value.get(group) ?? buildHistoryRenderSegmentsForGroup(group);
+  if (group.role !== "assistant") return [];
+  const hideThinking = shouldHideThinkingBlocks();
+  const cached = historyRenderSegmentCache.get(group);
+  if (cached && cached.hideThinking === hideThinking) return cached.segments;
+  const segments = buildHistoryRenderSegmentsForGroup(group);
+  historyRenderSegmentCache.set(group, { hideThinking, segments });
+  return segments;
 }
 
 function isToolOnlyMessageGroup(group: MessageGroup) {
@@ -2253,7 +2327,41 @@ if (transcriptTraceWatchEnabled("historyToolSegmentExpansionDecision")) {
   );
 }
 
-const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
+type TransientToolSegment = Extract<TransientRenderSegment, { type: "toolCalls" }>;
+type TransientThinkingSegment = Extract<TransientRenderSegment, { type: "thinking" }>;
+type TransientWaitingSegment = Extract<TransientRenderSegment, { type: "waiting" }>;
+type TransientStatus =
+  | { kind: "segment"; segment: TransientWaitingSegment }
+  | { kind: "toolRow"; segmentKey: string }
+  | { kind: "thinking"; segment: TransientThinkingSegment };
+
+// The live status is retained until new output renders; see transientStatusHold.
+let transientStatusMemory: TransientStatusMemory<TransientStatus> | null = null;
+const transientStatusEpoch = ref(0);
+
+function transientContentHasVisibleText(segment: Extract<TransientRenderSegment, { type: "content" }>) {
+  if (segment.content.trim()) return true;
+  const stream = segment.stream;
+  if (!stream) return false;
+  if (stream.hasNonWhitespace) return true;
+  // Re-evaluate on growth only until the first visible character arrives.
+  void stream.version.value;
+  return stream.hasNonWhitespace;
+}
+
+function transientOutputUnits(segments: readonly TransientRenderSegment[]) {
+  const units = new Set<string>();
+  for (const segment of segments) {
+    if (segment.type === "toolCalls") {
+      for (const toolCall of segment.toolCalls) units.add(`tool:${toolCall.id}`);
+    } else if (segment.type === "content" && transientContentHasVisibleText(segment)) {
+      units.add(`text:${segment.key}`);
+    }
+  }
+  return units;
+}
+
+const transientRenderState = computed(() => {
   const segments: TransientRenderSegment[] = [];
   const transientById = new Map(transientToolCalls.value.map((toolCall) => [toolCall.id, toolCall]));
   let pendingToolPart: Extract<AssistantRenderPart, { kind: "toolCall" }> | null = null;
@@ -2268,6 +2376,7 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
       part: pendingToolPart,
       toolCalls: pendingToolCalls,
       showWaiting: false,
+      showWaitingRow: false,
       allowCollapse: transientToolCallsAllowCollapse.value,
       collapseEnabled: transientToolCallsCollapseEnabled.value,
       animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
@@ -2381,6 +2490,7 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
           part: promotedPart,
           toolCalls: prefixToolCalls,
           showWaiting: false,
+          showWaitingRow: false,
           allowCollapse: true,
           collapseEnabled: shouldCollapsePromotedPrefix,
           animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
@@ -2399,6 +2509,7 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
         part: handoffPart,
         toolCalls: transientToolCalls.value,
         showWaiting: false,
+        showWaitingRow: false,
         allowCollapse: transientToolCallsAllowCollapse.value,
         collapseEnabled: transientToolCallsCollapseEnabled.value,
         animateCollapseOnMount: !!toolCallHandoff.value?.collapseArmed,
@@ -2406,7 +2517,9 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
     }
   }
 
-  const toolSegments = segments.filter((segment) => segment.type === "toolCalls");
+  const toolSegments = segments.filter(
+    (segment): segment is TransientToolSegment => segment.type === "toolCalls",
+  );
   const lastToolSegment = toolSegments[toolSegments.length - 1];
   if (lastToolSegment) {
     lastToolSegment.showWaiting = true;
@@ -2440,21 +2553,171 @@ const transientRenderSegments = computed<TransientRenderSegment[]>(() => {
     }
   }
 
+  let waitingSegment: TransientWaitingSegment | null = null;
   if (claudeCodeActivityLabel.value) {
     // Status only: unlike a thinking part, this row has no summary or click action.
-    segments.push({ type: "waiting", key: "transient:claude-code", label: claudeCodeActivityLabel.value });
-  }
-  if (hasStandaloneCompactingPlaceholder.value || isStandaloneWaitingPlaceholder.value) {
+    waitingSegment = { type: "waiting", key: "transient:claude-code", label: claudeCodeActivityLabel.value };
+  } else if (hasStandaloneCompactingPlaceholder.value || isStandaloneWaitingPlaceholder.value) {
     const isCompactingPlaceholder = props.isCompacting;
-    segments.push({
+    waitingSegment = {
       type: "waiting",
       key: isCompactingPlaceholder ? "transient:compacting" : "transient:waiting",
       label: isCompactingPlaceholder ? props.compactingLabel : props.waitingLabel,
-    });
+    };
   }
 
-  return segments;
+  let currentStatus: TransientStatus | null = null;
+  if (waitingSegment) {
+    currentStatus = { kind: "segment", segment: waitingSegment };
+  } else if (lastToolSegment && isToolWaitingRowVisible.value) {
+    currentStatus = { kind: "toolRow", segmentKey: lastToolSegment.key };
+  } else {
+    const activeThinking = segments.find(
+      (segment): segment is TransientThinkingSegment => segment.type === "thinking" && segment.active,
+    );
+    if (activeThinking) currentStatus = { kind: "thinking", segment: activeThinking };
+  }
+
+  // A session switch drops the retained status.
+  void transientStatusEpoch.value;
+  const resolution = resolveTransientStatus({
+    current: currentStatus,
+    currentRetainable: !(props.isCompacting && currentStatus?.kind === "segment"),
+    units: transientOutputUnits(segments),
+    streaming: props.isStreaming,
+    memory: transientStatusMemory,
+  });
+  transientStatusMemory = resolution.memory;
+  const status = resolution.status;
+  if (status?.kind === "segment") {
+    segments.push(status.segment);
+  } else if (status?.kind === "toolRow") {
+    const target = toolSegments.find((segment) => segment.key === status.segmentKey) ?? lastToolSegment;
+    if (target) {
+      target.showWaitingRow = true;
+    } else {
+      segments.push({ type: "waiting", key: "transient:waiting", label: effectiveWaitingLabel.value });
+    }
+  } else if (status?.kind === "thinking") {
+    const existing = segments.find(
+      (segment): segment is TransientThinkingSegment =>
+        segment.type === "thinking" && segment.key === status.segment.key,
+    );
+    if (existing) {
+      existing.active = true;
+    } else {
+      segments.push({ ...status.segment, active: true });
+    }
+  }
+
+  return { segments, status, statusHeld: resolution.held };
 });
+
+transientStatusHeldSource.value = transientRenderState;
+const transientRenderSegments = computed(() => transientRenderState.value.segments);
+
+/** Identifies the live status row currently rendered, or "" when none is. */
+const transientStatusRenderKey = computed(() => {
+  const status = transientRenderState.value.status;
+  if (!status) return "";
+  if (status.kind === "toolRow") return `tool-row:${status.segmentKey}`;
+  return `${status.kind}:${status.segment.key}`;
+});
+
+const isRenderedStandaloneWaitingPlaceholder = computed(() => {
+  const status = transientRenderState.value.status;
+  return status?.kind === "segment" && status.segment.key === "transient:waiting";
+});
+
+// -- Status swap shrink hold --
+// When the status row leaves because shorter output arrived, the live stack
+// keeps its previous height until the output grows past it, so the swap never
+// shrinks the bottom of a bottom-following transcript.
+const transientContentRef = ref<HTMLElement | null>(null);
+const transientItemStackRef = ref<HTMLElement | null>(null);
+
+interface TransientShrinkHold {
+  content: HTMLElement;
+  stack: HTMLElement;
+  minHeight: number;
+  observer: ResizeObserver | null;
+}
+
+let transientShrinkHold: TransientShrinkHold | null = null;
+let pendingTransientShrinkBaseline: { stack: HTMLElement; height: number; statusFootprint: number } | null = null;
+
+function releaseTransientShrinkHold() {
+  const hold = transientShrinkHold;
+  if (!hold) return;
+  transientShrinkHold = null;
+  hold.observer?.disconnect();
+  hold.content.style.minHeight = "";
+}
+
+function measureTransientStatusFootprint(stack: HTMLElement) {
+  const status = stack.querySelector<HTMLElement>('[data-transient-status="true"]');
+  if (!status) return 0;
+  const gap = Number.parseFloat(getComputedStyle(stack).rowGap) || 0;
+  return status.getBoundingClientRect().height + gap;
+}
+
+function applyTransientShrinkHold(content: HTMLElement, stack: HTMLElement, minHeight: number) {
+  const current = transientShrinkHold;
+  if (current && (current.content !== content || current.stack !== stack)) releaseTransientShrinkHold();
+  const nextMinHeight = Math.max(minHeight, transientShrinkHold?.minHeight ?? 0);
+  content.style.minHeight = `${nextMinHeight}px`;
+  if (transientShrinkHold) {
+    transientShrinkHold.minHeight = nextMinHeight;
+    return;
+  }
+  const hold: TransientShrinkHold = { content, stack, minHeight: nextMinHeight, observer: null };
+  transientShrinkHold = hold;
+  if (typeof ResizeObserver === "undefined") return;
+  hold.observer = new ResizeObserver(() => {
+    if (transientShrinkHold !== hold) return;
+    if (!stack.isConnected || stack.getBoundingClientRect().height >= hold.minHeight - 0.5) {
+      releaseTransientShrinkHold();
+    }
+  });
+  hold.observer.observe(stack);
+}
+
+// Measures the stack with the status still rendered (before the patch).
+watch(transientStatusRenderKey, (next, previous) => {
+  pendingTransientShrinkBaseline = null;
+  if (!previous || next || !props.isStreaming) return;
+  const stack = transientItemStackRef.value;
+  if (!stack?.isConnected) return;
+  const statusFootprint = measureTransientStatusFootprint(stack);
+  if (statusFootprint <= 0) return;
+  pendingTransientShrinkBaseline = { stack, height: stack.getBoundingClientRect().height, statusFootprint };
+}, { flush: "pre" });
+
+// Holds the difference after the patch, before the frame is painted.
+watch(transientStatusRenderKey, () => {
+  const baseline = pendingTransientShrinkBaseline;
+  pendingTransientShrinkBaseline = null;
+  if (!baseline || !props.isStreaming) return;
+  const stack = transientItemStackRef.value;
+  const content = transientContentRef.value;
+  if (!stack || !content || stack !== baseline.stack || !stack.isConnected) return;
+  const minHeight = transientShrinkHoldHeight({
+    heightBefore: baseline.height,
+    heightAfter: stack.getBoundingClientRect().height,
+    statusFootprint: baseline.statusFootprint,
+  });
+  if (minHeight !== null) applyTransientShrinkHold(content, stack, minHeight);
+}, { flush: "post" });
+
+watch(transientContentRef, (content) => {
+  if (transientShrinkHold && transientShrinkHold.content !== content) releaseTransientShrinkHold();
+});
+
+watch(() => props.isStreaming, (streaming) => {
+  if (!streaming) releaseTransientShrinkHold();
+});
+
+onUnmounted(releaseTransientShrinkHold);
 
 // The concrete tool calls the transient region renders this tick. Drives the
 // fail-open hide decision in `historyHiddenToolCallMatchState` above so history
@@ -2756,6 +3019,12 @@ function isCompactMarkerGroup(group: MessageGroup) {
   return group.items.length > 0 && group.items.every((item) => isCompactHandoffMessage(item.message));
 }
 
+/** A background result or agent message delivered to the agent: a system line. */
+function noticeGroupLabel(group: Pick<MessageGroup, "items">) {
+  const notice = group.items.length === 1 && group.items[0] ? deliveredNotice(group.items[0].message) : null;
+  return notice ? deliveredNoticeLabel(notice) : null;
+}
+
 function openCompactedContext(group: MessageGroup) {
   if (!props.enableCompactedContextOpen) return;
   const messageId = group.items[0]?.id;
@@ -2885,13 +3154,14 @@ function openImage(src: string) {
         </slot>
       </div>
       <template v-else>
+        <!-- v-memo belongs on the v-for itself: on a child it shares one cache slot across all groups. -->
         <template
           v-for="(group, idx) in groupedMessages"
           :key="group.id"
+          v-memo="[group, historyGroupMemoKey(group, idx)]"
         >
           <button
             v-if="isCompactMarkerGroup(group)"
-            v-memo="[group, idx, historyGroupMemoKey(group, idx)]"
             type="button"
             class="chat-transcript-compact-marker"
             :class="[`is-${variant}`, { 'is-interactive': enableCompactedContextOpen }]"
@@ -2907,8 +3177,17 @@ function openImage(src: string) {
           </button>
 
           <div
+            v-else-if="noticeGroupLabel(group) !== null"
+            class="chat-transcript-delivered-notice"
+            :class="`is-${variant}`"
+            role="note"
+            :data-scroll-anchor-id="group.items[0]?.id"
+          >
+            <span class="chat-transcript-delivered-notice-label">{{ noticeGroupLabel(group) }}</span>
+          </div>
+
+          <div
             v-else
-            v-memo="[group, idx, historyGroupMemoKey(group, idx)]"
             class="chat-transcript-message"
             :class="[
               `is-${variant}`,
@@ -3219,7 +3498,7 @@ function openImage(src: string) {
             `is-${variant}`,
             {
               continuation: isRenderedStreamingContinuation,
-              'waiting-placeholder': isStandaloneWaitingPlaceholder,
+              'waiting-placeholder': isRenderedStandaloneWaitingPlaceholder,
               'compact-handoff': isCompacting,
               'has-live-thinking': hasVisibleActiveThinkingBlock,
               'has-tool-waiting-status': isToolWaitingStatusVisible,
@@ -3235,8 +3514,8 @@ function openImage(src: string) {
             {{ isCompacting ? handoffLabel : assistantLabel }}
           </div>
 
-          <div class="chat-transcript-message-content" :class="`is-${variant}`">
-            <div class="chat-transcript-item-stack" :class="`is-${variant}`">
+          <div ref="transientContentRef" class="chat-transcript-message-content" :class="`is-${variant}`">
+            <div ref="transientItemStackRef" class="chat-transcript-item-stack" :class="`is-${variant}`">
               <template
                 v-for="segment in transientRenderSegments"
                 :key="segment.key"
@@ -3247,6 +3526,7 @@ function openImage(src: string) {
                   data-render-part-kind="thinking"
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
+                  :data-transient-status="segment.active ? 'true' : undefined"
                 >
                   <button
                     v-if="variant === 'session'"
@@ -3288,7 +3568,7 @@ function openImage(src: string) {
                   :data-tool-layout-allow-collapse="String(segment.allowCollapse)"
                   :data-tool-layout-collapse-enabled="String(segment.collapseEnabled)"
                   :data-tool-layout-animate-collapse-on-mount="String(segment.animateCollapseOnMount)"
-                  :data-tool-layout-show-waiting="String(segment.showWaiting && isToolWaitingRowVisible)"
+                  :data-tool-layout-show-waiting="String(segment.showWaitingRow)"
                   :data-tool-layout-waiting-status="String(segment.showWaiting && isToolWaitingStatusVisible)"
                 >
                   <ToolCallCollection
@@ -3316,7 +3596,7 @@ function openImage(src: string) {
                       />
                     </template>
                   </ToolCallCollection>
-                  <div v-if="segment.showWaiting && isToolWaitingRowVisible" class="chat-transcript-tool-waiting-row">
+                  <div v-if="segment.showWaitingRow" class="chat-transcript-tool-waiting-row" data-transient-status="true">
                     <ChatWaitingIndicator :label="effectiveWaitingLabel" compact />
                   </div>
                 </div>
@@ -3327,6 +3607,7 @@ function openImage(src: string) {
                   data-render-part-kind="waiting"
                   data-render-part-scope="transient"
                   :data-render-part-key="segment.key"
+                  data-transient-status="true"
                 >
                   <div class="chat-transcript-thinking-header active">
                     <ChatWaitingIndicator :label="segment.label" />
@@ -3385,6 +3666,8 @@ function openImage(src: string) {
 .chat-transcript-scroll.is-session {
   --chat-transcript-session-segment-gap: 10px;
   --chat-transcript-session-bottom-gap: 40px;
+  /* Session rows are inset by var(--chat-transcript-session-inline-padding,
+     48px); narrow hosts (the phone page) set it on an ancestor. */
   padding: 24px 0 0;
   background: var(--msg-assistant-bg);
   overflow-anchor: none;
@@ -3427,7 +3710,7 @@ function openImage(src: string) {
 }
 
 .chat-transcript-message.is-session {
-  padding: 12px 48px;
+  padding: 12px var(--chat-transcript-session-inline-padding, 48px);
   max-width: 100%;
   position: relative;
   contain: layout paint;
@@ -3517,12 +3800,43 @@ function openImage(src: string) {
 }
 
 .chat-transcript-compact-marker.is-session {
-  padding: 10px 48px;
+  padding: 10px var(--chat-transcript-session-inline-padding, 48px);
   background: var(--msg-assistant-bg);
 }
 
 .chat-transcript-compact-marker.is-embedded {
   padding: 8px 14px;
+}
+
+/* A delivered background result or agent message: context for the reply
+   that follows, not a user turn. */
+.chat-transcript-delivered-notice {
+  display: flex;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  user-select: none;
+}
+
+.chat-transcript-delivered-notice.is-session {
+  padding: 8px var(--chat-transcript-session-inline-padding, 48px);
+  background: var(--msg-assistant-bg);
+}
+
+.chat-transcript-delivered-notice.is-embedded {
+  padding: 6px 14px;
+}
+
+.chat-transcript-delivered-notice-label {
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-transcript-compact-marker-line {
@@ -3565,7 +3879,7 @@ function openImage(src: string) {
   display: flex;
   justify-content: flex-start;
   align-items: center;
-  padding: 10px 48px 12px;
+  padding: 10px var(--chat-transcript-session-inline-padding, 48px) 12px;
   background: var(--msg-assistant-bg);
 }
 

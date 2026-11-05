@@ -57,7 +57,7 @@ export type StreamMutation =
   | { type: "upsertMessage"; message: ChatMessage }
   | { type: "upsertUserMessage"; message: ChatMessage }
   | { type: "removeMessage"; messageId: string }
-  | { type: "replaceMessages"; messages: ChatMessage[] }
+  | { type: "replaceMessages"; messages: ChatMessage[]; history?: HistoryPageCursor }
   | { type: "pushToolResults"; toolCallIds?: string[] }
   | { type: "resetRound" }
   | { type: "resetRoundKeepToolCalls" }
@@ -70,6 +70,33 @@ export type StreamMutation =
   | { type: "setTodos"; runId: string; todos: TodoItem[]; sessionScoped?: boolean }
   | { type: "setStreaming"; value: boolean }
   | { type: "setCompacting"; value: boolean };
+
+/** Paging cursor for a replaced newest-page message window. */
+export interface HistoryPageCursor {
+  oldestMessageRowId: number | null;
+  hasMoreHistory: boolean;
+}
+
+/**
+ * History events replace the visible messages only when they carry a page.
+ * Persisted replays omit it; a page without paging metadata is a legacy
+ * full-history event and leaves the existing cursor alone.
+ */
+function replaceHistoryMutation(event: {
+  messages?: ChatMessage[];
+  oldestMessageRowId?: number | null;
+  hasMoreHistory?: boolean;
+}): StreamMutation[] {
+  if (!Array.isArray(event.messages)) return [];
+  if (typeof event.hasMoreHistory !== "boolean") {
+    return [{ type: "replaceMessages", messages: event.messages }];
+  }
+  return [{
+    type: "replaceMessages",
+    messages: event.messages,
+    history: { oldestMessageRowId: event.oldestMessageRowId ?? null, hasMoreHistory: event.hasMoreHistory },
+  }];
+}
 
 export function buildToolResultMessages(
   activeToolCalls: ToolCallDisplay[],
@@ -801,11 +828,11 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
       mutations.push({ type: "resetRound" });
       mutations.push({ type: "clearPendingInputs" });
       mutations.push({ type: "setClaudeCodePhase", phase: state.claudeCodePhase ?? null });
-      mutations.push({ type: "replaceMessages", messages: event.messages });
+      mutations.push(...replaceHistoryMutation(event));
       break;
 
     case "compactDone":
-      mutations.push({ type: "replaceMessages", messages: event.messages });
+      mutations.push(...replaceHistoryMutation(event));
       if ((event.contextTokens ?? 0) > 0 && (event.contextLimit ?? 0) > 0) {
         mutations.push({
           type: "updateUsage",
@@ -839,6 +866,7 @@ export function reduceStreamEvent(state: StreamState, event: StreamEvent): Strea
           questionId: event.questionId,
           toolCallId: event.toolCallId,
           display: event.display,
+          ...(event.agent ? { agent: event.agent } : {}),
         },
       });
       break;

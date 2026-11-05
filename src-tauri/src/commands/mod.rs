@@ -4,6 +4,8 @@ pub(crate) use async_tasks::*;
 mod agent_documents;
 pub use agent_documents::*;
 mod auth;
+mod blender;
+mod latex_preview;
 mod claude_connection;
 pub use claude_connection::*;
 mod csharp_lsp;
@@ -114,6 +116,67 @@ pub enum CompactTrigger {
     Auto,
     Manual,
     Reactive,
+}
+
+/// Rows carried by stream events that replace the transcript; matches the
+/// desktop's default page size (`DEFAULT_SESSION_MESSAGE_PAGE_SIZE`).
+pub const STREAM_HISTORY_PAGE_SIZE: u32 = 120;
+
+/// Newest display page for `HistorySynchronized` / `CompactDone`.
+pub struct StreamHistoryPage {
+    pub messages: Option<Vec<crate::session::models::ChatMessage>>,
+    pub oldest_message_row_id: Option<i64>,
+    pub has_more_history: Option<bool>,
+}
+
+impl StreamHistoryPage {
+    pub fn load(
+        store: &crate::session::store::SessionStore,
+        session_id: &str,
+    ) -> Result<Self, String> {
+        let page = store.load_session_tail_page(session_id, STREAM_HISTORY_PAGE_SIZE)?;
+        Ok(Self {
+            messages: Some(page.messages),
+            oldest_message_row_id: page.oldest_message_row_id,
+            has_more_history: Some(page.has_more_history),
+        })
+    }
+}
+
+impl StreamEvent {
+    /// The durable form of an event. Transcript pages are a delivery detail:
+    /// the messages table already holds them, and persisting a page per
+    /// compaction would grow the event log with every compaction.
+    pub fn for_persistence(&self) -> std::borrow::Cow<'_, StreamEvent> {
+        match self {
+            StreamEvent::HistorySynchronized { session_id, .. } => {
+                std::borrow::Cow::Owned(StreamEvent::HistorySynchronized {
+                    session_id: session_id.clone(),
+                    messages: None,
+                    oldest_message_row_id: None,
+                    has_more_history: None,
+                })
+            }
+            StreamEvent::CompactDone {
+                session_id,
+                messages_before,
+                messages_after,
+                context_tokens,
+                context_limit,
+                ..
+            } => std::borrow::Cow::Owned(StreamEvent::CompactDone {
+                session_id: session_id.clone(),
+                messages_before: *messages_before,
+                messages_after: *messages_after,
+                context_tokens: *context_tokens,
+                context_limit: *context_limit,
+                messages: None,
+                oldest_message_row_id: None,
+                has_more_history: None,
+            }),
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +374,10 @@ pub enum StreamEvent {
         question_id: String,
         tool_call_id: String,
         display: ToolConfirmDisplay,
+        /// The Claude subagent asking. Its confirmation may arrive while the
+        /// conversation has no running turn.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     /// Sticky plan-mode transitions (entered via /plan or a plan-tagged
     /// message; exited via approved exit_plan_mode or the user toggle).
@@ -339,10 +406,19 @@ pub enum StreamEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<CompactTrigger>,
     },
+    /// Live events carry the newest display page (`STREAM_HISTORY_PAGE_SIZE`
+    /// rows) and its paging cursor; clients load older rows on demand. The
+    /// persisted copy omits the page because the messages table is the
+    /// source of truth.
     #[serde(rename_all = "camelCase")]
     HistorySynchronized {
         session_id: String,
-        messages: Vec<crate::session::models::ChatMessage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        messages: Option<Vec<crate::session::models::ChatMessage>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_message_row_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        has_more_history: Option<bool>,
     },
     #[serde(rename_all = "camelCase")]
     CompactDone {
@@ -353,7 +429,12 @@ pub enum StreamEvent {
         context_tokens: u32,
         #[serde(default)]
         context_limit: u32,
-        messages: Vec<crate::session::models::ChatMessage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        messages: Option<Vec<crate::session::models::ChatMessage>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oldest_message_row_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        has_more_history: Option<bool>,
     },
     #[serde(rename_all = "camelCase")]
     Cancelled {
@@ -607,6 +688,8 @@ pub struct ModelUsageReport {
 
 pub use asset::*;
 pub use auth::*;
+pub use blender::*;
+pub use latex_preview::*;
 pub use csharp_lsp::*;
 pub use diff::*;
 pub use extra_workdirs::*;
@@ -636,3 +719,47 @@ pub use workspace::*;
 pub use workspace_explorer::*;
 pub use workspace_service::*;
 pub use worktrees::*;
+
+#[cfg(test)]
+mod stream_event_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_history_events_omit_the_transcript_page() {
+        let message = crate::compact::claude_native::build_handoff_message("large transcript", 10, false);
+        let event = StreamEvent::CompactDone {
+            session_id: "s".into(),
+            messages_before: 9,
+            messages_after: 3,
+            context_tokens: 40,
+            context_limit: 100,
+            messages: Some(vec![message.clone()]),
+            oldest_message_row_id: Some(7),
+            has_more_history: Some(true),
+        };
+        let live = serde_json::to_value(&event).unwrap();
+        assert_eq!(live["messages"][0]["id"], message.id.as_str());
+        assert_eq!(live["oldestMessageRowId"], 7);
+        assert_eq!(live["hasMoreHistory"], true);
+        let stored = serde_json::to_value(event.for_persistence().as_ref()).unwrap();
+        assert_eq!(stored, serde_json::json!({
+            "type": "compactDone", "sessionId": "s", "messagesBefore": 9,
+            "messagesAfter": 3, "contextTokens": 40, "contextLimit": 100,
+        }));
+
+        let synced = StreamEvent::HistorySynchronized {
+            session_id: "s".into(),
+            messages: Some(vec![message]),
+            oldest_message_row_id: None,
+            has_more_history: Some(false),
+        };
+        let stored = serde_json::to_value(synced.for_persistence().as_ref()).unwrap();
+        assert_eq!(stored, serde_json::json!({"type": "historySynchronized", "sessionId": "s"}));
+        // Older persisted events with a full page still deserialize.
+        let legacy: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "historySynchronized", "sessionId": "s", "messages": [],
+        })).unwrap();
+        assert!(matches!(legacy, StreamEvent::HistorySynchronized { messages: Some(_), has_more_history: None, .. }));
+        assert!(matches!(event.for_persistence(), std::borrow::Cow::Owned(_)));
+    }
+}
