@@ -105,6 +105,8 @@ locus_unity/Editor/Native/x86_64/locus_native.dll
 locus_blender/locus_host/bin/*.dll
 locus_blender/locus_host/bin/native.json
 locus_unity/Editor/Roslyn/Locus.Roslyn.dll
+# Pre-rename native plugin directory (now locus_unity_native/); old checkouts keep its build cache.
+/locus_native_plugin/
 
 # Editor directories and files
 .vscode/
