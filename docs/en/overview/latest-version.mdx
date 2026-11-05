@@ -1,9 +1,9 @@
 ---
 title: "Latest Version"
-description: "Locus v0.9.2 (2026-10-25)"
+description: "Locus v0.9.3 (2026-11-05)"
 sidebarTitle: "Latest Version"
-version: "0.9.2"
-releasedAt: "2026-10-25"
+version: "0.9.3"
+releasedAt: "2026-11-05"
 channel: "stable"
 updateTitle: "Update available"
 changelogUrl: "/en/overview/latest-version"
@@ -11,11 +11,57 @@ changelogUrl: "/en/overview/latest-version"
 
 ## Download
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-setup.exe)
-- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus_0.9.3_x64-setup.exe)
+- [Windows x64 (system Python/Git)](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus_0.9.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64 (with Locus Remote for Android)](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus_0.9.3_x64-with_remote_app-setup.exe)
+- [Android (Locus Remote)](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus-remote_0.9.3_android-arm64.apk)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## Changes
+
+### v0.9.3 (Added)
+
+- Blender integration. Detect or add Blender installations in Settings > Integrations > Blender and install or update the add-on in one click. The Agent runs bpy code on the main thread of a running Blender through `blender_execute` and gets back printed output, the return value, and viewport images; the Python SDK adds `locus.blender`. The chat status bar shows the Blender connection, and background instances have a limit on how many run at once and an idle shutdown time.
+- Remote access from a phone (experimental, off by default). Turn it on in Settings > Connections > Remote Access and pair the Android app Locus Remote by scanning a QR code. From the phone you can browse sessions and live output, send messages, stop runs, answer questions, and read project files and knowledge documents. Phones connect over the LAN, directly over Tailscale, or through a tunnel to a local address. Paired devices can only view and chat by default; approving tool calls and changing content requires `Full control`.
+- New installer `Windows x64 - with Locus Remote (Android)`, which bundles the matching Locus Remote app so a phone can download it from the computer while pairing.
+- Settings is reorganized into seven groups (Models, Agent, Workspace, Integrations, Interface, Connections, System) and can be searched. All settings are stored in one place, and older settings, including interface preferences, migrate automatically. Project settings are saved in the project's `Locus/config.json` and can be shared through the repository.
+- The Agent can read and change Locus settings through `config_query` and `config_set`. Changing settings and changing sensitive settings are controlled separately under Tool Permissions.
+- When the main model is Claude Code and Multi-Agent is on, delegation can use Claude Code's own `Agent` and `SendMessage` tools (requires Claude Code 2.1.312 or later). A one-line notice appears in the conversation when a background agent finishes, and tool confirmations from sub-agents appear in the current conversation with their source.
+- With Multi-Agent on, agents get a `send_message` tool to message their parent, sub-agents, or sibling agents directly. The background tasks panel can stop all agents at once.
+- Subagent models can be multi-selected. The delegating agent picks one per task; the first is the default.
+- LaTeX preview. `.tex` files can be previewed next to the editor and recompile after edits only while the preview is visible; a failed build keeps the last successful result. The toolchain is detected from PATH and the default MiKTeX and TeX Live install locations; documents fall back to PDF when dvisvgm is missing or the document needs it.
+- File previews show FBX and GLB models with grid, wireframe, and clay display, play animation clips, and list mesh, triangle, and bone counts and the model size.
+- PDF files open in the workspace file editor, including PDFs inside Unity project folders, instead of the asset inspector.
+- Images in chat and Markdown open in a lightbox where you can zoom, fit to the window, or view the original size.
+- The message context menu adds `Copy as image`, which copies the message as rendered to the clipboard as a PNG.
+- The folder for pasted images can be set in the project settings or chosen per document in the editor; documents reference the images by relative path.
+- When adding a workspace, choose Auto, Lazy, or Off for Unity and for Blender. A new global `Enable Unity` switch stops connecting to the Unity Editor, scanning assets, and offering Unity tools when turned off.
+- Files and folders can be dragged from the system file manager into the workspace explorer to import them; Locus asks before overwriting a file with the same name.
+- After selecting text in a document, `Quote in new conversation` opens a new session that quotes it. The editor tab context menu adds `Reveal in Workspace` and `Open in File Browser`.
+- `unity_execute` adds a `timeout` parameter (10 minutes by default, up to 1 hour). Runtime exceptions in snippets show line numbers within the snippet, and a snippet that is a single expression returns its value.
+- `unity_code_usages` finds `[SerializeReference]` instances (including overrides on prefab instances, variants, and nested prefabs) and serialized values of plain `[Serializable]` types. `code_diagnostics` checks that the types recorded by `[SerializeReference]` still exist.
+- Merging several selected commits applies them in order, like a series of cherry-picks, and a whole branch can be merged as one squash. `change_summary()` summarizes changes per file, deleting an object is a single decision, and merged scenes are written in Unity's own fileID order.
+
+### v0.9.3 (Fixed)
+
+- With many session tabs open, each editor group keeps only the 6 most recent sessions loaded by default (adjustable in Settings), and hidden sessions and previews stop rendering updates. Long sessions load the latest 120 messages first and earlier messages on demand.
+- The thinking indicator, running session titles, and tab animations run on the compositor only and no longer repaint the whole window.
+- Unity connection, code analysis, knowledge indexing, asset scanning, background tasks, and Claude connection status are pushed by the backend instead of polled on a timer.
+- Any window can act as the primary window. Locus exits or minimizes to the tray only when the last window closes, and pop-out windows close with the window that opened them.
+- The workspace layout tree and file order are stored in the Locus data directory instead of the project's `Locus/workspace-trees` and `Locus/workspace-file-order.json`. Existing data is imported automatically.
+- Moving a PDF tab after its preview data expired reads the PDF again instead of failing to load it.
+- Workspaces outside a Git repository no longer show the worktree picker.
+- Long commands (over about 8 KB) run through sh on Windows are no longer cut off.
+- After Claude Code compacts the context natively, Locus appends the user's own messages, the task list, and excerpts of files read through Locus tools to the summary.
+- File paths in streaming replies become clickable references while the reply is still streaming. Selections inside Markdown table cells display correctly.
+- Tracebacks from the `python` tool show line numbers that match the submitted code.
+- Unity YAML with empty-string keys (such as plugin `.meta` files) can be parsed, edited, and merged. Large scenes are handed to the Editor through staged files in the project's `Library`, so they are no longer limited by the connection's request size.
+- The Unity native plugin is renamed to `locus_unity_native.dll` and shares a new native communication layer with Blender; the old `locus_native.dll` is removed automatically on update.
+- Find-in-document highlights are easier to see, and the current match uses a darker color.
+
+### v0.9.3 (Removed)
+
+- The Settings > Experimental page is removed and its options moved to the relevant pages. Async tasks no longer need a switch: `bash`, `unity_test_run`, and `task` can always run in the background.
 
 ### v0.9.2 (Added)
 

@@ -1,9 +1,9 @@
 ---
 title: "当前版本"
-description: "Locus v0.9.2 (2026-10-25)"
+description: "Locus v0.9.3 (2026-11-05)"
 sidebarTitle: "当前版本"
-version: "0.9.2"
-releasedAt: "2026-10-25"
+version: "0.9.3"
+releasedAt: "2026-11-05"
 channel: "stable"
 updateTitle: "发现新版本"
 changelogUrl: "/overview/latest-version"
@@ -11,11 +11,57 @@ changelogUrl: "/overview/latest-version"
 
 ## 下载
 
-- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-setup.exe)
-- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.9.2/locus_0.9.2_x64-without_embed_python_git-setup.exe)
+- [Windows x64](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus_0.9.3_x64-setup.exe)
+- [Windows x64（系统 Python/Git）](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus_0.9.3_x64-without_embed_python_git-setup.exe)
+- [Windows x64（含 Locus Remote Android 版）](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus_0.9.3_x64-with_remote_app-setup.exe)
+- [Android（Locus Remote）](https://github.com/r1n7aro/Locus/releases/download/v0.9.3/locus-remote_0.9.3_android-arm64.apk)
 - [GitHub Releases](https://github.com/r1n7aro/Locus/releases)
 
 ## 变更列表
+
+### v0.9.3（新增）
+
+- 新增 Blender 集成。在“设置 > 集成 > Blender”中检测或手动添加 Blender，并一键安装或更新插件。Agent 通过 `blender_execute` 在正在运行的 Blender 主线程上执行 bpy 代码，返回打印输出、返回值和视图截图；Python SDK 新增 `locus.blender`。对话状态栏显示 Blender 连接状态；后台实例可以设置同时运行的上限和空闲关闭时间。
+- 新增手机远程访问（实验性，默认关闭）。在“设置 > 连接 > 远程访问”中开启后，用 Android 版 Locus Remote 扫码配对，就可以在手机上浏览会话和实时输出、发送消息、停止运行、回答提问，并阅读项目文件和知识文档。连接方式支持局域网、Tailscale 直连和本机地址隧道转发。设备默认只能查看和对话，开启“完全控制”后才能批准工具调用和修改内容。
+- 新增安装包“Windows x64 - with Locus Remote (Android)”，内置与当前版本一致的 Locus Remote。手机配对时可以直接从电脑下载 App。
+- 设置页重新整理为模型、Agent、工作区、集成、界面、连接、系统七个分组，可以搜索设置项。所有设置统一保存，旧版设置（包括界面偏好）会自动迁移。项目级设置保存在项目的 `Locus/config.json` 中，可以随仓库共享。
+- Agent 可以通过 `config_query` 和 `config_set` 读取和修改 Locus 设置。“修改设置”和“修改敏感设置”分别在“工具权限”中控制。
+- 主模型为 Claude Code 并开启 Multi-Agent 时，可以改用 Claude Code 自带的 `Agent` 和 `SendMessage` 委派（需要 Claude Code 2.1.312 或更高版本）。后台 Agent 结束时，对话中会显示一行提示；子 Agent 的工具确认显示在当前对话里，并标注来源。
+- 开启 Multi-Agent 后，Agent 多了 `send_message` 工具，可以直接给父 Agent、子 Agent 或同级 Agent 发消息。后台任务面板可以一次停止全部 Agent。
+- 子代理模型可以多选。委派时 Agent 按任务从中选择，第一个为默认。
+- 新增 LaTeX 预览。`.tex` 文件可以在编辑器旁预览，修改后只在预览可见时重新编译；编译失败时保留上一次成功的结果。工具链从 PATH 以及 MiKTeX、TeX Live 的默认安装目录检测；缺少 dvisvgm 或文档需要时改用 PDF 显示。
+- 文件预览可以查看 FBX 和 GLB 模型，支持网格、线框和白模显示，可以播放动画片段，并显示网格、三角面、骨骼数量和尺寸。
+- PDF 文件在工作区文件编辑器中打开，Unity 项目文件夹里的 PDF 也一样，不再进入资产检查器。
+- 聊天和 Markdown 中的图片点击后在大图中打开，可以缩放、适应窗口或查看原始大小。
+- 消息右键菜单新增“复制为图片”，按界面渲染效果复制为 PNG。
+- 粘贴图片的保存位置可以在项目设置中指定，也可以在编辑器中为某个文档单独选择，文档里用相对路径引用。
+- 添加工作区时，可以分别为 Unity 和 Blender 选择“自动 / 按需 / 关闭”。新增全局“启用 Unity”开关，关闭后不连接 Unity Editor、不扫描资源，也不提供 Unity 工具。
+- 可以把系统文件管理器里的文件和文件夹拖进工作区资源管理器导入，遇到同名文件会先询问是否覆盖。
+- 在文档中选中文字后，可以“打开新会话并引用”。编辑器标签页的右键菜单新增“在工作区中定位”和“在文件浏览器中打开”。
+- `unity_execute` 新增 `timeout` 参数（默认 10 分钟，最长 1 小时）。代码片段的运行时异常会显示片段内的行号；整个片段只有一个表达式时，直接返回它的值。
+- `unity_code_usages` 可以查到 `[SerializeReference]` 实例（包括预制体实例、变体和嵌套预制体上的覆盖）和普通 `[Serializable]` 类型的序列化值。`code_diagnostics` 会检查 `[SerializeReference]` 记录的类型是否还存在。
+- 合并时选择的多个提交按顺序应用，效果类似连续 cherry-pick；支持把整条分支合并为一次（squash）。`change_summary()` 按文件汇总变更。删除一个对象只需要做一次决定。合并后的场景按 Unity 自己的 fileID 顺序写入。
+
+### v0.9.3（修复）
+
+- 打开多个会话标签页时，每个编辑器组默认只保持最近 6 个会话加载（可以在设置中调整），隐藏的会话和预览不再渲染更新。很长的会话先加载最近 120 条消息，更早的消息按需加载。
+- 思考提示、运行中的会话标题和标签页动画只在合成层播放，不再让整个窗口重绘。
+- Unity 连接、代码分析、知识库索引、资源扫描、后台任务和 Claude 连接状态改为由后端推送，不再定时轮询。
+- 任何窗口都可以作为主窗口。只有关闭最后一个窗口时才会退出或最小化到托盘；弹出窗口跟随打开它的窗口一起关闭。
+- 工作区布局树和文件排序改为保存在 Locus 数据目录中，不再写入项目的 `Locus/workspace-trees` 和 `Locus/workspace-file-order.json`。已有数据会自动导入。
+- 移动标签页后，预览数据已经过期的 PDF 会重新读取，不再加载失败。
+- 不在 Git 仓库里的工作区不再显示 worktree 选择器。
+- 在 Windows 上通过 sh 运行的长命令（超过约 8 KB）不再被截断。
+- Claude Code 原生压缩上下文后，Locus 会在摘要后补上用户自己的消息、任务列表和通过 Locus 工具读过的文件摘录。
+- 流式回复中的文件路径在输出过程中就能识别为可点击的引用。Markdown 表格单元格里的选区可以正常显示。
+- `python` 工具报错时，回溯里的行号对应提交的代码。
+- 可以解析、编辑和合并包含空字符串键的 Unity YAML（例如插件的 `.meta` 文件）。写入大场景时，内容通过项目 `Library` 中的暂存文件交给 Editor，不再受连接请求大小限制。
+- Unity 原生插件改名为 `locus_unity_native.dll`，和 Blender 共用新的原生通信层；更新时会自动移除旧的 `locus_native.dll`。
+- 文档内查找的匹配高亮更清晰，当前匹配使用更深的颜色。
+
+### v0.9.3（移除）
+
+- 移除“设置 > 实验性”页面，其中的选项移到了对应的页面。“异步任务”不再需要开关，`bash`、`unity_test_run`、`task` 始终可以在后台运行。
 
 ### v0.9.2（新增）
 
