@@ -24,6 +24,8 @@ pub struct NativeAgent {
     pub name: String,
     /// The `Agent` call's description (Claude repeats it for a resume).
     pub description: String,
+    /// This run's prompt: the `Agent` call's, or the message that resumed it.
+    pub prompt: String,
     pub run_id: String,
     /// Runs without holding a Locus turn: an explicit background `Agent`, or
     /// any resumed run.
@@ -84,6 +86,32 @@ struct RegistryAgent {
     agent_id: String,
     parent_tool_use_id: String,
     name: String,
+    /// The model Claude ran it on, as the engine resolved it (card display).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+fn read_registry(path: &std::path::Path) -> Option<AgentRegistryFile> {
+    std::fs::read(path).ok()
+        .and_then(|bytes| serde_json::from_slice::<AgentRegistryFile>(&bytes).ok())
+        .filter(|file| file.version == 1)
+}
+
+/// An Agent card of a conversation: its subagent and the model it ran on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryCard {
+    /// The `Agent` call that started the subagent.
+    pub card_id: String,
+    pub agent_id: String,
+    pub model: Option<String>,
+}
+
+/// The Agent cards in a conversation's registry file. Readable without a
+/// Claude process.
+pub fn registry_cards(path: &std::path::Path) -> Vec<RegistryCard> {
+    read_registry(path).map(|file| file.agents.into_iter()
+        .map(|agent| RegistryCard { card_id: agent.parent_tool_use_id, agent_id: agent.agent_id, model: agent.model })
+        .collect()).unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -99,6 +127,8 @@ pub struct ControlSignals {
     /// Agents the user stopped. Never resumed automatically, also across
     /// processes (persisted in the registry file).
     stopped_agents: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Agent id → the model it runs on (persisted in the registry file).
+    agent_models: std::sync::Mutex<std::collections::HashMap<String, String>>,
     agent_queue: std::sync::Mutex<Option<mpsc::Sender<PendingCall>>>,
     /// Set once the session's agent pump consumes the subagent queue. Until
     /// then (native agents off) every callback stays on the run queue.
@@ -115,9 +145,10 @@ impl ControlSignals {
     }
     /// Loads and then maintains the conversation's agent registry.
     pub fn attach_registry(&self, path: std::path::PathBuf) {
-        if let Some(file) = std::fs::read(&path).ok()
-            .and_then(|bytes| serde_json::from_slice::<AgentRegistryFile>(&bytes).ok())
-            .filter(|file| file.version == 1) {
+        if let Some(file) = read_registry(&path) {
+            self.agent_models.lock().unwrap_or_else(|e| e.into_inner()).extend(
+                file.agents.iter().filter_map(|agent| Some((agent.agent_id.clone(), agent.model.clone()?))),
+            );
             self.remember_native_agents(
                 file.agents.into_iter().map(|agent| KnownNativeAgent {
                     agent_id: agent.agent_id, parent_tool_use_id: agent.parent_tool_use_id, name: agent.name,
@@ -129,13 +160,16 @@ impl ControlSignals {
     }
     fn save_registry(&self) {
         let Some(path) = self.registry_path.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return; };
+        let models = self.agent_models.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut agents: std::collections::BTreeMap<String, RegistryAgent> = self.known_agents.lock().unwrap_or_else(|e| e.into_inner())
             .values().map(|agent| (agent.agent_id.clone(), RegistryAgent {
                 agent_id: agent.agent_id.clone(), parent_tool_use_id: agent.parent_tool_use_id.clone(), name: agent.name.clone(),
+                model: models.get(&agent.agent_id).cloned(),
             })).collect();
         for entry in self.agents.lock().unwrap_or_else(|e| e.into_inner()).values() {
             agents.insert(entry.agent.agent_id.clone(), RegistryAgent {
                 agent_id: entry.agent.agent_id.clone(), parent_tool_use_id: entry.agent.parent_tool_use_id.clone(), name: entry.agent.name.clone(),
+                model: models.get(&entry.agent.agent_id).cloned(),
             });
         }
         let file = AgentRegistryFile { version: 1, agents: agents.into_values().collect(), stopped: self.stopped_native_agents() };
@@ -205,6 +239,22 @@ impl ControlSignals {
         for agent in agents { known.insert(agent.agent_id.clone(), agent); }
         drop(known);
         self.stopped_agents.lock().unwrap_or_else(|e| e.into_inner()).extend(stopped);
+    }
+    pub fn agent_model(&self, id: &str) -> Option<String> {
+        self.agent_models.lock().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+    }
+    /// Records the model an agent's request runs on; true when it changed
+    /// (normally once per agent, so the registry is rarely rewritten).
+    pub fn note_agent_model(&self, id: &str, model: &str) -> bool {
+        let model = model.trim();
+        if id.is_empty() || model.is_empty() { return false; }
+        {
+            let mut models = self.agent_models.lock().unwrap_or_else(|e| e.into_inner());
+            if models.get(id).is_some_and(|known| known == model) { return false; }
+            models.insert(id.to_string(), model.to_string());
+        }
+        self.save_registry();
+        true
     }
     pub fn native_agent_stopped(&self, id: &str) -> bool {
         self.stopped_agents.lock().unwrap_or_else(|e| e.into_inner()).contains(id)
@@ -296,7 +346,7 @@ impl ControlSignals {
             .unwrap_or_default();
         let agent = NativeAgent {
             agent_id: agent_id.clone(), parent_tool_use_id, invocation_tool_use_id: invocation,
-            name: text("name").unwrap_or(name), description, run_id,
+            name: text("name").unwrap_or(name), description, prompt: text("prompt").unwrap_or_default(), run_id,
             background: resume || payload["background"] == true,
         };
         // A lost receipt repeats a registration; it starts nothing new.
@@ -765,7 +815,7 @@ mod tests {
         let (agent, reply) = tokio::join!(waiting, register);
         assert_eq!(reply, Some(json!({"ok":true})));
         assert_eq!(agent, NativeAgent { agent_id: "a1".into(), parent_tool_use_id: "toolu_1".into(),
-            invocation_tool_use_id: "toolu_1".into(), name: "Explore".into(), description: String::new(), run_id: "run".into(), background: false });
+            invocation_tool_use_id: "toolu_1".into(), name: "Explore".into(), description: String::new(), prompt: String::new(), run_id: "run".into(), background: false });
         // The same registration is idempotent; another parent call is not.
         assert_eq!(controls.route(&spawn("a1", "toolu_1", "run"), &options), Some(json!({"ok":true})));
         assert!(controls.route(&spawn("a1", "toolu_2", "run"), &options).unwrap()["deny"].is_string());
@@ -809,6 +859,35 @@ mod tests {
             json!({"ok":true,"native":true,"running":false,"stopped":true}));
         assert!(restarted.route(&resume, &options).unwrap()["deny"].as_str().unwrap().contains("stopped"));
         assert_eq!(restarted.route(&json!({"type":"agent_route","id":"nobody"}), &options).unwrap()["native"], false);
+    }
+
+    #[test]
+    fn an_agents_model_is_kept_for_its_card_across_processes() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("native_agents.json");
+        // A registry written before models were recorded still loads.
+        std::fs::write(&registry, r#"{"version":1,"agents":[{"agentId":"old","parentToolUseId":"toolu_old","name":"Plan"}],"stopped":[]}"#).unwrap();
+        let controls = ControlSignals::default();
+        controls.attach_registry(registry.clone());
+        let card = |id: &str| registry_cards(&registry).into_iter().find(|card| card.card_id == id);
+        assert_eq!(card("toolu_old"), Some(RegistryCard { card_id: "toolu_old".into(), agent_id: "old".into(), model: None }));
+        let options = Arc::new(std::sync::RwLock::new(json!({"active":true,"inputId":"run"})));
+        let spawn = json!({"type":"agent_spawn","runId":"run","agentId":"a1","parentToolUseId":"toolu_agent","name":"general-purpose","prompt":"Scan it"});
+        assert_eq!(controls.route(&spawn, &options), Some(json!({"ok":true})));
+        assert_eq!(controls.native_agent("a1").unwrap().prompt, "Scan it");
+        // Only a change is reported (and written).
+        assert!(controls.note_agent_model("a1", " claude-opus-5-5 "));
+        assert!(!controls.note_agent_model("a1", "claude-opus-5-5"));
+        assert!(!controls.note_agent_model("a1", "  ") && !controls.note_agent_model("", "claude-opus-5-5"));
+        assert_eq!(controls.agent_model("a1").as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(card("toolu_agent"), Some(RegistryCard { card_id: "toolu_agent".into(), agent_id: "a1".into(), model: Some("claude-opus-5-5".into()) }));
+        // A later process keeps it when it rewrites the registry.
+        let restarted = ControlSignals::default();
+        restarted.attach_registry(registry.clone());
+        assert_eq!(restarted.agent_model("a1").as_deref(), Some("claude-opus-5-5"));
+        restarted.stop_native_agent("old");
+        assert_eq!(card("toolu_agent").and_then(|card| card.model).as_deref(), Some("claude-opus-5-5"));
+        assert!(registry_cards(&root.path().join("missing.json")).is_empty());
     }
 
     #[tokio::test]

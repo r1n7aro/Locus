@@ -536,9 +536,12 @@ export function register(on) {
       // Registration is handled at the host's ingress, never behind a call.
       // A refused registration (stale turn) leaves the subagent without any
       // executable tool; its next model step is refused.
+      // The run's prompt (the Agent call's, or the message that resumed it)
+      // opens the run in the agent's Locus record.
       await callBridge($, '/event', { protocol: 1, type: 'agent_spawn', runId: spawnRunId,
         agentId: result.agentId, parentToolUseId: e.tool_use_id, name: e.subagentType,
         description: typeof e.description === 'string' ? e.description : '',
+        prompt: typeof e.prompt === 'string' ? e.prompt : '',
         background: e.background === true, resume: !!e.resume });
     }
     return result;
@@ -580,15 +583,19 @@ export function register(on) {
       return result;
     }
     // A subagent's text is display only, on its Agent card (or its task, in
-    // the background, also while the conversation is idle). tool.call
-    // announces its calls; only the text travels here.
+    // the background, also while the conversation is idle) and in its Locus
+    // record, with its thinking. tool.call announces its calls; only the
+    // text and thinking travel here.
     if (e.agentId && delegation && !bridgeFailed
         && e.message.type === 'assistant' && e.origin?.kind === 'model') {
       const text = content.filter(block => block.type === 'text').map(block => block.text).join('\n');
-      if (text.trim()) {
+      const thinking = content.filter(block => block.type === 'thinking' && typeof block.thinking === 'string')
+        .map(block => block.thinking).join('\n');
+      if (text.trim() || thinking.trim()) {
         try {
           await callBridge($, '/event', { protocol: 1, type: 'assistant', runId, agentId: e.agentId,
-            message: { content: [{ type: 'text', text }] } });
+            message: { content: [...(thinking.trim() ? [{ type: 'thinking', thinking }] : []),
+              ...(text.trim() ? [{ type: 'text', text }] : [])] } });
         } catch { /* display only */ }
       }
     }
@@ -646,7 +653,9 @@ export function register(on) {
     if (e.agentId && delegation) {
       agentSteps.set(e.agentId, (agentSteps.get(e.agentId) || 0) + 1);
       let gate;
-      try { gate = await callBridge($, '/event', { protocol: 1, type: 'agent_step', agentId: e.agentId }); }
+      // The engine has resolved the subagent's model here (its type's
+      // default, the call's model, or CLAUDE_CODE_SUBAGENT_MODEL); its card shows it.
+      try { gate = await callBridge($, '/event', { protocol: 1, type: 'agent_step', agentId: e.agentId, model: e.model || null }); }
       catch { return await refuseStep($, e); }
       if (!gate?.ok) return await refuseStep($, e);
       const result = yield* next(e);

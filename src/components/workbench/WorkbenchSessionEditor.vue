@@ -14,6 +14,7 @@ import type { WorkspaceRef } from "../../services/project";
 import type { ManagedWorktree } from "../../services/worktrees";
 import { saveSessionExecutionState, unarchiveSession } from "../../services/session";
 import { broadcastSessionExecutionState } from "../../services/sessionExecutionState";
+import { isNativeAgentRecordType } from "../../services/claudeAgentCards";
 import { useAgentStore } from "../../stores/agent";
 import { useAuthStore } from "../../stores/auth";
 import { useChatChangesStore } from "../../stores/chatChanges";
@@ -243,6 +244,7 @@ const {
   sessionFastMode,
   sessionMultiAgentEnabled,
   parentSessionId,
+  loadedSessionType,
   latestCompletedRunId,
   planModeActive,
   canResumeInterrupted,
@@ -757,6 +759,7 @@ defineExpose({
     :surface-hidden="surfaceHidden"
     :current-run-id="currentRunId"
     :is-viewing-subagent="!!parentSessionId"
+    :is-native-agent-record="isNativeAgentRecordType(loadedSessionType)"
     :pending-session-id="null"
     :unity-connected="workspaceUnityConnected"
     :unity-plugin-status="workspaceUnityPluginStatus"

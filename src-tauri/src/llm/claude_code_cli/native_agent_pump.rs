@@ -105,9 +105,9 @@ async fn handle(session: &Arc<Session>, session_id: &str, host: Arc<dyn ClaudeNa
         }
         Some("agent_step") => {
             let id = native_agent_id(message).unwrap_or_default();
-            if registered(session, id).await.is_none() {
+            let Some(agent) = registered(session, id).await else {
                 return json!({"deny":"Unknown Claude subagent; its request was not sent."});
-            }
+            };
             if session.controls.native_agent_stopped(id) {
                 return json!({"deny":"The user stopped this agent."});
             }
@@ -116,6 +116,7 @@ async fn handle(session: &Arc<Session>, session_id: &str, host: Arc<dyn ClaudeNa
                 && tokio::time::timeout(REGISTRATION_WAIT, session.controls.wait_agent_running(id)).await.is_err() {
                 return json!({"deny":"This agent run has ended."});
             }
+            note_model(session, &host, &agent, message["model"].as_str());
             ok
         }
         Some("assistant" | "interrupted_assistant") => announce(session, &host, message).await,
@@ -139,6 +140,11 @@ async fn handle(session: &Arc<Session>, session_id: &str, host: Arc<dyn ClaudeNa
         Some("usage") => {
             if let Some(agent) = native_agent_id(message).and_then(|id| session.controls.native_agent(id)) {
                 host.usage(&agent, &message["usage"]);
+                // The request's model is preferred (agent_step); this covers a
+                // step whose request did not name one.
+                if session.controls.agent_model(&agent.agent_id).is_none() {
+                    note_model(session, &host, &agent, message["usage"]["model"].as_str());
+                }
             }
             ok
         }
@@ -149,6 +155,15 @@ async fn handle(session: &Arc<Session>, session_id: &str, host: Arc<dyn ClaudeNa
 
 fn native_agent_id(message: &serde_json::Value) -> Option<&str> {
     message["agentId"].as_str().filter(|id| !id.is_empty())
+}
+
+/// The subagent's card shows the model Claude resolved for it; the host
+/// hears only of a change, so a healthy agent costs one update.
+fn note_model(session: &Session, host: &Arc<dyn ClaudeNativeAgentHost>, agent: &mod_bridge::NativeAgent, model: Option<&str>) {
+    let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else { return; };
+    if session.controls.note_agent_model(&agent.agent_id, model) {
+        host.model_resolved(agent, model);
+    }
 }
 
 /// The subagent's registration, which may trail its first callbacks.
@@ -183,8 +198,12 @@ async fn announce(session: &Session, host: &Arc<dyn ClaudeNativeAgentHost>, mess
     if had_tools && new_tools.is_empty() {
         return json!({"ok":true});
     }
-    let text = blocks.iter().filter(|block| block["type"] == "text")
-        .filter_map(|block| block["text"].as_str()).collect::<Vec<_>>().join("\n");
+    let joined = |kind: &str, key: &str| blocks.iter().filter(|block| block["type"] == kind)
+        .filter_map(|block| block[key].as_str()).collect::<Vec<_>>().join("\n");
+    let (text, thinking) = (joined("text", "text"), joined("thinking", "thinking"));
+    if !text.trim().is_empty() || !thinking.trim().is_empty() {
+        host.message(&agent, &thinking, &text);
+    }
     if !text.trim().is_empty() {
         host.text(&agent, &text);
     }
@@ -329,6 +348,13 @@ pub(crate) fn stop_native_agent(session_id: &str, agent_id: &str) -> Result<(), 
 }
 
 pub(super) const AGENT_REGISTRY_FILE: &str = "native_agents.json";
+
+/// The conversation's native Agent cards (subagent and model), for its
+/// history. The registry is current while Claude runs too.
+pub(crate) fn native_agent_cards(session_id: &str) -> Result<Vec<mod_bridge::RegistryCard>, String> {
+    let path = super::super::ssh::profile_root(session_id)?.join(AGENT_REGISTRY_FILE);
+    Ok(mod_bridge::registry_cards(&path))
+}
 
 /// `<task-notification>` as Claude 2.1.312 renders it for an agent.
 pub(super) fn parse_notification(text: &str) -> Option<ClaudeCodeAgentNotice> {

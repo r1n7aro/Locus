@@ -3,7 +3,7 @@ mod async_resume;
 mod backend;
 mod claude_code_cli;
 mod claude_native_agents;
-pub(crate) use claude_native_agents::claude_agent_routes;
+pub(crate) use claude_native_agents::{claude_agent_cards, claude_agent_routes, ClaudeAgentCard};
 mod codex_steering;
 mod codex_web;
 mod custom_codex;

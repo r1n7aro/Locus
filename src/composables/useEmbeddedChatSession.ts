@@ -120,6 +120,8 @@ interface EmbeddedChatState extends StreamState {
   sessionFastMode: boolean | null;
   sessionMultiAgentEnabled: boolean;
   parentSessionId: string | null;
+  /** The loaded session's type (`claude_agent` for a native subagent's record). */
+  loadedSessionType: string | null;
   latestCompletedRunId: string | null;
   latestTodoRunId: string | null;
   todosSessionScoped: boolean;
@@ -214,6 +216,7 @@ function createState(key: string): EmbeddedChatState {
     sessionFastMode: null,
     sessionMultiAgentEnabled: false,
     parentSessionId: null,
+    loadedSessionType: null,
     latestCompletedRunId: null,
     latestTodoRunId: null,
     todosSessionScoped: false,
@@ -1173,6 +1176,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     state.sessionFastMode = detail.lastFastMode ?? null;
     state.sessionMultiAgentEnabled = detail.lastMultiAgentEnabled ?? false;
     state.parentSessionId = detail.parentSessionId;
+    state.loadedSessionType = detail.sessionType ?? null;
     state.latestCompletedRunId = detail.latestCompletedRunId ?? null;
     state.historyOldestRowId = snapshot.oldestMessageRowId ?? null;
     state.historyHasMore = snapshot.hasMoreHistory;
@@ -2616,6 +2620,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
   const sessionFastMode = computed(() => activeState.value.sessionFastMode);
   const sessionMultiAgentEnabled = computed(() => activeState.value.sessionMultiAgentEnabled);
   const parentSessionId = computed(() => activeState.value.parentSessionId);
+  const loadedSessionType = computed(() => activeState.value.loadedSessionType);
   const latestCompletedRunId = computed(() => activeState.value.latestCompletedRunId);
   const planModeActive = computed(() => activeState.value.planModeActive);
   const planFilePath = computed(() => activeState.value.planFilePath);
@@ -2746,6 +2751,7 @@ export function useEmbeddedChatSession(options: UseEmbeddedChatSessionOptions) {
     sessionFastMode,
     sessionMultiAgentEnabled,
     parentSessionId,
+    loadedSessionType,
     latestCompletedRunId,
     planModeActive,
     planFilePath,

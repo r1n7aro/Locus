@@ -15,6 +15,7 @@ import {
   useInternalDragController,
 } from "../../composables/useInternalDrag";
 import { withInternalTreePreview } from "../explorer/internalTreePreview";
+import { isNativeAgentRecordType } from "../../services/claudeAgentCards";
 import { AppWindow, Archive, Box, Check, ChevronRight, FileSearch, Folder, FolderInput, FolderOpen, FolderPlus, GitBranch, HelpCircle, ListTree, LoaderCircle, MessageSquarePlus, PencilLine, Save, Settings2, Sparkles, Trash2, X } from "lucide";
 import { t } from "../../i18n";
 import { nodeContainsPluginView, viewPluginAttribution } from "../view/viewTreeActions";
@@ -1285,7 +1286,10 @@ function rowLabel(node: SessionTreeNode): string {
 }
 
 function isSubagentNode(node: SessionTreeNode): boolean {
-  return node.kind === "session" && node.sessionType === "chat" && !!node.parentSessionId;
+  // A native Claude subagent's read-only record is a subagent session too.
+  return node.kind === "session"
+    && (node.sessionType === "chat" || isNativeAgentRecordType(node.sessionType))
+    && !!node.parentSessionId;
 }
 
 function isDevNode(node: SessionTreeNode): boolean {

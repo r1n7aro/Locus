@@ -1466,6 +1466,7 @@ pub async fn create_session(
     workspace_registry: State<'_, Arc<crate::workspace_service::ProjectRegistry>>,
     store: State<'_, Arc<SessionStore>>,
 ) -> Result<String, AppError> {
+    native_agent_record_type(session_type.as_deref())?;
     let scope = resolve_workspace_scope(
         workspace_registry.inner().as_ref(),
         &workspace_ref,
@@ -1724,6 +1725,27 @@ pub async fn chat(
     .await
 }
 
+/// Refuses changes to a native Claude subagent's read-only record: Claude
+/// Code runs that agent, so Locus never runs, queues, compacts or rewinds
+/// anything there. The main agent continues it with `SendMessage`.
+pub(crate) fn ensure_writable_session(store: &SessionStore, session_id: &str, operation: &str) -> Result<(), AppError> {
+    store.ensure_not_native_agent_record(session_id).map_err(|error| {
+        let code = if error == crate::session::store::NATIVE_AGENT_RECORD_READONLY {
+            "session.native_agent_readonly"
+        } else {
+            "session.load_failed"
+        };
+        AppError::new(code, error).operation(operation)
+    })
+}
+
+fn native_agent_record_type(session_type: Option<&str>) -> Result<(), AppError> {
+    if session_type == Some(crate::session::store::NATIVE_AGENT_SESSION_TYPE) {
+        return Err(AppError::new("session.native_agent_readonly", "Only Locus creates Claude Code subagent records."));
+    }
+    Ok(())
+}
+
 /// `chat` plus a backend-only launch whose input is an internal system
 /// reminder (e.g. waking an idle session for delivered task results). Such a
 /// launch requires an existing session and an empty composer, and persists no
@@ -1772,6 +1794,11 @@ pub(crate) async fn launch_chat(
     app_agent_dir: State<'_, crate::AppAgentDir>,
     undo_manager: State<'_, crate::UndoManagerHandle>,
 ) -> Result<ChatLaunch, AppError> {
+    // Before anything is written: a record never receives input.
+    match session_id.as_deref() {
+        Some(id) => ensure_writable_session(store.inner(), id, "chat")?,
+        None => native_agent_record_type(session_type.as_deref())?,
+    }
     let chat_workspace = resolve_chat_workspace_scope(
         store.inner().as_ref(),
         workspace_registry.inner().as_ref(),
@@ -2551,6 +2578,7 @@ pub async fn queue_chat_input(
     pending_input_queue: State<'_, PendingInputQueueHandle>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<PendingSessionInput, AppError> {
+    ensure_writable_session(store.inner(), &session_id, "chat")?;
     let trimmed_merge_group_id = merge_group_id.trim();
     if trimmed_merge_group_id.is_empty() {
         return Err(AppError::new(
@@ -2702,6 +2730,7 @@ pub async fn queue_session_compact(
     pending_input_queue: State<'_, PendingInputQueueHandle>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<bool, AppError> {
+    ensure_writable_session(store.inner(), &session_id, "compact")?;
     {
         let tasks = active_tasks.lock().await;
         let Some(task) = tasks.get(&session_id) else {
@@ -2764,6 +2793,7 @@ pub async fn insert_pending_chat_input(
     pending_input_queue: State<'_, PendingInputQueueHandle>,
     active_tasks: State<'_, ActiveTasks>,
 ) -> Result<PendingSessionInput, AppError> {
+    ensure_writable_session(store.inner(), &session_id, "chat")?;
     {
         let tasks = active_tasks.lock().await;
         let Some(task) = tasks.get(&session_id) else {
@@ -3201,6 +3231,7 @@ pub async fn undo_latest_conversation_turn(
     store: State<'_, Arc<SessionStore>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SessionDetail, AppError> {
+    ensure_writable_session(store.inner(), &session_id, "undo_latest_conversation_turn")?;
     let scope = resolve_optional_session_workspace_scope(
         store.inner(),
         workspace_registry.inner(),
@@ -3245,6 +3276,7 @@ pub async fn rollback_session_to_message(
     store: State<'_, Arc<SessionStore>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SessionDetail, AppError> {
+    ensure_writable_session(store.inner(), &session_id, "rollback_session_to_message")?;
     let scope = resolve_optional_session_workspace_scope(
         store.inner(),
         workspace_registry.inner(),

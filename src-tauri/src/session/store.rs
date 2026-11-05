@@ -159,6 +159,10 @@ const DELETED_RESULT_TAG_OPEN: &str = "<persisted-output-deleted>";
 const DELETED_RESULT_TAG_CLOSE: &str = "</persisted-output-deleted>";
 const LARGE_RESULT_PATH_PREFIX: &str = "Full output saved to: ";
 pub const CHILD_SESSION_FORK_ERROR: &str = "Child sessions cannot be forked";
+/// Session type of a native Claude subagent's record: a read-only child
+/// session mirroring what the subagent did (`claude_native_agent_record.rs`).
+pub const NATIVE_AGENT_SESSION_TYPE: &str = "claude_agent";
+pub const NATIVE_AGENT_RECORD_READONLY: &str = "This conversation records a Claude Code subagent and is read-only. Ask the main agent to continue it with SendMessage.";
 const RUN_STATUS_QUEUED: &str = "queued";
 const RUN_STATUS_STARTING: &str = "starting";
 const RUN_STATUS_RUNNING: &str = "running";
@@ -4503,6 +4507,8 @@ impl SessionStore {
         run_id: &str,
         scope: Option<&SessionRunScopeSnapshot>,
     ) -> Result<(), String> {
+        // Every Locus run (chat, compaction, resume, SDK) starts here.
+        self.ensure_not_native_agent_record(session_id)?;
         let scoped_values = if let Some(scope) = scope {
             let project_id = scope.project_id.trim();
             let checkout_id = scope.checkout_id.trim();
@@ -5775,6 +5781,23 @@ impl SessionStore {
             .map_err(|e| format!("Failed to clear plan exited notice: {}", e))?;
         }
         Ok(pending != 0)
+    }
+
+    /// The session's type; `None` when it does not exist.
+    pub fn session_type(&self, id: &str) -> Result<Option<String>, String> {
+        self.read_conn()?
+            .query_row("SELECT session_type FROM sessions WHERE id = ?1", params![id], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|e| format!("Failed to read session type: {e}"))
+    }
+
+    /// A native Claude subagent's record is read-only: Claude Code runs the
+    /// agent, so nothing may run, be queued, compacted or rewound there.
+    pub fn ensure_not_native_agent_record(&self, id: &str) -> Result<(), String> {
+        if self.session_type(id)?.as_deref() == Some(NATIVE_AGENT_SESSION_TYPE) {
+            return Err(NATIVE_AGENT_RECORD_READONLY.to_string());
+        }
+        Ok(())
     }
 
     pub fn load_session(&self, id: &str) -> Result<SessionDetail, String> {
@@ -9341,8 +9364,8 @@ mod tests {
     use super::{
         build_large_tool_result_message, estimate_preview, PersistedToolResult, SessionEventAppend,
         SessionPromptPrefixCache, SessionStore, CHILD_SESSION_FORK_ERROR,
-        CONTEXT_COMPACTED_DISPLAY_MARKER, DEFERRED_TOOL_IMAGE_DATA_PREFIX, RUN_STATUS_CANCELLED,
-        RUN_STATUS_CANCELLING, RUN_STATUS_DONE, RUN_STATUS_ERROR,
+        CONTEXT_COMPACTED_DISPLAY_MARKER, DEFERRED_TOOL_IMAGE_DATA_PREFIX, NATIVE_AGENT_RECORD_READONLY,
+        NATIVE_AGENT_SESSION_TYPE, RUN_STATUS_CANCELLED, RUN_STATUS_CANCELLING, RUN_STATUS_DONE, RUN_STATUS_ERROR,
     };
     use crate::compact;
     use crate::session::models::{
@@ -13500,6 +13523,29 @@ mod tests {
         assert_eq!(snapshot.latest_run_id.as_deref(), Some("run-todo"));
         assert_eq!(snapshot.items.len(), 1);
         assert_eq!(snapshot.items[0].content, "Track current run");
+    }
+
+    #[test]
+    fn a_native_agent_record_never_starts_a_run_but_keeps_its_transcript() {
+        let dir = tempdir().expect("create temp dir");
+        let store = SessionStore::new(dir.path()).expect("initialize store");
+        let parent = store.create_session("Parent", None, None, "chat", None).expect("create parent");
+        let record = uuid::Uuid::new_v4().to_string();
+        store
+            .create_session_scoped_with_id(&record, "sub:Scan", Some(&parent), None, None, NATIVE_AGENT_SESSION_TYPE, None)
+            .expect("create record");
+        assert_eq!(store.session_type(&record).unwrap().as_deref(), Some(NATIVE_AGENT_SESSION_TYPE));
+        assert_eq!(store.session_type("missing").unwrap(), None);
+        // The host writes its transcript; nothing runs there.
+        store.add_message(&record, MessageRole::User, "Scan the handouts").expect("record prompt");
+        assert_eq!(store.try_start_run(&record, "run-1").unwrap_err(), NATIVE_AGENT_RECORD_READONLY);
+        assert_eq!(store.ensure_not_native_agent_record(&record).unwrap_err(), NATIVE_AGENT_RECORD_READONLY);
+        assert!(store.active_run_for_session(&record).unwrap().is_none());
+        assert_eq!(store.get_messages(&record).unwrap().len(), 1);
+        // Its conversation is unaffected.
+        store.ensure_not_native_agent_record(&parent).expect("parent is writable");
+        store.try_start_run(&parent, "run-2").expect("parent runs");
+        assert_eq!(store.load_session(&record).unwrap().parent_session_id.as_deref(), Some(parent.as_str()));
     }
 
     #[test]

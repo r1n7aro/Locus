@@ -136,7 +136,7 @@ describe('Claude native delegation Mod', () => {
     expect(await h.run('tool.call', background, start)).toBe(launched);
     expect(start).toHaveBeenCalledWith(background);
     expect(h.events('agent_spawn')).toEqual([{ protocol: 1, type: 'agent_spawn', runId: 'run-1', agentId: 'a7',
-      parentToolUseId: 'toolu_bg', name: 'Explore', description: 'Scan', background: true, resume: false }]);
+      parentToolUseId: 'toolu_bg', name: 'Explore', description: 'Scan', prompt: 'p', background: true, resume: false }]);
     expect(h.events('tool_result').find(event => event.id === 'toolu_bg')!.output).toContain('Running in the background as agent a7');
     expect(h.sent('/call')).toEqual([]);
 
@@ -243,9 +243,9 @@ describe('Claude native delegation Mod', () => {
     expect(resumed).toHaveBeenCalledOnce();
     expect(h.events('agent_spawn')).toEqual([
       { protocol: 1, type: 'agent_spawn', runId: 'run-1', agentId: 'a1', parentToolUseId: 'toolu_native', name: 'locus:reviewer',
-        description: 'Review', background: false, resume: false },
+        description: 'Review', prompt: 'p', background: false, resume: false },
       { protocol: 1, type: 'agent_spawn', runId: 'run-1', agentId: 'a2', parentToolUseId: 'toolu_send', name: 'locus:reviewer',
-        description: 'Review', background: true, resume: true },
+        description: 'Review', prompt: 'p', background: true, resume: true },
     ]);
   });
 
@@ -260,13 +260,14 @@ describe('Claude native delegation Mod', () => {
     expect(submit).not.toHaveBeenCalled();
   });
 
-  it('gates subagent steps by their registration, also while idle, and records their usage', async () => {
+  it('gates subagent steps by their registration, also while idle, and records their model and usage', async () => {
     const h = await delegation();
     h.state.options = { ...h.state.options, active: false };
     const { value, inference } = await subagentStep(h, { agentId: 'a1', turnId: 'sub-turn', index: 2, model: 'claude-sonnet-4-6' });
     expect(inference).toHaveBeenCalledOnce();
     expect(value).toMatchObject({ answer: 'working' });
-    expect(h.events('agent_step')).toEqual([{ protocol: 1, type: 'agent_step', agentId: 'a1' }]);
+    // The resolved model travels with the gate, before the request is sent.
+    expect(h.events('agent_step')).toEqual([{ protocol: 1, type: 'agent_step', agentId: 'a1', model: 'claude-sonnet-4-6' }]);
     expect(h.events('usage')).toEqual([{ protocol: 1, type: 'usage', agentId: 'a1',
       usage: { input_tokens: 10, output_tokens: 2, model: 'claude-sonnet-4-6', stepKey: 'sub-turn:2' } }]);
     // A stopped (or unregistered) agent sends nothing more.
@@ -280,6 +281,14 @@ describe('Claude native delegation Mod', () => {
     await h.run('session.append', { door: 'transcript', uuid: 'u1', agentId: 'a1', origin: { kind: 'model' },
       message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text: 'Found 3 files' }] } }, append);
     expect(h.events('assistant').slice(-1)[0]).toMatchObject({ agentId: 'a1', message: { content: [{ type: 'text', text: 'Found 3 files' }] } });
+    // Its thinking travels too, for its Locus record; a tool-only row sends nothing.
+    await h.run('session.append', { door: 'transcript', uuid: 'u2', agentId: 'a1', origin: { kind: 'model' },
+      message: { type: 'assistant', role: 'assistant', content: [{ type: 'thinking', thinking: 'Check the index first' }] } }, append);
+    expect(h.events('assistant').slice(-1)[0].message.content).toEqual([{ type: 'thinking', thinking: 'Check the index first' }]);
+    const before = h.events('assistant').length;
+    await h.run('session.append', { door: 'transcript', uuid: 'u3', agentId: 'a1', origin: { kind: 'model' },
+      message: { type: 'assistant', role: 'assistant', content: [{ type: 'tool_use', id: 'child_9', name: 'Read', input: {} }] } }, append);
+    expect(h.events('assistant')).toHaveLength(before);
     const complete = vi.fn(async () => ({ text: '' }));
     await h.run('turn.complete', { agentId: 'a1', turnId: 'sub-turn', isAborted: false }, complete);
     expect(complete).toHaveBeenCalledOnce();

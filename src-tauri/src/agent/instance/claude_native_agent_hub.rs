@@ -15,6 +15,7 @@
 //! to the conversation (waking it when idle) instead of Claude's own notice.
 use super::*;
 use super::native_agent_host::nested_record;
+use super::native_agent_record::{AgentRecords, RecordScope};
 use super::super::claude_native_agents::native_agent_tool_refusal;
 use crate::llm::claude_code_cli::{
     ClaudeCodeAgentNotice, ClaudeCodeNativeAgent, ClaudeCodeUnitFuture, ClaudeNativeAgentHost,
@@ -27,6 +28,21 @@ use tauri::Manager;
 const NESTED_OUTPUT_PREVIEW_CHARS: usize = 500;
 /// Async task tool name of a background native agent.
 pub(super) const NATIVE_AGENT_TASK_TOOL: &str = "Agent";
+/// What a native subagent's Agent card shows beyond its call: the model it
+/// runs on and its record (`src/services/claudeAgentCards.ts`).
+const CLAUDE_AGENT_CARD_EVENT: &str = "claude-agent-card";
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeAgentCardEvent {
+    session_id: String,
+    /// The card: the `Agent` call that started the subagent.
+    tool_call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_session_id: Option<String>,
+}
 
 fn output_preview(output: &str) -> String {
     let count = output.chars().count();
@@ -91,6 +107,8 @@ pub(super) struct NativeAgentHub {
     store: Arc<SessionStore>,
     authority: RwLock<Option<Arc<Authority>>>,
     state: Mutex<HubState>,
+    /// Each agent's read-only Locus record (a child session).
+    records: AgentRecords,
 }
 
 fn hubs() -> &'static Mutex<HashMap<String, Weak<NativeAgentHub>>> {
@@ -109,10 +127,17 @@ impl NativeAgentHub {
             match hubs.get(&session_id).and_then(Weak::upgrade) {
                 Some(hub) => hub,
                 None => {
+                    let store = host.app_handle.state::<Arc<SessionStore>>().inner().clone();
+                    let app = host.app_handle.clone();
+                    let announcer: super::native_agent_record::Announcer = Arc::new(move |events, working_dir, record| {
+                        crate::commands::emit_session_content_changed(&app, Some(events), working_dir, record,
+                            super::native_agent_record::ANNOUNCE_SOURCE);
+                    });
                     let hub = Arc::new(Self {
                         session_id: session_id.clone(),
                         app: host.app_handle.clone(),
-                        store: host.app_handle.state::<Arc<SessionStore>>().inner().clone(),
+                        records: AgentRecords::new(session_id.clone(), store.clone(), announcer),
+                        store,
                         authority: RwLock::new(None),
                         state: Mutex::new(HubState::default()),
                     });
@@ -138,6 +163,19 @@ impl NativeAgentHub {
 
     fn authority(&self) -> Option<Arc<Authority>> {
         self.authority.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The conversation's workspace, which its agents' records join.
+    fn record_scope(&self) -> RecordScope {
+        let authority = self.authority();
+        let instance = authority.as_ref().map(|authority| &authority.agent);
+        let execution = instance.and_then(|instance| instance.execution_context.as_ref());
+        RecordScope {
+            project_id: instance.and_then(|instance| instance.workspace_id.clone()),
+            checkout_id: execution.map(|execution| execution.checkout_id.as_str().to_string()),
+            working_dir: instance.map(|instance| instance.working_dir.clone()).unwrap_or_default(),
+            events: execution.map(|execution| crate::workspace_service::event::WorkspaceEventScope::for_runtime(execution.workspace.as_ref())),
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, HubState> {
@@ -169,6 +207,19 @@ impl NativeAgentHub {
         Some(card)
     }
 
+    /// Tells the open conversation what the agent's card links to.
+    fn announce_card(&self, agent: &ClaudeCodeNativeAgent, model: Option<String>, record_session_id: Option<String>) {
+        let event = ClaudeAgentCardEvent {
+            session_id: self.session_id.clone(),
+            tool_call_id: agent.parent_tool_use_id.clone(),
+            model,
+            record_session_id,
+        };
+        if let Err(error) = self.app.emit(CLAUDE_AGENT_CARD_EVENT, event) {
+            eprintln!("[Claude subagent] failed to update the card of {}: {error}", agent.agent_id);
+        }
+    }
+
     fn parent(&self, card_id: &str, run_id: &str) -> super::super::ParentToolCall {
         super::super::ParentToolCall::new(self.session_id.clone(), run_id.to_string(), card_id.to_string())
     }
@@ -182,6 +233,7 @@ impl NativeAgentHub {
             (state.records.remove(card_id).unwrap_or_default(), run_id)
         };
         let parent = self.parent(card_id, &run_id);
+        let scope = self.record_scope();
         for call in calls.iter_mut().filter(|call| call.outcome.is_none()) {
             call.outcome = Some(ToolCallOutcome::Interrupted);
             self.state().finished.insert(call.id.clone());
@@ -189,6 +241,7 @@ impl NativeAgentHub {
                 &self.app,
                 parent.subagent_tool_call_done(call.id.clone(), call.name.clone(), String::new(), ToolCallOutcome::Interrupted, None),
             );
+            self.records.call_finished(&call.id, crate::session::history::INTERRUPTED_TOOL_RESULT, ToolCallOutcome::Interrupted, None, &scope);
         }
         calls
     }
@@ -240,6 +293,7 @@ impl NativeAgentHub {
         if agent.background {
             self.persist_record(&card_id, &record);
         }
+        self.records.call_started(agent, &record, &self.record_scope());
     }
 
     /// Records a nested call's outcome once and updates the card.
@@ -271,6 +325,8 @@ impl NativeAgentHub {
         if agent.background {
             self.persist_record(&card_id, &record);
         }
+        // The record keeps the complete result, as a Locus subagent's session does.
+        self.records.call_finished(id, &result.output, outcome, images, &self.record_scope());
     }
 
     fn refusal(authority: &Authority, agent: &ClaudeCodeNativeAgent, name: &str, args: &serde_json::Value) -> Option<String> {
@@ -612,10 +668,19 @@ impl NativeAgentHub {
 impl ClaudeNativeAgentHost for NativeAgentHub {
     fn registered<'a>(&'a self, agent: &'a ClaudeCodeNativeAgent) -> ClaudeCodeUnitFuture<'a> {
         Box::pin(async move {
+            // Once per run: the card links its record (new, or created by
+            // content that overtook this start).
+            if let Some((record, _)) = self.records.run_started(agent, &self.record_scope()) {
+                self.announce_card(agent, None, Some(record));
+            }
             if agent.background {
                 self.start_task(agent);
             }
         })
+    }
+
+    fn message(&self, agent: &ClaudeCodeNativeAgent, thinking: &str, text: &str) {
+        self.records.message(agent, thinking, text, &self.record_scope());
     }
 
     fn tool_started(&self, agent: &ClaudeCodeNativeAgent, tool_call_id: &str, tool_name: &str, arguments: &serde_json::Value) {
@@ -717,6 +782,11 @@ impl ClaudeNativeAgentHost for NativeAgentHub {
         if recorded.is_none() {
             eprintln!("[Claude subagent] usage of {} was not recorded", agent.agent_id);
         }
+    }
+
+    fn model_resolved(&self, agent: &ClaudeCodeNativeAgent, model: &str) {
+        // The registry already keeps it for history (`get_claude_agent_cards`).
+        self.announce_card(agent, Some(model.to_string()), None);
     }
 
     fn process_exited<'a>(&'a self, agents: Vec<ClaudeCodeNativeAgent>) -> ClaudeCodeUnitFuture<'a> {

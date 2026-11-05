@@ -52,9 +52,19 @@ describe("Claude Code Agent cards", () => {
     // Claude may call a published type without its namespace.
     expect(delegationRoute(agent("explorer-luna"), routes))
       .toEqual({ backend: "locus", model: "custom/child/luna", modelId: "custom/child/luna", builtin: false });
-    // Builtins, including the default type: Claude Code chooses the model.
+    // Builtins, including the default type: Claude Code chooses the model,
+    // shown once its subagent reports the one it resolved.
     expect(delegationRoute(agent("Explore"), routes)).toEqual({ backend: "claude", model: null, modelId: null, builtin: true });
     expect(delegationRoute(agent(null), routes)).toMatchObject({ backend: "claude", builtin: true });
+    expect(delegationRoute(agent("Explore"), routes, " claude-haiku-4-5 "))
+      .toEqual({ backend: "claude", model: "claude-haiku-4-5", modelId: "claude-haiku-4-5", builtin: true });
+    expect(delegationRoute(agent(null), null, "claude-opus-5-5"))
+      .toEqual({ backend: "claude", model: "claude-opus-5-5", modelId: "claude-opus-5-5", builtin: true });
+    // A published type keeps its configured model; a Locus run has no native one.
+    expect(delegationRoute(agent("locus:explorer-sonnet"), routes, "claude-sonnet-4-5"))
+      .toEqual({ backend: "claude", model: "sonnet", modelId: "claude_code/sonnet", builtin: false });
+    expect(delegationRoute(agent("Explore", { status: "done", output: "Task id: t-1\nDone" }), null, "claude-opus-5-5"))
+      .toMatchObject({ backend: "locus", model: null });
     // Before the routes load, a running Locus card reports its model.
     const running = agent("locus:explorer-luna", { progress: { title: LOCUS_AGENT_PROGRESS_TITLE, info: "openrouter/openai/gpt-5", state: "running" } });
     expect(delegationRoute(running, null)).toEqual({ backend: "locus", model: "openai/gpt-5", modelId: "openrouter/openai/gpt-5", builtin: false });

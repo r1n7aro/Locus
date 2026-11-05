@@ -29,6 +29,8 @@ mod fork_sync_tests;
 mod native_agent_host;
 #[path = "claude_native_agent_hub.rs"]
 mod native_agent_hub;
+#[path = "claude_native_agent_record.rs"]
+pub(crate) mod native_agent_record;
 
 pub(super) fn pending_input_metadata() -> serde_json::Value {
     serde_json::json!({

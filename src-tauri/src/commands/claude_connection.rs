@@ -18,6 +18,13 @@ pub fn get_claude_agent_routes(session_id:String,store:State<'_,Arc<SessionStore
     crate::agent::instance::claude_agent_routes(store.inner(),&session_id)
 }
 
+/// Agent card id → the model its native Claude subagent ran on and its
+/// read-only record (live changes arrive as `claude-agent-card`).
+#[tauri::command]
+pub fn get_claude_agent_cards(session_id:String,store:State<'_,Arc<SessionStore>>)->Result<std::collections::HashMap<String,crate::agent::instance::ClaudeAgentCard>,String> {
+    crate::agent::instance::claude_agent_cards(store.inner(),&session_id)
+}
+
 #[tauri::command]
 pub async fn backup_claude_native_session(session_id:String,store:State<'_,Arc<SessionStore>>)->Result<Option<crate::llm::claude_code_cli::archive::ArchiveInfo>,String> {
     crate::llm::claude_code_cli::archive::backup(store.inner(),&session_id).await

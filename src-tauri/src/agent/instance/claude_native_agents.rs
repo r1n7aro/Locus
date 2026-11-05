@@ -537,6 +537,33 @@ pub(crate) fn claude_agent_routes(store: &SessionStore, session_id: &str) -> Res
     Ok(Some(serde_json::json!({"types": types, "builtins": directory.builtins})))
 }
 
+/// What a native subagent's Agent card links to beyond its call.
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClaudeAgentCard {
+    /// The model Claude ran the subagent on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The subagent's read-only Locus record (a child session).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_session_id: Option<String>,
+}
+
+/// Agent card id → its model and record, for the conversation's history.
+/// Agents that ran before either was kept are left out.
+pub(crate) fn claude_agent_cards(store: &SessionStore, session_id: &str) -> Result<std::collections::HashMap<String, ClaudeAgentCard>, String> {
+    let mut cards = std::collections::HashMap::new();
+    for card in crate::llm::claude_code_cli::tui::native_agent_cards(session_id)? {
+        let record = super::claude_code_cli::native_agent_record::record_session_id(session_id, &card.agent_id);
+        let record = (store.session_type(&record)?.as_deref() == Some(crate::session::store::NATIVE_AGENT_SESSION_TYPE))
+            .then_some(record);
+        if card.model.is_some() || record.is_some() {
+            cards.insert(card.card_id, ClaudeAgentCard { model: card.model, record_session_id: record });
+        }
+    }
+    Ok(cards)
+}
+
 /// Options neither backend supports.
 pub(super) fn unsupported_agent_option(input: &serde_json::Value) -> Option<String> {
     if input.get("isolation").is_some_and(|value| !value.is_null() && value != "") {

@@ -134,6 +134,7 @@ const RULES: &[Rule] = &[
     rule("get_archived_checkout_storage_bytes", Tier::View, &[]),
     rule("get_auth_status", Tier::View, &[]),
     rule("get_auth_url", Tier::Control, &[]),
+    rule("get_claude_agent_cards", Tier::View, &[]),
     rule("get_claude_agent_routes", Tier::View, &[]),
     rule("get_claude_code_cli_enabled", Tier::View, &[]),
     rule("get_claude_code_models", Tier::View, &[]),

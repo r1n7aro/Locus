@@ -141,6 +141,7 @@ pub async fn set_session_plan_mode(
     store: State<'_, Arc<SessionStore>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<SessionPlanStatePayload, AppError> {
+    super::session::ensure_writable_session(store.inner(), &session_id, "set_session_plan_mode")?;
     let scope = super::session::resolve_session_workspace_scope(
         store.inner(),
         workspace_registry.inner(),

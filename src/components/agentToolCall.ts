@@ -49,7 +49,7 @@ export function modelDisplayLabel(model: string): string {
 
 export interface DelegationRoute {
   backend: AgentBackend;
-  /** Short label and full id; `null` when the backend picks the model. */
+  /** Short label and full id; `null` while the backend's choice is unknown. */
   model: string | null;
   modelId: string | null;
   /** A Claude Code builtin type: Claude Code chooses its model. */
@@ -57,12 +57,14 @@ export interface DelegationRoute {
 }
 
 /** Backend and model a delegation card runs on. An Agent card follows its
- *  conversation's pinned route for the subagent_type (a builtin's model is
- *  Claude Code's choice); a Locus subagent card shows the model it asked
+ *  conversation's pinned route for the subagent_type; a builtin shows the
+ *  model Claude Code resolved for its subagent (`nativeModel`) once its
+ *  first request starts. A Locus subagent card shows the model it asked
  *  for. Refused Agent calls ran nowhere. */
 export function delegationRoute(
   toolCall: Pick<ToolCallDisplay, "name" | "arguments" | "status" | "output" | "progress">,
   routes: ClaudeAgentRoutes | null,
+  nativeModel: string | null = null,
 ): DelegationRoute | null {
   if (toolCall.name === "subagent" || toolCall.name === "task") {
     const model = parseArgs(toolCall.arguments)?.model;
@@ -82,12 +84,15 @@ export function delegationRoute(
       builtin: false,
     };
   }
-  // Before the routes load: a running Locus card reports its model.
+  // Before the routes load: a running Locus card reports its model. A
+  // native subagent reports the one Claude resolved (the type's default,
+  // the call's model, or CLAUDE_CODE_SUBAGENT_MODEL).
   const progressModel = toolCall.progress?.title === LOCUS_AGENT_PROGRESS_TITLE ? toolCall.progress.info.trim() : "";
+  const model = progressModel || (ran === "claude" ? nativeModel?.trim() ?? "" : "");
   return {
     backend: ran,
-    model: progressModel ? modelDisplayLabel(progressModel) : null,
-    modelId: progressModel || null,
+    model: model ? modelDisplayLabel(model) : null,
+    modelId: model || null,
     builtin: ran === "claude" && (routes?.builtins.includes(subagentType) ?? !subagentType.startsWith("locus:")),
   };
 }

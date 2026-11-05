@@ -58,6 +58,7 @@ import { normalizeAppError } from "../services/errors";
 import { useClaudeSessionTransfer } from "../composables/useClaudeSessionTransfer";
 import { knowledgeRevealTarget } from "../services/knowledge";
 import { t } from "../i18n";
+import { isNativeAgentRecordType } from "../services/claudeAgentCards";
 import { useChatChangesStore } from "../stores/chatChanges";
 import { useChatStore } from "../stores/chat";
 import { useUiStore } from "../stores/ui";
@@ -181,6 +182,13 @@ const isViewingSubagent = computed(() => {
   if (!props.activeSessionId) return false;
   const session = props.sessions.find(s => s.id === props.activeSessionId);
   return !!session?.parentSessionId;
+});
+// Nothing can be sent, rewound or forked there; the main agent continues
+// the subagent with SendMessage.
+const isNativeAgentRecord = computed(() => {
+  if (props.scopedSession) return !!props.isNativeAgentRecord;
+  if (!props.activeSessionId) return false;
+  return isNativeAgentRecordType(props.sessions.find(s => s.id === props.activeSessionId)?.sessionType);
 });
 const activeQueuedFollowUp = computed(() => (
   props.scopedSession ? props.queuedFollowUp ?? null : chatStore.activeQueuedFollowUp
@@ -358,6 +366,8 @@ const props = defineProps<{
   /** Uses pane-owned session state while preserving the standard Chat surface. */
   scopedSession?: boolean;
   isViewingSubagent?: boolean;
+  /** A native Claude subagent's record: read-only, Claude Code runs the agent. */
+  isNativeAgentRecord?: boolean;
   sessionSurfaceKey?: string;
   queuedFollowUp?: ScopedQueuedFollowUp | null;
   compactQueued?: boolean;
@@ -1383,11 +1393,12 @@ const messageContextCanCopy = computed(() =>
 );
 
 const messageContextCanReview = computed(() =>
-  !!props.activeSessionId && messageContextCanCopy.value,
+  !!props.activeSessionId && messageContextCanCopy.value && !isNativeAgentRecord.value,
 );
 
 const messageContextCanAct = computed(() =>
   !!props.activeSessionId
+  && !isNativeAgentRecord.value
   && !props.isStreaming
   && !!messageContextMessage.value
   && messageContextMessage.value.role !== "tool",
@@ -1399,6 +1410,7 @@ const effectiveCurrentRunId = computed(() => (
 
 const messageContextCanFork = computed(() =>
   !!props.activeSessionId
+  && !isNativeAgentRecord.value
   && !!messageContextMessage.value
   && messageContextMessage.value.role !== "tool"
   && (!props.scopedSession || !!props.forkFromMessage)
@@ -1436,6 +1448,7 @@ const messageContextShouldShowReEdit = computed(() => {
 
 const messageContextCanReEdit = computed(() =>
   !!props.activeSessionId
+  && !isNativeAgentRecord.value
   && !props.isStreaming
   && messageContextShouldShowReEdit.value
   && (
@@ -3957,7 +3970,11 @@ onUnmounted(() => {
             </button>
           </div>
         </div>
+        <div v-if="isNativeAgentRecord" class="native-agent-record-note" role="status">
+          {{ t("chat.session.nativeAgentRecordReadonly") }}
+        </div>
         <RichChatInput
+          v-else
           ref="composerPanelRef"
           v-model="inputText"
           :disabled="worktreeBusy || workspaceChanging || claudeTransferBusy"
@@ -4308,6 +4325,14 @@ onUnmounted(() => {
 .claude-transfer-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 3px; overflow-wrap: anywhere; }
 .claude-transfer-detail { color: var(--text-secondary); font-size: 11px; }
 .claude-transfer-error { color: var(--status-error-fg, var(--text-color)); }
+.native-agent-record-note {
+  padding: 10px 12px;
+  border: 1px dashed var(--border-color);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .chat-view-layout {
   flex: 1 1 0;
   display: flex;

@@ -424,6 +424,7 @@ pub async fn undo_perform_to_message(
     store: State<'_, Arc<SessionStore>>,
     workspace_registry: State<'_, Arc<ProjectRegistry>>,
 ) -> Result<UndoEntry, AppError> {
+    super::session::ensure_writable_session(store.inner(), &session_id, "undo_perform_to_message")?;
     let scope = super::session::resolve_session_workspace_scope(
         store.inner(),
         workspace_registry.inner(),

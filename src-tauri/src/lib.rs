@@ -1932,6 +1932,7 @@ pub fn run() {
             commands::get_claude_native_agents_support,
             commands::get_claude_native_archive,
             commands::get_claude_agent_routes,
+            commands::get_claude_agent_cards,
             commands::check_claude_session_transfer,
             commands::backup_claude_native_session,
             commands::restore_claude_native_session,

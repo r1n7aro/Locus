@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 mod permission_mode_tests;
 #[path = "native_agent_pump.rs"]
 mod agent_pump;
-pub(crate) use agent_pump::stop_native_agent;
+pub(crate) use agent_pump::{native_agent_cards, stop_native_agent};
 
 #[path = "connection_status.rs"]
 mod connection_status;

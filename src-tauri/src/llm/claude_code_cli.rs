@@ -269,6 +269,8 @@ pub trait ClaudeNativeAgentHost: Send + Sync {
     fn tool_started(&self, agent: &ClaudeCodeNativeAgent, tool_call_id: &str, tool_name: &str, arguments: &serde_json::Value);
     /// Display-only text of a subagent's message; never parent content.
     fn text(&self, agent: &ClaudeCodeNativeAgent, text: &str);
+    /// A subagent's model message (thinking and text), for its Locus record.
+    fn message(&self, _agent: &ClaudeCodeNativeAgent, _thinking: &str, _text: &str) {}
     /// Executes a bridged call under the parent's authority. `SendMessage`
     /// is a message to the main agent; its output is the native result JSON.
     fn execute<'a>(
@@ -285,6 +287,8 @@ pub trait ClaudeNativeAgentHost: Send + Sync {
     fn notification<'a>(&'a self, notice: &'a ClaudeCodeAgentNotice) -> ClaudeCodeUnitFuture<'a>;
     /// Usage of one subagent model step.
     fn usage(&self, _agent: &ClaudeCodeNativeAgent, _usage: &serde_json::Value) {}
+    /// The model a subagent runs on changed (first seen, normally once).
+    fn model_resolved(&self, _agent: &ClaudeCodeNativeAgent, _model: &str) {}
     /// The Claude process is gone; its running background agents ended.
     fn process_exited<'a>(&'a self, agents: Vec<ClaudeCodeNativeAgent>) -> ClaudeCodeUnitFuture<'a>;
 }

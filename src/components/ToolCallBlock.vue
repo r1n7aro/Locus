@@ -16,6 +16,8 @@ import { resolveToolBlockOverride } from "./tool-block-overrides/toolBlockOverri
 import { buildToolCallArgsSummary, toolCallDisplayName } from "./toolCallSummary";
 import { delegationDisplayName, delegationRoute, isDelegationToolName } from "./agentToolCall";
 import { AGENT_ROUTES_SESSION_KEY, claudeAgentRoutes } from "../services/claudeAgentRoutes";
+import { claudeAgentCard } from "../services/claudeAgentCards";
+import { openSessionReference } from "../services/sessionReference";
 import { persistedOutputDisplay } from "./toolPersistedOutput";
 import { normalizeViewError } from "../services/view";
 import { useOpenView } from "../composables/useOpenView";
@@ -223,13 +225,29 @@ const displayName = computed(() => {
   return toolCallDisplayName(props.toolCall.name);
 });
 const agentRoutesSessionId = inject(AGENT_ROUTES_SESSION_KEY, null);
+// Only Agent cards ask; other tool blocks never load or listen.
+const nativeAgentCard = computed(() => (
+  props.toolCall.name === "Agent" ? claudeAgentCard(agentRoutesSessionId?.value, props.toolCall.id) : null
+));
 const delegationRouteInfo = computed(() => {
   if (!isDelegationToolName(props.toolCall.name)) return null;
-  const routes = props.toolCall.name === "Agent" ? claudeAgentRoutes(agentRoutesSessionId?.value) : null;
-  const route = delegationRoute(props.toolCall, routes);
+  const isAgent = props.toolCall.name === "Agent";
+  const routes = isAgent ? claudeAgentRoutes(agentRoutesSessionId?.value) : null;
+  const route = delegationRoute(props.toolCall, routes, nativeAgentCard.value?.model ?? null);
   // Locus subagent cards always run in Locus; only a chosen model is news.
   return route && (props.toolCall.name === "Agent" || route.model) ? route : null;
 });
+// A native subagent's run, kept as a read-only child session. The phone
+// client lists no child sessions.
+const agentRecordSessionId = computed(() => (
+  delegationRouteInfo.value?.backend === "claude" && !isRemoteClient()
+    ? nativeAgentCard.value?.recordSessionId ?? null
+    : null
+));
+function openAgentRecord() {
+  const sessionId = agentRecordSessionId.value;
+  if (sessionId) void openSessionReference(sessionId, headerSummary.value || displayName.value);
+}
 const agentBackendLabel = computed(() => {
   const route = delegationRouteInfo.value;
   if (!route) return "";
@@ -241,7 +259,9 @@ const agentBackendTitle = computed(() => {
   const route = delegationRouteInfo.value;
   if (!route) return "";
   if (!route.modelId) return route.builtin ? `${agentBackendLabel.value}: ${t("tool.agent.builtinModel")}` : agentBackendLabel.value;
-  return `${agentBackendLabel.value} (${route.modelId})`;
+  const detail = route.model === route.modelId ? agentBackendLabel.value : `${agentBackendLabel.value} (${route.modelId})`;
+  // A builtin's model stays Claude Code's choice once it is known.
+  return route.builtin ? `${detail}: ${t("tool.agent.builtinModel")}` : detail;
 });
 
 const isEditTool = computed(() => props.toolCall.name === "edit");
@@ -677,6 +697,17 @@ const highlightedOutput = computed(() => {
           class="tool-call-inline-note"
           :title="skillLoadedLabel"
         >{{ skillLoadedLabel }}</span>
+      </button>
+      <button
+        v-if="agentRecordSessionId"
+        type="button"
+        class="tool-call-action-button"
+        :title="t('tool.agent.openRecordTitle')"
+        :aria-label="t('tool.agent.openRecordTitle')"
+        @click.stop="openAgentRecord"
+      >
+        <LucideIcon :icon="PanelTopOpen" :size="13" />
+        <span>{{ t("tool.agent.openRecord") }}</span>
       </button>
       <button
         v-if="showViewOpenButton"
