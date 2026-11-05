@@ -8,12 +8,19 @@ use crate::process_util::{async_command, ProcessOwner};
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 1_800_000;
 
-fn indent_python_body(code: &str) -> String {
-    code.lines()
-        .map(|line| format!("    {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+/// Virtual file name of the script body. Registered in `linecache` so
+/// tracebacks show source lines and `inspect.getsource` works for functions
+/// defined in the script (`@locus.blender.function` ships their source).
+pub(crate) const SCRIPT_FILENAME: &str = "<locus-python>";
+
+/// A condition Locus reported on purpose (stale snapshot, busy checkout, ...)
+/// prints as the script's own frames, the message and its next step. Every
+/// other exception, including unexpected SDK failures, is re-raised untouched
+/// so its complete traceback stays available for debugging.
+const REPORTED_ERROR_HANDLER: &str = "__locus_report = getattr(locus, \"_print_reported_error\", None)\n    \
+if __locus_report is None or not __locus_report(__locus_error):\n        \
+raise\n    \
+raise SystemExit(1) from None";
 
 fn build_python_source(
     code: &str,
@@ -26,17 +33,55 @@ fn build_python_source(
         .map_err(|error| format!("Failed to encode checkout path: {error}"))?;
     let checkout_id = serde_json::to_string(checkout_id)
         .map_err(|error| format!("Failed to encode checkout id: {error}"))?;
+    // The script runs as the body of `async def __locus_python_main__` so a
+    // top-level `await` and `return` work. Its parsed statements become that
+    // body; re-indenting the text would also indent the continuation lines
+    // of multi-line string literals and change their values. The registered
+    // source is the script itself, so line numbers match what was submitted.
+    let source = serde_json::to_string(code)
+        .map_err(|error| format!("Failed to encode Python code: {error}"))?;
+    let filename = serde_json::to_string(SCRIPT_FILENAME).unwrap_or_default();
     Ok(format!(
-        "import asyncio as __locus_asyncio\n\
+        "import ast as __locus_ast\n\
+import asyncio as __locus_asyncio\n\
+import linecache as __locus_linecache\n\
 import locus as locus\n\
 project = {project}\n\
 workspace_ref = locus.WorkspaceRef(checkout_id={checkout_id}, expected_generation={workspace_generation}, expected_materialization_epoch={materialization_epoch})\n\
+__locus_source__ = {source}\n\
+__locus_linecache.cache[{filename}] = (len(__locus_source__), None, __locus_source__.splitlines(True), {filename})\n\
+__locus_main__ = __locus_ast.parse(\"async def __locus_python_main__(): pass\")\n\
+__locus_main__.body[0].body = __locus_ast.parse(__locus_source__, {filename}).body or __locus_main__.body[0].body\n\
+exec(compile(__locus_main__, {filename}, \"exec\"))\n\
+del __locus_source__, __locus_main__\n\
 \n\
-async def __locus_python_main__():\n{}\n\
-\n\
-__locus_asyncio.run(__locus_python_main__())\n",
-        indent_python_body(code)
+try:\n    \
+__locus_asyncio.run(__locus_python_main__())\n\
+except locus.LocusRpcError as __locus_error:\n    \
+{REPORTED_ERROR_HANDLER}\n"
     ))
+}
+
+/// Images from `locus.attach_image` go to the caller's image sink (agent
+/// loop); without one they are saved as files and listed.
+fn deliver_images(images: Vec<crate::session::models::ImageData>, token: &str, output: &mut String) {
+    if images.is_empty() {
+        return;
+    }
+    if let Some(sink) = crate::tool::python_call::current_image_sink() {
+        let count = images.len();
+        if let Ok(mut sink) = sink.lock() {
+            sink.extend(images);
+        }
+        output.push_str(&format!("\n[{count} image(s) attached]"));
+        return;
+    }
+    let dir = std::env::temp_dir().join("locus-attachments").join(token);
+    let paths = crate::tool::python_call::save_images(&images, &dir);
+    output.push_str("\nAttached images were saved (view them with `read`):");
+    for path in paths {
+        output.push_str(&format!("\n- {}", path.display()));
+    }
 }
 
 pub(crate) fn is_readonly(args: &serde_json::Value) -> bool {
@@ -173,6 +218,19 @@ pub(super) fn python() -> ToolDef {
                     );
                 }
 
+                let python_call = crate::tool::python_call::register(
+                    is_readonly(&args),
+                    owner.session_id.clone(),
+                    ctx.output.clone(),
+                );
+                command.env(crate::tool::python_call::ENV_CALL, python_call.token());
+                if is_readonly(&args) {
+                    command.env(crate::tool::python_call::ENV_READONLY, "1");
+                }
+                // Blender instances changed by this call push their one undo
+                // step when the call ends, on every exit path.
+                let _blender_batch = crate::blender::exec::BatchGuard::new(python_call.token());
+
                 if let Some(report) = ctx.progress.as_ref() {
                     report("Python workflow running".to_string());
                 }
@@ -240,8 +298,10 @@ pub(super) fn python() -> ToolDef {
                             text = "(no output)".to_string();
                         }
                         let exit_code = output.status.code().unwrap_or(-1);
+                        let mut output = format!("Exit code: {exit_code}\n{text}");
+                        deliver_images(python_call.take_images(), python_call.token(), &mut output);
                         ToolResult {
-                            output: format!("Exit code: {exit_code}\n{text}"),
+                            output,
                             is_error: exit_code != 0,
                         }
                     }
@@ -273,8 +333,26 @@ mod tests {
         assert!(source.contains("checkout_id=\"checkout-7\""));
         assert!(source.contains("expected_generation=9"));
         assert!(source.contains("expected_materialization_epoch=3"));
-        assert!(source.contains("    status = await locus.get_unity_editor_status"));
+        assert!(source.contains(
+            "__locus_source__ = \"status = await locus.get_unity_editor_status(project=project)\\nprint(status.ready)\"\n"
+        ));
+        assert!(source.contains("__locus_main__.body[0].body = __locus_ast.parse(__locus_source__, \"<locus-python>\").body"));
         assert!(source.contains("__locus_asyncio.run(__locus_python_main__())"));
+        // Only reported Locus conditions are shortened; everything else re-raises.
+        assert!(source.contains(
+            "try:\n    __locus_asyncio.run(__locus_python_main__())\nexcept locus.LocusRpcError as __locus_error:\n    __locus_report = "
+        ));
+        assert!(source.contains("__locus_report = getattr(locus, \"_print_reported_error\", None)\n    if __locus_report is None or not __locus_report(__locus_error):"));
+        assert!(source.contains(":\n        raise\n    raise SystemExit(1) from None\n"));
+    }
+
+    #[test]
+    fn source_keeps_multiline_string_literals_verbatim() {
+        let code = "text = \"\"\"first\nsecond\n    third\"\"\"\nif text:\n    print(text)";
+        let source = build_python_source(code, r"F:\Project", "checkout-7", 9, 3).expect("source");
+        let literal = serde_json::to_string(code).expect("literal");
+        assert!(source.contains(&format!("__locus_source__ = {literal}\n")));
+        assert!(!source.contains("    second"));
     }
 
     #[test]
