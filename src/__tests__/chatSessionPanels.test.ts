@@ -3692,6 +3692,37 @@ describe("chat session panel state", () => {
     expect(chatStore.activeToolCalls[0].id).toBe("tc-resume");
   });
 
+  it("replaces stale run state and accepts tool progress without accepting old events", async () => {
+    const chatStore = useChatStore();
+    await chatStore.selectSession("s1");
+    chatStore.handleStreamEvent({ type: "runStart", sessionId: "s1", runId: "old-run" });
+    expect(chatStore.handleStreamEvent({
+      type: "runStart", sessionId: "s1", runId: "new-run",
+    })).toBe(true);
+    expect(chatStore.currentRunId).toBe("new-run");
+    expect(chatStore.handleStreamEvent({
+      type: "toolCallStart", sessionId: "s1", runId: "new-run",
+      toolCallId: "tc-new", toolName: "read", arguments: "{}",
+    })).toBe(true);
+    expect(chatStore.activeToolCalls.map((tool) => tool.id)).toEqual(["tc-new"]);
+    expect(chatStore.handleStreamEvent({
+      type: "toolCallStart", sessionId: "s1", runId: "old-run",
+      toolCallId: "tc-old", toolName: "read", arguments: "{}",
+    })).toBe(false);
+    expect(chatStore.handleStreamEvent({
+      type: "toolCallDone", sessionId: "s1", runId: "new-run",
+      toolCallId: "tc-new", toolName: "read", output: "ok", outcome: "done",
+    })).toBe(true);
+    expect(chatStore.handleStreamEvent({
+      type: "done", sessionId: "s1", runId: "new-run", messageId: "m-new", fullText: "Finished",
+    })).toBe(true);
+    expect(chatStore.isStreaming).toBe(false);
+    expect(chatStore.messages.find((message) => message.id === "m-new")?.content).toBe("Finished");
+    expect(chatStore.handleStreamEvent({
+      type: "runStart", sessionId: "s1", runId: "new-run",
+    })).toBe(false);
+  });
+
   it("forks a running active root session and switches to the frozen copy", async () => {
     const chatStore = useChatStore();
 

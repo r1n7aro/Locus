@@ -2057,12 +2057,12 @@ export const useChatStore = defineStore("chat", () => {
 
       const expectedRunId = sessionRunIds.value.get(event.sessionId);
       if (expectedRunId && expectedRunId !== event.runId) {
-        logChatStreamDebug("ignoring runStart with unexpected run id", {
+        // A backend runStart supersedes run ids restored from stale session state.
+        logChatStreamDebug("replacing stale run id on runStart", {
           sessionId: event.sessionId,
           runId: event.runId,
           expectedRunId,
         });
-        return false;
       }
 
       closedRunIds.delete(event.sessionId);

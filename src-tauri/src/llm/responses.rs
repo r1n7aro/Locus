@@ -734,9 +734,9 @@ fn parse_event_block(event_block: &str) -> Option<(String, String)> {
 
     for line in event_block.lines() {
         let line = line.trim();
-        if let Some(et) = line.strip_prefix("event: ") {
+        if let Some(et) = line.strip_prefix("event:") {
             event_type = et.trim().to_string();
-        } else if let Some(data) = line.strip_prefix("data: ") {
+        } else if let Some(data) = line.strip_prefix("data:") {
             data_lines.push(data.trim().to_string());
         }
     }
@@ -775,9 +775,12 @@ where
     G: Fn(String) + Send + 'static,
     H: Fn(String, String) + Send + 'static,
 {
-    let Some((event_type, data_str)) = parse_event_block(event_block) else {
+    let Some((mut event_type, data_str)) = parse_event_block(event_block) else {
         return Ok(());
     };
+    if event_type.is_empty() || event_type == "message" {
+        event_type = parse_json_text_field(&data_str, "type").unwrap_or(event_type);
+    }
 
     if debug {
         eprintln!("[DEBUG][Responses] event={} data={}", event_type, &data_str);
@@ -916,6 +919,23 @@ where
                 };
             }
         }
+        "error" | "response.failed" => {
+            let value = serde_json::from_str::<serde_json::Value>(&data_str).ok();
+            let error = value.as_ref().and_then(|value| {
+                value.get("response").and_then(|response| response.get("error"))
+                    .or_else(|| value.get("error"))
+                    .or(Some(value))
+            });
+            let message = error.and_then(|error| error.get("message"))
+                .and_then(|message| message.as_str())
+                .unwrap_or("Responses API stream failed");
+            let code = error.and_then(|error| error.get("code"))
+                .and_then(|code| code.as_str()).filter(|code| !code.is_empty());
+            return Err(match code {
+                Some(code) => format!("{}: {}", code, message),
+                None => message.to_string(),
+            });
+        }
         _ => {}
     }
 
@@ -1050,6 +1070,43 @@ mod tests {
     fn ignore_text(_: String) {}
     fn ignore_thinking(_: String) {}
     fn ignore_tool(_: String, _: String) {}
+
+    #[test]
+    fn propagates_gateway_stream_errors() {
+        for (event, expected) in [
+            (r#"data:{"type":"response.failed","response":{"error":{"code":"upstream_error","message":"Unavailable"}}}"#, "upstream_error: Unavailable"),
+            (r#"data: {"type":"error","code":"invalid_request","message":"Bad parameter"}"#, "invalid_request: Bad parameter"),
+            ("event:error\ndata:{\"error\":{\"message\":\"Nested failure\"}}", "Nested failure"),
+        ] {
+            let mut state = ResponsesStreamState::new();
+            let error = process_sse_event_block(event, false, &mut state, &ignore_text, &ignore_thinking, &ignore_tool)
+                .expect_err("stream errors must not become empty successful responses");
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn streams_data_only_text_and_tool_events() {
+        let mut state = ResponsesStreamState::new();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let captured = starts.clone();
+        let on_tool = move |id: String, name: String| captured.lock().unwrap().push((id, name));
+        let mut buffer = concat!(
+            "data:{\"type\":\"response.output_text.delta\",\"delta\":\"Checking\"}\r\n\r\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"tc1\",\"name\":\"read\"}}\n\n",
+            "event:message\ndata:{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{}\"}\n\n",
+            "data:{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"{}\"}\n\n",
+            "data:{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2}}}"
+        ).to_string();
+        drain_sse_buffer(&mut buffer, true, false, &mut state, &ignore_text, &ignore_thinking, &on_tool).unwrap();
+        assert_eq!(state.full_text, "Checking");
+        assert!(state.response_completed);
+        assert_eq!(state.input_tokens, 10);
+        assert_eq!(*starts.lock().unwrap(), vec![("tc1".to_string(), "read".to_string())]);
+        let tools = collect_tool_calls(state.tool_calls_map).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].arguments, "{}");
+    }
 
     fn user_message_with_images(text: &str, images: Vec<ImageData>) -> ChatMessage {
         ChatMessage {
